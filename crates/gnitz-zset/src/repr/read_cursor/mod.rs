@@ -10,9 +10,10 @@ use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::MemBatch;
 use crate::repr::merge::{self, ColumnarSource, PosCursor};
 use crate::repr::seek::gallop_by;
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
+use gnitz_wire::PkBuf;
 
 mod gather;
 mod output;
@@ -309,7 +310,7 @@ impl ReadCursor {
                 match key.len() == stride {
                     true => self.advance_to_forward(key),
                     // The prefix over an all-zero rest is its group's lower bound.
-                    false => self.advance_to_forward(PkBuf::from_bytes(key).padded(stride)),
+                    false => self.advance_to_forward(PkBuf::from_bytes(key).widened(stride).pk_bytes()),
                 }
                 self.valid && self.current_pk_starts_with(key)
             }
@@ -360,8 +361,9 @@ impl ReadCursor {
         &self.sources[idx]
     }
 
-    /// The current row's PK as its native scalar value. Only narrow
-    /// (`pk_stride ≤ 16`) relations have one; panics above that width.
+    /// The current row's PK as its image: its OPK bytes read as a big-endian
+    /// integer. Only narrow (`pk_stride ≤ 16`) relations have one; panics above
+    /// that width.
     #[inline]
     pub fn current_key_narrow(&self) -> u128 {
         debug_assert!(self.valid, "current_key_narrow on an invalid cursor");
@@ -537,7 +539,7 @@ impl ReadCursor {
     /// re-seek would re-find the row already consumed and spin forever.
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride();
-        self.advance_to(PkBuf::from_bytes(prefix).padded(stride));
+        self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
         while self.valid {
             if !self.current_pk_bytes().starts_with(prefix) {
                 return false;

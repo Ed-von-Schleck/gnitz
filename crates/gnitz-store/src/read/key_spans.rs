@@ -2,6 +2,7 @@
 //! columns where one exists, else from a spill sort of the relation's rows.
 
 use crate::relation::{relation_dir, RelationRegistry};
+use gnitz_zset::algebra::append_spans;
 use gnitz_zset::repr::{Batch, KeyProducer, ReadCursor, SpillSort};
 use gnitz_zset::schema::KeySpec;
 
@@ -32,8 +33,12 @@ impl RelationRegistry {
                 let dir = relation_dir(&self.base_dir, id);
                 let mut sort = SpillSort::new(&dir, spec.key_size(), self.config.key_spans_spill_bytes);
                 let mut rows = relation.cursor();
+                let mut spans = Vec::new();
+                // A drained chunk is consolidated, every row at weight 1.
                 while let Some(chunk) = rows.drain_chunk(chunk_rows) {
-                    sort.push_spans(&chunk, &spec)?;
+                    spans.clear();
+                    append_spans(&mut spans, sort.slot(), &chunk.as_mem_batch(), &spec, |_| true);
+                    sort.push(&spans)?;
                 }
                 Source::Sorted(sort.finish()?)
             }

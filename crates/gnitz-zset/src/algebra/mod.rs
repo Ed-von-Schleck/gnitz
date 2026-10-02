@@ -36,7 +36,7 @@ mod sink;
 pub use exchange::{op_exchange_gather, op_worker_filter, ScatterPlan};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
-pub use reindex::index_entries;
+pub use reindex::{append_spans, index_entries};
 pub use sink::SinkPlan;
 
 pub(crate) use aggregate::{emit_reduce_row, Accumulator, ExtremeSpec, GroupedState, ReduceShape};

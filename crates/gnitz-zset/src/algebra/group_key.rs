@@ -42,7 +42,81 @@ impl GroupKey {
             (ReduceOutKey::Natural, _) => GroupKey::PkPrefix(schema.pk_stride()),
         })
     }
+
+    /// This key as one cell per row of `mb`, where it is 1 to 16 bytes of one region.
+    pub(crate) fn cells<'a>(&self, mb: &MemBatch<'a>) -> Option<KeyCells<'a>> {
+        let pk = |off: usize, width: usize| KeyCells {
+            region: mb.pk(),
+            stride: mb.pk_stride(),
+            off,
+            width,
+            opk: true,
+            signed: false,
+        };
+        match *self {
+            GroupKey::PkPrefix(n) if (1..=NARROW_PK_MAX_BYTES).contains(&n) => Some(pk(0, n)),
+            GroupKey::Image(ColumnLocator::Pk { byte_off, size, .. }) => Some(pk(byte_off as usize, size as usize)),
+            GroupKey::Image(ColumnLocator::Payload { slot, size, type_code }) => Some(KeyCells {
+                region: mb.col_data(slot as usize, size as usize),
+                stride: size as usize,
+                off: 0,
+                width: size as usize,
+                opk: false,
+                signed: type_code.is_signed_int(),
+            }),
+            GroupKey::PkPrefix(_) | GroupKey::Fold(_) => None,
+        }
+    }
 }
+
+/// A group key of at most 16 bytes, as the cell it is in every row of `region`.
+pub(crate) struct KeyCells<'a> {
+    pub(crate) region: &'a [u8],
+    pub(crate) stride: usize,
+    pub(crate) off: usize,
+    pub(crate) width: usize,
+    /// A PK cell, stored as its image; else a native payload cell, signed or not.
+    pub(crate) opk: bool,
+    pub(crate) signed: bool,
+}
+
+impl KeyCells<'_> {
+    /// Row `r`'s cell; `W` is `self.width`.
+    #[inline(always)]
+    fn cell<const W: usize>(&self, r: usize) -> &[u8; W] {
+        let at = r * self.stride + self.off;
+        self.region[at..at + W].try_into().unwrap()
+    }
+}
+
+/// One `W`-byte cell's key image: a PK cell's bytes as they are, a payload cell's
+/// native value with its sign bit flipped.
+#[inline(always)]
+pub(crate) fn cell_image<const W: usize, const OPK: bool>(cell: &[u8; W], signed: bool) -> u128 {
+    if OPK {
+        return gnitz_wire::widen_pk_be(cell);
+    }
+    let mut le = [0u8; 16];
+    le[..W].copy_from_slice(cell);
+    u128::from_le_bytes(le) ^ ((signed as u128) << (8 * W - 1))
+}
+
+/// Run `$body` with `$w` the constant `$width`, a [`KeyCells`] width.
+macro_rules! for_cell_width {
+    ($width:expr, |$w:ident| $body:expr) => {
+        $crate::algebra::group_key::for_cell_width!(@arms $width, $w, $body, 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+    };
+    (@arms $width:expr, $w:ident, $body:expr, $($n:literal)*) => {
+        match $width {
+            $($n => {
+                const $w: usize = $n;
+                $body
+            })*
+            _ => unreachable!("a key cell is 1..=16 bytes"),
+        }
+    };
+}
+pub(crate) use for_cell_width;
 
 /// The synthetic `_group_pk` key — the whole PK region of an output whose group
 /// set has no natural key.
@@ -134,16 +208,19 @@ impl GroupOutKey {
     }
 
     /// `body` over `mb`, handed each row's identity: the output PK up to 16 bytes,
-    /// widened, else its XXH3-128. The key's form is matched once per call.
+    /// widened, else its XXH3-128. The key's form and width are matched once per call.
     #[inline]
     pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, body: L) -> L::Out {
+        if let Some(cells) = self.key.cells(mb) {
+            return for_cell_width!(cells.width, |W| match cells.opk {
+                true => body.run(|r| cell_image::<W, true>(cells.cell::<W>(r), cells.signed)),
+                false => body.run(|r| cell_image::<W, false>(cells.cell::<W>(r), cells.signed)),
+            });
+        }
         match &self.key {
-            &GroupKey::Image(loc) => body.run(|r| loc.opk_image(mb, r)),
             GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r, mb.get_null_word(r))),
-            &GroupKey::PkPrefix(w) if w <= NARROW_PK_MAX_BYTES => {
-                body.run(|r| gnitz_wire::widen_pk_be(mb.get_pk_prefix(r, w)))
-            }
             &GroupKey::PkPrefix(w) => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_prefix(r, w))),
+            GroupKey::Image(_) => unreachable!("an image key is one cell"),
         }
     }
 

@@ -25,28 +25,40 @@ const PATTERNS: &[u128] = &[
 /// encoded key IS the typed order of the value it encodes (`cmp_col_window` is
 /// the crate's own definition of that order over native LE bytes, tested
 /// independently), so a wrong sign flip fails here rather than as silently
-/// mis-summed weights downstream. `decode_pk_column` inverts the encode — the
+/// mis-summed weights downstream. `decode_pk_cell` inverts the encode — the
 /// bijection byte-equal ⟺ key-equal rests on — `key_image` is the key read as
-/// a big-endian integer, and `decode_opk_i64` fuses the decode with
-/// `FixedInt`'s widening.
+/// a big-endian integer and its own inverse, `push_opk` appends what `store_opk`
+/// stores, and `decode_opk_i64` fuses the decode with `FixedInt`'s widening.
 #[test]
 fn opk_codec_over_every_pk_type() {
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let sz = tc.wire_stride();
         let les: Vec<[u8; 16]> = PATTERNS.iter().map(|p| p.to_le_bytes()).collect();
-        let keys: Vec<Vec<u8>> = les
+        let keys: Vec<Vec<u8>> = PATTERNS
             .iter()
-            .map(|le| {
+            .map(|&p| {
                 let mut o = vec![0u8; sz];
-                encode_pk_column(&le[..sz], tc, &mut o);
+                store_opk(&mut o, p, tc.is_signed_int());
+                let mut pushed = vec![0xEE];
+                push_opk(&mut pushed, sz, p, tc.is_signed_int());
+                assert_eq!(pushed[1..], o[..], "tc={tc} p={p:#x}: push_opk");
                 o
             })
             .collect();
         for (i, (le, opk)) in les.iter().zip(&keys).enumerate() {
             let mut back = [0u8; 16];
-            decode_pk_column(opk, tc, &mut back[..sz]);
+            decode_pk_cell(opk, tc.is_signed_int(), &mut back[..sz]);
             assert_eq!(back[..sz], le[..sz], "tc={tc} p={i}: decode(encode(v)) != v");
-            assert_eq!(key_image(tc, PATTERNS[i]), widen_pk_be(opk), "tc={tc} p={i}: key_image");
+            let image = key_image(tc, PATTERNS[i]);
+            assert_eq!(image, widen_pk_be(opk), "tc={tc} p={i}: key_image");
+            assert_eq!(
+                key_image(tc, image),
+                PATTERNS[i] & image_mask(sz),
+                "tc={tc} p={i}: inverse"
+            );
+            let mut stored = vec![0u8; sz];
+            store_opk(&mut stored, image, false);
+            assert_eq!(&stored, opk, "tc={tc} p={i}: an image stores as it is");
             if let Some(fi) = FixedInt::from_type_code(tc) {
                 assert_eq!(decode_opk_i64(opk, fi), fi.decode_le_i64(&le[..sz]), "tc={tc} p={i}");
             }
@@ -61,36 +73,26 @@ fn opk_codec_over_every_pk_type() {
     }
 }
 
-/// `store_opk_image` writes what decode → widen → encode writes, for every
-/// promotion the engine performs: an FK's domain widening and a join key's
-/// packing at its common slot.
+/// The column decoder writes what `decode_pk_cell` writes per row, at every width,
+/// for a column that is the whole row and for one inside a wider key.
 #[test]
-fn store_opk_image_matches_decode_widen_encode() {
-    let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
-    let mut pairs: Vec<(TypeCode, TypeCode)> = Vec::new();
-    for &src in &pk_types {
-        for &target in &pk_types {
-            if src == target || src.int_domain_fits(target) || src.packs_at(target) {
-                pairs.push((src, target));
+fn decode_pk_cells_matches_decode_pk_cell() {
+    let rows = 37usize;
+    for width in [1usize, 2, 4, 8, 16] {
+        for (stride, off) in [(width, 0), (width + 11, 3)] {
+            let pk: Vec<u8> = (0..rows * stride)
+                .map(|i| (i as u8).wrapping_mul(151).wrapping_add(7))
+                .collect();
+            for signed in [false, true] {
+                let mut got = vec![0u8; rows * width];
+                decode_pk_cells(&pk, stride, off, width, signed, &mut got);
+                let mut want = vec![0u8; rows * width];
+                for r in 0..rows {
+                    let at = r * stride + off;
+                    decode_pk_cell(&pk[at..at + width], signed, &mut want[r * width..(r + 1) * width]);
+                }
+                assert_eq!(got, want, "width {width} stride {stride} signed {signed}");
             }
-        }
-    }
-    for (src, target) in pairs {
-        let (sw, tw) = (src.wire_stride(), target.wire_stride());
-        for p in PATTERNS {
-            let le = p.to_le_bytes();
-            let native = &le[..sw];
-            let mut opk_src = [0u8; 16];
-            encode_pk_column(native, src, &mut opk_src[..sw]);
-
-            let mut got = [0u8; 16];
-            store_opk_image(widen_pk_be(&opk_src[..sw]), src, sw, target, &mut got[..tw]);
-
-            let mut wide = [0u8; 16];
-            widen_native_le(native, src, &mut wide[..tw]);
-            let mut want = [0u8; 16];
-            encode_pk_column(&wide[..tw], target, &mut want[..tw]);
-            assert_eq!(got[..tw], want[..tw], "src={src} target={target} p={p:#x}");
         }
     }
 }
@@ -115,14 +117,15 @@ fn widen_pk_be_matches_the_general_form() {
     }
 }
 
-/// A `MAX_PK_BYTES` key fits, and narrowing a buffer re-zeroes the tail it
-/// gives up, so widening it again reads zeros there rather than stale bytes, and
-/// the narrowed key equals, hashes and looks up as a fresh one.
+/// A `MAX_PK_BYTES` key fits; a key built column by column widens with zeros and
+/// equals, hashes and looks up as the same bytes do.
 #[test]
-fn a_pk_buf_holds_max_pk_bytes_and_narrows_clean() {
-    let mut t = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
-    assert_eq!(t.width(), crate::MAX_PK_BYTES);
-    t.write(4, |b| b.fill(1));
+fn a_pk_buf_holds_max_pk_bytes_and_widens() {
+    let full = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
+    assert_eq!(full.pk_bytes().len(), crate::MAX_PK_BYTES);
+    let mut t = PkBuf::zeroed(0);
+    t.push(2, 0x0101, false);
+    t.push(2, 0x0101, false);
     assert_eq!(t.widened(8).pk_bytes(), [1, 1, 1, 1, 0, 0, 0, 0]);
     let fresh = PkBuf::from_bytes(&[1; 4]);
     assert_eq!(t, fresh);

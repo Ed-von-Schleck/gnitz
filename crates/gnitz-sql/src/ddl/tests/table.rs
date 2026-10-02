@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_wire::TypeCode;
 
 fn table_options_of(with: &str) -> CreateTableOptions {
     match crate::test_support::parse_stmt(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY) {with}")) {

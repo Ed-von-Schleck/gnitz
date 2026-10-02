@@ -188,9 +188,9 @@ fn a_repeated_unique_is_rejected_in_both_spellings() {
     }
 }
 
-/// An inline UNIQUE builds an index, so it takes only what an index takes: an
-/// indexable column, a user name, and an index record (the columns plus the
-/// source PK) within the key arity limit.
+/// An inline UNIQUE builds an index, so it takes only what an index takes: a
+/// key column, a user name, and an index record (the columns plus the source
+/// PK) within the key arity limit.
 #[test]
 fn an_inline_unique_must_be_an_admissible_index() {
     let cat = catalog(vec![]);
@@ -203,7 +203,7 @@ fn an_inline_unique_must_be_an_admissible_index() {
         (
             "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, d BIGINT, e BIGINT, f BIGINT, \
              UNIQUE(e, f), PRIMARY KEY (a, b, c, d))",
-            "index arity",
+            "UNIQUE: column list column count 2 out of range 1..=1",
         ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
@@ -474,17 +474,17 @@ fn a_self_fk_adopts_the_type_its_pk_column_adopted() {
     }
 }
 
-/// Every FK column carries an index, so it takes only a type an index key has.
+/// Every FK column carries an index, which keys on any PK-eligible type: a
+/// HUGEINT column references a HUGEINT key.
 #[test]
-fn an_fk_column_must_be_an_admissible_index_key() {
+fn an_fk_column_may_be_any_key_type() {
     let parent = rel(42, RelClass::Table, vec![col("id", TypeCode::I128)], vec![0], vec![]);
     let cat = catalog(vec![("parent", parent)]);
-    let sql = "CREATE TABLE c (id BIGINT PRIMARY KEY, p HUGEINT REFERENCES parent(id))";
-    assert_rejects(
-        sql,
-        plan_table(&cat, sql),
-        "FOREIGN KEY: column 'p' of type I128 cannot be an index key",
+    let c = created(
+        &cat,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, p HUGEINT REFERENCES parent(id))",
     );
+    assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I128);
 }
 
 /// A repeated column is the definition's error, reported before a column list

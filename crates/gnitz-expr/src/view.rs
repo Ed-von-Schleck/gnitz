@@ -153,9 +153,9 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
         );
         for (row, &want) in vals.iter().enumerate() {
             let mut native = [0u8; 16];
-            gnitz_wire::decode_pk_column(
+            gnitz_wire::decode_pk_cell(
                 &v.get_pk_bytes(row)[byte_off..byte_off + size],
-                type_code,
+                type_code.is_signed_int(),
                 &mut native[..size],
             );
             assert_eq!(

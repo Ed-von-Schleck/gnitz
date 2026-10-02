@@ -28,6 +28,14 @@ _CODE_PAIR = ("CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSI
               "CREATE TABLE c (cid BIGINT PRIMARY KEY, ref BIGINT UNSIGNED REFERENCES p(code))")
 
 
+# A HUGEINT UNIQUE target: the parent's index and the child's FK index both key
+# on the 16-byte signed value.
+_HUGE_PAIR = ("CREATE TABLE p (pid BIGINT PRIMARY KEY, code HUGEINT); "
+              "CREATE UNIQUE INDEX ON p(code); "
+              "CREATE TABLE c (cid BIGINT PRIMARY KEY, ref HUGEINT REFERENCES p(code))")
+_HUGE_ROWS = {"p": [(1, -(2**100)), (2, 2**100), (3, -1)], "c": [(10, -(2**100)), (11, -1)]}
+
+
 def _seed(client, ddl, seed):
     client.execute_sql(ddl)
     for table, rows in seed.items():
@@ -80,6 +88,9 @@ _ENFORCED = {
     # A row of the same batch satisfies a self-reference — its own included —
     # where a committed-state probe would refuse both.
     "self-reference": (_TREE, {"tree": [(1, None), (2, 1), (3, 3)]}, ("tree", (4, 99))),
+    # The orphan is the positive twin of a held negative value: a probe that lost
+    # the sign would find it.
+    "hugeint-unique-target": (_HUGE_PAIR, _HUGE_ROWS, ("c", (12, 1))),
 }
 
 
@@ -124,6 +135,10 @@ _LOOP = "CREATE TABLE loop (id BIGINT PRIMARY KEY REFERENCES loop(id))"
 # where the statements are refused and every table keeps its seed)`.
 _STATEMENTS = {
     "a referenced parent's delete": (_FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 1", None),
+    "a referenced HUGEINT value's delete": (_HUGE_PAIR, _HUGE_ROWS, "DELETE FROM p WHERE pid = 1", None),
+    "an unreferenced HUGEINT value's delete": (
+        _HUGE_PAIR, _HUGE_ROWS, "DELETE FROM p WHERE pid = 2",
+        {"p": [(1, -(2**100)), (3, -1)], "c": _HUGE_ROWS["c"]}),
     "an unreferenced parent's delete": (
         _FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 2",
         {"parent": [(1, 100)], "child": [(10, 1)]}),

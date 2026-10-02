@@ -18,7 +18,7 @@ fn batch_builder_writes_payload_around_a_non_leading_compound_pk() {
     let schema = schema_of(&[(U8, false), (U64, false), (U32, false), (I16, false)], &[1, 2]);
     let mut bb = BatchBuilder::new(&schema);
     for (k, a, b) in [(1u128, 0xAB_u128, -5i16), (2, 0xCD, 300)] {
-        bb.begin_row_opk(&[k, k * 10], 1);
+        bb.begin_row_natives(&[k, k * 10], 1);
         bb.put_int(a);
         bb.put_int(b as u128);
         bb.end_row();

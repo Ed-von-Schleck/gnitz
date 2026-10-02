@@ -21,9 +21,8 @@ use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, ColumnTable, SchemaFacts};
 use gnitz_store::relation::Relation;
-use gnitz_wire::{PkColList, PkKeys, Probe, WireConflictMode, WireStatus};
+use gnitz_wire::{PkColList, PkKeys, Probe, WireConflictMode, WireStatus, MAX_PK_BYTES};
 use gnitz_zset::repr::MemBatch;
-use gnitz_zset::schema::key::PkBuf;
 use gnitz_zset::schema::{encode_schema_block, KeySpec};
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
@@ -50,10 +49,10 @@ impl<P> Check<P> {
     }
 }
 
-/// The row of the ascending `keys` that `key` prefixes.
+/// The row of the ascending `keys` that is `key`.
 fn row_of(keys: &Batch, key: &[u8]) -> Option<usize> {
-    let lo = keys.find_lower_bound_bytes(PkBuf::from_bytes(key).padded(keys.schema().pk_stride()));
-    (lo < keys.len() && keys.get_pk_bytes(lo).starts_with(key)).then_some(lo)
+    let lo = keys.find_lower_bound_bytes(key);
+    (lo < keys.len() && keys.get_pk_bytes(lo) == key).then_some(lo)
 }
 
 /// Where an own-PK probe of `rel` goes: to the owners of its keys — or, every
@@ -65,25 +64,24 @@ fn probe_placement(rel: &Relation) -> Placement {
     }
 }
 
-/// A PK-sorted check batch whose row `j` carries `keys[j]` — an image at type
-/// `ref_tc` — in the leading key column of `schema`'s PK, the rest of each key
-/// zero. Sorts `keys` first: an image orders as its OPK bytes do.
-fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128], ref_tc: gnitz_wire::TypeCode) -> Batch {
+/// A PK-sorted check batch whose row `j` is `keys[j]`, an image of `schema`'s one key
+/// column. Sorts `keys` first: an image orders as its OPK bytes do.
+fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128]) -> Batch {
     keys.sort_unstable();
-    let key_tc = schema.columns[schema.pk_cols()[0] as usize].type_code;
-    let (ref_w, key_w) = (ref_tc.wire_stride(), key_tc.wire_stride());
-    let mut key = [0u8; gnitz_wire::MAX_PK_BYTES];
+    debug_assert_eq!(schema.pk_cols().len(), 1, "a check batch keys on one column");
+    let w = schema.pk_stride();
+    let mut key = [0u8; 16];
     let mut batch = Batch::with_capacity(schema, keys.len());
     for &k in keys.iter() {
-        gnitz_wire::store_opk_image(k, ref_tc, ref_w, key_tc, &mut key[..key_w]);
-        batch.push_key_row(&key[..schema.pk_stride()], 1);
+        gnitz_wire::store_opk(&mut key[..w], k, false);
+        batch.push_key_row(&key[..w], 1);
     }
     batch
 }
 
 /// Build a check batch from `keys`, OPK byte spans already in the target
 /// schema's key layout. Each lands verbatim in the PK region, where
-/// [`build_check_batch`] re-encodes column 0.
+/// [`build_check_batch`] encodes an image.
 fn build_check_batch_pk_bytes<'k>(schema: &SchemaDescriptor, keys: impl ExactSizeIterator<Item = &'k [u8]>) -> Batch {
     let mut batch = Batch::with_capacity(schema, keys.len());
     for k in keys {
@@ -332,11 +330,14 @@ impl<'a> TxnBundle<'a> {
     /// Whether the bundle retires `holder`'s claim on `span` in `tid`'s index
     /// `spec`: its surviving state is deleted, or holds a NULL or another span
     /// there. A holder the bundle does not touch keeps its claim.
-    fn retires(&self, tid: u64, spec: &KeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
+    fn retires(&self, tid: u64, spec: &KeySpec, holder: &[u8], span: &[u8]) -> bool {
         match self.fold(tid).get(holder).map(|e| e.last) {
             None => false,
             Some(FoldOp::Deleted) => true,
-            Some(FoldOp::Inserted(f, r)) => !spec.key_bytes(self.mem(f), r as usize, buf) || buf.pk_bytes() != span,
+            Some(FoldOp::Inserted(f, r)) => {
+                let mut own = [0u8; MAX_PK_BYTES];
+                !spec.write_span(self.mem(f), r as usize, &mut own) || own[..spec.key_size()] != *span
+            }
         }
     }
 }
@@ -584,25 +585,22 @@ fn plan_unique_checks<'a>(
     for t in &b.tables {
         let tid = t.tid;
         for &(col_indices, idx_schema, spec) in &t.cons.uniques {
-            let stride = idx_schema.pk_stride();
+            let key_size = spec.key_size();
 
             // The surviving spans as a flat arena plus an order vector, so the
             // sort moves 4-byte indices.
-            let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * stride);
-            let mut keybuf = PkBuf::zeroed(0);
+            let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * key_size);
             for (_pk, fam, row) in b.surviving(tid) {
+                let at = spans.len();
+                spans.resize(at + key_size, 0);
                 // NULL in an indexed column ⇒ unindexed.
-                if spec.key_bytes(b.mem(fam), row as usize, &mut keybuf) {
-                    spans.extend_from_slice(keybuf.padded(stride));
+                if !spec.write_span(b.mem(fam), row as usize, &mut spans[at..]) {
+                    spans.truncate(at);
                 }
             }
-            // Each arena slot is a span zero-padded to the index stride, which
-            // is the probe key.
-            let key_size = spec.key_size();
-            let probe_key = |i: u32| &spans[i as usize * stride..(i as usize + 1) * stride];
-            let span = |i: u32| &probe_key(i)[..key_size];
+            let span = |i: u32| &spans[i as usize * key_size..(i as usize + 1) * key_size];
             let mut order: Vec<u32> = Vec::new();
-            gnitz_zset::schema::key::sort_indices(&spans, stride, &mut order);
+            gnitz_zset::schema::key::sort_indices(&spans, key_size, &mut order);
             // `surviving` yields each PK once, so an adjacent-equal pair is two
             // rows of the bundle claiming one span.
             if order.windows(2).any(|w| span(w[0]) == span(w[1])) {
@@ -619,12 +617,15 @@ fn plan_unique_checks<'a>(
             if order.is_empty() {
                 continue;
             }
-            checks.push(Check::new(
-                tid,
-                Probe::Index(col_indices, NonZeroU64::MIN),
-                build_check_batch_pk_bytes(&idx_schema, order.iter().map(|&x| probe_key(x))),
-                Rule::Unique { cols: col_indices, span: key_size },
-            ));
+            checks.push(Check {
+                reply: idx_schema,
+                ..Check::new(
+                    tid,
+                    Probe::Index(col_indices, NonZeroU64::MIN),
+                    build_check_batch_pk_bytes(&spec.span_schema(), order.iter().map(|&x| span(x))),
+                    Rule::Unique { cols: col_indices, span: key_size },
+                )
+            });
         }
     }
     Ok(())
@@ -667,27 +668,28 @@ fn plan_fk_existence<'a>(
         // column, its UNIQUE index on the column otherwise.
         let parent = disp.cat().registry.relation_or_err(parent_tid)?;
         let parent_schema = parent.schema();
-        let (key_schema, probe, span) = if parent_schema.lone_pk_col() == Some(parent_col) {
-            (parent_schema.pk_only(), Probe::Pk, parent_schema.pk_stride())
+        // An FK column has its parent column's type, so its image is the key's.
+        let (key_schema, reply, probe) = if parent_schema.lone_pk_col() == Some(parent_col) {
+            let pk_only = parent_schema.pk_only();
+            (pk_only, pk_only, Probe::Pk)
         } else {
             let index = parent
                 .index_on(&[parent_col as u32])
                 .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
             let cols = PkColList::from_slice(&[parent_col as u32]);
             (
+                index.key_spec().span_schema(),
                 index.schema(),
                 Probe::Index(cols, NonZeroU64::MIN),
-                index.key_spec().key_size(),
             )
         };
-        let keys = build_check_batch(&key_schema, &mut values, loc.type_code());
+        let span = key_schema.pk_stride();
+        let keys = build_check_batch(&key_schema, &mut values);
         let values = values.into_iter().map(|v| (v, false)).collect();
-        checks.push(Check::new(
-            parent_tid,
-            probe,
-            keys,
-            Rule::FkExists { edge, span, values },
-        ));
+        checks.push(Check {
+            reply,
+            ..Check::new(parent_tid, probe, keys, Rule::FkExists { edge, span, values })
+        });
     }
     Ok(())
 }
@@ -820,12 +822,7 @@ async fn txn_check_fk_restrict(
 ) -> Result<(), WireFault> {
     let mut checks: Vec<Check<RestrictPlan>> = Vec::new();
     for &edge in children {
-        let FkEdge {
-            child_tid,
-            fk_col,
-            parent_tid,
-            parent_col,
-        } = edge;
+        let FkEdge { child_tid, fk_col, .. } = edge;
         let (retired, added) = &deltas[&delta_key(&edge)];
         let mut values: Vec<u128> = retired.keys().copied().filter(|v| !added.contains(v)).collect();
         if values.is_empty() {
@@ -838,8 +835,8 @@ async fn txn_check_fk_restrict(
             .and_then(|r| r.index_on(&[fk_col as u32]))
             .map(|ic| (ic.schema(), ic.key_spec()))
             .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
-        let ref_tc = b.schema(parent_tid).columns[parent_col].type_code;
-        let keys = build_check_batch(&idx_schema, &mut values, ref_tc);
+        // The parent column has the FK column's type, so its image is the span's.
+        let keys = build_check_batch(&spec.span_schema(), &mut values);
         let bundled = b.has(child_tid);
         // Past `K` holders one is not a key of the child's `K`-key fold, and
         // only a fold key is exempt. An unbundled child exempts none.
@@ -849,12 +846,14 @@ async fn txn_check_fk_restrict(
             NonZeroU64::MIN.saturating_add(exempt),
         );
         let plan = RestrictPlan { edge, spec, values, bundled };
-        checks.push(Check::new(child_tid, probe, keys, plan));
+        checks.push(Check {
+            reply: idx_schema,
+            ..Check::new(child_tid, probe, keys, plan)
+        });
     }
 
     // The first non-exempt holder aborts the drain, whose lease drop discards
     // every train still in flight.
-    let mut hspan = PkBuf::zeroed(0);
     execute_probe_burst(disp, &mut checks, |check, rows| {
         let plan = &check.plan;
         let retired = &deltas[&delta_key(&plan.edge)].0;
@@ -866,7 +865,7 @@ async fn txn_check_fk_restrict(
             let Some(r) = row_of(&check.keys, span) else {
                 continue;
             };
-            if plan.bundled && b.retires(plan.edge.child_tid, &plan.spec, holder, span, &mut hspan) {
+            if plan.bundled && b.retires(plan.edge.child_tid, &plan.spec, holder, span) {
                 continue;
             }
             // Anything but a surviving row holding a new value reads as a delete.

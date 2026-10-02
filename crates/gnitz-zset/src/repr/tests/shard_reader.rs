@@ -551,7 +551,7 @@ fn shapes() -> Vec<Shape> {
         Shape {
             label: "3xu64 all-pk",
             written: build(all_pk, 9, |b, i| {
-                b.begin_row_opk(&[1, (i / 4) as u128, (i * 7) as u128], 1)
+                b.begin_row_natives(&[1, (i / 4) as u128, (i * 7) as u128], 1)
             }),
             reader: all_pk,
             pack: false,

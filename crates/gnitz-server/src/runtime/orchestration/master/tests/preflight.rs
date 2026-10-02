@@ -3,19 +3,20 @@ use crate::test_support::{make_schema_u64_i64, opk_pk, pk_only_schema, pk_payloa
 use gnitz_wire::TypeCode;
 
 /// Row `j` of the check batch holds `keys[j]` once the call returns — the order
-/// F1/F2 map replies back by — each image promoted into the leading key column,
-/// the source-PK suffix zero.
+/// F1/F2 map replies back by — each image stored as the key column's bytes.
 #[test]
 fn build_check_batch_sorts_the_keys_into_its_rows() {
-    let idx = pk_only_schema(&[TypeCode::I64, TypeCode::U64]);
-    let mut keys = [5i32, -1, 0].map(|v| gnitz_wire::key_image(TypeCode::I32, v as u128));
+    for tc in [TypeCode::I32, TypeCode::I64, TypeCode::I128] {
+        let span = pk_only_schema(&[tc]);
+        let mut keys = [5i32, -1, 0].map(|v| gnitz_wire::key_image(tc, v as u128));
 
-    let batch = build_check_batch(&idx, &mut keys, TypeCode::I32);
+        let batch = build_check_batch(&span, &mut keys);
 
-    assert!(keys.is_sorted());
-    let rows: Vec<&[u8]> = (0..batch.len()).map(|j| batch.get_pk_bytes(j)).collect();
-    let want: Vec<Vec<u8>> = [-1i64, 0, 5].iter().map(|&v| opk_pk(&idx, &[v as u128, 0])).collect();
-    assert_eq!(rows, want);
+        assert!(keys.is_sorted());
+        let rows: Vec<&[u8]> = (0..batch.len()).map(|j| batch.get_pk_bytes(j)).collect();
+        let want: Vec<Vec<u8>> = [-1i64, 0, 5].iter().map(|&v| opk_pk(&span, &[v as u128])).collect();
+        assert_eq!(rows, want, "{tc}");
+    }
 }
 
 /// An own-PK probe goes where the relation's keys are held. A replicated
@@ -70,7 +71,7 @@ fn check_batch_build_bench() {
 }
 
 #[test]
-fn row_of_names_the_row_a_key_prefixes() {
+fn row_of_names_the_row_that_is_a_key() {
     let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let key = |a: u64, b: u64| opk_pk(&schema, &[a as u128, b as u128]);
     let rows = [key(1, 0), key(3, 1), key(5, 9), key(7, 0)];
@@ -78,8 +79,7 @@ fn row_of_names_the_row_a_key_prefixes() {
     assert_eq!(row_of(&keys, &key(3, 1)), Some(1), "a present key");
     assert_eq!(row_of(&keys, &key(3, 2)), None, "an absent key");
     assert_eq!(row_of(&keys, &key(9, 0)), None, "an absent key past the last row");
-    assert_eq!(row_of(&keys, &5u64.to_be_bytes()), Some(2), "a span prefix");
-    assert_eq!(row_of(&keys, &0u64.to_be_bytes()), None, "a span below every row");
+    assert_eq!(row_of(&keys, &key(0, 0)), None, "a key below every row");
 }
 
 /// A write to a parent referenced through its lone PK column probes nothing

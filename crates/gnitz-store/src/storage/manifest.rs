@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 
+use gnitz_wire::PkBuf;
 use gnitz_wire::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::schema::key::PkBuf;
 
 const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 17;

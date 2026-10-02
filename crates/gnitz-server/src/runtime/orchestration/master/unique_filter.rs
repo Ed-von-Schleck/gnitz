@@ -5,7 +5,8 @@
 use rustc_hash::FxHashSet;
 
 use super::*;
-use gnitz_zset::schema::key::{probe_key, PkBuf};
+use gnitz_zset::algebra::append_spans;
+use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::KeySpec;
 
 /// Spans a filter tracks before it disables itself.
@@ -43,6 +44,11 @@ impl UniqueFilter {
         true
     }
 
+    /// Whether the cap has disabled the filter.
+    fn is_capped(&self) -> bool {
+        self.values.is_none()
+    }
+
     /// A fingerprint probe: a collision, and every span once the filter has
     /// capped, answers true.
     pub(super) fn may_contain(&self, span: &[u8]) -> bool {
@@ -53,17 +59,16 @@ impl UniqueFilter {
 }
 
 /// Insert the indexed span of every live row of `batch` into `filter`; a NULL
-/// in an indexed column means no span (`key_bytes` → false) and no occupancy.
+/// in an indexed column means no span and no occupancy.
 pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset::repr::MemBatch<'_>, spec: &KeySpec) {
-    let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.len() {
-        if batch.get_weight(row) <= 0 {
-            continue;
-        }
-        if !spec.key_bytes(batch, row, &mut keybuf) {
-            continue;
-        }
-        if !filter.insert(keybuf.pk_bytes()) {
+    if filter.is_capped() {
+        return;
+    }
+    let key_size = spec.key_size();
+    let mut spans = Vec::new();
+    append_spans(&mut spans, key_size, batch, spec, |w| w > 0);
+    for span in spans.chunks_exact(key_size) {
+        if !filter.insert(span) {
             return;
         }
     }

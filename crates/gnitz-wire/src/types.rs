@@ -395,73 +395,6 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
     }
 }
 
-/// Promote a base-table column's type to the leading-key type its secondary
-/// index stores: an unsigned ≤8-byte integer (U8..U64) promotes to `U64`, a
-/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal or decimal type as
-/// its storage integer does — so a `DATE` index key is the exercised 8-byte
-/// signed one, not the only 4-byte key in the system; `U128`/`UUID` keep their
-/// 16-byte width; STRING/BLOB/float/I128 are index-ineligible and return `None`.
-/// Signed columns keep a *signed* promoted type so the OPK leading key is
-/// order-preserving (`encode_pk_column` sign-flips only signed types);
-/// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
-/// never moves the index record's arity or stride.
-pub fn index_key_type(field_type: TypeCode) -> Option<TypeCode> {
-    match FixedInt::from_type_code(field_type) {
-        Some(fi) if fi.is_signed() => Some(TypeCode::I64),
-        Some(_) => Some(TypeCode::U64),
-        None if matches!(field_type, TypeCode::U128 | TypeCode::UUID) => Some(field_type),
-        None => None,
-    }
-}
-
-/// The promoted key type of each indexed column, or the rule the index breaks.
-/// An index record keys on the promoted columns then the source PK, so its PK
-/// arity is `col_types.len() + src_pk_count`.
-pub fn index_key_types(col_types: &[TypeCode], src_pk_count: usize) -> Result<Vec<TypeCode>, IndexKeyRule> {
-    let mut promoted: Vec<TypeCode> = Vec::with_capacity(col_types.len());
-    for (col, &t) in col_types.iter().enumerate() {
-        // Indexed by position, so the layer above can name the SQL column that
-        // failed.
-        let p = index_key_type(t).ok_or(IndexKeyRule::NotEligible { col, type_code: t })?;
-        promoted.push(p);
-    }
-    let n = promoted.len();
-    if n + src_pk_count > crate::MAX_PK_COLUMNS {
-        return Err(IndexKeyRule::ArityOutOfRange { n, src_pk_count });
-    }
-    Ok(promoted)
-}
-
-/// Which rule a candidate secondary-index key broke — [`PkRule`]'s counterpart
-/// for [`index_key_types`], so the SQL planner can name the offending column by
-/// its SQL identifier. `col` indexes `col_types`, never the appended source PK:
-/// only the indexed columns are promoted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexKeyRule {
-    /// A column type [`index_key_type`] promotes to no index key.
-    NotEligible { col: usize, type_code: TypeCode },
-    /// The index record is the indexed columns plus the source PK, and every one
-    /// of them is a PK column, so their total arity is capped by
-    /// [`crate::MAX_PK_COLUMNS`].
-    ArityOutOfRange { n: usize, src_pk_count: usize },
-}
-
-impl core::fmt::Display for IndexKeyRule {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {
-            IndexKeyRule::NotEligible { col, type_code } => write!(
-                f,
-                "Secondary index on column type {type_code} not supported (index key column {col})"
-            ),
-            IndexKeyRule::ArityOutOfRange { n, src_pk_count } => write!(
-                f,
-                "index arity {n} + source PK arity {src_pk_count} exceeds the limit of {}",
-                crate::MAX_PK_COLUMNS
-            ),
-        }
-    }
-}
-
 /// Which rule a candidate primary key broke, worded by [`PkRule::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
@@ -529,7 +462,7 @@ impl PkRule {
             PkRule::Duplicate { col: c } => format!("{what} names column {} twice", col(c)),
             PkRule::NotEligible { col: c, type_code } => format!(
                 "{what} column {} has type_code {type_code}; only fixed-width integer, \
-                 U128, UUID, and I128 columns can be PK columns \
+                 U128, UUID, and I128 columns can be key columns \
                  (String, Blob, and float columns cannot)",
                 col(c)
             ),

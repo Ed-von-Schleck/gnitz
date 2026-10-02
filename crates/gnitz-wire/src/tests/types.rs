@@ -44,46 +44,6 @@ fn type_predicates_partition_the_type_table() {
     }
 }
 
-/// The whole source → index-key promotion map, over the whole `u8` domain:
-/// unsigned ≤8-byte ints → U64, signed ≤8-byte ints → I64 (an order-preserving
-/// signed leading key), U128/UUID keep their width, everything else is
-/// index-ineligible.
-#[test]
-fn index_key_type_pins_the_whole_promotion_map() {
-    use TypeCode as T;
-    let map: &[(TypeCode, TypeCode)] = &[
-        (T::U8, T::U64),
-        (T::U16, T::U64),
-        (T::U32, T::U64),
-        (T::U64, T::U64),
-        (T::I8, T::I64),
-        (T::I16, T::I64),
-        (T::I32, T::I64),
-        (T::I64, T::I64),
-        (T::U128, T::U128),
-        (T::UUID, T::UUID),
-        // A temporal or decimal column indexes on its storage integer's
-        // promoted key.
-        (T::Date, T::I64),
-        (T::Timestamp, T::I64),
-        (T::Decimal, T::I64),
-    ];
-    for &tc in TypeCode::ALL {
-        match map.iter().find(|&&(src, _)| src == tc) {
-            Some(&(_, want)) => {
-                assert_eq!(index_key_type(tc), Some(want), "tc={tc}");
-                // The promoted slot must hold every value of the source: a
-                // promotion may widen or rename, never narrow or cross sign.
-                assert!(
-                    tc == want || tc.int_domain_fits(want),
-                    "tc={tc}: the promoted key {want} cannot hold it",
-                );
-            }
-            None => assert!(index_key_type(tc).is_none(), "tc={tc} must be index-ineligible"),
-        }
-    }
-}
-
 /// Membership and the discriminant round-trip are `wire_enum!`'s; only the
 /// names need a runtime compare.
 #[test]
@@ -214,59 +174,6 @@ fn join_key_common_type_is_the_narrowest_faithful_slot() {
     }
 }
 
-/// Equal values on both sides of an accepted join key pair pack byte-identically
-/// at the common slot, so they co-partition and match; and distinct values never
-/// collide — including the native-byte aliasing trap (U8 255 and I8 -1 share all
-/// 0xFF native bytes).
-#[test]
-fn every_accepted_join_key_pair_copartitions() {
-    const PROBES: &[i128] = &[
-        i128::MIN,
-        i64::MIN as i128,
-        i32::MIN as i128,
-        -32768,
-        -129,
-        -128,
-        -56,
-        -1,
-        0,
-        1,
-        127,
-        128,
-        200,
-        255,
-        256,
-        32767,
-        65535,
-        i32::MAX as i128,
-        u32::MAX as i128,
-        i64::MAX as i128,
-        u64::MAX as i128,
-        i128::MAX,
-    ];
-    let pk: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
-    for &l in &pk {
-        for &r in &pk {
-            let Ok(t) = l.join_key_common_type(r) else { continue };
-            let keys: Vec<(i128, crate::PkBuf)> = [l, r]
-                .into_iter()
-                .flat_map(|tc| {
-                    let (lo, hi) = key_bounds(tc);
-                    PROBES
-                        .iter()
-                        .filter(move |&&v| lo <= v && (v < 0 || v as u128 <= hi))
-                        .map(move |&v| (v, crate::encode_pk_images([(tc, t, crate::key_image(tc, v as u128))])))
-                })
-                .collect();
-            for (va, ka) in &keys {
-                for (vb, kb) in &keys {
-                    assert_eq!(ka.pk_bytes() == kb.pk_bytes(), va == vb, "{l}/{r} at {t}: {va} vs {vb}");
-                }
-            }
-        }
-    }
-}
-
 /// The PK admission rule, one refusal per rule.
 #[test]
 fn validate_pk_tuple_names_each_rule() {
@@ -327,24 +234,6 @@ fn a_pk_rule_names_the_columns_its_caller_can() {
     assert!(float
         .for_role(role)
         .starts_with("primary key column 1 has type_code F64;"));
-}
-
-/// An index key promotes each column, and its record — the key columns plus the
-/// source PK — is capped in arity.
-#[test]
-fn index_key_types_promote_and_cap_the_record() {
-    use TypeCode::*;
-    assert_eq!(index_key_types(&[U8, I32], 1), Ok(vec![U64, I64]));
-    assert_eq!(
-        index_key_types(&[I64, String], 1),
-        Err(IndexKeyRule::NotEligible { col: 1, type_code: String })
-    );
-    let n = crate::MAX_PK_COLUMNS;
-    assert_eq!(index_key_types(&[U64; 1], n - 1), Ok(vec![U64]));
-    assert_eq!(
-        index_key_types(&[U64; 1], n),
-        Err(IndexKeyRule::ArityOutOfRange { n: 1, src_pk_count: n })
-    );
 }
 
 /// Each fixed-width type's order, both directions: unsigned magnitude at every

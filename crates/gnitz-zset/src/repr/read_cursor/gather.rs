@@ -12,8 +12,8 @@ use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::run::Run;
 use crate::repr::scatter::gather_rows;
-use crate::schema::key::PkBuf;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor, SchemaFacts};
+use gnitz_wire::PkBuf;
 
 pub struct PkSetGather {
     cursor: ReadCursor,
@@ -35,7 +35,10 @@ impl PkSetGather {
     pub fn over_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize, keys: PkKeys) -> Self {
         debug_assert!(keys.stride() <= schema.pk_stride());
         let cursor = match keys.iter().next() {
-            Some(first) => from_runs_at(runs, schema, cap, PkBuf::from_bytes(first).padded(schema.pk_stride())),
+            Some(first) => {
+                let first = PkBuf::from_bytes(first).widened(schema.pk_stride());
+                from_runs_at(runs, schema, cap, first.pk_bytes())
+            }
             None => empty_cursor(schema),
         };
         PkSetGather { cursor, keys, next: 0 }

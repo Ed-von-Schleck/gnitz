@@ -8,7 +8,6 @@ use crate::storage::Table;
 use gnitz_expr::ColumnTable;
 use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
-use gnitz_zset::schema::SchemaDescriptor;
 
 const INDEX_SCAN_RATIO: usize = 16;
 
@@ -16,11 +15,10 @@ impl RelationRegistry {
     /// Answer `probe` at `keys` over the rows this process holds of `id`.
     pub fn probe(&self, id: u64, probe: Probe, keys: &Batch) -> Result<Batch, String> {
         let stride = keys.schema().pk_stride();
-        let keyed_as = |store: SchemaDescriptor| match store.pk_stride() == stride {
+        let keyed_as = |expected: usize| match expected == stride {
             true => Ok(()),
             false => Err(format!(
-                "probe: key stride {stride} != the probed store's {} (table {id})",
-                store.pk_stride()
+                "probe: key stride {stride} != the probed store's {expected} (table {id})"
             )),
         };
         let (cols, cap) = match probe {
@@ -28,14 +26,14 @@ impl RelationRegistry {
                 let mut echo = Batch::empty_with_schema(keys.schema());
                 // An id this process has not registered holds no row.
                 if let Some(relation) = self.relation(id) {
-                    keyed_as(relation.schema())?;
+                    keyed_as(relation.schema().pk_stride())?;
                     held(keys, relation.table()).for_each(|key| echo.push_key_row(key, 1));
                 }
                 return Ok(echo);
             }
             Probe::PkColumn(col) => {
                 let relation = self.relation_or_err(id)?;
-                keyed_as(relation.schema())?;
+                keyed_as(relation.schema().pk_stride())?;
                 let mut live = Vec::with_capacity(keys.pk_data().len());
                 held(keys, relation.table()).for_each(|key| live.extend_from_slice(key));
                 let live = PkKeys::from_sorted(stride, live);
@@ -47,15 +45,13 @@ impl RelationRegistry {
             .relation(id)
             .and_then(|r| r.index_on(cols.as_slice()))
             .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), id))?;
-        keyed_as(index.schema())?;
+        // The keys are the probed spans themselves.
         let span = index.key_spec().key_size();
-        let mut spans = Vec::with_capacity(keys.len() * span);
-        for i in 0..keys.len() {
-            spans.extend_from_slice(&keys.get_pk_bytes(i)[..span]);
-        }
-        let spans = PkKeys::checked(span, spans).map_err(|e| format!("probe: index {e} (table {id})"))?;
+        keyed_as(span)?;
+        let spans =
+            PkKeys::checked(span, keys.pk_data().to_vec()).map_err(|e| format!("probe: index {e} (table {id})"))?;
         let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
-        let mut entries = Batch::empty_with_schema(keys.schema());
+        let mut entries = Batch::empty_with_schema(&index.schema());
         index
             .gather(spans)
             .for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));

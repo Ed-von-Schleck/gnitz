@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_expr::SchemaFacts;
+use gnitz_expr::{ColumnLocator, ColumnTable, SchemaFacts};
 
 use std::path::Path;
 
@@ -363,12 +363,25 @@ fn child_rows(
 /// A test PK: the PK columns' native little-endian images, packed in PK-list
 /// order into one `u128`.
 fn opk_of(schema: &SchemaDescriptor, pk: u128) -> gnitz_wire::PkBuf {
-    schema.opk_key(&pk.to_le_bytes())
+    let natives: Vec<u128> = pk_cells(schema)
+        .map(|(off, w, _)| (pk >> (8 * off)) & gnitz_wire::image_mask(w))
+        .collect();
+    schema.opk_key_cols(&natives)
 }
 
 /// The inverse of [`opk_of`].
 fn native_pk(schema: &SchemaDescriptor, opk: &[u8]) -> u128 {
-    u128::from_le_bytes(schema.native_le_key(opk)[..16].try_into().unwrap())
+    pk_cells(schema).fold(0, |pk, (off, w, tc)| {
+        pk | gnitz_wire::key_image(tc, gnitz_wire::widen_pk_be(&opk[off..off + w])) << (8 * off)
+    })
+}
+
+/// Each PK column's `(byte offset, width, type)` in the key, in PK-list order.
+fn pk_cells(schema: &SchemaDescriptor) -> impl Iterator<Item = (usize, usize, TypeCode)> + '_ {
+    schema.pk_cols().iter().map(|&c| match schema.locate(c as usize) {
+        ColumnLocator::Pk { byte_off, size, type_code } => (byte_off as usize, size as usize, type_code),
+        ColumnLocator::Payload { .. } => unreachable!("a PK column"),
+    })
 }
 
 /// Relation `tid`'s schema and placement.

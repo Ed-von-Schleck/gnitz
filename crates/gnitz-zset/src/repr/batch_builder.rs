@@ -16,7 +16,7 @@ pub struct BatchBuilder {
 /// `gnitz_wire::sys_rows` writes a system-table row into.
 impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
     fn begin_row(&mut self, pk: &[u128], weight: i64) {
-        BatchBuilder::begin_row_opk(self, pk, weight);
+        BatchBuilder::begin_row_natives(self, pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
         BatchBuilder::put_u64(self, v);
@@ -43,14 +43,14 @@ impl BatchBuilder {
     }
 
     /// Begin a new row with the given single-column PK and weight: `pk` is the
-    /// column's native value, as [`Self::begin_row_opk`] takes it.
+    /// column's native value, as [`Self::begin_row_natives`] takes it.
     pub fn begin_row(&mut self, pk: u128, weight: i64) {
-        self.begin_row_opk(&[pk], weight);
+        self.begin_row_natives(&[pk], weight);
     }
 
     /// [`Self::begin_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order, OPK-encoded into the packed PK region.
-    pub fn begin_row_opk(&mut self, natives: &[u128], weight: i64) {
+    pub fn begin_row_natives(&mut self, natives: &[u128], weight: i64) {
         let key = self.schema().opk_key_cols(natives);
         self.begin_row_bytes(key.pk_bytes(), weight);
     }
@@ -68,7 +68,7 @@ impl BatchBuilder {
     ///
     /// Signed values are passed as `v as u128`: sign-extending to 128 bits leaves
     /// the low `size()` bytes exactly the two's-complement image the column
-    /// holds. That is the same native convention [`Self::begin_row_opk`] takes
+    /// holds. That is the same native convention [`Self::begin_row_natives`] takes
     /// for PK columns.
     pub fn put_int(&mut self, val: u128) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;

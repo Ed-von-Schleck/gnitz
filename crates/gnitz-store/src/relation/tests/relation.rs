@@ -268,7 +268,7 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
     let rows = |rows: &[(u64, u64, i64, i64)]| {
         let mut b = BatchBuilder::new(&schema);
         for &(a, k, w, v) in rows {
-            b.begin_row_opk(&[a as u128, k as u128], w);
+            b.begin_row_natives(&[a as u128, k as u128], w);
             b.put_int(v as u128);
             b.end_row();
         }
@@ -323,7 +323,7 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
         // rows of every other key are a walk's to skip.
         let mut probe = BatchBuilder::new(&SchemaDescriptor::new(&[col], &[0]));
         for k in keys {
-            probe.begin_row_opk(&[k as u128], 1);
+            probe.begin_row_natives(&[k as u128], 1);
             probe.end_row();
         }
         let cursor = relation.cursor_for_keys(&probe.finish().into_consolidated(), cut);

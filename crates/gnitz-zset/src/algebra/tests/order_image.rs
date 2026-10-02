@@ -21,7 +21,7 @@ fn column_batch(tc: TypeCode, vals: &[u128], as_pk: bool) -> Batch {
     let mut b = BatchBuilder::new(&schema);
     for (i, &v) in vals.iter().enumerate() {
         if as_pk {
-            b.begin_row_opk(&[v], 1);
+            b.begin_row_natives(&[v], 1);
             b.put_int(0);
         } else {
             b.begin_row(i as u128, 1);
@@ -118,16 +118,14 @@ fn wide_image_orders_and_round_trips() {
     }
 }
 
-/// `order_bits`' integer half is the value's index key (`encode_pk_images` at
-/// `index_key_type`), on both arms, and `order_inverse` recovers the value from
-/// it.
+/// `order_bits`' integer half is the value's OPK key in the 8-byte slot of its
+/// own sign, on both arms, and `order_inverse` recovers the value from it.
 #[test]
 fn order_bits_matches_the_opk_promotion_on_both_arms() {
-    fn oracle(native: u64, type_code: TypeCode) -> u64 {
-        let target = gnitz_wire::index_key_type(type_code).unwrap();
-        let image = gnitz_wire::key_image(type_code, native as u128);
-        let key = gnitz_wire::encode_pk_images([(type_code, target, image)]);
-        u64::from_be_bytes(key.pk_bytes().try_into().unwrap())
+    fn oracle(native: u64, fi: FixedInt) -> u64 {
+        let mut key = [0u8; 8];
+        gnitz_wire::store_opk(&mut key, fi.unpack(native as u128) as u128, fi.is_signed());
+        u64::from_be_bytes(key)
     }
 
     // (FixedInt, type code, the values to check as raw native-LE u64s.)
@@ -162,7 +160,7 @@ fn order_bits_matches_the_opk_promotion_on_both_arms() {
         let (pk, payload) = (pk.as_mem_batch(), payload.as_mem_batch());
         let kind = ScalarKind::Int(fi);
         for (row, &x) in vals.iter().enumerate() {
-            let want = oracle(x, type_code);
+            let want = oracle(x, fi);
             assert_eq!(order_bits(&pk_loc, &pk, row, kind), want, "{fi:?} pk arm, value {x:#x}");
             assert_eq!(
                 order_bits(&payload_loc, &payload, row, kind),

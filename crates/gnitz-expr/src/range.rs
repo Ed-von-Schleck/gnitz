@@ -126,7 +126,7 @@ fn and_column<C: KeyCell<W>, const W: usize>(
         // A payload column's image is its native value plus the sign bias.
         ColumnLocator::Payload { slot, type_code, .. } => {
             let col = mb.col_data(slot as usize, W);
-            let lo = C::low(lo.wrapping_sub(gnitz_wire::opk_bias(type_code, W)));
+            let lo = C::low(lo.wrapping_sub(gnitz_wire::opk_bias(type_code)));
             and_cells(words, col, W, 0, |c| C::from_le(c).sub(lo) <= span);
         }
     }

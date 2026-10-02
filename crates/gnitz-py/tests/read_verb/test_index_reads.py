@@ -216,6 +216,33 @@ def test_index_range_walks_the_signed_interval(ranged, predicate, keep):
     assert bag(rows(ranged, f"SELECT pk FROM ranged WHERE {predicate}")) == want
 
 
+@pytest.mark.parametrize("coltype,lo,hi", [
+    ("INT", -2**31, 2**31 - 1),
+    ("SMALLINT", -2**15, 2**15 - 1),
+    ("TINYINT", -2**7, 2**7 - 1),
+    ("HUGEINT", -2**127, 2**127 - 1),
+])
+def test_index_range_on_a_column_of_every_signed_width(client, coltype, lo, hi):
+    """An index keys a column at the column's own width, so a range over it walks
+    that width's signed order from the type's minimum to its maximum."""
+    vals = [lo, -35, -1, 0, 1, 35, hi]
+    client.execute_sql(f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x {coltype})")
+    insert(client, "t", [(pk, v) for pk, v in enumerate(vals, 1)]
+           + [(-i, None) for i in range(1, PAD + 1)])
+    client.execute_sql("CREATE INDEX ON t(x)")
+    for predicate, keep in [
+        ("x >= -1 AND x <= 35", lambda v: -1 <= v <= 35),
+        ("x < 0", lambda v: v < 0),
+        ("x > 0", lambda v: v > 0),
+        (f"x = {lo}", lambda v: v == lo),
+        (f"x = {hi}", lambda v: v == hi),
+    ]:
+        q = f"SELECT pk FROM t WHERE {predicate}"
+        assert access(client, q) == "index range on (x)", predicate
+        want = {(pk,): 1 for pk, v in enumerate(vals, 1) if keep(v)}
+        assert bag(rows(client, q)) == want, predicate
+
+
 def test_range_over_a_composite_index(client):
     """On index (a, b), `a = 5 AND b > 10` is served by the composite range scan,
     NOT a bare `a = 5` prefix seek + residual: a row at (5, 0) must be absent,

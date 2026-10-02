@@ -56,7 +56,7 @@ fn the_index_and_the_sort_yield_the_same_sorted_spans() {
         .filter(|id| id % 7 != 0)
         .map(|id| {
             let val = -((id / 2) as i64);
-            span_schema.opk_key(&(val as u128).to_le_bytes()).pk_bytes().to_vec()
+            span_schema.opk_key_cols(&[val as u128]).pk_bytes().to_vec()
         })
         .collect();
     want.sort();

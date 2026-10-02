@@ -29,12 +29,7 @@ fn every_walk_admits_exactly_the_rows_between_its_cuts() {
             let mut v = TestView::for_schema(&schema, N);
             for row in 0..N {
                 v.set_native(&schema, row, pin_col, pinned(row));
-                v.set_native(
-                    &schema,
-                    row,
-                    range_col,
-                    img(row) ^ gnitz_wire::opk_bias(tc, tc.wire_stride()),
-                );
+                v.set_native(&schema, row, range_col, img(row) ^ gnitz_wire::opk_bias(tc));
                 for ci in [pin_col, range_col].into_iter().filter(|&ci| null(row, ci)) {
                     v.set_null(row, schema.payload_slot(ci).unwrap());
                 }

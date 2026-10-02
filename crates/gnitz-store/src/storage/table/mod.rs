@@ -18,6 +18,7 @@ use gnitz_wire::PkKeys;
 use super::manifest::Manifest;
 use super::run_set::RunSet;
 use super::shard_index::{ShardBudget, ShardIndex};
+use gnitz_wire::PkBuf;
 use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::Batch;
 #[cfg(test)]
@@ -25,7 +26,7 @@ use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
-use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut, PkBuf};
+use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Ingest runs fold into the RAM tier once they pass this.

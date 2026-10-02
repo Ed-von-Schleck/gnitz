@@ -2,10 +2,10 @@ use super::super::batch::REG_NULL_BMP;
 use super::super::layout::{Encoding, ShardHeader};
 use super::super::shard_file::{region_dir, ShardWriteOpts};
 use super::*;
-use crate::schema::key::PkBuf;
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_u64_i64, map_shard, FoldRow,
 };
+use gnitz_wire::PkBuf;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;

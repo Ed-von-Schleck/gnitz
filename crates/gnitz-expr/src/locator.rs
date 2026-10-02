@@ -93,7 +93,7 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { size, type_code, .. } => {
                 let dst = &mut scratch[..size as usize];
-                gnitz_wire::decode_pk_column(self.bytes(mb, row), type_code, dst);
+                gnitz_wire::decode_pk_cell(self.bytes(mb, row), type_code.is_signed_int(), dst);
                 dst
             }
             ColumnLocator::Payload { .. } => self.bytes(mb, row),
@@ -121,13 +121,6 @@ impl ColumnLocator {
                 gnitz_wire::cmp_col_window(self.bytes(a, ra), a.blob(), self.bytes(b, rb), b.blob(), type_code)
             }
         }
-    }
-
-    /// Write this column's value in `row` as `out_tc`'s OPK bytes into `dst`;
-    /// `out_tc` must hold every value of this column's type.
-    #[inline(always)]
-    pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: TypeCode, dst: &mut [u8]) {
-        gnitz_wire::store_opk_image(self.opk_image(mb, row), self.type_code(), self.size(), out_tc, dst);
     }
 
     /// The value in `row` as its OPK bytes read as a big-endian integer; a NULL

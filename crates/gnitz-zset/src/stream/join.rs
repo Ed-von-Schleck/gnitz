@@ -16,12 +16,12 @@ use crate::repr::{
     copy_runs, copy_string_cells, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where,
     should_relocate_blob, width_dispatch, Batch, BlobCache, ReadCursor,
 };
-use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
+use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 
 use crate::algebra::MapPlan;
 use gnitz_expr::{ColCopy, ColumnLocator, NullPerm, RowSource};
-use gnitz_wire::{null_word_at, JoinKind, RangeRel, TypeCode};
+use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
 
 // ---------------------------------------------------------------------------
 // The plan

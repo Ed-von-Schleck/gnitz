@@ -300,8 +300,8 @@ fn test_seek_by_index_negative_i32() {
     engine.registry.checkpoint_base().unwrap();
 
     // The seek key is the I32 value's zero-extended native bit pattern; projection
-    // and seek both sign-extend it from I32 into the promoted signed I64 index
-    // column, so the equality lookup matches.
+    // and seek both key it as the signed I32 index column, so the equality lookup
+    // matches.
     let result = seek_by_index(&mut engine, tid, &[1], &[(-1i32) as u32 as u128])
         .unwrap()
         .0;
@@ -555,7 +555,7 @@ fn test_compound_pk_secondary_index_seek() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Compound PK = (a: U32, b: U32), payload = val: U64.
-    // Source PK stride = 8 → index PK stride = 8 (promoted U64) + 8 = 16,
+    // Source PK stride = 8 → index PK stride = 8 (the U64 key) + 8 = 16,
     // which keeps the index cursor on the narrow-PK fast path.
     let cols = vec![
         col_def("a", TypeCode::U32),
@@ -576,9 +576,9 @@ fn test_compound_pk_secondary_index_seek() {
     ];
     for &(a, bcol, val) in rows {
         // `begin_row_bytes` takes the OPK image verbatim, so a compound PK must
-        // be built through `begin_row_opk` — a native-LE concatenation is not the
+        // be built through `begin_row_natives` — a native-LE concatenation is not the
         // at-rest form and would ingest a PK region the engine forbids.
-        bb.begin_row_opk(&[a as u128, bcol as u128], 1);
+        bb.begin_row_natives(&[a as u128, bcol as u128], 1);
         bb.put_int(val as u128);
         bb.end_row();
     }
@@ -618,7 +618,7 @@ fn test_compound_pk_secondary_index_retract() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row_opk(&[7, 3], 1);
+    bb.begin_row_natives(&[7, 3], 1);
     bb.put_int(500);
     bb.end_row();
     let b = bb.finish();
@@ -629,7 +629,7 @@ fn test_compound_pk_secondary_index_retract() {
 
     // Retract the same row.
     let mut rb = BatchBuilder::new(&schema);
-    rb.begin_row_opk(&[7, 3], -1);
+    rb.begin_row_natives(&[7, 3], -1);
     rb.put_int(500);
     rb.end_row();
     let r = rb.finish();
@@ -686,14 +686,14 @@ fn test_create_unique_index_on_string_blob_rejected() {
     ];
     engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    // Unique or not, the rejection is the same one: STRING and BLOB have no
-    // order-preserving fixed-width index key, so `index_key_types` refuses to
-    // promote them and `precheck_family` never reaches the registration.
+    // Unique or not, the rejection is the same one: STRING and BLOB are no key
+    // columns, so the PK rule refuses them and `precheck_family` never reaches
+    // the registration.
     for unique in [true, false] {
         for col in ["name", "data"] {
             let e = engine.create_index("public.t", &[col], unique).unwrap_err();
             assert!(
-                e.contains("Secondary index on column type"),
+                e.contains("Index: column list column") && e.contains("can be key columns"),
                 "unique={unique} col={col} got: {e}"
             );
         }

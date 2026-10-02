@@ -4,7 +4,6 @@ mod bundle_precheck_tests;
 mod compound_pk_smoke;
 mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
-use gnitz_expr::SchemaFacts;
 mod ddl_tests;
 mod dir_deletion_tests;
 mod echo_fold_bench;
@@ -43,8 +42,7 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
-    let opk = schema.opk_key(&key.to_le_bytes());
-    pk_group(engine, tid, opk.pk_bytes())
+    pk_group(engine, tid, &opk_pk(&schema, &[key]))
 }
 
 use crate::test_support::{

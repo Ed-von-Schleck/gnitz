@@ -237,8 +237,7 @@ fn test_fk_child_type_must_equal_parent() {
         .create_table("public.p", &[col_def("id", TypeCode::I32)], &[0])
         .unwrap();
 
-    // I64 child → I32 parent: `index_key_type` maps both to I64, but the child's
-    // domain does not fit the parent's.
+    // I64 child → I32 parent: the child's domain does not fit the parent's.
     let narrowing = vec![
         col_def("cid", TypeCode::I64),
         fk_def("pid", TypeCode::I64, parent_tid, 0),
@@ -298,11 +297,11 @@ fn a_decimal_fk_child_must_carry_the_parents_scale() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An FK column whose index cannot be built is refused by the precheck, before
-/// the register hook reaches it.
+/// An I128 column is a key column like any other: an FK may reference one, and
+/// the child's FK index keys on it.
 #[test]
-fn an_fk_column_with_no_index_key_is_refused_by_the_precheck() {
-    let dir = temp_dir("fk_unindexable");
+fn an_i128_column_is_an_fk_target() {
+    let dir = temp_dir("fk_i128");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent_tid = engine
         .create_table("public.p", &[col_def("id", TypeCode::I128)], &[0])
@@ -311,10 +310,9 @@ fn an_fk_column_with_no_index_key_is_refused_by_the_precheck() {
         col_def("cid", TypeCode::U64),
         fk_def("pid", TypeCode::I128, parent_tid, 0),
     ];
-    let err = engine
-        .create_table("public.c", &child, &[0])
-        .expect_err("an I128 column has no index key");
-    assert!(err.contains("FK column 1:"), "got: {err}");
+    let child_tid = engine.create_table("public.c", &child, &[0]).unwrap();
+    let index = engine.registry.relation(child_tid).unwrap().index_on(&[1]).unwrap();
+    assert_eq!(index.schema().pk_stride(), 16 + 8);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

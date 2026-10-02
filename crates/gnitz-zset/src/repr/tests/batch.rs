@@ -463,7 +463,7 @@ fn a_key_prefix_round_trips() {
 
     let mut b = BatchBuilder::new(&view);
     for &(k0, k1, w, s, n) in &rows {
-        b.begin_row_opk(&[k0 as u128, k1 as u128], w);
+        b.begin_row_natives(&[k0 as u128, k1 as u128], w);
         b.put_blob(s);
         b.put_opt_int(n.map(|v| v as u128));
         b.end_row();

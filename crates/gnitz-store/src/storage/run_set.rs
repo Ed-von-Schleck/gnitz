@@ -4,8 +4,9 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 
 use super::bloom::BloomFilter;
+use gnitz_wire::PkBuf;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
-use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
+use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a

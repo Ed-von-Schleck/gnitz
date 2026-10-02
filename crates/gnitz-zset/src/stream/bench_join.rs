@@ -95,7 +95,7 @@ type Row = (Vec<u128>, i64);
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for (i, (pk, ord)) in rows.iter().enumerate() {
-        b.begin_row_opk(pk, 1);
+        b.begin_row_natives(pk, 1);
         b.put_int(*ord as u128);
         match p {
             Payload::Int => {}

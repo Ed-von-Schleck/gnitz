@@ -30,8 +30,7 @@ fn typed_cmp(s: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
 /// Over random compound PKs — 1..=4 columns of any PK-eligible type, the PK list
 /// in random order — and native tuples sharing a random-length byte prefix, so
 /// later columns and bytes past 16 decide often: a `memcmp` of the OPK keys is
-/// the typed order, decoding inverts encoding, and the column-wise encoder
-/// writes the same key.
+/// the typed order, and each key column decodes back to its native value.
 #[test]
 fn opk_is_an_order_preserving_bijection() {
     let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
@@ -47,22 +46,29 @@ fn opk_is_an_order_preserving_bijection() {
             *x = rng.next_u64() as u8;
         }
 
-        let (oa, ob) = (s.opk_key(&a), s.opk_key(&b));
+        let natives = |le: &[u8]| -> Vec<u128> {
+            let mut off = 0;
+            s.pk_columns()
+                .map(|(_, c)| {
+                    off += c.size() as usize;
+                    le_cell(&le[off - c.size() as usize..off])
+                })
+                .collect()
+        };
+        let (na, nb) = (natives(&a), natives(&b));
+        let (oa, ob) = (s.opk_key_cols(&na), s.opk_key_cols(&nb));
         assert_eq!(
             compare_pk_bytes(oa.pk_bytes(), ob.pk_bytes()),
             typed_cmp(&s, &a, &b),
             "{s:?}: {a:?} vs {b:?}"
         );
-        assert_eq!(&s.native_le_key(oa.pk_bytes())[..a.len()], &a[..], "{s:?}");
         let mut off = 0;
-        let natives: Vec<u128> = s
-            .pk_columns()
-            .map(|(_, c)| {
-                off += c.size() as usize;
-                le_cell(&a[off - c.size() as usize..off])
-            })
-            .collect();
-        assert_eq!(s.opk_key_cols(&natives), oa, "{s:?}");
+        for ((_, c), &native) in s.pk_columns().zip(&na) {
+            let cell = &oa.pk_bytes()[off..off + c.size() as usize];
+            off += cell.len();
+            assert_eq!(key_image(c.type_code, widen_pk_be(cell)), native, "{s:?}");
+        }
+        assert_eq!(off, oa.pk_bytes().len(), "{s:?}");
     }
 }
 
@@ -163,27 +169,46 @@ fn narrow_pk_opk_inverts_the_widening() {
 // Index key spans
 // ---------------------------------------------------------------------------
 
-/// An index schema is the promoted key columns then the source PK, all in the
-/// PK, and its span schema the promoted key columns alone. An arity past
-/// `MAX_PK_COLUMNS` is an `Err`.
+/// An index schema is the key columns at their own types then the source PK, all
+/// in the PK, and its span schema the key columns alone. A key column list
+/// follows the PK rule with nullability waived, and the index record the PK
+/// arity limit.
 #[test]
-fn index_schema_is_the_promoted_key_then_the_source_pk() {
-    use TypeCode::{I16, I32, I64, I8, U128, U32, U64};
+fn index_schema_is_the_key_at_its_own_types_then_the_source_pk() {
+    use TypeCode::{I128, I16, I32, I64, I8, U128, U32, U64};
     let src = SchemaDescriptor::new(&[col(U64), col(U32), col(U128)], &[0]);
     let (spec, index) = index_spec_and_schema(&[1, 2], &src).unwrap();
-    assert_eq!(index, pk_only_schema(&[U64, U128, U64]));
-    assert_eq!(spec.span_schema(), pk_only_schema(&[U64, U128]));
-    for t in [I8, I16, I32, I64] {
-        let src = SchemaDescriptor::new(&[col(U64), col(t)], &[0]);
+    assert_eq!(index, pk_only_schema(&[U32, U128, U64]));
+    assert_eq!(spec.span_schema(), pk_only_schema(&[U32, U128]));
+    assert_eq!(spec.key_size(), 20);
+    for t in [I8, I16, I32, I64, I128] {
+        let src = SchemaDescriptor::new(&[col(U64), SchemaColumn::new(t, true)], &[0]);
         let (spec, index) = index_spec_and_schema(&[1], &src).unwrap();
-        assert_eq!(index, pk_only_schema(&[I64, U64]), "{t}");
-        assert_eq!(spec.span_schema(), pk_only_schema(&[I64]), "{t}");
+        assert_eq!(index, pk_only_schema(&[t, U64]), "{t}");
+        assert_eq!(spec.span_schema(), pk_only_schema(&[t]), "{t}");
     }
 
     let wide = SchemaDescriptor::new(&[col(U64); MAX_PK_COLUMNS + 1], &[0, 1]);
     let key: Vec<u32> = (2..=MAX_PK_COLUMNS as u32).collect();
     assert!(index_spec_and_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
     assert!(index_spec_and_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
+
+    let mixed = SchemaDescriptor::new(&[col(U64), col(U32), col(TypeCode::F64), col(TypeCode::String)], &[0]);
+    for (cols, why) in [
+        (&[][..], "must name at least one column"),
+        (&[1, 1], "names column 1 twice"),
+        (&[9], "index 9 out of bounds"),
+        (&[2], "column 2 has type_code F64"),
+        (&[3], "column 3 has type_code STRING"),
+    ] {
+        let err = KeySpec::new(cols, &mixed)
+            .err()
+            .unwrap_or_else(|| panic!("{cols:?} must be refused"));
+        assert!(
+            err.starts_with("Index: column list ") && err.contains(why),
+            "{cols:?}: {err}"
+        );
+    }
 }
 
 /// The span `write_span` writes for a row: each indexed column decoded to its
@@ -229,11 +254,11 @@ fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
         .into_iter()
         .enumerate()
     {
-        bb.begin_row_opk(&[a as u128, v as u64 as u128], 1);
+        bb.begin_row_natives(&[a as u128, v as u64 as u128], 1);
         bb.put_int(-(i as i32) as u128);
         bb.end_row();
     }
-    bb.begin_row_opk(&[9, 5], 1);
+    bb.begin_row_natives(&[9, 5], 1);
     bb.put_null();
     bb.end_row();
     let b = bb.finish();
@@ -268,10 +293,7 @@ fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
 /// builds, and spans sort as the values do.
 #[test]
 fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
-    for &t in TypeCode::ALL
-        .iter()
-        .filter(|t| gnitz_wire::index_key_type(**t).is_some())
-    {
+    for &t in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let sz = t.wire_stride();
         let mask = image_mask(sz);
         let top = 1u128 << (8 * sz - 1);
@@ -289,7 +311,7 @@ fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
                 .seek_prefix(&[key_image(t, native)]);
             for (src, c) in [(payload_src, 1u32), (pk_src, 0)] {
                 let mut bb = BatchBuilder::new(&src);
-                bb.begin_row_opk(&[if c == 0 { native } else { 1 }], 1);
+                bb.begin_row_natives(&[if c == 0 { native } else { 1 }], 1);
                 bb.put_int(if c == 0 { 0 } else { native });
                 bb.end_row();
                 let b = bb.finish();
@@ -341,5 +363,73 @@ fn sort_indices_bench() {
                 println!("  n={n:<8} stride={stride:<3} {shape:<3} {ns:7.2} ns/record");
             }
         }
+    }
+}
+
+/// `compare_pk_ordering` per compare and `find_lower_bound_bytes` per probe, in
+/// instructions, at the strides an index entry and a PK take.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
+fn pk_compare_bench() {
+    use std::hint::black_box;
+
+    const ROWS: usize = 512 * 1024;
+    const PROBES: usize = 100_000;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    println!("\npk_compare_bench — instructions per compare / per probe ({ROWS} rows):");
+    for stride in [2usize, 4, 8, 9, 10, 12, 16, 24] {
+        let types: Vec<TypeCode> = match stride {
+            2 => vec![TypeCode::U16],
+            4 => vec![TypeCode::U32],
+            8 => vec![TypeCode::U64],
+            9 => vec![TypeCode::U8, TypeCode::U64],
+            10 => vec![TypeCode::U16, TypeCode::U64],
+            12 => vec![TypeCode::U32, TypeCode::U64],
+            16 => vec![TypeCode::U64, TypeCode::U64],
+            _ => vec![TypeCode::U64, TypeCode::U64, TypeCode::U64],
+        };
+        let schema = pk_only_schema(&types);
+        assert_eq!(schema.pk_stride(), stride);
+        // Ascending keys: the row number in the trailing bytes, a slow counter ahead of it.
+        let rows = ROWS.min(1 << (8 * stride.min(3)));
+        let mut bb = BatchBuilder::new(&schema);
+        for i in 0..rows as u128 {
+            let natives: Vec<u128> = match types.len() {
+                1 => vec![i],
+                2 => vec![(i >> 16) & 0xFF, i],
+                _ => vec![i >> 16, 7, i],
+            };
+            bb.begin_row_natives(&natives, 1);
+            bb.end_row();
+        }
+        let mut batch = bb.finish();
+        batch.certify_consolidated();
+        let mb = batch.as_mem_batch();
+        let mut rng = Rng::new(0xC0FFEE + stride as u64);
+        let picks: Vec<(usize, usize)> = (0..PROBES)
+            .map(|_| (rng.gen_range(rows as u64) as usize, rng.gen_range(rows as u64) as usize))
+            .collect();
+
+        let (acc, cmp) = counter.measure(|| {
+            let mut acc = 0usize;
+            for &(a, b) in &picks {
+                acc += compare_pk_ordering(black_box(mb.get_pk_bytes(a)), black_box(mb.get_pk_bytes(b))) as i8 as usize;
+            }
+            acc
+        });
+        black_box(acc);
+        let (acc, probe) = counter.measure(|| {
+            let mut acc = 0usize;
+            for &(a, _) in &picks {
+                acc += batch.find_lower_bound_bytes(black_box(mb.get_pk_bytes(a)));
+            }
+            acc
+        });
+        black_box(acc);
+        println!(
+            "  stride={stride:<3} rows={rows:<7} compare {:6.1}  lower_bound {:7.1}",
+            cmp as f64 / PROBES as f64,
+            probe as f64 / PROBES as f64
+        );
     }
 }

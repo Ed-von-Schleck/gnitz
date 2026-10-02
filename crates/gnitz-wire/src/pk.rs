@@ -11,70 +11,45 @@
 
 use crate::TypeCode;
 
-/// Order-preserving big-endian encoding of one PK column.
-///
-/// `src` and `dst` are both exactly the column's width (1/2/4/8/16). Native
-/// little-endian input is byte-reversed to big-endian; signed types additionally
-/// flip the sign bit so the signed range maps monotonically onto the unsigned
-/// range. The result's unsigned lexicographic order equals the numeric order of
-/// the source value.
-///
-/// The sign flip rides in the integer, not in `dst`: the sign bit *is* the top
-/// bit of the big-endian image, so XOR-ing it before the store keeps the whole
-/// transform one load, one `bswap` and one store — a trailing `dst[0] ^= 0x80`
-/// would be a read-modify-write of bytes just written. [`decode_pk_column`] is
-/// the exact mirror, `#[inline(always)]` for the reason stated there.
+/// Write the low `dst.len()` bytes of `v` big-endian into `dst`, the top bit of that
+/// width flipped when `flip`. With `v` a native value and `flip = tc.is_signed_int()`
+/// that is the column's OPK bytes; with `flip = false` it stores a key image as it is.
 #[inline(always)]
-pub fn encode_pk_column(src: &[u8], tc: TypeCode, dst: &mut [u8]) {
-    debug_assert_eq!(dst.len(), src.len());
-    let flip = tc.is_signed_int();
+pub fn store_opk(dst: &mut [u8], v: u128, flip: bool) {
+    macro_rules! store {
+        ($ty:ty) => {{
+            let d: &mut [u8; std::mem::size_of::<$ty>()] = dst.try_into().unwrap();
+            *d = ((v as $ty) ^ ((flip as $ty) << (<$ty>::BITS - 1))).to_be_bytes();
+        }};
+    }
     match dst.len() {
-        16 => {
-            let v = u128::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u128) << 127);
-            dst.copy_from_slice(&v.to_be_bytes());
-        }
-        8 => {
-            let v = u64::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u64) << 63);
-            dst.copy_from_slice(&v.to_be_bytes());
-        }
-        4 => {
-            let v = u32::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u32) << 31);
-            dst.copy_from_slice(&v.to_be_bytes());
-        }
-        2 => {
-            let v = u16::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u16) << 15);
-            dst.copy_from_slice(&v.to_be_bytes());
-        }
-        1 => dst[0] = src[0] ^ ((flip as u8) << 7),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
+        16 => store!(u128),
+        8 => store!(u64),
+        4 => store!(u32),
+        2 => store!(u16),
+        1 => store!(u8),
+        _ => unreachable!("PK column width is 1/2/4/8/16"),
     }
 }
 
-/// OPK-encode a PK tuple from its native little-endian image. `cols` are the PK
-/// columns' `(width, type)` in PK-list order, the order the key compares in.
+/// [`store_opk`] appended to `buf` as one `width`-byte column.
 #[inline(always)]
-pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, TypeCode)>, src: &[u8]) -> PkBuf {
-    let mut out = PkBuf::zeroed(0);
-    let mut off = 0;
-    for (cs, tc) in cols {
-        out.append(cs, |dst| encode_pk_column(&src[off..off + cs], tc, dst));
-        off += cs;
+pub fn push_opk(buf: &mut Vec<u8>, width: usize, v: u128, flip: bool) {
+    macro_rules! push {
+        ($w:literal) => {{
+            let mut cell = [0u8; $w];
+            store_opk(&mut cell, v, flip);
+            buf.extend_from_slice(&cell);
+        }};
     }
-    debug_assert_eq!(off, src.len(), "pk tuple width != sum of column widths");
-    out
-}
-
-/// OPK-encode one image per `(src_tc, target_tc, image)` column, each truncated to
-/// `src_tc`'s width, promoted to `target_tc` and packed in order.
-pub fn encode_pk_images(cols: impl IntoIterator<Item = (TypeCode, TypeCode, u128)>) -> PkBuf {
-    let mut out = PkBuf::zeroed(0);
-    for (src_tc, target_tc, image) in cols {
-        let src_w = src_tc.wire_stride();
-        out.append(target_tc.wire_stride(), |dst| {
-            store_opk_image(image & image_mask(src_w), src_tc, src_w, target_tc, dst)
-        });
+    match width {
+        16 => push!(16),
+        8 => push!(8),
+        4 => push!(4),
+        2 => push!(2),
+        1 => push!(1),
+        _ => unreachable!("PK column width is 1/2/4/8/16"),
     }
-    out
 }
 
 /// The mask of a `width`-byte column's images: its low `8·width` bits.
@@ -84,107 +59,93 @@ pub const fn image_mask(width: usize) -> u128 {
 }
 
 /// A native value's image in its column's key order: masked to the type's width, sign bit
-/// flipped for a signed type — the OPK bytes read as a big-endian integer.
+/// flipped for a signed type — the OPK bytes read as a big-endian integer. Its own
+/// inverse on a masked value.
 #[inline(always)]
 pub fn key_image(tc: TypeCode, native: u128) -> u128 {
-    let w = tc.wire_stride();
-    (native & image_mask(w)) ^ opk_bias(tc, w)
+    (native & image_mask(tc.wire_stride())) ^ opk_bias(tc)
 }
 
-/// The image of zero in a `width`-byte column of type `tc`: `2^(width·8−1)` if
-/// signed, else 0. A value's image — its OPK bytes as a big-endian integer — is
-/// `value + opk_bias`.
+/// The image of zero in a column of type `tc`: its sign bit if signed, else 0.
 #[inline(always)]
-pub fn opk_bias(tc: TypeCode, width: usize) -> u128 {
-    (tc.is_signed_int() as u128) << (width * 8 - 1)
+pub fn opk_bias(tc: TypeCode) -> u128 {
+    (tc.is_signed_int() as u128) << (tc.wire_stride() * 8 - 1)
 }
 
-/// Write into `dst` the OPK bytes at `target_tc` of the value whose image at `src_tc`
-/// (width `src_w`) is `image`. `target_tc` must hold every `src_tc` value.
-#[inline(always)]
-pub fn store_opk_image(image: u128, src_tc: TypeCode, src_w: usize, target_tc: TypeCode, dst: &mut [u8]) {
-    // Skipping the re-bias at identity saves the two bias adds on the common unpromoted slot.
-    let v = if src_tc == target_tc {
-        image
-    } else {
-        image
-            .wrapping_sub(opk_bias(src_tc, src_w))
-            .wrapping_add(opk_bias(target_tc, dst.len()))
-    };
-    debug_assert!(
-        dst.len() == 16 || v >> (dst.len() * 8) == 0,
-        "store_opk_image: target narrower than the value"
-    );
-    macro_rules! store {
-        ($ty:ty) => {{
-            let d: &mut [u8; std::mem::size_of::<$ty>()] = dst.try_into().unwrap();
-            *d = (v as $ty).to_be_bytes();
-        }};
-    }
-    match dst.len() {
-        16 => store!(u128),
-        8 => store!(u64),
-        4 => store!(u32),
-        2 => store!(u16),
-        1 => dst[0] = v as u8,
-        _ => unreachable!("store_opk_image: PK column width is 1/2/4/8/16"),
-    }
-}
-
-/// Symmetric inverse of [`encode_pk_column`]: decode an OPK column back to
-/// native little-endian bytes. `src` and `dst` are both the column's width. The
-/// big-endian image is read, its sign bit un-flipped for signed types, and the
-/// native little-endian value stored — the mirror of the encoder, arm for arm,
-/// and likewise never a read-modify-write of `dst`.
+/// Decode one OPK cell into its native little-endian bytes: `src` and `dst` are both
+/// the column's width, `signed` the column's signedness.
 ///
-/// Each arm stores through a `&mut [u8; W]`, never `copy_from_slice`: LLVM
-/// tail-merges four runtime-length copies into one shared `memcpy` call, leaving
-/// a caller's row loop an indirect branch and a `call memcpy`. In the type the
-/// width propagates and the store is one instruction.
+/// Each arm stores through a `&mut [u8; W]`: a runtime-length `copy_from_slice` per
+/// arm tail-merges into one shared `memcpy` call in a caller's row loop.
 #[inline(always)]
-pub fn decode_pk_column(src: &[u8], tc: TypeCode, dst: &mut [u8]) {
-    decode_pk_cell(src, tc.is_signed_int(), dst)
-}
-
-/// [`decode_pk_column`] with the column's signedness decided by the caller, so a
-/// row loop tests the type once.
-#[inline(always)]
-pub fn decode_pk_cell(src: &[u8], flip: bool, dst: &mut [u8]) {
+pub fn decode_pk_cell(src: &[u8], signed: bool, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
     macro_rules! decode {
-        ($ty:ty, $sign_bit:expr) => {{
+        ($ty:ty) => {{
             const W: usize = std::mem::size_of::<$ty>();
-            let v = <$ty>::from_be_bytes(src.try_into().unwrap()) ^ ((flip as $ty) << $sign_bit);
+            let v = <$ty>::from_be_bytes(src.try_into().unwrap()) ^ ((signed as $ty) << (<$ty>::BITS - 1));
             let d: &mut [u8; W] = dst.try_into().unwrap();
             *d = v.to_le_bytes();
         }};
     }
     match src.len() {
-        16 => decode!(u128, 127),
-        8 => decode!(u64, 63),
-        4 => decode!(u32, 31),
-        2 => decode!(u16, 15),
-        1 => dst[0] = src[0] ^ ((flip as u8) << 7),
+        16 => decode!(u128),
+        8 => decode!(u64),
+        4 => decode!(u32),
+        2 => decode!(u16),
+        1 => decode!(u8),
         other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }
 }
 
-/// Sign- or zero-extend a native-LE integer of type `src_tc` into the wider slot
-/// `dst`, as `copy_column` widens a payload cell.
-#[inline]
-pub fn widen_native_le(src: &[u8], src_tc: TypeCode, dst: &mut [u8]) {
-    let src_width = src.len();
-    debug_assert!(dst.len() >= src_width);
-    // Native LE: the sign bit is the high bit of the most-significant (last)
-    // byte; the extension bytes are appended at the high LE indices.
-    let is_neg = src_tc.is_signed_int() && src_width > 0 && (src[src_width - 1] & 0x80) != 0;
-    dst[..src_width].copy_from_slice(src);
-    dst[src_width..].fill(if is_neg { 0xFF } else { 0x00 });
+/// `f` over the `W`-byte cell at byte `off` of each `stride`-byte row of `src`, paired
+/// with `dst`'s items in order.
+#[inline(always)]
+pub fn zip_cells<const W: usize, D>(
+    src: &[u8],
+    stride: usize,
+    off: usize,
+    dst: impl Iterator<Item = D>,
+    mut f: impl FnMut(&[u8; W], D),
+) {
+    assert!(off + W <= stride, "a cell lies inside its row");
+    if stride == W {
+        for (cell, d) in src.as_chunks::<W>().0.iter().zip(dst) {
+            f(cell, d);
+        }
+    } else {
+        for (row, d) in src.chunks_exact(stride).zip(dst) {
+            f(row[off..off + W].try_into().unwrap(), d);
+        }
+    }
 }
 
-/// A narrow OPK region's image: its bytes read as a big-endian integer. Right-aligned,
-/// unlike the left-aligned sort key `pack_pk_be`; width-specialized so only strides
-/// 3/5/6/7 pay a `memcpy`.
+/// Decode the `width`-byte PK column at byte `off` of each `stride`-byte row of `pk`
+/// into `dst`'s native little-endian cells, `width` bytes each.
+pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, width: usize, signed: bool, dst: &mut [u8]) {
+    macro_rules! decode_rows {
+        ($w:literal) => {
+            zip_cells::<$w, _>(pk, stride, off, dst.as_chunks_mut::<$w>().0.iter_mut(), |s, d| {
+                decode_pk_cell(s, signed, d)
+            })
+        };
+    }
+    match width {
+        1 => decode_rows!(1),
+        2 => decode_rows!(2),
+        4 => decode_rows!(4),
+        8 => decode_rows!(8),
+        16 => decode_rows!(16),
+        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
+    }
+}
+
+/// Widest PK region [`widen_pk_be`] packs into a `u128`; a wider key is ordered
+/// and hashed as raw bytes.
+pub const NARROW_PK_MAX_BYTES: usize = 16;
+
+/// A narrow OPK region's image: its bytes read as a big-endian integer, right-aligned.
+/// Width-specialized so only strides 3/5/6/7 pay a `memcpy`.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
     let stride = pk_bytes.len();
@@ -215,13 +176,11 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
-/// Decode one OPK PK column straight to `i64` — the exact inverse of
-/// [`encode_pk_column`], fused with the widening [`crate::types::FixedInt`] defines.
+/// Decode one OPK cell to `i64`, widened as [`crate::types::FixedInt`] defines.
 ///
-/// Spelled with byte-array literals rather than composed from `decode_pk_column`
-/// and [`widen_pk_be`], which at `-O0` costs a per-row caller an out-of-line call
-/// and a 16-byte stack image. The assert carries a static message: an
-/// `#[inline(always)]` body duplicates a formatted `Arguments` block into every
+/// Spelled with byte-array literals, which at `-O0` spares a per-row caller an
+/// out-of-line call and a 16-byte stack image. The assert carries a static message:
+/// an `#[inline(always)]` body duplicates a formatted `Arguments` block into every
 /// call site.
 #[inline(always)]
 pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
@@ -241,19 +200,14 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     }
 }
 
-/// Widest PK region [`widen_pk_be`] packs into a `u128`; a wider key is ordered
-/// and hashed as raw bytes.
-pub const NARROW_PK_MAX_BYTES: usize = 16;
-
 // ---------------------------------------------------------------------------
 // Width-tagged PK byte buffer
 // ---------------------------------------------------------------------------
 
-/// Width-tagged PK byte buffer — the one OPK byte container, held by the engine's
-/// key encoders and the client's row-identity maps alike. Only `bytes[..len]` is
-/// meaningful and the tail past it is always zero, which is what lets
-/// [`Self::padded`] widen a key without touching it; every writer below derives
-/// `len` from the span it hands out.
+/// An OPK key of up to `MAX_PK_BYTES` bytes, held by the engine's key encoders and
+/// the client's row-identity maps alike. `bytes[..len]` is the key and the tail past
+/// it is zero: every constructor starts from a zeroed array and no method shortens a
+/// key, which is what [`Self::widened`] reads.
 #[derive(Clone, Copy)]
 pub struct PkBuf {
     bytes: [u8; crate::MAX_PK_BYTES],
@@ -340,70 +294,36 @@ impl PkBuf {
         PkBuf { bytes, len: slice.len() as u8 }
     }
 
-    /// Extend the key by `n` bytes, written by `f` into exactly that span.
+    /// Extend the key by one `width`-byte column, written as [`store_opk`] writes it.
     #[inline(always)]
-    fn append(&mut self, n: usize, f: impl FnOnce(&mut [u8])) {
+    pub fn push(&mut self, width: usize, v: u128, flip: bool) {
         let at = self.len as usize;
-        f(&mut self.bytes[at..at + n]);
-        self.len = (at + n) as u8;
+        store_opk(&mut self.bytes[at..at + width], v, flip);
+        self.len = (at + width) as u8;
     }
 
-    /// Re-tag the key as `width` bytes (zeroing anything a wider key left past it)
-    /// and hand them to `f`, returning what `f` returns.
-    #[inline(always)]
-    pub fn write<R>(&mut self, width: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        self.set_len(width);
-        f(&mut self.bytes[..width])
-    }
-
-    #[inline]
-    fn debug_assert_zero_tail(&self) {
-        debug_assert!(
-            self.bytes[self.len as usize..].iter().all(|&b| b == 0),
-            "PkBuf tail past len must be zero; widening would carry stale bytes",
-        );
-    }
-
-    /// The key's OPK bytes — the single PK accessor.
+    /// The key's OPK bytes.
     #[inline(always)]
     pub fn pk_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }
 
-    /// Bytes per key — what [`Self::padded`] and [`Self::widened`] widen from.
+    /// The key's bytes, writable in place at their width.
     #[inline(always)]
-    pub fn width(&self) -> usize {
-        self.len as usize
+    pub fn pk_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len as usize]
     }
 
-    /// The key zero-padded to `width` bytes. Widens an index leading-key span to
-    /// a full PK stride.
-    #[inline]
-    pub fn padded(&self, width: usize) -> &[u8] {
-        debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
-        self.debug_assert_zero_tail();
-        &self.bytes[..width]
-    }
-
-    /// Owning [`Self::padded`]: a `len` bump, no copy.
+    /// The key zero-padded to `width` bytes: an index leading-key span widened to a
+    /// full PK stride.
     #[inline]
     pub fn widened(mut self, width: usize) -> Self {
-        debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
-        self.debug_assert_zero_tail();
+        assert!(
+            self.len as usize <= width && width <= crate::MAX_PK_BYTES,
+            "PkBuf::widened: width outside len..=MAX_PK_BYTES"
+        );
         self.len = width as u8;
         self
-    }
-
-    /// Re-tag as `len` bytes, re-zeroing whatever a wider previous key left past
-    /// it. The one writer of `len`, and private: the public writers above derive
-    /// their width from the span they hand out.
-    #[inline(always)]
-    fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= crate::MAX_PK_BYTES);
-        if (self.len as usize) > len {
-            self.bytes[len..self.len as usize].fill(0);
-        }
-        self.len = len as u8;
     }
 }
 

@@ -149,34 +149,6 @@ impl ColumnTable for Schema {
     }
 }
 
-/// A key's columns as a schema of their own: every column a PK column, in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KeyLayout {
-    /// `types[..n]` are the key columns' types in PK-list order; the rest is `U8`.
-    types: [TypeCode; MAX_PK_COLUMNS],
-    n: u8,
-}
-
-const _: () = assert!(MAX_PK_COLUMNS == 5, "KeyLayout::pk_cols lists every key position");
-
-impl ColumnTable for KeyLayout {
-    fn pk_cols(&self) -> &[u32] {
-        &[0, 1, 2, 3, 4][..self.n as usize]
-    }
-
-    fn num_columns(&self) -> usize {
-        self.n as usize
-    }
-
-    fn col_type_code(&self, ci: usize) -> TypeCode {
-        self.types[ci]
-    }
-
-    fn col_nullable(&self, _: usize) -> bool {
-        false
-    }
-}
-
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
 /// §4) — the bytes the wire carries and the engine stores, so a client batch's
 /// region and a `BatchBuilder`'s are byte-identical.
@@ -185,8 +157,10 @@ impl ColumnTable for KeyLayout {
 /// mis-partition rather than error. Every append encodes or copies OPK.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PkColumn {
-    layout: KeyLayout,
-    /// `layout.pk_stride()`, held because `RowSource::get_pk_bytes` reads it per row.
+    /// `types[..n]` are the key columns' types in PK-list order; the rest is `U8`.
+    types: [TypeCode; MAX_PK_COLUMNS],
+    n: u8,
+    /// The sum of the key columns' widths.
     stride: u8,
     buf: Vec<u8>,
 }
@@ -205,10 +179,11 @@ impl PkColumn {
         for (t, &c) in types.iter_mut().zip(&schema.pk_cols) {
             *t = schema.columns[c as usize].ty.tc;
         }
-        let layout = KeyLayout { types, n: n as u8 };
+        let stride: usize = types[..n].iter().map(|t| t.wire_stride()).sum();
         PkColumn {
-            layout,
-            stride: layout.pk_stride() as u8,
+            types,
+            n: n as u8,
+            stride: stride as u8,
             buf: vec![],
         }
     }
@@ -217,8 +192,10 @@ impl PkColumn {
     /// counterpart of [`Self::get`].
     pub fn from_natives(schema: &Schema, vals: impl IntoIterator<Item = u128>) -> Self {
         let mut c = Self::empty_for_schema(schema);
+        assert_eq!(c.n, 1, "PkColumn::from_natives: a compound key takes push_natives");
+        let (width, signed) = (c.stride(), c.types[0].is_signed_int());
         for v in vals {
-            c.push_u128(v);
+            gnitz_wire::push_opk(&mut c.buf, width, v, signed);
         }
         c
     }
@@ -232,7 +209,7 @@ impl PkColumn {
     /// The key columns' types in PK-list order.
     #[inline]
     pub fn key_types(&self) -> &[TypeCode] {
-        &self.layout.types[..self.layout.n as usize]
+        &self.types[..self.n as usize]
     }
 
     /// The whole PK region: `len()` rows of `stride` OPK bytes.
@@ -257,9 +234,8 @@ impl PkColumn {
     /// Row `i`'s native value. Defined only for a single-column key; a compound
     /// one is read as bytes.
     pub fn get(&self, i: usize) -> u128 {
-        assert_eq!(self.layout.n, 1, "PkColumn::get: a compound key has no scalar form");
-        let native = self.layout.native_le_key(self.get_bytes(i));
-        u128::from_le_bytes(native[..gnitz_wire::NARROW_PK_MAX_BYTES].try_into().unwrap())
+        assert_eq!(self.n, 1, "PkColumn::get: a compound key has no scalar form");
+        gnitz_wire::key_image(self.types[0], gnitz_wire::widen_pk_be(self.get_bytes(i)))
     }
 
     /// Borrow row `i`'s `stride` OPK bytes.
@@ -273,44 +249,18 @@ impl PkColumn {
         self.buf.reserve(n * self.stride());
     }
 
-    /// Append a single-column key from its native value.
-    pub fn push_u128(&mut self, pk: u128) {
-        assert_eq!(self.layout.n, 1, "push_u128: a compound key takes push_natives");
-        let s = self.stride();
-        self.push_region_bytes(self.layout.opk_key(&pk.to_le_bytes()[..s]).pk_bytes());
-    }
-
-    /// Append one row: `write(k, buf)` appends the native little-endian bytes
-    /// of the `k`-th PK column. An error appends nothing.
-    pub fn push_row<E>(&mut self, mut write: impl FnMut(usize, &mut Vec<u8>) -> Result<(), E>) -> Result<(), E> {
-        let row = self.buf.len();
-        let layout = self.layout;
-        for (k, &tc) in layout.types[..layout.n as usize].iter().enumerate() {
-            let at = self.buf.len();
-            if let Err(e) = write(k, &mut self.buf) {
-                self.buf.truncate(row);
-                return Err(e);
-            }
-            let w = self.buf.len() - at;
-            assert_eq!(w, tc.wire_stride(), "push_row: PK column {k} is a {tc:?}");
-            let mut native = [0u8; 16];
-            native[..w].copy_from_slice(&self.buf[at..]);
-            gnitz_wire::encode_pk_column(&native[..w], tc, &mut self.buf[at..]);
-        }
-        debug_assert_eq!(self.buf.len() - row, self.stride());
-        Ok(())
-    }
-
     /// Append one row from the PK columns' native values in PK-list order.
     pub fn push_natives(&mut self, natives: &[u128]) {
         // Hard, not debug-only: a short list would encode a short row and shift
         // every later one.
         assert_eq!(
             natives.len(),
-            self.layout.n as usize,
+            self.n as usize,
             "push_natives: one native value per key column"
         );
-        self.push_region_bytes(self.layout.opk_key_cols(natives).pk_bytes());
+        for (&tc, &v) in self.types.iter().zip(natives) {
+            gnitz_wire::push_opk(&mut self.buf, tc.wire_stride(), v, tc.is_signed_int());
+        }
     }
 
     /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
@@ -327,7 +277,7 @@ impl PkColumn {
 
     /// Move every row of `other` onto this column's tail.
     pub(crate) fn append(&mut self, other: &mut PkColumn) {
-        debug_assert_eq!(self.layout, other.layout);
+        debug_assert_eq!(self.key_types(), other.key_types());
         self.buf.append(&mut other.buf);
     }
 
@@ -337,7 +287,7 @@ impl PkColumn {
 
     /// Append the row at `src[i]` to `self`. Layouts must match.
     fn push_from(&mut self, src: &PkColumn, i: usize) {
-        debug_assert_eq!(self.layout, src.layout);
+        debug_assert_eq!(self.key_types(), src.key_types());
         self.buf.extend_from_slice(src.get_bytes(i));
     }
 }
@@ -459,7 +409,7 @@ impl ZSetBatch {
 
     /// Same key column types and the same payload type list.
     fn same_layout(&self, other: &ZSetBatch) -> bool {
-        self.pks.layout == other.pks.layout
+        self.pks.key_types() == other.pks.key_types()
             && self.payload.len() == other.payload.len()
             && self.payload.iter().zip(&other.payload).all(|(a, b)| a.tc() == b.tc())
     }
@@ -676,7 +626,8 @@ impl ZSetBatch {
         let whole = n == self.len();
         let mut blob = Vec::new();
         let mut pks = PkColumn {
-            layout: self.pks.layout,
+            types: self.pks.types,
+            n: self.pks.n,
             stride: self.pks.stride,
             buf: Vec::with_capacity(n * self.pks.stride()),
         };
@@ -768,7 +719,7 @@ impl<'a> BatchAppender<'a> {
     /// Start a new row with the given single-column primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
         self.open_row(weight);
-        self.batch.pks.push_u128(pk);
+        self.batch.pks.push_natives(&[pk]);
         self
     }
 

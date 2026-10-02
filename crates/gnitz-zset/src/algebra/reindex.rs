@@ -4,16 +4,16 @@
 //! The reindex Map keys rows through it and the exchange scatter routes by the
 //! bytes it packs, so the reindexed trace side and the scattered delta
 //! co-partition byte-for-byte. [`index_entries`] is a secondary index's
-//! projection of its owner's rows.
+//! projection of its owner's rows, and [`append_spans`] their spans alone.
 
 use std::cell::Cell;
 
 use gnitz_expr::{BatchView, RowSource};
 
-use crate::repr::{range_rows, runs_where, Batch};
+use crate::repr::{range_rows, runs_where, Batch, MemBatch};
 
 use crate::schema::{
-    key::KeyCol, oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
+    oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
     MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
@@ -144,10 +144,31 @@ const _: () = assert!(MAX_PK_COLUMNS * TypeCode::U128.wire_stride() <= MAX_PK_BY
 // ReindexPacker — the synthetic-key composer
 // ---------------------------------------------------------------------------
 
+/// One key column: where its source value lives, and the key column it packs
+/// into.
+#[derive(Clone, Copy)]
+struct KeyCol {
+    loc: ColumnLocator,
+    out: SchemaColumn,
+}
+
+impl KeyCol {
+    /// Padding for the fixed array's unused slots; nothing reads past `n`.
+    const EMPTY: KeyCol = KeyCol {
+        loc: ColumnLocator::Pk {
+            byte_off: 0,
+            size: 0,
+            type_code: TypeCode::U8,
+        },
+        out: SchemaColumn::EMPTY,
+    };
+}
+
 /// Packs a reindex column list into a contiguous OPK PK region.
 pub(crate) struct ReindexPacker {
-    /// The packed columns, between the bitmap and the fold.
-    span: KeySpec,
+    /// `cols[..n]` are the packed columns, between the bitmap and the fold.
+    cols: [KeyCol; MAX_PK_COLUMNS],
+    n: u8,
     pub(crate) out_stride: usize,
     /// Group key only: a leading `U8` slot, bit *i* set iff packed column *i* is
     /// NULL.
@@ -176,19 +197,36 @@ impl ReindexPacker {
             }
             cols.push((loc, t));
         }
-        Ok(Self::of_span(KeySpec::of(cols)))
+        Ok(Self::finish(cols, false, FoldCols::new(Vec::new())))
     }
 
-    /// The packer of `span` alone: no bitmap, no fold.
-    pub(crate) fn of_span(span: KeySpec) -> Self {
-        Self::finish(span, false, FoldCols::new(Vec::new()))
+    /// The packer of `span` alone, each column at its own type: no bitmap, no fold.
+    pub(crate) fn of_span(span: &KeySpec) -> Self {
+        let cols = span.locators().iter().map(|&loc| (loc, loc.type_code()));
+        Self::finish(cols, false, FoldCols::new(Vec::new()))
     }
 
-    /// The packer over `span`, its stride the sum of [`Self::key_columns`].
-    fn finish(span: KeySpec, has_bitmap: bool, fold: FoldCols) -> Self {
-        let mut packer = ReindexPacker { span, out_stride: 0, has_bitmap, fold };
+    /// The packer over `packed` — each column and its slot type — its stride the
+    /// sum of [`Self::key_columns`].
+    fn finish(packed: impl IntoIterator<Item = (ColumnLocator, TypeCode)>, has_bitmap: bool, fold: FoldCols) -> Self {
+        let mut packer = ReindexPacker {
+            cols: [KeyCol::EMPTY; MAX_PK_COLUMNS],
+            n: 0,
+            out_stride: 0,
+            has_bitmap,
+            fold,
+        };
+        for (loc, tc) in packed {
+            packer.cols[packer.n as usize] = KeyCol { loc, out: SchemaColumn::new(tc, false) };
+            packer.n += 1;
+        }
         packer.out_stride = packer.key_columns().map(|c| c.size() as usize).sum();
         packer
+    }
+
+    /// The packed columns, in key order.
+    fn columns(&self) -> &[KeyCol] {
+        &self.cols[..self.n as usize]
     }
 
     /// The output PK columns this packer's bytes fill, in key order.
@@ -197,19 +235,19 @@ impl ReindexPacker {
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
         bitmap
             .into_iter()
-            .chain(self.span.columns().iter().map(|c| c.out))
+            .chain(self.columns().iter().map(|c| c.out))
             .chain(fold)
     }
 
     /// The columns, when the packed key is their own OPK images laid end to end.
     pub(crate) fn identity_columns(&self) -> Option<Vec<ColumnLocator>> {
         let identity = |c: &KeyCol| {
-            let (src, w) = (c.loc.type_code(), c.loc.size());
+            let src = c.loc.type_code();
             !src.is_german_string()
-                && c.out.size() as usize == w
-                && gnitz_wire::opk_bias(src, w) == gnitz_wire::opk_bias(c.out.type_code, w)
+                && c.out.size() as usize == c.loc.size()
+                && gnitz_wire::opk_bias(src) == gnitz_wire::opk_bias(c.out.type_code)
         };
-        let cols = self.span.columns();
+        let cols = self.columns();
         (!self.has_bitmap && self.fold.is_empty() && cols.iter().all(identity))
             .then(|| cols.iter().map(|c| c.loc).collect())
     }
@@ -289,7 +327,7 @@ impl ReindexPacker {
             stride += w;
         }
         let fold = FoldCols::new(group[packed.len()..].iter().map(|&(_, loc)| loc).collect());
-        let packer = Self::finish(KeySpec::of(packed), has_bitmap, fold);
+        let packer = Self::finish(packed, has_bitmap, fold);
         let mut b = DerivedSchema::new();
         packer
             .key_columns()
@@ -313,7 +351,7 @@ impl ReindexPacker {
         let null_word = batch.get_null_word(row);
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         let mut null_bits = 0u8;
-        for (i, &KeyCol { loc, out }) in self.span.columns().iter().enumerate() {
+        for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
             let w = out.size() as usize;
             let cell = &mut dst[off..off + w];
             off += w;
@@ -326,7 +364,10 @@ impl ReindexPacker {
                     let h = gnitz_wire::checksum_128(gnitz_expr::payload_bytes(batch, row, slot as usize));
                     cell.copy_from_slice(&h.to_be_bytes());
                 }
-                _ => loc.encode_opk_promoted(batch, row, out.type_code, cell),
+                _ => {
+                    let image = promote_image(loc.opk_image(batch, row), loc.type_code(), out.type_code);
+                    gnitz_wire::store_opk(cell, image, false)
+                }
             }
         }
         if self.has_bitmap {
@@ -344,7 +385,7 @@ impl ReindexPacker {
         let mut bufs = vec![0u8; rows.min(KEY_CHUNK) * width];
         for start in (0..rows).step_by(KEY_CHUNK) {
             let n = (rows - start).min(KEY_CHUNK);
-            self.pack_rows(&mut bufs, width, batch, start, n);
+            self.pack_rows(&mut bufs, width, batch, &[(start, start + n)]);
             for (i, buf) in bufs.chunks_exact_mut(width).take(n).enumerate() {
                 f(start + i, buf);
             }
@@ -353,21 +394,20 @@ impl ReindexPacker {
 
     /// Whether [`Self::pack_rows`] packs a column at a time.
     fn packs_by_column(&self) -> bool {
-        self.fold.is_empty()
-            && self
-                .span
-                .columns()
-                .iter()
-                .all(|c| !c.loc.type_code().is_german_string())
+        self.fold.is_empty() && self.columns().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 
-    /// [`Self::pack_into`] for `n` rows from `start`, into the fronts of `dst`'s
-    /// `n` slots `stride` apart.
-    pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, start: usize, n: usize) {
-        let dst = &mut dst[..n * stride];
+    /// [`Self::pack_into`] for the rows of `runs` — ascending `[start, end)` — in order,
+    /// into the fronts of `dst`'s slots `stride` apart.
+    pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
+        let dst = &mut dst[..range_rows(runs) * stride];
         if !self.packs_by_column() {
-            for (i, key) in dst.chunks_exact_mut(stride).enumerate() {
-                self.pack_into(&mut key[..self.out_stride], batch, start + i);
+            let mut keys = dst.chunks_exact_mut(stride);
+            for &(s, e) in runs {
+                // The rows lead the zip: it stops on them without taking a key it leaves unwritten.
+                for (row, key) in (s..e).zip(keys.by_ref()) {
+                    self.pack_into(&mut key[..self.out_stride], batch, row);
+                }
             }
             return;
         }
@@ -375,31 +415,35 @@ impl ReindexPacker {
         if self.has_bitmap {
             dst.chunks_exact_mut(stride).for_each(|key| key[0] = 0);
         }
-        for (i, &KeyCol { loc, out }) in self.span.columns().iter().enumerate() {
+        for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
             let (sw, dw) = (loc.size(), out.size() as usize);
             let col = IntCol {
                 dst: &mut *dst,
+                runs,
                 stride,
                 off,
-                bias: gnitz_wire::opk_bias(out.type_code, dw),
+                bias: gnitz_wire::opk_bias(out.type_code),
             };
             let signed = loc.type_code().is_signed_int();
             match loc {
                 ColumnLocator::Pk { byte_off, .. } => {
                     let (pk, pk_stride) = batch.pk_region();
-                    let src = &pk[start * pk_stride..(start + n) * pk_stride];
-                    col.dispatch::<true>(sw, dw, signed, src, pk_stride, byte_off as usize);
+                    col.dispatch::<true>(sw, dw, signed, pk, pk_stride, byte_off as usize);
                 }
                 ColumnLocator::Payload { slot, .. } => {
-                    let src = &batch.col_data(slot as usize, sw)[start * sw..(start + n) * sw];
-                    col.dispatch::<false>(sw, dw, signed, src, sw, 0);
+                    col.dispatch::<false>(sw, dw, signed, batch.col_data(slot as usize, sw), sw, 0);
                     if self.has_bitmap {
                         // A NULL packs as a zeroed slot under its bitmap bit.
-                        let nulls = batch.null_bmp()[start * 8..(start + n) * 8].as_chunks::<8>().0;
-                        for (key, word) in dst.chunks_exact_mut(stride).zip(nulls) {
-                            if gnitz_wire::null_word_get(u64::from_le_bytes(*word), slot as usize) {
-                                key[0] |= 1 << i;
-                                key[off..off + dw].fill(0);
+                        let nulls = batch.null_bmp().as_chunks::<8>().0;
+                        let mut rest = &mut *dst;
+                        for &(s, e) in runs {
+                            let (keys, tail) = rest.split_at_mut((e - s) * stride);
+                            rest = tail;
+                            for (key, word) in keys.chunks_exact_mut(stride).zip(&nulls[s..e]) {
+                                if gnitz_wire::null_word_get(u64::from_le_bytes(*word), slot as usize) {
+                                    key[0] |= 1 << i;
+                                    key[off..off + dw].fill(0);
+                                }
                             }
                         }
                     }
@@ -413,9 +457,11 @@ impl ReindexPacker {
 /// Rows [`ReindexPacker::for_each_key`] packs per [`ReindexPacker::pack_rows`] call.
 const KEY_CHUNK: usize = 256;
 
-/// One integer key column's slot, at `off` of each of `dst`'s keys.
+/// One integer key column's slot, at `off` of each of `dst`'s keys: one key per
+/// row of `runs`, in order.
 struct IntCol<'a> {
     dst: &'a mut [u8],
+    runs: &'a [(usize, usize)],
     stride: usize,
     off: usize,
     /// The slot type's OPK bias: a slot holds `value + bias`, big-endian.
@@ -464,9 +510,9 @@ impl IntCol<'_> {
         )
     }
 
-    /// Each source row's `SW`-byte cell at `src_off` of its `src_stride` bytes of
-    /// `src` — a PK column's OPK image when `PK`, else a native value — as its
-    /// slot's `DW` bytes.
+    /// Each row's `SW`-byte cell at `src_off` of its `src_stride` bytes of `src` —
+    /// a PK column's OPK image when `PK`, else a native value — as its slot's `DW`
+    /// bytes.
     #[inline(always)]
     fn pack<const SW: usize, const DW: usize, const PK: bool, const SIGNED: bool>(
         self,
@@ -474,7 +520,7 @@ impl IntCol<'_> {
         src_stride: usize,
         src_off: usize,
     ) {
-        let IntCol { dst, stride, off, bias } = self;
+        let IntCol { mut dst, runs, stride, off, bias } = self;
         let encode = |cell: &[u8; SW], key: &mut [u8]| {
             let mut b = [0u8; 16];
             let raw = match PK {
@@ -492,54 +538,122 @@ impl IntCol<'_> {
             let slot: &mut [u8; DW] = (&mut key[off..off + DW]).try_into().unwrap();
             *slot = v.to_be_bytes()[16 - DW..].try_into().unwrap();
         };
-        let keys = dst.chunks_exact_mut(stride);
-        match src_stride == SW {
-            true => src.as_chunks::<SW>().0.iter().zip(keys).for_each(|(c, k)| encode(c, k)),
-            false => src
-                .chunks_exact(src_stride)
-                .zip(keys)
-                .for_each(|(row, k)| encode(row[src_off..src_off + SW].try_into().unwrap(), k)),
+        for &(s, e) in runs {
+            let (keys, rest) = std::mem::take(&mut dst).split_at_mut((e - s) * stride);
+            dst = rest;
+            let src = &src[s * src_stride..e * src_stride];
+            let keys = keys.chunks_exact_mut(stride);
+            match src_stride == SW {
+                true => src.as_chunks::<SW>().0.iter().zip(keys).for_each(|(c, k)| encode(c, k)),
+                false => src
+                    .chunks_exact(src_stride)
+                    .zip(keys)
+                    .for_each(|(row, k)| encode(row[src_off..src_off + SW].try_into().unwrap(), k)),
+            }
         }
     }
+}
+
+/// The image at type `out` of the value whose image at type `src` is `image`; `out`
+/// holds every `src` value.
+#[inline(always)]
+fn promote_image(image: u128, src: TypeCode, out: TypeCode) -> u128 {
+    if src == out {
+        return image;
+    }
+    let v = image
+        .wrapping_sub(gnitz_wire::opk_bias(src))
+        .wrapping_add(gnitz_wire::opk_bias(out));
+    debug_assert!(
+        out.wire_stride() == 16 || v >> (out.wire_stride() * 8) == 0,
+        "promote_image: slot narrower than the value"
+    );
+    v
 }
 
 // ---------------------------------------------------------------------------
 // Secondary-index entries
 // ---------------------------------------------------------------------------
 
+/// The row runs of `mb` that `spec` indexes — no NULL in an indexed column — and whose
+/// weight `keep` admits.
+fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -> Vec<(usize, usize)> {
+    let indexed_slots = spec.locators().iter().fold(0u64, |slots, loc| match *loc {
+        ColumnLocator::Payload { slot, .. } => slots | 1u64 << slot,
+        ColumnLocator::Pk { .. } => slots,
+    });
+    let weights = mb.weight().as_chunks::<8>().0;
+    let nulls = mb.null_bmp().as_chunks::<8>().0;
+    runs_where(weights.len(), |row| {
+        keep(i64::from_le_bytes(weights[row])) && u64::from_le_bytes(nulls[row]) & indexed_slots == 0
+    })
+}
+
+/// Append to `out` one zeroed `slot`-byte record per row [`indexed_runs`] yields, in row
+/// order, the row's `spec` span at its front.
+pub fn append_spans(out: &mut Vec<u8>, slot: usize, mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) {
+    let runs = indexed_runs(mb, spec, keep);
+    let at = out.len();
+    out.resize(at + range_rows(&runs) * slot, 0);
+    ReindexPacker::of_span(spec).pack_rows(&mut out[at..], slot, mb, &runs);
+}
+
 /// Each nonzero-weight row of `source` that `spec` indexes, as its index entry
 /// `[span ‖ source PK]` at that row's weight, in source order. A row NULL in an
 /// indexed column has no entry.
 pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
+    /// Copy each `runs` row's `W`-byte PK behind its entry's span.
+    #[inline(always)]
+    fn suffix<const W: usize>(
+        entries: &mut [u8],
+        idx_stride: usize,
+        key_size: usize,
+        pks: &[u8],
+        runs: &[(usize, usize)],
+    ) {
+        let mut entries = entries.chunks_exact_mut(idx_stride);
+        for &(s, e) in runs {
+            // The PKs lead the zip: it stops on them without taking an entry it leaves unwritten.
+            for (pk, entry) in pks[s * W..e * W].as_chunks::<W>().0.iter().zip(entries.by_ref()) {
+                let d: &mut [u8; W] = (&mut entry[key_size..]).try_into().unwrap();
+                *d = *pk;
+            }
+        }
+    }
+
     let (idx_stride, key_size) = (idx_schema.pk_stride(), spec.key_size());
     let src_stride = source.schema().pk_stride();
     assert_eq!(idx_stride, key_size + src_stride, "index schema of another spec");
     let mb = source.as_mem_batch();
-    let indexed_slots = spec.columns().iter().fold(0u64, |slots, c| match c.loc {
-        ColumnLocator::Payload { slot, .. } => slots | 1u64 << slot,
-        ColumnLocator::Pk { .. } => slots,
-    });
-    let weights = source.weight_data().as_chunks::<8>().0;
-    let nulls = source.null_bmp_data().as_chunks::<8>().0;
-    let runs = runs_where(source.len(), |row| {
-        weights[row] != [0; 8] && u64::from_le_bytes(nulls[row]) & indexed_slots == 0
-    });
+    let runs = indexed_runs(&mb, spec, |w| w != 0);
     let rows = range_rows(&runs);
     if rows == 0 {
         return Batch::empty_with_schema(idx_schema);
     }
-    let packer = ReindexPacker::of_span(*spec);
     let mut out = Batch::with_capacity(idx_schema, rows);
     out.grow_rows(rows);
+    let entries = &mut out.pk_data_mut()[..rows * idx_stride];
+    ReindexPacker::of_span(spec).pack_rows(entries, idx_stride, &mb, &runs);
+    let pks = source.pk_data();
+    match src_stride {
+        4 => suffix::<4>(entries, idx_stride, key_size, pks, &runs),
+        8 => suffix::<8>(entries, idx_stride, key_size, pks, &runs),
+        16 => suffix::<16>(entries, idx_stride, key_size, pks, &runs),
+        24 => suffix::<24>(entries, idx_stride, key_size, pks, &runs),
+        32 => suffix::<32>(entries, idx_stride, key_size, pks, &runs),
+        _ => {
+            let mut entries = entries.chunks_exact_mut(idx_stride);
+            for &(s, e) in &runs {
+                let pks = pks[s * src_stride..e * src_stride].chunks_exact(src_stride);
+                for (pk, entry) in pks.zip(entries.by_ref()) {
+                    entry[key_size..].copy_from_slice(pk);
+                }
+            }
+        }
+    }
     let mut at = 0;
     for &(s, e) in &runs {
         let end = at + (e - s);
-        let entries = &mut out.pk_data_mut()[at * idx_stride..end * idx_stride];
-        packer.pack_rows(entries, idx_stride, &mb, s, e - s);
-        let pks = source.pk_data()[s * src_stride..e * src_stride].chunks_exact(src_stride);
-        for (entry, pk) in entries.chunks_exact_mut(idx_stride).zip(pks) {
-            entry[key_size..].copy_from_slice(pk);
-        }
         out.weight_data_mut()[at * 8..end * 8].copy_from_slice(&source.weight_data()[s * 8..e * 8]);
         at = end;
     }

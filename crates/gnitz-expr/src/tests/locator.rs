@@ -26,10 +26,10 @@ fn every_locator_read_agrees_with_the_values_encoding() {
         1 << 127,
         u128::MAX,
     ];
-    let opk = |native: &[u8], tc: TypeCode| {
-        let mut out = [0u8; 16];
-        gnitz_wire::encode_pk_column(native, tc, &mut out[..native.len()]);
-        out[..native.len()].to_vec()
+    let opk = |native: u128, tc: TypeCode| {
+        let mut out = vec![0u8; tc.wire_stride()];
+        gnitz_wire::store_opk(&mut out, native, tc.is_signed_int());
+        out
     };
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let w = tc.wire_stride();
@@ -57,7 +57,7 @@ fn every_locator_read_agrees_with_the_values_encoding() {
                 let label = format!("{tc} {arm} row {row}");
                 assert_eq!(
                     loc.opk_image(&v, row),
-                    gnitz_wire::widen_pk_be(&opk(native, tc)),
+                    gnitz_wire::widen_pk_be(&opk(PATTERNS[row], tc)),
                     "{label}"
                 );
                 assert_eq!(loc.native_le_bytes(&v, row, &mut [0u8; 16]), &native[..], "{label}");
@@ -65,18 +65,7 @@ fn every_locator_read_agrees_with_the_values_encoding() {
                 let Some(fi) = FixedInt::from_type_code(tc) else {
                     continue;
                 };
-                let value = fi.decode_le_i64(native);
-                assert_eq!(loc.decode_i64(&v, row, fi), value, "{label}");
-                for &target in TypeCode::ALL.iter().filter(|&&t| tc.is_widening_promotion(t)) {
-                    let tw = target.wire_stride();
-                    let mut got = vec![0u8; tw];
-                    loc.encode_opk_promoted(&v, row, target, &mut got);
-                    let widened = match fi.is_signed() {
-                        true => value as i128 as u128,
-                        false => value as u64 as u128,
-                    };
-                    assert_eq!(got, opk(&widened.to_le_bytes()[..tw], target), "{label} -> {target}");
-                }
+                assert_eq!(loc.decode_i64(&v, row, fi), fi.decode_le_i64(native), "{label}");
             }
             for i in 0..natives.len() {
                 for j in 0..natives.len() {
@@ -92,10 +81,10 @@ fn every_locator_read_agrees_with_the_values_encoding() {
     // The at-rest image itself: big-endian with the sign bit flipped, so `-1`
     // lands just below `i64::MAX` and `i64::MIN` at all-zero.
     assert_eq!(
-        opk(&(-1i64).to_le_bytes(), TypeCode::I64),
+        opk(-1i64 as u128, TypeCode::I64),
         [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
     );
-    assert_eq!(opk(&i64::MIN.to_le_bytes(), TypeCode::I64), [0; 8]);
+    assert_eq!(opk(i64::MIN as u128, TypeCode::I64), [0; 8]);
 }
 
 /// The identity tiebreak follows the written keys: PK columns in PK-list order

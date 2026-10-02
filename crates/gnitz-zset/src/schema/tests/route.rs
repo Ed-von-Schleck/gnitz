@@ -1,8 +1,7 @@
 use super::*;
-use crate::schema::key::PkBuf;
 use crate::schema::SchemaColumn;
 use crate::test_support::Rng;
-use gnitz_wire::{key_image, Cut, PkColList, TypeCode};
+use gnitz_wire::{key_image, Cut, PkBuf, PkColList, TypeCode};
 
 /// The largest worker count a server launches.
 const NW_MAX: usize = 64;

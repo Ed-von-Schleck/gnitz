@@ -19,7 +19,7 @@ use gnitz_core::{PkColumn, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::place::{place_scaled, Placed};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::decimal::parse_decimal_text;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
 
 use crate::read::{scan_result, PyScanResult};
 use crate::schema::PySchema;
@@ -29,6 +29,7 @@ use crate::schema::PySchema;
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
     let mut pk_col = PkColumn::empty_for_schema(schema);
     pk_col.reserve(pks.len());
+    let mut scratch = Vec::with_capacity(16);
     for pk in pks {
         let tuple;
         let vals = if schema.pk_cols.len() == 1 {
@@ -46,13 +47,15 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
                 vals.len()
             )));
         }
-        pk_col.push_row(|k, buf| {
+        let mut natives = [0u128; MAX_PK_COLUMNS];
+        for (k, (native, v)) in natives.iter_mut().zip(vals).enumerate() {
             let col = &schema.columns[schema.pk_cols[k] as usize];
-            if vals[k].is_none() {
+            if v.is_none() {
                 return Err(not_nullable_err(&col.name));
             }
-            push_fixed_le(buf, col.ty, &vals[k], Inexact::Refuse)
-        })?;
+            *native = py_native(&mut scratch, col.ty, v, Inexact::Refuse)?;
+        }
+        pk_col.push_natives(&natives[..vals.len()]);
     }
     Ok(pk_col)
 }
@@ -78,6 +81,8 @@ pub struct PyZSetBatch {
     weight_is_column: bool,
     /// The plan the last row was written through — see [`KwPlan`].
     kw_plan: Option<KwPlan>,
+    /// [`py_native`]'s buffer, reused by every row written.
+    key_scratch: Vec<u8>,
 }
 
 impl PyZSetBatch {
@@ -280,8 +285,8 @@ impl PyZSetBatch {
     /// `names` to its value. `tuple` is those names as a Python tuple where the
     /// caller holds one, which the plan is matched against by pointer first.
     ///
-    /// PK bytes go straight into the batch's PK buffer, then each payload cell
-    /// into its column, and the weight and null word close the row. Rolls
+    /// The key is appended once every PK column has extracted, then each payload
+    /// cell into its column, and the weight and null word close the row. Rolls
     /// nothing back on error: each surface wraps its own call in
     /// [`Self::with_rollback`], which cuts a half-written row off every stream.
     fn write_row<'a, 'py>(
@@ -292,7 +297,13 @@ impl PyZSetBatch {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let PyZSetBatch { batch, schema, weight_is_column, kw_plan } = &mut *self;
+        let PyZSetBatch {
+            batch,
+            schema,
+            weight_is_column,
+            kw_plan,
+            key_scratch,
+        } = &mut *self;
         let schema: &Schema = schema;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
@@ -310,14 +321,15 @@ impl PyZSetBatch {
                 .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
             None => default_weight,
         };
-        batch.pks.push_row(|k, buf| {
-            let PkPlan { pos, ci, ty } = plan.pks[k];
+        let mut natives = [0u128; MAX_PK_COLUMNS];
+        for (native, &PkPlan { pos, ci, ty }) in natives.iter_mut().zip(&plan.pks) {
             let v = arg(pos);
             if v.is_none() {
                 return Err(not_nullable_err(&schema.columns[ci].name));
             }
-            push_fixed_le(buf, ty, &v, Inexact::Round)
-        })?;
+            *native = py_native(key_scratch, ty, &v, Inexact::Round)?;
+        }
+        batch.pks.push_natives(&natives[..plan.pks.len()]);
         let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
@@ -488,6 +500,7 @@ impl PyZSetBatch {
             batch,
             weight_is_column,
             kw_plan: None,
+            key_scratch: Vec::with_capacity(16),
             schema,
         }
     }
@@ -698,6 +711,15 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexac
     Ok(())
 }
 
+/// `v` as `ty`'s native value, zero-extended. `scratch` is reused across calls.
+fn py_native(scratch: &mut Vec<u8>, ty: ColType, v: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<u128> {
+    scratch.clear();
+    push_fixed_le(scratch, ty, v, inexact)?;
+    let mut le = [0u8; 16];
+    le[..scratch.len()].copy_from_slice(scratch);
+    Ok(u128::from_le_bytes(le))
+}
+
 /// One key value's image in `col`'s key order.
 pub(crate) fn py_key_image(col: &ColumnDef, v: &Bound<'_, PyAny>) -> PyResult<u128> {
     if !col.ty.tc.is_pk_eligible() {
@@ -706,11 +728,6 @@ pub(crate) fn py_key_image(col: &ColumnDef, v: &Bound<'_, PyAny>) -> PyResult<u1
             col.name
         )));
     }
-    let mut native = Vec::with_capacity(16);
-    push_fixed_le(&mut native, col.ty, v, Inexact::Refuse)?;
-    native.resize(16, 0);
-    Ok(gnitz_wire::key_image(
-        col.ty.tc,
-        u128::from_le_bytes(native.try_into().unwrap()),
-    ))
+    let native = py_native(&mut Vec::with_capacity(16), col.ty, v, Inexact::Refuse)?;
+    Ok(gnitz_wire::key_image(col.ty.tc, native))
 }

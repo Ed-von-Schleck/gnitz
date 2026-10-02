@@ -2,12 +2,13 @@
 //! FROM-less SELECT's constant row.
 
 use std::collections::hash_map::Entry;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
+use gnitz_wire::ColumnDef;
 use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
-use gnitz_wire::{ColumnDef, PkBuf};
 use rustc_hash::FxHashMap;
 
 use crate::error::GnitzSqlError;
@@ -74,32 +75,73 @@ impl FoldFinish {
         let n_group = schema.num_payload_cols() - self.merge.len();
         let payload = schema.payload_locators();
         let agg_locs = &payload[n_group..];
-        // Output key → the group's first row.
-        let mut first_of: FxHashMap<PkBuf, usize> =
-            FxHashMap::with_capacity_and_hasher(partial.len(), Default::default());
-        let mut keep: Vec<(usize, usize)> = Vec::new();
-        for row in 0..partial.len() {
-            debug_assert_eq!(partial.weights[row], 1, "a fold partial is one reduce row");
-            let key = PkBuf::from_bytes(partial.pks.get_bytes(row));
-            match first_of.entry(key) {
-                Entry::Occupied(e) => {
-                    let first = *e.get();
-                    for (k, (loc, &merge)) in agg_locs.iter().zip(&self.merge).enumerate() {
-                        merge_cell(&mut partial, first, row, n_group + k, merge, loc);
+        debug_assert!(
+            partial.weights.iter().all(|&w| w == 1),
+            "a fold partial is one reduce row"
+        );
+        let n = partial.len();
+        let (stride, region) = (partial.pks.stride(), partial.pks.region());
+        // A narrow key groups by its image, a wide one by its bytes.
+        let (first, keep) = match stride <= gnitz_wire::NARROW_PK_MAX_BYTES {
+            true => firsts(region.chunks_exact(stride).map(gnitz_wire::widen_pk_be)),
+            false => firsts(region.chunks_exact(stride)),
+        };
+        // Every row its own group: nothing to merge or drop.
+        if keep == [(0, n)] {
+            return partial;
+        }
+        let absorbed = || first.iter().enumerate().filter(|&(row, &f)| f as usize != row);
+        for (k, (loc, &merge)) in agg_locs.iter().zip(&self.merge).enumerate() {
+            let pi = n_group + k;
+            match merge {
+                // An integer wraps mod 2^64 as the engine accumulator does.
+                Merge::Add if !loc.type_code().is_float() => {
+                    let nulls = &mut partial.nulls;
+                    let cells = partial.payload[pi].bytes.as_chunks_mut::<8>().0;
+                    for (row, &f) in absorbed() {
+                        let f = f as usize;
+                        if gnitz_wire::null_word_get(nulls[row], pi) {
+                            continue;
+                        }
+                        if gnitz_wire::null_word_get(nulls[f], pi) {
+                            cells[f] = cells[row];
+                            gnitz_wire::null_word_set(&mut nulls[f], pi, false);
+                        } else {
+                            let sum = u64::from_le_bytes(cells[f]).wrapping_add(u64::from_le_bytes(cells[row]));
+                            cells[f] = sum.to_le_bytes();
+                        }
                     }
                 }
-                Entry::Vacant(e) => {
-                    e.insert(row);
-                    match keep.last_mut() {
-                        Some((_, end)) if *end == row => *end += 1,
-                        _ => keep.push((row, row + 1)),
-                    }
-                }
+                // Row order, so a float sum adds in reply order.
+                _ => absorbed().for_each(|(row, &f)| merge_cell(&mut partial, f as usize, row, pi, merge, loc)),
             }
         }
         partial.retain_ranges(&keep);
         partial
     }
+}
+
+/// Each key's first position, per position, and the runs of first positions.
+fn firsts<K: Hash + Eq>(keys: impl ExactSizeIterator<Item = K>) -> (Vec<u32>, Vec<(usize, usize)>) {
+    let n = keys.len();
+    assert!(n <= u32::MAX as usize, "partial row count exceeds u32");
+    let mut first_of: FxHashMap<K, u32> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+    let mut first = Vec::with_capacity(n);
+    let mut keep: Vec<(usize, usize)> = Vec::new();
+    for (row, key) in keys.enumerate() {
+        match first_of.entry(key) {
+            Entry::Occupied(e) => first.push(*e.get()),
+            Entry::Vacant(e) => {
+                e.insert(row as u32);
+                first.push(row as u32);
+                match keep.last_mut() {
+                    Some((_, end)) if *end == row => *end += 1,
+                    _ => keep.push((row, row + 1)),
+                }
+            }
+        }
+    }
+    (first, keep)
 }
 
 /// How two partials of one aggregate combine.
@@ -119,8 +161,8 @@ fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, merge: Mer
         _ if loc.is_null_word(b.nulls[first]) => true,
         Merge::Min => loc.cmp_non_null(&*b, row, &*b, first).is_lt(),
         Merge::Max => loc.cmp_non_null(&*b, row, &*b, first).is_gt(),
-        // F64 adds in reply order, so its low bits follow the worker count; an integer wraps
-        // mod 2^64 as the engine accumulator does.
+        // F64 adds in reply order, so its low bits follow the worker count. An integer
+        // sum takes `combine`'s column loop; this arm states the same wrap.
         Merge::Add => {
             let col = &mut b.payload[pi].bytes;
             let (acc, add) = (read_u64_le(col, first * 8), read_u64_le(col, row * 8));

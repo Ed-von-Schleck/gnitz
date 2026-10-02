@@ -248,35 +248,68 @@ fn secondary_index_single_u64_pk_sort_bench() {
 /// Per-row cost of projecting a secondary index's entries (`index_entries` =
 /// leading-key span ‖ source-PK suffix, per live row).
 ///
-/// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
-/// promotion — the span is the OPK bytes already in the PK region), an **I64
-/// payload** source (no promotion, native LE into the encoder), a **U32 payload
-/// → U64** source (real width promotion), and a **compound (U64 PK, I64
-/// payload)** two-column span.
+/// Four span shapes, chosen to separate the encode paths: a **U64 PK** (the span
+/// is the OPK bytes already in the PK region), an **I64 payload** (native LE
+/// into the encoder), a **U32 payload** (a 4-byte span) and a **compound (U64
+/// PK, I64 payload)** two-column span — then the suffix copy: a 16-byte source
+/// PK, and an index on a nullable column at three NULL densities, which cut the
+/// rows into runs.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn index_entries_bench() {
     use crate::algebra::index_entries;
     use crate::schema::index_spec_and_schema;
 
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let measure = |label: &str, input: &Batch, cols: &[u32]| {
+        let (spec, idx_schema) = index_spec_and_schema(cols, input.schema()).unwrap();
+        std::hint::black_box(index_entries(input, &spec, &idx_schema));
+        let (out, instructions) = counter.measure(|| index_entries(input, &spec, &idx_schema));
+        std::hint::black_box(out);
+        println!("  {label:<32} {:7.1} instr/row", instructions as f64 / N_ROWS as f64);
+    };
+
     // `src_schema()` / `build_input` from the top of this file: U64 pk (col 0) |
     // U32 (col 1) | I64 (col 2), 500k rows. The four shapes map onto it directly.
     let src = src_schema();
     let input = build_input(&src);
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-
     println!("\nindex_entries — per-row cost ({N_ROWS} rows):");
     for (label, cols) in [
         ("U64 PK        (identity)", &[0u32][..]),
-        ("I64 payload   (direct)  ", &[2][..]),
-        ("U32 payload   (promoted)", &[1][..]),
-        ("compound (PK, I64)      ", &[0, 2][..]),
+        ("I64 payload   (direct)", &[2][..]),
+        ("U32 payload   (4-byte span)", &[1][..]),
+        ("compound (PK, I64)", &[0, 2][..]),
     ] {
-        let (spec, idx_schema) = index_spec_and_schema(cols, &src).unwrap();
-        std::hint::black_box(index_entries(&input, &spec, &idx_schema));
-        let (out, instructions) = counter.measure(|| index_entries(&input, &spec, &idx_schema));
-        std::hint::black_box(out);
-        println!("  {label}  {:7.1} instr/row", instructions as f64 / N_ROWS as f64);
+        measure(label, &input, cols);
+    }
+
+    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+    let mut b = BatchBuilder::new(&wide);
+    for row in 0..N_ROWS as u64 {
+        b.begin_row_natives(&[(row >> 8) as u128, row as u128], 1);
+        b.put_int(row.wrapping_mul(2654435761) as i64 as u128);
+        b.end_row();
+    }
+    measure("16-byte PK, I64 payload", &b.finish(), &[2]);
+
+    let nullable = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
+    for null_every in [0u64, 8, 2] {
+        let mut b = BatchBuilder::new(&nullable);
+        for row in 0..N_ROWS as u64 {
+            b.begin_row(row as u128, 1);
+            match null_every != 0 && row % null_every == 0 {
+                true => b.put_null(),
+                false => b.put_int(row.wrapping_mul(2654435761) as i64 as u128),
+            }
+            b.end_row();
+        }
+        measure(&format!("nullable I64, NULL every {null_every}"), &b.finish(), &[1]);
     }
 }
 
@@ -345,7 +378,7 @@ fn op_reduce_bench() {
         for i in 0..N {
             match schema.pk_cols().len() {
                 1 => bb.begin_row(i as u128, 1),
-                _ => bb.begin_row_opk(&[(i / 16) as u128, (i % 16) as u128], 1),
+                _ => bb.begin_row_natives(&[(i / 16) as u128, (i % 16) as u128], 1),
             }
             bb.put_int((i + salt) as u128);
             bb.end_row();

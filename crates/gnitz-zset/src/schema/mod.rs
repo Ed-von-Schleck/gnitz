@@ -288,20 +288,24 @@ impl SchemaDescriptor {
     /// Render a PK from its raw OPK byte form, for error messages: the per-column
     /// native values in PK-list order, comma-separated.
     pub fn format_pk_bytes(&self, pk_bytes: &[u8]) -> String {
-        let native = self.native_le_key(pk_bytes);
         let mut off = 0usize;
         self.pk_columns()
             .map(|(_, col)| {
-                let le = &native[off..off + col.size() as usize];
-                off += le.len();
-                // Through the storage type: a calendar column renders as the signed
-                // integer it is, not as the unsigned fallthrough.
-                match col.type_code.storage_type() {
-                    TypeCode::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
-                    TypeCode::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
-                    TypeCode::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
-                    t if t.is_signed_int() => format!("{}", gnitz_wire::read_signed_exact(le)),
-                    _ => format!("{}", gnitz_wire::read_unsigned_exact(le)),
+                let cell = &pk_bytes[off..off + col.size() as usize];
+                off += cell.len();
+                let tc = col.type_code;
+                // A calendar or decimal column renders as the integer it is stored as.
+                match gnitz_wire::FixedInt::from_type_code(tc) {
+                    Some(fi) if fi.is_signed() => format!("{}", gnitz_wire::decode_opk_i64(cell, fi)),
+                    Some(fi) => format!("{}", gnitz_wire::decode_opk_i64(cell, fi) as u64),
+                    None => {
+                        let native = gnitz_wire::key_image(tc, gnitz_wire::widen_pk_be(cell));
+                        match tc {
+                            TypeCode::UUID => gnitz_wire::format_uuid(native),
+                            TypeCode::I128 => format!("{}", native as i128),
+                            _ => format!("{native}"),
+                        }
+                    }
                 }
             })
             .collect::<Vec<_>>()
@@ -500,7 +504,7 @@ impl Eq for SchemaDescriptor {}
 // ---------------------------------------------------------------------------
 
 /// The [`KeySpec`] of a secondary index on `source_cols` of `source`, with the
-/// index schema its entries land in: the promoted key columns in declared order,
+/// index schema its entries land in: the key columns in declared order,
 /// then the source PK columns, all in the PK.
 pub fn index_spec_and_schema(
     source_cols: &[u32],

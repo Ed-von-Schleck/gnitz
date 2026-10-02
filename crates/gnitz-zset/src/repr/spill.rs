@@ -1,6 +1,9 @@
 //! Bounded external sort of fixed-stride byte records: peak RAM is about one
 //! run, whatever the input size. The spill file is `O_TMPFILE`, so no exit
 //! leaves it on disk.
+//!
+//! A record occupies a slot of its stride rounded up to 8 bytes, zero past the
+//! record, so the kernel compares whole words and the slot orders as the record.
 
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
@@ -12,7 +15,6 @@ use gnitz_wire::MAX_PK_BYTES;
 
 use super::batch::Batch;
 use super::loser_tree::{HeapNode, LoserTree};
-use crate::schema::key::{KeySpec, PkBuf};
 
 /// Unsigned byte order of two records, compared a big-endian word at a time.
 #[inline(always)]
@@ -26,12 +28,12 @@ fn cmp_records(a: &[u8], b: &[u8]) -> Ordering {
     Ordering::Equal
 }
 
-fn sort_records(flat: &mut [u8], stride: usize) {
+fn sort_records(flat: &mut [u8], slot: usize) {
     macro_rules! by_width {
         ($($w:literal)*) => {
-            match stride {
+            match slot {
                 $($w => flat.as_chunks_mut::<$w>().0.sort_unstable_by(|a, b| cmp_records(a, b)),)*
-                _ => unreachable!("SpillSort::new admits multiples of 8 up to MAX_PK_BYTES"),
+                _ => unreachable!("a slot is a multiple of 8 up to MAX_PK_BYTES"),
             }
         };
     }
@@ -41,6 +43,8 @@ const _: () = assert!(MAX_PK_BYTES == 80); // the arm list above is total
 
 pub struct SpillSort {
     stride: usize,
+    /// `stride` rounded up to whole 8-byte words.
+    slot: usize,
     run_len: usize,
     dir: String,
     flat: Vec<u8>,
@@ -49,48 +53,43 @@ pub struct SpillSort {
 
 impl SpillSort {
     /// `dir` names the filesystem the spill file goes on; a run is `budget`
-    /// bytes of records, rounded up to whole records.
+    /// bytes of slots, rounded up to whole slots.
     pub fn new(dir: &str, stride: usize, budget: usize) -> Self {
-        assert!(
-            stride.is_multiple_of(8) && (8..=MAX_PK_BYTES).contains(&stride),
-            "record stride {stride}"
-        );
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "record stride {stride}");
+        let slot = stride.next_multiple_of(8);
         SpillSort {
             stride,
+            slot,
             // `HeapNode::row` indexes a run with a `u32`.
-            run_len: budget.div_ceil(stride).clamp(1, u32::MAX as usize),
+            run_len: budget.div_ceil(slot).clamp(1, u32::MAX as usize),
             dir: dir.to_string(),
             flat: Vec::new(),
             spill: None,
         }
     }
 
-    /// Push the `spec` span of every row of `chunk` that has one — a NULL in an
-    /// indexed column means none. `chunk` is consolidated, every row at weight 1.
-    pub fn push_spans(&mut self, chunk: &Batch, spec: &KeySpec) -> Result<(), String> {
-        debug_assert_eq!(spec.key_size(), self.stride);
-        let mb = chunk.as_mem_batch();
-        let mut span = PkBuf::zeroed(0);
-        for row in 0..chunk.len() {
-            debug_assert_eq!(chunk.get_weight(row), 1, "a consolidated row at weight 1");
-            if spec.key_bytes(&mb, row, &mut span) {
-                self.push(span.pk_bytes())?;
-            }
+    /// Bytes a record occupies in [`Self::push`]'s input.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Push a whole number of slot-wide records, each zero past its `stride` bytes.
+    pub fn push(&mut self, records: &[u8]) -> Result<(), String> {
+        debug_assert!(records.len().is_multiple_of(self.slot));
+        self.flat.extend_from_slice(records);
+        let run = self.run_len * self.slot;
+        let mut at = 0;
+        while self.flat.len() - at >= run {
+            self.spill_run(at, at + run)?;
+            at += run;
         }
+        self.flat.drain(..at);
         Ok(())
     }
 
-    pub fn push(&mut self, record: &[u8]) -> Result<(), String> {
-        debug_assert_eq!(record.len(), self.stride);
-        self.flat.extend_from_slice(record);
-        if self.flat.len() == self.run_len * self.stride {
-            self.spill_run()?;
-        }
-        Ok(())
-    }
-
-    fn spill_run(&mut self) -> Result<(), String> {
-        sort_records(&mut self.flat, self.stride);
+    /// Sort `flat[from..to]` and append it to the spill file as one run.
+    fn spill_run(&mut self, from: usize, to: usize) -> Result<(), String> {
+        sort_records(&mut self.flat[from..to], self.slot);
         let file = match &mut self.spill {
             Some(f) => f,
             None => self.spill.insert(
@@ -103,26 +102,24 @@ impl SpillSort {
                     .map_err(|e| format!("external sort: cannot create spill file in {}: {e}", self.dir))?,
             ),
         };
-        file.write_all(&self.flat)
-            .map_err(|e| format!("external sort: spill write failed: {e}"))?;
-        self.flat.clear();
-        Ok(())
+        file.write_all(&self.flat[from..to])
+            .map_err(|e| format!("external sort: spill write failed: {e}"))
     }
 
     pub fn finish(mut self) -> Result<KeyProducer, String> {
         let records = if self.spill.is_none() {
-            sort_records(&mut self.flat, self.stride);
+            sort_records(&mut self.flat, self.slot);
             Records::Ram(self.flat)
         } else {
             // The last run goes to disk too, so `flat` is freed before the merge.
-            self.spill_run()?;
+            self.spill_run(0, self.flat.len())?;
             let file = self.spill.take().expect("spilled");
             // The mapping keeps the inode alive after `file` closes.
             let map = Mmap::from_file(&file).map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
             map.advise_sequential();
             Records::Mapped(map)
         };
-        Ok(KeyProducer::new(records, self.stride, self.run_len))
+        Ok(KeyProducer::new(records, self.stride, self.slot, self.run_len))
     }
 }
 
@@ -146,8 +143,8 @@ fn record_index(n: &HeapNode, run_len: usize) -> usize {
     n.source_idx as usize * run_len + n.row as usize
 }
 
-fn less(bytes: &[u8], stride: usize, run_len: usize) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
-    let rec = move |n: &HeapNode| &bytes[record_index(n, run_len) * stride..][..stride];
+fn less(bytes: &[u8], slot: usize, run_len: usize) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
+    let rec = move |n: &HeapNode| &bytes[record_index(n, run_len) * slot..][..slot];
     move |a, b| cmp_records(rec(a), rec(b)).is_lt()
 }
 
@@ -155,6 +152,7 @@ fn less(bytes: &[u8], stride: usize, run_len: usize) -> impl Fn(&HeapNode, &Heap
 pub struct KeyProducer {
     records: Records,
     stride: usize,
+    slot: usize,
     run_len: usize,
     total: usize,
     remaining: usize,
@@ -162,16 +160,17 @@ pub struct KeyProducer {
 }
 
 impl KeyProducer {
-    fn new(records: Records, stride: usize, run_len: usize) -> Self {
-        let total = records.as_slice().len() / stride;
+    fn new(records: Records, stride: usize, slot: usize, run_len: usize) -> Self {
+        let total = records.as_slice().len() / slot;
         let tree = LoserTree::build(
             total.div_ceil(run_len),
             |_| Some(0),
-            less(records.as_slice(), stride, run_len),
+            less(records.as_slice(), slot, run_len),
         );
         KeyProducer {
             records,
             stride,
+            slot,
             run_len,
             total,
             remaining: total,
@@ -189,9 +188,9 @@ impl KeyProducer {
         let more = (top.row as usize + 1) < self.run_len && g + 1 < self.total;
         let bytes = self.records.as_slice();
         self.tree
-            .step_top(more.then_some(top.row + 1), &less(bytes, self.stride, self.run_len));
+            .step_top(more.then_some(top.row + 1), &less(bytes, self.slot, self.run_len));
         self.remaining -= 1;
-        Some(&bytes[g * self.stride..][..self.stride])
+        Some(&bytes[g * self.slot..][..self.stride])
     }
 
     #[inline]

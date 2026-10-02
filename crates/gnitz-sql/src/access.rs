@@ -239,11 +239,10 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
         for (k, s) in slices.iter().enumerate() {
             tuple[k] = s[at[k]];
         }
-        let key = gnitz_wire::encode_pk_images(schema.pk_cols.iter().zip(&tuple[..pk_count]).map(|(&c, &v)| {
-            let tc = schema.columns[c as usize].ty.tc;
-            (tc, tc, v)
-        }));
-        bytes.extend_from_slice(key.pk_bytes());
+        for (&c, &image) in schema.pk_cols.iter().zip(&tuple[..pk_count]) {
+            let width = schema.columns[c as usize].ty.tc.wire_stride();
+            gnitz_wire::push_opk(&mut bytes, width, image, false);
+        }
         for k in (0..pk_count).rev() {
             at[k] += 1;
             if at[k] < slices[k].len() {

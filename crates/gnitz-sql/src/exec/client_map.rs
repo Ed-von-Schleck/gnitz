@@ -63,14 +63,14 @@ impl ClientMap {
         for c in self.ev.copies() {
             match c.src {
                 ColumnLocator::Payload { slot, .. } => moves.push((c.slot, slot as usize)),
-                ColumnLocator::Pk { .. } => {
-                    let mut bytes = Vec::with_capacity(n * c.width);
-                    let mut scratch = [0u8; 16];
-                    for r in 0..n {
-                        bytes.extend_from_slice(c.src.native_le_bytes(&src, r, &mut scratch));
-                    }
-                    out.payload[c.slot].bytes = bytes;
-                }
+                ColumnLocator::Pk { byte_off, type_code, .. } => gnitz_wire::decode_pk_cells(
+                    src.pks.region(),
+                    src.pks.stride(),
+                    byte_off as usize,
+                    c.width,
+                    type_code.is_signed_int(),
+                    &mut out.payload[c.slot].bytes,
+                ),
             }
         }
         // The evaluator is done with `src`; its parts move into the output.

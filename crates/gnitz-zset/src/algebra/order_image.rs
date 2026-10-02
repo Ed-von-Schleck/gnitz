@@ -188,7 +188,7 @@ pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
     match kind {
         WideKind::Fixed(tc) => {
             let (n, mut native) = (v.len(), [0u8; 16]);
-            gnitz_wire::decode_pk_column(&v, tc, &mut native[..n]);
+            gnitz_wire::decode_pk_cell(&v, tc.is_signed_int(), &mut native[..n]);
             v.copy_from_slice(&native[..n]);
             v
         }

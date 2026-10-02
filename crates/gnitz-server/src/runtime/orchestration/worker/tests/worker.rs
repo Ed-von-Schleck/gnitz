@@ -756,12 +756,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
                 .all(|f| !f.ctrl.hdr.flags.scan_last && f.ctrl.data.is_some()));
             let want: Vec<Vec<u8>> = (0..n)
                 .rev()
-                .map(|i| {
-                    span_schema
-                        .opk_key(&(-(i as i64) as u128).to_le_bytes())
-                        .pk_bytes()
-                        .to_vec()
-                })
+                .map(|i| span_schema.opk_key_cols(&[-(i as i64) as u128]).pk_bytes().to_vec())
                 .collect();
             assert_eq!(got, want, "indexed={indexed}, {n} spans");
         }

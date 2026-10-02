@@ -30,23 +30,19 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
     r
 }
 
-/// The probe keys of `vals`, ascending: each value's span over a zero holder.
+/// The probe keys of `vals`, ascending: each value's span.
 fn probe_keys(r: &RelationFixture, vals: impl Iterator<Item = i64>) -> Batch {
     let schema = make_schema_u64_i64();
     let ix = r.relation(TID).unwrap().index_on(&[1]).unwrap();
-    let (ix_schema, span) = (ix.schema(), ix.key_spec().key_size());
+    let (spec, ix_schema) = (ix.key_spec(), ix.schema());
     let rows: Vec<_> = vals.map(|v| (0, 1, v)).collect();
-    let entries = gnitz_zset::algebra::index_entries(&make_batch_raw(&schema, &rows), &ix.key_spec(), &ix_schema);
+    let entries = gnitz_zset::algebra::index_entries(&make_batch_raw(&schema, &rows), &spec, &ix_schema);
     let mut keys: Vec<Vec<u8>> = (0..entries.len())
-        .map(|i| {
-            let mut key = entries.get_pk_bytes(i).to_vec();
-            key[span..].fill(0);
-            key
-        })
+        .map(|i| entries.get_pk_bytes(i)[..spec.key_size()].to_vec())
         .collect();
     keys.sort_unstable();
     keys.dedup();
-    let mut batch = Batch::with_capacity(&ix_schema, keys.len());
+    let mut batch = Batch::with_capacity(&spec.span_schema(), keys.len());
     for key in &keys {
         batch.push_key_row(key, 1);
     }

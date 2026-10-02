@@ -22,7 +22,7 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
         let mut b = BatchBuilder::new(&schema);
         match col1_is_pk {
-            true => b.begin_row_opk(&[0, le_cell(le)], 1),
+            true => b.begin_row_natives(&[0, le_cell(le)], 1),
             false => {
                 b.begin_row(0, 1);
                 b.put_int(le_cell(le));
@@ -181,7 +181,7 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     let mut bb = BatchBuilder::new(&schema);
     for i in 0..64u64 {
         let m = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
-        bb.begin_row_opk(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);
+        bb.begin_row_natives(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);
         bb.put_int(((m % 9) as i64 - 4) as u128);
         bb.put_int(u128::from(m % 3) << 100);
         match m % 4 {
@@ -251,5 +251,59 @@ fn reduce_sort_argsort_bench() {
 
         let mrps = n as f64 / dt.as_secs_f64() / 1e6;
         println!("argsort {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
+    }
+}
+
+/// Instructions per row of grouping 1M rows in 1000 groups by hashing each row's
+/// identity, per key form.
+///
+/// `cd crates && cargo test -p gnitz-zset --release group_identity_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn group_identity_bench() {
+    use TypeCode::{I32, I64, U32, U64};
+    const N: u64 = 1_000_000;
+    const GROUPS: u64 = 1000;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let schema = |pk: &[TypeCode], payload: TypeCode| {
+        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+        cols.push(SchemaColumn::new(payload, false));
+        SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
+    };
+    // The group value sits in the grouped column; a row counter keeps the PK distinct.
+    for (label, pk, payload, group_cols) in [
+        ("payload I64 image", &[U64][..], I64, &[1u32][..]),
+        ("payload I32 image", &[U64], I32, &[1]),
+        ("PK column, 8 bytes at offset 8 of 16", &[U64, U64], I64, &[1]),
+        ("PK prefix, 8 of 16", &[U64, U64], I64, &[0]),
+        ("whole PK, 16 bytes", &[U64, U64], I64, &[0, 1]),
+        ("whole PK, 12 bytes", &[U32, U64], I64, &[0, 1]),
+    ] {
+        let schema = schema(pk, payload);
+        let whole_pk = group_cols.len() == pk.len() && pk.len() > 1;
+        let mut bb = BatchBuilder::new(&schema);
+        for i in 0..N {
+            let g = (i.wrapping_mul(0x9E37_79B9) % GROUPS) as u128;
+            let natives: Vec<u128> = match (pk.len(), whole_pk, group_cols[0]) {
+                (1, ..) => vec![i as u128],
+                // The whole PK is the group: 1000 distinct keys, repeated.
+                (_, true, _) => vec![g % 10, g],
+                (_, false, 0) => vec![g, i as u128],
+                _ => vec![i as u128, g],
+            };
+            bb.begin_row_natives(&natives, 1);
+            bb.put_int(g);
+            bb.end_row();
+        }
+        let batch = bb.finish();
+        let key = GroupOutKey::new(&schema, group_cols, []).unwrap().0;
+        std::hint::black_box(key.numbered(&batch));
+        let (groups, instructions) = counter.measure(|| key.numbered(&batch));
+        assert_eq!(groups.len(), GROUPS as usize, "{label}");
+        std::hint::black_box(groups);
+        println!(
+            "group_identity_bench {label:<38} {:6.1} instr/row",
+            instructions as f64 / N as f64
+        );
     }
 }

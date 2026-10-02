@@ -5,6 +5,7 @@ use crate::test_support::{
 use gnitz_wire::TypeCode;
 use gnitz_wire::{key_image, Cut, PkColList};
 use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::SchemaDescriptor;
 
 const NBASE: u64 = 200;
 
@@ -145,7 +146,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let mut bb = BatchBuilder::new(&schema);
     for a in 0..8u128 {
         for b in 0..3u128 {
-            bb.begin_row_opk(&[a, b], 1);
+            bb.begin_row_natives(&[a, b], 1);
             bb.end_row();
         }
     }
@@ -213,7 +214,7 @@ fn a_pk_probe_echoes_the_keys_a_live_row_carries() {
 }
 
 /// The index of [`fixture`], with what builds a stored entry and a probe key
-/// of it.
+/// for it.
 struct ValIndex {
     spec: gnitz_zset::schema::KeySpec,
     schema: SchemaDescriptor,
@@ -232,13 +233,11 @@ impl ValIndex {
         entries.get_pk_bytes(0).to_vec()
     }
 
-    /// The probe keys of `vals`, each span over a holder no row has.
+    /// The probe keys of `vals`: each one's span.
     fn keys(&self, vals: &[i64]) -> Batch {
-        let mut keys = Batch::empty_with_schema(&self.schema);
+        let mut keys = Batch::empty_with_schema(&self.spec.span_schema());
         for &val in vals {
-            let mut key = self.entry(0, val);
-            key[self.spec.key_size()..].fill(0xAB);
-            keys.push_key_row(&key, 1);
+            keys.push_key_row(&self.entry(0, val)[..self.spec.key_size()], 1);
         }
         keys
     }
@@ -288,17 +287,19 @@ fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
 }
 
 /// A probe is refused when no index is on its column list, and when its keys are
-/// not as wide as the store it reads.
+/// not as wide as the PK it reads or the span it probes.
 #[test]
 fn a_probe_refuses_a_missing_index_and_a_foreign_key_stride() {
     let r = fixture(|id| id as i64);
     let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), cap(1));
-    let pk_keys = pk_probe(&[2]);
-    for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1])), (TID, index(&[1]))] {
-        assert!(r.probe(id, probe, &pk_keys).is_err(), "{id} {probe:?}");
+    let span_keys = ValIndex::of(&r).keys(&[2]);
+    for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1]))] {
+        assert!(r.probe(id, probe, &span_keys).is_err(), "{id} {probe:?}");
     }
+    assert!(r.probe(TID, index(&[1]), &span_keys).is_ok());
+    // A whole entry is a span and a source PK: wider than either store's key.
     let wide = Batch::empty_with_schema(&r.relation(TID).unwrap().index_on(&[1]).unwrap().schema());
-    for probe in [Probe::Pk, Probe::PkColumn(1)] {
+    for probe in [Probe::Pk, Probe::PkColumn(1), index(&[1])] {
         assert!(r.probe(TID, probe, &wide).is_err(), "{probe:?}");
     }
 }

@@ -137,34 +137,16 @@ pub trait SchemaFacts: ColumnTable {
         })
     }
 
-    /// One row's PK as OPK bytes, from its PK columns' native little-endian
-    /// images in PK-list order. Reads the first `pk_stride()` bytes of
-    /// `native_le`.
-    fn opk_key(&self, native_le: &[u8]) -> gnitz_wire::PkBuf {
-        let stride = self.pk_stride();
-        debug_assert!(
-            native_le.len() >= stride,
-            "opk_key: native_le ({}) shorter than pk_stride ({stride})",
-            native_le.len(),
-        );
-        gnitz_wire::encode_pk_tuple(
-            self.pk_cols().iter().map(|&p| {
-                let tc = self.col_type_code(p as usize);
-                (tc.wire_stride(), tc)
-            }),
-            &native_le[..stride],
-        )
-    }
-
-    /// [`Self::opk_key`] from one native value per PK column, in PK-list order.
-    /// A signed value is passed sign-extended (`v as u128`).
+    /// One row's PK as OPK bytes, from one native value per PK column in PK-list
+    /// order. A signed value is passed sign-extended (`v as u128`).
     fn opk_key_cols(&self, natives: &[u128]) -> gnitz_wire::PkBuf {
         debug_assert_eq!(
             natives.len(),
             self.pk_cols().len(),
             "opk_key_cols: one native value per PK column",
         );
-        gnitz_wire::encode_pk_images(self.pk_cols().iter().zip(natives).map(|(&p, &v)| {
+        let mut key = gnitz_wire::PkBuf::zeroed(0);
+        for (&p, &v) in self.pk_cols().iter().zip(natives) {
             let tc = self.col_type_code(p as usize);
             debug_assert!(
                 {
@@ -174,23 +156,9 @@ pub trait SchemaFacts: ColumnTable {
                 },
                 "opk_key_cols: {v:#x} does not fit a {tc:?} column",
             );
-            (tc, tc, gnitz_wire::key_image(tc, v))
-        }))
-    }
-
-    /// The inverse of [`Self::opk_key`]: `key`'s columns as native
-    /// little-endian images at the same offsets, zero past `key.len()`.
-    fn native_le_key(&self, key: &[u8]) -> [u8; gnitz_wire::MAX_PK_BYTES] {
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
-        let mut off = 0;
-        for &p in self.pk_cols() {
-            let tc = self.col_type_code(p as usize);
-            let w = tc.wire_stride();
-            gnitz_wire::decode_pk_column(&key[off..off + w], tc, &mut buf[off..off + w]);
-            off += w;
+            key.push(tc.wire_stride(), v, tc.is_signed_int());
         }
-        debug_assert_eq!(off, key.len(), "native_le_key: schema stride != key width");
-        buf
+        key
     }
 }
 

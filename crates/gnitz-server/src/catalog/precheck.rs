@@ -699,11 +699,6 @@ impl CatalogEngine {
                             .map_err(|e| format!("{rel}: {e}"))?;
                     }
                     self.validate_fk_columns(rel.id, &col_defs, &schema, net_dead)?;
-                    // The register hook indexes every FK column; an index it cannot
-                    // build is refused here, before the relation registers.
-                    for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
-                        KeySpec::new(&[ci as u32], &schema).map_err(|e| format!("{rel} FK column {ci}: {e}"))?;
-                    }
                 }
                 RelDetail::View { owner_view_id, .. } => {
                     self.validate_view_owner(rel.id, rel.name, owner_view_id, &creates)?

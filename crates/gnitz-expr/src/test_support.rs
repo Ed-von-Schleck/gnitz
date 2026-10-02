@@ -51,13 +51,14 @@ impl TestView {
     /// schema places the column.
     pub fn set_native(&mut self, schema: &TestSchema, row: usize, ci: usize, native: u128) {
         let loc = schema.locate(ci);
-        let bytes = &native.to_le_bytes()[..loc.size()];
         match loc {
-            ColumnLocator::Pk { byte_off, type_code, .. } => {
+            ColumnLocator::Pk { byte_off, size, type_code } => {
                 let at = row * self.pk_stride + byte_off as usize;
-                gnitz_wire::encode_pk_column(bytes, type_code, &mut self.pk[at..at + bytes.len()]);
+                gnitz_wire::store_opk(&mut self.pk[at..at + size as usize], native, type_code.is_signed_int());
             }
-            ColumnLocator::Payload { slot, .. } => self.set_payload(row, slot as usize, bytes),
+            ColumnLocator::Payload { slot, size, .. } => {
+                self.set_payload(row, slot as usize, &native.to_le_bytes()[..size as usize])
+            }
         }
     }
 

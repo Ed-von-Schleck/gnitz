@@ -101,7 +101,7 @@ fn every_encoder_round_trips_at_narrow_strides() {
         let schema = SchemaDescriptor::new(&cols, &key);
         let mut b = BatchBuilder::new(&schema);
         for i in 0..5u128 {
-            b.begin_row_opk(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
+            b.begin_row_natives(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
             b.put_opt_int((i % 2 == 0).then_some(i * 7));
             b.put_string(&format!("row {i} holds a string past the inline limit"));
             b.end_row();

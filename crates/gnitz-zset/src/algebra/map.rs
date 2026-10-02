@@ -10,6 +10,7 @@ use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{copy_string_cells, Batch, BlobCache};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use gnitz_wire::{zip_cells, FixedInt};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`. The three travel together through every columnar body
@@ -66,65 +67,19 @@ fn copy_column(
     w: RowWindow,
 ) {
     let RowWindow { src: src_start, dst: dst_base, n } = w;
-    if n == 0 {
-        // Every arm below is a no-op over an empty window, and the PK arm's
-        // source span is expressed off row `n - 1`.
-        return;
-    }
-
-    // Destructured ONCE before the row loops, so the per-row bodies below carry
-    // no locator dispatch (and no `native_le_bytes` by-value [u8; 16]).
+    // Destructured once, so each arm below is one column kernel over the window.
     match src_loc {
         ColumnLocator::Pk { byte_off, size, type_code } => {
-            // PK region holds OPK bytes; decode the addressed column back to
-            // native LE. A raw byte copy would be wrong for signed (sign-flipped)
-            // and big-endian-encoded columns. Both regions are resolved once, as
-            // in the Payload arms below.
-            let pk = in_batch.pk_data();
+            // The PK region holds OPK bytes, decoded back to native LE at the
+            // source column's own width.
             let pk_stride = in_batch.schema().pk_stride();
-            let dst = output.col_data_mut(dst_payload);
-            let pk_off = byte_off as usize;
-            let src_stride = size as usize;
-            // Plan-time constant, so it selects a loop rather than branching per
-            // row. Each read is the source column's OWN width — the wider
-            // destination stride would over-read into the next PK column.
+            let pk = &in_batch.pk_data()[src_start * pk_stride..(src_start + n) * pk_stride];
+            let dst = &mut output.col_data_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
+            let (off, src_stride) = (byte_off as usize, size as usize);
             if src_stride == stride {
-                let signed = type_code.is_signed_int();
-                let rows = pk[src_start * pk_stride..(src_start + n) * pk_stride].chunks_exact(pk_stride);
-                // A constant width, so `decode_pk_cell`'s own width match folds away.
-                macro_rules! decode_rows {
-                    ($w:expr) => {{
-                        const W: usize = $w;
-                        assert!(pk_off + W <= pk_stride, "a PK column lies inside the PK");
-                        let out = &mut dst[dst_base * W..(dst_base + n) * W];
-                        for (d, row) in out.as_chunks_mut::<W>().0.iter_mut().zip(rows) {
-                            let s: &[u8; W] = row[pk_off..pk_off + W].try_into().unwrap();
-                            gnitz_wire::decode_pk_cell(s, signed, d);
-                        }
-                    }};
-                }
-                match stride {
-                    1 => decode_rows!(1),
-                    2 => decode_rows!(2),
-                    4 => decode_rows!(4),
-                    8 => decode_rows!(8),
-                    16 => decode_rows!(16),
-                    other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-                }
+                gnitz_wire::decode_pk_cells(pk, pk_stride, off, stride, type_code.is_signed_int(), dst);
             } else {
-                // One PK column, so 16 bytes covers every fixed-width type — not
-                // MAX_PK_BYTES, which is the whole multi-column PK stride.
-                let mut le = [0u8; 16];
-                for i in 0..n {
-                    let off = (src_start + i) * pk_stride + pk_off;
-                    gnitz_wire::decode_pk_column(&pk[off..off + src_stride], type_code, &mut le[..src_stride]);
-                    let row = dst_base + i;
-                    gnitz_wire::widen_native_le(
-                        &le[..src_stride],
-                        type_code,
-                        &mut dst[row * stride..row * stride + stride],
-                    );
-                }
+                widen_column(pk, pk_stride, off, type_code, true, stride, dst);
             }
         }
         ColumnLocator::Payload { slot, size, type_code } => {
@@ -143,31 +98,49 @@ fn copy_column(
                 let (dst_col, _, dst_blob) = output.col_null_and_blob_mut(dst_payload);
                 let dst = &mut dst_col[dst_base * 16..(dst_base + n) * 16];
                 copy_string_cells(dst, src, in_batch.blob(), dst_blob, heap_at, cache);
-            } else if src_stride == stride {
-                debug_assert!(
-                    (src_start + n) * stride <= in_batch.col_data(in_pi).len(),
-                    "copy_column: source column {in_pi} is shorter than rows [{src_start}, {}) at stride {stride}",
-                    src_start + n
-                );
-                let src = &in_batch.col_data(in_pi)[src_start * stride..(src_start + n) * stride];
-                output.col_data_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride].copy_from_slice(src);
+                return;
+            }
+            debug_assert!(
+                (src_start + n) * src_stride <= in_batch.col_data(in_pi).len(),
+                "copy_column: source column {in_pi} is shorter than rows [{src_start}, {}) at stride {src_stride}",
+                src_start + n
+            );
+            let src = &in_batch.col_data(in_pi)[src_start * src_stride..(src_start + n) * src_stride];
+            let dst = &mut output.col_data_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
+            if src_stride == stride {
+                dst.copy_from_slice(src);
             } else {
-                // Wider destination slot (a promoted integer column): sign/zero-extend
-                // the narrower source into it, one row at a time.
-                let src = in_batch.col_data(in_pi);
-                let dst = output.col_data_mut(dst_payload);
-                for i in 0..n {
-                    let sr = src_start + i;
-                    let dr = dst_base + i;
-                    gnitz_wire::widen_native_le(
-                        &src[sr * src_stride..sr * src_stride + src_stride],
-                        type_code,
-                        &mut dst[dr * stride..dr * stride + stride],
-                    );
-                }
+                widen_column(src, src_stride, 0, type_code, false, stride, dst);
             }
         }
     }
+}
+
+/// [`widen_cells`] at the slot width `dw`: 2, 4 or 8, a widened slot being a fixed int.
+fn widen_column(src: &[u8], src_stride: usize, off: usize, tc: TypeCode, pk: bool, dw: usize, dst: &mut [u8]) {
+    let fi = FixedInt::from_type_code(tc).expect("a widened column is a fixed int");
+    match dw {
+        2 => widen_cells::<2>(src, src_stride, off, fi, pk, dst),
+        4 => widen_cells::<4>(src, src_stride, off, fi, pk, dst),
+        8 => widen_cells::<8>(src, src_stride, off, fi, pk, dst),
+        other => unreachable!("a widened slot is 2/4/8 bytes, got {other}"),
+    }
+}
+
+/// Widen each `fi` cell at byte `off` of `src`'s `src_stride`-byte rows — a PK column's
+/// OPK cell when `pk`, else a native one — into `dst`'s `DW`-byte native cells.
+fn widen_cells<const DW: usize>(src: &[u8], src_stride: usize, off: usize, fi: FixedInt, pk: bool, dst: &mut [u8]) {
+    let out = dst.as_chunks_mut::<DW>().0.iter_mut();
+    gnitz_wire::for_each_fixed_int!(fi, |FI| {
+        const W: usize = FI.width();
+        let store = |v: i64, d: &mut [u8; DW]| *d = v.to_le_bytes()[..DW].try_into().unwrap();
+        match pk {
+            true => zip_cells::<W, _>(src, src_stride, off, out, |c, d| {
+                store(gnitz_wire::decode_opk_i64(c, FI), d)
+            }),
+            false => zip_cells::<W, _>(src, src_stride, off, out, |c, d| store(FI.decode_le_i64(c), d)),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +449,7 @@ impl MapPlan {
                 debug_assert_eq!(output.schema().pk_stride(), packer.out_stride);
                 let stride = packer.out_stride;
                 let pk = &mut output.pk_data_mut()[dst_base * stride..];
-                packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), src_start, n);
+                packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), &[(src_start, src_start + n)]);
             }
             // Hashes the finished output row, so `evaluate_map_batch` stamps it
             // once the payload below is written.

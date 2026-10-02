@@ -6,9 +6,9 @@ use std::rc::Rc;
 
 use super::manifest::{self, ManifestEntry, ShardSet};
 use gnitz_expr::RowSource;
+use gnitz_wire::PkBuf;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{guard_slot, pk_group_end, MappedShard};
-use gnitz_zset::schema::key::PkBuf;
 use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range};
 use gnitz_zset::schema::SchemaDescriptor;
 

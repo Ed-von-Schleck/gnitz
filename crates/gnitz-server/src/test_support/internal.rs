@@ -245,7 +245,7 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: u64, source_tid: 
 /// comparison of two such cells reads both blob heaps.
 pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], weight: i64, cell: impl Fn(usize) -> u64) {
     let schema = family.schema();
-    bb.begin_row_opk(&key.map(u128::from)[..schema.pk_cols().len()], weight);
+    bb.begin_row_natives(&key.map(u128::from)[..schema.pk_cols().len()], weight);
     for (pi, col) in schema.payload_columns() {
         match col.type_code {
             TypeCode::U64 => bb.put_u64(cell(pi)),

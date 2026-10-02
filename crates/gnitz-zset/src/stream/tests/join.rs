@@ -419,7 +419,7 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
     for (eq, range, w, val) in rows {
         let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
         vals.push(*range as u128);
-        b.begin_row_opk(&vals, *w);
+        b.begin_row_natives(&vals, *w);
         b.put_int(*val as u128);
         if wide {
             match *val < 0 {
@@ -611,7 +611,7 @@ fn keyed_source_batch(rows: &[(i64, u64, i64)]) -> Batch {
     let schema = keyed_source();
     let mut b = BatchBuilder::new(&schema);
     for &(a, k, w) in rows {
-        b.begin_row_opk(&[a as u128, k as u128], w);
+        b.begin_row_natives(&[a as u128, k as u128], w);
         b.put_string(&format!("a string long enough for the heap, number {}", k % 3));
         b.put_opt_int((k % 3 != 0).then_some((a * 100 + k as i64) as u128));
         b.end_row();
@@ -667,7 +667,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
             (8, 0, 1),
         ] {
             let pk: Vec<u128> = [a as u128, k as u128][..key.len()].to_vec();
-            d.begin_row_opk(&pk, w);
+            d.begin_row_natives(&pk, w);
             d.put_int((a * 7) as u128);
             d.end_row();
         }

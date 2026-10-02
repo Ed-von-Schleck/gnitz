@@ -15,7 +15,7 @@ use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, Schema};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::TableDistribution;
-use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -63,20 +63,19 @@ fn is_auto_name(name: &str, base: &str) -> bool {
     }
 }
 
-/// The column list of an index over `key`, or why no index can be built on it.
+/// The column list of an index over `key`, or why no index can be built on it: an
+/// index key column is a PK column of the index, nullable or not, and the index
+/// record — `key` then the source PK — keeps the PK arity limit.
 fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
-    let types: Vec<TypeCode> = key.iter().map(|&c| cols[c as usize].ty.tc).collect();
-    match gnitz_wire::index_key_types(&types, src_pk_count) {
-        Ok(_) => PkColList::checked(key, cols.len())
-            .map_err(|rule| GnitzSqlError::Rejected(format!("{role}: {}", rule.for_role(PkListRole::ColumnList)))),
-        Err(gnitz_wire::IndexKeyRule::NotEligible { col, type_code }) => Err(GnitzSqlError::Rejected(format!(
-            "{role}: column '{}' of type {type_code} cannot be an index key",
-            cols[key[col] as usize].name
-        ))),
-        Err(arity @ gnitz_wire::IndexKeyRule::ArityOutOfRange { .. }) => {
-            Err(GnitzSqlError::Rejected(arity.to_string()))
-        }
-    }
+    let rejected = |rule: gnitz_wire::PkRule| {
+        let named = rule.named(PkListRole::ColumnList, |c| {
+            cols.get(c as usize).map(|d| d.name.as_str())
+        });
+        GnitzSqlError::Rejected(format!("{role}: {named}"))
+    };
+    let max = gnitz_wire::MAX_PK_COLUMNS - src_pk_count;
+    gnitz_wire::validate_pk_tuple(key, cols.len(), max, |c| (cols[c as usize].ty.tc, false)).map_err(rejected)?;
+    PkColList::checked(key, cols.len()).map_err(rejected)
 }
 
 /// The FK child-type rule: a child adopts the referenced type, so its type must

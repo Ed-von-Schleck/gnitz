@@ -30,6 +30,8 @@ _TAB = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)"
 _AB_PK = ("CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
           " payload BIGINT, PRIMARY KEY (a, b))")
 
+_T_INT = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val INT NOT NULL)"
+
 _CREATE_DUP = "contains duplicate values"
 _VIOLATION = "[Uu]nique index violation"
 
@@ -71,6 +73,10 @@ _PREFLIGHT = {
     "one pair among many": (
         _T, "val", [(pk, pk * 10) for pk in range(1, 301)] + [(1000, 1500)], (1001, 1500), None),
     "all distinct": (_T, "val", [(pk, pk) for pk in range(1, 301)], (900001, 150), (900002, 0)),
+    # A 4-byte key: the spans sort at their own width, across zero.
+    "INT, one pair among many": (
+        _T_INT, "val", [(pk, pk - 150) for pk in range(1, 301)] + [(1000, -7)], (1001, -7), None),
+    "INT, all distinct": (_T_INT, "val", [(pk, pk - 150) for pk in range(1, 301)], (900001, -100), (900002, 500)),
     # A NULL key never enters any worker's key stream.
     "nulls": (
         _T_NULLABLE, "val", [(pk, None) for pk in range(1, 9)] + [(pk, pk) for pk in range(100, 108)],
@@ -137,6 +143,22 @@ def test_create_over_present_rows_admits_exactly_a_duplicate_free_seed(
         landed = fresh
     # Every worker still answers, and nothing a verdict refused landed.
     assert bag(scanned(client, "t")) == dict.fromkeys(seed + [landed], 1)
+
+
+def test_a_smallint_unique_index_refuses_a_value_a_second_push_repeats(client):
+    """A 2-byte key enforces across pushes at both ends of its range and on both
+    sides of zero: each seeded value is refused under a new PK, and a value no
+    row holds lands."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val SMALLINT NOT NULL); "
+        "CREATE UNIQUE INDEX ON t(val)")
+    seed = list(zip(_SPREAD, [-32768, -1, 0, 1, 32767, 7, -7, 100, -100, 255]))
+    insert(client, "t", seed)
+    for pk, val in seed:
+        with _violation():
+            insert(client, "t", [(pk + 1, val)])
+    insert(client, "t", [(5, 8), (6, -8)])
+    assert bag(scanned(client, "t")) == dict.fromkeys(seed + [(5, 8), (6, -8)], 1)
 
 
 def test_concurrent_inserts_during_create(client, server):

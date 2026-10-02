@@ -144,7 +144,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     );
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
     let mut batch = BatchBuilder::new(&in_schema);
-    batch.begin_row_opk(&[c0 as u128, c1 as u16 as u128], 1i64);
+    batch.begin_row_natives(&[c0 as u128, c1 as u16 as u128], 1i64);
     batch.put_int(c2 as u128);
     batch.put_int(c3 as u128);
     batch.end_row();
@@ -163,6 +163,40 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     assert_eq!(widened(1), c1 as i64, "I16 PK sign-extends");
     assert_eq!(widened(2), c2 as i64, "I8 payload sign-extends");
     assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
+}
+
+/// A widened copy over many rows, from a PK column that is the whole key (cells
+/// back to back) and from one inside a wider key, and from a payload column.
+#[test]
+fn a_widened_copy_holds_each_rows_value() {
+    use TypeCode::{I16, I32, I64, U16, U32, U64, U8};
+    let vals: Vec<i64> = (0..300i64).map(|i| (i - 150) * 7_654_321).collect();
+    for (src, slot) in [(I32, I64), (U32, I64), (I16, I32), (U16, U64), (U8, I16)] {
+        let fi = gnitz_wire::FixedInt::from_type_code(src).unwrap();
+        let native = |v: i64| (v as u128) & gnitz_wire::image_mask(fi.width());
+        let want: Vec<i64> = vals.iter().map(|&v| fi.unpack(native(v))).collect();
+        for (pk, col) in [(&[src][..], 0u32), (&[U64, src], 1), (&[U64], 1)] {
+            let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+            cols.push(SchemaColumn::new(src, false));
+            let in_schema = SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>());
+            let mut batch = BatchBuilder::new(&in_schema);
+            for (row, &v) in vals.iter().enumerate() {
+                let natives: Vec<u128> = pk
+                    .iter()
+                    .map(|&t| if t == src { native(v) } else { row as u128 })
+                    .collect();
+                batch.begin_row_natives(&natives, 1);
+                batch.put_int(native(v));
+                batch.end_row();
+            }
+            let out = compute(&in_schema, LogicalProgram::copy_cols(&[col]), &[(slot, false)])
+                .evaluate_map_batch(&batch.finish());
+            let w = slot.wire_stride();
+            let got: Vec<&[u8]> = out.col_data(0).chunks_exact(w).collect();
+            let want: Vec<Vec<u8>> = want.iter().map(|v| v.to_le_bytes()[..w].to_vec()).collect();
+            assert_eq!(got, want, "{src} -> {slot}, PK {pk:?} column {col}");
+        }
+    }
 }
 
 /// A computed string beside a copy of its source column: the copy still
@@ -352,7 +386,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
     let mut batch = BatchBuilder::new(&in_schema);
     for (vals, w) in &rows {
         let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
-        batch.begin_row_opk(&natives, *w);
+        batch.begin_row_natives(&natives, *w);
         batch.end_row();
     }
     let batch = batch.finish();
@@ -736,6 +770,30 @@ fn map_ranges_bench() {
     let str2_batch = str2_batch.finish();
     let (mut keep_str, mut drop_str) = (project(&str2_in, &[1, 2]), project(&str2_in, &[1]));
 
+    // --- Column copies: one column of `[pk..., payload]` copied into an I64 slot,
+    // widened from a PK or a payload cell, or decoded at its own width.
+    let col_copy = |name: &'static str, pk: &[TypeCode], payload: TypeCode, col: u32| {
+        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+        cols.push(SchemaColumn::new(payload, false));
+        let in_schema = SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>());
+        let mut batch = BatchBuilder::new(&in_schema);
+        for i in 0..N as u64 {
+            let natives: Vec<u128> = (0..pk.len() as u64).map(|c| (i + c) as u32 as u128).collect();
+            batch.begin_row_natives(&natives, 1);
+            batch.put_int(i.wrapping_mul(2_654_435_761) as u16 as u128);
+            batch.end_row();
+        }
+        let plan = compute(&in_schema, LogicalProgram::copy_cols(&[col]), &[(TypeCode::I64, false)]);
+        (name, plan, batch.finish())
+    };
+    let mut col_copies = [
+        col_copy("widen_pk_i32", &[TypeCode::I32], TypeCode::I64, 0),
+        col_copy("widen_pk_i32_u64", &[TypeCode::I32, TypeCode::U64], TypeCode::I64, 0),
+        col_copy("widen_payload_i32", &[TypeCode::U64], TypeCode::I32, 1),
+        col_copy("widen_payload_u16", &[TypeCode::U64], TypeCode::U16, 1),
+        col_copy("copy_pk_i64", &[TypeCode::I64], TypeCode::I64, 0),
+    ];
+
     // Whole-batch shapes, through `evaluate_map_batch`.
     let whole = [
         ("reindex", &mut rx_plan, &rx_batch),
@@ -745,17 +803,27 @@ fn map_ranges_bench() {
         ("proj_drop_str", &mut drop_str, &str2_batch),
     ]
     .into_iter()
-    .chain(hash_rows.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)));
+    .chain(hash_rows.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)))
+    .chain(col_copies.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)));
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
     for (name, plan, src) in whole {
         if !driven(name) {
             continue;
         }
         n_selected += 1;
-        for _ in 0..passes {
-            let out = plan.evaluate_map_batch(black_box(src));
-            acc = acc.wrapping_add(out.count).wrapping_add(out.blob().len());
-            black_box(&out);
-        }
+        // Untimed: the batch pool holds an arena of the output's size.
+        black_box(plan.evaluate_map_batch(src));
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..passes {
+                let out = plan.evaluate_map_batch(black_box(src));
+                acc = acc.wrapping_add(out.count).wrapping_add(out.blob().len());
+                black_box(&out);
+            }
+        });
+        println!(
+            "map_ranges_bench {name}: {:.1} instr/row",
+            instructions as f64 / (passes * N) as f64
+        );
     }
 
     // Range shapes, through `append_map_ranges`: one range, and `r`-row runs with

@@ -1,12 +1,13 @@
 //! Exchange worker routing: [`ScatterPlan`] and the per-row routing-key
 //! kernels.
 
-use crate::algebra::group_key::GroupKey;
+use crate::algebra::group_key::{cell_image, for_cell_width, GroupKey, KeyCells};
 use crate::algebra::reindex::{FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
-use crate::schema::{ColumnLocator, Placement, SchemaDescriptor};
+use crate::schema::{Placement, SchemaDescriptor};
+use gnitz_wire::zip_cells;
 
 /// Keep only the live rows `slot` owns: those whose PK `worker_for_pk_bytes`
 /// routes to it, the hash the equality scatter routes a join key by. A broadcast
@@ -112,13 +113,18 @@ impl ScatterPlan {
         match self.0 {
             // One worker owns every key, so no key is read or hashed.
             _ if nw == 1 => route_rows(mb, sink, ListZero),
-            Key::Group(GroupKey::PkPrefix(n)) => route_rows(mb, sink, PrefixW { n, nw }),
-            Key::Group(GroupKey::Image(loc @ ColumnLocator::Payload { .. })) => {
-                route_rows(mb, sink, ImageW::<true> { loc, nw })
-            }
-            Key::Group(GroupKey::Image(loc)) => route_rows(mb, sink, ImageW::<false> { loc, nw }),
+            Key::Group(ref key) => match key.cells(mb) {
+                Some(cells) => for_cell_width!(cells.width, |W| match cells.opk {
+                    true => route_cells::<W, true>(&cells, mb.weight(), sink, nw),
+                    false => route_cells::<W, false>(&cells, mb.weight(), sink, nw),
+                }),
+                None => match *key {
+                    GroupKey::PkPrefix(n) => route_rows(mb, sink, PrefixW { n, nw }),
+                    GroupKey::Fold(ref fold) => route_rows(mb, sink, FoldW { fold, nw }),
+                    GroupKey::Image(_) => unreachable!("an image key is one cell"),
+                },
+            },
             Key::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
-            Key::Group(GroupKey::Fold(ref fold)) => route_rows(mb, sink, FoldW { fold, nw }),
             Key::Broadcast => route_rows(mb, sink, ListZero),
         }
     }
@@ -160,6 +166,7 @@ trait RowWorker {
     fn worker(&self, mb: &MemBatch, row: usize) -> usize;
 }
 
+/// A PK prefix [`GroupKey::cells`] does not answer for.
 struct PrefixW {
     n: usize,
     nw: usize,
@@ -169,21 +176,6 @@ impl RowWorker for PrefixW {
     #[inline(always)]
     fn worker(&self, mb: &MemBatch, row: usize) -> usize {
         worker_for_pk_bytes(&mb.get_pk_bytes(row)[..self.n], self.nw)
-    }
-}
-
-/// `PAYLOAD` fixes the locator's variant for the walk, so `opk_image`'s region
-/// branch folds away.
-struct ImageW<const PAYLOAD: bool> {
-    loc: ColumnLocator,
-    nw: usize,
-}
-
-impl<const PAYLOAD: bool> RowWorker for ImageW<PAYLOAD> {
-    #[inline(always)]
-    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        assert!(matches!(self.loc, ColumnLocator::Payload { .. }) == PAYLOAD);
-        worker_for_key(self.loc.opk_image(mb, row), self.nw)
     }
 }
 
@@ -215,6 +207,18 @@ fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
             sink.put(w.worker(mb, row), row as u32);
         }
     }
+}
+
+/// [`route_rows`] for a key that is one `W`-byte cell per row: each live row to the
+/// owner of its cell's image.
+#[inline(never)]
+fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8], sink: &mut impl RowSink, nw: usize) {
+    let rows = weights.as_chunks::<8>().0.iter().enumerate();
+    zip_cells::<W, _>(cells.region, cells.stride, cells.off, rows, |cell, (row, weight)| {
+        if *weight != [0; 8] {
+            sink.put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row as u32);
+        }
+    });
 }
 
 /// [`route_rows`] for a packed join key, packed a chunk of rows at a time.

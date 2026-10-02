@@ -7,8 +7,128 @@ use crate::test_support::{le_cell, make_schema_pk_u64_payload_blob, make_schema_
 fn packed_keys<B: BatchView>(packer: &ReindexPacker, src: &B, n: usize) -> Vec<Vec<u8>> {
     let stride = packer.out_stride;
     let mut region = vec![0u8; n * stride];
-    packer.pack_rows(&mut region, stride, src, 0, n);
+    packer.pack_rows(&mut region, stride, src, &[(0, n)]);
     region.chunks(stride).map(<[u8]>::to_vec).collect()
+}
+
+/// `native`, a `tc` value in its low bytes, sign- or zero-extended to 128 bits.
+fn extended(tc: TypeCode, native: u128) -> u128 {
+    let shift = 128 - 8 * tc.wire_stride() as u32;
+    match tc.is_signed_int() {
+        true => ((native << shift) as i128 >> shift) as u128,
+        false => native << shift >> shift,
+    }
+}
+
+/// The OPK bytes of `tc`'s value `native` in a slot of type `target`.
+fn slot_bytes(tc: TypeCode, native: u128, target: TypeCode) -> Vec<u8> {
+    let mut slot = vec![0u8; target.wire_stride()];
+    gnitz_wire::store_opk(&mut slot, extended(tc, native), target.is_signed_int());
+    slot
+}
+
+/// `promote_image` re-biases a column's image to the slot type's: the bytes the
+/// value itself encodes to there, for every promotion the engine performs — an
+/// FK's domain widening and a join key's packing at its common slot.
+#[test]
+fn promote_image_is_the_values_image_at_the_slot_type() {
+    const PATTERNS: &[u128] = &[
+        0,
+        1,
+        2,
+        0x7F,
+        0x80,
+        0xFF,
+        0x100,
+        i64::MAX as u128,
+        1 << 63,
+        u64::MAX as u128,
+        1 << 64,
+        i128::MAX as u128,
+        1 << 127,
+        u128::MAX,
+    ];
+    let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
+    for &src in &pk_types {
+        for &target in &pk_types {
+            if !(src == target || src.int_domain_fits(target) || src.packs_at(target)) {
+                continue;
+            }
+            for &p in PATTERNS {
+                let mut got = vec![0u8; target.wire_stride()];
+                let image = promote_image(gnitz_wire::key_image(src, p), src, target);
+                gnitz_wire::store_opk(&mut got, image, false);
+                assert_eq!(got, slot_bytes(src, p, target), "src={src} target={target} p={p:#x}");
+            }
+        }
+    }
+}
+
+/// Equal values on both sides of an accepted join key pair pack byte-identically
+/// at the common slot, so they co-partition and match; and distinct values never
+/// collide — including the native-byte aliasing trap (U8 255 and I8 -1 share all
+/// 0xFF native bytes).
+#[test]
+fn every_accepted_join_key_pair_copartitions() {
+    const PROBES: &[i128] = &[
+        i128::MIN,
+        i64::MIN as i128,
+        i32::MIN as i128,
+        -32768,
+        -129,
+        -128,
+        -56,
+        -1,
+        0,
+        1,
+        127,
+        128,
+        200,
+        255,
+        256,
+        32767,
+        65535,
+        i32::MAX as i128,
+        u32::MAX as i128,
+        i64::MAX as i128,
+        u64::MAX as i128,
+        i128::MAX,
+    ];
+    /// `[min, max]` of a key type's values; a UUID keys as the U128 it is stored as.
+    fn key_bounds(tc: TypeCode) -> (i128, u128) {
+        match (tc.wire_stride(), tc.is_signed_int()) {
+            (16, true) => (i128::MIN, i128::MAX as u128),
+            (16, false) => (0, u128::MAX),
+            (w, true) => (-(1i128 << (8 * w - 1)), (1u128 << (8 * w - 1)) - 1),
+            (w, false) => (0, (1u128 << (8 * w)) - 1),
+        }
+    }
+    let pk: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
+    for &l in &pk {
+        for &r in &pk {
+            let Ok(t) = l.join_key_common_type(r) else { continue };
+            let keys: Vec<(i128, Vec<u8>)> = [l, r]
+                .into_iter()
+                .flat_map(|tc| {
+                    let (lo, hi) = key_bounds(tc);
+                    PROBES
+                        .iter()
+                        .filter(move |&&v| lo <= v && (v < 0 || v as u128 <= hi))
+                        .map(move |&v| {
+                            let mut key = vec![0u8; t.wire_stride()];
+                            let image = promote_image(gnitz_wire::key_image(tc, v as u128), tc, t);
+                            gnitz_wire::store_opk(&mut key, image, false);
+                            (v, key)
+                        })
+                })
+                .collect();
+            for (va, ka) in &keys {
+                for (vb, kb) in &keys {
+                    assert_eq!(ka == kb, va == vb, "{l}/{r} at {t}: {va} vs {vb}");
+                }
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -264,7 +384,7 @@ fn a_group_key_overwrites_its_whole_slot() {
         let packer = ReindexPacker::new_group_key(&schema, group, &[]).unwrap().0;
         let stride = packer.out_stride;
         let mut dirty = vec![0xA5u8; mb.count * stride];
-        packer.pack_rows(&mut dirty, stride, &mb, 0, mb.count);
+        packer.pack_rows(&mut dirty, stride, &mb, &[(0, mb.count)]);
         for (row, key) in dirty.chunks_exact(stride).enumerate() {
             let mut clean = vec![0u8; stride];
             packer.pack_into(&mut clean, &mb, row);
@@ -305,7 +425,8 @@ mod pack_proptest {
         /// At every arity and every PK-eligible type, self-typed and promoted,
         /// and in both placements — the key columns as payload and as the PK,
         /// which go through different primitives — `pack_rows` over a window at
-        /// an arbitrary start writes each row's key as `pack_into` does, and
+        /// an arbitrary start, whole or cut into two runs around a skipped row,
+        /// writes each row's key as `pack_into` does, and
         /// each slot as its own wire encoder does at the offset the running sum
         /// put it. The placements agreeing is the co-partition contract.
         #[test]
@@ -336,7 +457,7 @@ mod pack_proptest {
                     pb.put_int(v);
                 }
                 pb.end_row();
-                kb.begin_row_opk(&natives, 1);
+                kb.begin_row_natives(&natives, 1);
                 kb.end_row();
             }
             let (pb, kb) = (pb.finish(), kb.finish());
@@ -344,12 +465,8 @@ mod pack_proptest {
             for promoted in [false, true] {
                 let target = |tc: TypeCode| if promoted { promoted_type(tc) } else { tc.reindex_output_type() };
                 let want: Vec<u8> = (start..rows)
-                    .flat_map(|r| {
-                        let images = types.iter().enumerate().map(|(i, &tc)| {
-                            (tc, target(tc), gnitz_wire::key_image(tc, le_cell(cell(r, i))))
-                        });
-                        gnitz_wire::encode_pk_images(images).pk_bytes().to_vec()
-                    })
+                    .flat_map(|r| (0..types.len()).map(move |i| (r, i)))
+                    .flat_map(|(r, i)| slot_bytes(types[i], le_cell(cell(r, i)), target(types[i])))
                     .collect();
                 for (schema, batch, first) in [(&pay_schema, &pb, 1u32), (&pk_schema, &kb, 0)] {
                     let key: Vec<gnitz_wire::ReindexSlot> =
@@ -359,8 +476,15 @@ mod pack_proptest {
                     prop_assert_eq!(n * stride, want.len());
                     let mb = batch.as_mem_batch();
                     let mut got = vec![0xA5u8; n * stride];
-                    packer.pack_rows(&mut got, stride, &mb, start, n);
+                    packer.pack_rows(&mut got, stride, &mb, &[(start, rows)]);
                     prop_assert_eq!(&got, &want, "first key column {}", first);
+                    if n >= 3 {
+                        // Every row but the window's second.
+                        let mut cut = vec![0xA5u8; (n - 1) * stride];
+                        packer.pack_rows(&mut cut, stride, &mb, &[(start, start + 1), (start + 2, rows)]);
+                        prop_assert_eq!(&cut[..stride], &want[..stride]);
+                        prop_assert_eq!(&cut[stride..], &want[2 * stride..]);
+                    }
                     // An identity key is each column's own OPK image, end to end:
                     // every unpromoted one, which the scatter then routes unpacked.
                     let own = packer.identity_columns().map(|locs| -> Vec<u8> {
@@ -465,14 +589,14 @@ fn reindex_pack_bench() {
         let stride = packer.out_stride;
         let mut buf = vec![0u8; KEY_CHUNK * stride];
         // Warm up.
-        packer.pack_rows(&mut buf, stride, mb, 0, KEY_CHUNK);
+        packer.pack_rows(&mut buf, stride, mb, &[(0, KEY_CHUNK)]);
 
         let t = Instant::now();
         let mut acc = 0u64;
         for _ in 0..ITERS {
             for start in (0..N).step_by(KEY_CHUNK) {
                 let n = (N - start).min(KEY_CHUNK);
-                packer.pack_rows(&mut buf, stride, mb, start, n);
+                packer.pack_rows(&mut buf, stride, mb, &[(start, start + n)]);
                 acc = acc.wrapping_add(black_box(buf[0]) as u64);
             }
         }
@@ -484,34 +608,33 @@ fn reindex_pack_bench() {
     }
 }
 
-/// Over a compound PK and a nullable indexed column of every indexable width:
-/// the projection holds exactly the rows `write_span` admits, each as its span
-/// followed by its own PK, in source order.
+/// Over PKs of every suffix width and a nullable indexed column of every
+/// indexable width: the projection holds exactly the rows `write_span` admits,
+/// each as its span followed by its own PK, in source order — and `append_spans`
+/// the same rows' spans, zero to the end of a wider slot.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
     use crate::repr::BatchBuilder;
     use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+    use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
     let mut rng = crate::test_support::Rng::new(0x1dc5);
-    for tc in [
-        TypeCode::U8,
-        TypeCode::I16,
-        TypeCode::U32,
-        TypeCode::I64,
-        TypeCode::U128,
-    ] {
-        let cols = [
-            SchemaColumn::new(TypeCode::U32, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(tc, true),
-            SchemaColumn::new(TypeCode::I32, false),
-        ];
-        let owner = SchemaDescriptor::new(&cols, &[0, 1]);
-        let width = cols[2].size() as usize;
+    let pks: [&[TypeCode]; 6] = [&[U32, I64], &[U32], &[U64], &[U128], &[U64, U128], &[U128, U128]];
+    for (pk, tc) in pks
+        .into_iter()
+        .flat_map(|pk| [U8, I16, U32, I64, U128, I128].map(|tc| (pk, tc)))
+    {
+        let k = pk.len() as u32;
+        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+        cols.extend([SchemaColumn::new(tc, true), SchemaColumn::new(TypeCode::I32, false)]);
+        let owner = SchemaDescriptor::new(&cols, &(0..k).collect::<Vec<_>>());
+        let width = tc.wire_stride();
         let mut b = BatchBuilder::new(&owner);
         for row in 0..300u64 {
             // Runs of live rows broken by ghosts and by NULLs.
             let weight = [1, 1, 1, 0, -2, 1][(row % 6) as usize];
-            b.begin_row_opk(&[row as u128, rng.next_u64() as u128], weight);
+            let mut natives = vec![row as u128];
+            natives.extend((1..k).map(|_| rng.next_u64() as u128));
+            b.begin_row_natives(&natives, weight);
             let v = rng.gen_u128();
             match rng.gen_range(5) {
                 0 => b.put_null(),
@@ -523,7 +646,7 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
         }
         let src = b.finish();
         let mb = src.as_mem_batch();
-        for indexed in [&[2u32][..], &[2, 3], &[1, 2]] {
+        for indexed in [&[k][..], &[k, k + 1], &[k - 1, k]] {
             let (spec, idx_schema) = crate::schema::index_spec_and_schema(indexed, &owner).unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
             for row in 0..src.len() {
@@ -538,7 +661,22 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
             let got: Vec<(Vec<u8>, i64)> = (0..got.len())
                 .map(|r| (got.get_pk_bytes(r).to_vec(), got.get_weight(r)))
                 .collect();
-            assert_eq!(got, want, "{tc} indexed on {indexed:?}");
+            assert_eq!(got, want, "{pk:?} {tc} indexed on {indexed:?}");
+
+            let (key_size, slot) = (spec.key_size(), spec.key_size().next_multiple_of(8));
+            let mut spans = vec![0xEEu8; 3];
+            append_spans(&mut spans, slot, &mb, &spec, |w| w > 0);
+            let want_spans: Vec<u8> = want
+                .iter()
+                .filter(|(_, w)| *w > 0)
+                .flat_map(|(e, _)| {
+                    let mut record = e[..key_size].to_vec();
+                    record.resize(slot, 0);
+                    record
+                })
+                .collect();
+            assert_eq!(spans[..3], [0xEE; 3], "{pk:?} {tc} indexed on {indexed:?}");
+            assert_eq!(spans[3..], want_spans, "{pk:?} {tc} indexed on {indexed:?}");
         }
     }
 }
@@ -592,12 +730,72 @@ fn a_nullable_group_key_packs_by_column_as_by_row() {
             // Wider than the key, as an index entry's slot is.
             let stride = packer.out_stride + 3;
             let mut by_col = vec![0xEEu8; N * stride];
-            packer.pack_rows(&mut by_col, stride, &mb, 0, N);
+            // Two runs around a skipped row.
+            let runs = [(0, 300), (301, N)];
+            let mut cut = vec![0xEEu8; (N - 1) * stride];
+            packer.pack_rows(&mut cut, stride, &mb, &runs);
+            for (key, row) in cut.chunks_exact(stride).zip((0..300).chain(301..N)) {
+                let mut by_row = [0u8; MAX_PK_BYTES];
+                let want = packer.pack_prefix(&mut by_row, &mb, row);
+                assert_eq!(&key[..packer.out_stride], want, "{pair:?} {nullable:?} cut row {row}");
+            }
+            packer.pack_rows(&mut by_col, stride, &mb, &[(0, N)]);
             for (row, key) in by_col.chunks_exact(stride).enumerate() {
                 let mut by_row = [0u8; MAX_PK_BYTES];
                 let want = packer.pack_prefix(&mut by_row, &mb, row);
                 assert_eq!(&key[..packer.out_stride], want, "{pair:?} {nullable:?} row {row}");
             }
+        }
+    }
+}
+
+/// Instructions per input row of `append_spans`, by span shape and NULL density.
+///
+/// `cd crates && cargo test -p gnitz-zset --release append_spans_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn append_spans_bench() {
+    const N: usize = 500_000;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U32, true),
+        ],
+        &[0],
+    );
+    for null_every in [0usize, 8, 2] {
+        let mut b = BatchBuilder::new(&schema);
+        for row in 0..N {
+            b.begin_row(row as u128, 1);
+            let v = (row as u64).wrapping_mul(2_654_435_761);
+            match null_every != 0 && row % null_every == 0 {
+                true => (b.put_null(), b.put_null()),
+                false => (b.put_int(v as i64 as u128), b.put_int(v as u32 as u128)),
+            };
+            b.end_row();
+        }
+        let batch = b.finish();
+        let mb = batch.as_mem_batch();
+        for (label, cols) in [
+            ("U64 PK", &[0u32][..]),
+            ("I64 payload", &[1]),
+            ("compound (PK, I64)", &[0, 1]),
+            ("U32 payload, 8-byte slot", &[2]),
+        ] {
+            let spec = KeySpec::new(cols, &schema).unwrap();
+            let slot = spec.key_size().next_multiple_of(8);
+            let mut spans = Vec::with_capacity(N * slot);
+            append_spans(&mut spans, slot, &mb, &spec, |_| true);
+            spans.clear();
+            let ((), instructions) = counter.measure(|| append_spans(&mut spans, slot, &mb, &spec, |_| true));
+            std::hint::black_box(&spans);
+            println!(
+                "append_spans_bench null_every={null_every} {label:<26} {:6.1} instr/row ({} spans)",
+                instructions as f64 / N as f64,
+                spans.len() / slot
+            );
         }
     }
 }

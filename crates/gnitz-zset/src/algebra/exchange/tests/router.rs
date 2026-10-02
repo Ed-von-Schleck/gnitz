@@ -25,7 +25,7 @@ fn batch(schema: &SchemaDescriptor) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for i in 0..600u64 {
         let neg = |m: u64| (i % m) as i64 - (m / 2) as i64;
-        b.begin_row_opk(
+        b.begin_row_natives(
             &[(i % 5) as u128, neg(7) as u128, (i * 31 + 7) as u128, (i % 3) as u128],
             [1, 2, 0, -1][(i % 4) as usize],
         );
@@ -93,6 +93,20 @@ fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
         let owner = |mb: &MemBatch, row| worker_for_pk_bytes(gk.out_pk(mb, row).bytes(), NW);
         assert_routes(&plan, &b, NW, &format!("group {cols:?}"), owner);
         assert_routes(&plan, &empty, NW, &format!("group {cols:?} of no rows"), owner);
+    }
+}
+
+/// A PK prefix of any byte width routes each row where those bytes hash: a narrow
+/// one by its image, at every cell width, and a wide one by its digest.
+#[test]
+fn a_pk_prefix_of_every_width_routes_by_its_bytes() {
+    let schema = schema();
+    let b = batch(&schema);
+    for n in 1..=schema.pk_stride() {
+        let plan = ScatterPlan::native(Placement::Keyed { dist_stride: n as u8 });
+        assert_routes(&plan, &b, NW, &format!("prefix {n}"), |mb, row| {
+            worker_for_pk_bytes(&mb.get_pk_bytes(row)[..n], NW)
+        });
     }
 }
 
@@ -281,12 +295,18 @@ fn a_layout_identical_promotion_routes_natively() {
     }
 }
 
-/// `n` rows over a U64-PK, all-I64-payload `schema`, PKs `0..n`, each payload a
-/// spread function of the PK.
+/// `n` rows over a U64-PK-columns, all-I64-payload `schema`, the last PK column
+/// `0..n`, every other column a spread function of it.
 fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
+    use crate::schema::ColumnTable;
     let mut b = BatchBuilder::new(schema);
+    let lead = schema.pk_cols().len() as u64 - 1;
     for pk in 0..n as u64 {
-        b.begin_row(pk as u128, 1);
+        let mut natives: Vec<u128> = (0..lead)
+            .map(|c| pk.wrapping_mul(0x9E37_79B9_7F4A_7C15 + 2 * c) as u128)
+            .collect();
+        natives.push(pk as u128);
+        b.begin_row_natives(&natives, 1);
         for c in 1..=schema.num_payload_cols() as i64 {
             b.put_int((pk as i64).wrapping_mul(2_654_435_761 + c) as u128);
         }
@@ -302,7 +322,7 @@ fn the_native_plan_places_each_live_row_by_its_placement() {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
     let mut bb = BatchBuilder::new(&schema);
     for b in 0..8u128 {
-        bb.begin_row_opk(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
+        bb.begin_row_natives(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
         bb.end_row();
     }
     let batch = bb.finish();
@@ -345,8 +365,15 @@ fn the_native_plan_of_a_local_relation_panics() {
 fn exchange_route_bench() {
     let instructions = gnitz_foundation::perf::Counter::instructions().unwrap();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
+    let wide = crate::test_support::wide_pk_3xu64_schema();
+    let prefix = |n: u8| Ok(ScatterPlan::native(Placement::Keyed { dist_stride: n }));
     for (name, schema, plan) in [
         ("pk", &one, ScatterPlan::group(&one, &[0])),
+        ("prefix 3", &wide, prefix(3)),
+        ("prefix 5", &wide, prefix(5)),
+        ("prefix 12", &wide, prefix(12)),
+        ("prefix 16", &wide, prefix(16)),
+        ("pk column in a 24-byte pk", &wide, ScatterPlan::group(&wide, &[1])),
         ("image", &one, ScatterPlan::group(&one, &[1])),
         (
             "packed",

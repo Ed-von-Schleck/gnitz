@@ -162,10 +162,10 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             }
         }
 
+        bake.key_packer
+            .pack_rows(&mut out.pk_data_mut()[base * width..], width, &mb, &runs);
         let mut at = base;
         for &(s, e) in &runs {
-            let keys = &mut out.pk_data_mut()[at * width..(at + (e - s)) * width];
-            bake.key_packer.pack_rows(keys, width, &mb, s, e - s);
             out.weight_data_mut()[at * 8..(at + (e - s)) * 8].copy_from_slice(&delta.weight_data()[s * 8..e * 8]);
             at += e - s;
         }
