@@ -450,3 +450,66 @@ fn in_flight_cap_raises_rather_than_hanging() {
     assert!(s.at_capacity());
     assert!(matches!(submit_scan(&mut s, 1, &sa), Err(ClientError::Refused(_))));
 }
+
+/// A one-view delta poll answered by a block and then `behind`, all in one
+/// read, stepped with a sink that panics on the block. Returns the session the
+/// unwind left.
+fn poll_whose_sink_panics(behind: &[Vec<u8>]) -> (Session, crate::test_support::Peer) {
+    let (mut s, peer) = pair();
+    s.submit_delta_poll(&[txn_frame::DeltaPollItem {
+        view_id: 7,
+        after_tick: 4,
+        reply_layout: schema_a().layout_digest(),
+    }])
+    .unwrap();
+    s.step(Interest::WRITE);
+    peer.recv();
+    let mut wire = framed(&reply_rows(7, &batch_a(&[1]), 0, true));
+    for frame in behind {
+        wire.extend(framed(frame));
+    }
+    peer.send_bytes(&wire);
+    let mut sink = |_: SlotId, p: Polled| {
+        if matches!(p, Polled::Block(_)) {
+            panic!("the sink's own failure")
+        }
+    };
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.step_polling(Interest::READ, Some(&mut sink))
+    }));
+    assert!(unwound.is_err(), "the sink's panic unwinds out of the step");
+    (s, peer)
+}
+
+/// A sink that panics on a block finds every frame of that read already fed:
+/// the terminal behind the block ended the poll, and the session answers the
+/// next request.
+#[test]
+fn a_panicking_sink_leaves_the_frames_behind_its_block_fed() {
+    let (mut s, peer) = poll_whose_sink_panics(&[encode_frame(reply_header(7, 9, false), &[], None, None)]);
+    assert!(!s.is_closed());
+    assert_eq!(
+        s.interest(),
+        Interest::NONE,
+        "the terminal behind the block ended the poll"
+    );
+    let slot = s.submit(COMMIT).unwrap();
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&reply_ctrl(0, 11));
+    let done = s.step(Interest::READ);
+    assert!(
+        matches!(&done[..], [(id, Ok(Reply::Lsn(11)))] if *id == slot),
+        "{done:?}"
+    );
+}
+
+/// A frame that fails behind the block ends the session before the sink runs,
+/// so the unwind leaves it closed rather than half-fed.
+#[test]
+fn a_panicking_sink_finds_a_failure_behind_its_block_already_recorded() {
+    // The poll's position is on view 7; the frame behind the block names 8.
+    let (mut s, _peer) = poll_whose_sink_panics(&[reply_ctrl(8, 1)]);
+    assert!(s.is_closed());
+    assert!(matches!(s.submit(COMMIT), Err(ClientError::ConnectionLost(_))));
+}

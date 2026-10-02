@@ -1,6 +1,7 @@
 use super::*;
-use crate::protocol::transport::{hello_handshake, poll_fd, Next};
-use crate::test_support::{framed, io_kind, read_frame, write_frame};
+use crate::protocol::transport::poll_fd;
+use crate::protocol::transport::tests::{bench_bursts, bench_pass, bench_wire};
+use crate::test_support::{flush_all, framed, io_kind, pass, read_frame, recv_frames, write_frame};
 use crate::ClientError;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::CONNECT_TIMEOUT;
@@ -14,6 +15,8 @@ use std::time::Duration;
 struct Loopback {
     target: String,
     thread: std::thread::JoinHandle<()>,
+    /// Releases a [`Self::start`] script once [`Self::connect`] has returned.
+    connected: Option<mpsc::Sender<()>>,
     /// Holds the minted cert's PEM for as long as the target names it.
     _ca_dir: tempfile::TempDir,
 }
@@ -44,9 +47,18 @@ fn drain(mut r: impl std::io::Read) {
 }
 
 impl Loopback {
-    /// A peer that completes the handshake and the HELLO exchange, then runs `script`.
+    /// A peer that completes the handshake and the HELLO exchange, then runs
+    /// `script` once the client has connected.
     fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        Self::serve(None, |sock, cfg| script(hello(handshake(sock, cfg))))
+        let (connected, go) = mpsc::channel();
+        let mut lb = Self::serve(None, move |sock, cfg| {
+            let end = hello(handshake(sock, cfg));
+            if go.recv().is_ok() {
+                script(end)
+            }
+        });
+        lb.connected = Some(connected);
+        lb
     }
 
     /// `serve` gets the accepted socket (`TCP_NODELAY`, as the server sets it)
@@ -80,18 +92,21 @@ impl Loopback {
         Loopback {
             target: format!("tls://127.0.0.1:{port}?ca={}", pem.display()),
             thread,
+            connected: None,
             _ca_dir: ca_dir,
         }
     }
 
     fn connect(&self) -> ClientTransport {
-        let until = Some(Instant::now() + CONNECT_TIMEOUT);
-        let mut t = ClientTransport::connect(&self.target, until).unwrap();
-        hello_handshake(&mut t, until).unwrap();
+        let t = ClientTransport::connect(&self.target, Instant::now() + CONNECT_TIMEOUT).unwrap();
+        if let Some(connected) = &self.connected {
+            connected.send(()).unwrap();
+        }
         t
     }
 
     fn join(self) {
+        drop(self.connected);
         self.thread.join().unwrap();
     }
 }
@@ -130,13 +145,9 @@ fn ca_file_with_an_unparsable_certificate_is_refused() {
 #[test]
 fn one_wakeup_drains_every_frame_rustls_holds() {
     // Two frames in one record and a third in the next: one readable wakeup
-    // and one reading pass must bring out all three, leaving nothing behind in
-    // rustls's plaintext or the carry. The server waits out the HELLO, so no
-    // record rides the handshake's read.
-    let (go_tx, go_rx) = mpsc::channel::<()>();
+    // and one reading pass bring out all three.
     let (tx, rx) = mpsc::channel::<()>();
     let lb = Loopback::start(move |mut end| {
-        go_rx.recv().unwrap();
         let mut both = framed(b"one");
         both.extend(framed(b"two"));
         end.write_all(&both).unwrap();
@@ -145,28 +156,26 @@ fn one_wakeup_drains_every_frame_rustls_holds() {
         tx.send(()).unwrap();
     });
     let mut t = lb.connect();
-    go_tx.send(()).unwrap();
     rx.recv().unwrap();
     poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
-    let mut got = Vec::new();
-    let mut may_read = true;
-    while let Next::Frame(f) = t.next_frame(&mut may_read).unwrap() {
-        got.push(f);
-    }
+    let (got, end) = pass(&mut t);
+    end.unwrap();
     assert_eq!(got, [b"one".as_slice(), b"two", b"three"]);
     lb.join();
-    assert_eq!(io_kind(&t.next_frame(&mut true)), Some(ErrorKind::UnexpectedEof));
+    let (got, end) = pass(&mut t);
+    assert!(got.is_empty());
+    assert_eq!(io_kind(&end), Some(ErrorKind::UnexpectedEof));
 }
 
 #[test]
 fn large_reply_spanning_many_records_is_intact() {
-    // Many 16 KiB records: the ciphertext buffer is refilled repeatedly and
-    // records straddle the refills.
+    // Many 16 KiB records: the window is refilled repeatedly and records
+    // straddle the refills.
     let payload: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(1024);
     let p = payload.clone();
     let lb = Loopback::start(move |mut end| write_frame(&mut end, &p));
     let mut t = lb.connect();
-    assert_eq!(t.recv_framed(None).unwrap(), payload);
+    assert_eq!(recv_frames(&mut t, 1), [payload]);
     lb.join();
 }
 
@@ -185,18 +194,18 @@ fn flush_can_empty_the_queue_with_ciphertext_still_pending() {
     let mut t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024);
     t.enqueue(frame);
-    assert!(t.flush().unwrap(), "ciphertext still pending");
+    t.flush().unwrap();
     assert_eq!(t.queued_bytes(), 0, "rustls took the whole frame");
     assert!(t.wants_write(), "the queue alone is not the predicate");
     tx.send(()).unwrap();
-    t.flush_blocking(None).unwrap();
+    flush_all(&mut t);
     lb.join();
 }
 
 #[test]
-fn send_deadline_over_tls_never_tears_a_frame() {
-    // The frame outgrows rustls's send buffer, so an already-expired deadline
-    // leaves its tail in the queue, and the next frame queues behind it.
+fn a_frame_larger_than_the_send_buffer_leaves_its_tail_queued() {
+    // The frame outgrows rustls's send buffer, so one flush leaves its tail in
+    // the queue, and the next frame goes out behind it.
     let big: Vec<u8> = (0u8..=255)
         .collect::<Vec<_>>()
         .repeat((SEND_BUFFER_BYTES + 256 * 1024) / 256);
@@ -209,35 +218,54 @@ fn send_deadline_over_tls_never_tears_a_frame() {
     });
     let mut t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024);
-    let r = t.send_frame(big, Some(Instant::now()));
-    assert_eq!(io_kind(&r), Some(ErrorKind::WouldBlock));
+    t.enqueue(big);
+    t.flush().unwrap();
     assert!(t.queued_bytes() > 0, "the tail is queue state, not rustls's");
     tx.send(()).unwrap();
-    t.send_frame(b"after".to_vec(), None).unwrap();
+    t.enqueue(b"after".to_vec());
+    flush_all(&mut t);
     lb.join();
 }
 
 #[test]
-fn silent_peer_fails_the_hello_at_the_one_deadline() {
+fn silent_peer_fails_the_connect_at_the_one_deadline() {
     // A peer that stalls the TLS handshake, or completes it and then never
-    // answers the HELLO: either way the one deadline bounds the whole exchange
+    // answers the HELLO: either way the one deadline bounds the whole connect
     // — once, not once per phase.
     let silent_tcp = Loopback::serve(None, |sock, _| drain(sock));
     let silent_tls = Loopback::serve(None, |sock, cfg| drain(handshake(sock, cfg)));
     for lb in [silent_tcp, silent_tls] {
         let d = Duration::from_millis(300);
         let t0 = Instant::now();
-        let until = Some(t0 + d);
-        let mut t = ClientTransport::connect(&lb.target, until).unwrap();
+        let r = ClientTransport::connect(&lb.target, t0 + d);
         assert!(matches!(
-            hello_handshake(&mut t, until),
-            Err(ClientError::Protocol(ProtocolError::IoError(ref e))) if e.kind() == ErrorKind::WouldBlock
+            r,
+            Err(ClientError::Protocol(ProtocolError::IoError(ref e))) if e.kind() == ErrorKind::TimedOut
         ));
         let took = t0.elapsed();
         assert!(took >= d && took < 2 * d, "{took:?}");
-        drop(t);
         lb.join();
     }
+}
+
+#[test]
+fn another_versions_hello_is_the_refusal_when_the_close_rides_the_same_read() {
+    // The refusing HELLO and the close_notify in one flight: the read that
+    // hands the HELLO out also fails, and the version is what is reported.
+    let lb = Loopback::serve(None, |sock, cfg| {
+        let mut end = handshake(sock, cfg);
+        assert_eq!(read_frame(&mut end), gnitz_wire::HELLO);
+        let mut other = gnitz_wire::HELLO;
+        other[4] ^= 1;
+        end.conn.writer().write_all(&framed(&other)).unwrap();
+        end.conn.send_close_notify();
+        end.flush().unwrap();
+    });
+    match ClientTransport::connect(&lb.target, Instant::now() + CONNECT_TIMEOUT) {
+        Err(ClientError::Refused(f)) => assert!(f.text.contains("version mismatch"), "{}", f.text),
+        r => panic!("expected a version refusal, got {:?}", r.err()),
+    }
+    lb.join();
 }
 
 #[test]
@@ -258,14 +286,14 @@ fn close_notify_with_bytes_behind_it_surfaces_eof() {
     let (done_tx, done_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut t = t;
-        let frame = t.recv_framed(None).map_err(|e| e.to_string());
-        done_tx.send((frame, io_kind(&t.recv_framed(None)))).unwrap();
+        let (frames, end) = pass(&mut t);
+        done_tx.send((frames, io_kind(&end))).unwrap();
     });
-    let (frame, next) = done_rx
+    let (frames, end) = done_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("the read after close_notify must not spin");
-    assert_eq!(frame.unwrap(), b"last");
-    assert_eq!(next, Some(ErrorKind::UnexpectedEof));
+        .expect("the read past close_notify must not spin");
+    assert_eq!(frames, [b"last".to_vec()]);
+    assert_eq!(end, Some(ErrorKind::UnexpectedEof));
     reader.join().unwrap();
     lb.join();
 }
@@ -321,4 +349,41 @@ fn parse_target_rejects_malformed() {
             "{bad:?} must be rejected by the target parser"
         );
     }
+}
+
+/// Instructions per burst over the reading passes that take it, each burst
+/// written whole before the first pass.
+#[test]
+#[ignore]
+fn tls_read_burst_bench() {
+    const ROUNDS: u64 = 200;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let (burst_tx, burst_rx) = mpsc::channel::<Vec<u8>>();
+    let (written_tx, written_rx) = mpsc::channel::<()>();
+    let lb = Loopback::start(move |mut end| {
+        for wire in burst_rx {
+            end.write_all(&wire).unwrap();
+            end.flush().unwrap();
+            written_tx.send(()).unwrap();
+        }
+    });
+    let mut t = lb.connect();
+    for (name, frames) in bench_bursts() {
+        let wire = bench_wire(&frames);
+        let mut total = 0;
+        for _ in 0..ROUNDS {
+            burst_tx.send(wire.clone()).unwrap();
+            written_rx.recv().unwrap();
+            let mut left = frames.len();
+            while left > 0 {
+                poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+                let (got, instr) = counter.measure(|| bench_pass(&mut t));
+                left = left.checked_sub(got).expect("no frame past the burst");
+                total += instr;
+            }
+        }
+        println!("tls read {name}: {} instr/burst", total / ROUNDS);
+    }
+    drop(burst_tx);
+    lb.join();
 }

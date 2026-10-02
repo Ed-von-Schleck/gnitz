@@ -1,11 +1,9 @@
 //! TLS 1.3 over TCP: rustls driven by the transport's own non-blocking cores.
 //! Not `rustls::StreamOwned`: its `Read` would be a plaintext path around the
-//! frame reader.
+//! deframer.
 
 use std::io::{self, BufRead, IoSlice, Write};
-use std::mem::MaybeUninit;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::ops::Range;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,7 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 use super::super::error::ProtocolError;
-use super::{timed_out, write_nonblocking, ClientTransport, Inner, ReadOutcome, WriteOutcome};
+use super::{timed_out, write_nonblocking, ClientTransport, Inner, WriteOutcome};
 
 /// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
 struct Target {
@@ -33,8 +31,8 @@ fn bad_target(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("tls target: {msg}"))
 }
 
-/// Parse the target after `tls://`; the grammar is documented on
-/// [`ClientTransport::connect`].
+/// Parse `HOST:PORT[?QUERY]`, the target after `tls://`. `QUERY` is
+/// `&`-separated `ca=PATH`, `cert=PATH` and `key=PATH`, each at most once.
 fn parse_target(rest: &str) -> io::Result<Target> {
     let (hostport, query) = match rest.split_once('?') {
         Some((hp, q)) => (hp, Some(q)),
@@ -138,35 +136,31 @@ fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
-/// rustls's outgoing-buffer limit. Its default (64 KiB) costs a `writev` per 64 KiB of
-/// a large push; `write_tls` offers the socket up to 64 records (~1 MiB) per call.
+/// The plaintext rustls holds unsent before it refuses more, which bounds what
+/// one `flush` moves out of the queue.
 const SEND_BUFFER_BYTES: usize = 1 << 20;
 
-/// Connect to `rest` (the target after the `tls://` prefix): the TCP connect
-/// under `until`, trying every resolved address. The TLS handshake is not run
-/// here: it completes inside the first exchange.
-pub(super) fn connect_tls(rest: &str, until: Option<Instant>) -> Result<ClientTransport, ProtocolError> {
+/// The TCP connect to `rest` (the target after the `tls://` prefix), no later
+/// than `until`. No TLS handshake is run.
+pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<ClientTransport, ProtocolError> {
     let target = parse_target(rest)?;
     let cfg = build_client_config(&target)?;
     let server_name = ServerName::try_from(target.host.clone())
         .map_err(|e| bad_target(format!("server name {:?}: {e}", target.host)))?;
 
-    // Every resolved address in turn: `localhost` resolving to [::1] first must not
-    // fail a server listening only on 127.0.0.1.
+    // Every resolved address in turn — `localhost` may resolve to [::1] ahead of
+    // the 127.0.0.1 a server listens on — each on an equal share of the time left.
+    let addrs: Vec<SocketAddr> = (target.host.as_str(), target.port).to_socket_addrs()?.collect();
+    let mut last_err = bad_target(format!("{}:{}: no addresses resolved", target.host, target.port));
     let sock = 'connect: {
-        let mut last_err = bad_target(format!("{}:{}: no addresses resolved", target.host, target.port));
-        for addr in (target.host.as_str(), target.port).to_socket_addrs()? {
-            let attempt = match until.map(|t| t.saturating_duration_since(Instant::now())) {
-                None => TcpStream::connect(addr),
-                Some(left) if left.is_zero() => {
-                    last_err = timed_out();
-                    break;
-                }
-                Some(left) => TcpStream::connect_timeout(&addr, left),
-            };
-            match attempt {
+        for (i, addr) in addrs.iter().enumerate() {
+            let share = until.saturating_duration_since(Instant::now()) / (addrs.len() - i) as u32;
+            if share.is_zero() {
+                last_err = timed_out();
+                break;
+            }
+            match TcpStream::connect_timeout(addr, share) {
                 Ok(s) => break 'connect s,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => last_err = timed_out(),
                 Err(e) => last_err = e,
             }
         }
@@ -180,28 +174,13 @@ pub(super) fn connect_tls(rest: &str, until: Option<Instant>) -> Result<ClientTr
     let mut conn = ClientConnection::new(cfg, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tls: {e}")))?;
     conn.set_buffer_limit(Some(SEND_BUFFER_BYTES));
-    Ok(ClientTransport::new(Inner::Tls(Box::new(TlsInner {
-        conn,
-        sock,
-        cipher: Box::new_uninit_slice(CIPHER_BYTES),
-        unread: 0..0,
-        sock_drained: false,
-    }))))
+    Ok(ClientTransport::new(Inner::Tls(Box::new(TlsInner { conn, sock }))))
 }
-
-/// Ciphertext per `recv`, handed to rustls in slices: its `read_tls` takes only
-/// a few KiB per call.
-const CIPHER_BYTES: usize = 64 * 1024;
 
 /// The TLS arm's state: the rustls connection and the socket beneath it.
 pub(super) struct TlsInner {
     conn: ClientConnection,
     sock: TcpStream,
-    /// Ciphertext off the socket; `unread` is the part rustls has not taken.
-    cipher: Box<[MaybeUninit<u8>]>,
-    unread: Range<usize>,
-    /// The last socket read returned less than it asked for.
-    sock_drained: bool,
 }
 
 impl TlsInner {
@@ -228,54 +207,42 @@ impl TlsInner {
     /// until the handshake completes.
     pub(super) fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<WriteOutcome, ProtocolError> {
         debug_assert!(!self.conn.wants_write());
-        Ok(WriteOutcome::Written(self.conn.writer().write_vectored(slices)?))
+        write_nonblocking(|| self.conn.writer().write_vectored(slices))
     }
 
-    /// The TLS read core: plaintext first, then buffered ciphertext, then the socket.
-    pub(super) fn read_into(&mut self, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
-        loop {
-            let mut plain = self.conn.reader();
-            match plain.fill_buf() {
-                // The peer's close_notify, every plaintext byte before it already handed out.
-                Ok([]) => return Ok(ReadOutcome::Eof),
-                Ok(chunk) => {
-                    let n = chunk.len().min(buf.len());
-                    buf[..n].write_copy_of_slice(&chunk[..n]);
-                    plain.consume(n);
-                    // A close_notify behind this chunk counts as empty: it surfaces on the next read.
-                    let plain_empty = match plain.fill_buf() {
-                        Ok(rest) => rest.is_empty(),
-                        Err(e) => e.kind() == io::ErrorKind::WouldBlock,
-                    };
-                    return Ok(ReadOutcome::Data {
-                        n,
-                        drained: plain_empty && self.unread.is_empty() && self.sock_drained,
-                    });
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+    /// Decrypt one read's ciphertext, handing `plain` every chunk it yields.
+    /// False once the peer's close_notify is reached, every plaintext byte
+    /// before it handed out.
+    pub(super) fn ingest(
+        &mut self,
+        mut cipher: &[u8],
+        mut plain: impl FnMut(&[u8]) -> Result<(), ProtocolError>,
+    ) -> Result<bool, ProtocolError> {
+        while !cipher.is_empty() {
+            // rustls takes nothing more from a peer that has closed.
+            if self.conn.read_tls(&mut cipher)? == 0 {
+                return Ok(false);
             }
-            if !self.unread.is_empty() {
-                // Fed only once the plaintext is gone, which keeps rustls's "received
-                // plaintext buffer full" refusal unreachable.
-                // SAFETY: `unread` covers exactly the bytes a socket read initialised.
-                let mut src = unsafe { self.cipher[self.unread.clone()].assume_init_ref() };
-                self.unread.start += self.conn.read_tls(&mut src)?;
-                if let Err(e) = self.conn.process_new_packets() {
-                    // Last gasp: the alert rustls queued for the peer.
-                    let _ = self.ship();
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("tls: {e}")).into());
-                }
-                continue;
+            if let Err(e) = self.conn.process_new_packets() {
+                // Last gasp: the alert rustls queued for the peer.
+                let _ = self.ship();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("tls: {e}")).into());
             }
-            match super::recv_into(self.sock.as_raw_fd(), &mut self.cipher)? {
-                ReadOutcome::Data { n, drained } => {
-                    self.unread = 0..n;
-                    self.sock_drained = drained;
-                }
-                end => return Ok(end),
+            let mut reader = self.conn.reader();
+            loop {
+                let took = match reader.fill_buf() {
+                    Ok([]) => return Ok(false),
+                    Ok(chunk) => {
+                        plain(chunk)?;
+                        chunk.len()
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                };
+                reader.consume(took);
             }
         }
+        Ok(true)
     }
 }
 

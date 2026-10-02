@@ -26,7 +26,7 @@ pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, 
 pub use protocol::error::ProtocolError;
 pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};
-pub(crate) use protocol::transport::{hello_handshake, ClientTransport};
+pub(crate) use protocol::transport::ClientTransport;
 pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };

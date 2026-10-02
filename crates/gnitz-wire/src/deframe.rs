@@ -1,6 +1,7 @@
 //! The deframer both ends of a connection read through: a `u32` LE length prefix,
 //! then exactly that many payload bytes.
 
+use std::borrow::Cow;
 use std::mem::MaybeUninit;
 
 /// The payload ceiling of every frame, in both directions.
@@ -27,14 +28,20 @@ pub enum FrameLenError {
     Alloc { len: usize },
 }
 
-/// Turns a byte stream into frames, each allocated at exactly its declared
-/// length once `admit` has accepted that length; `A` is what `admit` answered,
-/// handed back with the frame. A split length prefix is held here, never in the
-/// caller.
+/// Turns a byte stream into frames. `A` is what `admit` answered for a frame's
+/// declared length, handed back with the frame.
 pub struct Deframer<A = ()> {
     hdr: [u8; FRAME_LEN_PREFIX_BYTES],
     hdr_len: usize,
     pending: Option<Pending<A>>,
+    /// The window a read is out on, until it lands or `feed` runs.
+    lent: Option<Lent>,
+}
+
+/// Which storage [`Deframer::window`] handed out.
+enum Lent {
+    Carry,
+    Payload,
 }
 
 /// The payload being filled.
@@ -45,8 +52,9 @@ struct Pending<A> {
     admitted: A,
 }
 
-/// One whole payload, and what `admit` answered for it.
-pub type Frame<A> = (Box<[u8]>, A);
+/// One whole payload, and what `admit` answered for it. Borrowed where it lay
+/// whole in the bytes fed.
+pub type Frame<'s, A> = (Cow<'s, [u8]>, A);
 
 impl<A> Default for Deframer<A> {
     fn default() -> Self {
@@ -54,6 +62,7 @@ impl<A> Default for Deframer<A> {
             hdr: [0; FRAME_LEN_PREFIX_BYTES],
             hdr_len: 0,
             pending: None,
+            lent: None,
         }
     }
 }
@@ -66,16 +75,20 @@ impl<A> Deframer<A> {
 
     /// Consume `src` from the front until one frame is whole and return it with
     /// its admission, or `None` once `src` is exhausted.
-    pub fn feed<E: From<FrameLenError>>(
+    pub fn feed<'s, E: From<FrameLenError>>(
         &mut self,
-        src: &mut &[u8],
+        src: &mut &'s [u8],
         mut admit: impl FnMut(usize) -> Result<A, E>,
-    ) -> Result<Option<Frame<A>>, E> {
+    ) -> Result<Option<Frame<'s, A>>, E> {
+        self.lent = None;
         loop {
             if let Some(p) = self.pending.take_if(|p| p.pos == p.buf.len()) {
                 // SAFETY: every byte below `pos` was written by `feed`'s own copy or
-                // vouched for through `filled`, and `pos` is the length.
-                return Ok(Some((unsafe { p.buf.assume_init() }, p.admitted)));
+                // vouched for through `landed`, and `pos` is the length.
+                return Ok(Some((
+                    Cow::Owned(unsafe { p.buf.assume_init() }.into_vec()),
+                    p.admitted,
+                )));
             }
             if let Some(Pending { buf, pos, .. }) = &mut self.pending {
                 let take = (buf.len() - *pos).min(src.len());
@@ -102,6 +115,11 @@ impl<A> Deframer<A> {
                     len => len,
                 };
                 let admitted = admit(len)?;
+                // A payload wholly in `src` is handed out in place.
+                if let Some((payload, rest)) = src.split_at_checked(len) {
+                    *src = rest;
+                    return Ok(Some((Cow::Borrowed(payload), admitted)));
+                }
                 let mut v: Vec<MaybeUninit<u8>> = Vec::new();
                 // A failure drops `admitted` here.
                 v.try_reserve_exact(len).map_err(|_| FrameLenError::Alloc { len })?;
@@ -116,19 +134,39 @@ impl<A> Deframer<A> {
         }
     }
 
-    /// The unfilled tail of the payload in progress, for a reader that reads
-    /// straight into it.
-    pub fn payload_tail(&mut self) -> Option<&mut [MaybeUninit<u8>]> {
-        self.pending.as_mut().map(|p| &mut p.buf[p.pos..])
+    /// Where the next read lands: the payload in progress when at least a
+    /// carry of it is still to come, else `carry`.
+    pub fn window<'a>(&'a mut self, carry: &'a mut [MaybeUninit<u8>]) -> &'a mut [MaybeUninit<u8>] {
+        let min = carry.len();
+        let tail = self.pending.as_mut().map(|p| &mut p.buf[p.pos..]);
+        match tail.filter(|t| t.len() >= min) {
+            Some(tail) => {
+                self.lent = Some(Lent::Payload);
+                tail
+            }
+            None => {
+                self.lent = Some(Lent::Carry);
+                carry
+            }
+        }
     }
 
-    /// Record `n` bytes written at the head of [`Self::payload_tail`]. The next
-    /// `feed` hands the frame out once it is whole.
+    /// The bytes a read of `n` into the last [`Self::window`] leaves to be fed:
+    /// the carried ones, or none where the read went into the payload.
     ///
     /// # Safety
-    /// Those `n` bytes must be initialised.
-    pub unsafe fn filled(&mut self, n: usize) {
-        self.pending.as_mut().expect("a payload in progress").pos += n;
+    /// The read initialised `n` bytes at the head of that window.
+    pub unsafe fn landed<'a>(&mut self, carry: &'a [MaybeUninit<u8>], n: usize) -> &'a [u8] {
+        match self.lent.take().expect("a read landed with no window out") {
+            Lent::Payload => {
+                let p = self.pending.as_mut().expect("a window in the payload");
+                assert!(n <= p.buf.len() - p.pos, "a read past its window");
+                p.pos += n;
+                &[]
+            }
+            // SAFETY: the window was the carry.
+            Lent::Carry => unsafe { carry[..n].assume_init_ref() },
+        }
     }
 }
 

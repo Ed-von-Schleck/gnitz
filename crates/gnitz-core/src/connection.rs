@@ -6,6 +6,7 @@
 //! that arrives is the head slot's until its last train terminates.
 
 use gnitz_expr::SchemaFacts;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::os::fd::{OwnedFd, RawFd};
@@ -13,11 +14,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::ClientError;
-use crate::protocol::transport::Next;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::{
-    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, sys_schema, ClientTransport, ProtocolError,
-    PushFamily, Schema, ZSetBatch,
+    encode_ddl_txn, encode_frame, encode_push_txn, sys_schema, ClientTransport, ProtocolError, PushFamily, Schema,
+    ZSetBatch,
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
@@ -511,9 +511,6 @@ pub(crate) type PolledView = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 /// matched onto a live view of the same id.
 pub(crate) type PollSink<'a> = dyn FnMut(SlotId, Polled) + 'a;
 
-/// What one frame owes a delta poll's listener: a block, a terminal, or both.
-type PollFrame = (SlotId, Option<RawBlock>, Option<PollEnd>);
-
 /// Why a session refuses work.
 enum Ended {
     Closed,
@@ -547,10 +544,10 @@ impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://` target (see
     /// `ClientTransport::connect`).
     pub fn connect(target: &str) -> Result<Self, ClientError> {
-        let until = Some(Instant::now() + CONNECT_TIMEOUT);
-        let mut transport = ClientTransport::connect(target, until)?;
-        hello_handshake(&mut transport, until)?;
-        Ok(Self::over(transport))
+        Ok(Self::over(ClientTransport::connect(
+            target,
+            Instant::now() + CONNECT_TIMEOUT,
+        )?))
     }
 
     /// A session over a connected transport.
@@ -643,47 +640,43 @@ impl Session {
     /// [`Self::step`] for a drain that takes a delta poll's per-view results.
     pub(crate) fn step_polling(&mut self, ready: Interest, mut sink: Option<&mut PollSink<'_>>) -> Completions {
         let mut done: Completions = Vec::new();
-        if self.ended.is_some() {
-            return done;
+        if ready.read {
+            self.read_frames(sink.as_deref_mut(), &mut done);
         }
-        let mut result = self.read_frames(ready.read, sink.as_deref_mut(), &mut done);
         // Last, so the ciphertext a read queues goes out with this flush.
-        if result.is_ok() && ready.write {
+        if ready.write && self.ended.is_none() {
             if let Err(e) = self.transport.flush() {
                 // A peer gone after answering is still readable.
-                let _ = self.read_frames(true, sink, &mut done);
-                result = Err(e);
+                self.read_frames(sink, &mut done);
+                self.end(Ended::Lost(e), &mut done);
             }
-        }
-        if let Err(e) = result {
-            self.end(Ended::Lost(e), &mut done);
         }
         done
     }
 
-    /// Feed every frame the transport can complete, reading the fd only when
-    /// `may_read` and until a read proves it drained.
-    fn read_frames(
-        &mut self,
-        mut may_read: bool,
-        mut sink: Option<&mut PollSink<'_>>,
-        done: &mut Completions,
-    ) -> Result<(), ProtocolError> {
-        while let Next::Frame(buf) = self.transport.next_frame(&mut may_read)? {
-            // The sink runs after `feed` has returned, so an unwind out of the
-            // caller's code finds the session consistent. No sink is an
-            // abandoned poll — an interrupt, or an unwind past its driver — and
-            // the frame is dropped, which is what its caller being gone wants.
-            if let Some((slot, block, end)) = self.feed(buf, done)? {
-                if let Some(f) = sink.as_deref_mut() {
-                    let polled = block.map(Polled::Block).into_iter().chain(end.map(Polled::End));
-                    for p in polled {
-                        f(slot, p);
-                    }
+    /// Feed the frames of every read the fd allows, until one proves it drained
+    /// or fails — which ends the session.
+    fn read_frames(&mut self, mut sink: Option<&mut PollSink<'_>>, done: &mut Completions) {
+        let mut polled = Vec::new();
+        while self.ended.is_none() {
+            let Session { transport, pending, accum, .. } = self;
+            let read = transport.read(|buf| feed(pending, accum, buf, done, &mut polled));
+            let more = match read {
+                Ok(more) => more,
+                Err(e) => {
+                    self.end(Ended::Lost(e), done);
+                    false
                 }
+            };
+            match sink.as_deref_mut() {
+                Some(sink) => polled.drain(..).for_each(|(slot, p)| sink(slot, p)),
+                // An abandoned poll: nobody is left to take what its frames owed.
+                None => polled.clear(),
+            }
+            if !more {
+                return;
             }
         }
-        Ok(())
     }
 
     /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
@@ -722,8 +715,7 @@ impl Session {
         if self.ended.is_some() {
             return;
         }
-        self.transport.shutdown();
-        self.transport.clear_queue();
+        self.transport.close();
         self.accum = Accumulator::default();
         done.extend(self.pending.drain(..).map(|s| (s.id, Err(how.error()))));
         self.ended = Some(how);
@@ -745,133 +737,136 @@ impl Session {
         self.end(Ended::Lost(cause), &mut done);
         done
     }
+}
 
-    /// One reply frame for the head slot. A non-OK frame ends the whole request, so
-    /// its fault is read before the continuation test.
-    ///
-    /// Returns what the frame owes a delta poll's listener, if anything.
-    fn feed(&mut self, mut buf: Vec<u8>, done: &mut Completions) -> Result<Option<PollFrame>, ProtocolError> {
-        // Destructured so the head slot stays borrowed for the whole function
-        // while the accumulator is an independent `&mut`.
-        let Session { pending, accum, .. } = self;
-        let Some(head) = pending.front() else {
-            return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
-        };
-        // The view a DELTA_POLL slot is on and how many positions it answers,
-        // else `None` — what tells the paths below to fill one position rather
-        // than end the request.
-        let poll = match &head.kind {
-            SlotKind::DeltaPoll { views } => views.get(accum.at).map(|&v| (v, views.len())),
-            _ => None,
-        };
-        // The relation this frame must name.
-        let correlate_tid = match &head.kind {
-            SlotKind::Push { tid } | SlotKind::ScanSpec { tid, .. } => Some(*tid),
-            SlotKind::Multi { rels } => rels.get(accum.at).map(|r| r.0),
-            SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
-            SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve => None,
-        };
+/// Feed one reply frame to the head slot: the slots it completes go onto `done`,
+/// what it owes a delta poll's listener onto `polled`.
+fn feed(
+    pending: &mut VecDeque<Slot>,
+    accum: &mut Accumulator,
+    mut buf: Cow<'_, [u8]>,
+    done: &mut Completions,
+    polled: &mut Vec<(SlotId, Polled)>,
+) -> Result<(), ProtocolError> {
+    let Some(head) = pending.front() else {
+        return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
+    };
+    // The view a DELTA_POLL slot is on and how many positions it answers,
+    // else `None` — what tells the paths below to fill one position rather
+    // than end the request.
+    let poll = match &head.kind {
+        SlotKind::DeltaPoll { views } => views.get(accum.at).map(|&v| (v, views.len())),
+        _ => None,
+    };
+    // The relation this frame must name.
+    let correlate_tid = match &head.kind {
+        SlotKind::Push { tid } | SlotKind::ScanSpec { tid, .. } => Some(*tid),
+        SlotKind::Multi { rels } => rels.get(accum.at).map(|r| r.0),
+        SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
+        SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve => None,
+    };
 
-        let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
-        if let Some(fault) = ctrl.fault(&buf) {
-            // A DELTA_POLL failure that names a view ends that view's position
-            // alone; only one naming no relation fails the request.
-            if let Some((view, positions)) = poll {
-                if ctrl.hdr.target_id != 0 {
-                    if ctrl.hdr.target_id != view {
-                        return Err(out_of_order(view, ctrl.hdr.target_id));
-                    }
-                    let slot = end_poll_position(pending, accum, done, positions);
-                    return Ok(Some((slot, None, Some(Err(ClientError::Refused(fault))))));
+    let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
+    if let Some(fault) = ctrl.fault(&buf) {
+        // A DELTA_POLL failure that names a view ends that view's position
+        // alone; only one naming no relation fails the request.
+        if let Some((view, positions)) = poll {
+            if ctrl.hdr.target_id != 0 {
+                if ctrl.hdr.target_id != view {
+                    return Err(out_of_order(view, ctrl.hdr.target_id));
                 }
-            }
-            complete_head(pending, accum, Err(ClientError::Refused(fault)), done);
-            return Ok(None);
-        }
-        if let Some(tid) = correlate_tid {
-            // Replies arrive in request order, so a frame naming another
-            // relation would decode under the wrong schema silently; make it loud.
-            if ctrl.hdr.target_id != tid {
-                return Err(out_of_order(tid, ctrl.hdr.target_id));
+                let slot = end_poll_position(pending, accum, done, positions);
+                polled.push((slot, Polled::End(Err(ClientError::Refused(fault)))));
+                return Ok(());
             }
         }
-        // Only a RESOLVE is answered in the server's schema; every read decodes
-        // under the schema its request named.
-        let frame_schema = match ctrl.schema.clone() {
-            None => None,
-            Some(r) if matches!(head.kind, SlotKind::Resolve) => Some(Arc::new(
-                Schema::from_block(&buf[r]).map_err(ProtocolError::DecodeError)?,
-            )),
-            Some(_) => {
-                return Err(ProtocolError::DecodeError(
-                    "a schema block on a reply whose request named its schema".into(),
-                ))
-            }
-        };
+        complete_head(pending, accum, Err(ClientError::Refused(fault)), done);
+        return Ok(());
+    }
+    if let Some(tid) = correlate_tid {
+        // Replies arrive in request order, so a frame naming another
+        // relation would decode under the wrong schema silently; make it loud.
+        if ctrl.hdr.target_id != tid {
+            return Err(out_of_order(tid, ctrl.hdr.target_id));
+        }
+    }
+    // Only a RESOLVE is answered in the server's schema; every read decodes
+    // under the schema its request named.
+    let frame_schema = match ctrl.schema.clone() {
+        None => None,
+        Some(r) if matches!(head.kind, SlotKind::Resolve) => Some(Arc::new(
+            Schema::from_block(&buf[r]).map_err(ProtocolError::DecodeError)?,
+        )),
+        Some(_) => {
+            return Err(ProtocolError::DecodeError(
+                "a schema block on a reply whose request named its schema".into(),
+            ))
+        }
+    };
 
+    match ctrl.data.clone() {
+        Some(r) if head.kind.keeps_blocks_raw() => polled.push((
+            head.id,
+            Polled::Block(RawBlock {
+                frame: std::mem::take(&mut buf).into_owned(),
+                block: r,
+            }),
+        )),
         // Decoded straight into the accumulator: a train carries one data frame
         // per worker, and a per-frame batch would be copied in and dropped.
-        let mut block = None;
-        match ctrl.data.clone() {
-            Some(r) if head.kind.keeps_blocks_raw() => {
-                block = Some(RawBlock {
-                    frame: std::mem::take(&mut buf),
-                    block: r,
-                })
-            }
-            Some(r) => {
-                let eff = head
-                    .kind
-                    .reply_schema(accum.at)
-                    .ok_or_else(|| ProtocolError::DecodeError("a data block on a reply that carries no rows".into()))?;
-                let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
-                decode_wal_block_into(sink, &buf[r], eff)?;
-            }
-            None => {}
+        Some(r) => {
+            let eff = head
+                .kind
+                .reply_schema(accum.at)
+                .ok_or_else(|| ProtocolError::DecodeError("a data block on a reply that carries no rows".into()))?;
+            let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
+            decode_wal_block_into(sink, &buf[r], eff)?;
         }
-
-        if ctrl.hdr.flags.continuation {
-            return Ok(block.map(|b| (head.id, Some(b), None)));
-        }
-
-        // The train terminated.
-        let data = accum.data.take();
-        if let Some((_, positions)) = poll {
-            let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
-                .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-            let slot = end_poll_position(pending, accum, done, positions);
-            return Ok(Some((slot, block, Some(Ok(cursor)))));
-        }
-        let scan_reply = |schema: &Arc<Schema>, data: Option<ZSetBatch>, lsn: u64| ScanReply {
-            batch: data.unwrap_or_else(|| ZSetBatch::new(schema)),
-            schema: Arc::clone(schema),
-            lsn: Some(lsn),
-        };
-        let reply = match &head.kind {
-            SlotKind::Push { .. } => Ok(Reply::Lsn(ctrl.hdr.arg0)),
-            SlotKind::Resolve => resolve_descriptor(&ctrl, &buf, frame_schema).map(Reply::Resolve),
-            SlotKind::Alloc => Ok(Reply::Id(ctrl.hdr.target_id)),
-            SlotKind::Commit => Ok(Reply::Lsn(ctrl.hdr.arg0)),
-            SlotKind::ScanSpec { reply_schema, .. } => Ok(Reply::Scan(scan_reply(reply_schema, data, ctrl.hdr.arg0))),
-            SlotKind::Multi { rels } => {
-                accum.replies.push(scan_reply(&rels[accum.at].1, data, ctrl.hdr.arg0));
-                // This position's train is over; the next one starts clean.
-                *accum = Accumulator {
-                    at: accum.at + 1,
-                    replies: std::mem::take(&mut accum.replies),
-                    ..Default::default()
-                };
-                if accum.at < rels.len() {
-                    return Ok(None);
-                }
-                Ok(Reply::Multi(std::mem::take(&mut accum.replies)))
-            }
-            // `poll` is `Some` for exactly this kind, and that path returned.
-            SlotKind::DeltaPoll { .. } => unreachable!("a DELTA_POLL position is filled before this match"),
-        };
-        complete_head(pending, accum, reply, done);
-        Ok(None)
+        None => {}
     }
+
+    if ctrl.hdr.flags.continuation {
+        return Ok(());
+    }
+
+    // The train terminated.
+    let data = accum.data.take();
+    if let Some((_, positions)) = poll {
+        let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
+            .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
+        let slot = end_poll_position(pending, accum, done, positions);
+        polled.push((slot, Polled::End(Ok(cursor))));
+        return Ok(());
+    }
+    let scan_reply = |schema: &Arc<Schema>, data: Option<ZSetBatch>, lsn: u64| ScanReply {
+        batch: data.unwrap_or_else(|| ZSetBatch::new(schema)),
+        schema: Arc::clone(schema),
+        lsn: Some(lsn),
+    };
+    let reply = match &head.kind {
+        SlotKind::Push { .. } => Ok(Reply::Lsn(ctrl.hdr.arg0)),
+        SlotKind::Resolve => resolve_descriptor(&ctrl, &buf, frame_schema).map(Reply::Resolve),
+        SlotKind::Alloc => Ok(Reply::Id(ctrl.hdr.target_id)),
+        SlotKind::Commit => Ok(Reply::Lsn(ctrl.hdr.arg0)),
+        SlotKind::ScanSpec { reply_schema, .. } => Ok(Reply::Scan(scan_reply(reply_schema, data, ctrl.hdr.arg0))),
+        SlotKind::Multi { rels } => {
+            accum.replies.push(scan_reply(&rels[accum.at].1, data, ctrl.hdr.arg0));
+            // This position's train is over; the next one starts clean.
+            *accum = Accumulator {
+                at: accum.at + 1,
+                replies: std::mem::take(&mut accum.replies),
+                ..Default::default()
+            };
+            if accum.at < rels.len() {
+                return Ok(());
+            }
+            Ok(Reply::Multi(std::mem::take(&mut accum.replies)))
+        }
+        // `poll` is `Some` for exactly this kind, and that path returned.
+        SlotKind::DeltaPoll { .. } => unreachable!("a DELTA_POLL position is filled before this match"),
+    };
+    complete_head(pending, accum, reply, done);
+    Ok(())
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.

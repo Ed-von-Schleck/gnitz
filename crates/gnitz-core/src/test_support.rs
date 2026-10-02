@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
 
-use crate::protocol::transport::ClientTransport;
+use crate::protocol::error::ProtocolError;
+use crate::protocol::transport::{poll_fd, ClientTransport};
 use crate::{BatchAppender, Schema, Session, ZSetBatch};
 
 /// `(pk U64, v <v>)`.
@@ -60,6 +61,46 @@ impl Peer {
 pub(crate) fn transport_pair() -> (ClientTransport, Peer) {
     let (a, b) = UnixStream::pair().unwrap();
     (ClientTransport::unix(a).unwrap(), Peer(b))
+}
+
+/// One reading pass: `read` until it returns false or fails. The frames it
+/// handed out, and how it ended.
+pub(crate) fn pass(t: &mut ClientTransport) -> (Vec<Vec<u8>>, Result<(), ProtocolError>) {
+    let mut frames = Vec::new();
+    loop {
+        let read = t.read(|f| {
+            frames.push(f.into_owned());
+            Ok(())
+        });
+        match read {
+            Ok(true) => {}
+            Ok(false) => return (frames, Ok(())),
+            Err(e) => return (frames, Err(e)),
+        }
+    }
+}
+
+/// Reading passes, parked on the fd between them, until `n` frames are out.
+pub(crate) fn recv_frames(t: &mut ClientTransport, n: usize) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while frames.len() < n {
+        poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+        let (got, end) = pass(t);
+        end.unwrap();
+        frames.extend(got);
+    }
+    frames
+}
+
+/// `flush`, parked on the fd between calls, until nothing is left to write.
+pub(crate) fn flush_all(t: &mut ClientTransport) {
+    loop {
+        t.flush().unwrap();
+        if !t.wants_write() {
+            return;
+        }
+        poll_fd(t.as_raw_fd(), libc::POLLOUT, None).unwrap();
+    }
 }
 
 /// [`transport_pair`] with a session over the transport.
@@ -121,9 +162,9 @@ pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
 }
 
 /// The I/O error kind `r` failed with, if it failed with one.
-pub(crate) fn io_kind<T>(r: &Result<T, crate::protocol::error::ProtocolError>) -> Option<std::io::ErrorKind> {
+pub(crate) fn io_kind<T>(r: &Result<T, ProtocolError>) -> Option<std::io::ErrorKind> {
     match r {
-        Err(crate::protocol::error::ProtocolError::IoError(e)) => Some(e.kind()),
+        Err(ProtocolError::IoError(e)) => Some(e.kind()),
         _ => None,
     }
 }
@@ -151,10 +192,7 @@ pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
 }
 
 /// A WAL block decoded under `schema` into a fresh batch.
-pub(crate) fn decode_wal_block(
-    data: &[u8],
-    schema: &Schema,
-) -> Result<ZSetBatch, crate::protocol::error::ProtocolError> {
+pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
     let mut sink = ZSetBatch::new(schema);
     crate::protocol::wal_block::decode_wal_block_into(&mut sink, data, schema)?;
     Ok(sink)

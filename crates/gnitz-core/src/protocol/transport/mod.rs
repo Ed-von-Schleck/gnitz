@@ -1,24 +1,11 @@
-//! Client transport: AF-agnostic framing over a per-transport byte stream.
-//!
-//! The 4-byte LE length prefix used by every framed message is built and
-//! parsed here. [`ClientTransport`] dispatches between the transports: an
-//! AF_UNIX stream socket and TLS 1.3 over TCP (`tls.rs`). Both meet at one
-//! non-blocking core per direction — [`Inner::read_into`] and
-//! [`Inner::write_slices`] — and everything above them is transport-blind:
-//! the [`FrameReader`] that turns reads into frames, the owned outbound queue
-//! that [`ClientTransport::flush`] drains through a partial-write cursor, and
-//! the blocking wrappers ([`ClientTransport::send_frame`],
-//! [`ClientTransport::recv_framed`]) that park in `poll(2)` around those
-//! cores. Nothing beneath the wrappers ever waits.
-//!
-//! The fd is `O_NONBLOCK` always; the wrappers emulate blocking under an
-//! `until` instant the caller passes, so one deadline covers a whole call
-//! however many parks it takes.
+//! Client transport: frames over an AF_UNIX stream socket or TLS 1.3 over TCP
+//! (`tls.rs`), the same wire bytes on both. Nothing here waits except the HELLO
+//! exchange inside [`ClientTransport::connect`].
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
-use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -31,31 +18,24 @@ use crate::ClientError;
 
 mod tls;
 
-/// One connected client transport. All framed I/O goes through these
-/// methods; the wire bytes are identical across transports ("ZSets over the
-/// wire" rides verbatim inside the TLS stream). On TLS the handshake completes
-/// inside the first exchange (HELLO), where certificate failures surface.
+/// One connected client transport.
 pub struct ClientTransport {
     inner: Inner,
-    reader: FrameReader,
+    deframer: Deframer,
+    /// Where a socket read lands: the plain socket's carry, the TLS socket's
+    /// ciphertext.
+    window: Box<[MaybeUninit<u8>]>,
+    /// A read ended with bytes of it unfed, so the stream has lost its framing.
+    torn: bool,
     queue: OutQueue,
 }
+
+/// Bytes one socket read can take, short of a read straight into a payload.
+const WINDOW_BYTES: usize = 64 * 1024;
 
 enum Inner {
     Unix(UnixStream),
     Tls(Box<tls::TlsInner>),
-}
-
-/// What one non-blocking read of the source produced.
-#[derive(Clone, Copy)]
-enum ReadOutcome {
-    /// `n` bytes landed; `drained` says the read returned less than it asked
-    /// for, which on a stream socket proves the receive queue is empty.
-    Data { n: usize, drained: bool },
-    /// The peer closed the stream.
-    Eof,
-    /// Nothing readable yet.
-    WouldBlock,
 }
 
 /// What one non-blocking vectored write accepted.
@@ -65,16 +45,6 @@ enum WriteOutcome {
 }
 
 impl Inner {
-    /// The non-blocking read core: read what is there into `buf`, once, and
-    /// report what happened. Retries `EINTR` — Python signal handlers run on
-    /// the main thread during I/O.
-    fn read_into(&mut self, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
-        match self {
-            Inner::Unix(s) => recv_into(s.as_raw_fd(), buf),
-            Inner::Tls(t) => t.read_into(buf),
-        }
-    }
-
     /// The non-blocking write core: hand `slices` to the sink and report how
     /// many bytes it accepted. std's `write_vectored` clamps to `IOV_MAX`
     /// itself, so a caller may pass any number of slices and gets a prefix.
@@ -123,36 +93,32 @@ fn write_nonblocking(mut write: impl FnMut() -> std::io::Result<usize>) -> Resul
     }
 }
 
-/// One `recv` into possibly-uninitialised storage: the Unix read core, and the
-/// TLS arm's ciphertext read.
-fn recv_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
+/// One `recv` into `buf`: the bytes it took, 0 at EOF, or `None` where it
+/// would block.
+fn recv(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<Option<usize>, ProtocolError> {
     loop {
         // SAFETY: pointer/len come from a valid &mut [MaybeUninit<u8>].
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            return match e.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => Ok(ReadOutcome::WouldBlock),
-                _ => Err(e.into()),
-            };
+        if n >= 0 {
+            return Ok(Some(n as usize));
         }
-        if n == 0 {
-            return Ok(ReadOutcome::Eof);
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            _ => return Err(e.into()),
         }
-        let n = n as usize;
-        return Ok(ReadOutcome::Data { n, drained: n < buf.len() });
     }
 }
 
-/// A deadline's expiry, as a deadlined blocking call reports it: `WouldBlock`.
+/// A deadline's expiry.
 fn timed_out() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::WouldBlock, "socket operation timed out")
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "socket operation timed out")
 }
 
 /// One `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
-/// Expiry surfaces as `WouldBlock`, as a deadlined blocking call would; `EINTR`
-/// is returned, and since `until` is absolute a caller may simply call again.
+/// Expiry surfaces as `TimedOut`; `EINTR` is returned, and since `until` is
+/// absolute a caller may simply call again.
 pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, until: Option<Instant>) -> std::io::Result<libc::c_short> {
     let timeout_ms: libc::c_int = match until {
         None => -1,
@@ -179,7 +145,9 @@ impl ClientTransport {
     fn new(inner: Inner) -> Self {
         ClientTransport {
             inner,
-            reader: FrameReader::new(),
+            deframer: Deframer::default(),
+            window: Box::new_uninit_slice(WINDOW_BYTES),
+            torn: false,
             queue: OutQueue::default(),
         }
     }
@@ -191,17 +159,19 @@ impl ClientTransport {
         Ok(self.inner.as_fd().try_clone_to_owned()?)
     }
 
-    /// Connect to `tls://HOST:PORT[?QUERY]`, or else to an AF_UNIX socket path.
-    /// `QUERY` is `&`-separated, each at most once: `ca=PATH` (PEM roots, default
-    /// webpki), `cert=PATH` and `key=PATH` (mTLS). `until` bounds a TCP connect.
-    pub fn connect(target: &str, until: Option<Instant>) -> Result<Self, ProtocolError> {
-        match target.strip_prefix("tls://") {
-            Some(rest) => tls::connect_tls(rest, until),
-            None => ClientTransport::unix(UnixStream::connect(target)?),
-        }
+    /// Connect to a `tls://` target, or else to an AF_UNIX socket path, and
+    /// exchange HELLOs, all no later than `until`.
+    pub fn connect(target: &str, until: Instant) -> Result<Self, ClientError> {
+        let mut t = match target.strip_prefix("tls://") {
+            Some(rest) => tls::connect_tls(rest, until)?,
+            None => ClientTransport::unix(UnixStream::connect(target)?)?,
+        };
+        t.hello(until)?;
+        Ok(t)
     }
 
-    /// Wrap a connected AF_UNIX stream socket, which the transport closes on drop.
+    /// Wrap a connected AF_UNIX stream socket, which the transport closes on
+    /// drop. No HELLO is exchanged.
     pub(crate) fn unix(stream: UnixStream) -> Result<Self, ProtocolError> {
         stream.set_nonblocking(true)?;
         Ok(ClientTransport::new(Inner::Unix(stream)))
@@ -213,60 +183,68 @@ impl ClientTransport {
         self.inner.as_fd().as_raw_fd()
     }
 
-    /// Send one owned frame — `[u32 LE payload_length][payload]` — blocking
-    /// behind anything still queued, and no longer than `until`.
-    pub fn send_frame(&mut self, payload: Vec<u8>, until: Option<Instant>) -> Result<(), ProtocolError> {
-        self.enqueue(payload);
-        self.flush_blocking(until)
-    }
-
-    /// Park until the fd reports `events`, no longer than `until`: expiry
-    /// surfaces as `WouldBlock`.
-    fn park(&self, events: libc::c_short, until: Option<Instant>) -> Result<(), ProtocolError> {
+    /// Exchange HELLOs, no later than `until`. On TLS this is also where the
+    /// handshake completes and certificate failures surface.
+    fn hello(&mut self, until: Instant) -> Result<(), ClientError> {
+        self.enqueue(gnitz_wire::HELLO.to_vec());
         loop {
-            match poll_fd(self.as_raw_fd(), events, until) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                r => return Ok(r.map(|_| ())?),
-            }
+            // Every round: a read queues the TLS handshake's next flight.
+            self.flush()?;
+            let events = if self.wants_write() {
+                libc::POLLIN | libc::POLLOUT
+            } else {
+                libc::POLLIN
+            };
+            match poll_fd(self.as_raw_fd(), events, Some(until)) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                polled => polled.map_err(ProtocolError::from)?,
+            };
+            let mut frames = Vec::new();
+            let read = self.read(|frame| {
+                frames.push(frame.into_owned());
+                Ok(())
+            });
+            let reply = match &frames[..] {
+                [] => {
+                    read?;
+                    continue;
+                }
+                [reply] => reply,
+                _ => return Err(ProtocolError::DecodeError("a frame behind the server's HELLO".into()).into()),
+            };
+            // Ahead of `read`'s own failure: a server refusing the version
+            // answers, then hangs up.
+            gnitz_wire::check_hello(reply).map_err(|e| match e {
+                HelloError::Malformed => ClientError::from(ProtocolError::DecodeError(e.to_string())),
+                HelloError::Version { .. } => ClientError::from(e.to_string()),
+            })?;
+            read?;
+            return Ok(());
         }
     }
 
     /// Queue an owned frame behind everything already queued. Nothing is
-    /// written here; `flush` / `flush_blocking` ship the queue.
+    /// written here; `flush` ships the queue.
     pub(crate) fn enqueue(&mut self, payload: Vec<u8>) {
         self.queue.push(gnitz_wire::frame_len_prefix(payload.len()), payload);
     }
 
-    /// Write what the fd accepts from the queue cursor and report whether
-    /// anything is still pending — the negation of `wants_write`, which on
-    /// TLS includes ciphertext rustls holds after the queue has emptied into
-    /// it. Never parks.
-    pub(crate) fn flush(&mut self) -> Result<bool, ProtocolError> {
+    /// Write what the fd accepts from the queue cursor. Never parks; what is
+    /// left is reported by `wants_write`.
+    pub(crate) fn flush(&mut self) -> Result<(), ProtocolError> {
         loop {
             self.inner.ship_ciphertext()?;
-            if self.inner.has_pending_ciphertext() {
-                return Ok(true);
-            }
-            if self.queue.is_empty() {
-                return Ok(false);
+            if self.inner.has_pending_ciphertext() || self.queue.is_empty() {
+                return Ok(());
             }
             let ClientTransport { inner, queue, .. } = self;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * queue.len()));
             queue.build_slices(&mut slices);
             match inner.write_slices(&slices)? {
                 WriteOutcome::Written(n) => queue.advance(n),
-                WriteOutcome::WouldBlock => return Ok(true),
+                WriteOutcome::WouldBlock => return Ok(()),
             }
         }
-    }
-
-    /// `flush` inside the `POLLOUT` park-and-retry loop: returns once nothing
-    /// is pending, or with `WouldBlock` at `until` with the cursor intact.
-    fn flush_blocking(&mut self, until: Option<Instant>) -> Result<(), ProtocolError> {
-        while self.flush()? {
-            self.park(libc::POLLOUT, until)?;
-        }
-        Ok(())
     }
 
     /// Frame bytes queued and not yet written.
@@ -275,144 +253,74 @@ impl ClientTransport {
     }
 
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
-    /// interest.
+    /// interest. On TLS the ciphertext can outlast the queue that emptied into
+    /// it.
     pub(crate) fn wants_write(&self) -> bool {
         !self.queue.is_empty() || self.inner.has_pending_ciphertext()
     }
 
-    /// Drop every queued frame and the cursor with them.
-    pub(crate) fn clear_queue(&mut self) {
-        self.queue.clear();
-    }
-
-    /// Shut the socket down so the peer sees EOF. The fd stays open until the
-    /// transport drops, since a reactor may still have it registered.
-    pub(crate) fn shutdown(&self) {
+    /// Shut the socket down so the peer sees EOF, and drop every queued frame.
+    /// The fd stays open until the transport drops, since a reactor may still
+    /// have it registered.
+    pub(crate) fn close(&mut self) {
         // SAFETY: `as_raw_fd` is this transport's own open socket.
         let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
+        self.queue = OutQueue::default();
     }
 
-    /// The next complete frame, reading the fd only while `*may_read`. A read
-    /// that proves the source drained clears it, so a loop over one wakeup
-    /// stops reading there; each wakeup starts its pass with a fresh flag.
-    /// Returns `Pending` once nothing buffered completes a frame and no read
-    /// is allowed or the read would block.
-    pub(crate) fn next_frame(&mut self, may_read: &mut bool) -> Result<Next, ProtocolError> {
-        let ClientTransport { inner, reader, .. } = self;
-        reader.next_frame(inner, may_read)
-    }
-
-    /// Receive one frame, blocking until it is whole and no longer than
-    /// `until`. The ceiling is enforced on the prefix, before any allocation.
-    pub fn recv_framed(&mut self, until: Option<Instant>) -> Result<Vec<u8>, ProtocolError> {
-        loop {
-            match self.next_frame(&mut true)? {
-                Next::Frame(f) => return Ok(f),
-                Next::Pending => {
-                    // A read can queue ciphertext nothing else will send: during the handshake,
-                    // the client's Finished flight and the plaintext buffered behind it.
-                    let events = if self.flush()? {
-                        libc::POLLIN | libc::POLLOUT
-                    } else {
-                        libc::POLLIN
-                    };
-                    self.park(events, until)?;
-                }
-            }
+    /// One read of the socket, handing `on_frame` every frame it completes.
+    /// True when the read filled its window, so more may be waiting.
+    pub(crate) fn read(
+        &mut self,
+        mut on_frame: impl FnMut(Cow<'_, [u8]>) -> Result<(), ProtocolError>,
+    ) -> Result<bool, ProtocolError> {
+        let ClientTransport { inner, deframer, window, torn, .. } = self;
+        if *torn {
+            return Err(std::io::Error::other("an earlier read was abandoned with bytes unfed").into());
         }
-    }
-}
-
-// ── Framing: the reader ──────────────────────────────────────────────────────
-
-/// Size of the read scratch: large enough that one read serves a whole run
-/// of pipelined push ACKs.
-const SCRATCH_BYTES: usize = 64 * 1024;
-
-/// What `next_frame` produced.
-pub(crate) enum Next {
-    Frame(Vec<u8>),
-    /// No frame can be completed from what is buffered, and the source is
-    /// proven drained or would block.
-    Pending,
-}
-
-/// Turns reads into frames. A read lands in the scratch unless a payload is in
-/// progress, in which case it goes straight into that payload's tail.
-struct FrameReader {
-    scratch: Box<[MaybeUninit<u8>]>,
-    /// The initialised, not-yet-consumed bytes of `scratch`.
-    carry: Range<usize>,
-    deframer: Deframer,
-}
-
-impl FrameReader {
-    fn new() -> Self {
-        FrameReader {
-            scratch: Box::new_uninit_slice(SCRATCH_BYTES),
-            carry: 0..0,
-            deframer: Deframer::default(),
+        let fd = inner.as_fd().as_raw_fd();
+        let into = match inner {
+            Inner::Unix(_) => deframer.window(window),
+            Inner::Tls(_) => &mut window[..],
+        };
+        let len = into.len();
+        let Some(n) = recv(fd, into)? else { return Ok(false) };
+        let mut feed = |deframer: &mut Deframer, mut src: &[u8]| {
+            while let Some((frame, ())) = deframer.feed(&mut src, |_| Ok::<_, ProtocolError>(()))? {
+                on_frame(frame)?;
+            }
+            Ok::<_, ProtocolError>(())
+        };
+        // Set across the feed, so an error or an unwind out of it leaves it set.
+        *torn = true;
+        let open = n > 0
+            && match inner {
+                Inner::Unix(_) => {
+                    // SAFETY: the read wrote `n` bytes at the head of the window.
+                    let src = unsafe { deframer.landed(window, n) };
+                    feed(deframer, src)?;
+                    true
+                }
+                // SAFETY: the read wrote `n` bytes at the head of the window.
+                Inner::Tls(t) => t.ingest(unsafe { window[..n].assume_init_ref() }, |plain| feed(deframer, plain))?,
+            };
+        *torn = false;
+        if !open {
+            let msg = if deframer.is_mid_frame() {
+                "connection closed mid-frame"
+            } else {
+                "connection closed"
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg).into());
         }
-    }
-
-    fn next_frame(&mut self, inner: &mut Inner, may_read: &mut bool) -> Result<Next, ProtocolError> {
-        loop {
-            // SAFETY: `carry` covers exactly the bytes a read initialised.
-            let mut src = unsafe { self.scratch[self.carry.clone()].assume_init_ref() };
-            let before = src.len();
-            let frame = self.deframer.feed(&mut src, |_| Ok::<_, ProtocolError>(()))?;
-            self.carry.start += before - src.len();
-            if let Some((b, ())) = frame {
-                return Ok(Next::Frame(b.into_vec()));
-            }
-            if !*may_read {
-                return Ok(Next::Pending);
-            }
-            match self.read_more(inner)? {
-                ReadOutcome::Data { drained, .. } => *may_read = !drained,
-                ReadOutcome::WouldBlock => return Ok(Next::Pending),
-                // The read landed nothing, so nothing buffered can complete a frame.
-                ReadOutcome::Eof => {
-                    let msg = if self.deframer.is_mid_frame() {
-                        "connection closed mid-frame"
-                    } else {
-                        "connection closed"
-                    };
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg).into());
-                }
-            }
-        }
-    }
-
-    /// One read, into the payload in progress when there is one, else into the
-    /// whole scratch.
-    fn read_more(&mut self, inner: &mut Inner) -> Result<ReadOutcome, ProtocolError> {
-        debug_assert!(self.carry.is_empty(), "a read would land ahead of carried bytes");
-        Ok(match self.deframer.payload_tail() {
-            Some(tail) => {
-                let outcome = inner.read_into(tail)?;
-                if let ReadOutcome::Data { n, .. } = outcome {
-                    // SAFETY: the read initialised `n` bytes at the head of the tail.
-                    unsafe { self.deframer.filled(n) };
-                }
-                outcome
-            }
-            None => {
-                let outcome = inner.read_into(&mut self.scratch[..])?;
-                if let ReadOutcome::Data { n, .. } = outcome {
-                    self.carry = 0..n;
-                }
-                outcome
-            }
-        })
+        Ok(n == len)
     }
 }
 
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
 /// Slices per `flush` chunk: Linux's `UIO_MAXIOV`. std clamps to `IOV_MAX`
-/// itself, so this bounds the local slice array rather than the syscall. A frame
-/// is two slices, so one chunk carries 512 pipelined frames.
+/// itself, so this bounds the local slice array rather than the syscall.
 const IOV_MAX_CHUNK: usize = 1024;
 
 /// One queue entry: a frame's payload and its own length prefix.
@@ -429,7 +337,7 @@ impl QueuedFrame {
 }
 
 /// The owned outbound queue and its partial-write cursor: one byte offset into
-/// the front entry, so a send that hit its deadline resumes where it stopped.
+/// the front entry, so a write the socket cut short resumes where it stopped.
 #[derive(Default)]
 struct OutQueue {
     frames: VecDeque<QueuedFrame>,
@@ -451,12 +359,6 @@ impl OutQueue {
 
     fn len(&self) -> usize {
         self.frames.len()
-    }
-
-    fn clear(&mut self) {
-        self.frames.clear();
-        self.off = 0;
-        self.bytes = 0;
     }
 
     /// Slices from the cursor forward, at most `IOV_MAX_CHUNK` of them.
@@ -507,16 +409,6 @@ impl From<FrameLenError> for ProtocolError {
             FrameLenError::Alloc { .. } => std::io::Error::from(std::io::ErrorKind::OutOfMemory).into(),
         }
     }
-}
-
-/// Exchange HELLOs, all within `until`.
-pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<(), ClientError> {
-    t.send_frame(gnitz_wire::HELLO.to_vec(), until)?;
-    let reply = t.recv_framed(until)?;
-    gnitz_wire::check_hello(&reply).map_err(|e| match e {
-        HelloError::Malformed => ProtocolError::DecodeError(e.to_string()).into(),
-        HelloError::Version { .. } => ClientError::from(e.to_string()),
-    })
 }
 
 #[cfg(test)]

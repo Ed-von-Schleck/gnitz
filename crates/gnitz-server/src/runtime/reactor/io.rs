@@ -163,7 +163,10 @@ impl RecvQueue {
             let want = frame_weight(len);
             budget.charge(want).ok_or(RecvEnd::CapBreach { want })
         })? {
-            self.frames.push(RecvBuf { buf, charge });
+            self.frames.push(RecvBuf {
+                buf: buf.into_owned().into_boxed_slice(),
+                charge,
+            });
         }
         Ok(())
     }
@@ -275,41 +278,28 @@ pub(crate) trait RecvFilter {
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd>;
 }
 
-/// Size of [`Plain`]'s read staging buffer.
+/// Size of [`Plain`]'s carry.
 const CARRY_BYTES: usize = 32 * 1024;
 
-/// A socket whose bytes are the frames themselves. One carry read serves a
-/// whole pipelined run; a payload tail at least a carry long is read into directly.
-pub(crate) struct Plain {
-    carry: Box<[MaybeUninit<u8>]>,
-    /// The last window was the payload tail, not the carry.
-    direct: bool,
-}
+/// A socket whose bytes are the frames themselves, read through the deframer's
+/// window over this carry.
+pub(crate) struct Plain(Box<[MaybeUninit<u8>]>);
 
 impl Plain {
     pub(crate) fn new() -> Plain {
-        Plain {
-            carry: Box::new_uninit_slice(CARRY_BYTES),
-            direct: false,
-        }
+        Plain(Box::new_uninit_slice(CARRY_BYTES))
     }
 }
 
 impl RecvFilter for Plain {
     fn window<'a>(&'a mut self, q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>] {
-        let tail = q.deframer.payload_tail().filter(|t| t.len() >= CARRY_BYTES);
-        self.direct = tail.is_some();
-        tail.unwrap_or(&mut self.carry[..])
+        q.deframer.window(&mut self.0)
     }
 
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
-        if self.direct {
-            // SAFETY: the completed recv wrote `n` bytes at the head of the tail.
-            unsafe { q.deframer.filled(n) };
-            return q.feed(&[]);
-        }
-        // SAFETY: the completed recv wrote `n` bytes into the carry.
-        q.feed(unsafe { self.carry[..n].assume_init_ref() })
+        // SAFETY: the completed recv wrote `n` bytes at the head of the window.
+        let src = unsafe { q.deframer.landed(&self.0, n) };
+        q.feed(src)
     }
 }
 
