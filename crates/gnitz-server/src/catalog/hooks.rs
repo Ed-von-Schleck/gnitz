@@ -1,4 +1,4 @@
-use super::cache::RelationEntry;
+use super::cache::{encode_record, RelationEntry};
 use super::*;
 use gnitz_expr::ColumnTable;
 use gnitz_wire::TableDistribution;
@@ -6,26 +6,22 @@ use std::collections::hash_map::Entry;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
-    //
-    // Call order is dependency order. A relation's COL_TAB rows must be in storage
-    // when its register hook runs: live DDL applies ascending `topo_priority`, and
-    // boot replay opens every sys store first.
+
+    /// Run `family`'s name index and its register hook over `batch`. A registration
+    /// reads the relation's COL_TAB rows, and a view's its CIRCUIT_TAB row, from the
+    /// store, so the caller applies those families first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        self.raise_next_id(family, batch, batch.live_rows());
+        self.raise_next_id(family, batch);
         match family {
-            SysFamily::Schema => self.apply_schema_caches(batch),
+            SysFamily::Schema => self.apply_schema_names(batch),
             SysFamily::Table | SysFamily::View => {
-                self.apply_entity_caches(batch);
+                self.apply_relation_names(batch);
                 self.hook_relation_register(family, batch)?;
             }
             SysFamily::Column => self.hook_column_change(batch)?,
-            SysFamily::Index => {
-                self.apply_index_caches(batch);
-                self.hook_index_register(batch)?;
-            }
-            // `_sequences` rows drive no cache.
-            SysFamily::Sequence => {}
-            SysFamily::Circuit => self.dag.apply_circuit_delta(batch)?,
+            SysFamily::Index => self.hook_index_register(batch)?,
+            // `_sequences` rows drive no cache; a view's registration reads its `_circuits` row.
+            SysFamily::Sequence | SysFamily::Circuit => {}
         }
         Ok(())
     }
@@ -33,66 +29,71 @@ impl CatalogEngine {
     // -- Hook handlers ---------------------------------------------------------
 
     /// Build a relation's store and enter it in the registry — the create half of
-    /// [`hook_relation_register`](Self::hook_relation_register), over the values
-    /// its per-family builder decoded.
-    fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
-        let RelationRegistration {
-            kind,
-            id,
-            schema_id: _,
-            name,
-            pk,
-            distribution,
-            facts,
-        } = reg;
-        let col_defs = self.read_column_defs(id)?;
-        let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice())
-            .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
-        let placement = match distribution {
-            None => self
-                .dag
-                .register_view(&self.registry, id, &schema)
-                .map_err(|e| format!("{e} (vid={id})"))?,
-            Some(TableDistribution::Replicated) => Placement::Replicated,
-            Some(TableDistribution::Keyed { prefix_len: 0 }) => Placement::full_pk(&schema),
-            Some(TableDistribution::Keyed { prefix_len }) => Placement::keyed(&schema, prefix_len as usize),
+    /// [`hook_relation_register`](Self::hook_relation_register). Messages are bare
+    /// predicates; the caller names the relation.
+    fn register_relation(&mut self, rel: &RelRow<'_>) -> Result<(), String> {
+        let col_defs = self.read_column_defs(rel.id)?;
+        let schema = build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice())?;
+        let placement = match rel.detail {
+            RelDetail::View { .. } => {
+                let placement = self.dag.register_view(&self.registry, rel.id, &schema)?;
+                // A capacity-bounded view is a leaf: its store holds skeleton rows, so
+                // nothing may scan it.
+                let bounded = |s: &&u64| self.registry.relation(**s).is_some_and(|r| r.kind().is_bounded());
+                if let Some(&src) = self.dag.sources_of(rel.id).iter().find(bounded) {
+                    return Err(format!(
+                        "reads '{}', which is a capacity-bounded view; views cannot be created over one",
+                        self.qualified_name(src)
+                    ));
+                }
+                placement
+            }
+            RelDetail::Table {
+                distribution: TableDistribution::Replicated,
+                ..
+            } => Placement::Replicated,
+            RelDetail::Table {
+                distribution: TableDistribution::Keyed { prefix_len: 0 },
+                ..
+            } => Placement::full_pk(&schema),
+            RelDetail::Table {
+                distribution: TableDistribution::Keyed { prefix_len },
+                ..
+            } => Placement::keyed(&schema, prefix_len as usize),
         };
         gnitz_debug!(
             "catalog: creating {} name={} id={} workers={}",
-            kind.noun(),
-            name,
-            id,
+            rel.kind.noun(),
+            rel.name,
+            rel.id,
             self.registry.slot().of
         );
-        self.registry.register(RelationSpec { id, kind, schema, placement })?;
-        self.enter_relation(id, kind, schema.pk_cols(), &col_defs, facts);
-        // Derived, not stored: every process builds the same FK circuits from the same
+        self.registry.register(RelationSpec {
+            id: rel.id,
+            kind: rel.kind,
+            schema,
+            placement,
+        })?;
+        self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.facts());
+        // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included — a
         // parent's RESTRICT probe reads the child through it.
-        let fk_cols: Vec<usize> = self.fk_constraints_of(id).iter().map(|e| e.fk_col).collect();
-        for ci in fk_cols {
+        for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
             self.registry
-                .add_index(id, IndexClaim::ForeignKey, &[ci as u32])
-                .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
+                .add_index(rel.id, IndexClaim::ForeignKey, &[ci as u32])
+                .map_err(|e| format!("FK index on column {ci}: {e}"))?;
         }
         Ok(())
     }
 
     /// Enter registered relation `id`'s [`RelationEntry`], and index the FK edges it
-    /// declares by parent. Only a base table's column records declare one.
-    pub(in crate::catalog) fn enter_relation(
-        &mut self,
-        id: u64,
-        kind: RelationKind,
-        pk: &[u32],
-        defs: &[CatalogColumn],
-        facts: RelFacts,
-    ) {
+    /// declares by parent.
+    pub(in crate::catalog) fn enter_relation(&mut self, id: u64, pk: &[u32], defs: &[CatalogColumn], facts: RelFacts) {
         let fks: Vec<FkEdge> = defs
             .iter()
             .enumerate()
             .filter_map(|(ci, cd)| {
-                cd.fk.filter(|_| kind.is_base_table()).map(|fk| FkEdge {
+                cd.fk.map(|fk| FkEdge {
                     child_tid: id,
                     fk_col: ci,
                     parent_tid: fk.table_id,
@@ -103,22 +104,16 @@ impl CatalogEngine {
         for e in &fks {
             self.caches.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
         }
-        self.caches
-            .relations
-            .insert(id, RelationEntry::new(pk, defs, fks, facts));
+        let record = encode_record(pk, defs);
+        self.caches.relations.insert(id, RelationEntry { record, fks, facts });
     }
 
-    /// Tear relation `id` out of the registry. Its owned system rows are retracted by
-    /// the rows that dropped it (see `submit`), never from here; its directory is
-    /// left to the orphan sweep.
+    /// Tear relation `id` out of the registry and the DAG. Its owned system rows are
+    /// retracted by the rows that dropped it (see `submit`), never from here; its
+    /// directory is left to the orphan sweep.
     fn unregister_relation(&mut self, id: u64) {
-        // The DAG can hold a view whose store failed to register.
         self.dag.forget(id);
-        if !self.registry.has_id(id) {
-            return;
-        }
         self.registry.unregister(id);
-        self.caches.fk_by_parent.remove(&id);
         if let Some(entry) = self.caches.relations.remove(&id) {
             for e in entry.fks {
                 if let Entry::Occupied(mut edges) = self.caches.fk_by_parent.entry(e.parent_tid) {
@@ -147,48 +142,16 @@ impl CatalogEngine {
         // scans.
         creates.sort_unstable_by_key(|c| c.0);
         for (id, row) in creates {
+            // A system family's own TABLE_TAB row names a relation registered at open.
             if self.registry.has_id(id) {
                 continue;
             }
-            let reg = if family == SysFamily::Table {
-                read_table_tab_row(batch, row).map_err(|e| format!("{e} (tid={id})"))?
-            } else {
-                self.view_registration(batch, row, id)?
-            };
-            self.register_relation(reg)?;
+            let rel = read_rel_row(family, batch, row)?;
             // A view registers empty; the backfill, checkpoint resume or boot rebuild
             // fills it.
+            self.register_relation(&rel).map_err(|e| format!("{rel} {e}"))?;
         }
         Ok(())
-    }
-
-    /// The registration values for VIEW_TAB row `i`.
-    fn view_registration<'a>(
-        &mut self,
-        batch: &'a Batch,
-        i: usize,
-        vid: u64,
-    ) -> Result<RelationRegistration<'a>, String> {
-        let ViewRegistration {
-            schema_id,
-            name,
-            pk,
-            props,
-            owner_view_id,
-            pk_repeats,
-        } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
-        // Re-checked for the paths that skip the precheck: boot replay, a
-        // worker's `ddl_sync`.
-        self.validate_view_options(vid, name, props, owner_view_id)?;
-        Ok(RelationRegistration {
-            kind: RelationKind::View(props),
-            id: vid,
-            schema_id,
-            name,
-            pk,
-            distribution: None,
-            facts: RelFacts { pk_repeats, serial: false },
-        })
     }
 
     /// Apply a column ALTER (or its compensation) to every registered owner.
@@ -203,26 +166,22 @@ impl CatalogEngine {
                 continue;
             };
             let defs = self.read_column_defs(owner)?;
-            if kind.is_base_table() {
-                let rebuilt = build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_cols())
-                    .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
-                if rebuilt != cur {
-                    self.reject_if_dependent_views(owner, "column ALTER")?;
-                    self.registry.swap_schema(owner, rebuilt)?;
-                }
-                self.caches
-                    .relations
-                    .get_mut(&owner)
-                    .expect("every registered relation has an entry")
-                    .reschema(cur.pk_cols(), &defs);
+            let rebuilt = build_schema_from_col_defs(kind, &defs, cur.pk_cols())
+                .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
+            if rebuilt != cur {
+                self.registry.swap_schema(owner, rebuilt)?;
             }
+            self.caches
+                .relations
+                .get_mut(&owner)
+                .expect("every registered relation has an entry")
+                .record = encode_record(cur.pk_cols(), &defs);
         }
         Ok(())
     }
 
-    /// The IDX_TAB register hook: a sign dispatch over the batch.
-    /// `apply_index_caches` has already populated the name-indexed caches from
-    /// `IDXTAB_PAY_NAME`, so neither half below reads that string.
+    /// The IDX_TAB register hook: a `+1` adds the index's claim on its column list,
+    /// a `-1` releases it.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as u64;

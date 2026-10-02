@@ -28,27 +28,32 @@ pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 }
 
 impl CatalogEngine {
-    /// The id this catalog holds for schema `name`, or `None` when it holds no
-    /// such schema.
-    pub(in crate::catalog) fn schema_id(&self, name: &str) -> Option<u64> {
-        self.caches.schema_by_name.get(name).copied()
-    }
-
     pub(in crate::catalog) fn schema_is_empty(&self, schema_name: &str) -> bool {
-        match self.caches.schema_by_name.get(schema_name) {
-            Some(&sid) => [SysFamily::Table, SysFamily::View]
-                .into_iter()
-                .all(|f| self.schema_members(f, sid).is_empty()),
-            None => true,
-        }
+        self.schema_id(schema_name)
+            .is_none_or(|sid| !self.caches.relation_by_name.contains_key(&sid))
     }
 
     pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<u64> {
-        self.entity_id_by_qname(&gnitz_wire::qualified_key(schema_name, table_name))
+        self.relation_id(self.schema_id(schema_name)?, table_name)
+    }
+
+    /// The live rows of relation family `family` (Table or View) in schema `sid`.
+    fn schema_members(&self, family: SysFamily, sid: u64) -> Batch {
+        self.sys_rows_where(family, |s, i| {
+            payload_u64(s, i, gnitz_wire::RELTAB_PAY_SCHEMA_ID) == sid
+        })
+    }
+
+    /// The id of the live index named `name`.
+    fn index_id_by_name(&self, name: &str) -> Option<u64> {
+        let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
+            gnitz_expr::payload_str(s, i, gnitz_wire::IDXTAB_PAY_NAME) == name
+        });
+        (!rows.is_empty()).then(|| rows.get_pk(0) as u64)
     }
 
     pub(in crate::catalog) fn has_index_by_name(&self, name: &str) -> bool {
-        self.caches.index_by_name.contains_key(name)
+        self.index_id_by_name(name).is_some()
     }
 
     /// The ids of the live `sys_indices` rows `owner` owns.
@@ -73,7 +78,7 @@ impl CatalogEngine {
 
     pub(in crate::catalog) fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if self.has_schema(name) {
+        if self.schema_id(name).is_some() {
             return Err(format!("Schema already exists: {name}"));
         }
         let sid = self.allocate_ids(1).unwrap();
@@ -93,10 +98,7 @@ impl CatalogEngine {
     /// to get right, covered end-to-end, not the guard these tests are about.
     pub(in crate::catalog) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if !self.has_schema(name) {
-            return Err("Schema does not exist".into());
-        }
-        let sid = self.schema_id(name).expect("the schema exists");
+        let sid = self.schema_id(name).ok_or("Schema does not exist")?;
 
         for family in [SysFamily::View, SysFamily::Table] {
             let members = self.schema_members(family, sid);
@@ -174,12 +176,9 @@ impl CatalogEngine {
         validate_user_identifier(schema_name)?;
         validate_user_identifier(table_name)?;
 
-        let qualified = format!("{schema_name}.{table_name}");
-        let tid = *self
-            .caches
-            .entity_by_qname
-            .get(&qualified)
-            .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
+        let tid = self
+            .get_by_name(schema_name, table_name)
+            .ok_or_else(|| format!("Table does not exist: {schema_name}.{table_name}"))?;
 
         self.submit_retraction(SysFamily::Table, tid)
     }
@@ -188,12 +187,9 @@ impl CatalogEngine {
 
     pub(in crate::catalog) fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
-        let qualified = format!("{schema_name}.{view_name}");
-        let vid = *self
-            .caches
-            .entity_by_qname
-            .get(&qualified)
-            .ok_or_else(|| format!("View does not exist: {qualified}"))?;
+        let vid = self
+            .get_by_name(schema_name, view_name)
+            .ok_or_else(|| format!("View does not exist: {schema_name}.{view_name}"))?;
 
         self.submit_retraction(SysFamily::View, vid)
     }
@@ -207,12 +203,9 @@ impl CatalogEngine {
         is_unique: bool,
     ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
-        let qualified = format!("{schema_name}.{table_name}");
-        let owner_id = *self
-            .caches
-            .entity_by_qname
-            .get(&qualified)
-            .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
+        let owner_id = self
+            .get_by_name(schema_name, table_name)
+            .ok_or_else(|| format!("Table does not exist: {schema_name}.{table_name}"))?;
 
         // Resolve each column name to its index, in declared order.
         let col_defs = self.read_column_defs(owner_id).unwrap();
@@ -251,10 +244,8 @@ impl CatalogEngine {
     }
 
     pub(in crate::catalog) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
-        let idx_id = *self
-            .caches
-            .index_by_name
-            .get(index_name)
+        let idx_id = self
+            .index_id_by_name(index_name)
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
         // precheck_family enforces the FK-target uniqueness guard on the -1;

@@ -110,6 +110,28 @@ fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
     bb.finish()
 }
 
+/// A `DDL_TXN` bundle of `blocks`, one per family.
+fn bundle(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> [Option<Batch>; SysFamily::COUNT] {
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    for (family, batch) in blocks {
+        assert!(families[family.index()].replace(batch).is_none());
+    }
+    families
+}
+
+/// `(live rows, net-negative rows)` of every system family.
+fn sys_row_counts(engine: &CatalogEngine) -> Vec<(usize, usize)> {
+    SysFamily::ALL
+        .iter()
+        .map(|&f| {
+            (
+                count_records(engine.sys_relation(f).cursor()),
+                count_negative_records(engine.sys_relation(f).cursor()),
+            )
+        })
+        .collect()
+}
+
 fn temp_dir(name: &str) -> String {
     scratch_dir("catalog", name)
 }

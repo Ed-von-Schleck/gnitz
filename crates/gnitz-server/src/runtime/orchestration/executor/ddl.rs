@@ -106,14 +106,8 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
 /// family — flows here, so there is one system-write code path end to end.
 ///
-/// Families are ingested in topo order — ascending for a bundle that creates, so
-/// every register/index hook sees its dependencies already in the memtable;
-/// descending for one that only drops, so a dependent is retired first. The loop
-/// prechecks and applies one family at a time, so a later family's precheck reads
-/// the caches an earlier family's apply updated — which is what lets one DROP
-/// SCHEMA bundle pass the empty-schema guard. On any failure the applied families
-/// are negated in master memory before broadcast, so neither a crash nor a
-/// precheck failure can strand an orphan row.
+/// On any failure the applied families are negated in master memory before
+/// broadcast, so neither a crash nor a precheck failure can strand an orphan row.
 ///
 /// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent once the
 /// DDL guards have dropped — so a client stalled on its
@@ -140,7 +134,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         }
     }
 
-    // Both signs of every family, up front: the ingest loop below consumes
+    // Both signs of every family, up front: applying the bundle consumes
     // `families`, and the post-fsync reclamation needs the `-1` ids.
     let views = partition_of(&families, SysFamily::View);
     let tables = partition_of(&families, SysFamily::Table);
@@ -150,16 +144,8 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         .unwrap_or_default();
 
     let new_view_ids = views.creates;
-    let view_create = !new_view_ids.is_empty();
 
     let locks = enter_ddl(shared).await;
-
-    // The cross-family guards, before anything is reserved or applied: a
-    // rejection here returns having written nothing, so it needs no
-    // compensation. Placing it after the ingest loop instead would
-    // make a check that needs no applied state indistinguishable from a
-    // post-apply failure.
-    shared.cat().precheck_bundle(&families)?;
 
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle before reserving the zone LSN or mutating the catalog, so a
@@ -185,66 +171,27 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         }
     }
 
-    // Ingest the families in ascending topo order so every register/index hook
-    // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
-    // new view's base sources once the circuit rows are applied (so the dependency
-    // map names the view's sources) but before VIEW_TAB registers the view — after
-    // registration the view is a dependent of those bases, so an undrained pending
-    // delta would tick it through a `Drive::Tick` over rows the backfill below also
-    // scans, counting them twice. VIEW_TAB is the first family at or past view
-    // priority. A stream source is not drained (see `base_tables_reachable_from`):
-    // the backfill scans its empty store, so a still-pending stream row can only
-    // reach the new view through the tick, and so reaches it at most once.
-    // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
-    // only in the tail below), so the in-loop drain's tick precedes the zone's
-    // broadcasts in SAL order.
-    let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
-        .iter()
-        .filter_map(|&f| families[f.index()].take().map(|b| (f, b)))
-        .collect();
-    // A bundle that only drops is ingested in the reverse of creation order —
-    // a view retired before the tables it reads, a schema after its members —
-    // which is what lets one DROP SCHEMA bundle carry
-    // `[VIEW_TAB, TABLE_TAB, SCHEMA_TAB]`. A mixed-sign bundle (an ALTER
-    // VIEW's retract-then-register) keeps the creation order.
-    if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
-        ordered.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
-    } else {
-        ordered.sort_by_key(|(f, _)| f.topo_priority());
+    // A new view's base sources tick before it registers: registered, it would be ticked
+    // over rows its backfill also scans. Nothing commits between this drain and the
+    // registration — the DDL holds the catalog write and the tick gate. A stream source
+    // is not drained: the backfill scans its empty store, so a pending stream row reaches
+    // the view through the tick alone.
+    if let Some(circuits) = families[SysFamily::Circuit.index()].as_ref() {
+        let sources = {
+            let cat = shared.cat();
+            cat.dag.base_tables_scanned_by(&cat.registry, circuits)?
+        };
+        guard_panic_async("DDL", shared.disp().drain_tick(&sources)).await?;
     }
-    let view_prio = SysFamily::View.topo_priority();
-    let mut drained_sources = false;
-    let ingest_res = guard_panic_async("DDL", async {
-        for (family, fbatch) in ordered {
-            if view_create && !drained_sources && family.topo_priority() >= view_prio {
-                let sources = {
-                    let cat = shared.cat();
-                    cat.dag.base_tables_reachable_from(&cat.registry, new_view_ids.clone())
-                };
-                shared.disp().drain_tick(&sources).await?;
-                drained_sources = true;
-            }
-            shared.cat_mut().submit(family, fbatch)?;
-        }
-        // Compile every new view's circuit here, on the master, while the bundle
-        // is still undoable. VIEW_TAB has been applied, so each view is registered
-        // and every source resolves — and nothing has reached the SAL yet, so a
-        // rejection leaves through the arm below with the view uncreated.
-        // Compiling only on the workers, as the backfill does, puts the verdict
-        // after the DDL is durable, where it can be nothing but a log line and a
-        // view that returns no rows forever.
-        for &vid in &new_view_ids {
-            crate::query::preflight_compile(&shared.cat().registry, vid)?;
-        }
-        Ok::<_, WireFault>(())
-    })
-    .await;
-    if let Err(e) = &ingest_res {
+    let applied = guard_panic("DDL", || {
+        shared.cat_mut().apply_bundle(families).map_err(WireFault::from)
+    });
+    if let Err(e) = &applied {
         guard_panic("DDL-compensate", || shared.cat_mut().compensate_stage_a()).unwrap_or_else(|ce| {
             gnitz_fatal_abort!("Stage-A DDL compensation failed after DDL error '{}': {}", e, ce);
         });
     }
-    ingest_res?;
+    applied?;
 
     // SAL emission window: broadcast each queued family as one zone, then fsync.
     // A failure here is unrecoverable — workers already applied the DdlSync

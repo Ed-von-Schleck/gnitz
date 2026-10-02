@@ -10,8 +10,8 @@ fn test_bootstrap() {
     let dir = temp_dir("bootstrap");
     let engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    assert!(engine.has_schema("_system"));
-    assert!(engine.has_schema("public"));
+    assert!(engine.schema_id("_system").is_some());
+    assert!(engine.schema_id("public").is_some());
     assert_eq!(engine.next_id, FIRST_ALLOCATED_ID);
 
     let schemas_before = count_records(engine.sys_relation(SysFamily::Schema).cursor());
@@ -160,7 +160,7 @@ fn test_ddl() {
 
     // Schema creation
     engine.create_schema("sales").unwrap();
-    assert!(engine.has_schema("sales"));
+    assert!(engine.schema_id("sales").is_some());
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Schema).cursor()),
         init_schemas + 1
@@ -198,7 +198,7 @@ fn test_ddl() {
     // Drop schema
     engine.create_schema("temp").unwrap();
     engine.drop_schema("temp").unwrap();
-    assert!(!engine.has_schema("temp"));
+    assert!(engine.schema_id("temp").is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -227,7 +227,7 @@ fn test_edge_cases() {
     engine.create_schema("my_schema").unwrap();
     engine.create_table("my_schema.tbl2", &cols, &[0]).unwrap();
     engine.drop_schema("my_schema").unwrap();
-    assert!(!engine.has_schema("my_schema"));
+    assert!(engine.schema_id("my_schema").is_none());
     assert!(
         engine.get_by_name("my_schema", "tbl2").is_none(),
         "cascade must drop the contained table"
@@ -338,7 +338,7 @@ fn test_nonempty_schema_drop_rejected() {
     );
 
     // Nothing was orphaned: the schema, its member, and the caches all survive.
-    assert!(engine.has_schema("s"), "schema must survive a rejected drop");
+    assert!(engine.schema_id("s").is_some(), "schema must survive a rejected drop");
     assert_eq!(
         engine.get_by_name("s", "t"),
         Some(tid),
@@ -348,7 +348,10 @@ fn test_nonempty_schema_drop_rejected() {
     // Emptying the schema first lets the same drop succeed (guard now passes).
     engine.drop_table("s.t").unwrap();
     engine.drop_schema("s").unwrap();
-    assert!(!engine.has_schema("s"), "schema gone after dropping its member first");
+    assert!(
+        engine.schema_id("s").is_none(),
+        "schema gone after dropping its member first"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -377,10 +380,10 @@ fn test_restart_full() {
 
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert!(engine.has_schema("marketing"));
+        assert!(engine.schema_id("marketing").is_some());
         assert!(engine.get_by_name("marketing", "products").is_some());
         // Dropped should stay gone
-        assert!(!engine.has_schema("trash"));
+        assert!(engine.schema_id("trash").is_none());
         assert!(engine.get_by_name("trash", "items").is_none());
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
@@ -753,14 +756,11 @@ fn dropped_name_resolves_to_its_recreation() {
 
     // Create, then drop, a table named `public.t`.
     let tid1 = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid1));
+    assert_eq!(engine.get_by_name("public", "t"), Some(tid1));
     engine.drop_table("public.t").unwrap();
 
     // The drop must have cleared the qname mapping.
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.t"),
-        "drop must clear entity_by_qname"
-    );
+    assert!(engine.get_by_name("public", "t").is_none(), "drop must clear the name");
 
     // Recreate under the same qualified name. A leaked stale mapping would
     // make the qname-uniqueness guard reject this create.
@@ -772,11 +772,11 @@ fn dropped_name_resolves_to_its_recreation() {
     let tid2 = recreate.unwrap();
     assert_ne!(tid1, tid2, "recreated table must get a fresh tid");
 
-    // entity_by_qname must resolve to the NEW tid.
+    // The name must resolve to the NEW tid.
     assert_eq!(
-        engine.caches.entity_by_qname.get("public.t").copied(),
+        engine.get_by_name("public", "t"),
         Some(tid2),
-        "entity_by_qname must resolve to the NEW tid after drop + recreate"
+        "the name must resolve to the NEW tid after drop + recreate"
     );
 
     engine.close();

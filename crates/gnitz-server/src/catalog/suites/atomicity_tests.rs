@@ -172,8 +172,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     let tid = engine
         .create_table("owner.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let vid = engine.allocate_ids(1).unwrap();
-    write_identity_circuit(&mut engine, vid, tid, gnitz_wire::ReadBound::None);
+    let vid = register_identity_view(&mut engine, tid, "v", &[col_def("id", TypeCode::U64)]);
     assert_eq!(
         engine.dag.dependents_of(tid),
         &[vid][..],
@@ -201,7 +200,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 }
 
 // ---------------------------------------------------------------------------
-// DDL_TXN bundle rollback: `submit` per family, then `compensate_stage_a`, as
+// DDL_TXN bundle rollback: `apply_bundle`, then `compensate_stage_a`, as
 // `handle_ddl_txn` does.
 // ---------------------------------------------------------------------------
 
@@ -221,17 +220,15 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let _ = engine.drain_pending_broadcasts();
 
     let new_tid = engine.allocate_ids(1).unwrap();
-    // Ascending topo: COL_TAB(1) applied first.
-    let col_batch = col_tab_batch(new_tid, &cols, 1);
-    engine.submit(SysFamily::Column, col_batch).unwrap();
-
-    // TABLE_TAB(6): precheck fails (duplicate name), so nothing of it is queued
-    // or applied.
-    let table_batch = table_tab_batch(&[(new_tid, "dupname", 1)]);
-    assert!(
-        engine.submit(SysFamily::Table, table_batch).is_err(),
-        "duplicate-name TABLE_TAB must fail precheck"
-    );
+    // COL_TAB is applied first; TABLE_TAB then fails its precheck, so nothing of
+    // it is queued or applied.
+    let err = engine
+        .apply_bundle(bundle([
+            (SysFamily::Table, table_tab_batch(&[(new_tid, "dupname", 1)])),
+            (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
+        ]))
+        .expect_err("duplicate-name TABLE_TAB must fail precheck");
+    assert!(err.contains("already exists: public.dupname"), "{err}");
     engine.compensate_stage_a().unwrap();
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
@@ -266,21 +263,19 @@ fn ddl_txn_hook_failure_is_compensated() {
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
+    let _ = engine.drain_pending_broadcasts();
     let new_tid = engine.allocate_ids(1).unwrap();
-    let col_batch = col_tab_batch(new_tid, &cols, 1);
-    engine.submit(SysFamily::Column, col_batch).unwrap();
-
     let blocker = relation_dir(&dir, new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
-    let table_batch = table_tab_batch(&[(new_tid, "hooktbl", 1)]);
-    engine
-        .precheck_family(SysFamily::Table, &table_batch)
-        .expect("the precheck reads no path, so the blocker is invisible to it");
-    assert!(
-        engine.submit(SysFamily::Table, table_batch).is_err(),
-        "register_relation must fail when the relation directory cannot be made"
-    );
+    // The precheck reads no path, so the blocker is invisible to it.
+    let err = engine
+        .apply_bundle(bundle([
+            (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
+            (SysFamily::Table, table_tab_batch(&[(new_tid, "hooktbl", 1)])),
+        ]))
+        .expect_err("register_relation must fail when the relation directory cannot be made");
+    assert!(err.starts_with(&format!("table 'hooktbl' (id={new_tid}) ")), "{err}");
     engine.compensate_stage_a().unwrap();
 
     assert!(
@@ -401,20 +396,9 @@ fn compensated_create_table_leaves_no_trace() {
         .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
     let _ = engine.drain_pending_broadcasts();
-    let counts = |engine: &CatalogEngine| -> Vec<(usize, usize)> {
-        SysFamily::ALL
-            .iter()
-            .map(|&f| {
-                (
-                    count_records(engine.sys_relation(f).cursor()),
-                    count_negative_records(engine.sys_relation(f).cursor()),
-                )
-            })
-            .collect()
-    };
     let tid = engine.allocate_ids(1).unwrap();
     let idx_id = engine.allocate_ids(1).unwrap();
-    let before = counts(&engine);
+    let before = sys_row_counts(&engine);
 
     let cols = vec![
         col_def("id", TypeCode::U64),
@@ -451,7 +435,11 @@ fn compensated_create_table_leaves_no_trace() {
         !engine.fk_children_of(parent).iter().any(|e| e.child_tid == tid),
         "the parent must keep no edge from the uncreated child"
     );
-    assert_eq!(counts(&engine), before, "no system family may keep a row of the table");
+    assert_eq!(
+        sys_row_counts(&engine),
+        before,
+        "no system family may keep a row of the table"
+    );
     engine.reclaim_orphan_dirs();
     assert!(
         !std::path::Path::new(&relation_dir(&dir, tid)).exists(),

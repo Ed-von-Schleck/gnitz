@@ -1,5 +1,5 @@
-//! Catalog write path: `submit` (precheck → owned-row cascade → ingest →
-//! `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
+//! Catalog write path: `apply_bundle` over `submit` (precheck → owned-row cascade →
+//! ingest → `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
 //! orphan-directory sweep.
 
 use super::*;
@@ -81,6 +81,38 @@ impl CatalogEngine {
             self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight));
         }
         batch
+    }
+
+    /// Apply one `DDL_TXN` bundle: the cross-family guards, each family through
+    /// [`Self::submit`] in dependency order, then a compile of every view it creates.
+    /// Ascending `topo_priority` for a bundle that creates, so every register hook finds
+    /// its dependencies applied; descending for one that only drops, so a dependent is
+    /// retired first. On `Err` what was applied stays queued for
+    /// [`Self::compensate_stage_a`].
+    pub(crate) fn apply_bundle(&mut self, mut families: [Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
+        self.precheck_bundle(&families)?;
+        let new_views = families[SysFamily::View.index()]
+            .as_ref()
+            .map(|b| family_pk_partition(SysFamily::View, b).creates)
+            .unwrap_or_default();
+        let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
+            .iter()
+            .filter_map(|&f| families[f.index()].take().map(|b| (f, b)))
+            .collect();
+        if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
+            ordered.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
+        } else {
+            ordered.sort_by_key(|(f, _)| f.topo_priority());
+        }
+        for (family, batch) in ordered {
+            self.submit(family, batch)?;
+        }
+        // On the master, while the bundle is still undoable: a worker's compile verdict
+        // comes after the DDL is durable.
+        for &vid in &new_views {
+            crate::query::preflight_compile(&self.registry, vid)?;
+        }
+        Ok(())
     }
 
     /// Ingest one delta into its family's store and fire its hooks.

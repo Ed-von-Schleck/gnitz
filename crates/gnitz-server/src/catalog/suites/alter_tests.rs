@@ -48,8 +48,8 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     assert!(engine.registry.has_id(tid), "rename must not unregister the table");
     assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
     // Caches reflect the new name; no persistent ghost row.
-    assert!(engine.caches.entity_by_qname.contains_key("public.renamed"));
-    assert!(!engine.caches.entity_by_qname.contains_key("public.orig"));
+    assert!(engine.get_by_name("public", "renamed").is_some());
+    assert!(engine.get_by_name("public", "orig").is_none());
     assert_eq!(
         rows_under(&engine, SysFamily::Table, tid),
         1,
@@ -88,7 +88,7 @@ fn rename_then_reopen_resolves_flushed_data() {
     // the rename), so the flushed row still resolves under the new name.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
-        engine.caches.entity_by_qname.get("public.renamed").copied(),
+        engine.get_by_name("public", "renamed"),
         Some(tid),
         "renamed relation must resolve after reopen"
     );
@@ -112,10 +112,7 @@ fn valid_long_name_rename_accepted() {
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
     engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
-    assert!(engine
-        .caches
-        .entity_by_qname
-        .contains_key("public.renamed_to_a_long_name"));
+    assert!(engine.get_by_name("public", "renamed_to_a_long_name").is_some());
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -340,11 +337,11 @@ fn insert_first_rename_pair_lands_the_new_name() {
     engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
 
     assert!(
-        engine.caches.entity_by_qname.contains_key("public.renamed"),
+        engine.get_by_name("public", "renamed").is_some(),
         "the new name must resolve"
     );
     assert!(
-        !engine.caches.entity_by_qname.contains_key("public.orig"),
+        engine.get_by_name("public", "orig").is_none(),
         "the outgoing name must be unmapped"
     );
     assert_eq!(

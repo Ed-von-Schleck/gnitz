@@ -900,27 +900,19 @@ fn target_kind(shared: &Shared, target_id: u64, access: Access) -> Result<Relati
 /// The relation id a RESOLVE names, unvalidated when the client sent an id; `None`
 /// when its qualified name names none. `Err` when the name's schema does not exist.
 fn resolve_request_target(shared: &Rc<Shared>, target_id: u64, name_blob: &[u8]) -> Result<Option<u64>, WireFault> {
-    let candidate = if name_blob.is_empty() {
-        target_id
-    } else {
-        let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
-        match shared.cat().entity_id_by_qname(qname) {
-            Some(tid) => tid,
-            None => {
-                let (schema_name, _) = qname
-                    .split_once('.')
-                    .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
-                if !shared.cat().has_schema(schema_name) {
-                    return Err(WireFault {
-                        status: WireStatus::NotFound,
-                        text: format!("schema '{schema_name}' not found"),
-                    });
-                }
-                return Ok(None);
-            }
-        }
-    };
-    Ok(Some(candidate))
+    if name_blob.is_empty() {
+        return Ok(Some(target_id));
+    }
+    let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
+    let (schema_name, name) = qname
+        .split_once('.')
+        .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
+    let cat = shared.cat();
+    let sid = cat.schema_id(schema_name).ok_or_else(|| WireFault {
+        status: WireStatus::NotFound,
+        text: format!("schema '{schema_name}' not found"),
+    })?;
+    Ok(cat.relation_id(sid, name))
 }
 
 /// Answer a RESOLVE with the relation's schema block and descriptor.

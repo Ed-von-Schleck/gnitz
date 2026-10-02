@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{idx_tab_batch, push_sys_row, table_tab_batch};
+use crate::test_support::{idx_tab_batch, push_sys_row, push_view_tab_row, table_tab_batch};
 use gnitz_wire::IndexProps;
 use gnitz_zset::repr::BatchBuilder;
 
@@ -111,4 +111,48 @@ fn read_idx_tab_row_refuses_an_unpacked_column_list() {
         read_idx_tab_row(&bb.finish(), 0).unwrap_err(),
         "column list word carries no packed-list flag"
     );
+}
+
+/// A chain segment is planner-minted, so its VIEW_TAB row carries no WITH option;
+/// a user view's may.
+#[test]
+fn read_rel_row_refuses_a_segment_with_an_option() {
+    let row = |owner_view_id: u64| {
+        let mut bb = BatchBuilder::new(SysFamily::View.schema());
+        push_view_tab_row(&mut bb, 1, 30, "seg", 4 << 20, 0, owner_view_id);
+        bb.finish()
+    };
+    let err = read_rel_row(SysFamily::View, &row(29), 0).map(drop).unwrap_err();
+    assert_eq!(
+        err,
+        "catalog invariant violated: internal segment 'seg' (id=30) carries a WITH option"
+    );
+    let user = row(0);
+    let rel = read_rel_row(SysFamily::View, &user, 0).map_err(drop).unwrap();
+    assert!(rel.kind.is_bounded());
+    assert_eq!(rel.to_string(), "view 'seg' (id=30)");
+}
+
+/// A stream's PK repeats; a base table's does not.
+#[test]
+fn read_rel_row_reports_a_streams_pk_as_repeating() {
+    let row = |stream: bool| {
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        let row = TableTabRow {
+            table_id: 40,
+            schema_id: PUBLIC_SCHEMA_ID,
+            name: "events",
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
+            flags: gnitz_wire::TableProps { stream, ..Default::default() }.pack(),
+        };
+        write_table_tab_row(&mut bb, &row, 1);
+        bb.finish()
+    };
+    for stream in [true, false] {
+        let batch = row(stream);
+        let rel = read_rel_row(SysFamily::Table, &batch, 0).map_err(drop).unwrap();
+        assert_eq!(rel.kind == RelationKind::Stream, stream);
+        assert_eq!(rel.facts().pk_repeats, stream);
+        assert!(!rel.facts().serial);
+    }
 }

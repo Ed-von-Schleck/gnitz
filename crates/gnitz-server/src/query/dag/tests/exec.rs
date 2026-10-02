@@ -3,8 +3,7 @@
 use super::*;
 use crate::catalog::{CatalogColumn, CatalogEngine};
 use crate::test_support::{
-    circuit_batch, col_def, make_batch, register_identity_view, scan_all, scanning_circuit, scratch_dir,
-    try_register_view, zset_of, LocalDrive, RowKey,
+    col_def, make_batch, register_identity_view, scan_all, scratch_dir, try_register_view, zset_of, LocalDrive, RowKey,
 };
 use gnitz_store::relation::Relation;
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -105,8 +104,7 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     let step = |view, producer| Step { view, producer };
     let mut dag = DagEngine::default();
     for (view, sources) in [(2, &[1][..]), (3, &[1]), (4, &[2, 3]), (5, &[4]), (7, &[6])] {
-        dag.apply_circuit_delta(&circuit_batch(view, &scanning_circuit(sources)))
-            .unwrap();
+        dag.dep.link(view, sources.iter().copied());
     }
 
     let every = [step(2, 1), step(3, 1), step(4, 2), step(4, 3), step(5, 4)];

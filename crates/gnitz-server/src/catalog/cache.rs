@@ -2,9 +2,9 @@ use super::*;
 use gnitz_expr::payload_str;
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{RelDescriptorBlob, RelIndex};
-use gnitz_wire::{IDXTAB_PAY_NAME, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::FxHashMap;
-use std::hash::Hash;
+use std::collections::hash_map::Entry;
 
 // ---------------------------------------------------------------------------
 // CatalogCacheSet — all typed caches for one CatalogEngine
@@ -21,8 +21,8 @@ pub(in crate::catalog) struct RelFacts {
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
-    /// The relation's named record — the one every client-bound reply and every
-    /// push/DDL SAL slot carries.
+    /// The relation's named record — the one a RESOLVE reply and every push/DDL
+    /// SAL slot carries.
     pub(in crate::catalog) record: Rc<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
@@ -35,21 +35,6 @@ pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> R
         defs.iter().map(|c| c.def.block_col()),
         pk,
     ))
-}
-
-impl RelationEntry {
-    pub(in crate::catalog) fn new(pk: &[u32], defs: &[CatalogColumn], fks: Vec<FkEdge>, facts: RelFacts) -> Self {
-        RelationEntry {
-            record: encode_record(pk, defs),
-            fks,
-            facts,
-        }
-    }
-
-    /// Re-encode the record for a changed column set.
-    pub(in crate::catalog) fn reschema(&mut self, pk: &[u32], defs: &[CatalogColumn]) {
-        self.record = encode_record(pk, defs);
-    }
 }
 
 impl CatalogEngine {
@@ -104,53 +89,57 @@ impl CatalogEngine {
 
 #[derive(Default)]
 pub(in crate::catalog) struct CatalogCacheSet {
+    /// SCHEMA_TAB by name.
     pub(in crate::catalog) schema_by_name: FxHashMap<String, u64>,
-    pub(in crate::catalog) schema_by_id: FxHashMap<u64, String>,
-    pub(in crate::catalog) entity_by_qname: FxHashMap<String, u64>,
-    pub(in crate::catalog) index_by_name: FxHashMap<String, u64>,
+    /// TABLE_TAB and VIEW_TAB by `(schema_id, name)`. A schema's entry exists only
+    /// while it holds a relation.
+    pub(in crate::catalog) relation_by_name: FxHashMap<u64, FxHashMap<String, u64>>,
     pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
     pub(in crate::catalog) fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
 }
 
 // ---------------------------------------------------------------------------
-// Cache delta appliers on CatalogEngine
+// Name-index delta appliers on CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// Apply `batch` to a map holding one `row(i)` entry per live row. Retractions go
-/// first: one delta may hand a key from one row to another.
-fn apply_map_delta<K: Eq + Hash, V>(map: &mut FxHashMap<K, V>, batch: &Batch, row: impl Fn(usize) -> (K, V)) {
-    for i in batch.retracted_rows() {
-        map.remove(&row(i).0);
-    }
-    for i in batch.live_rows() {
-        let (k, v) = row(i);
-        map.insert(k, v);
-    }
-}
-
 impl CatalogEngine {
-    pub(in crate::catalog) fn apply_schema_caches(&mut self, batch: &Batch) {
-        let name = |i| payload_string(batch, i, SCHEMATAB_PAY_NAME);
-        let sid = |i| batch.get_pk(i) as u64;
-        apply_map_delta(&mut self.caches.schema_by_name, batch, |i| (name(i), sid(i)));
-        apply_map_delta(&mut self.caches.schema_by_id, batch, |i| (sid(i), name(i)));
+    // Both appliers retract first: one delta may hand a name from one row to another.
+
+    pub(in crate::catalog) fn apply_schema_names(&mut self, batch: &Batch) {
+        let names = &mut self.caches.schema_by_name;
+        for i in batch.retracted_rows() {
+            names.remove(payload_str(batch, i, SCHEMATAB_PAY_NAME));
+        }
+        for i in batch.live_rows() {
+            names.insert(payload_string(batch, i, SCHEMATAB_PAY_NAME), batch.get_pk(i) as u64);
+        }
     }
 
     /// TABLE_TAB and VIEW_TAB share the leading `(schema_id, name)` payload prefix.
-    pub(in crate::catalog) fn apply_entity_caches(&mut self, batch: &Batch) {
-        let CatalogCacheSet { schema_by_id, entity_by_qname, .. } = &mut self.caches;
-        apply_map_delta(entity_by_qname, batch, |i| {
-            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID);
-            let schema = schema_by_id.get(&sid).expect("a relation row names a live schema");
-            let qualified = gnitz_wire::qualified_key(schema, payload_str(batch, i, RELTAB_PAY_NAME));
-            (qualified, batch.get_pk(i) as u64)
-        });
-    }
-
-    pub(in crate::catalog) fn apply_index_caches(&mut self, batch: &Batch) {
-        apply_map_delta(&mut self.caches.index_by_name, batch, |i| {
-            (payload_string(batch, i, IDXTAB_PAY_NAME), batch.get_pk(i) as u64)
-        });
+    pub(in crate::catalog) fn apply_relation_names(&mut self, batch: &Batch) {
+        let key = |i| {
+            (
+                payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID),
+                payload_str(batch, i, RELTAB_PAY_NAME),
+            )
+        };
+        let by_schema = &mut self.caches.relation_by_name;
+        for i in batch.retracted_rows() {
+            let (sid, name) = key(i);
+            if let Entry::Occupied(mut names) = by_schema.entry(sid) {
+                names.get_mut().remove(name);
+                if names.get().is_empty() {
+                    names.remove();
+                }
+            }
+        }
+        for i in batch.live_rows() {
+            let (sid, name) = key(i);
+            by_schema
+                .entry(sid)
+                .or_default()
+                .insert(name.to_string(), batch.get_pk(i) as u64);
+        }
     }
 }

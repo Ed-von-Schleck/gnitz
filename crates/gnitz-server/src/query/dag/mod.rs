@@ -65,8 +65,8 @@ pub(crate) struct DagEngine {
 impl DagEngine {
     // ── Registration ────────────────────────────────────────────────────
 
-    /// Derive `view_id`'s routing metadata, keep it until [`Self::forget`], and
-    /// answer the placement its store registers under.
+    /// Derive `view_id`'s routing metadata and link it to its sources, both kept until
+    /// [`Self::forget`], and answer the placement its store registers under.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
@@ -74,13 +74,19 @@ impl DagEngine {
         view: &SchemaDescriptor,
     ) -> Result<Placement, String> {
         let loaded = compiler::load_circuit(registry, view_id)?;
+        // Tick scheduling and backfill take ascending id order as dependency order.
+        if let Some(src) = loaded.sources().find(|&s| s >= view_id) {
+            return Err(format!("scans relation {src}, which is not older than it"));
+        }
         let (meta, placement) = ViewMeta::derive(&loaded, registry, view)?;
+        self.dep.link(view_id, loaded.sources());
         self.views.insert(view_id, RegisteredView { meta, plan: None });
         Ok(placement)
     }
 
     /// Drop everything this layer holds for relation `id`.
     pub(crate) fn forget(&mut self, id: u64) {
+        self.dep.unlink(id);
         self.views.remove(&id);
         self.rebuild.remove(&id);
     }

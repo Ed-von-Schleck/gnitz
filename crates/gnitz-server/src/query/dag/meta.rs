@@ -3,8 +3,8 @@
 use super::*;
 use std::collections::hash_map::Entry;
 
-/// The bidirectional view-dependency index, kept current by every `CIRCUIT_TAB` delta.
-/// A `forward` / `reverse` entry exists only while it holds an id.
+/// The bidirectional view-dependency index, kept current by every view registration
+/// and drop. A `forward` / `reverse` entry exists only while it holds an id.
 #[derive(Default)]
 pub(super) struct DepMap {
     /// source_table_id → [view_ids]
@@ -14,33 +14,27 @@ pub(super) struct DepMap {
 }
 
 impl DepMap {
-    /// Apply one `CIRCUIT_TAB` delta: a `-1` forgets its view, a `+1` links its view
-    /// to each source the circuit scans. Either may repeat.
-    fn apply(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in batch.retracted_rows() {
-            let view = batch.get_pk(i) as u64;
-            for source in self.reverse.remove(&view).into_iter().flatten() {
-                if let Entry::Occupied(mut views) = self.forward.entry(source) {
-                    views.get_mut().retain(|&v| v != view);
-                    if views.get().is_empty() {
-                        views.remove();
-                    }
+    /// Link `view` to each relation its circuit scans. A source may repeat.
+    pub(super) fn link(&mut self, view: u64, sources: impl Iterator<Item = u64>) {
+        for source in sources {
+            let srcs = self.reverse.entry(view).or_default();
+            if !srcs.contains(&source) {
+                srcs.push(source);
+                self.forward.entry(source).or_default().push(view);
+            }
+        }
+    }
+
+    /// Forget `view`'s edges.
+    pub(super) fn unlink(&mut self, view: u64) {
+        for source in self.reverse.remove(&view).into_iter().flatten() {
+            if let Entry::Occupied(mut views) = self.forward.entry(source) {
+                views.get_mut().retain(|&v| v != view);
+                if views.get().is_empty() {
+                    views.remove();
                 }
             }
         }
-        for i in batch.live_rows() {
-            let view = batch.get_pk(i) as u64;
-            let cell = gnitz_expr::payload_bytes(batch, i, gnitz_wire::CIRCTAB_PAY_CIRCUIT);
-            let circuit = gnitz_wire::Circuit::decode(cell).map_err(|e| format!("view {view}: {e}"))?;
-            for source in circuit.sources() {
-                let srcs = self.reverse.entry(view).or_default();
-                if !srcs.contains(&source) {
-                    srcs.push(source);
-                    self.forward.entry(source).or_default().push(view);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Every id one or more edges from some seed over one half of the map — a
@@ -61,11 +55,6 @@ impl DepMap {
 
 impl DagEngine {
     // ── Dependency map ──────────────────────────────────────────────────
-
-    /// Apply one `CIRCUIT_TAB` delta to the dependency map.
-    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) -> Result<(), String> {
-        self.dep.apply(batch)
-    }
 
     /// The views that scan `id` directly. Empty when none do.
     pub(crate) fn dependents_of(&self, id: u64) -> &[u64] {
@@ -98,19 +87,42 @@ impl DagEngine {
     /// The base tables — not streams — that `seeds`' source chains reach through
     /// view sources, sorted.
     pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<u64>) -> Vec<u64> {
-        let mut bases: Vec<u64> = self
-            .source_closure(seeds)
-            .into_iter()
-            .filter(|&s| {
-                registry
-                    .relation(s)
-                    .map(Relation::kind)
-                    .is_some_and(|k| k.is_base_table())
-            })
-            .collect();
-        bases.sort_unstable();
-        bases
+        base_tables_among(registry, self.source_closure(seeds))
     }
+
+    /// The base tables the circuits of `circuits` — a `CIRCUIT_TAB` delta not applied
+    /// yet — reach through view sources, sorted.
+    pub(crate) fn base_tables_scanned_by(
+        &self,
+        registry: &RelationRegistry,
+        circuits: &Batch,
+    ) -> Result<Vec<u64>, String> {
+        let mut reached = FxHashSet::default();
+        for i in circuits.live_rows() {
+            let cell = gnitz_expr::payload_bytes(circuits, i, gnitz_wire::CIRCTAB_PAY_CIRCUIT);
+            let circuit =
+                gnitz_wire::Circuit::decode(cell).map_err(|e| format!("view {}: {e}", circuits.get_pk(i) as u64))?;
+            reached.extend(circuit.sources());
+        }
+        let through_views = self.source_closure(reached.iter().copied().collect());
+        reached.extend(through_views);
+        Ok(base_tables_among(registry, reached))
+    }
+}
+
+/// The base tables — not streams — among `ids`, sorted.
+fn base_tables_among(registry: &RelationRegistry, ids: FxHashSet<u64>) -> Vec<u64> {
+    let mut bases: Vec<u64> = ids
+        .into_iter()
+        .filter(|&s| {
+            registry
+                .relation(s)
+                .map(Relation::kind)
+                .is_some_and(|k| k.is_base_table())
+        })
+        .collect();
+    bases.sort_unstable();
+    bases
 }
 
 // ---------------------------------------------------------------------------

@@ -56,98 +56,113 @@ use gnitz_wire::{unpack_pk_cols, PkListRole};
 // after one named field reads it through that field's `*_PAY_*` constant
 // instead.
 //
-// The two relation families decode a wire `Batch`, which is what every caller
-// holds; the rest are generic over `RowSource`, so a stored row or a positioned
-// cursor decodes too.
+// `read_rel_row` decodes both relation families off a wire `Batch`, which is
+// what every caller holds; the rest are generic over `RowSource`, so a stored
+// row or a positioned cursor decodes too.
 // ---------------------------------------------------------------------------
 
-/// What `register_relation` needs to build and register one relation: the values
-/// decoded off its TABLE_TAB / VIEW_TAB row.
-pub(super) struct RelationRegistration<'a> {
-    pub(super) kind: RelationKind,
+/// A TABLE_TAB or VIEW_TAB row as decoded.
+pub(super) struct RelRow<'a> {
     pub(super) id: u64,
     pub(super) schema_id: u64,
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
-    /// `Some` off a TABLE_TAB row; `None` for a view, whose placement its
-    /// circuit decides.
-    pub(super) distribution: Option<TableDistribution>,
-    pub(super) facts: RelFacts,
+    pub(super) kind: RelationKind,
+    pub(super) detail: RelDetail,
 }
 
-/// Decode TABLE_TAB `row` into the whole registration it describes, `id` off the
-/// row's own PK included. The raw `flags` word does not escape, so the
-/// rejections below hold on the paths that bypass the precheck too.
-pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRegistration<'_>, String> {
-    let name = payload_str(batch, row, RELTAB_PAY_NAME);
-    let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS))
-        .map_err(|e| format!("catalog invariant violated: relation '{name}' {e}"))?;
-    let kind = if props.stream {
-        RelationKind::Stream
-    } else {
-        RelationKind::BaseTable
-    };
-    let noun = kind.noun();
-    let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX)).map_err(|rule| {
-        format!(
-            "catalog invariant violated: {noun} '{name}' {}",
-            rule.for_role(PkListRole::PrimaryKey)
-        )
-    })?;
-    props
-        .validate(pk.as_slice().len())
-        .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
-    Ok(RelationRegistration {
-        kind,
-        id: batch.get_pk(row) as u64,
-        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
-        name,
-        pk,
-        distribution: Some(props.distribution),
-        facts: RelFacts {
+pub(super) enum RelDetail {
+    Table {
+        distribution: TableDistribution,
+        serial: bool,
+    },
+    /// `owner_view_id` is the user view this row is a chain segment of; `0` for a
+    /// user view.
+    View { owner_view_id: u64, pk_repeats: bool },
+}
+
+impl RelRow<'_> {
+    pub(super) fn facts(&self) -> RelFacts {
+        match self.detail {
             // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-            pk_repeats: props.stream,
-            serial: props.serial,
-        },
-    })
+            RelDetail::Table { serial, .. } => RelFacts {
+                pk_repeats: self.kind == RelationKind::Stream,
+                serial,
+            },
+            RelDetail::View { pk_repeats, .. } => RelFacts { pk_repeats, serial: false },
+        }
+    }
 }
 
-/// A VIEW_TAB row as decoded.
-pub(super) struct ViewRegistration<'a> {
-    pub(super) schema_id: u64,
-    pub(super) name: &'a str,
-    pub(super) pk: PkColList,
-    pub(super) props: ViewProps,
-    /// The user view this row is an internal chain segment of; `0` for a user
-    /// view.
-    pub(super) owner_view_id: u64,
-    /// [`gnitz_wire::ViewFlags::pk_repeats`].
-    pub(super) pk_repeats: bool,
+/// `table 'orders' (id=17)` — the subject of a registration or precheck message.
+impl std::fmt::Display for RelRow<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} '{}' (id={})", self.kind.noun(), self.name, self.id)
+    }
 }
 
-/// Decode VIEW_TAB `row`.
-pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistration<'_>, String> {
+/// Decode row `row` of relation family `family` (Table or View). The raw `flags`
+/// word does not escape, so the rejections below hold for every caller.
+pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
+    let id = batch.get_pk(row) as u64;
     let name = payload_str(batch, row, RELTAB_PAY_NAME);
-    let pk = unpack_pk_cols(payload_u64(batch, row, VIEWTAB_PAY_PK_COL_IDX)).map_err(|rule| {
-        format!(
-            "catalog invariant violated: view '{name}' {}",
-            rule.for_role(PkListRole::PrimaryKey)
-        )
-    })?;
-    let props = ViewProps::from_row(
-        payload_u64(batch, row, VIEWTAB_PAY_CAPACITY),
-        payload_u64(batch, row, VIEWTAB_PAY_DELTA),
-    )
-    .map_err(|e| format!("view '{name}': {e}"))?;
-    let flags = gnitz_wire::ViewFlags::from_flags(payload_u64(batch, row, VIEWTAB_PAY_FLAGS))
-        .map_err(|e| format!("catalog invariant violated: view '{name}' {e}"))?;
-    Ok(ViewRegistration {
+    let violated = |noun: &str, e: String| format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}");
+    let pk_list = |noun: &str, pi: usize| {
+        unpack_pk_cols(payload_u64(batch, row, pi))
+            .map_err(|rule| violated(noun, rule.for_role(PkListRole::PrimaryKey)))
+    };
+    let (pk, kind, detail) = match family {
+        SysFamily::Table => {
+            let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS))
+                .map_err(|e| violated(family.row_noun(), e))?;
+            let kind = if props.stream {
+                RelationKind::Stream
+            } else {
+                RelationKind::BaseTable
+            };
+            let pk = pk_list(kind.noun(), TABTAB_PAY_PK_COL_IDX)?;
+            props
+                .validate(pk.as_slice().len())
+                .map_err(|e| violated(kind.noun(), e))?;
+            let detail = RelDetail::Table {
+                distribution: props.distribution,
+                serial: props.serial,
+            };
+            (pk, kind, detail)
+        }
+        SysFamily::View => {
+            let noun = family.row_noun();
+            let pk = pk_list(noun, VIEWTAB_PAY_PK_COL_IDX)?;
+            let props = ViewProps::from_row(
+                payload_u64(batch, row, VIEWTAB_PAY_CAPACITY),
+                payload_u64(batch, row, VIEWTAB_PAY_DELTA),
+            )
+            .map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
+            let flags = gnitz_wire::ViewFlags::from_flags(payload_u64(batch, row, VIEWTAB_PAY_FLAGS))
+                .map_err(|e| violated(noun, e))?;
+            let owner_view_id = payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID);
+            // A chain segment is a relation the planner mints, never one an option
+            // clause may name.
+            if props != ViewProps::Plain && owner_view_id != 0 {
+                return Err(format!(
+                    "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
+                ));
+            }
+            let detail = RelDetail::View {
+                owner_view_id,
+                pk_repeats: flags.pk_repeats,
+            };
+            (pk, RelationKind::View(props), detail)
+        }
+        _ => unreachable!("{} is not a relation family", family.name()),
+    };
+    Ok(RelRow {
+        id,
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
         name,
         pk,
-        props,
-        owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID),
-        pk_repeats: flags.pk_repeats,
+        kind,
+        detail,
     })
 }
 
@@ -479,9 +494,7 @@ impl SysFamily {
     }
 
     /// Topological creation priority: lower = created first, destroyed last.
-    /// A creating `DDL_TXN` bundle ingests ascending, so every register hook
-    /// sees its dependencies in the memtable; an all-negative one descending,
-    /// retiring a dependent before what it depends on.
+    /// `apply_bundle` and `replay_catalog` walk it.
     #[inline]
     pub(crate) fn topo_priority(self) -> u8 {
         match self {
@@ -513,7 +526,8 @@ impl SysFamily {
 
     /// The lowest id a client may write in this family's id space; everything
     /// below is bootstrap-owned. Read against [`Self::leading_id`], so Column's
-    /// floor is its owner's. `None` where the PK is no id space at all.
+    /// floor is its owner's. `None` for Circuit, whose rows `check_circuit_rows`
+    /// ties to a view this bundle creates.
     pub(super) fn first_user_id(self) -> Option<u64> {
         match self {
             SysFamily::Schema => Some(gnitz_wire::FIRST_USER_SCHEMA_ID),

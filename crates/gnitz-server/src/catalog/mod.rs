@@ -5,15 +5,11 @@
 //! # Hook model
 //!
 //! Every system-table write flows through
-//! [`fire_hooks`](CatalogEngine::fire_hooks), which dispatches a static
-//! per-family sequence of two kinds of handler over the batch:
-//!
-//! * `apply_*` — pure cache-delta appliers.
-//! * `hook_*` — side effects: directories, stores, DAG registrations, derived
-//!   state. They write no system rows.
-//!
-//! See `hooks.rs` for the cross-family ordering contract and where it is
-//! enforced.
+//! [`fire_hooks`](CatalogEngine::fire_hooks), which runs, per family, that family's
+//! name index and its register hook. A registration reads the relation's COL_TAB
+//! rows, and a view's its CIRCUIT_TAB row, from the store, so those families are
+//! applied first — by `apply_bundle` for a live bundle, `replay_catalog` at boot,
+//! `with_owned_retractions` for a drop's owned rows.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its

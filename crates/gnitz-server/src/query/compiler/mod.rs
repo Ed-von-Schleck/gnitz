@@ -50,6 +50,11 @@ const _: () = assert!(2 * MAX_CIRCUIT_NODES <= u16::MAX as usize);
 pub(super) struct LoadedCircuit(gnitz_wire::Circuit);
 
 impl LoadedCircuit {
+    /// Every relation the circuit scans, once per scan.
+    pub(in crate::query) fn sources(&self) -> impl Iterator<Item = u64> + '_ {
+        self.0.sources()
+    }
+
     fn len(&self) -> usize {
         self.0.nodes().len()
     }

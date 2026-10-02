@@ -83,27 +83,21 @@ impl CatalogEngine {
 
     // -- Registry query methods -----------------------------------------------
 
-    pub(crate) fn has_schema(&self, name: &str) -> bool {
-        self.caches.schema_by_name.contains_key(name)
+    /// The id of schema `name`.
+    pub(crate) fn schema_id(&self, name: &str) -> Option<u64> {
+        self.caches.schema_by_name.get(name).copied()
     }
 
-    /// The live rows of relation family `family` (Table or View) in schema `sid`.
-    pub(in crate::catalog) fn schema_members(&self, family: SysFamily, sid: u64) -> Batch {
-        self.sys_rows_where(family, |s, i| {
-            payload_u64(s, i, gnitz_wire::RELTAB_PAY_SCHEMA_ID) == sid
-        })
+    /// The id of relation `name` in schema `schema_id`.
+    pub(crate) fn relation_id(&self, schema_id: u64, name: &str) -> Option<u64> {
+        self.caches.relation_by_name.get(&schema_id)?.get(name).copied()
     }
 
-    /// Raise the id counter past the id leading each of `batch`'s `rows`, when
+    /// Raise the id counter past the id leading each of `batch`'s rows, when
     /// `family` allocates ids.
-    pub(in crate::catalog) fn raise_next_id(
-        &mut self,
-        family: SysFamily,
-        batch: &Batch,
-        rows: impl Iterator<Item = usize>,
-    ) {
+    pub(in crate::catalog) fn raise_next_id(&mut self, family: SysFamily, batch: &Batch) {
         if family.allocates_ids() {
-            for i in rows {
+            for i in 0..batch.len() {
                 let id = family.leading_id(batch.get_pk(i));
                 self.next_id = self.next_id.max(id.saturating_add(1));
             }
@@ -119,6 +113,13 @@ impl CatalogEngine {
         Ok(base)
     }
 
+    /// The name of schema `sid`, from its live SCHEMA_TAB row.
+    pub(in crate::catalog) fn schema_name(&self, sid: u64) -> Option<String> {
+        let row = self.live_sys_row(SysFamily::Schema, sid)?;
+        let (src, ri) = row.source();
+        Some(payload_string(src, ri, gnitz_wire::SCHEMATAB_PAY_NAME))
+    }
+
     /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
     /// `sys_views` row; `"?"` for a part the catalog has no entry for.
     pub(crate) fn qualified_name_or_unknown(&self, table_id: u64) -> (String, String) {
@@ -130,8 +131,8 @@ impl CatalogEngine {
         };
         let (src, ri) = row.source();
         let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID);
-        let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
-        (schema.to_string(), payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
+        let schema = self.schema_name(sid).unwrap_or_else(|| "?".into());
+        (schema, payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
     }
 
     /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.
@@ -149,11 +150,6 @@ impl CatalogEngine {
             .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.def.name.as_str()))
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    /// The entity id registered under a canonical `"schema.relation"` key.
-    pub(crate) fn entity_id_by_qname(&self, qname: &str) -> Option<u64> {
-        self.caches.entity_by_qname.get(qname).copied()
     }
 
     // -- `_sequences` -------------------------------------------------------

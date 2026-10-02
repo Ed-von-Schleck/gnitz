@@ -140,8 +140,8 @@ fn test_failed_create_index_rolls_back() {
         "no half-built index may stay registered"
     );
     assert!(
-        !engine.caches.index_by_name.contains_key(idx_name.as_str()),
-        "index_by_name must not retain a ghost entry"
+        !engine.has_index_by_name(&idx_name),
+        "the name must not resolve to a ghost index"
     );
     assert_eq!(
         idx_weights_for(&engine, failed_idx_id),
@@ -160,7 +160,7 @@ fn test_failed_create_index_rolls_back() {
     // The failed attempt does not block a later index on the same column.
     fs::remove_file(&blocker).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
-    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
+    assert!(engine.has_index_by_name(&idx_name));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -420,7 +420,7 @@ fn test_drop_table_cascades_secondary_index() {
     engine.create_index("public.cascade_tbl", &["val"], false).unwrap();
 
     let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
-    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
+    assert!(engine.has_index_by_name(&idx_name));
     let idx_records_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
     assert!(idx_records_before >= 1);
 
@@ -428,7 +428,7 @@ fn test_drop_table_cascades_secondary_index() {
     engine.drop_table("public.cascade_tbl").unwrap();
 
     assert!(
-        !engine.caches.index_by_name.contains_key(idx_name.as_str()),
+        !engine.has_index_by_name(&idx_name),
         "in-memory index registry must forget the index"
     );
     assert!(!engine.registry.has_id(tid));
@@ -442,7 +442,7 @@ fn test_drop_table_cascades_secondary_index() {
     // the orphaned sys_indices row references tid which no longer exists.
     engine.close();
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine2.caches.index_by_name.contains_key(idx_name.as_str()));
+    assert!(!engine2.has_index_by_name(&idx_name));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -477,7 +477,7 @@ fn test_drop_table_cascades_fk_index() {
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.registry.has_id(child_tid));
     assert!(
-        engine2.index_ids_of(child_tid).is_empty() && !engine2.caches.index_by_name.values().any(|&id| id == child_tid),
+        engine2.index_ids_of(child_tid).is_empty(),
         "no index row may exist for the dropped child"
     );
     engine2.close();
@@ -520,14 +520,8 @@ fn test_drop_table_cascades_multiple_indices() {
     engine.drop_table("public.t").unwrap();
 
     assert!(!engine.registry.has_id(tid), "table DAG entry must be gone");
-    assert!(
-        !engine.has_index_by_name(&name1),
-        "idx1 must be removed from the caches"
-    );
-    assert!(
-        !engine.has_index_by_name(&name2),
-        "idx2 must be removed from the caches"
-    );
+    assert!(!engine.has_index_by_name(&name1), "idx1 must be gone");
+    assert!(!engine.has_index_by_name(&name2), "idx2 must be gone");
     assert!(
         owned_indices(&engine).is_empty(),
         "sys_indices must name no index under the dropped table"
@@ -659,7 +653,6 @@ fn drop_table_removes_the_relation_entry() {
     );
     engine.create_index("public.t", &["val"], false).unwrap();
 
-    // A column rename bumps the registered table's version.
     let rename = col_alter_pair(tid, 1, &col_def("val", TypeCode::I64), |c| c.def.name = "val2".into());
     engine.submit(SysFamily::Column, rename).unwrap();
 

@@ -23,7 +23,7 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, p
 }
 
 /// Register `vid` as a view over `base_tid` whose filter is `pred`, exactly as
-/// the DDL ingest loop does: circuit and columns first, then the VIEW_TAB row
+/// `apply_bundle` does: circuit and columns first, then the VIEW_TAB row
 /// (the hook invariant).
 fn register_filtered_view(engine: &mut CatalogEngine, base_tid: u64, name: &str, pred: &[u8]) -> u64 {
     let vid = engine.next_id;
@@ -105,8 +105,8 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A view bundle whose circuit cell does not decode is refused at that cell, one
-/// whose view the register hook refuses at the view's row, and each compensated:
+/// A view bundle whose circuit cell does not decode, and one whose circuit the
+/// register hook cannot route, are each refused at the view's row and compensated:
 /// no view, no circuit row, and nothing depending on the source.
 #[test]
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
@@ -133,13 +133,11 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
         let _ = engine.drain_pending_broadcasts();
         let vid = engine.next_id;
         engine.write_column_records(vid, &cols).unwrap();
+        engine.submit(SysFamily::Circuit, rows(vid)).unwrap();
         let err = engine
-            .submit(SysFamily::Circuit, rows(vid))
-            .and_then(|()| {
-                assert_eq!(engine.dag.dependents_of(base), [vid], "{want}");
-                engine.submit(SysFamily::View, build_view_tab_row(vid, "v"))
-            })
-            .expect_err("the bundle is refused");
+            .submit(SysFamily::View, build_view_tab_row(vid, "v"))
+            .expect_err("the view's registration is refused");
+        assert!(err.starts_with(&format!("view 'v' (id={vid}) ")), "got: {err}");
         assert!(err.contains(want), "got: {err}");
         engine.compensate_stage_a().unwrap();
 
@@ -156,12 +154,59 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A capacity-bounded view is a leaf even to a view its own bundle creates, and the
+/// refused bundle leaves neither view an edge.
+#[test]
+fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
+    let dir = temp_dir("preflight_bounded_in_bundle");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let base = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let _ = engine.drain_pending_broadcasts();
+    let bounded = engine.allocate_ids(1).unwrap();
+    let over = engine.allocate_ids(1).unwrap();
+
+    let identity = |vid, source| {
+        let circuit = crate::test_support::identity_circuit(source, gnitz_wire::ReadBound::None);
+        crate::test_support::circuit_batch(vid, &circuit)
+    };
+    let mut circuits = identity(bounded, base);
+    circuits.append_batch(&identity(over, bounded));
+    let mut columns = col_tab_batch(bounded, &cols, 1);
+    columns.append_batch(&col_tab_batch(over, &cols, 1));
+    let mut views = BatchBuilder::new(SysFamily::View.schema());
+    push_view_tab_row(&mut views, 1, over, "over", 0, 0, 0);
+    push_view_tab_row(&mut views, 1, bounded, "bounded", 4 << 20, 0, 0);
+
+    let err = engine
+        .apply_bundle(bundle([
+            (SysFamily::Circuit, circuits),
+            (SysFamily::Column, columns),
+            (SysFamily::View, views.finish()),
+        ]))
+        .expect_err("a bounded view is a leaf");
+    assert!(
+        err.contains("reads 'public.bounded', which is a capacity-bounded view"),
+        "got: {err}"
+    );
+    engine.compensate_stage_a().unwrap();
+
+    for id in [base, bounded, over] {
+        assert!(engine.dag.dependents_of(id).is_empty(), "{id}");
+        assert!(engine.dag.sources_of(id).is_empty(), "{id}");
+    }
+    assert!(!engine.registry.has_id(bounded) && !engine.registry.has_id(over));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── The one-bundle replacement ──────────────────────────────────────────────
 
 /// `ALTER VIEW` is one DDL zone: the outgoing view's `-1` and the fresh chain's
 /// `+1` in a single VIEW_TAB batch, so a rejected new definition leaves the old
 /// view untouched. The guard that stands in the way is the qualified-name
-/// collision check — precheck runs before apply, so the caches still map the
+/// collision check — precheck runs before apply, so the name index still maps the
 /// name to the outgoing id. An incumbent this same bundle retires is not a
 /// collision; one it does not retire still is.
 #[test]

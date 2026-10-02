@@ -15,7 +15,7 @@ impl UnreplayedCatalog {
     pub(crate) fn stage(&mut self, table_id: u64, lsn: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
         let engine = &mut self.0;
-        engine.raise_next_id(family, &batch, 0..batch.len());
+        engine.raise_next_id(family, &batch);
         engine.registry.ingest(table_id, batch)?;
         engine.mark_zone_applied(lsn);
         Ok(())
@@ -64,7 +64,6 @@ impl CatalogEngine {
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.enter_relation(
                 family.id(),
-                RelationKind::SystemCatalog,
                 family.schema().pk_cols(),
                 &family.column_defs(),
                 RelFacts::default(),

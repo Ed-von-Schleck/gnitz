@@ -348,14 +348,14 @@ fn test_ddl_sync() {
 
     // Create a schema via normal DDL
     engine.create_schema("app").unwrap();
-    assert!(engine.has_schema("app"));
+    assert!(engine.schema_id("app").is_some());
 
     engine
         .ddl_sync(gnitz_wire::SCHEMA_TAB, schema_tab_batch(&[(100, "synced", 1)]))
         .unwrap();
 
     // Hooks should have registered the schema
-    assert!(engine.has_schema("synced"));
+    assert!(engine.schema_id("synced").is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -414,7 +414,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     let flushed = engine.registry.system_replay_floors()[&gnitz_wire::SCHEMA_TAB];
     assert_eq!(flushed, 500, "the flushed SCHEMA_TAB must dedup the group at lsn 500");
-    assert!(engine.has_schema("synced"));
+    assert!(engine.schema_id("synced").is_some());
 
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
@@ -490,26 +490,27 @@ fn test_fk_index_metadata_queries() {
 
 #[test]
 fn test_dep_map_view_on_view_chain() {
-    // Submitted circuit rows reach the map, and boot replays them into it.
+    // A registered view's edges reach the map, and boot registers them again.
     let dir = temp_dir("dep_map_view_chain");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    write_identity_circuit(&mut engine, 107, 100, gnitz_wire::ReadBound::None);
-    write_identity_circuit(&mut engine, 108, 107, gnitz_wire::ReadBound::None);
-    assert_eq!(engine.dag.dependents_of(107), [108]);
+    let v1 = register_identity_view(&mut engine, tid, "v1", &cols);
+    let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
+    assert_eq!(engine.dag.dependents_of(v1), [v2]);
     engine.close();
 
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.dag.dependents_of(100), [107]);
-    assert_eq!(engine.dag.dependents_of(107), [108]);
-    assert_eq!(engine.dag.sources_of(108), [107]);
+    assert_eq!(engine.dag.dependents_of(tid), [v1]);
+    assert_eq!(engine.dag.dependents_of(v1), [v2]);
+    assert_eq!(engine.dag.sources_of(v2), [v1]);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
 /// A retired view contributes no edges: DROP VIEW and the ALTER VIEW
-/// `replaces` path both retract the outgoing view's circuit rows, and the map
-/// forgets the view with them.
+/// `replaces` path both unregister the outgoing view, and the map forgets it.
 #[test]
 fn test_dep_map_drops_a_retired_views_edges() {
     let dir = temp_dir("dep_map_retired");
@@ -544,9 +545,9 @@ fn test_dep_map_drops_a_retired_views_edges() {
 }
 
 /// The two dependent-view RESTRICTs — DROP TABLE and DROP COLUMN — both read
-/// the CIRCUIT_TAB-backed map.
+/// the dependency map.
 #[test]
-fn test_dependent_view_restricts_fire_from_circuit_rows() {
+fn test_dependent_view_restricts_fire_from_registered_views() {
     let dir = temp_dir("dep_map_restrict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -591,6 +592,70 @@ fn test_circuit_table_surface_introspectable() {
     let pk_bytes = opk_pk(SysFamily::Circuit.schema(), &[107]);
     let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_TAB, &pk_bytes);
     assert_eq!(found.len(), 1, "the circuit row by PK");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── The name indexes ────────────────────────────────────────────────────────
+
+/// A rename hands the relation's id from the old name to the new one, and a
+/// schema's entry goes with its last relation.
+#[test]
+fn the_relation_name_index_follows_renames_and_drops() {
+    let dir = temp_dir("relation_name_index");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    engine.create_schema("s").unwrap();
+    let sid = engine.schema_id("s").unwrap();
+    let cols = vec![col_def("id", TypeCode::U64)];
+    let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
+    let member = engine.create_table("s.only", &cols, &[0]).unwrap();
+    assert_eq!(engine.relation_id(sid, "only"), Some(member));
+    assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "only"), None);
+
+    let pair = table_tab_batch(&[(tid, "orig", -1), (tid, "renamed", 1)]);
+    engine.submit(SysFamily::Table, pair).unwrap();
+    assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "orig"), None);
+    assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "renamed"), Some(tid));
+
+    engine.drop_table("s.only").unwrap();
+    assert!(!engine.caches.relation_by_name.contains_key(&sid));
+    assert!(engine.schema_is_empty("s"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An index name is taken by a live index and by an earlier row of the same batch,
+/// and free again once its index is dropped.
+#[test]
+fn an_index_name_is_claimed_once() {
+    let cols = vec![
+        col_def("id", TypeCode::U64),
+        col_def("a", TypeCode::I64),
+        col_def("b", TypeCode::I64),
+    ];
+    let (mut engine, tid, dir) = table_fixture("index_name_claimed_once", &cols);
+    let index = |engine: &mut CatalogEngine, col: u32, name: &str| {
+        let id = engine.allocate_ids(1).unwrap();
+        idx_tab_batch(id, tid, &[col], name, gnitz_wire::IndexProps::default(), 1)
+    };
+
+    let live = index(&mut engine, 1, "ix");
+    engine.submit(SysFamily::Index, live).unwrap();
+    let second = index(&mut engine, 2, "ix");
+    let err = engine.precheck_family(SysFamily::Index, &second).unwrap_err();
+    assert_eq!(err, "Index already exists: ix");
+
+    let mut twice = index(&mut engine, 2, "other");
+    twice.append_batch(&index(&mut engine, 1, "other"));
+    let err = engine.precheck_family(SysFamily::Index, &twice).unwrap_err();
+    assert_eq!(err, "Index already exists: other");
+
+    engine.drop_index("ix").unwrap();
+    engine
+        .precheck_family(SysFamily::Index, &second)
+        .expect("a dropped index frees its name");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
