@@ -25,7 +25,7 @@ mod wide_pk_validation;
 use super::sys_tables::*;
 use super::*;
 use gnitz_store::relation::{relation_dir, relations_dir, ChildAddr, ChildKind, SecondaryIndex};
-use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
+use gnitz_wire::{PkColList, TypeCode, PK_LIST_PACKED_FLAG};
 use gnitz_zset::schema::Slot;
 
 use std::fs;
@@ -203,14 +203,13 @@ fn ingest_fixture(
 /// `flags` words — the shapes `create_table` cannot make.
 fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    let row = gnitz_wire::sys_rows::TableTabRow {
-        table_id: tid,
-        schema_id: PUBLIC_SCHEMA_ID,
-        name: table_name,
-        pk_col_idx,
-        flags,
-    };
-    gnitz_wire::sys_rows::write_table_tab_row(&mut bb, &row, 1);
+    let sink: &mut dyn gnitz_wire::sys_rows::SysRowSink = &mut bb;
+    sink.begin_row(&[tid as u128], 1);
+    sink.put_u64(PUBLIC_SCHEMA_ID);
+    sink.put_string(table_name);
+    sink.put_u64(pk_col_idx);
+    sink.put_u64(flags);
+    sink.end_row();
     bb.finish()
 }
 
@@ -227,7 +226,7 @@ fn create_flagged_table(
 ) -> u64 {
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, cols).unwrap();
-    let batch = table_tab_row_words(tid, table_name, pack_pk_cols(pk_cols), flags);
+    let batch = table_tab_row_words(tid, table_name, PkColList::from_slice(pk_cols).pack(), flags);
     engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
     tid
 }

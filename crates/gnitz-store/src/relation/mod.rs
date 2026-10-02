@@ -459,21 +459,21 @@ impl RelationRegistry {
     /// slice of the owner, or add a claim to the one already on `cols`. On
     /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
     /// straddle two workers' slices, so only the caller can check it.
-    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: &[u32]) -> Result<(), String> {
+    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
         let owner_schema = self.index_owner(owner)?.schema();
         let entry = self.tables.get_mut(&owner).expect("resolved above");
-        if let Some(ix) = entry.indexes.iter_mut().find(|ix| ix.cols.as_slice() == cols) {
+        if let Some(ix) = entry.indexes.iter_mut().find(|ix| ix.cols == cols) {
             debug_assert!(!ix.claims.contains(&claim), "{claim:?} claimed twice");
             ix.claims.push(claim);
             return Ok(());
         }
-        let (key_spec, index_schema) = index_spec_and_schema(cols, &owner_schema)?;
+        let (key_spec, index_schema) = index_spec_and_schema(cols.as_slice(), &owner_schema)?;
         let mut ix = SecondaryIndex {
-            cols: PkColList::from_slice(cols),
+            cols,
             store: Store::Absent(Box::new(index_schema)),
             key_spec,
             claims: vec![claim],
-            covers_pk: owner_schema.covers_pk(cols),
+            covers_pk: owner_schema.covers_pk(cols.as_slice()),
         };
         if self.residency.owns_stores() {
             ix.store = Store::Held(Box::new(self.open_child(

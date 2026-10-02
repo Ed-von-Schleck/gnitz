@@ -324,8 +324,12 @@ impl PyGnitzClient {
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyScanResult>> {
-        gnitz_wire::validate_pk_col_list(&col_indices, schema.rust.columns.len())
-            .map_err(|e| PyValueError::new_err(format!("seek_by_index: {e}")))?;
+        let cols = PkColList::checked(&col_indices, schema.rust.columns.len()).map_err(|rule| {
+            PyValueError::new_err(format!(
+                "seek_by_index: {}",
+                rule.for_role(gnitz_wire::PkListRole::ColumnList)
+            ))
+        })?;
         if !(1..=col_indices.len()).contains(&key_vals.len()) {
             return Err(PyValueError::new_err(format!(
                 "seek_by_index: key value count {} must be in 1..={}",
@@ -339,7 +343,7 @@ impl PyGnitzClient {
             .map(|(&c, v)| py_key_image(&schema.rust.columns[c as usize], &v))
             .collect::<PyResult<Vec<u128>>>()?;
         let (&last, eq) = keys.split_last().expect("at least one key value");
-        let range = KeyRange::point(PkColList::from_slice(&col_indices), eq, last);
+        let range = KeyRange::point(cols, eq, last);
         if !range.is_exact(|c| schema.rust.columns[c as usize].is_nullable) {
             return Err(PyValueError::new_err(
                 "seek_by_index: the key values stop short of a nullable column, whose NULL rows no walk reaches",

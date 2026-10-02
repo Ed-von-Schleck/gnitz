@@ -199,7 +199,14 @@ fn clones_share_one_blocking_client() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
     let vid = blocking
-        .create_view(&sn, "v", tid, ViewProps::Fed { delta_bytes: 8 << 20 })
+        .create_view(
+            &sn,
+            "v",
+            tid,
+            ViewProps::Fed {
+                delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
+            },
+        )
         .unwrap();
     // A push, then a read against the server: the read drains the pending
     // ticks, so the rounds a mirror reads already exist.

@@ -38,8 +38,12 @@ fn a_circuit_lives_while_one_claim_remains() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     registry.register(table(50, pk_u64_two_i64_schema())).unwrap();
-    registry.add_index(50, index(70, false), &[2]).unwrap();
-    registry.add_index(50, index(71, true), &[2]).unwrap();
+    registry
+        .add_index(50, index(70, false), PkColList::from_slice(&[2]))
+        .unwrap();
+    registry
+        .add_index(50, index(71, true), PkColList::from_slice(&[2]))
+        .unwrap();
     let circuit = |r: &RelationRegistry| r.relation(50).unwrap().index_on(&[2]).map(|ix| ix.is_unique());
     assert_eq!(
         registry.relation(50).unwrap().indexes().len(),
@@ -73,7 +77,9 @@ fn a_master_creates_the_relation_directory_and_no_child() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::master(tmp.path().to_str().unwrap(), 1, StoreConfig::default());
     registry.register(table(50, make_schema_u64_i64())).unwrap();
-    registry.add_index(50, index(999, false), &[1]).unwrap();
+    registry
+        .add_index(50, index(999, false), PkColList::from_slice(&[1]))
+        .unwrap();
     let dir = relation_dir(registry.base_dir(), 50);
     assert!(std::path::Path::new(&dir).is_dir());
     assert_eq!(super::dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
@@ -85,10 +91,18 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     registry.register(table(60, pk_u64_two_i64_schema())).unwrap();
-    registry.add_index(60, index(901, true), &[0]).unwrap(); // exactly the PK
-    registry.add_index(60, index(902, true), &[2, 0]).unwrap(); // the PK plus a payload column
-    registry.add_index(60, index(903, true), &[1]).unwrap(); // the only real check
-    registry.add_index(60, index(904, false), &[2]).unwrap(); // not unique at all
+    registry
+        .add_index(60, index(901, true), PkColList::from_slice(&[0]))
+        .unwrap(); // exactly the PK
+    registry
+        .add_index(60, index(902, true), PkColList::from_slice(&[2, 0]))
+        .unwrap(); // the PK plus a payload column
+    registry
+        .add_index(60, index(903, true), PkColList::from_slice(&[1]))
+        .unwrap(); // the only real check
+    registry
+        .add_index(60, index(904, false), PkColList::from_slice(&[2]))
+        .unwrap(); // not unique at all
 
     let cols: Vec<Vec<u32>> = registry
         .relation(60)
@@ -127,7 +141,9 @@ fn an_upsert_moves_the_index_entry() {
     let mut registry = solo(tmp.path());
     let schema = make_schema_u64_i64();
     registry.register(table(50, schema)).unwrap();
-    registry.add_index(50, index(51, false), &[1]).unwrap();
+    registry
+        .add_index(50, index(51, false), PkColList::from_slice(&[1]))
+        .unwrap();
     registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 10)])).unwrap();
     registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 20)])).unwrap();
 
@@ -147,7 +163,9 @@ fn only_the_ephemeral_round_publishes_an_index() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     registry.register(table(70, make_schema_u64_i64())).unwrap();
-    registry.add_index(70, index(999, false), &[1]).unwrap();
+    registry
+        .add_index(70, index(999, false), PkColList::from_slice(&[1]))
+        .unwrap();
     let dir = registry.child_dir(70, ChildKind::Index(PkColList::from_slice(&[1])));
 
     registry.checkpoint_base().unwrap();

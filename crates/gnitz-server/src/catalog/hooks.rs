@@ -80,7 +80,11 @@ impl CatalogEngine {
         // parent's RESTRICT probe reads the child through it.
         for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
             self.registry
-                .add_index(rel.id, IndexClaim::ForeignKey, &[ci as u32])
+                .add_index(
+                    rel.id,
+                    IndexClaim::ForeignKey,
+                    gnitz_wire::PkColList::from_slice(&[ci as u32]),
+                )
                 .map_err(|e| format!("FK index on column {ci}: {e}"))?;
         }
         Ok(())
@@ -185,13 +189,10 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as u64;
-            let (owner_id, cols, props) = read_idx_tab_row(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
+            let (owner_id, cols, unique) = read_idx_tab_row(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
             if batch.get_weight(i) > 0 {
-                self.registry.add_index(
-                    owner_id,
-                    IndexClaim::Index { id: idx_id, unique: props.is_unique },
-                    cols.as_slice(),
-                )?;
+                self.registry
+                    .add_index(owner_id, IndexClaim::Index { id: idx_id, unique }, cols)?;
             } else {
                 self.registry.release_index(owner_id, idx_id);
             }

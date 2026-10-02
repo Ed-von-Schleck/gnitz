@@ -251,7 +251,7 @@ impl<'c> WorkerProcess<'c> {
             }
 
             SalMessageKind::KeySpans => {
-                let cols = gnitz_wire::unpack_pk_cols(hdr.arg1).map_err(|e| {
+                let cols = gnitz_wire::PkColList::unpack(hdr.arg1).map_err(|e| {
                     format!(
                         "key spans of table {target_id}: {}",
                         e.for_role(gnitz_wire::PkListRole::ColumnList)

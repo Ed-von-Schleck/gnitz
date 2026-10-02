@@ -1,14 +1,6 @@
-//! The system-catalog **row codecs**: one writer per family, taking a struct of
-//! named fields and emitting against the same `*_PAY_*` payload positions the
-//! readers on both sides resolve by name. A family's column list can therefore
-//! be reordered without transposing a writer against its readers.
-//!
-//! One writer per family a client may write — the six [`crate::SYS_FAMILIES`]
-//! entries `SysFamily::client_writable` admits; `SEQ_TAB` is engine-built and
-//! has none. One and not two, because a `-1` row must reproduce its `+1`'s
-//! payload byte-for-byte: the engine's retraction CAS rejects a mismatch, and
-//! only byte-equal `(PK, payload)` rows cancel in the Z-set. A drop and its
-//! create cannot diverge if they are the same code.
+//! The system-catalog **row codecs**: one writer per family a client may write,
+//! so the client's rows and the engine's seed rows are laid out by the same code.
+//! `SEQ_TAB` is engine-built and has none.
 
 /// Where a row codec writes. Both sides already build batches this way — begin a
 /// row with its key and weight, push one value per payload column in schema
@@ -87,22 +79,21 @@ pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64)
 // TABLE_TAB
 // ---------------------------------------------------------------------------
 
-/// One `TABLE_TAB` row. `pk_col_idx` is the packed PK column list
-/// (`pack_pk_cols`); `flags` is packed by `TableProps::pack`.
+/// One `TABLE_TAB` row.
 pub struct TableTabRow<'a> {
     pub table_id: u64,
     pub schema_id: u64,
     pub name: &'a str,
-    pub pk_col_idx: u64,
-    pub flags: u64,
+    pub pk: crate::PkColList,
+    pub props: crate::TableProps,
 }
 
 pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: i64) {
     sink.begin_row(&[r.table_id as u128], weight);
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
-    sink.put_u64(r.pk_col_idx);
-    sink.put_u64(r.flags);
+    sink.put_u64(r.pk.pack());
+    sink.put_u64(r.props.pack());
     sink.end_row();
 }
 
@@ -110,19 +101,19 @@ pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: 
 // VIEW_TAB
 // ---------------------------------------------------------------------------
 
-/// One `VIEW_TAB` row. `pk_col_idx` is the packed view-PK column list
-/// (`pack_pk_cols`).
+/// One `VIEW_TAB` row.
 pub struct ViewTabRow<'a> {
     pub view_id: u64,
     pub schema_id: u64,
     pub name: &'a str,
-    pub pk_col_idx: u64,
+    pub pk: crate::PkColList,
     /// The view's `WITH (…)` budgets; both absent on a chain segment.
     pub props: crate::ViewProps,
     /// The user view this row is an internal chain segment of; `0` is a user
     /// view.
     pub owner_view_id: u64,
-    /// [`crate::ViewFlags::pk_repeats`].
+    /// Two of the view's rows may carry the same PK, or one may stand at weight
+    /// above 1, so its PK region identifies no single row.
     pub pk_repeats: bool,
 }
 
@@ -130,12 +121,12 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
     sink.begin_row(&[r.view_id as u128], weight);
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
-    sink.put_u64(r.pk_col_idx);
+    sink.put_u64(r.pk.pack());
     let (capacity, delta) = r.props.row_words();
     sink.put_u64(capacity);
     sink.put_u64(delta);
     sink.put_u64(r.owner_view_id);
-    sink.put_u64(crate::ViewFlags { pk_repeats: r.pk_repeats }.pack());
+    sink.put_u64(r.pk_repeats as u64);
     sink.end_row();
 }
 
@@ -143,26 +134,21 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
 // IDX_TAB
 // ---------------------------------------------------------------------------
 
-/// One `IDX_TAB` row. `source_col_idx` carries `pack_pk_cols(&col_indices)` for
-/// every index, single- and multi-column alike.
-///
-/// `flags` is the packed word (`IndexProps::pack`), not a decoded struct: a
-/// `-1` echoes back exactly what the reader gave it, and only a byte-equal
-/// payload cancels.
+/// One `IDX_TAB` row: the index `index_id` on `cols` of `owner_id`.
 pub struct IdxTabRow<'a> {
     pub index_id: u64,
     pub owner_id: u64,
-    pub source_col_idx: u64,
+    pub cols: crate::PkColList,
     pub name: &'a str,
-    pub flags: u64,
+    pub is_unique: bool,
 }
 
 pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64) {
     sink.begin_row(&[r.index_id as u128], weight);
     sink.put_u64(r.owner_id);
-    sink.put_u64(r.source_col_idx);
+    sink.put_u64(r.cols.pack());
     sink.put_string(r.name);
-    sink.put_u64(r.flags);
+    sink.put_u64(r.is_unique as u64);
     sink.end_row();
 }
 

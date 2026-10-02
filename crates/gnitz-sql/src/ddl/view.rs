@@ -11,6 +11,8 @@ use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, ViewBundle};
 use gnitz_wire::ViewProps;
+use std::num::NonZeroU64;
+
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
@@ -27,7 +29,7 @@ fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzS
 }
 
 /// The byte count of one size-valued `CREATE VIEW` option.
-fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<u64, GnitzSqlError> {
+fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64, GnitzSqlError> {
     let sqlparser::ast::Expr::Value(ValueWithSpan {
         value: Value::SingleQuotedString(text), ..
     }) = value
@@ -43,7 +45,7 @@ fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<u64, GnitzS
 /// (KB = 2^10). Zero and a `u64`-overflowing product are rejected: a zero
 /// capacity names a store that cannot hold its own skeleton, and a zero delta
 /// budget one that retains nothing.
-fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
+fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
     let bad = || {
         GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
@@ -60,12 +62,11 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
         .find(|(u, _)| unit.eq_ignore_ascii_case(u))
         .map(|&(_, m)| m)
         .ok_or_else(bad)?;
-    match num.checked_mul(mult) {
-        Some(0) | None => Err(GnitzSqlError::Rejected(format!(
+    num.checked_mul(mult).and_then(NonZeroU64::new).ok_or_else(|| {
+        GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
-        ))),
-        Some(bytes) => Ok(bytes),
-    }
+        ))
+    })
 }
 
 /// Reject every `CREATE VIEW` clause the planner does not consume. Exhaustive

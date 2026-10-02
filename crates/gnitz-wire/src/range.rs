@@ -2,7 +2,7 @@
 
 use crate::catalog::PK_LIST_MAX_COLS;
 use crate::codec::{Reader, Wire, Writer};
-use crate::{pack_pk_cols, unpack_pk_cols, PkColList, PkListRole};
+use crate::{PkColList, PkListRole};
 
 const START_AFTER: u8 = 1 << 0;
 const END_AFTER: u8 = 1 << 1;
@@ -34,7 +34,7 @@ impl Cut {
 ///
 /// | bytes        | content                                                  |
 /// |--------------|----------------------------------------------------------|
-/// | 0            | `cols`, packed by `pack_pk_cols`                         |
+/// | 0            | `cols`, packed by `PkColList::pack`                     |
 /// | 8            | `n_eq` — count of equality-pinned leading columns        |
 /// | 9            | cut kinds: bit 0 start is `after`, bit 1 end is `after`  |
 /// | 10 + 16·i    | i-th equality image, LE `u128`                           |
@@ -99,7 +99,7 @@ impl KeyRange {
 impl Wire for KeyRange {
     fn write(&self, w: &mut Writer) {
         let flags = ((self.start.after as u8) * START_AFTER) | ((self.end.after as u8) * END_AFTER);
-        w.u64(pack_pk_cols(self.cols.as_slice())).u8(self.n_eq as u8).u8(flags);
+        w.u64(self.cols.pack()).u8(self.n_eq as u8).u8(flags);
         for v in self.eq_vals() {
             w.u128(*v);
         }
@@ -107,7 +107,7 @@ impl Wire for KeyRange {
     }
 
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
-        let cols = unpack_pk_cols(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
+        let cols = PkColList::unpack(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
         let n_eq = r.u8()? as usize;
         let flags = r.flags(START_AFTER | END_AFTER)?;
         if n_eq >= cols.as_slice().len() {

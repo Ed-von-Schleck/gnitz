@@ -163,8 +163,8 @@ impl CatalogEngine {
             table_id: tid,
             schema_id: sid,
             name: table_name,
-            pk_col_idx: gnitz_wire::pack_pk_cols(pk_cols),
-            flags: props.pack(),
+            pk: gnitz_wire::PkColList::from_slice(pk_cols),
+            props,
         };
         write_table_tab_row(&mut bb, &row, 1);
         self.submit(SysFamily::Table, bb.finish())?;
@@ -223,14 +223,7 @@ impl CatalogEngine {
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
         let index_id = self.allocate_ids(1).unwrap();
 
-        let batch = idx_tab_batch(
-            index_id,
-            owner_id,
-            &col_indices,
-            &index_name,
-            gnitz_wire::IndexProps { is_unique },
-            1,
-        );
+        let batch = idx_tab_batch(index_id, owner_id, &col_indices, &index_name, is_unique, 1);
         // Compensate this DDL alone, as the DDL_TXN handler does a failed bundle:
         // the earlier fixture DDLs are committed, so they sit outside the undo log.
         let committed = std::mem::take(&mut self.pending_broadcasts);
@@ -294,8 +287,8 @@ impl CatalogEngine {
             table_id: tid,
             schema_id,
             name,
-            pk_col_idx: gnitz_wire::pack_pk_cols(pk),
-            flags: gnitz_wire::TableProps::default().pack(),
+            pk: gnitz_wire::PkColList::from_slice(pk),
+            props: gnitz_wire::TableProps::default(),
         };
         write_table_tab_row(&mut bb, &row, 1);
         self.ddl_sync(SysFamily::Table.id(), bb.finish())

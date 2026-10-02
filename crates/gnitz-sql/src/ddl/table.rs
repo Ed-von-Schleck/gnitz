@@ -617,6 +617,33 @@ fn reject_unhonored_table_constraints(constraints: &[sqlparser::ast::TableConstr
 /// Plan a `CREATE TABLE` into the bundle its commit writes; `None` when
 /// `IF NOT EXISTS` finds the name taken. [`collect_declarations`] reads the statement; everything below it
 /// resolves, admits and names.
+/// `Err` unless `cluster` is exactly `pk`'s leading prefix, in PK order: the
+/// distribution key is a leading PK prefix so write-side routing is a byte-slice
+/// of the OPK region. `cols` names a column the PK does not hold.
+fn validate_dist_prefix(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Result<(), GnitzSqlError> {
+    if cluster.is_empty() || cluster.len() > pk.len() {
+        return Err(GnitzSqlError::Rejected(format!(
+            "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
+            pk.len(),
+            cluster.len()
+        )));
+    }
+    if let Some(&c) = cluster.iter().find(|c| !pk.contains(c)) {
+        return Err(GnitzSqlError::Rejected(format!(
+            "CLUSTER BY column '{}' is not a PRIMARY KEY column",
+            cols[c as usize].name
+        )));
+    }
+    if cluster != &pk[..cluster.len()] {
+        return Err(GnitzSqlError::Rejected(
+            "CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
+             in PK order; reorder the PK so the distribution column(s) lead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn plan_create_table(
     create: &sqlparser::ast::CreateTable,
     cat: &Catalog<'_>,
@@ -728,11 +755,10 @@ pub(crate) fn plan_create_table(
                 .ok_or_else(|| GnitzSqlError::Rejected(format!("CLUSTER BY column '{col_name}' not found")))?;
             cluster_indices.push(idx as u32);
         }
-        let prefix_len =
-            gnitz_wire::validate_dist_prefix(pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
+        validate_dist_prefix(cols, pk_indices, &cluster_indices)?;
         // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
         // is lossless.
-        let prefix_len = prefix_len as u8;
+        let prefix_len = cluster_indices.len() as u8;
         if props.distribution == TableDistribution::Replicated {
             return Err(GnitzSqlError::Rejected(gnitz_wire::replicated_with_prefix(prefix_len)));
         }

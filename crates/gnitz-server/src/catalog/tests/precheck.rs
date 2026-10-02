@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::test_support::push_sys_row;
-use gnitz_wire::{CATALOG_ID_CEILING, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID};
+use gnitz_wire::{CATALOG_ID_CEILING, FIRST_USER_TABLE_ID};
 
 #[test]
 fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
@@ -89,10 +89,12 @@ fn only_an_owned_row_refuses_an_unpaired_retraction() {
 fn an_id_outside_a_familys_range_is_rejected_whatever_its_sign() {
     for family in SysFamily::ALL {
         let floor = match family {
-            SysFamily::Schema => FIRST_USER_SCHEMA_ID,
-            SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Index | SysFamily::Sequence => {
-                FIRST_USER_TABLE_ID
-            }
+            SysFamily::Schema
+            | SysFamily::Table
+            | SysFamily::View
+            | SysFamily::Column
+            | SysFamily::Index
+            | SysFamily::Sequence => FIRST_USER_TABLE_ID,
             SysFamily::Circuit => 0,
         };
         assert_eq!(shape(family, &[(floor, 1, "")]), "", "{family:?}");

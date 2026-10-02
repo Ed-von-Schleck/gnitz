@@ -34,7 +34,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ..Default::default()
     }
     .encode();
-    // The first index entry: its packed column list, then its flags word.
+    // The first index entry: its packed column list, then its uniqueness byte.
     let ix = RelDescriptorBlob::default().encode().len();
     let forge = |f: &dyn Fn(&mut Vec<u8>)| {
         let mut b = base.clone();
@@ -59,10 +59,11 @@ fn each_decode_guard_rejects_its_own_forgery() {
             "no packed-list flag",
         ),
         (
-            "index flags",
-            forge(&|b| crate::write_u64_le(b, ix + 8, 2)),
-            "unknown bits",
+            "index repeats a column",
+            forge(&|b| crate::write_u64_le(b, ix, crate::PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11)),
+            "names column 1 twice",
         ),
+        ("is_unique byte 2", forge(&|b| b[ix + 8] = 2), "neither 0 nor 1"),
     ];
     for (what, bytes, want) in cases {
         let err = RelDescriptorBlob::decode(bytes).expect_err(what);

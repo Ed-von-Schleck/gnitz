@@ -154,14 +154,10 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     for (owner_id, cols) in indices
         .creates
         .into_iter()
-        .filter(|(_, _, props)| props.is_unique)
+        .filter(|&(_, _, is_unique)| is_unique)
         .map(|(owner_id, cols, _)| (owner_id, cols))
     {
-        match shared
-            .disp()
-            .validate_unique_index_create(owner_id, cols.as_slice())
-            .await
-        {
+        match shared.disp().validate_unique_index_create(owner_id, cols).await {
             // No catalog mutation yet: just surface the violation to the
             // client. The write lock drops on return.
             Err(e) => return Err(e),

@@ -16,9 +16,9 @@ use gnitz_wire::sys_rows::{ColTabRow, FkRef, IdxTabRow, TableTabRow, ViewTabRow}
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    RelClass, TableProps, ViewProps, CIRCUIT_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
-    COL_TAB, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
-    RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    PkColList, PkListRole, RelClass, TableProps, ViewProps, CIRCUIT_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
+    COLTAB_PAY_NAME, COL_TAB, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -105,7 +105,7 @@ pub struct IndexRow {
     /// The id of the table it indexes.
     pub owner: u64,
     pub name: String,
-    pub cols: gnitz_wire::PkColList,
+    pub cols: PkColList,
     pub is_unique: bool,
 }
 
@@ -174,8 +174,7 @@ pub fn segment_id(j: u64) -> u64 {
 pub struct PlannedView {
     pub circuit: Circuit,
     pub schema: Arc<Schema>,
-    /// [`gnitz_wire::ViewFlags::pk_repeats`], stated by the emitter that minted
-    /// the key.
+    /// [`ViewTabRow::pk_repeats`], stated by the emitter that minted the key.
     pub pk_repeats: bool,
 }
 
@@ -532,10 +531,8 @@ impl GnitzClient {
         is_unique: bool,
     ) -> Result<u64, ClientError> {
         let index_name = gnitz_wire::canonical_identifier(index_name)?;
-        // Arity, 7-bit column range, duplicates — the Err form of the
-        // pack_pk_cols contract, so the pack below can never panic.
-        gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
-            .map_err(|e| ClientError::from(format!("create_index: {e}")))?;
+        let cols = PkColList::checked(col_indices, gnitz_wire::MAX_COLUMNS)
+            .map_err(|rule| ClientError::from(format!("create_index: {}", rule.for_role(PkListRole::ColumnList))))?;
 
         let index_id = self.alloc_id()?;
 
@@ -546,9 +543,9 @@ impl GnitzClient {
             &IdxTabRow {
                 index_id,
                 owner_id: table_id,
-                source_col_idx: gnitz_wire::pack_pk_cols(col_indices),
+                cols,
                 name: &index_name,
-                flags: gnitz_wire::IndexProps { is_unique }.pack(),
+                is_unique,
             },
             1,
         );
@@ -569,7 +566,7 @@ impl GnitzClient {
     pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
         self.drop_index_rows(&[name], "constraint", if_exists, |b, i| {
             payload_u64(b, i, IDXTAB_PAY_OWNER_ID) == tid
-                && gnitz_wire::IndexProps::from_flags(payload_u64(b, i, IDXTAB_PAY_FLAGS)).is_ok_and(|p| p.is_unique)
+                && gnitz_wire::bool_word(payload_u64(b, i, IDXTAB_PAY_IS_UNIQUE)) == Ok(true)
         })
     }
 
@@ -624,17 +621,11 @@ impl GnitzClient {
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
-            let cols =
-                gnitz_wire::unpack_pk_cols(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
-                    ProtocolError::DecodeError(format!(
-                        "index '{name}': {}",
-                        rule.for_role(gnitz_wire::PkListRole::ColumnList)
-                    ))
-                })?;
-            let flags = payload_u64(&idx_batch, i, IDXTAB_PAY_FLAGS);
-            let is_unique = gnitz_wire::IndexProps::from_flags(flags)
-                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?
-                .is_unique;
+            let cols = PkColList::unpack(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
+                ProtocolError::DecodeError(format!("index '{name}': {}", rule.for_role(PkListRole::ColumnList)))
+            })?;
+            let is_unique = gnitz_wire::bool_word(payload_u64(&idx_batch, i, IDXTAB_PAY_IS_UNIQUE))
+                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
             out.push(IndexRow {
                 owner: payload_u64(&idx_batch, i, IDXTAB_PAY_OWNER_ID),
                 name,
@@ -889,11 +880,11 @@ impl GnitzClient {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // Full schema-admissibility rule set (column cap + PK rules), applied
         // here so a caller that skipped the planner gets a clean error before
-        // any id allocation instead of relying on the server-side reject (and
-        // `pack_pk_cols` below can never panic).
+        // any id allocation instead of relying on the server-side reject.
         schema
             .validate()
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
+        let pk = PkColList::from_slice(&schema.pk_cols);
         // Before any id is allocated.
         let pk_cols = schema.pk_cols.iter().map(|&c| &schema.columns[c as usize]);
         props
@@ -919,22 +910,24 @@ impl GnitzClient {
             }
         }
 
-        for spec in unique_indexes {
-            // Structural rules only (arity, in-range, no duplicates) — unlike a
-            // PK, an indexed column may be nullable. They are `pack_pk_cols`'s
-            // precondition.
-            gnitz_wire::validate_pk_col_list(&spec.col_indices, schema.columns.len())
-                .map_err(|msg| ClientError::from(format!("create_table: unique index '{}': {msg}", spec.name)))?;
-        }
+        // Structural rules only (arity, in-range, no duplicates) — unlike a PK,
+        // an indexed column may be nullable.
+        let index_cols = unique_indexes
+            .iter()
+            .map(|spec| {
+                PkColList::checked(&spec.col_indices, schema.columns.len()).map_err(|rule| {
+                    ClientError::from(format!(
+                        "create_table: unique index '{}': {}",
+                        spec.name,
+                        rule.for_role(PkListRole::ColumnList)
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let schema_id = self.lookup_schema_id(&schema_name)?;
         // The table's id, then one per inline UNIQUE index.
         let new_tid = self.alloc(IdRun::Ids(1 + unique_indexes.len() as u64))?;
-
-        // Encode the PK list using the shared wire packer so the engine
-        // catalog decodes it identically. Single-PK callers still flow
-        // through the same packer; there is no second form of the word.
-        let pk_packed = gnitz_wire::pack_pk_cols(&schema.pk_cols);
 
         // COL_TAB family — the server sorts families by topo priority, so it
         // ingests columns before the TABLE_TAB register hook that reads them.
@@ -951,8 +944,8 @@ impl GnitzClient {
                 table_id: new_tid,
                 schema_id,
                 name: &table_name,
-                pk_col_idx: pk_packed,
-                flags: props.pack(),
+                pk,
+                props,
             },
             1,
         );
@@ -963,15 +956,15 @@ impl GnitzClient {
             let mut idx_batch = ZSetBatch::new(idx_schema);
             {
                 let mut a = BatchAppender::new(&mut idx_batch);
-                for (k, spec) in unique_indexes.iter().enumerate() {
+                for (k, &cols) in index_cols.iter().enumerate() {
                     gnitz_wire::sys_rows::write_idx_tab_row(
                         &mut a,
                         &IdxTabRow {
                             index_id: new_tid + 1 + k as u64,
                             owner_id: new_tid,
-                            source_col_idx: gnitz_wire::pack_pk_cols(&spec.col_indices),
+                            cols,
                             name: &index_names[k],
-                            flags: gnitz_wire::IndexProps { is_unique: true }.pack(),
+                            is_unique: true,
                         },
                         1,
                     );
@@ -1039,7 +1032,7 @@ impl GnitzClient {
         }
 
         // Before any allocation, so a bad schema leaves no residue and never
-        // reaches `pack_pk_cols`, which asserts on one.
+        // reaches `PkColList::from_slice`, which panics on one.
         for (k, pv) in bundle.segments.iter().chain([&bundle.view]).enumerate() {
             pv.schema
                 .validate()
@@ -1110,15 +1103,14 @@ impl GnitzClient {
                 gnitz_wire::sys_rows::write_circuit_row(&mut circuit_a, vid, &pv.circuit);
 
                 // 3. View row — the VIEW_TAB register hook triggers server-side
-                // compilation. Encode the view PK with the shared wire packer so the
-                // engine catalog decodes it identically to a TABLE_TAB PK.
+                // compilation.
                 gnitz_wire::sys_rows::write_view_tab_row(
                     &mut view_a,
                     &ViewTabRow {
                         view_id: vid,
                         schema_id,
                         name: &name,
-                        pk_col_idx: gnitz_wire::pack_pk_cols(&pv.schema.pk_cols),
+                        pk: PkColList::from_slice(&pv.schema.pk_cols),
                         props: row_props,
                         owner_view_id,
                         pk_repeats: pv.pk_repeats,

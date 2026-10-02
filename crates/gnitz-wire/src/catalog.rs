@@ -2,7 +2,9 @@
 //! table column lists and IDs, schema sizing caps, and the compound-PK
 //! column-list codec for the persisted `TABLE_TAB.pk_col_idx` u64.
 
-use crate::{ColType, TypeCode, WireProbeMode};
+use std::num::NonZeroU64;
+
+use crate::{ColType, PkListRole, PkRule, TypeCode, WireProbeMode};
 
 // ---------------------------------------------------------------------------
 // System table column descriptors — shared single source of truth
@@ -14,10 +16,8 @@ pub struct WireSysCol {
 }
 
 /// Terse `WireSysCol` constructor so the column tables read as one line per
-/// column. `pub(crate)` — internal to the wire crate;
-/// not part of the public surface. `const` so it is callable in the `pub const`
-/// table initializers (visibility does not affect const-eval).
-pub(crate) const fn col(name: &'static str, type_code: TypeCode) -> WireSysCol {
+/// column.
+const fn col(name: &'static str, type_code: TypeCode) -> WireSysCol {
     WireSysCol { name, type_code }
 }
 
@@ -52,7 +52,7 @@ const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 /// Payload slot of column `name` in system family `id`, whose column list and
 /// key are paired in one place. A PK column or an unknown name is a const-eval
 /// panic.
-pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
+const fn pay_index_in_fam(id: u64, name: &str) -> usize {
     let f = &SYS_FAMILIES[match sys_family_index(id) {
         Some(i) => i,
         None => panic!("not a system family"),
@@ -71,38 +71,31 @@ pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
 // mismatch the wire decode rejects — so neither half is offered separately for a
 // consumer to pair up itself.
 
-/// The primary key of every system table whose key is its single leading column.
-pub(crate) const LEADING_COL_PK: &[u32] = &[0];
-
-/// The primary key of a system table keyed by its two leading columns: COL_TAB's
-/// `(owner_id, col_idx)`.
-pub(crate) const LEADING_PAIR_PK: &[u32] = &[0, 1];
-
-/// The two halves of a `LEADING_PAIR_PK` key, off the widened `u128` a PK
-/// region reads back to. Both columns are `U64` — asserted over
-/// [`SYS_FAMILIES`] below — so the split is exact.
+/// The two halves of a two-column key (COL_TAB's `(owner_id, col_idx)`), off the
+/// widened `u128` a PK region reads back to. Both columns are `U64` — asserted
+/// over [`SYS_FAMILIES`] below — so the split is exact.
 #[inline]
 pub const fn unpack_pair_pk(pk: u128) -> (u64, u64) {
     ((pk >> 64) as u64, pk as u64)
 }
 
-pub(crate) const SCHEMA_TAB_COLS: &[WireSysCol] = &[col("schema_id", TypeCode::U64), col("name", TypeCode::String)];
+const SCHEMA_TAB_COLS: &[WireSysCol] = &[col("schema_id", TypeCode::U64), col("name", TypeCode::String)];
 
-pub(crate) const TABLE_TAB_COLS: &[WireSysCol] = &[
+const TABLE_TAB_COLS: &[WireSysCol] = &[
     col("table_id", TypeCode::U64),
     col("schema_id", TypeCode::U64),
     col("name", TypeCode::String),
-    // Packed PK column list (`pack_pk_cols`).
+    // Packed PK column list (`PkColList::pack`).
     col("pk_col_idx", TypeCode::U64),
     // See `TableProps::pack` for the bit layout.
     col("flags", TypeCode::U64),
 ];
 
-pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
+const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("view_id", TypeCode::U64),
     col("schema_id", TypeCode::U64),
     col("name", TypeCode::String),
-    // Packed view-PK column list (`pack_pk_cols`).
+    // Packed view-PK column list (`PkColList::pack`).
     col("pk_col_idx", TypeCode::U64),
     // `ViewProps::row_words`: `WITH (capacity = …)` in bytes, `0` absent.
     col("capacity_bytes", TypeCode::U64),
@@ -113,13 +106,17 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     // validate it against a forger. Appended, not inserted: the `RELTAB_*`
     // constants below pin `name` to the same slot in TABLE_TAB and VIEW_TAB.
     col("owner_view_id", TypeCode::U64),
-    // See `ViewFlags` for the bit layout.
-    col("flags", TypeCode::U64),
+    // A boolean ([`bool_word`]): two of the view's rows may carry the same PK, or
+    // one may stand at weight above 1, so its PK region identifies no single row —
+    // a view over a stream, one keyed on a join key or a source-PK pair, a top-N
+    // holding more than one slot per partition, or an ALL set operation. The
+    // planner that compiled the view states it; the engine stores it verbatim.
+    col("pk_repeats", TypeCode::U64),
 ];
 
 // Keyed by the compound `(owner_id, col_idx)` — the pair *is* a column record's
 // identity.
-pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
+const COL_TAB_COLS: &[WireSysCol] = &[
     col("owner_id", TypeCode::U64),
     col("col_idx", TypeCode::U64),
     col("name", TypeCode::String),
@@ -136,24 +133,21 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("scale", TypeCode::U64),
 ];
 
-pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
+const IDX_TAB_COLS: &[WireSysCol] = &[
     col("index_id", TypeCode::U64),
     col("owner_id", TypeCode::U64),
-    // Holds `pack_pk_cols(&col_indices)` for every row (single- and
-    // multi-column indexes alike); decoded via `unpack_pk_cols`.
+    // The indexed columns' packed list (`PkColList::pack`), single- and
+    // multi-column indexes alike.
     col("source_col_idx", TypeCode::U64),
     col("name", TypeCode::String),
-    // See `IndexProps::pack` for the bit layout. One word rather than a bool
-    // column per property: the family is scanned whole by `DROP INDEX` and the
-    // planner's name/column probe, so a second `U64` would widen every row for
-    // one bit.
-    col("flags", TypeCode::U64),
+    // A boolean ([`bool_word`]): the index enforces uniqueness.
+    col("is_unique", TypeCode::U64),
 ];
 
-pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[col("seq_id", TypeCode::U64), col("next_val", TypeCode::U64)];
+const SEQ_TAB_COLS: &[WireSysCol] = &[col("seq_id", TypeCode::U64), col("next_val", TypeCode::U64)];
 
 // One row per view: its whole circuit, as `Circuit::encode` lays it out.
-pub(crate) const CIRCUIT_TAB_COLS: &[WireSysCol] = &[col("view_id", TypeCode::U64), col("circuit", TypeCode::Blob)];
+const CIRCUIT_TAB_COLS: &[WireSysCol] = &[col("view_id", TypeCode::U64), col("circuit", TypeCode::Blob)];
 
 // ---------------------------------------------------------------------------
 // Catalog column positions
@@ -176,7 +170,7 @@ pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(VIEW_TAB, "pk_col_idx
 pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in_fam(VIEW_TAB, "capacity_bytes");
 pub const VIEWTAB_PAY_DELTA: usize = pay_index_in_fam(VIEW_TAB, "delta_bytes");
 pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in_fam(VIEW_TAB, "owner_view_id");
-pub const VIEWTAB_PAY_FLAGS: usize = pay_index_in_fam(VIEW_TAB, "flags");
+pub const VIEWTAB_PAY_PK_REPEATS: usize = pay_index_in_fam(VIEW_TAB, "pk_repeats");
 
 // `RELTAB_*`: an address valid in TABLE_TAB and VIEW_TAB alike, for the readers
 // that take either family through one code path. A column at the same slot in
@@ -209,7 +203,7 @@ pub const CIRCTAB_PAY_CIRCUIT: usize = pay_index_in_fam(CIRCUIT_TAB, "circuit");
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
 pub const IDXTAB_PAY_NAME: usize = pay_index_in_fam(IDX_TAB, "name");
-pub const IDXTAB_PAY_FLAGS: usize = pay_index_in_fam(IDX_TAB, "flags");
+pub const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in_fam(IDX_TAB, "is_unique");
 
 pub const SEQTAB_PAY_VALUE: usize = pay_index_in_fam(SEQ_TAB, "next_val");
 
@@ -229,8 +223,8 @@ const fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
     h
 }
 
-/// FNV-1a over one family's stored identity: its id, its shard directory
-/// (`name`), each column's name and type, and its key columns.
+/// FNV-1a over one family's stored identity: its id, its `TABLE_TAB` name, each
+/// column's name and type, and its key columns.
 const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
     let (cols, pk) = (f.cols, f.pk_cols);
     h = (h ^ f.id).wrapping_mul(FNV_PRIME);
@@ -294,7 +288,7 @@ pub const CIRCUIT_TAB: u64 = 11;
 /// instead of being handed a separately-chosen one that may not match.
 pub struct WireSysFamily {
     pub id: u64,
-    /// The table's name, and its subdirectory under the engine's catalog root.
+    /// The family's name in `TABLE_TAB`.
     pub name: &'static str,
     pub cols: &'static [WireSysCol],
     pub pk_cols: &'static [u32],
@@ -306,13 +300,13 @@ const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: 
 
 /// Every system family, in the order both sides index them by.
 pub const SYS_FAMILIES: &[WireSysFamily] = &[
-    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, LEADING_COL_PK),
-    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, LEADING_COL_PK),
-    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, LEADING_COL_PK),
-    fam(COL_TAB, "_columns", COL_TAB_COLS, LEADING_PAIR_PK),
-    fam(IDX_TAB, "_indices", IDX_TAB_COLS, LEADING_COL_PK),
-    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, LEADING_COL_PK),
-    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, LEADING_COL_PK),
+    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, &[0]),
+    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, &[0]),
+    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, &[0]),
+    fam(COL_TAB, "_columns", COL_TAB_COLS, &[0, 1]),
+    fam(IDX_TAB, "_indices", IDX_TAB_COLS, &[0]),
+    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, &[0]),
+    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, &[0]),
 ];
 
 // What `unpack_pair_pk`'s `>> 64` split is written against.
@@ -345,7 +339,6 @@ pub const fn sys_family_index(id: u64) -> Option<usize> {
 }
 
 pub const FIRST_USER_TABLE_ID: u64 = 16;
-pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 
 /// A tripwire on catalog object-id allocation, not a live limit: reaching it
 /// needs 2^31 durable CREATEs. Schema, relation and index ids all live below it,
@@ -394,12 +387,8 @@ pub fn canonical_identifier(name: &str) -> Result<String, String> {
     Ok(name.to_ascii_lowercase())
 }
 
-/// The canonical `"schema.relation"` key, from names **already canonical**.
-///
-/// It must not fold: a mixed-case name that slipped past the engine's
-/// `reject_unstorable_name` would then key the cache while mismatching the store,
-/// turning a loud rejection into silent divergence. `.` is outside
-/// [`is_valid_ident_char`], so no pair can produce another pair's key.
+/// The canonical `"schema.relation"` key, from names **already canonical**. `.`
+/// is outside [`is_valid_ident_char`], so no pair can produce another pair's key.
 pub fn qualified_key(schema_name: &str, name: &str) -> String {
     let mut q = String::with_capacity(schema_name.len() + 1 + name.len());
     q.push_str(schema_name);
@@ -458,12 +447,10 @@ const fn contains_col(cols: &[u32], ci: usize) -> bool {
     false
 }
 
-/// Sizing cap for the compound-PK column list.
-///
-/// Set to 5 to cover the user-facing PK cap (4 columns, planner-enforced)
-/// plus one indexed-column prefix used by secondary index schemas — modeled
-/// as `(indexed_col, src_pk_0, …, src_pk_{k-1})`.
-pub const MAX_PK_COLUMNS: usize = 5;
+/// Sizing cap for an engine schema's PK: the widest user-declared PK plus the one
+/// indexed-column prefix of a secondary index schema — modeled as
+/// `(indexed_col, src_pk_0, …, src_pk_{k-1})`.
+pub const MAX_PK_COLUMNS: usize = PK_LIST_MAX_COLS + 1;
 
 /// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
 /// and the per-column ceiling (16 == max wire stride of any type valid as a
@@ -477,25 +464,19 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 // The only form. A word without the tag is malformed, not a second spelling:
 //        bit 63        : PK_LIST_PACKED_FLAG
 //        bit 62        : reserved
-//        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid; larger
-//                        counts are reserved for tests / malformed payloads)
+//        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid)
 //        bits [4+7i..) : i-th column index, 7 bits each
 //
 // Both client (gnitz-core) and engine (gnitz-server catalog) MUST share this
 // encoder/decoder so they cannot drift on the encoding.
 // ---------------------------------------------------------------------------
 
-/// Capacity of the persisted PK-list codec (`pack_pk_cols` / `PkColList`):
-/// the most PK columns a table or view PK may declare. The codec, both
-/// validators, and the two planner admission caps all derive from this one
-/// constant — raise or lower it and every dependent site follows, with the
-/// static guards below catching a value the encoding or schema layout can't
-/// hold.
+/// Capacity of the persisted PK-list codec ([`PkColList`]): the most columns a
+/// table or view PK, or an index column list, may declare. The static guards
+/// below catch a value the encoding can't hold.
 ///
-/// Distinct from `MAX_PK_COLUMNS` (5), which sizes the engine's in-memory PK
-/// arrays and reserves one extra slot for the secondary-index column prefix.
-/// Keeping `PK_LIST_MAX_COLS < MAX_PK_COLUMNS` leaves that slot free for any
-/// table.
+/// Distinct from [`MAX_PK_COLUMNS`], which sizes the engine's in-memory PK
+/// arrays.
 pub const PK_LIST_MAX_COLS: usize = 4;
 
 /// Width of the packed decoded-count field (bits `[0..4)`).
@@ -504,23 +485,11 @@ const PK_LIST_COUNT_BITS: u32 = 4;
 /// exclusive ceiling on a column index the list can carry.
 const PK_LIST_COL_BITS: u32 = 7;
 const PK_LIST_COL_MAX: u32 = (1 << PK_LIST_COL_BITS) - 1;
-/// The exclusive ceiling on a column index a packed list can carry — the bound a
-/// [`validate_pk_col_list`] caller passes when it holds no column count of its own.
-pub const PK_LIST_COL_LIMIT: usize = 1 << PK_LIST_COL_BITS;
-
-/// The **user-facing** PK-list arity rule: `1..=PK_LIST_MAX_COLS` columns — what
-/// the persisted `u64` word can round-trip. One predicate behind every spelling
-/// of *that* bound, so they cannot disagree on it.
-#[inline]
-pub(crate) const fn pk_list_arity_ok(n: usize) -> bool {
-    n >= 1 && n <= PK_LIST_MAX_COLS
-}
 
 // The packed u64 lays the decoded count in bits [0..4) and each column index in
 // a 7-bit field at bit 4 + 7*i; the packed flag occupies bit 63. Guard the
 // ceilings at compile time so bumping PK_LIST_MAX_COLS past what the encoding
-// (or the index-prefix reservation) can hold fails to build instead of
-// silently corrupting the catalog word.
+// can hold fails to build instead of silently corrupting the catalog word.
 const _: () = assert!(PK_LIST_MAX_COLS >= 1);
 const _: () = assert!(
     PK_LIST_MAX_COLS < (1 << PK_LIST_COUNT_BITS),
@@ -531,15 +500,11 @@ const _: () = assert!(
     "PK_LIST_MAX_COLS overflows the packed u64 column region" // bits 62/63 are flags
 );
 const _: () = assert!(
-    PK_LIST_MAX_COLS < MAX_PK_COLUMNS, // leave the index-prefix slot
-    "PK_LIST_MAX_COLS leaves no MAX_PK_COLUMNS slot for the secondary-index prefix"
-);
-const _: () = assert!(
     MAX_COLUMNS <= 1 << PK_LIST_COL_BITS,
     "a schema column index no longer fits the packed 7-bit field"
 );
 
-/// Bit 63: the tag whose absence [`unpack_pk_cols`] refuses. An `arg1` means
+/// Bit 63: the tag whose absence [`PkColList::unpack`] refuses. An `arg1` means
 /// different things per message kind, so the decode insists on a tag rather than
 /// reading a shape.
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
@@ -555,7 +520,7 @@ pub enum Probe {
     /// The secondary index on this exact column list: each key answered with up
     /// to this many of the stored entries under its span, each
     /// `[span ‖ holder PK]`.
-    Index(PkColList, std::num::NonZeroU64),
+    Index(PkColList, NonZeroU64),
 }
 
 impl Probe {
@@ -564,7 +529,7 @@ impl Probe {
         match self {
             Probe::Pk => (WireProbeMode::Pk, 0, 0),
             Probe::PkColumn(col) => (WireProbeMode::PkColumn, col as u64, 0),
-            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), pack_pk_cols(cols.as_slice())),
+            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), cols.pack()),
         }
     }
 
@@ -575,8 +540,8 @@ impl Probe {
             (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
             (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
             (WireProbeMode::Index, cap, cols) => {
-                let cap = std::num::NonZeroU64::new(cap).ok_or_else(refused)?;
-                let cols = unpack_pk_cols(cols).map_err(|e| e.for_role(crate::PkListRole::ColumnList))?;
+                let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
+                let cols = PkColList::unpack(cols).map_err(|e| e.for_role(PkListRole::ColumnList))?;
                 Ok(Probe::Index(cols, cap))
             }
             _ => Err(refused()),
@@ -584,10 +549,10 @@ impl Probe {
     }
 }
 
-/// A PK column list, `1..=PK_LIST_MAX_COLS` entries, inline. Constructing one is
-/// the arity check, so a holder never gates on the count. `from_slice` zero-fills
-/// the tail, so the derived `Hash` and `PartialEq` see no padding and a list can
-/// key a map.
+/// A column list — a PK's or an index's: `1..=PK_LIST_MAX_COLS` distinct columns,
+/// each below `MAX_COLUMNS`, inline. [`Self::checked`] is the one way to build
+/// one, so a holder never re-checks it. The tail past the list is zero, so the
+/// derived `Hash` and `PartialEq` see no padding and a list can key a map.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct PkColList {
     cols: [u32; PK_LIST_MAX_COLS],
@@ -595,122 +560,65 @@ pub struct PkColList {
 }
 
 impl PkColList {
-    /// Construct from a column-index slice. Panics on an out-of-range length
-    /// (`1..=PK_LIST_MAX_COLS`) — like `pack_pk_cols`, callers must validate the
-    /// arity before constructing, because a silent clamp here would desync the
-    /// list from the persisted/packed form it round-trips with. Wire input goes
-    /// through [`unpack_pk_cols`], which returns that arity as an `Err`.
-    pub fn from_slice(cols: &[u32]) -> Self {
-        assert!(
-            pk_list_arity_ok(cols.len()),
-            "PkColList::from_slice: count {} out of range 1..={PK_LIST_MAX_COLS}",
-            cols.len(),
-        );
+    /// `cols` as a column list of a relation with `ncols` columns: `Err` where it
+    /// is empty, longer than `PK_LIST_MAX_COLS`, names a column twice, or names
+    /// one at or past `ncols`. A caller holding no column count passes
+    /// `MAX_COLUMNS`.
+    pub fn checked(cols: &[u32], ncols: usize) -> Result<Self, PkRule> {
+        crate::validate_pk_indices(cols, ncols.min(MAX_COLUMNS), PK_LIST_MAX_COLS)?;
         let mut arr = [0u32; PK_LIST_MAX_COLS];
         arr[..cols.len()].copy_from_slice(cols);
-        PkColList { cols: arr, len: cols.len() }
+        Ok(PkColList { cols: arr, len: cols.len() })
     }
+
+    /// [`Self::checked`] for a list the caller already knows is one. Panics
+    /// otherwise.
+    pub fn from_slice(cols: &[u32]) -> Self {
+        Self::checked(cols, MAX_COLUMNS).unwrap_or_else(|rule| {
+            panic!(
+                "PkColList::from_slice({cols:?}): {}",
+                rule.for_role(PkListRole::ColumnList)
+            )
+        })
+    }
+
     /// The column indices, in list order.
     pub fn as_slice(&self) -> &[u32] {
         &self.cols[..self.len]
     }
-}
 
-/// The `Err`-returning form of [`pack_pk_cols`]' panicking contract, plus the
-/// no-duplicates rule both consumers (table PKs and index column lists) share:
-/// count in `1..=PK_LIST_MAX_COLS`, every index below `ncols`, no repeated
-/// column. Call this at user-input boundaries so `pack_pk_cols` and
-/// `PkColList::from_slice` can never panic downstream.
-///
-/// `ncols` is the source relation's column count, or [`PK_LIST_COL_LIMIT`] — the
-/// packed field's own bound — for a caller that holds no column count.
-pub fn validate_pk_col_list(cols: &[u32], ncols: usize) -> Result<(), String> {
-    // The rule itself is `validate_pk_indices`. Only the wording differs — these
-    // lists are also secondary-index column lists, which "primary key ..." would
-    // misname.
-    crate::validate_pk_indices(cols, ncols, PK_LIST_MAX_COLS)
-        .map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
-}
+    /// The persisted `u64` form.
+    pub fn pack(self) -> u64 {
+        let mut w = PK_LIST_PACKED_FLAG | self.len as u64;
+        for (i, &c) in self.as_slice().iter().enumerate() {
+            w |= (c as u64) << (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32);
+        }
+        w
+    }
 
-/// Validate a `CLUSTER BY` column list against the table's PK, returning the
-/// distribution prefix length `k` (`= cols.len()`) when `cols` is exactly the
-/// PK's leading prefix in PK order. The distribution key is constrained to a
-/// **leading PK prefix** so write-side routing is a pure byte-slice of the OPK
-/// region (no gather, no separate packer). No type/null/width re-checks — those
-/// are inherited from the PK validation, since `dist ⊆ pk`. Shared by the SQL
-/// planner (pre-engine `CLUSTER BY` check) so the surface error names PK column
-/// order.
-pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
-    if cols.is_empty() || cols.len() > pk.len() {
-        return Err(format!(
-            "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
-            pk.len(),
-            cols.len()
-        ));
+    /// Decode the persisted `u64` form.
+    pub fn unpack(word: u64) -> Result<Self, PkRule> {
+        if word & PK_LIST_PACKED_FLAG == 0 {
+            return Err(PkRule::NotPacked);
+        }
+        let n = (word & ((1 << PK_LIST_COUNT_BITS) - 1)) as usize;
+        if n > PK_LIST_MAX_COLS {
+            return Err(PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS });
+        }
+        let mut cols = [0u32; PK_LIST_MAX_COLS];
+        for (i, slot) in cols[..n].iter_mut().enumerate() {
+            *slot = ((word >> (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32)) & PK_LIST_COL_MAX as u64) as u32;
+        }
+        Self::checked(&cols[..n], MAX_COLUMNS)
     }
-    if let Some(c) = cols.iter().find(|c| !pk.contains(c)) {
-        return Err(format!("CLUSTER BY column {c} is not a PRIMARY KEY column"));
-    }
-    if cols != &pk[..cols.len()] {
-        return Err("CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
-                    in PK order; reorder the PK so the distribution column(s) lead"
-            .into());
-    }
-    Ok(cols.len())
-}
-
-/// Pack a PK column-index list into the persisted `u64` form. Panics on a
-/// violated contract because a silent truncation here corrupts the
-/// catalog encoding; callers (client + engine) must reject out-of-range
-/// lists before calling this (see [`validate_pk_col_list`]).
-pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
-    assert!(
-        pk_list_arity_ok(pk_cols.len()),
-        "pack_pk_cols: count {} out of range 1..={PK_LIST_MAX_COLS}",
-        pk_cols.len(),
-    );
-    let mut v = pk_cols.len() as u64; // the count field
-    for (i, &c) in pk_cols.iter().enumerate() {
-        assert!(c <= PK_LIST_COL_MAX, "pack_pk_cols: column index {c} exceeds its field");
-        v |= (c as u64) << (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32);
-    }
-    v | PK_LIST_PACKED_FLAG
-}
-
-/// Decode the persisted `u64` PK-list form. The one crossing from wire bits into
-/// [`PkColList`], and so where an untagged word or a crafted count is refused.
-pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
-    if packed & PK_LIST_PACKED_FLAG == 0 {
-        return Err(crate::PkRule::NotPacked);
-    }
-    let n = (packed & ((1 << PK_LIST_COUNT_BITS) - 1)) as usize;
-    if !pk_list_arity_ok(n) {
-        return Err(if n == 0 {
-            crate::PkRule::Empty
-        } else {
-            crate::PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS }
-        });
-    }
-    let mut cols = [0u32; PK_LIST_MAX_COLS];
-    for (i, slot) in cols.iter_mut().enumerate().take(n) {
-        *slot = ((packed >> (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32)) & PK_LIST_COL_MAX as u64) as u32;
-    }
-    Ok(PkColList { cols, len: n })
 }
 
 // ---------------------------------------------------------------------------
-// TABLE_TAB.flags layout — the single source of truth shared by the gnitz-core
-// writer and the gnitz-server reader, so the bit packing cannot drift.
-//
-//   bit 0        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
-//   bit 1        stream (TABLE_FLAG_STREAM) — storeless append-only ingestion point
-//   bit 2        serial (TABLE_FLAG_SERIAL) — INSERT draws the lone PK column from a sequence
-//   bits [8..16) distribution prefix length k (0 = default = full PK)
-//
-// Every other bit is refused on decode. `replicated` and a non-default `k` are
-// mutually exclusive (a CLUSTER BY prefix is meaningless when every worker
-// holds the full copy): [`TableDistribution`] cannot represent both, and
-// [`TableProps::from_flags`] refuses a word that carries both.
+// TABLE_TAB.flags layout. Every bit outside the constants below is refused on
+// decode. `replicated` and a non-default prefix length are mutually exclusive (a
+// CLUSTER BY prefix is meaningless when every worker holds the full copy):
+// [`TableDistribution`] cannot represent both, and [`TableProps::from_flags`]
+// refuses a word that carries both.
 // ---------------------------------------------------------------------------
 
 /// Bit 0: the table is **replicated** — every worker holds an identical full
@@ -722,7 +630,8 @@ const TABLE_FLAG_STREAM: u64 = 1 << 1;
 /// Bit 2: the table's single PK column is **SERIAL** — INSERT draws it from the
 /// table's sequence.
 const TABLE_FLAG_SERIAL: u64 = 1 << 2;
-/// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
+/// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`;
+/// `0` there is the default, the full PK.
 const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
 /// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte.
@@ -731,71 +640,12 @@ const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 const TABLE_FLAGS_DEFINED: u64 =
     TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | TABLE_FLAG_SERIAL | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
-/// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, or one
-/// may stand at weight above 1, so its PK region identifies no single row — a view
-/// over a stream, one keyed on a join key or a source-PK pair, a top-N holding
-/// more than one slot per partition, or an ALL set operation. The
-/// planner that compiled the view states it; the engine stores it verbatim.
-const VIEW_FLAG_PK_REPEATS: u64 = 1 << 0;
-
-/// The logical content of `VIEW_TAB.flags`.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub struct ViewFlags {
-    pub pk_repeats: bool,
-}
-
-impl ViewFlags {
-    /// Pack the persisted `VIEW_TAB.flags` u64. Inverse of [`Self::from_flags`].
-    #[inline]
-    pub fn pack(self) -> u64 {
-        if self.pk_repeats {
-            VIEW_FLAG_PK_REPEATS
-        } else {
-            0
-        }
-    }
-
-    /// Decode a persisted `VIEW_TAB.flags` u64; a bit outside the defined set is
-    /// refused.
-    pub fn from_flags(flags: u64) -> Result<ViewFlags, String> {
-        if flags & !VIEW_FLAG_PK_REPEATS != 0 {
-            return Err(format!("flags {flags:#x} carry unknown bits"));
-        }
-        Ok(ViewFlags {
-            pk_repeats: flags & VIEW_FLAG_PK_REPEATS != 0,
-        })
-    }
-}
-
-/// `IDX_TAB.flags` bit 0: the index enforces uniqueness.
-const INDEX_FLAG_UNIQUE: u64 = 1 << 0;
-
-/// The logical content of `IDX_TAB.flags`.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub struct IndexProps {
-    pub is_unique: bool,
-}
-
-impl IndexProps {
-    /// Pack the persisted `IDX_TAB.flags` u64. Inverse of [`Self::from_flags`].
-    #[inline]
-    pub fn pack(self) -> u64 {
-        if self.is_unique {
-            INDEX_FLAG_UNIQUE
-        } else {
-            0
-        }
-    }
-
-    /// Decode a persisted `IDX_TAB.flags` u64; a bit outside the defined set is
-    /// refused.
-    pub fn from_flags(flags: u64) -> Result<IndexProps, String> {
-        if flags & !INDEX_FLAG_UNIQUE != 0 {
-            return Err(format!("index flags {flags:#x} carry unknown bits"));
-        }
-        Ok(IndexProps {
-            is_unique: flags & INDEX_FLAG_UNIQUE != 0,
-        })
+/// A catalog column holding a boolean: `0` or `1`, any other word refused.
+pub fn bool_word(w: u64) -> Result<bool, String> {
+    match w {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!("boolean word {w} is neither 0 nor 1")),
     }
 }
 
@@ -825,8 +675,7 @@ pub struct TableProps {
     /// INSERT draws the table's single PK column from a sequence.
     pub serial: bool,
     /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
-    /// prefix; the SQL planner validates it against the PK before packing, and
-    /// the schema constructor normalizes the default `0` to `|PK|`.
+    /// prefix; the SQL planner validates it against the PK before packing.
     pub distribution: TableDistribution,
 }
 
@@ -906,14 +755,17 @@ pub enum ViewProps {
     #[default]
     Plain,
     /// `WITH (capacity = …)`: the view's output store is bounded, dehydrating past it.
-    Bounded { capacity_bytes: u64 },
+    Bounded { capacity_bytes: NonZeroU64 },
     /// `WITH (delta = …)`: the view keeps its recent deltas in a store of its own.
-    Fed { delta_bytes: u64 },
+    Fed { delta_bytes: NonZeroU64 },
 }
 
 impl ViewProps {
     /// The props two optional budgets name.
-    pub fn from_budgets(capacity_bytes: Option<u64>, delta_bytes: Option<u64>) -> Result<ViewProps, String> {
+    pub fn from_budgets(
+        capacity_bytes: Option<NonZeroU64>,
+        delta_bytes: Option<NonZeroU64>,
+    ) -> Result<ViewProps, String> {
         match (capacity_bytes, delta_bytes) {
             (None, None) => Ok(ViewProps::Plain),
             (Some(capacity_bytes), None) => Ok(ViewProps::Bounded { capacity_bytes }),
@@ -926,7 +778,7 @@ impl ViewProps {
 
     /// Decode the `(capacity, delta)` `VIEW_TAB` words, where `0` is absent.
     pub fn from_row(capacity: u64, delta: u64) -> Result<ViewProps, String> {
-        Self::from_budgets((capacity != 0).then_some(capacity), (delta != 0).then_some(delta))
+        Self::from_budgets(NonZeroU64::new(capacity), NonZeroU64::new(delta))
     }
 
     /// The `(capacity, delta)` `VIEW_TAB` words.
@@ -936,14 +788,14 @@ impl ViewProps {
 
     pub fn capacity_bytes(self) -> Option<u64> {
         match self {
-            ViewProps::Bounded { capacity_bytes } => Some(capacity_bytes),
+            ViewProps::Bounded { capacity_bytes } => Some(capacity_bytes.get()),
             _ => None,
         }
     }
 
     pub fn delta_bytes(self) -> Option<u64> {
         match self {
-            ViewProps::Fed { delta_bytes } => Some(delta_bytes),
+            ViewProps::Fed { delta_bytes } => Some(delta_bytes.get()),
             _ => None,
         }
     }

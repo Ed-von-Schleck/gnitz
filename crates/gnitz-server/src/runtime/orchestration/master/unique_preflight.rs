@@ -102,7 +102,7 @@ impl MasterDispatcher {
     pub async fn validate_unique_index_create(
         &self,
         owner_id: u64,
-        col_indices: &[u32],
+        cols: PkColList,
     ) -> Result<Option<UniqueFilter>, WireFault> {
         let spec = {
             let cat = self.cat();
@@ -111,9 +111,9 @@ impl MasterDispatcher {
                 return Ok(Some(UniqueFilter::new()));
             };
             // What the IDX_TAB precheck refuses is refused before any scan.
-            let spec = cat.validate_index_create(owner_id, col_indices)?;
+            let spec = cat.validate_index_create(owner_id, cols.as_slice())?;
             // A PK-covering index skips the scan, and every check it would ever plan.
-            if owner_schema.covers_pk(col_indices) {
+            if owner_schema.covers_pk(cols.as_slice()) {
                 return Ok(None);
             }
             spec
@@ -122,7 +122,7 @@ impl MasterDispatcher {
 
         // A replicated owner is read on one worker: every worker's copy would
         // pop each value `nw` times.
-        let lease = self.scan(DirectGroup::key_spans(owner_id, col_indices)).await?;
+        let lease = self.scan(DirectGroup::key_spans(owner_id, cols)).await?;
 
         let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
             let cat = self.cat();
@@ -131,7 +131,7 @@ impl MasterDispatcher {
                 text: format!(
                     "cannot create unique index on '{}' column '{}': column contains duplicate values",
                     cat.qualified_name(owner_id),
-                    cat.column_names(owner_id, col_indices),
+                    cat.column_names(owner_id, cols.as_slice()),
                 ),
             });
         };

@@ -97,8 +97,7 @@ impl<'a> ChildAddr<'a> {
             Some(p) => match p.strip_prefix("idx_") {
                 Some(list) => {
                     let cols: Vec<u32> = list.split('-').map(|c| c.parse().ok()).collect::<Option<_>>()?;
-                    gnitz_wire::validate_pk_col_list(&cols, gnitz_wire::PK_LIST_COL_LIMIT).ok()?;
-                    ChildKind::Index(PkColList::from_slice(&cols))
+                    ChildKind::Index(PkColList::checked(&cols, gnitz_wire::MAX_COLUMNS).ok()?)
                 }
                 None => ChildKind::Scratch(p.strip_prefix("scratch_")?),
             },

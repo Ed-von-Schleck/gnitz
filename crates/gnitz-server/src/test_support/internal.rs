@@ -267,8 +267,8 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
             table_id,
             schema_id: PUBLIC_SCHEMA_ID,
             name,
-            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
-            flags: gnitz_wire::TableProps::default().pack(),
+            pk: gnitz_wire::PkColList::from_slice(&[0]),
+            props: gnitz_wire::TableProps::default(),
         };
         write_table_tab_row(&mut bb, &row, weight);
     }
@@ -292,23 +292,16 @@ pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batc
 }
 
 /// The one-row IDX_TAB batch of an index over `cols` at `weight`.
-pub fn idx_tab_batch(
-    index_id: u64,
-    owner_id: u64,
-    cols: &[u32],
-    name: &str,
-    props: gnitz_wire::IndexProps,
-    weight: i64,
-) -> Batch {
+pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_unique: bool, weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     write_idx_tab_row(
         &mut bb,
         &IdxTabRow {
             index_id,
             owner_id,
-            source_col_idx: gnitz_wire::pack_pk_cols(cols),
+            cols: gnitz_wire::PkColList::from_slice(cols),
             name,
-            flags: props.pack(),
+            is_unique,
         },
         weight,
     );
@@ -330,11 +323,11 @@ pub fn push_view_tab_row(
     sink.begin_row(&[vid as u128], weight);
     sink.put_u64(PUBLIC_SCHEMA_ID);
     sink.put_string(view_name);
-    sink.put_u64(gnitz_wire::pack_pk_cols(&[0]));
+    sink.put_u64(gnitz_wire::PkColList::from_slice(&[0]).pack());
     sink.put_u64(capacity_bytes);
     sink.put_u64(delta_bytes);
     sink.put_u64(owner_view_id);
-    sink.put_u64(gnitz_wire::ViewFlags::default().pack());
+    sink.put_u64(0); // pk_repeats
     sink.end_row();
 }
 

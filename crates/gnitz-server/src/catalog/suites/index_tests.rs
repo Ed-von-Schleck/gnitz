@@ -800,7 +800,7 @@ fn compensated_drop_of_a_shared_index_keeps_its_directory() {
     let mut ids = Vec::new();
     for name in ["public__t__a", "public__t__b"] {
         let id = engine.allocate_ids(1).unwrap();
-        let idx = idx_tab_batch(id, tid, &[1], name, gnitz_wire::IndexProps { is_unique: false }, 1);
+        let idx = idx_tab_batch(id, tid, &[1], name, false, 1);
         engine.submit(SysFamily::Index, idx).unwrap();
         ids.push(id);
     }
@@ -1857,7 +1857,11 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         .unwrap();
     engine
         .registry
-        .add_index(tid, IndexClaim::Index { id: tid + 1, unique: false }, &[3])
+        .add_index(
+            tid,
+            IndexClaim::Index { id: tid + 1, unique: false },
+            gnitz_wire::PkColList::from_slice(&[3]),
+        )
         .unwrap();
     // The registry projects the index itself, from the same `key_spec` and index
     // schema a hand-written projection would use.

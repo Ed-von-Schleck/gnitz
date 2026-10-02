@@ -311,8 +311,12 @@ fn scan_spec_global_sum_bench() {
 fn scan_spec_index_range_bench() {
     use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
     let mut e = numeric_fixture(NUMERIC_ROWS);
-    e.add_index(TID, IndexClaim::Index { id: TID + 1, unique: false }, &[3])
-        .unwrap();
+    e.add_index(
+        TID,
+        IndexClaim::Index { id: TID + 1, unique: false },
+        gnitz_wire::PkColList::from_slice(&[3]),
+    )
+    .unwrap();
     e.set_scan_chunk_rows(16_384);
     let src = e.relation(TID).unwrap().schema();
     // `c2 = id ^ 0xa5a5_a5a5` over `id < 2^21`: a 2^16-wide value band holds at most

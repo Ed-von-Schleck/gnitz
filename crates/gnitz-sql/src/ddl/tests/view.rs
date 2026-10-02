@@ -18,7 +18,7 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
         ("1 GB", 1 << 30),
         (" 1 gb ", 1 << 30),
     ] {
-        assert_eq!(parse_size("capacity", lit).unwrap(), bytes, "{lit:?}");
+        assert_eq!(parse_size("capacity", lit).unwrap().get(), bytes, "{lit:?}");
     }
     for lit in ["lots", "5", "5 TB", "-5 MB", "0 MB", "18446744073709551615 GB", ""] {
         assert!(
@@ -32,10 +32,14 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
 fn each_budget_decodes_to_its_view_class() {
     assert_eq!(
         options_of("WITH (capacity = '1 MB')").unwrap(),
-        ViewProps::Bounded { capacity_bytes: 1 << 20 }
+        ViewProps::Bounded {
+            capacity_bytes: NonZeroU64::new(1 << 20).unwrap()
+        }
     );
     assert_eq!(
         options_of("WITH (delta = '2 KB')").unwrap(),
-        ViewProps::Fed { delta_bytes: 2 << 10 }
+        ViewProps::Fed {
+            delta_bytes: NonZeroU64::new(2 << 10).unwrap()
+        }
     );
 }

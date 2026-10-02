@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::{idx_tab_batch, push_sys_row, push_view_tab_row, table_tab_batch};
-use gnitz_wire::IndexProps;
 use gnitz_zset::repr::BatchBuilder;
 
 /// The pair-keyed family's at-rest PK is `owner_BE ‖ member_BE`, so one owner's
@@ -38,17 +37,9 @@ fn family_pk_partition_reports_creates_and_drops_and_neither_for_a_pair() {
 
 #[test]
 fn idx_tab_partition_carries_each_rows_column_list() {
-    let unique = IndexProps { is_unique: true };
-    let mut batch = idx_tab_batch(50, 20, &[1, 2], "a", unique, 1);
+    let mut batch = idx_tab_batch(50, 20, &[1, 2], "a", true, 1);
     for (index_id, owner_id, cols, weight) in [(51, 21, &[3][..], -1), (52, 22, &[1], -1), (52, 22, &[1], 1)] {
-        batch.append_batch(&idx_tab_batch(
-            index_id,
-            owner_id,
-            cols,
-            "b",
-            IndexProps::default(),
-            weight,
-        ));
+        batch.append_batch(&idx_tab_batch(index_id, owner_id, cols, "b", false, weight));
     }
     // A row whose column list does not decode is in neither list.
     let mut undecodable = BatchBuilder::new(SysFamily::Index.schema());
@@ -62,7 +53,7 @@ fn idx_tab_partition_carries_each_rows_column_list() {
         .map(|(o, c, props)| (*o, c.as_slice(), *props))
         .collect();
     let drops: Vec<_> = p.drops.iter().map(|(o, c)| (*o, c.as_slice())).collect();
-    assert_eq!(creates, [(20, &[1, 2][..], unique)]);
+    assert_eq!(creates, [(20, &[1, 2][..], true)]);
     assert_eq!(drops, [(21, &[3][..])]);
 }
 
@@ -102,7 +93,7 @@ fn read_idx_tab_row_refuses_an_unpacked_column_list() {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     push_sys_row(&mut bb, SysFamily::Index, [53, 0], 1, |pi| {
         if pi == IDXTAB_PAY_SOURCE_COLS {
-            gnitz_wire::pack_pk_cols(&[1]) & !gnitz_wire::PK_LIST_PACKED_FLAG
+            PkColList::from_slice(&[1]).pack() & !gnitz_wire::PK_LIST_PACKED_FLAG
         } else {
             0
         }
@@ -142,8 +133,8 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
             table_id: 40,
             schema_id: PUBLIC_SCHEMA_ID,
             name: "events",
-            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
-            flags: gnitz_wire::TableProps { stream, ..Default::default() }.pack(),
+            pk: PkColList::from_slice(&[0]),
+            props: gnitz_wire::TableProps { stream, ..Default::default() },
         };
         write_table_tab_row(&mut bb, &row, 1);
         bb.finish()

@@ -17,8 +17,8 @@ fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch
         table_id: tid,
         schema_id: payload_u64(&minus, 0, RELTAB_PAY_SCHEMA_ID),
         name: new_name,
-        pk_col_idx: payload_u64(&minus, 0, TABTAB_PAY_PK_COL_IDX),
-        flags: payload_u64(&minus, 0, TABTAB_PAY_FLAGS),
+        pk: gnitz_wire::PkColList::unpack(payload_u64(&minus, 0, TABTAB_PAY_PK_COL_IDX)).unwrap(),
+        props: gnitz_wire::TableProps::from_flags(payload_u64(&minus, 0, TABTAB_PAY_FLAGS)).unwrap(),
     };
     write_table_tab_row(&mut bb, &row, 1);
     [minus, bb.finish()]
@@ -307,14 +307,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
         .unwrap_err();
     assert!(err.contains("dropped"), "rename: {err}");
 
-    let idx = idx_tab_batch(
-        engine.allocate_ids(1).unwrap(),
-        tid,
-        &[1],
-        "public__t__idx_a",
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
+    let idx = idx_tab_batch(engine.allocate_ids(1).unwrap(), tid, &[1], "public__t__idx_a", false, 1);
     let err = engine.precheck_family(SysFamily::Index, &idx).unwrap_err();
     assert!(err.contains("dropped"), "index: {err}");
 
@@ -392,7 +385,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
         tid,
         &[1],
         "public__t__idx_v",
-        gnitz_wire::IndexProps { is_unique: false },
+        false,
         1,
     ));
     let err = engine.precheck_bundle(&families).unwrap_err();

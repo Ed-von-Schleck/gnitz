@@ -125,8 +125,8 @@ fn ddl_txn_roundtrip_client_to_server() {
             table_id: tid,
             schema_id: 3,
             name: "t",
-            pk_col_idx: 0,
-            flags: 0,
+            pk: gnitz_wire::PkColList::from_slice(&[0]),
+            props: gnitz_wire::TableProps::default(),
         };
         write_table_tab_row(&mut BatchAppender::new(&mut b), &row, weight);
         b
@@ -137,9 +137,9 @@ fn ddl_txn_roundtrip_client_to_server() {
         let row = IdxTabRow {
             index_id: idx_id,
             owner_id: owner,
-            source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
+            cols: gnitz_wire::PkColList::from_slice(&[1]),
             name: "idx_t_b",
-            flags: 1, // unique, not internal
+            is_unique: true,
         };
         write_idx_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
         b
@@ -206,7 +206,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             view_id: vid,
             schema_id: 3,
             name: "v",
-            pk_col_idx: 0,
+            pk: gnitz_wire::PkColList::from_slice(&[0]),
             props: gnitz_wire::ViewProps::default(),
             owner_view_id: 0,
             pk_repeats: false,

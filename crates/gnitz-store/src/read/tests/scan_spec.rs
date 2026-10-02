@@ -242,7 +242,7 @@ fn a_malformed_request_is_refused() {
     let two_slots = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::I64)], &[0]);
     let cases = [
         (rows_spec(None, order_by(99, false), 1), own),
-        (walk(99), own),
+        (walk(64), own),
         (walk(2), own),
         (
             ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(16, [&[0u8; 16][..]]))),
@@ -565,7 +565,9 @@ fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64
     let schema = make_schema_u64_i64();
     let rows =
         |ids: std::ops::Range<u64>| make_batch_raw(&schema, &ids.map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
-    let kind = RelationKind::View(ViewProps::Bounded { capacity_bytes: 1 });
+    let kind = RelationKind::View(ViewProps::Bounded {
+        capacity_bytes: std::num::NonZeroU64::MIN,
+    });
     let mut registry = relation_fixture(kind, schema, &[], rows(on_disk));
     registry.checkpoint_ephemeral([], 1).unwrap();
     assert!(
@@ -732,7 +734,9 @@ fn a_hydration_off_the_skeleton_weight_panics() {
 #[test]
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
-    let kind = RelationKind::View(ViewProps::Fed { delta_bytes: 1 << 20 });
+    let kind = RelationKind::View(ViewProps::Fed {
+        delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
+    });
     let mut r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
     r.ingest_at(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();

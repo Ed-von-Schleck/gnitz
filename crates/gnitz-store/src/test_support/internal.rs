@@ -76,7 +76,11 @@ pub(crate) fn relation_fixture(
         .unwrap();
     for (id, &col) in (TID + 1..).zip(indexed) {
         registry
-            .add_index(TID, IndexClaim::Index { id, unique: false }, &[col])
+            .add_index(
+                TID,
+                IndexClaim::Index { id, unique: false },
+                gnitz_wire::PkColList::from_slice(&[col]),
+            )
             .unwrap();
     }
     registry.ingest(TID, rows).unwrap();

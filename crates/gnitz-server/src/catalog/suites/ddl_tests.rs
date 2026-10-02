@@ -962,7 +962,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
         ];
         let tid = engine.allocate_ids(1).unwrap();
         engine.write_column_records(tid, &col_defs).unwrap();
-        let batch = table_tab_row_words(tid, name, pack_pk_cols(&[0]), flags);
+        let batch = table_tab_row_words(tid, name, PkColList::from_slice(&[0]).pack(), flags);
         let err = engine
             .ingest_to_family(gnitz_wire::TABLE_TAB, &batch)
             .expect_err("a duplicate visible column name must be refused");

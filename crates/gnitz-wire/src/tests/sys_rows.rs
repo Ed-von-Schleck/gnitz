@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
     CIRCTAB_PAY_CIRCUIT, CIRCUIT_TAB, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB, IDXTAB_PAY_FLAGS,
+    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB, IDXTAB_PAY_IS_UNIQUE,
     IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
     SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
-    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB,
+    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_PK_REPEATS, VIEW_TAB,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -100,27 +100,30 @@ fn values_land_in_their_named_payload_slots() {
     };
     assert_col_tab_slots(&ColTabRow { col: &flipped, ..witness }, 1);
 
+    let idx_cols = crate::PkColList::from_slice(&[2, 1]);
     let mut r = Recorder::default();
     write_idx_tab_row(
         &mut r,
         &IdxTabRow {
             index_id: 100,
             owner_id: 16,
-            source_col_idx: 9,
+            cols: idx_cols,
             name: "idx_t_b",
-            flags: 3,
+            is_unique: true,
         },
         1,
     );
     assert_eq!(r.pk, [100]);
     let v = r.row(IDX_TAB);
     assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
-    assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
+    assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(idx_cols.pack()));
     assert_eq!(v[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
-    assert_eq!(v[IDXTAB_PAY_FLAGS], Val::U64(3));
+    assert_eq!(v[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
 
     // Distinct values per field, so a transposed pair in the writer body
     // fails here rather than round-tripping unnoticed.
+    let pk = crate::PkColList::from_slice(&[1, 0]);
+    let props = crate::TableProps { stream: true, ..Default::default() };
     let mut r = Recorder::default();
     write_table_tab_row(
         &mut r,
@@ -128,8 +131,8 @@ fn values_land_in_their_named_payload_slots() {
             table_id: 16,
             schema_id: 3,
             name: "t",
-            pk_col_idx: 5,
-            flags: 9,
+            pk,
+            props,
         },
         1,
     );
@@ -137,8 +140,8 @@ fn values_land_in_their_named_payload_slots() {
     let v = r.row(TABLE_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(3));
     assert_eq!(v[RELTAB_PAY_NAME], Val::Str("t".into()));
-    assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
-    assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(9));
+    assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(pk.pack()));
+    assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(props.pack()));
 
     let mut r = Recorder::default();
     write_view_tab_row(
@@ -147,8 +150,10 @@ fn values_land_in_their_named_payload_slots() {
             view_id: 20,
             schema_id: 4,
             name: "v",
-            pk_col_idx: 6,
-            props: crate::ViewProps::Fed { delta_bytes: 1 << 20 },
+            pk,
+            props: crate::ViewProps::Fed {
+                delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
+            },
             owner_view_id: 21,
             pk_repeats: true,
         },
@@ -158,14 +163,11 @@ fn values_land_in_their_named_payload_slots() {
     let v = r.row(VIEW_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
     assert_eq!(v[RELTAB_PAY_NAME], Val::Str("v".into()));
-    assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
+    assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(pk.pack()));
     assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(0));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
     assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
-    assert_eq!(
-        v[VIEWTAB_PAY_FLAGS],
-        Val::U64(crate::ViewFlags { pk_repeats: true }.pack())
-    );
+    assert_eq!(v[VIEWTAB_PAY_PK_REPEATS], Val::U64(1));
 
     let mut r = Recorder::default();
     write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);

@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_core::sys_schema;
 use gnitz_wire::sys_rows::{write_idx_tab_row, write_schema_tab_row, IdxTabRow, SchemaTabRow};
-use gnitz_wire::{IndexProps, ViewProps, IDX_TAB, SCHEMA_TAB, SEQ_TAB};
+use gnitz_wire::{PkColList, ViewProps, IDX_TAB, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
@@ -61,9 +61,9 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
         let row = IdxTabRow {
             index_id: client.alloc_id().unwrap(),
             owner_id,
-            source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
+            cols: PkColList::from_slice(&[1]),
             name: "ix",
-            flags: IndexProps { is_unique: true }.pack(),
+            is_unique: true,
         };
         write_idx_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
         client.push_ddl_txn(&[(IDX_TAB, b)]).unwrap_err().to_string()

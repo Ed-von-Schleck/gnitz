@@ -282,11 +282,11 @@ impl<'a> DirectGroup<'a> {
     }
 
     /// The sorted key spans of `cols` over `target_id`.
-    pub(crate) fn key_spans(target_id: u64, cols: &[u32]) -> Self {
+    pub(crate) fn key_spans(target_id: u64, cols: gnitz_wire::PkColList) -> Self {
         DirectGroup {
             template: WireMsg {
                 target_id,
-                arg1: gnitz_wire::pack_pk_cols(cols),
+                arg1: cols.pack(),
                 ..Default::default()
             },
             ..Self::new(SalMessageKind::KeySpans)

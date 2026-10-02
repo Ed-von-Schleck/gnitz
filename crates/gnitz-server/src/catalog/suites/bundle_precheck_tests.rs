@@ -2,7 +2,6 @@
 //! never builds, which a wire peer skipping its canonicalization can still send.
 
 use super::*;
-use gnitz_wire::IndexProps;
 
 fn id_v() -> Vec<CatalogColumn> {
     vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
@@ -59,14 +58,36 @@ fn an_index_row_takes_a_canonical_name_once_per_batch() {
     let (mut engine, tid, dir) = table_fixture("bundle_index_names", &cols);
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
 
-    let mut twice = idx_tab_batch(a, tid, &[1], "ix", IndexProps::default(), 1);
-    twice.append_batch(&idx_tab_batch(b, tid, &[2], "ix", IndexProps::default(), 1));
+    let mut twice = idx_tab_batch(a, tid, &[1], "ix", false, 1);
+    twice.append_batch(&idx_tab_batch(b, tid, &[2], "ix", false, 1));
     let err = engine.precheck_family(SysFamily::Index, &twice).unwrap_err();
     assert!(err.contains("Index already exists: ix"), "{err}");
 
-    let mixed = idx_tab_batch(a, tid, &[1], "MixedCase", IndexProps::default(), 1);
+    let mixed = idx_tab_batch(a, tid, &[1], "MixedCase", false, 1);
     let err = engine.precheck_family(SysFamily::Index, &mixed).unwrap_err();
     assert!(err.contains("not canonical"), "{err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An IDX_TAB `+1` whose column list names a column twice is refused: its store
+/// directory would carry a name the directory grammar does not parse.
+#[test]
+fn an_index_row_repeating_a_column_is_refused() {
+    let (mut engine, tid, dir) = table_fixture("bundle_index_repeated_col", &id_v());
+    let index_id = engine.allocate_ids(1).unwrap();
+
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
+    let sink: &mut dyn gnitz_wire::sys_rows::SysRowSink = &mut bb;
+    sink.begin_row(&[index_id as u128], 1);
+    sink.put_u64(tid);
+    sink.put_u64(PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11);
+    sink.put_string("ix");
+    sink.put_u64(0);
+    sink.end_row();
+    let err = engine.precheck_family(SysFamily::Index, &bb.finish()).unwrap_err();
+    assert!(err.contains("names column 1 twice"), "{err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

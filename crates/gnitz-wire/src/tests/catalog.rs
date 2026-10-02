@@ -21,13 +21,18 @@ fn system_table_keys_are_valid_for_their_columns() {
 /// arity. The word is persisted, so its layout is pinned as a literal.
 #[test]
 fn a_pk_col_list_roundtrips_through_its_packed_word() {
-    for cols in [&[0u32][..], &[3], &[1, PK_LIST_COL_MAX], &[2, 5, 7], &[9, 1, 4, 6]] {
+    for cols in [
+        &[0u32][..],
+        &[3],
+        &[1, MAX_COLUMNS as u32 - 1],
+        &[2, 5, 7],
+        &[9, 1, 4, 6],
+    ] {
         let list = PkColList::from_slice(cols);
         assert_eq!(list.as_slice(), cols);
-        let packed = pack_pk_cols(cols);
-        assert_eq!(unpack_pk_cols(packed), Ok(list), "{cols:?}");
+        assert_eq!(PkColList::unpack(list.pack()), Ok(list), "{cols:?}");
     }
-    assert_eq!(pack_pk_cols(&[3, 9]), 1 << 63 | 9 << 11 | 3 << 4 | 2);
+    assert_eq!(PkColList::from_slice(&[3, 9]).pack(), 1 << 63 | 9 << 11 | 3 << 4 | 2);
 }
 
 /// Every probe round-trips through its wire words, and a triple no probe
@@ -46,7 +51,7 @@ fn a_probe_roundtrips_through_its_wire_words() {
         let (mode, arg0, arg1) = probe.wire();
         assert_eq!(Probe::from_wire(mode, arg0, arg1), Ok(probe));
     }
-    let index = pack_pk_cols(cols.as_slice());
+    let index = cols.pack();
     for (mode, arg0, arg1) in [
         (WireProbeMode::Pk, 5, 0),
         (WireProbeMode::Pk, 0, index),
@@ -63,10 +68,10 @@ fn a_probe_roundtrips_through_its_wire_words() {
 
 /// A flag-clear word names no column list, whatever its other bits say — `0` is
 /// the one an `arg1` carries when it means the relation's own PK store — and a
-/// crafted count of zero or past the cap is refused, so no `PkColList` with such
-/// a count is ever built.
+/// crafted count of zero or past the cap, a repeated column and a column no
+/// schema has are refused.
 #[test]
-fn unpack_refuses_an_untagged_word_and_a_crafted_count() {
+fn unpack_refuses_an_untagged_word_and_a_crafted_list() {
     use crate::PkRule::*;
     let over = PK_LIST_MAX_COLS + 1;
     for (w, want) in [
@@ -81,40 +86,26 @@ fn unpack_refuses_an_untagged_word_and_a_crafted_count() {
             PK_LIST_PACKED_FLAG | 15,
             TooManyColumns { count: 15, max: PK_LIST_MAX_COLS },
         ),
+        (PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11, Duplicate { col: 1 }),
+        (
+            PK_LIST_PACKED_FLAG | 1 | (MAX_COLUMNS as u64) << 4,
+            IndexOutOfRange { col: MAX_COLUMNS as u32 },
+        ),
     ] {
-        assert_eq!(unpack_pk_cols(w), Err(want), "{w:#x}");
+        assert_eq!(PkColList::unpack(w), Err(want), "{w:#x}");
     }
 }
 
 #[test]
-#[should_panic(expected = "out of range")]
+#[should_panic(expected = "at least one column")]
 fn from_slice_panics_on_empty() {
     let _ = PkColList::from_slice(&[]);
 }
 
-#[test]
-fn validate_dist_prefix_accepts_leading_rejects_rest() {
-    // Exact leading prefixes of PK (0, 1) are accepted, returning k.
-    assert_eq!(validate_dist_prefix(&[0, 1], &[0]), Ok(1));
-    assert_eq!(validate_dist_prefix(&[0, 1], &[0, 1]), Ok(2));
-    // A single-column PK: only the whole PK is a valid prefix.
-    assert_eq!(validate_dist_prefix(&[3], &[3]), Ok(1));
-    // Reordered PK so the distribution column leads: prefix is the new lead.
-    assert_eq!(validate_dist_prefix(&[2, 1], &[2]), Ok(1));
-
-    // Non-leading PK column, non-contiguous-prefix, wrong order, empty, and
-    // over-long lists are all rejected.
-    assert!(validate_dist_prefix(&[0, 1], &[1]).is_err(), "non-leading PK column");
-    assert!(validate_dist_prefix(&[0, 1, 2], &[0, 2]).is_err(), "skips col 1");
-    assert!(validate_dist_prefix(&[0, 1], &[1, 0]).is_err(), "wrong order");
-    assert!(validate_dist_prefix(&[0, 1], &[]).is_err(), "empty");
-    assert!(validate_dist_prefix(&[0, 1], &[0, 1, 2]).is_err(), "longer than PK");
-    assert!(validate_dist_prefix(&[0, 1], &[5]).is_err(), "non-PK column");
-}
-
-/// Each catalog flags word round-trips, pins its persisted bits as literals —
+/// The `TABLE_TAB` flags word round-trips, pins its persisted bits as literals —
 /// comparing against the constants the packer is written from would hold for any
-/// value it gave them — and accepts exactly the single bits its layout defines.
+/// value it gave them — and accepts exactly the single bits its layout defines. A
+/// boolean column holds `0` or `1`.
 #[test]
 fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
     let dists = (0..=PK_LIST_MAX_COLS as u8)
@@ -128,16 +119,6 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
             }
         }
     }
-    for b in [false, true] {
-        assert_eq!(
-            ViewFlags::from_flags(ViewFlags { pk_repeats: b }.pack()),
-            Ok(ViewFlags { pk_repeats: b })
-        );
-        assert_eq!(
-            IndexProps::from_flags(IndexProps { is_unique: b }.pack()),
-            Ok(IndexProps { is_unique: b })
-        );
-    }
 
     let t = |stream, serial, distribution| TableProps { stream, serial, distribution }.pack();
     assert_eq!(TableProps::default().pack(), 0);
@@ -145,13 +126,6 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
     assert_eq!(t(true, false, TableDistribution::default()), 0b010);
     assert_eq!(t(false, true, TableDistribution::default()), 0b100);
     assert_eq!(t(false, false, TableDistribution::Keyed { prefix_len: 2 }), 2 << 8);
-    assert_eq!(
-        (
-            ViewFlags { pk_repeats: true }.pack(),
-            IndexProps { is_unique: true }.pack()
-        ),
-        (1, 1)
-    );
 
     for bit in 0..64u32 {
         let w = 1u64 << bit;
@@ -160,13 +134,15 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
             bit <= 2 || (8..16).contains(&bit),
             "table bit {bit}"
         );
-        assert_eq!(ViewFlags::from_flags(w).is_ok(), bit == 0, "view bit {bit}");
-        assert_eq!(IndexProps::from_flags(w).is_ok(), bit == 0, "index bit {bit}");
     }
     // The one state the packing can hold and `TableProps` cannot.
     assert!(TableProps::from_flags(0b01 | 2 << 8)
         .unwrap_err()
         .contains("mutually exclusive"));
+
+    assert_eq!(bool_word(0), Ok(false));
+    assert_eq!(bool_word(1), Ok(true));
+    assert!(bool_word(2).is_err());
 }
 
 /// `validate` refuses what the flags word can hold but the table cannot: a
@@ -193,13 +169,13 @@ fn fold_family_separates_every_stored_axis() {
     const A: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::U64)];
     const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64), col("w", TypeCode::U64)];
     const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::I64)];
-    let base = fold_family(0, &fam(1, "_t", A, LEADING_COL_PK));
+    let base = fold_family(0, &fam(1, "_t", A, &[0]));
     let others = [
-        fam(2, "_t", A, LEADING_COL_PK),
-        fam(1, "_u", A, LEADING_COL_PK),
-        fam(1, "_t", RENAMED, LEADING_COL_PK),
-        fam(1, "_t", RETYPED, LEADING_COL_PK),
-        fam(1, "_t", A, LEADING_PAIR_PK),
+        fam(2, "_t", A, &[0]),
+        fam(1, "_u", A, &[0]),
+        fam(1, "_t", RENAMED, &[0]),
+        fam(1, "_t", RETYPED, &[0]),
+        fam(1, "_t", A, &[0, 1]),
     ];
     for (i, other) in others.iter().enumerate() {
         assert_ne!(fold_family(0, other), base, "variant {i}");

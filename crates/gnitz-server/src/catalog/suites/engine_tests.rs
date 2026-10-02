@@ -13,14 +13,7 @@ fn test_orphaned_metadata_recovery() {
             .registry
             .ingest(
                 SysFamily::Index.id(),
-                idx_tab_batch(
-                    888,
-                    99999,
-                    &[1],
-                    "orphaned_idx",
-                    gnitz_wire::IndexProps { is_unique: false },
-                    1,
-                ),
+                idx_tab_batch(888, 99999, &[1], "orphaned_idx", false, 1),
             )
             .unwrap();
         let _ = engine.registry.checkpoint_system(engine.system_zone);
@@ -638,7 +631,7 @@ fn an_index_name_is_claimed_once() {
     let (mut engine, tid, dir) = table_fixture("index_name_claimed_once", &cols);
     let index = |engine: &mut CatalogEngine, col: u32, name: &str| {
         let id = engine.allocate_ids(1).unwrap();
-        idx_tab_batch(id, tid, &[col], name, gnitz_wire::IndexProps::default(), 1)
+        idx_tab_batch(id, tid, &[col], name, false, 1)
     };
 
     let live = index(&mut engine, 1, "ix");

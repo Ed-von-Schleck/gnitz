@@ -81,3 +81,29 @@ fn an_auto_name_is_recognized_from_its_base() {
         assert!(!is_auto_name(other, &base), "{other}");
     }
 }
+
+#[test]
+fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
+    let cols: Vec<ColumnDef> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|&n| ColumnDef::new(n, TypeCode::U64, false))
+        .collect();
+    let check = |pk: &[u32], cluster: &[u32]| validate_dist_prefix(&cols, pk, cluster);
+    assert!(check(&[0, 1], &[0]).is_ok());
+    assert!(check(&[0, 1], &[0, 1]).is_ok());
+    // A single-column PK: only the whole PK is a valid prefix.
+    assert!(check(&[3], &[3]).is_ok());
+    // A reordered PK whose distribution column leads.
+    assert!(check(&[2, 1], &[2]).is_ok());
+
+    assert!(check(&[0, 1], &[1]).is_err(), "non-leading PK column");
+    assert!(check(&[0, 1, 2], &[0, 2]).is_err(), "skips col 1");
+    assert!(check(&[0, 1], &[1, 0]).is_err(), "wrong order");
+    assert!(check(&[0, 1], &[]).is_err(), "empty");
+    assert!(check(&[0, 1], &[0, 1, 2]).is_err(), "longer than PK");
+    let e = check(&[0, 1], &[3]).unwrap_err();
+    assert!(
+        matches!(&e, GnitzSqlError::Rejected(m) if m.contains("column 'd' is not a PRIMARY KEY column")),
+        "{e:?}"
+    );
+}

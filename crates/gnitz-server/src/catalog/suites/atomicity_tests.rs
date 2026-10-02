@@ -38,16 +38,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     }
     engine.submit(SysFamily::Column, bb.finish()).unwrap();
     let unregistered = engine.allocate_ids(1).unwrap();
-    let index_on = |owner: u64, cols: &[u32], name: &str| {
-        idx_tab_batch(
-            unregistered + 1,
-            owner,
-            cols,
-            name,
-            gnitz_wire::IndexProps::default(),
-            1,
-        )
-    };
+    let index_on = |owner: u64, cols: &[u32], name: &str| idx_tab_batch(unregistered + 1, owner, cols, name, false, 1);
 
     for (family, batch, why) in [
         (
@@ -117,14 +108,7 @@ fn test_next_id_advances_on_index_register() {
 
     // An index id far ahead of the local counter.
     let large_idx_id = engine.next_id + 500;
-    let batch = idx_tab_batch(
-        large_idx_id,
-        tid,
-        &[1],
-        "public__seqsync__idx_val_sync",
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
+    let batch = idx_tab_batch(large_idx_id, tid, &[1], "public__seqsync__idx_val_sync", false, 1);
     engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch).unwrap();
 
     assert!(
@@ -417,14 +401,7 @@ fn compensated_create_table_leaves_no_trace() {
         .registry
         .child_dir(tid, ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])));
     fs::write(&blocker, b"not a directory").unwrap();
-    let idx = idx_tab_batch(
-        idx_id,
-        tid,
-        &[2],
-        "public__child__idx_val",
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
+    let idx = idx_tab_batch(idx_id, tid, &[2], "public__child__idx_val", false, 1);
     assert!(engine.submit(SysFamily::Index, idx).is_err());
     engine.compensate_stage_a().unwrap();
 
