@@ -5,8 +5,9 @@
 //! `gnitz-wire` (type codes, the OPK codec, the German-string layout, and the
 //! bounds-checked byte cursor its blob framing reads through), so both
 //! the server and the client-side planner can link it without pulling in
-//! storage, the catalog, or the runtime. Its one external crate, `memchr`, is
-//! `no_std` and dependency-free and supplies the substring scan.
+//! storage, the catalog, or the runtime. Its two external crates are
+//! dependency-free: `memchr` supplies the substring scan, and `fearless_simd`
+//! the vector types and run-time dispatch under the kernels of `simd.rs`.
 //! Whatever the engine computes for an expression, the client computes
 //! bit-for-bit, because it is the same code.
 //!
@@ -68,6 +69,7 @@ mod program;
 mod range;
 mod schema_facts;
 mod search;
+mod simd;
 mod view;
 
 pub use batch::scan_filter_bits;

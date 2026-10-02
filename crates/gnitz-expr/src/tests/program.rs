@@ -8,7 +8,7 @@ use crate::test_support::{
 };
 use crate::{
     CalendarOp, CmpOp, ColumnLocator, ConstIdx, ExprValidateErr, IntArithOp, LogicalInstr, LogicalProgram, NullPerm,
-    PoolEntry, Reg, ScalarEval, Sink, TrimMode,
+    PoolEntry, Reg, RowFilter, ScalarEval, Sink, TrimMode,
 };
 
 /// The phrase a `ColKindMismatch` renders for `kind`, from its one source.
@@ -723,19 +723,24 @@ fn a_sink_list_that_does_not_cover_the_output_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
-/// `col1 IN (…)`. `col_tc` picks col1's type (I64 / U64 / …).
-fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval) {
+/// `col1 IN (…)` — as a value and as a filter. `col_tc` picks col1's type
+/// (I64 / U64 / …).
+fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval, RowFilter) {
     let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, col_tc]);
     let instrs = vec![
         LogicalInstr::LoadCol { col: 1 },
         LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
     ];
-    let prog = scalar_prog(&schema, instrs, vec![gnitz_wire::as_le_bytes(set).to_vec()]);
-    (schema, prog)
+    let consts = vec![gnitz_wire::as_le_bytes(set).to_vec()];
+    let prog = scalar_prog(&schema, instrs.clone(), consts.clone());
+    let filter = filter_prog(&schema, instrs, consts);
+    (schema, prog, filter)
 }
 
 /// IN over every pool shape that can change the answer; a NULL operand is NULL.
 /// A U64 column holding `u64::MAX` matches `-1` bit for bit, as `col = -1` does.
+/// Each verdict is read back as a filter too, whose packed bits come from a
+/// kernel of their own.
 #[test]
 fn int_in_set_membership_over_every_pool_shape() {
     for (col_tc, pool, probes) in [
@@ -751,8 +756,8 @@ fn int_in_set_membership_over_every_pool_shape() {
             (0..1000).collect(),
             vec![(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)],
         ),
-        // Either side of the size at which the kernel stops scanning the set
-        // and searches it.
+        // Either side of the sizes at which the kernel stops scanning the set
+        // and searches it: one for a value, a larger one for a filter.
         (
             TypeCode::I64,
             (0..32).map(|v| v * 3).collect(),
@@ -763,8 +768,18 @@ fn int_in_set_membership_over_every_pool_shape() {
             (0..33).map(|v| v * 3).collect(),
             vec![(0, 1), (96, 1), (45, 1), (46, 0), (97, 0), (-3, 0)],
         ),
+        (
+            TypeCode::I64,
+            (0..64).map(|v| v * 3).collect(),
+            vec![(0, 1), (189, 1), (45, 1), (46, 0), (190, 0), (-3, 0)],
+        ),
+        (
+            TypeCode::I64,
+            (0..65).map(|v| v * 3).collect(),
+            vec![(0, 1), (192, 1), (45, 1), (46, 0), (193, 0), (-3, 0)],
+        ),
     ] {
-        let (schema, mut prog) = in_set_prog(col_tc, &pool);
+        let (schema, mut prog, mut filter) = in_set_prog(col_tc, &pool);
         // One row per probe, then a NULL operand.
         let n = probes.len() + 1;
         let mb = make_n_col_view(
@@ -775,6 +790,13 @@ fn int_in_set_membership_over_every_pool_shape() {
         );
         let want: Vec<Option<i128>> = probes.iter().map(|&(_, member)| Some(member)).chain([None]).collect();
         assert_eq!(row_values(&mut prog, &mb), want, "tc={col_tc} pool_len={}", pool.len());
+        let passes: Vec<bool> = want.iter().map(|v| *v == Some(1)).collect();
+        assert_eq!(
+            passing_rows(&mut filter, &mb),
+            passes,
+            "tc={col_tc} pool_len={} as a filter",
+            pool.len()
+        );
     }
 }
 

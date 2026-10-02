@@ -71,9 +71,9 @@ fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col 
     Col { tc: TypeCode::String, cells }
 }
 
-/// A program loading each of `cols` into its own register, in order, then `mk`'s
-/// instructions over those registers; the last is the result.
-fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (ScalarEval, TestView) {
+/// The schema, instructions and rows of [`prog`]: one U64 PK and `cols`, each
+/// loaded into its own register, in order, ahead of `mk`'s instructions.
+fn build(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (TestSchema, Vec<LogicalInstr>, TestView) {
     let mut schema_cols = vec![(TypeCode::U64, false)];
     schema_cols.extend(cols.iter().map(|c| (c.tc, c.nullable())));
     let schema = TestSchema::new(&schema_cols, &[0]);
@@ -92,6 +92,13 @@ fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<Logic
     let mut instrs: Vec<LogicalInstr> = cols.iter().zip(1..).map(|(c, col)| c.load(col)).collect();
     let regs: Vec<Reg> = (0..cols.len() as u16).map(Reg).collect();
     instrs.extend(mk(&regs));
+    (schema, instrs, view)
+}
+
+/// A program loading each of `cols` into its own register, in order, then `mk`'s
+/// instructions over those registers; the last is the result.
+fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (ScalarEval, TestView) {
+    let (schema, instrs, view) = build(cols, mk);
     (scalar_prog(&schema, instrs, consts), view)
 }
 
@@ -100,6 +107,19 @@ fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<Logic
 fn ints(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
     let (mut ev, view) = prog(cols, vec![], mk);
     int_rows(&mut ev, &view)
+}
+
+/// [`ints`] for a boolean result, which is read back as a filter verdict too: a
+/// register only the filter reads is written as packed bits and never as lanes,
+/// so the two readings run different kernels.
+fn bools(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
+    let (schema, instrs, view) = build(cols, mk);
+    let got = int_rows(&mut scalar_prog(&schema, instrs.clone(), vec![]), &view);
+    let passed = passing_rows(&mut filter_prog(&schema, instrs, vec![]), &view);
+    for (row, (value, passed)) in got.iter().zip(passed).enumerate() {
+        assert_eq!(passed, *value == Some(1), "row {row} as a filter");
+    }
+    got
 }
 
 /// Every row's result of a string-valued [`prog`], as text.
@@ -521,7 +541,7 @@ fn int_compare_reads_each_operand_with_its_own_signedness() {
     for a_tc in [TypeCode::I64, TypeCode::U64] {
         for b_tc in [TypeCode::I64, TypeCode::U64] {
             for op in CmpOp::ALL.iter().copied() {
-                let got = ints(&[int(a_tc, a.clone()), int(b_tc, b.clone())], |r| {
+                let got = bools(&[int(a_tc, a.clone()), int(b_tc, b.clone())], |r| {
                     vec![LogicalInstr::Cmp { op, a: r[0], b: r[1] }]
                 });
                 let want: Vec<Option<i64>> = a
@@ -541,7 +561,7 @@ fn float_compare_is_ieee_so_every_nan_comparison_is_false() {
     // unordered against everything including itself, and -0.0 == 0.0.
     let (x, y) = pairs(&[0.0f64, -0.0, 1.5, -1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN]);
     for op in CmpOp::ALL.iter().copied() {
-        let got = ints(&[f64s(x.clone()), f64s(y.clone())], |r| {
+        let got = bools(&[f64s(x.clone()), f64s(y.clone())], |r| {
             vec![LogicalInstr::FCmp { op, a: r[0], b: r[1] }]
         });
         let want: Vec<Option<i64>> = x

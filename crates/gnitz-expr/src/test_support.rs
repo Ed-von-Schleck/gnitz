@@ -388,3 +388,17 @@ pub fn is_null_op(col: u32) -> LogicalInstr {
 pub fn is_not_null_op(col: u32) -> LogicalInstr {
     LogicalInstr::IsNull { col, invert: true }
 }
+
+/// Every instruction set [`crate::simd`]'s kernels can run at on this CPU: the
+/// one it reports, and below it the one the build targets when the two differ —
+/// the level a CPU without the wider set runs.
+pub(crate) fn simd_levels() -> Vec<(&'static str, crate::simd::Level)> {
+    use crate::simd::Level;
+    #[allow(unused_mut)]
+    let mut levels = vec![("native", Level::new())];
+    #[cfg(target_arch = "x86_64")]
+    if let (Some(_), Some(avx2)) = (Level::new().as_avx512(), Level::new().as_avx2()) {
+        levels.push(("avx2", Level::Avx2(avx2)));
+    }
+    levels
+}

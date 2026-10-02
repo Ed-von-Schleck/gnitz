@@ -8,6 +8,9 @@ gnitz-wire = { path = "../gnitz-wire" }
 # The substring scan.
 # `no_std` and itself dependency-free, so it pulls nothing into this leaf crate.
 memchr = "2.8.3"
+# The vector types under the mask kernels, and their run-time dispatch.
+# Dependency-free.
+fearless_simd = "1.0"
 
 [lints]
 workspace = true

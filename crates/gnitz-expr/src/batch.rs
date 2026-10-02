@@ -3,8 +3,8 @@
 //! `eval_batch` processes one morsel at a time (up to MORSEL rows), applying
 //! all expression opcodes as columnar loops over register buffers. Base
 //! pointers are hoisted outside the inner loop, which is what lets LLVM
-//! auto-vectorize the arithmetic opcodes — the string and null-gathering
-//! kernels do not vectorize.
+//! auto-vectorize the arithmetic opcodes. The loops that end in packed bits or
+//! start from them are [`crate::simd`]'s; the string kernels do not vectorize.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
@@ -12,10 +12,11 @@ use std::fmt::{self, Write as _};
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::program::{EmitWidth, FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, ScalarEmit, StrEmit};
 use crate::search::{fields, find};
+use crate::simd::{self, LanePred, Level};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_content, german_string_heap, german_string_inline, low_bits_mask,
-    null_word_get, read_u64_le, FixedInt,
+    null_word_get, FixedInt,
 };
 
 /// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
@@ -56,6 +57,10 @@ pub(crate) struct EvalScratch {
     /// A lane at a NULL row holds whatever its kernel computed from the row's
     /// stored bytes: kernels run unconditionally to stay branch-free, so a
     /// consumer must read `regs` against [`Self::null_bits`], never alone.
+    ///
+    /// The lanes between a morsel's last row and the end of its last 64-row
+    /// word hold no row: [`crate::simd`]'s kernels read and write them with
+    /// the rest of the word.
     regs: Vec<i64>,
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
@@ -77,6 +82,15 @@ pub(crate) struct EvalScratch {
     /// is tied to the one program it was built for. The evaluator owns both, so
     /// that pairing holds by construction.
     str_arena: Vec<u8>,
+    /// The instruction set [`crate::simd`]'s kernels run at.
+    level: Level,
+}
+
+/// Register `reg`'s lanes for every word a morsel of `words` words reaches —
+/// the window [`crate::simd`]'s kernels read, which runs past the morsel's last
+/// row to the end of its last word.
+fn word_lanes(regs: &[i64], reg: u16, words: usize) -> &[i64] {
+    &regs[reg as usize * MORSEL..][..words * 64]
 }
 
 /// `N` shared windows plus one mutable window into the same register-major
@@ -129,6 +143,7 @@ impl EvalScratch {
             bool_bits: vec![0; prog.num_regs() * NULL_WORDS_PER_REG],
             str_views: vec![StrView::default(); prog.str_lanes as usize * MORSEL],
             str_arena: prog.const_arena.clone(),
+            level: Level::new(),
         };
         scratch.install_consts(prog);
         scratch
@@ -143,7 +158,8 @@ impl EvalScratch {
             self.regs[base_r..base_r + MORSEL].fill(val);
             if prog.needs_bool_pack(dst as usize) {
                 let base_b = dst as usize * NULL_WORDS_PER_REG;
-                pack_truthy(
+                simd::truthy_bits(
+                    self.level,
                     &self.regs[base_r..base_r + MORSEL],
                     &mut self.bool_bits[base_b..base_b + NULL_WORDS_PER_REG],
                 );
@@ -478,21 +494,7 @@ fn fill_null_bits_mask(s: &mut EvalScratch, di: u16, mo: &Morsel<'_>, cols: u64)
     }
     let base = di as usize * NULL_WORDS_PER_REG;
     let rows = mo.null_words();
-    gather_null_words(rows, mask, &mut s.null_bits[base..base + mo.m.div_ceil(64)]);
-}
-
-/// Gather one bit per row of `rows` (the morsel's 8-byte null words) into `out`:
-/// bit `j` of word `w` is set iff row `w * 64 + j` is null in any column of
-/// `cols`. Whole words, so bits past the morsel's last row are 0. A column
-/// *mask*, so the two-operand string compare gathers both columns in one pass.
-fn gather_null_words(rows: &[u8], cols: u64, out: &mut [u64]) {
-    for (w, block) in rows.chunks(64 * 8).enumerate() {
-        let mut word: u64 = 0;
-        for j in 0..block.len() / 8 {
-            word |= ((read_u64_le(block, j * 8) & cols != 0) as u64) << j;
-        }
-        out[w] = word;
-    }
+    simd::null_bits(s.level, rows, mask, &mut s.null_bits[base..base + mo.m.div_ceil(64)]);
 }
 
 /// `IS [NOT] NULL` (`invert` for IS NOT NULL): payload column `pi`'s bit of the
@@ -524,7 +526,12 @@ fn is_null_packed(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usiz
     let words = mo.m.div_ceil(64);
     let base = dst as usize * NULL_WORDS_PER_REG;
     let flip = if invert { u64::MAX } else { 0 };
-    gather_null_words(mo.null_words(), 1u64 << pi, &mut scratch.bool_bits[base..base + words]);
+    simd::null_bits(
+        scratch.level,
+        mo.null_words(),
+        1u64 << pi,
+        &mut scratch.bool_bits[base..base + words],
+    );
     for w in 0..words {
         scratch.bool_bits[base + w] ^= flip;
     }
@@ -589,19 +596,6 @@ fn bool_and_or_word_loop(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a
     }
 }
 
-/// Pack `src`'s truthy bits into `out`, one bit per row. Callers cut the
-/// windows: indexing a scratch buffer through a base offset instead reloads the
-/// `Vec` header and bounds-checks the whole buffer per row.
-fn pack_truthy(src: &[i64], out: &mut [u64]) {
-    for (w, block) in src.chunks(64).enumerate() {
-        let mut bits: u64 = 0;
-        for (j, &v) in block.iter().enumerate() {
-            bits |= ((v != 0) as u64) << j;
-        }
-        out[w] = bits;
-    }
-}
-
 /// Unpack `bool_bits[dst]` into `regs[dst]` unless `dst` is bit_only, whose
 /// readers take the packed bits directly. The counterpart to
 /// [`maybe_pack_bool_bits`].
@@ -609,14 +603,15 @@ fn maybe_unpack_bool_to_regs(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u1
     if mo.prog.is_bit_only(dst as usize) {
         return;
     }
-    let EvalScratch { regs, bool_bits, .. } = scratch;
-    let bits = &bool_bits[dst as usize * NULL_WORDS_PER_REG..];
+    let EvalScratch { regs, bool_bits, level, .. } = scratch;
+    let words = mo.m.div_ceil(64);
+    let base_b = dst as usize * NULL_WORDS_PER_REG;
     let base_r = dst as usize * MORSEL;
-    for (w, block) in regs[base_r..base_r + mo.m].chunks_mut(64).enumerate() {
-        for (j, r) in block.iter_mut().enumerate() {
-            *r = ((bits[w] >> j) & 1) as i64;
-        }
-    }
+    simd::bit_lanes(
+        *level,
+        &bool_bits[base_b..base_b + words],
+        &mut regs[base_r..base_r + words * 64],
+    );
 }
 
 /// Bridge for producers that wrote `regs[dst]` and may have a downstream BOOL
@@ -633,12 +628,13 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
 }
 
 fn pack_bool_bits(scratch: &mut EvalScratch, m: usize, dst: u16) {
-    let EvalScratch { regs, bool_bits, .. } = scratch;
-    let base_r = dst as usize * MORSEL;
+    let EvalScratch { regs, bool_bits, level, .. } = scratch;
+    let words = m.div_ceil(64);
     let base_b = dst as usize * NULL_WORDS_PER_REG;
-    pack_truthy(
-        &regs[base_r..base_r + m],
-        &mut bool_bits[base_b..base_b + m.div_ceil(64)],
+    simd::truthy_bits(
+        *level,
+        word_lanes(regs, dst, words),
+        &mut bool_bits[base_b..base_b + words],
     );
 }
 
@@ -1199,46 +1195,27 @@ fn str_kernel_rows<const S: usize, const I: usize>(
     null_or_all(scratch, mo, dst, strs.iter().copied().chain(ints.iter().map(|r| r.reg)));
 }
 
-/// `SELECT`'s value blend under a per-row take mask, over either lane array:
-/// `buf[d][i] = if take_a bit i { buf[srcs[0]][i] } else { buf[srcs[1]][i] }`.
-#[inline]
-fn blend_by_mask<T: Blend>(buf: &mut [T], srcs: [u16; 2], d: u16, take_a: &[u64], m: usize) {
-    let ([ra, rb], rd) = split_windows(buf, MORSEL, srcs, d, m);
-    for ((rd, (ra, rb)), &word) in rd.chunks_mut(64).zip(ra.chunks(64).zip(rb.chunks(64))).zip(take_a) {
-        for (j, (r, (&x, &y))) in rd.iter_mut().zip(ra.iter().zip(rb)).enumerate() {
-            *r = T::blend(0u64.wrapping_sub((word >> j) & 1), x, y);
-        }
-    }
-}
-
-/// A lane value two of which blend under an all-ones or all-zeros mask.
-trait Blend: Copy {
-    fn blend(take_a: u64, a: Self, b: Self) -> Self;
-}
-
-impl Blend for i64 {
-    #[inline(always)]
-    fn blend(take_a: u64, a: i64, b: i64) -> i64 {
-        (a & take_a as i64) | (b & !take_a as i64)
-    }
-}
-
-impl Blend for StrView {
-    #[inline(always)]
-    fn blend(take_a: u64, a: StrView, b: StrView) -> StrView {
-        if take_a != 0 {
-            a
-        } else {
-            b
-        }
-    }
-}
-
-/// `Select`'s value blend over string lanes instead of scalar registers.
-fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, a: u16, b: u16) {
-    let m = mo.m;
+/// `Select`: rows where `cond` is true and not NULL take `a`'s value and null
+/// bit, every other row `b`'s.
+fn eval_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, a: u16, b: u16) {
     let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
-    blend_by_mask(&mut scratch.str_views, [a, b], dst, &take_a, m);
+    let (level, words) = (scratch.level, mo.m.div_ceil(64));
+    {
+        let ([ra, rb], rd) = scratch.regs_split([a, b], dst, words * 64);
+        simd::blend(level, &take_a[..words], ra, rb, rd);
+    }
+    maybe_pack_bool_bits(scratch, mo, dst);
+}
+
+/// [`eval_select`] over string lanes instead of scalar registers.
+fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, a: u16, b: u16) {
+    let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
+    let ([sa, sb], sd) = split_windows(&mut scratch.str_views, MORSEL, [a, b], dst, mo.m);
+    for ((sd, (sa, sb)), &word) in sd.chunks_mut(64).zip(sa.chunks(64).zip(sb.chunks(64))).zip(&take_a) {
+        for (j, (v, (&x, &y))) in sd.iter_mut().zip(sa.iter().zip(sb)).enumerate() {
+            *v = if (word >> j) & 1 != 0 { x } else { y };
+        }
+    }
 }
 
 /// SUBSTRING: a sub-view of the source, the bytes never copied.
@@ -1544,21 +1521,23 @@ fn bin_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, f:
 }
 
 /// [`bin_op`] for a predicate. A bit_only destination takes its packed bits
-/// straight off the operands, through a byte per row, and no lane is written.
+/// straight off the operands and no lane is written.
 #[inline]
-fn bin_pred(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, f: impl Fn(i64, i64) -> bool) {
+fn bin_pred<P: LanePred>(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16) {
     if !mo.prog.is_bit_only(d as usize) {
-        return bin_op(scratch, mo, d, a, b, |x, y| f(x, y) as i64);
+        return bin_op(scratch, mo, d, a, b, |x, y| P::scalar(x, y) as i64);
     }
-    let mut truth = [0u8; MORSEL];
+    let words = mo.m.div_ceil(64);
     {
-        let ([ra, rb], _) = scratch.regs_split([a, b], d, mo.m);
-        for ((t, &x), &y) in truth.iter_mut().zip(ra).zip(rb) {
-            *t = f(x, y) as u8;
-        }
+        let EvalScratch { regs, bool_bits, level, .. } = &mut *scratch;
+        let base = d as usize * NULL_WORDS_PER_REG;
+        simd::pred_bits::<P>(
+            *level,
+            word_lanes(regs, a, words),
+            word_lanes(regs, b, words),
+            &mut bool_bits[base..base + words],
+        );
     }
-    let base = d as usize * NULL_WORDS_PER_REG;
-    pack_bytes(&truth, &mut scratch.bool_bits[base..base + mo.m.div_ceil(64)]);
     null_or2(scratch, mo, d, a, b);
 }
 
@@ -1576,9 +1555,30 @@ fn un_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, f: impl Fn(
     maybe_pack_bool_bits(scratch, mo, d);
 }
 
-/// The largest IN set tested a value at a time; a larger one is searched per
-/// row. The `in*` shapes of `filter_kernel_bench` place the crossover.
+/// The largest IN set tested a value at a time into a register's lanes; a
+/// larger one is searched per row. [`IN_SET_BITS_MAX`] is the same limit for a
+/// bit_only destination, whose scan costs less a value. The `in*` shapes of
+/// `filter_kernel_bench` place both crossovers, a filter's verdict being
+/// bit_only.
 const IN_SET_SCAN_MAX: usize = 32;
+const IN_SET_BITS_MAX: usize = 64;
+
+/// `a IN set` for a bit_only destination: its packed bits straight off the
+/// operand, and no lane written.
+fn in_set_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, set: &[i64]) {
+    let words = mo.m.div_ceil(64);
+    {
+        let EvalScratch { regs, bool_bits, level, .. } = &mut *scratch;
+        let base = d as usize * NULL_WORDS_PER_REG;
+        simd::in_set_bits(
+            *level,
+            word_lanes(regs, a, words),
+            set,
+            &mut bool_bits[base..base + words],
+        );
+    }
+    null_copy1(scratch, mo, d, a);
+}
 
 /// `a IN set` for a small set: one equality pass over the whole lane per set
 /// value, each a branch-free loop, rather than a search per row.
@@ -1686,7 +1686,8 @@ fn minmax2(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, p
                 for (j, (r, (&x, &y))) in rd.iter_mut().zip(ra.iter().zip(rb)).enumerate() {
                     let (a_null, b_null) = ((na >> j) & 1, (nb >> j) & 1);
                     let take_a = (1 - a_null) & (b_null | pick(x, y) as u64);
-                    *r = i64::blend(0u64.wrapping_sub(take_a), x, y);
+                    let take_a = 0i64.wrapping_sub(take_a as i64);
+                    *r = (x & take_a) | (y & !take_a);
                 }
             }
         }
@@ -1936,7 +1937,9 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             Instr::IntInSet { value_reg, set_idx } => {
                 let set = &prog.int_sets[set_idx as usize];
-                if set.len() <= IN_SET_SCAN_MAX {
+                if prog.is_bit_only(dst as usize) && set.len() <= IN_SET_BITS_MAX {
+                    in_set_bits(scratch, mo, dst, value_reg, set);
+                } else if set.len() <= IN_SET_SCAN_MAX {
                     in_small_set(scratch, mo, dst, value_reg, set);
                 } else {
                     un_op(scratch, mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
@@ -1967,42 +1970,44 @@ pub(crate) fn eval_batch(
             // One arm per (op, order), so the per-row loop carries no branch.
             // `UnsignedSigned` decides a negative `y` by its sign alone.
             Instr::Cmp { op, a, b, order } => match (op, order) {
-                (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| x == y),
-                (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| x != y),
-                (CmpOp::Gt, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x > y),
-                (CmpOp::Ge, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x >= y),
-                (CmpOp::Lt, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x < y),
-                (CmpOp::Le, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x <= y),
-                (CmpOp::Gt, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
-                (CmpOp::Ge, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) >= (y as u64)),
-                (CmpOp::Lt, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) < (y as u64)),
-                (CmpOp::Le, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) <= (y as u64)),
-                (CmpOp::Eq, IntOrder::UnsignedSigned) => bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && x == y),
-                (CmpOp::Ne, IntOrder::UnsignedSigned) => bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || x != y),
-                (CmpOp::Lt, IntOrder::UnsignedSigned) => {
-                    bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && (x as u64) < (y as u64))
+                (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => bin_pred::<simd::Eq>(scratch, mo, dst, a, b),
+                (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => {
+                    bin_pred::<simd::Not<simd::Eq>>(scratch, mo, dst, a, b)
                 }
-                (CmpOp::Le, IntOrder::UnsignedSigned) => {
-                    bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && (x as u64) <= (y as u64))
+                (CmpOp::Gt, IntOrder::Signed) => bin_pred::<simd::GtSigned>(scratch, mo, dst, a, b),
+                (CmpOp::Ge, IntOrder::Signed) => bin_pred::<simd::GeSigned>(scratch, mo, dst, a, b),
+                (CmpOp::Lt, IntOrder::Signed) => bin_pred::<simd::GtSigned>(scratch, mo, dst, b, a),
+                (CmpOp::Le, IntOrder::Signed) => bin_pred::<simd::GeSigned>(scratch, mo, dst, b, a),
+                (CmpOp::Gt, IntOrder::Unsigned) => bin_pred::<simd::GtUnsigned>(scratch, mo, dst, a, b),
+                (CmpOp::Ge, IntOrder::Unsigned) => bin_pred::<simd::GeUnsigned>(scratch, mo, dst, a, b),
+                (CmpOp::Lt, IntOrder::Unsigned) => bin_pred::<simd::GtUnsigned>(scratch, mo, dst, b, a),
+                (CmpOp::Le, IntOrder::Unsigned) => bin_pred::<simd::GeUnsigned>(scratch, mo, dst, b, a),
+                (CmpOp::Eq, IntOrder::UnsignedSigned) => bin_pred::<simd::EqUnsignedSigned>(scratch, mo, dst, a, b),
+                (CmpOp::Ne, IntOrder::UnsignedSigned) => {
+                    bin_pred::<simd::Not<simd::EqUnsignedSigned>>(scratch, mo, dst, a, b)
                 }
+                (CmpOp::Lt, IntOrder::UnsignedSigned) => bin_pred::<simd::LtUnsignedSigned>(scratch, mo, dst, a, b),
+                (CmpOp::Le, IntOrder::UnsignedSigned) => bin_pred::<simd::LeUnsignedSigned>(scratch, mo, dst, a, b),
                 (CmpOp::Gt, IntOrder::UnsignedSigned) => {
-                    bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || (x as u64) > (y as u64))
+                    bin_pred::<simd::Not<simd::LeUnsignedSigned>>(scratch, mo, dst, a, b)
                 }
                 (CmpOp::Ge, IntOrder::UnsignedSigned) => {
-                    bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || (x as u64) >= (y as u64))
+                    bin_pred::<simd::Not<simd::LtUnsignedSigned>>(scratch, mo, dst, a, b)
                 }
             },
 
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
+            // `<` and `<=` are the mirrored comparison, which a NaN fails as it
+            // fails them; `<>` is the complement of `=`, which a NaN passes.
             Instr::FCmp { op, a, b } => match op {
-                CmpOp::Eq => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) == decode_f64(y)),
-                CmpOp::Ne => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) != decode_f64(y)),
-                CmpOp::Gt => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) > decode_f64(y)),
-                CmpOp::Ge => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) >= decode_f64(y)),
-                CmpOp::Lt => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) < decode_f64(y)),
-                CmpOp::Le => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) <= decode_f64(y)),
+                CmpOp::Eq => bin_pred::<simd::EqFloat>(scratch, mo, dst, a, b),
+                CmpOp::Ne => bin_pred::<simd::Not<simd::EqFloat>>(scratch, mo, dst, a, b),
+                CmpOp::Gt => bin_pred::<simd::GtFloat>(scratch, mo, dst, a, b),
+                CmpOp::Ge => bin_pred::<simd::GeFloat>(scratch, mo, dst, a, b),
+                CmpOp::Lt => bin_pred::<simd::GtFloat>(scratch, mo, dst, b, a),
+                CmpOp::Le => bin_pred::<simd::GeFloat>(scratch, mo, dst, b, a),
             },
 
             // ----------------------------------------------------------------
@@ -2050,13 +2055,7 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Conditional select (SQL CASE blend) / manufactured NULL
             // ----------------------------------------------------------------
-            // Rows where `cond` is non-NULL and truthy take `a`'s value + null
-            // bit; all others (false OR NULL cond) take `b`'s.
-            Instr::Select { cond, a, b } => {
-                let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
-                blend_by_mask(&mut scratch.regs, [a, b], dst, &take_a, m);
-                maybe_pack_bool_bits(scratch, mo, dst);
-            }
+            Instr::Select { cond, a, b } => eval_select(scratch, mo, dst, cond, a, b),
             // Manufacture a NULL: zero the value lane, set the null bit for every
             // live row. Only ever reached on the nullable arm (LoadNull forces
             // `no_nulls` off via its `Operands::makes_null` flag).

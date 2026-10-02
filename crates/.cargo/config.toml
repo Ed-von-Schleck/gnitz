@@ -8,6 +8,10 @@
 # `v4` is deliberately not used: AVX-512 is fused off on recent Intel consumer
 # parts, so it makes the hardware floor erratic rather than simply higher.
 #
+# The exception is gnitz-expr's mask kernels (`simd.rs`): written against vector
+# types and dispatched at run time, they use AVX-512 where the CPU has it and
+# this floor otherwise.
+#
 # Scoped to the target triple rather than `[build]` so build scripts and
 # proc macros, which are compiled for the host, keep the default baseline.
 #
