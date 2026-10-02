@@ -273,8 +273,7 @@ impl Copies {
         let regions = batch.wire_regions();
         let mut rows = ZSetBatch::new(reply_schema);
         // The client's own block decoder: a local and a remote reply decode by one rule.
-        decode_regions_into(&mut rows, &regions, batch.len(), reply_schema)
-            .map_err(|e| MirrorError::Engine(e.to_string()))?;
+        decode_regions_into(&mut rows, &regions, reply_schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
         Ok(rows)
     }
 

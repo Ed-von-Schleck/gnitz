@@ -59,11 +59,13 @@ fn a_block_round_trips_through_both_framers() {
     }
 }
 
-/// A zero-row block's heap is dropped: no cell can reference it.
+/// A block holds at least one row: an empty delta ships no block.
 #[test]
-fn a_zero_row_blocks_heap_is_dropped() {
-    let buf = encode_dead(&[&[], &[], &[], b"orphan heap"], 3);
-    assert_eq!(parse_block(&buf, ROW_WIDTH), Ok((0, &[][..], &[][..], 0)));
+fn a_zero_row_block_is_refused() {
+    for heap in [&b""[..], b"orphan heap"] {
+        let buf = encode_dead(&[&[], &[], &[], heap], 0);
+        assert_eq!(parse_block(&buf, ROW_WIDTH), Err("block holds no rows"));
+    }
 }
 
 /// Every guard, against the block that trips it — including every one-bit
@@ -107,7 +109,12 @@ fn each_guard_rejects_its_forgery() {
             flip(WAL_OFF_VERSION),
             Some("unknown block version"),
         ));
-        cases.push((format!("ROWS bit {bit}"), flip(WAL_OFF_ROWS), Some(mismatch)));
+        let rows_err = if ROWS ^ (1 << bit) == 0 {
+            "block holds no rows"
+        } else {
+            mismatch
+        };
+        cases.push((format!("ROWS bit {bit}"), flip(WAL_OFF_ROWS), Some(rows_err)));
         cases.push((format!("HEAP_LEN bit {bit}"), flip(WAL_OFF_HEAP_LEN), Some(mismatch)));
         // A dead-byte bound within the heap is a legitimate claim.
         let dead_err = ((1usize << bit) > heap_len).then_some("block declares more dead heap than heap");

@@ -12,8 +12,8 @@ use crate::catalog::SysFamily;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::SalWake;
 
-/// A writer over a fresh `size`-byte ring whose groups carry one slot per ring
-/// in `rings`, each worker's wake landing on its ring. Unrewound, as a boot's
+/// A writer over a fresh `size`-byte ring, written at one worker per ring in
+/// `rings`, each worker's wake landing on its ring. Unrewound, as a boot's
 /// writer is before [`SalExcl::boot_rewind`].
 pub(crate) fn test_writer(size: usize, rings: &[*mut u8]) -> SalWriter {
     let len = ANCHOR_BYTES + size;
@@ -27,7 +27,6 @@ pub(crate) fn test_writer(size: usize, rings: &[*mut u8]) -> SalWriter {
     SalWriter::new(
         unsafe { SalLog::new(ptr, len) },
         unsafe { BorrowedFd::borrow_raw(fd) },
-        rings.len(),
         wakes,
     )
 }
@@ -40,8 +39,8 @@ pub(crate) struct TestLog {
 }
 
 impl TestLog {
-    /// A log with a `size`-byte ring whose groups carry `workers` slots,
-    /// rewound to cursor 0 of `epoch`.
+    /// A log with a `size`-byte ring written at `workers` workers, rewound to
+    /// cursor 0 of `epoch`.
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
         let rings = (0..workers)
             .map(|_| crate::runtime::w2m::fixtures::test_ring(4096))
@@ -94,7 +93,8 @@ impl TestLog {
         self.writer.mark_synced(self.writer.epoch(), offset);
     }
 
-    /// Append one group whose slots are `payloads` verbatim; returns its base.
+    /// Append one group sending worker `w` the bytes `payloads[w]` verbatim, an
+    /// empty one being a worker the group does not address; returns its base.
     pub(super) fn write(&self, target: u64, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
         self.try_write(target, lsn, kind, 0, payloads).expect("group fits")
     }
@@ -109,14 +109,22 @@ impl TestLog {
         flags: u8,
         payloads: &[&[u8]],
     ) -> Result<u64, WireFault> {
-        let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
-        let base = self
-            .writer
-            .write_slots(target, lsn, kind, flags, 0, &sizes, |w, slot| {
-                slot.copy_from_slice(payloads[w])
-            })?;
+        let written = || payloads.iter().enumerate().filter(|(_, p)| !p.is_empty());
+        let sizes: Vec<usize> = written().map(|(_, p)| p.len()).collect();
+        let head = GroupHead {
+            lsn,
+            kind,
+            flags,
+            request_id: 0,
+            target_id: target,
+            targets: written().fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
+        };
+        let mut bytes = written().map(|(_, p)| *p);
+        let base = self.writer.write_slots(head, &sizes, |_, slot| {
+            slot.copy_from_slice(bytes.next().expect("one payload per size"))
+        })?;
         self.writer.publish(base);
-        Ok(base as u64)
+        Ok(base)
     }
 
     /// One committed zone of `groups`: its LSN and every member's base.
@@ -153,14 +161,14 @@ impl TestLog {
         lsn
     }
 
-    /// The header of the group at `base`, sized by its own slot count.
+    /// The header of the group at `base`, sized by its own payload count.
     pub(crate) fn header_mut(&mut self, base: u64) -> &mut [u8] {
         let at = base as usize + PREFIX_BYTES;
         // SAFETY: a test only asks for a header it wrote, so both reads are mapped.
         unsafe {
             let fixed = std::slice::from_raw_parts(self.ptr().add(at), HDR_PREFIX);
-            let slots = read_u32_le(fixed, OFF_SLOT_COUNT) as usize;
-            std::slice::from_raw_parts_mut(self.ptr().add(at), group_header_size(slots))
+            let payloads = payload_count(fixed[OFF_FLAGS], WorkerSet(read_u64_le(fixed, OFF_TARGETS)));
+            std::slice::from_raw_parts_mut(self.ptr().add(at), group_header_size(payloads))
         }
     }
 

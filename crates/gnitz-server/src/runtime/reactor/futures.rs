@@ -8,7 +8,7 @@ use gnitz_zset::repr::WalBlock;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
-use crate::runtime::sal::{SalMessageKind, WorkerSet};
+use crate::runtime::sal::{GroupTargets, SalMessageKind, WorkerSet};
 
 /// Worker `w`'s fault `f`, its text naming the worker and `op`.
 fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
@@ -24,6 +24,8 @@ fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
 
 /// What the workers have answered on one [`AckLease`] id.
 pub(super) struct AckRoute {
+    /// The workers that answer.
+    expected: WorkerSet,
     answered: WorkerSet,
     /// The fault of the lowest-numbered worker that failed.
     fault: Option<(usize, WireFault)>,
@@ -34,6 +36,10 @@ pub(super) struct AckRoute {
 impl AckRoute {
     /// Record worker `w`'s answer.
     fn record(&mut self, w: usize, fault: Option<WireFault>) {
+        debug_assert!(
+            self.expected.contains(w),
+            "worker {w} answered a request it was not sent"
+        );
         debug_assert!(!self.answered.contains(w), "worker {w} answered one request id twice");
         self.answered = self.answered.with(w);
         if let Some(f) = fault {
@@ -77,7 +83,7 @@ impl Reactor {
             }
             Some(Route::Acks(r)) => {
                 r.record(w, slot.control().fault(slot.bytes()));
-                if r.fault.is_some() || r.answered.covers(self.w2m.num_workers()) {
+                if r.fault.is_some() || r.answered == r.expected {
                     if let Some(waker) = r.waker.take() {
                         waker.wake();
                     }
@@ -88,7 +94,7 @@ impl Reactor {
         }
     }
 
-    /// A request id no live lease holds, never 0 (`GroupTargets::Unaddressed`'s).
+    /// A request id no live lease holds, never 0 (`GroupTargets::UNADDRESSED`'s).
     fn alloc_request_id(&self) -> u32 {
         let routes = self.routes.borrow();
         let mut id = self.next_request_id.get();
@@ -99,17 +105,24 @@ impl Reactor {
         id
     }
 
-    /// One request id, answered by one ACK from every worker, awaited under the
-    /// label `ctx`. See [`AckLease`].
-    pub(crate) fn lease_acks(&self, ctx: &'static str) -> AckLease {
+    /// One request id, answered by one ACK from every worker in `set`, awaited
+    /// under the label `ctx`. See [`AckLease`].
+    pub(crate) fn lease_acks(&self, ctx: &'static str, set: WorkerSet) -> AckLease {
+        let set = set.within(self.w2m.num_workers());
         let id = self.alloc_request_id();
         let route = AckRoute {
+            expected: set,
             answered: WorkerSet::EMPTY,
             fault: None,
             waker: None,
         };
         self.routes.borrow_mut().insert(id, Route::Acks(route));
-        AckLease { reactor: self.clone(), id, ctx }
+        AckLease {
+            reactor: self.clone(),
+            id,
+            workers: set,
+            ctx,
+        }
     }
 
     /// One request id, answered by a train of frames from every worker in `set`,
@@ -135,11 +148,13 @@ impl Reactor {
 // AckLease
 // ---------------------------------------------------------------------------
 
-/// One request id, answered by one ACK from every worker, routed while it lives,
-/// so an ACK beating its awaiter is kept.
+/// One request id, answered by one ACK from every worker of its set, routed
+/// while it lives, so an ACK beating its awaiter is kept.
 pub(crate) struct AckLease {
     reactor: Reactor,
     id: u32,
+    /// The set its route was built over.
+    workers: WorkerSet,
     /// What the ACKs answer, named in every fault the lease reports.
     ctx: &'static str,
 }
@@ -149,11 +164,19 @@ impl AckLease {
         self.id
     }
 
-    /// `Ok` once every worker has ACKed; `Err` as soon as one has failed, without
-    /// waiting for the rest — the fault of the lowest-numbered failed worker among
-    /// those that answered.
+    /// The targets of the group this lease's workers answer.
+    pub(crate) fn targets(&self) -> GroupTargets {
+        GroupTargets {
+            set: self.workers,
+            request_id: self.id,
+            in_request_order: false,
+        }
+    }
+
+    /// `Ok` once every worker of the set has ACKed; `Err` as soon as one has
+    /// failed, without waiting for the rest — the fault of the lowest-numbered
+    /// failed worker among those that answered.
     pub(crate) async fn acks(&self) -> Result<(), WireFault> {
-        let nw = self.reactor.w2m.num_workers();
         std::future::poll_fn(|cx| {
             let mut routes = self.reactor.routes.borrow_mut();
             let Some(Route::Acks(r)) = routes.get_mut(&self.id) else {
@@ -162,7 +185,7 @@ impl AckLease {
             if let Some((w, f)) = &r.fault {
                 return Poll::Ready(Err(worker_fault(*w, self.ctx, f.clone())));
             }
-            if r.answered.covers(nw) {
+            if r.answered == r.expected {
                 return Poll::Ready(Ok(()));
             }
             r.waker = Some(cx.waker().clone());
@@ -215,7 +238,8 @@ impl TrainFrame {
 }
 
 impl TrainLease {
-    /// The request id.
+    /// The request id, for a test to answer on.
+    #[cfg(test)]
     pub(crate) fn id(&self) -> u32 {
         self.id
     }
@@ -223,6 +247,15 @@ impl TrainLease {
     /// The workers answering, each launched.
     pub(crate) fn workers(&self) -> WorkerSet {
         self.workers
+    }
+
+    /// The targets of the group this lease's workers answer.
+    pub(crate) fn targets(&self, in_request_order: bool) -> GroupTargets {
+        GroupTargets {
+            set: self.workers,
+            request_id: self.id,
+            in_request_order,
+        }
     }
 
     /// Worker `w`'s next frame that carries rows, `None` once its train has ended;

@@ -92,7 +92,7 @@ pub const fn frame_head_size(blob_len: usize, schema_len: Option<usize>) -> usiz
 }
 
 /// Bytes of one frame with these sections.
-pub fn frame_size(blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> usize {
+pub(crate) fn frame_size(blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> usize {
     frame_head_size(blob.len(), schema.map(<[u8]>::len)) + data.map_or(0, crate::wal::block_size)
 }
 

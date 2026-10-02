@@ -6,7 +6,6 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
-use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::rc::Rc;
 
@@ -21,7 +20,7 @@ use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
+use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
 use crate::runtime::tls::TlsArgs;
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
@@ -43,13 +42,14 @@ fn decode_group_slot(
     data: &[u8],
     known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<Option<Batch>, String> {
-    let decoded = ipc::decode_sal_slot(data, known).map_err(|e| {
-        format!(
-            "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-            msg.base, msg.lsn, msg.target_id
-        )
-    })?;
-    Ok(decoded.data_batch.filter(|b| !b.is_empty()))
+    gnitz_wire::control::peek_control_block(data)
+        .and_then(|control| ipc::decode_sal_rows(data, &control, known))
+        .map_err(|e| {
+            format!(
+                "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
+                msg.base, msg.lsn, msg.target_id
+            )
+        })
 }
 
 /// Stage every committed DdlSync group above its family's replay floor into the
@@ -62,10 +62,10 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
 
     let mut replayed: u32 = 0;
     for msg in tail.groups().filter(mine) {
-        // A system family broadcasts: slot 0 carries the whole batch.
-        let Some(data) = msg.slot(0) else {
+        // A system family's group holds its batch as one payload.
+        let Some(data) = msg.payloads().next() else {
             return Err(format!(
-                "SAL replay: DdlSync group at offset={} (lsn={}) carries no slot 0",
+                "SAL replay: DdlSync group at offset={} (lsn={}) carries no payload",
                 msg.base, msg.lsn
             ));
         };
@@ -118,24 +118,6 @@ fn swept_base_tables(catalog: &CatalogEngine) -> Vec<u64> {
     catalog.dag.base_tables_reachable_from(&catalog.registry, keeps_state)
 }
 
-/// Which of a group's slots `slot` replays, and whether what it reads is still
-/// cut for another width. `written` is the group's own slot count.
-fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool) {
-    if written == slot.of {
-        // This rank's own slot: its share of a partitioned group, or the whole
-        // copy of a replicated one.
-        (slot.rank..slot.rank + 1, false)
-    } else if replicated {
-        // Every slot holds the same whole copy, so reading a second would add
-        // those rows' weights again.
-        (0..1, false)
-    } else {
-        // Written for another width, so no slot holds this rank's rows: walk
-        // every written slot and re-cut each for the launched topology.
-        (0..written, true)
-    }
-}
-
 /// Per-worker post-fork user-table replay for `slot`, applying each Push group
 /// through the registry's ingest, whose PK rule makes retractions cancel. Each
 /// swept base's effective delta is buffered as unticked, for the master's tick
@@ -149,7 +131,7 @@ fn recover_from_sal(
     swept_bases: &[u64],
     catalog: &mut CatalogEngine,
 ) -> Result<(), String> {
-    // Groups that applied at least one slot, and the width a re-sliced tail was
+    // Groups that applied at least one payload, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
@@ -161,19 +143,23 @@ fn recover_from_sal(
         let Some((schema, placement)) = catalog.registry.relation(tid).map(|r| (r.schema(), r.placement())) else {
             continue;
         };
-        let (wanted, reslice) = replay_slots(msg.slots(), slot, placement.is_replicated());
+        // Written for another width, so no payload is this rank's share: every one
+        // is re-cut for the launched topology.
+        let reslice = msg.width() != slot.of;
         if reslice {
-            resliced_from = Some(msg.slots());
+            resliced_from = Some(msg.width());
         }
+        let own = (!reslice).then(|| msg.slot(slot.rank)).flatten();
+        let all = reslice.then(|| msg.payloads()).into_iter().flatten();
         let mut applied = false;
-        for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
+        for data in own.into_iter().chain(all) {
             let Some(batch) = decode_group_slot(&msg, data, |tid, record| catalog.known_decode(tid, record))? else {
                 continue;
             };
             let mut owned = if reslice {
                 // The write path's own router, so what survives is exactly what the master
-                // would have written to this rank's slot. It reads only weights and PK
-                // bytes, so it cuts before the widening below.
+                // would have sent this rank. It reads only weights and PK bytes, so it
+                // cuts before the widening below.
                 gnitz_zset::algebra::ScatterPlan::native(placement).share(&batch, slot)
             } else {
                 batch
@@ -526,13 +512,13 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
         worker_pids,
         catalog,
         boot_generation,
-        SalWriter::new(sal, sal_fd, nw, wakes),
+        SalWriter::new(sal, sal_fd, wakes),
         reactor,
     ));
 
     // The workers' ready ACKs. Leased before the loop first runs, which drops
     // every W2M frame no lease routes.
-    let ready = dispatcher.reactor().lease_acks("recovery sync");
+    let ready = dispatcher.reactor().lease_acks("recovery sync", WorkerSet::ALL);
     assert_eq!(
         ready.id(),
         BOOT_READY_REQUEST_ID,

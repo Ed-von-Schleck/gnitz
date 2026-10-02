@@ -28,7 +28,7 @@ use crate::runtime::listen::ClientListener;
 use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, GroupTargets, SalMessageKind};
+use crate::runtime::sal::{DirectGroup, SalMessageKind, WorkerSet};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::control::DecodedControl;
@@ -557,16 +557,14 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
         return Ok(());
     }
 
-    let lease = shared.disp().reactor().lease_acks("tick");
+    let lease = shared.disp().reactor().lease_acks("tick", WorkerSet::ALL);
     let emit = {
         let excl = shared.disp().sal().lock().await;
         guard_panic("tick", || {
             if TICK_EMIT_ERROR.take_once() {
                 return Err("injected tick emit error".into());
             }
-            shared
-                .disp()
-                .write_tick_group(&excl, tids, GroupTargets::all(lease.id()))
+            shared.disp().write_tick_group(&excl, tids, lease.targets())
         })
     };
     // A refused write publishes nothing, so no worker took any tid's delta.
@@ -668,7 +666,7 @@ fn decode_push_frame(
     cat: &CatalogEngine,
     data: &[u8],
     ctrl: DecodedControl,
-) -> Result<(ipc::DecodedWire, Rc<[u8]>), WireFault> {
+) -> Result<(Option<Batch>, Rc<[u8]>), WireFault> {
     let tid = ctrl.hdr.target_id;
     let target = cat.schema_record(tid).ok_or_else(|| not_found(tid))?;
     let schema = cat
@@ -676,11 +674,14 @@ fn decode_push_frame(
         .relation(tid)
         .map(Relation::schema)
         .ok_or_else(|| not_found(tid))?;
-    let wire = ipc::decode_client_frame(data, ctrl, None, |record| {
-        gnitz_wire::schema_block::check_same_types(record, &target).map(|()| Some(schema))
-    })
-    .map_err(|e| format!("decode error: {e}"))?;
-    Ok((wire, target))
+    match &ctrl.schema {
+        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], &target)
+            .map_err(|e| format!("decode error: {e}"))?,
+        None if ctrl.data.is_some() => return Err("decode error: a data block without a schema block".into()),
+        None => {}
+    }
+    let batch = ipc::decode_client_rows(data, &ctrl, &schema).map_err(|e| format!("decode error: {e}"))?;
+    Ok((batch, target))
 }
 
 /// Handle a client push: decode the frame, then commit it under the catalog read
@@ -697,7 +698,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     let mode = ctrl.hdr.flags.conflict_mode;
 
     let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared.cat(), data, ctrl));
-    let (decoded, seen) = decoded?;
+    let (batch, seen) = decoded?;
     if PUSH_HOLD_FOR_DDL.take_once() {
         hold_push_for_ddl(shared, target_id, &seen).await;
     }
@@ -706,10 +707,10 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     // a stream between the two, and the stream rules below read the kind.
     let is_stream = target_kind(shared, target_id, Access::Write)? == RelationKind::Stream;
     if is_stream {
-        check_stream_push(target_id, decoded.data_batch.as_ref(), mode)?;
+        check_stream_push(target_id, batch.as_ref(), mode)?;
     }
 
-    let Some(batch) = decoded.data_batch else {
+    let Some(batch) = batch else {
         send_push_ack(peer, target_id, 0);
         return Ok(());
     };
@@ -830,11 +831,11 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
     let mut heads = Vec::with_capacity(items.len());
     for (frame, ctrl) in items {
         let (tid, mode, basis) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
-        let (wire, seen) = decode_push_frame(cat, frame, ctrl).map_err(|e| WireFault {
+        let (batch, seen) = decode_push_frame(cat, frame, ctrl).map_err(|e| WireFault {
             text: format!("TXN family {tid}: {}", e.text),
             ..e
         })?;
-        let batch = wire.data_batch.expect("a PUSH_TXN item carries a data block");
+        let batch = batch.expect("a PUSH_TXN item carries a data block");
         heads.push(TxnHead { tid, basis, seen });
         families.push(TxnFamily { tid, mode, batch });
     }
@@ -1298,9 +1299,9 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     let base = out.len();
     let total = base + PFX + sz;
     out.reserve(PFX + sz);
-    // SAFETY: `encode` writes every byte of the payload — a block's header,
-    // directory and regions pack end to end — and the length prefix is written
-    // immediately below.
+    // SAFETY: `encode` writes every byte of the payload — a block's header and
+    // regions pack end to end — and the length prefix is written immediately
+    // below.
     #[allow(clippy::uninit_vec)]
     unsafe {
         out.set_len(total);

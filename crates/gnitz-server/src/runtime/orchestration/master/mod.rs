@@ -127,11 +127,7 @@ impl<'d> ScanCut<'d> {
         let lease = self.disp.reactor.lease_train(set, group.kind);
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         self.excl.write(&DirectGroup {
-            targets: GroupTargets::Leased {
-                set: lease.workers(),
-                request_id: lease.id(),
-                in_request_order: self.in_request_order,
-            },
+            targets: lease.targets(self.in_request_order),
             ..group
         })?;
         self.scans.push(lease);

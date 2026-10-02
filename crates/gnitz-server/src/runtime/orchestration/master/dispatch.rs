@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use super::scatter::with_routed;
 use super::*;
+use crate::catalog::SysFamily;
+use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_store::relation::Relation;
@@ -62,7 +64,7 @@ impl MasterDispatcher {
         debug_assert_eq!(
             sal.num_workers(),
             worker_pids.len(),
-            "the SAL's slot count is the worker count"
+            "the SAL is written at the worker count"
         );
         MasterDispatcher {
             worker_pids,
@@ -125,8 +127,8 @@ impl MasterDispatcher {
         ctx: &'static str,
         write: impl FnOnce(&SalExcl<'_>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
-        let lease = self.reactor.lease_acks(ctx);
-        write(&self.sal.lock().await, GroupTargets::all(lease.id()))?;
+        let lease = self.reactor.lease_acks(ctx, WorkerSet::ALL);
+        write(&self.sal.lock().await, lease.targets())?;
         lease.acks().await
     }
 
@@ -149,11 +151,11 @@ impl MasterDispatcher {
 
     /// Write `round`'s flush group, wait for every worker's ACK, finalize.
     pub(crate) async fn checkpoint_round(&self, excl: &mut SalExcl<'_>, round: FlushRound) -> Result<(), WireFault> {
-        let lease = self.reactor.lease_acks(round.phase());
+        let lease = self.reactor.lease_acks(round.phase(), WorkerSet::ALL);
         let generation = self.note_flush_round(round);
         excl.write(&DirectGroup {
             template: wire::WireMsg { arg0: generation, ..Default::default() },
-            targets: GroupTargets::all(lease.id()),
+            targets: lease.targets(),
             ..DirectGroup::new(round.kind())
         })?;
         // `excl` is held through the ACKs, so its drop would wake too late.
@@ -254,12 +256,21 @@ impl MasterDispatcher {
             .await
     }
 
-    /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN
-    /// across a DDL's broadcasts, so recovery groups them atomically. Publishes
-    /// nothing; that is the scope's commit.
-    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: u64, batch: &Batch) -> Result<(), WireFault> {
+    /// Log a DDL batch of `family` inside `scope`'s zone — one LSN across a DDL's
+    /// groups, so recovery groups them atomically — and send it to every worker.
+    /// `_sequences` is master state no worker reads, so its group is logged and
+    /// addresses none. Publishes nothing; that is the scope's commit.
+    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
+        let target_id = family.id();
         let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
-        scope.write(&DirectGroup::ddl_sync(&relation, batch), true)?;
+        let mut group = DirectGroup::ddl_sync(&relation, batch);
+        if family == SysFamily::Sequence {
+            group.targets = GroupTargets {
+                set: WorkerSet::EMPTY,
+                ..GroupTargets::UNADDRESSED
+            };
+        }
+        scope.write(&group, true)?;
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.len());
         Ok(())
     }
@@ -278,16 +289,13 @@ impl MasterDispatcher {
     ) -> Result<(), WireFault> {
         let first = self.tick_round.get() + 1;
         self.tick_round.set(first + tids.len() as u64 - 1);
-        let mut blob = gnitz_wire::Writer::with_capacity(8 * tids.len());
         for (i, &tid) in tids.iter().enumerate() {
             self.record_delta_round(tid, first + i as u64);
-            blob.u64(tid);
         }
-        let blob = blob.into_vec();
         excl.write(&DirectGroup {
             template: wire::WireMsg {
                 arg0: first,
-                blob: &blob,
+                blob: gnitz_wire::as_le_bytes(tids),
                 ..Default::default()
             },
             targets,
@@ -417,18 +425,17 @@ impl MasterDispatcher {
         }
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, every worker
-    /// answering on `request_id`. `recoverable` puts it inside the zone; a
-    /// stream's rows ride outside. The committer commits the scope and awaits the
-    /// ACKs.
+    /// Lay one push batch out as a SAL group inside `scope`, written to the
+    /// workers that own its rows, and answer the lease those workers ACK on.
+    /// `recoverable` puts it inside the zone; a stream's rows ride outside. The
+    /// committer commits the scope and awaits the ACKs.
     pub(crate) fn write_commit_group(
         &self,
         scope: &SalScope,
         target_id: u64,
         batch: &Batch,
-        request_id: u32,
         recoverable: bool,
-    ) -> Result<(), WireFault> {
+    ) -> Result<AckLease, WireFault> {
         if recoverable {
             self.unflushed_pushes.set(true);
         }
@@ -439,8 +446,11 @@ impl MasterDispatcher {
             .relation(target_id)
             .expect("a push target is registered under the catalog lock")
             .placement();
-        with_routed(batch, placement, self.num_workers(), |_, data| {
-            scope.write(&DirectGroup::push(&relation, data, request_id), recoverable)
+        with_routed(batch, placement, self.num_workers(), |data| {
+            // Leased before the group is laid out, so no ACK arrives unrouted.
+            let lease = self.reactor.lease_acks("commit", data.holders());
+            scope.write(&DirectGroup::push(&relation, data, lease.targets()), recoverable)?;
+            Ok(lease)
         })
     }
 

@@ -56,6 +56,34 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
     }
 }
 
+/// An ACK lease over a set is complete on that set's ACKs — the other workers
+/// are never waited on — and one over the empty set is complete at once.
+#[test]
+fn an_ack_lease_completes_on_its_own_sets_acks() {
+    let (r, writers) = reactor_with_rings(4);
+    let lease = r.lease_acks("test", WorkerSet::one(1).with(3));
+    let targets = lease.targets();
+    assert_eq!(
+        (targets.set, targets.request_id),
+        (WorkerSet::one(1).with(3), lease.id())
+    );
+
+    writers[3].send_status(lease.id(), gnitz_wire::WireStatus::Ok, &[]);
+    r.drain_all_w2m();
+    assert!(try_poll_once(lease.acks()).is_none(), "one of the two has answered");
+    writers[1].send_status(lease.id(), gnitz_wire::WireStatus::Ok, &[]);
+    r.drain_all_w2m();
+    assert!(matches!(try_poll_once(lease.acks()), Some(Ok(()))));
+
+    let none = r.lease_acks("test", WorkerSet::EMPTY);
+    assert!(
+        matches!(try_poll_once(none.acks()), Some(Ok(()))),
+        "nothing is owed, so nothing is waited on"
+    );
+    let clipped = r.lease_acks("test", WorkerSet::ALL);
+    assert_eq!(clipped.targets().set.len(), 4, "clipped to the launched");
+}
+
 /// A train route is a queue, not a slot: more frames than any worker count all
 /// wait in it, and come out in arrival order.
 #[test]

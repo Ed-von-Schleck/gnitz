@@ -1,43 +1,16 @@
 use super::*;
 use crate::catalog::{CatalogColumn, SysFamily};
+use crate::runtime::master::scatter::with_routed;
 use crate::runtime::sal::fixtures::TestLog;
+use crate::runtime::sal::{DirectGroup, GroupTargets};
+use crate::runtime::wire::WireSchema;
 use crate::test_support::{
-    circuit_batch, col_def, col_tab_batch, identity_circuit, push_view_tab_row, sum_weights, table_tab_batch,
+    circuit_batch, col_def, col_tab_batch, identity_circuit, make_batch, push_view_tab_row, sum_weights,
+    table_tab_batch,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::Placement;
-
-/// Which of a group's written slots this rank replays. A wrong range silently
-/// loses or doubles ACKed rows, so every case is pinned.
-#[test]
-fn replay_slots_covers_every_width_and_placement() {
-    /// `written` slots on disk, this process being rank `rank` of `of`.
-    fn check(written: u32, rank: u32, of: u32, replicated: bool, want: Range<u32>, want_reslice: bool) {
-        let (range, reslice) = replay_slots(written, Slot::new(rank, of), replicated);
-        assert_eq!(
-            (range, reslice),
-            (want, want_reslice),
-            "written={written} rank={rank} of={of} replicated={replicated}"
-        );
-    }
-
-    // Written at the launched width: this rank's own slot, whether it holds its
-    // share of a partitioned group or a whole replicated copy.
-    check(4, 2, 4, false, 2..3, false);
-    check(4, 2, 4, true, 2..3, false);
-    check(1, 0, 1, false, 0..1, false);
-
-    // Another width, replicated: every slot is the same whole copy, so exactly
-    // one is read and never re-cut.
-    check(4, 1, 2, true, 0..1, false);
-    check(2, 1, 4, true, 0..1, false);
-
-    // Another width, partitioned: no slot holds this rank's rows, so every
-    // written slot is walked and re-cut.
-    check(4, 1, 2, false, 0..4, true);
-    check(2, 3, 4, false, 0..2, true);
-}
 
 // -- Boot staging -----------------------------------------------------------
 
@@ -125,4 +98,69 @@ fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
         [net(&engine, SysFamily::Table), net(&engine, SysFamily::Column)],
         flushed
     );
+}
+
+// -- Tail replay --------------------------------------------------------------
+
+/// The PKs `tid`'s store holds, and the net weight over them.
+fn held(engine: &CatalogEngine, tid: u64) -> (Vec<u64>, i64) {
+    let relation = engine.registry.relation(tid).unwrap();
+    let mut cursor = relation.cursor();
+    let mut pks = Vec::new();
+    while let Some(chunk) = cursor.drain_chunk(1024) {
+        pks.extend((0..chunk.len()).map(|row| u64::from_be_bytes(chunk.get_pk_bytes(row).try_into().unwrap())));
+    }
+    (pks, sum_weights(relation.cursor()))
+}
+
+/// A tail written at another worker count than the one launched. A replicated
+/// push holds its rows once however many workers it was written for, and a
+/// keyed push written at one worker is re-cut to this rank's share.
+#[test]
+fn a_tail_written_at_another_width_replays_for_the_launched_one() {
+    const ROWS: u64 = 64;
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = Slot::new(0, 2);
+    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), slot.of).unwrap();
+    let replicated = gnitz_wire::TableProps {
+        distribution: gnitz_wire::TableDistribution::Replicated,
+        ..Default::default()
+    };
+    let r = engine.create_table_with("public.r", &cols(), &[0], replicated).unwrap();
+    let k = engine.create_table("public.k", &cols(), &[0]).unwrap();
+    let keyed = engine.registry.relation(k).unwrap().placement();
+    let rows: Vec<_> = (0..ROWS).map(|pk| (pk, 1, pk as i64)).collect();
+    let rows = make_batch(&engine.registry.relation(k).unwrap().schema(), &rows);
+
+    for (tid, written_at) in [(r, 4), (k, 1)] {
+        let log = TestLog::new(SAL_SIZE, written_at, 1);
+        let placement = engine.registry.relation(tid).unwrap().placement();
+        let relation = WireSchema::from_catalog(&engine, tid);
+        with_routed(&rows, placement, written_at, |data| {
+            let targets = GroupTargets {
+                set: data.holders(),
+                ..GroupTargets::UNADDRESSED
+            };
+            log.commit_zone(&[DirectGroup::push(&relation, data, targets)]);
+        });
+        log.synced_through(log.cursor());
+
+        let tail = CommittedTail::read(log.log()).unwrap();
+        let group = tail.groups().next().expect("the push is committed");
+        assert_eq!(
+            (group.width() as usize, group.payloads().count()),
+            (written_at, 1),
+            "one payload, written for {written_at} worker(s)"
+        );
+        recover_from_sal(tail, slot, &[], &mut engine).unwrap();
+    }
+
+    assert_eq!(held(&engine, r), ((0..ROWS).collect(), ROWS as i64), "replicated");
+    let own: Vec<u64> = (0..ROWS)
+        .filter(|pk| keyed.owner(&pk.to_be_bytes(), slot.of as usize) == Some(slot.rank as usize))
+        .collect();
+    assert!(!own.is_empty() && own.len() < ROWS as usize, "the key space is split");
+    let net = own.len() as i64;
+    assert_eq!(held(&engine, k), (own, net), "keyed: this rank's share");
+    engine.close();
 }

@@ -768,7 +768,6 @@ fn batches_round_trip_through_a_wal_block() {
         (fixture_b_schema(), fixture_b_batch()),
         (wide, wide_batch),
         (fixture_a_schema(), a_retraction),
-        (fixture_a_schema(), ZSetBatch::new(&fixture_a_schema())),
     ] {
         let block = encode_wal_block(&batch);
         let mut sink = ZSetBatch::new(&schema);

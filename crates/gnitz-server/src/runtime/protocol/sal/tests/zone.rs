@@ -1,6 +1,8 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{DirectGroup, GroupData, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES};
+use crate::runtime::sal::{
+    DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES,
+};
 use crate::runtime::wire::{WireMsg, WireSchema};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
@@ -82,23 +84,44 @@ fn a_fresh_file_anchors_epoch_0() {
     assert_eq!((tail.live_epoch(), tail.groups().count()), (1, 0));
 }
 
-/// A damaged anchor fails the boot.
+/// A flipped bit of the anchor word or of its checksum fails the boot; the
+/// spare word behind them is read only when the front word does not verify.
 #[test]
 fn a_flipped_anchor_bit_fails_the_boot() {
     let log = TestLog::new(SIZE, 1, 3);
     log.zone(&[11]);
     log.synced_through(log.cursor());
     let view = log.log();
-    assert_eq!(view.anchor(), Ok((3, log.cursor())));
+    let clean = (3, log.cursor());
+    assert_eq!(view.anchor(), Ok(clean));
 
     let anchor = unsafe { &mut *view.anchor_record() };
-    sweep_bit_flips(anchor, 0..ANCHOR_RECORD, |byte, bit, _| {
+    sweep_bit_flips(anchor, 0..16, |byte, bit, _| {
         let err = CommittedTail::read(view).err();
         assert!(
             err.is_some_and(|e| e.contains("SAL anchor")),
             "anchor byte {byte} bit {bit} must fail the read"
         );
     });
+    sweep_bit_flips(anchor, 16..ANCHOR_RECORD, |byte, bit, _| {
+        assert_eq!(view.anchor(), Ok(clean), "spare byte {byte} bit {bit}");
+    });
+}
+
+/// A rewind anchors the next epoch before it empties the ring, so a kill
+/// between the two leaves that epoch's anchor over the old epoch's groups —
+/// which the walk rejects by their header epoch.
+#[test]
+fn the_next_epochs_anchor_over_the_old_ring_is_an_empty_tail() {
+    let log = TestLog::new(SIZE, 1, 1);
+    log.zone(&[11]);
+    log.zone(&[21]);
+    log.synced_through(log.cursor());
+    assert_eq!(committed(log.log()).unwrap().len(), 2);
+
+    log.writer.write_anchor(2, 0);
+    let tail = CommittedTail::read(log.log()).expect("an empty tail, not a hole");
+    assert_eq!((tail.live_epoch(), tail.groups().count()), (3, 0));
 }
 
 /// A checkpoint reset durably anchors the next epoch at cursor 0: the old
@@ -234,7 +257,7 @@ fn a_stop_past_the_mapping_below_synced_fails() {
     assert!(err.contains(&format!("offset={},", second[0])), "{err}");
 }
 
-/// Rot in any worker's slot demotes the zone.
+/// Rot in any worker's payload demotes the zone.
 #[test]
 fn the_demotion_is_global_across_slots() {
     for victim in 0..NW as u32 {
@@ -256,7 +279,10 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
         WireSchema::encoded(TID + 1, batch.schema()),
     );
     let data = GroupData::Same(batch.wire_whole());
-    let (member, stream) = (DirectGroup::push(&member, data, 0), DirectGroup::push(&stream, data, 0));
+    let (member, stream) = (
+        DirectGroup::push(&member, data, GroupTargets::UNADDRESSED),
+        DirectGroup::push(&stream, data, GroupTargets::UNADDRESSED),
+    );
     let mut excl = log.excl();
     let scope = excl.begin("test");
     scope.write(&member, true).expect("group fits");
@@ -299,17 +325,17 @@ impl TestLog {
         self.commit_zone(&groups)
     }
 
-    /// A committed zone of one `Push` group per target, every worker sent
-    /// [`rows`].
+    /// A committed zone of one `Push` group per target, every worker sent its
+    /// own payload of [`rows`].
     fn push_zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
-        let batch = rows();
+        let batches = vec![rows(); self.writer.num_workers()];
         let relations: Vec<WireSchema> = targets
             .iter()
-            .map(|&t| WireSchema::encoded(t, batch.schema()))
+            .map(|&t| WireSchema::encoded(t, batches[0].schema()))
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()
-            .map(|r| DirectGroup::push(r, GroupData::Same(batch.wire_whole()), 0))
+            .map(|r| DirectGroup::push(r, GroupData::Batches(&batches), GroupTargets::UNADDRESSED))
             .collect();
         self.commit_zone(&groups)
     }
@@ -325,9 +351,11 @@ impl TestLog {
         self.write(21, self.writer.next_zone_lsn(), SalMessageKind::DdlSync, &[&[0u8; 64]])
     }
 
-    /// Corrupt one byte of slot `w` of the group at `base`.
+    /// Corrupt one byte of worker `w`'s payload of the group at `base`.
     fn damage_slot(&self, base: u64, w: u32) {
-        let slot = group_at(self.log(), base).slot(w).expect("slot carries bytes");
+        let slot = group_at(self.log(), base)
+            .slot(w)
+            .expect("the group addresses the worker");
         let off = (slot.as_ptr() as usize) - (self.ptr() as usize);
         unsafe { *self.ptr().add(off + slot.len() / 2) ^= 0xFF };
     }

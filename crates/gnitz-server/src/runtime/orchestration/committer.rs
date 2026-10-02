@@ -220,7 +220,8 @@ struct GroupInfo {
     /// See `PendingPush::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,
-    lease: AckLease,
+    /// The ACKs of the workers the group was written to; `Some` once it is laid out.
+    lease: Option<AckLease>,
     merged: Batch,
 }
 
@@ -266,10 +267,9 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     pushes.sort_by_key(|p| p.tid);
 
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let lease_acks = || shared.disp().reactor().lease_acks("commit");
 
     // ------------------------------------------------------------------
-    // Phase A (no lock): build merged batches + req_id allocations.
+    // Phase A (no lock): build merged batches.
     // Transaction units come FIRST (transactions-first emission), each family its
     // own group in frame order; then the merged single-push units.
     // ------------------------------------------------------------------
@@ -280,7 +280,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
                 .map(|fam| GroupInfo {
                     tid: fam.tid,
                     recoverable: true,
-                    lease: lease_acks(),
+                    lease: None,
                     merged: fam.batch,
                 })
                 .collect(),
@@ -323,12 +323,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         };
         units.push(match merged {
             Ok(merged) => CommitUnit {
-                groups: vec![GroupInfo {
-                    tid,
-                    recoverable,
-                    lease: lease_acks(),
-                    merged,
-                }],
+                groups: vec![GroupInfo { tid, recoverable, lease: None, merged }],
                 dones,
                 failed: None,
             },
@@ -364,7 +359,16 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         // that push alone.
         for unit in units.iter_mut().filter(|u| u.failed.is_none()) {
             let savepoint = scope.savepoint();
-            unit.failed = unit.groups.iter().find_map(|g| lay_out_group(shared, &scope, g).err());
+            unit.failed = unit
+                .groups
+                .iter_mut()
+                .find_map(|g| match lay_out_group(shared, &scope, g) {
+                    Ok(lease) => {
+                        g.lease = Some(lease);
+                        None
+                    }
+                    Err(e) => Some(e),
+                });
             if unit.failed.is_some() {
                 scope.roll_back(savepoint);
             }
@@ -387,7 +391,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
     for g in units.iter().flat_map(|u| u.live()) {
-        if let Err(e) = g.lease.acks().await {
+        let lease = g.lease.as_ref().expect("a live group was laid out");
+        if let Err(e) = lease.acks().await {
             // The group is durable and the other workers applied it: answering it
             // would leave the SAL and this worker's partition disagreeing.
             gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
@@ -425,12 +430,11 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
 }
 
 /// Lay one group out in `scope`, inside its zone when the group is
-/// `recoverable`. `guard_panic` covers the encode of a client-supplied batch.
-fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result<(), WireFault> {
+/// `recoverable`, and answer the lease its workers ACK on. `guard_panic` covers
+/// the encode of a client-supplied batch.
+fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result<AckLease, WireFault> {
     guard_panic("commit_write", || {
-        shared
-            .disp()
-            .write_commit_group(scope, g.tid, &g.merged, g.lease.id(), g.recoverable)
+        shared.disp().write_commit_group(scope, g.tid, &g.merged, g.recoverable)
     })
 }
 

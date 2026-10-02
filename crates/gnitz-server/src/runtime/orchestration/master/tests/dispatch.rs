@@ -3,7 +3,6 @@ use std::rc::Rc;
 use super::super::fixtures::test_dispatcher;
 use super::FlushRound;
 use crate::catalog::{CatalogEngine, SysFamily};
-use crate::runtime::sal::GroupTargets;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{WireFault, WireStatus};
@@ -87,9 +86,7 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
                             text: "SAL full".into(),
                         });
                     }
-                    let GroupTargets::Leased { request_id: id, .. } = targets else {
-                        unreachable!("a round broadcasts")
-                    };
+                    let id = targets.request_id;
                     d.reactor().spawn(async move {
                         match answer {
                             Answer::Acks => writers.iter().for_each(|w| w.send_status(id, WireStatus::Ok, b"")),

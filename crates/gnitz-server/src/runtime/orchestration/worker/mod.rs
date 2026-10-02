@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::catalog::{CatalogEngine, SysFamily};
+use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{SalMessageKind, SalReader};
@@ -16,6 +16,7 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{Relation, RelationRegistry};
+use gnitz_wire::control::{peek_control_block, ControlHeader};
 use gnitz_wire::{WireFlags, WireStatus};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -25,7 +26,9 @@ use gnitz_zset::schema::SchemaDescriptor;
 struct Request {
     kind: SalMessageKind,
     route: ReplyRoute,
-    wire: ipc::DecodedWire,
+    hdr: ControlHeader,
+    blob: Vec<u8>,
+    batch: Option<Batch>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,31 +132,28 @@ impl WorkerProcess {
     }
 
     /// The next SAL group this worker acts on, decoded into an owned
-    /// [`Request`]: the single decode point of both drain loops. A `_sequences`
-    /// DdlSync is skipped unread — `_sequences` is master state, which no worker
-    /// reads.
+    /// [`Request`]: the single decode point of both drain loops.
     fn next_request(&mut self) -> Option<Request> {
-        loop {
-            let (msg, wire) = self.sal_reader.next()?;
-            if msg.kind == SalMessageKind::DdlSync && SysFamily::from_id(msg.target_id) == Some(SysFamily::Sequence) {
-                continue;
-            }
-            // The kinds the master frames with their target's catalog record.
-            let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
-            let known = |tid, record: &[u8]| catalog_record.then(|| self.cat().known_decode(tid, record)).flatten();
-            // Fail-stop: a dropped group diverges this worker from the master.
-            return match ipc::decode_sal_slot(wire, known) {
-                Ok(w) => Some(Request {
-                    kind: msg.kind,
-                    route: ReplyRoute {
-                        target_id: w.control.hdr.target_id,
-                        request_id: msg.request_id,
-                        fifo: msg.in_request_order,
-                    },
-                    wire: w,
-                }),
-                Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
-            };
+        let (msg, wire) = self.sal_reader.next()?;
+        // The kinds the master frames with their target's catalog record.
+        let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
+        let known = |tid, record: &[u8]| catalog_record.then(|| self.cat().known_decode(tid, record)).flatten();
+        // Fail-stop: a dropped group diverges this worker from the master.
+        let decoded =
+            peek_control_block(wire).and_then(|control| Ok((ipc::decode_sal_rows(wire, &control, known)?, control)));
+        match decoded {
+            Ok((batch, control)) => Some(Request {
+                kind: msg.kind,
+                route: ReplyRoute {
+                    target_id: control.hdr.target_id,
+                    request_id: msg.request_id,
+                    fifo: msg.in_request_order,
+                },
+                hdr: control.hdr,
+                blob: wire[control.blob].to_vec(),
+                batch,
+            }),
+            Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
         }
     }
 
@@ -167,23 +167,19 @@ impl WorkerProcess {
     }
 
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
-        let Request { kind, route, wire: decoded } = req;
-        let (hdr, target_id, request_id) = (decoded.control.hdr, route.target_id, route.request_id);
-        let blob = decoded.blob;
-        let batch = decoded.data_batch;
+        let Request { kind, route, hdr, blob, batch } = req;
+        let (target_id, request_id) = (route.target_id, route.request_id);
 
         match kind {
             SalMessageKind::Shutdown => unsafe { libc::_exit(0) },
 
             SalMessageKind::Flush => {
-                self.sal_reader.rewind();
                 self.cat().registry.checkpoint_base()?;
                 self.send_ack(request_id);
                 Ok(())
             }
 
             SalMessageKind::FlushEph => {
-                self.sal_reader.rewind();
                 self.cat().flush_ephemeral_round(hdr.arg0)?;
                 self.send_ack(request_id);
                 Ok(())
@@ -194,7 +190,7 @@ impl WorkerProcess {
             // engine bug, and continuing would leave this worker with a
             // permanently stale catalog — silently wrong results.
             SalMessageKind::DdlSync => {
-                if let Some(batch) = batch.filter(|b| !b.is_empty()) {
+                if let Some(batch) = batch {
                     if let Err(e) = self.cat().ddl_sync(target_id, batch) {
                         gnitz_fatal_abort!("DdlSync application failed for tid={target_id}: {e}");
                     }
@@ -222,7 +218,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Push => {
-                if let Some(batch) = batch.filter(|b| !b.is_empty()) {
+                if let Some(batch) = batch {
                     self.handle_push(target_id, batch);
                 }
                 self.send_ack(request_id);
@@ -230,15 +226,12 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                let tids = gnitz_wire::decode_all(&blob, "tick", |r| {
-                    let mut tids = Vec::with_capacity(r.remaining() / 8);
-                    while r.remaining() > 0 {
-                        tids.push(r.u64()?);
-                    }
-                    Ok(tids)
-                })?;
-                for (i, &tid) in tids.iter().enumerate() {
-                    self.handle_tick(tid, hdr.arg0 + i as u64);
+                let (tids, rest) = blob.as_chunks::<8>();
+                if !rest.is_empty() {
+                    return Err("tick: the blob is not whole tids".into());
+                }
+                for (i, tid) in tids.iter().enumerate() {
+                    self.handle_tick(u64::from_le_bytes(*tid), hdr.arg0 + i as u64);
                 }
                 self.send_ack(request_id);
                 Ok(())

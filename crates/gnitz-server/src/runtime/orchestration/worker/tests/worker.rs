@@ -1,6 +1,7 @@
 use super::*;
+use crate::catalog::SysFamily;
 use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::DirectGroup;
+use crate::runtime::sal::{DirectGroup, GroupTargets, WorkerSet};
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, weighted_rows,
@@ -105,7 +106,7 @@ fn weight(i: u64) -> i64 {
 
 /// The in-wait matrix, driven through the exchange wait's own drain loop: reads
 /// park in SAL order; `HasPk`, `Push` and `Flush` answer from inside the wait; a
-/// `_sequences` DdlSync is skipped unread; and a queued train stays unsent — a
+/// DdlSync that addresses no worker is stepped over; and a queued train stays unsent — a
 /// slow client can fill the ring, and a worker blocked on it would stall the
 /// round every peer waits on.
 #[test]
@@ -118,7 +119,7 @@ fn in_wait_dispositions() {
     let seq = SysFamily::Sequence.id();
     // Target 7 is a system id, which a Push may not name — but a control-only
     // slot carries no rows, so the arm ACKs without reaching the store.
-    // `Flush` goes last: it rewinds the reader, as a checkpoint does.
+    // `Flush` goes last: the reader leaves the epoch on stepping past it.
     let groups = [
         (SalMessageKind::ScanSpec, 76),
         (SalMessageKind::DeltaRead, 77),
@@ -128,9 +129,15 @@ fn in_wait_dispositions() {
         (SalMessageKind::Flush, 7),
     ];
     for (kind, target_id) in groups {
+        // Addresses no worker.
+        let set = match kind {
+            SalMessageKind::DdlSync => WorkerSet::EMPTY,
+            _ => WorkerSet::ALL,
+        };
         sal.excl()
             .write(&DirectGroup {
                 template: ipc::WireMsg { target_id, ..Default::default() },
+                targets: GroupTargets { set, ..GroupTargets::UNADDRESSED },
                 ..DirectGroup::new(kind)
             })
             .expect("group fits");

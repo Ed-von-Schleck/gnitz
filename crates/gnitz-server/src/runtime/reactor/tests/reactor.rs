@@ -14,7 +14,7 @@ use gnitz_wire::WireStatus;
 #[test]
 fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
     let (r, writers) = reactor_with_rings(3);
-    let lease = r.lease_acks("test");
+    let lease = r.lease_acks("test", WorkerSet::ALL);
     writers[0].send_status(lease.id(), WireStatus::Ok, &[]);
     writers[1].send_status(lease.id(), WireStatus::Ok, &[]);
     r.drain_all_w2m(); // before any awaiter
@@ -38,7 +38,7 @@ fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
 #[test]
 fn acks_resolve_on_a_fault_naming_the_lowest_failed_worker() {
     let (r, writers) = reactor_with_rings(3);
-    let lease = r.lease_acks("test");
+    let lease = r.lease_acks("test", WorkerSet::ALL);
     let mut fut = std::pin::pin!(lease.acks());
     let (flag, waker) = WakeFlag::new();
     assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
@@ -60,7 +60,7 @@ fn acks_resolve_on_a_fault_naming_the_lowest_failed_worker() {
 #[test]
 fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
     let (r, writers) = reactor_with_rings(3);
-    let id = r.lease_acks("test").id();
+    let id = r.lease_acks("test", WorkerSet::ALL).id();
     writers[0].send_status(id, WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
@@ -80,9 +80,9 @@ fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
 fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let (r, _writers) = reactor_with_rings(1);
     r.next_request_id.set(u32::MAX);
-    let top = r.lease_acks("test");
+    let top = r.lease_acks("test", WorkerSet::ALL);
     assert_eq!(top.id(), u32::MAX);
-    let wrapped = r.lease_acks("test");
+    let wrapped = r.lease_acks("test", WorkerSet::ALL);
     assert_eq!(wrapped.id(), 1, "the id after u32::MAX is 1, not 0");
 
     r.next_request_id.set(1);
@@ -97,7 +97,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let writer = writers.pop().expect("one ring");
-        let lease = r.lease_acks("test");
+        let lease = r.lease_acks("test", WorkerSet::ALL);
         let id = lease.id();
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
@@ -167,7 +167,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     };
     let pid = unsafe { fork_child(child) };
 
-    let lease = reactor.lease_acks("stress");
+    let lease = reactor.lease_acks("stress", WorkerSet::ALL);
     assert_eq!(lease.id(), 1);
     let timer = reactor.sleep(TIMEOUT);
     let out = reactor.block_on(async move { select2(lease.acks(), timer).await });
@@ -204,7 +204,7 @@ fn a_publish_on_a_later_ring_wakes_the_reactor() {
 
     let r = make_reactor_over(W2mReceiver::new(vec![r0, r1]));
     // Request id 1 is a fresh reactor's first.
-    let lease = r.lease_acks("later ring");
+    let lease = r.lease_acks("later ring", WorkerSet::ALL);
     let timer = r.sleep(TIMEOUT);
     let out = r.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {

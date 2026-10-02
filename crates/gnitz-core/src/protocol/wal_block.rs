@@ -38,32 +38,22 @@ pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &
         at += rows * s;
     }
     regions.push(heap);
-    decode_regions_into(sink, &regions, rows, schema)
+    decode_regions_into(sink, &regions, schema)
 }
 
-/// `sink` is a well-formed batch of `schema`, and so can be appended to.
-fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> {
-    let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
-    sink.layout_matches(schema).map_err(sink_err)?;
-    sink.check_columns().map_err(sink_err)
-}
-
-/// Decode `count` rows laid out as the canonical region list `regions` under
-/// `schema`, appending them to `sink`. On error `sink` is left as it was.
-pub fn decode_regions_into(
-    sink: &mut ZSetBatch,
-    regions: &[&[u8]],
-    count: usize,
-    schema: &Schema,
-) -> Result<(), ProtocolError> {
-    debug_assert_eq!(regions.len(), gnitz_wire::num_regions(schema.num_payload_cols()));
-    debug_assert!(fixed_strides(schema).zip(regions).all(|(s, r)| r.len() == count * s));
-    sink_matches(sink, schema)?;
-    let mark = sink.mark();
-    append_regions(sink, regions, count, schema).inspect_err(|_| sink.rollback_to(mark))
-}
-
-fn append_regions(sink: &mut ZSetBatch, regions: &[&[u8]], count: usize, schema: &Schema) -> Result<(), ProtocolError> {
+/// Decode the rows laid out as the canonical region list `regions` under
+/// `schema`, appending them to `sink`, a batch of `schema`. On error `sink` is
+/// not usable.
+pub fn decode_regions_into(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
+    debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
+    let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / 8);
+    if regions.len() != gnitz_wire::num_regions(schema.num_payload_cols())
+        || !fixed_strides(schema).zip(regions).all(|(s, r)| r.len() == count * s)
+    {
+        return Err(ProtocolError::DecodeError(
+            "a region list that does not lay out its schema".into(),
+        ));
+    }
     sink.reserve(count);
     sink.pks.push_region_bytes(regions[REG_PK]);
     gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);

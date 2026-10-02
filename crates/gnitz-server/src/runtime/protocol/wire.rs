@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::control::{peek_control_block, DecodedControl};
+use gnitz_wire::control::DecodedControl;
 use gnitz_wire::{WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
@@ -123,96 +123,38 @@ impl<'a> WireMsg<'a> {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Full decoded wire message.
-pub struct DecodedWire {
-    pub control: DecodedControl,
-    /// The frame's blob, copied out of the buffer `control` indexes: a decoded
-    /// request can outlive that buffer.
-    pub blob: Vec<u8>,
-    pub schema: Option<SchemaDescriptor>,
-    pub data_batch: Option<Batch>,
-}
-
-/// A `known` for a frame whose record is always decoded.
-pub fn unknown(_: &[u8]) -> Result<Option<SchemaDescriptor>, String> {
-    Ok(None)
-}
-
-/// Decode a client frame. `recordless` lays out a frame that carries no record; `known` answers
-/// what a record decodes to when that is already known (`Ok(None)`: decode it),
-/// or refuses the frame.
-///
-/// A data block with no rows is refused: an empty delta ships no block (as
-/// [`WireMsg`] encodes one), so a present block always carries a row, and no
-/// handler opens a zone or bumps a commit LSN for nothing.
-pub fn decode_client_frame(
+/// The rows of a client frame's data block under `schema`; `None` for a frame
+/// without one.
+pub fn decode_client_rows(
     data: &[u8],
-    control: DecodedControl,
-    recordless: Option<&SchemaDescriptor>,
-    known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
-) -> Result<DecodedWire, String> {
-    decode_frame(data, control, recordless, known, |b, s| {
-        let batch = Batch::decode_foreign_wal_block(b, s)?;
-        if batch.is_empty() {
-            return Err("a data block with no rows");
-        }
-        Ok(batch)
-    })
+    control: &DecodedControl,
+    schema: &SchemaDescriptor,
+) -> Result<Option<Batch>, &'static str> {
+    control
+        .data
+        .clone()
+        .map(|r| Batch::decode_foreign_wal_block(&data[r], schema))
+        .transpose()
 }
 
-/// Decode one SAL slot; `known` is asked with the slot's target id.
-pub fn decode_sal_slot(
+/// The rows of a SAL slot's data block under the slot's own schema record;
+/// `known` answers what that record decodes to when the caller already knows.
+pub fn decode_sal_rows(
     data: &[u8],
+    control: &DecodedControl,
     known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
-) -> Result<DecodedWire, String> {
-    let control = peek_control_block(data)?;
-    let tid = control.hdr.target_id;
-    let decoded = decode_frame(
-        data,
-        control,
-        None,
-        |record: &[u8]| Ok(known(tid, record)),
-        Batch::decode_from_wal_block,
-    )?;
-    if let Some(b) = &decoded.data_batch {
-        b.debug_verify_null_bits();
-    }
-    Ok(decoded)
-}
-
-/// A frame decoded into its `DecodedWire`, every field built in the slot it
-/// stays in rather than assembled from a returned tuple.
-fn decode_frame(
-    data: &[u8],
-    control: DecodedControl,
-    recordless: Option<&SchemaDescriptor>,
-    known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
-    decode: impl FnOnce(&[u8], &SchemaDescriptor) -> Result<Batch, &'static str>,
-) -> Result<DecodedWire, String> {
-    let schema = match &control.schema {
-        Some(r) => {
-            let record = &data[r.clone()];
-            Some(match known(record)? {
-                Some(s) => s,
-                None => decode_schema_block(record)?,
-            })
-        }
-        None => recordless.copied(),
+) -> Result<Option<Batch>, String> {
+    let Some(r) = control.data.clone() else {
+        return Ok(None);
     };
-    let mut out = DecodedWire {
-        blob: data[control.blob.clone()].to_vec(),
-        control,
-        schema,
-        data_batch: None,
+    let record = &data[control.schema.clone().ok_or("a data block without a schema block")?];
+    let schema = match known(control.hdr.target_id, record) {
+        Some(s) => s,
+        None => decode_schema_block(record)?,
     };
-    let Some(r) = out.control.data.clone() else {
-        return Ok(out);
-    };
-
-    let (schema, batch) = (&out.schema, &mut out.data_batch);
-    let schema = schema.as_ref().ok_or("a data block without a schema block")?;
-    *batch = Some(decode(&data[r], schema).map_err(str::to_string)?);
-    Ok(out)
+    let batch = Batch::decode_from_wal_block(&data[r], &schema)?;
+    batch.debug_verify_null_bits();
+    Ok(Some(batch))
 }
 
 #[cfg(test)]

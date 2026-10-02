@@ -14,13 +14,13 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Route `batch`'s live rows to the workers `placement` names, and hand `f` each
-/// slot's row list and the group payload that carries them.
+/// Route `batch`'s live rows to the workers `placement` names, and hand `f` the
+/// group data that carries them.
 pub(crate) fn with_routed<R>(
     batch: &Batch,
     placement: Placement,
     num_workers: usize,
-    f: impl FnOnce(&[Vec<u32>], GroupData<'_>) -> R,
+    f: impl FnOnce(GroupData<'_>) -> R,
 ) -> R {
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -34,7 +34,7 @@ pub(crate) fn with_routed<R>(
                 GroupData::batches(&subs)
             }
         };
-        f(rows, data)
+        f(data)
     })
 }
 

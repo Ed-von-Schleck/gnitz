@@ -81,8 +81,7 @@ impl WorkerProcess {
             // A drive writes no base-table key.
             HasPk => self.handle_request(req),
             Shutdown => self.handle_request(req),
-            // Never sent beside a drive. (A `_sequences` DdlSync — a serial-range
-            // reservation, which takes no tick gate — is skipped before dispatch.)
+            // Never sent beside a drive.
             DdlSync | Tick | FlushEph | Backfill | UniquePreflight => {
                 gnitz_fatal_abort!("{:?} inside an exchange wait — diverged from the master", req.kind)
             }

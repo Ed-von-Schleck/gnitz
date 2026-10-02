@@ -22,15 +22,15 @@ pub const WAL_FORMAT_VERSION: u32 = WAL_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEM
 
 /// Total block size: header, fixed regions and heap.
 pub(crate) const WAL_OFF_SIZE: usize = 0;
-pub const WAL_OFF_VERSION: usize = 4;
-pub const WAL_OFF_ROWS: usize = 8;
-pub const WAL_OFF_HEAP_LEN: usize = 12;
+const WAL_OFF_VERSION: usize = 4;
+const WAL_OFF_ROWS: usize = 8;
+const WAL_OFF_HEAP_LEN: usize = 12;
 /// An upper bound on the heap bytes no string cell of the block references.
-pub const WAL_OFF_HEAP_DEAD: usize = 16;
+const WAL_OFF_HEAP_DEAD: usize = 16;
 const _: () = assert!(WAL_OFF_HEAP_DEAD + 4 == WAL_HEADER_SIZE);
 
 /// The framed size of a block over the canonical region list `regions`.
-pub fn block_size(regions: &[&[u8]]) -> usize {
+pub(crate) fn block_size(regions: &[&[u8]]) -> usize {
     WAL_HEADER_SIZE + regions.iter().map(|r| r.len()).sum::<usize>()
 }
 
@@ -92,7 +92,7 @@ pub fn append_block(regions: &[&[u8]], heap_dead: usize, out: &mut Vec<u8>) {
 }
 
 /// The WAL block at the front of `tail`, sized by its own `SIZE` field.
-pub fn block_slice(tail: &[u8]) -> Result<&[u8], &'static str> {
+pub(crate) fn block_slice(tail: &[u8]) -> Result<&[u8], &'static str> {
     if tail.len() < WAL_HEADER_SIZE {
         return Err("block shorter than header");
     }
@@ -109,8 +109,8 @@ pub type ParsedBlock<'a> = (usize, &'a [u8], &'a [u8], usize);
 
 /// Validate a block whose rows are `row_width` bytes of fixed regions each,
 /// and return its row count, its fixed-region bytes, its heap and its
-/// dead-byte bound. A zero-row block's heap is dropped: no cell can reference
-/// it, so it holds nothing dead either.
+/// dead-byte bound. A block holds at least one row: an empty delta ships no
+/// block.
 pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'static str> {
     let block = block_slice(block)?;
     if read_u32_le(block, WAL_OFF_VERSION) != WAL_FORMAT_VERSION {
@@ -118,6 +118,9 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
     }
     let size = block.len();
     let rows = read_u32_le(block, WAL_OFF_ROWS) as usize;
+    if rows == 0 {
+        return Err("block holds no rows");
+    }
     let heap_len = read_u32_le(block, WAL_OFF_HEAP_LEN) as usize;
     let heap_dead = read_u32_le(block, WAL_OFF_HEAP_DEAD) as usize;
     let fixed_end = rows.checked_mul(row_width).and_then(|f| f.checked_add(WAL_HEADER_SIZE));
@@ -127,12 +130,12 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
     if heap_dead > heap_len {
         return Err("block declares more dead heap than heap");
     }
-    let (heap, heap_dead) = if rows == 0 {
-        (&[][..], 0)
-    } else {
-        (&block[fixed_end..size], heap_dead)
-    };
-    Ok((rows, &block[WAL_HEADER_SIZE..fixed_end], heap, heap_dead))
+    Ok((
+        rows,
+        &block[WAL_HEADER_SIZE..fixed_end],
+        &block[fixed_end..size],
+        heap_dead,
+    ))
 }
 
 #[cfg(test)]

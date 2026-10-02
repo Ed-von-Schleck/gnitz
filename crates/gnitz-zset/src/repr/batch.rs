@@ -14,9 +14,9 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
 
 /// Max regions **including** the trailing blob region — the bound for the
-/// WAL/wire region-directory arrays (ptrs / sizes / offsets / positions).
-/// Owned by `gnitz_wire::region` (the framer's directory cap); the in-memory
-/// cap below derives from it.
+/// WAL/wire region arrays (ptrs / sizes / offsets / positions). Owned by
+/// `gnitz_wire::region` (the framer's region cap); the in-memory cap below
+/// derives from it.
 pub(crate) use gnitz_wire::MAX_WIRE_REGIONS;
 
 /// Regions tracked in the `offsets`/`strides` arrays: 3 fixed (pk, weight,

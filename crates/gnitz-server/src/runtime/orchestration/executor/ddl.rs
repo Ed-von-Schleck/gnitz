@@ -95,9 +95,8 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
             family.name()
         ));
     }
-    let batch = ipc::decode_client_frame(frame, ctrl, Some(family.schema()), ipc::unknown)
+    let batch = ipc::decode_client_rows(frame, &ctrl, family.schema())
         .map_err(|e| format!("family {tid} decode error: {e}"))?
-        .data_batch
         .expect("a DDL_TXN item carries a data block");
     Ok((family, batch))
 }
@@ -310,10 +309,8 @@ fn emit_zone_to_sal<'w>(
     let scope = excl.begin("ddl");
     let zone_lsn = scope.lsn();
     let emitted = guard_panic(op, || {
-        // The wire carries the family as its tid; this is the one place the
-        // typed family narrows.
         for (family, bat) in &drained {
-            disp.broadcast_ddl(&scope, family.id(), bat)?;
+            disp.broadcast_ddl(&scope, *family, bat)?;
         }
         Ok::<_, WireFault>(())
     });

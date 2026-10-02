@@ -404,14 +404,9 @@ async fn execute_probe_burst(
                             .registry
                             .relation(check.tid)
                             .expect("a probed relation is registered under the catalog lock");
-                        with_routed(&check.batch, probe_placement(rel), nw, |rows, data| {
-                            let holders = rows
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, r)| !r.is_empty())
-                                .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
+                        with_routed(&check.batch, probe_placement(rel), nw, |data| {
                             cut.push(
-                                holders,
+                                data.holders(),
                                 DirectGroup {
                                     template,
                                     data,
