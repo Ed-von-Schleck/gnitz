@@ -22,10 +22,6 @@ use gnitz_wire::read_u64_le;
 
 use StorageError::Corrupt;
 
-/// Rows per lazily decoded block of a packed column, sized so that a block of an
-/// I64 column is one page.
-const DECODE_BLOCK_ROWS: usize = 512;
-
 /// A payload-column region.
 pub(crate) enum PayloadRegion {
     /// Readable in place: a Raw (stride = width) or Constant (stride 0) region
@@ -41,14 +37,59 @@ pub(crate) enum PayloadRegion {
 /// What every row of a column the file predates reads.
 static ZERO_CELL: [u8; 16] = [0; 16];
 
-/// An [`Encoding::For`] payload region. A per-row read decodes the block it
+/// A payload region read through a decode. A per-row read decodes the block it
 /// lands in and keeps it; a bulk read decodes its own window and keeps nothing.
 pub(crate) struct PackedRegion {
-    image: *const [u8],
-    bw: usize,
-    elem_width: usize,
-    /// One per `DECODE_BLOCK_ROWS` rows.
-    blocks: Box<[OnceCell<Box<[u8]>>]>,
+    image: PackedImage,
+    /// The column's cell width.
+    width: usize,
+    blocks: DecodedBlocks,
+}
+
+/// A [`PackedRegion`]'s image, a region of the mapping.
+enum PackedImage {
+    /// [`Encoding::For`], of `bw`-byte offsets.
+    For {
+        image: &'static [u8],
+        bw: usize,
+    },
+    Seq(SeqImage<'static>),
+    Sparse(SparseImage<'static>),
+}
+
+/// The blocks of a column that per-row reads have decoded, one per
+/// `DECODE_BLOCK_ROWS` rows.
+pub(crate) struct DecodedBlocks(Box<[OnceCell<Box<[u8]>>]>);
+
+impl DecodedBlocks {
+    fn new(rows: usize) -> Self {
+        DecodedBlocks((0..rows.div_ceil(DECODE_BLOCK_ROWS)).map(|_| OnceCell::new()).collect())
+    }
+
+    /// The leading `size` bytes of row `row`'s `width`-byte cell of a column of
+    /// `rows`, from the block holding it — which `decode` fills from its first
+    /// row on if no per-row read has yet.
+    #[inline]
+    fn cell(
+        &self,
+        row: usize,
+        size: usize,
+        (rows, width): (usize, usize),
+        decode: impl FnOnce(usize, &mut [u8]),
+    ) -> &[u8] {
+        let block = &self.0[row / DECODE_BLOCK_ROWS];
+        // The decode stays out of the read of a block already held.
+        let cells = match block.get() {
+            Some(cells) => cells,
+            None => block.get_or_init(|| {
+                let first = row - row % DECODE_BLOCK_ROWS;
+                let mut out = vec![0u8; DECODE_BLOCK_ROWS.min(rows - first) * width].into_boxed_slice();
+                decode(first, &mut out);
+                out
+            }),
+        };
+        &cells[(row % DECODE_BLOCK_ROWS) * width..][..size]
+    }
 }
 
 /// A region of one 8-byte word per row: the weights, or the null words.
@@ -154,7 +195,7 @@ fn direct_region(data: &[u8], span: &Span, count: usize, width: usize) -> Result
     let (stride, size) = match span.encoding {
         Encoding::Raw => (width, count * width),
         Encoding::Constant => (0, width),
-        Encoding::TwoValue | Encoding::For | Encoding::Dict => return Err(Corrupt("encoding")),
+        _ => return Err(Corrupt("encoding")),
     };
     if span.size != size {
         return Err(Corrupt("region size"));
@@ -182,7 +223,10 @@ impl MappedShard {
 
     /// Whether payload column `pi` is stored frame-of-reference packed.
     pub fn packs_payload(&self, pi: usize) -> bool {
-        matches!(self.col_regions[pi], PayloadRegion::Packed(_))
+        matches!(
+            self.col_regions[pi],
+            PayloadRegion::Packed(PackedRegion { image: PackedImage::For { .. }, .. })
+        )
     }
 
     pub fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
@@ -235,29 +279,33 @@ impl MappedShard {
                     return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
-                if span.encoding == Encoding::Dict {
-                    if width < 2 {
-                        return Err(Corrupt("encoding"));
+                // SAFETY: the image lies in the mapping `mmap` keeps alive, and
+                // every read of the region borrows this handle.
+                let image: &'static [u8] = unsafe { &*(span.bytes(data) as *const [u8]) };
+                let string = col.type_code.is_german_string();
+                let image = match span.encoding {
+                    Encoding::Raw | Encoding::Constant => {
+                        return direct_region(data, span, count, width).map(PayloadRegion::Mapped);
                     }
-                    // SAFETY: the image lies in the mapping `mmap` keeps alive,
-                    // and every read of the region borrows this handle.
-                    let image: &'static [u8] = unsafe { &*(span.bytes(data) as *const [u8]) };
-                    return DictImage::parse(image, count)
-                        .map(PayloadRegion::Dict)
-                        .ok_or(Corrupt("region size"));
-                }
-                if span.encoding != Encoding::For {
-                    return direct_region(data, span, count, width).map(PayloadRegion::Mapped);
-                }
-                let fi = col.fixed_int().ok_or(Corrupt("encoding"))?;
-                let bw = for_image_bw(span.size, count, fi.width()).ok_or(Corrupt("region size"))?;
+                    Encoding::Dict if width >= 2 => {
+                        return DictImage::parse(image, count)
+                            .map(PayloadRegion::Dict)
+                            .ok_or(Corrupt("region size"));
+                    }
+                    Encoding::For => {
+                        let fi = col.fixed_int().ok_or(Corrupt("encoding"))?;
+                        for_image_bw(span.size, count, fi.width()).map(|bw| PackedImage::For { image, bw })
+                    }
+                    Encoding::Seq if string => SeqImage::parse(image, count).map(PackedImage::Seq),
+                    Encoding::Sparse if col.nullable && !string => {
+                        SparseImage::parse(image, count, width).map(PackedImage::Sparse)
+                    }
+                    _ => return Err(Corrupt("encoding")),
+                };
                 Ok(PayloadRegion::Packed(PackedRegion {
-                    image: span.bytes(data),
-                    bw,
-                    elem_width: fi.width(),
-                    blocks: (0..count.div_ceil(DECODE_BLOCK_ROWS))
-                        .map(|_| OnceCell::new())
-                        .collect(),
+                    image: image.ok_or(Corrupt("region size"))?,
+                    width,
+                    blocks: DecodedBlocks::new(count),
                 }))
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
@@ -345,26 +393,36 @@ impl MappedShard {
         }
     }
 
-    /// Row `row`'s `size`-byte cell of packed column `p`, from the block holding
-    /// it — decoded here if no per-row read has decoded it yet.
+    /// Rows `first..` of `p`, payload column `pi`, as they stand in a batch:
+    /// `out.len() / p.width` rows.
+    fn decode_packed(&self, p: &PackedRegion, pi: usize, first: usize, out: &mut [u8]) {
+        match &p.image {
+            PackedImage::For { image, bw } => for_decode(image, *bw, p.width, first, out),
+            PackedImage::Seq(seq) => seq.decode(self.blob(), first, out),
+            PackedImage::Sparse(sparse) => {
+                // From the block's first row on: the decode counts the values before `first`.
+                let from = first - first % DECODE_BLOCK_ROWS;
+                let rows = first - from + out.len() / p.width;
+                // SAFETY: `decode_words` writes every word of `nulls`.
+                let mut nulls = unsafe { PooledBuf::uninit(rows * FIXED_REGION_BYTES) };
+                self.decode_words(&self.null_bmp, from, &mut nulls);
+                sparse.decode(first, p.width, out, &nulls, pi)
+            }
+        }
+    }
+
+    /// The leading `size` bytes of row `row`'s cell of `p`, payload column `pi`.
     #[inline]
-    fn packed_cell<'a>(&'a self, p: &'a PackedRegion, row: usize, size: usize) -> &'a [u8] {
-        let block = row / DECODE_BLOCK_ROWS;
-        let cells = p.blocks[block].get_or_init(|| {
-            let first = block * DECODE_BLOCK_ROWS;
-            let rows = DECODE_BLOCK_ROWS.min(self.header.row_count - first);
-            let mut out = vec![0u8; rows * p.elem_width].into_boxed_slice();
-            for_decode(self.mapped(p.image), p.bw, p.elem_width, first, &mut out);
-            out
-        });
-        &cells[(row % DECODE_BLOCK_ROWS) * p.elem_width..][..size]
+    fn packed_cell<'a>(&'a self, p: &'a PackedRegion, pi: usize, row: usize, size: usize) -> &'a [u8] {
+        let decode = |first, out: &mut [u8]| self.decode_packed(p, pi, first, out);
+        p.blocks.cell(row, size, (self.header.row_count, p.width), decode)
     }
 
     /// How many blocks of payload column `pi` per-row reads have decoded.
     #[cfg(test)]
     fn decoded_blocks(&self, pi: usize) -> usize {
         match &self.col_regions[pi] {
-            PayloadRegion::Packed(p) => p.blocks.iter().filter(|b| b.get().is_some()).count(),
+            PayloadRegion::Packed(p) => p.blocks.0.iter().filter(|b| b.get().is_some()).count(),
             PayloadRegion::Mapped(_) | PayloadRegion::Dict(_) => 0,
         }
     }
@@ -455,7 +513,15 @@ impl MappedShard {
                 let cp = match &self.col_regions[pi] {
                     PayloadRegion::Mapped(cp) => *cp,
                     PayloadRegion::Packed(p) => {
-                        for_decode(self.mapped(p.image), p.bw, p.elem_width, start, w.col_mut(pi));
+                        if relocate && col.type_code.is_german_string() {
+                            let mut cells = vec![0u8; row_count * 16];
+                            self.decode_packed(p, pi, start, &mut cells);
+                            for (i, cell) in cells.as_chunks::<16>().0.iter().enumerate() {
+                                w.write_string_cell(pi, cell, blob, None, i);
+                            }
+                        } else {
+                            self.decode_packed(p, pi, start, w.col_mut(pi));
+                        }
                         continue;
                     }
                     PayloadRegion::Dict(d) => {
@@ -507,7 +573,7 @@ impl RowSource for MappedShard {
         debug_assert!(row < self.header.row_count);
         match &self.col_regions[payload_col] {
             PayloadRegion::Mapped(cp) => unsafe { cp.row(row, col_size) },
-            PayloadRegion::Packed(p) => self.packed_cell(p, row, col_size),
+            PayloadRegion::Packed(p) => self.packed_cell(p, payload_col, row, col_size),
             PayloadRegion::Dict(d) => &d.cell(row)[..col_size],
         }
     }
@@ -537,28 +603,22 @@ impl ColumnarSource for MappedShard {
             self.col_regions[..schema.num_payload_cols()]
                 .iter()
                 .zip(self.schema.payload_columns())
-                .map(|(region, (_, col))| match region {
-                    PayloadRegion::Mapped(cp) => *cp,
-                    PayloadRegion::Packed(p) => {
-                        let w = p.elem_width;
-                        // SAFETY: `for_decode` writes every cell of `column`.
+                .map(|(region, (pi, col))| {
+                    let w = col.size() as usize;
+                    let mut held = |decode: &dyn Fn(&mut [u8])| {
+                        // SAFETY: either decode writes every cell of `column`.
                         let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
-                        for_decode(self.mapped(p.image), p.bw, w, window.start, &mut column);
+                        decode(&mut column);
                         // Rebased so that row `window.start` reads the column's first cell.
                         ColPtr {
                             base: decoded.hold(column).wrapping_sub(window.start * w),
                             stride: w,
                         }
-                    }
-                    PayloadRegion::Dict(d) => {
-                        let w = col.size() as usize;
-                        // SAFETY: `decode` writes every cell of `column`.
-                        let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
-                        d.decode(window.start, w, &mut column);
-                        ColPtr {
-                            base: decoded.hold(column).wrapping_sub(window.start * w),
-                            stride: w,
-                        }
+                    };
+                    match region {
+                        PayloadRegion::Mapped(cp) => *cp,
+                        PayloadRegion::Packed(p) => held(&|out| self.decode_packed(p, pi, window.start, out)),
+                        PayloadRegion::Dict(d) => held(&|out| d.decode(window.start, w, out)),
                     }
                 }),
         );

@@ -130,6 +130,23 @@ def dict_cells(data, rows, heap):
     return entries, n
 
 
+def seq_cells(data, rows, heap):
+    """Each cell's content of a `seq` region: the FoR image of the lengths, then the short values' pool."""
+    pool_len = int.from_bytes(data[:8], "little")
+    lens_at = 8 + 16 * -(-rows // 512)
+    pool_at = len(data) - pool_len - 12
+    lens, _ = for_decode(data[lens_at:pool_at], rows)
+    heap_at, out = int.from_bytes(data[8:16], "little"), []
+    for n in map(int, lens):
+        if n > 12:
+            out.append(heap[heap_at:heap_at + n])
+            heap_at += n
+        else:
+            out.append(data[pool_at:pool_at + n])
+            pool_at += n
+    return out
+
+
 def block_zstd(blob, level=3, dictionary=None):
     """`blob` compressed in independent `BLOCK`-byte blocks, with a 4-byte offset per block."""
     kw = {"zstd_dict": dictionary} if dictionary else {}
@@ -179,6 +196,8 @@ def price_shard(shard, acc):
                 acc["string dict: entries as length + bytes"] += sum(16 - (1 + (len(e) if len(e) <= 12 else 0))
                                                                    for e in entries)
                 long_contents += [e for e in entries if len(e) > 12]
+        elif r.encoding == "seq":
+            long_contents += [c for c in seq_cells(r.data, rows, heap) if len(c) > 12]
         elif r.encoding in ("raw", "for"):
             cells = string_cells(r.data, rows, heap) if r.encoding == "raw" else None
             if cells is not None:
@@ -240,7 +259,8 @@ def main():
         on_disk = {(s["relation"], s["store"]): s for s in rec["stores"]}
         # Rows a store holds past its relation's live rows: retractions and the rows they cancel.
         for (rel, store), s in on_disk.items():
-            if store == "rows":
+            # A relation the planner put under a view has no live count to hold its rows against.
+            if store == "rows" and s["name"] in rec["relations"]:
                 extra = s["rows"] - rec["relations"][s["name"]]
                 if extra > 0:
                     acc["uncancelled rows in output stores (bytes pro rata)"] += s["bytes"] * extra // s["rows"]

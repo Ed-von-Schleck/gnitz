@@ -234,3 +234,251 @@ fn a_dict_code_past_the_last_entry_reads_the_last() {
         assert_eq!(out[16..], entries[n - 1], "{n} entries: bulk decode");
     }
 }
+
+/// A column of `rows` values whose lengths span `spread`, short and long.
+fn seq_values(rows: usize, spread: usize) -> Vec<Vec<u8>> {
+    (0..rows)
+        .map(|i| {
+            let len = match (i % 7, i == rows / 2) {
+                (_, true) => 5 + spread - 1,
+                (0, _) => 5,
+                (k, _) => 5 + (i * k) % spread.min(40),
+            };
+            (0..len).map(|b| (i + b) as u8).collect()
+        })
+        .collect()
+}
+
+/// `values` as a Seq image over `heap`.
+fn seq_image(values: &[Vec<u8>], heap: &mut Vec<u8>) -> Vec<u8> {
+    let lens = values.iter().map(Vec::len);
+    let span = (lens.clone().min().unwrap(), lens.max().unwrap());
+    seq_encode(values.len(), span, values.iter().map(Vec::as_slice), heap)
+}
+
+#[test]
+fn seq_roundtrips_at_every_length_width() {
+    // One length takes a byte as thirty do.
+    for (spread, bw, rows) in [
+        (1, 1, 9),
+        (30, 1, 2),
+        (30, 1, DECODE_BLOCK_ROWS),
+        (300, 2, DECODE_BLOCK_ROWS + 1),
+        (70_000, 3, 3 * DECODE_BLOCK_ROWS + 5),
+    ] {
+        let values = seq_values(rows, spread);
+        // The heap a second column packs behind a first.
+        let mut heap = vec![0xEE; 77];
+        let image = seq_image(&values, &mut heap);
+        let lens = values.iter().map(Vec::len);
+        let span = (lens.clone().min().unwrap(), lens.clone().max().unwrap());
+        let (short, long): (Vec<usize>, Vec<usize>) = lens.partition(|&len| len <= SHORT_STRING_THRESHOLD);
+        assert_eq!(
+            image.len(),
+            seq_image_len(rows, span, short.iter().sum()),
+            "{bw}: {rows} rows"
+        );
+        assert_eq!(
+            image.len()
+                - short.iter().sum::<usize>()
+                - SEQ_BLOCKS_AT
+                - rows.div_ceil(DECODE_BLOCK_ROWS) * SEQ_BLOCK_ENTRY,
+            for_image_len(rows, bw) + SEQ_POOL_SLACK,
+            "{bw}: length width"
+        );
+        assert_eq!(
+            heap.len(),
+            77 + long.iter().sum::<usize>(),
+            "{bw}: the long values alone reach the heap"
+        );
+
+        let seq = SeqImage::parse(&image, rows).unwrap();
+        for window in [
+            0..rows,
+            rows / 3..rows,
+            rows - 1..rows,
+            DECODE_BLOCK_ROWS.min(rows)..rows,
+            2..2,
+        ] {
+            let mut out = vec![0xAAu8; window.len() * 16];
+            seq.decode(&heap, window.start, &mut out);
+            for (cell, want) in out.as_chunks::<16>().0.iter().zip(&values[window.clone()]) {
+                assert!(gnitz_wire::german_string_cell_ok(cell, &heap), "{bw}: a canonical cell");
+                assert_eq!(
+                    gnitz_wire::german_string_content(cell, &heap),
+                    want,
+                    "{bw}: rows {window:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn seq_parse_refuses_a_size_its_header_does_not_give() {
+    let values = seq_values(DECODE_BLOCK_ROWS + 3, 30);
+    let image = seq_image(&values, &mut Vec::new());
+    assert!(SeqImage::parse(&image, values.len()).is_some());
+    for rows in [values.len() - 1, values.len() + 1, DECODE_BLOCK_ROWS] {
+        assert!(SeqImage::parse(&image, rows).is_none(), "{rows} rows");
+    }
+    assert!(SeqImage::parse(&image[..image.len() - 1], values.len()).is_none());
+    assert!(SeqImage::parse(&image[..SEQ_BLOCKS_AT - 1], values.len()).is_none());
+    let mut forged = image.clone();
+    forged[..SEQ_BLOCKS_AT].copy_from_slice(&(image.len() as u64).to_le_bytes());
+    assert!(
+        SeqImage::parse(&forged, values.len()).is_none(),
+        "a pool larger than the image"
+    );
+}
+
+/// The lengths and block entries are body bytes no open verifies.
+#[test]
+fn a_seq_value_past_its_heap_or_pool_reads_empty() {
+    let values = seq_values(40, 30);
+    let mut heap = Vec::new();
+    let image = seq_image(&values, &mut heap);
+    let mut forged = image.clone();
+    forged[SEQ_BLOCKS_AT..SEQ_BLOCKS_AT + SEQ_BLOCK_ENTRY].fill(0xFF);
+    let seq = SeqImage::parse(&forged, values.len()).unwrap();
+    let mut out = vec![0xAAu8; values.len() * 16];
+    seq.decode(&heap, 0, &mut out);
+    assert_eq!(out, vec![0u8; out.len()]);
+    // A heap shorter than the lengths name.
+    let seq = SeqImage::parse(&image, values.len()).unwrap();
+    seq.decode(&heap[..heap.len() / 2], 0, &mut out);
+    for (cell, want) in out.as_chunks::<16>().0.iter().zip(&values) {
+        let got = gnitz_wire::german_string_content(cell, &heap);
+        assert!(got == want.as_slice() || got.is_empty());
+    }
+}
+
+/// A region of `rows` `width`-byte cells, NULL — and zero — wherever `is_null`
+/// says, and holding `value(row)` elsewhere.
+fn sparse_region(rows: usize, width: usize, is_null: impl Fn(usize) -> bool, value: impl Fn(usize) -> u128) -> Vec<u8> {
+    (0..rows)
+        .flat_map(|row| {
+            let cell = if is_null(row) { 0 } else { value(row) };
+            cell.to_le_bytes()[..width].to_vec()
+        })
+        .collect()
+}
+
+/// Decode rows `first_row..` of `sparse` under null words whose bit 3 is `is_null`'s.
+fn sparse_decode(
+    sparse: &SparseImage,
+    first_row: usize,
+    width: usize,
+    out: &mut [u8],
+    is_null: impl Fn(usize) -> bool,
+) {
+    let from = first_row - first_row % DECODE_BLOCK_ROWS;
+    let nulls: Vec<u8> = (from..first_row + out.len() / width)
+        .flat_map(|row| ((is_null(row) as u64) << 3 | 0b10111).to_le_bytes())
+        .collect();
+    sparse.decode(first_row, width, out, &nulls, 3);
+}
+
+#[test]
+fn sparse_roundtrips_framed_and_unframed() {
+    let is_null = |row: usize| row % 11 != 3 && row % 700 != 1;
+    type Value = fn(usize) -> u128;
+    // A cell width, its integer type, a row's value and the width a frame takes them at.
+    let cases: [(usize, Option<FixedInt>, Value, usize); 4] = [
+        // Values a frame of two bytes spans, though the zero of a NULL cell lies far below it.
+        (8, Some(FixedInt::I64), |row| 1_700_000_000_000 + row as u128 * 7, 2),
+        (4, Some(FixedInt::U32), |row| row as u128 % 200, 1),
+        // No frame narrower than the cell, and a type no frame admits.
+        (
+            8,
+            Some(FixedInt::U64),
+            |row| ((row as u128 + 1) * 0x0123_4567_89AB_CDEF) & u64::MAX as u128,
+            8,
+        ),
+        (16, None, |row| (row as u128 + 1).wrapping_mul(u128::MAX / 977), 16),
+    ];
+    for (width, fi, value, bw) in cases {
+        for rows in [1, 40, DECODE_BLOCK_ROWS, 3 * DECODE_BLOCK_ROWS + 5] {
+            let src = sparse_region(rows, width, is_null, value);
+            let held = (0..rows).filter(|&row| !is_null(row)).count();
+            let image = sparse_encode(&src, width, fi, is_null);
+            let values = image.len() - SPARSE_RANKS_AT - rows.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY;
+            // Too few values for a frame to shrink them stay cells.
+            let framed = bw < width && held > 0 && values != held * width;
+            assert_eq!(
+                values,
+                if framed { for_image_len(held, bw) } else { held * width },
+                "{width}: {rows} rows"
+            );
+            assert!(framed || bw == width || rows <= 40, "{width}: {rows} rows frame");
+
+            let sparse = SparseImage::parse(&image, rows, width).unwrap();
+            for window in [
+                0..rows,
+                rows / 3..rows,
+                rows - 1..rows,
+                DECODE_BLOCK_ROWS.min(rows)..rows,
+                0..0,
+            ] {
+                let mut out = vec![0xAAu8; window.len() * width];
+                sparse_decode(&sparse, window.start, width, &mut out, is_null);
+                assert_eq!(
+                    out,
+                    src[window.start * width..window.end * width],
+                    "{width}: rows {window:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sparse_parse_refuses_a_size_its_header_does_not_give() {
+    let is_null = |row: usize| !row.is_multiple_of(5);
+    let src = sparse_region(DECODE_BLOCK_ROWS + 3, 8, is_null, |row| 1000 + row as u128);
+    let rows = src.len() / 8;
+    let image = sparse_encode(&src, 8, Some(FixedInt::I64), is_null);
+    assert!(SparseImage::parse(&image, rows, 8).is_some());
+    assert!(
+        SparseImage::parse(&image, DECODE_BLOCK_ROWS, 8).is_none(),
+        "a block entry too many"
+    );
+    for width in [1, 2] {
+        assert!(
+            SparseImage::parse(&image, rows, width).is_none(),
+            "offsets no narrower than the cell"
+        );
+    }
+    assert!(SparseImage::parse(&image[..image.len() - 1], rows, 8).is_none());
+    assert!(SparseImage::parse(&image[..SPARSE_RANKS_AT - 1], rows, 8).is_none());
+    let forged = |at: usize, v: u32| {
+        let mut image = image.clone();
+        image[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        SparseImage::parse(&image, rows, 8).is_none()
+    };
+    assert!(forged(0, rows as u32 + 1), "more values than rows");
+}
+
+/// The null words and the block ranks are body bytes no open verifies.
+#[test]
+fn a_sparse_row_past_the_last_value_reads_zero() {
+    let is_null = |row: usize| row % 2 == 1;
+    let src = sparse_region(600, 8, is_null, |row| 1000 + row as u128);
+    for fi in [Some(FixedInt::I64), None] {
+        let image = sparse_encode(&src, 8, fi, is_null);
+        let sparse = SparseImage::parse(&image, 600, 8).unwrap();
+        let mut out = vec![0xAAu8; src.len()];
+        // Null words that name twice the values the image holds.
+        sparse_decode(&sparse, 0, 8, &mut out, |_| false);
+        assert_eq!(
+            out[..300 * 8],
+            sparse_region(300, 8, |_| false, |row| 1000 + 2 * row as u128)
+        );
+        assert_eq!(out[300 * 8..], vec![0u8; 300 * 8]);
+        let mut forged = image.clone();
+        forged[SPARSE_RANKS_AT + SPARSE_RANK_ENTRY..][..SPARSE_RANK_ENTRY].fill(0xFF);
+        let sparse = SparseImage::parse(&forged, 600, 8).unwrap();
+        sparse_decode(&sparse, DECODE_BLOCK_ROWS, 8, &mut out[..88 * 8], is_null);
+        assert_eq!(out[..88 * 8], vec![0u8; 88 * 8]);
+    }
+}

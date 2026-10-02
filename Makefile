@@ -18,7 +18,7 @@ PERF_DWARF ?=
 ROWS       ?=                                # bench-disk: rows loaded per scenario
 RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES of its compacted regime
 SCENARIO   ?=                                # bench-disk: comma-separated scenario names
-REGIME     ?=                                # bench-disk: l0, compacted or both
+REGIME     ?=                                # bench-disk: l0, compacted, checkpointed or all
 T          ?=                                # cargo test name filter
 K          ?=                                # pytest -k expression
 

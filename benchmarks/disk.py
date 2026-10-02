@@ -7,18 +7,23 @@ LSM level, and the same shards summed by region class — key, weight, null
 bitmap, payload by encoding, string heap, PK filter, and the header, directory
 and alignment padding around them.
 
-A scenario runs under one or both regimes. `l0` leaves the server's own RAM
+A scenario runs under any of three regimes. `l0` leaves the server's own RAM
 tier, which a store of this size never fills, so every store is one L0 shard per
 worker at the checkpoint. `compacted` shrinks the tier so the same rows spill,
-fold and compact into the deeper levels.
+fold and compact into the deeper levels. `checkpointed` leaves the tier and
+shrinks the SAL's checkpoint threshold instead, so the load is cut by
+checkpoints, each of which flushes every store that changed since the last — the
+small shards of a server that runs for days.
 
 "Value bytes" is what the live rows hold: each number at its column's width,
 each string at its length, a NULL at nothing. "Pushed" is the same measure over
 every row a scenario sent, the rewritten and the deleted ones included.
 
 What each store wrote — the shards it superseded on the way included — comes
-from an `strace` attached to the workers; without one, or without the right to
-attach it, the written columns are empty.
+from an `strace` attached to the workers, and so does the part of it a manifest
+published: a store syncs a shard only to publish it, so the rest never has to
+reach the device. Without an `strace`, or without the right to attach it, both
+columns are empty.
 
 Run through `make bench-disk`, which builds the server and the extension first.
 """
@@ -40,6 +45,8 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -52,8 +59,13 @@ from _serverproc import ServerProc, disk_usage  # noqa: E402
 from helpers.shards import read_shards, region_class, store_of  # noqa: E402
 
 WIDTHS = {"U8": 1, "I8": 1, "U16": 2, "I16": 2, "U32": 4, "I32": 4, "F32": 4, "U64": 8, "I64": 8,
-          "F64": 8, "U128": 16, "UUID": 16, "I128": 16, "DATE": 4, "TIMESTAMP": 8, "DECIMAL": 16}
+          "F64": 8, "U128": 16, "UUID": 16, "I128": 16, "DATE": 4, "TIMESTAMP": 8, "DECIMAL": 8}
 COMPACTED_RAM_TIER = 1 << 20
+CHECKPOINT_BYTES = 256 << 10
+REGIMES = ["l0", "compacted", "checkpointed"]
+FS_BLOCK = 4096
+MAX_STORE_LINES = 40
+SMALL_TABLES, SMALL_TABLE_ROWS = 100, 200
 WORDS = [f"{a}{b}{c}" for a in ("in", "con", "re", "de", "trans", "per", "sub", "ex")
          for b in ("struct", "form", "port", "duc", "scrib", "mit", "vers", "clud")
          for c in ("", "ion", "ed", "ing", "or", "ive", "able", "ure")]
@@ -226,6 +238,46 @@ def load_operators(ld, rows, rng):
         for k in range(rows)))
 
 
+def load_money(ld, rows, rng):
+    accounts = [uuid.UUID(int=rng.getrandbits(128)) for _ in range(max(rows // 100, 1))]
+    currencies = ["EUR", "EUR", "EUR", "USD", "GBP", "CHF"]
+    return ld.push("ledger", (
+        dict(id=k + 1, account=rng.choice(accounts),
+             booked=datetime(2024, 1, 1) + timedelta(seconds=k * 7 + rng.randrange(7)),
+             value_date=date(2024, 1, 1) + timedelta(days=k * 365 // rows),
+             amount=Decimal(rng.randrange(-500_000, 500_000)).scaleb(-2),
+             fee=Decimal(rng.choice([0, 0, 0, 25, 150])).scaleb(-2), currency=rng.choice(currencies))
+        for k in range(rows)))
+
+
+def load_stream(ld, rows, rng):
+    users = max(rows // 40, 1)
+    countries = ["de", "fr", "us", "gb", "jp", "br", "in", "pl"]
+    ld.push("users", (dict(id=u, name=f"user-{u:07d}", country=rng.choice(countries)) for u in range(users)))
+    # A stream holds no row: what it was pushed is the measure its views are held against.
+    return ld.push("clicks", (
+        dict(id=k + 1, user_id=rng.randrange(users), page=rng.randrange(200), ms=rng.randrange(60_000))
+        for k in range(rows)))
+
+
+def load_bounded(ld, rows, rng):
+    return ld.push("messages", (
+        dict(id=k + 1, kind=rng.randrange(4),
+             body=f"message {rng.randrange(10**9):09d} " + " ".join(rng.choice(WORDS) for _ in range(6)))
+        for k in range(rows)))
+
+
+def load_small_tables(ld, rows, rng):
+    """`rows` is not read: the scenario is the relation count, not the row count."""
+    names = [f"item-{i:03d}" for i in range(20)]
+    step = SMALL_TABLE_ROWS // 4
+    # In rounds over the tables, so that a checkpoint finds every one of them changed.
+    return sum(
+        ld.push(f"t_{t:03d}", (dict(id=k + 1, name=rng.choice(names), qty=rng.randrange(100), ts=1_700_000_000 + k)
+                               for k in range(first, first + step)))
+        for first in range(0, SMALL_TABLE_ROWS, step) for t in range(SMALL_TABLES))
+
+
 CHURN_DDL = [
     "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, owner TEXT NOT NULL, balance BIGINT NOT NULL, "
     "note TEXT NOT NULL)",
@@ -349,6 +401,45 @@ SCENARIOS = [
          "CREATE VIEW v_latest AS SELECT id, user_id, page, day FROM visits "
          "QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY day DESC) <= 3"],
         load_operators),
+    Scenario(
+        "money",
+        "the named types over a stored integer — DECIMAL amounts of a few digits, a near-monotone TIMESTAMP, "
+        "a DATE — and a UUID reference drawn from a small set, under a filter view and a sum per reference",
+        ["CREATE TABLE ledger (id BIGINT NOT NULL PRIMARY KEY, account UUID NOT NULL, booked TIMESTAMP NOT NULL, "
+         "value_date DATE NOT NULL, amount DECIMAL(18, 2) NOT NULL, fee DECIMAL(18, 2) NOT NULL, "
+         "currency TEXT NOT NULL)",
+         "CREATE VIEW v_large AS SELECT id, account, booked, amount FROM ledger WHERE amount > 4000",
+         "CREATE VIEW v_balance AS SELECT account, COUNT(*) AS n, SUM(amount) AS balance, SUM(fee) AS fees "
+         "FROM ledger GROUP BY account"],
+        load_money),
+    Scenario(
+        "stream",
+        "a stream, which holds no row of its own, under two aggregates and a join to a table: every byte "
+        "is view or operator state",
+        ["CREATE TABLE users (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, country TEXT NOT NULL)",
+         "CREATE TABLE clicks (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
+         "ms INT NOT NULL) WITH (stream = true)",
+         "CREATE VIEW v_page AS SELECT page, COUNT(*) AS n, SUM(ms) AS total FROM clicks GROUP BY page",
+         "CREATE VIEW v_slowest AS SELECT user_id, MAX(ms) AS slowest FROM clicks GROUP BY user_id",
+         "CREATE VIEW v_country AS SELECT u.country, COUNT(*) AS n FROM clicks c JOIN users u "
+         "ON c.user_id = u.id GROUP BY u.country"],
+        load_stream),
+    Scenario(
+        "bounded",
+        "a filter view held under a capacity a sixth of what it would take, beside its unbounded twin",
+        ["CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, body TEXT NOT NULL)",
+         "CREATE VIEW v_bounded WITH (capacity = '1 MB') AS SELECT id, body FROM messages WHERE kind < 3",
+         "CREATE VIEW v_twin AS SELECT id, body FROM messages WHERE kind < 3"],
+        load_bounded),
+    Scenario(
+        "small_tables",
+        f"{SMALL_TABLES} tables of {SMALL_TABLE_ROWS} rows, each under a grouped view: what a shard costs "
+        "before its first row",
+        [stmt for t in range(SMALL_TABLES) for stmt in (
+            f"CREATE TABLE t_{t:03d} (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, qty BIGINT NOT NULL, "
+            "ts BIGINT NOT NULL)",
+            f"CREATE VIEW v_{t:03d} AS SELECT name, COUNT(*) AS n, SUM(qty) AS total FROM t_{t:03d} GROUP BY name")],
+        load_small_tables),
 ]
 
 
@@ -357,17 +448,20 @@ SCENARIOS = [
 # ---------------------------------------------------------------------------
 
 class WriteTrace:
-    """Every `pwrite64` of the traced processes, summed by the store whose shard
-    it lands in."""
+    """Every shard byte the traced processes wrote, by store: all of it, and the
+    part a manifest went on to publish. A store syncs a shard only to publish
+    it, so one written and unlinked between two publishes — a spill a fold
+    consumed, a fold's output a split rewrote — is page cache that never has to
+    reach the device."""
 
-    _CALL = re.compile(r"^pwrite64\(\d+<([^>]*)>.*\) = (\d+)$")
+    _CALL = re.compile(r'^(\d+\.\d+) (pwrite64|rename|unlink)\((?:\d+<([^>]*)>|"([^"]*)")(?:, "([^"]*)")?.*\) = (\d+)$')
 
     def __init__(self, pids, prefix):
         self.prefix = Path(prefix)
         self.proc = None
         if not shutil.which("strace"):
             return
-        args = ["strace", "-ff", "-y", "-e", "trace=pwrite64", "-o", str(prefix)]
+        args = ["strace", "-ff", "-y", "-ttt", "-e", "trace=pwrite64,rename,unlink", "-o", str(prefix)]
         self.proc = subprocess.Popen(args + [f"--attach={pid}" for pid in pids],
                                      stderr=subprocess.PIPE, text=True)
         # A row pushed before the last attach would be written unseen.
@@ -378,20 +472,28 @@ class WriteTrace:
                 return
 
     def by_store(self):
-        """`{(relation, store): bytes}` once every traced process has exited, or
-        None when nothing was traced."""
+        """`{(relation, store): bytes}` twice over — written and published — once
+        every traced process has exited, or None when nothing was traced."""
         if self.proc is None:
             return None
         self.proc.wait()
-        written = defaultdict(int)
+        events = []
         for log in self.prefix.parent.glob(self.prefix.name + ".*"):
-            for line in log.read_text(errors="replace").splitlines():
-                m = self._CALL.match(line)
-                store = m and store_of(m.group(1))
-                if store:
-                    written[store] += int(m.group(2))
+            events += [m.groups() for line in log.read_text(errors="replace").splitlines()
+                       if (m := self._CALL.match(line))]
             log.unlink()
-        return written
+        written, published = defaultdict(int), defaultdict(int)
+        unpublished = {}                                                # shard path -> bytes written
+        for _, call, fd_path, path, target, result in sorted(events, key=lambda e: float(e[0])):
+            if call == "pwrite64" and (store := store_of(fd_path)):
+                written[store] += int(result)
+                unpublished[fd_path] = unpublished.get(fd_path, 0) + int(result)
+            elif call == "unlink":
+                unpublished.pop(path, None)
+            elif call == "rename" and Path(target).name == "manifest.bin":
+                for shard in [s for s in unpublished if Path(s).parent == Path(target).parent]:
+                    published[store_of(shard)] += unpublished.pop(shard)
+        return written, published
 
 
 def zstd_bytes(blobs):
@@ -401,7 +503,7 @@ def zstd_bytes(blobs):
 
 def run(scenario, regime, args):
     """Load `scenario` under `regime`; returns its result record."""
-    ram_tier = None if regime == "l0" else args.ram_tier_bytes or COMPACTED_RAM_TIER
+    ram_tier = (args.ram_tier_bytes or COMPACTED_RAM_TIER) if regime == "compacted" else None
     (REPO_ROOT / "tmp").mkdir(exist_ok=True)
     tmp = Path(tempfile.mkdtemp(dir=REPO_ROOT / "tmp", prefix=f"bench_disk_{scenario.name}_{regime}_"))
     data_dir = tmp / "data"
@@ -410,6 +512,8 @@ def run(scenario, regime, args):
     server.extra_env["GNITZ_SAL_BYTES"] = os.environ.get("GNITZ_SAL_BYTES", str(256 << 20))
     if ram_tier is not None:
         server.extra_env["GNITZ_RAM_TIER_BYTES"] = str(ram_tier)
+    if regime == "checkpointed":
+        server.extra_env["GNITZ_CHECKPOINT_BYTES"] = str(args.checkpoint_bytes)
     server.extra_env.update(kv.split("=", 1) for kv in args.env)
     server.start(workers=args.workers, timeout=20.0)
     try:
@@ -423,10 +527,13 @@ def run(scenario, regime, args):
             names = {}
             for name in scenario.relations:
                 tid, schema = conn.resolve_table(name)
-                names[tid] = (name, len(conn.scan(tid, schema)))
+                try:
+                    names[tid] = (name, len(conn.scan(tid, schema)))
+                except gnitz.GnitzError:
+                    names[tid] = (name, 0)                              # a stream holds no row to scan
         # Its final checkpoint puts every store on disk.
         server.stop_graceful(timeout=600)
-        written = trace.by_store()
+        traced = trace.by_store()
     finally:
         server.stop()
 
@@ -445,25 +552,30 @@ def run(scenario, regime, args):
         by_store[key]["overhead"] += s.overhead
         by_store[key]["rows"] += s.rows
         by_store[key]["retractions"] += s.retractions
+        by_store[key]["files"] += 1
+        by_store[key]["blocks"] += -(-s.size // FS_BLOCK) * FS_BLOCK
         for r in s.regions:
             by_store[key][region_class(r)] += len(r.data)
             blobs[key].append(r.data)
     store_records = []
     for (rel, store), classes in sorted(by_store.items()):
         rows, retractions = classes.pop("rows"), classes.pop("retractions")
+        files, blocks = classes.pop("files"), classes.pop("blocks")
         store_records.append({
             "relation": rel, "name": names.get(rel, (f"relation {rel}", 0))[0], "store": store, "rows": rows,
-            "retractions": retractions, "written": None if written is None else written[(rel, store)],
+            "retractions": retractions, "files": files, "block_bytes": blocks,
+            "written": traced and traced[0][(rel, store)], "published": traced and traced[1][(rel, store)],
             "bytes": sum(classes.values()), "zstd3": zstd_bytes(blobs[(rel, store)]),
             "classes": dict(sorted(classes.items())),
         })
+    def user_bytes(by):
+        return sum(n for (rel, _), n in by.items() if rel >= gnitz.FIRST_USER_TABLE_ID)
     identical = sum(int(line.split()[4]) for line in report.splitlines() if line.startswith("identical shards:"))
     record = {
         "scenario": scenario.name, "regime": regime, "rows": args.rows, "workers": args.workers,
         "ram_tier_bytes": ram_tier, "value_bytes": value_bytes, "pushed_bytes": loader.pushed,
         "shard_bytes": shard_bytes, "identical_bytes": identical,
-        "written_bytes": None if written is None else sum(
-            n for (rel, _), n in written.items() if rel >= gnitz.FIRST_USER_TABLE_ID),
+        "written_bytes": traced and user_bytes(traced[0]), "published_bytes": traced and user_bytes(traced[1]),
         "relations": {name: live for name, live in names.values()},
         "stores": store_records,
         "report": "\n".join(line for line in report.splitlines() if line not in system),
@@ -481,33 +593,56 @@ def run(scenario, regime, args):
 def print_record(rec):
     print(f"\n=== {rec['scenario']} / {rec['regime']}: {rec['rows']} rows of {rec['value_bytes']} value bytes, "
           f"{rec['workers']} workers, RAM tier {rec['ram_tier_bytes'] or 'default'}")
-    for name, live in rec["relations"].items():
+    for name, live in list(rec["relations"].items())[:12]:
         print(f"  {name}: {live} rows")
-    print(rec["report"])
-    classes = sorted({c for s in rec["stores"] for c in s["classes"]})
+    stores = rec["stores"]
+    report = rec["report"].splitlines()
+    if len(stores) > MAX_STORE_LINES:
+        # One line per store would bury the totals: sum the stores whose names differ in digits alone.
+        report = [line for line in report if not line.split(maxsplit=1)[0].isdigit()]
+        merged = {}
+        for s in stores:
+            m = merged.setdefault((re.sub(r"\d+", "*", s["name"]), s["store"]), dict(
+                s, name=re.sub(r"\d+", "*", s["name"]), rows=0, retractions=0, files=0, bytes=0, zstd3=0,
+                written=None if s["written"] is None else 0,
+                published=None if s["written"] is None else 0, classes=defaultdict(int)))
+            for k in ("rows", "retractions", "files", "bytes", "zstd3"):
+                m[k] += s[k]
+            if s["written"] is not None:
+                m["written"] += s["written"]
+                m["published"] += s["published"]
+            for c, n in s["classes"].items():
+                m["classes"][c] += n
+        stores = list(merged.values())
+    print("\n".join(report))
+    classes = sorted({c for s in stores for c in s["classes"]})
     # `retract` is the rows of negative weight; `live` the rows a scan of the relation
-    # returns; `written` every shard byte the store wrote to hold `bytes`.
-    head = (f"{'store':<28} {'rows':>9} {'retract':>8} {'live':>8} {'bytes':>11} {'B/row':>6} {'zstd-3':>6} "
-            f"{'written':>11}  " + " ".join(f"{c:>16}" for c in classes))
+    # returns; `written` every shard byte the store wrote to hold `bytes`, and `published`
+    # the part of it a manifest named, which is what the store synced.
+    head = (f"{'store':<28} {'files':>5} {'rows':>9} {'retract':>8} {'live':>8} {'bytes':>11} {'B/row':>6} "
+            f"{'zstd-3':>6} {'written':>11} {'published':>11}  " + " ".join(f"{c:>16}" for c in classes))
     print(head)
-    for s in rec["stores"]:
+    for s in stores:
         label = f"{s['name']} {s['store']}"
         live = rec["relations"].get(s["name"], "") if s["store"] == "rows" else ""
         cells = " ".join(f"{s['classes'].get(c, 0):>16}" for c in classes)
-        print(f"{label:<28} {s['rows']:>9} {s['retractions']:>8} {live:>8} {s['bytes']:>11} "
+        print(f"{label:<28} {s['files']:>5} {s['rows']:>9} {s['retractions']:>8} {live:>8} {s['bytes']:>11} "
               f"{s['bytes'] / max(s['rows'], 1):>6.1f} {s['zstd3'] / max(s['bytes'], 1):>6.2f} "
-              f"{'' if s['written'] is None else s['written']:>11}  {cells}")
+              f"{'' if s['written'] is None else s['written']:>11} "
+              f"{'' if s['published'] is None else s['published']:>11}  {cells}")
     print(f"shard bytes per value byte: {rec['shard_bytes'] / rec['value_bytes']:.2f}"
           + ("" if rec["written_bytes"] is None else
-             f"; the workers wrote {rec['written_bytes'] / rec['pushed_bytes']:.2f} bytes per value byte pushed")
+             f"; the workers wrote {rec['written_bytes'] / rec['pushed_bytes']:.2f} bytes per value byte pushed "
+             f"and published {rec['published_bytes'] / rec['pushed_bytes']:.2f}")
           + (f"; {rec['identical_bytes']} bytes are a second copy of an identical shard" if rec["identical_bytes"] else "")
           + (f"; kept: {rec['kept']}" if "kept" in rec else ""))
 
 
 def print_summary(records):
-    print(f"\n{'scenario':<18} {'regime':<10} {'value bytes':>12} {'shard bytes':>12} {'per value':>9} "
-          f"{'base':>12} {'views':>12} {'traces+idx':>12} {'zstd-3':>6} {'dead rows':>9} {'pushed':>12} "
-          f"{'written':>12} {'per pushed':>10}")
+    # `in 4K blocks` is the shard bytes with every file rounded up to a filesystem block.
+    print(f"\n{'scenario':<18} {'regime':<12} {'value bytes':>12} {'shard bytes':>12} {'per value':>9} "
+          f"{'files':>6} {'in 4K blocks':>12} {'base':>12} {'views':>12} {'traces+idx':>12} {'zstd-3':>6} "
+          f"{'dead rows':>9} {'pushed':>12} {'written':>12} {'per pushed':>10} {'published':>12} {'per pushed':>10}")
     for rec in records:
         # Every scenario names its views `v_…`; a relation it did not name is one
         # the planner put under a view.
@@ -518,11 +653,15 @@ def print_summary(records):
         z = sum(s["zstd3"] for s in rec["stores"]) / max(rec["shard_bytes"], 1)
         # A retraction and the row it cancels are both dead.
         dead = 2 * sum(s["retractions"] for s in rec["stores"]) / max(sum(s["rows"] for s in rec["stores"]), 1)
-        print(f"{rec['scenario']:<18} {rec['regime']:<10} {rec['value_bytes']:>12} {rec['shard_bytes']:>12} "
-              f"{rec['shard_bytes'] / rec['value_bytes']:>9.2f} {base:>12} {views:>12} {other:>12} {z:>6.2f} "
+        files = sum(s["files"] for s in rec["stores"])
+        blocks = sum(s["block_bytes"] for s in rec["stores"])
+        print(f"{rec['scenario']:<18} {rec['regime']:<12} {rec['value_bytes']:>12} {rec['shard_bytes']:>12} "
+              f"{rec['shard_bytes'] / rec['value_bytes']:>9.2f} {files:>6} {blocks:>12} {base:>12} {views:>12} "
+              f"{other:>12} {z:>6.2f} "
               f"{dead:>8.0%} {rec['pushed_bytes']:>12} "
               + ("" if rec["written_bytes"] is None else
-                 f"{rec['written_bytes']:>12} {rec['written_bytes'] / rec['pushed_bytes']:>10.2f}"))
+                 f"{rec['written_bytes']:>12} {rec['written_bytes'] / rec['pushed_bytes']:>10.2f} "
+                 f"{rec['published_bytes']:>12} {rec['published_bytes'] / rec['pushed_bytes']:>10.2f}"))
 
 
 def main():
@@ -531,9 +670,11 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--batch-rows", type=int, default=20_000)
     ap.add_argument("--scenario", default="", help="comma-separated scenario names (default: all)")
-    ap.add_argument("--regime", default="both", choices=["l0", "compacted", "both"])
+    ap.add_argument("--regime", default="all", choices=[*REGIMES, "all"])
     ap.add_argument("--ram-tier-bytes", type=int, default=None,
                     help=f"GNITZ_RAM_TIER_BYTES of the compacted regime (default: {COMPACTED_RAM_TIER})")
+    ap.add_argument("--checkpoint-bytes", type=int, default=CHECKPOINT_BYTES,
+                    help="GNITZ_CHECKPOINT_BYTES of the checkpointed regime")
     ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
                     help="an environment variable of the server; repeatable")
     ap.add_argument("--tag", default="", help="a label in the results file's name")
@@ -549,7 +690,7 @@ def main():
     unknown = set(wanted) - {s.name for s in SCENARIOS}
     if unknown:
         ap.error(f"unknown scenario: {', '.join(sorted(unknown))}")
-    regimes = ["l0", "compacted"] if args.regime == "both" else [args.regime]
+    regimes = REGIMES if args.regime == "all" else [args.regime]
     records = []
     for scenario in SCENARIOS:
         if wanted and scenario.name not in wanted:

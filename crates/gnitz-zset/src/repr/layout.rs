@@ -2,14 +2,17 @@
 //! decide how the rest of a shard is read.
 
 use crate::repr::error::StorageError;
-use gnitz_wire::{read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le, FixedInt};
+use gnitz_wire::{
+    read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le, FixedInt, GERMAN_INLINE_OFF,
+    SHORT_STRING_THRESHOLD,
+};
 
 use StorageError::Corrupt;
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 25;
+pub(crate) const SHARD_EPOCH: u64 = 26;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
@@ -277,21 +280,30 @@ fn for_encode_cells<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Ve
         max = max.max(b);
     }
     let reference = min ^ bias;
-    let max_offset = (max ^ bias).wrapping_sub(reference);
-    let bw = ((u64::BITS - max_offset.leading_zeros()) as usize).div_ceil(8);
+    let bw = for_bw((max ^ bias).wrapping_sub(reference));
     let n = cells.len();
     // A raw-byte win that vanishes after alignment saves no disk and still costs
     // a decode. Implies `bw < W`.
     if bw == 0 || region_start(for_image_len(n, bw)) >= region_start(src.len()) {
         return None;
     }
-    let mut image = vec![0u8; for_image_len(n, bw)];
+    Some(for_image(n, cells.iter().map(widen), reference, bw))
+}
+
+/// The fewest bytes that hold every offset up to `max_offset`.
+const fn for_bw(max_offset: u64) -> usize {
+    ((u64::BITS - max_offset.leading_zeros()) as usize).div_ceil(8)
+}
+
+/// The FoR image of `count` `values`, framed on `reference` at `bw` bytes each.
+fn for_image(count: usize, values: impl Iterator<Item = u64>, reference: u64, bw: usize) -> Vec<u8> {
+    let mut image = vec![0u8; for_image_len(count, bw)];
     write_u64_le(&mut image, FOR_REFERENCE_AT, reference);
     // A whole u64 per row: the next row overwrites the excess, the slack takes the last row's.
-    for (row, cell) in cells.iter().enumerate() {
-        write_u64_le(&mut image, for_cell_at(row, bw), widen(cell).wrapping_sub(reference));
+    for (row, value) in values.enumerate() {
+        write_u64_le(&mut image, for_cell_at(row, bw), value.wrapping_sub(reference));
     }
-    Some(image)
+    image
 }
 
 /// Row `row` of a FoR image of `bw`-byte offsets, widened to 64 bits.
@@ -441,6 +453,276 @@ impl<'a> DictImage<'a> {
     }
 }
 
+/// Rows per block of a packed payload column: what a per-row read decodes and
+/// keeps, sized so that a block of an I64 column is one page, and the spacing of
+/// the entry points a Seq or Sparse image holds, so that a block decodes from
+/// one.
+pub(crate) const DECODE_BLOCK_ROWS: usize = 512;
+
+// A Seq image: a string column as its lengths alone, its content lying in row
+// order — a long value in the shard's heap, a short one in the image's own pool.
+// The pool's size (u64 LE); per block, where its long content starts in the heap
+// and its short content in the pool (u64 LE each); the FoR image of the lengths;
+// the pool, then zero slack so that its last value loads as the twelve bytes a
+// short cell holds.
+const SEQ_BLOCKS_AT: usize = 8;
+const SEQ_BLOCK_ENTRY: usize = 16;
+const SEQ_POOL_SLACK: usize = SHORT_STRING_THRESHOLD;
+
+/// Where a Seq image of `count` rows holds its lengths.
+const fn seq_lens_at(count: usize) -> usize {
+    SEQ_BLOCKS_AT + count.div_ceil(DECODE_BLOCK_ROWS) * SEQ_BLOCK_ENTRY
+}
+
+/// Bytes per length of a column whose lengths span `min..=max`: one even where
+/// they are all the same, so that the lengths are a FoR image like any other.
+const fn seq_bw(min: usize, max: usize) -> usize {
+    match for_bw((max - min) as u64) {
+        0 => 1,
+        bw => bw,
+    }
+}
+
+/// The size of the Seq image of `count` rows whose lengths span `min..=max`
+/// and whose short values take `pool` bytes.
+pub(crate) const fn seq_image_len(count: usize, (min, max): (usize, usize), pool: usize) -> usize {
+    seq_lens_at(count) + for_image_len(count, seq_bw(min, max)) + pool + SEQ_POOL_SLACK
+}
+
+/// The Seq image of a column of `count` rows whose contents `content` yields in
+/// row order, their lengths spanning `min..=max`. The long ones are appended to
+/// `heap`.
+pub(crate) fn seq_encode<'a>(
+    count: usize,
+    (min, max): (usize, usize),
+    content: impl Iterator<Item = &'a [u8]> + Clone,
+    heap: &mut Vec<u8>,
+) -> Vec<u8> {
+    let mut image = vec![0u8; seq_lens_at(count)];
+    let lens = content.clone().map(|c| c.len() as u64);
+    image.extend_from_slice(&for_image(count, lens, min as u64, seq_bw(min, max)));
+    let pool_at = image.len();
+    for (row, c) in content.enumerate() {
+        if row % DECODE_BLOCK_ROWS == 0 {
+            let entry = SEQ_BLOCKS_AT + row / DECODE_BLOCK_ROWS * SEQ_BLOCK_ENTRY;
+            let pooled = image.len() - pool_at;
+            write_u64_le(&mut image, entry, heap.len() as u64);
+            write_u64_le(&mut image, entry + 8, pooled as u64);
+        }
+        if c.len() > SHORT_STRING_THRESHOLD {
+            heap.extend_from_slice(c);
+        } else {
+            image.extend_from_slice(c);
+        }
+    }
+    let pooled = image.len() - pool_at;
+    write_u64_le(&mut image, 0, pooled as u64);
+    image.resize(image.len() + SEQ_POOL_SLACK, 0);
+    image
+}
+
+/// A Seq image taken apart.
+#[derive(Clone, Copy)]
+pub(crate) struct SeqImage<'a> {
+    blocks: &'a [[u8; SEQ_BLOCK_ENTRY]],
+    /// The FoR image of the lengths, of `bw`-byte offsets.
+    lens: &'a [u8],
+    bw: usize,
+    /// The pool and its slack.
+    pool: &'a [u8],
+}
+
+impl<'a> SeqImage<'a> {
+    /// `image` as the Seq image of `count` rows, or `None` unless its pool size
+    /// and some length width give exactly that size.
+    pub(crate) fn parse(image: &'a [u8], count: usize) -> Option<Self> {
+        let pool = usize::try_from(read_u64_le(image.get(..SEQ_BLOCKS_AT)?, 0)).ok()?;
+        let (blocks, rest) = image[SEQ_BLOCKS_AT..].split_at_checked(seq_lens_at(count) - SEQ_BLOCKS_AT)?;
+        let (lens, pool) = rest.split_at_checked(rest.len().checked_sub(pool.checked_add(SEQ_POOL_SLACK)?)?)?;
+        Some(SeqImage {
+            blocks: blocks.as_chunks().0,
+            lens,
+            // A length is a u32, framed at any width up to its own.
+            bw: for_image_bw(lens.len(), count, size_of::<u32>() + 1)?,
+            pool,
+        })
+    }
+
+    /// Decode rows `first_row..` to their cells over `heap`, `out.len() / 16`
+    /// rows. The lengths are body bytes no open verifies, so a value they place
+    /// past the heap or the pool reads as the empty string.
+    pub(crate) fn decode(&self, heap: &[u8], first_row: usize, out: &mut [u8]) {
+        let cells = out.as_chunks_mut::<16>().0;
+        if cells.is_empty() {
+            return;
+        }
+        let block = first_row / DECODE_BLOCK_ROWS;
+        let start = |at| usize::try_from(read_u64_le(&self.blocks[block], at)).unwrap_or(usize::MAX);
+        let (mut heap_at, mut pool_at) = (start(0), start(8));
+        let len = |row| for_at(self.lens, self.bw, row) as u32 as usize;
+        // The value of `len` bytes at `*at`, which it moves past.
+        let step = |at: &mut usize, len: usize| std::mem::replace(at, at.saturating_add(len));
+        for row in block * DECODE_BLOCK_ROWS..first_row {
+            match len(row) {
+                long if long > SHORT_STRING_THRESHOLD => step(&mut heap_at, long),
+                short => step(&mut pool_at, short),
+            };
+        }
+        for (i, cell) in cells.iter_mut().enumerate() {
+            let len = len(first_row + i);
+            let mut image = [0u8; 16];
+            if len > SHORT_STRING_THRESHOLD {
+                let at = step(&mut heap_at, len);
+                let value = heap.get(at..).filter(|rest| rest.len() >= len);
+                if let Some(prefix) = value.and_then(|v| v.first_chunk::<4>()) {
+                    image[..4].copy_from_slice(&(len as u32).to_le_bytes());
+                    image[4..8].copy_from_slice(prefix);
+                    image[8..].copy_from_slice(&(at as u64).to_le_bytes());
+                }
+            } else if let Some(value) = self
+                .pool
+                .get(step(&mut pool_at, len)..)
+                .and_then(|v| v.first_chunk::<SEQ_POOL_SLACK>())
+            {
+                // Twelve bytes whatever the length: the mask drops the next values'.
+                image[GERMAN_INLINE_OFF..].copy_from_slice(value);
+                let keep = u128::MAX >> (128 - 8 * (GERMAN_INLINE_OFF + len));
+                image = (u128::from_le_bytes(image) & keep | len as u128).to_le_bytes();
+            }
+            *cell = image;
+        }
+    }
+}
+
+// A Sparse image: a nullable column as its non-NULL cells alone. The non-NULL
+// row count (u64 LE); per block, the non-NULL rows before it (u32 LE); the
+// values in row order — the FoR image of them where one is the smaller, else
+// the cells themselves.
+const SPARSE_RANKS_AT: usize = 8;
+const SPARSE_RANK_ENTRY: usize = size_of::<u32>();
+
+/// The Sparse image of a region of `width`-byte cells whose row `r` is NULL
+/// iff `is_null(r)`, its values framed where `fi` admits a frame that shrinks
+/// them.
+pub(crate) fn sparse_encode(
+    src: &[u8],
+    width: usize,
+    fi: Option<FixedInt>,
+    is_null: impl Fn(usize) -> bool,
+) -> Vec<u8> {
+    let n = src.len() / width;
+    let mut image = vec![0u8; SPARSE_RANKS_AT + n.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY];
+    let mut values = Vec::new();
+    for (row, cell) in src.chunks_exact(width).enumerate() {
+        if row % DECODE_BLOCK_ROWS == 0 {
+            let rank = ((values.len() / width) as u32).to_le_bytes();
+            let entry = SPARSE_RANKS_AT + row / DECODE_BLOCK_ROWS * SPARSE_RANK_ENTRY;
+            image[entry..entry + SPARSE_RANK_ENTRY].copy_from_slice(&rank);
+        }
+        if !is_null(row) {
+            values.extend_from_slice(cell);
+        }
+    }
+    write_u64_le(&mut image, 0, (values.len() / width) as u64);
+    let framed = fi.filter(|_| !values.is_empty()).and_then(|fi| for_encode(&values, fi));
+    image.extend_from_slice(framed.as_ref().unwrap_or(&values));
+    image
+}
+
+/// A Sparse image taken apart.
+#[derive(Clone, Copy)]
+pub(crate) struct SparseImage<'a> {
+    ranks: &'a [[u8; SPARSE_RANK_ENTRY]],
+    values: &'a [u8],
+    /// How many values there are.
+    held: usize,
+    /// The offset width of the values' FoR image, or `None` for the cells.
+    bw: Option<usize>,
+}
+
+impl<'a> SparseImage<'a> {
+    /// `image` as the Sparse image of `count` rows of `width`-byte cells, or
+    /// `None` unless its value count gives exactly that size, as cells or under
+    /// some frame.
+    pub(crate) fn parse(image: &'a [u8], count: usize, width: usize) -> Option<Self> {
+        let held = usize::try_from(read_u64_le(image.get(..SPARSE_RANKS_AT)?, 0)).ok()?;
+        let ranks = count.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY;
+        let (ranks, values) = image[SPARSE_RANKS_AT..].split_at_checked(ranks)?;
+        // A writer frames only what the frame shrinks, so cells of a frame's size are cells.
+        let bw = match held.checked_mul(width)? == values.len() {
+            true => None,
+            false if width <= size_of::<u64>() && held > 0 => Some(for_image_bw(values.len(), held, width)?),
+            false => return None,
+        };
+        (held <= count).then_some(SparseImage {
+            ranks: ranks.as_chunks().0,
+            values,
+            held,
+            bw,
+        })
+    }
+
+    /// Decode rows `first_row..` to their `width`-byte cells, `out.len() /
+    /// width` rows: a NULL row's is zero. `nulls` is the null words from the
+    /// first row of `first_row`'s block on, of which bit `pi` is this column's.
+    /// They are body bytes no open verifies, so a row they place past the last
+    /// value reads zero too.
+    pub(crate) fn decode(&self, first_row: usize, width: usize, out: &mut [u8], nulls: &[u8], pi: usize) {
+        match width {
+            1 => self.decode_cells::<1>(first_row, out, nulls, pi),
+            2 => self.decode_cells::<2>(first_row, out, nulls, pi),
+            4 => self.decode_cells::<4>(first_row, out, nulls, pi),
+            8 => self.decode_cells::<8>(first_row, out, nulls, pi),
+            16 => self.decode_cells::<16>(first_row, out, nulls, pi),
+            _ => unreachable!("a fixed-width cell is 1, 2, 4, 8 or 16 bytes"),
+        }
+    }
+
+    fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8], nulls: &[u8], pi: usize) {
+        // No rows may lie past the last block.
+        if out.is_empty() {
+            return;
+        }
+        let (before, nulls) = nulls.as_chunks::<8>().0.split_at(first_row % DECODE_BLOCK_ROWS);
+        let held = |word: &[u8; 8]| (u64::from_le_bytes(*word) >> pi & 1 == 0) as usize;
+        let at = u32::from_le_bytes(self.ranks[first_row / DECODE_BLOCK_ROWS]) as usize;
+        let at = at + before.iter().map(held).sum::<usize>();
+        let cells = out.as_chunks_mut::<W>().0.iter_mut().zip(nulls.iter().map(held));
+        match self.bw {
+            Some(bw) => {
+                let reference = read_u64_le(self.values, FOR_REFERENCE_AT);
+                let mask = gnitz_wire::low_bits_mask(8 * bw);
+                self.fill(cells, at, |at| {
+                    let packed = u64::from_le_bytes(*self.values[for_cell_at(at, bw)..].first_chunk().unwrap());
+                    // `parse` admits a frame only under cells a u64 holds.
+                    *(packed & mask)
+                        .wrapping_add(reference)
+                        .to_le_bytes()
+                        .first_chunk()
+                        .unwrap()
+                })
+            }
+            None => self.fill(cells, at, |at| *self.values[at * W..].first_chunk().unwrap()),
+        }
+    }
+
+    /// Write each of `cells` — a cell, and whether its row holds a value — from
+    /// value `at` on. A cell past the last value is zero whatever its row holds.
+    #[inline(always)]
+    fn fill<'c, const W: usize>(
+        &self,
+        cells: impl Iterator<Item = (&'c mut [u8; W], usize)>,
+        mut at: usize,
+        value: impl Fn(usize) -> [u8; W],
+    ) {
+        for (cell, held) in cells {
+            let held = held & (at < self.held) as usize;
+            *cell = if held != 0 { value(at) } else { [0; W] };
+            at += held;
+        }
+    }
+}
+
 /// Header plus directory, by the file's own payload arity.
 pub(crate) const fn desc_len(file_npc: usize) -> usize {
     dir_entry_off(gnitz_wire::num_regions(file_npc) + 1)
@@ -469,6 +751,11 @@ pub(crate) enum Encoding {
     /// Dictionary: a payload column of 2 bytes or wider as its distinct cells and
     /// one code per row.
     Dict = 4,
+    /// Sequential: a string column of values that do not repeat, as one length
+    /// per row.
+    Seq = 5,
+    /// Sparse: a nullable payload column, not a string's, as its non-NULL cells.
+    Sparse = 6,
 }
 
 impl Encoding {
@@ -480,6 +767,8 @@ impl Encoding {
             Encoding::TwoValue => "two-value",
             Encoding::For => "for",
             Encoding::Dict => "dict",
+            Encoding::Seq => "seq",
+            Encoding::Sparse => "sparse",
         }
     }
 
@@ -490,6 +779,8 @@ impl Encoding {
             2 => Encoding::TwoValue,
             3 => Encoding::For,
             4 => Encoding::Dict,
+            5 => Encoding::Seq,
+            6 => Encoding::Sparse,
             _ => return None,
         })
     }

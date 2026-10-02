@@ -7,7 +7,7 @@ use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_sc
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (25, 8239948856233422411);
+    const PINNED: (u64, u64) = (26, 2877720371824318169);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let schema = SchemaDescriptor::new(
         &[
@@ -15,6 +15,9 @@ fn shard_bytes_are_pinned() {
             int,
             int,
             SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            int,
         ],
         &[0],
     );
@@ -26,6 +29,11 @@ fn shard_bytes_are_pinned() {
         b.put_int((i.wrapping_mul(0x0123_4567_89AB_CDEF) ^ (i << 60)) as u128);
         // Five values, inline and on the heap, make a dictionary.
         b.put_string(&"shard".repeat(1 + (i % 5) as usize));
+        // No value twice, inline and on the heap, is its lengths.
+        b.put_string(&format!("{i:0w$}", w = 6 + i as usize % 12));
+        // One row in eight holds a value: the others' cells are left out.
+        b.put_opt_int((i % 8 == 0).then_some((1 << 40) + i as u128));
+        b.put_int(7);
         b.end_row();
     }
     let dir = tempfile::tempdir().unwrap();
@@ -38,16 +46,16 @@ fn shard_bytes_are_pinned() {
         .unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
 
-    let encodings: Vec<Encoding> = (0..=gnitz_wire::num_regions(3))
+    let encodings: Vec<Encoding> = (0..=gnitz_wire::num_regions(6))
         .map(|i| region_dir(&bytes, i).1)
         .collect();
     use Encoding::*;
     assert_eq!(
         encodings,
-        [Raw, TwoValue, Constant, For, Raw, Dict, Raw, Raw],
+        [Raw, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Raw, Raw],
         "the batch covers every encoding"
     );
-    assert!(region_dir(&bytes, gnitz_wire::num_regions(3)).0 > 0, "and a PK filter");
+    assert!(region_dir(&bytes, gnitz_wire::num_regions(6)).0 > 0, "and a PK filter");
 
     // Both vary with things other than the writer: the system schema, the path.
     write_u64_le(&mut bytes, OFF_VERSION, 0);
@@ -147,17 +155,23 @@ fn a_packed_shard_drops_its_runs_dead_heap() {
     assert_eq!(shard.row_count(), 3);
 }
 
-/// Past a dictionary's worth of values the column keeps a cell per row, over a
-/// heap that still holds each value once.
+/// `2 * values` cells holding each of `values` strings of `width` bytes twice,
+/// and their heap.
+fn each_value_twice(values: usize, width: usize) -> (Vec<[u8; 16]>, Vec<u8>) {
+    let mut heap = Vec::new();
+    let cells = (0..2 * values)
+        .map(|i| gnitz_wire::encode_german_string(format!("{:0width$}", i % values).as_bytes(), &mut heap))
+        .collect();
+    (cells, heap)
+}
+
+/// Past a dictionary's worth of values a column whose cells cost less than a
+/// second copy of each value keeps a cell per row, over a heap that holds each
+/// value once.
 #[test]
 fn more_values_than_a_dictionary_holds_stay_raw_over_a_shared_heap() {
     let values = DICT_MAX_ENTRIES + 1;
-    let mut src_heap = Vec::new();
-    let cells: Vec<[u8; 16]> = (0..2 * values)
-        .map(|i| gnitz_wire::encode_german_string(format!("value-{:012}", i % values).as_bytes(), &mut src_heap))
-        .collect();
-    let content = |row: usize| gnitz_wire::german_string_content(&cells[row], &src_heap);
-    assert!(sample_repeats(cells.len(), content) || cells.len() > SAMPLE_RUN * SAMPLE_RUNS);
+    let (cells, src_heap) = each_value_twice(values, 40);
     let mut heap = Vec::new();
     let (encoding, image) = pack_string_column(&cells, &src_heap, &mut heap);
     assert_eq!(encoding, Encoding::Raw);
@@ -172,6 +186,52 @@ fn more_values_than_a_dictionary_holds_stay_raw_over_a_shared_heap() {
         );
     }
     assert_eq!(packed[..values], packed[values..], "a value's rows share its cell");
+}
+
+/// The same column of values a cell outweighs is its lengths, every row's value
+/// on the heap.
+#[test]
+fn more_short_values_than_a_dictionary_holds_are_their_lengths() {
+    let (cells, src_heap) = each_value_twice(DICT_MAX_ENTRIES + 1, 20);
+    let mut heap = vec![0u8; 5];
+    let (encoding, image) = pack_string_column(&cells, &src_heap, &mut heap);
+    assert_eq!(encoding, Encoding::Seq);
+    assert_eq!(
+        heap.len() - 5,
+        src_heap.len(),
+        "every row's value, and nothing a refused image left"
+    );
+    let mut packed = vec![0u8; cells.len() * 16];
+    SeqImage::parse(&image, cells.len())
+        .unwrap()
+        .decode(&heap, 0, &mut packed);
+    for (i, (cell, src)) in packed.as_chunks::<16>().0.iter().zip(&cells).enumerate() {
+        assert_eq!(
+            gnitz_wire::german_string_content(cell, &heap),
+            gnitz_wire::german_string_content(src, &src_heap),
+            "row {i}"
+        );
+    }
+}
+
+/// A column of values that never repeat is its lengths once those are the
+/// smaller region.
+#[test]
+fn distinct_strings_are_their_lengths() {
+    let distinct = |n: u64| -> Vec<(u64, i64, Vec<u8>)> {
+        (1..=n)
+            .map(|pk| (pk, 1, format!("{pk:0w$}", w = 8 + pk as usize % 9).into_bytes()))
+            .collect()
+    };
+    let written = |rows: &[(u64, i64, Vec<u8>)]| {
+        let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(pk, w, s)| (*pk, *w, &s[..])).collect();
+        written_strings(&rows)
+    };
+    let long = |rows: &[(u64, i64, Vec<u8>)]| rows.iter().map(|r| r.2.len()).filter(|&len| len > 12).sum::<usize>();
+    let (two, forty) = (distinct(2), distinct(40));
+    assert_eq!(written(&two), (long(&two), Encoding::Raw));
+    assert_eq!(written(&forty), (long(&forty), Encoding::Seq));
+    assert_eq!(written(&distinct(1)).1, Encoding::Constant);
 }
 
 /// The sample finds a value repeated across the column and one repeated only

@@ -207,7 +207,7 @@ fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut BatchBuild
 }
 
 fn shapes() -> Vec<Shape> {
-    use Encoding::{Constant, Dict, For, Raw, TwoValue};
+    use Encoding::{Constant, Dict, For, Raw, Seq, Sparse, TwoValue};
     let u64_i64 = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
@@ -216,6 +216,15 @@ fn shapes() -> Vec<Shape> {
     let opt_i64 = SchemaColumn::new(TypeCode::I64, true);
     let three_nullable = SchemaDescriptor::new(
         &[SchemaColumn::new(TypeCode::U64, false), opt_i64, opt_i64, opt_i64],
+        &[0],
+    );
+    let sparse_mix = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U128, true),
+            opt_i64,
+            opt_i64,
+        ],
         &[0],
     );
     let u128_i64 = make_schema_u128_i64();
@@ -279,6 +288,47 @@ fn shapes() -> Vec<Shape> {
             reader: three_nullable,
             pack: true,
             encodings: vec![(REG_NULL_BMP, For)],
+        },
+        // One row in six holds a value: the frame over those alone is two bytes,
+        // where the zero of a NULL cell would stretch it to six.
+        Shape {
+            label: "sparse i64 across decode blocks",
+            written: build(nullable_i64, 2 * DECODE_BLOCK_ROWS + 17, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int((i % 6 == 2).then_some(1_700_000_000_000 + i as u128 * 13));
+            }),
+            reader: nullable_i64,
+            pack: true,
+            encodings: vec![(REG_NULL_BMP, TwoValue), (REG_PAYLOAD_START, Sparse)],
+        },
+        // The first holds its cells, a u128 taking no frame; the third is under
+        // half NULL and keeps its frame.
+        Shape {
+            label: "sparse columns beside a framed one",
+            written: build(sparse_mix, 900, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int((i % 9 == 0).then_some((i as u128 + 1) * (u128::MAX / 1000)));
+                b.put_opt_int((i % 4 == 1).then_some((i as u128 * 0x9E37_79B9_7F4A_7C15) & u64::MAX as u128));
+                b.put_opt_int((i % 3 != 0).then_some(40_000 + i as u128));
+            }),
+            reader: sparse_mix,
+            pack: true,
+            encodings: vec![
+                (REG_PAYLOAD_START, Sparse),
+                (REG_PAYLOAD_START + 1, Sparse),
+                (REG_PAYLOAD_START + 2, For),
+            ],
+        },
+        // The same column a writer may not pack.
+        Shape {
+            label: "mostly-NULL i64 a writer may not pack",
+            written: build(nullable_i64, 300, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int((i % 6 == 2).then_some(1_700_000_000_000 + i as u128 * 13));
+            }),
+            reader: nullable_i64,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Raw)],
         },
         Shape {
             label: "dictionary of floats",
@@ -385,7 +435,8 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: string,
             pack: true,
-            encodings: vec![(REG_PAYLOAD_START, Dict)],
+            // One value in a third of the rows: a dictionary's entries outweigh the lengths.
+            encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
         Shape {
             label: "strings, no value twice",
@@ -398,7 +449,34 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: string,
             pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Seq)],
+        },
+        // Two rows: their lengths would not be the smaller image.
+        Shape {
+            label: "two strings",
+            written: build(string, 2, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&wide_string(i, 20 + i));
+            }),
+            reader: string,
+            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Raw)],
+        },
+        // Lengths of two bytes, and a NULL the sample's runs do not reach twice.
+        Shape {
+            label: "distinct strings across decode blocks",
+            written: build(nullable_string, 2 * DECODE_BLOCK_ROWS + 17, |b, i| {
+                b.begin_row(i as u128, 1);
+                match i % 700 {
+                    0 => b.put_null(),
+                    1 => b.put_string(&wide_string(i, 300)),
+                    v if v % 2 == 0 => b.put_string(&format!("s{i}")),
+                    _ => b.put_string(&wide_string(i, 13 + i % 40)),
+                }
+            }),
+            reader: nullable_string,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
         Shape {
             label: "one long string in every row",
@@ -447,8 +525,8 @@ fn shapes() -> Vec<Shape> {
             pack: false,
             encodings: vec![(REG_NULL_BMP, TwoValue), (REG_PAYLOAD_START, Dict)],
         },
-        // The second column's sample repeats nothing, so it is copied onto the
-        // heap the first one's dictionary is packed over.
+        // The second column's sample repeats nothing, so its long values follow the
+        // first one's dictionary entries on the heap.
         Shape {
             label: "a repeating string column beside a distinct one",
             written: build(two_strings, 70, |b, i| {
@@ -458,7 +536,7 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: two_strings,
             pack: false,
-            encodings: vec![(REG_PAYLOAD_START, Dict), (REG_PAYLOAD_START + 1, Raw)],
+            encodings: vec![(REG_PAYLOAD_START, Dict), (REG_PAYLOAD_START + 1, Seq)],
         },
         Shape {
             label: "u128 pk across the u64 boundary",
@@ -712,31 +790,22 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
 // Slice blob relocation
 // -----------------------------------------------------------------------
 
-/// A slice relocates its own strings, each distinct span once, until the rows it
-/// leaves out would leave a carried heap under a quarter dead.
+/// A slice relocates its own strings until the rows it leaves out would leave a
+/// carried heap under a quarter dead.
 #[test]
 fn slice_relocates_only_its_own_strings() {
     let dir = tempfile::tempdir().unwrap();
     const N: usize = 128;
     const W: usize = 64;
-    // The fewest rows whose 31 × 64 excluded bytes are under a quarter of the heap.
-    const CUT: usize = 97;
+    // The fewest rows whose 32 × 64 excluded bytes are no more than a quarter of the heap.
+    const CUT: usize = 96;
     let schema = make_schema_pk_u64_payload_string();
-    let mut batch = Batch::with_capacity(&schema, N);
-    // Row 1 reuses row 0's cell verbatim, so the two share one heap span — which
-    // a per-row `encode_german_string` never produces (it always appends).
-    let shared = gnitz_wire::encode_german_string(wide_string(0, W).as_bytes(), &mut batch.blob);
-    for i in 0..N {
-        let cell = match i {
-            0 | 1 => shared,
-            _ => gnitz_wire::encode_german_string(wide_string(i, W).as_bytes(), &mut batch.blob),
-        };
-        batch.begin_row(&(i as u64 + 1).to_be_bytes(), 1);
-        batch.extend_col(0, &cell);
-        batch.commit_row();
-    }
+    let batch = build(schema, N, |b, i| {
+        b.begin_row(i as u128 + 1, 1);
+        b.put_string(&wide_string(i, W));
+    });
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch, false), &schema).unwrap();
-    assert_eq!(shard.blob().len(), (N - 1) * W, "row 1 added no bytes");
+    assert_eq!(shard.blob().len(), N * W);
     let string = |b: &Batch, i: usize| String::from_utf8(read_german_string(b, 0, i)).unwrap();
 
     let one = shard.slice_to_owned_batch(37, 1);
@@ -744,27 +813,43 @@ fn slice_relocates_only_its_own_strings() {
     assert_eq!(string(&one, 0), wide_string(37, W));
 
     let under = shard.slice_to_owned_batch(0, CUT - 1);
-    assert_eq!(
-        (under.blob.len(), under.dead_heap),
-        ((CUT - 2) * W, 0),
-        "relocates, and rows 0/1 share one span"
-    );
-    // Rows 0 and 1 both resolve to row 0's string, through the one copied span.
-    assert_eq!(string(&under, 0), wide_string(0, W));
-    assert_eq!(string(&under, 1), wide_string(0, W));
+    assert_eq!((under.blob.len(), under.dead_heap), ((CUT - 1) * W, 0), "relocates");
 
     let at = shard.slice_to_owned_batch(0, CUT);
     assert_eq!(
         (at.blob.len(), at.dead_heap),
-        ((N - 1) * W, (N - CUT) * W),
+        (N * W, (N - CUT) * W),
         "at the cut the whole region is copied, the rows left out charged dead"
     );
     let full = shard.slice_to_owned_batch(0, N);
     assert_eq!(full.blob.as_slice(), shard.blob(), "whole shard: verbatim");
 
-    for i in 2..CUT - 1 {
+    for i in 0..CUT - 1 {
         assert_eq!(string(&under, i), wide_string(i, W), "relocated row {i}");
         assert_eq!(string(&at, i), wide_string(i, W), "whole-region row {i}");
+    }
+}
+
+/// A relocating slice copies a span two of its cells share once.
+#[test]
+fn a_relocating_slice_copies_a_shared_span_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_pk_u64_payload_string();
+    // Too few rows for any image but their cells, which share a repeated value's span.
+    let batch = build(schema, 3, |b, i| {
+        b.begin_row(i as u128 + 1, 1);
+        b.put_string(&wide_string(i % 2, 40));
+    });
+    let shard = MappedShard::open(&write(dir.path(), "shared.db", &batch, false), &schema).unwrap();
+    assert_eq!(shard.blob().len(), 2 * 40, "premise: rows 0 and 2 share one span");
+    let slice = shard.slice_to_owned_batch_with(0, 3, None);
+    assert_eq!(slice.blob.len(), 2 * 40);
+    for i in 0..3 {
+        assert_eq!(
+            read_german_string(&slice, 0, i),
+            wide_string(i % 2, 40).as_bytes(),
+            "row {i}"
+        );
     }
 }
 
@@ -1045,7 +1130,9 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
 // Benchmarks
 // -----------------------------------------------------------------------
 
-/// Per-pass cost of slicing a FoR shard window by window.
+/// Per-pass cost of slicing a packed shard window by window: a framed column,
+/// and a column holding a value in one row of ten as a frame over its zeroes
+/// and as its non-NULL cells alone.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_slice_bench() {
@@ -1054,30 +1141,48 @@ fn for_slice_bench() {
     const N: usize = 1_000_000;
     const WINDOW: usize = 1024;
     const HANDLES: usize = 20;
-    let schema = make_schema_u64_i64();
+    let nullable = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    fn value(i: usize) -> Option<u128> {
+        Some(3_000_000_000 + i as u128)
+    }
+    fn tenth(i: usize) -> Option<u128> {
+        value(i).filter(|_| i.is_multiple_of(10))
+    }
+    type Value = fn(usize) -> Option<u128>;
+    let shapes: [(&str, SchemaDescriptor, Value); 3] = [
+        ("framed", make_schema_u64_i64(), value),
+        ("a value in one row of ten, framed", make_schema_u64_i64(), |i| {
+            tenth(i).or(Some(0))
+        }),
+        ("a value in one row of ten, the rest NULL", nullable, tenth),
+    ];
     let dir = tempfile::tempdir().unwrap();
-    let batch = build(schema, N, |b, i| {
-        b.begin_row(i as u128, 1);
-        b.put_int((3_000_000_000 + (i % 4000) as i64) as u128);
-    });
-    let path = write(dir.path(), "for_slice.db", &batch, true);
-    let handles: Vec<MappedShard> = (0..HANDLES)
-        .map(|_| MappedShard::open(&path, &schema).unwrap())
-        .collect();
-    assert!(matches!(handles[0].col_regions[0], PayloadRegion::Packed(_)));
-    let slice_all = |shard: &MappedShard| {
-        for start in (0..N).step_by(WINDOW) {
-            black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
-        }
-    };
     let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
-    for label in ["first pass", "second pass"] {
-        let (((), i), c) = cycles.measure(|| instructions.measure(|| handles.iter().for_each(slice_all)));
-        println!(
-            "{label}: {} cycles, {} instructions per pass",
-            c / HANDLES as u64,
-            i / HANDLES as u64,
-        );
+    for (label, schema, value) in shapes {
+        let batch = build(schema, N, |b, i| {
+            b.begin_row(i as u128, 1);
+            b.put_opt_int(value(i));
+        });
+        let path = write(dir.path(), "for_slice.db", &batch, true);
+        let handles: Vec<MappedShard> = (0..HANDLES)
+            .map(|_| MappedShard::open(&path, &schema).unwrap())
+            .collect();
+        assert!(matches!(handles[0].col_regions[0], PayloadRegion::Packed(_)));
+        let slice_all = |shard: &MappedShard| {
+            for start in (0..N).step_by(WINDOW) {
+                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
+            }
+        };
+        println!("{label}: {} bytes", handles[0].file_len());
+        for pass in ["first pass", "second pass"] {
+            let (((), i), c) = cycles.measure(|| instructions.measure(|| handles.iter().for_each(slice_all)));
+            println!(
+                "  {pass}: {} cycles, {} instructions per pass",
+                c / HANDLES as u64,
+                i / HANDLES as u64,
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }
 
@@ -1110,6 +1215,17 @@ fn for_point_touch_bench() {
         let (((), i), c) = cycles.measure(|| instructions.measure(read));
         let retained = settled_rss().saturating_sub(rss0);
         println!("{label}: {i} instructions, {c} cycles; {retained} bytes retained");
+    }
+    // Every block: the second pass is the read of a block already held.
+    for pass in ["every row, first pass", "every row, second pass"] {
+        let ((), i) = instructions.measure(|| {
+            for row in 0..N {
+                for pi in 0..2 {
+                    black_box(shard.get_col_ptr(black_box(row), pi, 8));
+                }
+            }
+        });
+        println!("{pass}: {} instructions per read", i / (2 * N as u64));
     }
 }
 
