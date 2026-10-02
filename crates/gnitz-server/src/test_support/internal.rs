@@ -6,10 +6,7 @@
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_wire::sys_rows::{
-    write_circuit_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, FkRef, IdxTabRow, SchemaTabRow,
-    SysRowSink, TableTabRow,
-};
+use gnitz_wire::sys_rows::{CircuitRow, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
@@ -101,7 +98,7 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 /// commits with.
 pub fn circuit_batch(vid: u64, circuit: &Circuit) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
-    write_circuit_row(&mut bb, vid, circuit);
+    CircuitRow { view_id: vid, circuit }.write(&mut bb, 1);
     bb.finish()
 }
 
@@ -270,7 +267,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
             pk: gnitz_wire::PkColList::from_slice(&[0]),
             props: gnitz_wire::TableProps::default(),
         };
-        write_table_tab_row(&mut bb, &row, weight);
+        row.write(&mut bb, weight);
     }
     bb.finish()
 }
@@ -279,7 +276,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id, name }, weight);
+        SchemaTabRow { schema_id, name }.write(&mut bb, weight);
     }
     bb.finish()
 }
@@ -294,17 +291,14 @@ pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batc
 /// The one-row IDX_TAB batch of an index over `cols` at `weight`.
 pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_unique: bool, weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    write_idx_tab_row(
-        &mut bb,
-        &IdxTabRow {
-            index_id,
-            owner_id,
-            cols: gnitz_wire::PkColList::from_slice(cols),
-            name,
-            is_unique,
-        },
-        weight,
-    );
+    IdxTabRow {
+        index_id,
+        owner_id,
+        cols: gnitz_wire::PkColList::from_slice(cols),
+        name,
+        is_unique,
+    }
+    .write(&mut bb, weight);
     bb.finish()
 }
 

@@ -9,7 +9,7 @@
 
 use super::super::*;
 use crate::test_support::{col_tab_batch, idx_tab_batch, schema_tab_batch};
-use gnitz_wire::sys_rows::{write_table_tab_row, TableTabRow};
+use gnitz_wire::sys_rows::{SysRow, TableTabRow};
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
 /// points take qualified-name strings; the wire path ships schema and entity ids
@@ -166,7 +166,7 @@ impl CatalogEngine {
             pk: gnitz_wire::PkColList::from_slice(pk_cols),
             props,
         };
-        write_table_tab_row(&mut bb, &row, 1);
+        row.write(&mut bb, 1);
         self.submit(SysFamily::Table, bb.finish())?;
         Ok(tid)
     }
@@ -290,7 +290,7 @@ impl CatalogEngine {
             pk: gnitz_wire::PkColList::from_slice(pk),
             props: gnitz_wire::TableProps::default(),
         };
-        write_table_tab_row(&mut bb, &row, 1);
+        row.write(&mut bb, 1);
         self.ddl_sync(SysFamily::Table.id(), bb.finish())
     }
 }

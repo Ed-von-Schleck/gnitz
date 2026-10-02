@@ -2,6 +2,7 @@
 //! end of a socketpair feeds reply frames one `step` at a time.
 
 use super::*;
+use crate::client::await_slot;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{framed, kv_rows, kv_schema, reply_ctrl, reply_status, session_pair as pair};
 use crate::BatchAppender;
@@ -67,19 +68,6 @@ fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
     encode_frame(reply_header(tid, lsn, cont), &[], None, Some(batch))
 }
 
-/// Drive `s` until `slot` completes, parking between steps — the blocking
-/// driver's loop, over one slot.
-fn drive(s: &mut Session, slot: SlotId) -> Result<Reply, ClientError> {
-    let mut ready = Interest::WRITE;
-    loop {
-        let mut done = s.step(ready);
-        if let Some(i) = done.iter().position(|(id, _)| *id == slot) {
-            return done.swap_remove(i).1;
-        }
-        ready = crate::client::park(s, &mut None).unwrap();
-    }
-}
-
 #[test]
 fn train_split_across_continuation_frames_completes_once() {
     let (mut s, peer) = pair();
@@ -130,7 +118,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert!(s.step(Interest::READ).is_empty(), "one of two trains");
     peer.send(&reply_rows(2, &batch_b(&[20]), 0, true));
     peer.send(&reply_rows(2, &batch_b(&[21]), 0, false));
-    let Reply::Multi(replies) = drive(&mut s, slot).unwrap() else {
+    let Reply::Multi(replies) = await_slot(&mut s, &mut None, slot, None).unwrap() else {
         panic!("multi")
     };
     assert_eq!(replies.len(), 2);
@@ -156,7 +144,7 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
         Some(&sa.to_block()),
         Some(&batch_a(&[5])),
     ));
-    let e = drive(&mut s, slot).expect_err("a schema block on a read is a decode error");
+    let e = await_slot(&mut s, &mut None, slot, None).expect_err("a schema block on a read is a decode error");
     assert!(
         matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
         "{e:?}"
@@ -193,7 +181,7 @@ fn a_status_frame_fails_its_slot_alone() {
             peer.send(&reply_rows(tid, &batch_a(&[tid]), 0, false));
         }
         peer.send(&reply_status(0, status, "refused"));
-        let r = drive(&mut s, slot);
+        let r = await_slot(&mut s, &mut None, slot, None);
         assert!(
             matches!(&r, Err(ClientError::Refused(f)) if f.status == status && f.text == "refused"),
             "{what}: {r:?}"
@@ -205,7 +193,7 @@ fn a_status_frame_fails_its_slot_alone() {
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
-        let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
+        let Reply::Scan(r) = await_slot(&mut s, &mut None, slot, None).unwrap() else {
             panic!("scan")
         };
         assert_eq!(r.lsn, Some(42), "{what}: the next request completes normally");

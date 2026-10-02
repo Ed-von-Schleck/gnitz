@@ -101,32 +101,6 @@ fn the_index_list_is_exact_across_create_and_drop() {
     assert_eq!(db.indexes("t"), [a]);
 }
 
-/// Every id-addressed probe ends at the same registration gate, so no
-/// client-chosen tid reaches the column reader. None of these may abort or hang
-/// the master or desync the connection; each is a clean miss.
-#[test]
-fn an_unregistered_id_is_a_clean_miss() {
-    let mut db = Db::boot(1);
-    for tid in [
-        1_000_000_u64,                  // never allocated
-        gnitz_wire::CATALOG_ID_CEILING, // at the catalog id ceiling
-        1 << 55,                        // a plausible id no allocation reaches
-        u64::MAX,                       // negative once cast to i64
-        u64::MAX - 1,
-    ] {
-        let err = db
-            .client
-            .describe_by_id(tid)
-            .expect_err("an unregistered id must not resolve");
-        assert!(
-            matches!(&err, ClientError::Refused(WireFault { status: NotFound, .. })),
-            "tid {tid}: got {err:?}"
-        );
-    }
-    db.exec(T_ID_V);
-    assert!(db.exists("t"));
-}
-
 // ── Statement cost ───────────────────────────────────────────────────────────
 
 /// Request frames one `execute` of `sql` costs, whether or not it succeeds.
@@ -183,6 +157,16 @@ fn a_statement_resolves_each_relation_once() {
             "resolve, two reads, PUSH_TXN",
         ),
         (
+            "BEGIN; UPDATE t SET x = x + 1 WHERE id = 3; UPDATE t SET x = x + 1 WHERE id = 3; COMMIT",
+            3,
+            "resolve, one read, PUSH_TXN: the second UPDATE reads the first one's row",
+        ),
+        (
+            "BEGIN; INSERT INTO t VALUES (5, 1, 50); UPDATE t SET x = x + 1 WHERE id = 5; COMMIT",
+            2,
+            "resolve, PUSH_TXN: the UPDATE reads the INSERT's row",
+        ),
+        (
             "BEGIN; SELECT * FROM v; SELECT * FROM v; ROLLBACK",
             4,
             "a resolve and a read per SELECT",
@@ -199,7 +183,7 @@ fn a_statement_resolves_each_relation_once() {
     }
     assert_eq!(
         db.scan("u", &["id", "x"]),
-        at_weight_one(&[vec![1, 10], vec![2, 10], vec![3, 31], vec![4, 41]])
+        at_weight_one(&[vec![1, 10], vec![2, 10], vec![3, 33], vec![4, 41], vec![5, 51]])
     );
 }
 

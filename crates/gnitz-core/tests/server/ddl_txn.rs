@@ -1,18 +1,25 @@
 //! What the master's `DDL_TXN` handler decides itself, around the catalog's own
-//! rules: `GnitzClient::push_ddl_txn` ships a hand-built bundle without the
-//! client's checks.
+//! rules. A hand-built bundle goes through the session, without the client's
+//! checks.
 
 use super::*;
 use gnitz_core::sys_schema;
-use gnitz_wire::sys_rows::{write_idx_tab_row, write_schema_tab_row, IdxTabRow, SchemaTabRow};
-use gnitz_wire::{PkColList, ViewProps, IDX_TAB, SCHEMA_TAB, SEQ_TAB};
+use gnitz_wire::sys_rows::{SchemaTabRow, SysRow};
+use gnitz_wire::{PkColList, ViewProps, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
     let s = sys_schema(SCHEMA_TAB);
     let mut b = ZSetBatch::new(s);
-    write_schema_tab_row(&mut BatchAppender::new(&mut b), &SchemaTabRow { schema_id, name }, 1);
+    SchemaTabRow { schema_id, name }.write(&mut BatchAppender::new(&mut b), 1);
     b
+}
+
+/// The refusal of `families` sent as one DDL bundle.
+fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
+    let slot = s.submit(Request::DdlTxn(families)).unwrap();
+    let (mut done, _) = drive_all(s, 1);
+    done.remove(&slot).unwrap().unwrap_err().to_string()
 }
 
 /// Refused whole, before the catalog reads it: a bundle with two blocks for one
@@ -24,17 +31,18 @@ fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
 fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let mut s = Session::connect(srv.sock_path()).unwrap();
     let (a, b) = (client.alloc_id().unwrap(), client.alloc_id().unwrap());
-    let err = client
-        .push_ddl_txn(&[(SCHEMA_TAB, schema_row(a, "one")), (SCHEMA_TAB, schema_row(b, "two"))])
-        .unwrap_err()
-        .to_string();
+    let err = refusal(
+        &mut s,
+        &[(SCHEMA_TAB, schema_row(a, "one")), (SCHEMA_TAB, schema_row(b, "two"))],
+    );
     assert!(err.contains("two blocks"), "{err}");
 
     let seq = sys_schema(SEQ_TAB);
     let mut forged = ZSetBatch::new(seq);
     BatchAppender::new(&mut forged).add_row(2, 1).u64_val(1 << 40);
-    let err = client.push_ddl_txn(&[(SEQ_TAB, forged)]).unwrap_err().to_string();
+    let err = refusal(&mut s, &[(SEQ_TAB, forged)]);
     assert!(err.contains("not writable from the wire"), "{err}");
 
     // Neither wrote anything: both names are still free.
@@ -56,21 +64,15 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     client.push(tid, &schema, &dup, WireConflictMode::Update).unwrap();
 
     let unique_on_v = |client: &mut GnitzClient, owner_id: u64| {
-        let s = sys_schema(IDX_TAB);
-        let mut b = ZSetBatch::new(s);
-        let row = IdxTabRow {
-            index_id: client.alloc_id().unwrap(),
-            owner_id,
-            cols: PkColList::from_slice(&[1]),
-            name: "ix",
-            is_unique: true,
-        };
-        write_idx_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
-        client.push_ddl_txn(&[(IDX_TAB, b)]).unwrap_err().to_string()
+        client
+            .create_index(owner_id, PkColList::from_slice(&[1]), "ix", true)
+            .unwrap_err()
+            .to_string()
     };
 
     // The backfill copies both rows into the view.
-    let vid = client.create_view(&sn, "v", tid, ViewProps::default()).unwrap();
+    let source = client.resolve_relation(&sn, "t").unwrap();
+    let vid = client.create_view(&sn, "v", &source, ViewProps::default()).unwrap();
     let err = unique_on_v(&mut client, vid);
     assert!(err.contains("only a base table can be indexed"), "{err}");
 

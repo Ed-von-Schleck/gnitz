@@ -66,7 +66,7 @@ impl Recorder {
 /// is read off the struct, so the check cannot itself transpose a pair.
 fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     let mut rec = Recorder::default();
-    write_col_tab_row(&mut rec, r, weight);
+    r.write(&mut rec, weight);
     assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
     assert_eq!(rec.weight, weight);
     let v = rec.row(COL_TAB);
@@ -102,17 +102,14 @@ fn values_land_in_their_named_payload_slots() {
 
     let idx_cols = crate::PkColList::from_slice(&[2, 1]);
     let mut r = Recorder::default();
-    write_idx_tab_row(
-        &mut r,
-        &IdxTabRow {
-            index_id: 100,
-            owner_id: 16,
-            cols: idx_cols,
-            name: "idx_t_b",
-            is_unique: true,
-        },
-        1,
-    );
+    IdxTabRow {
+        index_id: 100,
+        owner_id: 16,
+        cols: idx_cols,
+        name: "idx_t_b",
+        is_unique: true,
+    }
+    .write(&mut r, 1);
     assert_eq!(r.pk, [100]);
     let v = r.row(IDX_TAB);
     assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
@@ -125,17 +122,14 @@ fn values_land_in_their_named_payload_slots() {
     let pk = crate::PkColList::from_slice(&[1, 0]);
     let props = crate::TableProps { stream: true, ..Default::default() };
     let mut r = Recorder::default();
-    write_table_tab_row(
-        &mut r,
-        &TableTabRow {
-            table_id: 16,
-            schema_id: 3,
-            name: "t",
-            pk,
-            props,
-        },
-        1,
-    );
+    TableTabRow {
+        table_id: 16,
+        schema_id: 3,
+        name: "t",
+        pk,
+        props,
+    }
+    .write(&mut r, 1);
     assert_eq!(r.pk, [16]);
     let v = r.row(TABLE_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(3));
@@ -144,21 +138,18 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(props.pack()));
 
     let mut r = Recorder::default();
-    write_view_tab_row(
-        &mut r,
-        &ViewTabRow {
-            view_id: 20,
-            schema_id: 4,
-            name: "v",
-            pk,
-            props: crate::ViewProps::Fed {
-                delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
-            },
-            owner_view_id: 21,
-            pk_repeats: true,
+    ViewTabRow {
+        view_id: 20,
+        schema_id: 4,
+        name: "v",
+        pk,
+        props: crate::ViewProps::Fed {
+            delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
         },
-        1,
-    );
+        owner_view_id: 21,
+        pk_repeats: true,
+    }
+    .write(&mut r, 1);
     assert_eq!(r.pk, [20]);
     let v = r.row(VIEW_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
@@ -170,7 +161,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[VIEWTAB_PAY_PK_REPEATS], Val::U64(1));
 
     let mut r = Recorder::default();
-    write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);
+    SchemaTabRow { schema_id: 3, name: "public" }.write(&mut r, 1);
     assert_eq!(r.pk, [3]);
     assert_eq!(r.row(SCHEMA_TAB)[SCHEMATAB_PAY_NAME], Val::Str("public".into()));
 
@@ -179,7 +170,7 @@ fn values_land_in_their_named_payload_slots() {
     let scan = circuit.input_delta(31, crate::ReadBound::None);
     circuit.sink(scan);
     let mut r = Recorder::default();
-    write_circuit_row(&mut r, 7, &circuit);
+    CircuitRow { view_id: 7, circuit: &circuit }.write(&mut r, 1);
     assert_eq!((r.pk.as_slice(), r.weight), (&[7][..], 1));
     assert_eq!(r.row(CIRCUIT_TAB)[CIRCTAB_PAY_CIRCUIT], Val::Bytes(circuit.encode()));
 }

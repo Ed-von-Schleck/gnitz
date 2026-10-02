@@ -4,7 +4,7 @@
 //! end-to-end SQL surface is in `crates/gnitz-sql/tests/engine/ddl.rs`.
 
 use super::*;
-use gnitz_wire::sys_rows::{write_table_tab_row, TableTabRow};
+use gnitz_wire::sys_rows::{SysRow, TableTabRow};
 use gnitz_wire::{RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};
 use std::path::Path;
 
@@ -20,7 +20,7 @@ fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch
         pk: gnitz_wire::PkColList::unpack(payload_u64(&minus, 0, TABTAB_PAY_PK_COL_IDX)).unwrap(),
         props: gnitz_wire::TableProps::from_flags(payload_u64(&minus, 0, TABTAB_PAY_FLAGS)).unwrap(),
     };
-    write_table_tab_row(&mut bb, &row, 1);
+    row.write(&mut bb, 1);
     [minus, bb.finish()]
 }
 

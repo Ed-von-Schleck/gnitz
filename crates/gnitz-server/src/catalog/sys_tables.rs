@@ -12,10 +12,7 @@ use super::RelFacts;
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::sys_rows::{
-    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, FkRef, SchemaTabRow, SysRowSink,
-    TableTabRow,
-};
+use gnitz_wire::sys_rows::{ColTabRow, FkRef, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
 use gnitz_wire::{ColType, ColumnDef, TableDistribution, ViewProps};
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
@@ -225,7 +222,7 @@ impl CatalogColumn {
             col: &self.def,
             fk: self.fk,
         };
-        write_col_tab_row(sink, &row, weight);
+        row.write(sink, weight);
     }
 }
 
@@ -462,7 +459,7 @@ impl SysFamily {
         match self {
             SysFamily::Schema => {
                 for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
-                    write_schema_tab_row(bb, &SchemaTabRow { schema_id, name }, 1);
+                    SchemaTabRow { schema_id, name }.write(bb, 1);
                 }
             }
             SysFamily::Table => {
@@ -474,7 +471,7 @@ impl SysFamily {
                         pk: PkColList::from_slice(family.wire().pk_cols),
                         props: gnitz_wire::TableProps::default(),
                     };
-                    write_table_tab_row(bb, &row, 1);
+                    row.write(bb, 1);
                 }
             }
             SysFamily::Column => {

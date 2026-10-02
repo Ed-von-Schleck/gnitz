@@ -1,41 +1,27 @@
 use crate::connection::{
-    DeltaCursor, IdRun, Interest, PollEnd, PollSink, Polled, PolledView, RawBlock, RelDescriptor, RelTarget, Reply,
-    Request, ScanReply, ScanResult, Session, SlotId,
+    DeltaCursor, IdRun, Interest, PollEnd, PollSink, Polled, RawBlock, RelDescriptor, Reply, Request, ScanReply,
+    Session, SlotId,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Schema, ZSetBatch};
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_wire::{ColumnDef, PkBuf, WireConflictMode};
+use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, LogicalProgram, RowFilter};
-use gnitz_wire::sys_rows::{ColTabRow, FkRef, IdxTabRow, TableTabRow, ViewTabRow};
+use gnitz_expr::{payload_str, payload_u64, LogicalProgram, RowFilter};
+use gnitz_wire::sys_rows::{CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    PkColList, PkListRole, RelClass, TableProps, ViewProps, CIRCUIT_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
+    PkColList, PkListRole, RelClass, TableProps, ViewProps, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
     COLTAB_PAY_NAME, COL_TAB, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
     IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
-
-/// Row `i` of a system-table STRING payload column. Every such column is declared
-/// non-nullable, so a NULL is a malformed reply, not a case — this is the trust
-/// boundary that says so rather than substituting `""`. UTF-8 is validated here
-/// too: the region carries bytes.
-fn col_str(batch: &ZSetBatch, pi: usize, i: usize) -> Result<&str, ClientError> {
-    if payload_is_null(batch, i, pi) {
-        return Err(
-            ProtocolError::DecodeError(format!("col_str: NULL in a non-nullable system column at row {i}")).into(),
-        );
-    }
-    std::str::from_utf8(payload_bytes(batch, i, pi))
-        .map_err(|e| ProtocolError::DecodeError(format!("col_str: invalid UTF-8 at row {i}: {e}")).into())
-}
 
 /// [`gnitz_wire::qualified_key`] from names that may still be raw user text.
 /// The fold lives on this side only — see that function for why.
@@ -95,7 +81,7 @@ pub const RMW_MAX_ATTEMPTS: usize = 4;
 /// index name `DROP INDEX` matches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineUniqueIndex {
-    pub col_indices: Vec<u32>,
+    pub cols: PkColList,
     pub name: String,
 }
 
@@ -127,25 +113,33 @@ impl FkTarget {
     }
 }
 
-/// One FOREIGN KEY column of a `CREATE TABLE`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InlineForeignKey {
-    pub col_idx: u32,
-    pub target: FkTarget,
-}
-
-/// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
-/// drawn from the master by `reserve_serial_ids`. Cache-loss on disconnect
-/// discards the unissued tail (an intentional, PostgreSQL-style gap).
-struct SerialRange {
-    next: u64,
-    end: u64,
-}
-
-/// Number of SERIAL ids reserved per master round-trip. Each reservation is a
-/// `catalog_rwlock`-serialized, fsync'd durable advance on the master, so the
-/// range cache amortizes that one fsync across `SERIAL_RANGE_SIZE` inserts.
+/// The ids one SERIAL reservation takes when the statement asks for fewer. Each
+/// reservation is a durable advance on the master.
 const SERIAL_RANGE_SIZE: u64 = 64;
+
+/// The rows of one DDL transaction: one batch per system family it writes.
+#[derive(Default)]
+struct DdlBundle(Vec<(u64, ZSetBatch)>);
+
+impl DdlBundle {
+    /// `family`'s batch, opened on first use — so a family nothing wrote to has
+    /// no entry, and no family has two.
+    fn batch(&mut self, family: u64) -> &mut ZSetBatch {
+        let at = match self.0.iter().position(|(f, _)| *f == family) {
+            Some(at) => at,
+            None => {
+                self.0.push((family, ZSetBatch::new(sys_schema(family))));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[at].1
+    }
+
+    /// `row` at `weight`, in its own family's batch.
+    fn put<R: SysRow>(&mut self, row: &R, weight: i64) {
+        row.write(&mut BatchAppender::new(self.batch(R::FAMILY)), weight);
+    }
+}
 
 /// Upper bound on the segments in one atomic view chain — a bound on the DDL
 /// bundle, not on planning: every segment is already built and in RAM by the time
@@ -199,7 +193,9 @@ pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Se
 pub struct GnitzClient {
     pub(crate) session: Session,
     pub(crate) park_hook: Option<ParkHook>,
-    serial_cache: HashMap<u64, SerialRange>,
+    /// Per table, the SERIAL ids a reservation drew and no INSERT has taken. A
+    /// disconnect discards them (an intentional, PostgreSQL-style gap).
+    serial_cache: HashMap<u64, std::ops::Range<u64>>,
     /// Open transaction, if any; `None` is autocommit. Every user-table write
     /// buffers here while it is open, and dropping it is ROLLBACK.
     txn: Option<TxnBuffer>,
@@ -270,17 +266,16 @@ impl GnitzClient {
     /// range's, or this reservation's — is the intentional PostgreSQL-style gap.
     pub fn reserve_serial_ids(&mut self, table_id: u64, count: u64) -> Result<u64, ClientError> {
         match self.serial_cache.get_mut(&table_id) {
-            Some(r) if r.end.saturating_sub(r.next) >= count => {
-                let base = r.next;
-                r.next += count;
+            Some(r) if r.end - r.start >= count => {
+                let base = r.start;
+                r.start += count;
                 Ok(base)
             }
             // Refill, abandoning whatever tail the old range still held.
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
                 let base = self.alloc(IdRun::Serial { table_id, count: want })?;
-                self.serial_cache
-                    .insert(table_id, SerialRange { next: base + count, end: base + want });
+                self.serial_cache.insert(table_id, base + count..base + want);
                 Ok(base)
             }
         }
@@ -348,7 +343,12 @@ impl GnitzClient {
     }
 
     /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
-    pub fn scan_spec(&mut self, table_id: u64, spec: &ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
+    pub fn scan_spec(
+        &mut self,
+        table_id: u64,
+        spec: &ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> Result<ScanReply, ClientError> {
         self.round_trip(Request::ScanSpec { target_id: table_id, spec, reply_schema })
             .map(Reply::into_scan)
     }
@@ -364,10 +364,11 @@ impl GnitzClient {
     /// [`Self::resolve`], answered off a mirrored registration when there is one
     /// — which is what keeps a mirrored `SELECT` round-trip-free.
     ///
-    /// The trade is a name → id binding as stale as the copy itself; the feed
-    /// detects it (the next poll's tag stops continuing) and the recovery
-    /// re-resolves before it reseeds. A name binds locally exactly when its copy
-    /// answers locally: the cursor is the one gate, for names and reads alike.
+    /// The trade is a name → id binding as stale as the copy itself: a relation
+    /// dropped and recreated under the name is found by the next poll, whose
+    /// recovery re-resolves before it reseeds. A name binds locally exactly when
+    /// its copy answers locally: the cursor is the one gate, for names and reads
+    /// alike.
     /// The stored names are canonical, so part-wise case-insensitive equality is
     /// the same test as folding the joined name, without the allocation.
     pub fn resolve_local_first(
@@ -395,7 +396,12 @@ impl GnitzClient {
 
     /// [`Self::scan_spec`], answered off the copy when it holds `table_id`, with
     /// no served LSN: a copy's freshness is [`Self::cursor_of`].
-    pub fn scan_spec_local_first(&mut self, table_id: u64, spec: ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
+    pub fn scan_spec_local_first(
+        &mut self,
+        table_id: u64,
+        spec: ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> Result<ScanReply, ClientError> {
         match self.mirror.as_deref_mut() {
             Some(m) if m.cursor_of(table_id).is_some() => Ok(ScanReply {
                 batch: m.store.scan_spec(table_id, spec, reply_schema)?,
@@ -494,17 +500,6 @@ impl GnitzClient {
         Ok((ScanReply { schema, batch, lsn: None }, cursor))
     }
 
-    /// [`Self::delta_read`] keeping the reply's raw blocks, the whole train in
-    /// hand. The cursor comes back unchecked against a previous one.
-    pub(crate) fn delta_read_raw(&mut self, item: DeltaPollItem) -> PolledView {
-        let mut blocks = Vec::new();
-        let cursor = delta_read_blocks(&mut self.session, &mut self.park_hook, item, |b| {
-            blocks.push(b);
-            Ok(())
-        })?;
-        Ok((blocks, cursor))
-    }
-
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
     /// in request order. An atomic multi-table `txn_commit` is never observed torn
     /// across the result set.
@@ -513,33 +508,19 @@ impl GnitzClient {
         self.round_trip(Request::ScanMulti(relations)).map(Reply::into_multi)
     }
 
-    /// The descriptor for `tid` — the by-id twin of [`Self::resolve`], one round
-    /// trip.
-    pub fn describe_by_id(&mut self, tid: u64) -> Result<Arc<RelDescriptor>, ClientError> {
-        self.round_trip(Request::Resolve(RelTarget::Id(tid)))
-            .map(Reply::into_resolve)?
-            .ok_or_else(|| absent(format!("relation {tid} not found")))
-    }
-
-    /// Index `col_indices` of table `table_id`, in that order, under the catalog
-    /// name `index_name`.
+    /// Index `cols` of table `table_id`, in that order, under the catalog name
+    /// `index_name`.
     pub fn create_index(
         &mut self,
         table_id: u64,
-        col_indices: &[u32],
+        cols: PkColList,
         index_name: &str,
         is_unique: bool,
     ) -> Result<u64, ClientError> {
         let index_name = gnitz_wire::canonical_identifier(index_name)?;
-        let cols = PkColList::checked(col_indices, gnitz_wire::MAX_COLUMNS)
-            .map_err(|rule| ClientError::from(format!("create_index: {}", rule.for_role(PkListRole::ColumnList))))?;
-
         let index_id = self.alloc_id()?;
-
-        let idx_schema = sys_schema(IDX_TAB);
-        let mut batch = ZSetBatch::new(idx_schema);
-        gnitz_wire::sys_rows::write_idx_tab_row(
-            &mut BatchAppender::new(&mut batch),
+        let mut b = DdlBundle::default();
+        b.put(
             &IdxTabRow {
                 index_id,
                 owner_id: table_id,
@@ -549,91 +530,57 @@ impl GnitzClient {
             },
             1,
         );
-
-        self.push_ddl_txn(&[(IDX_TAB, batch)])?;
+        self.commit_ddl(b)?;
         Ok(index_id)
     }
 
     /// Drop indexes by name as **one** DDL zone: the whole set retires or none of
     /// it does, and a name repeated in `index_names` retires once.
     pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
-        self.drop_index_rows(index_names, "index", if_exists, |_, _| true)
+        self.drop_index_rows(index_names, "index", if_exists, |_| true)
     }
 
     /// `ALTER TABLE … DROP CONSTRAINT`: the UNIQUE index `name` of table `tid`.
     /// The `-1` is the stored row, so the engine's CAS re-proves owner and
     /// uniqueness against the live row.
     pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
-        self.drop_index_rows(&[name], "constraint", if_exists, |b, i| {
-            payload_u64(b, i, IDXTAB_PAY_OWNER_ID) == tid
-                && gnitz_wire::bool_word(payload_u64(b, i, IDXTAB_PAY_IS_UNIQUE)) == Ok(true)
-        })
+        self.drop_index_rows(&[name], "constraint", if_exists, |r| r.owner == tid && r.is_unique)
     }
 
     /// Retract the live IDX_TAB rows named in `names` that pass `matches`.
-    ///
-    /// `if_exists` is answered at this verb's own not-found path, never by a
-    /// pre-check: a pre-check leaves a window a concurrent DROP can land in and
-    /// resurface the "not found" it must suppress.
     fn drop_index_rows(
         &mut self,
         names: &[&str],
         noun: &'static str,
         if_exists: bool,
-        matches: impl Fn(&ZSetBatch, usize) -> bool,
+        matches: impl Fn(&IndexRow) -> bool,
     ) -> Result<(), ClientError> {
         let scanned = self.sys_rows(IDX_TAB, ReadBound::None)?;
-        let idx_schema = sys_schema(IDX_TAB);
-        let mut batch = ZSetBatch::new(idx_schema);
+        let rows = idx_rows(&scanned)?;
+        let mut b = DdlBundle::default();
         let mut retired: Vec<usize> = Vec::with_capacity(names.len());
         for name in names {
             let name = gnitz_wire::canonical_identifier(name)?;
-            let mut hit = None;
-            for i in scanned.live_rows() {
-                if col_str(&scanned, IDXTAB_PAY_NAME, i)? == name && matches(&scanned, i) {
-                    hit = Some(i);
-                    break;
-                }
-            }
-            match hit {
-                Some(i) => {
+            match rows.iter().find(|(_, r)| r.name == name && matches(r)) {
+                Some(&(i, _)) => {
                     // A repeated name retires once: the row is already in the batch.
                     if !retired.contains(&i) {
                         retired.push(i);
-                        batch.copy_row_at(&scanned, i, -1);
+                        b.batch(IDX_TAB).copy_row_at(&scanned, i, -1);
                     }
                 }
                 None if if_exists => {}
                 None => return Err(absent(format!("{noun} '{name}' not found"))),
             }
         }
-        // Every name skipped: no zone, so no barrier and no fdatasync.
-        if batch.is_empty() {
-            return Ok(());
-        }
-        self.push_ddl_txn(&[(IDX_TAB, batch)])
+        self.commit_ddl(b)
     }
 
     /// Every live secondary index. Names come back canonical (lowercase): every
     /// writer folds them at store time.
     pub fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
-        let idx_batch = self.sys_rows(IDX_TAB, ReadBound::None)?;
-        let mut out = Vec::new();
-        for i in idx_batch.live_rows() {
-            let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
-            let cols = PkColList::unpack(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
-                ProtocolError::DecodeError(format!("index '{name}': {}", rule.for_role(PkListRole::ColumnList)))
-            })?;
-            let is_unique = gnitz_wire::bool_word(payload_u64(&idx_batch, i, IDXTAB_PAY_IS_UNIQUE))
-                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
-            out.push(IndexRow {
-                owner: payload_u64(&idx_batch, i, IDXTAB_PAY_OWNER_ID),
-                name,
-                cols,
-                is_unique,
-            });
-        }
-        Ok(out)
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None)?;
+        Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
     }
 
     /// Delete `pks` from `table_id` (retraction rows). Buffered like any other
@@ -730,8 +677,25 @@ impl GnitzClient {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let ScanReply { batch, lsn, .. } = self.scan_spec(tid, &spec, &reply)?;
-            let basis = lsn.expect("a server read carries its watermark");
+            let rest = match (self.txn.as_mut(), &spec.bound) {
+                (Some(txn), ReadBound::PkSet(set)) => txn.unwritten(tid, set),
+                _ => None,
+            };
+            let (batch, basis) = match rest {
+                // Every key is the transaction's own: nothing is read, so the write
+                // depends on no committed state.
+                Some(rest) if rest.is_empty() => (ZSetBatch::new(&reply), BLIND),
+                rest => {
+                    let narrowed = rest.map(|rest| ReadSpec {
+                        bound: ReadBound::PkSet(rest),
+                        predicate: spec.predicate.clone(),
+                        sink: spec.sink.clone(),
+                    });
+                    let ScanReply { batch, lsn, .. } =
+                        self.scan_spec(tid, narrowed.as_ref().unwrap_or(&spec), &reply)?;
+                    (batch, lsn.expect("a server read carries its watermark"))
+                }
+            };
             let mut own = TxnBuffer::default();
             let txn = self.txn.as_mut().unwrap_or(&mut own);
             let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
@@ -754,14 +718,16 @@ impl GnitzClient {
 
     // --- DDL ---
 
-    /// Every catalog write goes through here, so this is where DDL is refused
-    /// inside a transaction and where the copies learn what it committed.
-    pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
+    /// Commit `bundle` as one DDL zone. One that holds no row opens no zone.
+    fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
+        if bundle.0.is_empty() {
+            return Ok(());
+        }
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
-        self.round_trip(Request::DdlTxn(families))?;
-        self.after_ddl_commit(families);
+        self.round_trip(Request::DdlTxn(&bundle.0))?;
+        self.after_ddl_commit(&bundle.0);
         Ok(())
     }
 
@@ -782,38 +748,32 @@ impl GnitzClient {
             match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
                 (Some(view), Some(j)) => renamed.push((
                     view.schema_name.clone(),
-                    gnitz_expr::payload_str(b, j, RELTAB_PAY_NAME).to_owned(),
+                    payload_str(b, j, RELTAB_PAY_NAME).to_owned(),
                     Arc::clone(&view.desc),
                 )),
                 _ => dropped.push(v),
             }
         }
         for v in dropped {
-            self.invalidate_own_copy(v);
+            let _ = self.forget_view(v);
         }
         for (schema_name, name, desc) in renamed {
             let tid = desc.tid;
             if self.bind(&schema_name, &name, desc).is_err() {
-                self.invalidate_own_copy(tid);
+                let _ = self.forget_view(tid);
             }
         }
     }
 
     pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
-        // Reject the empty string, a leading `_` (reserved system prefix), and
-        // illegal characters. The SQL planner has no CREATE SCHEMA surface, so
-        // this client entry point is the sole enforcement for schema names.
+        // Refuses the empty string, a leading `_` (the reserved system prefix)
+        // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
-        let new_sid = self.alloc_id()?;
-        let schema = sys_schema(SCHEMA_TAB);
-        let mut batch = ZSetBatch::new(schema);
-        gnitz_wire::sys_rows::write_schema_tab_row(
-            &mut BatchAppender::new(&mut batch),
-            &gnitz_wire::sys_rows::SchemaTabRow { schema_id: new_sid, name: &name },
-            1,
-        );
-        self.push_ddl_txn(&[(SCHEMA_TAB, batch)])?;
-        Ok(new_sid)
+        let schema_id = self.alloc_id()?;
+        let mut b = DdlBundle::default();
+        b.put(&SchemaTabRow { schema_id, name: &name }, 1);
+        self.commit_ddl(b)?;
+        Ok(schema_id)
     }
 
     /// Drop a schema and every table and view it contains — PostgreSQL
@@ -826,49 +786,38 @@ impl GnitzClient {
     ///
     /// Atomic in both directions: an external dependent (a cross-schema FK child
     /// or view-on-view) or a rename landing between the scans and the push fails
-    /// the whole bundle and drops nothing. A schema whose view text exceeds the
-    /// frame cap must be drained with individual `DROP VIEW`s.
+    /// the whole bundle and drops nothing.
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = gnitz_wire::canonical_identifier(name)?;
-        let schema_id = self.lookup_schema_id(&name)?;
+        let (schemas, at) = self.lookup_schema(&name)?;
+        let schema_id = schemas.pks.get(at) as u64;
 
         // Hidden segments need no separate pass: each is an ordinary VIEW_TAB row
         // carrying this `schema_id`, so the whole matching set is already complete
         // — and the engine's co-drop carve-out admits it, every dependent being in
         // the same drop set.
-        let schema_s = sys_schema(SCHEMA_TAB);
-
-        let vb = self.schema_retractions(VIEW_TAB, schema_id)?;
-        let tb = self.schema_retractions(TABLE_TAB, schema_id)?;
-
-        // `create_schema`'s own writer at `-1`: both values are in hand, so this
-        // family keeps exactly one writer.
-        let mut sb = ZSetBatch::new(schema_s);
-        gnitz_wire::sys_rows::write_schema_tab_row(
-            &mut BatchAppender::new(&mut sb),
-            &gnitz_wire::sys_rows::SchemaTabRow { schema_id, name: &name },
-            -1,
-        );
-
-        let mut families: Vec<(u64, ZSetBatch)> = Vec::with_capacity(3);
-        if !vb.is_empty() {
-            families.push((VIEW_TAB, vb));
+        let mut b = DdlBundle::default();
+        for family in [VIEW_TAB, TABLE_TAB] {
+            let scanned = self.sys_rows(family, ReadBound::None)?;
+            for i in scanned.live_rows() {
+                if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
+                    b.batch(family).copy_row_at(&scanned, i, -1);
+                }
+            }
         }
-        if !tb.is_empty() {
-            families.push((TABLE_TAB, tb));
-        }
-        families.push((SCHEMA_TAB, sb));
-        self.push_ddl_txn(&families)
+        b.batch(SCHEMA_TAB).copy_row_at(&schemas, at, -1);
+        self.commit_ddl(b)
     }
 
     /// Register a table, its FOREIGN KEY columns and its inline UNIQUE indexes as
-    /// one DDL bundle.
+    /// one DDL bundle. `fks[i]` is column `i`'s target; an empty `fks` gives no
+    /// column one.
     pub fn create_table(
         &mut self,
         schema_name: &str,
         table_name: &str,
         schema: &Schema,
-        fks: &[InlineForeignKey],
+        fks: &[Option<FkTarget>],
         props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
@@ -878,68 +827,27 @@ impl GnitzClient {
             .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
             .collect::<Result<Vec<_>, String>>()?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        // Full schema-admissibility rule set (column cap + PK rules), applied
-        // here so a caller that skipped the planner gets a clean error before
-        // any id allocation instead of relying on the server-side reject.
+        // `PkColList::from_slice` panics on a schema this refuses.
         schema
             .validate()
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
         let pk = PkColList::from_slice(&schema.pk_cols);
-        // Before any id is allocated.
-        let pk_cols = schema.pk_cols.iter().map(|&c| &schema.columns[c as usize]);
-        props
-            .validate(schema.pk_cols.len())
-            .and_then(|()| match props.serial {
-                true => gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.name.as_str(), cd.ty))),
-                false => Ok(()),
-            })
-            .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
-
-        for (j, fk) in fks.iter().enumerate() {
-            let ci = fk.col_idx;
-            if ci as usize >= schema.columns.len() {
-                return Err(ClientError::from(format!(
-                    "create_table: foreign key names column {ci}, past the table's {} columns",
-                    schema.columns.len()
-                )));
-            }
-            if fks[..j].iter().any(|prev| prev.col_idx == ci) {
-                return Err(ClientError::from(format!(
-                    "create_table: column {ci} carries more than one foreign key"
-                )));
-            }
+        if !fks.is_empty() && fks.len() != schema.columns.len() {
+            return Err(ClientError::from(format!(
+                "create_table: {} foreign-key slots for {} columns",
+                fks.len(),
+                schema.columns.len()
+            )));
         }
 
-        // Structural rules only (arity, in-range, no duplicates) — unlike a PK,
-        // an indexed column may be nullable.
-        let index_cols = unique_indexes
-            .iter()
-            .map(|spec| {
-                PkColList::checked(&spec.col_indices, schema.columns.len()).map_err(|rule| {
-                    ClientError::from(format!(
-                        "create_table: unique index '{}': {}",
-                        spec.name,
-                        rule.for_role(PkListRole::ColumnList)
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let schema_id = self.lookup_schema_id(&schema_name)?;
+        let (schemas, at) = self.lookup_schema(&schema_name)?;
+        let schema_id = schemas.pks.get(at) as u64;
         // The table's id, then one per inline UNIQUE index.
         let new_tid = self.alloc(IdRun::Ids(1 + unique_indexes.len() as u64))?;
 
-        // COL_TAB family — the server sorts families by topo priority, so it
-        // ingests columns before the TABLE_TAB register hook that reads them.
-        let col_s = sys_schema(COL_TAB);
-        let mut col_batch = ZSetBatch::new(col_s);
-        append_col_rows(&mut BatchAppender::new(&mut col_batch), new_tid, &schema.columns, fks);
-
-        // TABLE_TAB family.
-        let tbl_schema = sys_schema(TABLE_TAB);
-        let mut tb = ZSetBatch::new(tbl_schema);
-        gnitz_wire::sys_rows::write_table_tab_row(
-            &mut BatchAppender::new(&mut tb),
+        let mut b = DdlBundle::default();
+        append_col_rows(&mut b, new_tid, &schema.columns, fks);
+        b.put(
             &TableTabRow {
                 table_id: new_tid,
                 schema_id,
@@ -949,30 +857,19 @@ impl GnitzClient {
             },
             1,
         );
-
-        let mut families: Vec<(u64, ZSetBatch)> = vec![(COL_TAB, col_batch), (TABLE_TAB, tb)];
-        if !unique_indexes.is_empty() {
-            let idx_schema = sys_schema(IDX_TAB);
-            let mut idx_batch = ZSetBatch::new(idx_schema);
-            {
-                let mut a = BatchAppender::new(&mut idx_batch);
-                for (k, &cols) in index_cols.iter().enumerate() {
-                    gnitz_wire::sys_rows::write_idx_tab_row(
-                        &mut a,
-                        &IdxTabRow {
-                            index_id: new_tid + 1 + k as u64,
-                            owner_id: new_tid,
-                            cols,
-                            name: &index_names[k],
-                            is_unique: true,
-                        },
-                        1,
-                    );
-                }
-            }
-            families.push((IDX_TAB, idx_batch));
+        for (k, spec) in unique_indexes.iter().enumerate() {
+            b.put(
+                &IdxTabRow {
+                    index_id: new_tid + 1 + k as u64,
+                    owner_id: new_tid,
+                    cols: spec.cols,
+                    name: &index_names[k],
+                    is_unique: true,
+                },
+                1,
+            );
         }
-        self.push_ddl_txn(&families)?;
+        self.commit_ddl(b)?;
 
         Ok(new_tid)
     }
@@ -983,27 +880,26 @@ impl GnitzClient {
         self.drop_relations(TABLE_TAB, "table", schema_name, table_names, if_exists)
     }
 
-    /// Create a passthrough view over `source_table_id` and return its id.
+    /// Create a passthrough view over `source` and return its id.
     pub fn create_view(
         &mut self,
         schema_name: &str,
         view_name: &str,
-        source_table_id: u64,
+        source: &RelDescriptor,
         props: ViewProps,
     ) -> Result<u64, ClientError> {
-        // A passthrough's layout must equal its source's, so the whole output
-        // schema and its PK-repeat flag are the source's own.
-        let src = self.describe_by_id(source_table_id)?;
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
         let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(source_table_id, ReadBound::None);
+        let scan = circuit.input_delta(source.tid, ReadBound::None);
         circuit.sink(scan);
 
+        // A passthrough's layout must equal its source's, so the whole output
+        // schema and its PK-repeat flag are the source's own.
         let view = PlannedView {
             circuit,
-            schema: Arc::clone(&src.schema),
-            pk_repeats: src.pk_repeats,
+            schema: Arc::clone(&source.schema),
+            pk_repeats: source.pk_repeats,
         };
         self.create_view_chain(schema_name, view_name, view.into(), props, None)
     }
@@ -1048,7 +944,10 @@ impl GnitzClient {
         };
         let schema_id = match &replaced {
             Some((row, i)) => payload_u64(row, *i, RELTAB_PAY_SCHEMA_ID),
-            None => self.lookup_schema_id(&schema_name)?,
+            None => {
+                let (schemas, at) = self.lookup_schema(&schema_name)?;
+                schemas.pks.get(at) as u64
+            }
         };
 
         // The whole bundle is assigned in one allocation before any substitution
@@ -1059,76 +958,48 @@ impl GnitzClient {
         // segment names it as owner.
         let owner_vid = base + bundle.segments.len() as u64;
 
-        // One batch per family, spanning all views.
-        let col_s = sys_schema(COL_TAB);
-        let circuit_s = sys_schema(CIRCUIT_TAB);
-        let view_s = sys_schema(VIEW_TAB);
-
-        let mut col_batch = ZSetBatch::new(col_s);
-        let mut circuit_batch = ZSetBatch::new(circuit_s);
-        let mut view_batch = ZSetBatch::new(view_s);
-
-        // 0. The replaced view's retraction, ahead of the new chain's `+1`s.
+        let mut b = DdlBundle::default();
+        // The replaced view's retraction, ahead of the new chain's `+1`s.
         if let Some((scanned, i)) = &replaced {
-            view_batch.copy_row_at(scanned, *i, -1);
+            b.batch(VIEW_TAB).copy_row_at(scanned, *i, -1);
         }
 
-        {
-            let mut col_a = BatchAppender::new(&mut col_batch);
-            let mut circuit_a = BatchAppender::new(&mut circuit_batch);
-            let mut view_a = BatchAppender::new(&mut view_batch);
-
-            let ViewBundle { segments, view } = bundle;
-            let views = segments.into_iter().map(|pv| (pv, false)).chain([(view, true)]);
-            for ((mut pv, is_view), vid) in views.zip(base..) {
-                // 0.5. Substitute the bundle's symbolic ids. `base` is below the
-                // ceiling, so this cannot overflow; a forward or out-of-range tag
-                // becomes an id no lower than the view's own, which the engine
-                // refuses.
-                for src in pv.circuit.sources_mut() {
-                    if *src >= gnitz_wire::CATALOG_ID_CEILING {
-                        *src = base + (*src - gnitz_wire::CATALOG_ID_CEILING);
-                    }
+        let ViewBundle { segments, view } = bundle;
+        let views = segments.into_iter().map(|pv| (pv, false)).chain([(view, true)]);
+        for ((mut pv, is_view), vid) in views.zip(base..) {
+            // Substitute the bundle's symbolic ids. `base` is below the ceiling,
+            // so this cannot overflow; a forward or out-of-range tag becomes an
+            // id no lower than the view's own, which the engine refuses.
+            for src in pv.circuit.sources_mut() {
+                if *src >= gnitz_wire::CATALOG_ID_CEILING {
+                    *src = base + (*src - gnitz_wire::CATALOG_ID_CEILING);
                 }
-                let (name, owner_view_id, row_props) = if is_view {
-                    (view_name.clone(), 0, props)
-                } else {
-                    (segment_name(vid), owner_vid, ViewProps::default())
-                };
-
-                // 1. Column records. A foreign key constrains a base table, not a view.
-                append_col_rows(&mut col_a, vid, &pv.schema.columns, &[]);
-
-                // 2. The circuit row.
-                gnitz_wire::sys_rows::write_circuit_row(&mut circuit_a, vid, &pv.circuit);
-
-                // 3. View row — the VIEW_TAB register hook triggers server-side
-                // compilation.
-                gnitz_wire::sys_rows::write_view_tab_row(
-                    &mut view_a,
-                    &ViewTabRow {
-                        view_id: vid,
-                        schema_id,
-                        name: &name,
-                        pk: PkColList::from_slice(&pv.schema.pk_cols),
-                        props: row_props,
-                        owner_view_id,
-                        pk_repeats: pv.pk_repeats,
-                    },
-                    1,
-                );
             }
+            let (name, owner_view_id, row_props) = if is_view {
+                (view_name.clone(), 0, props)
+            } else {
+                (segment_name(vid), owner_vid, ViewProps::default())
+            };
+
+            // A foreign key constrains a base table, not a view.
+            append_col_rows(&mut b, vid, &pv.schema.columns, &[]);
+            b.put(&CircuitRow { view_id: vid, circuit: &pv.circuit }, 1);
+            // The VIEW_TAB register hook triggers server-side compilation.
+            b.put(
+                &ViewTabRow {
+                    view_id: vid,
+                    schema_id,
+                    name: &name,
+                    pk: PkColList::from_slice(&pv.schema.pk_cols),
+                    props: row_props,
+                    owner_view_id,
+                    pk_repeats: pv.pk_repeats,
+                },
+                1,
+            );
         }
 
-        // One families entry per tid: the engine refuses a second block per
-        // family.
-        let families = [
-            (COL_TAB, col_batch),
-            (CIRCUIT_TAB, circuit_batch),
-            (VIEW_TAB, view_batch),
-        ];
-
-        self.push_ddl_txn(&families)?;
+        self.commit_ddl(b)?;
         Ok(owner_vid)
     }
 
@@ -1154,8 +1025,7 @@ impl GnitzClient {
         if_exists: bool,
     ) -> Result<(), ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        let s = sys_schema(family);
-        let mut batch = ZSetBatch::new(s);
+        let mut b = DdlBundle::default();
         let mut retired: Vec<u64> = Vec::with_capacity(names.len());
         for &raw in names {
             let name = gnitz_wire::canonical_identifier(raw)?;
@@ -1168,29 +1038,10 @@ impl GnitzClient {
             let id = scanned.pks.get(i) as u64;
             if !retired.contains(&id) {
                 retired.push(id);
-                batch.copy_row_at(&scanned, i, -1);
+                b.batch(family).copy_row_at(&scanned, i, -1);
             }
         }
-        // Every name skipped: no zone, so no barrier and no fdatasync.
-        if batch.is_empty() {
-            return Ok(());
-        }
-        self.push_ddl_txn(&[(family, batch)])
-    }
-
-    /// The `-1` batch retiring every live row of system family `family` whose
-    /// `schema_id` matches — the members `DROP SCHEMA` retracts. Each `-1` is the
-    /// scanned row copied verbatim. One code path over TABLE_TAB and VIEW_TAB.
-    fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<ZSetBatch, ClientError> {
-        let s = sys_schema(family);
-        let mut out = ZSetBatch::new(s);
-        let scanned = self.sys_rows(family, ReadBound::None)?;
-        for i in scanned.live_rows() {
-            if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
-                out.copy_row_at(&scanned, i, -1);
-            }
-        }
-        Ok(out)
+        self.commit_ddl(b)
     }
 
     /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
@@ -1206,8 +1057,12 @@ impl GnitzClient {
         let Some(desc) = self.resolve(schema_name, name)? else {
             return Ok(None);
         };
-        self.seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))
-            .map(Some)
+        let (scanned, i) = self.seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))?;
+        // Renamed since the resolve: the name no longer denotes this relation.
+        if payload_str(&scanned, i, RELTAB_PAY_NAME) != name {
+            return Ok(None);
+        }
+        Ok(Some((scanned, i)))
     }
 
     /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.
@@ -1234,10 +1089,8 @@ impl GnitzClient {
     }
 
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
-    /// pair on the same packed column id, only `is_nullable` flipped to true at
-    /// `+1`. Once the catalog reports the column nullable, `ZSetBatch::validate`
-    /// permits a null bit there and the engine swaps the table comparator
-    /// `FixedIntNonnull → Generic` (if the table was all-non-null-fixed-int).
+    /// pair, only `is_nullable` flipped to true at `+1`. Once the catalog reports
+    /// the column nullable, `ZSetBatch::validate` permits a null bit there.
     pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_NULLABLE, 1))
     }
@@ -1247,20 +1100,17 @@ impl GnitzClient {
     pub fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
         let (tid, col_idx) = (rel.tid, rel.schema.num_columns());
 
-        let col_s = sys_schema(COL_TAB);
-        let mut cb = ZSetBatch::new(col_s);
-        {
-            let mut a = BatchAppender::new(&mut cb);
-            let row = ColTabRow {
+        let mut b = DdlBundle::default();
+        b.put(
+            &ColTabRow {
                 owner_id: tid,
                 col_idx: col_idx as u64,
                 col: def,
                 fk: None,
-            };
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &row, 1);
-        }
-        self.push_ddl_txn(&[(COL_TAB, cb)])?;
-        Ok(())
+            },
+            1,
+        );
+        self.commit_ddl(b)
     }
 
     /// [`Self::rewrite_sys_row`] on column `col_idx` of relation `tid`.
@@ -1288,11 +1138,12 @@ impl GnitzClient {
         patch: impl FnOnce(&mut ZSetBatch, usize),
     ) -> Result<(), ClientError> {
         let (scanned, i) = self.seek_sys_row(family, key, missing)?;
-        let mut b = ZSetBatch::new(sys_schema(family));
-        b.copy_row_at(&scanned, i, -1);
-        b.copy_row_at(&scanned, i, 1);
-        patch(&mut b, 1);
-        self.push_ddl_txn(&[(family, b)])
+        let mut b = DdlBundle::default();
+        let rows = b.batch(family);
+        rows.copy_row_at(&scanned, i, -1);
+        rows.copy_row_at(&scanned, i, 1);
+        patch(rows, 1);
+        self.commit_ddl(b)
     }
 
     /// Resolve `name` under `schema_name`, rejecting a missing relation. The
@@ -1313,9 +1164,7 @@ impl GnitzClient {
         if let Some(bound) = self.txn.as_ref().and_then(|t| t.bound.get(&qname)) {
             return Ok(Some(Arc::clone(bound)));
         }
-        let found = self
-            .round_trip(Request::Resolve(RelTarget::Name(&qname)))
-            .map(Reply::into_resolve)?;
+        let found = self.round_trip(Request::Resolve(&qname)).map(Reply::into_resolve)?;
         if let (Some(txn), Some(desc)) = (self.txn.as_mut(), &found) {
             if desc.class == RelClass::Table {
                 txn.bound.insert(qname, Arc::clone(desc));
@@ -1326,12 +1175,15 @@ impl GnitzClient {
 
     // --- Private catalog-lookup helpers ---
 
-    /// Resolve `schema_name` (already canonicalized) to its SCHEMA_TAB id. A
-    /// missing row — or an entirely empty SCHEMA_TAB — is a
-    /// `NotFound` refusal, like every other catalog absence.
-    fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
+    /// The live SCHEMA_TAB row named `schema_name` (already canonical): the scanned
+    /// batch and the row's index in it.
+    fn lookup_schema(&mut self, schema_name: &str) -> Result<(ZSetBatch, usize), ClientError> {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None)?;
-        find_schema_id(&batch, schema_name)?.ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
+        let i = batch
+            .live_rows()
+            .find(|&i| payload_str(&batch, i, SCHEMATAB_PAY_NAME) == schema_name)
+            .ok_or_else(|| absent(format!("schema '{schema_name}' not found")))?;
+        Ok((batch, i))
     }
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;
@@ -1363,7 +1215,7 @@ impl GnitzClient {
 
 /// Step and park until `slot` completes, handing `sink` what the steps read of
 /// a delta poll.
-fn await_slot(
+pub(crate) fn await_slot(
     session: &mut Session,
     hook: &mut Option<ParkHook>,
     slot: SlotId,
@@ -1551,9 +1403,24 @@ impl TxnBuffer {
         }
     }
 
+    /// The keys of `set` this transaction has not written — what a read of
+    /// `set` still has to ask the server. `None` when it wrote none of them.
+    fn unwritten(&mut self, tid: u64, set: &PkKeys) -> Option<PkKeys> {
+        self.index_tid(tid);
+        let index = self.last_op_of.get(&tid)?;
+        let first = set.iter().position(|k| index.contains_key(k))?;
+        let stride = set.stride();
+        let mut rest = Vec::with_capacity(set.as_bytes().len() - stride);
+        rest.extend_from_slice(&set.as_bytes()[..first * stride]);
+        for k in set.iter().skip(first + 1).filter(|k| !index.contains_key(*k)) {
+            rest.extend_from_slice(k);
+        }
+        Some(PkKeys::from_sorted(stride, rest))
+    }
+
     /// `committed`, a server read of `tid` under `spec`, as this transaction sees
     /// it: less every PK the transaction wrote, plus its live rows (last op per PK,
-    /// weight > 0) that `spec` keeps. With `keys`, `committed` is in the
+    /// weight > 0) that `spec` keeps, each at weight 1. With `keys`, `committed` is in the
     /// [`key_reply`] layout, and so are the added rows.
     fn overlay(
         &mut self,
@@ -1580,7 +1447,7 @@ impl TxnBuffer {
         let take = |&(fam, row): &(usize, usize)| {
             let b = &families[fam].batch;
             if b.weights[row] > 0 {
-                live.copy_row_at(b, row, b.weights[row]);
+                live.copy_row_at(b, row, 1);
             }
         };
         match &spec.bound {
@@ -1613,30 +1480,29 @@ impl TxnBuffer {
     }
 }
 
-/// `Ok(None)` = name absent (a legitimate miss); `Err` = a decode error on a
-/// corrupt catalog batch.
-fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
-    for i in batch.live_rows() {
-        if col_str(batch, SCHEMATAB_PAY_NAME, i)? == name {
-            return Ok(Some(batch.pks.get(i) as u64));
-        }
-    }
-    Ok(None)
+/// The live rows of `batch`, a read of IDX_TAB, each with its index in `batch`.
+fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
+    batch
+        .live_rows()
+        .map(|i| {
+            let name = payload_str(batch, i, IDXTAB_PAY_NAME).to_string();
+            let cols = PkColList::unpack(payload_u64(batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
+                ProtocolError::DecodeError(format!("index '{name}': {}", rule.for_role(PkListRole::ColumnList)))
+            })?;
+            let is_unique = gnitz_wire::bool_word(payload_u64(batch, i, IDXTAB_PAY_IS_UNIQUE))
+                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
+            let owner = payload_u64(batch, i, IDXTAB_PAY_OWNER_ID);
+            Ok((i, IndexRow { owner, name, cols, is_unique }))
+        })
+        .collect()
 }
 
-/// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
-fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef], fks: &[InlineForeignKey]) {
+/// Append one `COL_TAB` row per column of `owner_id`, at `+1`. `fks[i]` is
+/// column `i`'s target; a column past its end has none.
+fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &[Option<FkTarget>]) {
     for (i, cd) in columns.iter().enumerate() {
-        let row = ColTabRow {
-            owner_id,
-            col_idx: i as u64,
-            col: cd,
-            fk: fks
-                .iter()
-                .find(|fk| fk.col_idx as usize == i)
-                .map(|fk| fk.target.resolve(owner_id)),
-        };
-        gnitz_wire::sys_rows::write_col_tab_row(a, &row, 1);
+        let fk = fks.get(i).copied().flatten().map(|t| t.resolve(owner_id));
+        b.put(&ColTabRow { owner_id, col_idx: i as u64, col: cd, fk }, 1);
     }
 }
 

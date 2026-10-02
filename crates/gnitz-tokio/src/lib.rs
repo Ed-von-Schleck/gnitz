@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use gnitz_core::{
-    qualified_name, ClientError, Encoded, GnitzClient, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply,
-    Schema, Session, SlotId, ZSetBatch,
+    qualified_name, ClientError, Encoded, GnitzClient, Interest, RelDescriptor, Reply, Request, ScanReply, Schema,
+    Session, SlotId, ZSetBatch,
 };
 use gnitz_wire::{ReadSpec, WireConflictMode};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
@@ -149,7 +149,7 @@ impl AsyncClient {
         name: &str,
     ) -> impl Future<Output = Result<Option<Arc<RelDescriptor>>, ClientError>> {
         let qname = qualified_name(schema_name, name);
-        self.call(Request::Resolve(RelTarget::Name(&qname)), Reply::into_resolve)
+        self.call(Request::Resolve(&qname), Reply::into_resolve)
     }
 
     /// Run `f` on a blocking thread against the handle's `GnitzClient`, which

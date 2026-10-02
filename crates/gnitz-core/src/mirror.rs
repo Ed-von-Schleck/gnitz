@@ -34,7 +34,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::client::{delta_read_blocks, park, GnitzClient};
-use crate::connection::{DeltaCursor, Interest, Polled, PolledView, RawBlock, RelDescriptor, SlotId};
+use crate::connection::{DeltaCursor, Interest, Polled, RawBlock, RelDescriptor, SlotId};
 use crate::error::ClientError;
 use crate::{Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
@@ -274,14 +274,20 @@ impl MirrorState {
         self.store.cursor_of(tid)
     }
 
-    /// Check the tag `fetched` carries against `prev`, apply, advance the cursor.
+    /// Check `at`, the cursor `blocks` ended at, against `prev`, apply, advance
+    /// the cursor.
     ///
     /// **No recovery here**: a recovery can re-point a registration at a view
     /// whose reply is already in hand, and applying it twice doubles every weight
     /// in the overlap with the row set unchanged. Failures go back unclassified,
     /// to [`GnitzClient::recover`].
-    fn advance_from(&mut self, tid: u64, prev: DeltaCursor, fetched: PolledView) -> Result<PollResult, ClientError> {
-        let (blocks, at) = fetched?;
+    fn advance_from(
+        &mut self,
+        tid: u64,
+        prev: DeltaCursor,
+        blocks: Vec<RawBlock>,
+        at: DeltaCursor,
+    ) -> Result<PollResult, ClientError> {
         let next = prev.advanced_to(at)?;
         self.store
             .advance(tid, &blocks.iter().map(RawBlock::block).collect::<Vec<_>>(), next)?;
@@ -422,9 +428,11 @@ impl GnitzClient {
             return self.bootstrap(tid);
         };
         let item = self.mirrored_view(tid)?.poll_item(prev.tick.get());
-        let fetched = self.delta_read_raw(item);
-        let m = self.mirror_state()?;
-        match m.advance_from(tid, prev, fetched) {
+        let (_, polled) = self
+            .delta_poll_many(&[(prev, item)])?
+            .pop()
+            .expect("one view, one result");
+        match polled {
             Ok(result) => Ok((tid, result)),
             Err(e) => self.recover(tid, e),
         }
@@ -605,10 +613,10 @@ impl GnitzClient {
     ///
     /// The host's word for [`Invalidate::Registration`].
     pub fn forget_view(&mut self, table_id: u64) -> Result<(), ClientError> {
-        // The client-side entry goes first, as in `invalidate_own_copy`: it is
-        // the read gate `resolve_local_first` consults. Unconditional, unlike
-        // that one, because a reopened store holds copies this client has not
-        // registered — and forgetting one is exactly the call that erases it.
+        // The client-side entry goes first: it is the read gate
+        // `resolve_local_first` consults. The store is asked whether or not
+        // there was one, because a reopened store holds copies this client has
+        // not registered — and forgetting one is exactly the call that erases it.
         let m = self.mirror_state()?;
         m.views.remove(&table_id);
         m.store.invalidate(table_id, Invalidate::Registration)?;
@@ -657,8 +665,7 @@ impl GnitzClient {
                     let answered = poll.unanswered.next().expect("the session answers no position twice");
                     let (prev, DeltaPollItem { view_id: tid, .. }) = views[answered];
                     let blocks = std::mem::take(&mut poll.blocks);
-                    let fetched = end.map(|cursor| (blocks, cursor));
-                    applied.push((tid, mirror.advance_from(tid, prev, fetched)));
+                    applied.push((tid, end.and_then(|at| mirror.advance_from(tid, prev, blocks, at))));
                 };
                 session.step_polling(ready, Some(&mut sink))
             };
@@ -824,16 +831,6 @@ impl GnitzClient {
             Some(why) => Err(MirrorError::Poisoned(why.to_string()).into()),
             None => Ok(()),
         }
-    }
-
-    /// Drop this client's copy of `tid`. Leaving `views` is what stops local
-    /// reads; the store's teardown fails only on a poisoned store.
-    pub(crate) fn invalidate_own_copy(&mut self, tid: u64) {
-        let Some(m) = self.mirror.as_deref_mut() else {
-            return;
-        };
-        m.views.remove(&tid);
-        let _ = m.store.invalidate(tid, Invalidate::Registration);
     }
 }
 

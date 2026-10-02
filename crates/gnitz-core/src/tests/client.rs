@@ -1,8 +1,6 @@
 use super::*;
-use crate::protocol::message::encode_frame;
-use crate::test_support::{decode_wal_block, interrupt_self_until, kv_rows, kv_schema, reply_ctrl, session_pair};
-use gnitz_wire::control::{peek_control_block, ControlHeader};
-use gnitz_wire::{TypeCode, WireFlags};
+use crate::test_support::{interrupt_self_until, kv_rows, kv_schema, reply_ctrl, session_pair};
+use gnitz_wire::TypeCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use WireConflictMode::{Error, Update};
 
@@ -90,6 +88,17 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
         "the last of pk 1's three ops wins"
     );
     assert_eq!(overlaid(&mut buf, 17), [(1, 12, 1)], "tids are independent");
+}
+
+/// A buffered row joins the read at weight 1, as the committed rows beside it
+/// stand, whatever weight it was pushed at.
+#[test]
+fn the_overlay_adds_a_buffered_row_at_weight_one() {
+    let s = kv_schema(TypeCode::I64);
+    let mut buf = TxnBuffer::default();
+    buf.push(7, &s, kv_rows(&[(1, 11, 2)]), Update, 3).unwrap();
+    let got = overlay_of(&mut buf, 7, ReadBound::None, Vec::new(), kv_rows(&[(2, 20, 1)]));
+    assert_eq!(got, [(1, 11, 1), (2, 20, 1)]);
 }
 
 /// The overlay replaces every committed row the transaction wrote with its last
@@ -250,28 +259,23 @@ fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
     assert_eq!(c.txn.as_ref().unwrap().families.len(), 1);
 }
 
-/// An FK that names no column, or a second one on a column, is refused before
-/// anything is sent — the peer is gone, so a request would fail as a transport
-/// error instead.
+/// Foreign-key slots that are neither absent nor one per column are refused
+/// before anything is sent — the peer is gone, so a request would fail as a
+/// transport error instead.
 #[test]
 fn create_table_refuses_an_fk_it_cannot_write() {
     let (s, peer) = session_pair();
     drop(peer);
     let mut c = GnitzClient::from_session(s);
     let schema = kv_schema(TypeCode::I64);
-    let fk = |col_idx| InlineForeignKey {
-        col_idx,
-        target: FkTarget::Table(FkRef { table_id: 16, col: 0 }),
-    };
-    for (fks, want) in [
-        (vec![fk(2)], "foreign key names column 2"),
-        (vec![fk(1), fk(1)], "column 1 carries more than one foreign key"),
-    ] {
+    let fk = Some(FkTarget::Table(FkRef { table_id: 16, col: 0 }));
+    for fks in [vec![fk], vec![None, fk, None]] {
         let err = c
             .create_table("public", "t", &schema, &fks, TableProps::default(), &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains(want), "{err}");
+        let want = format!("{} foreign-key slots for 2 columns", fks.len());
+        assert!(err.contains(&want), "{err}");
     }
 }
 
@@ -301,19 +305,6 @@ fn a_keys_reply_appends_keys_only() {
 // ---------------------------------------------------------------------------
 // The blocking driver
 // ---------------------------------------------------------------------------
-
-/// A reply frame naming `tid` with `batch` as its data block and `(tick, tag)`
-/// in `(arg0, arg1)`; `cont` sets `continuation`.
-fn reply_frame(tid: u64, batch: &ZSetBatch, tick: u64, tag: u64, cont: bool) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: tid,
-        flags: WireFlags { continuation: cont, ..Default::default() },
-        arg0: tick,
-        arg1: tag,
-        ..Default::default()
-    };
-    encode_frame(hdr, &[], None, Some(batch))
-}
 
 /// An aborted park leaves its slot pending — the frame is already on the
 /// wire, so the next call drains that reply before its own.
@@ -352,37 +343,4 @@ fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
     assert_eq!(c.scan_spec(1, &spec, &sa).unwrap().lsn, Some(200));
     let _peer = h.join().unwrap();
     assert_eq!(c.session.interest(), Interest::NONE);
-}
-
-/// A one-view delta read hands back its train's blocks undecoded, and the
-/// terminal's round and tag as the cursor.
-#[test]
-fn a_delta_read_keeps_blocks_undecoded() {
-    let (s, peer) = session_pair();
-    let mut c = GnitzClient::from_session(s);
-    let schema = kv_schema(TypeCode::I64);
-    let layout = schema.layout_digest();
-    let h = std::thread::spawn(move || {
-        let req = peer.recv();
-        let ctrl = peek_control_block(&req).unwrap();
-        let items = gnitz_wire::txn_frame::decode_delta_poll(&req[ctrl.body]).unwrap();
-        assert_eq!(items[0].reply_layout, layout, "the reply layout rides the request");
-        peer.send(&reply_frame(9, &kv_rows(&[(1, 10, 1), (2, 20, 1)]), 0, 0, true));
-        peer.send(&reply_frame(9, &kv_rows(&[(3, 30, -1)]), 5, 0xFEED, false));
-        peer
-    });
-    let (blocks, cursor) = c
-        .delta_read_raw(DeltaPollItem {
-            view_id: 9,
-            after_tick: 4,
-            reply_layout: layout,
-        })
-        .unwrap();
-    let _peer = h.join().unwrap();
-    assert_eq!(cursor.pair(), (0xFEED, 5));
-    let decoded: Vec<ZSetBatch> = blocks
-        .iter()
-        .map(|b| decode_wal_block(b.block(), &schema).unwrap())
-        .collect();
-    assert_eq!(decoded, [kv_rows(&[(1, 10, 1), (2, 20, 1)]), kv_rows(&[(3, 30, -1)])]);
 }

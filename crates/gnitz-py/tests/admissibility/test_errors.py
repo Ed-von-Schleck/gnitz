@@ -137,7 +137,7 @@ def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, s
     with gnitz.connect(server, schema="s" + uid()) as other:
         other.create_schema(other.schema)
         tid = other.create_table("t", KV)
-        client.create_view("v", tid)
+        client.create_view("v", "t", source_schema=other.schema)
 
         for drop in (lambda: other.drop_table("t"), lambda: other.drop_schema(other.schema)):
             with pytest.raises(gnitz.GnitzRefusedError, match="dependen"):

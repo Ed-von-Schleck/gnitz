@@ -223,12 +223,21 @@ impl PyGnitzClient {
 
     // ----- Views -----
 
-    /// create_view(view_name, source_table_id) — a passthrough view, whose
-    /// schema is its source's.
-    pub fn create_view(&mut self, py: Python<'_>, view_name: &str, source_table_id: u64) -> PyResult<u64> {
+    /// create_view(view_name, source_name, source_schema=None) — a passthrough
+    /// view, whose schema is its source's. The source is resolved in this
+    /// client's schema unless `source_schema` names another.
+    #[pyo3(signature = (view_name, source_name, source_schema = None))]
+    pub fn create_view(
+        &mut self,
+        py: Python<'_>,
+        view_name: &str,
+        source_name: &str,
+        source_schema: Option<&str>,
+    ) -> PyResult<u64> {
         let sn = self.schema.clone();
         self.call(py, |c| {
-            c.create_view(&sn, view_name, source_table_id, ViewProps::default())
+            let source = c.resolve_relation(source_schema.unwrap_or(&sn), source_name)?;
+            c.create_view(&sn, view_name, &source, ViewProps::default())
         })
     }
 

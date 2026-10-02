@@ -94,10 +94,7 @@ proptest! {
 fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_core::sys_schema;
     use gnitz_core::{BatchAppender, ZSetBatch};
-    use gnitz_wire::sys_rows::{
-        write_circuit_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row, ColTabRow,
-        IdxTabRow, TableTabRow, ViewTabRow,
-    };
+    use gnitz_wire::sys_rows::{CircuitRow, ColTabRow, IdxTabRow, SysRow, TableTabRow, ViewTabRow};
     use gnitz_wire::txn_frame::decode_items;
     use gnitz_wire::{CIRCUIT_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
@@ -114,7 +111,7 @@ fn ddl_txn_roundtrip_client_to_server() {
                 col: &col,
                 fk: None,
             };
-            write_col_tab_row(&mut a, &row, 1);
+            row.write(&mut a, 1);
         }
         b
     };
@@ -128,7 +125,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             pk: gnitz_wire::PkColList::from_slice(&[0]),
             props: gnitz_wire::TableProps::default(),
         };
-        write_table_tab_row(&mut BatchAppender::new(&mut b), &row, weight);
+        row.write(&mut BatchAppender::new(&mut b), weight);
         b
     };
     let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
@@ -141,7 +138,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             name: "idx_t_b",
             is_unique: true,
         };
-        write_idx_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
+        row.write(&mut BatchAppender::new(&mut b), 1);
         b
     };
 
@@ -196,7 +193,7 @@ fn ddl_txn_roundtrip_client_to_server() {
         let s = sys_schema(CIRCUIT_TAB);
         let mut b = ZSetBatch::new(s);
         let identity = crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None);
-        write_circuit_row(&mut BatchAppender::new(&mut b), vid, &identity);
+        CircuitRow { view_id: vid, circuit: &identity }.write(&mut BatchAppender::new(&mut b), 1);
         b
     };
     let view = {
@@ -211,7 +208,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             owner_view_id: 0,
             pk_repeats: false,
         };
-        write_view_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
+        row.write(&mut BatchAppender::new(&mut b), 1);
         b
     };
     verify(&[(COL_TAB, col_batch(vid, 1)), (CIRCUIT_TAB, circuit), (VIEW_TAB, view)]);

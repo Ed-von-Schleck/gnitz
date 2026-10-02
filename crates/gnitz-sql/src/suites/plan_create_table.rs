@@ -2,9 +2,9 @@
 //! precedence between the passes, the constraint spellings that are rejected,
 //! and the bundle a plan carries.
 
-use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex};
+use gnitz_core::{FkTarget, InlineUniqueIndex};
 use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::{RelClass, TableDistribution, TypeCode};
+use gnitz_wire::{PkColList, RelClass, TableDistribution, TypeCode};
 
 use super::*;
 
@@ -28,7 +28,7 @@ fn created(cat: &Catalog<'_>, sql: &str) -> TablePlan {
 /// An inline UNIQUE index on `cols`, named `name`.
 fn unique(cols: &[u32], name: &str) -> InlineUniqueIndex {
     InlineUniqueIndex {
-        col_indices: cols.to_vec(),
+        cols: PkColList::from_slice(cols),
         name: name.to_string(),
     }
 }
@@ -169,13 +169,7 @@ fn primary_key_precedence() {
         "CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)",
     );
     assert_eq!(c.schema.pk_cols, vec![1]);
-    assert_eq!(
-        c.fks,
-        vec![InlineForeignKey {
-            col_idx: 0,
-            target: FkTarget::SelfTable { col: 1 }
-        }]
-    );
+    assert_eq!(c.fks, vec![Some(FkTarget::SelfTable { col: 1 }), None]);
 }
 
 // ── the constraint spellings that are rejected ───────────────────────────────
@@ -408,13 +402,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
     assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I64, "widened to the parent's type");
-    assert_eq!(
-        c.fks,
-        vec![InlineForeignKey {
-            col_idx: 1,
-            target: FkTarget::Table(FkRef { table_id: 41, col: 0 })
-        }]
-    );
+    assert_eq!(c.fks, vec![None, Some(FkTarget::Table(FkRef { table_id: 41, col: 0 }))]);
     assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
 
     // A non-PK parent column is a legal target only with a single-column UNIQUE
@@ -442,9 +430,10 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
         ("CREATE TABLE tree (id BIGINT PRIMARY KEY REFERENCES tree(id))", 0),
     ] {
         let c = created(&cat, sql);
-        let target = FkTarget::SelfTable { col: 0 };
-        assert_eq!(c.fks, vec![InlineForeignKey { col_idx, target }], "{sql}");
-        assert_eq!(c.schema.columns[col_idx as usize].ty.tc, TypeCode::I64, "{sql}");
+        let mut fks = vec![None; c.schema.columns.len()];
+        fks[col_idx] = Some(FkTarget::SelfTable { col: 0 });
+        assert_eq!(c.fks, fks, "{sql}");
+        assert_eq!(c.schema.columns[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
     for (sql, needle) in [
         (

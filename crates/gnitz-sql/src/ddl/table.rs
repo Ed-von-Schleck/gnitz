@@ -11,11 +11,11 @@ use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
-use gnitz_core::{FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema};
+use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, Schema};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::TableDistribution;
-use gnitz_wire::{ColType, ColumnDef, TableProps, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps, TypeCode};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -63,17 +63,12 @@ fn is_auto_name(name: &str, base: &str) -> bool {
     }
 }
 
-/// Reject `key`, column indices into `cols`, as an index key the engine could not
-/// build, naming the column.
-fn reject_unbuildable_index_key(
-    cols: &[ColumnDef],
-    key: &[u32],
-    src_pk_count: usize,
-    role: &str,
-) -> Result<(), GnitzSqlError> {
+/// The column list of an index over `key`, or why no index can be built on it.
+fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
     let types: Vec<TypeCode> = key.iter().map(|&c| cols[c as usize].ty.tc).collect();
     match gnitz_wire::index_key_types(&types, src_pk_count) {
-        Ok(_) => Ok(()),
+        Ok(_) => PkColList::checked(key, cols.len())
+            .map_err(|rule| GnitzSqlError::Rejected(format!("{role}: {}", rule.for_role(PkListRole::ColumnList)))),
         Err(gnitz_wire::IndexKeyRule::NotEligible { col, type_code }) => Err(GnitzSqlError::Rejected(format!(
             "{role}: column '{}' of type {type_code} cannot be an index key",
             cols[key[col] as usize].name
@@ -460,9 +455,11 @@ fn drop_unique_covered_by_pk(
 
 /// Give each UNIQUE constraint the catalog name its index will carry: the written
 /// `CONSTRAINT <name>`, which no two may share, or an auto-name free in this bundle.
+/// `pk_count` is the table's PK arity.
 fn name_unique_indexes(
     unique: Vec<UniqueDecl>,
     cols: &[ColumnDef],
+    pk_count: usize,
     schema_name: &str,
     table_name: &str,
 ) -> Result<Vec<InlineUniqueIndex>, GnitzSqlError> {
@@ -475,9 +472,10 @@ fn name_unique_indexes(
             }
         }
     }
-    Ok(unique
+    unique
         .into_iter()
         .map(|u| {
+            let key = index_key(cols, &u.cols, pk_count, "UNIQUE")?;
             let name = match u.name {
                 Some(name) => name,
                 None => {
@@ -488,16 +486,17 @@ fn name_unique_indexes(
                     name
                 }
             };
-            InlineUniqueIndex { col_indices: u.cols, name }
+            Ok(InlineUniqueIndex { cols: key, name })
         })
-        .collect())
+        .collect()
 }
 
 /// A `CREATE TABLE`'s bundle: the table and its inline unique indexes.
 pub(crate) struct TablePlan {
     pub(crate) name: String,
     pub(crate) schema: Schema,
-    pub(crate) fks: Vec<InlineForeignKey>,
+    /// Per column, the target its FOREIGN KEY names.
+    pub(crate) fks: Vec<Option<FkTarget>>,
     pub(crate) props: TableProps,
     /// Each inline UNIQUE constraint's columns and the catalog name its index
     /// takes — auto-names already disambiguated within the bundle.
@@ -700,16 +699,16 @@ pub(crate) fn plan_create_table(
         })
         .collect::<Result<_, GnitzSqlError>>()?;
     sites.sort_by_key(|(ref_table, _)| ref_table.eq_ignore_ascii_case(&table_name));
-    let mut fks: Vec<InlineForeignKey> = Vec::with_capacity(sites.len());
+    let mut fks: Vec<Option<FkTarget>> = vec![None; cols.len()];
     for (ref_table, site) in sites {
-        if fks.iter().any(|fk| fk.col_idx as usize == site.col_idx) {
+        if fks[site.col_idx].is_some() {
             return Err(GnitzSqlError::Rejected(format!(
                 "column '{}' carries more than one FOREIGN KEY",
                 cols[site.col_idx].name
             )));
         }
         let (fk, parent_pk_type) = resolve_fk_target(cat, site, &ref_table, &table_name, &cols, &pk_indices)?;
-        fks.push(InlineForeignKey { col_idx: site.col_idx as u32, target: fk });
+        fks[site.col_idx] = Some(fk);
         cols[site.col_idx].ty = parent_pk_type;
     }
 
@@ -734,12 +733,10 @@ pub(crate) fn plan_create_table(
 
     drop_unique_covered_by_pk(&mut unique, cols, pk_indices)?;
 
-    for u in &unique {
-        reject_unbuildable_index_key(cols, &u.cols, pk_indices.len(), "UNIQUE")?;
-    }
+    let unique_indexes = name_unique_indexes(unique, cols, pk_indices.len(), schema_name, &table_name)?;
     // Every FK column carries an index of its own.
-    for fk in &fks {
-        reject_unbuildable_index_key(cols, &[fk.col_idx], pk_indices.len(), "FOREIGN KEY")?;
+    for (i, _) in fks.iter().enumerate().filter(|(_, fk)| fk.is_some()) {
+        index_key(cols, &[i as u32], pk_indices.len(), "FOREIGN KEY")?;
     }
 
     // CLUSTER BY (hash distribution key). The named columns must be the PK's
@@ -766,7 +763,6 @@ pub(crate) fn plan_create_table(
     }
     props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
 
-    let unique_indexes = name_unique_indexes(unique, cols, schema_name, &table_name)?;
     Ok(Some(TablePlan {
         name: table_name,
         schema,
@@ -809,9 +805,8 @@ pub(crate) fn execute_drop(
     }
     let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
 
-    // `IF EXISTS` rides the verb, which resolves its own targets — the one place
-    // that can answer "no such object" without a second lookup. It softens nothing
-    // else: one refusal still fails the whole statement.
+    // `IF EXISTS` rides the verb, which resolves its own targets. It softens
+    // nothing else: one refusal still fails the whole statement.
     match object_type {
         ObjectType::View => client.drop_view(schema_name, &targets, if_exists)?,
         ObjectType::Index => client.drop_indexes_by_name(&targets, if_exists)?,
@@ -941,7 +936,7 @@ pub(crate) fn create_index_core(
     let (table_id, schema) = (target.tid, &target.schema);
     let (col_names, col_indices) = resolve_index_columns(req.columns, &schema.columns, ctx)?;
 
-    reject_unbuildable_index_key(&schema.columns, &col_indices, schema.pk_cols.len(), ctx)?;
+    let cols = index_key(&schema.columns, &col_indices, schema.pk_cols.len(), ctx)?;
 
     let index_name = match req.explicit_name.clone() {
         Some(name) => {
@@ -957,9 +952,7 @@ pub(crate) fn create_index_core(
             let base = default_index_name(schema_name, req.table_name, &col_names);
             let existing = client.index_rows()?;
             let serves_request = |r: &gnitz_core::IndexRow| {
-                r.owner == table_id
-                    && r.cols.as_slice() == col_indices.as_slice()
-                    && (r.is_unique || !req.site.is_unique())
+                r.owner == table_id && r.cols == cols && (r.is_unique || !req.site.is_unique())
             };
             if let Some(same) = existing
                 .iter()
@@ -975,7 +968,7 @@ pub(crate) fn create_index_core(
         }
     };
 
-    client.create_index(table_id, &col_indices, &index_name, req.site.is_unique())?;
+    client.create_index(table_id, cols, &index_name, req.site.is_unique())?;
     Ok(SqlResult::Ddl)
 }
 

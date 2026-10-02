@@ -19,7 +19,7 @@ wire_enum! {
         /// own cursor and client-authored reply schema.
         DeltaPoll = 4,
         /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
-        /// name in the blob (`target_id = 0`) or by `target_id`.
+        /// name in the blob.
         Resolve = 5,
         /// System-table batches committed as one SAL zone.
         DdlTxn = 6,

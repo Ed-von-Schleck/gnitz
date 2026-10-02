@@ -638,7 +638,7 @@ async fn dispatch_request(
         // drain `read_lock` waits for buys nothing here.
         ClientVerb::Resolve => {
             let _g = shared.catalog_rwlock.read().await;
-            build_resolve_reply(shared, peer, target_id, &data[ctrl.blob.clone()])
+            build_resolve_reply(shared, peer, &data[ctrl.blob.clone()])
         }
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
@@ -892,12 +892,9 @@ fn target_kind(shared: &Shared, target_id: u64, access: Access) -> Result<Relati
     }
 }
 
-/// The relation id a RESOLVE names, unvalidated when the client sent an id; `None`
-/// when its qualified name names none. `Err` when the name's schema does not exist.
-fn resolve_request_target(shared: &Rc<Shared>, target_id: u64, name_blob: &[u8]) -> Result<Option<u64>, WireFault> {
-    if name_blob.is_empty() {
-        return Ok(Some(target_id));
-    }
+/// The relation id a RESOLVE names; `None` when its qualified name names none.
+/// `Err` when the name's schema does not exist.
+fn resolve_request_target(shared: &Rc<Shared>, name_blob: &[u8]) -> Result<Option<u64>, WireFault> {
     let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
     let (schema_name, name) = qname
         .split_once('.')
@@ -911,9 +908,9 @@ fn resolve_request_target(shared: &Rc<Shared>, target_id: u64, name_blob: &[u8])
 }
 
 /// Answer a RESOLVE with the relation's schema block and descriptor.
-fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: u64, name_blob: &[u8]) -> Result<(), WireFault> {
-    let answer = resolve_request_target(shared, target_id, name_blob)?
-        .and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
+fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
+    let answer =
+        resolve_request_target(shared, name_blob)?.and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
     let Some((tid, (desc, schema_block))) = answer else {
         // No such relation: a successful reply naming none.
         send_msg(peer, ipc::WireMsg::default());

@@ -1,6 +1,6 @@
-//! The system-catalog **row codecs**: one writer per family a client may write,
-//! so the client's rows and the engine's seed rows are laid out by the same code.
-//! `SEQ_TAB` is engine-built and has none.
+//! The system-catalog **row codecs**: one [`SysRow`] per family a client may
+//! write, so the client's rows and the engine's seed rows are laid out by the
+//! same code. `SEQ_TAB` is engine-built and has none.
 
 /// Where a row codec writes. Both sides already build batches this way — begin a
 /// row with its key and weight, push one value per payload column in schema
@@ -22,6 +22,14 @@ pub trait SysRowSink {
     fn end_row(&mut self);
 }
 
+/// One row of a system family, as the client's DDL and the engine's seed rows
+/// write it.
+pub trait SysRow {
+    /// The family the row belongs to.
+    const FAMILY: u64;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64);
+}
+
 // ---------------------------------------------------------------------------
 // SCHEMA_TAB
 // ---------------------------------------------------------------------------
@@ -32,10 +40,13 @@ pub struct SchemaTabRow<'a> {
     pub name: &'a str,
 }
 
-pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight: i64) {
-    sink.begin_row(&[r.schema_id as u128], weight);
-    sink.put_string(r.name);
-    sink.end_row();
+impl SysRow for SchemaTabRow<'_> {
+    const FAMILY: u64 = crate::SCHEMA_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        sink.begin_row(&[self.schema_id as u128], weight);
+        sink.put_string(self.name);
+        sink.end_row();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,20 +70,21 @@ pub struct ColTabRow<'a> {
     pub fk: Option<FkRef>,
 }
 
-/// Write one `COL_TAB` row, keyed by the compound `(owner_id, col_idx)` — the
-/// identity of a column record, so neither half is repeated in the payload.
-pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) {
-    // COL_TAB stores "no FK" as table id 0, which no relation has.
-    let (fk_table_id, fk_col_idx) = r.fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
-    sink.begin_row(&[r.owner_id as u128, r.col_idx as u128], weight);
-    sink.put_string(&r.col.name);
-    sink.put_u64(r.col.ty.tc.as_wire() as u64);
-    sink.put_u64(r.col.is_nullable as u64);
-    sink.put_u64(fk_table_id);
-    sink.put_u64(fk_col_idx);
-    sink.put_u64(r.col.is_hidden as u64);
-    sink.put_u64(r.col.ty.scale as u64);
-    sink.end_row();
+impl SysRow for ColTabRow<'_> {
+    const FAMILY: u64 = crate::COL_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        // COL_TAB stores "no FK" as table id 0, which no relation has.
+        let (fk_table_id, fk_col_idx) = self.fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
+        sink.begin_row(&[self.owner_id as u128, self.col_idx as u128], weight);
+        sink.put_string(&self.col.name);
+        sink.put_u64(self.col.ty.tc.as_wire() as u64);
+        sink.put_u64(self.col.is_nullable as u64);
+        sink.put_u64(fk_table_id);
+        sink.put_u64(fk_col_idx);
+        sink.put_u64(self.col.is_hidden as u64);
+        sink.put_u64(self.col.ty.scale as u64);
+        sink.end_row();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,13 +100,16 @@ pub struct TableTabRow<'a> {
     pub props: crate::TableProps,
 }
 
-pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: i64) {
-    sink.begin_row(&[r.table_id as u128], weight);
-    sink.put_u64(r.schema_id);
-    sink.put_string(r.name);
-    sink.put_u64(r.pk.pack());
-    sink.put_u64(r.props.pack());
-    sink.end_row();
+impl SysRow for TableTabRow<'_> {
+    const FAMILY: u64 = crate::TABLE_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        sink.begin_row(&[self.table_id as u128], weight);
+        sink.put_u64(self.schema_id);
+        sink.put_string(self.name);
+        sink.put_u64(self.pk.pack());
+        sink.put_u64(self.props.pack());
+        sink.end_row();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,17 +132,20 @@ pub struct ViewTabRow<'a> {
     pub pk_repeats: bool,
 }
 
-pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i64) {
-    sink.begin_row(&[r.view_id as u128], weight);
-    sink.put_u64(r.schema_id);
-    sink.put_string(r.name);
-    sink.put_u64(r.pk.pack());
-    let (capacity, delta) = r.props.row_words();
-    sink.put_u64(capacity);
-    sink.put_u64(delta);
-    sink.put_u64(r.owner_view_id);
-    sink.put_u64(r.pk_repeats as u64);
-    sink.end_row();
+impl SysRow for ViewTabRow<'_> {
+    const FAMILY: u64 = crate::VIEW_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        sink.begin_row(&[self.view_id as u128], weight);
+        sink.put_u64(self.schema_id);
+        sink.put_string(self.name);
+        sink.put_u64(self.pk.pack());
+        let (capacity, delta) = self.props.row_words();
+        sink.put_u64(capacity);
+        sink.put_u64(delta);
+        sink.put_u64(self.owner_view_id);
+        sink.put_u64(self.pk_repeats as u64);
+        sink.end_row();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,24 +161,35 @@ pub struct IdxTabRow<'a> {
     pub is_unique: bool,
 }
 
-pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64) {
-    sink.begin_row(&[r.index_id as u128], weight);
-    sink.put_u64(r.owner_id);
-    sink.put_u64(r.cols.pack());
-    sink.put_string(r.name);
-    sink.put_u64(r.is_unique as u64);
-    sink.end_row();
+impl SysRow for IdxTabRow<'_> {
+    const FAMILY: u64 = crate::IDX_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        sink.begin_row(&[self.index_id as u128], weight);
+        sink.put_u64(self.owner_id);
+        sink.put_u64(self.cols.pack());
+        sink.put_string(self.name);
+        sink.put_u64(self.is_unique as u64);
+        sink.end_row();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CIRCUIT_TAB
 // ---------------------------------------------------------------------------
 
-/// `view_id`'s circuit as its one `CIRCUIT_TAB` row, at `+1`.
-pub fn write_circuit_row(sink: &mut impl SysRowSink, view_id: u64, circuit: &crate::Circuit) {
-    sink.begin_row(&[view_id as u128], 1);
-    sink.put_bytes(&circuit.encode());
-    sink.end_row();
+/// `view_id`'s circuit as its one `CIRCUIT_TAB` row.
+pub struct CircuitRow<'a> {
+    pub view_id: u64,
+    pub circuit: &'a crate::Circuit,
+}
+
+impl SysRow for CircuitRow<'_> {
+    const FAMILY: u64 = crate::CIRCUIT_TAB;
+    fn write(&self, sink: &mut impl SysRowSink, weight: i64) {
+        sink.begin_row(&[self.view_id as u128], weight);
+        sink.put_bytes(&self.circuit.encode());
+        sink.end_row();
+    }
 }
 
 #[cfg(test)]

@@ -136,7 +136,7 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
             pk: PkColList::from_slice(&[0]),
             props: gnitz_wire::TableProps { stream, ..Default::default() },
         };
-        write_table_tab_row(&mut bb, &row, 1);
+        row.write(&mut bb, 1);
         bb.finish()
     };
     for stream in [true, false] {

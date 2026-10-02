@@ -45,9 +45,6 @@ pub struct ScanReply {
     pub lsn: Option<u64>,
 }
 
-/// The single-relation read result.
-pub type ScanResult = Result<ScanReply, ClientError>;
-
 /// One relation, as a RESOLVE describes it.
 #[derive(Debug)]
 pub struct RelDescriptor {
@@ -112,16 +109,6 @@ fn delta_expired(text: &str) -> ClientError {
     })
 }
 
-/// Which relation a RESOLVE request describes. The wire carries an id field and
-/// a name blob and lets the name win, but exactly one is ever meaningful — this
-/// says which, so no caller has to encode that as a `0` / `""` sentinel pair.
-#[derive(Copy, Clone, Debug)]
-pub enum RelTarget<'a> {
-    /// The canonical `"schema_name.relation_name"`.
-    Name(&'a str),
-    Id(u64),
-}
-
 // ── The spine's vocabulary ───────────────────────────────────────────────────
 
 /// What a driver should wait for before its next `step`, and what it hands
@@ -177,9 +164,10 @@ pub enum Request<'a> {
     /// family's relation was written after that family's `basis`. Completes as
     /// [`Reply::Lsn`].
     PushTxn { families: &'a [PushFamily<'a>] },
-    /// RESOLVE — describe one relation. Uncorrelated on the wire, because a
-    /// by-name resolve names no id.
-    Resolve(RelTarget<'a>),
+    /// RESOLVE — describe the relation named by the canonical
+    /// `"schema_name.relation_name"`. Uncorrelated on the wire, because the
+    /// request names no id.
+    Resolve(&'a str),
     /// PUSH. The frame always carries `schema`'s record.
     Push {
         target_id: u64,
@@ -254,18 +242,12 @@ impl Request<'_> {
                 }
                 (encode_push_txn(families), SlotKind::Commit)
             }
-            Request::Resolve(target) => {
-                // The wire lets the name win over the id, so the name rides the blob.
-                let (target_id, qname) = match target {
-                    RelTarget::Name(q) => (0, q),
-                    RelTarget::Id(tid) => (tid, ""),
-                };
+            Request::Resolve(qname) => {
                 let hdr = ControlHeader {
                     flags: WireFlags {
                         verb: ClientVerb::Resolve,
                         ..Default::default()
                     },
-                    target_id,
                     ..Default::default()
                 };
                 (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
@@ -502,9 +484,6 @@ pub(crate) enum Polled {
     /// The view's terminal; the position is answered.
     End(PollEnd),
 }
-
-/// One view's whole train, for a listener that collects it.
-pub(crate) type PolledView = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 
 /// The listener a delta poll's results go to, addressed by the slot that asked
 /// — so a train left behind by an abandoned poll is recognised rather than

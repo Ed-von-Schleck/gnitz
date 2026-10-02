@@ -198,11 +198,12 @@ fn one_writev_per_burst() {
 fn clones_share_one_blocking_client() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
+    let source = blocking.resolve_relation(&sn, "t").unwrap();
     let vid = blocking
         .create_view(
             &sn,
             "v",
-            tid,
+            &source,
             ViewProps::Fed {
                 delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
             },
