@@ -306,6 +306,16 @@ impl Program {
         self.instructions.iter().filter(|i| is(&i.op)).count()
     }
 
+    /// True iff a reduce or top-N reads the view's own store as its output trace.
+    pub(in crate::query) fn reads_view_store(&self) -> bool {
+        self.instructions.iter().any(|i| {
+            matches!(
+                i.op,
+                Op::Reduce { out_trace: None, .. } | Op::TopN { out_trace: None, .. }
+            )
+        })
+    }
+
     /// True iff some instruction trims the delta to this worker's own rows, so
     /// the result is a slice rather than a copy of what every worker computes.
     pub(in crate::query) fn trims_per_worker(&self) -> bool {

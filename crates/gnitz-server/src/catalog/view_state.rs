@@ -28,6 +28,8 @@ impl CatalogEngine {
     ///     [`RelationRegistry::view_children_resumable`] answers; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
+    ///   * every view of its chain is valid — a segment's rows are dropped once
+    ///     its chain is built, so a chain member's rebuild needs them rebuilt; and
     ///   * none of its sources is a STREAM — a stream-fed view's manifests are
     ///     published normally, so without this it would resume at the committed
     ///     generation onto state whose stream inputs are gone.
@@ -35,7 +37,8 @@ impl CatalogEngine {
     /// The topology word is decided once for the whole set. Then phase 1 decides
     /// each view's **local** validity (direct sources + child manifests), and
     /// phase 2 propagates invalidity to any view scanning an invalid source,
-    /// following scan edges forward from every locally invalid view.
+    /// following scan edges forward from every locally invalid view, and to the
+    /// whole chain of any invalid view.
     pub(crate) fn compute_invalid_views(&mut self) {
         let topo_valid = self.topology_matches();
 
@@ -70,12 +73,13 @@ impl CatalogEngine {
             }
         }
 
-        // Phase 2: every registered view downstream of an invalid one.
-        let view_set: FxHashSet<u64> = view_ids.iter().copied().collect();
+        // Phase 2: every view downstream of an invalid one, then every view of a
+        // chain holding one.
         let seeds = invalid.iter().copied().collect();
-        let reached = self.dag.dependent_closure(seeds);
-        invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
-        self.dag.set_rebuild(invalid);
+        invalid.extend(self.dag.dependent_closure(seeds));
+        let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.dag.chain_of(v)).collect();
+        let whole_chains = view_ids.into_iter().filter(|&v| chains.contains(&self.dag.chain_of(v)));
+        self.dag.set_rebuild(whole_chains.collect());
     }
 
     /// Open this process's stores under the boot's resume verdict: a relation's

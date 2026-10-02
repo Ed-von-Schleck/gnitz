@@ -204,7 +204,7 @@ impl<'c> WorkerProcess<'c> {
                 // same exchange rounds until every source is drained.
                 while !self.drive(Drive::Backfill { view, source }, cursor.drain_chunk(chunk_rows))? {}
                 let cat = &mut *self.catalog;
-                cat.dag.finish_backfill(&mut cat.registry, view)
+                cat.dag.finish_backfill(&mut cat.registry, view, source)
             }
         }
     }

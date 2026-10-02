@@ -7,7 +7,7 @@ use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_sc
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (24, 11567886519790207916);
+    const PINNED: (u64, u64) = (25, 8239948856233422411);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let schema = SchemaDescriptor::new(
         &[

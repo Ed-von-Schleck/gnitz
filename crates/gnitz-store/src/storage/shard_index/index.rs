@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use super::super::manifest;
 use super::{
-    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardBudget, ShardEntry, ShardIndex,
+    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardBudget, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL,
 };
 use gnitz_expr::RowSource;
@@ -99,10 +99,24 @@ impl ShardIndex {
 
     /// The disk tier's upkeep after a spill.
     pub(crate) fn maintain(&mut self) -> Result<(), StorageError> {
-        if self.levels[L0].entries().count() > L0_COMPACT_THRESHOLD {
+        if self.levels[L0].entries().count() > L0_COMPACT_THRESHOLD || self.l0_cancels() {
             self.run_compact()?;
         }
         self.enforce_capacity()
+    }
+
+    /// Whether `retractions` are expected to cancel [`CANCEL_PERCENT`] of `rows`.
+    fn cancels(&self, retractions: usize, rows: usize) -> bool {
+        let cancelled = self.cancel_yield.expect(retractions);
+        cancelled > 0 && cancelled * 100 >= rows * CANCEL_PERCENT
+    }
+
+    /// Whether L0's retractions are expected to cancel that share of the whole
+    /// store. They retract from the levels below, so only the fold down brings
+    /// them to the guards whose own folds then cancel them.
+    fn l0_cancels(&self) -> bool {
+        let retractions: usize = self.levels[L0].entries().map(|e| e.shard.retraction_rows()).sum();
+        retractions > 0 && self.cancels(retractions, self.settled_entries().map(|e| e.shard.row_count()).sum())
     }
 
     /// Write `run` as one unpublished shard at the terminal level, under a new
@@ -255,6 +269,18 @@ impl ShardIndex {
             let largest = opened.iter().map(|(_, e)| e.shard.file_len()).max();
             self.l0_run_bytes = self.l0_run_bytes.max(largest.unwrap_or(0));
         }
+        if kind == CompactionKind::GuardSplit {
+            // The one fold that reads a guard's whole history at its level, and so
+            // every row its retractions can cancel there.
+            let (level, guards) = &sources[0];
+            let retractions = self.levels[*level].guards[guards.clone()]
+                .iter()
+                .map(LevelGuard::retractions)
+                .sum();
+            let read: usize = shards.iter().map(|s| s.row_count()).sum();
+            let wrote: usize = opened.iter().map(|(_, e)| e.shard.row_count()).sum();
+            self.cancel_yield.observe(retractions, read.saturating_sub(wrote));
+        }
         #[cfg(test)]
         super::cstats::record(
             kind,
@@ -293,6 +319,14 @@ impl ShardIndex {
                 self.unlink_shard(e.seq);
             }
         }
+    }
+
+    /// Retire every shard, leaving a store of no rows.
+    pub(crate) fn clear(&mut self) {
+        let levels = std::mem::take(&mut self.levels);
+        let settled = levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries);
+        let pending = std::mem::take(&mut self.pending);
+        self.retire(settled.chain(pending));
     }
 
     /// Fold L0 into L1, rebalance L1 and the terminal level against their byte
@@ -418,15 +452,19 @@ impl ShardIndex {
     }
 
     /// Fold every guard in `level_idx` that is over the file threshold or its
-    /// byte target, cutting the byte-overfull ones at their own key quantiles —
-    /// a guard over the file threshold alone folds to one shard in place.
+    /// byte target, or whose retractions are expected to cancel
+    /// [`CANCEL_PERCENT`] of its rows, cutting the byte-overfull ones at their own
+    /// key quantiles — any other folds to one shard in place.
     fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
         let target = self.guard_target_bytes(level_idx);
         // Descending, so each fold reshapes only indices above the guards still to go.
         for gi in (0..self.levels[level_idx].guards.len()).rev() {
             let guard = &self.levels[level_idx].guards[gi];
             let keys = fold_destinations(guard.guard_key, guard.entries.iter(), target);
-            if keys.len() > 1 || guard.entries.len() > GUARD_FILE_THRESHOLD {
+            if keys.len() > 1
+                || guard.entries.len() > GUARD_FILE_THRESHOLD
+                || self.cancels(guard.retractions(), guard.rows())
+            {
                 self.compact(&[(level_idx, gi..gi + 1)], level_idx, &keys, CompactionKind::GuardSplit)?;
             }
         }

@@ -180,8 +180,8 @@ fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
                 break;
             }
         }
+        engine.dag.finish_backfill(&mut engine.registry, view, source).unwrap();
     }
-    engine.dag.finish_backfill(&mut engine.registry, view).unwrap();
 }
 
 /// [`table_fixture`] holding ids `0..n`, every row at weight 1, ingested as one

@@ -50,14 +50,15 @@ pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) {
     }
 }
 
-/// Ask btrfs to overwrite `path` in place instead of copying (`FS_NOCOW_FL`).
+/// Ask btrfs to overwrite the file at `fd` in place instead of copying
+/// (`FS_NOCOW_FL`), which also exempts it from the mount's compression. Btrfs
+/// honours the flag on an empty file only, so it takes hold where the file was
+/// just created.
 ///
 /// Best-effort, like [`madvise_hugepage`]: ext4/xfs/tmpfs reject the flag with
 /// `EOPNOTSUPP` and have no copy-on-write path to disable, so a failure here is
 /// the normal case off btrfs and carries no information worth reporting.
-pub fn try_set_nocow(path: &str) {
-    let Ok(file) = std::fs::File::open(path) else { return };
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+fn try_set_nocow(fd: c_int) {
     const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
     const FS_IOC_SETFLAGS: libc::c_ulong = 0x40086602;
     const FS_NOCOW_FL: libc::c_int = 0x00800000;
@@ -140,9 +141,12 @@ pub fn map_anon_shared(size: usize) -> std::io::Result<*mut u8> {
 /// mmap `size` bytes of `fd` `MAP_SHARED` read-write, `fallocate`ing `[0, size)`
 /// first: `mmap` past the end of a file succeeds and the first store into the
 /// resulting hole raises `SIGBUS`, which nothing here handles. Reserving the
-/// blocks also means a later store cannot fail for want of disk space. A file
-/// already longer than `size` keeps its length and contents.
+/// blocks also means a later store cannot fail for want of disk space — on a
+/// copy-on-write filesystem only for a file overwritten in place, which a file
+/// created empty is asked to be. A file already longer than `size` keeps its
+/// length and contents.
 pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
+    try_set_nocow(fd);
     retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) })?;
     let ptr = unsafe {
         libc::mmap(

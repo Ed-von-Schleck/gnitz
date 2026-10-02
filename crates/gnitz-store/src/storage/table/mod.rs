@@ -300,6 +300,16 @@ impl Table {
         Ok(())
     }
 
+    /// Drop every row this store holds, in RAM and on disk. The next barrier
+    /// publishes the empty store.
+    pub(crate) fn clear(&mut self) {
+        self.cached_full_scan.set(None);
+        self.pending.clear();
+        self.memtable.clear();
+        self.ram_tier.clear();
+        self.shard_index.clear();
+    }
+
     /// [`Self::ingest_owned_batch`] above the cut: every reader sees the rows
     /// but one at [`Cut::Sealed`], until [`Self::seal`].
     pub(crate) fn ingest_pending(&mut self, batch: Batch) {

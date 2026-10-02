@@ -291,6 +291,7 @@ impl Batch {
 
         ShardHeader {
             row_count: n,
+            retractions: self.retracted_rows().count(),
             file_npc: npc,
             skeleton: opts.skeleton,
             body_checksum: body.digest(),

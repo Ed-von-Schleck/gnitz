@@ -86,6 +86,15 @@ impl RelationRegistry {
         }
     }
 
+    /// Drop every row view `id`'s store holds; the next barrier publishes it
+    /// empty. For a view with no index and no delta feed.
+    pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
+        let entry = self.relation_mut_or_err(id)?;
+        debug_assert!(entry.kind.is_view() && entry.delta.is_none() && entry.indexes.is_empty());
+        entry.store.held_mut().clear();
+        Ok(())
+    }
+
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
     /// enforcement — what a caller that must forward the applied rows takes.
     pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, String> {

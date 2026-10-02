@@ -206,7 +206,7 @@ pub struct DirLock {
 }
 
 /// Create and lock `base_dir`, retrying a held lock for [`DIR_LOCK_RETRY_FOR`],
-/// then set NOCOW on it and create its [`relations_dir`].
+/// then create its [`relations_dir`].
 pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
     ensure_dir(base_dir)?;
     let path = format!("{base_dir}/{DIR_LOCK_FILENAME}");
@@ -226,7 +226,6 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
             Err(TryLockError::Error(e)) => return Err(format!("lock data directory '{base_dir}': {e}")),
         }
     }
-    gnitz_foundation::posix_io::try_set_nocow(base_dir);
     let root = relations_dir(base_dir);
     let create_err = |e: std::io::Error| format!("create '{root}': {e}");
     if create_dir(&root).map_err(create_err)? {

@@ -15,7 +15,9 @@ use gnitz_zset::schema::SchemaDescriptor;
 mod index;
 
 /// Which trigger a compaction is serving. Only [`Dehydrate`](Self::Dehydrate)
-/// changes what is written; the rest label the byte accounting the
+/// changes what is written. The index learns its run size from an
+/// [`L0Fold`](Self::L0Fold) and its cancel yield from a
+/// [`GuardSplit`](Self::GuardSplit); the rest label the byte accounting the
 /// amplification benchmark reads.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum CompactionKind {
@@ -115,6 +117,10 @@ pub(super) const TERMINAL: usize = 2;
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
 /// Files one guard holds before it folds.
 const GUARD_FILE_THRESHOLD: usize = 4;
+/// The share of its rows a guard, or of the store's rows L0, may hold that a
+/// fold is expected to cancel before it folds for that alone: the rows a
+/// retraction and the row it retracts take up until one merge reads both.
+const CANCEL_PERCENT: usize = 25;
 /// Floor under every guard byte target. It bounds the guard *count*: a store
 /// holds `resident / target` guards, so a target derived from a tiny budget
 /// would otherwise shatter one fold into shards of a few hundred bytes.
@@ -198,6 +204,17 @@ impl LevelGuard {
     /// Total registered bytes of this guard's entries.
     fn bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.shard.file_len()).sum()
+    }
+
+    /// Total rows of this guard's entries, the ones that cancel included.
+    fn rows(&self) -> usize {
+        self.entries.iter().map(|e| e.shard.row_count()).sum()
+    }
+
+    /// The retractions a fold of this guard alone can cancel: those of every
+    /// shard but the oldest, which has no older one here to retract from.
+    fn retractions(&self) -> usize {
+        self.entries.iter().skip(1).map(|e| e.shard.retraction_rows()).sum()
     }
 
     /// The key span this guard's entries actually cover. The guard *key* is only
@@ -353,6 +370,39 @@ pub(super) struct ShardIndex {
     dropped_max: PkBuf,
     /// Passed to every shard write.
     skip_pk_filter: bool,
+    /// What the in-place guard folds so far cancelled per retraction they read.
+    cancel_yield: CancelYield,
+}
+
+/// How many rows a retraction is expected to cancel when a fold brings it
+/// together with the shards under it, learned from the folds that did. Two where
+/// each retraction meets the row it retracts, none in a store whose retractions
+/// are its content — the trace of a subtracted operand, a delta feed.
+///
+/// Both terms halve at every observation, so the estimate follows a store whose
+/// input changes character. Not persisted: a reopened store starts at two and
+/// pays at most one fold a guard to learn otherwise.
+#[derive(Clone, Copy)]
+struct CancelYield {
+    cancelled: usize,
+    retractions: usize,
+}
+
+impl CancelYield {
+    const FRESH: Self = CancelYield { cancelled: 2, retractions: 1 };
+
+    /// The rows a fold over `retractions` is expected to cancel.
+    fn expect(self, retractions: usize) -> usize {
+        (retractions as u128 * self.cancelled as u128 / self.retractions as u128) as usize
+    }
+
+    /// A fold that read `retractions` wrote `cancelled` rows fewer than it read.
+    fn observe(&mut self, retractions: usize, cancelled: usize) {
+        if retractions > 0 {
+            self.cancelled = self.cancelled / 2 + cancelled.min(2 * retractions);
+            self.retractions = self.retractions / 2 + retractions;
+        }
+    }
 }
 
 impl ShardIndex {
@@ -378,6 +428,7 @@ impl ShardIndex {
             budget,
             dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,
+            cancel_yield: CancelYield::FRESH,
         };
         for e in &shards.entries {
             let entry = ShardEntry::open(output_dir, e.seq, &idx.schema, e.newest)?;

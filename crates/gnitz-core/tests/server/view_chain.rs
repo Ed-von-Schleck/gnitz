@@ -85,10 +85,12 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let chain_views = vec![(owner - 2, owner), (owner - 1, owner), (owner, 0)];
     assert_eq!(live_views(&mut client), chain_views);
 
-    // Every view holds the base's rows at weight 1.
+    // The user view holds the base's rows at weight 1, each backfilled through
+    // both segments, which hold none once the chain is built.
     let base = weighted_rows(&base_rows(&schema));
-    for &(vid, _) in &chain_views {
-        assert_eq!(view_rows(&mut client, vid, &schema), base, "view {vid}");
+    assert_eq!(view_rows(&mut client, owner, &schema), base);
+    for segment in [owner - 2, owner - 1] {
+        assert_eq!(view_rows(&mut client, segment, &schema), [], "segment {segment}");
     }
 
     let err = client.drop_table(&sn, &["t"], false).unwrap_err().to_string();

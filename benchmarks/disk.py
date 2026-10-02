@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import compression.zstd as zstd
+import functools
 import json
 import os
 import random
@@ -100,8 +101,12 @@ class Scenario:
     name: str
     doc: str
     ddl: list[str]
-    relations: list[str]
     load: Callable[[Loader, int, random.Random], int]   # returns the live rows' value bytes
+
+    @property
+    def relations(self) -> list[str]:
+        """The tables and views `ddl` creates, in its order."""
+        return [m[1] for stmt in self.ddl if (m := re.match(r"CREATE (?:TABLE|VIEW) (\w+)", stmt))]
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,9 @@ def load_sparse_nulls(ld, rows, rng):
     return ld.push("wide", (row(k) for k in range(rows)))
 
 
-def load_join(ld, rows, rng):
+def load_join(ld, rows, rng, key_range=1.2):
+    """An order's customer is drawn from `key_range` times the customers there are: of 1.2, a sixth match
+    nothing."""
     customers = max(rows // 20, 1)
     regions = ["emea-north", "emea-south", "apac", "americas-east", "americas-west"]
     total = ld.push("customers", (
@@ -180,12 +187,12 @@ def load_join(ld, rows, rng):
         for c in range(customers)))
     statuses = ["open", "paid", "shipped", "returned_by_customer"]
     return total + ld.push("orders", (
-        dict(id=k + 1, customer_id=rng.randrange(int(customers * 1.2)) + 1,     # a sixth match nothing
+        dict(id=k + 1, customer_id=rng.randrange(int(customers * key_range)) + 1,
              amount=rng.randrange(100_000), status=rng.choice(statuses))
         for k in range(rows)))
 
 
-def load_churn(ld, rows, rng):
+def load_churn(ld, rows, rng, rounds=3):
     owners = [f"owner-{i:05d}" for i in range(5_000)]
     live = {}
 
@@ -195,7 +202,7 @@ def load_churn(ld, rows, rng):
         live[k] = r
         return r
     ld.push("accounts", (row(k + 1) for k in range(rows)))
-    for _ in range(3):                                                  # each round rewrites half the rows
+    for _ in range(rounds):                                             # each round rewrites half the rows
         ld.push("accounts", (row(k) for k in rng.sample(range(1, rows + 1), rows // 2)))
     gone = rng.sample(range(1, rows + 1), rows // 5)
     ld.push("accounts", (live.pop(k) for k in gone), weight=-1)
@@ -219,6 +226,29 @@ def load_operators(ld, rows, rng):
         for k in range(rows)))
 
 
+CHURN_DDL = [
+    "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, owner TEXT NOT NULL, balance BIGINT NOT NULL, "
+    "note TEXT NOT NULL)",
+    "CREATE VIEW v_rich AS SELECT id, owner, balance FROM accounts WHERE balance > 500",
+    "CREATE VIEW v_owner AS SELECT owner, COUNT(*) AS n, SUM(balance) AS total FROM accounts GROUP BY owner",
+]
+
+CUSTOMERS = ("CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, region TEXT NOT NULL, "
+             "tier INT NOT NULL)")
+ORDERS = ("CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, customer_id BIGINT NOT NULL, "
+          "amount BIGINT NOT NULL, status TEXT NOT NULL)")
+FANOUT_VIEWS = [
+    "CREATE VIEW v_named AS SELECT o.id, o.amount, c.name FROM orders o JOIN customers c ON o.customer_id = c.id",
+    "CREATE VIEW v_region AS SELECT o.id, o.status, c.region FROM orders o JOIN customers c ON o.customer_id = c.id",
+    "CREATE VIEW v_tier AS SELECT o.id, o.amount, c.tier FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+    "CREATE VIEW v_region_total AS SELECT c.region, COUNT(*) AS n, SUM(o.amount) AS total FROM orders o "
+    "JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+    "CREATE VIEW v_cust_ext AS SELECT customer_id, MIN(amount) AS lo, MAX(amount) AS hi FROM orders "
+    "GROUP BY customer_id",
+    "CREATE VIEW v_cust_sum AS SELECT customer_id, COUNT(*) AS n, SUM(amount) AS total FROM orders "
+    "GROUP BY customer_id",
+]
+
 SCENARIOS = [
     Scenario(
         "strings_repeated",
@@ -229,7 +259,7 @@ SCENARIOS = [
          "CREATE VIEW v_errors AS SELECT id, tenant, url, agent, status FROM events WHERE status <> 'ok'",
          "CREATE VIEW v_by_url AS SELECT tenant, url, COUNT(*) AS n, SUM(amount) AS total "
          "FROM events GROUP BY tenant, url"],
-        ["events", "v_errors", "v_by_url"], load_strings_repeated),
+        load_strings_repeated),
     Scenario(
         "strings_unique",
         "TEXT columns that never repeat — random tokens, paths sharing long prefixes, word titles, "
@@ -237,7 +267,7 @@ SCENARIOS = [
         ["CREATE TABLE docs (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, token TEXT NOT NULL, "
          "path TEXT NOT NULL, title TEXT NOT NULL, tag TEXT NOT NULL)",
          "CREATE VIEW v_kind0 AS SELECT id, token, path, title FROM docs WHERE kind = 0"],
-        ["docs", "v_kind0"], load_strings_unique),
+        load_strings_unique),
     Scenario(
         "ints",
         "integer and float columns of every range — a near-monotone timestamp, small domains, 60 random "
@@ -249,7 +279,7 @@ SCENARIOS = [
          "CREATE VIEW v_kind3 AS SELECT id, ts, device, value FROM metrics WHERE kind = 3",
          "CREATE VIEW v_dev AS SELECT device, COUNT(*) AS n, SUM(value) AS total FROM metrics GROUP BY device",
          "CREATE VIEW v_ext AS SELECT device, MIN(value) AS lo, MAX(ts) AS last FROM metrics GROUP BY device"],
-        ["metrics", "v_kind3", "v_dev", "v_ext"], load_ints),
+        load_ints),
     Scenario(
         "compound_pk",
         "a three-column key whose leading columns repeat for long runs, under a grouped view",
@@ -257,7 +287,7 @@ SCENARIOS = [
          "v BIGINT NOT NULL, PRIMARY KEY (tenant, device, ts))",
          "CREATE VIEW v_device AS SELECT tenant, device, COUNT(*) AS n, SUM(v) AS total "
          "FROM readings GROUP BY tenant, device"],
-        ["readings", "v_device"], load_compound_pk),
+        load_compound_pk),
     Scenario(
         "sparse_nulls",
         "twelve nullable columns, each NULL in nine rows of ten, under a filter view",
@@ -265,35 +295,48 @@ SCENARIOS = [
          + ", ".join(f"c{i} BIGINT" for i in range(8)) + ", "
          + ", ".join(f"s{i} TEXT" for i in range(4)) + ")",
          "CREATE VIEW v_c0 AS SELECT id, c0, c1, s0 FROM wide WHERE c0 IS NOT NULL"],
-        ["wide", "v_c0"], load_sparse_nulls),
+        load_sparse_nulls),
     Scenario(
         "join",
         "an inner and a left join of an order table to a customer table a twentieth its size",
-        ["CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, region TEXT NOT NULL, "
-         "tier INT NOT NULL)",
-         "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, customer_id BIGINT NOT NULL, "
-         "amount BIGINT NOT NULL, status TEXT NOT NULL)",
+        [CUSTOMERS,
+         ORDERS,
          "CREATE VIEW v_inner AS SELECT o.id, o.amount, o.status, c.name, c.region "
          "FROM orders o JOIN customers c ON o.customer_id = c.id",
          "CREATE VIEW v_left AS SELECT o.id, o.amount, c.name "
          "FROM orders o LEFT JOIN customers c ON o.customer_id = c.id"],
-        ["customers", "orders", "v_inner", "v_left"], load_join),
+        load_join),
+    Scenario(
+        "fanout",
+        "six views and an index that each read an order table by its customer: three joins, a join under an "
+        "aggregate, a MIN/MAX and a SUM per customer",
+        [CUSTOMERS, ORDERS, "CREATE INDEX ON orders(customer_id)", *FANOUT_VIEWS],
+        functools.partial(load_join, key_range=1)),
+    Scenario(
+        "fanout_clustered",
+        "the fanout scenario over an order table keyed and clustered by its customer, whose own store is "
+        "then the order the views read it in",
+        [CUSTOMERS,
+         "CREATE TABLE orders (customer_id BIGINT NOT NULL, id BIGINT NOT NULL, amount BIGINT NOT NULL, "
+         "status TEXT NOT NULL, PRIMARY KEY (customer_id, id)) CLUSTER BY customer_id",
+         *FANOUT_VIEWS],
+        functools.partial(load_join, key_range=1)),
     Scenario(
         "churn",
         "every row rewritten one and a half times on average and a fifth deleted, under a filter view "
         "and a grouped one",
-        ["CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, owner TEXT NOT NULL, balance BIGINT NOT NULL, "
-         "note TEXT NOT NULL)",
-         "CREATE VIEW v_rich AS SELECT id, owner, balance FROM accounts WHERE balance > 500",
-         "CREATE VIEW v_owner AS SELECT owner, COUNT(*) AS n, SUM(balance) AS total FROM accounts GROUP BY owner"],
-        ["accounts", "v_rich", "v_owner"], load_churn),
+        CHURN_DDL, load_churn),
+    Scenario(
+        "churn_long",
+        "the churn scenario with every row rewritten six times on average",
+        CHURN_DDL, functools.partial(load_churn, rounds=12)),
     Scenario(
         "uuid_pk",
         "a random 16-byte key and a 16-byte reference column, under a view grouped on the reference",
         ["CREATE TABLE sessions (sid UUID NOT NULL PRIMARY KEY, user_ref UUID NOT NULL, started BIGINT NOT NULL, "
          "hits INT NOT NULL)",
          "CREATE VIEW v_user AS SELECT user_ref, COUNT(*) AS n, SUM(hits) AS total FROM sessions GROUP BY user_ref"],
-        ["sessions", "v_user"], load_uuid_pk),
+        load_uuid_pk),
     Scenario(
         "operators",
         "the operator state no other scenario holds: a DISTINCT and an EXCEPT, whose leaves are keyed on "
@@ -305,7 +348,7 @@ SCENARIOS = [
          "CREATE VIEW v_clean AS SELECT user_id FROM visits EXCEPT SELECT user_id FROM banned",
          "CREATE VIEW v_latest AS SELECT id, user_id, page, day FROM visits "
          "QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY day DESC) <= 3"],
-        ["visits", "banned", "v_pairs", "v_clean", "v_latest"], load_operators),
+        load_operators),
 ]
 
 

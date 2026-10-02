@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAGIC = 0x31305F5A54494E47
-HEADER_SIZE = 56
+HEADER_SIZE = 64
 DIR_ENTRY_SIZE = 16
 ALIGNMENT = 64
 ENCODINGS = ["raw", "constant", "two-value", "for", "dict"]
@@ -36,6 +36,7 @@ class Shard:
     relation: int
     store: str         # "rows", "scratch_<child>", "idx_<cols>", "delta"
     rows: int
+    retractions: int   # rows of negative weight: each cancels a row some other shard of the store holds
     size: int
     regions: list[Region]
 
@@ -44,30 +45,10 @@ class Shard:
         """Header, directory and alignment padding."""
         return self.size - sum(len(r.data) for r in self.regions)
 
-    @property
-    def retractions(self):
-        """Rows of negative weight: each cancels a row some other shard of the store holds."""
-        w = next(r for r in self.regions if r.role == "weight")
-        if w.encoding == "constant":
-            return self.rows if struct.unpack("<q", w.data)[0] < 0 else 0
-        if w.encoding == "two-value":
-            a, b = struct.unpack_from("<qq", w.data)
-            ones = int.from_bytes(w.data[16:], "little").bit_count()
-            return (ones if b < 0 else 0) + (self.rows - ones if a < 0 else 0)
-        if w.encoding == "for":
-            # The reference is the least weight, and every offset is non-negative.
-            (ref,) = struct.unpack_from("<q", w.data)
-            if ref >= 0:
-                return 0
-            bw = (len(w.data) - 15) // self.rows
-            cells = w.data[8:8 + self.rows * bw]
-            return sum(1 for i in range(self.rows) if int.from_bytes(cells[i * bw:(i + 1) * bw], "little") < -ref)
-        return sum(1 for (v,) in struct.iter_unpack("<q", w.data) if v < 0)
-
 
 def read_shard(path, relation=0, store="rows"):
     image = Path(path).read_bytes()
-    magic, _version, rows, _desc, npc, _flags, _body = struct.unpack_from("<7Q", image, 0)
+    magic, _version, rows, _desc, npc, _flags, _body, retractions = struct.unpack_from("<8Q", image, 0)
     if magic != MAGIC:
         raise ValueError(f"{path}: not a shard")
     roles = ["pk", "weight", "null"] + [f"p{i}" for i in range(npc)] + ["blob", "filter"]
@@ -80,7 +61,7 @@ def read_shard(path, relation=0, store="rows"):
         regions.append(Region(role, ENCODINGS[encoding], image[off:end]))
     if end != len(image):
         raise ValueError(f"{path}: directory does not span the file")
-    return Shard(Path(path), relation, store, rows, len(image), regions)
+    return Shard(Path(path), relation, store, rows, retractions, len(image), regions)
 
 
 def store_of(path):

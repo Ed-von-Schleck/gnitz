@@ -50,6 +50,8 @@ struct ViewPlan {
 struct RegisteredView {
     meta: ViewMeta,
     plan: Option<ViewPlan>,
+    /// The user view whose chain this view is a segment of; `0` for a user view.
+    owner: u64,
 }
 
 #[derive(Default)]
@@ -68,11 +70,13 @@ impl DagEngine {
 
     /// Derive `view_id`'s routing metadata and link it to its sources, both kept until
     /// [`Self::forget`], and answer the placement its store registers under.
+    /// `owner`: the user view whose chain it is a segment of, `0` for a user view.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
         view_id: u64,
         view: &SchemaDescriptor,
+        owner: u64,
     ) -> Result<Placement, String> {
         let loaded = compiler::load_circuit(registry, view_id)?;
         // Tick scheduling and backfill take ascending id order as dependency order.
@@ -81,8 +85,32 @@ impl DagEngine {
         }
         let (meta, placement) = ViewMeta::derive(&loaded, registry, view)?;
         self.dep.link(view_id, loaded.sources());
-        self.views.insert(view_id, RegisteredView { meta, plan: None });
+        self.views.insert(view_id, RegisteredView { meta, plan: None, owner });
         Ok(placement)
+    }
+
+    /// Whether nothing reads the rows of view `id`'s store once its chain is
+    /// built: a compiled segment's, unless a reduce or top-N of its own reads them
+    /// as its output trace.
+    ///
+    /// A segment's rows are otherwise read by the backfills of the chain members
+    /// that scan it and by nothing else: its circuit keeps what it needs of them in
+    /// traces, and a tick hands its delta to its readers directly.
+    fn passes_through(&self, id: u64) -> bool {
+        self.views.get(&id).is_some_and(|v| {
+            v.owner != 0
+                && v.plan
+                    .as_ref()
+                    .is_some_and(|p| !p.code.post.vm.program.reads_view_store())
+        })
+    }
+
+    /// The user view whose chain holds view `id`: its owner, or `id` itself.
+    pub(crate) fn chain_of(&self, id: u64) -> u64 {
+        match self.views.get(&id) {
+            Some(RegisteredView { owner, .. }) if *owner != 0 => *owner,
+            _ => id,
+        }
     }
 
     /// Drop everything this layer holds for relation `id`.
@@ -157,7 +185,7 @@ fn ensure_compiled<'a>(
     registry: &RelationRegistry,
     view_id: u64,
 ) -> Result<(&'a ViewMeta, &'a mut ViewPlan), String> {
-    let RegisteredView { meta, plan } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
+    let RegisteredView { meta, plan, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
     if plan.is_none() {
         let view = registry.relation_or_err(view_id)?;
         let (code, layout) = compile(registry, view)

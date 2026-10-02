@@ -232,6 +232,52 @@ fn guards_over_the_file_threshold_fold_in_place() {
     assert_all_found(&idx, 1..=GUARD_FILE_THRESHOLD as u64 + 1);
 }
 
+/// One spill retracting enough of the rows under it folds down and cancels them,
+/// with neither level near its file threshold.
+#[test]
+fn a_spill_of_retractions_folds_into_the_rows_it_cancels() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = fresh(dir.path(), make_schema_u64_i64());
+    seed_guard(&mut idx, L1, gk(0), &dense_batch(0, 1000), 1);
+
+    // Too few to be worth a rewrite of the thousand.
+    idx.append_l0_run(&dense_batch(0, 50).negated()).unwrap();
+    idx.maintain().unwrap();
+    assert_eq!(idx.level_shape(), (1, [1, 0]));
+
+    idx.append_l0_run(&dense_batch(50, 250).negated()).unwrap();
+    idx.maintain().unwrap();
+    assert_eq!(idx.level_shape(), (0, [1, 0]));
+    let guard = &idx.levels[L1].guards[0];
+    assert_eq!((guard.entries.len(), guard.rows()), (1, 700));
+    assert_weighs(&idx, 0, (0..300).map(gk));
+    assert_all_found(&idx, 300..1000);
+}
+
+/// A store whose retractions cancel nothing — the trace of a subtracted operand
+/// — pays one fold to learn that, then folds as a store of insertions does.
+#[test]
+fn retractions_that_cancel_nothing_stop_folding_for_them() {
+    let folds_of = |weight: i64| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = fresh(dir.path(), make_schema_u64_i64());
+        cstats::reset();
+        for spill in 0..40 {
+            let run = dense_batch(spill * 100, 100);
+            let run = if weight < 0 { run.negated() } else { run };
+            idx.append_l0_run(&run).unwrap();
+            idx.maintain().unwrap();
+        }
+        assert_weighs(&idx, weight, (0..4000).map(gk));
+        cstats::dump().values().map(|p| p.n).sum::<usize>()
+    };
+    let (inserted, retracted) = (folds_of(1), folds_of(-1));
+    assert!(
+        retracted <= inserted + 2,
+        "{retracted} folds of retractions against {inserted} of insertions"
+    );
+}
+
 /// A vertical is atomic per band: a failure in band `k` leaves bands `0..k`
 /// folded, the failing band untouched, and every key reachable.
 #[test]

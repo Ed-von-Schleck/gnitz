@@ -132,6 +132,11 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     assert_eq!(shard.row_count(), n, "{label}: row count");
     let want_rows = rows_of(&want.as_mem_batch(), schema);
     assert_eq!(rows_of(shard, schema), want_rows, "{label}: per-row");
+    assert_eq!(
+        shard.retraction_rows(),
+        want.retracted_rows().count(),
+        "{label}: retractions"
+    );
 
     // An odd-length window starting mid-shard.
     let mid_start = n / 3;
@@ -990,11 +995,10 @@ fn every_body_region_and_its_padding_is_inside_the_body_checksum() {
             "{label}"
         );
         let spans = spans_of(&base);
-        let pad = spans[0].off - 1;
-        assert!(
-            pad >= desc_len(schema.num_payload_cols()),
-            "{label}: the first region is padded"
-        );
+        // The byte before the first region that starts past the end of what precedes it.
+        let ends = std::iter::once(desc_len(schema.num_payload_cols())).chain(spans.iter().map(|s| s.off + s.size));
+        let padded = ends.zip(&spans).find(|(end, s)| s.off > *end);
+        let pad = padded.unwrap_or_else(|| panic!("{label}: no region is padded")).1.off - 1;
         let targets = spans
             .iter()
             .enumerate()

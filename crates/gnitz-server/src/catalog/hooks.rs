@@ -35,16 +35,26 @@ impl CatalogEngine {
         let col_defs = self.read_column_defs(rel.id)?;
         let schema = build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice())?;
         let placement = match rel.detail {
-            RelDetail::View { .. } => {
-                let placement = self.dag.register_view(&self.registry, rel.id, &schema)?;
-                // A capacity-bounded view is a leaf: its store holds skeleton rows, so
-                // nothing may scan it.
-                let bounded = |s: &&u64| self.registry.relation(**s).is_some_and(|r| r.kind().is_bounded());
-                if let Some(&src) = self.dag.sources_of(rel.id).iter().find(bounded) {
-                    return Err(format!(
-                        "reads '{}', which is a capacity-bounded view; views cannot be created over one",
-                        self.qualified_name(src)
-                    ));
+            RelDetail::View { owner_view_id, .. } => {
+                let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner_view_id)?;
+                for &src in self.dag.sources_of(rel.id) {
+                    // A capacity-bounded view is a leaf: its store holds skeleton rows, so
+                    // nothing may scan it.
+                    if self.registry.relation(src).is_some_and(|r| r.kind().is_bounded()) {
+                        return Err(format!(
+                            "reads '{}', which is a capacity-bounded view; views cannot be created over one",
+                            self.qualified_name(src)
+                        ));
+                    }
+                    // A segment keeps its rows only for the build of its chain, so only
+                    // that chain may scan it — and a capacity-bounded view, which
+                    // recomputes a key from the rows of what it scans, not at all.
+                    let chain = self.dag.chain_of(src);
+                    if chain != src && (chain != self.dag.chain_of(rel.id) || rel.kind.is_bounded()) {
+                        return Err(format!(
+                            "reads {src}, a segment of view {chain} that holds no rows for it"
+                        ));
+                    }
                 }
                 placement
             }

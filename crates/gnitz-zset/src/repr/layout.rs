@@ -9,7 +9,7 @@ use StorageError::Corrupt;
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 24;
+pub(crate) const SHARD_EPOCH: u64 = 25;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
@@ -29,7 +29,9 @@ pub(crate) const OFF_FLAGS: usize = 40;
 /// XXH3-64 over every byte after the descriptive prefix, alignment padding
 /// included.
 pub(crate) const OFF_BODY_CHECKSUM: usize = 48;
-pub(crate) const HEADER_SIZE: usize = OFF_BODY_CHECKSUM + 8;
+/// How many rows carry a negative weight (u64 LE).
+pub(crate) const OFF_RETRACTIONS: usize = 56;
+pub(crate) const HEADER_SIZE: usize = OFF_RETRACTIONS + 8;
 
 /// [`OFF_FLAGS`] bit: a capacity-bounded view's skeleton shard, one (PK, coarse
 /// weight) row per key.
@@ -40,6 +42,7 @@ pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
 #[derive(Clone, Copy)]
 pub(crate) struct ShardHeader {
     pub row_count: usize,
+    pub retractions: usize,
     pub file_npc: usize,
     pub skeleton: bool,
     pub body_checksum: u64,
@@ -66,6 +69,7 @@ impl ShardHeader {
         };
         Ok(ShardHeader {
             row_count,
+            retractions: read_u64_le(data, OFF_RETRACTIONS) as usize,
             file_npc,
             skeleton: read_u64_le(data, OFF_FLAGS) & SHARD_FLAG_SKELETON != 0,
             body_checksum: read_u64_le(data, OFF_BODY_CHECKSUM),
@@ -77,6 +81,7 @@ impl ShardHeader {
         write_u64_le(header, OFF_MAGIC, SHARD_MAGIC);
         write_u64_le(header, OFF_VERSION, SHARD_VERSION);
         write_u64_le(header, OFF_ROW_COUNT, self.row_count as u64);
+        write_u64_le(header, OFF_RETRACTIONS, self.retractions as u64);
         write_u64_le(header, OFF_FILE_NPC, self.file_npc as u64);
         write_u64_le(header, OFF_FLAGS, if self.skeleton { SHARD_FLAG_SKELETON } else { 0 });
         write_u64_le(header, OFF_BODY_CHECKSUM, self.body_checksum);

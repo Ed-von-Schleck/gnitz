@@ -175,6 +175,11 @@ impl MappedShard {
         ColumnarSource::get_weight(self, row)
     }
 
+    /// How many rows carry a negative weight.
+    pub fn retraction_rows(&self) -> usize {
+        self.header.retractions
+    }
+
     /// Whether payload column `pi` is stored frame-of-reference packed.
     pub fn packs_payload(&self, pi: usize) -> bool {
         matches!(self.col_regions[pi], PayloadRegion::Packed(_))

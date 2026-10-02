@@ -171,18 +171,31 @@ impl DagEngine {
         schedule
     }
 
-    /// End `view_id`'s backfill.
+    /// End `view_id`'s backfill from `source`.
     ///
     /// Releases the last chunk's pinned registers and trace cursors, then folds
     /// the view's memtable into its RAM tier once — so the view's first reads open
     /// over fewer sources, at one fold per backfill rather than one per chunk.
-    pub(crate) fn finish_backfill(&mut self, registry: &mut RelationRegistry, view_id: u64) -> Result<(), String> {
+    ///
+    /// A source that [passes through](Self::passes_through) held its rows for the
+    /// backfills of the views scanning it. Those run in ascending id order, so the
+    /// highest of them ends the last, and the rows are dropped.
+    pub(crate) fn finish_backfill(
+        &mut self,
+        registry: &mut RelationRegistry,
+        view_id: u64,
+        source: u64,
+    ) -> Result<(), String> {
         if let Some(plan) = self.plan_mut(view_id) {
             for sub in plan.code.sub_plans_mut() {
                 sub.vm.release();
             }
         }
-        registry.fold_to_ram(view_id)
+        registry.fold_to_ram(view_id)?;
+        if self.passes_through(source) && self.dependents_of(source).iter().max() == Some(&view_id) {
+            registry.clear_rows(source)?;
+        }
+        Ok(())
     }
 }
 
@@ -230,7 +243,13 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>
         .expect("the schedule runs every producer before the steps it feeds");
         let needed = readers.contains_key(&step.view);
         let out = run_view_epoch(host, step.view, input, step.producer, &unfed)?;
-        let echo = host.parts().1.ingest_at(step.view, out, round, needed)?;
+        let (dag, registry) = host.parts();
+        let echo = match round {
+            // A tick's delta reaches its readers in this schedule, and no tick
+            // runs while a chain is being built.
+            Some(_) if dag.passes_through(step.view) => needed.then(|| out.into_consolidated()),
+            _ => registry.ingest_at(step.view, out, round, needed)?,
+        };
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
             let merged = match outputs.remove(&step.view) {
