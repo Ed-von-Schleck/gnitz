@@ -14,6 +14,6 @@ mod suites;
 
 #[cfg(test)]
 pub(crate) use manifest::shard_path;
-pub(crate) use manifest::{link_store, manifest_path, read_at, read_intact, retire_store, shard_files};
+pub(crate) use manifest::{fsync_dir, link_store, manifest_path, read_at, read_intact, retire_store, shard_files};
 pub use table::Cut;
 pub(crate) use table::{flush_barrier, RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};

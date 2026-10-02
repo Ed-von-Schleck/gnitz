@@ -5,59 +5,49 @@
 //! raw writes below forge what no scope writes — arbitrary LSNs and flags, an
 //! open zone — and every other group goes through [`SalExcl`].
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::FromRawFd;
 
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::test_support::try_poll_once;
+use crate::runtime::w2m::fixtures::test_rings;
 use crate::runtime::w2m::SalWake;
 
-/// A writer over a fresh `size`-byte ring, written at one worker per ring in
-/// `rings`, each worker's wake landing on its ring. Unrewound, as a boot's
-/// writer is before [`SalExcl::boot_rewind`].
-pub(crate) fn test_writer(size: usize, rings: &[*mut u8]) -> SalWriter {
+/// A writer over a fresh `size`-byte ring, written at one worker per wake in
+/// `wakes`. Unrewound, as a boot's writer is before [`SalExcl::boot_rewind`].
+pub(crate) fn test_writer(size: usize, wakes: Vec<SalWake>) -> SalWriter {
     let len = ANCHOR_BYTES + size;
-    // A real fd, so the writer can `fdatasync` it; mapped and open for the rest
-    // of the process.
     let fd = unsafe { libc::memfd_create(c"test_sal".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
-    let ptr = gnitz_foundation::posix_io::map_file_reserved(fd, len).expect("map the test SAL");
-    // SAFETY: a test ring is never unmapped.
-    let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
-    SalWriter::new(
-        unsafe { SalLog::new(ptr, len) },
-        unsafe { BorrowedFd::borrow_raw(fd) },
-        wakes,
-    )
+    // SAFETY: a descriptor nothing else owns. Leaked: open and mapped for the rest of the process.
+    let file: &'static File = Box::leak(Box::new(unsafe { File::from_raw_fd(fd) }));
+    SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), wakes)
 }
 
 /// A SAL over its own file.
 pub(crate) struct TestLog {
     pub(crate) writer: SalWriter,
-    /// One W2M ring per worker, carrying the park the writer's wakes land on.
-    rings: Vec<*mut u8>,
+    /// One per worker, on the park the writer's wakes land on.
+    wakes: Vec<SalWake>,
 }
 
 impl TestLog {
     /// A log with a `size`-byte ring written at `workers` workers, rewound to
     /// cursor 0 of `epoch`.
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
-        let rings = (0..workers)
-            .map(|_| crate::runtime::w2m::fixtures::test_ring(4096))
-            .collect();
-        Self::with_rings(size, rings, epoch)
+        Self::with_wakes(size, test_rings(vec![4096; workers]).2, epoch)
     }
 
-    /// [`Self::new`] over the caller's W2M rings, one per worker.
-    pub(crate) fn with_rings(size: usize, rings: Vec<*mut u8>, epoch: u32) -> TestLog {
-        let writer = test_writer(size, &rings);
+    /// [`Self::new`] over the wakes of the caller's W2M rings, one per worker.
+    pub(crate) fn with_wakes(size: usize, wakes: Vec<SalWake>, epoch: u32) -> TestLog {
+        let writer = test_writer(size, wakes.clone());
         writer.rewind(epoch);
-        TestLog { writer, rings }
+        TestLog { writer, wakes }
     }
 
-    /// Worker `w`'s W2M ring.
-    pub(crate) fn ring(&self, w: usize) -> *mut u8 {
-        self.rings[w]
+    /// Worker `w`'s wake.
+    pub(crate) fn wake(&self, w: usize) -> &SalWake {
+        &self.wakes[w]
     }
 
     /// The ring's first byte — offset 0 of every group base.

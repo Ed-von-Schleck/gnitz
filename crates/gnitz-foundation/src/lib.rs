@@ -5,11 +5,8 @@
 //!   - `env`        — `GNITZ_*` environment-variable overrides
 //!   - `fault`      — debug-only `GNITZ_INJECT_*` fault-injection seams
 //!   - `host`       — what the machine or container will give us (RAM budget)
-//!   - `posix_io`   — file-I/O, mmap and the syscall idioms around them,
-//!     including the anonymous and reserved mappings the server builds its SAL
-//!     and W2M rings on, and the socket option client and server share. The
-//!     reactor's socket tier is not here; it lives beside the reactor that owns
-//!     the fds, in `gnitz-server`
+//!   - `posix_io`   — the syscall idioms `std` lacks: an EINTR retry and an integer
+//!     socket option
 //!   - `perf`       — cost probes: instructions retired, context switches and
 //!     resident-set bytes, for benchmarks and cost-claim tests
 //!

@@ -6,12 +6,11 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
-use gnitz_foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
@@ -20,7 +19,7 @@ use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
+use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
 use crate::runtime::tls::TlsArgs;
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
@@ -244,56 +243,44 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Opt
     }
 }
 
-/// Every shared region and descriptor the master and its forked workers use to
-/// talk to each other.
+/// One worker's share of the IPC: the SAL it reads, and its own ends.
+struct WorkerIpc {
+    sal: SalLog,
+    tail: CommittedTail,
+    w2m_writer: W2mWriter,
+    mesh: Mesh,
+}
+
+/// The SAL and every end of the regions the master and its forked workers talk
+/// through.
 ///
 /// Nothing here is reclaimed on error: the only response to a failed boot is to
 /// exit the process, which returns all of it to the kernel.
 struct SharedIpc {
-    sal_fd: BorrowedFd<'static>,
     sal: SalLog,
     /// The committed tail every recovery replays, and the epoch the next writer
     /// epoch starts above. Read once with the mapping, before the fork.
     tail: CommittedTail,
-    w2m_ptrs: Vec<*mut u8>,
-    /// The workers' exchange mesh.
-    mesh: *mut u8,
+    /// In rank order.
+    workers: Vec<WorkerIpc>,
+    /// The master's ends: the reader over every ring, and a wake per worker.
+    receiver: W2mReceiver,
+    wakes: Vec<SalWake>,
 }
 
 /// Open and map the SAL, one W2M ring per worker, and the exchange mesh.
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
-    // A fresh SAL file reads all-zero through O_CREAT + fallocate, which is
-    // exactly the empty-SAL state recovery expects.
-    let sal_file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o644)
-            .open(format!("{data_dir}/wal.sal"))
-            .map_err(|e| format!("failed to open SAL file: {e}"))?
-    };
-    // Leaked: the writer and the reactor's fsync SQEs name it for the process's life.
-    let sal_file: &'static std::fs::File = Box::leak(Box::new(sal_file));
-    let sal_fd = sal_file.as_fd();
-    // The SAL is a real file, and reserving its blocks now is what keeps a later
-    // write from failing for want of disk space.
-    let sal_len = sal_mmap_size();
-    let sal_ptr = posix_io::map_file_reserved(sal_fd.as_raw_fd(), sal_len)
-        .map_err(|e| format!("failed to map SAL ({sal_len} bytes): {e}"))?;
-    // SAFETY: the mapping above is `sal_len` bytes and outlives the process.
-    let sal = unsafe { SalLog::new(sal_ptr, sal_len) };
+    let sal = SalLog::open(data_dir)?;
     let tail = CommittedTail::read(sal)?;
-
-    let w2m_ptrs = (0..nw)
-        .map(|w| w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}")))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mesh =
-        mesh::create_region(nw, mesh::outbox_bytes()).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
-
-    Ok(SharedIpc { sal_fd, sal, tail, w2m_ptrs, mesh })
+    let (writers, receiver, wakes) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
+    let meshes =
+        mesh::create(mesh::outbox_bytes(), &wakes).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
+    let workers = writers
+        .into_iter()
+        .zip(meshes)
+        .map(|(w2m_writer, mesh)| WorkerIpc { sal, tail, w2m_writer, mesh })
+        .collect();
+    Ok(SharedIpc { sal, tail, workers, receiver, wakes })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -304,7 +291,7 @@ fn run_worker_child(
     data_dir: &str,
     master_pid: i32,
     catalog: &mut CatalogEngine,
-    ipc: &SharedIpc,
+    ipc: WorkerIpc,
     swept_bases: &[u64],
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
@@ -330,8 +317,6 @@ fn run_worker_child(
     // Only the tag: the level is a process-wide static the fork already copied.
     gnitz_foundation::log::set_tag(gnitz_foundation::log::Tag::Worker(w as u32));
 
-    let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
-
     // Pinned before the recovery below allocates, so its pages land on this core's node.
     let boot = pinning
         .map_or(Ok(()), |p| p.enter_worker(w))
@@ -345,15 +330,9 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
-    // SAFETY: every ring was initialized by `create_region` and the mesh mapped
-    // for `slot.of` workers, all before the fork, and none is ever unmapped.
-    let mesh = unsafe {
-        let wakes = ipc.w2m_ptrs.iter().map(|&p| SalWake::new(p)).collect();
-        Mesh::new(ipc.mesh, w, wakes)
-    };
     // The id the master leased before it collects.
-    w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
-    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
+    ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
+    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
@@ -376,23 +355,23 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<Vec<u64>, Str
     Ok(swept_base_tables(catalog))
 }
 
-/// Fork one child per worker, each of which never returns. Yields the parent's
-/// pid list.
+/// Fork one child per worker, each of which never returns and takes its own
+/// ends with it. Yields the parent's pid list.
 fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
-    num_workers: u32,
-    ipc: &SharedIpc,
+    workers: Vec<WorkerIpc>,
     swept_bases: &[u64],
     pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<i32>, String> {
     let master_pid = unsafe { libc::getpid() };
-    let mut worker_pids: Vec<i32> = Vec::with_capacity(num_workers as usize);
-    for w in 0..num_workers {
+    let num_workers = workers.len() as u32;
+    let mut worker_pids: Vec<i32> = Vec::with_capacity(workers.len());
+    for (w, ipc) in workers.into_iter().enumerate() {
         match unsafe { libc::fork() } {
             -1 => return Err("fork failed".to_string()),
             0 => run_worker_child(
-                Slot::new(w, num_workers),
+                Slot::new(w as u32, num_workers),
                 data_dir,
                 master_pid,
                 catalog,
@@ -453,11 +432,31 @@ async fn master_post_fork_recovery(
     Ok(())
 }
 
+/// Descriptors besides client connections: an fsync batch's chunk and a fixed
+/// handful.
+const FD_RESERVE: u64 = 1024;
+
+/// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
+/// limit. Best-effort: a refusal surfaces later as `EMFILE` at the open that
+/// could not be served.
+fn raise_fd_limit(target: u64) {
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
+            return;
+        }
+        rl.rlim_cur = (target as libc::rlim_t).min(rl.rlim_max);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+    }
+}
+
 fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> Result<i32, String> {
     let tls = tls.map(TlsArgs::resolve).transpose()?;
 
-    // Child directories + shard files.
-    posix_io::raise_fd_limit(65536);
+    let limits = Limits::from_env();
+    // Client connections are the one descriptor demand that grows: a shard is
+    // held by its mapping, and an fsync batch opens a bounded chunk.
+    raise_fd_limit((limits.max_conns as u64).saturating_add(FD_RESERVE));
 
     // Before any io_uring worker thread exists: each keeps the mask it starts with.
     let nw = num_workers as usize;
@@ -473,7 +472,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
 
     let ipc = acquire_shared_ipc(data_dir, nw)?;
-    gnitz_debug!("SAL fd={}", ipc.sal_fd.as_raw_fd());
 
     stage_system_tail(ipc.tail, &mut opened)?;
     let catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
@@ -483,20 +481,16 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     let swept_bases = master_pre_fork_recovery(catalog)?;
 
-    let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, pinning.as_ref())?;
+    let SharedIpc { sal, tail, workers, receiver, wakes } = ipc;
+    let worker_pids = fork_workers(catalog, data_dir, workers, &swept_bases, pinning.as_ref())?;
 
     // --- Parent process ---
-    let SharedIpc { sal_fd, sal, tail, w2m_ptrs, .. } = ipc;
-
-    // SAFETY: every ring was initialized by `create_region` and is never unmapped.
-    let wakes = w2m_ptrs.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
-    let reactor = Reactor::new(256, Limits::from_env(), W2mReceiver::new(w2m_ptrs))
-        .map_err(|e| format!("io_uring init failed: {e}"))?;
+    let reactor = Reactor::new(256, limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
-        SalWriter::new(sal, sal_fd, wakes),
+        SalWriter::new(sal, wakes),
         reactor,
     ));
 

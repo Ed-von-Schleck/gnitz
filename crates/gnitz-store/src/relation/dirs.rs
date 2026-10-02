@@ -7,11 +7,10 @@ use std::fs::{self, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::PkColList;
 
 use super::RelationRegistry;
-use crate::storage::{manifest_path, read_at, read_intact, retire_store};
+use crate::storage::{fsync_dir, manifest_path, read_at, read_intact, retire_store};
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::schema::Slot;
 
@@ -187,9 +186,7 @@ pub(super) fn parse_relation_dir_name(name: &str) -> Option<u64> {
 }
 
 pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
-    create_dir(path)
-        .map(drop)
-        .map_err(|e| format!("create directory '{path}': {e}"))
+    fs::create_dir_all(path).map_err(|e| format!("create directory '{path}': {e}"))
 }
 
 /// How long [`lock_data_dir`] waits out a held lock: a forked child holds its
@@ -227,10 +224,10 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
         }
     }
     let root = relations_dir(base_dir);
-    let create_err = |e: std::io::Error| format!("create '{root}': {e}");
-    if create_dir(&root).map_err(create_err)? {
-        fsync_dir(base_dir).map_err(create_err)?;
-    }
+    ensure_dir(&root)?;
+    // `LOCK` and `_relations` are entries of `base_dir`. Every boot, since a
+    // boot killed before this fsync left them created and unsynced.
+    fsync_dir(base_dir).map_err(|e| format!("fsync '{base_dir}': {e}"))?;
     Ok(DirLock { _file: file })
 }
 

@@ -73,8 +73,12 @@ fn bind_tcp(addr: SocketAddr) -> Result<(OwnedFd, SocketAddr), String> {
     let fd = listener.as_raw_fd();
     // Both are inherited by every accepted socket. Keepalive lets the kernel
     // reap a half-open peer that would otherwise park its recv forever.
-    set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    for (level, opt) in [
+        (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+    ] {
+        set_sockopt_int(fd, level, opt, 1).map_err(|e| format!("failed to configure the TLS listener: {e}"))?;
+    }
     // A negative backlog re-listens at `net.core.somaxconn`.
     if unsafe { libc::listen(fd, -1) } < 0 {
         return Err(format!(

@@ -396,3 +396,15 @@ fn a_heap_row_that_fits_only_a_fresh_part_moves_to_it() {
         );
     }
 }
+
+/// A trim frees the pages past the part, in a mapping every worker shares.
+#[test]
+fn trim_returns_the_pages_past_a_part() {
+    let mut m = super::fixtures::meshes(1, 2 * RESIDENT_SLACK_BYTES).pop().unwrap();
+    let resident = BLOCKS_AT + RESIDENT_SLACK_BYTES + 2 * PAGE_BYTES;
+    unsafe { m.outbox(0).add(resident - 1).write(7) };
+    m.resident[0] = resident;
+    m.trim(BLOCKS_AT);
+    assert_eq!(unsafe { m.outbox(0).add(resident - 1).read() }, 0);
+    assert_eq!(m.resident[0], BLOCKS_AT);
+}

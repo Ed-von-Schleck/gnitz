@@ -209,7 +209,7 @@ impl ClientConn {
     /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which
     /// `close` would not. Never closes the fd; a peer already gone is not an error.
     pub(crate) fn shutdown(&self) {
-        let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) });
+        unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) };
     }
 
     pub(crate) fn is_gone(&self) -> bool {

@@ -81,7 +81,7 @@ impl Loopback {
         let cfg = Arc::new(cfg);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         if let Some(sz) = rcvbuf {
-            set_sockopt_int(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, sz);
+            set_sockopt_int(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, sz).unwrap();
         }
         let port = listener.local_addr().unwrap().port();
         let thread = std::thread::spawn(move || {
@@ -192,7 +192,7 @@ fn flush_can_empty_the_queue_with_ciphertext_still_pending() {
         assert_eq!(read_frame(&mut end), expect);
     });
     let mut t = lb.connect();
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024).unwrap();
     t.enqueue(frame);
     t.flush().unwrap();
     assert_eq!(t.queued_bytes(), 0, "rustls took the whole frame");
@@ -217,7 +217,7 @@ fn a_frame_larger_than_the_send_buffer_leaves_its_tail_queued() {
         assert_eq!(read_frame(&mut end), b"after");
     });
     let mut t = lb.connect();
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024).unwrap();
     t.enqueue(big);
     t.flush().unwrap();
     assert!(t.queued_bytes() > 0, "the tail is queue state, not rustls's");

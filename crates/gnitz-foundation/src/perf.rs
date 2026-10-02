@@ -3,6 +3,10 @@
 //! voluntary context switches on the calling thread, and this process's
 //! resident set.
 
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+
 /// `perf_event_attr`'s version-0 layout; the kernel reads `size` bytes of it.
 #[repr(C)]
 #[derive(Default)]
@@ -34,7 +38,7 @@ const IOC_RESET: libc::c_ulong = 0x2403;
 
 /// An open hardware counter for the calling thread.
 pub struct Counter {
-    fd: libc::c_int,
+    fd: File,
     /// Whether kernel-mode instructions are counted; `perf_event_paranoid` can
     /// refuse them.
     pub counts_kernel: bool,
@@ -57,7 +61,7 @@ impl Counter {
             .or_else(|| Self::open_with(config, true).map(|fd| Counter { fd, counts_kernel: false }))
     }
 
-    fn open_with(config: u64, exclude_kernel: bool) -> Option<libc::c_int> {
+    fn open_with(config: u64, exclude_kernel: bool) -> Option<File> {
         let attr = PerfEventAttr {
             type_: PERF_TYPE_HARDWARE,
             size: std::mem::size_of::<PerfEventAttr>() as u32,
@@ -67,28 +71,22 @@ impl Counter {
         };
         // pid 0 = this thread, cpu -1 = any, no group, no flags.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const _, 0, -1, -1, 0) };
-        (fd >= 0).then_some(fd as libc::c_int)
+        // SAFETY: a descriptor the syscall just returned, owned by nothing else.
+        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd as libc::c_int) })
     }
 
     /// The events `f` counted on this thread.
     pub fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, u64) {
+        let fd = self.fd.as_raw_fd();
         unsafe {
-            libc::ioctl(self.fd, IOC_RESET, 0);
-            libc::ioctl(self.fd, IOC_ENABLE, 0);
+            libc::ioctl(fd, IOC_RESET, 0);
+            libc::ioctl(fd, IOC_ENABLE, 0);
         }
         let out = f();
+        unsafe { libc::ioctl(fd, IOC_DISABLE, 0) };
         let mut buf = [0u8; 8];
-        unsafe {
-            libc::ioctl(self.fd, IOC_DISABLE, 0);
-            libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
-        }
+        (&self.fd).read_exact(&mut buf).expect("read the perf counter");
         (out, u64::from_le_bytes(buf))
-    }
-}
-
-impl Drop for Counter {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
     }
 }
 

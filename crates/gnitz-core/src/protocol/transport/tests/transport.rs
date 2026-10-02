@@ -40,7 +40,7 @@ fn queue_survives_chunked_and_partial_writes() {
     // Far more slices than one chunk, through a 4 KiB send buffer: every
     // writev is clamped or cut short mid-frame, and the cursor resumes each time.
     let (mut t, peer) = transport_pair();
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096).unwrap();
     let n = 3000usize;
     let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("f{i}").repeat(i % 7 + 1).into_bytes()).collect();
     for f in &expected {
@@ -223,7 +223,7 @@ fn a_frame_is_delivered_before_eof_when_the_read_fills_the_window_exactly() {
     // one breath. The answering read is full — proving nothing — so the pass
     // reads again and sees the 0, with the frame already handed out.
     let (mut t, peer) = transport_pair();
-    set_sockopt_int(peer.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 256 * 1024);
+    set_sockopt_int(peer.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 256 * 1024).unwrap();
     let payload: Vec<u8> = vec![9u8; WINDOW_BYTES - 4];
     peer.send(&payload);
     drop(peer);

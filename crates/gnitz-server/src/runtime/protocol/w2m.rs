@@ -1,7 +1,8 @@
 //! W2M: the worker→master SPSC transport — one `MAP_SHARED` tail-chasing ring
 //! per worker, the worker's [`W2mWriter`], the master's [`W2mReceiver`], the
 //! futex park/wake protocol between them, and the anonymous shared mapping
-//! ([`create_region`]) they all live in.
+//! they all live in. [`create`] maps the rings and builds their ends: no end has
+//! a constructor of its own, so a ring has one writer and one reader.
 //!
 //! ## Layout
 //!
@@ -36,7 +37,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::WireMsg;
-use gnitz_foundation::posix_io;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 /// The request id every worker's boot verdict answers on.
@@ -472,19 +472,12 @@ fn wake_writer(park: &ParkWord, flags: u32) {
 
 /// A wake for one worker parked on its `sal_park`: the master's for a SAL group,
 /// a peer's for a completed exchange round.
+#[derive(Clone, Copy)]
 pub(crate) struct SalWake {
     park: &'static ParkWord,
 }
 
 impl SalWake {
-    /// # Safety
-    /// `ring` is a live W2M region initialized by `init_region`.
-    pub(crate) unsafe fn new(ring: *mut u8) -> Self {
-        SalWake {
-            park: &W2mRingHeader::from_raw(ring).sal_park,
-        }
-    }
-
     pub(crate) fn wake(&self) {
         if self.park.bump() & FLAG_SAL_PARKED != 0 {
             futex_wake_u32(futex_word(&self.park.cursor), 1, "SalWake::wake");
@@ -509,16 +502,71 @@ impl SalPark {
 // init / reserve / commit
 // ---------------------------------------------------------------------------
 
-/// One worker's ring region, shared with every forked child, initialized and
-/// never unmapped.
-pub(crate) fn create_region() -> std::io::Result<*mut u8> {
-    let base = posix_io::map_anon_shared(W2M_REGION_SIZE)?;
-    // An anonymous shared mapping is shmem-backed, so this follows
-    // `shmem_enabled` — see `madvise_hugepage`.
-    posix_io::madvise_hugepage(base, W2M_REGION_SIZE);
-    // SAFETY: a fresh mapping of exactly `W2M_REGION_SIZE` bytes, unshared.
-    unsafe { init_region(base, W2M_REGION_SIZE as u64) };
-    Ok(base)
+/// Map and initialize one `capacity`-byte ring, shared with every forked child
+/// and never unmapped, and build the three ends over it: its writer, its reader
+/// and the wake on its SAL park.
+fn ring(capacity: usize) -> std::io::Result<(W2mWriter, WorkerRing, SalWake)> {
+    let base = map_anon_shared(capacity)?;
+    // SAFETY: a fresh mapping of `capacity` bytes nothing else holds, initialized
+    // before any end reads its header.
+    unsafe {
+        // Before the first touch. Shared anonymous memory is shmem-backed, so the
+        // hint is the kernel's to honour under `shmem_enabled=advise`.
+        libc::madvise(base.cast(), capacity, libc::MADV_HUGEPAGE);
+        init_region(base, capacity as u64);
+        let hdr = W2mRingHeader::from_raw(base);
+        Ok((
+            W2mWriter {
+                cursor: Cell::new(RingCursor::producer(base)),
+            },
+            WorkerRing {
+                hdr,
+                in_flight: UnsafeCell::new(InFlightState::new(RingCursor::consumer(base))),
+            },
+            SalWake { park: &hdr.sal_park },
+        ))
+    }
+}
+
+/// One ring per capacity: every ring's writer, the reader over all of them, and
+/// every ring's wake, in ring order.
+fn rings(capacities: impl IntoIterator<Item = usize>) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver, Vec<SalWake>)> {
+    let (mut writers, mut readers, mut wakes) = (Vec::new(), Vec::new(), Vec::new());
+    for capacity in capacities {
+        let (writer, reader, wake) = ring(capacity)?;
+        writers.push(writer);
+        readers.push(reader);
+        wakes.push(wake);
+    }
+    Ok((writers, W2mReceiver { rings: readers.into_boxed_slice() }, wakes))
+}
+
+/// One ring per worker: each worker's writer, the master's reader, and the wake
+/// for each worker.
+pub(crate) fn create(nw: usize) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver, Vec<SalWake>)> {
+    rings(std::iter::repeat_n(W2M_REGION_SIZE, nw))
+}
+
+/// An anonymous read-write mapping shared with every `fork()`ed child.
+/// `MAP_NORESERVE`: its pages are charged as they are touched, so under
+/// heuristic overcommit a mapping sized far above its occupancy is not refused
+/// for its size.
+fn map_anon_shared(size: usize) -> std::io::Result<*mut u8> {
+    // SAFETY: a fresh mapping at an address the kernel picks.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ptr.cast())
 }
 
 /// Zero the header, seat both cursors at the start of the data area and record
@@ -682,16 +730,6 @@ pub struct W2mWriter {
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
-    /// Capacity and cursor come from the header [`init_region`] wrote, so this
-    /// ring — not a global — is what [`try_reserve`] bounds a message against.
-    pub fn new(region_ptr: *mut u8) -> Self {
-        W2mWriter {
-            // SAFETY: every W2M region is initialized before the fork that
-            // hands it to a worker.
-            cursor: Cell::new(unsafe { RingCursor::producer(region_ptr) }),
-        }
-    }
-
     /// This ring's SAL park.
     pub(crate) fn sal_park(&self) -> SalPark {
         SalPark {
@@ -951,22 +989,6 @@ pub struct W2mReceiver {
 }
 
 impl W2mReceiver {
-    pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
-        let rings = region_ptrs
-            .into_iter()
-            .map(|p| {
-                // SAFETY: every W2M region is initialized before a receiver is
-                // built over it.
-                let (hdr, read) = unsafe { (W2mRingHeader::from_raw(p), RingCursor::consumer(p)) };
-                WorkerRing {
-                    hdr,
-                    in_flight: UnsafeCell::new(InFlightState::new(read)),
-                }
-            })
-            .collect();
-        W2mReceiver { rings }
-    }
-
     /// Take a slot from the ring without freeing its space. `release_cursor`
     /// advances only when the returned `W2mSlot` is dropped, which is what tells
     /// the writer the bytes are reusable.

@@ -164,3 +164,31 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     assert_eq!(held(&engine, k), (own, net), "keyed: this rank's share");
     engine.close();
 }
+
+// -- The descriptor limit ---------------------------------------------------
+
+#[test]
+fn the_fd_limit_is_raised_to_the_requested_soft_ceiling() {
+    use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
+
+    let soft = || {
+        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+        rl
+    };
+    // A child, since the soft limit is process-wide.
+    let pid = unsafe {
+        fork_child(|| {
+            let mut rl = soft();
+            rl.rlim_cur = 64;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &rl), 0);
+            raise_fd_limit(32);
+            assert_eq!(soft().rlim_cur, 64);
+            raise_fd_limit(128);
+            assert_eq!(soft().rlim_cur, 128.min(rl.rlim_max));
+            raise_fd_limit(u64::MAX);
+            assert_eq!(soft().rlim_cur, rl.rlim_max);
+        })
+    };
+    unsafe { assert_child_exited_ok(pid) };
+}

@@ -30,7 +30,7 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, Arc<Schema>) {
 /// deadlock but is a test artifact.
 fn set_small_bufs(fd: RawFd) {
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        set_sockopt_int(fd, libc::SOL_SOCKET, opt, 128 * 1024);
+        set_sockopt_int(fd, libc::SOL_SOCKET, opt, 128 * 1024).unwrap();
     }
 }
 

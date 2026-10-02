@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::*;
 pub(super) use crate::runtime::test_support::within;
+use crate::runtime::w2m::fixtures::test_rings;
 use crate::runtime::w2m::W2mWriter;
 
 /// A reactor with no W2M rings, for the tests that route no worker traffic.
@@ -18,7 +19,7 @@ pub(super) fn make_reactor() -> Reactor {
 
 /// [`make_reactor`] built with `limits`.
 pub(crate) fn make_reactor_with(limits: Limits) -> Reactor {
-    Reactor::new(16, limits, W2mReceiver::new(vec![])).expect("reactor")
+    Reactor::new(16, limits, test_rings([]).1).expect("reactor")
 }
 
 /// A test reactor reading the rings `w2m` covers.
@@ -54,22 +55,17 @@ impl Reactor {
 
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
-    let ptrs: Vec<*mut u8> = (0..n)
-        .map(|_| crate::runtime::w2m::fixtures::test_ring(64 * 1024))
-        .collect();
-    let writers = ptrs.iter().map(|&p| W2mWriter::new(p)).collect();
-    let r = make_reactor_over(W2mReceiver::new(ptrs));
-    (r, writers)
+    let (writers, receiver, _) = test_rings(vec![64 * 1024; n]);
+    (make_reactor_over(receiver), writers)
 }
 
 /// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
 /// slot.
 pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
-    let ptr = crate::runtime::w2m::fixtures::test_ring(256 * 1024);
+    let (writers, receiver, _) = test_rings([256 * 1024]);
     let text = vec![0x42u8; pad];
     let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
-    W2mWriter::new(ptr).send_msg(1, &msg);
-    let receiver = W2mReceiver::new(vec![ptr]);
+    writers[0].send_msg(1, &msg);
     let slot = receiver.try_read_slot(0).expect("a frame");
     (receiver, slot)
 }
@@ -140,7 +136,7 @@ pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Reactor, Rc<C
     let (conn, partner) = client_pair(&r);
     if let Some(bytes) = sndbuf {
         for (fd, opt) in [(conn.fd(), libc::SO_SNDBUF), (partner.as_raw_fd(), libc::SO_RCVBUF)] {
-            gnitz_foundation::posix_io::set_sockopt_int(fd, libc::SOL_SOCKET, opt, bytes);
+            gnitz_foundation::posix_io::set_sockopt_int(fd, libc::SOL_SOCKET, opt, bytes).unwrap();
         }
     }
     (r, conn, partner)

@@ -34,7 +34,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     let mut s = Session::connect(target).unwrap();
     // Small socket buffers so the outbound queue is drained across several
     // steps rather than in one writev.
-    set_sockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
+    set_sockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024).unwrap();
     let all = ReadSpec::all_rows(ReadBound::None);
     let sent_before = s.requests_sent();
     let (n, per) = (40u64, 5_000u64);

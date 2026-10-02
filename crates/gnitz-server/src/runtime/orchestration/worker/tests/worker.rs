@@ -30,14 +30,14 @@ fn worker_over(
     ring_bytes: usize,
     sal_bytes: usize,
 ) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
-    let ring = w2m::fixtures::test_ring(ring_bytes);
-    let sal = TestLog::with_rings(sal_bytes, vec![ring], 1);
+    let (mut writers, receiver, wakes) = w2m::fixtures::test_rings([ring_bytes]);
+    let sal = TestLog::with_wakes(sal_bytes, wakes, 1);
     let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
         .pop()
         .unwrap();
-    let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), W2mWriter::new(ring), mesh);
+    let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), writers.pop().unwrap(), mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
-    (wp, sal, W2mReceiver::new(vec![ring]))
+    (wp, sal, receiver)
 }
 
 /// The route of request `request_id`, written in cut `cut`.

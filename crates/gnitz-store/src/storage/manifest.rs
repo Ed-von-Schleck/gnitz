@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 
-use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
 use gnitz_zset::repr::StorageError;
@@ -204,6 +203,11 @@ pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, St
     Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
 }
 
+/// `fsync` `dir`, making its entries durable.
+pub(crate) fn fsync_dir(dir: &str) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
 /// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest. Does NOT
 /// fdatasync or rename.
 pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<(), StorageError> {
@@ -238,7 +242,7 @@ pub(crate) fn retire_store(store_dir: &str) -> Result<(), StorageError> {
 /// Make `dst_dir` a durable hard-linked copy of the published store at `src_dir`.
 pub(crate) fn link_store(src_dir: &str, dst_dir: &str) -> Result<(), StorageError> {
     let m = read(src_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
-    create_dir(dst_dir)?;
+    fs::create_dir_all(dst_dir)?;
     for e in &m.shards.entries {
         fs::hard_link(shard_path(src_dir, e.seq), shard_path(dst_dir, e.seq))?;
     }

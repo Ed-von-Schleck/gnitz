@@ -1,5 +1,5 @@
 //! The exchange mesh: workers trade a round's partitions directly through one
-//! anonymous shared mapping. A round is one or more parts, and each part is one
+//! shared memfd mapping. A round is one or more parts, and each part is one
 //! arrival per worker. Every worker runs the same parts in the same order, so a
 //! part is complete once the cluster-wide `arrivals` count reaches
 //! `(part + 1) * W`. Each worker has two outboxes, alternating by part, so it
@@ -8,7 +8,6 @@
 //!
 //! ```text
 //! [0, 8)                         arrivals: AtomicU64 — parts published since boot
-//! [8, 16)                        outbox_bytes: u64 — fixed when the region is mapped
 //! [HEADER_BYTES + (2w + p) * outbox_bytes, +outbox_bytes)   worker w's outbox p
 //!   outbox: [Head, padded to BLOCKS_AT][blocks, 8-aligned]
 //! ```
@@ -17,6 +16,8 @@
 //! schema, which every worker already holds from its own partition; an empty
 //! [`Span`] sends none. The [`Head`] names the view, and is the divergence check.
 
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::sal::MAX_WORKERS;
@@ -35,7 +36,7 @@ const _: () = assert!(
 
 const PAGE_BYTES: usize = 4096;
 
-/// The page holding `arrivals` and the outbox size; the outboxes start past it.
+/// The page holding `arrivals`; the outboxes start past it.
 const HEADER_BYTES: usize = PAGE_BYTES;
 
 /// Where an outbox's blocks start: past its [`Head`].
@@ -59,13 +60,49 @@ pub(crate) fn outbox_bytes() -> usize {
     size
 }
 
-/// The mesh region for `nw` workers' outboxes of `outbox_bytes` each, zeroed but
-/// for the size it records, shared with every forked child and never unmapped.
-pub(crate) fn create_region(nw: usize, outbox_bytes: usize) -> std::io::Result<*mut u8> {
-    let base = posix_io::map_anon_shared(HEADER_BYTES + 2 * nw * outbox_bytes)?;
-    // SAFETY: the mapping is page-aligned and its first page is the header.
-    unsafe { base.add(8).cast::<u64>().write(outbox_bytes as u64) };
-    Ok(base)
+/// Map the mesh for `wakes.len()` workers' outboxes of `outbox_bytes` each, and
+/// build every worker's view of it. Zeroed, shared with every forked child and
+/// never unmapped. A memfd, so [`Mesh::trim`] can return pages by file offset.
+pub(crate) fn create(outbox_bytes: usize, wakes: &[SalWake]) -> std::io::Result<Vec<Mesh>> {
+    let nw = wakes.len();
+    assert!(nw <= MAX_WORKERS, "{nw} workers");
+    let len = HEADER_BYTES + 2 * nw * outbox_bytes;
+    // SAFETY: the name is a NUL-terminated literal.
+    let fd = unsafe { libc::memfd_create(c"gnitz-mesh".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor nothing else owns. Leaked with the mapping.
+    let file: &'static File = Box::leak(Box::new(unsafe { File::from_raw_fd(fd) }));
+    file.set_len(len as u64)?;
+    // SAFETY: a fresh mapping of the whole `len`-byte file.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((0..nw)
+        .map(|rank| Mesh {
+            base: base.cast(),
+            file,
+            rank,
+            outbox_bytes,
+            part: 0,
+            open: None,
+            wakes: wakes.to_vec(),
+            routed: Vec::new(),
+            resident: [0; 2],
+            drained: false,
+        })
+        .collect())
 }
 
 /// Bytes `[at, at + len)` of an outbox; `len == 0` names no block.
@@ -98,6 +135,8 @@ struct Head {
 
 pub(crate) struct Mesh {
     base: *mut u8,
+    /// The memfd behind `base`.
+    file: &'static File,
     rank: usize,
     outbox_bytes: usize,
     /// Parts gathered since boot — identical on every worker; its parity picks
@@ -144,28 +183,6 @@ struct Cursor {
 }
 
 impl Mesh {
-    /// Worker `rank`'s view of the mesh among `wakes.len()` workers.
-    ///
-    /// # Safety
-    /// `base` is a live region [`create_region`] mapped for `wakes.len()` workers,
-    /// shared by every one of them.
-    pub(crate) unsafe fn new(base: *mut u8, rank: usize, wakes: Vec<SalWake>) -> Self {
-        let nw = wakes.len();
-        assert!(rank < nw && nw <= MAX_WORKERS, "rank {rank} of {nw} workers");
-        Mesh {
-            base,
-            rank,
-            // SAFETY: `create_region` wrote it before any worker was forked.
-            outbox_bytes: unsafe { base.add(8).cast::<u64>().read() } as usize,
-            part: 0,
-            open: None,
-            wakes,
-            routed: Vec::new(),
-            resident: [0; 2],
-            drained: false,
-        }
-    }
-
     fn nw(&self) -> usize {
         self.wakes.len()
     }
@@ -311,9 +328,17 @@ impl Mesh {
         let p = self.parity();
         let end = end.next_multiple_of(PAGE_BYTES);
         if self.resident[p] > end + RESIDENT_SLACK_BYTES {
-            // SAFETY: `[end, resident)` lies inside this worker's own outbox, and
-            // every peer is done with what it held.
-            unsafe { posix_io::madvise_remove(self.outbox(self.rank).add(end), self.resident[p] - end) };
+            let at = HEADER_BYTES + (2 * self.rank + p) * self.outbox_bytes + end;
+            // `[end, resident)` of this worker's own outbox, which every peer is done
+            // with. Best-effort: a refusal only leaves the pages resident.
+            let _ = posix_io::retry_eintr(|| unsafe {
+                libc::fallocate(
+                    self.file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    at as libc::off_t,
+                    (self.resident[p] - end) as libc::off_t,
+                )
+            });
             self.resident[p] = end;
         }
         self.resident[p] = self.resident[p].max(end);

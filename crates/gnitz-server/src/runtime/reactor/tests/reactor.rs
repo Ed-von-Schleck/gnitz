@@ -160,26 +160,24 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
 /// child answers on ring 0, waits until the reactor parks, then answers on ring 1.
 #[test]
 fn a_publish_on_a_later_ring_wakes_the_reactor() {
-    use crate::runtime::w2m::fixtures::{master_parked, test_ring};
-    use crate::runtime::w2m::W2mWriter;
+    use crate::runtime::w2m::fixtures::{master_parked, test_rings};
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let r0 = test_ring(64 * 1024);
-    let r1 = test_ring(64 * 1024);
+    let (writers, receiver, _) = test_rings([64 * 1024; 2]);
 
     let child = || {
-        W2mWriter::new(r0).send_ack(1);
+        writers[0].send_ack(1);
         let deadline = Instant::now() + TIMEOUT;
-        while !unsafe { master_parked(r1) } {
+        while !master_parked(&receiver, 1) {
             assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
             std::thread::yield_now();
         }
-        W2mWriter::new(r1).send_ack(1);
+        writers[1].send_ack(1);
     };
     let pid = unsafe { fork_child(child) };
 
-    let r = make_reactor_over(W2mReceiver::new(vec![r0, r1]));
+    let r = make_reactor_over(receiver);
     // Request id 1 is a fresh reactor's first.
     let lease = r.lease_acks(WorkerSet::ALL);
     let timer = r.sleep(TIMEOUT);

@@ -8,10 +8,11 @@
 //! column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
 //! shard PK-probe filter (`shard_filter`), the shard-image encoder and writer
 //! (`shard_file`), the shard-format constants (`layout`), and the guard-routed
-//! shard merge a compaction runs (`compact`), and the bounded external sort of
-//! key records (`spill`). The low-level WAL-block framer
-//! lives in `gnitz_wire::wal` (the one definition client and engine share). The
-//! row-at-a-time system-table writer over a batch is `batch_builder`.
+//! shard merge a compaction runs (`compact`), the bounded external sort of
+//! key records (`spill`), and the read-only file mapping (`mmap`). The low-level
+//! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
+//! engine share). The row-at-a-time system-table writer over a batch is
+//! `batch_builder`.
 //!
 //! The shard *image* has one owner: `shard_file` encodes it, `shard_reader`
 //! mmaps and validates it, and `layout` holds the format rules both call.
@@ -34,6 +35,7 @@ mod error;
 mod layout;
 mod loser_tree;
 mod merge;
+mod mmap;
 mod read_cursor;
 mod run;
 mod scatter;

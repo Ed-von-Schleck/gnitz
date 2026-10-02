@@ -8,11 +8,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use gnitz_foundation::posix_io::fsync_dir;
-
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
-use crate::storage::{flush_barrier, link_store, retire_store, RecoverySource, StoreBudgets, Table};
+use crate::storage::{flush_barrier, fsync_dir, link_store, retire_store, RecoverySource, StoreBudgets, Table};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};

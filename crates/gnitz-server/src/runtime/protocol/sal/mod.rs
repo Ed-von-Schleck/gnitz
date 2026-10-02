@@ -14,8 +14,11 @@ pub(crate) mod zone;
 pub(crate) use request::{Apply, Read, SalRequest};
 
 use std::cell::Cell;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
@@ -375,9 +378,9 @@ const _: () = assert!(
 /// `SAL_MMAP_SIZE`, or `GNITZ_SAL_BYTES` clamped into
 /// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it. The
 /// override exists because each server `fallocate`s its whole SAL at startup, so
-/// dozens of test servers sharing a tmpfs would exhaust it. Called once, by the
-/// boot that maps the SAL; every consumer carries the length beside the pointer.
-pub(in crate::runtime) fn sal_mmap_size() -> usize {
+/// dozens of test servers sharing a tmpfs would exhaust it. Called once, by
+/// [`SalLog::open`].
+fn sal_mmap_size() -> usize {
     let asked = gnitz_foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
     let size = asked.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE);
     if size != asked {
@@ -555,6 +558,22 @@ impl EpochGate {
 /// spare word — the one in force before the last write began.
 const ANCHOR_RECORD: usize = 24;
 
+/// Ask btrfs to overwrite the file in place (`FS_NOCOW_FL`): a copy-on-write
+/// rewrite needs new blocks, so the reservation alone would not keep a store
+/// from failing for want of space. Btrfs honours the flag on an empty file
+/// only. Best-effort: other filesystems refuse the ioctl.
+fn set_nocow(fd: libc::c_int) {
+    const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: both ioctls read or write one `int` through the pointer.
+    unsafe {
+        if libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) == 0 && flags & FS_NOCOW_FL == 0 {
+            flags |= FS_NOCOW_FL;
+            libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &flags);
+        }
+    }
+}
+
 /// The stores of an anchor write from the word `in_force` to `word`, as
 /// `(byte offset, value)` in the order they are made. A kill between any two
 /// leaves a record [`SalLog::anchor_word`] resolves to one of the two words: the
@@ -568,25 +587,70 @@ fn anchor_stores(in_force: u64, word: u64) -> [(usize, u64); 3] {
     ]
 }
 
-/// The SAL mapping, as anything that reads it sees it.
+/// The opened SAL: its mapping and the file behind it.
 ///
-/// A non-owning view: the mapping is created in `bootstrap` and inherited across
-/// the `fork()`, so this has no `Drop`.
+/// Mapped once, by [`SalLog::open`], and inherited across the `fork()`; it is
+/// never unmapped, so this is `Copy` and has no `Drop`.
 #[derive(Clone, Copy)]
 pub(crate) struct SalLog {
     ring: *mut u8,
     ring_len: usize,
+    /// What the writer syncs.
+    file: &'static File,
 }
 
 impl SalLog {
-    /// # Safety
-    /// `ptr` must be a valid mmap pointer of `len > ANCHOR_BYTES` bytes, live for
-    /// as long as this view and everything read through it.
-    pub(crate) unsafe fn new(ptr: *const u8, len: usize) -> Self {
-        SalLog {
-            ring: ptr.add(ANCHOR_BYTES).cast_mut(),
-            ring_len: len - ANCHOR_BYTES,
+    /// Open `data_dir`'s SAL, creating it on a first boot. A fresh file reads
+    /// all-zero, the empty log recovery expects. The file is leaked: the writer
+    /// and the reactor's fsync SQEs name it for the process's life.
+    pub(crate) fn open(data_dir: &str) -> Result<SalLog, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .open(format!("{data_dir}/wal.sal"))
+            .map_err(|e| format!("failed to open SAL file: {e}"))?;
+        let len = sal_mmap_size();
+        let log =
+            Self::map(Box::leak(Box::new(file)), len).map_err(|e| format!("failed to map SAL ({len} bytes): {e}"))?;
+        // The file's name in `data_dir`, before any group written to it is ACKed.
+        File::open(data_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("failed to fsync '{data_dir}': {e}"))?;
+        Ok(log)
+    }
+
+    /// Map `len` bytes of `file` shared and writable. The file is extended to
+    /// `len` first, since a store past its end raises `SIGBUS`, and its blocks
+    /// are reserved, so a store cannot fail for want of disk space. A file
+    /// already longer keeps its length and contents.
+    fn map(file: &'static File, len: usize) -> io::Result<SalLog> {
+        assert!(len > ANCHOR_BYTES, "the SAL holds a ring behind its anchor page");
+        let fd = file.as_raw_fd();
+        set_nocow(fd);
+        posix_io::retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) })?;
+        // SAFETY: a fresh mapping of a file at least `len` bytes long.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
         }
+        Ok(SalLog {
+            // SAFETY: `len > ANCHOR_BYTES`.
+            ring: unsafe { ptr.cast::<u8>().add(ANCHOR_BYTES) },
+            ring_len: len - ANCHOR_BYTES,
+            file,
+        })
     }
 
     fn anchor_record(&self) -> *mut [u8; ANCHOR_RECORD] {
@@ -743,7 +807,6 @@ struct GroupHead {
 
 pub(crate) struct SalWriter {
     log: SalLog,
-    fd: BorrowedFd<'static>,
     write_cursor: Cell<u64>,
     epoch: Cell<u32>,
     /// The anchored synced offset of the live epoch.
@@ -767,7 +830,7 @@ pub(crate) struct SalWriter {
 impl SalWriter {
     /// Starts at epoch 0, which [`Self::write_slots`] refuses: nothing can be
     /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
-    pub(crate) fn new(log: SalLog, fd: BorrowedFd<'static>, wakes: Vec<SalWake>) -> Self {
+    pub(crate) fn new(log: SalLog, wakes: Vec<SalWake>) -> Self {
         assert!(
             wakes.len() <= MAX_WORKERS,
             "a SAL group cannot address more than MAX_WORKERS workers"
@@ -780,7 +843,6 @@ impl SalWriter {
             gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (log.ring_len as u64 * 3) >> 2);
         SalWriter {
             log,
-            fd,
             write_cursor: Cell::new(0),
             epoch: Cell::new(0),
             synced: Cell::new(0),
@@ -1010,7 +1072,7 @@ impl SalWriter {
         // Emptied only once the new epoch is durable: a kill before that must
         // leave the old epoch's tail whole.
         self.write_anchor(epoch, 0);
-        if let Err(e) = posix_io::retry_eintr(|| unsafe { libc::fdatasync(self.fd.as_raw_fd()) }) {
+        if let Err(e) = self.log.file.sync_data() {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");
         }
         unsafe { write_end_prefix(self.log.ring, 0) };
@@ -1090,7 +1152,7 @@ impl<'a> SalExcl<'a> {
     pub(crate) fn sync(&self, reactor: &Reactor, op: &'static str) -> impl Future<Output = ()> + 'a {
         let w = self.writer;
         let (epoch, through) = (w.epoch.get(), w.write_cursor.get());
-        let done = reactor.fsync(w.fd);
+        let done = reactor.fsync(w.log.file.as_fd());
         async move {
             let rc = done.await;
             if rc < 0 {

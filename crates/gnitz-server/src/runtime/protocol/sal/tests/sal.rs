@@ -6,12 +6,12 @@ use super::{
     KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
-use crate::runtime::w2m::fixtures::sal_wake_seq;
-use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+use crate::runtime::w2m::fixtures::{sal_wake_seq, test_rings};
 use crate::runtime::wire::{WireMsg, WireSchema};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
 use gnitz_wire::WireStatus;
+use std::fs::File;
 use std::sync::atomic::Ordering;
 
 /// A control-only group addressed to `target_id`.
@@ -290,12 +290,12 @@ fn a_reader_leaves_its_epoch_on_stepping_past_a_flush() {
 /// group it wakes to back over its ring.
 #[test]
 fn sal_cross_process_checkpoint() {
-    let log = TestLog::new(1 << 20, 1, 1);
-    let ring = log.ring(0);
+    let (mut writers, receiver, wakes) = test_rings([4096]);
+    let writer = writers.pop().unwrap();
+    let log = TestLog::with_wakes(1 << 20, wakes, 1);
 
     let child = || {
         let reader = SalReader::new(log.log(), 0, 1);
-        let writer = W2mWriter::new(ring);
         for _ in 0..2 {
             let slot = loop {
                 writer.sal_park().park(|| reader.is_empty());
@@ -318,7 +318,6 @@ fn sal_cross_process_checkpoint() {
 
     let pid = unsafe { fork_child(child) };
 
-    let receiver = W2mReceiver::new(vec![ring]);
     let report = || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -429,7 +428,7 @@ fn every_worker_numbers_a_cut_alike() {
 #[test]
 fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     let log = TestLog::new(1 << 20, 4, 1);
-    let seqs = || (0..4).map(|w| unsafe { sal_wake_seq(log.ring(w)) }).collect::<Vec<_>>();
+    let seqs = || (0..4).map(|w| sal_wake_seq(log.wake(w))).collect::<Vec<_>>();
     let leased = |set| DirectGroup {
         targets: GroupTargets {
             set,
@@ -559,8 +558,7 @@ fn a_header_only_verifies_at_the_offset_it_was_published_at() {
 fn a_probe_never_reads_past_the_end_of_the_mapping() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 8]]);
-    let read_in =
-        |len: usize| unsafe { SalLog::new(log.anchor_ptr(), ANCHOR_BYTES + len) }.read_at(0, EpochGate::Walk(1));
+    let read_in = |len: usize| SalLog { ring_len: len, ..log.log() }.read_at(0, EpochGate::Walk(1));
 
     let header = PREFIX_BYTES + group_header_size(1);
     assert!(
@@ -866,4 +864,19 @@ fn sal_read_bench() {
             eprintln!("sal_read_bench NW={nw:<2} {case}: {} instructions/group", n / GROUPS);
         }
     }
+}
+
+/// The file reaches `len` before the mapping exists, so the store lands on a
+/// real page instead of raising SIGBUS; a remap keeps what the file holds, and a
+/// smaller one does not shrink it.
+#[test]
+fn mapping_extends_the_file_and_never_shrinks_it() {
+    let file: &'static File = Box::leak(Box::new(tempfile::tempfile().unwrap()));
+    let len = || file.metadata().unwrap().len();
+    let log = SalLog::map(file, ANCHOR_BYTES + 8192).unwrap();
+    assert_eq!(len(), (ANCHOR_BYTES + 8192) as u64);
+    unsafe { log.ring.add(4096).write(42) };
+    let log = SalLog::map(file, ANCHOR_BYTES + 4097).unwrap();
+    assert_eq!(len(), (ANCHOR_BYTES + 8192) as u64);
+    assert_eq!(unsafe { log.ring.add(4096).read() }, 42);
 }

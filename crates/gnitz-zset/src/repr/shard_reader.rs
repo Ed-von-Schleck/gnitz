@@ -11,13 +11,13 @@ use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_
 use super::batch_pool::PooledBuf;
 use super::layout::*;
 use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
+use super::mmap::Mmap;
 use super::scatter::DecodedColumns;
 use super::shard_filter;
 use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
-use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::read_u64_le;
 
 use StorageError::Corrupt;

@@ -135,3 +135,14 @@ fn read_roundtrips_a_prepared_manifest() {
         assert_eq!(read(d).unwrap(), Some(m), "count={count}");
     }
 }
+
+#[test]
+fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
+    let root = tempfile::tempdir().unwrap();
+    fsync_dir(root.path().to_str().unwrap()).unwrap();
+    let missing = root.path().join("absent");
+    assert_eq!(
+        fsync_dir(missing.to_str().unwrap()).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}

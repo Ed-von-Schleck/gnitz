@@ -9,9 +9,10 @@
 //! [`Cut`], and [`Table::seal`] moves the cut past it.
 
 use std::cell::Cell;
+use std::fs;
+use std::io;
 use std::rc::Rc;
 
-use gnitz_foundation::posix_io::create_dir;
 use gnitz_wire::PkKeys;
 
 use super::manifest::Manifest;
@@ -165,8 +166,18 @@ impl Table {
         budgets: StoreBudgets,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
-        // flush.
-        let created = create_dir(dir)?;
+        // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
+        // read as freshly created skips its manifest, and the shard index then
+        // unlinks every shard in the directory.
+        let created = match fs::create_dir(dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir)?;
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e.into()),
+        };
 
         let rederived = matches!(recovery_source, RecoverySource::Rederive { .. });
         let loaded = match recovery_source {

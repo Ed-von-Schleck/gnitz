@@ -1,8 +1,6 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{
-    Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES,
-};
+use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_RECORD, PREFIX_BYTES};
 use crate::runtime::wire::WireSchema;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
@@ -249,7 +247,10 @@ fn a_stop_past_the_mapping_below_synced_fails() {
     let (first, _) = log.zone(&[11]);
     let (_, second) = log.zone(&[21]);
     // A mapping that ends inside the second zone's group.
-    let shrunk = || unsafe { SalLog::new(log.anchor_ptr(), ANCHOR_BYTES + second[0] as usize + 64) };
+    let shrunk = || SalLog {
+        ring_len: second[0] as usize + 64,
+        ..log.log()
+    };
     assert_eq!(committed(shrunk()).unwrap(), [first]);
 
     log.synced_through(log.cursor());

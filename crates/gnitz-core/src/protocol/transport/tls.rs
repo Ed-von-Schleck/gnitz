@@ -169,7 +169,7 @@ pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<ClientTransport,
     sock.set_nodelay(true)?;
     // Bare SO_KEEPALIVE: a silently half-open connection is eventually reaped rather
     // than parking an untimed read forever.
-    set_sockopt_int(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_sockopt_int(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
     sock.set_nonblocking(true)?;
     let mut conn = ClientConnection::new(cfg, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tls: {e}")))?;

@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 
-use gnitz_foundation::posix_io::Mmap;
+use super::mmap::Mmap;
 use gnitz_wire::MAX_PK_BYTES;
 
 use super::batch::Batch;
