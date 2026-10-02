@@ -466,10 +466,7 @@ gnitz_wire::wire_enum! {
         /// Initial full-source scan feeding a newly created view: `target_id` =
         /// the source, `arg0` = the view.
         Backfill = 6,
-        /// Probe a relation's PK store or one of its secondary indexes for a
-        /// scattered/broadcast key list; `WireProbeMode` names what a matched
-        /// key is answered with, up to and including one projected column.
-        /// `arg1` = the keyspace, `arg0` = the mode's parameter.
+        /// Answer a [`gnitz_wire::Probe`] at a scattered or broadcast key list.
         HasPk = 7,
         /// CREATE UNIQUE INDEX pre-flight: stream the sorted key spans of the
         /// column list in `arg1` for the master's merge.

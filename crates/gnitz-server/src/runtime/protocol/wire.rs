@@ -45,10 +45,6 @@ impl WireSchema {
         }
     }
 
-    pub(crate) fn tid(&self) -> u64 {
-        self.tid
-    }
-
     /// `rest` addressed to this relation: its target id and schema block, with
     /// the caller's own header fields kept.
     pub(crate) fn frame<'a>(&'a self, rest: WireMsg<'a>) -> WireMsg<'a> {

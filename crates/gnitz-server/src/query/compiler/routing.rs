@@ -63,7 +63,7 @@ impl ViewMeta {
         };
         let placement = placement(&sources, rows, view);
 
-        let replicated = |tid: u64| sources[&tid].is_replicated();
+        let replicated = |tid: u64| sources[&tid].placement().is_replicated();
         let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key.as_deref()?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless the circuit also
@@ -170,7 +170,7 @@ fn placement(sources: &FxHashMap<u64, &Relation>, rows: RowHome, view: &SchemaDe
         return Placement::full_pk(view);
     }
     // Every worker computes the whole result from its own full copies.
-    if sources.values().all(|s| s.is_replicated()) {
+    if sources.values().all(|s| s.placement().is_replicated()) {
         return Placement::Replicated;
     }
     if sources.values().any(|s| !s.placement().is_key_routed()) {

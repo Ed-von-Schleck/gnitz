@@ -14,6 +14,8 @@ fn probes(key: u64, num_bits: u64) -> impl Iterator<Item = u64> {
 pub(crate) struct BloomFilter {
     bits: Vec<u8>,
     num_bits: u64,
+    /// Keys added, one per row, repeats counted.
+    added: usize,
 }
 
 impl BloomFilter {
@@ -28,14 +30,22 @@ impl BloomFilter {
         BloomFilter {
             bits: vec![0u8; num_bytes],
             num_bits: (num_bytes * 8) as u64,
+            added: 0,
         }
     }
 
     #[inline]
     pub(crate) fn add(&mut self, key: u64) {
+        self.added += 1;
         for pos in probes(key, self.num_bits) {
             self.bits[(pos >> 3) as usize] |= 1u8 << (pos & 7);
         }
+    }
+
+    /// More keys went in than the bits are sized for, and no more than half of
+    /// them are among the `live` rows the filter still answers for.
+    pub(crate) fn stale(&self, live: usize) -> bool {
+        self.added * BITS_PER_KEY > self.num_bits as usize && self.added >= 2 * live
     }
 
     #[inline]

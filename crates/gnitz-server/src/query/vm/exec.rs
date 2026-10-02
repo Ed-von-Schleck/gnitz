@@ -32,7 +32,6 @@ impl SourceReads<'_> {
         if self.unfed.contains(&source) {
             return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
         }
-        debug_assert!(delta.is_consolidated() && !delta.is_empty());
         Ok(relation.cursor_for_keys(delta, self.unticked.get(&source)))
     }
 

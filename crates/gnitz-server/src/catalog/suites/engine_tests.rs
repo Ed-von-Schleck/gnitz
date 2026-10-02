@@ -140,8 +140,8 @@ fn test_recover_checkpoint_gen_and_topology() {
         assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), 0);
         engine.record_topology(4).unwrap();
         assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), expected_topology);
-        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
-        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 1);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 2);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -157,18 +157,17 @@ fn test_boot_generation_advance_monotonic() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.record_topology(4).unwrap();
-        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
-        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 1);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 2);
         engine.close();
     }
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation(), 2);
         assert_eq!(engine.advance_durable_generation().unwrap(), 3);
-        assert_eq!(engine.registry.resume_generation(), 2);
+        assert_eq!(engine.resume_generation, 2);
         assert_eq!(engine.sequence_value(SEQ_ID_CHECKPOINT_GEN), Some(3));
-        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 4);
-        assert_eq!(engine.registry.resume_generation(), 4);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 4);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -432,7 +431,6 @@ fn test_master_holds_no_user_store() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    assert!(!engine.registry.residency().owns_stores());
     let entry = engine.registry.relation_or_err(tid).unwrap();
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.cursor())).is_err(),

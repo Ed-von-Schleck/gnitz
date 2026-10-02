@@ -51,8 +51,8 @@ impl std::ops::Deref for TrimmedRun {
 
 pub(super) struct RunSet {
     runs: Vec<Rc<Batch>>,
-    /// PK bloom over every live run, built on the first probe: a set that is
-    /// never probed never hashes a row.
+    /// PK bloom over every key pushed since it was built — a superset of the
+    /// live runs' keys — built on the first probe.
     bloom: OnceCell<BloomFilter>,
     /// Heap budget: [`is_full`](Self::is_full) reports crossing it, and the
     /// bloom's key capacity is derived from it. What crossing it *means* — fold
@@ -172,8 +172,8 @@ impl RunSet {
             self.consolidate_all(schema)
         };
         self.runs.clear();
-        // Keep the bloom only while it holds exactly the survivors' keys.
-        if merged.len() != input_rows {
+        // A cancelled row's key stays in the filter as a false positive.
+        if self.bloom.get().is_some_and(|b| b.stale(merged.len())) {
             self.bloom.take();
         }
         self.bytes = 0;

@@ -7,8 +7,8 @@ use rustc_hash::FxHashSet;
 use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
 use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{low_bits_mask, BitIter, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
-use gnitz_wire::{ViewProps, MAX_COLUMNS};
 use gnitz_zset::schema::KeySpec;
 
 /// The name rules a catalog row must satisfy to be *stored*: non-empty
@@ -42,7 +42,7 @@ fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), 
     // plain projection prepends the k source PK columns. A fed view gets one
     // column less, since its delta store stamps a `_tick` key column ahead of
     // the view's own.
-    let fed = matches!(kind, RelationKind::View(ViewProps::Fed { .. }));
+    let fed = kind.has_delta_feed();
     let max = MAX_COLUMNS - usize::from(fed);
     if col_defs.len() > max {
         let why = if fed {
@@ -591,7 +591,7 @@ impl CatalogEngine {
             let Some(e) = self.registry.relation(src) else {
                 continue;
             };
-            if e.is_bounded() {
+            if e.kind().is_bounded() {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads '{}', which is a \
                      capacity-bounded view; views cannot be created over one",

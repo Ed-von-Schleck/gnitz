@@ -64,7 +64,7 @@ pub struct DiskUsage {
 
 impl DiskUsage {
     /// Shard bytes, each file counted once however many names it has.
-    pub fn shard_bytes(&self) -> u64 {
+    fn shard_bytes(&self) -> u64 {
         self.shards.values().map(|t| t.bytes).sum()
     }
 }

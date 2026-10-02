@@ -138,7 +138,7 @@ impl MasterDispatcher {
     /// checkpointed view and index is invalid until the next ephemeral round
     /// restamps it.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
-        self.cat().bump_checkpoint_generation()?;
+        self.cat().advance_durable_generation()?;
         self.flush(FlushRound::Base).await
     }
 
@@ -310,7 +310,7 @@ impl MasterDispatcher {
         let reached = cat.dag.dependent_closure(vec![tid]);
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
-            if cat.registry.relation(vid).is_some_and(Relation::has_delta_feed) {
+            if cat.registry.relation(vid).is_some_and(|r| r.kind().has_delta_feed()) {
                 map.insert(vid, round);
             }
         }

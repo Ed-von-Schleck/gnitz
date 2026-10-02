@@ -42,3 +42,19 @@ fn false_positive_rate() {
     // rate near 1%; the bound is loose enough to survive a hash change.
     assert!(fp(&bf) < 50, "FPR too high: {}/1000", fp(&bf));
 }
+
+/// A filter is stale once it has taken more keys than its bits are sized for
+/// and at most half of them are live.
+#[test]
+fn a_filter_is_stale_once_overfull_and_half_gone() {
+    let mut bf = BloomFilter::new(100);
+    let sized_for = bf.num_bits as usize / BITS_PER_KEY;
+    for i in 0..sized_for as u64 {
+        bf.add(key(i));
+    }
+    assert!(!bf.stale(0), "at its size");
+    bf.add(key(u64::MAX));
+    let added = sized_for + 1;
+    assert!(bf.stale(added / 2));
+    assert!(!bf.stale(added / 2 + 1), "more than half live");
+}

@@ -214,8 +214,9 @@ impl WorkerProcess {
                 let Some(batch) = batch else {
                     return Err("has_pk: a probe carries its keys".into());
                 };
-                let keyspace = gnitz_wire::ProbeKeyspace::from_arg1(hdr.arg1).map_err(|e| format!("has_pk: {e}"))?;
-                let result = self.handle_has_pk(target_id, batch, keyspace, hdr.flags.probe_mode, hdr.arg0 as usize)?;
+                let probe = gnitz_wire::Probe::from_wire(hdr.flags.probe_mode, hdr.arg0, hdr.arg1)
+                    .map_err(|e| format!("has_pk: {e}"))?;
+                let result = self.cat().registry.probe(target_id, probe, &batch)?;
                 self.send_reply(route, result);
                 Ok(())
             }
@@ -390,86 +391,6 @@ impl WorkerProcess {
             &mut producer,
         );
         Ok(())
-    }
-
-    /// Answer one HasPk probe over the keys that exist committed on this
-    /// worker; `mode` decides what a match is answered with, `keyspace` which
-    /// store is probed (a composite index is located by its exact list). Unique
-    /// and non-unique alike — the FK parent-delete check probes a child's FK
-    /// auto-index, which is never unique.
-    fn handle_has_pk(
-        &mut self,
-        target_id: u64,
-        batch: Batch,
-        keyspace: gnitz_wire::ProbeKeyspace,
-        mode: gnitz_wire::WireProbeMode,
-        mode_param: usize,
-    ) -> Result<Batch, gnitz_wire::WireFault> {
-        if let gnitz_wire::WireProbeMode::Project = mode {
-            // `arg1` names the own PK store here, so the column to project rides
-            // the per-mode parameter word instead.
-            if keyspace != gnitz_wire::ProbeKeyspace::OwnPk {
-                return Err("has_pk: a projecting probe reads the table's own PK store".into());
-            }
-            let ref_col = mode_param as u8;
-            let keys = gnitz_wire::PkKeys::from_sorted(batch.schema().pk_stride(), batch.pk_data().to_vec());
-            return Ok(self.cat().registry.gather_bytes(target_id, keys, ref_col)?);
-        }
-        // Grown on demand, not reserved at the probe count: the expected hit
-        // count on a fresh-key insert is zero, and `with_capacity` bypasses the
-        // batch arena above 2 MiB. For an index probe the schema is the INDEX
-        // table's, `(indexed_col, src_pk…)` — NOT the owner table's.
-        let mut result = Batch::empty_with_schema(batch.schema());
-        let gnitz_wire::ProbeKeyspace::Index(cols) = keyspace else {
-            let relation = self.cat().registry.relation(target_id);
-            for i in 0..batch.len() {
-                let pkb = batch.get_pk_bytes(i);
-                // `false` for an id this worker has not registered.
-                if relation.is_some_and(|r| r.has_pk(pkb)) {
-                    result.push_key_row(pkb, 1);
-                }
-            }
-            return Ok(result);
-        };
-        // One resolution of `(target_id, cols)`: the circuit carries the index
-        // table and the span width.
-        let ic = self
-            .cat()
-            .registry
-            .relation(target_id)
-            .and_then(|r| r.index_on(cols.as_slice()))
-            .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
-        // Index layout: PK = (indexed-key span, src_pk_cols). Any positive-weight
-        // match means the value is already in the index. `open_cursor` keeps a
-        // compaction Io/Corrupt failure from silently turning a present key into
-        // "absent".
-        let mut cursor = ic.cursor();
-        // Prefix-match the WHOLE indexed-value span: OPK puts the distinguishing
-        // bytes last, so a source-width prefix would match only the zero high
-        // bytes. Width off the circuit's own key spec, so no width crosses the
-        // process boundary.
-        let idx_key_size = ic.key_spec().key_size();
-        for i in 0..batch.len() {
-            let pkb = batch.get_pk_bytes(i);
-            let prefix = &pkb[..idx_key_size];
-            // `[span ‖ holder PK]` verbatim: an index entry holds the
-            // source PK at `idx_key_size`, so the caller splits it back out
-            // without decoding anything.
-            if let gnitz_wire::WireProbeMode::AllHolders = mode {
-                // Capped by the asking write's size; at least one, or an occupied
-                // span would answer "no holders".
-                cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
-                    result.push_key_row(c.current_pk_bytes(), 1);
-                });
-                continue;
-            }
-            if !cursor.seek_first_positive_with_prefix(prefix) {
-                continue;
-            }
-            let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
-            result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
-        }
-        Ok(result)
     }
 
     /// Run one DAG drive with the exchange context, returning its

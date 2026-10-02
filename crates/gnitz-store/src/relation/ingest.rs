@@ -2,7 +2,7 @@
 //! application, delta capture, and the flush / checkpoint table collection.
 
 use super::delta::delta_round_prefix;
-use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
+use super::{RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 
@@ -68,32 +68,22 @@ impl RelationRegistry {
     /// enforcement — what a caller that must forward the applied rows takes.
     pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, String> {
         self.ingest_at(id, batch, None, true)
-            .map(|b| b.expect("`needed` is set, so the effective batch comes back"))
+            .map(|b| b.expect("an echo was asked for"))
     }
 
-    /// Ingest a view's epoch output into its own store, and — where this process
-    /// serves the view's feed — a copy stamped with `round` into its delta store.
-    /// `round` is `None` for a backfill, which captures nothing; the batch comes
-    /// back only when `needed`.
-    ///
-    /// The capture belongs here rather than downstream: the store's fold drops
-    /// net-zero rows, and a round has to keep both sides of one.
-    pub fn ingest_view_delta(
+    /// [`Self::ingest`], captured as round `round` by the delta feed this process
+    /// serves for `id`; the batch as applied comes back iff `echo`.
+    pub fn ingest_at(
         &mut self,
-        view_id: u64,
+        id: u64,
         batch: Batch,
         round: Option<u64>,
-        needed: bool,
+        echo: bool,
     ) -> Result<Option<Batch>, String> {
-        self.ingest_at(view_id, batch, round, needed)
-    }
-
-    /// Resolve `id`, admit the batch's shape against the store's, and apply it.
-    fn ingest_at(&mut self, id: u64, batch: Batch, round: Option<u64>, needed: bool) -> Result<Option<Batch>, String> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
-        let want = entry.schema().num_payload_cols();
+        let want = entry.store.schema().num_payload_cols();
         if batch.num_payload_cols() != want {
             return Err(format!(
                 "batch for relation {id} carries {} payload columns, its schema has {}",
@@ -101,25 +91,10 @@ impl RelationRegistry {
                 want
             ));
         }
-        Self::ingest_into(entry, batch, round, needed)
-    }
-
-    /// Apply `batch` to one resolved relation: its PK rule, its index
-    /// projections, its own store and its delta capture.
-    ///
-    /// `#[inline]`: it returns a `Batch` by value, so a call would cost an
-    /// extra sret move at every site.
-    #[inline]
-    fn ingest_into(
-        entry: &mut Relation,
-        batch: Batch,
-        round: Option<u64>,
-        needed: bool,
-    ) -> Result<Option<Batch>, String> {
-        let (id, kind) = (entry.id(), entry.kind);
+        let kind = entry.kind;
         let effective = match kind {
             // A stream's rows exist only as the deltas they produce.
-            RelationKind::Stream => return Ok(needed.then_some(batch)),
+            RelationKind::Stream => return Ok(echo.then_some(batch)),
             RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
             // Folded once for the store, the delta capture and every reader of the
             // echo, which all read a view's output at net weights.
@@ -127,7 +102,7 @@ impl RelationRegistry {
             RelationKind::SystemCatalog => batch,
         };
         if effective.is_empty() {
-            return Ok(needed.then_some(effective));
+            return Ok(echo.then_some(effective));
         }
 
         let pending = entry
@@ -152,14 +127,14 @@ impl RelationRegistry {
         }
 
         let store = entry.store.held_mut();
-        let (res, echo) = match needed {
+        let (res, applied) = match echo {
             true => (store.ingest_borrowed_batch(&effective), Some(effective)),
             false => (store.ingest_owned_batch(effective), None),
         };
         inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
 
         let Some((stamped, round)) = pending else {
-            return Ok(echo);
+            return Ok(applied);
         };
         let feed = entry.delta.as_deref_mut().expect("capture implies a feed");
         if let Err(e) = feed.ingest_owned_batch(stamped) {
@@ -173,7 +148,7 @@ impl RelationRegistry {
                 e,
             );
         }
-        Ok(echo)
+        Ok(applied)
     }
 
     // ── Flush / checkpoint collection ───────────────────────────────────
@@ -205,7 +180,7 @@ impl RelationRegistry {
     }
 
     /// The system families' stores: the complement of [`Self::collect_user_tables`].
-    fn collect_system_tables(&mut self) -> impl Iterator<Item = &mut Table> {
+    pub(super) fn collect_system_tables(&mut self) -> impl Iterator<Item = &mut Table> {
         self.tables
             .values_mut()
             .filter(|e| e.kind == RelationKind::SystemCatalog)
@@ -226,13 +201,13 @@ impl RelationRegistry {
             .map_err(|e| format!("system catalog flush: {e}"))
     }
 
-    /// The ephemeral round at the resume generation: `state`'s operator traces and
-    /// every rederived store, in one barrier.
+    /// The ephemeral round at `generation`: `state`'s operator traces and every
+    /// rederived store, in one barrier.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
+        generation: u64,
     ) -> Result<(), String> {
-        let generation = self.resume_generation;
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
         tables.extend(self.collect_user_tables().filter(|t| t.is_rederived()));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))

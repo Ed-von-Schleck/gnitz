@@ -832,7 +832,13 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     }
     engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
 
-    let stamp = |e: &mut CatalogEngine, id: u64| e.registry.relation_or_err(id).expect("registered").is_replicated();
+    let stamp = |e: &mut CatalogEngine, id: u64| {
+        e.registry
+            .relation_or_err(id)
+            .expect("registered")
+            .placement()
+            .is_replicated()
+    };
     let assert_stamps = |e: &mut CatalogEngine, when: &str| {
         assert!(stamp(e, rt), "replicated base table ({when})");
         assert!(stamp(e, r_producer), "view over a replicated table ({when})");

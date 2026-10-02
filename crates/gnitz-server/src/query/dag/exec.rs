@@ -221,7 +221,7 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
         .expect("the schedule runs every producer before the steps it feeds");
         let needed = readers.contains_key(&step.view);
         let out = run_view_epoch(host, step.view, input, step.producer, &unfed)?;
-        let echo = host.parts().1.ingest_view_delta(step.view, out, round, needed)?;
+        let echo = host.parts().1.ingest_at(step.view, out, round, needed)?;
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
             let merged = match outputs.remove(&step.view) {

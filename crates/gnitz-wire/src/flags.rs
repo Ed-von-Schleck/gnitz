@@ -128,22 +128,13 @@ wire_enum! {
 }
 
 wire_enum! {
-    /// What a `HasPk` probe answers each matched key with, carried in
-    /// [`WireFlags::probe_mode`].
+    /// The code a [`Probe`](crate::Probe) rides [`WireFlags::probe_mode`] as.
     #[derive(Default)]
     pub enum WireProbeMode: u8 {
-        /// Echo the probe key back; the caller asked only whether it is
-        /// occupied.
         #[default]
         Exists = 0,
-        /// Answer with the matched STORED index entry `[span ‖ holder PK]`, so
-        /// the caller learns which committed row holds the span. Index only.
         FirstHolder = 1,
-        /// [`Self::FirstHolder`] for EVERY committed holder of the span, capped
-        /// per value at the count in `arg0`. Index only.
         AllHolders = 2,
-        /// Answer each matched key with that key plus ONE of the stored row's
-        /// columns, named by `arg0`. PK store only.
         Project = 3,
     }
 }

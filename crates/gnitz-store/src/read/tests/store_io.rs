@@ -168,19 +168,97 @@ fn open_bound_refuses_a_foreign_key_stride_and_an_unknown_relation() {
     assert!(r.open_bound(999_999, ReadBound::None).is_err());
 }
 
-/// The FK parent probe answers each named key's live row at weight 1, projected to
-/// the referenced column, and nothing for a key with no row.
+/// Probe keys over the table's own PK store, one row per id.
+fn pk_probe(ids: &[u128]) -> Batch {
+    let schema = pk_only_schema(&[TypeCode::U64]);
+    let mut keys = Batch::empty_with_schema(&schema);
+    for &id in ids {
+        keys.push_key_row(&opk_pk(&schema, &[id]), 1);
+    }
+    keys
+}
+
+/// The rows of a probe reply as `(key bytes, weight)`.
+fn reply_rows(reply: &Batch) -> Vec<(Vec<u8>, i64)> {
+    (0..reply.len())
+        .map(|i| (reply.get_pk_bytes(i).to_vec(), reply.get_weight(i)))
+        .collect()
+}
+
+/// A column probe answers each named key's live row at weight 1 with that
+/// column, and nothing for a key with no row.
 #[test]
-fn gather_bytes_projects_each_live_parent_to_its_referenced_column() {
+fn a_column_probe_answers_each_live_key_with_its_column() {
     let mut r = fixture(|id| id as i64 * 10);
     let schema = make_schema_u64_i64();
     r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
-    let keys: Vec<_> = [2, 5, 7, 300].map(|k| opk_pk(&schema, &[k])).to_vec();
-    let got = r
-        .gather_bytes(TID, PkKeys::from_keys(8, keys.iter().map(Vec::as_slice)), 1)
-        .unwrap();
+    let got = r.probe(TID, Probe::PkColumn(1), &pk_probe(&[2, 5, 7, 300])).unwrap();
     let rows: Vec<_> = (0..got.len())
         .map(|i| (got.get_pk(i), got.get_weight(i), payload0_i64(&got, i)))
         .collect();
     assert_eq!(rows, [(2, 1, 20), (7, 1, 70)]);
+}
+
+/// A PK probe echoes each key a live row carries, and nothing at all for an id
+/// this process has not registered.
+#[test]
+fn a_pk_probe_echoes_the_keys_a_live_row_carries() {
+    let mut r = fixture(|id| id as i64 * 10);
+    let schema = make_schema_u64_i64();
+    r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
+    let keys = pk_probe(&[2, 5, 7, 300]);
+    let held = r.probe(TID, Probe::Pk, &keys).unwrap();
+    assert_eq!(reply_rows(&held), reply_rows(&pk_probe(&[2, 7])));
+    assert!(r.probe(999_999, Probe::Pk, &keys).unwrap().is_empty());
+}
+
+/// Each answer an index probe gives, over one span two rows hold and one none
+/// does.
+#[test]
+fn an_index_probe_answers_a_held_span_with_its_holders() {
+    // Ids 2k and 2k + 1 share `val = 10k`.
+    let r = fixture(|id| (id / 2) as i64 * 10);
+    let schema = make_schema_u64_i64();
+    let cols = PkColList::from_slice(&[1]);
+    let ix = r.relation(TID).unwrap().index_on(&[1]).unwrap();
+    let (ix_schema, span) = (ix.schema(), ix.key_spec().key_size());
+    let entry = |id: u64, val: i64| {
+        let rows = make_batch_raw(&schema, &[(id, 1, val)]);
+        let entries = gnitz_zset::algebra::index_entries(&rows, &ix.key_spec(), &ix_schema);
+        entries.get_pk_bytes(0).to_vec()
+    };
+    let probe_key = |val: i64| {
+        let mut key = entry(0, val);
+        key[span..].fill(0xAB);
+        key
+    };
+    let (held, absent) = (probe_key(20), probe_key(25));
+    let mut keys = Batch::empty_with_schema(&ix_schema);
+    for key in [&held, &absent] {
+        keys.push_key_row(key, 1);
+    }
+    let probe = |holders| reply_rows(&r.probe(TID, Probe::Index(cols, holders), &keys).unwrap());
+    let up_to = |cap| Holders::UpTo(std::num::NonZeroU64::new(cap).unwrap());
+    let (first, second) = (entry(4, 20), entry(5, 20));
+
+    assert_eq!(probe(Holders::Echo), [(held, 1)]);
+    assert_eq!(probe(Holders::First), [(first.clone(), 1)]);
+    assert_eq!(probe(up_to(1)), [(first.clone(), 1)]);
+    assert_eq!(probe(up_to(8)), [(first, 1), (second, 1)]);
+}
+
+/// A probe is refused when no index is on its column list, and when its keys are
+/// not as wide as the store it reads.
+#[test]
+fn a_probe_refuses_a_missing_index_and_a_foreign_key_stride() {
+    let r = fixture(|id| id as i64);
+    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), Holders::Echo);
+    let pk_keys = pk_probe(&[2]);
+    for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1])), (TID, index(&[1]))] {
+        assert!(r.probe(id, probe, &pk_keys).is_err(), "{id} {probe:?}");
+    }
+    let wide = Batch::empty_with_schema(&r.relation(TID).unwrap().index_on(&[1]).unwrap().schema());
+    for probe in [Probe::Pk, Probe::PkColumn(1)] {
+        assert!(r.probe(TID, probe, &wide).is_err(), "{probe:?}");
+    }
 }

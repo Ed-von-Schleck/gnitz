@@ -39,6 +39,7 @@ pub(crate) struct StoreBudgets {
     shard: ShardBudget,
 }
 
+#[cfg(test)]
 impl Default for StoreBudgets {
     fn default() -> Self {
         StoreBudgets::new(DEFAULT_RAM_TIER_BYTES)
@@ -324,11 +325,11 @@ impl Table {
         from_runs(self.runs(), self.shard_index.schema, cap)
     }
 
-    /// A cursor over the rows whose PK begins with a key in `[first, last]` —
-    /// whole PKs, or the same leading columns of one — positioned on the first,
-    /// with `extra` merged in as one more run. It does not end at the last: the
-    /// rows past it are a walk's to stop at.
-    pub(crate) fn open_cursor_over_prefixes(&self, first: &[u8], last: &[u8], extra: Option<Rc<Batch>>) -> ReadCursor {
+    /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
+    /// columns of one — positioned on the first, with `extra` as one more run.
+    pub(crate) fn cursor_for_keys(&self, keys: &Batch, extra: Option<Rc<Batch>>) -> ReadCursor {
+        debug_assert!(keys.is_consolidated() && !keys.is_empty());
+        let (first, last) = (keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1));
         let (runs, cap, start) = self.runs_over_prefixes(first, last, extra);
         from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
     }

@@ -229,7 +229,7 @@ fn worker_boot_recovery(
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        catalog.durable_generation() > catalog.registry.resume_generation(),
+        catalog.durable_generation() > catalog.resume_generation,
         "boot base flush without the pre-fork generation advance ahead of it",
     );
     catalog

@@ -52,6 +52,9 @@ impl MirrorConfig {
 /// The store's directory under the one a host names.
 const ROOT: &str = "_mirror";
 
+/// The one generation a mirror's manifests carry.
+const GENERATION: u64 = 0;
+
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
 /// included. A panic rather than an `Err`: nothing else reaches
 /// [`Guarded::touching`]'s panic arm.
@@ -96,9 +99,12 @@ impl Mirror {
         for (tid, record) in persisted {
             let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
                 // Reopened from the manifest `rec` was read from.
-                Ok(Some((rec, schema))) => copies.registry.reopen_view(copy_spec(tid, schema)).map(|()| {
-                    copies.records.insert(tid, rec);
-                }),
+                Ok(Some((rec, schema))) => copies
+                    .registry
+                    .reopen_view(copy_spec(tid, schema), GENERATION)
+                    .map(|()| {
+                        copies.records.insert(tid, rec);
+                    }),
                 // Not a record this store wrote; the directory is the orphan sweep's.
                 Ok(None) => continue,
                 Err(e) => Err(e),
@@ -281,7 +287,9 @@ impl Copies {
                 .set_caller_record(tid, rec.encode())
                 .map_err(MirrorError::Engine)?;
         }
-        self.registry.checkpoint_ephemeral([]).map_err(MirrorError::Engine)
+        self.registry
+            .checkpoint_ephemeral([], GENERATION)
+            .map_err(MirrorError::Engine)
     }
 }
 

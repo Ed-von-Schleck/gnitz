@@ -131,9 +131,11 @@ fn stream_fed_views_are_invalid_at_boot() {
     // then every view's output store published through an ephemeral round at that
     // generation — a completed checkpoint.
     engine.record_topology(1).unwrap();
-    engine.bump_checkpoint_generation().unwrap();
-    engine.registry.checkpoint_ephemeral([]).unwrap();
+    let g = engine.advance_durable_generation().unwrap();
+    engine.registry.checkpoint_ephemeral([], g).unwrap();
+    engine.close();
 
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     engine.compute_invalid_views();
     assert!(engine.dag.awaits_rebuild(direct), "a direct stream source invalidates");
     assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");

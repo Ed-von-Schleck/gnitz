@@ -103,4 +103,7 @@ pub(crate) struct CatalogEngine {
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) system_zone: u64,
+    /// The checkpoint generation this boot recovered, which a manifest must
+    /// carry to be resumed from.
+    pub(crate) resume_generation: u64,
 }

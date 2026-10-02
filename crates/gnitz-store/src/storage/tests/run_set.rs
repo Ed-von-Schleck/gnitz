@@ -49,6 +49,41 @@ proptest! {
     }
 }
 
+/// A probed set keeps its filter through a fold that cancels a few rows, drops
+/// it at one that cancels most of what went in, and answers its probes alike.
+#[test]
+fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk};
+    let schema = make_schema_u64_i64();
+    let mut set = RunSet::new(0);
+    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
+        let rows: Vec<_> = keys.map(|k| (k, w, 7)).collect();
+        set.push(
+            TrimmedRun::new(make_batch_raw(&schema, &rows).into_consolidated()),
+            &schema,
+        );
+    };
+    let holds = |set: &RunSet, k: u64| {
+        let key = opk_pk(&schema, &[k as u128]);
+        let mut found = false;
+        set.find_pk_bytes(&key, probe_key(&key), |_, _| found = true);
+        found
+    };
+
+    push(&mut set, 0..10, 1);
+    assert!(holds(&set, 3), "the first probe builds the filter");
+    push(&mut set, 0..5, -1);
+    set.fold(&schema);
+    assert!(set.bloom.get().is_some());
+    assert!(holds(&set, 7) && !holds(&set, 3));
+
+    push(&mut set, 100..1100, 1);
+    push(&mut set, 100..1100, -1);
+    set.fold(&schema);
+    assert!(set.bloom.get().is_none());
+    assert!(holds(&set, 7) && !holds(&set, 3) && !holds(&set, 105));
+}
+
 /// Runs from either side of an `ALTER … DROP NOT NULL` fold under the schema the
 /// fold is handed, not the dominant run's NOT NULL label.
 #[test]

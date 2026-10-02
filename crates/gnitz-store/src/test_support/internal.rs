@@ -11,7 +11,7 @@ use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
 /// A rederived table under `dir` at the default budgets — nothing a test puts
-/// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
+/// here spills, since that needs the whole RAM tier. For a test that just
 /// needs somewhere to put rows.
 pub(crate) fn scratch_table(dir: impl AsRef<Path>, schema: SchemaDescriptor) -> Table {
     Table::new(

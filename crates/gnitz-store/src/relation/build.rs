@@ -11,15 +11,15 @@ static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS"
 impl RelationRegistry {
     /// Enter a relation, its stores opened fresh.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
-        let stores = self.build_relation_store(spec, false)?;
+        let stores = self.build_relation_store(spec, None)?;
         self.enter(spec, stores);
         Ok(())
     }
 
-    /// Enter a view whose rows open from the manifest already in its directory;
-    /// `Err`, entering nothing, otherwise.
-    pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), String> {
-        let stores = self.build_relation_store(spec, true)?;
+    /// Enter a view whose rows open from the manifest at `generation` already in
+    /// its directory; `Err`, entering nothing, otherwise.
+    pub fn reopen_view(&mut self, spec: RelationSpec, generation: u64) -> Result<(), String> {
+        let stores = self.build_relation_store(spec, Some(generation))?;
         self.enter(spec, stores);
         Ok(())
     }
@@ -41,11 +41,11 @@ impl RelationRegistry {
     }
 
     /// This process's stores for a relation: its rows, and a fed view's deltas. A
-    /// view's rows resume from a checkpoint manifest iff `resume`.
+    /// view's rows resume from the manifest at `resume_at`, or are rebuilt.
     pub(super) fn build_relation_store(
         &self,
         spec: RelationSpec,
-        resume: bool,
+        resume_at: Option<u64>,
     ) -> Result<(Store, Option<Box<Table>>), String> {
         let RelationSpec { id, kind, schema, placement } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
@@ -72,7 +72,7 @@ impl RelationRegistry {
                 (RecoverySource::SalReplay, self.store_budgets(), None)
             }
             RelationKind::View(p) => {
-                if !resume {
+                if resume_at.is_none() {
                     // The traces a previous compile left here are rebuilt with the rows they
                     // integrate; one the next compile does not declare would never be erased.
                     let slot = self.slot;
@@ -82,7 +82,7 @@ impl RelationRegistry {
                     .map_err(|e| format!("remove the operator traces of view {id}: {e}"))?;
                 }
                 (
-                    self.rederive_source(resume),
+                    RecoverySource::Rederive { resume_at },
                     self.store_budgets().bounded(p.capacity_bytes()),
                     p.delta_bytes(),
                 )
@@ -99,7 +99,7 @@ impl RelationRegistry {
                     id,
                     ChildKind::Delta,
                     delta_schema,
-                    self.rederive_source(false),
+                    RecoverySource::Rederive { resume_at: None },
                     self.store_budgets().delta(budget),
                 )?;
                 Some(Box::new(table))

@@ -79,22 +79,6 @@ fn a_master_creates_the_relation_directory_and_no_child() {
     assert_eq!(super::dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
 }
 
-#[test]
-fn bound_cols_admits_only_the_relations_columns() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut registry = solo(tmp.path());
-    registry.register(table(50, pk_u64_two_i64_schema())).unwrap();
-    let r = registry.relation(50).unwrap();
-    let bound = |cols: &[u32]| {
-        r.bound_cols(PkColList::from_slice(cols), "op")
-            .map(|c| c.as_slice().to_vec())
-    };
-    assert_eq!(bound(&[2, 0]), Ok(vec![2, 0]));
-    for cols in [&[3][..], &[0, 3]] {
-        assert!(bound(cols).is_err(), "{cols:?}");
-    }
-}
-
 /// Not unique, or covering the PK: either one excludes an index.
 #[test]
 fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
@@ -157,7 +141,7 @@ fn an_upsert_moves_the_index_entry() {
 }
 
 /// An index store is rederived: the base round leaves it, the ephemeral round
-/// publishes it at the resume generation.
+/// publishes it at the generation it is handed.
 #[test]
 fn only_the_ephemeral_round_publishes_an_index() {
     let tmp = tempfile::tempdir().unwrap();
@@ -166,10 +150,9 @@ fn only_the_ephemeral_round_publishes_an_index() {
     registry.add_index(70, index(999, false), &[1]).unwrap();
     let dir = registry.child_dir(70, ChildKind::Index(PkColList::from_slice(&[1])));
 
-    registry.set_resume_generation(3);
     registry.checkpoint_base().unwrap();
     assert!(read_intact(&dir).unwrap().is_none(), "the base round skips it");
-    registry.checkpoint_ephemeral([]).unwrap();
+    registry.checkpoint_ephemeral([], 3).unwrap();
     assert!(read_at(&dir, 3).unwrap().is_some());
 }
 
@@ -184,7 +167,7 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     registry.register(view(damaged)).unwrap();
     registry.set_caller_record(good, b"good".to_vec()).unwrap();
     registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
-    registry.checkpoint_ephemeral([]).unwrap();
+    registry.checkpoint_ephemeral([], 0).unwrap();
 
     flip_last_byte_in_place(manifest_path(&registry.child_dir(damaged, ChildKind::Rows)));
     // A name that parses to `good`'s id but is not the name its directory has.
@@ -223,18 +206,20 @@ fn a_resumed_view_refuses_a_missing_manifest() {
         let mut origin = solo(tmp.path());
         origin.register(spec).unwrap();
         let mut state = CircuitState::open(&origin, 7, layout()).unwrap();
-        origin.checkpoint_ephemeral([&mut state]).unwrap();
+        origin.checkpoint_ephemeral([&mut state], 0).unwrap();
     }
     let reopen = || {
         let mut r = solo(tmp.path());
-        r.reopen_view(spec).map(|()| r)
+        r.reopen_view(spec, 0).map(|()| r)
     };
     let trace = |r: &RelationRegistry| CircuitState::open(r, 7, layout()).map(drop);
     let worker = |resume: bool| {
         let mut master = RelationRegistry::master(base, 1, StoreConfig::default());
         master.register(spec).unwrap();
         master.reconcile_child_dirs().unwrap();
-        master.open_stores(0, Residency::Worker, |_| resume).map(drop)
+        master
+            .open_stores(0, Residency::Worker, |_| resume.then_some(0))
+            .map(drop)
     };
     let child = |kind| manifest_path(&solo(tmp.path()).child_dir(7, kind));
     trace(&reopen().unwrap()).expect("a published trace resumes");
@@ -245,7 +230,7 @@ fn a_resumed_view_refuses_a_missing_manifest() {
 
     std::fs::remove_file(child(ChildKind::Rows)).unwrap();
     let mut r = solo(tmp.path());
-    assert!(r.reopen_view(spec).is_err());
+    assert!(r.reopen_view(spec, 0).is_err());
     assert!(!r.has_id(7), "a refused view is not entered");
     assert!(worker(true).is_err());
     // Last: a rebuild erases the traces.
@@ -324,7 +309,7 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
             probe.begin_row_opk(&[k as u128], 1);
             probe.end_row();
         }
-        let cursor = relation.cursor_for_keys(&probe.finish(), held);
+        let cursor = relation.cursor_for_keys(&probe.finish().into_consolidated(), held);
         let mut read = zset_of(&cursor.materialize(), &schema);
         read.retain(|row, _| keys.iter().any(|k| row.0[..8] == k.to_be_bytes()));
         assert_eq!(read, under(state, &keys), "cursor, unticked={}", held.is_some());

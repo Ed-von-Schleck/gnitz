@@ -1,21 +1,71 @@
 //! Read I/O on relation families. [`RelationRegistry::open_bound`] opens every
 //! source a bound can name as a [`SourceCursor`], choosing between the store and
 //! an index over it;
-//! [`RelationRegistry::gather_bytes`] is the batched FK parent probe.
+//! [`RelationRegistry::probe`] answers a HasPk probe.
 
 use crate::relation::{Relation, RelationKind, RelationRegistry};
 use gnitz_expr::ColumnTable;
-use gnitz_wire::{KeyRange, PkKeys, ReadBound};
+use gnitz_wire::{Holders, KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
+use gnitz_zset::schema::SchemaDescriptor;
 
 const INDEX_SCAN_RATIO: usize = 16;
 
 impl RelationRegistry {
-    /// The FK parent probe: every live row of `keys` at weight 1, projected to the payload
-    /// column `ref_col`.
-    pub fn gather_bytes(&self, id: u64, keys: PkKeys, ref_col: u8) -> Result<Batch, String> {
-        let entry = self.relation_or_err(id)?;
-        entry.gather(keys, None).project_live(&[ref_col as u32])
+    /// Answer `probe` at `keys` over the rows this process holds of `id`.
+    pub fn probe(&self, id: u64, probe: Probe, keys: &Batch) -> Result<Batch, String> {
+        let stride = keys.schema().pk_stride();
+        let keyed_as = |store: SchemaDescriptor| match store.pk_stride() == stride {
+            true => Ok(()),
+            false => Err(format!(
+                "probe: key stride {stride} != the probed store's {} (table {id})",
+                store.pk_stride()
+            )),
+        };
+        let (cols, holders) = match probe {
+            Probe::Pk => {
+                let mut held = Batch::empty_with_schema(keys.schema());
+                // An id this process has not registered holds no row.
+                if let Some(relation) = self.relation(id) {
+                    keyed_as(relation.schema())?;
+                    let table = relation.table();
+                    for key in (0..keys.len()).map(|i| keys.get_pk_bytes(i)) {
+                        if table.has_pk_bytes(key) {
+                            held.push_key_row(key, 1);
+                        }
+                    }
+                }
+                return Ok(held);
+            }
+            Probe::PkColumn(col) => {
+                let relation = self.relation_or_err(id)?;
+                keyed_as(relation.schema())?;
+                let keys = PkKeys::from_sorted(stride, keys.pk_data().to_vec());
+                return relation.gather(keys, None).project_live(&[col]);
+            }
+            Probe::Index(cols, holders) => (cols, holders),
+        };
+        let index = self
+            .relation(id)
+            .and_then(|r| r.index_on(cols.as_slice()))
+            .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), id))?;
+        keyed_as(index.schema())?;
+        let span = index.key_spec().key_size();
+        let mut cursor = index.cursor();
+        let mut entries = Batch::empty_with_schema(keys.schema());
+        for key in (0..keys.len()).map(|i| keys.get_pk_bytes(i)) {
+            match holders {
+                Holders::UpTo(cap) => {
+                    cursor.for_each_positive_with_prefix_capped(&key[..span], cap.get() as usize, |c| {
+                        entries.push_key_row(c.current_pk_bytes(), 1)
+                    })
+                }
+                _ if !cursor.seek_first_positive_with_prefix(&key[..span]) => {}
+                Holders::First => entries.push_key_row(cursor.current_pk_bytes(), 1),
+                Holders::Echo => entries.push_key_row(key, 1),
+            }
+        }
+        Ok(entries)
     }
 
     /// Open `bound`'s source over `id`, without walking it, and the part of `bound`
@@ -50,15 +100,14 @@ impl RelationRegistry {
 
 /// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.
 fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), String> {
-    let cols = entry.bound_cols(r.cols(), "open_bound")?;
     let schema = entry.schema();
     if r.walks_pk(schema.pk_cols()) {
-        let cursor = entry.store().held().range_cursor(schema.pk_range_keys(&r));
+        let cursor = entry.table().range_cursor(schema.pk_range_keys(&r));
         return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
     }
-    if let Some(ic) = entry.index_on(cols.as_slice()) {
+    if let Some(ic) = entry.index_on(r.cols().as_slice()) {
         let idx = ic.cursor_over(&r);
-        if idx.estimated_length() <= entry.store().held().estimated_rows() / INDEX_SCAN_RATIO {
+        if idx.estimated_length() <= entry.table().estimated_rows() / INDEX_SCAN_RATIO {
             let walk = BoundedIndexCursor::new(idx, entry.cursor(), ic.key_spec());
             return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
         }

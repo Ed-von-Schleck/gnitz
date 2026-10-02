@@ -45,9 +45,8 @@ impl CircuitState {
     /// directory at this registry's rank.
     pub fn open(reg: &RelationRegistry, view_id: u64, layout: StateLayout) -> Result<Self, String> {
         let view = reg.relation_or_err(view_id)?;
-        // The output store's policy, not the registry's current one: the traces
-        // must resume from the generation the output they feed resumed from.
-        let recovery = view.store().held().recovery_source();
+        // The traces resume from the generation the output they feed resumed from.
+        let recovery = view.table().recovery_source();
         let tables = layout
             .children
             .into_iter()
@@ -76,9 +75,7 @@ impl CircuitState {
 
     /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
-        debug_assert!(keys.is_consolidated() && !keys.is_empty());
-        self.at(idx)
-            .open_cursor_over_prefixes(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), None)
+        self.at(idx).cursor_for_keys(keys, None)
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

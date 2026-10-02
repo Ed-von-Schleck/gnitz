@@ -320,11 +320,11 @@ fn sequence_advances_leave_no_negative_ghost() {
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
     engine.record_topology(1).unwrap();
-    engine.bump_checkpoint_generation().unwrap();
+    engine.advance_durable_generation().unwrap();
     // …and a second round, where each retraction now has a live row to cancel.
     engine.create_table("s.t2", &cols, &[0]).unwrap();
     engine.record_topology(4).unwrap();
-    engine.bump_checkpoint_generation().unwrap();
+    engine.advance_durable_generation().unwrap();
 
     assert_eq!(
         count_negative_records(engine.sys_relation(SysFamily::Sequence).cursor()),

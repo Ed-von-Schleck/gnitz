@@ -28,10 +28,10 @@ mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub(crate) use delta::{delta_round, delta_round_prefix};
-pub(crate) use dirs::ensure_dir;
+use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
-pub(crate) use store::Store;
+use store::Store;
 
 /// What cancels `unticked`'s rows at `keys` when merged into a read of the
 /// store that ingested them; `None` when it holds none there. `keys` ascend,
@@ -206,6 +206,20 @@ impl RelationKind {
     pub fn is_view(self) -> bool {
         matches!(self, RelationKind::View(_))
     }
+
+    /// Whether this relation keeps a delta feed, whether or not this process holds
+    /// its store.
+    #[inline]
+    pub fn has_delta_feed(self) -> bool {
+        matches!(self, RelationKind::View(ViewProps::Fed { .. }))
+    }
+
+    /// Whether a capacity bounds this relation's registered shard bytes, so its
+    /// sweep may leave skeleton rows behind.
+    #[inline]
+    pub fn is_bounded(self) -> bool {
+        matches!(self, RelationKind::View(ViewProps::Bounded { .. }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +242,7 @@ pub enum Residency {
 impl Residency {
     /// True iff this process opens a store for every relation it registers.
     #[inline]
-    pub fn owns_stores(self) -> bool {
+    pub(crate) fn owns_stores(self) -> bool {
         !matches!(self, Residency::Master)
     }
 }
@@ -277,24 +291,6 @@ impl Relation {
         self.placement
     }
 
-    /// Whether this relation keeps a delta feed, whether or not this process holds
-    /// its store.
-    pub fn has_delta_feed(&self) -> bool {
-        matches!(self.kind, RelationKind::View(ViewProps::Fed { .. }))
-    }
-
-    /// Whether a capacity bounds this relation's registered shard bytes, so its
-    /// sweep may leave skeleton rows behind.
-    pub fn is_bounded(&self) -> bool {
-        matches!(self.kind, RelationKind::View(ViewProps::Bounded { .. }))
-    }
-
-    /// Whether every worker holds the whole relation rather than a partition of
-    /// it — so a read of it must single-source, and a write of it broadcasts.
-    pub fn is_replicated(&self) -> bool {
-        self.placement.is_replicated()
-    }
-
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
@@ -303,7 +299,7 @@ impl Relation {
 
     /// Non-compacting cursor over this relation's store.
     pub fn cursor(&self) -> ReadCursor {
-        self.store.held().open_cursor()
+        self.table().open_cursor()
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of one,
@@ -311,23 +307,20 @@ impl Relation {
     /// as it was before those ingests.
     pub fn gather(&self, keys: PkKeys, unticked: Option<&Batch>) -> PkSetGather {
         let undo = unticked.and_then(|b| undo_at(b, keys.as_bytes(), keys.stride()));
-        self.store.held().gather(keys, undo)
+        self.table().gather(keys, undo)
     }
 
-    /// A cursor for probing at the PKs of the non-empty, PK-ordered `keys` —
-    /// this relation's whole PKs, or the same leading columns of one, each then
-    /// naming every row it prefixes — positioned on the first. With `unticked`,
-    /// the store is read at those keys as it was before those ingests.
+    /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
+    /// columns of one — positioned on the first. With `unticked`, the store is
+    /// read at those keys as it was before those ingests.
     pub fn cursor_for_keys(&self, keys: &Batch, unticked: Option<&Batch>) -> ReadCursor {
         let undo = unticked.and_then(|b| undo_at(b, keys.pk_data(), keys.schema().pk_stride()));
-        self.store
-            .held()
-            .open_cursor_over_prefixes(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), undo)
+        self.table().cursor_for_keys(keys, undo)
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`.
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
-        let table = self.store.held();
+        let table = self.table();
         let band = key_range_between_cuts(
             KeyCut::min_of(prefix),
             KeyCut::above(prefix),
@@ -338,17 +331,12 @@ impl Relation {
 
     /// Materialize every row of this relation's store whose net weight is non-zero.
     pub fn full_scan(&self) -> std::rc::Rc<Batch> {
-        self.store.held().full_scan()
-    }
-
-    /// Whether a live row carries this OPK key.
-    pub fn has_pk(&self, key: &[u8]) -> bool {
-        self.store.held().has_pk_bytes(key)
+        self.table().full_scan()
     }
 
     /// The net weight at `key`, and the live row if there is one.
     pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.store.held().live_row_at(key)
+        self.table().live_row_at(key)
     }
 
     /// Every secondary index on this relation, in registration order.
@@ -362,23 +350,9 @@ impl Relation {
         self.indexes.iter().find(|ix| ix.cols.as_slice() == cols)
     }
 
-    /// [`Self::index_on`] as `&mut`.
-    pub(crate) fn index_on_mut(&mut self, cols: &[u32]) -> Option<&mut SecondaryIndex> {
-        self.indexes.iter_mut().find(|ix| ix.cols.as_slice() == cols)
-    }
-
-    /// This process's store, for the crate's own read and write paths.
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
-    }
-
-    /// `cols`, if each names a column of this relation.
-    pub(crate) fn bound_cols(&self, cols: PkColList, op: &str) -> Result<PkColList, String> {
-        let schema = self.schema();
-        match cols.as_slice().iter().all(|&c| schema.column(c as usize).is_some()) {
-            true => Ok(cols),
-            false => Err(format!("{op}: invalid column list for table {}", self.id)),
-        }
+    /// This process's store of the relation; panics when it holds none.
+    pub(crate) fn table(&self) -> &Table {
+        self.store.held()
     }
 }
 
@@ -437,9 +411,7 @@ impl StoreConfig {
 }
 
 /// Which relations this process holds, the stores behind them, and what this
-/// process is to those stores. One type rather than several because every verb
-/// on it reads or writes the same `id -> Relation` map under the same
-/// [`Residency`], and a split would hand two owners `&mut` over it.
+/// process is to those stores.
 ///
 /// Nothing here compiles a circuit or runs an epoch — those are
 /// `gnitz-server`'s, and the crate graph is what says so.
@@ -461,8 +433,6 @@ pub struct RelationRegistry {
     pub(crate) residency: Residency,
     /// Set by [`Self::reconcile_child_dirs`]; [`Self::open_stores`] requires it.
     pub(crate) children_reconciled: bool,
-    /// The generation a manifest must carry to be resumed from.
-    pub(crate) resume_generation: u64,
 }
 
 impl RelationRegistry {
@@ -478,7 +448,6 @@ impl RelationRegistry {
             },
             residency: Residency::Origin,
             children_reconciled: false,
-            resume_generation: 0,
         }
     }
 
@@ -503,8 +472,8 @@ impl RelationRegistry {
     /// straddle two workers' slices, so only the caller can check it.
     pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: &[u32]) -> Result<(), String> {
         let owner_schema = self.index_owner(owner)?.schema();
-        if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
-            // The IDX_TAB net bound keeps one live row per id, applied once per process.
+        let entry = self.tables.get_mut(&owner).expect("resolved above");
+        if let Some(ix) = entry.indexes.iter_mut().find(|ix| ix.cols.as_slice() == cols) {
             debug_assert!(!ix.claims.contains(&claim), "{claim:?} claimed twice");
             ix.claims.push(claim);
             return Ok(());
@@ -522,7 +491,7 @@ impl RelationRegistry {
                 owner,
                 ChildKind::Index(ix.cols),
                 index_schema,
-                self.rederive_source(false),
+                RecoverySource::Rederive { resume_at: None },
                 self.store_budgets(),
             )?));
             let owner_store = &self.tables[&owner].store;
@@ -555,8 +524,7 @@ impl RelationRegistry {
         // wrong index projection, which release codegen would not guard at all.
         if !schema.is_trailing_append_of(entry.store.schema()) {
             return Err(format!(
-                "ALTER on table {id}: the new descriptor is not a trailing append, \
-                 which every index circuit's baked key_spec requires"
+                "ALTER on table {id}: the new descriptor is not a trailing append of the stored one"
             ));
         }
         entry
@@ -585,11 +553,6 @@ impl RelationRegistry {
         ChildAddr { kind, slot: self.slot }.dir(&relation_dir(&self.base_dir, id))
     }
 
-    /// What this process is to the stores it registered.
-    pub fn residency(&self) -> Residency {
-        self.residency
-    }
-
     /// See [`StoreConfig::scan_chunk_rows`].
     pub fn scan_chunk_rows(&self) -> usize {
         self.config.scan_chunk_rows
@@ -601,21 +564,13 @@ impl RelationRegistry {
         self.config.scan_chunk_rows = rows.max(1);
     }
 
-    /// The relation `id` names, or `None` for an unknown id — the shape every
-    /// probing caller wants.
+    /// The relation `id` names, or `None` for an unknown id.
     pub fn relation(&self, id: u64) -> Option<&Relation> {
         self.tables.get(&id)
     }
 
-    /// [`Self::relation`] as `&mut` — the one mutable route into a relation, so
-    /// navigation reads the same in both directions.
-    pub(crate) fn relation_mut(&mut self, id: u64) -> Option<&mut Relation> {
-        self.tables.get_mut(&id)
-    }
-
     /// [`Self::relation`] plus the one "not registered" sentence — spelled the
-    /// same by the mutating paths, so which verb asked cannot change what a
-    /// client reads.
+    /// same by the mutating paths.
     pub fn relation_or_err(&self, id: u64) -> Result<&Relation, String> {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
     }
@@ -634,7 +589,7 @@ impl RelationRegistry {
 
     /// [`Self::relation_or_err`] as `&mut`.
     pub(crate) fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
-        self.relation_mut(id).ok_or_else(|| Self::unregistered(id))
+        self.tables.get_mut(&id).ok_or_else(|| Self::unregistered(id))
     }
 
     fn unregistered(id: u64) -> String {
@@ -643,7 +598,7 @@ impl RelationRegistry {
 
     /// True iff at least one registered relation carries a delta feed.
     pub fn any_delta_feed(&self) -> bool {
-        self.tables.values().any(Relation::has_delta_feed)
+        self.tables.values().any(|r| r.kind.has_delta_feed())
     }
 
     /// Every registered view id.
@@ -655,31 +610,10 @@ impl RelationRegistry {
             .collect()
     }
 
-    // ── The resume fence ────────────────────────────────────────────────
-
-    /// The one writer of `resume_generation`. A worker latches it off a
-    /// `FlushEph` header, with no verdict in hand.
-    pub fn set_resume_generation(&mut self, g: u64) {
-        self.resume_generation = g;
-    }
-
-    /// The generation a manifest must carry to be resumed from.
-    pub fn resume_generation(&self) -> u64 {
-        self.resume_generation
-    }
-
     /// What every store this registry opens starts from; the two bounded kinds
     /// narrow it.
     pub(crate) fn store_budgets(&self) -> StoreBudgets {
         StoreBudgets::new(self.config.ram_tier_bytes)
-    }
-
-    /// A rederived store's recovery: rebuilt, or with `resume` from a manifest at
-    /// this registry's resume generation.
-    pub(crate) fn rederive_source(&self, resume: bool) -> RecoverySource {
-        RecoverySource::Rederive {
-            resume_at: resume.then_some(self.resume_generation),
-        }
     }
 }
 

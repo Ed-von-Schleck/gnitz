@@ -219,19 +219,18 @@ impl CatalogEngine {
         self.registry.checkpoint_system(self.system_zone)
     }
 
-    /// Load the next catalog id stored in `_sequences`, and latch the registry's
-    /// resume generation from the checkpoint rows beside it.
+    /// Load the next catalog id stored in `_sequences`, and latch the resume
+    /// generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
             self.next_id = self.next_id.max(v);
         }
-        self.registry.set_resume_generation(self.durable_generation());
+        self.resume_generation = self.durable_generation();
     }
 
     // -- Checkpoint records -------------------------------------------------
 
-    /// Advance the checkpoint generation and flush it durable, leaving the resume
-    /// generation where it is.
+    /// Advance the checkpoint generation and flush it durable. Returns it.
     pub(crate) fn advance_durable_generation(&mut self) -> Result<u64, String> {
         let g = self.durable_generation() + 1;
         self.set_sequence(SEQ_ID_CHECKPOINT_GEN, g)?;
@@ -240,20 +239,11 @@ impl CatalogEngine {
         Ok(g)
     }
 
-    /// [`Self::advance_durable_generation`], then stamp every manifest published
-    /// from here on with the new generation. Returns it.
-    pub(crate) fn bump_checkpoint_generation(&mut self) -> Result<u64, String> {
-        let g = self.advance_durable_generation()?;
-        self.registry.set_resume_generation(g);
-        Ok(g)
-    }
-
     /// The ephemeral checkpoint round: persist every view's operator traces and
-    /// output stores, and every index, at `generation` — which every manifest
-    /// published after it is stamped with too.
+    /// output stores, and every index, at `generation`.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
-        self.registry.set_resume_generation(generation);
-        self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())
+        self.registry
+            .checkpoint_ephemeral(self.dag.ephemeral_states(), generation)
     }
 
     /// Record the launched topology. Durable at the next system flush.

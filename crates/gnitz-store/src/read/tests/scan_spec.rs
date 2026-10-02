@@ -567,10 +567,9 @@ fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64
         |ids: std::ops::Range<u64>| make_batch_raw(&schema, &ids.map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
     let kind = RelationKind::View(ViewProps::Bounded { capacity_bytes: 1 });
     let mut registry = relation_fixture(kind, schema, &[], rows(on_disk));
-    registry.set_resume_generation(1);
-    registry.checkpoint_ephemeral([]).unwrap();
+    registry.checkpoint_ephemeral([], 1).unwrap();
     assert!(
-        registry.relation(TID).unwrap().store().held().has_skeleton_rows(),
+        registry.relation(TID).unwrap().table().has_skeleton_rows(),
         "premise: the capacity sweep must have dehydrated the flushed shard",
     );
     registry.ingest(TID, rows(in_ram)).unwrap();
@@ -735,9 +734,9 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
     let kind = RelationKind::View(ViewProps::Fed { delta_bytes: 1 << 20 });
     let mut r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
-    r.ingest_view_delta(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
+    r.ingest_at(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
-    r.ingest_view_delta(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
+    r.ingest_at(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
         .unwrap();
     let own = schema.layout_digest();
     let read = |after_tick| rows_of(&r.delta_read(TID, after_tick, 5, own).unwrap());

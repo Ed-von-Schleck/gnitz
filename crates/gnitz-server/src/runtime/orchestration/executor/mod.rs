@@ -1204,7 +1204,7 @@ fn delta_up_to_date(shared: &Shared, target_id: u64, after_tick: u64) -> bool {
             .cat()
             .registry
             .relation(target_id)
-            .is_some_and(Relation::has_delta_feed)
+            .is_some_and(|r| r.kind().has_delta_feed())
         && after_tick >= shared.disp().last_delta_round(target_id)
 }
 

@@ -384,15 +384,18 @@ fn a_damaged_copy_costs_that_copy_alone() {
                 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
                 let mut raw =
                     RelationRegistry::new(&root(path(&dir)), gnitz_zset::schema::Slot::SOLO, Default::default());
-                raw.reopen_view(RelationSpec {
-                    id: TID,
-                    kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
-                    schema: make_schema_u64_i64(),
-                    placement: gnitz_zset::schema::Placement::Local,
-                })
+                raw.reopen_view(
+                    RelationSpec {
+                        id: TID,
+                        kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
+                        schema: make_schema_u64_i64(),
+                        placement: gnitz_zset::schema::Placement::Local,
+                    },
+                    0,
+                )
                 .unwrap();
                 raw.set_caller_record(TID, b"not a mirror record".to_vec()).unwrap();
-                raw.checkpoint_ephemeral([]).unwrap();
+                raw.checkpoint_ephemeral([], 0).unwrap();
             }
         }
 

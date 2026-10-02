@@ -18,8 +18,7 @@ fn system_table_keys_are_valid_for_their_columns() {
 }
 
 /// The in-memory constructor and the persisted codec are the same list at every
-/// arity, and a probe keyspace round-trips through its `arg1` word. The word is persisted, so
-/// its layout is pinned as a literal.
+/// arity. The word is persisted, so its layout is pinned as a literal.
 #[test]
 fn a_pk_col_list_roundtrips_through_its_packed_word() {
     for cols in [&[0u32][..], &[3], &[1, PK_LIST_COL_MAX], &[2, 5, 7], &[9, 1, 4, 6]] {
@@ -27,15 +26,41 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
         assert_eq!(list.as_slice(), cols);
         let packed = pack_pk_cols(cols);
         assert_eq!(unpack_pk_cols(packed), Ok(list), "{cols:?}");
-        let index = ProbeKeyspace::Index(list);
-        assert_eq!(ProbeKeyspace::from_arg1(index.arg1()), Ok(index), "{cols:?}");
     }
-    assert_eq!(
-        ProbeKeyspace::from_arg1(ProbeKeyspace::OwnPk.arg1()),
-        Ok(ProbeKeyspace::OwnPk)
-    );
-    assert!(ProbeKeyspace::from_arg1(7).is_err(), "a nonzero word must be packed");
     assert_eq!(pack_pk_cols(&[3, 9]), 1 << 63 | 9 << 11 | 3 << 4 | 2);
+}
+
+/// Every probe round-trips through its wire words, and a triple no probe
+/// encodes to is refused.
+#[test]
+fn a_probe_roundtrips_through_its_wire_words() {
+    let cols = PkColList::from_slice(&[2, 5]);
+    let cap = std::num::NonZeroU64::new(9).unwrap();
+    let probes = [
+        Probe::Pk,
+        Probe::PkColumn(4),
+        Probe::Index(cols, Holders::Echo),
+        Probe::Index(cols, Holders::First),
+        Probe::Index(cols, Holders::UpTo(cap)),
+    ];
+    for probe in probes {
+        let (mode, arg0, arg1) = probe.wire();
+        assert_eq!(Probe::from_wire(mode, arg0, arg1), Ok(probe));
+    }
+    let index = pack_pk_cols(cols.as_slice());
+    for (mode, arg0, arg1) in [
+        (WireProbeMode::Exists, 5, 0),
+        (WireProbeMode::FirstHolder, 0, 0),
+        (WireProbeMode::Exists, 5, index),
+        (WireProbeMode::FirstHolder, 1, index),
+        (WireProbeMode::AllHolders, 9, 0),
+        (WireProbeMode::Project, 1 << 32, 0),
+        (WireProbeMode::Project, 4, index),
+        (WireProbeMode::AllHolders, 0, index),
+        (WireProbeMode::Exists, 0, 7),
+    ] {
+        assert!(Probe::from_wire(mode, arg0, arg1).is_err(), "{mode:?} {arg0} {arg1}");
+    }
 }
 
 /// A flag-clear word names no column list, whatever its other bits say — `0` is

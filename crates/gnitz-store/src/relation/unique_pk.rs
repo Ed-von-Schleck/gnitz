@@ -20,30 +20,33 @@ pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
 
     let mut dropped: Vec<usize> = Vec::new();
     let mut stored: Vec<StoredRow> = Vec::new();
-    let mut live_insert: FxHashMap<&[u8], Option<usize>> =
-        FxHashMap::with_capacity_and_hasher(batch.len(), Default::default());
-    for row in 0..batch.len() {
-        let w = batch.get_weight(row);
-        if w <= 0 {
-            dropped.push(row);
-        }
-        if w == 0 {
-            continue;
-        }
-        let pk = batch.get_pk_bytes(row);
-        let slot = match live_insert.entry(pk) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                stored.extend(store.live_row_at(pk).1);
-                e.insert(None)
+    {
+        let mut live_insert: FxHashMap<&[u8], Option<usize>> =
+            FxHashMap::with_capacity_and_hasher(batch.len(), Default::default());
+        for row in 0..batch.len() {
+            let w = batch.get_weight(row);
+            if w <= 0 {
+                dropped.push(row);
             }
-        };
-        if let Some(displaced) = std::mem::replace(slot, (w > 0).then_some(row)) {
-            dropped.push(displaced);
+            if w == 0 {
+                continue;
+            }
+            let pk = batch.get_pk_bytes(row);
+            let slot = match live_insert.entry(pk) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    stored.extend(store.live_row_at(pk).1);
+                    e.insert(None)
+                }
+            };
+            if let Some(displaced) = std::mem::replace(slot, (w > 0).then_some(row)) {
+                dropped.push(displaced);
+            }
         }
     }
 
-    if dropped.is_empty() && stored.is_empty() {
+    if dropped.is_empty() {
+        batch.append_stored(&stored, -1);
         return batch;
     }
     let kept = complement(dropped, batch.len());

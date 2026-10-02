@@ -206,11 +206,11 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (u64, u64)
 
     // The two halves of the verdict, written the way a boot writes them.
     engine.record_topology(recorded_workers).unwrap();
-    let g = engine.bump_checkpoint_generation().unwrap();
+    let g = engine.advance_durable_generation().unwrap();
 
     // The index is the only rederived store this table owns, so the ephemeral
     // round publishes exactly it.
-    engine.registry.checkpoint_ephemeral([]).unwrap();
+    engine.registry.checkpoint_ephemeral([], g).unwrap();
 
     engine.close();
     (tid, g)
@@ -224,7 +224,7 @@ fn index_rebuild_is_skipped_after_resume() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        engine.topology_matches() && engine.registry.resume_generation() == g,
+        engine.topology_matches() && engine.resume_generation == g,
         "a matching topology leaves the recovered generation as the whole verdict"
     );
     assert!(
@@ -296,20 +296,16 @@ fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
     backfill(&mut engine, vid, &[tid]);
 
     engine.record_topology(1).unwrap();
-    let g = engine.bump_checkpoint_generation().unwrap();
+    let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
-    assert_eq!(engine.registry.resume_generation(), g);
 
     engine.close();
     (tid, vid)
 }
 
 // ── view_traces_resume_with_their_output_store ──────────────────────────
-// A compile must open the traces against the generation the *output store*
-// accepted, not whatever the engine holds when the compile runs. After a bump
-// between the two, a trace looking for `g + 1` is erased: an empty integral
-// under a full output store, which re-inserting a present row exposes as a
-// second copy in the view.
+// A compile opens the traces against the generation the output store resumed
+// from.
 #[test]
 fn view_traces_resume_with_their_output_store() {
     let dir = temp_dir("view_traces_resume_with_output");
@@ -318,7 +314,6 @@ fn view_traces_resume_with_their_output_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let view_weight = |engine: &CatalogEngine| sum_weights(engine.registry.relation(vid).unwrap().cursor());
     assert_eq!(view_weight(&engine), N, "the output store resumes");
-    engine.bump_checkpoint_generation().unwrap();
     engine.dag.open_plan(&engine.registry, vid).unwrap();
 
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -347,9 +342,8 @@ fn uncompiled_view_traces_invalidate_the_view() {
     // A checkpoint with nothing in the plan cache — what a boot checkpoint is for
     // a view no tick sweep reaches.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let g2 = engine.bump_checkpoint_generation().unwrap();
+    let g2 = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g2).unwrap();
-    assert_eq!(engine.registry.resume_generation(), g2);
     engine.close();
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();

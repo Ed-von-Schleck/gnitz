@@ -65,7 +65,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
 /// Checkpoint every store, so the sweep has skeletonized every bounded view.
 fn checkpoint(engine: &mut CatalogEngine) {
     engine.record_topology(1).unwrap();
-    let g = engine.bump_checkpoint_generation().unwrap();
+    let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
 }
 

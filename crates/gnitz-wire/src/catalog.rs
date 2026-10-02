@@ -2,7 +2,7 @@
 //! table column lists and IDs, schema sizing caps, and the compound-PK
 //! column-list codec for the persisted `TABLE_TAB.pk_col_idx` u64.
 
-use crate::{ColType, TypeCode};
+use crate::{ColType, TypeCode, WireProbeMode};
 
 // ---------------------------------------------------------------------------
 // System table column descriptors — shared single source of truth
@@ -579,33 +579,67 @@ const _: () = assert!(
 /// reading a shape.
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-/// The store a `HasPk` probe reads, as its group's `arg1` carries it.
+/// One `HasPk` probe: the store it reads, and what it answers each matched key
+/// with.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum ProbeKeyspace {
-    /// The relation's own PK store, carried as `0`.
-    OwnPk,
-    /// The secondary index on this exact column list, carried packed.
-    Index(PkColList),
+pub enum Probe {
+    /// The relation's own PK store: each key a live row carries, echoed.
+    Pk,
+    /// The own PK store: each key a live row carries, with that row's column.
+    PkColumn(u32),
+    /// The secondary index on this exact column list.
+    Index(PkColList, Holders),
 }
 
-impl ProbeKeyspace {
-    /// The `arg1` word. [`pack_pk_cols`] sets [`PK_LIST_PACKED_FLAG`], so an index
-    /// word is never `0`.
-    pub fn arg1(self) -> u64 {
+/// What an index probe answers a probe key whose span is held with.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Holders {
+    /// The probe key.
+    Echo,
+    /// The first stored entry under the span, `[span ‖ holder PK]`.
+    First,
+    /// Every stored entry under the span, up to this many.
+    UpTo(std::num::NonZeroU64),
+}
+
+impl Probe {
+    /// The probe mode, `arg0` and `arg1` a `HasPk` group carries this as.
+    pub fn wire(self) -> (WireProbeMode, u64, u64) {
         match self {
-            ProbeKeyspace::OwnPk => 0,
-            ProbeKeyspace::Index(cols) => pack_pk_cols(cols.as_slice()),
+            Probe::Pk => (WireProbeMode::Exists, 0, 0),
+            Probe::PkColumn(col) => (WireProbeMode::Project, col as u64, 0),
+            Probe::Index(cols, holders) => {
+                let (mode, arg0) = match holders {
+                    Holders::Echo => (WireProbeMode::Exists, 0),
+                    Holders::First => (WireProbeMode::FirstHolder, 0),
+                    Holders::UpTo(cap) => (WireProbeMode::AllHolders, cap.get()),
+                };
+                (mode, arg0, pack_pk_cols(cols.as_slice()))
+            }
         }
     }
 
-    /// Decode an `arg1` word; a nonzero word must be a packed column list.
-    pub fn from_arg1(arg1: u64) -> Result<Self, String> {
-        if arg1 == 0 {
-            return Ok(ProbeKeyspace::OwnPk);
-        }
-        unpack_pk_cols(arg1)
-            .map(ProbeKeyspace::Index)
-            .map_err(|e| e.for_role(crate::PkListRole::ColumnList))
+    /// The inverse of [`Self::wire`], refusing every other triple.
+    /// [`pack_pk_cols`] sets [`PK_LIST_PACKED_FLAG`], so an `arg1` of `0` is the
+    /// own PK store.
+    pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
+        let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
+        let probe = match (mode, arg0, arg1) {
+            (WireProbeMode::Exists, 0, 0) => Probe::Pk,
+            (WireProbeMode::Project, col, 0) => Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?),
+            (_, _, 0) | (WireProbeMode::Project, ..) => return Err(refused()),
+            (mode, arg0, cols) => {
+                let cols = unpack_pk_cols(cols).map_err(|e| e.for_role(crate::PkListRole::ColumnList))?;
+                let holders = match (mode, std::num::NonZeroU64::new(arg0)) {
+                    (WireProbeMode::Exists, None) => Holders::Echo,
+                    (WireProbeMode::FirstHolder, None) => Holders::First,
+                    (WireProbeMode::AllHolders, Some(cap)) => Holders::UpTo(cap),
+                    _ => return Err(refused()),
+                };
+                Probe::Index(cols, holders)
+            }
+        };
+        Ok(probe)
     }
 }
 

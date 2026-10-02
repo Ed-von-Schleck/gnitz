@@ -34,7 +34,7 @@ impl RelationRegistry {
         if let (ReadBound::None, true, None, SinkKind::Rows { limit_k: 0, .. }) =
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
-            if !entry.store().held().has_skeleton_rows() {
+            if !entry.table().has_skeleton_rows() {
                 check_layout(reply_layout, &src_schema)?;
                 return Ok(entry.full_scan());
             }
@@ -77,7 +77,7 @@ impl RelationRegistry {
         reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
         let entry = self.relation_or_err(id)?;
-        if !entry.has_delta_feed() {
+        if !entry.kind().has_delta_feed() {
             return Err(format!(
                 "delta_read: relation {id} carries no delta feed; \
                  create the view WITH (delta = '<size>') to subscribe to it"

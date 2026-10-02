@@ -74,12 +74,8 @@ fn rows_of_names_every_row_a_key_prefixes() {
     let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let key = |a: u64, b: u64| opk_pk(&schema, &[a as u128, b as u128]);
     let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
-    let check = PipelinedCheck {
-        keyspace: ProbeKeyspace::OwnPk,
-        probe: Probe::Exists,
-        batch: build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..])),
-        schema: wire::WireSchema::encoded(1, &schema),
-    };
+    let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..]));
+    let check = PipelinedCheck::new(1, Probe::Pk, batch);
     assert_eq!(check.rows_of(&key(3, 1)), 1..3, "a duplicate key");
     assert_eq!(check.rows_of(&key(3, 2)), 3..3, "an absent key");
     assert_eq!(check.rows_of(&key(9, 0)), 5..5, "an absent key past the last row");

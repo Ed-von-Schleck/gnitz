@@ -6,21 +6,20 @@ use super::dirs::children_at_generation;
 use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
+use crate::storage::{RecoverySource, Table};
 use gnitz_zset::schema::Slot;
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
 
-    /// Take rank `rank` of the launched count as `residency`, open this process's
-    /// store for every relation and index, and fill each index that did not resume.
-    /// Returns how many were filled. `resume(id)` says whether relation `id`'s
-    /// rederived stores — a view's rows and traces, a base table's indexes — may
-    /// resume from a checkpoint manifest.
+    /// Become rank `rank` as `residency`: open this process's store of every
+    /// relation and index, a rederived one from its manifest at `resume_at(id)` or
+    /// rebuilt, and fill each index that did not resume. Returns how many it filled.
     pub fn open_stores(
         &mut self,
         rank: u32,
         residency: Residency,
-        resume: impl Fn(u64) -> bool,
+        resume_at: impl Fn(u64) -> Option<u64>,
     ) -> Result<usize, String> {
         assert_eq!(
             self.residency,
@@ -41,14 +40,14 @@ impl RelationRegistry {
         let mut filled = 0usize;
         for tid in tids {
             let e = &self.tables[&tid];
-            let may_resume = resume(tid);
+            let resume_at = resume_at(tid);
             let spec = RelationSpec {
                 id: tid,
                 kind: e.kind(),
                 schema: e.schema(),
                 placement: e.placement(),
             };
-            let (store, delta) = self.build_relation_store(spec, may_resume)?;
+            let (store, delta) = self.build_relation_store(spec, resume_at)?;
             let index_stores = e
                 .indexes
                 .iter()
@@ -57,7 +56,7 @@ impl RelationRegistry {
                         tid,
                         ChildKind::Index(ix.cols),
                         ix.schema(),
-                        self.rederive_source(may_resume),
+                        RecoverySource::Rederive { resume_at },
                         self.store_budgets(),
                     )
                 })
@@ -74,11 +73,7 @@ impl RelationRegistry {
         // A worker applies the same catalog deltas as the master, but only the
         // master writes the system tables' shards.
         if residency == Residency::Worker {
-            for entry in self.tables.values_mut() {
-                if entry.kind() == RelationKind::SystemCatalog {
-                    entry.store.held_mut().hold_in_ram();
-                }
-            }
+            self.collect_system_tables().for_each(Table::hold_in_ram);
         }
         Ok(filled)
     }
@@ -119,20 +114,15 @@ impl RelationRegistry {
     }
 
     /// Whether every checkpointed child of `view_id`, on **every launched rank**,
-    /// carries a manifest at this registry's resume generation — the store half
-    /// of the resume verdict. `false` for an id this registry does not hold.
-    pub fn view_children_resumable(&self, view_id: u64) -> bool {
+    /// carries a manifest at `generation` — the store half of the resume verdict.
+    /// `false` for an id this registry does not hold.
+    pub fn view_children_resumable(&self, view_id: u64, generation: u64) -> bool {
         // A worker cannot speak for its peers.
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
             "view_children_resumable reads every rank's children"
         );
-        self.has_id(view_id)
-            && children_at_generation(
-                &relation_dir(&self.base_dir, view_id),
-                self.slot.of,
-                self.resume_generation,
-            )
+        self.has_id(view_id) && children_at_generation(&relation_dir(&self.base_dir, view_id), self.slot.of, generation)
     }
 
     /// The system families' `table id → replay floor` their stores opened with:

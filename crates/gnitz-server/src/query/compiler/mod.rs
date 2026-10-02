@@ -258,7 +258,7 @@ pub(super) struct Side {
 fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
     plan.source_reg_map
         .keys()
-        .all(|tid| registry.relation(*tid).is_some_and(Relation::is_replicated))
+        .all(|tid| registry.relation(*tid).is_some_and(|r| r.placement().is_replicated()))
         && !plan.vm.program.trims_per_worker()
 }
 

@@ -65,7 +65,7 @@ impl CatalogEngine {
                 invalid.insert(vid);
                 continue;
             }
-            if !self.registry.view_children_resumable(vid) {
+            if !self.registry.view_children_resumable(vid, self.resume_generation) {
                 invalid.insert(vid);
             }
         }
@@ -81,10 +81,10 @@ impl CatalogEngine {
     /// Open this process's stores under the boot's resume verdict: a relation's
     /// rederived state resumes iff the topology matches and the verdict kept it.
     pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
-        let topology = self.topology_matches();
+        let resume_at = self.topology_matches().then_some(self.resume_generation);
         let dag = &self.dag;
         self.registry
-            .open_stores(rank, residency, |id| topology && !dag.awaits_rebuild(id))
+            .open_stores(rank, residency, |id| resume_at.filter(|_| !dag.awaits_rebuild(id)))
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the

@@ -167,7 +167,13 @@ fn unregistered(view_id: u64) -> String {
 /// Load and compile `view`'s circuit. Opens nothing.
 fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutput, StateLayout), String> {
     let loaded = compiler::load_circuit(registry, view.id())?;
-    compiler::compile_view(&loaded, registry, &view.schema(), view.placement(), view.is_bounded())
+    compiler::compile_view(
+        &loaded,
+        registry,
+        &view.schema(),
+        view.placement(),
+        view.kind().is_bounded(),
+    )
 }
 
 /// This view's metadata and its compiled plan, compiling and opening its
