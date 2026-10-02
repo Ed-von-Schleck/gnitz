@@ -14,8 +14,8 @@ use crate::program::{EmitWidth, FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntU
 use crate::search::{fields, find};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
-    compare_german_strings, german_string_heap, german_string_inline, low_bits_mask, null_word_get, read_u64_le,
-    FixedInt,
+    compare_german_strings, german_string_content, german_string_heap, german_string_inline, low_bits_mask,
+    null_word_get, read_u64_le, FixedInt,
 };
 
 /// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
@@ -60,9 +60,9 @@ pub(crate) struct EvalScratch {
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
     null_bits: Vec<u64>,
-    /// Packed truthy bits, register-major; bridges boolean producers and
-    /// consumers on the nullable arm without per-row repack from `regs`.
-    /// Empty (capacity 0) when `no_nulls` is true.
+    /// Packed truthy bits, register-major like [`Self::null_bits`]: what a
+    /// boolean consumer reads a register through, on both arms. A producer
+    /// writes whole words, so the bits past a morsel's last row are undefined.
     bool_bits: Vec<u64>,
     /// String register lanes, register-major like [`Self::regs`]:
     /// `str_views[reg * MORSEL + row]`. Empty (capacity 0) unless the program
@@ -126,7 +126,7 @@ impl EvalScratch {
         let mut scratch = EvalScratch {
             regs: vec![0; prog.scalar_lanes as usize * MORSEL],
             null_bits: vec![0; null_cap],
-            bool_bits: vec![0; null_cap],
+            bool_bits: vec![0; prog.num_regs() * NULL_WORDS_PER_REG],
             str_views: vec![StrView::default(); prog.str_lanes as usize * MORSEL],
             str_arena: prog.const_arena.clone(),
         };
@@ -141,7 +141,7 @@ impl EvalScratch {
         for &(dst, val) in &prog.const_regs {
             let base_r = dst as usize * MORSEL;
             self.regs[base_r..base_r + MORSEL].fill(val);
-            if !prog.no_nulls && prog.needs_bool_pack(dst as usize) {
+            if prog.needs_bool_pack(dst as usize) {
                 let base_b = dst as usize * NULL_WORDS_PER_REG;
                 pack_truthy(
                     &self.regs[base_r..base_r + MORSEL],
@@ -162,7 +162,7 @@ impl EvalScratch {
 
     /// Split borrows over `regs`: `N` shared source windows + one mutable
     /// destination. Backs every unary opcode (`N = 1`), every binary one
-    /// (`N = 2`) and SELECT's no-nulls value blend (`N = 3`).
+    /// (`N = 2`).
     fn regs_split<const N: usize>(&mut self, srcs: [u16; N], d: u16, m: usize) -> ([&[i64]; N], &mut [i64]) {
         split_windows(&mut self.regs, MORSEL, srcs, d, m)
     }
@@ -179,10 +179,8 @@ impl EvalScratch {
     pub(crate) fn morsel_out<'a>(&'a self, prog: &ResolvedProgram, bufs: StrBufs<'a>, m: usize) -> MorselOut<'a> {
         MorselOut {
             regs: &self.regs,
-            nulls: (!prog.no_nulls).then_some(NullLanes {
-                null_bits: &self.null_bits,
-                bool_bits: &self.bool_bits,
-            }),
+            null_bits: (!prog.no_nulls).then_some(&self.null_bits[..]),
+            bool_bits: &self.bool_bits,
             str_views: &self.str_views,
             str_arena: &self.str_arena,
             bufs,
@@ -203,18 +201,13 @@ impl EvalScratch {
 /// One morsel's results, read out of the register file.
 pub(crate) struct MorselOut<'a> {
     regs: &'a [i64],
-    /// `None` on the `no_nulls` arm, which tracks no null or truth bits.
-    nulls: Option<NullLanes<'a>>,
+    /// `None` on the `no_nulls` arm, which tracks no null bits.
+    null_bits: Option<&'a [u64]>,
+    bool_bits: &'a [u64],
     str_views: &'a [StrView],
     str_arena: &'a [u8],
     bufs: StrBufs<'a>,
     m: usize,
-}
-
-#[derive(Clone, Copy)]
-struct NullLanes<'a> {
-    null_bits: &'a [u64],
-    bool_bits: &'a [u64],
 }
 
 impl MorselOut<'_> {
@@ -228,14 +221,17 @@ impl MorselOut<'_> {
     /// the value is true and not NULL.
     pub(crate) fn filter_words(&self, reg: usize, out: &mut [u64]) {
         debug_assert_eq!(out.len(), self.m.div_ceil(64), "one bit per row");
-        let Some(NullLanes { null_bits, bool_bits }) = self.nulls else {
-            return pack_truthy(self.reg_values(reg), out);
-        };
         let base = reg * NULL_WORDS_PER_REG;
-        for (w, word) in out.iter_mut().enumerate() {
-            *word = bool_bits[base + w] & !null_bits[base + w];
+        let bool_bits = &self.bool_bits[base..base + out.len()];
+        match self.null_bits {
+            None => out.copy_from_slice(bool_bits),
+            Some(null_bits) => {
+                for (w, word) in out.iter_mut().enumerate() {
+                    *word = bool_bits[w] & !null_bits[base + w];
+                }
+            }
         }
-        // Boolean producers on this arm write whole words.
+        // Boolean producers write whole words.
         out[out.len() - 1] &= tail_mask(self.m);
     }
 
@@ -318,7 +314,7 @@ impl MorselOut<'_> {
     /// Call `f(i)` for each of the morsel's rows where register `reg` is NULL.
     #[inline(always)]
     pub(crate) fn for_each_null_row(&self, reg: usize, mut f: impl FnMut(usize)) {
-        let Some(NullLanes { null_bits, .. }) = self.nulls else {
+        let Some(null_bits) = self.null_bits else {
             return;
         };
         let base = reg * NULL_WORDS_PER_REG;
@@ -503,10 +499,6 @@ fn gather_null_words(rows: &[u8], cols: u64, out: &mut [u64]) {
 /// batch bitmap, per row, as a boolean in register `dst` that is never NULL.
 fn eval_is_null(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: u8, invert: bool) {
     let pi = pi as usize;
-    if mo.no_nulls() {
-        // This arm has no `null_bits` to clear and no `bool_bits` to pack.
-        return fill_is_null_regs(scratch, mo, dst, pi, invert);
-    }
     // A destination read as a packed bit builds its word off the gather directly.
     if mo.prog.needs_bool_pack(dst as usize) {
         return is_null_packed(scratch, mo, dst, pi, invert);
@@ -535,23 +527,23 @@ fn is_null_packed(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usiz
     gather_null_words(mo.null_words(), 1u64 << pi, &mut scratch.bool_bits[base..base + words]);
     for w in 0..words {
         scratch.bool_bits[base + w] ^= flip;
-        // Whole words; a verdict's reader masks past the last row.
-        scratch.null_bits[base + w] = 0;
     }
+    // Whole words; a verdict's reader masks past the last row.
+    scratch.clear_null_reg(mo, dst);
     maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
 
-/// `IS [NOT] NULL` over register `a`'s null lane, a definite boolean. Under
-/// `no_nulls` there is no lane and nothing is NULL, so it is the constant
-/// `invert`; otherwise the lane *is* the packed boolean (the `BoolNot` shape).
+/// `IS [NOT] NULL` over register `a`'s null lane, a definite boolean: the lane
+/// *is* the packed boolean. Under `no_nulls` there is no lane and nothing is
+/// NULL, so every row is the constant `invert`.
 fn eval_is_null_reg(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, invert: bool) {
-    if mo.no_nulls() {
-        scratch.reg_mut(dst, mo.m).fill(invert as i64);
-        return;
-    }
     let flip = if invert { u64::MAX } else { 0 };
     let base_a = a as usize * NULL_WORDS_PER_REG;
     let base_d = dst as usize * NULL_WORDS_PER_REG;
+    if mo.no_nulls() {
+        scratch.bool_bits[base_d..base_d + mo.m.div_ceil(64)].fill(flip);
+        return maybe_unpack_bool_to_regs(scratch, mo, dst);
+    }
     for w in 0..mo.m.div_ceil(64) {
         scratch.bool_bits[base_d + w] = scratch.null_bits[base_a + w] ^ flip;
         scratch.null_bits[base_d + w] = 0;
@@ -559,14 +551,21 @@ fn eval_is_null_reg(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16
     maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
 
-/// `BoolBinary`'s word-level 3VL kernel, both selectors (nullable arm).
-/// `va`/`vb` come from `bool_bits`; `na`/`nb` from `null_bits`.
-/// Writes `bool_bits[dst]` and `null_bits[dst]` at word granularity.
-fn bool_and_or_word_loop(scratch: &mut EvalScratch, dst: u16, a: u16, b: u16, m: usize, is_or: bool) {
-    let words = m.div_ceil(64);
+/// `BoolBinary`'s word-level kernel, both selectors: three-valued over
+/// `bool_bits` and `null_bits`, and plain AND / OR over `bool_bits` under
+/// `no_nulls`, which has no null words to read or write.
+fn bool_and_or_word_loop(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16, is_or: bool) {
+    let words = mo.m.div_ceil(64);
     let base_a_n = a as usize * NULL_WORDS_PER_REG;
     let base_b_n = b as usize * NULL_WORDS_PER_REG;
     let base_d_n = dst as usize * NULL_WORDS_PER_REG;
+    if mo.no_nulls() {
+        let (ba, bd) = split_windows(&mut scratch.bool_bits, NULL_WORDS_PER_REG, [a, b], dst, words);
+        for ((d, &va), &vb) in bd.iter_mut().zip(ba[0]).zip(ba[1]) {
+            *d = if is_or { va | vb } else { va & vb };
+        }
+        return;
+    }
     for w in 0..words {
         let va = scratch.bool_bits[base_a_n + w];
         let vb = scratch.bool_bits[base_b_n + w];
@@ -621,14 +620,14 @@ fn maybe_unpack_bool_to_regs(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u1
 }
 
 /// Bridge for producers that wrote `regs[dst]` and may have a downstream BOOL
-/// consumer (or, for filters, a bit_only result_reg). Non-bool producers reach
-/// a BOOL consumer through this path without restructuring their inner loop.
+/// consumer, a filter's verdict included. Non-bool producers reach a BOOL
+/// consumer through this path without restructuring their inner loop.
 ///
 /// The tests inline into the caller and the pack does not; the `map` shape of
 /// `expr_kernel_bench` measures the split.
 #[inline]
 fn maybe_pack_bool_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
-    if !mo.no_nulls() && mo.prog.needs_bool_pack(dst as usize) {
+    if mo.prog.needs_bool_pack(dst as usize) {
         pack_bool_bits(scratch, mo.m, dst);
     }
 }
@@ -647,7 +646,6 @@ fn pack_bool_bits(scratch: &mut EvalScratch, m: usize, dst: u16) {
 /// here in a second pass: packing inside the value loop would read-modify-write
 /// one mask word every iteration, which serialises it.
 fn merge_fail_mask(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, bad: &[u8; MORSEL]) {
-    let m = mo.m;
     // The usual morsel has no failure. A fold rather than `any`: with no early
     // exit it vectorizes.
     if bad.iter().fold(0u8, |acc, &b| acc | b) == 0 {
@@ -658,15 +656,23 @@ fn merge_fail_mask(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, bad: &[
         "a kernel raised a failure flag under no_nulls: \
          its `Operands` entry does not set `makes_null`"
     );
+    let mut failed = [0u64; NULL_WORDS_PER_REG];
+    pack_bytes(bad, &mut failed);
     let base = dst as usize * NULL_WORDS_PER_REG;
-    for w in 0..m.div_ceil(64) {
-        let lo = w * 64;
-        let n = core::cmp::min(64, m - lo);
-        let mut word = 0u64;
-        for j in 0..n {
-            word |= (bad[lo + j] as u64) << j;
+    for (w, f) in failed.iter().enumerate().take(mo.m.div_ceil(64)) {
+        scratch.null_bits[base + w] |= f;
+    }
+}
+
+/// One bit per byte of `src`, each byte 0 or 1: eight bytes fold to eight bits
+/// in one multiply.
+fn pack_bytes(src: &[u8; MORSEL], out: &mut [u64]) {
+    for (w, blk) in out.iter_mut().zip(src.as_chunks::<64>().0) {
+        let mut bits = 0u64;
+        for (k, g) in blk.as_chunks::<8>().0.iter().enumerate() {
+            bits |= (u64::from_le_bytes(*g).wrapping_mul(0x0102_0408_1020_4080) >> 56) << (k * 8);
         }
-        scratch.null_bits[base + w] |= word;
+        *w = bits;
     }
 }
 
@@ -773,13 +779,17 @@ fn view_span(v: StrView, buf_len: usize) -> (usize, usize) {
     }
 }
 
-/// `v`'s bytes together with the offset they sit at. The sub-view producers
-/// need both, and must read the offset from here rather than from `v.off`: a
-/// clamped-away view reports offset 0.
+/// `v`'s bytes together with the offset they sit at, a view running past its
+/// buffer reading as the empty string at offset 0 — [`view_span`]'s convention
+/// in one range check. The sub-view producers need both, and must read the
+/// offset from here rather than from `v.off`.
 fn view_bytes_at<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> (&'x [u8], usize) {
     let buf = bufs.region(v.src).unwrap_or(arena);
-    let (o, l) = view_span(v, buf.len());
-    (&buf[o..o + l], o)
+    let o = v.off as usize;
+    match buf.get(o..o.wrapping_add(v.len as usize)) {
+        Some(bytes) => (bytes, o),
+        None => (&[], 0),
+    }
 }
 
 fn view_bytes<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> &'x [u8] {
@@ -954,17 +964,23 @@ fn arena_push_float(arena: &mut Vec<u8>, v: f64) -> StrView {
 /// Returns the per-row "take `a`" bits: `cond` truthy AND non-null. `cond` may be
 /// bit_only (its producer skips the unpack to `regs`), so its truthiness comes
 /// from `bool_bits`, not `regs`. `dst`'s null word is written here: `dst` is null
-/// wherever the chosen branch is null.
+/// wherever the chosen branch is null. Under `no_nulls` the mask is `cond`'s
+/// bits and there is no null word.
 fn select_take_mask(
     s: &mut EvalScratch,
+    mo: &Morsel<'_>,
     dst: u16,
     cond: u16,
     a: u16,
     b: u16,
-    words: usize,
 ) -> [u64; NULL_WORDS_PER_REG] {
+    let words = mo.m.div_ceil(64);
     let base_cond = cond as usize * NULL_WORDS_PER_REG;
     let mut take_a = [0u64; NULL_WORDS_PER_REG];
+    if mo.no_nulls() {
+        take_a[..words].copy_from_slice(&s.bool_bits[base_cond..base_cond + words]);
+        return take_a;
+    }
     for (w, t) in take_a.iter_mut().enumerate().take(words) {
         *t = s.bool_bits[base_cond + w] & !s.null_bits[base_cond + w];
     }
@@ -1016,6 +1032,22 @@ fn str_to_scalar(
         );
         for (i, r) in rd.iter_mut().enumerate() {
             *r = f(view_bytes(va[i], str_arena, bufs));
+        }
+    }
+    null_copy1(scratch, mo, dst, a);
+    maybe_pack_bool_bits(scratch, mo, dst);
+}
+
+/// The byte length of every row of string register `a` into scalar register
+/// `dst`, read off the views: every producer writes a view that lies inside its
+/// buffer, so `len` is the length resolving it would report.
+fn str_byte_len(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16) {
+    {
+        let EvalScratch { regs, str_views, .. } = &mut *scratch;
+        let va = &str_views[a as usize * MORSEL..][..mo.m];
+        let rd = &mut regs[dst as usize * MORSEL..][..mo.m];
+        for (r, v) in rd.iter_mut().zip(va) {
+            *r = v.len as i64;
         }
     }
     null_copy1(scratch, mo, dst, a);
@@ -1205,16 +1237,7 @@ impl Blend for StrView {
 /// `Select`'s value blend over string lanes instead of scalar registers.
 fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, a: u16, b: u16) {
     let m = mo.m;
-    if mo.no_nulls() {
-        let base_c = cond as usize * MORSEL;
-        let EvalScratch { regs, str_views, .. } = &mut *scratch;
-        let ([va, vb], vd) = split_windows(str_views, MORSEL, [a, b], dst, m);
-        for (i, r) in vd.iter_mut().enumerate() {
-            *r = if regs[base_c + i] != 0 { va[i] } else { vb[i] };
-        }
-        return;
-    }
-    let take_a = select_take_mask(scratch, dst, cond, a, b, m.div_ceil(64));
+    let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
     blend_by_mask(&mut scratch.str_views, [a, b], dst, &take_a, m);
 }
 
@@ -1345,6 +1368,8 @@ fn eval_str_concat(
 /// Where a compare operand's cell for morsel row `i` comes from.
 trait Cells: Copy {
     fn cell(&self, i: usize) -> &[u8; 16];
+    /// Every row's cell, in row order.
+    fn iter(&self) -> impl Iterator<Item = &[u8; 16]>;
 }
 
 /// A payload column's cells over the morsel.
@@ -1355,6 +1380,9 @@ impl Cells for ColumnCells<'_> {
     fn cell(&self, i: usize) -> &[u8; 16] {
         &self.0[i]
     }
+    fn iter(&self) -> impl Iterator<Item = &[u8; 16]> {
+        self.0.iter()
+    }
 }
 
 /// A resolved constant: one cell for every row.
@@ -1364,6 +1392,9 @@ struct ConstCell<'a>(&'a [u8; 16]);
 impl Cells for ConstCell<'_> {
     fn cell(&self, _: usize) -> &[u8; 16] {
         self.0
+    }
+    fn iter(&self) -> impl Iterator<Item = &[u8; 16]> {
+        std::iter::repeat(self.0)
     }
 }
 
@@ -1398,7 +1429,7 @@ impl<'a> StrOperand<'a, ConstCell<'a>> {
     }
 }
 
-/// The one string-compare kernel. The compare runs unconditionally, including on
+/// The ordering string-compare kernel. The compare runs unconditionally, including on
 /// rows where either operand's column is null, keeping the loop branch-free.
 /// `str_const_filter_bench` measures the inlining.
 #[inline(always)]
@@ -1417,6 +1448,63 @@ fn eval_str_cmp<A: Cells, B: Cells>(
         *r = pred(compare_german_strings(a.cells.cell(i), a.blob, b.cells.cell(i), b.blob)) as i64;
     }
     maybe_pack_bool_bits(scratch, mo, dst);
+}
+
+/// A cell's two words: its length under its prefix, then its suffix or heap
+/// offset.
+#[inline(always)]
+fn cell_words(cell: &[u8; 16]) -> (u64, u64) {
+    (
+        u64::from_le_bytes(cell[..8].try_into().unwrap()),
+        u64::from_le_bytes(cell[8..].try_into().unwrap()),
+    )
+}
+
+/// String equality, `<>` when `ne`, read off the cells. Two canonical cells
+/// hold one string iff their first words agree and, short, their second words
+/// do — or, long, their heap bytes. One branch-free pass settles every short
+/// row and marks the long rows whose length and prefix agree; only those reach
+/// the heap. Runs over NULL rows too, as [`eval_str_cmp`] does.
+#[inline(always)]
+fn eval_str_eq<A: Cells, B: Cells>(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    dst: u16,
+    a: StrOperand<'_, A>,
+    b: StrOperand<'_, B>,
+    ne: bool,
+) {
+    fill_null_bits_mask(scratch, dst, mo, a.null_bit | b.null_bit);
+    let (mut eq, mut long_match) = ([0u8; MORSEL], [0u8; MORSEL]);
+    let cells = a.cells.iter().zip(b.cells.iter()).take(mo.m);
+    for ((eq, long_match), (ca, cb)) in eq.iter_mut().zip(&mut long_match).zip(cells) {
+        let ((a0, a1), (b0, b1)) = (cell_words(ca), cell_words(cb));
+        let long = a0 as u32 > gnitz_wire::SHORT_STRING_THRESHOLD as u32;
+        *eq = ((a0 == b0) & (a1 == b1) & !long) as u8;
+        *long_match = ((a0 == b0) & long) as u8;
+    }
+    let words = mo.m.div_ceil(64);
+    let mut eq_bits = [0u64; NULL_WORDS_PER_REG];
+    pack_bytes(&eq, &mut eq_bits);
+    // A fold rather than `any`: with no early exit it vectorizes.
+    if long_match.iter().fold(0u8, |acc, &c| acc | c) != 0 {
+        let mut pending = [0u64; NULL_WORDS_PER_REG];
+        pack_bytes(&long_match, &mut pending);
+        for (w, &word) in pending.iter().enumerate().take(words) {
+            for j in gnitz_wire::BitIter(word) {
+                let (ca, cb) = (a.cells.cell(w * 64 + j), b.cells.cell(w * 64 + j));
+                let same = german_string_content(ca, a.blob) == german_string_content(cb, b.blob);
+                eq_bits[w] |= (same as u64) << j;
+            }
+        }
+    }
+    let flip = if ne { u64::MAX } else { 0 };
+    let base = dst as usize * NULL_WORDS_PER_REG;
+    for (w, &bits) in eq_bits.iter().enumerate().take(words) {
+        // Whole words; a verdict's reader masks past the last row.
+        scratch.bool_bits[base + w] = bits ^ flip;
+    }
+    maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
 
 /// Reinterpret a register's raw i64 bits as the `f64` they encode, and back.
@@ -1455,6 +1543,25 @@ fn bin_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, f:
     maybe_pack_bool_bits(scratch, mo, d);
 }
 
+/// [`bin_op`] for a predicate. A bit_only destination takes its packed bits
+/// straight off the operands, through a byte per row, and no lane is written.
+#[inline]
+fn bin_pred(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, f: impl Fn(i64, i64) -> bool) {
+    if !mo.prog.is_bit_only(d as usize) {
+        return bin_op(scratch, mo, d, a, b, |x, y| f(x, y) as i64);
+    }
+    let mut truth = [0u8; MORSEL];
+    {
+        let ([ra, rb], _) = scratch.regs_split([a, b], d, mo.m);
+        for ((t, &x), &y) in truth.iter_mut().zip(ra).zip(rb) {
+            *t = f(x, y) as u8;
+        }
+    }
+    let base = d as usize * NULL_WORDS_PER_REG;
+    pack_bytes(&truth, &mut scratch.bool_bits[base..base + mo.m.div_ceil(64)]);
+    null_or2(scratch, mo, d, a, b);
+}
+
 /// Unary counterpart of [`bin_op`]: read one source register, write one, copy
 /// the source null word, repack bool bits.
 #[inline]
@@ -1463,6 +1570,26 @@ fn un_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, f: impl Fn(
         let ([ra], rd) = scratch.regs_split([a], d, mo.m);
         for (r, &x) in rd.iter_mut().zip(ra) {
             *r = f(x);
+        }
+    }
+    null_copy1(scratch, mo, d, a);
+    maybe_pack_bool_bits(scratch, mo, d);
+}
+
+/// The largest IN set tested a value at a time; a larger one is searched per
+/// row. The `in*` shapes of `filter_kernel_bench` place the crossover.
+const IN_SET_SCAN_MAX: usize = 32;
+
+/// `a IN set` for a small set: one equality pass over the whole lane per set
+/// value, each a branch-free loop, rather than a search per row.
+fn in_small_set(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, set: &[i64]) {
+    {
+        let ([ra], rd) = scratch.regs_split([a], d, mo.m);
+        rd.fill(0);
+        for &v in set {
+            for (r, &x) in rd.iter_mut().zip(ra) {
+                *r |= (x == v) as i64;
+            }
         }
     }
     null_copy1(scratch, mo, d, a);
@@ -1572,8 +1699,9 @@ fn minmax2(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, p
 }
 
 /// Dispatch a German-string compare on its operator, hoisting the six-way
-/// branch out of the row loop: each arm instantiates [`eval_str_cmp`] with its
-/// own `Ordering` predicate.
+/// branch out of the row loop: the two equalities read the cells through
+/// [`eval_str_eq`], and each ordering arm instantiates [`eval_str_cmp`] with
+/// its own `Ordering` predicate.
 fn str_cmp<A: Cells, B: Cells>(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1583,8 +1711,8 @@ fn str_cmp<A: Cells, B: Cells>(
     b: StrOperand<'_, B>,
 ) {
     match op {
-        CmpOp::Eq => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Equal),
-        CmpOp::Ne => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Equal),
+        CmpOp::Eq => eval_str_eq(scratch, mo, d, a, b, false),
+        CmpOp::Ne => eval_str_eq(scratch, mo, d, a, b, true),
         CmpOp::Gt => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Greater),
         CmpOp::Ge => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Less),
         CmpOp::Lt => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Less),
@@ -1808,7 +1936,11 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             Instr::IntInSet { value_reg, set_idx } => {
                 let set = &prog.int_sets[set_idx as usize];
-                un_op(scratch, mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
+                if set.len() <= IN_SET_SCAN_MAX {
+                    in_small_set(scratch, mo, dst, value_reg, set);
+                } else {
+                    un_op(scratch, mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
+                }
             }
 
             // ----------------------------------------------------------------
@@ -1835,98 +1967,69 @@ pub(crate) fn eval_batch(
             // One arm per (op, order), so the per-row loop carries no branch.
             // `UnsignedSigned` decides a negative `y` by its sign alone.
             Instr::Cmp { op, a, b, order } => match (op, order) {
-                (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| (x == y) as i64)
+                (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| x == y),
+                (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| x != y),
+                (CmpOp::Gt, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x > y),
+                (CmpOp::Ge, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x >= y),
+                (CmpOp::Lt, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x < y),
+                (CmpOp::Le, IntOrder::Signed) => bin_pred(scratch, mo, dst, a, b, |x, y| x <= y),
+                (CmpOp::Gt, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
+                (CmpOp::Ge, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) >= (y as u64)),
+                (CmpOp::Lt, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) < (y as u64)),
+                (CmpOp::Le, IntOrder::Unsigned) => bin_pred(scratch, mo, dst, a, b, |x, y| (x as u64) <= (y as u64)),
+                (CmpOp::Eq, IntOrder::UnsignedSigned) => bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && x == y),
+                (CmpOp::Ne, IntOrder::UnsignedSigned) => bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || x != y),
+                (CmpOp::Lt, IntOrder::UnsignedSigned) => {
+                    bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && (x as u64) < (y as u64))
                 }
-                (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| (x != y) as i64)
+                (CmpOp::Le, IntOrder::UnsignedSigned) => {
+                    bin_pred(scratch, mo, dst, a, b, |x, y| y >= 0 && (x as u64) <= (y as u64))
                 }
-                (CmpOp::Gt, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x > y) as i64),
-                (CmpOp::Ge, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x >= y) as i64),
-                (CmpOp::Lt, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x < y) as i64),
-                (CmpOp::Le, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x <= y) as i64),
-                (CmpOp::Gt, IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) > (y as u64)) as i64)
-                }
-                (CmpOp::Ge, IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) >= (y as u64)) as i64)
-                }
-                (CmpOp::Lt, IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) < (y as u64)) as i64)
-                }
-                (CmpOp::Le, IntOrder::Unsigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) <= (y as u64)) as i64)
-                }
-                (CmpOp::Eq, IntOrder::UnsignedSigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| (y >= 0 && x == y) as i64)
-                }
-                (CmpOp::Ne, IntOrder::UnsignedSigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| (y < 0 || x != y) as i64)
-                }
-                (CmpOp::Lt, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
-                    (y >= 0 && (x as u64) < (y as u64)) as i64
-                }),
-                (CmpOp::Le, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
-                    (y >= 0 && (x as u64) <= (y as u64)) as i64
-                }),
                 (CmpOp::Gt, IntOrder::UnsignedSigned) => {
-                    bin_op(scratch, mo, dst, a, b, |x, y| (y < 0 || (x as u64) > (y as u64)) as i64)
+                    bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || (x as u64) > (y as u64))
                 }
-                (CmpOp::Ge, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
-                    (y < 0 || (x as u64) >= (y as u64)) as i64
-                }),
+                (CmpOp::Ge, IntOrder::UnsignedSigned) => {
+                    bin_pred(scratch, mo, dst, a, b, |x, y| y < 0 || (x as u64) >= (y as u64))
+                }
             },
 
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
             Instr::FCmp { op, a, b } => match op {
-                CmpOp::Eq => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
-                CmpOp::Ne => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
-                CmpOp::Gt => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
-                CmpOp::Ge => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
-                CmpOp::Lt => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
-                CmpOp::Le => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
+                CmpOp::Eq => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) == decode_f64(y)),
+                CmpOp::Ne => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) != decode_f64(y)),
+                CmpOp::Gt => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) > decode_f64(y)),
+                CmpOp::Ge => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) >= decode_f64(y)),
+                CmpOp::Lt => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) < decode_f64(y)),
+                CmpOp::Le => bin_pred(scratch, mo, dst, a, b, |x, y| decode_f64(x) <= decode_f64(y)),
             },
 
             // ----------------------------------------------------------------
             // Boolean 3VL
             // ----------------------------------------------------------------
-            // The operator branch stays outside the row loop on both arms: each
-            // `bin_op` instantiation is its own branch-free loop.
+            // Word operations over the packed bits on both arms. The unpack to
+            // `regs[dst]` is skipped for a bit_only destination, whose only
+            // readers are boolean.
             Instr::BoolBinary { a, b, is_or } => {
-                if mo.no_nulls() {
-                    if is_or {
-                        bin_op(scratch, mo, dst, a, b, |x, y| ((x != 0) || (y != 0)) as i64);
-                    } else {
-                        bin_op(scratch, mo, dst, a, b, |x, y| ((x != 0) && (y != 0)) as i64);
-                    }
-                } else {
-                    // Nullable arm: word-level u64 3VL on packed truthy bits.
-                    // Upstream producers populate `bool_bits` via
-                    // `needs_bool_pack`; the unpack to `regs[dst]` is skipped
-                    // for bit_only destinations whose only readers are BOOL.
-                    bool_and_or_word_loop(scratch, dst, a, b, m, is_or);
-                    maybe_unpack_bool_to_regs(scratch, mo, dst);
-                }
+                bool_and_or_word_loop(scratch, mo, dst, a, b, is_or);
+                maybe_unpack_bool_to_regs(scratch, mo, dst);
             }
             Instr::BoolNot { a } => {
-                if mo.no_nulls() {
-                    un_op(scratch, mo, dst, a, |x| (x == 0) as i64);
-                } else {
-                    let words = m.div_ceil(64);
-                    let base_a = a as usize * NULL_WORDS_PER_REG;
-                    let base_d = dst as usize * NULL_WORDS_PER_REG;
-                    for w in 0..words {
-                        let va = scratch.bool_bits[base_a + w];
+                let base_a = a as usize * NULL_WORDS_PER_REG;
+                let base_d = dst as usize * NULL_WORDS_PER_REG;
+                for w in 0..m.div_ceil(64) {
+                    let va = scratch.bool_bits[base_a + w];
+                    if mo.no_nulls() {
+                        scratch.bool_bits[base_d + w] = !va;
+                    } else {
+                        // 3VL: NOT NULL = NULL, its truth bit cleared.
                         let na = scratch.null_bits[base_a + w];
-                        // 3VL: NOT NULL = NULL. Result truthy = !va & !na (cleared
-                        // in null positions); null-bits unchanged.
                         scratch.bool_bits[base_d + w] = !va & !na;
                         scratch.null_bits[base_d + w] = na;
                     }
-                    maybe_unpack_bool_to_regs(scratch, mo, dst);
                 }
+                maybe_unpack_bool_to_regs(scratch, mo, dst);
             }
 
             // ----------------------------------------------------------------
@@ -1950,18 +2053,9 @@ pub(crate) fn eval_batch(
             // Rows where `cond` is non-NULL and truthy take `a`'s value + null
             // bit; all others (false OR NULL cond) take `b`'s.
             Instr::Select { cond, a, b } => {
-                if mo.no_nulls() {
-                    // Fast arm: cond truthiness lives in `regs` (no bool_bits in
-                    // no_nulls mode); a straight per-row blend.
-                    let ([rc, ra, rb], rd) = scratch.regs_split([cond, a, b], dst, m);
-                    for (((r, &c), &x), &y) in rd.iter_mut().zip(rc).zip(ra).zip(rb) {
-                        *r = if c != 0 { x } else { y };
-                    }
-                } else {
-                    let take_a = select_take_mask(scratch, dst, cond, a, b, m.div_ceil(64));
-                    blend_by_mask(&mut scratch.regs, [a, b], dst, &take_a, m);
-                    maybe_pack_bool_bits(scratch, mo, dst);
-                }
+                let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
+                blend_by_mask(&mut scratch.regs, [a, b], dst, &take_a, m);
+                maybe_pack_bool_bits(scratch, mo, dst);
             }
             // Manufacture a NULL: zero the value lane, set the null bit for every
             // live row. Only ever reached on the nullable arm (LoadNull forces
@@ -2042,12 +2136,12 @@ pub(crate) fn eval_batch(
                 CmpOp::Le => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x <= y) as i64),
             },
 
-            // Unswitched on `chars`, so each measure is its own monomorphised loop.
+            // Characters are counted off the bytes; a byte length is the view's own.
             Instr::StrLen { a, chars } => {
                 if chars {
                     str_to_scalar(scratch, mo, bufs, dst, a, |s| char_count(s) as i64);
                 } else {
-                    str_to_scalar(scratch, mo, bufs, dst, a, |s| s.len() as i64);
+                    str_byte_len(scratch, mo, dst, a);
                 }
             }
 

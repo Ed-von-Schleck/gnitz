@@ -943,7 +943,8 @@ fn concat_null_rules_differ_by_operand_side() {
 
 /// The three string-compare channels agree with `compare_german_strings`, the
 /// order consolidation uses, over pairs diverging inside and past the 4-byte
-/// prefix a fused compare short-circuits on — with and without NULLs.
+/// prefix a fused compare short-circuits on — with and without NULLs, read back
+/// as values and as filter verdicts.
 #[test]
 fn every_string_compare_channel_agrees_with_the_cell_comparator() {
     let corpus: &[&[u8]] = &[
@@ -995,7 +996,18 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             ];
             assert_eq!(run(by_regs, vec![]), all_rows, "nullable={nullable} StrCmp {op:?}");
             let in_place = vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }];
-            assert_eq!(run(in_place, vec![]), all_rows, "nullable={nullable} StrColCol {op:?}");
+            assert_eq!(
+                run(in_place.clone(), vec![]),
+                all_rows,
+                "nullable={nullable} StrColCol {op:?}"
+            );
+            // As a filter the verdict leaves as packed bits, with no lane read.
+            let passes: Vec<bool> = all_rows.iter().map(|v| *v == Some(1)).collect();
+            assert_eq!(
+                passing_rows(&mut filter_prog(&schema, in_place, vec![]), &view),
+                passes,
+                "nullable={nullable} StrColCol {op:?} as a filter"
+            );
             // The constant is baked into the program, so it is checked on the
             // rows whose right-hand side it is; only the left column is read.
             for (j, b) in corpus.iter().enumerate() {
@@ -1009,6 +1021,15 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                         )
                     });
                     assert_eq!(got[row], want, "nullable={nullable} StrColConst {op:?} row {row}");
+                }
+                let vs_const = vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }];
+                let passed = passing_rows(&mut filter_prog(&schema, vs_const, vec![b.to_vec()]), &view);
+                for row in (j..len * len).step_by(len) {
+                    assert_eq!(
+                        passed[row],
+                        got[row] == Some(1),
+                        "nullable={nullable} StrColConst {op:?} row {row} as a filter"
+                    );
                 }
             }
         }

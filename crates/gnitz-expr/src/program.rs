@@ -2405,8 +2405,9 @@ pub(crate) struct ResolvedProgram {
     /// over the bit the batch carries for it.
     pub(crate) nullable_slots: u64,
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
-    /// reads `regs[r]`. A permission, not an obligation: `BoolBinary`, `BoolNot`
-    /// and `IsNullReg` skip the lane and write `bool_bits` natively.
+    /// reads `regs[r]`. A permission, not an obligation: the compares, the
+    /// string equalities, `BoolBinary`, `BoolNot` and the null tests skip the
+    /// lane and write `bool_bits` natively.
     bit_only_mask: u64,
     /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
     /// consumer reads it as a truth bit. A filter's result register is covered

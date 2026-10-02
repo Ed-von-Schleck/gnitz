@@ -91,22 +91,24 @@ fn drive_filter(f: &mut RowFilter, view: &TestView, passes: usize) {
 }
 
 /// The fused `StrColConst` against the register channel (`GNITZ_BENCH_CHANNEL`)
-/// on `col <op> 'const'` over ~1M NOT NULL strings, per `GNITZ_BENCH_DOMAIN`.
-/// `digits-first` and `abcd-shared-prefix` differ only in whether the prefix the
-/// fused compare short-circuits on collides.
+/// on `col <op> 'const'` (`GNITZ_BENCH_OP`) over ~1M NOT NULL strings, per
+/// `GNITZ_BENCH_DOMAIN`. `digits-first` and `abcd-shared-prefix` differ only in
+/// whether the prefix the fused compare short-circuits on collides; `long` and
+/// `long-distinct` only in whether the heap strings share theirs.
 #[test]
 #[ignore]
 fn str_const_filter_bench() {
     let passes = bench_passes();
     let mut channel = Selector::new("GNITZ_BENCH_CHANNEL");
     let mut only = Selector::new("GNITZ_BENCH_DOMAIN");
+    let mut only_op = Selector::new("GNITZ_BENCH_OP");
 
     let schema = schema_pk_strings(1, false);
     let n = 1_000_000usize;
     // (domain, constant, value per row). `mixed` is the original fixture:
     // ~1/16 rows match and every 7th row is a long (heap-backed) string.
     type Domain = (&'static str, &'static str, fn(usize) -> String);
-    let domains: [Domain; 4] = [
+    let domains: [Domain; 5] = [
         ("mixed", "match_target", |row| {
             if row % 16 == 0 {
                 "match_target".to_string()
@@ -121,6 +123,9 @@ fn str_const_filter_bench() {
         }),
         // The controlled pair: `{i}abcd` and `abcd{i}` hold the same bytes at the
         // same lengths, so the prefix is the only thing that differs.
+        ("long-distinct", "42_long_string_variant_number", |row| {
+            format!("{}_long_string_variant_number", row % 97)
+        }),
         ("digits-first", "42abcd", |row| format!("{}abcd", row % 97)),
         ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
     ];
@@ -128,7 +133,7 @@ fn str_const_filter_bench() {
     for (domain, constant, value) in domains {
         let mb = make_string_view(&schema, n, |row, _| value(row), |_, _| false);
 
-        for (name, op) in [("eq", CmpOp::Eq), ("lt", CmpOp::Lt)] {
+        for (name, op) in [("eq", CmpOp::Eq), ("ne", CmpOp::Ne), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
             let mut fused = filter_prog(
                 &schema,
@@ -154,7 +159,7 @@ fn str_const_filter_bench() {
             );
             let hits = passed.iter().filter(|&&p| p).count();
             for (chan, ev) in [("fused", &mut fused), ("registers", &mut regs)] {
-                if only.drives(domain) && channel.drives(chan) {
+                if only.drives(domain) && channel.drives(chan) && only_op.drives(name) {
                     drive_filter(ev, &mb, passes);
                 }
             }
@@ -280,7 +285,48 @@ fn filter_kernel_bench() {
     }
     let mut lit_filter = filter_prog(&lit_schema, lit_instrs, vec![]);
 
+    // `a IN (…)` over one NOT NULL column whose values spread over 0..1000, the
+    // list sized either side of where the kernel stops scanning it.
+    let in_list = |k: usize| {
+        let mut b = ExprBuilder::new();
+        let set_idx = b.add_const_int_set((0..k as i64).map(|i| i * (1000 / k as i64) + 1).collect());
+        let col = b.emit(LogicalInstr::LoadCol { col: 1 });
+        let hit = b.emit(LogicalInstr::IntInSet { value_reg: col, set_idx });
+        b.build(vec![Sink::Reg(hit)])
+            .expect("a well-formed predicate")
+            .resolve_filter(&lit_schema)
+            .expect("resolves")
+    };
+    let mut in_lists: Vec<(String, RowFilter)> = [2, 4, 8, 16, 32, 64, 1000]
+        .into_iter()
+        .map(|k| (format!("in{k}"), in_list(k)))
+        .collect();
+
+    // `s1 = s2` / `s1 < s2` over two NOT NULL string columns: short strings that
+    // agree on every third row, and long ones sharing a prefix on every seventh.
+    let cc_schema = schema_pk_strings(2, false);
+    let cc_view = make_string_view(
+        &cc_schema,
+        n,
+        |row, pi| match (row % 7, row % 3) {
+            (0, _) => format!("long_string_variant_number_{}", (row + pi * (row % 2)) % 97),
+            (_, 0) => format!("k{}", row % 97),
+            _ => format!("k{}", (row + pi) % 97),
+        },
+        |_, _| false,
+    );
+    let col_col = |op| {
+        filter_prog(
+            &cc_schema,
+            vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }],
+            vec![],
+        )
+    };
+    let (mut cc_eq, mut cc_lt) = (col_col(CmpOp::Eq), col_col(CmpOp::Lt));
+
     for (name, ev, view) in [
+        ("colcol_eq", &mut cc_eq, &cc_view),
+        ("colcol_lt", &mut cc_lt, &cc_view),
         ("pk", &mut pk_filter, &pk_view),
         ("pk_i64", &mut pk_i64_filter, &pk_i64_view),
         ("i32", &mut i32_filter, &i32_view),
@@ -290,6 +336,11 @@ fn filter_kernel_bench() {
     ] {
         if shape.drives(name) {
             drive_filter(ev, view, passes);
+        }
+    }
+    for (name, ev) in &mut in_lists {
+        if shape.drives(name) {
+            drive_filter(ev, &lit_view, passes);
         }
     }
     println!("filter_kernel_bench passes={passes} n={n}");

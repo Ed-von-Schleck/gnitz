@@ -719,7 +719,7 @@ fn a_sink_list_that_does_not_cover_the_output_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// IntInSet — set membership as one opcode (O(1) registers, O(log N) per row)
+// IntInSet — set membership as one opcode (O(1) registers)
 // ---------------------------------------------------------------------------
 
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
@@ -750,6 +750,18 @@ fn int_in_set_membership_over_every_pool_shape() {
             TypeCode::I64,
             (0..1000).collect(),
             vec![(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)],
+        ),
+        // Either side of the size at which the kernel stops scanning the set
+        // and searches it.
+        (
+            TypeCode::I64,
+            (0..32).map(|v| v * 3).collect(),
+            vec![(0, 1), (93, 1), (45, 1), (46, 0), (94, 0), (-3, 0)],
+        ),
+        (
+            TypeCode::I64,
+            (0..33).map(|v| v * 3).collect(),
+            vec![(0, 1), (96, 1), (45, 1), (46, 0), (97, 0), (-3, 0)],
         ),
     ] {
         let (schema, mut prog) = in_set_prog(col_tc, &pool);
