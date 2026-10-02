@@ -1,5 +1,5 @@
 //! Reactor state: W2M routing by ring id — leases and their id space, the
-//! release of an unrouted frame — and when a tick sleeps.
+//! release of an unrouted frame — and when a pass sleeps.
 
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
     let id = r.lease_acks("test").id();
     writers[0].send_status(id, WireStatus::Ok, &[]);
     r.drain_all_w2m();
-    assert_eq!(r.inner.w2m.release_cursor(0), r.inner.w2m.write_cursor(0));
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
 
     let train = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     assert_ne!(train.id(), id);
@@ -79,13 +79,13 @@ fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
 #[test]
 fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let (r, _writers) = reactor_with_rings(1);
-    r.inner.next_request_id.set(u32::MAX);
+    r.next_request_id.set(u32::MAX);
     let top = r.lease_acks("test");
     assert_eq!(top.id(), u32::MAX);
     let wrapped = r.lease_acks("test");
     assert_eq!(wrapped.id(), 1, "the id after u32::MAX is 1, not 0");
 
-    r.inner.next_request_id.set(1);
+    r.next_request_id.set(1);
     let skipped = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     assert_eq!(skipped.id(), 2, "a live lease's id is skipped");
 }
@@ -108,54 +108,43 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
             d.set(true);
         });
         r.tick(true);
-        assert!(!r.inner.futex_waitv_armed.get(), "the woken tick must not arm");
+        assert!(!r.futex_waitv_armed.get(), "the woken tick must not arm");
         r.tick(false);
         assert!(done.get());
     });
 }
 
-/// `request_shutdown` from inside a task keeps that very tick from sleeping.
-#[test]
-fn request_shutdown_keeps_the_current_tick_from_sleeping() {
-    within(|| {
-        let r = Rc::new(make_reactor());
-        let r2 = Rc::clone(&r);
-        r.spawn(async move {
-            r2.request_shutdown();
-            std::future::pending::<()>().await
-        });
-        r.tick(true);
-        r.inner.tasks.borrow_mut().clear(); // the task holds the reactor
-    });
-}
-
-/// A blocking tick with a timer pending sleeps until that timer's deadline — not
+/// A blocking pass with a timer pending sleeps until that timer's deadline — not
 /// forever, not past it, and not for a later one — with no CQE involved.
 #[test]
 fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
     within(|| {
-        let r = Rc::new(make_reactor());
+        let r = make_reactor();
         let start = Instant::now();
         let fired = Rc::new(Cell::new(false));
-        let (f, r2) = (Rc::clone(&fired), Rc::clone(&r));
-        let early = r.timer(start + Duration::from_millis(20));
+        let f = Rc::clone(&fired);
+        let early = r.sleep(Duration::from_millis(20));
         r.spawn(async move {
             early.await;
             f.set(true);
-            // Otherwise the tick that polled this sleeps on toward the later deadline.
-            r2.request_shutdown();
         });
-        r.spawn(r.timer(start + Duration::from_secs(3600)));
+        r.spawn(r.sleep(Duration::from_secs(3600)));
 
         let mut ticks = 0;
-        while !fired.get() {
-            r.tick(true);
+        loop {
+            r.run_ready();
             ticks += 1;
+            // Otherwise the pass that polled the early timer sleeps on toward the
+            // later deadline.
+            if fired.get() {
+                break;
+            }
+            r.submit_or_sleep(true);
         }
         assert!(start.elapsed() >= Duration::from_millis(20), "woke before the deadline");
         assert!(ticks <= 16, "{ticks} ticks: the reactor spun instead of sleeping");
-        assert_eq!(r.inner.deadlines.borrow().len(), 1, "only the later deadline is left");
-        r.inner.tasks.borrow_mut().clear(); // the pending timer holds the reactor state
+        assert_eq!(r.deadlines.borrow().len(), 1, "only the later deadline is left");
+        r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }
 
@@ -180,7 +169,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
 
     let lease = reactor.lease_acks("stress");
     assert_eq!(lease.id(), 1);
-    let timer = reactor.timer(Instant::now() + TIMEOUT);
+    let timer = reactor.sleep(TIMEOUT);
     let out = reactor.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -213,11 +202,11 @@ fn a_publish_on_a_later_ring_wakes_the_reactor() {
     };
     let pid = unsafe { fork_child(child) };
 
-    let r = Rc::new(make_reactor_over(W2mReceiver::new(vec![r0, r1])));
+    let r = make_reactor_over(W2mReceiver::new(vec![r0, r1]));
     // Request id 1 is a fresh reactor's first.
     let lease = r.lease_acks("later ring");
-    let r2 = Rc::clone(&r);
-    let out = r.block_on(async move { select2(lease.acks(), r2.timer(Instant::now() + TIMEOUT)).await });
+    let timer = r.sleep(TIMEOUT);
+    let out = r.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: ring 1's wake never reached it");

@@ -1,25 +1,14 @@
-use std::mem::MaybeUninit;
-
 use super::*;
-
-type Buf = Box<[MaybeUninit<u8>]>;
 
 fn framed(payload: &[u8]) -> Vec<u8> {
     [&frame_len_prefix(payload.len())[..], payload].concat()
 }
 
-fn alloc(len: usize) -> Result<Buf, FrameLenError> {
-    Ok(Box::new_uninit_slice(len))
-}
-
-fn bytes(b: Buf) -> Vec<u8> {
-    // SAFETY: the deframer hands a payload out only once every byte is written.
-    unsafe { b.assume_init() }.into_vec()
-}
-
 /// One `feed` over `src`, the payload as bytes.
-fn feed_one(d: &mut Deframer<Buf>, src: &mut &[u8]) -> Option<Vec<u8>> {
-    d.feed(src, alloc).expect("no refusal").map(bytes)
+fn feed_one(d: &mut Deframer, src: &mut &[u8]) -> Option<Vec<u8>> {
+    d.feed(src, |_| Ok::<_, FrameLenError>(()))
+        .expect("no refusal")
+        .map(|(b, ())| b.into_vec())
 }
 
 /// A pipelined run split at every byte offset — inside a prefix, inside a
@@ -37,7 +26,7 @@ fn a_pipelined_run_split_anywhere_yields_each_frame_once() {
         })
         .collect();
     for split in 0..=wire.len() {
-        let mut d = Deframer::<Buf>::default();
+        let mut d = Deframer::default();
         let mut got = Vec::new();
         for (i, half) in [&wire[..split], &wire[split..]].into_iter().enumerate() {
             let mut src = half;
@@ -55,22 +44,22 @@ fn a_pipelined_run_split_anywhere_yields_each_frame_once() {
     }
 }
 
-/// A zero prefix and a prefix over the ceiling are refused before any
-/// allocation and leave nothing buffered; a prefix of exactly the ceiling
-/// allocates once and opens a payload.
+/// A zero prefix and a prefix over the ceiling are refused before `admit` is
+/// asked, so before any allocation, and leave nothing buffered; a prefix of
+/// exactly the ceiling is admitted once and opens a payload.
 #[test]
 fn a_prefix_is_bounded_before_allocating() {
     let open = |len: usize| {
-        let mut d = Deframer::<Buf>::default();
-        let mut allocs = 0;
+        let mut d = Deframer::default();
+        let mut admits = 0;
         let prefix = (len as u32).to_le_bytes();
         let got = d
-            .feed(&mut &prefix[..], |n| {
-                allocs += 1;
-                alloc(n)
+            .feed(&mut &prefix[..], |_| {
+                admits += 1;
+                Ok::<_, FrameLenError>(())
             })
             .map(|p| p.is_some());
-        (got, allocs, d.is_mid_frame())
+        (got, admits, d.is_mid_frame())
     };
     assert_eq!(open(0), (Err(FrameLenError::Zero), 0, false));
     assert_eq!(
@@ -84,7 +73,7 @@ fn a_prefix_is_bounded_before_allocating() {
 /// `feed`, even of nothing.
 #[test]
 fn a_directly_filled_payload_completes_on_the_next_feed() {
-    let mut d = Deframer::<Buf>::default();
+    let mut d = Deframer::default();
     let mut src = &framed(&[7u8; 10])[..6];
     assert_eq!(feed_one(&mut d, &mut src), None);
     let tail = d.payload_tail().expect("a payload in progress");

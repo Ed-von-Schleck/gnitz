@@ -216,9 +216,9 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
 }
 
 /// A `TlsShared` over one end of a socketpair; the other end is the client.
-fn tls_over_socketpair() -> (Rc<Reactor>, Rc<ClientConn>, UnixStream) {
+fn tls_over_socketpair() -> (Reactor, Rc<ClientConn>, UnixStream) {
     let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    TlsShared::start(Rc::clone(&r), Rc::clone(&conn), dev_config().0.cfg);
+    TlsShared::start(r.clone(), Rc::clone(&conn), dev_config().0.cfg);
     (r, conn, receiver)
 }
 

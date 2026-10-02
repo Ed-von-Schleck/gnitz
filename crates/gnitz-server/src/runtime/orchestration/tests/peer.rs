@@ -132,11 +132,8 @@ fn next_request_ships_before_parking() {
     let frame = vec![0x6Bu8; 300];
     peer.cork(&frame);
 
-    let r2 = Rc::clone(&r);
-    let parked = r.block_on(async move {
-        let timer = r2.timer(Instant::now() + Duration::from_millis(50));
-        matches!(select2(peer.next_request(), timer).await, Either::B(()))
-    });
+    let timer = r.sleep(Duration::from_millis(50));
+    let parked = r.block_on(async move { matches!(select2(peer.next_request(), timer).await, Either::B(())) });
 
     assert!(parked, "no request is queued, so the timer wins");
     assert_eq!(
@@ -169,7 +166,7 @@ fn fanout_coalesced_egress_bench() {
             let drain_t = spawn_drain(receiver, expect);
 
             let frame = vec![0xA5u8; per_frame];
-            let r2 = Rc::clone(&r);
+            let r2 = r.clone();
             let (per_frame_dur, coalesced_dur) = r.block_on(async move {
                 let (mut a, mut b) = (Duration::ZERO, Duration::ZERO);
                 for i in 0..ITERS {

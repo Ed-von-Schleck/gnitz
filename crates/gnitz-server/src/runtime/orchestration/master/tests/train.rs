@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::reactor::{client_pair, reactor_with_rings, read_nonblocking};
+use crate::runtime::reactor::{client_pair, framed, reactor_with_rings, read_nonblocking};
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::WireMsg;
@@ -8,9 +8,8 @@ use gnitz_wire::WireStatus;
 use gnitz_zset::repr::Batch;
 
 /// A scan lease over `n` workers' fresh rings, with each ring's writer.
-fn scan_lease(n: usize) -> (Rc<Reactor>, TrainLease, Vec<W2mWriter>) {
+fn scan_lease(n: usize) -> (Reactor, TrainLease, Vec<W2mWriter>) {
     let (reactor, writers) = reactor_with_rings(n);
-    let reactor = Rc::new(reactor);
     let lease = reactor.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     (reactor, lease, writers)
 }
@@ -25,7 +24,7 @@ fn frame(writer: &W2mWriter, req: u32, last: bool, batch: Option<&Batch>) -> Vec
         ..Default::default()
     };
     writer.send_msg(req, &msg);
-    [&gnitz_wire::frame_len_prefix(msg.size())[..], &msg.encode_to_vec()].concat()
+    framed(&msg.encode_to_vec())
 }
 
 /// Worker `w`'s next frame is still routed: a drain that returned early left it

@@ -1,8 +1,8 @@
-//! Client connections: accept dispatch, the send loop, its CQE and its eviction
+//! Client connections: the accept op, the send loop, its CQE and its eviction
 //! deadline, and how a connection's recv side ends and its socket closes.
 
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
 use super::super::test_support::*;
@@ -35,8 +35,8 @@ fn send_cqe_retires_its_entry_wakes_its_awaiter_and_returns_the_body() {
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
-    r.dispatch_cqe(u, 16, 0);
-    assert!(r.inner.ops.borrow().is_empty(), "the CQE alone retires the entry");
+    r.dispatch_cqe(u, 16);
+    assert!(r.ops.borrow().is_empty(), "the CQE alone retires the entry");
     assert!(flag.woken(), "KIND_OP must wake the op future");
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready((rc, body)) => {
@@ -64,7 +64,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
     let (u, mut fut) = r.install_op(Some(out));
     assert!(try_poll_once(&mut fut).is_none());
     drop(fut);
-    assert_eq!(r.inner.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
+    assert_eq!(r.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
     assert_eq!(Rc::strong_count(&conn), 2, "the entry holds the connection");
     assert_eq!(
         receiver.release_cursor(0),
@@ -72,8 +72,8 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
         "the kernel may still read the body — it must outlive the future"
     );
 
-    r.dispatch_cqe(u, 64, 0);
-    assert_eq!(r.inner.ops.borrow().len(), 0, "the late CQE must retire the entry");
+    r.dispatch_cqe(u, 64);
+    assert_eq!(r.ops.borrow().len(), 0, "the late CQE must retire the entry");
     assert!(receiver.release_cursor(0) > held, "and free the body");
     assert_eq!(Rc::strong_count(&conn), 1, "and release the connection");
 }
@@ -174,7 +174,7 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     let payload_len = payload.len();
     let drain_t = spawn_drain(receiver, payload_len);
 
-    let r2 = Rc::clone(&r);
+    let r2 = r.clone();
     // `conn` drops with the task, closing the sender before the join: on the
     // truncated send this test exists to catch, the drain's blocking `read`
     // would otherwise never return and the whole binary would hang.
@@ -205,7 +205,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
     // Far larger than both buffers, and nothing ever reads the other
     // end — the send stalls partway and only the deadline can end it.
     let payload = vec![0x7Au8; 1024 * 1024];
-    let (r2, c2) = (Rc::clone(&r), Rc::clone(&conn));
+    let (r2, c2) = (r.clone(), Rc::clone(&conn));
     let start = Instant::now();
     let res = r.block_on(async move { r2.send_owned(&c2, SendBody::Pooled(PooledBuf(payload))).await });
     let elapsed = start.elapsed();
@@ -224,46 +224,56 @@ fn send_owned_evicts_a_client_that_never_drains() {
     );
 }
 
-/// An attached listener hands each connection it accepts to its channel.
+/// `accept` resolves to a connection the listener took.
 #[test]
-fn an_attached_listener_delivers_accepted_connections() {
+fn accept_delivers_an_accepted_connection() {
     within(|| {
         let r = make_reactor();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let mut rx = r.attach_listener(OwnedFd::from(listener));
+        let listener = leaked(OwnedFd::from(listener));
         let client = std::net::TcpStream::connect(addr).expect("connect");
-        let accepted = std::net::TcpStream::from(r.block_on(async move { rx.recv().await }));
+        let r2 = r.clone();
+        let accepted = std::net::TcpStream::from(r.block_on(async move { r2.accept(listener).await }));
         assert_eq!(accepted.peer_addr().ok(), client.local_addr().ok());
     });
 }
 
-/// A failed accept ends a listener's multishot accept, and the re-arm is
-/// deferred behind a backoff so closing connections get a window. Both
-/// listeners can fail in the same window — fd exhaustion is global — and each
-/// must come back.
+/// A failed accept is retried once its backoff has passed: a bound socket that
+/// does not listen refuses every accept, and the one in flight takes the first
+/// connection after it starts to.
 #[test]
-fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
+fn accept_retries_after_a_failure() {
     let r = make_reactor();
-    let (a, b) = (fake_listener(), fake_listener());
-    let (_rx_a, _rx_b) = (r.attach_listener(a), r.attach_listener(b));
-
-    // `CQE_F_MORE` clear (`flags = 0`) is the kernel saying the multishot SQE
-    // is gone; -EMFILE is why.
-    r.handle_accept_cqe(0, -libc::EMFILE, 0);
-    r.handle_accept_cqe(1, -libc::EMFILE, 0);
+    // SAFETY: a fresh fd from the kernel, owned by nothing else.
+    let sock = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
+    let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    name.sin_family = libc::AF_INET as libc::sa_family_t;
+    name.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+    let len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
     assert_eq!(
-        r.inner.tasks.borrow().len(),
-        2,
-        "each cancelled listener gets its own backoff task"
+        unsafe { libc::bind(sock.as_raw_fd(), (&raw const name).cast(), len) },
+        0
+    );
+    let listener = leaked(sock);
+
+    let accepted = Rc::new(RefCell::new(None));
+    let (r2, a) = (r.clone(), Rc::clone(&accepted));
+    r.spawn(async move { *a.borrow_mut() = Some(r2.accept(listener).await) });
+    assert!(
+        poll_until(&r, || !r.deadlines.borrow().is_empty()),
+        "an accept the socket refuses backs off"
     );
 
-    let deadline = Instant::now() + Limits::TEST.accept_rearm_backoff + Duration::from_secs(5);
-    while !r.inner.tasks.borrow().is_empty() && Instant::now() < deadline {
-        r.tick(true);
-    }
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let addr = std::net::TcpListener::from(listener.try_clone_to_owned().expect("dup"))
+        .local_addr()
+        .expect("addr");
+    let client = std::net::TcpStream::connect(addr).expect("connect");
     assert!(
-        r.inner.tasks.borrow().is_empty(),
-        "both backoff tasks must fire and re-arm their listener"
+        poll_until(&r, || accepted.borrow().is_some()),
+        "the retry takes the connection"
     );
+    let accepted = std::net::TcpStream::from(accepted.take().expect("just seen"));
+    assert_eq!(accepted.peer_addr().ok(), client.local_addr().ok());
 }

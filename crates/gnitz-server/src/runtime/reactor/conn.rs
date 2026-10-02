@@ -1,7 +1,8 @@
-//! Reactor client connections. Nothing here flushes: an SQE ships with the tick's
+//! Reactor client connections. Nothing here flushes: an SQE ships with the loop's
 //! own submit, before the task awaiting it can run.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::collections::hash_map::Entry;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use gnitz_zset::repr::PooledBuf;
 
@@ -13,12 +14,6 @@ use super::*;
 pub(super) struct Armed {
     conn: Rc<ClientConn>,
     filter: Box<dyn RecvFilter>,
-}
-
-/// One attached listener: the fd its accepts name, and where they are delivered.
-pub(super) struct Listener {
-    fd: OwnedFd,
-    accepted: chan::Sender<OwnedFd>,
 }
 
 /// A send in flight: the connection whose fd its SQE names, and the bytes the
@@ -47,105 +42,77 @@ impl SendBody {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerGone;
 
-/// Client-egress deadline (`GNITZ_CLIENT_SEND_TIMEOUT_MS`): one kernel send making no
-/// progress for this long evicts the client.
-pub(super) fn resolve_client_send_timeout() -> std::time::Duration {
-    std::time::Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000))
-}
-
-/// Arm (or re-arm) the multishot accept of the listener at index `id`, which rides
-/// the udata so its completions route back through `listeners`.
-fn arm_accept(inner: &ReactorShared, id: usize) {
-    let fd = inner.listeners.borrow()[id].fd.as_raw_fd();
-    let sqe = opcode::AcceptMulti::new(types::Fd(fd)).build();
-    // SAFETY: `AcceptMulti` names no memory, and the `OwnedFd` lives in
-    // `listeners`, which drops after `ring`.
-    unsafe { inner.ring.borrow_mut().push(sqe, udata(KIND_ACCEPT, id as u64)) };
-}
-
-/// Arm a recv on `fd` into the window of its `conns` entry. The fd rides the
-/// udata id, so the completion routes back to that entry. Not flushed (see the
-/// module header).
-fn arm_recv(ring: &mut IoUringRing, conns: &mut FxHashMap<i32, Armed>, fd: i32) {
-    let armed = conns.get_mut(&fd).expect("a registered connection");
-    let (ptr, len) = armed.filter.window(&mut armed.conn.q.borrow_mut());
-    let sqe = opcode::Recv::new(types::Fd(fd), ptr, len).build();
+/// Arm (or re-arm) `armed`'s recv on `fd` into its filter's window. The fd rides
+/// the udata id, so the completion routes back to the entry. Not flushed (see
+/// the module header).
+fn arm_recv(ring: &mut IoUringRing, fd: i32, armed: &mut Armed) {
+    let mut q = armed.conn.q.borrow_mut();
+    let w = armed.filter.window(&mut q);
+    let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
     // SAFETY: only this recv's CQE removes or refills the entry, which holds the
     // connection (so `fd`) and the filter owning the window; `ring` drops first.
     unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
 }
 
 impl Reactor {
-    /// Attach a listen socket fd and arm its multishot accept; every connection it
-    /// accepts arrives on the returned channel.
-    pub fn attach_listener(&self, fd: OwnedFd) -> chan::Receiver<OwnedFd> {
-        let (accepted, rx) = chan::unbounded::<OwnedFd>();
-        let id = {
-            let mut listeners = self.inner.listeners.borrow_mut();
-            listeners.push(Listener { fd, accepted });
-            listeners.len() - 1
-        };
-        arm_accept(&self.inner, id);
-        rx
-    }
-
-    /// Route an accept completion: hand the accepted fd to its listener's accept
-    /// loop and, when the multishot SQE has been cancelled, re-arm the listener.
-    pub(super) fn handle_accept_cqe(&self, id: usize, res: i32, flags: u32) {
-        if res >= 0 {
-            // SAFETY: a fresh fd from the kernel, owned by nothing else.
-            self.inner.listeners.borrow()[id]
-                .accepted
-                .send(unsafe { OwnedFd::from_raw_fd(res) });
+    /// The next connection accepted on `listener`. A failed accept is retried after
+    /// `Limits::accept_rearm_backoff`, so an error that persists — fd exhaustion
+    /// above all, which closing connections relieve — is not retried in a hot loop.
+    ///
+    /// Not cancel-safe: a future dropped mid-accept leaves an op whose later
+    /// result is a raw fd nothing owns.
+    pub(crate) async fn accept(&self, listener: BorrowedFd<'static>) -> OwnedFd {
+        loop {
+            let (u, op) = self.install_op(None);
+            let sqe = opcode::Accept::new(
+                types::Fd(listener.as_raw_fd()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .build();
+            // SAFETY: the SQE names no memory, and `listener` is open for the
+            // process's life.
+            unsafe { self.ring.borrow_mut().push(sqe, u) };
+            let (res, _) = op.await;
+            if res >= 0 {
+                // SAFETY: a fresh fd from the kernel, owned by nothing else.
+                return unsafe { OwnedFd::from_raw_fd(res) };
+            }
+            self.sleep(self.limits.accept_rearm_backoff).await;
         }
-        if io_uring::cqueue::more(flags) {
-            return;
-        }
-        if res >= 0 {
-            arm_accept(&self.inner, id);
-            return;
-        }
-        // Failed: back off before re-arming, so an error that persists (fd
-        // exhaustion, above all, which closing connections relieve) is not
-        // re-armed into a hot loop. One task per cancelled listener — exhaustion
-        // is global, so both can cancel at once and each is owed a full backoff.
-        let backoff = self.timer(Instant::now() + self.inner.limits.accept_rearm_backoff);
-        let inner = Rc::clone(&self.inner);
-        self.spawn(async move {
-            backoff.await;
-            arm_accept(&inner, id);
-        });
     }
 
     /// A connection over `fd`, taking one slot under the connection cap and
     /// charging frames to the inbound budget; `None`, closing `fd`, at the cap.
     /// Nothing is armed on it yet.
     pub(crate) fn client_conn(&self, fd: OwnedFd) -> Option<Rc<ClientConn>> {
-        let Some(slot) = self.inner.conn_slots.charge(1) else {
+        let Some(slot) = self.conn_slots.charge(1) else {
             gnitz_warn!(
                 "connection cap {} reached; closing fd={}",
-                self.inner.conn_slots.cap(),
+                self.conn_slots.cap(),
                 fd.as_raw_fd()
             );
             return None;
         };
-        Some(Rc::new(ClientConn::new(fd, slot, Rc::clone(&self.inner.inbound))))
+        Some(Rc::new(ClientConn::new(fd, slot, Rc::clone(&self.inbound))))
     }
 
     /// Arm `conn`'s first recv into `filter`'s window, and hold the connection
     /// until the recv side ends.
     pub(crate) fn register_conn(&self, conn: &Rc<ClientConn>, filter: Box<dyn RecvFilter>) {
         let fd = conn.fd();
-        let mut conns = self.inner.conns.borrow_mut();
-        // The entry holds the connection and so its fd open, so no live entry
-        // can share this fd number.
-        let prev = conns.insert(fd, Armed { conn: Rc::clone(conn), filter });
-        debug_assert!(prev.is_none(), "fd={fd} registered while an entry still holds it");
-        arm_recv(&mut self.inner.ring.borrow_mut(), &mut conns, fd);
+        let mut conns = self.conns.borrow_mut();
+        let Entry::Vacant(slot) = conns.entry(fd) else {
+            // An entry holds its connection, so its fd is open and cannot be
+            // reissued.
+            unreachable!("fd={fd} registered while an entry still holds it")
+        };
+        let armed = slot.insert(Armed { conn: Rc::clone(conn), filter });
+        arm_recv(&mut self.ring.borrow_mut(), fd, armed);
     }
 
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
-        let mut conns = self.inner.conns.borrow_mut();
+        let mut conns = self.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
         if armed.conn.is_gone() {
             // Retired while this recv was in flight: its bytes are discarded.
@@ -162,7 +129,7 @@ impl Reactor {
         };
         drop(q);
         match next {
-            Ok(()) => arm_recv(&mut self.inner.ring.borrow_mut(), &mut conns, fd),
+            Ok(()) => arm_recv(&mut self.ring.borrow_mut(), fd, armed),
             Err(end) => {
                 let armed = conns.remove(&fd).expect("entry present");
                 drop(conns);
@@ -172,8 +139,8 @@ impl Reactor {
                 } else {
                     gnitz_warn!(
                         "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
-                        self.inner.inbound.held(),
-                        self.inner.inbound.cap(),
+                        self.inbound.held(),
+                        self.inbound.cap(),
                     );
                     match end {
                         // The transport may owe the client a reply to the violation.
@@ -200,9 +167,8 @@ impl Reactor {
             let (u, op) = self.install_op(Some(out));
             // SAFETY: the op holds `out` until the CQE, and moving a `SendBody`
             // leaves its bytes in place.
-            unsafe { self.inner.ring.borrow_mut().push(sqe, u) };
-            let deadline = Instant::now() + self.inner.limits.client_send_timeout;
-            let rc = match select2(op, self.timer(deadline)).await {
+            unsafe { self.ring.borrow_mut().push(sqe, u) };
+            let rc = match select2(op, self.sleep(self.limits.client_send_timeout)).await {
                 Either::A((rc, back)) => {
                     out = back.expect("a send carries its connection and body");
                     rc
@@ -212,7 +178,7 @@ impl Reactor {
                     gnitz_warn!(
                         "client fd={} made no send progress for {:?}; evicting",
                         conn.fd(),
-                        self.inner.limits.client_send_timeout
+                        self.limits.client_send_timeout
                     );
                     // The abandoned send completes only once the socket errors; its
                     // `ops` entry holds the connection and body until then.

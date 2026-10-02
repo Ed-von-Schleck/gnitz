@@ -1,12 +1,11 @@
-//! Master SAL dispatcher: the `MasterDispatcher` core — ack collection, the
+//! Master SAL dispatcher: the `MasterDispatcher` core — the ACK rounds, the
 //! fan-out family (backfill / scan / index), the checkpoint rounds, the
 //! tick-round counter and worker reaping.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::scatter::with_routed;
 use super::*;
-use crate::runtime::reactor::{select2, Either};
 use crate::runtime::sal::SalScope;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_store::relation::Relation;
@@ -58,7 +57,7 @@ impl MasterDispatcher {
         catalog: *mut CatalogEngine,
         last_ephemeral_gen: u64,
         sal: SalWriter,
-        reactor: Rc<Reactor>,
+        reactor: Reactor,
     ) -> Self {
         debug_assert_eq!(
             sal.num_workers(),
@@ -100,7 +99,7 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// The master's event loop.
-    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+    pub(crate) fn reactor(&self) -> &Reactor {
         &self.reactor
     }
 
@@ -108,28 +107,19 @@ impl MasterDispatcher {
         self.sal.num_workers()
     }
 
-    /// Wait until every worker has answered `lease`. Fails on a worker's error
-    /// ACK or death.
-    pub(crate) async fn collect_round(&self, lease: &AckLease) -> Result<(), WireFault> {
-        match select2(lease.acks(), self.worker_death(lease.ctx())).await {
-            Either::A(r) => r,
-            Either::B(e) => Err(e),
-        }
-    }
-
-    /// Resolves once a worker has died, probing every `WORKER_WATCH`.
-    async fn worker_death(&self, ctx: &str) -> WireFault {
+    /// Resolves with the first worker found dead, probing every `WORKER_WATCH`.
+    pub(crate) async fn worker_death(&self) -> usize {
         loop {
-            self.reactor.timer(Instant::now() + WORKER_WATCH).await;
+            self.reactor.sleep(WORKER_WATCH).await;
             if let Some(w) = self.check_workers() {
-                return format!("worker {w} exited during {ctx}").into();
+                return w;
             }
         }
     }
 
-    /// Write the group `write` builds on a fresh ACK lease, then
-    /// [`Self::collect_round`]. A refused write fails before any worker is woken,
-    /// keeping its status.
+    /// Write the group `write` builds on a fresh ACK lease, then wait for every
+    /// worker's ACK. A refused write fails before any worker is woken, keeping
+    /// its status.
     async fn broadcast_round(
         &self,
         ctx: &'static str,
@@ -137,7 +127,7 @@ impl MasterDispatcher {
     ) -> Result<(), WireFault> {
         let lease = self.reactor.lease_acks(ctx);
         write(&self.sal.lock().await, GroupTargets::all(lease.id()))?;
-        self.collect_round(&lease).await
+        lease.acks().await
     }
 
     // -----------------------------------------------------------------------
@@ -168,7 +158,7 @@ impl MasterDispatcher {
         })?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
-        self.collect_round(&lease).await?;
+        lease.acks().await?;
         self.checkpoint_post_ack(excl)
     }
 
@@ -403,7 +393,9 @@ impl MasterDispatcher {
         self.reap_workers();
     }
 
-    /// Broadcast `Shutdown` and reap the worker processes, blocking on each.
+    /// Broadcast `Shutdown` and reap the worker processes, blocking on each. No
+    /// await separates the write from the reap, so [`Self::worker_death`] never
+    /// probes workers that exited on request.
     pub(crate) async fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments. A
         // refusal would hang the reap below, so it must not vanish.

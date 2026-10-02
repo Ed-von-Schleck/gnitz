@@ -1,22 +1,22 @@
 //! The reactor's futures: timers, fsync, and a train lease's frame stream.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
 
-/// A timer in the past resolves on the very first poll instead of
-/// hanging the reactor.
+/// A sleep of nothing resolves on the very first poll instead of hanging the
+/// reactor.
 #[test]
-fn timer_in_the_past_resolves_immediately() {
+fn a_zero_sleep_resolves_immediately() {
     let r = make_reactor();
     assert!(
-        try_poll_once(r.timer(Instant::now() - Duration::from_secs(1))).is_some(),
-        "a past deadline must resolve on the first poll"
+        try_poll_once(r.sleep(Duration::ZERO)).is_some(),
+        "a passed deadline must resolve on the first poll"
     );
-    assert!(r.inner.deadlines.borrow().is_empty(), "and register no deadline");
+    assert!(r.deadlines.borrow().is_empty(), "and register no deadline");
 }
 
 /// A dropped timer removes its deadline, so it neither wakes its waker nor
@@ -24,17 +24,11 @@ fn timer_in_the_past_resolves_immediately() {
 #[test]
 fn a_dropped_timer_leaves_no_deadline() {
     let r = make_reactor();
-    let mut tf = Box::pin(r.timer(Instant::now() + Duration::from_secs(3600)));
+    let mut tf = Box::pin(r.sleep(Duration::from_secs(3600)));
     assert!(tf.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-    assert_eq!(r.inner.deadlines.borrow().len(), 1, "the poll registers the deadline");
+    assert_eq!(r.deadlines.borrow().len(), 1, "the poll registers the deadline");
     drop(tf);
-    assert!(r.inner.deadlines.borrow().is_empty(), "the drop removes it");
-}
-
-/// `fd`, open for the rest of the process, as `Reactor::fsync` requires.
-fn leaked(fd: OwnedFd) -> BorrowedFd<'static> {
-    let fd: &'static OwnedFd = Box::leak(Box::new(fd));
-    fd.as_fd()
+    assert!(r.deadlines.borrow().is_empty(), "the drop removes it");
 }
 
 /// `fsync` submits its SQE before returning, so its CQE arrives with no tick
@@ -98,12 +92,9 @@ fn a_dropped_lease_releases_the_frames_it_holds() {
         writers[0].send_msg(lease.id(), &Default::default());
     }
     r.drain_all_w2m();
-    assert!(
-        r.inner.w2m.release_cursor(0) < r.inner.w2m.write_cursor(0),
-        "the route holds them"
-    );
+    assert!(r.w2m.release_cursor(0) < r.w2m.write_cursor(0), "the route holds them");
     drop(lease);
-    assert_eq!(r.inner.w2m.release_cursor(0), r.inner.w2m.write_cursor(0));
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
 }
 
 /// `next` yields exactly the frames that carry rows, workers in ascending order,
@@ -142,7 +133,7 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
         .expect("no fault")
         .is_none());
     for w in 0..2 {
-        assert_eq!(r.inner.w2m.release_cursor(w), r.inner.w2m.write_cursor(w), "worker {w}");
+        assert_eq!(r.w2m.release_cursor(w), r.w2m.write_cursor(w), "worker {w}");
     }
 }
 
@@ -158,7 +149,7 @@ fn op_park_roundtrip_bench() {
     for _ in 0..N {
         let (u, mut rx) = r.install_op(None);
         assert!(Pin::new(&mut rx).poll(&mut cx).is_pending());
-        r.dispatch_cqe(u, 0, 0);
+        r.dispatch_cqe(u, 0);
         assert!(std::hint::black_box(Pin::new(&mut rx).poll(&mut cx)).is_ready());
     }
     let ns = start.elapsed().as_nanos() as f64 / N as f64;

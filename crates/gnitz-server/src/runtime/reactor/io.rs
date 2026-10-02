@@ -75,33 +75,6 @@ impl Drop for Charge {
     }
 }
 
-/// A frame payload the deframer is filling, charged from its header on.
-struct Payload {
-    buf: Box<[MaybeUninit<u8>]>,
-    charge: Charge,
-}
-
-impl Payload {
-    /// Charge and allocate one frame payload buffer, or refuse the frame: the charge
-    /// would pass the cap, or the allocation failed.
-    fn alloc(budget: &Rc<Budget>, len: usize) -> Result<Payload, RecvEnd> {
-        let weight = frame_weight(len);
-        let breach = RecvEnd::CapBreach { want: weight };
-        let charge = budget.charge(weight).ok_or(breach)?;
-        let mut v: Vec<MaybeUninit<u8>> = Vec::new();
-        v.try_reserve_exact(len).map_err(|_| breach)?;
-        // SAFETY: `len` elements are reserved, and `MaybeUninit` needs no init.
-        unsafe { v.set_len(len) };
-        Ok(Payload { buf: v.into_boxed_slice(), charge })
-    }
-}
-
-impl AsMut<[MaybeUninit<u8>]> for Payload {
-    fn as_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        &mut self.buf
-    }
-}
-
 /// One complete inbound frame payload, charged to the inbound [`Budget`] for as
 /// long as it lives.
 pub struct RecvBuf {
@@ -133,6 +106,8 @@ pub(crate) enum RecvEnd {
     Oversize,
     /// The declared frame's `want` bytes would push the inbound budget past its cap.
     CapBreach { want: usize },
+    /// The declared frame's `len`-byte buffer could not be allocated.
+    Alloc { len: usize },
     /// The bytes did not parse as this transport's framing.
     Protocol,
 }
@@ -144,6 +119,7 @@ impl std::fmt::Display for RecvEnd {
             RecvEnd::Socket => f.write_str("the recv failed"),
             RecvEnd::Oversize => f.write_str("a frame over the payload ceiling"),
             RecvEnd::CapBreach { want } => write!(f, "a {want}-byte frame would pass the inbound cap"),
+            RecvEnd::Alloc { len } => write!(f, "a {len}-byte frame could not be allocated"),
             RecvEnd::Protocol => f.write_str("a framing violation"),
         }
     }
@@ -154,6 +130,7 @@ impl From<FrameLenError> for RecvEnd {
         match e {
             FrameLenError::Zero => RecvEnd::Protocol,
             FrameLenError::Oversize { .. } => RecvEnd::Oversize,
+            FrameLenError::Alloc { len } => RecvEnd::Alloc { len },
         }
     }
 }
@@ -161,7 +138,8 @@ impl From<FrameLenError> for RecvEnd {
 /// The inbound half of one client connection: the deframer, the frames it has
 /// completed, and the single task awaiting them.
 pub(crate) struct RecvQueue {
-    deframer: Deframer<Payload>,
+    /// Each payload in progress is charged to `budget` from its header on.
+    deframer: Deframer<Charge>,
     /// Complete messages awaiting pickup by `recv().await`, and the one task
     /// awaiting them. A queue, not a slot: with one slot a pipelined client
     /// deadlocks once the kernel socket buffer fills.
@@ -181,10 +159,11 @@ impl RecvQueue {
     /// Deframe `src`, queueing every frame it completes.
     pub(crate) fn feed(&mut self, mut src: &[u8]) -> Result<(), RecvEnd> {
         let budget = &self.budget;
-        while let Some(p) = self.deframer.feed(&mut src, |len| Payload::alloc(budget, len))? {
-            // SAFETY: the deframer hands a payload out only once every byte is written.
-            let buf = unsafe { p.buf.assume_init() };
-            self.frames.push(RecvBuf { buf, charge: p.charge });
+        while let Some((buf, charge)) = self.deframer.feed(&mut src, |len| {
+            let want = frame_weight(len);
+            budget.charge(want).ok_or(RecvEnd::CapBreach { want })
+        })? {
+            self.frames.push(RecvBuf { buf, charge });
         }
         Ok(())
     }
@@ -289,8 +268,9 @@ impl ClientConn {
 
 /// What stands between a socket and its `RecvQueue`.
 pub(crate) trait RecvFilter {
-    /// Where the next socket bytes land; valid until the recv completes.
-    fn window(&mut self, q: &mut RecvQueue) -> (*mut u8, u32);
+    /// Where the next socket bytes land. The reactor keeps the address until the
+    /// recv completes, and calls nothing on the filter in between.
+    fn window<'a>(&'a mut self, q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>];
     /// `n` bytes landed in the window: queue the frames they complete.
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd>;
 }
@@ -316,11 +296,10 @@ impl Plain {
 }
 
 impl RecvFilter for Plain {
-    fn window(&mut self, q: &mut RecvQueue) -> (*mut u8, u32) {
+    fn window<'a>(&'a mut self, q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>] {
         let tail = q.deframer.payload_tail().filter(|t| t.len() >= CARRY_BYTES);
         self.direct = tail.is_some();
-        let w = tail.unwrap_or(&mut self.carry[..]);
-        (w.as_mut_ptr().cast(), w.len() as u32)
+        tail.unwrap_or(&mut self.carry[..])
     }
 
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {

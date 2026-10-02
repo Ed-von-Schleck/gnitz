@@ -2,9 +2,8 @@
 //! router and every read/push handler, and the reply-frame vocabulary. The
 //! catalog-zone write path is the child `ddl`.
 //!
-//! The master owns one `Reactor` driving the accept sockets, a task per
-//! connection, the committer (group commit + checkpoint + fsync), the tick task
-//! and the worker-crash watchdog.
+//! The master owns one `Reactor`: `ServerExecutor::run` spawns its tasks on it
+//! and races the signal loop against a worker's death.
 //!
 //! A request handler rejects by returning `Err`, and the router sends it: no
 //! handler writes a fault frame for its request as a whole.
@@ -12,8 +11,9 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
+use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
@@ -60,11 +60,7 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
         if ready() {
             return;
         }
-        shared
-            .disp()
-            .reactor()
-            .timer(Instant::now() + Duration::from_millis(1))
-            .await;
+        shared.disp().reactor().sleep(Duration::from_millis(1)).await;
     }
     gnitz_warn!("{}: seam armed but the event never arrived; releasing", what);
 }
@@ -137,9 +133,9 @@ pub struct Shared {
     /// guard; a push that reads no committed state takes the read guard, so
     /// same-table pushes reach the committer concurrently and share one fsync.
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
-    /// Set true by the graceful-shutdown watcher before it sends the final
-    /// Shutdown barrier. Read only by [`Shared::commit`], which is what
-    /// makes the test and the send one step.
+    /// Set true by the signal loop before it sends the final Shutdown barrier.
+    /// Read only by [`Shared::commit`], which is what makes the test and the send
+    /// one step.
     draining: Cell<bool>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`. A missing entry reads as `boot_seed`.
@@ -149,10 +145,6 @@ pub struct Shared {
     /// The SAL watermark when the executor started: every read watermark this
     /// boot is at or above it, and every commit's zone above it.
     boot_seed: u64,
-    /// Set by the watchdog when it tears the node down over a dead worker. The
-    /// watchdog is detached and its `Output` discarded, so this is how the
-    /// verdict reaches `ServerExecutor::run`.
-    worker_crashed: Cell<bool>,
     /// The data directory, where each worker's log lives.
     data_dir: String,
     /// How long a connection may take from accept to its HELLO, handshake
@@ -237,7 +229,7 @@ impl Shared {
     /// Commit `req` unless a graceful shutdown has begun, await its verdict under
     /// the caller's catalog read guard, and on success raise each of `tids`' commit
     /// LSN to it. No await separates the test from the send: a request that saw a
-    /// live server is queued ahead of the watchdog's Shutdown barrier.
+    /// live server is queued ahead of the signal loop's Shutdown barrier.
     async fn commit(
         &self,
         _catalog: &ReadGuard,
@@ -355,7 +347,7 @@ pub struct ServerExecutor;
 
 impl ServerExecutor {
     pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>) -> i32 {
-        let reactor = Rc::clone(dispatcher.reactor());
+        let reactor = dispatcher.reactor().clone();
         let boot_seed = dispatcher.sal().watermark();
 
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
@@ -372,7 +364,6 @@ impl ServerExecutor {
             draining: Cell::new(false),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed,
-            worker_crashed: Cell::new(false),
             data_dir: data_dir.to_string(),
             hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
                 "GNITZ_HELLO_TIMEOUT_MS",
@@ -380,7 +371,7 @@ impl ServerExecutor {
             )),
         });
 
-        // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
+        // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
         // before exiting.
         install_shutdown_signal_handlers();
 
@@ -389,16 +380,20 @@ impl ServerExecutor {
             reactor.spawn(accept_loop(Rc::clone(&shared), listener));
         }
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
-        reactor.spawn(watchdog(Rc::clone(&shared)));
 
-        reactor.block_until_shutdown();
         // `2` separates a dead worker from a failed boot's `1` and from
         // `gnitz_fatal_abort!`'s `134`.
-        if shared.worker_crashed.get() {
-            2
-        } else {
-            0
-        }
+        reactor.block_on(async move {
+            match select2(serve_until_signalled(&shared), shared.disp().worker_death()).await {
+                Either::A(()) => 0,
+                Either::B(crashed) => {
+                    let data_dir = &shared.data_dir;
+                    gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
+                    shared.disp().kill_workers();
+                    2
+                }
+            }
+        })
     }
 }
 
@@ -408,10 +403,11 @@ impl ServerExecutor {
 
 async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
     let ClientListener { fd, tls } = listener;
-    let reactor = Rc::clone(shared.disp().reactor());
-    let mut accepted = reactor.attach_listener(fd);
+    // Leaked: the loop never ends, and its accept SQEs name the fd throughout.
+    let fd: &'static OwnedFd = Box::leak(Box::new(fd));
+    let reactor = shared.disp().reactor().clone();
     loop {
-        let Some(conn) = reactor.client_conn(accepted.recv().await) else {
+        let Some(conn) = reactor.client_conn(reactor.accept(fd.as_fd()).await) else {
             continue;
         };
         let peer = Peer::new(&reactor, conn, tls.as_ref());
@@ -433,7 +429,7 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
 ///
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
-    let deadline = shared.disp().reactor().timer(Instant::now() + shared.hello_timeout);
+    let deadline = shared.disp().reactor().sleep(shared.hello_timeout);
     let hello = match select2(peer.next_request(), deadline).await {
         Either::A(hello) => hello,
         Either::B(()) => None,
@@ -453,10 +449,10 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
 }
 
 // ---------------------------------------------------------------------------
-// Watchdog: worker crashes + graceful shutdown (SIGTERM / SIGINT)
+// Signal loop: graceful shutdown (SIGTERM / SIGINT) and SAL reclaim
 // ---------------------------------------------------------------------------
 
-/// Set by the SIGTERM/SIGINT handler; polled by `watchdog`. A plain
+/// Set by the SIGTERM/SIGINT handler; polled by the signal loop. A plain
 /// `AtomicBool` store is async-signal-safe (unlike touching the reactor-thread
 /// `Cell` flags), so the handler does nothing but flip this.
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -466,7 +462,7 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 }
 
 /// Install async-signal-safe handlers for SIGTERM and SIGINT. The handler only
-/// flips `SHUTDOWN_REQUESTED`; the watchdog's timer picks it up.
+/// flips `SHUTDOWN_REQUESTED`; the signal loop's timer picks it up.
 fn install_shutdown_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -478,44 +474,20 @@ fn install_shutdown_signal_handlers() {
     }
 }
 
-/// One 100 ms reactor-timer poll loop with two terminal duties: worker-crash
-/// detection (broadcast Shutdown, stop the reactor) and graceful shutdown
-/// on SIGTERM/SIGINT — stop admitting pushes, run one final full checkpoint
-/// through the committer (drain + persist while the reactor is still live),
-/// then broadcast Shutdown and request reactor shutdown so `server_main`
-/// exits cleanly.
-async fn watchdog(shared: Rc<Shared>) {
+/// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
+/// Then stop admitting pushes, run one final checkpoint, and stop the workers.
+async fn serve_until_signalled(shared: &Shared) {
     loop {
-        shared.disp().reactor().timer(Instant::now() + WORKER_WATCH).await;
+        shared.disp().reactor().sleep(WORKER_WATCH).await;
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
-
-            // 1. Stop admitting new pushes (none may commit after the final
-            //    flush).
+            // No push may commit after the final flush.
             shared.draining.set(true);
-
-            // 2. One final full checkpoint through the committer. The Shutdown
-            //    barrier forces the whole sequence and is deferred to its end,
-            //    so `done` resolves only after the base + drain + ephemeral
-            //    rounds complete. A just-pushed delta may still sit unticked
-            //    (below the row threshold, so no `Auto` fired), so the
-            //    sequence's drain is what gets it into the views.
-            request_barrier(&shared, BarrierKind::Shutdown).await;
-
-            // 3. Shut the workers down, then stop the reactor. The reactor/W2M
-            //    receiver stays live throughout, so no `w2m()` handle dangles.
+            // Resolves once the committer has run the final checkpoint, which
+            // also drains the pushes no tick has taken yet.
+            request_barrier(shared, BarrierKind::Shutdown).await;
             shared.disp().shutdown_workers().await;
-            shared.disp().reactor().request_shutdown();
-            return;
-        }
-
-        if let Some(crashed) = shared.disp().check_workers() {
-            let data_dir = &shared.data_dir;
-            gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
-            shared.worker_crashed.set(true);
-            shared.disp().kill_workers();
-            shared.disp().reactor().request_shutdown();
             return;
         }
 
@@ -606,7 +578,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
     if TICK_HOLD_FOR_DDL.take_once() {
         hold_tick_for_ddl(shared).await;
     }
-    shared.disp().collect_round(&lease).await?;
+    lease.acks().await?;
     shared.last_tick_lsn.set(snapshot_lsn);
     Ok(())
 }

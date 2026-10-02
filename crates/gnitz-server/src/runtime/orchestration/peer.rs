@@ -29,7 +29,7 @@ pub struct Peer {
 
 enum Transport {
     /// The socket's own bytes: the reactor sends on it directly.
-    Plain(Rc<Reactor>),
+    Plain(Reactor),
     /// TLS 1.3 over TCP; record I/O lives in `runtime::tls`.
     Tls(Rc<TlsShared>),
 }
@@ -37,13 +37,13 @@ enum Transport {
 impl Peer {
     /// Arm `conn`'s recv and start serving it: a TLS session under `tls`, the
     /// socket's own bytes otherwise.
-    pub fn new(reactor: &Rc<Reactor>, conn: Rc<ClientConn>, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
+    pub fn new(reactor: &Reactor, conn: Rc<ClientConn>, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
         let transport = match tls {
             None => {
                 reactor.register_conn(&conn, Box::new(Plain::new()));
-                Transport::Plain(Rc::clone(reactor))
+                Transport::Plain(reactor.clone())
             }
-            Some(cfg) => Transport::Tls(TlsShared::start(Rc::clone(reactor), Rc::clone(&conn), Arc::clone(cfg))),
+            Some(cfg) => Transport::Tls(TlsShared::start(reactor.clone(), Rc::clone(&conn), Arc::clone(cfg))),
         };
         Peer {
             conn,

@@ -1,7 +1,8 @@
-//! Single-threaded io_uring reactor: the master process's one event loop. A task's
-//! waker is its key (see `waker_wake`); one-CQE awaiters hold a [`oneshot`],
-//! next-of-many awaiters park in a [`wake_queue::WakeQueue`], an all-workers round
-//! parks on its ACK route, and every deadline sits in one deadline map.
+//! Single-threaded io_uring reactor: the master process's one event loop, driven
+//! by [`Reactor::block_on`] alone. A task's waker is its key (see `waker_wake`);
+//! one-CQE awaiters hold a [`oneshot`], next-of-many awaiters park in a
+//! [`wake_queue::WakeQueue`], an all-workers round parks on its ACK route, and
+//! every deadline sits in one deadline map.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -10,7 +11,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use io_uring::types::FutexWaitV;
 use io_uring::{opcode, types};
@@ -38,7 +39,7 @@ mod wake_queue;
 pub(crate) use conn::{PeerGone, SendBody};
 
 pub(crate) use futures::{AckLease, TrainFrame, TrainLease};
-use futures::{AckRoute, TimerFuture, TrainRoute};
+use futures::{Route, TimerFuture};
 use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
 
@@ -56,11 +57,12 @@ pub(crate) struct Limits {
     /// connection.
     pub inbound_cap: usize,
     /// One kernel send making no progress for this long evicts the client, whose
-    /// stalled sends would otherwise pin W2M ring space and block a worker.
-    pub client_send_timeout: std::time::Duration,
-    /// How long a listener whose multishot accept ended on an error waits
-    /// before re-arming, so closing connections get a window to free fds.
-    pub accept_rearm_backoff: std::time::Duration,
+    /// stalled sends would otherwise pin W2M ring space and block a worker
+    /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`).
+    pub client_send_timeout: Duration,
+    /// A failed accept is retried after this long, so closing connections get a
+    /// window to free fds.
+    pub accept_rearm_backoff: Duration,
     /// Ceiling on open client connections, across every listener and
     /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed
     /// at once.
@@ -72,8 +74,11 @@ impl Limits {
     pub(crate) fn from_env() -> Limits {
         Limits {
             inbound_cap: io::resolve_inbound_cap(),
-            client_send_timeout: conn::resolve_client_send_timeout(),
-            accept_rearm_backoff: std::time::Duration::from_millis(50),
+            client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
+                "GNITZ_CLIENT_SEND_TIMEOUT_MS",
+                30_000,
+            )),
+            accept_rearm_backoff: Duration::from_millis(50),
             max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
         }
     }
@@ -84,8 +89,8 @@ impl Limits {
     #[cfg(test)]
     pub(crate) const TEST: Limits = Limits {
         inbound_cap: usize::MAX,
-        client_send_timeout: std::time::Duration::from_secs(30),
-        accept_rearm_backoff: std::time::Duration::from_millis(2),
+        client_send_timeout: Duration::from_secs(30),
+        accept_rearm_backoff: Duration::from_millis(2),
         max_conns: usize::MAX,
     };
 }
@@ -97,8 +102,7 @@ impl Limits {
 /// A one-shot op whose CQE lands in `ops`.
 const KIND_OP: u64 = 1;
 const KIND_FUTEX_WAITV: u64 = 2;
-const KIND_ACCEPT: u64 = 3;
-const KIND_RECV: u64 = 4;
+const KIND_RECV: u64 = 3;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -124,9 +128,9 @@ const fn udata_id(u: u64) -> u64 {
 
 type Task = Pin<Box<dyn Future<Output = ()>>>;
 
-/// Field order is drop order, and both ends of it are fixed; see `ring` and
-/// `w2m`.
-struct ReactorShared {
+/// The state behind every [`Reactor`] handle. Field order is drop order, and
+/// both ends of it are fixed; see `ring` and `w2m`.
+pub struct ReactorShared {
     /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. A task's future may
@@ -134,17 +138,15 @@ struct ReactorShared {
     /// it back at the same key rather than holding a borrow across the poll.
     tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
-    /// Every live [`AckLease`] id and what its workers have answered.
-    acks: RefCell<FxHashMap<u32, AckRoute>>,
-    /// Every live [`TrainLease`] id and its workers' frame queues.
-    trains: RefCell<FxHashMap<u32, TrainRoute>>,
+    /// Every live lease's id and what its workers have answered on it.
+    routes: RefCell<FxHashMap<u32, Route>>,
     /// The next request id a lease starts from.
     next_request_id: Cell<u32>,
     /// In-flight one-shot ops, by op id.
     ops: RefCell<FxHashMap<u64, PendingOp>>,
     /// The array the `FUTEX_WAITV` SQE is prepped over, one entry per worker
     /// ring. Read by the kernel when the SQE is submitted, which a failed submit
-    /// defers to a later tick; hence a field.
+    /// defers to a later pass; hence a field.
     futex_waitv: RefCell<Box<[FutexWaitV]>>,
     /// A `FUTEX_WAITV` SQE is outstanding. Cleared by its CQE.
     futex_waitv_armed: Cell<bool>,
@@ -163,11 +165,6 @@ struct ReactorShared {
     conn_slots: Rc<io::Budget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
-    /// Every attached listener, indexed by the id its accept SQEs carry. See
-    /// [`conn::Listener`].
-    listeners: RefCell<Vec<conn::Listener>>,
-    /// Shutdown flag. `block_until_shutdown` polls until this is set.
-    shutdown: Cell<bool>,
     /// Last: every `W2mSlot` the reactor holds, in a field or in a task, releases
     /// through it on drop.
     w2m: W2mReceiver,
@@ -183,32 +180,29 @@ struct PendingOp {
     carry: Option<conn::Outbound>,
 }
 
-impl ReactorShared {
-    /// Next local op id, lossless when packed into a CQE's `user_data`: the
-    /// 56-bit counter does not wrap within a process's life.
-    fn alloc_op_id(&self) -> u64 {
-        let id = self.next_op_id.get();
-        self.next_op_id.set(id + 1);
-        id
-    }
-}
+/// A handle on the master's one event loop; clones share it.
+#[derive(Clone)]
+pub struct Reactor(Rc<ReactorShared>);
 
-/// The reactor. The futures it creates capture an `Rc<ReactorShared>`, since
-/// they must be `'static`.
-pub struct Reactor {
-    inner: Rc<ReactorShared>,
+impl std::ops::Deref for Reactor {
+    type Target = ReactorShared;
+    fn deref(&self) -> &ReactorShared {
+        &self.0
+    }
 }
 
 impl Reactor {
     pub fn new(ring_capacity: u32, limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
         let ring = IoUringRing::new(ring_capacity)?;
         let futex_waitv = (0..w2m.num_workers()).map(|_| FutexWaitV::new()).collect();
-        let inner = Rc::new(ReactorShared {
+        // Before the shared state exists: a refused claim then drops none of it,
+        // and so does not end the live reactor's claim.
+        runloop::claim_thread();
+        Ok(Reactor(Rc::new(ReactorShared {
             ring: RefCell::new(ring),
             tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
-            acks: RefCell::new(FxHashMap::default()),
-            trains: RefCell::new(FxHashMap::default()),
+            routes: RefCell::new(FxHashMap::default()),
             next_request_id: Cell::new(BOOT_READY_REQUEST_ID),
             ops: RefCell::new(FxHashMap::default()),
             futex_waitv: RefCell::new(futex_waitv),
@@ -219,30 +213,28 @@ impl Reactor {
             inbound: io::Budget::new(limits.inbound_cap),
             conn_slots: io::Budget::new(limits.max_conns),
             limits,
-            listeners: RefCell::new(Vec::new()),
-            shutdown: Cell::new(false),
             w2m,
-        });
-        runloop::claim_thread();
-        Ok(Reactor { inner })
+        })))
     }
 
-    /// Stop the reactor: the current tick does not sleep, and `block_until_shutdown`
-    /// returns after it. Client sends still in flight are abandoned.
-    pub fn request_shutdown(&self) {
-        self.inner.shutdown.set(true);
+    /// Next local op id, lossless when packed into a CQE's `user_data`: the
+    /// 56-bit counter does not wrap within a process's life.
+    fn alloc_op_id(&self) -> u64 {
+        let id = self.next_op_id.get();
+        self.next_op_id.set(id + 1);
+        id
     }
 
-    /// Future that completes at `deadline`.
-    pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
-        TimerFuture::new(deadline, Rc::clone(&self.inner))
+    /// Future that completes once `d` has passed.
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
+        TimerFuture::new(Instant::now() + d, self.clone())
     }
 
     /// Route every unread slot of every worker's ring.
     fn drain_all_w2m(&self) {
-        for w in 0..self.inner.w2m.num_workers() {
-            while let Some(slot) = self.inner.w2m.try_read_slot(w) {
-                self.inner.route(w, slot);
+        for w in 0..self.w2m.num_workers() {
+            while let Some(slot) = self.w2m.try_read_slot(w) {
+                self.route(w, slot);
             }
         }
     }
@@ -250,11 +242,11 @@ impl Reactor {
     /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
     /// first woke a task.
     fn arm_futex_waitv(&self) -> bool {
-        let w2m = &self.inner.w2m;
+        let w2m = &self.w2m;
         if w2m.num_workers() == 0 {
             return true; // nothing to watch, and a zero-length FUTEX_WAITV is -EINVAL
         }
-        let mut waitv = self.inner.futex_waitv.borrow_mut();
+        let mut waitv = self.futex_waitv.borrow_mut();
         loop {
             self.drain_all_w2m();
             if !run_queue_is_empty() {
@@ -264,8 +256,8 @@ impl Reactor {
                 let sqe = opcode::FutexWaitV::new(armed.as_ptr(), armed.len() as u32).build();
                 // SAFETY: the array lives in `futex_waitv`, which drops after
                 // `ring`; every `uaddr` is a word of a never-unmapped W2M mapping.
-                unsafe { self.inner.ring.borrow_mut().push(sqe, udata(KIND_FUTEX_WAITV, 0)) };
-                self.inner.futex_waitv_armed.set(true);
+                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_FUTEX_WAITV, 0)) };
+                self.futex_waitv_armed.set(true);
                 return true;
             }
         }
@@ -274,9 +266,9 @@ impl Reactor {
     /// Register a one-shot op holding `carry`: the `user_data` its SQE must carry,
     /// and the receiver its CQE resolves.
     fn install_op(&self, carry: Option<conn::Outbound>) -> (u64, oneshot::Receiver<OpResult>) {
-        let id = self.inner.alloc_op_id();
+        let id = self.alloc_op_id();
         let (done, rx) = oneshot::channel();
-        self.inner.ops.borrow_mut().insert(id, PendingOp { done, carry });
+        self.ops.borrow_mut().insert(id, PendingOp { done, carry });
         (udata(KIND_OP, id), rx)
     }
 
@@ -287,21 +279,11 @@ impl Reactor {
         let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build();
-        let mut ring = self.inner.ring.borrow_mut();
+        let mut ring = self.ring.borrow_mut();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
         unsafe { ring.push(sqe, u) };
-        if let Err(e) = ring.submit() {
-            gnitz_error!("reactor: fsync SQE submit failed ({e}); it goes out with the next tick");
-        }
+        ring.submit();
         async move { op.await.0 }
-    }
-
-    /// Drive the reactor forever; returns when `request_shutdown` is
-    /// called. Used by the executor's main loop.
-    pub fn block_until_shutdown(&self) {
-        while !self.inner.shutdown.get() {
-            self.tick(true);
-        }
     }
 }
 

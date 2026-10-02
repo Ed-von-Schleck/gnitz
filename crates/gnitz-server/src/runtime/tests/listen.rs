@@ -43,7 +43,6 @@ fn bind_listeners_publishes_the_tls_files_and_accepted_sockets_inherit_the_optio
     assert_eq!(listeners.len(), 2);
     assert!(listeners[0].tls.is_none() && listeners[1].tls.is_some());
     let tcp = TcpListener::from(listeners.pop().unwrap().fd);
-    tcp.set_nonblocking(false).unwrap();
     let _client = std::net::TcpStream::connect(addr).unwrap();
     let (accepted, _) = tcp.accept().unwrap();
     assert!(accepted.nodelay().unwrap());

@@ -16,12 +16,11 @@ mod unique_preflight;
 mod fixtures;
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
-use crate::runtime::reactor::{AckLease, Reactor, TrainLease};
+use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalExcl, SalMessageKind, SalWriter, WorkerSet};
 use crate::runtime::wire;
 use gnitz_wire::{BoundPeek, PkColList, WireFault, WireFlags};
@@ -40,7 +39,7 @@ pub struct MasterDispatcher {
     worker_pids: Vec<i32>,
     sal: SalWriter,
     /// The master's one event loop, which reads every worker's replies.
-    reactor: Rc<Reactor>,
+    reactor: Reactor,
     /// Dereferenced by [`MasterDispatcher::cat`] alone.
     catalog: *mut CatalogEngine,
     /// Per-(table_id, column list) filter skipping redundant unique-index
@@ -123,23 +122,18 @@ pub(crate) struct ScanCut<'d> {
 }
 
 impl<'d> ScanCut<'d> {
-    /// Lease a reply id for `set`, then write the `kind` group `write` builds on it.
-    pub(crate) fn push(
-        &mut self,
-        kind: SalMessageKind,
-        set: WorkerSet,
-        write: impl FnOnce(&SalExcl<'d>, GroupTargets) -> Result<(), WireFault>,
-    ) -> Result<(), WireFault> {
-        let lease = self.disp.reactor.lease_train(set, kind);
+    /// Lease a reply id for `set`, then write `group` to it.
+    pub(crate) fn push(&mut self, set: WorkerSet, group: DirectGroup<'_>) -> Result<(), WireFault> {
+        let lease = self.disp.reactor.lease_train(set, group.kind);
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
-        write(
-            &self.excl,
-            GroupTargets::Leased {
+        self.excl.write(&DirectGroup {
+            targets: GroupTargets::Leased {
                 set: lease.workers(),
                 request_id: lease.id(),
                 in_request_order: self.in_request_order,
             },
-        )?;
+            ..group
+        })?;
         self.scans.push(lease);
         Ok(())
     }
@@ -157,13 +151,13 @@ impl<'d> ScanCut<'d> {
             .map(|rel| (rel.schema(), rel.placement()))
             .unwrap_or_else(|| panic!("master: no relation for target_id={tid}"));
         let route = route_read(&schema, placement, bound, self.disp.num_workers());
-        self.push(group.kind, route.set, |excl, targets| {
-            excl.write(&DirectGroup {
+        self.push(
+            route.set,
+            DirectGroup {
                 extras: route.per_worker.as_deref(),
-                targets,
                 ..group
-            })
-        })
+            },
+        )
     }
 }
 

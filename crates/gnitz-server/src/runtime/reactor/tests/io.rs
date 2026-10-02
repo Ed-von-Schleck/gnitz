@@ -27,7 +27,7 @@ fn assert_refused(cap: usize, wire: &[u8], why: &str) {
         matches!(try_poll_once(conn.recv()), Some(None)),
         "{why}: a refusal discards the queue, and recv never parks after it"
     );
-    assert_eq!(r.inner.inbound.held(), 0, "{why}: budget must be reconciled");
+    assert_eq!(r.inbound.held(), 0, "{why}: budget must be reconciled");
     partner.set_nonblocking(true).expect("nonblocking");
     assert_eq!(
         partner.read(&mut [0u8; 1]).ok(),
@@ -76,7 +76,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     hdr_and_part.extend_from_slice(&[0x11u8; 100]);
     (&partner1).write_all(&hdr_and_part).expect("write");
 
-    let counted = poll_until(&r, || r.inner.inbound.held() == 10_000);
+    let counted = poll_until(&r, || r.inbound.held() == 10_000);
     assert!(counted, "in-flight buffer was not accounted");
     assert!(
         conn1.try_recv().is_none(),
@@ -92,7 +92,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
         "over-cap second connection was not closed"
     );
     // Refused connection allocated nothing; the first buffer is intact.
-    assert_eq!(r.inner.inbound.held(), 10_000);
+    assert_eq!(r.inbound.held(), 10_000);
 }
 
 /// Accounting balances: consumption decrements the counter, so total traffic
@@ -121,7 +121,7 @@ fn inbound_cap_accounting_balances_on_consume() {
         });
     }
     assert_eq!(
-        r.inner.inbound.held(),
+        r.inbound.held(),
         0,
         "counter must return to 0 once every frame is consumed"
     );
@@ -129,7 +129,7 @@ fn inbound_cap_accounting_balances_on_consume() {
 
 // ─────────────────────────────────────────────────────────────────
 // `Plain`'s reads over the deframer, driven the way the reactor drives them:
-// the window is a raw pointer a recv writes into.
+// the window is an address a recv writes into.
 // ─────────────────────────────────────────────────────────────────
 
 /// One uncapped `RecvQueue` behind a `Plain`, and the window it last handed out,
@@ -137,25 +137,34 @@ fn inbound_cap_accounting_balances_on_consume() {
 struct Feeder {
     q: RecvQueue,
     plain: Plain,
-    window: (*mut u8, u32),
+    window: (*mut u8, usize),
 }
 
 impl Feeder {
     fn new() -> Feeder {
-        let mut q = RecvQueue::new(Budget::new(usize::MAX));
-        let mut plain = Plain::new();
-        let window = plain.window(&mut q);
-        Feeder { q, plain, window }
+        let mut f = Feeder {
+            q: RecvQueue::new(Budget::new(usize::MAX)),
+            plain: Plain::new(),
+            window: (std::ptr::null_mut(), 0),
+        };
+        f.take_window();
+        f
+    }
+
+    /// Keep the next window's address and length, as an armed recv does.
+    fn take_window(&mut self) {
+        let w = self.plain.window(&mut self.q);
+        self.window = (w.as_mut_ptr().cast(), w.len());
     }
 
     /// One read: hand the window as many of `bytes` as it takes. Returns how
     /// many, or why the queue closed the connection.
     fn read(&mut self, bytes: &[u8]) -> Result<usize, RecvEnd> {
         assert!(self.window.1 > 0, "a window is never zero-length");
-        let n = bytes.len().min(self.window.1 as usize);
+        let n = bytes.len().min(self.window.1);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.window.0, n) };
         self.plain.ingest(n, &mut self.q)?;
-        self.window = self.plain.window(&mut self.q);
+        self.take_window();
         Ok(n)
     }
 

@@ -344,7 +344,7 @@ impl WorkerProcess {
         }
 
         // A spill fault leaves the view store unbounded, so the process cannot
-        // continue; the watchdog turns this into a cluster abort.
+        // continue.
         let cat = self.cat();
         if let Err(e) = cat.dag.finish_backfill(&mut cat.registry, view_id) {
             gnitz_fatal_abort!(

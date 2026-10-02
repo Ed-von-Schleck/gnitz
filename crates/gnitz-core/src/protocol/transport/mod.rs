@@ -343,7 +343,7 @@ struct FrameReader {
     scratch: Box<[MaybeUninit<u8>]>,
     /// The initialised, not-yet-consumed bytes of `scratch`.
     carry: Range<usize>,
-    deframer: Deframer<Box<[MaybeUninit<u8>]>>,
+    deframer: Deframer,
 }
 
 impl FrameReader {
@@ -360,13 +360,10 @@ impl FrameReader {
             // SAFETY: `carry` covers exactly the bytes a read initialised.
             let mut src = unsafe { self.scratch[self.carry.clone()].assume_init_ref() };
             let before = src.len();
-            let frame = self
-                .deframer
-                .feed(&mut src, |len| Ok::<_, ProtocolError>(Box::new_uninit_slice(len)))?;
+            let frame = self.deframer.feed(&mut src, |_| Ok::<_, ProtocolError>(()))?;
             self.carry.start += before - src.len();
-            if let Some(b) = frame {
-                // SAFETY: the deframer hands a payload out only once every byte is written.
-                return Ok(Next::Frame(unsafe { b.assume_init() }.into_vec()));
+            if let Some((b, ())) = frame {
+                return Ok(Next::Frame(b.into_vec()));
             }
             if !*may_read {
                 return Ok(Next::Pending);
@@ -507,6 +504,7 @@ impl From<FrameLenError> for ProtocolError {
                 "payload length {len} exceeds maximum {} bytes",
                 gnitz_wire::MAX_FRAME_PAYLOAD
             )),
+            FrameLenError::Alloc { .. } => std::io::Error::from(std::io::ErrorKind::OutOfMemory).into(),
         }
     }
 }

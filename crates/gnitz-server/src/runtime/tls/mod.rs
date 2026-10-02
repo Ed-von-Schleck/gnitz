@@ -60,7 +60,7 @@ fn feed_decrypted(sess: &mut rustls::ServerConnection, q: &mut RecvQueue) -> Res
 
 /// Shared handle to one TLS connection.
 pub(crate) struct TlsShared {
-    reactor: Rc<Reactor>,
+    reactor: Reactor,
     /// The socket and its deframed frames; see `ClientConn` for the fd's lifetime.
     conn: Rc<ClientConn>,
     /// The codec state, and nothing else. Never borrowed across an await.
@@ -73,7 +73,7 @@ pub(crate) struct TlsShared {
 impl TlsShared {
     /// Build the connection, arm its recv filter and spawn its flusher; between them
     /// they drive the handshake.
-    pub(crate) fn start(reactor: Rc<Reactor>, conn: Rc<ClientConn>, cfg: Arc<rustls::ServerConfig>) -> Rc<TlsShared> {
+    pub(crate) fn start(reactor: Reactor, conn: Rc<ClientConn>, cfg: Arc<rustls::ServerConfig>) -> Rc<TlsShared> {
         /// rustls's outgoing-buffer limit: what one `writer().write()` accepts, and
         /// so how much ciphertext one encrypt-and-send turn carries.
         const SEND_BUFFER_BYTES: usize = 256 * 1024;
@@ -154,8 +154,8 @@ struct TlsIngress {
 }
 
 impl RecvFilter for TlsIngress {
-    fn window(&mut self, _q: &mut RecvQueue) -> (*mut u8, u32) {
-        (self.cipher.as_mut_ptr().cast::<u8>(), self.cipher.len() as u32)
+    fn window<'a>(&'a mut self, _q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>] {
+        &mut self.cipher
     }
 
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {

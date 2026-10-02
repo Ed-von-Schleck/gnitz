@@ -2,7 +2,7 @@
 //! suites elsewhere that drive a reactor over test rings.
 
 use std::io::Read;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,12 +36,19 @@ impl Reactor {
     pub(super) fn block_until_idle(&self) {
         const MAX_TICKS: usize = 10_000;
         for _ in 0..MAX_TICKS {
-            if self.inner.tasks.borrow().is_empty() {
+            if self.tasks.borrow().is_empty() {
                 return;
             }
             self.tick(false);
         }
         panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
+    }
+
+    /// One pass of the loop `block_on` runs; with `block`, it sleeps whenever
+    /// nothing is runnable.
+    pub(super) fn tick(&self, block: bool) {
+        self.run_ready();
+        self.submit_or_sleep(block);
     }
 }
 
@@ -128,8 +135,8 @@ pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
 
 /// A reactor built with `limits`, and a [`client_pair`] on it. `sndbuf` shrinks
 /// both socket buffers.
-pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, Rc<ClientConn>, UnixStream) {
-    let r = Rc::new(make_reactor_with(limits));
+pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Reactor, Rc<ClientConn>, UnixStream) {
+    let r = make_reactor_with(limits);
     let (conn, partner) = client_pair(&r);
     if let Some(bytes) = sndbuf {
         for (fd, opt) in [(conn.fd(), libc::SO_SNDBUF), (partner.as_raw_fd(), libc::SO_RCVBUF)] {
@@ -178,8 +185,8 @@ pub(crate) fn poll_until(r: &Reactor, mut cond: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// A listening socket no peer connects to, so an accept submitted on it stays
-/// pending until the reactor drops.
-pub(super) fn fake_listener() -> OwnedFd {
-    OwnedFd::from(std::net::TcpListener::bind("127.0.0.1:0").expect("bind"))
+/// `fd`, open for the rest of the process.
+pub(super) fn leaked(fd: OwnedFd) -> BorrowedFd<'static> {
+    let fd: &'static OwnedFd = Box::leak(Box::new(fd));
+    fd.as_fd()
 }

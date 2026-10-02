@@ -94,7 +94,7 @@ pub struct PendingPush {
     pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
-/// The committer task loop. Returns when the reactor shutdown drops this task.
+/// The committer task loop. Never returns.
 ///
 /// For checkpoint flush rounds the lock is held across the ENTIRE round
 /// (write + ACK wait + reset; see `MasterDispatcher::flush`), but released across the

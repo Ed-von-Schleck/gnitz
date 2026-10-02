@@ -39,7 +39,7 @@ pub(super) mod worker;
 /// `Result` is returned unchanged.
 ///
 /// `Reactor::poll_task` does not catch unwinds, so a panic in any task
-/// propagates through `tick` and takes the process down. Two kinds of call site
+/// propagates through `block_on` and takes the process down. Two kinds of call site
 /// wrap against that, and they want opposite things from the `Err`: a request
 /// handler returns it to the client as `WireStatus::Error` and stays live, while a
 /// site whose panic would leave master and workers inconsistent — DDL

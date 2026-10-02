@@ -50,11 +50,22 @@ fn check_workers_keeps_reporting_a_dead_worker() {
     }
 }
 
+/// `worker_death` resolves with the dead worker's rank, here a pid every probe
+/// answers ECHILD for.
+#[test]
+fn worker_death_names_the_dead_worker() {
+    within(|| {
+        let (disp, _) = test_dispatcher(vec![0, spawn_and_reap_dead()], std::ptr::null_mut());
+        let disp = Rc::new(disp);
+        let d = Rc::clone(&disp);
+        assert_eq!(disp.reactor().block_on(async move { d.worker_death().await }), 1);
+    });
+}
+
 /// A round ends on every worker's ACK, and fails — without waiting on the other
-/// workers' ACKs — on a refused write, keeping its status; on a worker's error
-/// ACK; and on a worker's death, naming the worker and the round's phase. The
-/// ACKs come from a task spawned once the group is written, so the round must
-/// let other tasks run.
+/// workers' ACKs — on a refused write, keeping its status, and on a worker's
+/// error ACK. The ACKs come from a task spawned once the group is written, so
+/// the round must let other tasks run.
 #[test]
 fn a_round_ends_on_its_acks_or_its_first_failure() {
     #[derive(Clone, Copy, Debug)]
@@ -62,15 +73,10 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
         Acks,
         Refused,
         ErrorAck,
-        Dead,
     }
     within(|| {
-        for answer in [Answer::Acks, Answer::Refused, Answer::ErrorAck, Answer::Dead] {
-            let pids = match answer {
-                Answer::Dead => vec![spawn_and_reap_dead(), 0],
-                _ => vec![0, 0],
-            };
-            let (disp, writers) = test_dispatcher(pids, std::ptr::null_mut());
+        for answer in [Answer::Acks, Answer::Refused, Answer::ErrorAck] {
+            let (disp, writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
             let disp = Rc::new(disp);
             let d = Rc::clone(&disp);
             let got = disp.reactor().block_on(async move {
@@ -88,7 +94,7 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
                         match answer {
                             Answer::Acks => writers.iter().for_each(|w| w.send_status(id, WireStatus::Ok, b"")),
                             Answer::ErrorAck => writers[0].send_status(id, WireStatus::Error, b"boom"),
-                            Answer::Refused | Answer::Dead => {}
+                            Answer::Refused => {}
                         }
                     });
                     Ok(())
@@ -99,7 +105,6 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
                 (Answer::Acks, Ok(())) => {}
                 (Answer::Refused, Err(e)) => assert_eq!(e.status, WireStatus::SalFull, "{e}"),
                 (Answer::ErrorAck, Err(e)) => assert!(e.text.contains("worker 0") && e.text.contains("boom"), "{e}"),
-                (Answer::Dead, Err(e)) => assert!(e.text.contains("worker 0") && e.text.contains("backfill"), "{e}"),
                 (answer, got) => panic!("{answer:?}: {got:?}"),
             }
         }

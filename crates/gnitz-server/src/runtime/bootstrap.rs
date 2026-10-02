@@ -19,7 +19,7 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
-use crate::runtime::reactor::{AckLease, Limits, Reactor};
+use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::TlsArgs;
@@ -433,13 +433,14 @@ fn fork_workers(
 /// checkpoint a clean restart resumes from. `ready` is the lease the workers'
 /// ready ACKs answer.
 async fn master_post_fork_recovery(
-    disp: Rc<MasterDispatcher>,
+    disp: &MasterDispatcher,
     ready: AckLease,
     live_epoch: u32,
     swept_bases: Vec<u64>,
 ) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
-    disp.collect_round(&ready)
+    ready
+        .acks()
         .await
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
@@ -519,10 +520,8 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     // SAFETY: every ring was initialized by `create_region` and is never unmapped.
     let wakes = w2m_ptrs.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
-    let reactor = Rc::new(
-        Reactor::new(256, Limits::from_env(), W2mReceiver::new(w2m_ptrs))
-            .map_err(|e| format!("io_uring init failed: {e}"))?,
-    );
+    let reactor = Reactor::new(256, Limits::from_env(), W2mReceiver::new(w2m_ptrs))
+        .map_err(|e| format!("io_uring init failed: {e}"))?;
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
@@ -531,20 +530,24 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
         reactor,
     ));
 
-    // The workers' ready ACKs. Leased before the first tick, which drops every
-    // W2M frame no lease routes.
+    // The workers' ready ACKs. Leased before the loop first runs, which drops
+    // every W2M frame no lease routes.
     let ready = dispatcher.reactor().lease_acks("recovery sync");
     assert_eq!(
         ready.id(),
         BOOT_READY_REQUEST_ID,
         "the ready ACKs name the reactor's first lease"
     );
-    dispatcher.reactor().block_on(master_post_fork_recovery(
-        Rc::clone(&dispatcher),
-        ready,
-        tail.live_epoch(),
-        swept_bases,
-    ))?;
+    let live_epoch = tail.live_epoch();
+    let d = Rc::clone(&dispatcher);
+    // Raced against a worker's death, which would leave recovery waiting forever.
+    dispatcher.reactor().block_on(async move {
+        let recovery = master_post_fork_recovery(&d, ready, live_epoch, swept_bases);
+        match select2(recovery, d.worker_death()).await {
+            Either::A(r) => r,
+            Either::B(w) => Err(format!("worker {w} exited during recovery")),
+        }
+    })?;
 
     let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
     gnitz_note!("GnitzDB ready");

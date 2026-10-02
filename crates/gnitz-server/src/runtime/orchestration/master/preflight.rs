@@ -431,14 +431,14 @@ async fn execute_probe_burst(
                                 .enumerate()
                                 .filter(|(_, r)| !r.is_empty())
                                 .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
-                            cut.push(SalMessageKind::HasPk, holders, |excl, targets| {
-                                excl.write(&DirectGroup {
+                            cut.push(
+                                holders,
+                                DirectGroup {
                                     template,
                                     data,
-                                    targets,
                                     ..DirectGroup::new(SalMessageKind::HasPk)
-                                })
-                            })
+                                },
+                            )
                         })?
                     }
                     // Index entries are partitioned independently of the probe

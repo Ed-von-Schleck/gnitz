@@ -12,7 +12,7 @@ use crate::runtime::tls::TlsConfig;
 const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
 const TLS_DEV_CERT_FILE: &str = "tls_dev_cert.pem";
 
-/// A bound, listening, non-blocking socket, and the rustls config its connections are
+/// A bound, listening socket, and the rustls config its connections are
 /// served under (`None`: the AF_UNIX socket, served in plaintext).
 pub(crate) struct ClientListener {
     pub fd: OwnedFd,
@@ -82,9 +82,6 @@ fn bind_tcp(addr: SocketAddr) -> Result<(OwnedFd, SocketAddr), String> {
             std::io::Error::last_os_error()
         ));
     }
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("failed to set the TLS listener non-blocking: {e}"))?;
     // Not `addr`, whose port may be 0.
     let bound = listener
         .local_addr()
@@ -113,10 +110,7 @@ fn bind_unix(path: &str) -> Result<OwnedFd, String> {
         }
         r => r,
     }
-    .and_then(|l| {
-        l.set_nonblocking(true)?;
-        Ok(OwnedFd::from(l))
-    })
+    .map(OwnedFd::from)
     .map_err(|e| format!("failed to create server socket {path}: {e}"))?;
     gnitz_info!("Listening on {}", path);
     Ok(listener)

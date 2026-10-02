@@ -5,7 +5,7 @@ use super::super::test_support::*;
 use super::*;
 
 /// A panic during poll must propagate rather than be swallowed: it unwinds
-/// through `tick` and, in real use, up to the caller.
+/// through the pass and, in real use, up to `block_on`'s caller.
 #[test]
 #[should_panic(expected = "boom")]
 fn panic_in_spawned_task_propagates_not_swallowed() {
@@ -19,9 +19,9 @@ fn panic_in_spawned_task_propagates_not_swallowed() {
 /// A task may spawn during its own poll, and what it spawns runs.
 #[test]
 fn a_task_spawns_during_its_own_poll() {
-    let r = Rc::new(make_reactor());
+    let r = make_reactor();
     let ran = Rc::new(Cell::new(0));
-    let (r2, ran2) = (Rc::clone(&r), Rc::clone(&ran));
+    let (r2, ran2) = (r.clone(), Rc::clone(&ran));
     r.spawn(async move {
         for _ in 0..64 {
             let ran = Rc::clone(&ran2);
@@ -58,4 +58,15 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
         2,
         "16 wakes for one key must cost exactly one further poll"
     );
+}
+
+/// `block_on` returns in the pass that completes its future, whatever else is
+/// parked: nothing would ever end a sleep there.
+#[test]
+fn block_on_returns_beside_a_parked_task() {
+    within(|| {
+        let r = make_reactor();
+        r.spawn(std::future::pending());
+        assert_eq!(r.block_on(async { 7 }), 7);
+    });
 }
