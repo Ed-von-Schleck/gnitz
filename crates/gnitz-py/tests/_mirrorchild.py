@@ -40,7 +40,7 @@ def erase(base, target, sn):
     # The bootstrap never finished, so this view has no valid copy, and a read of
     # one is delegated rather than refused.
     [vid] = m.mirrored_ids()
-    assert m.mirrors(vid) is False
+    assert m.cursor(vid) is None
     _delegated(m, plain, "SELECT * FROM f")
     assert bag(scanned(m, "f")) == bag(scanned(plain, "f")), "and so is a scan of it"
     _delegated(m, plain, "SELECT * FROM t")
@@ -63,7 +63,7 @@ def panic(base, target, sn):
     m.mirror_at(base)
     vid = m.mirror_view("f").view_id
     f_schema = m.resolve_table("f")[1]
-    assert m.mirrors(vid), "the bootstrap succeeds; the seam fires on a poll"
+    assert m.cursor(vid) is not None, "the bootstrap succeeds; the seam fires on a poll"
 
     churn(m, 61, 120)
     m.execute_sql("SELECT COUNT(*) AS n FROM f")
@@ -75,7 +75,7 @@ def panic(base, target, sn):
     assert m.mirror_poisoned is not None, "the guard poisons before the unwind continues"
 
     # The copy is still gated in, so these are reads it would have answered.
-    assert m.mirrors(vid)
+    assert m.cursor(vid) is not None
     for call in (lambda: m.execute_sql("SELECT * FROM f"),
                  lambda: m.scan(vid, f_schema)):
         try:

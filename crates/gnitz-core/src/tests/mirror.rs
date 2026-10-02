@@ -18,7 +18,6 @@ use gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS;
 use gnitz_wire::RelDescriptorBlob;
 use gnitz_wire::{TypeCode, WireStatus};
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -243,7 +242,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
     let log = Log::default();
     let cursors = views
         .iter()
-        .filter_map(|&(tid, _, tick)| NonZeroU64::new(tick).map(|tick| (tid, DeltaCursor { tag: TAG, tick })))
+        .filter_map(|&(tid, _, tick)| Some((tid, DeltaCursor::from_pair(TAG, tick)?)))
         .collect();
     client
         .attach_mirror(StubStore {

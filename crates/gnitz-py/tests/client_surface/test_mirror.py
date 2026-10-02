@@ -29,7 +29,7 @@ import _childproc
 
 def _local(mirror, vid, sql):
     """One read off the copy, with the proof that it was one."""
-    assert mirror.mirrors(vid), f"{sql}: the view is not answered locally"
+    assert mirror.cursor(vid) is not None, f"{sql}: the view is not answered locally"
     before = mirror.requests_sent
     got = rows(mirror, sql)
     assert mirror.requests_sent == before, f"{sql}: the read was delegated upstream"
@@ -102,7 +102,7 @@ def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     assert mirror.requests_sent > before, "a table the copy does not hold must be read upstream"
 
     mirror.forget_view(vid)
-    assert not mirror.mirrors(vid)
+    assert mirror.cursor(vid) is None
     before = mirror.requests_sent
     _samebag("a forgotten view", rows(mirror, "SELECT * FROM f"), rows(client, "SELECT * FROM f"))
     assert mirror.requests_sent > before, "a forgotten view must be read upstream again"
@@ -448,7 +448,7 @@ def test_a_mirror_call_releases_the_gil(client, mirror):
         before = mirror.requests_sent
         held, read_dropped_gil = spin.wins(lambda: rows(mirror, "SELECT * FROM f"))
         assert mirror.requests_sent == before, "the mirrored read must be answered off the copy"
-        _, during_control = spin.during(mirror.mirrors, vid)
+        _, during_control = spin.during(mirror.cursor, vid)
 
     assert polled, "the poll must have covered the registered view"
     assert held, "the mirrored read must return rows, or it proves nothing"

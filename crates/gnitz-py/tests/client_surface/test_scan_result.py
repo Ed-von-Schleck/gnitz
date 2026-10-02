@@ -104,11 +104,16 @@ def test_every_field_access_path_agrees(scans):
     assert row._asdict() == {"pk": 1, "val": 10}
     assert row._weight == 1
 
-    twin = type(row)(tuple(row), _weight=99)
-    assert twin._fields == row._fields
-    assert row == twin and hash(row) == hash(twin)
-    assert {row: "value"}[twin] == "value"
-    assert row != type(row)((1, 11))
+    a, b, c = (ZSetBatch(KV).append(pk=1, val=10).append(pk=1, val=10, _weight=99)
+               .append(pk=1, val=11).rows())
+    assert a._fields == b._fields
+    assert a == b and hash(a) == hash(b)
+    assert {a: "value"}[b] == "value"
+    assert a != c
+
+    # A row comes from a result; the type builds none.
+    with pytest.raises(TypeError):
+        type(row)((1, 10))
 
     with pytest.raises(AttributeError):
         _ = row.nonexistent
@@ -133,3 +138,38 @@ def test_the_row_object_keeps_only_the_names_it_answers(scans):
     assert row._weight == 1                      # the Z-set weight, not 77
     assert row._fields == ("pk", "weight", "_x")
     assert row._asdict() == {"pk": 1, "weight": 77, "_x": 5}
+
+
+_ID = ColumnDef("id", TypeCode.I64)
+_A = ColumnDef("a", TypeCode.I64)
+_H = ColumnDef("a", TypeCode.I64, is_hidden=True)
+_B = ColumnDef("b", TypeCode.I64)
+
+
+@pytest.mark.parametrize("columns,extra", [
+    ([_ID, _H, _B, _A], {"b": 0}),
+    ([_ID, _A, _H], {}),
+], ids=["tombstone-ahead", "tombstone-behind"])
+def test_a_visible_column_claims_a_name_a_hidden_one_repeats(columns, extra):
+    """`including_hidden()` presents a tombstone beside the column re-added or
+    renamed onto its name. The hidden column holds its zero filler, so every
+    by-name path reading 10 is every path reading the visible one."""
+    batch = ZSetBatch(Schema(columns, [0])).append(id=1, a=10, **extra)
+    [r] = batch.rows().including_hidden()
+    assert r._fields == tuple(c.name for c in columns)
+    assert r.a == r["a"] == r._asdict()["a"] == 10
+
+
+def test_the_last_of_two_visible_columns_claims_a_repeated_name(module_client):
+    """A join view's wildcard presents both sides' columns under their own
+    names, so `pk` and `a` each appear twice."""
+    conn = module_client
+    conn.execute_sql(
+        "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+        "CREATE TABLE d (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL); "
+        "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk; "
+        "INSERT INTO c VALUES (4, 1, 4); INSERT INTO d VALUES (1, 1)")
+    [r] = conn.execute_sql("SELECT * FROM dup")[0]["rows"]
+    assert tuple(r) == (4, 1, 4, 1, 1)
+    assert r._fields == ("pk", "a", "b", "pk", "a")
+    assert r.pk == r["pk"] == r._asdict()["pk"] == 1

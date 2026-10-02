@@ -13,14 +13,12 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 
-use std::sync::Arc;
-
-use gnitz_core::{ClientError, Interest, Reply, Request, Schema, Session, SlotId};
+use gnitz_core::{ClientError, Interest, Reply, Request, Session, SlotId};
 use gnitz_wire::{ReadBound, ReadSpec, WireConflictMode};
 
 use crate::client_err;
 use crate::read::scan_result;
-use crate::schema::{resolve_py_schema, scan_pairs};
+use crate::schema::PySchema;
 use crate::write::{pk_point_spec, PyZSetBatch};
 
 #[pyclass(name = "AsyncTransport")]
@@ -203,41 +201,35 @@ impl PyAsyncTransport {
         )
     }
 
-    fn scan(
-        slf: &Bound<'_, Self>,
-        target_id: u64,
-        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
-    ) -> PyResult<Py<PyAny>> {
+    fn scan(slf: &Bound<'_, Self>, target_id: u64, schema: PySchema) -> PyResult<Py<PyAny>> {
         let spec = ReadSpec::all_rows(ReadBound::None);
         Self::submit(
             slf,
             Request::ScanSpec {
                 target_id,
                 spec: &spec,
-                reply_schema: &schema,
+                reply_schema: &schema.rust,
             },
         )
     }
 
     /// N `(table_id, schema)` relations at one server-side SAL cut, resolved as
     /// a list in request order.
-    fn scan_many(slf: &Bound<'_, Self>, pairs: Vec<(u64, Bound<'_, PyAny>)>) -> PyResult<Py<PyAny>> {
-        Self::submit(slf, Request::ScanMulti(scan_pairs(&pairs)?))
+    fn scan_many(slf: &Bound<'_, Self>, pairs: Vec<(u64, PySchema)>) -> PyResult<Py<PyAny>> {
+        Self::submit(
+            slf,
+            Request::ScanMulti(pairs.into_iter().map(|(tid, s)| (tid, s.rust)).collect()),
+        )
     }
 
-    fn seek(
-        slf: &Bound<'_, Self>,
-        target_id: u64,
-        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
-        pk: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let spec = pk_point_spec(&schema, &pk)?;
+    fn seek(slf: &Bound<'_, Self>, target_id: u64, schema: PySchema, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let spec = pk_point_spec(&schema.rust, &pk)?;
         Self::submit(
             slf,
             Request::ScanSpec {
                 target_id,
                 spec: &spec,
-                reply_schema: &schema,
+                reply_schema: &schema.rust,
             },
         )
     }

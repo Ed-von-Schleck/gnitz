@@ -38,6 +38,15 @@ fn cut_order_is_image_then_kind() {
 }
 
 #[test]
+fn a_walk_is_exact_iff_no_unbounded_column_is_nullable() {
+    let prefix = KeyRange::point(cols(&[4, 5, 6]), &[1], 2);
+    assert!(prefix.is_exact(|_| false));
+    assert!(prefix.is_exact(|c| c != 6), "a nullable bounded column loses no row");
+    assert!(!prefix.is_exact(|c| c == 6));
+    assert!(KeyRange::point(cols(&[4, 5]), &[1], 2).is_exact(|_| true));
+}
+
+#[test]
 fn walks_pk_iff_the_list_leads_the_pk() {
     let r = KeyRange::point(cols(&[2, 0]), &[1], 2);
     assert!(r.walks_pk(&[2, 0]));

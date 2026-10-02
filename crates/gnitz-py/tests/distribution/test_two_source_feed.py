@@ -31,7 +31,7 @@ def _poll(target, schema, ready, stop, copy):
             ready.set()
         while True:
             stopping = stop.is_set()
-            if len(sub.poll().rows) == 0 and stopping:
+            if len(sub.poll()) == 0 and stopping:
                 break
         copy.update(sub.copy)
 

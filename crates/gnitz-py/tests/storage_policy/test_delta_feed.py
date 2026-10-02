@@ -135,7 +135,7 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
 
         before = sal_digest()
         for _ in range(20):
-            assert len(sub.poll().rows) == 0
+            assert len(sub.poll()) == 0
         assert sal_digest() == before, "an up-to-date poll must write no SAL bytes"
 
 
@@ -163,7 +163,7 @@ def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
         client.execute_sql(
             "INSERT INTO ev VALUES " + ",".join(f"({r * 50 + i}, {i % 4}, {i + 1})" for i in range(50)),
         )
-        assert len(sub.poll().rows) == 0, f"poll {r} carried the push it raced — it drove a tick"
+        assert len(sub.poll()) == 0, f"poll {r} carried the push it raced — it drove a tick"
 
     sub.assert_converged("after the undrained polls")
 

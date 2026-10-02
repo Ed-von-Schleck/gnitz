@@ -85,6 +85,16 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
+    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none.
+    pub fn from_pair(tag: u64, tick: u64) -> Option<DeltaCursor> {
+        NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick })
+    }
+
+    /// This cursor as a flat `(tag, tick)` pair.
+    pub fn pair(self) -> (u64, u64) {
+        (self.tag, self.tick.get())
+    }
+
     /// `next` as this cursor's successor, or a `DeltaExpired` refusal when it
     /// names another boot or relation.
     pub(crate) fn advanced_to(self, next: DeltaCursor) -> Result<DeltaCursor, ClientError> {
@@ -827,9 +837,8 @@ impl Session {
         // The train terminated.
         let data = accum.data.take();
         if let Some((_, positions)) = poll {
-            let tick = NonZeroU64::new(ctrl.hdr.arg0)
+            let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-            let cursor = DeltaCursor { tag: ctrl.hdr.arg1, tick };
             let slot = end_poll_position(pending, accum, done, positions);
             return Ok(Some((slot, block, Some(Ok(cursor)))));
         }

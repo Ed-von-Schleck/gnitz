@@ -43,27 +43,25 @@ class Subscriber:
         self.cursor = (0, 0)
 
     def bootstrap(self):
-        reply = self.client.delta_bootstrap(self.vid, self.schema)
+        rows, self.cursor = self.client.delta_bootstrap(self.vid, self.schema)
         # A bootstrap replaces state; it does not add to it.
-        self.copy = bag(reply.rows.including_hidden())
-        self.cursor = reply.cursor
+        self.copy = bag(rows.including_hidden())
 
     def poll(self):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        reply = self.client.delta_poll(self.vid, self.schema, self.cursor)
-        for k, w in bag(reply.rows.including_hidden()).items():
+        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor)
+        for k, w in bag(rows.including_hidden()).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
                 del self.copy[k]
-        self.cursor = reply.cursor
-        return reply
+        return rows
 
     def drain(self):
         """Collect every round that exists: one poll, since a poll covers
         everything past its cursor — so the next one must come back empty."""
         self.poll()
-        assert len(self.poll().rows) == 0, "one poll left a round behind"
+        assert len(self.poll()) == 0, "one poll left a round behind"
 
     def scan(self):
         return bag(self.client.scan(self.vid, self.schema).including_hidden())

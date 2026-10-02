@@ -13,18 +13,6 @@ fn text_is_the_digits_and_scale_it_spells() {
     }
 }
 
-#[test]
-fn a_float_literal_is_the_decimal_it_was_written_as() {
-    assert_eq!(decimal_of_f64(1.1), Some((11, 1)));
-    assert_eq!(decimal_of_f64(0.1), Some((1, 1)));
-    assert_eq!(decimal_of_f64(-2.25), Some((-225, 2)));
-    assert_eq!(decimal_of_f64(3.0), Some((3, 0)));
-    assert_eq!(decimal_of_f64(1e5), Some((100_000, 0)));
-    assert_eq!(decimal_of_f64(f64::NAN), None);
-    assert_eq!(decimal_of_f64(f64::INFINITY), None);
-    assert_eq!(decimal_of_f64(1e30), None);
-}
-
 /// A numeric literal's text is the decimal it spells, exponent applied, at its
 /// smallest exact scale — digits no float print could carry included.
 #[test]

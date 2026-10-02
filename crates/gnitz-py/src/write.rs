@@ -3,8 +3,7 @@
 //!
 //! The per-cell encode table is private: what leaves this module is the key- and
 //! column-level entry points the client's own verbs call. `ZSetBatch.rows()`
-//! reads back through `read::scan_result` — a pyclass crosses the directional
-//! pair, no codec does.
+//! reads back through `read::scan_result`.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -18,11 +17,12 @@ use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::place::{place_scaled, Placed};
-use gnitz_wire::decimal::{decimal_of_f64, parse_decimal_text};
+use gnitz_expr::SchemaFacts;
+use gnitz_wire::decimal::parse_decimal_text;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode};
 
 use crate::read::{scan_result, PyScanResult};
-use crate::schema::resolve_py_schema;
+use crate::schema::PySchema;
 
 /// The lookup keys `pks` as a `PkColumn` for `schema`: a single-column key is
 /// its value, a compound key a tuple of its column values in PK order.
@@ -245,7 +245,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
         consumed[i] = true;
         pks.push(PkPlan { pos: i, ci, ty: schema.columns[ci].ty });
     }
-    let mut payload = Vec::with_capacity(names.len());
+    let mut payload = Vec::with_capacity(schema.num_payload_cols());
     for (_, ci, col) in schema.payload_columns() {
         let src = if col.is_hidden {
             PayloadSrc::Filler
@@ -479,10 +479,9 @@ pub(crate) fn install_append_method(py: Python<'_>) -> PyResult<()> {
 
 #[pymethods]
 impl PyZSetBatch {
-    /// Construct a batch for `schema`, resolved at the parameter through
-    /// [`resolve_py_schema`].
     #[new]
-    pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> Self {
+    pub fn new(schema: PySchema) -> Self {
+        let schema = schema.rust;
         let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
         let batch = ZSetBatch::new(&schema);
         PyZSetBatch {
@@ -581,15 +580,29 @@ fn py_days(d: &impl PyDateAccess) -> i64 {
     gnitz_expr::calendar::days_from_civil(d.get_year() as i64, d.get_month() as u32, d.get_day() as u32)
 }
 
-/// A DATE value: a `datetime.date` (a `datetime.datetime` is one too, and
+/// An aware `datetime` carries an offset no column stores.
+fn refuse_aware(dt: &Bound<'_, PyDateTime>) -> PyResult<()> {
+    match dt.get_tzinfo() {
+        Some(_) => Err(pyo3::exceptions::PyValueError::new_err(
+            "a DATE or TIMESTAMP takes a naive datetime; convert to UTC and drop tzinfo",
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A DATE value: a `datetime.date` (a naive `datetime.datetime` is one too, and
 /// contributes its date), or the day count as an int.
 fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
     let Ok(d) = item.cast::<PyDate>() else {
         return item.extract::<i32>();
     };
-    if inexact == Inexact::Refuse {
+    // A plain `date` is no `datetime`; only a subclass pays the subtype walk.
+    if !d.is_exact_instance_of::<PyDate>() {
         if let Ok(t) = item.cast::<PyDateTime>() {
-            if (t.get_hour(), t.get_minute(), t.get_second(), t.get_microsecond()) != (0, 0, 0, 0) {
+            refuse_aware(t)?;
+            if inexact == Inexact::Refuse
+                && (t.get_hour(), t.get_minute(), t.get_second(), t.get_microsecond()) != (0, 0, 0, 0)
+            {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!("{item} is not a DATE")));
             }
         }
@@ -602,11 +615,7 @@ fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
 fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
     use gnitz_expr::calendar::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
     if let Ok(dt) = item.cast::<PyDateTime>() {
-        if dt.get_tzinfo().is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "a TIMESTAMP takes a naive datetime; convert to UTC and drop tzinfo",
-            ));
-        }
+        refuse_aware(dt)?;
         return Ok(py_days(dt) * MICROS_PER_DAY
             + dt.get_hour() as i64 * MICROS_PER_HOUR
             + dt.get_minute() as i64 * MICROS_PER_MIN
@@ -629,8 +638,7 @@ fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8, inexact: Inexact) -> PyRe
     let (v, s) = if item.cast::<pyo3::types::PyInt>().is_ok() {
         (item.extract::<i128>()?, 0)
     } else if let Ok(f) = item.cast::<pyo3::types::PyFloat>() {
-        let (v, s) = decimal_of_f64(f.value()).ok_or_else(overflow)?;
-        (i128::from(v), s)
+        parse_decimal_text(&f.value().to_string()).ok_or_else(overflow)?
     } else {
         // Borrowed on both branches: `to_cow` hands back CPython's own UTF-8
         // where it has one.
@@ -644,14 +652,14 @@ fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8, inexact: Inexact) -> PyRe
         };
         parse_decimal_text(&text).ok_or_else(not_decimal)?
     };
-    match place_scaled(FixedInt::I64, v, s, scale) {
-        Placed::At(n) => Ok(n as i64),
-        Placed::Between { .. } if inexact == Inexact::Refuse => Err(not_decimal()),
-        Placed::Between { nearest, .. }
-        | Placed::Below { nearest: Some(nearest) }
-        | Placed::Above { nearest: Some(nearest) } => Ok(nearest as i64),
-        Placed::Below { .. } | Placed::Above { .. } => Err(overflow()),
-    }
+    let p = place_scaled(FixedInt::I64, v, s, scale);
+    let n = match (p, inexact) {
+        (Placed::At(n), _) => Some(n),
+        (_, Inexact::Refuse) => None,
+        (p, Inexact::Round) => p.stored(),
+    };
+    n.map(|n| n as i64)
+        .ok_or_else(|| if p.is_outside() { overflow() } else { not_decimal() })
 }
 
 /// What becomes of a value that falls between two of its column's.
@@ -664,7 +672,7 @@ enum Inexact {
 }
 
 /// Append one non-null fixed-width value to `buf` as its native little-endian
-/// bytes. Each arm's `extract` is its range check.
+/// bytes. Each integer arm's `extract` is its range check.
 fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
     match ty.tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),

@@ -1,6 +1,5 @@
 //! The wire→Python direction: every decode from a `ZSetBatch` to a Python
-//! object, and the read-side pyclasses built on them — `Row`, `ScanResult`,
-//! `RowIterator` and `DeltaReply`.
+//! object, and the read-side pyclasses built on them.
 //!
 //! The per-cell decode is private: what leaves this module is [`scan_result`],
 //! so no other module dispatches on a `TypeCode` to read a value.
@@ -51,18 +50,20 @@ impl ColumnDescriptor {
     }
 }
 
-/// The `Row` subclass that presents columns named `names`.
+/// The `Row` subclass that presents the columns `names`, each with whether it
+/// is hidden.
 struct RowType(Py<PyType>);
 
 impl RowType {
     /// One per distinct `names`, for the life of the process.
-    fn of(py: Python<'_>, names: &[&str]) -> PyResult<RowType> {
+    fn of(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<RowType> {
         static CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Py<PyType>>>> = LazyLock::new(Default::default);
-        // Length-prefixed, so no two name lists share a key.
+        // Length-prefixed, so no two column lists share a key.
         let mut key = Vec::new();
-        for name in names {
+        for &(name, hidden) in names {
             key.extend_from_slice(&(name.len() as u32).to_le_bytes());
             key.extend_from_slice(name.as_bytes());
+            key.push(hidden as u8);
         }
         if let Some(ty) = CACHE.lock().unwrap().get(&key) {
             return Ok(RowType(ty.clone_ref(py)));
@@ -71,23 +72,38 @@ impl RowType {
         Ok(RowType(CACHE.lock().unwrap().entry(key).or_insert(built).clone_ref(py)))
     }
 
-    fn build(py: Python<'_>, names: &[&str]) -> PyResult<Py<PyType>> {
+    fn build(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<Py<PyType>> {
         // Interned: `field_pos` settles on a pointer compare.
-        let fields = PyTuple::new(py, names.iter().map(|n| PyString::intern(py, n)))?;
+        let fields = PyTuple::new(py, names.iter().map(|(n, _)| PyString::intern(py, n)))?;
+        // A repeated name reads its last visible column, else its last hidden one.
+        let owner = |name: &str| {
+            let last = |hidden: bool| names.iter().rposition(|&c| c == (name, hidden));
+            last(false).or_else(|| last(true))
+        };
+        let keys = PyTuple::new(
+            py,
+            fields.iter().zip(names).enumerate().map(|(pos, (field, &(name, _)))| {
+                if owner(name) == Some(pos) {
+                    field.into_any()
+                } else {
+                    py.None().into_bound(py)
+                }
+            }),
+        )?;
         let ns = PyDict::new(py);
         // No `__dict__` / `__weakref__` per row: a row's namespace is its columns.
         ns.set_item(intern!(py, "__slots__"), PyTuple::empty(py))?;
         ns.set_item(intern!(py, "_fields"), &fields)?;
+        ns.set_item(intern!(py, "_keys"), &keys)?;
         let base = py.get_type::<PyRow>();
-        for (pos, name) in fields.as_slice().iter().enumerate() {
-            // A name the row object already answers (`_fields`, `_asdict`,
-            // `_weight`, a dunder) keeps that meaning; the column is read by
-            // position or through `_asdict()`. A repeated name keeps its first
-            // column.
-            if base.hasattr(name.cast::<PyString>()?)? || ns.contains(name)? {
+        for (pos, name) in keys.iter().enumerate() {
+            let Ok(name) = name.cast::<PyString>() else {
                 continue;
+            };
+            // A name the row object itself answers keeps that meaning.
+            if !(base.hasattr(name)? || ns.contains(name)?) {
+                ns.set_item(name, Bound::new(py, ColumnDescriptor { pos })?)?;
             }
-            ns.set_item(name, Bound::new(py, ColumnDescriptor { pos })?)?;
         }
         let bases = PyTuple::new(py, [base])?;
         let ty = py.get_type::<PyType>().call1((intern!(py, "Row"), bases, ns))?;
@@ -124,30 +140,13 @@ fn field_pos(fields: &Bound<'_, PyTuple>, name: &Bound<'_, PyString>) -> PyResul
     Ok(None)
 }
 
-/// A row's field names: its subclass's `_fields`, or `Row`'s own empty tuple.
-fn fields_of<'py>(slf: &Bound<'py, PyRow>) -> PyResult<Bound<'py, PyTuple>> {
-    Ok(slf
-        .get_type()
-        .getattr(intern!(slf.py(), "_fields"))?
-        .cast_into::<PyTuple>()?)
+/// A tuple attribute of the row's subclass.
+fn type_tuple<'py>(slf: &Bound<'py, PyRow>, attr: &Bound<'py, PyString>) -> PyResult<Bound<'py, PyTuple>> {
+    Ok(slf.get_type().getattr(attr)?.cast_into::<PyTuple>()?)
 }
 
 #[pymethods]
 impl PyRow {
-    #[new]
-    #[pyo3(signature = (values, _weight=1))]
-    pub fn new(values: Bound<'_, PyTuple>, _weight: i64) -> Self {
-        PyRow { values: values.unbind(), weight: _weight }
-    }
-
-    /// The presented column names, positionally aligned with the values —
-    /// `namedtuple`'s spelling. Empty on `Row` itself; a result's row subclass
-    /// shadows it with its own tuple.
-    #[classattr]
-    fn _fields(py: Python<'_>) -> Py<PyTuple> {
-        PyTuple::empty(py).unbind()
-    }
-
     /// The row's Z-set weight, always: the row object owns its underscore names,
     /// so a *column* named `_weight` is shadowed here and read through
     /// `_asdict()` or by position.
@@ -168,7 +167,7 @@ impl PyRow {
             }
             idx as usize
         } else if let Ok(name) = key.cast::<PyString>() {
-            match field_pos(&fields_of(slf)?, name)? {
+            match field_pos(&type_tuple(slf, intern!(py, "_keys"))?, name)? {
                 Some(i) => i,
                 None => return Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
             }
@@ -187,15 +186,13 @@ impl PyRow {
     }
 
     pub fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        let fields = fields_of(slf)?;
-        let values = slf.get().values.bind(slf.py());
-        let mut parts = Vec::with_capacity(values.len());
-        for (i, val) in values.as_slice().iter().enumerate() {
-            match fields.as_slice().get(i) {
-                Some(name) => parts.push(format!("{}={}", name.extract::<&str>()?, val.repr()?)),
-                None => parts.push(val.repr()?.to_string()),
-            }
-        }
+        let py = slf.py();
+        let parts = type_tuple(slf, intern!(py, "_fields"))?
+            .as_slice()
+            .iter()
+            .zip(slf.get().values.bind(py).as_slice())
+            .map(|(name, val)| Ok(format!("{}={}", name.extract::<&str>()?, val.repr()?)))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(format!("Row({}, _weight={})", parts.join(", "), slf.get().weight))
     }
 
@@ -215,12 +212,14 @@ impl PyRow {
     pub fn _asdict(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
         let py = slf.py();
         let dict = PyDict::new(py);
-        for (name, val) in fields_of(slf)?
+        for (name, val) in type_tuple(slf, intern!(py, "_keys"))?
             .as_slice()
             .iter()
             .zip(slf.get().values.bind(py).as_slice())
         {
-            dict.set_item(name, val)?;
+            if !name.is_none() {
+                dict.set_item(name, val)?;
+            }
         }
         Ok(dict.unbind())
     }
@@ -229,6 +228,9 @@ impl PyRow {
 // ---------------------------------------------------------------------------
 // Cell decode
 // ---------------------------------------------------------------------------
+
+/// The years a `datetime.date` holds.
+const PY_YEARS: std::ops::RangeInclusive<i64> = 1..=9999;
 
 /// `decimal.Decimal`, imported once.
 fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
@@ -240,11 +242,7 @@ fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
         .map(|d| d.bind(py))
 }
 
-/// Decode one cell at `loc` in `row`, PK or payload, null bit first: a set bit
-/// is `None` whatever the stored value. Integers as int, floats as float, UUID
-/// as its canonical string, DATE as `datetime.date`, TIMESTAMP as a naive
-/// `datetime.datetime`, DECIMAL as `decimal.Decimal` at the column's scale,
-/// STRING as `str`, BLOB as `bytes`.
+/// The cell at `loc` in `row`, PK or payload.
 fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> PyResult<Py<PyAny>> {
     if loc.is_null(batch, row) {
         return Ok(py.None());
@@ -264,15 +262,25 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::I128 => i128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::UUID => format_uuid(u128::from_le_bytes(b.try_into().unwrap())).into_py_any(py)?,
         TypeCode::Date => {
-            let (y, m, d) = gnitz_expr::calendar::civil_from_days(gnitz_wire::read_signed_exact(b));
-            PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
+            let days = gnitz_wire::read_signed_exact(b);
+            let (y, m, d) = gnitz_expr::calendar::civil_from_days(days);
+            if PY_YEARS.contains(&y) {
+                PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
+            } else {
+                days.into_py_any(py)?
+            }
         }
         TypeCode::Timestamp => {
-            let (days, h, mi, s, us) = gnitz_expr::calendar::split_micros(gnitz_wire::read_signed_exact(b));
+            let micros = gnitz_wire::read_signed_exact(b);
+            let (days, h, mi, s, us) = gnitz_expr::calendar::split_micros(micros);
             let (y, m, d) = gnitz_expr::calendar::civil_from_days(days);
-            PyDateTime::new(py, y as i32, m as u8, d as u8, h as u8, mi as u8, s as u8, us, None)?
-                .into_any()
-                .unbind()
+            if PY_YEARS.contains(&y) {
+                PyDateTime::new(py, y as i32, m as u8, d as u8, h as u8, mi as u8, s as u8, us, None)?
+                    .into_any()
+                    .unbind()
+            } else {
+                micros.into_py_any(py)?
+            }
         }
         TypeCode::Decimal => py_decimal(py)?
             .call1((format_decimal(gnitz_wire::read_signed_exact(b).into(), ty.scale),))?
@@ -307,7 +315,7 @@ fn present(
             continue;
         }
         cols.push((SchemaFacts::locate(schema.as_ref(), ci), c.ty));
-        names.push(c.name.as_str());
+        names.push((c.name.as_str(), c.is_hidden));
     }
     let row_type = RowType::of(py, &names)?;
     Ok(PyScanResult { schema, batch, cols, row_type, lsn })
@@ -386,35 +394,5 @@ impl PyRowIterator {
         let obj = data.row_type.row(py, values, batch.weights[row])?;
         self.pos += 1;
         Ok(Some(obj))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DeltaReply
-// ---------------------------------------------------------------------------
-
-/// One delta read's answer: the rows, and the cursor the next poll takes.
-#[pyclass(name = "DeltaReply", frozen)]
-pub struct PyDeltaReply {
-    /// The delta rows, weights included — a retraction arrives at weight −1.
-    #[pyo3(get)]
-    rows: Py<PyScanResult>,
-    /// `(tag, tick)`: the boot and relation this reply belongs to, and the last
-    /// round it covers. Hand it straight back to `delta_poll`.
-    #[pyo3(get)]
-    cursor: (u64, u64),
-}
-
-impl PyDeltaReply {
-    /// A delta read's rows and the cursor it returned.
-    pub(crate) fn new(py: Python<'_>, reply: ScanReply, cursor: gnitz_core::DeltaCursor) -> PyResult<Py<PyDeltaReply>> {
-        let rows = scan_result(py, reply)?;
-        Py::new(
-            py,
-            PyDeltaReply {
-                rows,
-                cursor: (cursor.tag, cursor.tick.get()),
-            },
-        )
     }
 }

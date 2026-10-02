@@ -6,7 +6,7 @@ Usage::
 
     async with connect("/var/run/gnitz.sock") as conn:
         lsn = await conn.push(table_id, batch)
-        result = await conn.scan(table_id)
+        result = await conn.scan(table_id, schema)
 
 The target may also be ``tls://HOST:PORT[?QUERY]``, ``QUERY`` being
 ``&``-separated ``ca=PATH`` (PEM roots, default webpki), ``cert=PATH`` and

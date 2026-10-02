@@ -37,6 +37,18 @@ impl Placed {
         matches!(self, Placed::Below { .. } | Placed::Above { .. })
     }
 
+    /// The value an assignment stores: the literal's own, or `nearest` where
+    /// rounding lands inside the type. `None` when even that lies outside.
+    pub fn stored(self) -> Option<u128> {
+        match self {
+            Placed::At(v)
+            | Placed::Between { nearest: v, .. }
+            | Placed::Below { nearest: Some(v) }
+            | Placed::Above { nearest: Some(v) } => Some(v),
+            Placed::Below { nearest: None } | Placed::Above { nearest: None } => None,
+        }
+    }
+
     /// `x cmp lit`, where this is `lit` placed among the values of `x`'s type,
     /// as a comparison against one of those values or a constant verdict. Seek
     /// keys and VM comparisons both read it.

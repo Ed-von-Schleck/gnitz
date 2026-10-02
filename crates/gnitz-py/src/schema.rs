@@ -104,7 +104,8 @@ impl PyColumnDef {
 ///
 /// The PK is `pk_indices`, held in **sort order** — e.g. `pk_indices=[2, 1]`
 /// sorts by col 2 first, then col 1. Order matters for seek/range semantics.
-#[pyclass(name = "Schema", frozen)]
+#[pyclass(name = "Schema", frozen, from_py_object)]
+#[derive(Clone)]
 pub struct PySchema {
     pub(crate) rust: Arc<Schema>,
 }
@@ -141,21 +142,6 @@ impl PySchema {
             self.rust.columns.len()
         )
     }
-}
-
-/// The Rust `Schema` behind a Python `Schema` argument, applied at the parameter
-/// through `#[pyo3(from_py_with = resolve_py_schema)]` so each method receives
-/// an owned `Arc<Schema>`.
-pub(crate) fn resolve_py_schema(obj: &Bound<'_, PyAny>) -> PyResult<Arc<Schema>> {
-    Ok(Arc::clone(&obj.cast::<PySchema>()?.get().rust))
-}
-
-/// `(table_id, schema)` pairs as the relations a multi-relation read names.
-pub(crate) fn scan_pairs(pairs: &[(u64, Bound<'_, PyAny>)]) -> PyResult<Vec<(u64, Arc<Schema>)>> {
-    pairs
-        .iter()
-        .map(|(tid, schema)| Ok((*tid, resolve_py_schema(schema)?)))
-        .collect()
 }
 
 /// sys_schema(table_id) -> Schema: the schema of system table `table_id`, the

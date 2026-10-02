@@ -9,7 +9,6 @@
 //! where a copy's child directory belongs, so whatever writes there fails.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
@@ -38,10 +37,7 @@ fn view_schema() -> Schema {
 }
 
 fn cursor(tick: u64) -> DeltaCursor {
-    DeltaCursor {
-        tag: 0xA11CE,
-        tick: NonZeroU64::new(tick).unwrap(),
-    }
+    DeltaCursor::from_pair(0xA11CE, tick).unwrap()
 }
 
 /// One wire block of the view's own rows, in the view's own schema — the shape

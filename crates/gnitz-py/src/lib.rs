@@ -15,7 +15,7 @@ mod write;
 
 use async_transport::PyAsyncTransport;
 use client::{PyGnitzClient, PyPollResult, PyTxn};
-use read::{PyDeltaReply, PyRow, PyRowIterator, PyScanResult};
+use read::{PyRow, PyRowIterator, PyScanResult};
 use schema::{PyColumnDef, PySchema};
 use write::{install_append_method, PyZSetBatch};
 
@@ -89,9 +89,8 @@ pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     }
 }
 
-/// The one way this crate obtains a connection, so no caller can skip the park
-/// hook — what makes a blocking call Ctrl-C-interruptible. `gnitz-core` must not
-/// depend on pyo3, so the hook is the host's to supply.
+/// How `GnitzClient` obtains its connection, with the park hook installed — what
+/// makes a blocking call Ctrl-C-interruptible.
 pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClient> {
     let mut client = py.detach(|| GnitzClient::connect(target)).map_err(client_err)?;
     client.set_park_hook(Some(Box::new(|| {
@@ -122,7 +121,7 @@ fn instructions_retired(f: &Bound<'_, PyAny>) -> PyResult<(u64, bool)> {
 // Module registration
 // ---------------------------------------------------------------------------
 
-// pyo3 0.29 makes free-threading opt-*out*: a bare `#[pymodule]` emits
+// pyo3 makes free-threading opt-*out*: a bare `#[pymodule]` emits
 // `Py_MOD_GIL_NOT_USED`. This module links the `Rc`-based engine, so that claim
 // would be false.
 #[pymodule(gil_used = true)]
@@ -155,7 +154,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Only the ids something addresses a relation by are exported.
     m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
-    m.add("VIEW_TAB", gnitz_wire::VIEW_TAB)?;
     m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
@@ -166,7 +164,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // are linked here and not into the server, so the server's build says nothing
     // about them: `e2e-release` pairs a release server with a debug extension.
     m.add("debug_assertions", cfg!(debug_assertions))?;
-    m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;
     m.add_function(wrap_pyfunction!(schema::sys_schema, m)?)?;

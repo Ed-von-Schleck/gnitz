@@ -75,19 +75,6 @@ pub fn format_decimal(v: i128, scale: u8) -> String {
     out
 }
 
-/// The decimal a float spells at the scale of its shortest round-trip print.
-/// `None` when it is not finite or has more digits than `i64` holds.
-pub fn decimal_of_f64(v: f64) -> Option<(i64, u8)> {
-    if !v.is_finite() {
-        return None;
-    }
-    let (u, scale) = parse_decimal_text(&format!("{v}"))?;
-    if scale > MAX_DECIMAL_SCALE {
-        return None;
-    }
-    Some((i64::try_from(u).ok()?, scale))
-}
-
 #[cfg(test)]
 #[path = "tests/decimal.rs"]
 mod tests;

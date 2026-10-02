@@ -321,8 +321,7 @@ impl GnitzClient {
 
     /// [`Self::push`] for a caller that owns the batch and drops it:
     /// inside a transaction the rows move into the buffer instead of being deep
-    /// cloned. The borrowing form stays for callers that cannot move (the Python
-    /// driver holds a `PyRef`).
+    /// cloned. The borrowing form stays for callers that keep the batch.
     pub fn push_owned(
         &mut self,
         table_id: u64,

@@ -50,7 +50,7 @@ def test_or_replace_writes_the_with_clause_out_as_stated(client, base):
         assert bag(scanned(client, name), "id", "b") == {(1, 100): 1, (2, 200): 1}, name
     with pytest.raises(gnitz.GnitzRefusedError, match="requires a relation a view can be created over"):
         client.execute_sql("CREATE VIEW over_it AS SELECT id FROM bounded")
-    assert bag(client.delta_bootstrap(*client.resolve_table("fed")).rows, "id", "b") == {
+    assert bag(client.delta_bootstrap(*client.resolve_table("fed"))[0], "id", "b") == {
         (1, 100): 1, (2, 200): 1}
 
     client.execute_sql(

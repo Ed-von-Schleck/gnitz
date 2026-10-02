@@ -18,6 +18,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
+from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch
 from _read import access, bag, rows, scanned
 from _sql import insert
 
@@ -105,6 +106,37 @@ def test_index_seek_reads_a_key_as_its_columns_type(client, col_type, stored, fi
     for key, error in refused:
         with pytest.raises(error):
             client.seek_by_index(tid, schema, [1], [key])
+
+
+def test_a_decimal_key_past_the_columns_range_reaches_no_row(client):
+    """A key that rounds onto the column's largest value names no row of it: it
+    raises instead of reading, or deleting, the row keyed at that edge."""
+    schema = Schema([ColumnDef("k", TypeCode.DECIMAL, scale=2)], [0])
+    tid = client.create_table("t", schema)
+    edge = Decimal("92233720368547758.07")
+    client.push(tid, ZSetBatch(schema).append(k=edge))
+    assert bag(client.seek(tid, schema, edge), "k") == {(edge,): 1}
+    for verb in (client.seek, lambda t, s, k: client.delete(t, s, [k])):
+        with pytest.raises(OverflowError):
+            verb(tid, schema, Decimal("92233720368547758.074"))
+    assert bag(client.scan(tid, schema), "k") == {(edge,): 1}
+
+
+@pytest.mark.parametrize("nullable", [False, True], ids=["not-null", "nullable"])
+def test_a_prefix_seek_stops_short_only_of_not_null_columns(client, nullable):
+    """A walk over (a, b) holds no row NULL in `b`, so key values that stop at
+    `a` are refused where `b` is nullable."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
+        f"b BIGINT{'' if nullable else ' NOT NULL'}); CREATE INDEX ON t(a, b)")
+    tid, schema = client.resolve_table("t")
+    insert(client, "t", [(1, 5, 1), (2, 5, 2), (3, 6, 1)])
+    if nullable:
+        with pytest.raises(ValueError, match="nullable"):
+            client.seek_by_index(tid, schema, [1, 2], [5])
+        assert bag(client.seek_by_index(tid, schema, [1, 2], [5, 1]), "pk") == {(1,): 1}
+    else:
+        assert bag(client.seek_by_index(tid, schema, [1, 2], [5]), "pk") == {(1,): 1, (2,): 1}
 
 
 def test_index_seek_refuses_a_column_that_cannot_be_a_key(client):

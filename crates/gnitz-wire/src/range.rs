@@ -84,6 +84,12 @@ impl KeyRange {
         &self.eq[..self.n_eq]
     }
 
+    /// Whether the walk is every row its bounds admit. It holds no row NULL in a column
+    /// of `cols`, so it is not where a column it leaves unbounded is nullable.
+    pub fn is_exact(&self, nullable: impl Fn(u32) -> bool) -> bool {
+        !self.cols.as_slice()[self.n_eq + 1..].iter().any(|&c| nullable(c))
+    }
+
     /// Whether this walk reads the relation's own store: `cols` leads its PK list.
     pub fn walks_pk(&self, pk_cols: &[u32]) -> bool {
         pk_cols.starts_with(self.cols.as_slice())

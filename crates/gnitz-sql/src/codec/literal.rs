@@ -25,27 +25,19 @@ pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
     format!("invalid {ty} literal: '{s}'")
 }
 
-/// The value an assignment of `lit` into `ty` stores, as its native image: the
-/// placed value, or the nearest one when rounding lands inside the type. A
+/// The value an assignment of `lit` into `ty` stores, as its native image. A
 /// float column takes every numeric spelling as its binary64 value.
 pub(crate) fn assign<R>(lit: &BExpr<R>, ty: ColType) -> Result<u128, String> {
     let v = match ty.tc {
         TypeCode::F64 => float_value(lit).map(|v| u128::from(v.to_bits())),
-        // F32 rounds through binary64, as the Python client's `ZSetBatch.append`
-        // does for a float, so the two ingest paths agree bit for bit.
+        // F32 rounds through binary64.
         TypeCode::F32 => float_value(lit).map(|v| u128::from((v as f32).to_bits())),
-        _ => match place(lit, ty) {
-            Some(
-                Placed::At(v)
-                | Placed::Between { nearest: v, .. }
-                | Placed::Below { nearest: Some(v) }
-                | Placed::Above { nearest: Some(v) },
-            ) => Some(v),
-            Some(Placed::Below { .. } | Placed::Above { .. }) => {
-                return Err(format!("{ty} value out of range: {}", lit.literal_text()))
-            }
-            None => None,
-        },
+        _ => place(lit, ty)
+            .map(|p| {
+                p.stored()
+                    .ok_or_else(|| format!("{ty} value out of range: {}", lit.literal_text()))
+            })
+            .transpose()?,
     };
     v.ok_or_else(|| match lit {
         BExpr::LitStr(s) => invalid_literal(ty, s),

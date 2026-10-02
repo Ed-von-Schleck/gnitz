@@ -15,10 +15,7 @@ fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
 }
 
 fn one_cursor() -> Option<DeltaCursor> {
-    Some(DeltaCursor {
-        tag: 0xFEED,
-        tick: NonZeroU64::new(41).unwrap(),
-    })
+    DeltaCursor::from_pair(0xFEED, 41)
 }
 
 /// A registration round-trips with its cursor and decodes to the layout its

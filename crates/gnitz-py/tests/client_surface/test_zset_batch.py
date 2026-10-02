@@ -448,6 +448,8 @@ class TestValueCoercion:
         (2, "-1.005", "-1.01"),
         (2, 1.005, "1.01"),
         (2, Decimal("1.004"), "1.00"),
+        (2, 1e-19, "0.00"),
+        (2, 1e30, OverflowError),
     ])
     def test_a_decimal_cell_rounds_half_away_from_zero_at_any_length(self, scale, value, want):
         schema = Schema([ColumnDef("id", TypeCode.I64),
@@ -482,7 +484,17 @@ class TestValueCoercion:
         assert _col(batch, "d") == [d, d, d]
         assert _col(batch, "ts") == [ts, datetime(2024, 2, 29), datetime(2024, 2, 29)]
 
+        # Past `datetime`'s years the stored integer is what reads back, and the
+        # row after it is still reached.
+        batch.append(id=4, d=2**31 - 1, ts=2**62)
+        batch.append(id=5, d=d, ts=ts)
+        assert _col(batch, "d")[3:] == [2**31 - 1, d]
+        assert _col(batch, "ts")[3:] == [2**62, ts]
+
+        aware = datetime.now().astimezone()
         with pytest.raises(ValueError, match="naive"):
-            ZSetBatch(schema).append(id=9, d=d, ts=datetime.now().astimezone())
+            ZSetBatch(schema).append(id=9, d=d, ts=aware)
+        with pytest.raises(ValueError, match="naive"):
+            ZSetBatch(schema).append(id=9, d=aware, ts=ts)
         with pytest.raises(TypeError):
             ZSetBatch(schema).append(id=9, d="2024-02-29", ts=ts)

@@ -182,12 +182,9 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
             (KeyRange::point(cols, init, last), 0)
         }
     };
-    let covered = range.eq_vals().len() + 1;
-    // An index holds no row with a NULL in any of its columns.
-    let trailing_nullable = cols.as_slice()[covered..]
-        .iter()
-        .any(|&c| schema.columns[c as usize].is_nullable);
-    (!trailing_nullable).then_some(ListBound { range, consumed, pinned, bounded_sides })
+    range
+        .is_exact(|c| schema.columns[c as usize].is_nullable)
+        .then_some(ListBound { range, consumed, pinned, bounded_sides })
 }
 
 // ---------------------------------------------------------------------------

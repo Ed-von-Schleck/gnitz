@@ -379,13 +379,7 @@ fn a_delta_read_keeps_blocks_undecoded() {
         })
         .unwrap();
     let _peer = h.join().unwrap();
-    assert_eq!(
-        cursor,
-        DeltaCursor {
-            tag: 0xFEED,
-            tick: std::num::NonZeroU64::new(5).unwrap()
-        }
-    );
+    assert_eq!(cursor.pair(), (0xFEED, 5));
     let decoded: Vec<ZSetBatch> = blocks
         .iter()
         .map(|b| decode_wal_block(b.block(), &schema).unwrap())
