@@ -4,6 +4,8 @@
 //! `Batch::negated`, MAP `crate::algebra::MapPlan::evaluate_map_batch`,
 //! null-extend `Batch::widened_with_nulls`.
 
+use std::borrow::Cow;
+
 use crate::schema::{ColumnTable, SchemaFacts};
 use gnitz_expr::RowFilter;
 
@@ -74,10 +76,17 @@ pub fn null_extend_output_schema(
 ///
 /// `out_schema` is the UNION's own, not either input's — it is the comparator the
 /// merge folds and certifies under.
-pub fn op_union(mut batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_a.consolidated_verified() && batch_b.consolidated_verified() && batch_b.count > 0 {
         return batch_a.merged_consolidated(batch_b, out_schema);
     }
+    let mut batch_a = match batch_a {
+        // Both operands sized once, where a clone would be grown by the append.
+        Cow::Borrowed(a) if batch_b.count > 0 => {
+            return Batch::concat(out_schema, [a.as_mem_batch(), batch_b.as_mem_batch()].into_iter());
+        }
+        a => a.into_owned(),
+    };
     // An empty `b` passes `a` through with no allocation, its consolidated claim
     // preserved: `out_schema` only ORs in nullability, which reorders nothing
     // `a` holds.

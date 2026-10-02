@@ -148,6 +148,13 @@ impl SchemaColumn {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SchemaDescriptor {
+    /// Bit `pi` set iff payload slot `pi` is a German string.
+    string_slots: u64,
+    /// Bit `pi` set iff payload slot `pi` admits NULL.
+    nullable_slots: u64,
+    /// Region `r`'s byte offset within one row's fixed bytes, in canonical
+    /// region order; entry `num_regions()` is the row width.
+    region_off: [u16; gnitz_wire::MAX_WIRE_REGIONS],
     num_columns: u32,
     pk_count: u32,
     pk_indices: [u32; MAX_PK_COLUMNS],
@@ -157,14 +164,15 @@ pub struct SchemaDescriptor {
     payload_to_ci: [u8; MAX_COLUMNS],
     /// Which comparator orders this schema's payload.
     pub(crate) payload_cmp: payload_order::PayloadCmpKind,
-    /// Whether any column is a German string.
-    has_german_string: bool,
+    /// One less than the row-count multiple an arena of eight rows or more
+    /// rounds its capacity up to, so that every region starts 8-aligned.
+    cap_mask: u8,
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
 // Every `Batch` embeds a `SchemaDescriptor` by value, so a field added here is
 // paid for at every batch copy.
-const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 356);
+const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 512);
 
 // No column is wider than 16 bytes, so a PK within `MAX_PK_COLUMNS` is within
 // `MAX_PK_BYTES` — what every `[0u8; MAX_PK_BYTES]` scratch key relies on — and
@@ -206,14 +214,35 @@ impl SchemaDescriptor {
         }
         let num_payload = cols.len() - pk_indices.len();
         let payload = payload_to_ci[..num_payload].iter().map(|&ci| cols[ci as usize]);
+        let mut region_off = [0u16; gnitz_wire::MAX_WIRE_REGIONS];
+        let (mut string_slots, mut nullable_slots) = (0u64, 0u64);
+        let mut off = pk_stride + 16;
+        region_off[gnitz_wire::REG_WEIGHT] = pk_stride as u16;
+        region_off[gnitz_wire::REG_NULL_BMP] = pk_stride as u16 + 8;
+        for (pi, col) in payload.clone().enumerate() {
+            region_off[gnitz_wire::REG_PAYLOAD_START + pi] = off as u16;
+            off += col.size() as usize;
+            string_slots |= u64::from(col.type_code.is_german_string()) << pi;
+            nullable_slots |= u64::from(col.nullable) << pi;
+        }
+        region_off[gnitz_wire::REG_PAYLOAD_START + num_payload] = off as u16;
+        // The smallest power of two `q <= 8` with `q * region_off[r]` a multiple
+        // of 8 for every region.
+        let low = region_off[..gnitz_wire::REG_PAYLOAD_START + num_payload]
+            .iter()
+            .fold(8u16, |g, &o| g | o);
+        let cap_mask = (8u8 >> low.trailing_zeros().min(3)) - 1;
         Ok(SchemaDescriptor {
+            string_slots,
+            nullable_slots,
+            region_off,
             num_columns: cols.len() as u32,
             pk_count: pk_indices.len() as u32,
             pk_indices: pk,
             pk_stride: pk_stride as u8,
             payload_to_ci,
             payload_cmp: payload_order::PayloadCmpKind::of(payload),
-            has_german_string: cols.iter().any(|c| c.type_code.is_german_string()),
+            cap_mask,
             columns,
         })
     }
@@ -299,7 +328,68 @@ impl SchemaDescriptor {
     /// whether a batch over it has a live blob region.
     #[inline]
     pub fn has_german_string(&self) -> bool {
-        self.has_german_string
+        self.string_slots != 0
+    }
+
+    /// [`SchemaFacts::string_payload_slots`], from a mask filled at construction.
+    #[inline]
+    pub fn string_payload_slots(&self) -> u64 {
+        self.string_slots
+    }
+
+    /// [`SchemaFacts::nullable_payload_slots`], from a mask filled at construction.
+    #[inline]
+    pub fn nullable_payload_slots(&self) -> u64 {
+        self.nullable_slots
+    }
+
+    /// [`SchemaFacts::not_null_payload_slots`], from the same mask.
+    #[inline]
+    pub fn not_null_payload_slots(&self) -> u64 {
+        gnitz_wire::low_bits_mask(self.num_payload_cols()) & !self.nullable_slots
+    }
+
+    /// Fixed regions of a batch: PK, weight, null words, one per payload column.
+    #[inline(always)]
+    pub const fn num_regions(&self) -> usize {
+        gnitz_wire::REG_PAYLOAD_START + self.num_payload_cols()
+    }
+
+    /// One row's bytes across the fixed regions.
+    #[inline(always)]
+    pub const fn row_width(&self) -> usize {
+        self.region_off[self.num_regions()] as usize
+    }
+
+    /// Where region `r` starts in an arena of `cap` rows: the regions lie back to
+    /// back, `cap` rows each.
+    #[inline(always)]
+    pub(crate) const fn region_start(&self, r: usize, cap: usize) -> usize {
+        cap * self.region_off[r] as usize
+    }
+
+    /// Bytes of one cell of region `r`.
+    #[inline(always)]
+    pub(crate) const fn region_stride(&self, r: usize) -> usize {
+        (self.region_off[r + 1] - self.region_off[r]) as usize
+    }
+
+    /// Whether `other` lays a batch's regions out as this schema does.
+    pub(crate) fn same_regions(&self, other: &SchemaDescriptor) -> bool {
+        self.region_off[..=self.num_regions()] == other.region_off[..=other.num_regions()]
+    }
+
+    /// The capacity an arena for `rows` rows is allocated at: `rows` itself below
+    /// eight, where no pass over a region is long enough for its alignment to
+    /// matter, and else the next count that starts every region 8-aligned.
+    #[inline]
+    pub(crate) const fn arena_rows(&self, rows: usize) -> usize {
+        let mask = self.cap_mask as usize;
+        if rows < 8 {
+            rows
+        } else {
+            (rows + mask) & !mask
+        }
     }
 
     /// The column at `ci`, or `None` when it is out of range. The bounded read

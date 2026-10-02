@@ -235,10 +235,13 @@ fn reduce_sort_argsort_bench() {
         ("image u128", &mixed, &[1]),
         ("fold 2-col", &wide, &[0, 1]),
     ] {
-        let mut batch = Batch::with_capacity(schema, n);
+        let mut batch = crate::repr::BatchBuilder::new(schema);
         for pk in bench_rows(n, schema.pk_stride()) {
-            batch.push_zero_filled_row(&pk, 1);
+            batch.begin_row_bytes(&pk, 1);
+            (0..schema.num_payload_cols()).for_each(|_| batch.put_int(0));
+            batch.end_row();
         }
+        let batch = batch.finish();
         let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
 
         let t = std::time::Instant::now();

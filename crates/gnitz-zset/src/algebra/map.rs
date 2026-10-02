@@ -426,17 +426,12 @@ impl MapPlan {
             Some(c) => (c, &whole[..]),
             None => (src, ranges),
         };
-        let heap_at = out.carry_heap(
-            &src.as_mem_batch(),
-            src.schema().string_payload_slots(),
-            self.copied_string_slots,
-            ranges,
-        );
+        let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
 
         let blob_cap = crate::repr::prorated_blob_cap(src.blob().len(), src.count, total);
         let old = out.grow_rows(total);
 
-        let mut cache = BlobCache::new(total);
+        let mut cache = BlobCache::new(out.string_cells(total));
         // For relocated copies and string emits alike.
         if out.schema().has_german_string() && heap_at.is_none() && blob_cap != 0 {
             out.reserve_blob(blob_cap);

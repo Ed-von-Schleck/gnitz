@@ -328,14 +328,15 @@ impl TestLog {
     /// A committed zone of one `Push` group per target, every worker sent its
     /// own payload of [`rows`].
     fn push_zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
-        let batches = vec![rows(); self.writer.num_workers()];
+        let batch = rows();
+        let each = vec![batch.wire_whole(); self.writer.num_workers()];
         let relations: Vec<WireSchema> = targets
             .iter()
-            .map(|&t| WireSchema::encoded(t, batches[0].schema()))
+            .map(|&t| WireSchema::encoded(t, batch.schema()))
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()
-            .map(|r| DirectGroup::push(r, GroupData::Batches(&batches), GroupTargets::UNADDRESSED))
+            .map(|r| DirectGroup::push(r, GroupData::Each(&each), GroupTargets::UNADDRESSED))
             .collect();
         self.commit_zone(&groups)
     }

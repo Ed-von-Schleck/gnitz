@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use gnitz_wire::WireFault;
-use gnitz_zset::repr::WalBlock;
+use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
@@ -226,8 +226,8 @@ pub(crate) struct TrainFrame {
 
 impl TrainFrame {
     /// The frame's rows under `schema`, aborting on failure: the ring is trusted.
-    pub(crate) fn rows(&self, schema: &SchemaDescriptor) -> WalBlock<'_> {
-        match WalBlock::parse(&self.slot.bytes()[self.data.clone()], schema) {
+    pub(crate) fn rows<'a>(&'a self, schema: &'a SchemaDescriptor) -> MemBatch<'a> {
+        match MemBatch::of_wal_block(&self.slot.bytes()[self.data.clone()], schema) {
             Ok(block) => block,
             Err(e) => gnitz_fatal_abort!(
                 "w2m: worker={} train frame does not decode under the reader's schema: {e}",

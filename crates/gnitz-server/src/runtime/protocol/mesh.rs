@@ -23,7 +23,7 @@ use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
 use gnitz_zset::algebra::{op_exchange_gather, ScatterPlan};
-use gnitz_zset::repr::{Batch, WalBlock};
+use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The default and largest virtual size of one outbox.
@@ -348,17 +348,16 @@ impl Mesh {
             return None;
         }
         let schema = open.schema;
-        let parsed: Vec<WalBlock> = open
+        let slices: Vec<MemBatch> = open
             .saved
             .iter()
             .map(Vec::as_slice)
             .chain(blocks)
             .map(|block| {
-                WalBlock::parse(block, &schema)
+                MemBatch::of_wal_block(block, &schema)
                     .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
             })
             .collect();
-        let slices: Vec<_> = parsed.iter().map(WalBlock::view).collect();
         let rows = op_exchange_gather(&slices, &schema, consolidated);
         self.part += 1;
         Some((rows, drained))

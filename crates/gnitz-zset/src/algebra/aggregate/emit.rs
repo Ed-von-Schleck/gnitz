@@ -13,12 +13,11 @@ pub(crate) fn emit_reduce_row(
     accs: &[Accumulator],
 ) {
     output.begin_row(out_pk_bytes, 1);
-    let mut null_word: u64 = 0;
     if let Some((src, row, locs)) = group {
-        output.append_cells_from(0, locs, src, row, &mut null_word);
+        output.append_cells_from(0, locs, src, row);
     }
     for acc in accs {
-        acc.emit(output, &mut null_word);
+        acc.emit(output);
     }
-    output.commit_row(null_word);
+    output.commit_row();
 }

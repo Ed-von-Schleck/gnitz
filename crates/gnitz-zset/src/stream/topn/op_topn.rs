@@ -68,10 +68,9 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
             if take > 0 {
                 budget -= take;
                 let (src, row) = history.current_row_source();
-                let mut null_word = 0u64;
                 out.begin_row(out_pk_bytes, take as i64);
-                out.append_cells_from(0, &plan.index.carried_in_index, src, row, &mut null_word);
-                out.commit_row(null_word);
+                out.append_cells_from(0, &plan.index.carried_in_index, src, row);
+                out.commit_row();
             }
             history.advance();
         }

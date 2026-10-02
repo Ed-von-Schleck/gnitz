@@ -8,14 +8,14 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-use super::batch_pool::acquire_uninit;
+use super::batch_pool::PooledBuf;
 use super::layout::*;
 use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
 use super::shard_filter;
 use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
-use crate::schema::{SchemaDescriptor, SchemaFacts};
+use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::{read_i64_le, read_u64_le};
@@ -403,18 +403,19 @@ impl MappedShard {
             blob.len()
         };
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
-            copy_rows(self.pk, schema.pk_stride(), w.pk);
+            let (pk, weight, null_bmp) = w.fixed_mut();
+            copy_rows(self.pk, schema.pk_stride(), pk);
             match &self.weight {
-                WeightRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, w.weight),
+                WeightRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, weight),
                 WeightRegion::TwoValue { .. } | WeightRegion::For { .. } => {
-                    for (i, cell) in w.weight.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    for (i, cell) in weight.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                         *cell = self.get_weight(start + i).to_le_bytes();
                     }
                 }
             }
-            copy_rows(self.null_bmp, FIXED_REGION_BYTES, w.null_bmp);
+            copy_rows(self.null_bmp, FIXED_REGION_BYTES, null_bmp);
             if self.null_pad_mask != 0 {
-                for word in w.null_bmp.as_chunks_mut::<8>().0 {
+                for word in null_bmp.as_chunks_mut::<8>().0 {
                     *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
                 }
             }
@@ -422,7 +423,7 @@ impl MappedShard {
                 let cp = match &self.col_regions[pi] {
                     PayloadRegion::Mapped(cp) => *cp,
                     PayloadRegion::Packed(p) => {
-                        for_decode(self.mapped(p.image), p.bw, p.elem_width, start, w.col_bufs[pi]);
+                        for_decode(self.mapped(p.image), p.bw, p.elem_width, start, w.col_mut(pi));
                         continue;
                     }
                     PayloadRegion::Dict(d) => {
@@ -431,7 +432,7 @@ impl MappedShard {
                                 w.write_string_cell(pi, d.cell(start + i), blob, None, i);
                             }
                         } else {
-                            d.decode(start, w.col_bufs[pi]);
+                            d.decode(start, w.col_mut(pi));
                         }
                         continue;
                     }
@@ -441,7 +442,7 @@ impl MappedShard {
                         w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, blob, None, i);
                     }
                 } else {
-                    copy_rows(cp, col.size() as usize, w.col_bufs[pi]);
+                    copy_rows(cp, col.size() as usize, w.col_mut(pi));
                 }
             }
             if !relocate {
@@ -508,7 +509,7 @@ impl ColumnarSource for MappedShard {
                     PayloadRegion::Packed(p) => {
                         let w = p.elem_width;
                         // SAFETY: `for_decode` writes every cell of `column`.
-                        let mut column = unsafe { acquire_uninit(window.len() * w) };
+                        let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
                         for_decode(self.mapped(p.image), p.bw, w, window.start, &mut column);
                         // Rebased so that row `window.start` reads the column's first cell.
                         ColPtr {
@@ -518,7 +519,7 @@ impl ColumnarSource for MappedShard {
                     }
                     PayloadRegion::Dict(d) => {
                         // SAFETY: `decode` writes every cell of `column`.
-                        let mut column = unsafe { acquire_uninit(window.len() * 16) };
+                        let mut column = unsafe { PooledBuf::uninit(window.len() * 16) };
                         d.decode(window.start, &mut column);
                         ColPtr {
                             base: decoded.hold(column).wrapping_sub(window.start * 16),

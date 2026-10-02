@@ -13,11 +13,11 @@
 use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
-use super::batch::Batch;
+use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_WEIGHT};
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
-use super::string_heap::{rebase_string_cell, BlobCache};
+use super::string_heap::{relocate_german_string_vec, BlobCache};
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
@@ -86,20 +86,16 @@ pub(crate) fn mem_batch_to_unified<'a>(
     let data_ptr = mb.data.as_ptr();
     let cols_off = cols.len();
     for (pi, col) in schema.payload_columns() {
-        let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi];
         cols.push(ColPtr {
-            base: unsafe { data_ptr.add(off) },
+            base: unsafe { data_ptr.add(mb.region_start(REG_PAYLOAD_START + pi)) },
             stride: col.size() as usize,
         });
     }
     UnifiedSource {
-        pk: ColPtr {
-            base: unsafe { data_ptr.add(mb.offsets[super::batch::REG_PK]) },
-            stride: mb.pk_stride as usize,
-        },
+        pk: ColPtr { base: data_ptr, stride: mb.pk_stride() },
         null_bmp: ColPtr {
-            base: unsafe { data_ptr.add(mb.offsets[super::batch::REG_NULL_BMP]) },
-            stride: super::batch::FIXED_REGION_BYTES,
+            base: unsafe { data_ptr.add(mb.region_start(REG_NULL_BMP)) },
+            stride: FIXED_REGION_BYTES,
         },
         null_pad_mask: 0,
         cols_off,
@@ -112,25 +108,15 @@ pub(crate) fn mem_batch_to_unified<'a>(
 // MemBatch: a view over flat columnar buffers (one batch / sorted run)
 // ---------------------------------------------------------------------------
 
-/// Borrowed slice-view of a `Batch`.
-///
-/// The full data buffer is referenced as `data: &[u8]`, with `offsets` recording
-/// the byte offset of each region (PK, weight, null_bmp, payload_0..N). This
-/// lets `Batch::as_mem_batch` return a `MemBatch` without allocating a
-/// `Vec<&[u8]>` of column slices.
-///
-/// Per-column strides are not stored here — callers iterate
-/// `schema.payload_columns()` and pass the column size explicitly.
+/// A borrowed view of batch rows: an arena of `cap` rows laid out under
+/// `schema`, of which the first `count` are rows. A [`Batch`]'s own, or a WAL
+/// block's fixed bytes, which are an arena exactly as large as its rows.
 #[derive(Clone)]
 pub struct MemBatch<'a> {
     pub(crate) data: &'a [u8],
-    /// Borrowed, not owned: the array is sized for `MAX_BATCH_REGIONS`, and this
-    /// view exists to be derived per range, per chunk and per operator call.
-    /// `Batch` already holds the array inline, so `as_mem_batch` lends it; the
-    /// one view with no owning `Batch`, a borrowed wire frame, borrows it from
-    /// its [`super::batch_wire::WalBlock`].
-    pub(crate) offsets: &'a [usize; super::batch::MAX_BATCH_REGIONS],
-    pub pk_stride: u8, // byte width of the PK region per row
+    /// The layout: region `r` starts at `schema.region_start(r, cap)`.
+    pub(crate) schema: &'a SchemaDescriptor,
+    pub(crate) cap: usize,
     pub(crate) blob: &'a [u8],
     /// Row count of the view. Read from outside through [`MemBatch::len`].
     pub(crate) count: usize,
@@ -149,17 +135,35 @@ impl<'a> MemBatch<'a> {
         self.count == 0
     }
 
+    /// Byte width of the PK region per row.
+    #[inline(always)]
+    pub fn pk_stride(&self) -> usize {
+        self.schema.pk_stride()
+    }
+
+    /// Where region `r` starts in the arena.
+    #[inline(always)]
+    pub(crate) fn region_start(&self, r: usize) -> usize {
+        self.schema.region_start(r, self.cap)
+    }
+
+    /// The `count` rows of region `r`.
+    #[inline(always)]
+    pub(crate) fn region(&self, r: usize) -> &'a [u8] {
+        let off = self.region_start(r);
+        &self.data[off..off + self.count * self.schema.region_stride(r)]
+    }
+
     /// PK region as a contiguous slice (`count * pk_stride` bytes).
     #[inline]
     pub fn pk(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PK];
-        &self.data[off..off + self.count * self.pk_stride as usize]
+        &self.data[..self.count * self.pk_stride()]
     }
 
     /// Weight region as a contiguous slice (`count * 8` bytes).
     #[inline]
     pub(crate) fn weight(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_WEIGHT];
+        let off = self.region_start(REG_WEIGHT);
         &self.data[off..off + self.count * 8]
     }
 
@@ -177,7 +181,7 @@ impl<'a> MemBatch<'a> {
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
     #[inline(always)]
     pub(crate) fn null_bmp(&self) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_NULL_BMP];
+        let off = self.region_start(REG_NULL_BMP);
         &self.data[off..off + self.count * 8]
     }
 
@@ -185,34 +189,34 @@ impl<'a> MemBatch<'a> {
     /// Caller supplies the stride from the schema (see `payload_columns`).
     #[inline(always)]
     pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PAYLOAD_START + pi];
+        let off = self.region_start(REG_PAYLOAD_START + pi);
         &self.data[off..off + self.count * stride]
     }
 
     #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
-        let stride = self.pk_stride as usize;
-        let off = self.offsets[super::batch::REG_PK] + row * stride;
+        let stride = self.pk_stride();
+        let off = row * stride;
         &self.data[off..off + stride]
     }
     /// The leading `n` bytes of row `row`'s PK.
     #[inline(always)]
     pub(crate) fn get_pk_prefix(&self, row: usize, n: usize) -> &'a [u8] {
-        debug_assert!(n <= self.pk_stride as usize);
-        let off = self.offsets[super::batch::REG_PK] + row * self.pk_stride as usize;
+        debug_assert!(n <= self.pk_stride());
+        let off = row * self.pk_stride();
         &self.data[off..off + n]
     }
     #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
-        gnitz_wire::read_i64_le(self.data, self.offsets[super::batch::REG_WEIGHT] + row * 8)
+        gnitz_wire::read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * 8)
     }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.offsets[super::batch::REG_NULL_BMP] + row * 8)
+        read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * 8)
     }
     #[inline(always)]
     pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
-        let off = self.offsets[super::batch::REG_PAYLOAD_START + payload_col] + row * col_size;
+        let off = self.region_start(REG_PAYLOAD_START + payload_col) + row * col_size;
         &self.data[off..off + col_size]
     }
 }
@@ -261,7 +265,7 @@ impl<'a> BatchView for MemBatch<'a> {
     }
     #[inline(always)]
     fn pk_region(&self) -> (&[u8], usize) {
-        (MemBatch::pk(self), self.pk_stride as usize)
+        (MemBatch::pk(self), self.pk_stride())
     }
 }
 
@@ -332,8 +336,8 @@ impl PosCursor {
 // DirectWriter: writes into pre-allocated output buffers
 // ---------------------------------------------------------------------------
 
-/// Writes rows into the pre-allocated region buffers of a `write_to_batch`
-/// arena.
+/// Writes rows into a pre-allocated arena: a `write_to_batch` batch's, or a
+/// wire block's fixed bytes.
 ///
 /// **Every entry point must write each live byte of each row it counts** — the
 /// batch invariant (see `Batch::with_capacity`), and here the whole reason the
@@ -344,17 +348,16 @@ impl PosCursor {
 /// to count (a ghost weight) need nothing: every reader bounds the batch to
 /// `count`.
 pub(crate) struct DirectWriter<'a> {
-    // `repr`'s row-copy kernels write these fixed regions directly, so they are
-    // `pub(super)`; `blob`/`blob_cache` stay private — the heap is reached only
-    // through its methods.
-    pub(super) pk: &'a mut [u8],
-    pub(super) weight: &'a mut [u8],
-    pub(super) null_bmp: &'a mut [u8],
-    pub(super) col_bufs: Vec<&'a mut [u8]>,
+    /// An arena of `cap` rows under `schema`, of which rows `[0, rows)` are
+    /// this writer's to fill.
+    data: &'a mut [u8],
+    cap: usize,
+    rows: usize,
     /// Growable blob arena; capacity is reserved up-front by `write_to_batch`,
     /// and `blob.len()` doubles as the next-write offset.
     blob: &'a mut Vec<u8>,
-    blob_cache: BlobCache,
+    /// `None` relocates every cell on its own.
+    blob_cache: Option<BlobCache>,
     pub(super) count: usize,
     /// Borrowed, not owned: the scatter reads it per column, and copying it in
     /// would put a `memcpy` on every writer open.
@@ -362,52 +365,70 @@ pub(crate) struct DirectWriter<'a> {
 }
 
 impl<'a> DirectWriter<'a> {
-    /// One writable slice per fixed region, carved at `offsets[r]` from
-    /// `data`'s own start — so a wire block's header comes out as
-    /// the first region's leading pad.
-    pub(crate) fn over_regions(
+    /// A writer of the first `rows` rows of `data`, an arena of `cap` rows under
+    /// `schema`.
+    pub(crate) fn over(
         data: &'a mut [u8],
-        offsets: &[usize],
-        strides: &[u8],
+        cap: usize,
         rows: usize,
         schema: &'a SchemaDescriptor,
         blob: &'a mut Vec<u8>,
     ) -> Self {
-        use super::batch::REG_PAYLOAD_START;
-        let nr = strides.len();
-        debug_assert!(nr >= REG_PAYLOAD_START, "a carve must cover the three fixed regions");
-
-        let mut fixed: [&mut [u8]; REG_PAYLOAD_START] = [&mut [], &mut [], &mut []];
-        let mut col_bufs: Vec<&mut [u8]> = Vec::with_capacity(nr - REG_PAYLOAD_START);
-        let mut rest: &mut [u8] = data;
-        let mut base = 0usize;
-        for r in 0..nr {
-            let after_pad = std::mem::take(&mut rest).split_at_mut(offsets[r] - base).1;
-            let sz = rows * strides[r] as usize;
-            let (region, remainder) = after_pad.split_at_mut(sz);
-            match fixed.get_mut(r) {
-                Some(slot) => *slot = region,
-                None => col_bufs.push(region),
-            }
-            base = offsets[r] + sz;
-            rest = remainder;
-        }
-        let [pk, weight, null_bmp] = fixed;
-
+        debug_assert!(rows <= cap && data.len() >= cap * schema.row_width());
+        let cells = rows * schema.string_payload_slots().count_ones() as usize;
         DirectWriter {
-            pk,
-            weight,
-            null_bmp,
-            col_bufs,
+            data,
+            cap,
+            rows,
             blob,
-            blob_cache: BlobCache::new(rows),
+            blob_cache: Some(BlobCache::new(cells)),
             count: 0,
             schema,
         }
     }
 
-    /// Write one German-string cell at `out_row`, rebased per
-    /// [`rebase_string_cell`].
+    /// The PK, weight and null-word regions, each bounded to this writer's rows.
+    #[inline]
+    pub(super) fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
+        let pk_stride = self.schema.pk_stride();
+        let (pk, rest) = self.data.split_at_mut(self.cap * pk_stride);
+        let (weight, rest) = rest.split_at_mut(self.cap * 8);
+        (
+            &mut pk[..self.rows * pk_stride],
+            &mut weight[..self.rows * 8],
+            &mut rest[..self.rows * 8],
+        )
+    }
+
+    /// Payload column `pi`'s region, bounded to this writer's rows.
+    #[inline]
+    pub(super) fn col_mut(&mut self, pi: usize) -> &mut [u8] {
+        let r = REG_PAYLOAD_START + pi;
+        let start = self.schema.region_start(r, self.cap);
+        &mut self.data[start..start + self.rows * self.schema.region_stride(r)]
+    }
+
+    /// String column `pi`'s region, with the heap a relocation into it appends
+    /// to and the dedup cache it runs under.
+    #[inline]
+    pub(super) fn string_col_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>, Option<&mut BlobCache>) {
+        let start = self.schema.region_start(REG_PAYLOAD_START + pi, self.cap);
+        (
+            &mut self.data[start..start + self.rows * 16],
+            &mut *self.blob,
+            self.blob_cache.as_mut(),
+        )
+    }
+
+    /// Relocate every string cell on its own from here on: two cells naming one
+    /// source span each get a copy. For rows whose spans rarely repeat, where
+    /// the dedup probe costs more than the copy it saves.
+    pub(super) fn copy_every_span(&mut self) {
+        self.blob_cache = None;
+    }
+
+    /// Write one German-string cell at `out_row`: shifted onto `src_blob`
+    /// carried at `heap_at`, or relocated into this writer's heap.
     #[inline]
     pub(super) fn write_string_cell(
         &mut self,
@@ -417,23 +438,20 @@ impl<'a> DirectWriter<'a> {
         heap_at: Option<usize>,
         out_row: usize,
     ) {
-        let off = out_row * 16;
-        let dst = &mut self.col_bufs[payload_col][off..off + 16];
-        rebase_string_cell(dst, src_struct, src_blob, self.blob, heap_at, &mut self.blob_cache);
-    }
-
-    /// [`Self::write_string_cell`] relocating without the span dedup, whose
-    /// probe costs more than the copy it saves when spans rarely repeat.
-    #[inline]
-    pub(super) fn write_string_cell_plain(
-        &mut self,
-        payload_col: usize,
-        src_struct: &[u8],
-        src_blob: &[u8],
-        out_row: usize,
-    ) {
-        let cell = super::string_heap::relocate_german_string_vec(src_struct, src_blob, self.blob, None);
-        self.col_bufs[payload_col][out_row * 16..(out_row + 1) * 16].copy_from_slice(&cell);
+        let start = self.schema.region_start(REG_PAYLOAD_START + payload_col, self.cap);
+        let dst = &mut self.data[start..start + self.rows * 16][out_row * 16..(out_row + 1) * 16];
+        match heap_at {
+            Some(base) => {
+                dst.copy_from_slice(&src_struct[..16]);
+                gnitz_wire::shift_german_string_heaps(dst, base);
+            }
+            None => dst.copy_from_slice(&relocate_german_string_vec(
+                src_struct,
+                src_blob,
+                self.blob,
+                self.blob_cache.as_mut(),
+            )),
+        }
     }
 
     /// Carry a source heap whole onto the end of this writer's heap. Returns the
@@ -847,7 +865,7 @@ fn consolidate_groups_inner<P: PayloadOrder>(
     out: &mut Vec<(u32, u32, i64)>,
     payload: P,
 ) {
-    pk_width_dispatch!(batch.pk_stride as usize, |K| {
+    pk_width_dispatch!(batch.pk_stride(), |K| {
         let mut entries: Vec<SortEntry<K>> = (0..n as u32)
             .map(|i| SortEntry {
                 key: K::from_opk(batch.get_pk_bytes(i as usize)),

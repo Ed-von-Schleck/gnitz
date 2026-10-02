@@ -57,7 +57,15 @@ fn union_is_the_zset_sum_under_every_input_layout() {
             opt_batch(&nonnull, &a_rows, a_cons),
             opt_batch(&nullable, b_rows, b_cons),
         );
-        let out = op_union(Batch::clone(&a), &b, &out_schema);
+        let out = op_union(Cow::Owned(Batch::clone(&a)), &b, &out_schema);
+        let lent = op_union(Cow::Borrowed(&a), &b, &out_schema);
+        assert_eq!(lent.schema(), &out_schema, "{what}");
+        assert_eq!(lent.is_consolidated(), out.is_consolidated(), "{what}");
+        assert_eq!(
+            zset_of(&lent, &out_schema),
+            zset_of(&out, &out_schema),
+            "{what}: a lent operand unions as an owned one"
+        );
         assert_eq!(out.schema(), &out_schema, "{what}");
         let consolidated = a_cons && (b_cons || b_rows.is_empty());
         assert_eq!(out.is_consolidated(), consolidated, "{what}");
@@ -145,7 +153,7 @@ fn union_merge_bench() {
         let t = Instant::now();
         let mut acc = 0usize;
         for _ in 0..ITERS {
-            acc += black_box(op_union(Batch::clone(&a), &b, &schema).count);
+            acc += black_box(op_union(Cow::Borrowed(&a), &b, &schema).count);
         }
         let secs = t.elapsed().as_secs_f64();
         println!(

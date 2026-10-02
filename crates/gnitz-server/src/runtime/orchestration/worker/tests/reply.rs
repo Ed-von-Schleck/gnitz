@@ -20,8 +20,8 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_
         assert!(ctrl.hdr.flags.continuation, "every span frame carries continuation");
         assert!(ctrl.schema.is_none(), "the master builds the frame schema itself");
         if let Some(data) = ctrl.data.clone() {
-            let block = gnitz_zset::repr::WalBlock::parse(&slot.bytes()[data], frame_schema).expect("frame decodes");
-            let mb = block.view();
+            let mb =
+                gnitz_zset::repr::MemBatch::of_wal_block(&slot.bytes()[data], frame_schema).expect("frame decodes");
             keys.extend((0..mb.len()).map(|i| mb.get_pk_bytes(i).to_vec()));
         }
         frames += 1;

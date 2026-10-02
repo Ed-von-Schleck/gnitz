@@ -132,10 +132,9 @@ impl PkSetGather {
         let mut out = Batch::with_capacity(&out_schema, self.remaining_keys());
         self.for_each_live_row(usize::MAX, |c| {
             let (src, row) = c.current_row_source();
-            let mut null_word = 0;
             out.begin_row(c.current_pk_bytes(), 1);
-            out.append_cells_from(0, &locs, src, row, &mut null_word);
-            out.commit_row(null_word);
+            out.append_cells_from(0, &locs, src, row);
+            out.commit_row();
         });
         Ok(out)
     }

@@ -1,5 +1,7 @@
 //! Epoch execution: the two entry points and the opcode dispatch loop.
 
+use std::borrow::Cow;
+
 use super::*;
 use gnitz_expr::SchemaFacts;
 use gnitz_store::relation::{Cut, RelationRegistry};
@@ -172,8 +174,10 @@ fn run_instructions(
                     if in_reg == *in_b {
                         // Z + Z doubles every weight; delegating would take
                         // operand 0 and add the emptied operand 1 to it.
+                        // Saturating: a wrapping double sends `i64::MIN` to 0, a
+                        // ghost under the claim `map_weights` keeps.
                         let mut batch = take_or_clone(batches, in_reg, takes(in_reg));
-                        batch.map_weights(|w| w.wrapping_mul(2));
+                        batch.map_weights(|w| w.saturating_mul(2));
                         batch
                     } else if batches[in_reg.at()].is_empty() {
                         // `0 + B = B`, taking B rather than cloning it — which is
@@ -183,11 +187,11 @@ fn run_instructions(
                         // The union's own (nullability-merged) schema, not the
                         // left input's — see `union_nullability_merge` for why a
                         // narrower one mis-sorts nulls.
-                        algebra::op_union(
-                            take_or_clone(batches, in_reg, takes(in_reg)),
-                            &batches[in_b.at()],
-                            &regs[out_reg.at()].schema,
-                        )
+                        let a = match takes(in_reg) {
+                            true => Cow::Owned(batches[in_reg.at()].take()),
+                            false => Cow::Borrowed(&batches[in_reg.at()]),
+                        };
+                        algebra::op_union(a, &batches[in_b.at()], &regs[out_reg.at()].schema)
                     }
                 }
 

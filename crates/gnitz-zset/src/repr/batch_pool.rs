@@ -55,47 +55,55 @@ pub(super) fn is_tight(capacity: usize, need: usize) -> bool {
     capacity <= need.saturating_mul(2)
 }
 
-/// An empty buffer with room for `size` bytes: a pooled one that [`is_tight`],
-/// else a fresh one.
-pub(super) fn acquire_arena(size: usize) -> Vec<u8> {
-    if size == 0 {
-        return Vec::new();
-    }
-    tls_pool::take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
-        .unwrap_or_else(|| Vec::with_capacity(size))
-}
-
-/// [`acquire_arena`] with `len == size`, the bytes uninitialized.
-///
-/// # Safety
-/// The caller writes each byte before reading it.
-#[allow(clippy::uninit_vec)]
-pub(super) unsafe fn acquire_uninit(size: usize) -> Vec<u8> {
-    let mut v = acquire_arena(size);
-    // SAFETY: `capacity >= size`.
-    unsafe { v.set_len(size) };
-    v
-}
-
-pub(super) fn recycle_buf(mut buf: Vec<u8>) {
-    buf.clear();
-    let cap = buf.capacity();
-    tls_pool::recycle(&BUF_POOL, buf, cap);
-}
-
-/// A buffer from the thread's pool that returns itself to it on drop.
+/// A byte buffer from the thread's pool, returned to it on drop.
+#[derive(Default)]
 pub struct PooledBuf(pub Vec<u8>);
 
 impl PooledBuf {
-    /// Empty, with room for `size` bytes.
+    /// Empty, with room for `size` bytes: a pooled buffer that [`is_tight`] for
+    /// them, else a fresh one. A zero `size` holds no buffer.
     pub fn with_capacity(size: usize) -> Self {
-        PooledBuf(acquire_arena(size))
+        if size == 0 {
+            return PooledBuf(Vec::new());
+        }
+        PooledBuf(
+            tls_pool::take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
+                .unwrap_or_else(|| Vec::with_capacity(size)),
+        )
+    }
+
+    /// [`Self::with_capacity`] with `len == size`, the bytes uninitialized.
+    ///
+    /// # Safety
+    /// The caller writes each byte before reading it.
+    #[allow(clippy::uninit_vec)]
+    pub(super) unsafe fn uninit(size: usize) -> Self {
+        let mut buf = Self::with_capacity(size);
+        // SAFETY: `capacity >= size`.
+        unsafe { buf.0.set_len(size) };
+        buf
+    }
+}
+
+impl std::ops::Deref for PooledBuf {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PooledBuf {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
     }
 }
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        recycle_buf(std::mem::take(&mut self.0));
+        let mut buf = std::mem::take(&mut self.0);
+        buf.clear();
+        let cap = buf.capacity();
+        tls_pool::recycle(&BUF_POOL, buf, cap);
     }
 }
 

@@ -215,7 +215,7 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
         for row in 0..N_ROWS {
             out.begin_row(&pk_bytes_for(row), 1);
             out.extend_col(0, &((row as i64).wrapping_mul(2654435761)).to_le_bytes());
-            out.commit_row(0);
+            out.commit_row();
         }
         out
     };

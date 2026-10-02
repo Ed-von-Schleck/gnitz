@@ -52,25 +52,25 @@ fn a_push_group_decodes_to_each_workers_rows() {
     type LaidOut = fn(&GroupData, &Batch) -> bool;
     let cases: [(&str, (Placement, Batch), LaidOut); 6] = [
         (
-            "keyed single row: one-copy scatter, its owner alone addressed",
+            "keyed single row: framed from the batch, its owner alone addressed",
             keyed(make_batch(&fixed, &[(1, 1, 10)])),
-            |g, _| matches!(g, GroupData::Scattered { .. }),
+            |g, _| matches!(g, GroupData::Each(_)),
         ),
         (
-            "keyed fixed-width: one-copy scatter",
+            "keyed fixed-width: framed from the batch",
             keyed(make_batch_raw(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)])),
-            |g, _| matches!(g, GroupData::Scattered { .. }),
+            |g, _| matches!(g, GroupData::Each(_)),
         ),
         (
-            "keyed inline strings: one-copy scatter",
+            "keyed inline strings: framed from the batch",
             keyed(make_batch_bytes_raw(
                 &string,
                 &[(1, 1, b"a"), (2, 3, b"twelve bytes"), (3, 1, b"")],
             )),
-            |g, _| matches!(g, GroupData::Scattered { .. }),
+            |g, _| matches!(g, GroupData::Each(_)),
         ),
         (
-            "keyed heap strings: a sub-batch per worker",
+            "keyed heap strings: framed from the batch, one entry per worker",
             keyed(make_batch_bytes_raw(
                 &string,
                 &long
@@ -79,7 +79,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                     .map(|(pk, s)| (pk as u64, 1, s.as_bytes()))
                     .collect::<Vec<_>>(),
             )),
-            |g, _| matches!(g, GroupData::Batches(b) if b.len() == 4),
+            |g, _| matches!(g, GroupData::Each(e) if e.len() == 4),
         ),
         (
             "replicated live rows: the batch itself",
@@ -151,6 +151,54 @@ fn a_push_group_decodes_to_each_workers_rows() {
             );
         }
     }
+}
+
+/// A keyed push of rows that name one heap span — a join view's rows, pushed
+/// back by a client — sends each worker that span once: no payload's heap
+/// outgrows the pushed one.
+#[test]
+fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
+    let (nw, rows) = (4, 20u64);
+    let schema = make_schema_pk_u64_payload_string();
+    let heap = vec![b'v'; 200];
+    let mut cell = gnitz_wire::encode_german_string(&heap, &mut Vec::new());
+    gnitz_wire::write_u64_le(&mut cell, 8, 0);
+    let pks: Vec<u8> = (0..rows).flat_map(u64::to_be_bytes).collect();
+    let weights: Vec<u8> = (0..rows).flat_map(|_| 1i64.to_le_bytes()).collect();
+    let nulls = vec![0u8; 8 * rows as usize];
+    let cells = cell.repeat(rows as usize);
+    let mut block = Vec::new();
+    gnitz_wire::wal::append_block(&[&pks, &weights, &nulls, &cells, &heap], 0, &mut block);
+    let batch = Batch::decode_foreign_wal_block(&block, &schema).expect("a canonical block");
+    assert_eq!(batch.blob().len(), heap.len());
+
+    let placement = Placement::full_pk(&schema);
+    let log = TestLog::new(1 << 20, nw, 1);
+    push(&log, &batch, placement, |g| {
+        assert!(matches!(g, GroupData::Each(e) if e.len() == nw))
+    });
+    let msg = group_at(log.log(), 0);
+    let sent: Vec<Batch> = (0..nw)
+        .filter_map(|w| {
+            let bytes = msg.slot(w as u32)?;
+            let control = peek_control_block(bytes).expect("every payload decodes");
+            decode_sal_rows(bytes, &control, |_, _| None).expect("every payload decodes")
+        })
+        .collect();
+    assert!(
+        sent.iter().any(|s| s.len() > 1),
+        "precondition: a worker owns several rows"
+    );
+    for s in &sent {
+        assert_eq!(
+            s.blob().len(),
+            heap.len(),
+            "a worker's {} rows carry the span once",
+            s.len()
+        );
+    }
+    let all = Batch::concat(&schema, sent.iter().map(Batch::as_mem_batch));
+    assert_eq!(zset_of(&all, &schema), zset_of(&batch, &schema));
 }
 
 /// What the master pays to route one group, lay it out in a scope and commit
@@ -237,8 +285,7 @@ fn push_group_layout_bench() {
                 with_routed(&batch, placement, nw, |data| {
                     layout = match data {
                         GroupData::Same(_) => "Same",
-                        GroupData::Batches(_) => "Batches",
-                        GroupData::Scattered { .. } => "Scattered",
+                        GroupData::Each(_) => "Each",
                     };
                     scope.write(&DirectGroup::push(&relation, data, holders_of(&data)), true)
                 })

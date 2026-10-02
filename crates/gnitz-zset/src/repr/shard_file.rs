@@ -10,7 +10,7 @@ use super::shard_filter;
 use super::string_heap::{relocate_german_string_vec, BlobCache};
 use crate::repr::error::StorageError;
 use crate::schema::key::probe_key;
-use crate::schema::{SchemaDescriptor, SchemaFacts};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::{german_string_content, write_u64_le};
 use rustc_hash::{FxHashMap, FxHashSet};
 use xorf::BinaryFuse8;
@@ -140,11 +140,11 @@ fn pack_strings(batch: &Batch) -> ShardStrings<'_> {
         })
         .collect();
     // The packed columns' values were all inline, and no other byte is dead.
-    if heap.is_empty() && (batch.dead_heap == 0 || super::string_heap::measure_dead_heap(&mb, schema) == 0) {
+    if heap.is_empty() && (batch.dead_heap == 0 || super::string_heap::measure_dead_heap(&mb) == 0) {
         return ShardStrings { columns, heap: Cow::Borrowed(mb.blob) };
     }
     // Two cells naming one span keep sharing it.
-    let mut spans = BlobCache::new(mb.count);
+    let mut spans = BlobCache::new(batch.string_cells(mb.count));
     for pi in gnitz_wire::BitIter(slots & !repeating) {
         let cells = cells_of(pi);
         let mut image = Vec::with_capacity(cells.len() * 16);

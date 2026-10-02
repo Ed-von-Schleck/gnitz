@@ -210,8 +210,8 @@ impl RowWorker for FoldW<'_> {
 
 #[inline(never)]
 fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
-    for row in 0..mb.count {
-        if mb.get_weight(row) != 0 {
+    for (row, weight) in mb.weight().as_chunks::<8>().0.iter().enumerate() {
+        if *weight != [0; 8] {
             sink.put(w.worker(mb, row), row as u32);
         }
     }

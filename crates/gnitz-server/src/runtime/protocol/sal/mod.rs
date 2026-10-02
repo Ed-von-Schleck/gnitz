@@ -210,44 +210,31 @@ impl GroupTargets {
 pub(crate) enum GroupData<'a> {
     /// Every worker is sent these rows.
     Same(Option<WireRows<'a>>),
-    /// Worker `w` is sent `batches[w]`; one batch per worker.
-    Batches(&'a [Batch]),
-    /// Worker `w` is sent the rows `rows[w]` of `batch`; one list per worker.
-    Scattered { batch: &'a Batch, rows: &'a [Vec<u32>] },
+    /// Worker `w` is sent `each[w]`; one entry per worker.
+    Each(&'a [Option<WireRows<'a>>]),
 }
 
 impl<'a> GroupData<'a> {
     /// A control-only group: every payload is a bare control block.
     pub(crate) const NONE: Self = Self::Same(None);
 
-    /// Worker `w` is sent `b[w]`; a single batch is sent to every worker.
-    pub(crate) fn batches(b: &'a [Batch]) -> Self {
-        match b {
-            [one] => Self::Same(one.wire_whole()),
-            each => Self::Batches(each),
-        }
-    }
-
     /// True when no worker is sent a row — the one shape allowed to omit a schema.
     fn is_dataless(&self) -> bool {
         match *self {
             Self::Same(d) => d.is_none(),
-            Self::Batches(b) => b.iter().all(Batch::is_empty),
-            Self::Scattered { rows, .. } => rows.iter().all(Vec::is_empty),
+            Self::Each(each) => each.iter().all(Option::is_none),
         }
     }
 
     /// The workers this data has rows for; every worker for the one payload all share.
     pub(crate) fn holders(&self) -> WorkerSet {
-        let nonempty = |it: &mut dyn Iterator<Item = bool>| {
-            it.enumerate()
-                .filter(|&(_, has)| has)
-                .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w))
-        };
         match *self {
             Self::Same(_) => WorkerSet::ALL,
-            Self::Batches(b) => nonempty(&mut b.iter().map(|b| !b.is_empty())),
-            Self::Scattered { rows, .. } => nonempty(&mut rows.iter().map(|r| !r.is_empty())),
+            Self::Each(each) => each
+                .iter()
+                .enumerate()
+                .filter(|(_, rows)| rows.is_some())
+                .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
         }
     }
 }
@@ -340,8 +327,7 @@ impl<'a> DirectGroup<'a> {
         );
         let data = match self.data {
             GroupData::Same(d) => d,
-            GroupData::Batches(b) => b[w].wire_whole(),
-            GroupData::Scattered { batch, rows } => batch.wire_listed(&rows[w]),
+            GroupData::Each(each) => each[w],
         };
         WireMsg {
             data,
@@ -998,8 +984,7 @@ impl SalWriter {
         let nw = self.wakes.len();
         let per_worker = match g.data {
             GroupData::Same(_) => nw,
-            GroupData::Batches(b) => b.len(),
-            GroupData::Scattered { rows, .. } => rows.len(),
+            GroupData::Each(each) => each.len(),
         };
         assert_eq!(per_worker, nw, "per-worker payloads={per_worker} != num_workers={nw}");
         debug_assert!(

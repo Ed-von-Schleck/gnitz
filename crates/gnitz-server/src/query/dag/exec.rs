@@ -228,7 +228,7 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
                 Some(held) if !held.is_empty() => {
                     // The held batch's schema: the union is certified under it.
                     let schema = *held.schema();
-                    algebra::op_union(held, &out, &schema)
+                    algebra::op_union(Cow::Owned(held), &out, &schema)
                 }
                 _ => out,
             };

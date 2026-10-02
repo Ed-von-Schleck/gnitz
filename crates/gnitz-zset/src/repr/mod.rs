@@ -2,7 +2,7 @@
 //! reads it back.
 //!
 //! The pure batch representation and the operations that work directly on it:
-//! region layout (`batch`), wire/shard serialization (`batch_wire`), TLS buffer
+//! region layout (`batch`), wire serialization (`batch_wire`), TLS buffer
 //! recycling (`batch_pool`), the OPK lower-bound search (`seek`), sort-merge
 //! consolidation (`merge`), the German-string heap (`string_heap`), the
 //! column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
@@ -47,7 +47,7 @@ mod string_heap;
 pub use batch::Batch;
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
-pub use batch_wire::{WalBlock, WireRows};
+pub use batch_wire::WireRows;
 pub use compact::{guard_slot, merge_and_route};
 pub use error::StorageError;
 pub use merge::{merge_consolidated, MemBatch};
@@ -62,7 +62,7 @@ pub use shard_reader::{MappedShard, ShardDirectory};
 pub use spill::{KeyProducer, SpillSort};
 
 pub(crate) use batch::{range_rows, runs_where, RowMark};
-pub(crate) use scatter::{materialize_carrying, width_dispatch};
+pub(crate) use scatter::{copy_runs, materialize_carrying, width_dispatch};
 pub(crate) use seek::pk_prefix_group_end;
 pub(crate) use string_heap::{
     copy_string_cells, prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCache,

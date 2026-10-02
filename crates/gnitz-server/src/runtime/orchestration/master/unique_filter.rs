@@ -128,8 +128,7 @@ impl MasterDispatcher {
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
             'train: while let Some(frame) = lease.next().await? {
-                let rows = frame.rows(&span_schema);
-                let spans = rows.view();
+                let spans = frame.rows(&span_schema);
                 for i in 0..spans.len() {
                     if !filter.insert(spans.get_pk_bytes(i)) {
                         break 'train;

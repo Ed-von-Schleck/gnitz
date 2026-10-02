@@ -1,4 +1,4 @@
-use super::super::batch_pool::{drain_pool, recycle_buf};
+use super::super::batch_pool::drain_pool;
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
@@ -127,13 +127,121 @@ fn appends_grow_the_arena_and_keep_every_row() {
     // An arena for 8 rows here is 256 bytes, so it takes this 512-byte buffer,
     // which then holds 16 rows.
     drain_pool();
-    recycle_buf(Vec::with_capacity(512));
+    drop(PooledBuf(Vec::with_capacity(512)));
     let mut roomy = Batch::with_capacity(&schema, 8);
     let arena = roomy.data.as_ptr();
     roomy.append_ranges(&src.as_mem_batch(), &[(0, 8)]);
     roomy.append_ranges(&src.as_mem_batch(), &[(8, 16)]);
     assert_eq!(roomy.data.as_ptr(), arena, "precondition: the growth stays in place");
     assert_eq!(weighted_rows(&roomy), &weighted_rows(&src)[..16]);
+}
+
+/// A `U64` key over `U8`, nullable `I64` and `U16` columns: a row is 35 bytes
+/// and no payload region starts at a multiple of 8 of them.
+fn ragged_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U8, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U16, false),
+        ],
+        &[0],
+    )
+}
+
+/// `rows` rows of [`ragged_schema`], every fifth with its `I64` NULL.
+fn ragged_batch(rows: usize) -> Batch {
+    let mut b = BatchBuilder::new(&ragged_schema());
+    for i in 0..rows as u128 {
+        b.begin_row(i, 1 + i as i64 % 3);
+        b.put_int(i % 251);
+        b.put_opt_int((i % 5 != 0).then_some(i * 10));
+        b.put_int(i % 65_521);
+        b.end_row();
+    }
+    b.finish()
+}
+
+/// An arena below eight rows holds exactly its rows; from eight up its capacity
+/// is rounded so that every region starts 8-aligned, by as little as the
+/// schema needs.
+#[test]
+fn an_arena_of_eight_rows_or_more_starts_every_region_aligned() {
+    let schema = ragged_schema();
+    assert_eq!([1, 7, 9].map(|rows| schema.arena_rows(rows)), [1, 7, 16]);
+    let b = Batch::with_capacity(&schema, 9);
+    assert_eq!(b.capacity, 16);
+    for r in 0..schema.num_regions() {
+        assert!(b.region_start(r).is_multiple_of(8), "region {r}");
+    }
+    assert_eq!(
+        make_schema_u64_i64().arena_rows(9),
+        9,
+        "8-byte regions align at any count"
+    );
+    let key = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+        ],
+        &[0, 1],
+    );
+    assert_eq!(key.arena_rows(9), 10, "a 12-byte key aligns at every second row");
+}
+
+/// Rows appended three at a time under a layout whose regions move with the
+/// capacity read back whole, whether a growth copies onto a fresh buffer or
+/// shifts the regions within the one it has.
+#[test]
+fn growth_keeps_every_row_under_a_ragged_layout() {
+    let schema = ragged_schema();
+    let src = ragged_batch(300);
+    let append_to = |dst: &mut Batch, end: usize| {
+        for start in (dst.count..end).step_by(3) {
+            dst.append_ranges(&src.as_mem_batch(), &[(start, start + 3)]);
+        }
+    };
+
+    drain_pool();
+    let mut fresh = Batch::empty_with_schema(&schema);
+    append_to(&mut fresh, 300);
+    assert_eq!(weighted_rows(&fresh), weighted_rows(&src));
+
+    // Eight rows are 280 bytes, so the arena takes this 560-byte buffer, which
+    // then holds sixteen.
+    drain_pool();
+    drop(PooledBuf(Vec::with_capacity(560)));
+    let mut roomy = Batch::with_capacity(&schema, 8);
+    let arena = roomy.data.as_ptr();
+    append_to(&mut roomy, 15);
+    assert_eq!(roomy.capacity, 16);
+    assert_eq!(roomy.data.as_ptr(), arena, "precondition: the growth stays in place");
+    assert_eq!(weighted_rows(&roomy), &weighted_rows(&src)[..15]);
+    append_to(&mut roomy, 300);
+    assert_eq!(weighted_rows(&roomy), weighted_rows(&src));
+}
+
+/// A NULL written into the open row is a zeroed cell under its bit, over an
+/// arena that held other bytes.
+#[test]
+fn put_null_leaves_a_zeroed_cell_under_its_bit() {
+    let schema = ragged_schema();
+    let mut b = Batch::with_capacity(&schema, 2);
+    b.data.fill(0xFF);
+    for pk in [1u64, 2] {
+        b.begin_row(&pk.to_be_bytes(), 1);
+        b.extend_col(0, &[7]);
+        b.put_null(1);
+        b.extend_col(2, &9u16.to_le_bytes());
+        b.commit_row();
+    }
+    for row in 0..2 {
+        assert_eq!(b.get_null_word(row), 0b10, "row {row}");
+        assert_eq!(b.get_col_ptr(row, 1, 8), &[0; 8], "row {row}");
+        assert_eq!(b.get_col_ptr(row, 0, 1), &[7], "row {row}");
+    }
+    b.debug_verify_null_bits();
 }
 
 /// Dropping a batch returns its data buffer to the thread-local pool; an empty
@@ -186,15 +294,17 @@ fn trimmed_copies_only_oversized_batches() {
         "a batch filled to its capacity is kept"
     );
 
-    // 1-byte columns pad each region to 8 bytes: a copy holding one row is
-    // still tight.
+    // A one-row copy's arena is that row, 1-byte columns and all.
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend((0..6).map(|_| SchemaColumn::new(TypeCode::U8, false)));
-    let mut narrow = Batch::with_capacity(&SchemaDescriptor::new(&cols, &[0]), 1);
-    narrow.push_zero_filled_row(&[0; 8], 1);
-    let narrow = narrow.clone();
+    let mut narrow = BatchBuilder::new(&SchemaDescriptor::new(&cols, &[0]));
+    narrow.begin_row(0, 1);
+    (0..6).for_each(|_| narrow.put_int(0));
+    narrow.end_row();
+    let narrow = narrow.finish().clone();
+    assert_eq!(narrow.capacity, 1);
     let ptr = narrow.data.as_ptr();
-    assert_eq!(narrow.trimmed().data.as_ptr(), ptr, "a padded one-row copy is kept");
+    assert_eq!(narrow.trimmed().data.as_ptr(), ptr, "a one-row copy is kept");
 }
 
 // ── Gather / widen: blob arms, layout propagation, empty shape ──────────
@@ -433,26 +543,26 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     let mb = src.as_mem_batch();
 
     let mut out = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(out.carry_heap(&mb, mask, mask, &[(0, 2), (3, 8)]), Some(0));
+    assert_eq!(out.carry_heap(&mb, mask, &[(0, 2), (3, 8)]), Some(0));
     assert_eq!(out.dead_heap, 5 + 30, "row 2's span and the source's own padding");
 
     let mut short = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(short.carry_heap(&mb, mask, mask, &[(0, 3), (4, 8)]), Some(0));
+    assert_eq!(short.carry_heap(&mb, mask, &[(0, 3), (4, 8)]), Some(0));
     assert_eq!(short.dead_heap, 5, "a short row leaves no span behind");
 
     let mut all = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(all.carry_heap(&mb, mask, mask, &[(0, 8)]), Some(0));
+    assert_eq!(all.carry_heap(&mb, mask, &[(0, 8)]), Some(0));
     assert_eq!(all.dead_heap, 5, "keeping every row charges only the padding");
 
     for kept in [&[][..], &[(0, 2)][..]] {
         let mut refused = Batch::with_capacity(src.schema(), 8);
-        assert_eq!(refused.carry_heap(&mb, mask, mask, kept), None, "{kept:?}");
+        assert_eq!(refused.carry_heap(&mb, mask, kept), None, "{kept:?}");
         assert_eq!((refused.blob.len(), refused.dead_heap), (0, 0));
     }
 
     let mut no_string = Batch::with_capacity(src.schema(), 8);
     assert_eq!(
-        no_string.carry_heap(&mb, mask, 0, &[(0, 8)]),
+        no_string.carry_heap(&mb, 0, &[(0, 8)]),
         None,
         "a copy keeping no string slot"
     );
@@ -478,19 +588,14 @@ fn carry_heap_charges_the_dropped_slots() {
         b.end_row();
     }
     let src = b.finish();
-    let mask = schema.string_payload_slots();
     let mb = src.as_mem_batch();
 
     let mut keeps_a = Batch::with_capacity(&schema, 4);
-    assert_eq!(keeps_a.carry_heap(&mb, mask, 0b01, &[(0, 4)]), Some(0));
+    assert_eq!(keeps_a.carry_heap(&mb, 0b01, &[(0, 4)]), Some(0));
     assert_eq!(keeps_a.dead_heap, 4 * 20, "slot 1's span on every kept row");
 
     let mut keeps_b = Batch::with_capacity(&schema, 4);
-    assert_eq!(
-        keeps_b.carry_heap(&mb, mask, 0b10, &[(0, 4)]),
-        None,
-        "400 of 480 bytes dead"
-    );
+    assert_eq!(keeps_b.carry_heap(&mb, 0b10, &[(0, 4)]), None, "400 of 480 bytes dead");
 }
 
 /// Truncation drops the heap appended since the mark along with its rows.
@@ -593,4 +698,104 @@ fn append_batch_strings_bench() {
         instructions / APPENDS as u64,
         dst.blob.len()
     );
+}
+
+/// Retired instructions per row of `Batch::from_ranges` copying every other run
+/// of a `U64` key over three `U64` columns, by run length. `#[ignore]`; run
+/// release:
+///   cargo test -p gnitz-zset --release from_ranges_run_length_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn from_ranges_run_length_bench() {
+    const ROWS: usize = 1 << 16;
+    const PASSES: usize = 20;
+    let u64_col = SchemaColumn::new(TypeCode::U64, false);
+    let schema = SchemaDescriptor::new(&[u64_col; 4], &[0]);
+    let mut b = BatchBuilder::new(&schema);
+    for i in 0..ROWS as u128 {
+        b.begin_row(i, 1);
+        (1..4).for_each(|c| b.put_int(i * c));
+        b.end_row();
+    }
+    let src = b.finish();
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    for run in [1usize, 2, 4, 16, 256] {
+        let ranges: Vec<(usize, usize)> = (0..ROWS).step_by(2 * run).map(|s| (s, s + run)).collect();
+        let (copied, instructions) = counter.measure(|| {
+            let mut copied = 0;
+            for _ in 0..PASSES {
+                let out = Batch::from_ranges(std::hint::black_box(&src), std::hint::black_box(&ranges), 0);
+                copied += std::hint::black_box(&out).count;
+            }
+            copied
+        });
+        assert_eq!(copied, PASSES * ROWS / 2);
+        println!(
+            "from_ranges_run_length_bench: run {run:>3}: {:.1} instr/row",
+            instructions as f64 / copied as f64
+        );
+    }
+}
+
+/// Retired instructions and cycles of a relocating append session — one long
+/// cell, and 100 rows of two long cells — on a thread whose last session left
+/// the pool a small map, and on one whose last session relocated 50 000
+/// distinct spans. `#[ignore]`; run release:
+///   cargo test -p gnitz-zset --release blob_cache_session_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn blob_cache_session_bench() {
+    const SESSIONS: u64 = 200;
+    let two_strings = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    let build = |rows: usize| {
+        let mut b = BatchBuilder::new(&two_strings);
+        for i in 0..rows {
+            b.begin_row(i as u128, 1);
+            b.put_string(&format!("{i:040}"));
+            b.put_string(&format!("{i:041}"));
+            b.end_row();
+        }
+        b.finish()
+    };
+    let (one, hundred, many) = (make_string_batch(&[(1, 1, &[b'x'; 40])]), build(100), build(25_000));
+    // A relocating session over every row of `src`: `compacted` carries no heap.
+    let session = |src: &Batch| std::hint::black_box(std::hint::black_box(src).compacted()).count;
+    let counters = [
+        (
+            "instr",
+            gnitz_foundation::perf::Counter::instructions().expect("instructions counter"),
+        ),
+        (
+            "cycles",
+            gnitz_foundation::perf::Counter::cycles().expect("cycles counter"),
+        ),
+    ];
+    for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
+        for (unit, counter) in &counters {
+            let small: u64 = (0..SESSIONS)
+                .map(|_| {
+                    session(src);
+                    counter.measure(|| session(src)).1
+                })
+                .sum();
+            let large: u64 = (0..SESSIONS)
+                .map(|_| {
+                    session(&many);
+                    counter.measure(|| session(src)).1
+                })
+                .sum();
+            println!(
+                "blob_cache_session_bench: {shape}: {} {unit} after a session of its own shape, {} after a 50 000-span session",
+                small / SESSIONS,
+                large / SESSIONS,
+            );
+        }
+    }
 }

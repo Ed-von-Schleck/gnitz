@@ -13,8 +13,8 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::repr::{
-    copy_string_cells, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
-    width_dispatch, Batch, BlobCache, ReadCursor,
+    copy_runs, copy_string_cells, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where,
+    should_relocate_blob, width_dispatch, Batch, BlobCache, ReadCursor,
 };
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
@@ -378,7 +378,7 @@ fn write_pairings(
             copy_runs,
             delta.pk_data(),
             out.pk_data_mut(),
-            pairs
+            delta_runs(pairs)
         ),
     }
 
@@ -415,17 +415,17 @@ fn write_pairings(
             let mut emitted = vec![false; delta.count];
             pairs.iter().for_each(|p| emitted[p.delta_rows()].fill(true));
             let kept = runs_where(delta.count, |row| emitted[row]);
-            out.carry_heap(&delta.as_mem_batch(), strings, strings, &kept)
+            out.carry_heap(&delta.as_mem_batch(), strings, &kept)
         }
         false => None,
     };
-    let mut cache = BlobCache::new(rows);
+    let mut cache = BlobCache::new(out.string_cells(rows));
 
     for (pi, col) in d_schema.payload_columns() {
         let src = delta.col_data(pi);
         let (dst, _, dst_blob) = out.col_null_and_blob_mut(d_first + pi);
         if !col.type_code.is_german_string() {
-            width_dispatch!(col.size() as usize, copy_runs, src, dst, pairs);
+            width_dispatch!(col.size() as usize, copy_runs, src, dst, delta_runs(pairs));
             continue;
         }
         let mut at = 0;
@@ -484,24 +484,10 @@ fn write_pairings(
     out
 }
 
-/// Each pairing's delta run of `width`-byte cells, copied out of `src` onto
-/// `dst` back to back.
+/// Each pairing's delta run as the `(start, rows)` [`copy_runs`] takes.
 #[inline(always)]
-fn copy_runs<const N: usize>(src: &[u8], dst: &mut [u8], pairs: &[Pairing], width: usize) {
-    // `N = 0` is the runtime width a compound PK stride takes.
-    let w = if N == 0 { width } else { N };
-    let mut at = 0usize;
-    for p in pairs {
-        let (rs, n) = (p.rs as usize, p.len());
-        if n == 1 && N != 0 {
-            // A constant width keeps the one-row run a load and a store.
-            let cell: [u8; N] = src[rs * N..rs * N + N].try_into().unwrap();
-            dst[at * N..at * N + N].copy_from_slice(&cell);
-        } else {
-            dst[at * w..(at + n) * w].copy_from_slice(&src[rs * w..(rs + n) * w]);
-        }
-        at += n;
-    }
+fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pairs.iter().map(|p| (p.rs as usize, p.len()))
 }
 
 /// Each pairing's trace cell of payload column `pi`, written once per row of its

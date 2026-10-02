@@ -154,7 +154,7 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
             .expect("no fault")
             .expect("a row frame");
         assert_eq!(f.slot.worker, w, "frames arrive in worker order");
-        assert_eq!(f.rows(&schema).view().get_pk_bytes(0), pk.to_be_bytes());
+        assert_eq!(f.rows(&schema).get_pk_bytes(0), pk.to_be_bytes());
     }
     assert!(try_poll_once(lease.next())
         .expect("routed")

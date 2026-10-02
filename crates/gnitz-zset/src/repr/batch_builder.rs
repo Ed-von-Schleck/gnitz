@@ -1,15 +1,14 @@
-//! [`BatchBuilder`] — the row-at-a-time writer the system-table mutations build
-//! their rows with. It owns its `Batch` and grows it.
+//! [`BatchBuilder`] — the row-at-a-time writer that builds the catalog's seed
+//! rows and the sequence delta, and the test fixtures. It owns its `Batch` and
+//! grows it.
 
 use super::batch::Batch;
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 
-/// Lightweight row-by-row builder for constructing Batch in Rust.
-/// Operates on Batch directly; the schema lives on the batch itself.
+/// Row-by-row builder of a `Batch`, whose schema lives on the batch itself.
 pub struct BatchBuilder {
     batch: Batch,
-    // per-row state
-    curr_null_word: u64,
+    /// The open row's next payload column.
     curr_col: usize,
 }
 
@@ -39,7 +38,6 @@ impl BatchBuilder {
             // Uninitialized, like every batch arena: every row writes every
             // column (`put_null` zero-fills rather than skipping).
             batch: Batch::with_capacity(schema, 8),
-            curr_null_word: 0,
             curr_col: 0,
         }
     }
@@ -61,7 +59,6 @@ impl BatchBuilder {
     /// written verbatim and must be exactly `pk_stride` bytes.
     pub fn begin_row_bytes(&mut self, pk: &[u8], weight: i64) {
         self.batch.begin_row(pk, weight);
-        self.curr_null_word = 0;
         self.curr_col = 0;
     }
 
@@ -109,8 +106,7 @@ impl BatchBuilder {
 
     /// Put a NULL value for the current payload column.
     pub fn put_null(&mut self) {
-        self.batch.fill_col_zero(self.curr_col);
-        gnitz_wire::null_word_set(&mut self.curr_null_word, self.curr_col, true);
+        self.batch.put_null(self.curr_col);
         self.curr_col += 1;
     }
 
@@ -134,8 +130,7 @@ impl BatchBuilder {
         }
     }
 
-    /// Finish the current row: the accumulated null word, through the shared
-    /// `Batch::commit_row`.
+    /// Finish the current row.
     pub fn end_row(&mut self) {
         // Nothing else notices a row that skipped a column: the count still
         // advances and the short region keeps whatever bytes were there.
@@ -146,7 +141,7 @@ impl BatchBuilder {
             self.curr_col,
             self.schema().num_payload_cols(),
         );
-        self.batch.commit_row(self.curr_null_word);
+        self.batch.commit_row();
     }
 
     /// Consume the builder, returning the built batch.

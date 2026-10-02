@@ -12,8 +12,8 @@ use std::ops::Range;
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
 use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
-use super::string_heap::{carried_dead, prorated_blob_cap, row_long_bytes};
-use crate::schema::{SchemaDescriptor, SchemaFacts};
+use super::string_heap::{carried_dead, prorated_blob_cap, relocate_german_string_vec, row_long_bytes};
+use crate::schema::SchemaDescriptor;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -33,6 +33,30 @@ macro_rules! width_dispatch {
     }};
 }
 pub(crate) use width_dispatch;
+
+/// Each `(start, rows)` run of `width`-byte cells of `src`, copied onto `dst`
+/// back to back.
+#[inline(always)]
+pub(crate) fn copy_runs<const N: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: impl Iterator<Item = (usize, usize)>,
+    width: usize,
+) {
+    // `N = 0` is the runtime width a compound PK stride takes.
+    let w = if N == 0 { width } else { N };
+    let mut at = 0usize;
+    for (start, n) in runs {
+        if n == 1 && N != 0 {
+            // A constant width keeps the one-row run a load and a store.
+            let cell: [u8; N] = src[start * N..start * N + N].try_into().unwrap();
+            dst[at * N..at * N + N].copy_from_slice(&cell);
+        } else {
+            dst[at * w..(at + n) * w].copy_from_slice(&src[start * w..(start + n) * w]);
+        }
+        at += n;
+    }
+}
 
 /// Copy the rows `indices` names, in the order given, each carrying its own
 /// weight. A caller supplying its own weights wants [`scatter_unified_sources`].
@@ -67,14 +91,14 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
         let cs = col.size() as usize;
         if col.type_code.is_german_string() {
             // Blob relocation is sequential per-row; no way to batch.
-            for (out, &idx) in indices.iter().enumerate() {
-                let row = idx as usize;
-                let src_struct = batch.get_col_ptr(row, pi, 16);
-                writer.write_string_cell(pi, src_struct, batch.blob, None, base + out);
+            let (cells, blob, mut cache) = writer.string_col_mut(pi);
+            for (cell, &idx) in cells[base * 16..].as_chunks_mut::<16>().0.iter_mut().zip(indices) {
+                let src = batch.get_col_ptr(idx as usize, pi, 16);
+                *cell = relocate_german_string_vec(src, batch.blob, blob, cache.as_deref_mut());
             }
         } else {
             let src_col = batch.col_data(pi, cs);
-            let dst_col = &mut writer.col_bufs[pi][base * cs..];
+            let dst_col = &mut writer.col_mut(pi)[base * cs..];
             width_dispatch!(cs, gather_col, src_col, dst_col, indices);
         }
     }
@@ -95,9 +119,10 @@ fn scatter_pk_wt_nbm<const PKS: usize>(
     let pk_src = batch.pk();
     let wt_src = batch.weight();
     let nb_src = batch.null_bmp();
-    let pk_dst = &mut writer.pk[base * pks..];
-    let wt_dst = &mut writer.weight[base * FB..];
-    let nb_dst = &mut writer.null_bmp[base * FB..];
+    let (pk_dst, wt_dst, nb_dst) = writer.fixed_mut();
+    let pk_dst = &mut pk_dst[base * pks..];
+    let wt_dst = &mut wt_dst[base * FB..];
+    let nb_dst = &mut nb_dst[base * FB..];
     debug_assert!(pk_dst.len() >= indices.len() * pks);
     debug_assert!(wt_dst.len() >= indices.len() * FB);
     debug_assert!(nb_dst.len() >= indices.len() * FB);
@@ -167,7 +192,7 @@ pub(crate) fn scatter_unified_sources(
                 writer.write_string_cell(pi, src_struct, src.blob, src.heap_at, base + out);
             }
         } else {
-            let dst = &mut writer.col_bufs[pi][base * cs..];
+            let dst = &mut writer.col_mut(pi)[base * cs..];
             width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, dst);
         }
     }
@@ -188,10 +213,10 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 ) {
     const FB: usize = FIXED_REGION_BYTES;
     let pks = if PKS == 0 { width } else { PKS };
-    let pk_dst = writer.pk.as_mut_ptr();
-    let wt_dst = writer.weight.as_mut_ptr();
-    let nbm_dst = writer.null_bmp.as_mut_ptr();
     let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols());
+    let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
+    debug_assert!(pk_dst.len() >= (base + rows.len()) * pks && wt_dst.len() >= (base + rows.len()) * FB);
+    let (pk_dst, wt_dst, nbm_dst) = (pk_dst.as_mut_ptr(), wt_dst.as_mut_ptr(), nbm_dst.as_mut_ptr());
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
@@ -239,12 +264,13 @@ pub(crate) fn gather_rows(
         width_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
         for (pi, col) in schema.payload_columns() {
             if col.type_code.is_german_string() {
-                for (out, &(si, ri, _)) in picks.iter().enumerate() {
+                let (cells, blob, _) = w.string_col_mut(pi);
+                for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
                     let s = &sources[si as usize];
-                    w.write_string_cell_plain(pi, s.get_col_ptr(ri as usize, pi, 16), s.blob(), out);
+                    *cell = relocate_german_string_vec(s.get_col_ptr(ri as usize, pi, 16), s.blob(), blob, None);
                 }
             } else {
-                let dst = &mut w.col_bufs[pi][..];
+                let dst = w.col_mut(pi);
                 width_dispatch!(col.size() as usize, gather_cells, sources, picks, pi, dst);
             }
         }
@@ -261,9 +287,10 @@ fn gather_pk_wt_nbm<const PKS: usize>(
 ) {
     let pks = if PKS == 0 { width } else { PKS };
     let keep = gnitz_wire::low_bits_mask(w.schema.num_payload_cols());
-    let weights = w.weight.as_chunks_mut::<8>().0.iter_mut();
-    let nulls = w.null_bmp.as_chunks_mut::<8>().0.iter_mut();
-    let pk = w.pk.chunks_exact_mut(pks);
+    let (pk, weight, null_bmp) = w.fixed_mut();
+    let weights = weight.as_chunks_mut::<8>().0.iter_mut();
+    let nulls = null_bmp.as_chunks_mut::<8>().0.iter_mut();
+    let pk = pk.chunks_exact_mut(pks);
     for (((&(si, ri, weight), pk), wt), nb) in picks.iter().zip(pk).zip(weights).zip(nulls) {
         debug_assert_ne!(weight, 0, "gather_rows: zero-weight row (filter before gather)");
         let s = &sources[si as usize];
@@ -292,9 +319,9 @@ pub(crate) struct DecodedColumns(Vec<PooledBuf>);
 
 impl DecodedColumns {
     /// Hold `column` for the set's lifetime; its first byte's address.
-    pub(crate) fn hold(&mut self, column: Vec<u8>) -> *const u8 {
+    pub(crate) fn hold(&mut self, column: PooledBuf) -> *const u8 {
         let base = column.as_ptr();
-        self.0.push(PooledBuf(column));
+        self.0.push(column);
         base
     }
 }

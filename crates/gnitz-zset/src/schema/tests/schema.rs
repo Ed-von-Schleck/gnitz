@@ -26,6 +26,40 @@ fn cached_layout_matches_the_derivation() {
         }
         assert!(s.pk_columns().map(|(ci, _)| ci as u32).eq(s.pk_cols().iter().copied()));
         assert_eq!(s.has_german_string(), s.string_payload_slots() != 0, "{s:?}");
+        assert_eq!(s.string_payload_slots(), SchemaFacts::string_payload_slots(&s), "{s:?}");
+        assert_eq!(
+            s.nullable_payload_slots(),
+            SchemaFacts::nullable_payload_slots(&s),
+            "{s:?}"
+        );
+        assert_eq!(
+            s.not_null_payload_slots(),
+            SchemaFacts::not_null_payload_slots(&s),
+            "{s:?}"
+        );
+        let widths = [s.pk_stride(), 8, 8]
+            .into_iter()
+            .chain(s.payload_columns().map(|(_, c)| c.size() as usize));
+        for (r, width) in widths.enumerate() {
+            assert_eq!(s.region_stride(r), width, "{s:?}: region {r}");
+        }
+        assert_eq!(
+            s.row_width(),
+            (0..s.num_regions()).map(|r| s.region_stride(r)).sum(),
+            "{s:?}"
+        );
+        for rows in [0, 1, 7, 8, 9, 100] {
+            let cap = s.arena_rows(rows);
+            assert!((rows..rows + 8).contains(&cap), "{s:?}: {rows} rows");
+            if rows >= 8 {
+                assert!(
+                    (0..s.num_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8)),
+                    "{s:?}: {rows} rows"
+                );
+            } else {
+                assert_eq!(cap, rows, "{s:?}");
+            }
+        }
         assert_eq!(decode_schema_block(&encode_schema_block(&s)).unwrap(), s);
     }
 }

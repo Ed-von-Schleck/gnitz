@@ -39,8 +39,7 @@ impl PreflightKeyStream<'_> {
             let Some(f) = self.lease.next_of(self.w).await? else {
                 return Ok(None);
             };
-            let block = f.rows(frame_schema);
-            let mb = block.view();
+            let mb = f.rows(frame_schema);
             let start = mb.pk().as_ptr() as usize - f.slot.bytes().as_ptr() as usize;
             self.keys = start..start + mb.len() * stride;
             self.frame = Some(f);

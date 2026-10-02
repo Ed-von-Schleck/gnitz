@@ -389,16 +389,13 @@ impl Accumulator {
     /// Write this aggregate into its column of the row `out` has open; `None` from
     /// [`Self::value`] renders NULL.
     #[inline]
-    pub(crate) fn emit(&self, out: &mut Batch, null_word: &mut u64) {
+    pub(crate) fn emit(&self, out: &mut Batch) {
         let ColumnLocator::Payload { slot, size, .. } = self.out else {
             unreachable!("an aggregate is a payload column")
         };
         let pi = slot as usize;
         match self.value() {
-            None => {
-                gnitz_wire::null_word_set(null_word, pi, true);
-                out.fill_col_zero(pi);
-            }
+            None => out.put_null(pi),
             Some(AggValue::Bits(bits)) => out.extend_col(pi, &bits.to_le_bytes()[..size as usize]),
             Some(AggValue::Wide(WideKind::Bytes, v)) => out.extend_col_blob(pi, v),
             Some(AggValue::Wide(WideKind::Fixed(_), v)) => out.extend_col(pi, v),

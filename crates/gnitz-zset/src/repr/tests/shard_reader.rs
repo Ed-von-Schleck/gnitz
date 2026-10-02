@@ -669,7 +669,7 @@ fn slice_relocates_only_its_own_strings() {
         };
         batch.begin_row(&(i as u64 + 1).to_be_bytes(), 1);
         batch.extend_col(0, &cell);
-        batch.commit_row(0);
+        batch.commit_row();
     }
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch, false), &schema).unwrap();
     assert_eq!(shard.blob().len(), (N - 1) * W, "row 1 added no bytes");

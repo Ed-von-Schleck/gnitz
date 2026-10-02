@@ -134,9 +134,8 @@ impl TopNIndex {
                 spec.append_image(&mb, row, &mut image);
                 out.extend_col_blob(i, &image);
             }
-            let mut null_word = 0u64;
-            out.append_cells_from(k, carried, &mb, row, &mut null_word);
-            out.commit_row(null_word);
+            out.append_cells_from(k, carried, &mb, row);
+            out.commit_row();
         });
         out
     }

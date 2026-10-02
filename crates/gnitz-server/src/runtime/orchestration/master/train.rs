@@ -14,7 +14,7 @@ pub(super) async fn drain_rows(
     mut on_batch: impl FnMut(&MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
     while let Some(f) = lease.next().await? {
-        on_batch(&f.rows(expected).view())?;
+        on_batch(&f.rows(expected))?;
     }
     Ok(())
 }

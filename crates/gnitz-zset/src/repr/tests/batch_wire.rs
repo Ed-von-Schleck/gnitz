@@ -1,6 +1,6 @@
 use super::super::batch::REG_PAYLOAD_START;
 use super::*;
-use crate::repr::BatchBuilder;
+use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
@@ -9,15 +9,7 @@ use crate::test_support::{
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
-    let strides = strides_from_schema(schema);
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    wire_offsets(
-        &strides,
-        REG_PAYLOAD_START + schema.num_payload_cols(),
-        rows,
-        &mut offsets,
-    );
-    offsets[r]
+    wal::WAL_HEADER_SIZE + schema.region_start(r, rows)
 }
 
 /// The foreign decode refuses a non-canonical string cell the engine's own decode admits.
@@ -92,8 +84,7 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
 }
 
 /// Every encoder round-trips through the validated decode at narrow and odd PK
-/// and payload strides. The block packs its regions unaligned while a decoded
-/// arena 8-aligns them, which is where the two can disagree.
+/// and payload strides, where a block's regions start unaligned.
 #[test]
 fn every_encoder_round_trips_at_narrow_strides() {
     use TypeCode::*;
@@ -131,7 +122,9 @@ fn every_encoder_round_trips_at_narrow_strides() {
         assert_eq!(n, range.byte_size(), "stride {stride}: range size");
         assert_eq!(decode(&buf[..n]), weighted_rows(&src)[1..], "stride {stride}: range");
 
-        let n = src.encode_listed(&[4, 0, 2], &mut buf).unwrap();
+        let listed = src.wire_listed(&[4, 0, 2]).unwrap();
+        let n = listed.encode(&mut buf);
+        assert_eq!(n, listed.byte_size(), "stride {stride}: scattered size");
         let picked = src.indexed_rows(&[4, 0, 2]);
         assert_eq!(decode(&buf[..n]), weighted_rows(&picked), "stride {stride}: scattered");
     }
@@ -158,8 +151,8 @@ fn wal_block_bench() {
 
         let t = crate::test_support::bench_time(ITERS, || {
             let n = black_box(&batch).wire_whole().unwrap().encode(black_box(&mut buf));
-            let block = WalBlock::parse(black_box(&buf[..n]), &schema).unwrap();
-            black_box(block.view().count);
+            let block = MemBatch::of_wal_block(black_box(&buf[..n]), &schema).unwrap();
+            black_box(block.count);
         });
         println!(
             "wal block {rows} rows: encode + decode {:.1} ns",
@@ -181,8 +174,8 @@ fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
 }
 
 /// A row run, and a scattered prefix, is the longest run whose block — sized as
-/// `encode_listed` writes it — fits; each reads back its rows. No rows is no
-/// block.
+/// `encode_listed` writes it under span dedup — fits; each reads back its rows.
+/// No rows is no block.
 #[test]
 fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
     let one = string_batch(&[(1, "v".repeat(200))]);
@@ -204,7 +197,7 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
     ] {
         let whole = b.wire_whole().unwrap().byte_size();
         let mut buf = vec![0u8; 2 * whole];
-        let size = |rows: &[u32]| b.encode_listed(rows, &mut vec![0; 2 * whole]).unwrap();
+        let size = |rows: &[u32]| b.encode_listed(rows, 0, &mut vec![0; 2 * whole], true).unwrap();
         assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
         assert!(Batch::empty_with_schema(b.schema()).wire_whole().is_none());
         let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
@@ -230,10 +223,102 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
                 if let Some((k, n)) = got {
                     assert_eq!(read_back(&out[..n]), weighted_rows(&b)[start..start + k]);
                     let mut short = vec![0u8; n - 1];
-                    assert!(b.encode_listed(&run(k), &mut short).is_none());
+                    assert!(b.encode_listed(&run(k), 0, &mut short, true).is_none());
                 }
             }
         }
+    }
+}
+
+/// A listed pick's size is the bytes it encodes, and its block decodes to the
+/// listed rows in list order with no dead heap byte — whether its strings go
+/// out a copy per cell or, for rows naming one span, once.
+#[test]
+fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
+    let one = string_batch(&[(1, "v".repeat(200))]);
+    // Rows naming one span, as a join's fan-out writes them.
+    let mut shared = Batch::with_capacity(one.schema(), 20);
+    shared
+        .append_session(20)
+        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
+    assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
+    let fixed: Vec<(u64, i64, i64)> = (1..=20).map(|i| (i, 1, i as i64)).collect();
+    for b in [
+        make_batch(&make_schema_u64_i64(), &fixed),
+        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
+        shared.clone(),
+    ] {
+        for list in [&[0u32, 3, 7, 19][..], &[19, 3, 0], &[5]] {
+            let rows = b.wire_listed(list).unwrap();
+            assert_eq!(rows.rows(), list.len());
+            let mut buf = vec![0u8; rows.byte_size()];
+            assert_eq!(
+                rows.encode(&mut buf),
+                buf.len(),
+                "{list:?}: the size is the bytes written"
+            );
+            let decoded = Batch::decode_foreign_wal_block(&buf, b.schema()).unwrap();
+            assert_eq!(
+                weighted_rows(&decoded),
+                weighted_rows(&b.indexed_rows(list)),
+                "{list:?}"
+            );
+            assert_eq!(decoded.dead_heap, 0, "{list:?}: every heap byte is referenced");
+        }
+        assert!(b.wire_listed(&[]).is_none());
+    }
+    let three = shared.wire_listed(&[0, 1, 2]).unwrap();
+    assert_eq!(
+        three.byte_size(),
+        wal::WAL_HEADER_SIZE + 3 * shared.schema().row_width() + 200,
+        "three rows naming one span carry it once"
+    );
+}
+
+/// A WAL block viewed in place is an arena of exactly its rows: at row counts
+/// on both sides of an owned arena's rounding it copies, appends and merges as
+/// the batch it was encoded from.
+#[test]
+fn a_viewed_wal_block_reads_as_its_batch() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U8, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U32, false),
+        ],
+        &[0],
+    );
+    for rows in [1usize, 3, 8, 13] {
+        let mut b = BatchBuilder::new(&schema);
+        for i in 0..rows as u128 {
+            b.begin_row(i + 1, 1 + (i % 3) as i64);
+            b.put_int(i % 200);
+            b.put_opt_int((i % 4 != 0).then_some(i * 11));
+            b.put_int(i * 1000);
+            b.end_row();
+        }
+        let mut src = b.finish();
+        src.certify_consolidated();
+        let block = encode_to_wire_vec(&src);
+        let mb = MemBatch::of_wal_block(&block, &schema).unwrap();
+        assert_eq!((mb.len(), mb.cap), (rows, rows));
+        let want = weighted_rows(&src);
+
+        assert_eq!(weighted_rows(&Batch::from_mem_batch(&mb)), want, "{rows} rows: copy");
+
+        let mut one = Batch::empty_with_schema(&schema);
+        one.append_ranges(&mb, &[(0, rows)]);
+        assert_eq!(weighted_rows(&one), want, "{rows} rows: one range");
+
+        let cut = rows / 2;
+        let mut two = Batch::empty_with_schema(&schema);
+        two.append_ranges(&mb, &[(0, cut), (cut, rows)]);
+        assert_eq!(weighted_rows(&two), want, "{rows} rows: two ranges");
+
+        let merged = merge_consolidated(&[mb.clone(), mb.clone()], &schema);
+        let doubled: Vec<_> = want.iter().map(|(row, w)| (row.clone(), 2 * w)).collect();
+        assert_eq!(weighted_rows(&merged), doubled, "{rows} rows: merge");
     }
 }
 

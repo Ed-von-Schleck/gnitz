@@ -76,7 +76,9 @@ fn a_union_sums_its_operands_in_every_epoch() {
 }
 
 /// A `Union` with `in_a == in_b` is `Z + Z`: taking operand 0 and then reading
-/// the emptied operand 1 would yield +1 where +2 is due.
+/// the emptied operand 1 would yield +1 where +2 is due. The double saturates,
+/// so a consolidated operand's `i64::MIN` row stays a row where a wrapping
+/// double would leave a ghost under the claim.
 #[test]
 fn a_self_union_doubles_every_weight() {
     let schema = make_schema_u128_i64();
@@ -86,6 +88,11 @@ fn a_self_union_doubles_every_weight() {
     let mut vm = p.open(out);
     let got = vm.epoch([(r0, make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]))]);
     assert_rows(&got, &[(1, 2, 10), (2, 6, 20)]);
+
+    let got = vm.epoch([(r0, make_batch_u128(&schema, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]))]);
+    assert!(!got.has_ghost());
+    assert!(got.consolidated_verified());
+    assert_rows(&got, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]);
 }
 
 /// A UNION whose sides disagree on a payload column's nullability runs, and

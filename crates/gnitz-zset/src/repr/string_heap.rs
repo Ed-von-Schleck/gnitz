@@ -5,9 +5,8 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 
-use super::batch_pool::tls_pool;
+use super::batch_pool::{is_tight, tls_pool};
 use super::merge::MemBatch;
-use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 use gnitz_wire::{write_u64_le, TypeCode};
 use rustc_hash::FxHashMap;
@@ -102,8 +101,9 @@ pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> us
         .sum()
 }
 
-/// Copy the whole German-string cells `src` onto `dst`, each rebased as
-/// [`rebase_string_cell`] rebases one: the carried arm shifts them in bulk.
+/// Copy the whole German-string cells `src` onto `dst`, each rebased onto the
+/// destination heap: shifted in bulk onto `src_blob` carried there at
+/// `heap_at`, or relocated into `dst_blob` under `cache`.
 #[inline]
 pub(crate) fn copy_string_cells(
     dst: &mut [u8],
@@ -123,27 +123,6 @@ pub(crate) fn copy_string_cells(
                 *d = relocate_german_string_vec(s, src_blob, dst_blob, Some(&mut *cache));
             }
         }
-    }
-}
-
-/// Write `src_cell` into `dst`, rebased onto the destination heap: shifted
-/// onto `src_blob` carried there at `heap_at`, or relocated into `dst_blob`
-/// under `cache`.
-#[inline(always)]
-pub(super) fn rebase_string_cell(
-    dst: &mut [u8],
-    src_cell: &[u8],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    heap_at: Option<usize>,
-    cache: &mut BlobCache,
-) {
-    match heap_at {
-        Some(base) => {
-            dst.copy_from_slice(&src_cell[..16]);
-            gnitz_wire::shift_german_string_heaps(dst, base);
-        }
-        None => dst.copy_from_slice(&relocate_german_string_vec(src_cell, src_blob, dst_blob, Some(cache))),
     }
 }
 
@@ -204,7 +183,7 @@ fn relocate_long_german_string(
 // Blob cache
 // ---------------------------------------------------------------------------
 
-/// The most entries a [`BlobCache`] reserves up front. Callers pass a row count,
+/// The most entries a [`BlobCache`] reserves up front. Callers pass a cell count,
 /// but only long strings reach the map.
 const BLOB_CACHE_RESERVE_CAP: usize = 4096;
 
@@ -216,22 +195,26 @@ thread_local! {
 /// copied once. Its map is pooled, and taken at the first relocation.
 pub(crate) struct BlobCache {
     map: Option<SpanMap>,
-    reserve: usize,
+    /// String cells the session relocates at most: what its map is sized and
+    /// chosen by.
+    cells: usize,
 }
 
 impl BlobCache {
-    pub(crate) fn new(rows: usize) -> Self {
-        BlobCache {
-            map: None,
-            reserve: rows.min(BLOB_CACHE_RESERVE_CAP),
-        }
+    pub(crate) fn new(cells: usize) -> Self {
+        BlobCache { map: None, cells }
     }
 
     #[inline]
     pub(super) fn map(&mut self) -> &mut SpanMap {
-        let reserve = self.reserve;
+        let cells = self.cells;
         self.map.get_or_insert_with(|| {
-            let mut map = tls_pool::take(&BLOB_CACHE_POOL, |_| true).unwrap_or_default();
+            // Clearing a map costs its capacity, whatever it held, so a session
+            // takes none larger than twice its own cells — and none smaller
+            // than its reserve, which would grow it.
+            let reserve = cells.min(BLOB_CACHE_RESERVE_CAP);
+            let fits = |m: &SpanMap| m.capacity() >= reserve && is_tight(m.capacity(), cells.max(4));
+            let mut map = tls_pool::take(&BLOB_CACHE_POOL, fits).unwrap_or_default();
             map.reserve(reserve);
             map
         })
@@ -250,18 +233,15 @@ impl Drop for BlobCache {
 
 /// The exact count of `mb`'s heap bytes no long string cell references, a cell
 /// overrunning the heap referencing none.
-pub(super) fn measure_dead_heap(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> usize {
-    walk_heap_spans(mb, schema, |_, _| true).expect("an accepting walk")
+pub(super) fn measure_dead_heap(mb: &MemBatch<'_>) -> usize {
+    walk_heap_spans(mb, |_, _| true).expect("an accepting walk")
 }
 
 /// Mark every German-string cell's heap span, after `accept` has passed the
 /// cell, and answer the heap bytes left unmarked; `None` at the first cell
 /// `accept` refuses.
-pub(super) fn walk_heap_spans(
-    mb: &MemBatch<'_>,
-    schema: &SchemaDescriptor,
-    mut accept: impl FnMut(&[u8; 16], TypeCode) -> bool,
-) -> Option<usize> {
+pub(super) fn walk_heap_spans(mb: &MemBatch<'_>, mut accept: impl FnMut(&[u8; 16], TypeCode) -> bool) -> Option<usize> {
+    let schema = mb.schema;
     let heap = mb.blob.len();
     if !schema.has_german_string() {
         return Some(heap);
