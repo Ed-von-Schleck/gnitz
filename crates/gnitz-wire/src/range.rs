@@ -1,7 +1,7 @@
 // Range bounds — the wire form of an ordered range walk over a key list.
 
 use crate::catalog::PK_LIST_MAX_COLS;
-use crate::codec::{Reader, Writer};
+use crate::codec::{Reader, Wire, Writer};
 use crate::{pack_pk_cols, unpack_pk_cols, PkColList, PkListRole};
 
 const START_AFTER: u8 = 1 << 0;
@@ -96,38 +96,40 @@ impl KeyRange {
     }
 }
 
-pub(crate) fn write_key_range(w: &mut Writer, r: &KeyRange) {
-    let flags = ((r.start.after as u8) * START_AFTER) | ((r.end.after as u8) * END_AFTER);
-    w.u64(pack_pk_cols(r.cols.as_slice())).u8(r.n_eq as u8).u8(flags);
-    for v in r.eq_vals() {
-        w.u128(*v);
+impl Wire for KeyRange {
+    fn write(&self, w: &mut Writer) {
+        let flags = ((self.start.after as u8) * START_AFTER) | ((self.end.after as u8) * END_AFTER);
+        w.u64(pack_pk_cols(self.cols.as_slice())).u8(self.n_eq as u8).u8(flags);
+        for v in self.eq_vals() {
+            w.u128(*v);
+        }
+        w.u128(self.start.image).u128(self.end.image);
     }
-    w.u128(r.start.image).u128(r.end.image);
-}
 
-pub(crate) fn read_key_range(r: &mut Reader) -> Result<KeyRange, String> {
-    let cols = unpack_pk_cols(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
-    let n_eq = r.u8()? as usize;
-    let flags = r.flags(START_AFTER | END_AFTER)?;
-    if n_eq >= cols.as_slice().len() {
-        return Err(format!(
-            "{n_eq} equality values leave no range column within its {} key columns",
-            cols.as_slice().len()
-        ));
+    fn read(r: &mut Reader) -> Result<KeyRange, String> {
+        let cols = unpack_pk_cols(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
+        let n_eq = r.u8()? as usize;
+        let flags = r.flags(START_AFTER | END_AFTER)?;
+        if n_eq >= cols.as_slice().len() {
+            return Err(format!(
+                "{n_eq} equality values leave no range column within its {} key columns",
+                cols.as_slice().len()
+            ));
+        }
+        let mut eq = [0u128; PK_LIST_MAX_COLS];
+        for slot in &mut eq[..n_eq] {
+            *slot = r.u128()?;
+        }
+        let start = Cut {
+            image: r.u128()?,
+            after: flags & START_AFTER != 0,
+        };
+        let end = Cut {
+            image: r.u128()?,
+            after: flags & END_AFTER != 0,
+        };
+        Ok(KeyRange { cols, eq, n_eq, start, end })
     }
-    let mut eq = [0u128; PK_LIST_MAX_COLS];
-    for slot in &mut eq[..n_eq] {
-        *slot = r.u128()?;
-    }
-    let start = Cut {
-        image: r.u128()?,
-        after: flags & START_AFTER != 0,
-    };
-    let end = Cut {
-        image: r.u128()?,
-        after: flags & END_AFTER != 0,
-    };
-    Ok(KeyRange { cols, eq, n_eq, start, end })
 }
 
 #[cfg(test)]

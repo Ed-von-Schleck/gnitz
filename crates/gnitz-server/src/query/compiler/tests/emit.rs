@@ -22,83 +22,6 @@ fn plan(build: Build) -> Result<SubPlan, String> {
     .map(|built| built.plan)
 }
 
-const TAKES_A_DELTA: &str = "operand port takes a delta, not an integral";
-
-/// The load holds a node to its arity, not to its producers' kinds: an integral
-/// names a store and a delta a batch, so every port refuses the other.
-#[test]
-fn a_port_refuses_the_other_kind_of_operand() {
-    let cases: [(&str, Build, &str); 6] = [
-        (
-            "a unary delta operator over an integral",
-            |c: &mut Circuit| {
-                let t = integral(c, 10);
-                let n = c.negate(t);
-                c.sink(n);
-            },
-            TAKES_A_DELTA,
-        ),
-        (
-            "a union's left operand",
-            |c: &mut Circuit| {
-                let (t, b) = (integral(c, 10), scan(c, 11));
-                let u = c.union(t, b);
-                c.sink(u);
-            },
-            TAKES_A_DELTA,
-        ),
-        (
-            "a union's right operand is a delta port, not a trace one",
-            |c: &mut Circuit| {
-                let (a, t) = (scan(c, 10), integral(c, 11));
-                let u = c.union(a, t);
-                c.sink(u);
-            },
-            TAKES_A_DELTA,
-        ),
-        (
-            "a join's delta port",
-            |c: &mut Circuit| {
-                let (ta, tb) = (integral(c, 10), integral(c, 11));
-                let j = c.join(ta, tb, JoinKind::Equi, false);
-                c.sink(j);
-            },
-            TAKES_A_DELTA,
-        ),
-        (
-            "the sink",
-            |c: &mut Circuit| {
-                let t = integral(c, 10);
-                c.sink(t);
-            },
-            TAKES_A_DELTA,
-        ),
-        (
-            "a join's trace port",
-            |c: &mut Circuit| {
-                let (a, b) = (scan(c, 10), scan(c, 11));
-                let j = c.join(a, b, JoinKind::Equi, false);
-                c.sink(j);
-            },
-            "operand port takes an integral, not a delta",
-        ),
-    ];
-    for (why, build, guard) in cases {
-        assert_eq!(rejection(plan(build)), guard, "{why}");
-    }
-    plan(|c| {
-        let (a, tb) = (scan(c, 10), integral(c, 11));
-        let j = c.join(a, tb, JoinKind::Equi, false);
-        c.sink(j);
-    })
-    .expect("a delta probing an integral");
-}
-
-fn integral(c: &mut Circuit, source: u64) -> NodeId {
-    let s = scan(c, source);
-    c.integrate_trace(s)
-}
-
 /// The driver seeds one register per source, so a second scan of one would
 /// silently see nothing.
 #[test]
@@ -130,7 +53,7 @@ fn a_corrupt_filter_program_aborts_the_compile() {
     }
 }
 
-// ── A trace that is its source's own store ────────────────────────────────
+// ── An integral that is its source's own store ────────────────────────────
 
 /// What varies of relation 10 `(a, b | v)`, keyed `(a, b)`.
 #[derive(Clone, Copy)]
@@ -161,11 +84,12 @@ fn two_tables(slot: gnitz_zset::schema::Slot, wide: Wide) -> (RelationRegistry, 
     (registry, dir)
 }
 
-/// What node `trace` of `build`'s circuit compiled to on worker `slot`.
+/// The integral of the node `build` answers, as its circuit compiled on worker
+/// `slot`.
 fn trace_of(slot: gnitz_zset::schema::Slot, wide: Wide, build: fn(&mut Circuit) -> NodeId) -> Integral {
     let (registry, _dir) = two_tables(slot, wide);
     let mut c = Circuit::default();
-    let trace = build(&mut c);
+    let integrand = build(&mut c);
     let loaded = loaded(c);
     let built = build_plan(
         &loaded,
@@ -177,11 +101,11 @@ fn trace_of(slot: gnitz_zset::schema::Slot, wide: Wide, build: fn(&mut Circuit) 
         PlanOut::Node(loaded.sink().unwrap()),
     )
     .unwrap();
-    built.regs[trace].unwrap().trace().unwrap()
+    built.integrals[integrand].expect("a join probes the integrand")
 }
 
 /// `10 ⋈ 11` on `10.a = 11.k`: 10 re-keyed onto `key`, `through` in between;
-/// answers 10's trace node.
+/// answers 10's re-key, the node 11's delta probes the integral of.
 fn rekeyed_join(
     c: &mut Circuit,
     key: &[gnitz_wire::ReindexSlot],
@@ -190,20 +114,19 @@ fn rekeyed_join(
     kind: JoinKind,
 ) -> NodeId {
     use gnitz_wire::{NullKeys, ReindexRole};
-    let role = |source: u64, key: &[gnitz_wire::ReindexSlot]| match scatters {
-        true => ReindexRole::ScatterKey { source, source_key: key.to_vec() },
+    let role = |key: &[gnitz_wire::ReindexSlot]| match scatters {
+        true => ReindexRole::ScatterKey { source_key: key.to_vec() },
         false => ReindexRole::Auxiliary,
     };
     let (a, b) = (scan(c, 10), scan(c, 11));
     let a = through(c, a);
-    let ra = c.map_reindex(a, key, &[1, 2], role(10, key), NullKeys::Drop);
+    let ra = c.map_reindex(a, key, &[1, 2], role(key), NullKeys::Drop);
     // Both sides pack at the one type the pair shares.
     let b_key = [(0, key[0].1)];
-    let rb = c.map_reindex(b, &b_key, &[1], role(11, &b_key), NullKeys::Drop);
-    let (ta, tb) = (c.integrate_trace(ra), c.integrate_trace(rb));
-    let j = c.join_terms([ra, rb], [ta, tb], kind);
+    let rb = c.map_reindex(b, &b_key, &[1], role(&b_key), NullKeys::Drop);
+    let j = c.join_terms([ra, rb], [ra, rb], kind);
     c.sink(j);
-    ta
+    ra
 }
 
 const A: [gnitz_wire::ReindexSlot; 1] = [(0, gnitz_wire::TypeCode::U64)];
@@ -213,12 +136,10 @@ fn id(_: &mut Circuit, n: NodeId) -> NodeId {
     n
 }
 
-/// A trace is read off its source table exactly when the table's store holds,
-/// on this worker and in key order, every row the trace would: the re-key is
-/// onto leading PK columns at their own widths, nothing sits between the scan
-/// and it, the source is a table, and every reader probes equal keys.
+/// An integral is read off its source table exactly where the table's store
+/// holds, on this worker and in key order, every row the integral would.
 #[test]
-fn a_trace_is_its_source_table_only_where_the_table_holds_what_it_would() {
+fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
     use gnitz_store::relation::RelationKind::{BaseTable, Stream};
     use gnitz_wire::TypeCode::{U128, U32, U64, UUID};
     use gnitz_zset::schema::{Placement, Slot};
@@ -246,9 +167,9 @@ fn a_trace_is_its_source_table_only_where_the_table_holds_what_it_would() {
     assert!(
         !is_source(trace_of(Slot::SOLO, table, |c| {
             let rel = gnitz_wire::RangeRel::Lt;
-            rekeyed_join(c, &A, true, id, JoinKind::Range { n_eq: 0, rel })
+            rekeyed_join(c, &A, true, id, JoinKind::Range { rel })
         })),
-        "a reader that walks a range of keys"
+        "a join that walks a range of keys"
     );
     assert!(
         !is_source(trace_of(Slot::SOLO, Wide { a: U32, ..table }, on_a)),
@@ -294,4 +215,136 @@ fn a_trace_is_its_source_table_only_where_the_table_holds_what_it_would() {
         ))),
         "a re-key that does not state where the delta scatters"
     );
+}
+
+/// Seeding a bounded view's replay reads the integral of side A's delta: the
+/// child the other term's join declared, or the table's own store where that is
+/// the integral.
+#[test]
+fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
+    use gnitz_store::relation::RelationKind::BaseTable;
+    use gnitz_zset::schema::{Placement, Slot};
+    let table = Wide {
+        kind: BaseTable,
+        placement: Placement::full_pk,
+        a: gnitz_wire::TypeCode::U64,
+    };
+    let seed = |build: fn(&mut Circuit) -> NodeId| {
+        let (registry, _dir) = two_tables(Slot::SOLO, table);
+        let mut c = Circuit::default();
+        build(&mut c);
+        let loaded = loaded(c);
+        let all = loaded.ordered_where(|_| true);
+        let out = PlanOut::Node(loaded.sink().unwrap());
+        let view = *build_plan(&loaded, &all, &registry, &mut StateLayout::default(), true, &[], out)
+            .unwrap()
+            .plan
+            .vm
+            .program
+            .out_schema();
+        let (out, _) = compile_view(&loaded, &registry, &view, Placement::full_pk(&view), true).unwrap();
+        out.hydration.expect("a bounded view").seed
+    };
+    assert_eq!(
+        seed(|c| rekeyed_join(c, &A, true, id, JoinKind::Equi)),
+        Integral::Source(10)
+    );
+    assert!(matches!(
+        seed(|c| rekeyed_join(c, &A, true, |c, n| c.negate(n), JoinKind::Equi)),
+        Integral::Own(_)
+    ));
+}
+
+/// A join's integrand must be a node of the join's own plan, also where its
+/// integral would be a table's store and need no register.
+#[test]
+fn an_integrand_outside_the_plan_is_refused_even_as_a_source_store() {
+    use gnitz_store::relation::RelationKind::BaseTable;
+    use gnitz_zset::schema::{Placement, Slot};
+    let table = Wide {
+        kind: BaseTable,
+        placement: Placement::full_pk,
+        a: gnitz_wire::TypeCode::U64,
+    };
+    let (registry, _dir) = two_tables(Slot::SOLO, table);
+    let mut c = Circuit::default();
+    let ra = rekeyed_join(&mut c, &A, true, id, JoinKind::Equi);
+    let loaded = loaded(c);
+    // 11's side alone: its scan, its re-key, and the term probing 10's.
+    let probe = loaded.readers(ra).find(|&n| loaded.inputs(n)[1] == ra).unwrap();
+    let rb = loaded.inputs(probe)[0];
+    let built = build_plan(
+        &loaded,
+        &[loaded.inputs(rb)[0], rb, probe],
+        &registry,
+        &mut StateLayout::default(),
+        true,
+        &[],
+        PlanOut::Node(probe),
+    );
+    assert_eq!(
+        rejection(built.map(|b| b.plan)),
+        "operand is produced outside this plan"
+    );
+}
+
+// ── One integral per integrand, one register per re-key ───────────────────
+
+/// [`left_join_circuit`] of table 10 `(id | nn, nullable)` and table 11 `(k | w)`,
+/// every column a U64, on column `key` of 10, compiled whole for one worker.
+/// Answers 10's join re-key beside the plan.
+fn left_join_plan(key: u32) -> (Built, StateLayout, NodeId) {
+    use gnitz_wire::TypeCode::U64;
+    use gnitz_zset::schema::SchemaColumn;
+    let (nn, nullable) = (SchemaColumn::new(U64, false), SchemaColumn::new(U64, true));
+    let a = SchemaDescriptor::new(&[nn, nn, nullable], &[0]);
+    let b = SchemaDescriptor::new(&[nn, nn], &[0]);
+    let (c, ra) = crate::test_support::left_join_circuit(10, 11, key);
+    let loaded = loaded(c);
+    let mut layout = StateLayout::default();
+    let built = build_plan(
+        &loaded,
+        &loaded.ordered_where(|_| true),
+        &sources([(10, a), (11, b)]),
+        &mut layout,
+        true,
+        &[],
+        PlanOut::Node(loaded.sink().unwrap()),
+    )
+    .unwrap();
+    (built, layout, ra)
+}
+
+/// A join names the node whose integral it probes, so the two joins reading the
+/// preserved side's re-key — the inner term and the matched term — share one
+/// store, and every child of the view has a name of its own.
+#[test]
+fn two_joins_probing_one_integrand_declare_one_child() {
+    let (built, layout, ra) = left_join_plan(1);
+    let names: Vec<&str> = layout.names().collect();
+    assert_eq!(names.iter().filter(|n| **n == format!("int_{ra}")).count(), 1);
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("int_")).count(),
+        3,
+        "A's re-key, B's, and B's key set: {names:?}"
+    );
+    let mut distinct = names.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), names.len(), "{names:?}");
+    assert_eq!(built.plan.vm.program.count_ops(|op| matches!(op, Op::JoinDT { .. })), 4);
+}
+
+/// The preserved side's two re-keys differ only in whether a NULL-keyed row
+/// survives. Over a NOT NULL key none exists to drop, so they are one instruction;
+/// over a nullable key they are two.
+#[test]
+fn a_rekey_that_drops_no_row_is_emitted_once() {
+    // B's re-key, B's key projection, and A's.
+    let maps = |key: u32| {
+        let (built, ..) = left_join_plan(key);
+        built.plan.vm.program.count_ops(|op| matches!(op, Op::Map(_)))
+    };
+    assert_eq!(maps(1), 3, "a NOT NULL key");
+    assert_eq!(maps(2), 4, "a nullable key");
 }

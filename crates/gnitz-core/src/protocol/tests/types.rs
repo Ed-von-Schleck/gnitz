@@ -390,7 +390,7 @@ fn closing_an_under_pushed_row_trips_the_tripwire() {
     let mut batch = ZSetBatch::new(&schema);
     let mut a = BatchAppender::new(&mut batch);
     a.begin_row(&[1], 1);
-    a.put_null(); // only 1 of 2 payload cols pushed
+    a.null(); // only 1 of 2 payload cols pushed
     a.end_row();
 }
 

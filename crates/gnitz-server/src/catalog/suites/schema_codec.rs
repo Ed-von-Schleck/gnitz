@@ -95,11 +95,11 @@ fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_core::sys_schema;
     use gnitz_core::{BatchAppender, ZSetBatch};
     use gnitz_wire::sys_rows::{
-        write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row,
-        CircuitNodeRow, ColTabRow, IdxTabRow, TableTabRow, ViewTabRow,
+        write_circuit_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row, ColTabRow,
+        IdxTabRow, TableTabRow, ViewTabRow,
     };
     use gnitz_wire::txn_frame::decode_items;
-    use gnitz_wire::{CIRCUIT_NODES_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
+    use gnitz_wire::{CIRCUIT_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
     // A COL_TAB batch for `oid` with `n` U64 columns.
     let col_batch = |oid: u64, n: usize| -> ZSetBatch {
@@ -189,32 +189,14 @@ fn ddl_txn_roundtrip_client_to_server() {
         (IDX_TAB, idx_batch(100, 18)),
     ]);
 
-    // 3-family: CREATE VIEW (COL_TAB + circuit nodes + VIEW_TAB).
+    // 3-family: CREATE VIEW (COL_TAB + CIRCUIT_TAB + VIEW_TAB).
     let vid: u64 = 20;
     let src: u64 = 16;
-    let nodes = {
-        let s = sys_schema(CIRCUIT_NODES_TAB);
+    let circuit = {
+        let s = sys_schema(CIRCUIT_TAB);
         let mut b = ZSetBatch::new(s);
-        let mut a = BatchAppender::new(&mut b);
-        // ScanDelta(src), unwired and parameterless.
-        let scan = CircuitNodeRow {
-            view_id: vid,
-            node_id: 1,
-            opcode: gnitz_wire::Opcode::ScanDelta.as_wire(),
-            source_table: Some(src),
-            inputs: [None, None],
-            params: None,
-        };
-        write_circuit_node_row(&mut a, &scan, 1);
-        // Integrate, fed by node 1.
-        let sink = CircuitNodeRow {
-            node_id: 2,
-            opcode: gnitz_wire::Opcode::IntegrateSink.as_wire(),
-            source_table: None,
-            inputs: [Some(1), None],
-            ..scan
-        };
-        write_circuit_node_row(&mut a, &sink, 1);
+        let identity = crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None);
+        write_circuit_row(&mut BatchAppender::new(&mut b), vid, &identity);
         b
     };
     let view = {
@@ -232,9 +214,5 @@ fn ddl_txn_roundtrip_client_to_server() {
         write_view_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
         b
     };
-    verify(&[
-        (COL_TAB, col_batch(vid, 1)),
-        (CIRCUIT_NODES_TAB, nodes),
-        (VIEW_TAB, view),
-    ]);
+    verify(&[(COL_TAB, col_batch(vid, 1)), (CIRCUIT_TAB, circuit), (VIEW_TAB, view)]);
 }

@@ -44,7 +44,7 @@ pub(super) fn lower_reduce(
         );
     }
     let ReduceSpecs { group, specs, cols } = r;
-    let reduced = cb.reduce_multi(node, &group, &specs, ungrouped);
+    let reduced = cb.reduce_multi(node, &group, &specs);
 
     // HAVING over the raw reduce output, then the finalize projection.
     let having_frame = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;

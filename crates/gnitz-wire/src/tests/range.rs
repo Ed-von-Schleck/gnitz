@@ -3,12 +3,12 @@ use crate::codec::{decode_all, Writer};
 
 fn enc(r: &KeyRange) -> Vec<u8> {
     let mut w = Writer::new();
-    write_key_range(&mut w, r);
+    w.put(r);
     w.into_vec()
 }
 
 fn dec(bytes: &[u8]) -> Result<KeyRange, String> {
-    decode_all(bytes, "range", read_key_range)
+    decode_all(bytes, "range", |r| r.get())
 }
 
 fn cols(c: &[u32]) -> PkColList {

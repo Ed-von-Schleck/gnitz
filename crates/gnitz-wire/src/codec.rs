@@ -51,8 +51,61 @@ impl Writer {
         self.u32(bytes.len() as u32).raw(bytes)
     }
 
+    pub fn put<T: Wire>(&mut self, v: &T) -> &mut Self {
+        v.write(self);
+        self
+    }
+
+    /// A list's length. One too long to count saturates, which every reader's cap
+    /// refuses.
+    pub fn count(&mut self, n: usize) -> &mut Self {
+        self.u16(u16::try_from(n).unwrap_or(u16::MAX))
+    }
+
+    /// A counted list: its length, then each item — the inverse of [`Reader::list`].
+    pub fn list<T: Wire>(&mut self, items: &[T]) -> &mut Self {
+        self.count(items.len());
+        for item in items {
+            item.write(self);
+        }
+        self
+    }
+
     pub fn into_vec(self) -> Vec<u8> {
         self.0
+    }
+}
+
+/// A value with one layout, spliced into a larger blob.
+pub trait Wire: Sized {
+    fn write(&self, w: &mut Writer);
+    fn read(r: &mut Reader) -> Result<Self, String>;
+}
+
+impl Wire for u32 {
+    fn write(&self, w: &mut Writer) {
+        w.u32(*self);
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        r.u32()
+    }
+}
+
+impl Wire for bool {
+    fn write(&self, w: &mut Writer) {
+        w.bool(*self);
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        r.bool()
+    }
+}
+
+impl<A: Wire, B: Wire> Wire for (A, B) {
+    fn write(&self, w: &mut Writer) {
+        w.put(&self.0).put(&self.1);
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        Ok((r.get()?, r.get()?))
     }
 }
 
@@ -135,6 +188,32 @@ impl<'a> Reader<'a> {
     pub fn bytes32(&mut self) -> Result<&'a [u8], String> {
         let n = self.u32()? as usize;
         self.take(n)
+    }
+
+    pub fn get<T: Wire>(&mut self) -> Result<T, String> {
+        T::read(self)
+    }
+
+    /// [`Writer::count`]'s inverse, refusing a length past `cap` before anything is
+    /// sized off it.
+    pub fn count(&mut self, what: &str, cap: usize) -> Result<usize, String> {
+        debug_assert!(cap < u16::MAX as usize, "a saturated count must stay refusable");
+        let n = self.u16()? as usize;
+        if n > cap {
+            return Err(format!("{what}: {n} entries exceeds cap {cap}"));
+        }
+        Ok(n)
+    }
+
+    /// A counted list of at most `cap` items — the inverse of [`Writer::list`].
+    pub fn list<T: Wire>(&mut self, what: &str, cap: usize) -> Result<Vec<T>, String> {
+        let n = self.count(what, cap)?;
+        // Sized once: a fallible `collect` has no lower size hint.
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            items.push(T::read(self)?);
+        }
+        Ok(items)
     }
 
     /// Bytes consumed so far.

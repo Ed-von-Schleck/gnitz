@@ -28,6 +28,11 @@ impl StateLayout {
         idx
     }
 
+    /// The declared children's names, in [`StateIdx`] order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.children.iter().map(|(name, _)| name.as_str())
+    }
+
     /// The schema of the child `idx` names.
     pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
         &self.children[idx.0 as usize].1

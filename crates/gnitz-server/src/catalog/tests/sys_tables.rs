@@ -3,21 +3,19 @@ use crate::test_support::{idx_tab_batch, push_sys_row, table_tab_batch};
 use gnitz_wire::IndexProps;
 use gnitz_zset::repr::BatchBuilder;
 
-/// A pair-keyed family's at-rest PK is `owner_BE ‖ member_BE`, so one owner's
+/// The pair-keyed family's at-rest PK is `owner_BE ‖ member_BE`, so one owner's
 /// rows form one contiguous prefix band.
 #[test]
-fn a_pair_keyed_familys_at_rest_pk_leads_with_its_owner() {
-    for family in [SysFamily::CircuitNodes, SysFamily::Column] {
-        let mut bb = BatchBuilder::new(family.schema());
-        push_sys_row(&mut bb, family, [0x1122, 0xAABB], 1, |_| 0);
-        let batch = bb.finish();
-        assert_eq!(
-            batch.get_pk_bytes(0),
-            [0, 0, 0, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
-            "{family:?}"
-        );
-        assert_eq!(family.leading_id(batch.get_pk(0)), 0x1122, "{family:?}");
-    }
+fn the_pair_keyed_familys_at_rest_pk_leads_with_its_owner() {
+    let family = SysFamily::Column;
+    let mut bb = BatchBuilder::new(family.schema());
+    push_sys_row(&mut bb, family, [0x1122, 0xAABB], 1, |_| 0);
+    let batch = bb.finish();
+    assert_eq!(
+        batch.get_pk_bytes(0),
+        [0, 0, 0, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
+    );
+    assert_eq!(family.leading_id(batch.get_pk(0)), 0x1122);
 }
 
 /// A rename is a `(-1, +1)` rewrite pair on one PK, in either row order: neither

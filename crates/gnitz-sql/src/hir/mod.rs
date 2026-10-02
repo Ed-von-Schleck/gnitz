@@ -648,11 +648,8 @@ impl JoinClass {
     }
 }
 
-/// Per-column common type for a set-op pair, or `None` to keep the exact-match
-/// type-mismatch error. A differing pair is admitted only where the lowering's
-/// column copy can widen into the target, which `check_copy_types` decides with
-/// this same predicate. A DATE or TIMESTAMP pairs only with itself: the join-key
-/// ladder reads it as its storage integer, which would retype the column.
+/// The type a set-op column pair shares: its own where the two agree, else one a
+/// column copy widens both into. `None` where there is neither.
 fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     if l == r {
         return Some(l);

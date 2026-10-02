@@ -240,7 +240,7 @@ fn compute_map_output_schema(
 
 /// Output schema of a HashRow Map: a U128 PK, then each projected column at its
 /// slot type and its source nullability. Typed at the slot, the promotion is
-/// what `from_map`'s `check_copy_types` screens.
+/// what the copy kernel screens.
 fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
@@ -356,6 +356,12 @@ impl MapPlan {
         debug_assert!(self.null_key_mask == 0 && !self.ev.emits_anything());
         debug_assert!(self.ev.copies().iter().all(|c| c.width == c.src.size()));
         Some(self.ev.copies().iter().map(|c| c.src).collect())
+    }
+
+    /// Whether some row can be dropped: a [`gnitz_wire::NullKeys::Drop`] re-key over
+    /// a nullable key column.
+    pub fn drops_null_keys(&self) -> bool {
+        self.null_key_mask != 0
     }
 
     /// True iff running this map would reproduce its input batch. A compiler

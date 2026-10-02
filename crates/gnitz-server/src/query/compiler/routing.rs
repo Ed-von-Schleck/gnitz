@@ -86,7 +86,7 @@ impl ViewMeta {
                 && !use_.owner_trimmed
                 // A clamp over one worker's slice admits the key once per worker.
                 && (replicated(tid) || !use_.set_fed);
-            let relay = match join_key(key, join_relay)? {
+            let relay = match join_key(key, join_relay) {
                 // Every worker already holds the whole delta a broadcast would
                 // hand it.
                 None if replicated(tid) => continue,
@@ -145,7 +145,7 @@ enum RowHome {
     Producer,
 }
 
-/// Each source `uses` names: every one a scanned, registered relation.
+/// Each source `uses` names: every one a registered relation.
 fn scanned_relations<'r>(
     uses: &FxHashMap<u64, SourceUse>,
     registry: &'r RelationRegistry,
@@ -154,12 +154,7 @@ fn scanned_relations<'r>(
     // Ascending, so every process reports the same offender.
     ids.sort_unstable();
     ids.into_iter()
-        .map(|tid| {
-            if uses[&tid].bound.is_none() {
-                return Err(format!("source {tid} states a scatter key but is not scanned"));
-            }
-            Ok((tid, registry.relation_or_err(tid)?))
-        })
+        .map(|tid| Ok((tid, registry.relation_or_err(tid)?)))
         .collect()
 }
 
@@ -188,19 +183,14 @@ fn placement(sources: &FxHashMap<u64, &Relation>, rows: RowHome, view: &SchemaDe
 }
 
 /// The slots of the reindex `key` a source scatters by, `None` when it
-/// broadcasts. A band join routes by its equality prefix alone, so its range
-/// probe stays partition-local.
-fn join_key(key: &[gnitz_wire::ReindexSlot], relay: JoinRelay) -> Result<Option<&[gnitz_wire::ReindexSlot]>, String> {
+/// broadcasts.
+fn join_key(key: &[gnitz_wire::ReindexSlot], relay: JoinRelay) -> Option<&[gnitz_wire::ReindexSlot]> {
     let route_len = match relay {
-        JoinRelay::Broadcast => return Ok(None),
+        JoinRelay::Broadcast => 0,
         JoinRelay::WholeKey => key.len(),
-        // A circuit is client-supplied, so a wider `n_eq` is refused, not sliced.
-        JoinRelay::EqPrefix { n_eq } if key.len() == n_eq as usize + 1 => n_eq as usize,
-        JoinRelay::EqPrefix { .. } => {
-            return Err("band join: n_eq does not match the source's reindex key arity".into())
-        }
+        JoinRelay::EqPrefix => key.len().saturating_sub(1),
     };
-    Ok(Some(&key[..route_len]))
+    (route_len > 0).then(|| &key[..route_len])
 }
 
 // ---------------------------------------------------------------------------
@@ -211,16 +201,14 @@ fn join_key(key: &[gnitz_wire::ReindexSlot], relay: JoinRelay) -> Result<Option<
 /// the trace-side `ReindexPacker`'s own order.
 type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 
-/// What the circuit does with one source's delta. Entries come from both
-/// `ScanDelta` nodes and `ScatterKey` reindex Maps, which name a source
-/// independently — neither implies the other.
+/// What the circuit does with one scanned source's delta.
 struct SourceUse {
     /// The scatter key it states, in the source relation's own column indices.
     key: Option<ReindexKey>,
-    /// Its backfill scan's bound: `None` until a `ScanDelta` names the source,
-    /// and `ReadBound::None` once a second does — one cursor feeds every scan.
+    /// Its backfill scan's bound, `ReadBound::None` once a second `ScanDelta`
+    /// names the source — one cursor feeds every scan.
     bound: Option<ReadBound>,
-    /// Every direct reader of every `ScatterKey` Map naming this source is a
+    /// Every direct reader of every `ScatterKey` Map over this source is a
     /// `WorkerFilter`, which keeps only rows already on their PK's owner.
     owner_trimmed: bool,
     /// The scan's rows reach something other than a join operand.
@@ -260,9 +248,9 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
     for (nid, op) in loaded.ops() {
         let propagates = matches!(
             op,
-            OpNode::Filter(_) | OpNode::Map(_) | OpNode::IntegrateTrace | OpNode::WeightClamp(ClampKind::Distinct)
+            OpNode::Filter(_) | OpNode::Map(_) | OpNode::WeightClamp(ClampKind::Distinct)
         );
-        for p in loaded.inputs(nid).iter() {
+        for &p in loaded.inputs(nid) {
             if let Some(tid) = owner[p] {
                 let use_ = uses.entry(tid).or_default();
                 match op {
@@ -276,7 +264,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
             }
         }
         if propagates {
-            owner[nid] = owner[loaded.inputs(nid).unary()];
+            owner[nid] = owner[loaded.inputs(nid)[0]];
         }
         match op {
             OpNode::ScanDelta { source, bound } => {
@@ -289,17 +277,19 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
                 owner[nid] = Some(tid);
             }
             OpNode::Map(MapKind::Reindex {
-                role: ReindexRole::ScatterKey { source, source_key },
+                role: ReindexRole::ScatterKey { source_key },
                 ..
             }) => {
-                let tid = *source;
+                // The key is stated in the columns of the source whose scan the
+                // node reads.
+                let tid = owner[nid].ok_or("a scatter key over no scanned source")?;
                 let key = uses
                     .entry(tid)
                     .or_default()
                     .key
                     .get_or_insert_with(|| source_key.clone());
                 if key != source_key {
-                    return Err(format!("source {source} feeds several distinct scatter keys"));
+                    return Err(format!("source {tid} feeds several distinct scatter keys"));
                 }
                 states_key[nid] = Some(tid);
             }
@@ -324,7 +314,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
 /// The source of the `ScanDelta` the row-local walk back from `enid`'s input
 /// ends at.
 fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<u64> {
-    match loaded.op(row_local_origin(loaded, loaded.inputs(enid).unary())) {
+    match loaded.op(row_local_origin(loaded, loaded.inputs(enid)[0])) {
         gnitz_wire::OpNode::ScanDelta { source, .. } => Some(*source),
         _ => None,
     }
@@ -336,9 +326,10 @@ fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<u64> {
 enum JoinRelay {
     /// An equi join, whose matches share a key — as a GROUP BY's groups do.
     WholeKey,
-    /// A band join, whose matches share the `n_eq` leading equality slots.
-    EqPrefix { n_eq: u8 },
-    /// A pure range or cross join, whose matches share nothing.
+    /// A range join, whose matches share every key slot but the last; a pure
+    /// range has none, and broadcasts.
+    EqPrefix,
+    /// A cross join, whose matches share nothing.
     Broadcast,
 }
 
@@ -362,8 +353,8 @@ fn relay_of(kind: gnitz_wire::JoinKind) -> JoinRelay {
     use gnitz_wire::JoinKind;
     match kind {
         JoinKind::Equi => JoinRelay::WholeKey,
-        JoinKind::Range { n_eq: 0, .. } | JoinKind::Cross => JoinRelay::Broadcast,
-        JoinKind::Range { n_eq, .. } => JoinRelay::EqPrefix { n_eq },
+        JoinKind::Range { .. } => JoinRelay::EqPrefix,
+        JoinKind::Cross => JoinRelay::Broadcast,
     }
 }
 

@@ -33,13 +33,12 @@ fn keyed_side(
     Ok((all, reindex))
 }
 
-/// An equi join's shared nodes: each side's [`keyed_side`] `all`, the reindex
-/// each side's delta joins through and its trace, and the symmetric 2-term join
-/// over `[_join_pk, kept-A, kept-B]`.
+/// An equi join's shared nodes: each side's [`keyed_side`] `all`, the re-key
+/// each side's delta joins through — and whose integral the other side's delta
+/// probes — and the symmetric 2-term join over `[_join_pk, kept-A, kept-B]`.
 pub(super) struct EquiPrologue {
     pub(super) all: [NodeId; 2],
     reindex: [NodeId; 2],
-    trace: [NodeId; 2],
     pub(super) inner: NodeId,
 }
 
@@ -50,11 +49,9 @@ impl EquiPrologue {
     pub(super) fn matched(&self, cb: &mut Circuit, p: usize) -> NodeId {
         let o = 1 - p;
         let keys = cb.map(self.reindex[o], &[]);
-        let set = cb.distinct(keys);
-        let trace_set = cb.integrate_trace(set);
-        let (mut deltas, mut traces) = (self.reindex, self.trace);
-        (deltas[o], traces[o]) = (set, trace_set);
-        cb.join_terms(deltas, traces, JoinKind::Equi)
+        let mut deltas = self.reindex;
+        deltas[o] = cb.distinct(keys);
+        cb.join_terms(deltas, deltas, JoinKind::Equi)
     }
 }
 
@@ -76,15 +73,9 @@ pub(super) fn equi_prologue(
         true => cb.distinct(reindex_b),
         false => reindex_b,
     };
-    let trace_a = cb.integrate_trace(reindex_a);
-    let trace_b = cb.integrate_trace(b_delta);
-    let inner = cb.join_terms([reindex_a, b_delta], [trace_a, trace_b], JoinKind::Equi);
-    Ok(EquiPrologue {
-        all: [all_a, all_b],
-        reindex: [reindex_a, b_delta],
-        trace: [trace_a, trace_b],
-        inner,
-    })
+    let reindex = [reindex_a, b_delta];
+    let inner = cb.join_terms(reindex, reindex, JoinKind::Equi);
+    Ok(EquiPrologue { all: [all_a, all_b], reindex, inner })
 }
 
 /// The output PK columns a re-key onto source PKs mints: one per listed
@@ -190,8 +181,8 @@ pub(super) struct RangePrologue<'a> {
     /// A's owned slice keyed on its source PK, NULL range keys included — built for
     /// a pure range with a ν over A.
     owned_a: Option<NodeId>,
+    /// The slice of A's range-keyed delta whose integral B's delta probes.
     int_a: NodeId,
-    trace_a: NodeId,
     /// The key arity: the eq prefix plus the one range slot — the width of the
     /// key region every term leads with.
     k: usize,
@@ -201,31 +192,23 @@ pub(super) struct RangePrologue<'a> {
 }
 
 impl RangePrologue<'_> {
-    /// The eq-prefix width the range probe matches on before comparing.
-    fn n_eq(&self) -> usize {
-        self.k - 1
-    }
-
-    /// The two range terms over `[key region, A, B]`. A pure range integrates B's
-    /// worker-filtered slice: an unfiltered trace against the broadcast A delta
-    /// would emit each pair once per worker.
+    /// The two range terms over `[key region, A, B]`. A pure range — a key of
+    /// the range slot alone — integrates B's worker-filtered slice: an unfiltered
+    /// integral against the broadcast A delta would emit each pair once per worker.
     pub(super) fn merged(&self, cb: &mut Circuit) -> NodeId {
-        let n_eq = self.n_eq() as u8;
         let reindex_a = self.reindex_a.expect("the pair terms read A's range-keyed delta");
-        let int_b = match n_eq {
-            0 => cb.worker_filter(self.reindex_b),
+        let int_b = match self.k {
+            1 => cb.worker_filter(self.reindex_b),
             _ => self.reindex_b,
         };
-        let trace_b = cb.integrate_trace(int_b);
-        let kind = JoinKind::Range { n_eq, rel: self.op };
-        cb.join_terms([reindex_a, self.reindex_b], [self.trace_a, trace_b], kind)
+        let kind = JoinKind::Range { rel: self.op };
+        cb.join_terms([reindex_a, self.reindex_b], [self.int_a, int_b], kind)
     }
 
     /// `(A_owned, matched)` for a pure range: A's owned slice and the rows of it
     /// matching the one-row threshold `m = MAX/MIN(b.range)`, both keyed on
     /// `[a.pk…, A]`, so `A_owned − matched` is the unmatched set.
     pub(super) fn threshold(&self, cb: &mut Circuit) -> (NodeId, NodeId) {
-        let n_eq = self.n_eq() as u8;
         let want_max = !self.op.bounds_below();
         let agg_func = if want_max { WireAggFunc::Max } else { WireAggFunc::Min };
 
@@ -240,15 +223,14 @@ impl RangePrologue<'_> {
             AggDescriptor::COUNT_STAR,
         ];
         // [_group_pk:U128, m:Tc, count]
-        let red = cb.reduce_multi_local(keys, &[], &specs, false);
+        let red = cb.reduce_multi_local(keys, &[], &specs);
         // `m` is never NULL: B's NULL range keys never reached the reduce.
         // `m` is a MIN/MAX of B's range slot.
         let reindex_m = cb.map_reindex(red, &[(1, self.range_tc)], &[], ReindexRole::Auxiliary, NullKeys::Keep);
-        let trace_m = cb.integrate_trace(reindex_m);
 
         // `m` carries no payload, so both terms are `[_join_pk × k, A]`.
-        let kind = JoinKind::Range { n_eq, rel: self.op };
-        let matched_raw = cb.join_terms([self.int_a, reindex_m], [self.trace_a, trace_m], kind);
+        let deltas = [self.int_a, reindex_m];
+        let matched_raw = cb.join_terms(deltas, deltas, JoinKind::Range { rel: self.op });
         let owned = self.owned_a.expect("a pure range with a ν over A owns A first");
         (owned, rekey_pinned(cb, matched_raw, self.k, &self.sides[..1]))
     }
@@ -283,8 +265,7 @@ impl RangePrologue<'_> {
     }
 }
 
-/// Re-key both sides on `[eq slots…, range slot]`, NULL keys dropped, and
-/// integrate A.
+/// Re-key both sides on `[eq slots…, range slot]`, NULL keys dropped.
 pub(super) fn range_prologue<'a>(
     cb: &mut Circuit,
     class: &JoinClass,
@@ -315,7 +296,6 @@ pub(super) fn range_prologue<'a>(
         Some(r) => (None, r),
         None => unreachable!("an EXISTS/IN over a pure range has a ν over A"),
     };
-    let trace_a = cb.integrate_trace(int_a);
     let reindex_b = reindex(cb, 1)?;
     Ok(RangePrologue {
         sides,
@@ -324,7 +304,6 @@ pub(super) fn range_prologue<'a>(
         reindex_b,
         owned_a,
         int_a,
-        trace_a,
         k: tcs.len(),
         range_tc: range.tc,
         op: range.op,

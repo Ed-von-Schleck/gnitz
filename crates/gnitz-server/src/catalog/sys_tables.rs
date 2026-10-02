@@ -356,11 +356,7 @@ pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
 static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|| {
     std::array::from_fn(|i| {
         let f = &gnitz_wire::SYS_FAMILIES[i];
-        let cols: Vec<SchemaColumn> = f
-            .cols
-            .iter()
-            .map(|c| SchemaColumn::new(c.type_code, c.nullable))
-            .collect();
+        let cols: Vec<SchemaColumn> = f.cols.iter().map(|c| SchemaColumn::new(c.type_code, false)).collect();
         SchemaDescriptor::new(&cols, f.pk_cols)
     })
 });
@@ -385,7 +381,7 @@ pub(crate) enum SysFamily {
     Column = gnitz_wire::COL_TAB,
     Index = gnitz_wire::IDX_TAB,
     Sequence = gnitz_wire::SEQ_TAB,
-    CircuitNodes = gnitz_wire::CIRCUIT_NODES_TAB,
+    Circuit = gnitz_wire::CIRCUIT_TAB,
 }
 
 impl SysFamily {
@@ -400,7 +396,7 @@ impl SysFamily {
         SysFamily::Column,
         SysFamily::Index,
         SysFamily::Sequence,
-        SysFamily::CircuitNodes,
+        SysFamily::Circuit,
     ];
 
     /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
@@ -447,7 +443,7 @@ impl SysFamily {
             .cols
             .iter()
             .map(|c| CatalogColumn {
-                def: ColumnDef::new(c.name, c.type_code, c.nullable),
+                def: ColumnDef::new(c.name, c.type_code, false),
                 fk: None,
             })
             .collect()
@@ -478,7 +474,7 @@ impl SysFamily {
                     write_col_tab_rows(bb, family.id(), &family.column_defs(), 1);
                 }
             }
-            SysFamily::View | SysFamily::Index | SysFamily::Sequence | SysFamily::CircuitNodes => {}
+            SysFamily::View | SysFamily::Index | SysFamily::Sequence | SysFamily::Circuit => {}
         }
     }
 
@@ -491,7 +487,7 @@ impl SysFamily {
         match self {
             SysFamily::Schema => 0,
             SysFamily::Column => 1,
-            SysFamily::CircuitNodes => 2,
+            SysFamily::Circuit => 2,
             SysFamily::Table => 5,
             SysFamily::View => 6,
             SysFamily::Index => 7,
@@ -501,14 +497,17 @@ impl SysFamily {
 
     /// The leading id of one of this family's PKs: the whole key where it is one
     /// column, its high half where the key is a pair — where `pk as u64` would
-    /// take the trailing half instead (a column index, or a node id).
+    /// take the trailing half instead (a column index).
     #[inline]
     pub(super) fn leading_id(self, pk: u128) -> u64 {
         match self {
-            SysFamily::Column | SysFamily::CircuitNodes => gnitz_wire::unpack_pair_pk(pk).0,
-            SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => {
-                pk as u64
-            }
+            SysFamily::Column => gnitz_wire::unpack_pair_pk(pk).0,
+            SysFamily::Schema
+            | SysFamily::Table
+            | SysFamily::View
+            | SysFamily::Index
+            | SysFamily::Sequence
+            | SysFamily::Circuit => pk as u64,
         }
     }
 
@@ -521,7 +520,7 @@ impl SysFamily {
             SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Sequence | SysFamily::Index => {
                 Some(gnitz_wire::FIRST_USER_TABLE_ID)
             }
-            SysFamily::CircuitNodes => None,
+            SysFamily::Circuit => None,
         }
     }
 
@@ -535,7 +534,7 @@ impl SysFamily {
     pub(super) fn allocates_ids(self) -> bool {
         match self {
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index => true,
-            SysFamily::Column | SysFamily::Sequence | SysFamily::CircuitNodes => false,
+            SysFamily::Column | SysFamily::Sequence | SysFamily::Circuit => false,
         }
     }
 
@@ -549,7 +548,7 @@ impl SysFamily {
                 Some((1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE))
             }
             SysFamily::Sequence => Some(1 << gnitz_wire::SEQTAB_PAY_VALUE),
-            SysFamily::Schema | SysFamily::Index | SysFamily::CircuitNodes => None,
+            SysFamily::Schema | SysFamily::Index | SysFamily::Circuit => None,
         }
     }
 
@@ -557,7 +556,7 @@ impl SysFamily {
     /// by the drop cascade? A client delta may then carry no unpaired `-1` for it.
     pub(super) fn retracts_with_owner(self) -> bool {
         match self {
-            SysFamily::Column | SysFamily::CircuitNodes => true,
+            SysFamily::Column | SysFamily::Circuit => true,
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => false,
         }
     }
@@ -574,7 +573,7 @@ impl SysFamily {
             | SysFamily::View
             | SysFamily::Column
             | SysFamily::Index
-            | SysFamily::CircuitNodes => true,
+            | SysFamily::Circuit => true,
         }
     }
 
@@ -584,7 +583,6 @@ impl SysFamily {
         let (hi, lo) = gnitz_wire::unpack_pair_pk(pk);
         match self {
             SysFamily::Column => format!("column {lo} of owner {hi}"),
-            SysFamily::CircuitNodes => format!("circuit row {lo} of view {hi}"),
             _ => format!("{} {pk}", self.row_noun()),
         }
     }
@@ -598,7 +596,7 @@ impl SysFamily {
             SysFamily::Column => "column",
             SysFamily::Index => "index",
             SysFamily::Sequence => "sequence",
-            SysFamily::CircuitNodes => "circuit row",
+            SysFamily::Circuit => "circuit",
         }
     }
 

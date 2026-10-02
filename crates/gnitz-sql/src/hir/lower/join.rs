@@ -417,8 +417,8 @@ fn emit_range(
 
 // ── Cross emission ──────────────────────────────────────────────────────────────
 
-/// The keyless join `A × B`, INNER only. Each side keys its trace on its own
-/// source PK, which takes no part in the match — it only partitions the trace the
+/// The keyless join `A × B`, INNER only. Each side is keyed on its own source PK,
+/// which takes no part in the match — it only partitions the integral the
 /// broadcast delta is paired against.
 fn emit_cross(
     cb: &mut Circuit,
@@ -429,11 +429,9 @@ fn emit_cross(
     let reindex_b = rekey_on_source_pk(cb, input_b, &sides[1], true)?;
     let int_a = cb.worker_filter(reindex_a);
     let int_b = cb.worker_filter(reindex_b);
-    let trace_a = cb.integrate_trace(int_a);
-    let trace_b = cb.integrate_trace(int_b);
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
     // so both terms already share one schema.
-    let inner = cb.join_terms([reindex_a, reindex_b], [trace_a, trace_b], JoinKind::Cross);
+    let inner = cb.join_terms([reindex_a, reindex_b], [int_a, int_b], JoinKind::Cross);
     Ok(vec![(inner, None)]) // [pair-PK, A, B]
 }
 

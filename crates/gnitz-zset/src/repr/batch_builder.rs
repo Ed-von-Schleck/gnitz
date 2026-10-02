@@ -28,9 +28,6 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
     fn put_bytes(&mut self, b: &[u8]) {
         BatchBuilder::put_blob(self, b);
     }
-    fn put_null(&mut self) {
-        BatchBuilder::put_null(self);
-    }
     fn end_row(&mut self) {
         BatchBuilder::end_row(self);
     }

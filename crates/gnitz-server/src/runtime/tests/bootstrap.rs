@@ -2,7 +2,7 @@ use super::*;
 use crate::catalog::{CatalogColumn, SysFamily};
 use crate::runtime::sal::fixtures::TestLog;
 use crate::test_support::{
-    circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_view_tab_row, sum_weights, table_tab_batch,
+    circuit_batch, col_def, col_tab_batch, identity_circuit, push_view_tab_row, sum_weights, table_tab_batch,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
@@ -86,8 +86,8 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     engine.close();
 
     let log = TestLog::new(SAL_SIZE, 1, 1);
-    let circuit = circuit_nodes_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
-    log.ddl_zone(&[(SysFamily::CircuitNodes, &circuit)]);
+    let circuit = circuit_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
+    log.ddl_zone(&[(SysFamily::Circuit, &circuit)]);
     let engine = recover(&log, dir);
 
     assert_eq!(engine.dag.sources_of(v), &[r][..]);

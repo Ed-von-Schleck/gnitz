@@ -105,6 +105,57 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A view bundle whose circuit cell does not decode is refused at that cell, one
+/// whose view the register hook refuses at the view's row, and each compensated:
+/// no view, no circuit row, and nothing depending on the source.
+#[test]
+fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
+    let dir = temp_dir("preflight_unusable_circuit");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let base = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let other = engine.create_table("public.other", &cols, &[0]).unwrap();
+    let circuits_before = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
+
+    let undecodable = |vid: u64| crate::test_support::circuit_cell_batch(vid, &[0xFF]);
+    // Decodes, and joins the base on a key it never states a route for.
+    let unroutable = |vid: u64| {
+        let circuit = equi_join_circuit(base, other, TypeCode::I64, [false, true]);
+        crate::test_support::circuit_batch(vid, &circuit)
+    };
+    type Rows<'a> = &'a dyn Fn(u64) -> Batch;
+    let cases: [(Rows, &str); 2] = [
+        (&undecodable, "circuit: truncated"),
+        (&unroutable, "feeds a join and states no scatter key"),
+    ];
+    for (rows, want) in cases {
+        // The setup is not part of the bundle being compensated.
+        let _ = engine.drain_pending_broadcasts();
+        let vid = engine.next_id;
+        engine.write_column_records(vid, &cols).unwrap();
+        let err = engine
+            .submit(SysFamily::Circuit, rows(vid))
+            .and_then(|()| {
+                assert_eq!(engine.dag.dependents_of(base), [vid], "{want}");
+                engine.submit(SysFamily::View, build_view_tab_row(vid, "v"))
+            })
+            .expect_err("the bundle is refused");
+        assert!(err.contains(want), "got: {err}");
+        engine.compensate_stage_a().unwrap();
+
+        assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
+        assert!(!engine.registry.has_id(vid), "the view is not registered");
+        assert_eq!(
+            count_records(engine.sys_relation(SysFamily::Circuit).cursor()),
+            circuits_before,
+            "{want}"
+        );
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── The one-bundle replacement ──────────────────────────────────────────────
 
 /// `ALTER VIEW` is one DDL zone: the outgoing view's `-1` and the fresh chain's

@@ -60,13 +60,13 @@ impl CatalogEngine {
             .negated();
         // A SERIAL row's key is its table id.
         let sequences = self.retract_under(SysFamily::Sequence, &owners);
-        let circuits = self.retract_under(SysFamily::CircuitNodes, &owners);
+        let circuits = self.retract_under(SysFamily::Circuit, &owners);
         let columns = self.retract_under(SysFamily::Column, &owners);
         vec![
             (SysFamily::Index, indices),
             (SysFamily::Sequence, sequences),
             (family, batch),
-            (SysFamily::CircuitNodes, circuits),
+            (SysFamily::Circuit, circuits),
             (SysFamily::Column, columns),
         ]
     }

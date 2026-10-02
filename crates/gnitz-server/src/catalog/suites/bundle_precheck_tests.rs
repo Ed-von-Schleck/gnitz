@@ -134,9 +134,9 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
     let dir = temp_dir("bundle_circuit_owner");
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    let mut circuits = crate::test_support::circuit_nodes_batch(30, &negate_chain(16, 2));
-    circuits.append_batch(&crate::test_support::circuit_nodes_batch(20, &negate_chain(16, 2)));
-    families[SysFamily::CircuitNodes.index()] = Some(circuits);
+    let mut circuits = crate::test_support::circuit_batch(30, &negate_chain(16, 2));
+    circuits.append_batch(&crate::test_support::circuit_batch(20, &negate_chain(16, 2)));
+    families[SysFamily::Circuit.index()] = Some(circuits);
     let mut views = |rows: &[(i64, u64)]| {
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
         for &(weight, vid) in rows {

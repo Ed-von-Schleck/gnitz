@@ -28,20 +28,21 @@ fn clustered_source() -> Source {
     Source::from(schema).placed(Placement::keyed(&schema, 1))
 }
 
-fn range(n_eq: u8) -> JoinKind {
-    JoinKind::Range { n_eq, rel: RangeRel::Lt }
+/// A range join: a pure range over a one-slot key, a band over a wider one.
+fn range() -> JoinKind {
+    JoinKind::Range { rel: RangeRel::Lt }
 }
 
 /// `d ⋈ I(d)`: the smallest circuit in which `d`'s source reaches a join.
 fn join_with_own_trace(c: &mut Circuit, d: NodeId, kind: JoinKind) -> NodeId {
-    let t = c.integrate_trace(d);
-    c.join(d, t, kind, false)
+    c.join(d, d, kind, false)
 }
 
-/// A reindex of `input` on `cols` of [`wide_schema`], stated as `source`'s route.
-fn states_route(c: &mut Circuit, input: NodeId, source: u64, cols: &[u32]) -> NodeId {
+/// A reindex of `input` on `cols` of [`wide_schema`], stated as the route of the
+/// source `input` reads.
+fn states_route(c: &mut Circuit, input: NodeId, cols: &[u32]) -> NodeId {
     let key = self_typed_slots(&wide_schema(), cols);
-    let role = ReindexRole::ScatterKey { source, source_key: key.clone() };
+    let role = ReindexRole::ScatterKey { source_key: key.clone() };
     c.map_reindex(input, &key, &[0], role, NullKeys::Keep)
 }
 
@@ -223,11 +224,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
 // ── A join's sources ────────────────────────────────────────────────────
 
 /// The two-term join of sources 7 and 9, each reindexed on `key_cols` and
-/// optionally clamped to a set, behind an output shard:
-///
-///   ScanDelta(7) → Map(reindex) → [Distinct] ─┬→ IntegrateTrace ─╮
-///   ScanDelta(9) → Map(reindex) → [Distinct] ─┴→ IntegrateTrace ─┴→ Join ×2 → Union
-///                                                   → ExchangeShard([1]) → IntegrateSink
+/// optionally clamped to a set, behind an output shard.
 fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: RelationRegistry) -> ViewMeta {
     let mut c = Circuit::default();
     let deltas = [(7, distinct[0]), (9, distinct[1])].map(|(source, set)| {
@@ -238,8 +235,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
             false => keyed,
         }
     });
-    let traces = deltas.map(|d| c.integrate_trace(d));
-    let joined = c.join_terms(deltas, traces, kind);
+    let joined = c.join_terms(deltas, deltas, kind);
     let shard = c.shard(joined, &[1]);
     c.sink(shard);
     derive(c, &ext).expect("fixture routes")
@@ -319,7 +315,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
         (
             "a band join's equality prefix is the CLUSTER BY key",
-            range(1),
+            range(),
             &[0, 1],
             plain,
             [clustered; 2],
@@ -327,7 +323,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
         (
             "the full-PK distribution is wider than a band join's equality prefix",
-            range(1),
+            range(),
             &[0, 1],
             plain,
             [compound; 2],
@@ -335,7 +331,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
         (
             "a band join beside a replicated partner",
-            range(1),
+            range(),
             &[0, 1],
             plain,
             [compound.placed(Placement::Replicated), compound],
@@ -351,7 +347,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
         (
             "a pure-range join's matches spread over the whole other side",
-            range(0),
+            range(),
             &[0],
             plain,
             [base; 2],
@@ -367,7 +363,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
         (
             "a replicated source already holds what a broadcast would hand it",
-            range(0),
+            range(),
             &[1],
             plain,
             [replicated, base],
@@ -380,14 +376,17 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
     }
 }
 
-/// A band join (`n_eq >= 1`) scatters by the equality prefix, dropping the
-/// trailing range slot: equal eq-values then co-partition both sides and the
-/// range probe stays partition-local. An equi-join routes by the whole key.
+/// A range join routes by its key's equality prefix — none for a key of the range
+/// slot alone, which broadcasts — and an equi join by the whole key.
 #[test]
-fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
+fn a_range_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
     let wide = || sources([(7, wide_schema()), (9, wide_schema())]);
-    let band = join_meta_in(range(1), &[3, 4], [false; 2], wide());
+    let band = join_meta_in(range(), &[3, 4], [false; 2], wide());
     assert_routes_by(band.source_route(7), &wide_schema(), &[3]);
+    let wider = join_meta_in(range(), &[2, 3, 4], [false; 2], wide());
+    assert_routes_by(wider.source_route(7), &wide_schema(), &[2, 3]);
+    let pure = join_meta_in(range(), &[3], [false; 2], wide());
+    assert_eq!(route(pure.source_route(7)), Route::Broadcast);
     let equi = join_meta_in(JoinKind::Equi, &[3, 4], [false; 2], wide());
     assert_routes_by(equi.source_route(7), &wide_schema(), &[3, 4]);
 }
@@ -402,8 +401,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let key = self_typed_slots(&base, &[1]);
     let mut c = Circuit::default();
     let (a, b) = (scan_keyed(&mut c, 7, &key), scan_keyed(&mut c, 9, &key));
-    let tb = c.integrate_trace(b);
-    let joined = c.join(a, tb, JoinKind::Equi, false);
+    let joined = c.join(a, b, JoinKind::Equi, false);
     let both = c.union(a, joined);
     c.sink(both);
     let ext = sources([(7, Source::from(base).placed(Placement::Replicated)), (9, base.into())]);
@@ -417,9 +415,6 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
 /// A source whose re-key only an owner filter reads routes by the whole key it
 /// states, whatever relay the circuit's joins call for, and never takes the
 /// replicated-partner skip: its filter drops every row the relay did not place.
-///
-///   ScanDelta(7) → Map(reindex key_cols) → WorkerFilter → IntegrateTrace ─┐
-///   ScanDelta(9) → Map(reindex [1]) ────────────────────────────────────→ Join(kind)
 #[test]
 fn an_owner_trimmed_source_routes_by_the_key_it_states() {
     let base = Source::from(make_schema_u64_i64());
@@ -428,9 +423,8 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
         let mut c = Circuit::default();
         let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a.schema, key_cols));
         let owned = c.worker_filter(keyed);
-        let trace = c.integrate_trace(owned);
         let delta = scan_keyed(&mut c, 9, &self_typed_slots(&b.schema, &[1]));
-        let joined = c.join(delta, trace, kind, false);
+        let joined = c.join(delta, owned, kind, false);
         c.sink(joined);
         derive(c, &sources([(7, a), (9, b)])).unwrap()
     };
@@ -440,14 +434,14 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
     assert_eq!(routes(&meta), [Route::Round, Route::Stays]);
     assert_routes_by(meta.source_route(7), &base.schema, &[1]);
 
-    let meta = trimmed(range(0), &[0], [base, base]);
+    let meta = trimmed(range(), &[0], [base, base]);
     assert_eq!(
         routes(&meta),
         [Route::Stays, Route::Broadcast],
         "already on its PK's owner"
     );
 
-    let meta = trimmed(range(0), &[0], [replicated, base]);
+    let meta = trimmed(range(), &[0], [replicated, base]);
     assert_eq!(
         routes(&meta),
         [Route::Share, Route::Broadcast],
@@ -463,10 +457,9 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
 fn a_source_routes_by_the_one_key_it_states() {
     let mut c = Circuit::default();
     let source = scan(&mut c, 10);
-    let delta = states_route(&mut c, source, 10, &[2]);
-    let again = states_route(&mut c, source, 10, &[2]);
-    let trace = c.integrate_trace(again);
-    let joined = c.join(delta, trace, JoinKind::Equi, false);
+    let delta = states_route(&mut c, source, &[2]);
+    let again = states_route(&mut c, source, &[2]);
+    let joined = c.join(delta, again, JoinKind::Equi, false);
     let other = scan(&mut c, 20);
     let both = c.union(joined, other);
     c.sink(both);
@@ -484,7 +477,6 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     let source = scan(&mut c, 7);
     let moved = c.map(source, &[5]);
     let role = ReindexRole::ScatterKey {
-        source: 7,
         source_key: self_typed_slots(&wide_schema(), &[5]),
     };
     let delta = c.map_reindex(moved, &[(2, TypeCode::I64)], &[0], role, NullKeys::Keep);
@@ -499,15 +491,7 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
 /// refused there, on the master and on every worker alike.
 #[test]
 fn a_circuit_derive_cannot_route_is_rejected() {
-    /// The band join of sources 7 and 9 on a three-slot key.
-    fn band(c: &mut Circuit, n_eq: u8) {
-        let key = self_typed_slots(&wide_schema(), &[1, 2, 3]);
-        let (a, b) = (scan_keyed(c, 7, &key), scan_keyed(c, 9, &key));
-        let tb = c.integrate_trace(b);
-        let joined = c.join(a, tb, range(n_eq), false);
-        c.sink(joined);
-    }
-    let cases: [(Build, &str); 8] = [
+    let cases: [(Build, &str); 6] = [
         // Integrated wherever it was produced, beside a trace scattered by the key.
         (
             |c: &mut Circuit| {
@@ -522,9 +506,8 @@ fn a_circuit_derive_cannot_route_is_rejected() {
         (
             |c: &mut Circuit| {
                 let source = scan(c, 7);
-                let (a, b) = (states_route(c, source, 7, &[1]), states_route(c, source, 7, &[2]));
-                let tb = c.integrate_trace(b);
-                let joined = c.join(a, tb, JoinKind::Equi, false);
+                let (a, b) = (states_route(c, source, &[1]), states_route(c, source, &[2]));
+                let joined = c.join(a, b, JoinKind::Equi, false);
                 c.sink(joined);
             },
             "source 7 feeds several distinct scatter keys",
@@ -538,23 +521,12 @@ fn a_circuit_derive_cannot_route_is_rejected() {
             },
             "source 7 scatter key",
         ),
-        // More equality slots than the reindex key holds, and fewer: the key is
-        // `[eq…, range]`, and a route sliced out of anything else is not it.
-        (
-            |c: &mut Circuit| band(c, 5),
-            "band join: n_eq does not match the source's reindex key arity",
-        ),
-        (
-            |c: &mut Circuit| band(c, 1),
-            "band join: n_eq does not match the source's reindex key arity",
-        ),
         // A view's sources are routed by one relay.
         (
             |c: &mut Circuit| {
                 let (a, b) = (scan(c, 7), scan(c, 9));
-                let (ta, tb) = (c.integrate_trace(a), c.integrate_trace(b));
-                let ab = c.join(a, tb, JoinKind::Equi, false);
-                let ba = c.join(b, ta, JoinKind::Cross, true);
+                let ab = c.join(a, b, JoinKind::Equi, false);
+                let ba = c.join(b, a, JoinKind::Cross, true);
                 let both = c.union(ab, ba);
                 c.sink(both);
             },
@@ -562,11 +534,13 @@ fn a_circuit_derive_cannot_route_is_rejected() {
         ),
         (
             |c: &mut Circuit| {
-                let source = scan(c, 7);
-                let delta = states_route(c, source, 9, &[1]);
+                // A union's rows are no one source's.
+                let (a, b) = (scan(c, 7), scan(c, 9));
+                let both = c.union(a, b);
+                let delta = states_route(c, both, &[1]);
                 c.sink(delta);
             },
-            "source 9 states a scatter key but is not scanned",
+            "a scatter key over no scanned source",
         ),
         (
             |c: &mut Circuit| {

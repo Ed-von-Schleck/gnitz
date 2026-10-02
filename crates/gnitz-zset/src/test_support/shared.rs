@@ -366,7 +366,11 @@ pub fn join_reference(
     trace: &Batch,
 ) -> (HashMap<RowKey, i64>, usize) {
     let eq_size = match kind {
-        gnitz_wire::JoinKind::Range { n_eq, .. } => 8 * n_eq as usize,
+        // Every key column but the last is an equality slot.
+        gnitz_wire::JoinKind::Range { .. } => {
+            let range_col = *gnitz_expr::ColumnTable::pk_cols(trace_schema).last().unwrap();
+            trace_schema.pk_stride() - trace_schema.columns[range_col as usize].size() as usize
+        }
         _ => 0,
     };
     let mut m: HashMap<RowKey, i64> = std::collections::HashMap::new();

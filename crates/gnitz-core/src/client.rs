@@ -16,7 +16,7 @@ use gnitz_wire::sys_rows::{ColTabRow, FkRef, IdxTabRow, TableTabRow, ViewTabRow}
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
+    RelClass, TableProps, ViewProps, CIRCUIT_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
     COL_TAB, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
     RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
@@ -1066,15 +1066,13 @@ impl GnitzClient {
         // segment names it as owner.
         let owner_vid = base + bundle.segments.len() as u64;
 
-        // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
-        // always non-empty; the circuit family is included only if some view
-        // contributed rows.
+        // One batch per family, spanning all views.
         let col_s = sys_schema(COL_TAB);
-        let nodes_s = sys_schema(CIRCUIT_NODES_TAB);
+        let circuit_s = sys_schema(CIRCUIT_TAB);
         let view_s = sys_schema(VIEW_TAB);
 
         let mut col_batch = ZSetBatch::new(col_s);
-        let mut nodes_batch = ZSetBatch::new(nodes_s);
+        let mut circuit_batch = ZSetBatch::new(circuit_s);
         let mut view_batch = ZSetBatch::new(view_s);
 
         // 0. The replaced view's retraction, ahead of the new chain's `+1`s.
@@ -1084,7 +1082,7 @@ impl GnitzClient {
 
         {
             let mut col_a = BatchAppender::new(&mut col_batch);
-            let mut nodes_a = BatchAppender::new(&mut nodes_batch);
+            let mut circuit_a = BatchAppender::new(&mut circuit_batch);
             let mut view_a = BatchAppender::new(&mut view_batch);
 
             let ViewBundle { segments, view } = bundle;
@@ -1108,8 +1106,8 @@ impl GnitzClient {
                 // 1. Column records. A foreign key constrains a base table, not a view.
                 append_col_rows(&mut col_a, vid, &pv.schema.columns, &[]);
 
-                // 2. Circuit node rows.
-                gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, &pv.circuit);
+                // 2. The circuit row.
+                gnitz_wire::sys_rows::write_circuit_row(&mut circuit_a, vid, &pv.circuit);
 
                 // 3. View row — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
@@ -1132,12 +1130,11 @@ impl GnitzClient {
 
         // One families entry per tid: the engine refuses a second block per
         // family.
-        let mut families: Vec<(u64, ZSetBatch)> = Vec::new();
-        families.push((COL_TAB, col_batch));
-        if !nodes_batch.is_empty() {
-            families.push((CIRCUIT_NODES_TAB, nodes_batch));
-        }
-        families.push((VIEW_TAB, view_batch));
+        let families = [
+            (COL_TAB, col_batch),
+            (CIRCUIT_TAB, circuit_batch),
+            (VIEW_TAB, view_batch),
+        ];
 
         self.push_ddl_txn(&families)?;
         Ok(owner_vid)

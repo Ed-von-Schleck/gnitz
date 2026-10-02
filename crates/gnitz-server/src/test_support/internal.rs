@@ -7,7 +7,7 @@
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::sys_rows::{
-    write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, FkRef, IdxTabRow, SchemaTabRow,
+    write_circuit_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, FkRef, IdxTabRow, SchemaTabRow,
     SysRowSink, TableTabRow,
 };
 use gnitz_wire::Circuit;
@@ -97,19 +97,26 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 // Circuit + view fixtures
 // ---------------------------------------------------------------------------
 
-/// `circuit` as `vid`'s CIRCUIT_NODES batch, through the row writer the client
+/// `circuit` as `vid`'s CIRCUIT_TAB batch, through the row writer the client
 /// commits with.
-pub fn circuit_nodes_batch(vid: u64, circuit: &Circuit) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
-    write_circuit_rows(&mut bb, vid, circuit);
+pub fn circuit_batch(vid: u64, circuit: &Circuit) -> Batch {
+    let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
+    write_circuit_row(&mut bb, vid, circuit);
+    bb.finish()
+}
+
+/// `vid`'s CIRCUIT_TAB row holding `cell` as given, whatever it decodes to.
+pub fn circuit_cell_batch(vid: u64, cell: &[u8]) -> Batch {
+    let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
+    bb.begin_row(vid as u128, 1);
+    bb.put_blob(cell);
+    bb.end_row();
     bb.finish()
 }
 
 /// Write `vid`'s circuit through the applied-delta path.
 pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
-    engine
-        .submit(SysFamily::CircuitNodes, circuit_nodes_batch(vid, &circuit))
-        .unwrap();
+    engine.submit(SysFamily::Circuit, circuit_batch(vid, &circuit)).unwrap();
 }
 
 /// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
@@ -146,7 +153,7 @@ pub fn negate_chain(source: u64, n: usize) -> Circuit {
 /// stated as its scatter key — what a spine that moves no column produces.
 pub fn scan_keyed(circuit: &mut Circuit, source: u64, key: &[gnitz_wire::ReindexSlot]) -> gnitz_wire::NodeId {
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    let role = gnitz_wire::ReindexRole::ScatterKey { source, source_key: key.to_vec() };
+    let role = gnitz_wire::ReindexRole::ScatterKey { source_key: key.to_vec() };
     circuit.map_reindex(scan, key, &[0], role, gnitz_wire::NullKeys::Keep)
 }
 
@@ -163,8 +170,7 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
         true => reindexed_on_col1(&mut circuit, source, tc),
         false => circuit.input_delta(source, gnitz_wire::ReadBound::None),
     });
-    let tb = circuit.integrate_trace(kb);
-    let joined = circuit.join(ka, tb, gnitz_wire::JoinKind::Equi, false);
+    let joined = circuit.join(ka, kb, gnitz_wire::JoinKind::Equi, false);
     circuit.sink(joined);
     circuit
 }
@@ -174,10 +180,35 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
 pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circuit {
     let mut circuit = Circuit::default();
     let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source, tc));
-    let traces = deltas.map(|d| circuit.integrate_trace(d));
-    let joined = circuit.join_terms(deltas, traces, gnitz_wire::JoinKind::Equi);
+    let joined = circuit.join_terms(deltas, deltas, gnitz_wire::JoinKind::Equi);
     circuit.sink(joined);
     circuit
+}
+
+/// `a (c0, c1, c2) LEFT JOIN b (c0, c1) ON a.<key> = b.c0` over U64 keys, as
+/// `[key, a.c0, a.c1, a.c2, b.c1]`. Answers the circuit and `a`'s join re-key.
+pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::NodeId) {
+    use gnitz_wire::{JoinKind, NullKeys, ReindexRole};
+    let mut c = Circuit::default();
+    let a_key = [(key, TypeCode::U64)];
+    let role = || ReindexRole::ScatterKey { source_key: a_key.to_vec() };
+    let sa = c.input_delta(a, gnitz_wire::ReadBound::None);
+    let sb = c.input_delta(b, gnitz_wire::ReadBound::None);
+    let b_key = [(0, TypeCode::U64)];
+    let b_role = ReindexRole::ScatterKey { source_key: b_key.to_vec() };
+    let rb = c.map_reindex(sb, &b_key, &[1], b_role, NullKeys::Drop);
+    let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Drop);
+    let all = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep);
+    let inner = c.join_terms([ra, rb], [ra, rb], JoinKind::Equi);
+    // `a`'s rows some row of `b` matches: its re-key against `b`'s key set.
+    let keys = c.map(rb, &[]);
+    let set = c.distinct(keys);
+    let matched = c.join_terms([ra, set], [ra, set], JoinKind::Equi);
+    let nu = c.difference(all, matched);
+    let filled = c.null_extend(nu, &[TypeCode::U64], false);
+    let out = c.union(filled, inner);
+    c.sink(out);
+    (c, ra)
 }
 
 /// A drive host for circuits that exchange nothing.

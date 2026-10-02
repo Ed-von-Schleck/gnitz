@@ -120,7 +120,7 @@ pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
                     columns: f
                         .cols
                         .iter()
-                        .map(|c| ColumnDef::new(c.name, c.type_code, c.nullable))
+                        .map(|c| ColumnDef::new(c.name, c.type_code, false))
                         .collect(),
                     pk_cols: f.pk_cols.to_vec(),
                 })
@@ -754,9 +754,6 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     }
     fn put_bytes(&mut self, b: &[u8]) {
         self.bytes_val(b);
-    }
-    fn put_null(&mut self) {
-        self.null();
     }
     fn end_row(&mut self) {
         self.check_row_complete();

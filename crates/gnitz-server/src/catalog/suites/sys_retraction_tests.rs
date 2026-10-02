@@ -31,7 +31,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
         let id = match family {
             SysFamily::Schema => sid,
             SysFamily::Table | SysFamily::Column | SysFamily::Sequence => tid,
-            SysFamily::View | SysFamily::CircuitNodes => vid,
+            SysFamily::View | SysFamily::Circuit => vid,
             SysFamily::Index => idx,
         };
 
@@ -45,7 +45,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
         // A retraction in the shape the family admits: a rewrite pair where it
         // declares one, a bare `-1` where a client may drop a row. A circuit row
         // admits neither.
-        if family == SysFamily::CircuitNodes {
+        if family == SysFamily::Circuit {
             continue;
         }
         let retraction = |leading: u64| {

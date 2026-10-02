@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
-use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
+use gnitz_wire::{AggDescriptor, NodeId, MAX_CIRCUIT_NODES};
 use gnitz_zset::algebra::MapPlan;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};
@@ -33,11 +33,9 @@ pub(super) use hydration::Hydration;
 
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
-pub(super) use load::{load_circuit, read_circuit_node_row};
+pub(super) use load::load_circuit;
 pub(super) use routing::{Relay, ViewMeta};
 
-/// The most nodes one view's circuit may hold.
-const MAX_CIRCUIT_NODES: usize = 16_384;
 // Registers — up to three per node, plus the seeds — and child stores — up to
 // two per node — are `u16` ids.
 const _: () = assert!(3 * MAX_CIRCUIT_NODES + 2 < u16::MAX as usize);
@@ -49,21 +47,9 @@ const _: () = assert!(2 * MAX_CIRCUIT_NODES <= u16::MAX as usize);
 
 /// A loaded circuit: the client's graph, whose index order is a topological
 /// order because every input names an earlier node.
-///
-/// Opaque outside this module: everything the rest of the engine wants from a
-/// circuit is derived once into [`ViewMeta`], so nothing else can read a
-/// second answer out of the graph.
 pub(super) struct LoadedCircuit(gnitz_wire::Circuit);
 
 impl LoadedCircuit {
-    /// The only constructor, so the one place the node cap has to hold.
-    fn new(circuit: gnitz_wire::Circuit) -> Result<Self, String> {
-        if circuit.nodes().len() > MAX_CIRCUIT_NODES {
-            return Err("circuit exceeds the node limit".into());
-        }
-        Ok(LoadedCircuit(circuit))
-    }
-
     fn len(&self) -> usize {
         self.0.nodes().len()
     }
@@ -72,8 +58,9 @@ impl LoadedCircuit {
         &self.0.nodes()[nid].op
     }
 
-    fn inputs(&self, nid: NodeId) -> &NodeInputs {
-        &self.0.nodes()[nid].inputs
+    /// `nid`'s producers, in slot order.
+    fn inputs(&self, nid: NodeId) -> &[NodeId] {
+        self.0.nodes()[nid].inputs()
     }
 
     /// Every operator, in topological order — identical on the master and on
@@ -99,7 +86,7 @@ impl LoadedCircuit {
 
     /// Every node reading `nid`, in topological order.
     fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        (nid + 1..self.len()).filter(move |&n| self.inputs(n).iter().any(|p| p == nid))
+        (nid + 1..self.len()).filter(move |&n| self.inputs(n).contains(&nid))
     }
 
     /// Backward pass: `start` and every node it reads, directly or transitively.
@@ -108,7 +95,7 @@ impl LoadedCircuit {
         reached[start] = true;
         for n in (0..=start).rev() {
             if reached[n] {
-                for p in self.inputs(n).iter() {
+                for &p in self.inputs(n) {
                     reached[p] = true;
                 }
             }
@@ -131,7 +118,7 @@ fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
 /// first node that does not.
 fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> NodeId {
     while keeps_rows_and_pk_region(loaded.op(from)) {
-        from = loaded.inputs(from).unary();
+        from = loaded.inputs(from)[0];
     }
     from
 }
@@ -307,7 +294,7 @@ pub(super) fn compile_view(
         // A worker holding the whole input has nothing to pre-aggregate.
         let out = match loaded.global_split(side.shard).filter(|_| !self_contained) {
             Some(consumer) => PlanOut::Split { consumer },
-            None => PlanOut::Node(loaded.inputs(side.shard).unary()),
+            None => PlanOut::Node(loaded.inputs(side.shard)[0]),
         };
         let Built { plan, partial, .. } =
             build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], out)?;
@@ -328,7 +315,11 @@ pub(super) fn compile_view(
         side_plans.push((plan, relay));
     }
     let Built {
-        plan: post, regs: post_regs, seed_regs, ..
+        plan: post,
+        regs: post_regs,
+        integrals: post_integrals,
+        seed_regs,
+        ..
     } = build_plan(
         loaded,
         &carve.post,
@@ -349,7 +340,7 @@ pub(super) fn compile_view(
         .map(|((plan, relay), seed_reg)| Side { plan, seed_reg, relay })
         .collect();
     let hydration = bounded
-        .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs))
+        .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs, &post_integrals))
         .transpose()?;
     Ok((CompileOutput { sides, post, hydration, self_contained }, layout))
 }

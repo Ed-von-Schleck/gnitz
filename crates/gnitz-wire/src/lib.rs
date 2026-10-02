@@ -111,6 +111,16 @@ macro_rules! wire_enum {
                 None
             }
         }
+
+        impl $crate::Wire for $name {
+            fn write(&self, w: &mut $crate::Writer) {
+                w.$repr(self.as_wire());
+            }
+            fn read(r: &mut $crate::Reader) -> Result<Self, String> {
+                let v = r.$repr()?;
+                Self::from_wire(v).ok_or_else(|| format!(concat!("unknown ", stringify!($name), " {}"), v))
+            }
+        }
     };
 }
 

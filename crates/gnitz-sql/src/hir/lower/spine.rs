@@ -84,7 +84,7 @@ impl SourceOrigin {
             .iter()
             .map(|&(c, tc)| Some((self.slot(frame, c as usize)?, tc)))
             .collect::<Option<Vec<ReindexSlot>>>()?;
-        Some(ReindexRole::ScatterKey { source: self.src.tid(), source_key })
+        Some(ReindexRole::ScatterKey { source_key })
     }
 }
 

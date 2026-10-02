@@ -25,7 +25,7 @@ impl CatalogEngine {
             }
             // `_sequences` rows drive no cache.
             SysFamily::Sequence => {}
-            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(batch),
+            SysFamily::Circuit => self.dag.apply_circuit_delta(batch)?,
         }
         Ok(())
     }

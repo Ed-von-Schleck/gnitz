@@ -6,9 +6,7 @@ use crate::query::vm::ReplayEntry;
 use gnitz_store::relation::RelationKind;
 
 /// Where a bounded view's per-key replay seeds: the register it enters at, and
-/// the integral of that register's delta, which the seed is gathered from —
-/// the scanned relation's store behind a `ScanDelta`'s register, one branch's
-/// trace behind that branch's delta port of an inner equi-join.
+/// the integral the seed is gathered from.
 #[derive(Clone, Copy)]
 pub(in crate::query) struct Hydration {
     pub(in crate::query) entry: ReplayEntry,
@@ -18,12 +16,10 @@ pub(in crate::query) struct Hydration {
 const UNSUPPORTED: &str =
     "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
 
-/// One term `delta ⋈ trace` of an equi-join over an integral.
+/// One term `delta ⋈ z⁻¹I(integrand)` of an equi-join.
 struct Term {
     delta: NodeId,
-    trace: NodeId,
-    /// The node `trace` integrates.
-    integrates: NodeId,
+    integrand: NodeId,
     delta_is_right: bool,
 }
 
@@ -33,11 +29,12 @@ impl Term {
         let OpNode::Join { kind: JoinKind::Equi, delta_is_right } = loaded.op(join) else {
             return None;
         };
-        let (delta, trace) = loaded.inputs(join).binary();
-        matches!(loaded.op(trace), OpNode::IntegrateTrace).then(|| Term {
+        let &[delta, integrand] = loaded.inputs(join) else {
+            unreachable!("a join is wired on two inputs")
+        };
+        Some(Term {
             delta,
-            trace,
-            integrates: loaded.inputs(trace).unary(),
+            integrand,
             delta_is_right: *delta_is_right,
         })
     }
@@ -60,8 +57,8 @@ fn sources(loaded: &LoadedCircuit, node: NodeId) -> Vec<u64> {
 enum SeedAt {
     /// The `ScanDelta` of a linear body.
     Scan { node: NodeId, source: u64 },
-    /// The trace integrating `delta`, one delta of an inner equi-join's two-term form.
-    Trace { delta: NodeId, trace: NodeId },
+    /// The integral of `delta`, one delta of an inner equi-join's two-term form.
+    Trace { delta: NodeId },
 }
 
 fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
@@ -70,26 +67,28 @@ fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
     if loaded.exchange_shards().next().is_some() {
         return Err(UNSUPPORTED.into());
     }
-    let origin = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
+    let origin = row_local_origin(loaded, loaded.inputs(loaded.sink()?)[0]);
     match loaded.op(origin) {
         OpNode::ScanDelta { source, .. } => return Ok(SeedAt::Scan { node: origin, source: *source }),
         OpNode::Union => {}
         _ => return Err(UNSUPPORTED.into()),
     }
-    let (j1, j2) = loaded.inputs(origin).binary();
+    let &[j1, j2] = loaded.inputs(origin) else {
+        unreachable!("a union is wired on two inputs")
+    };
     let (Some(t1), Some(t2)) = (Term::of(loaded, j1), Term::of(loaded, j2)) else {
         return Err(UNSUPPORTED.into());
     };
     // Seeding `t1.delta` alone replays `I(t1.delta) ⋈ I(t2.delta)`, which is the
     // maintained view only for the two-term form of one join.
-    let cross_wired = t1.integrates == t2.delta && t2.integrates == t1.delta;
+    let cross_wired = t1.integrand == t2.delta && t2.integrand == t1.delta;
     let one_side_order = t1.delta_is_right != t2.delta_is_right;
     let (s1, s2) = (sources(loaded, t1.delta), sources(loaded, t2.delta));
     let single_source_per_epoch = !s1.iter().any(|s| s2.contains(s));
     if !(cross_wired && one_side_order && single_source_per_epoch) {
         return Err(UNSUPPORTED.into());
     }
-    Ok(SeedAt::Trace { delta: t1.delta, trace: t2.trace })
+    Ok(SeedAt::Trace { delta: t1.delta })
 }
 
 /// Resolve the seed against the plan the emitter produced for it.
@@ -98,7 +97,8 @@ pub(super) fn derive_hydration(
     registry: &RelationRegistry,
     view_schema: &SchemaDescriptor,
     plan: &SubPlan,
-    regs: &[Option<OutReg>],
+    regs: &[Option<DeltaReg>],
+    integrals: &[Option<Integral>],
 ) -> Result<Hydration, String> {
     let reg = |n: NodeId| regs[n].expect("an exchange-free plan emits every node");
     let (in_node, seed, keyed) = match seed_node(loaded)? {
@@ -114,20 +114,20 @@ pub(super) fn derive_hydration(
             }
             (node, Integral::Source(source), node)
         }
-        SeedAt::Trace { delta, trace } => {
-            let seed = reg(trace).trace()?;
+        SeedAt::Trace { delta } => {
+            let seed = integrals[delta].expect("the cross-wired term's join declared its integrand's integral");
             let in_node = match seed {
                 Integral::Own(_) => delta,
                 // The relation's own rows enter where its delta does, and are
-                // re-keyed by `delta`, the reindex the trace stands for.
-                Integral::Source(_) => loaded.inputs(delta).unary(),
+                // re-keyed by `delta`, the reindex whose integral the store is.
+                Integral::Source(_) => loaded.inputs(delta)[0],
             };
             (in_node, seed, delta)
         }
     };
-    let entry = plan.vm.program.replay_entry(reg(in_node).delta()?)?;
+    let entry = plan.vm.program.replay_entry(reg(in_node))?;
     // The view's own keys gather the seed.
-    if plan.vm.program.schema_of(reg(keyed).delta()?).pk_stride() != view_schema.pk_stride() {
+    if plan.vm.program.schema_of(reg(keyed)).pk_stride() != view_schema.pk_stride() {
         return Err(UNSUPPORTED.into());
     }
     Ok(Hydration { entry, seed })

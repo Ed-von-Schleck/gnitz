@@ -44,7 +44,7 @@ fn shape(family: SysFamily, rows: &[(u64, i64, &str)]) -> String {
 
 /// Rows a drop cascade retracts with their owner, and so no client delta may.
 fn owned(family: SysFamily) -> bool {
-    matches!(family, SysFamily::Column | SysFamily::CircuitNodes)
+    matches!(family, SysFamily::Column | SysFamily::Circuit)
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn an_id_outside_a_familys_range_is_rejected_whatever_its_sign() {
             SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Index | SysFamily::Sequence => {
                 FIRST_USER_TABLE_ID
             }
-            SysFamily::CircuitNodes => 0,
+            SysFamily::Circuit => 0,
         };
         assert_eq!(shape(family, &[(floor, 1, "")]), "", "{family:?}");
         if let Some(below) = floor.checked_sub(1) {
@@ -132,7 +132,7 @@ fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
             SysFamily::Table | SysFamily::View => &["name"],
             SysFamily::Column => &["name", "is_nullable", "is_hidden"],
             SysFamily::Sequence => &["next_val"],
-            SysFamily::Schema | SysFamily::Index | SysFamily::CircuitNodes => &[],
+            SysFamily::Schema | SysFamily::Index | SysFamily::Circuit => &[],
         };
         let wire = family.wire();
         for col in &wire.cols[wire.pk_cols.len()..] {

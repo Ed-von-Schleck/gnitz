@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::hash_map::Entry;
 
-/// The bidirectional view-dependency index, kept current by every `CircuitNodes` delta.
+/// The bidirectional view-dependency index, kept current by every `CIRCUIT_TAB` delta.
 /// A `forward` / `reverse` entry exists only while it holds an id.
 #[derive(Default)]
 pub(super) struct DepMap {
@@ -14,14 +14,11 @@ pub(super) struct DepMap {
 }
 
 impl DepMap {
-    /// Apply one `CircuitNodes` delta. An edge is one `ScanDelta` row. A view's rows arrive
-    /// with the bundle creating it and leave with its drop (the catalog refuses any other
-    /// `-1`), so a `+1` links an edge once however many scans name it, and a `-1` forgets
-    /// the whole view. Both are idempotent: a Stage-A compensation negates a batch even
-    /// when that batch's ingest failed before its hook ran.
-    fn apply(&mut self, batch: &Batch) {
+    /// Apply one `CIRCUIT_TAB` delta: a `-1` forgets its view, a `+1` links its view
+    /// to each source the circuit scans. Either may repeat.
+    fn apply(&mut self, batch: &Batch) -> Result<(), String> {
         for i in batch.retracted_rows() {
-            let view = compiler::read_circuit_node_row(batch, i).view_id;
+            let view = batch.get_pk(i) as u64;
             for source in self.reverse.remove(&view).into_iter().flatten() {
                 if let Entry::Occupied(mut views) = self.forward.entry(source) {
                     views.get_mut().retain(|&v| v != view);
@@ -32,23 +29,22 @@ impl DepMap {
             }
         }
         for i in batch.live_rows() {
-            let row = compiler::read_circuit_node_row(batch, i);
-            let Some(source) = row.scan_source() else {
-                continue;
-            };
-            let view = row.view_id;
-            let srcs = self.reverse.entry(view).or_default();
-            if !srcs.contains(&source) {
-                srcs.push(source);
-                self.forward.entry(source).or_default().push(view);
+            let view = batch.get_pk(i) as u64;
+            let cell = gnitz_expr::payload_bytes(batch, i, gnitz_wire::CIRCTAB_PAY_CIRCUIT);
+            let circuit = gnitz_wire::Circuit::decode(cell).map_err(|e| format!("view {view}: {e}"))?;
+            for source in circuit.sources() {
+                let srcs = self.reverse.entry(view).or_default();
+                if !srcs.contains(&source) {
+                    srcs.push(source);
+                    self.forward.entry(source).or_default().push(view);
+                }
             }
         }
+        Ok(())
     }
 
     /// Every id one or more edges from some seed over one half of the map — a
-    /// seed only when another seed reaches it. Both directions are this one walk, so they cannot drift: `forward` reaches
-    /// a source's dependents, `reverse` reaches a view's sources, and
-    /// `apply` writes both halves from the same `ScanDelta` node.
+    /// seed only when another seed reaches it.
     fn closure(edges: &FxHashMap<u64, Vec<u64>>, seeds: Vec<u64>) -> FxHashSet<u64> {
         let mut reachable: FxHashSet<u64> = FxHashSet::default();
         let mut stack = seeds;
@@ -66,9 +62,9 @@ impl DepMap {
 impl DagEngine {
     // ── Dependency map ──────────────────────────────────────────────────
 
-    /// Apply one `CircuitNodes` delta to the dependency map.
-    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) {
-        self.dep.apply(batch);
+    /// Apply one `CIRCUIT_TAB` delta to the dependency map.
+    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) -> Result<(), String> {
+        self.dep.apply(batch)
     }
 
     /// The views that scan `id` directly. Empty when none do.

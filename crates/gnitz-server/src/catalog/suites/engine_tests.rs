@@ -544,7 +544,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
 }
 
 /// The two dependent-view RESTRICTs — DROP TABLE and DROP COLUMN — both read
-/// the CIRCUIT_NODES-backed map.
+/// the CIRCUIT_TAB-backed map.
 #[test]
 fn test_dependent_view_restricts_fire_from_circuit_rows() {
     let dir = temp_dir("dep_map_restrict");
@@ -576,21 +576,21 @@ fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 107,
+    // Inject a row directly into CIRCUIT_TAB so the store is non-empty: view 107,
     // with a single node, through the shared row codec.
     let mut circuit = gnitz_wire::Circuit::default();
     circuit.input_delta(100, gnitz_wire::ReadBound::None);
     write_circuit(&mut engine, 107, circuit);
 
-    // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
-    // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = scan_all(&mut engine, gnitz_wire::CIRCUIT_NODES_TAB);
-    assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
+    // The family is SQL-introspectable — `SELECT * FROM _circuits` must return
+    // what we just inserted (full-scan path, used by SQL planner).
+    let scan = scan_all(&mut engine, gnitz_wire::CIRCUIT_TAB);
+    assert_eq!(scan.len(), 1, "scan must expose the circuit row");
 
-    // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.
-    let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[107, 0]);
-    let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_NODES_TAB, &pk_bytes);
-    assert_eq!(found.len(), 1, "the CircuitNodes row by PK");
+    // A point read by the view id.
+    let pk_bytes = opk_pk(SysFamily::Circuit.schema(), &[107]);
+    let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_TAB, &pk_bytes);
+    assert_eq!(found.len(), 1, "the circuit row by PK");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

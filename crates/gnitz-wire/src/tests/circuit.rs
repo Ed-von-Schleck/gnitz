@@ -18,7 +18,7 @@ fn sample(op: Opcode) -> OpNode {
             delta_is_right: true,
         },
         Opcode::JoinRange => OpNode::Join {
-            kind: JoinKind::Range { n_eq: 3, rel: RangeRel::Le },
+            kind: JoinKind::Range { rel: RangeRel::Le },
             delta_is_right: true,
         },
         Opcode::JoinCross => OpNode::Join {
@@ -53,7 +53,6 @@ fn sample(op: Opcode) -> OpNode {
             type_codes: vec![TypeCode::I64, TypeCode::String],
             nulls_first: true,
         },
-        Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::MapProj => OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
         Opcode::MapExpr => OpNode::Map(MapKind::Compute(ComputeMap {
             program: vec![7],
@@ -66,10 +65,9 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            key: vec![(2, TypeCode::I64), (5, TypeCode::I64)],
+            key: vec![(2, TypeCode::I64), (5, TypeCode::U32)],
             role: ReindexRole::ScatterKey {
-                source: 4,
-                source_key: vec![(1, TypeCode::I64), (6, TypeCode::I64)],
+                source_key: vec![(1, TypeCode::I64), (6, TypeCode::U32)],
             },
             nulls: NullKeys::Drop,
         }),
@@ -85,24 +83,54 @@ fn sample(op: Opcode) -> OpNode {
     }
 }
 
-/// Re-decode a node through the row fields `encode_op_node` produces.
-fn roundtrip(op: OpNode) -> Result<OpNode, String> {
-    let (opcode, src_tab, params) = encode_op_node(&op);
-    decode_op_node(opcode.as_wire(), src_tab, params.as_deref())
+fn scan(source: u64) -> OpNode {
+    OpNode::ScanDelta { source, bound: crate::ReadBound::None }
 }
 
-/// Every `OpNode` shape survives `encode_op_node` → `decode_op_node`. This is
-/// the crate's largest codec and the only one whose bugs land in a persisted
-/// circuit, so the variant set is swept rather than sampled: the opcode space and
-/// every wire enum the encoder embeds are driven from their own `ALL`, so a
-/// variant added to any of them is round-tripped without a second edit here.
+/// The bytes of one unbounded scan in a cell: its tag, its source, its bound tag.
+const SCAN_LEN: usize = 10;
+
+/// `op` behind one unbounded scan per input slot, wired on them in descending
+/// order, so a codec that swapped a binary operator's slots fails the round-trip.
+fn wired(op: OpNode) -> Circuit {
+    let mut c = Circuit::default();
+    let mut inputs: Vec<NodeId> = (0..op.arity())
+        .map(|i| c.push(scan(7 + i as u64), &[]).unwrap())
+        .collect();
+    inputs.reverse();
+    c.push(op, &inputs).unwrap();
+    c
+}
+
+/// Where `op`'s opcode byte sits in `wired(op).encode()`: behind the node count
+/// and the scans.
+fn tag_at(op: &OpNode) -> usize {
+    2 + SCAN_LEN * op.arity()
+}
+
+/// A cell laid out as `encode` would, around `push`: what a forger can write and
+/// a builder cannot.
+fn cell(nodes: &[(OpNode, &[u16])]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.count(nodes.len());
+    for (op, inputs) in nodes {
+        op.write(&mut w);
+        for &input in *inputs {
+            w.u16(input);
+        }
+    }
+    w.into_vec()
+}
+
+/// Every `OpNode` shape survives `encode` → `decode`, the opcode space and each
+/// wire enum the encoder embeds driven from its own `ALL`.
 #[test]
 fn every_op_node_variant_roundtrips() {
     let mut nodes: Vec<OpNode> = Opcode::ALL.iter().map(|&op| sample(op)).collect();
-    // The shapes an opcode's own sample cannot also be: an absent parameter cell,
-    // the other bound kind, and the empty lists each counted layout allows.
+    // The shapes an opcode's own sample cannot also be: the other bound kinds,
+    // and the empty lists each counted layout allows.
     nodes.extend([
-        OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
+        scan(7),
         OpNode::ScanDelta {
             source: 7,
             bound: crate::ReadBound::PkSet(crate::PkKeys::from_keys(
@@ -120,7 +148,7 @@ fn every_op_node_variant_roundtrips() {
             global_ground: true,
         },
         // The global shape: no group, one key, no offset — and a zero limit,
-        // which frames fine: refusing it is `TopNPlan::from_wire`'s.
+        // which frames fine: refusing it is the top-N kernel's.
         OpNode::TopN {
             group_cols: vec![],
             order: vec![crate::OrderKey { col: 2, desc: false, nulls_first: false }],
@@ -144,7 +172,7 @@ fn every_op_node_variant_roundtrips() {
         }
         for &rel in RangeRel::ALL {
             nodes.push(OpNode::Join {
-                kind: JoinKind::Range { n_eq: 3, rel },
+                kind: JoinKind::Range { rel },
                 delta_is_right,
             });
         }
@@ -154,56 +182,140 @@ fn every_op_node_variant_roundtrips() {
         });
     }
     for node in nodes {
-        assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
+        let circuit = wired(node);
+        assert_eq!(Circuit::decode(&circuit.encode()), Ok(circuit.clone()), "{circuit:?}");
     }
+    assert_eq!(Circuit::decode(&Circuit::default().encode()), Ok(Circuit::default()));
 }
 
-/// Each opcode's sample encodes under that opcode — so encode and decode cannot
-/// agree on a permuted opcode table — and a row differing from what
-/// `encode_op_node` writes is refused: the `source_table` cell's presence
-/// flipped, or a params cell one byte short, one long, or present and empty. A
-/// layout reading a fixed prefix and ignoring the rest would pass the round-trip
-/// and fail here.
+/// Each opcode's sample encodes under its own tag, and its cell is refused cut
+/// anywhere, one byte long, or under a tag no operator has.
 #[test]
-fn each_opcode_row_refuses_every_perturbation() {
+fn each_opcode_cell_refuses_every_perturbation() {
+    let unknown = (0..=u8::MAX).find(|&o| Opcode::from_wire(o).is_none()).unwrap();
     for &op in Opcode::ALL {
-        let (opcode, src_tab, params) = encode_op_node(&sample(op));
-        assert_eq!(opcode, op, "{op:?} encodes under {opcode:?}");
-        let decode = |src, p: Option<&[u8]>| decode_op_node(op.as_wire(), src, p);
-        let flipped = if src_tab.is_some() { None } else { Some(3) };
-        assert!(
-            decode(flipped, params.as_deref()).is_err(),
-            "{op:?}: source_table flipped"
-        );
-        let mut over_long = params.clone().unwrap_or_default();
-        over_long.push(0);
-        assert!(decode(src_tab, Some(&over_long)).is_err(), "{op:?}: trailing byte");
-        assert!(decode(src_tab, Some(&[])).is_err(), "{op:?}: empty cell");
-        if let Some(p) = &params {
-            assert!(decode(src_tab, Some(&p[..p.len() - 1])).is_err(), "{op:?}: truncated");
+        let node = sample(op);
+        let bytes = wired(node.clone()).encode();
+        let at = tag_at(&node);
+        assert_eq!(bytes[at], op.as_wire(), "{op:?} encodes under its own tag");
+        for cut in 0..bytes.len() {
+            let err = Circuit::decode(&bytes[..cut]).expect_err("a cut cell");
+            assert_eq!(err.matches("circuit").count(), 1, "{op:?} cut at {cut}: {err:?}");
         }
+        let mut over_long = bytes.clone();
+        over_long.push(0);
+        assert!(Circuit::decode(&over_long).unwrap_err().contains("trailing"), "{op:?}");
+        let mut forged = bytes;
+        forged[at] = unknown;
+        assert!(
+            Circuit::decode(&forged).unwrap_err().contains("unknown Opcode"),
+            "{op:?}"
+        );
     }
-    let unknown = (0..).find(|&o| Opcode::from_wire(o).is_none()).unwrap();
-    assert!(decode_op_node(unknown, None, None)
-        .unwrap_err()
-        .contains("unknown opcode"));
 }
 
-/// Every params guard, against the forgery that trips it: a well-framed cell
-/// whose content the decoder refuses rather than defaults. Most are shapes the
-/// infallible encoder writes as given; the rest are one byte poked into an
-/// encoded sample. A bound's own guards are `read_spec`'s and `range`'s.
+/// A cell's layout moves only with its version: the digest is every opcode's
+/// sample cell, so either both halves of the pair change or neither does.
 #[test]
-fn each_params_guard_rejects_its_own_forgery() {
-    let row = |op: &OpNode| {
-        let (c, s, p) = encode_op_node(op);
-        (c, s, p.unwrap())
-    };
+fn the_cell_layout_is_pinned_to_its_version() {
+    let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (9, 0x01dd_98d4_fe31_574d));
+}
+
+/// Every framing guard, against the forgery that trips it.
+#[test]
+fn each_decode_guard_rejects_its_own_forgery() {
+    // `off` counts from the operator's opcode byte.
     let poke = |op: &OpNode, off: usize, v: u8| {
-        let (c, s, mut p) = row(op);
-        p[off] = v;
-        (c, s, p)
+        let mut bytes = wired(op.clone()).encode();
+        bytes[tag_at(op) + off] = v;
+        bytes
     };
+    // tag 0 | nulls 1 | key count 2..4 | col 4..8 | type 8 | keep count 9..11 | role 11
+    let aux = OpNode::Map(MapKind::Reindex {
+        keep: vec![],
+        key: vec![(3, TypeCode::I64)],
+        role: ReindexRole::Auxiliary,
+        nulls: NullKeys::Keep,
+    });
+    // tag 0 | count 1..3 | col 3..7 | type 7
+    let hash_row = OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::I64)] });
+    // tag 0 | nulls_first 1 | count 2..4 | type 4
+    let null_ext = OpNode::NullExtend {
+        type_codes: vec![TypeCode::I64],
+        nulls_first: false,
+    };
+    // tag 0 | global_ground 1 | group count 2..4 | agg count 4..6 | func 6
+    let reduce = OpNode::Reduce {
+        group_cols: vec![],
+        agg: vec![AggDescriptor::COUNT_STAR],
+        global_ground: false,
+    };
+    // The first byte outside each wire enum — not a literal, which the next
+    // variant added would quietly turn into a valid value.
+    fn outside<T>(from_wire: impl Fn(u8) -> Option<T>) -> u8 {
+        (0..=u8::MAX).find(|&b| from_wire(b).is_none()).unwrap()
+    }
+    let mut past_cap = Writer::new();
+    past_cap.count(MAX_CIRCUIT_NODES + 1);
+    let cases = [
+        (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
+        (poke(&aux, 8, 0), "unknown TypeCode 0"),
+        (poke(&aux, 8, 200), "unknown TypeCode 200"),
+        (poke(&aux, 11, 2), "boolean byte 2"),
+        (poke(&hash_row, 7, 0), "unknown TypeCode 0"),
+        (poke(&null_ext, 4, 200), "unknown TypeCode 200"),
+        // tag 0 | rel 1 | delta_is_right 2
+        (
+            poke(&sample(Opcode::JoinRange), 1, outside(RangeRel::from_wire)),
+            "unknown RangeRel",
+        ),
+        (poke(&reduce, 6, outside(AggFunc::from_wire)), "unknown AggFunc"),
+        // The encoder is infallible; the decode refuses by the count before
+        // reading the body.
+        (
+            wired(OpNode::Map(MapKind::Projection(
+                (0..=crate::MAX_COLUMNS as u32).collect(),
+            )))
+            .encode(),
+            "exceeds cap",
+        ),
+        // tag 0 | source 1..9 | bound tag 9. A malformed backfill hint is catalog
+        // corruption, not a wider scan.
+        (poke(&scan(3), 9, 9), "unknown bound kind"),
+        // The count is refused before a node is read.
+        (past_cap.into_vec(), "nodes: 16385 entries exceeds cap 16384"),
+        (
+            cell(&[(scan(7), &[]), (OpNode::Negate, &[1])]),
+            "a node's input is not an earlier node",
+        ),
+        (cell(&[(OpNode::Negate, &[0])]), "a node's input is not an earlier node"),
+        // A cell holds at least its node count.
+        (vec![], "truncated"),
+    ];
+    for (bytes, want) in cases {
+        let err = Circuit::decode(&bytes).unwrap_err();
+        assert!(err.contains(want), "{err:?} does not name {want:?}");
+    }
+}
+
+/// The count `decode` refuses past is one a circuit may hold.
+#[test]
+fn decode_accepts_a_circuit_at_the_node_cap() {
+    let mut c = Circuit::default();
+    let mut last = c.input_delta(7, crate::ReadBound::None);
+    while c.nodes().len() < MAX_CIRCUIT_NODES {
+        last = c.negate(last);
+    }
+    assert_eq!(Circuit::decode(&c.encode()), Ok(c.clone()));
+    c.negate(last);
+    assert!(Circuit::decode(&c.encode()).unwrap_err().contains("exceeds cap"));
+}
+
+/// What holds of an operator under every schema is `push`'s, so a built node and
+/// a decoded one are refused alike.
+#[test]
+fn push_refuses_a_malformed_operator_built_or_decoded() {
     let key = vec![(3, TypeCode::I64)];
     let reindex = |role, key| {
         OpNode::Map(MapKind::Reindex {
@@ -213,70 +325,49 @@ fn each_params_guard_rejects_its_own_forgery() {
             nulls: NullKeys::Keep,
         })
     };
-    // role 0 | nulls 1 | key count 2..4 | col 4..8 | type 8
-    let aux = reindex(ReindexRole::Auxiliary, key.clone());
-    // count 0..2 | col 2..6 | type 6
-    let hash_row = OpNode::Map(MapKind::HashRow { cols: key.clone() });
-    // nulls_first 0 | count 1..3 | type 3
-    let null_ext = OpNode::NullExtend {
-        type_codes: vec![TypeCode::I64],
-        nulls_first: false,
-    };
-    let bad_rel = (0..=u8::MAX).find(|&b| RangeRel::from_wire(b).is_none()).unwrap();
-    let scan = |cell: Vec<u8>| (Opcode::ScanDelta, Some(3), cell);
+    let scatter = |source_key| ReindexRole::ScatterKey { source_key };
     let cases = [
-        (poke(&aux, 0, 99), "unknown route-key role"),
-        (poke(&aux, 1, 7), "unknown NULL-key rule"),
-        (poke(&aux, 8, 0), "invalid type code 0"),
-        (poke(&aux, 8, 200), "invalid type code 200"),
-        (poke(&hash_row, 6, 0), "invalid type code 0"),
-        (poke(&null_ext, 3, 200), "invalid type code 200"),
-        (poke(&sample(Opcode::JoinRange), 2, bad_rel), "JOIN unknown rel"),
-        (row(&reindex(ReindexRole::Auxiliary, vec![])), "names no key columns"),
-        // A stated route with no source columns would scatter the whole
-        // relation onto one worker.
         (
-            row(&reindex(
-                ReindexRole::ScatterKey { source: 7, source_key: vec![] },
-                key.clone(),
-            )),
-            "scatter key names no source columns",
+            reindex(ReindexRole::Auxiliary, vec![]),
+            "a reindex names no key columns",
+        ),
+        // The scatter and the trace must pack one byte image.
+        (
+            reindex(scatter(vec![(1, TypeCode::I32)]), key.clone()),
+            "a scatter key's slot types are not its reindex key's",
+        ),
+        // A stated route with no source columns would scatter the whole relation
+        // onto one worker.
+        (
+            reindex(scatter(vec![]), key.clone()),
+            "a scatter key's slot types are not its reindex key's",
         ),
         (
-            row(&OpNode::Map(MapKind::HashRow { cols: vec![] })),
-            "MAP_HASH_ROW names no columns",
+            reindex(scatter(vec![(1, TypeCode::I64), (2, TypeCode::I64)]), key),
+            "a scatter key's slot types are not its reindex key's",
+        ),
+        (
+            OpNode::Map(MapKind::HashRow { cols: vec![] }),
+            "a hash-row map names no columns",
         ),
         // A ground-seeding reduce groups on nothing.
         (
-            row(&OpNode::Reduce {
+            OpNode::Reduce {
                 group_cols: vec![0],
                 agg: vec![AggDescriptor::COUNT_STAR],
                 global_ground: true,
-            }),
-            "global-ground over a non-empty group set",
+            },
+            "a global-ground reduce over a non-empty group set",
         ),
-        // The encoder is infallible; the decode refuses by the count before
-        // reading the body.
-        (
-            row(&OpNode::Map(MapKind::Projection(
-                (0..=crate::MAX_COLUMNS as u32).collect(),
-            ))),
-            "exceeds cap",
-        ),
-        // "No bound" is spelled by the absent cell alone.
-        (scan(vec![0]), "carries no params cell"),
-        // A malformed backfill hint is catalog corruption, not a wider scan.
-        (scan(vec![9]), "unknown bound kind"),
     ];
-    for ((op, src, params), want) in cases {
-        let err = decode_op_node(op.as_wire(), src, Some(&params)).unwrap_err();
-        assert!(err.contains(want), "{op:?}: {err:?} does not name {want:?}");
+    for (op, want) in cases {
+        let mut c = Circuit::default();
+        let input = c.push(scan(7), &[]).unwrap();
+        assert_eq!(c.push(op.clone(), &[input]).unwrap_err(), want);
+        assert_eq!(c.nodes().len(), 1, "a refused push appends nothing");
+        let decoded = Circuit::decode(&cell(&[(scan(7), &[]), (op, &[0])])).unwrap_err();
+        assert_eq!(decoded, format!("circuit: {want}"));
     }
-    assert!(decode_op_node(Opcode::ScanDelta.as_wire(), None, None)
-        .unwrap_err()
-        .contains("missing source_table"));
-    let unbounded = OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None };
-    assert_eq!(encode_op_node(&unbounded), (Opcode::ScanDelta, Some(7), None));
 }
 
 /// The reduce output key: the source PK list keys on itself, and so does a
@@ -370,77 +461,71 @@ fn range_rel_predicates_and_converse() {
 #[test]
 fn push_refuses_an_arity_mismatch_and_a_forward_input() {
     let mut c = Circuit::default();
-    let scan = c
-        .push(
-            OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
-            NodeInputs::Source,
-        )
-        .unwrap();
+    let scan = c.push(scan(7), &[]).unwrap();
     assert_eq!(scan, 0);
     assert_eq!(
-        c.push(OpNode::Union, NodeInputs::Unary(scan)).unwrap_err(),
+        c.push(OpNode::Union, &[scan]).unwrap_err(),
         "node's inputs do not match its operator's arity"
     );
     assert_eq!(
-        c.push(OpNode::Negate, NodeInputs::Unary(1)).unwrap_err(),
+        c.push(OpNode::Negate, &[1]).unwrap_err(),
         "a node's input is not an earlier node"
     );
     assert_eq!(
-        c.push(OpNode::Negate, NodeInputs::Unary(scan)),
+        c.push(OpNode::Negate, &[scan]),
         Ok(1),
         "an input naming an earlier node is accepted"
     );
     assert_eq!(c.nodes().len(), 2, "a refused push appends nothing");
+    assert_eq!(c.nodes()[1].inputs(), [scan]);
+    assert_eq!(c.nodes()[0].inputs(), [] as [NodeId; 0]);
 
-    // Slot 1 is filled solely by a binary join: a forged bundle filling it on a
-    // reduce would hand it a delta register with no `Integrate` behind it.
+    // Slot 1 is filled solely by a binary operator.
     let reduce = OpNode::Reduce {
         group_cols: vec![0],
         agg: vec![AggDescriptor::COUNT_STAR],
         global_ground: false,
     };
     assert_eq!(
-        c.push(reduce, NodeInputs::Binary { a: 0, b: 1 }).unwrap_err(),
+        c.push(reduce, &[0, 1]).unwrap_err(),
         "node's inputs do not match its operator's arity"
     );
 }
 
-/// The client's id substitution moves every relation a circuit names: each
-/// scan's source and each scatter key's route.
+/// A circuit's sources are its scans', one per scan: the client's id substitution
+/// moves each, and a source scanned twice is named twice.
 #[test]
-fn sources_mut_yields_every_named_relation() {
+fn sources_are_the_scans_sources() {
     let mut c = Circuit::default();
-    let scan = c
-        .push(
-            OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
-            NodeInputs::Source,
-        )
-        .unwrap();
-    let scatter = c.push(sample(Opcode::MapReindex), NodeInputs::Unary(scan)).unwrap();
-    let aux = OpNode::Map(MapKind::Reindex {
-        keep: vec![],
-        key: vec![(0, TypeCode::I64)],
-        role: ReindexRole::Auxiliary,
-        nulls: NullKeys::Keep,
-    });
-    c.push(aux, NodeInputs::Unary(scatter)).unwrap();
-    assert_eq!(c.sources_mut().map(|s| *s).collect::<Vec<_>>(), [7, 4]);
+    let a = c.input_delta(7, crate::ReadBound::None);
+    let b = c.input_delta(9, crate::ReadBound::None);
+    let again = c.input_delta(7, crate::ReadBound::None);
+    let ab = c.union(a, b);
+    c.union(ab, again);
+    assert_eq!(c.sources().collect::<Vec<_>>(), [7, 9, 7]);
+    for source in c.sources_mut() {
+        *source += 100;
+    }
+    assert_eq!(c.sources().collect::<Vec<_>>(), [107, 109, 107]);
 }
 
-/// A row's slots round-trip through `NodeInputs`, and a slot 1 filled behind an
-/// empty slot 0 is no operator's wiring.
+/// A reduce over no group columns owes its ground row behind an exchange and not
+/// as each worker's local fold; a grouped one never does.
 #[test]
-fn from_slots_is_to_slots_inverse_and_refuses_a_trailing_slot() {
-    for inputs in [
-        NodeInputs::Source,
-        NodeInputs::Unary(3),
-        NodeInputs::Binary { a: 1, b: 2 },
-    ] {
-        assert_eq!(NodeInputs::from_slots(inputs.to_slots()), Ok(inputs));
-    }
+fn the_reduce_builders_derive_the_ground_row() {
+    let ground = |c: &Circuit, id: NodeId| match c.nodes()[id].op {
+        OpNode::Reduce { global_ground, .. } => global_ground,
+        ref op => panic!("{op:?}"),
+    };
+    let mut c = Circuit::default();
+    let input = c.input_delta(7, crate::ReadBound::None);
+    let aggs = [AggDescriptor::COUNT_STAR];
+    let global = c.reduce_multi(input, &[], &aggs);
+    let grouped = c.reduce_multi(input, &[1], &aggs);
+    let local = c.reduce_multi_local(input, &[], &aggs);
     assert_eq!(
-        NodeInputs::from_slots([None, Some(0)]).unwrap_err(),
-        "node's inputs do not match its operator's arity"
+        [ground(&c, global), ground(&c, grouped), ground(&c, local)],
+        [true, false, false]
     );
 }
 

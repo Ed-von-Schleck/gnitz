@@ -298,6 +298,12 @@ impl Program {
         self.regs[reg.at()].fold
     }
 
+    /// How many instructions run an op `is` holds of.
+    #[cfg(test)]
+    pub(in crate::query) fn count_ops(&self, is: impl Fn(&Op) -> bool) -> usize {
+        self.instructions.iter().filter(|i| is(&i.op)).count()
+    }
+
     /// True iff some instruction trims the delta to this worker's own rows, so
     /// the result is a slice rather than a copy of what every worker computes.
     pub(in crate::query) fn trims_per_worker(&self) -> bool {

@@ -592,13 +592,14 @@ fn test_drop_view_removes_directory() {
 
     // A view needs a base table to reference.
     let base_cols = vec![col_def("id", TypeCode::U64)];
-    engine.create_table("public.base", &base_cols, &[0]).unwrap();
+    let base = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // Register a view via the raw system-table path.
-    // Column records must precede the VIEW_TAB row (hook invariant).
+    // Column records and the circuit must precede the VIEW_TAB row (hook invariant).
     let vid = engine.next_id;
     let view_cols = vec![col_def("id", TypeCode::U64)];
     engine.write_column_records(vid, &view_cols).unwrap();
+    write_identity_circuit(&mut engine, vid, base, gnitz_wire::ReadBound::None);
 
     let batch = build_view_tab_row(vid, "myview");
     engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
@@ -630,7 +631,7 @@ fn test_drop_view_removes_directory() {
 
 // ── test_drop_view_cascades_columns_and_circuit_rows ─────────────────
 // DROP VIEW retracts only the VIEW_TAB row; the expanded cascade must clear both
-// the view's column rows and its circuit rows.
+// the view's column rows and its circuit row.
 
 #[test]
 fn test_drop_view_cascades_columns_and_circuit_rows() {
@@ -641,9 +642,9 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
         .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
 
-    // Baseline: system + base-table column rows; no circuit rows yet.
+    // Baseline: system + base-table column rows; no circuit row yet.
     let base_cols = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    let base_nodes = count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor());
+    let base_circuits = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_id;
@@ -659,8 +660,8 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
         "view column rows must be present before drop"
     );
     assert!(
-        count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor()) > base_nodes,
-        "circuit node rows must be present before drop"
+        count_records(engine.sys_relation(SysFamily::Circuit).cursor()) > base_circuits,
+        "the circuit row must be present before drop"
     );
 
     // Drop the view: the VIEW_TAB -1 cascade must retract both families.
@@ -672,8 +673,8 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
         "sys_columns must return to baseline after drop_view (column cascade)"
     );
     assert_eq!(
-        count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor()),
-        base_nodes,
+        count_records(engine.sys_relation(SysFamily::Circuit).cursor()),
+        base_circuits,
         "circuit rows must return to baseline after drop_view (circuit cascade)"
     );
 
@@ -1044,10 +1045,10 @@ fn view_drop_retracts_its_segments() {
     engine.submit_retraction(SysFamily::View, v).unwrap();
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
-    assert_eq!(families, [SysFamily::View, SysFamily::CircuitNodes, SysFamily::Column]);
+    assert_eq!(families, [SysFamily::View, SysFamily::Circuit, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry.has_id(id));
-        assert_eq!(rows_under(&engine, SysFamily::CircuitNodes, id), 0);
+        assert_eq!(rows_under(&engine, SysFamily::Circuit, id), 0);
         assert_eq!(rows_under(&engine, SysFamily::Column, id), 0);
     }
 

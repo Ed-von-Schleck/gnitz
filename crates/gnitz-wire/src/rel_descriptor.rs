@@ -65,7 +65,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         let index_count = u16::try_from(self.indexes.len()).expect("a relation's index count fits a u16");
         let mut w = Writer::new();
-        w.u8(self.class.as_wire())
+        w.put(&self.class)
             .bool(self.pk_repeats)
             .bool(self.serial)
             .u16(index_count);
@@ -78,8 +78,7 @@ impl RelDescriptorBlob {
 
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         decode_all(buf, "rel descriptor", |r| {
-            let class = r.u8()?;
-            let class = RelClass::from_wire(class).ok_or_else(|| format!("unknown relation class {class}"))?;
+            let class = r.get()?;
             let pk_repeats = r.bool()?;
             let serial = r.bool()?;
             let indexes = (0..r.u16()?)

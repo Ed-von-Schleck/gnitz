@@ -1,9 +1,9 @@
 use super::*;
-use crate::test_support::{circuit_nodes_batch, scanning_circuit};
+use crate::test_support::{circuit_batch, circuit_cell_batch, scanning_circuit};
 
-/// `view`'s CIRCUIT_NODES batch for a circuit scanning each of `sources`.
+/// `view`'s CIRCUIT_TAB batch for a circuit scanning each of `sources`.
 fn scans(view: u64, sources: &[u64]) -> Batch {
-    circuit_nodes_batch(view, &scanning_circuit(sources))
+    circuit_batch(view, &scanning_circuit(sources))
 }
 
 fn set(ids: &[u64]) -> FxHashSet<u64> {
@@ -24,7 +24,7 @@ fn the_closures_walk_both_directions_transitively() {
         (13, &[11, 12]),
         (21, &[20]),
     ] {
-        dag.apply_circuit_delta(&scans(view, sources));
+        dag.apply_circuit_delta(&scans(view, sources)).unwrap();
     }
 
     assert!(dag.source_closure(vec![]).is_empty());
@@ -41,52 +41,40 @@ fn the_closures_walk_both_directions_transitively() {
     assert!(dag.dependent_closure(vec![21]).is_empty());
 }
 
-/// Only a `ScanDelta` row is an edge, and a `+1` links each `(view, source)`
-/// pair once however many scans name it. A `-1` forgets the view, and both are
-/// no-ops when repeated — including a compensation's `-1` whose `+1` never
-/// reached the map.
+/// A `+1` links each `(view, source)` pair once however many scans name it. A
+/// `-1` forgets the view, and both are no-ops when repeated — including a
+/// compensation's `-1` whose `+1` never reached the map.
 #[test]
 fn the_dep_map_follows_circuit_deltas_idempotently() {
-    // Raw rows, not a `Circuit`: a sink carrying a `source_table` is a shape no
-    // circuit encodes to.
-    let mut bb = gnitz_zset::repr::BatchBuilder::new(crate::catalog::SysFamily::CircuitNodes.schema());
-    for (node_id, (opcode, source)) in [
-        (gnitz_wire::Opcode::ScanDelta, 1),
-        (gnitz_wire::Opcode::ScanDelta, 1),
-        (gnitz_wire::Opcode::ScanDelta, 2),
-        (gnitz_wire::Opcode::IntegrateSink, 3),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let row = gnitz_wire::sys_rows::CircuitNodeRow {
-            view_id: 5,
-            node_id: node_id as u64,
-            opcode: opcode.as_wire(),
-            source_table: Some(source),
-            inputs: [None; 2],
-            params: None,
-        };
-        gnitz_wire::sys_rows::write_circuit_node_row(&mut bb, &row, 1);
-    }
-    let plus = bb.finish();
+    let plus = scans(5, &[1, 1, 2]);
     let minus = plus.clone().negated();
 
     let mut dag = DagEngine::default();
-    dag.apply_circuit_delta(&minus);
+    dag.apply_circuit_delta(&minus).unwrap();
     assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
 
     for _ in 0..2 {
-        dag.apply_circuit_delta(&plus);
+        dag.apply_circuit_delta(&plus).unwrap();
         assert_eq!(dag.sources_of(5), [1, 2]);
         assert_eq!(dag.dependents_of(1), [5]);
         assert_eq!(dag.dependents_of(2), [5]);
-        assert!(!dag.is_scanned(3), "a non-ScanDelta node is no edge");
     }
     for _ in 0..2 {
-        dag.apply_circuit_delta(&minus);
+        dag.apply_circuit_delta(&minus).unwrap();
         assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
     }
+}
+
+/// A cell that does not decode is the hook's error, and a circuit that scans
+/// nothing leaves no entry behind.
+#[test]
+fn an_undecodable_cell_is_refused_and_a_scanless_circuit_links_nothing() {
+    let mut dag = DagEngine::default();
+    let err = dag.apply_circuit_delta(&circuit_cell_batch(5, &[0xff])).unwrap_err();
+    assert!(err.starts_with("view 5: circuit: truncated"), "{err}");
+    dag.apply_circuit_delta(&circuit_batch(6, &gnitz_wire::Circuit::default()))
+        .unwrap();
+    assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
 }
 
 /// One `-1` unlinks only its own view, leaving a sibling over the same source
@@ -96,11 +84,11 @@ fn a_retraction_unlinks_only_its_own_view() {
     let (five, six) = (scans(5, &[1]), scans(6, &[1]));
 
     let mut dag = DagEngine::default();
-    dag.apply_circuit_delta(&five);
-    dag.apply_circuit_delta(&six);
+    dag.apply_circuit_delta(&five).unwrap();
+    dag.apply_circuit_delta(&six).unwrap();
     assert_eq!(dag.dependents_of(1), [5, 6]);
 
-    dag.apply_circuit_delta(&five.negated());
+    dag.apply_circuit_delta(&five.negated()).unwrap();
     assert_eq!(dag.dependents_of(1), [6]);
     assert!(dag.sources_of(5).is_empty());
     assert_eq!(dag.sources_of(6), [1]);

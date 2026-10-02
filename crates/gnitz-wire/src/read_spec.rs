@@ -2,13 +2,12 @@
 //! fold). The master routes a request blob by `peek_bound`; the worker's `decode`
 //! is the trust boundary.
 
-use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_cols, write_compute_map};
-use crate::circuit::{read_order_keys, write_order_keys, AggDescriptor, ComputeMap};
+use crate::circuit::{AggDescriptor, ComputeMap};
 use std::ops::Range;
 
-use crate::codec::{decode_all, Reader, Writer};
-use crate::range::{read_key_range, write_key_range, KeyRange};
-use crate::MAX_PK_BYTES;
+use crate::codec::{decode_all, Reader, Wire, Writer};
+use crate::range::KeyRange;
+use crate::{MAX_COLUMNS, MAX_PK_BYTES};
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -27,6 +26,33 @@ pub struct OrderKey {
     pub col: u16,
     pub desc: bool,
     pub nulls_first: bool,
+}
+
+const ORDER_DESC: u8 = 1 << 0;
+const ORDER_NULLS_FIRST: u8 = 1 << 1;
+
+/// The column, then a flag byte; an unknown flag bit is a refusal.
+impl Wire for OrderKey {
+    fn write(&self, w: &mut Writer) {
+        let mut flags = 0u8;
+        if self.desc {
+            flags |= ORDER_DESC;
+        }
+        if self.nulls_first {
+            flags |= ORDER_NULLS_FIRST;
+        }
+        w.u16(self.col).u8(flags);
+    }
+
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        let col = r.u16()?;
+        let flags = r.flags(ORDER_DESC | ORDER_NULLS_FIRST)?;
+        Ok(OrderKey {
+            col,
+            desc: flags & ORDER_DESC != 0,
+            nulls_first: flags & ORDER_NULLS_FIRST != 0,
+        })
+    }
 }
 
 /// The fold sink's per-worker hash-fold. `aggs` is the physical reduce layout,
@@ -192,57 +218,41 @@ impl ReadSpec {
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
         let mut w = Writer::with_capacity(64 + self.predicate.len() + keys + map);
 
-        write_read_bound(&mut w, &self.bound);
-
-        w.bytes32(&self.predicate);
+        w.put(&self.bound).bytes32(&self.predicate);
 
         match &self.sink.map {
-            Some(m) => {
-                w.bool(true);
-                write_compute_map(&mut w, m);
-            }
-            None => {
-                w.bool(false);
-            }
-        }
+            Some(m) => w.bool(true).put(m),
+            None => w.bool(false),
+        };
 
         match &self.sink.kind {
-            SinkKind::Rows { order, limit_k } => {
-                w.u8(SINK_ROWS).u64(*limit_k);
-                write_order_keys(&mut w, order);
-            }
-            SinkKind::Fold(agg) => {
-                w.u8(SINK_FOLD);
-                write_cols(&mut w, &agg.group_cols);
-                write_aggs(&mut w, &agg.aggs);
-            }
-        }
+            SinkKind::Rows { order, limit_k } => w.u8(SINK_ROWS).u64(*limit_k).list(order),
+            SinkKind::Fold(agg) => w.u8(SINK_FOLD).list(&agg.group_cols).list(&agg.aggs),
+        };
         w.into_vec()
     }
 
     /// Decode at the trust boundary. A malformed frame is an `Err`.
     pub fn decode(buf: &[u8]) -> Result<ReadSpec, String> {
         decode_all(buf, "read_spec", |r| {
-            let bound = read_read_bound(r)?;
+            let bound = r.get()?;
 
             let predicate = r.bytes32()?.to_vec();
 
-            let map = if r.bool()? { Some(read_compute_map(r)?) } else { None };
+            let map = if r.bool()? { Some(r.get()?) } else { None };
 
             let kind = match r.u8()? {
                 SINK_ROWS => {
                     let limit_k = r.u64()?;
-                    let order = read_order_keys(r)?;
+                    let order = r.list("order keys", MAX_ORDER_KEYS)?;
                     if limit_k == 0 && !order.is_empty() {
                         return Err("an order key without a cut".into());
                     }
                     SinkKind::Rows { order, limit_k }
                 }
                 SINK_FOLD => {
-                    // Both counted sections take the circuit codec's caps and
-                    // domain checks.
-                    let group_cols = read_cols(r)?;
-                    let aggs = read_aggs(r)?;
+                    let group_cols = r.list("column list", MAX_COLUMNS)?;
+                    let aggs = r.list("aggregate list", MAX_COLUMNS)?;
                     SinkKind::Fold(AggReadSpec { group_cols, aggs })
                 }
                 other => return Err(format!("unknown sink tag {other}")),
@@ -273,42 +283,41 @@ fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
     Ok((stride, keys))
 }
 
-/// Splice a [`ReadBound`] into a larger blob: its kind tag, then that kind's
-/// layout. [`peek_bound`] reads the same layout.
-pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
-    match b {
-        ReadBound::None => {
-            w.u8(BOUND_NONE);
-        }
-        ReadBound::Range(range) => {
-            w.u8(BOUND_RANGE);
-            write_key_range(w, range);
-        }
-        ReadBound::PkSet(keys) => {
-            w.u8(BOUND_PK_SET);
-            write_pk_set(w, keys.stride(), keys.as_bytes());
+/// The kind tag, then that kind's layout. [`peek_bound`] reads the same layout.
+impl Wire for ReadBound {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            ReadBound::None => {
+                w.u8(BOUND_NONE);
+            }
+            ReadBound::Range(range) => {
+                w.u8(BOUND_RANGE).put(range);
+            }
+            ReadBound::PkSet(keys) => {
+                w.u8(BOUND_PK_SET);
+                write_pk_set(w, keys.stride(), keys.as_bytes());
+            }
         }
     }
-}
 
-/// Read a [`ReadBound`] at the trust boundary — the reader dual of
-/// [`write_read_bound`]. A malformed bound is an `Err`.
-pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
-    Ok(match r.u8()? {
-        BOUND_NONE => ReadBound::None,
-        BOUND_RANGE => ReadBound::Range(read_key_range(r)?),
-        BOUND_PK_SET => {
-            let (stride, bytes) = read_pk_set(r)?;
-            if !strictly_ascending(bytes, stride) {
-                return Err("PkSet keys are not strictly ascending".to_string());
+    /// At the trust boundary: a malformed bound is an `Err`.
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        Ok(match r.u8()? {
+            BOUND_NONE => ReadBound::None,
+            BOUND_RANGE => ReadBound::Range(r.get()?),
+            BOUND_PK_SET => {
+                let (stride, bytes) = read_pk_set(r)?;
+                if !strictly_ascending(bytes, stride) {
+                    return Err("PkSet keys are not strictly ascending".to_string());
+                }
+                ReadBound::PkSet(PkKeys {
+                    stride: stride as u8,
+                    bytes: bytes.to_vec(),
+                })
             }
-            ReadBound::PkSet(PkKeys {
-                stride: stride as u8,
-                bytes: bytes.to_vec(),
-            })
-        }
-        other => return Err(format!("unknown bound kind {other}")),
-    })
+            other => return Err(format!("unknown bound kind {other}")),
+        })
+    }
 }
 
 /// The bound of an encoded request that routing reads, without decoding the
@@ -349,7 +358,7 @@ impl PkSetPeek<'_> {
 pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
     let mut r = Reader::new(blob);
     match r.u8().ok()? {
-        BOUND_RANGE => read_key_range(&mut r).ok().map(BoundPeek::Range),
+        BOUND_RANGE => r.get().ok().map(BoundPeek::Range),
         BOUND_PK_SET => {
             let start = r.pos();
             let (stride, keys) = read_pk_set(&mut r).ok()?;

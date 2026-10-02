@@ -11,7 +11,7 @@ fn system_table_keys_are_valid_for_their_columns() {
         assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
         crate::validate_pk_tuple(pk, cols.len(), PK_LIST_MAX_COLS, |c| {
             let col = &cols[c as usize];
-            (col.type_code, col.nullable)
+            (col.type_code, false)
         })
         .unwrap_or_else(|rule| panic!("{name}: {}", rule.for_role(crate::PkListRole::PrimaryKey)));
     }
@@ -192,17 +192,15 @@ fn table_props_validate_refuses_what_the_pk_cannot_carry() {
 /// The system-shape digest moves with every axis of a family's stored identity.
 #[test]
 fn fold_family_separates_every_stored_axis() {
-    const A: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::U64, false)];
-    const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("w", TypeCode::U64, false)];
-    const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::I64, false)];
-    const NULLABLE: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::U64, true)];
+    const A: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::U64)];
+    const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64), col("w", TypeCode::U64)];
+    const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::I64)];
     let base = fold_family(0, &fam(1, "_t", A, LEADING_COL_PK));
     let others = [
         fam(2, "_t", A, LEADING_COL_PK),
         fam(1, "_u", A, LEADING_COL_PK),
         fam(1, "_t", RENAMED, LEADING_COL_PK),
         fam(1, "_t", RETYPED, LEADING_COL_PK),
-        fam(1, "_t", NULLABLE, LEADING_COL_PK),
         fam(1, "_t", A, LEADING_PAIR_PK),
     ];
     for (i, other) in others.iter().enumerate() {

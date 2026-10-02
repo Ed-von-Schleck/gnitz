@@ -1,8 +1,7 @@
 use super::fixtures::*;
 use super::*;
 use crate::test_support::{
-    identity_circuit, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, negate_chain, pk_only_schema,
-    u64_pk_schema,
+    identity_circuit, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
 };
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
@@ -71,15 +70,16 @@ fn a_circuit_no_plan_can_be_carved_from_is_rejected() {
             },
             "operand is produced outside this plan",
         ),
-        // A side relays a batch, and an integral is a store.
+        // So is the delta a post-phase join would integrate.
         (
             |c: &mut Circuit| {
                 let a = scan(c, 10);
-                let t = c.integrate_trace(a);
-                let s = c.shard(t, &[0]);
-                c.sink(s);
+                let n = c.negate(a);
+                let s = c.shard(n, &[0]);
+                let j = c.join(s, n, gnitz_wire::JoinKind::Equi, false);
+                c.sink(j);
             },
-            "operand port takes a delta, not an integral",
+            "operand is produced outside this plan",
         ),
         (
             |c: &mut Circuit| {
@@ -109,21 +109,6 @@ fn a_circuit_no_plan_can_be_carved_from_is_rejected() {
         );
         assert_eq!(rejection(compiled), guard);
     }
-}
-
-/// The node cap is what keeps every downstream `u16` id — registers, tables —
-/// in range without any per-plan arithmetic.
-#[test]
-fn a_circuit_over_the_node_limit_is_rejected() {
-    let chain = |n: usize| LoadedCircuit::new(negate_chain(10, n));
-    assert_eq!(
-        rejection(chain(MAX_CIRCUIT_NODES + 1)),
-        "circuit exceeds the node limit"
-    );
-    assert!(
-        chain(MAX_CIRCUIT_NODES).is_ok(),
-        "exactly MAX_CIRCUIT_NODES is accepted"
-    );
 }
 
 /// The sink must match the view schema's physical layout, not just its width.
@@ -200,7 +185,7 @@ fn a_side_relays_only_what_is_not_already_in_place() {
             .map(|(source, (_, mid, cols))| {
                 let mut tip = scan(&mut c, source);
                 if let Some(op) = mid {
-                    tip = c.push(op.clone(), NodeInputs::Unary(tip)).unwrap();
+                    tip = c.push(op.clone(), &[tip]).unwrap();
                 }
                 c.shard(tip, cols)
             })
@@ -263,7 +248,7 @@ fn global_circuit(op: &OpNode, shard: Option<&[u32]>) -> Circuit {
     if let Some(cols) = shard {
         tip = c.shard(tip, cols);
     }
-    let out = c.push(op.clone(), NodeInputs::Unary(tip)).unwrap();
+    let out = c.push(op.clone(), &[tip]).unwrap();
     c.sink(out);
     c
 }
@@ -343,6 +328,57 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     assert!(!split(shared, keyed, 4), "a shard read twice");
 }
 
+const OFF_GROUP_EXCHANGE: &str = "an exchange in front of a reduce or top-N shards on other than its group columns";
+
+/// The view behind an exchange registers under the key its reduce or top-N stamps
+/// over the group columns, so an exchange on anything else places rows where no
+/// read looks for them.
+#[test]
+fn an_exchange_off_the_group_columns_is_rejected() {
+    let source = Source::from(make_schema_u64_i64());
+    let grouped = |group_cols: Vec<u32>| OpNode::Reduce {
+        group_cols,
+        agg: vec![AggDescriptor::COUNT_STAR],
+        global_ground: false,
+    };
+    let top = |group_cols: Vec<u32>| OpNode::TopN {
+        group_cols,
+        order: vec![gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false }],
+        limit: 10,
+        offset: 5,
+    };
+    let compile = |op: OpNode, shard: &[u32]| {
+        let loaded = loaded(global_circuit(&op, Some(shard)));
+        let carve = loaded.carve().unwrap();
+        build_plan(
+            &loaded,
+            &carve.post,
+            &sources([(10, source)]),
+            &mut StateLayout::default(),
+            true,
+            &[Seed {
+                shard: carve.sides[0].shard,
+                schema: source.schema,
+                partials: false,
+            }],
+            PlanOut::Node(loaded.sink().unwrap()),
+        )
+        .map(|built| built.plan)
+    };
+    for (op, shard) in [
+        (grouped(vec![1]), &[0][..]),
+        (grouped(vec![0, 1]), &[0]),
+        (grouped(vec![]), &[1]),
+        (top(vec![1]), &[0]),
+        (top(vec![]), &[1]),
+    ] {
+        assert_eq!(rejection(compile(op.clone(), shard)), OFF_GROUP_EXCHANGE, "{op:?}");
+    }
+    for (op, shard) in [(grouped(vec![1]), &[1][..]), (top(vec![1]), &[1])] {
+        assert!(compile(op.clone(), shard).is_ok(), "{op:?}");
+    }
+}
+
 /// A global aggregate's ground row is seeded once per copy of the result: on each
 /// worker holding the whole input, else on the one worker the empty-keyed shard
 /// sends every row to.
@@ -365,10 +401,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
     );
     // The row's owner is elected from the empty group key, so a shard keyed on
     // anything else would route the input to one worker and elect another.
-    assert_eq!(
-        rejection(seeds(Some(&[1]), keyed, Slot::SOLO)),
-        "reduce: a global aggregate under a keyed exchange shard"
-    );
+    assert_eq!(rejection(seeds(Some(&[1]), keyed, Slot::SOLO)), OFF_GROUP_EXCHANGE);
 
     let probe = make_batch(&keyed.schema, &[(1, 1, 1)]);
     let (seeded, receives): (Vec<bool>, Vec<bool>) = (0..4)

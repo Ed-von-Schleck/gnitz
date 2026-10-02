@@ -11,15 +11,14 @@ use crate::{ColType, TypeCode, WireProbeMode};
 pub struct WireSysCol {
     pub name: &'static str,
     pub type_code: TypeCode,
-    pub nullable: bool,
 }
 
 /// Terse `WireSysCol` constructor so the column tables read as one line per
 /// column. `pub(crate)` — internal to the wire crate;
 /// not part of the public surface. `const` so it is callable in the `pub const`
 /// table initializers (visibility does not affect const-eval).
-pub(crate) const fn col(name: &'static str, type_code: TypeCode, nullable: bool) -> WireSysCol {
-    WireSysCol { name, type_code, nullable }
+pub(crate) const fn col(name: &'static str, type_code: TypeCode) -> WireSysCol {
+    WireSysCol { name, type_code }
 }
 
 /// Index of the column named `name` in `cols`, resolved at compile time.
@@ -75,8 +74,8 @@ pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
 /// The primary key of every system table whose key is its single leading column.
 pub(crate) const LEADING_COL_PK: &[u32] = &[0];
 
-/// The primary key of every system table keyed by its two leading columns:
-/// COL_TAB's `(owner_id, col_idx)` and the circuit family's `(view_id, node_id)`.
+/// The primary key of a system table keyed by its two leading columns: COL_TAB's
+/// `(owner_id, col_idx)`.
 pub(crate) const LEADING_PAIR_PK: &[u32] = &[0, 1];
 
 /// The two halves of a `LEADING_PAIR_PK` key, off the widened `u128` a PK
@@ -87,96 +86,74 @@ pub const fn unpack_pair_pk(pk: u128) -> (u64, u64) {
     ((pk >> 64) as u64, pk as u64)
 }
 
-pub(crate) const SCHEMA_TAB_COLS: &[WireSysCol] = &[
-    col("schema_id", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
-];
+pub(crate) const SCHEMA_TAB_COLS: &[WireSysCol] = &[col("schema_id", TypeCode::U64), col("name", TypeCode::String)];
 
 pub(crate) const TABLE_TAB_COLS: &[WireSysCol] = &[
-    col("table_id", TypeCode::U64, false),
-    col("schema_id", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
+    col("table_id", TypeCode::U64),
+    col("schema_id", TypeCode::U64),
+    col("name", TypeCode::String),
     // Packed PK column list (`pack_pk_cols`).
-    col("pk_col_idx", TypeCode::U64, false),
+    col("pk_col_idx", TypeCode::U64),
     // See `TableProps::pack` for the bit layout.
-    col("flags", TypeCode::U64, false),
+    col("flags", TypeCode::U64),
 ];
 
 pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64, false),
-    col("schema_id", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
+    col("view_id", TypeCode::U64),
+    col("schema_id", TypeCode::U64),
+    col("name", TypeCode::String),
     // Packed view-PK column list (`pack_pk_cols`).
-    col("pk_col_idx", TypeCode::U64, false),
+    col("pk_col_idx", TypeCode::U64),
     // `ViewProps::row_words`: `WITH (capacity = …)` in bytes, `0` absent.
-    col("capacity_bytes", TypeCode::U64, false),
+    col("capacity_bytes", TypeCode::U64),
     // `ViewProps::row_words`: `WITH (delta = …)` in bytes, `0` absent.
-    col("delta_bytes", TypeCode::U64, false),
+    col("delta_bytes", TypeCode::U64),
     // The user view this row is an internal chain segment of; `0` is a user
     // view. A column rather than a name prefix, because the precheck can
     // validate it against a forger. Appended, not inserted: the `RELTAB_*`
     // constants below pin `name` to the same slot in TABLE_TAB and VIEW_TAB.
-    col("owner_view_id", TypeCode::U64, false),
+    col("owner_view_id", TypeCode::U64),
     // See `ViewFlags` for the bit layout.
-    col("flags", TypeCode::U64, false),
+    col("flags", TypeCode::U64),
 ];
 
 // Keyed by the compound `(owner_id, col_idx)` — the pair *is* a column record's
 // identity.
 pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
-    col("owner_id", TypeCode::U64, false),
-    col("col_idx", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
-    col("type_code", TypeCode::U64, false),
-    col("is_nullable", TypeCode::U64, false),
-    col("fk_table_id", TypeCode::U64, false),
-    col("fk_col_idx", TypeCode::U64, false),
+    col("owner_id", TypeCode::U64),
+    col("col_idx", TypeCode::U64),
+    col("name", TypeCode::String),
+    col("type_code", TypeCode::U64),
+    col("is_nullable", TypeCode::U64),
+    col("fk_table_id", TypeCode::U64),
+    col("fk_col_idx", TypeCode::U64),
     // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
     // the record's `hidden` flag.
-    col("is_hidden", TypeCode::U64, false),
+    col("is_hidden", TypeCode::U64),
     // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
     // column type.
-    col("scale", TypeCode::U64, false),
+    col("scale", TypeCode::U64),
 ];
 
 pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
-    col("index_id", TypeCode::U64, false),
-    col("owner_id", TypeCode::U64, false),
+    col("index_id", TypeCode::U64),
+    col("owner_id", TypeCode::U64),
     // Holds `pack_pk_cols(&col_indices)` for every row (single- and
     // multi-column indexes alike); decoded via `unpack_pk_cols`.
-    col("source_col_idx", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
+    col("source_col_idx", TypeCode::U64),
+    col("name", TypeCode::String),
     // See `IndexProps::pack` for the bit layout. One word rather than a bool
     // column per property: the family is scanned whole by `DROP INDEX` and the
     // planner's name/column probe, so a second `U64` would widen every row for
     // one bit.
-    col("flags", TypeCode::U64, false),
+    col("flags", TypeCode::U64),
 ];
 
-pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
-    col("seq_id", TypeCode::U64, false),
-    col("next_val", TypeCode::U64, false),
-];
+pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[col("seq_id", TypeCode::U64), col("next_val", TypeCode::U64)];
 
-// The circuit table uses a real compound primary key `(view_id, node_id)`
-// instead of hand-packing both halves into one U128 column. PK = columns [0, 1].
-//
-// `opcode` and `source_table` stay scannable columns, so a node's scan edge reads
-// without the `params` codec. `input_0`/`input_1` are
-// port-indexed, so the column name *is* the port; keeping them out of `params`
-// leaves a parameterless node with no blob cell at all.
-pub(crate) const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64, false),
-    col("node_id", TypeCode::U64, false),
-    col("opcode", TypeCode::U64, false),
-    col("source_table", TypeCode::U64, true),
-    col("input_0", TypeCode::U64, true),
-    col("input_1", TypeCode::U64, true),
-    // The node's per-opcode parameters (`encode_op_node`); NULL for an operator
-    // that carries none.
-    col("params", TypeCode::Blob, true),
-];
+// One row per view: its whole circuit, as `Circuit::encode` lays it out.
+pub(crate) const CIRCUIT_TAB_COLS: &[WireSysCol] = &[col("view_id", TypeCode::U64), col("circuit", TypeCode::Blob)];
 
 // ---------------------------------------------------------------------------
 // Catalog column positions
@@ -227,11 +204,7 @@ pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in_fam(COL_TAB, "is_nullable
 pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in_fam(COL_TAB, "is_hidden");
 pub const COLTAB_PAY_SCALE: usize = pay_index_in_fam(COL_TAB, "scale");
 
-pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "opcode");
-pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "source_table");
-pub const CIRCNODES_PAY_INPUT_0: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "input_0");
-pub const CIRCNODES_PAY_INPUT_1: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "input_1");
-pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "params");
+pub const CIRCTAB_PAY_CIRCUIT: usize = pay_index_in_fam(CIRCUIT_TAB, "circuit");
 
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
@@ -257,9 +230,7 @@ const fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
 }
 
 /// FNV-1a over one family's stored identity: its id, its shard directory
-/// (`name`), each column's name/type/nullability, and its key columns. Renaming
-/// a family orphans its shards and boots on an empty store, which is why `name`
-/// is in here.
+/// (`name`), each column's name and type, and its key columns.
 const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
     let (cols, pk) = (f.cols, f.pk_cols);
     h = (h ^ f.id).wrapping_mul(FNV_PRIME);
@@ -268,7 +239,6 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
     while i < cols.len() {
         h = fnv_bytes(h, cols[i].name.as_bytes());
         h = (h ^ cols[i].type_code as u64).wrapping_mul(FNV_PRIME);
-        h = (h ^ cols[i].nullable as u64).wrapping_mul(FNV_PRIME);
         i += 1;
     }
     let mut k = 0;
@@ -297,18 +267,13 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
         h = fold_family(h, &SYS_FAMILIES[i]);
         i += 1;
     }
-    h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(FNV_PRIME);
+    h = (h ^ crate::circuit::CIRCUIT_VERSION as u64).wrapping_mul(FNV_PRIME);
     h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(FNV_PRIME);
     h
 };
 
-/// Version of the compiled expression-program blob, whose layout and encoder
-/// live in `gnitz-expr`. It sits here because [`SYS_SCHEMA_DIGEST`] folds it in
-/// at `const` time and this crate cannot depend on that one.
-///
-/// Carried by no blob — each rides a slot of an already-versioned container.
-/// Bumping it rejects both carriers of a stale one: a stored
-/// `CIRCUIT_NODES.params` cell, and an old client's live `ReadSpec` predicate.
+/// Version of the compiled expression-program blob `gnitz-expr` lays out, folded
+/// into [`SYS_SCHEMA_DIGEST`].
 pub const EXPR_BLOB_VERSION: u8 = 7;
 
 // ---------------------------------------------------------------------------
@@ -321,7 +286,7 @@ pub const VIEW_TAB: u64 = 3;
 pub const COL_TAB: u64 = 4;
 pub const IDX_TAB: u64 = 5;
 pub const SEQ_TAB: u64 = 7;
-pub const CIRCUIT_NODES_TAB: u64 = 11;
+pub const CIRCUIT_TAB: u64 = 11;
 
 /// One system family's wire identity: the table id both sides address it by,
 /// its name, and the column shape they each build their schema type from.
@@ -347,7 +312,7 @@ pub const SYS_FAMILIES: &[WireSysFamily] = &[
     fam(COL_TAB, "_columns", COL_TAB_COLS, LEADING_PAIR_PK),
     fam(IDX_TAB, "_indices", IDX_TAB_COLS, LEADING_COL_PK),
     fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, LEADING_COL_PK),
-    fam(CIRCUIT_NODES_TAB, "_circuit_nodes", CIRCUIT_NODES_COLS, LEADING_PAIR_PK),
+    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, LEADING_COL_PK),
 ];
 
 // What `unpack_pair_pk`'s `>> 64` split is written against.

@@ -1,7 +1,6 @@
 use super::*;
 use crate::{
-    CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
-    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_TAB, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
+    CIRCTAB_PAY_CIRCUIT, CIRCUIT_TAB, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
     COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB, IDXTAB_PAY_FLAGS,
     IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
     SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
@@ -23,7 +22,6 @@ enum Val {
     U64(u64),
     Str(String),
     Bytes(Vec<u8>),
-    Null,
 }
 
 impl SysRowSink for Recorder {
@@ -39,9 +37,6 @@ impl SysRowSink for Recorder {
     }
     fn put_bytes(&mut self, b: &[u8]) {
         self.vals.push(Val::Bytes(b.to_vec()));
-    }
-    fn put_null(&mut self) {
-        self.vals.push(Val::Null);
     }
     fn end_row(&mut self) {
         self.closed = true;
@@ -177,111 +172,12 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(r.pk, [3]);
     assert_eq!(r.row(SCHEMA_TAB)[SCHEMATAB_PAY_NAME], Val::Str("public".into()));
 
-    // The circuit family: `view_id` leads the compound key, so the engine's
-    // per-view prefix seek reads it.
+    // The circuit family: one row per view, its whole circuit in one cell.
+    let mut circuit = crate::Circuit::default();
+    let scan = circuit.input_delta(31, crate::ReadBound::None);
+    circuit.sink(scan);
     let mut r = Recorder::default();
-    write_circuit_node_row(
-        &mut r,
-        &CircuitNodeRow {
-            view_id: 7,
-            node_id: 5,
-            opcode: 9,
-            source_table: Some(31),
-            inputs: [Some(4), Some(3)],
-            params: Some(&[0xAB, 0xCD]),
-        },
-        1,
-    );
-    assert_eq!(r.pk, [7, 5]);
-    let v = r.row(CIRCUIT_NODES_TAB);
-    assert_eq!(v[CIRCNODES_PAY_OPCODE], Val::U64(9));
-    assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::U64(31));
-    assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
-    assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::U64(3));
-    assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Bytes(vec![0xAB, 0xCD]));
-
-    // Every nullable column still takes its slot when absent, so an omitted
-    // `put_null` would shift every later value.
-    let mut r = Recorder::default();
-    write_circuit_node_row(
-        &mut r,
-        &CircuitNodeRow {
-            view_id: 7,
-            node_id: 5,
-            opcode: 9,
-            source_table: None,
-            inputs: [Some(4), None],
-            params: None,
-        },
-        1,
-    );
-    let v = r.row(CIRCUIT_NODES_TAB);
-    assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::Null);
-    assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
-    assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::Null);
-    assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Null);
-}
-
-/// Pushing each row `write_circuit_rows` would lay down rebuilds the circuit, and a
-/// row whose id skips the next index is refused.
-#[test]
-fn push_row_rebuilds_the_rows_and_refuses_a_gap() {
-    use crate::{encode_op_node, Circuit, NodeInputs, OpNode, Opcode};
-    let mut original = Circuit::default();
-    let scan = original
-        .push(
-            OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
-            NodeInputs::Source,
-        )
-        .unwrap();
-    let filter = original
-        .push(OpNode::Filter(vec![1, 2, 3]), NodeInputs::Unary(scan))
-        .unwrap();
-    original.push(OpNode::IntegrateSink, NodeInputs::Unary(filter)).unwrap();
-
-    let mut rebuilt = Circuit::default();
-    for (node_id, node) in original.nodes().iter().enumerate() {
-        let (opcode, source_table, params) = encode_op_node(&node.op);
-        let row = CircuitNodeRow {
-            view_id: 1,
-            node_id: node_id as u64,
-            opcode: opcode.as_wire(),
-            source_table,
-            inputs: node.inputs.to_slots(),
-            params: params.as_deref(),
-        };
-        rebuilt.push_row(&row).unwrap();
-    }
-    assert_eq!(rebuilt, original);
-
-    let gap = CircuitNodeRow {
-        view_id: 1,
-        node_id: 5,
-        opcode: Opcode::Negate.as_wire(),
-        source_table: None,
-        inputs: [Some(0), None],
-        params: None,
-    };
-    assert_eq!(
-        rebuilt.push_row(&gap).unwrap_err(),
-        "circuit node ids are not dense from 0"
-    );
-}
-
-/// A row's scan source is its source-table cell, on a scan alone.
-#[test]
-fn scan_source_is_a_scans_source_table_cell() {
-    use crate::Opcode;
-
-    let row = |opcode: Opcode, source_table| CircuitNodeRow {
-        view_id: 1,
-        node_id: 0,
-        opcode: opcode.as_wire(),
-        source_table,
-        inputs: [None, None],
-        params: None,
-    };
-    assert_eq!(row(Opcode::ScanDelta, Some(7)).scan_source(), Some(7));
-    assert_eq!(row(Opcode::IntegrateSink, Some(7)).scan_source(), None);
-    assert_eq!(row(Opcode::ScanDelta, None).scan_source(), None);
+    write_circuit_row(&mut r, 7, &circuit);
+    assert_eq!((r.pk.as_slice(), r.weight), (&[7][..], 1));
+    assert_eq!(r.row(CIRCUIT_TAB)[CIRCTAB_PAY_CIRCUIT], Val::Bytes(circuit.encode()));
 }

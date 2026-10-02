@@ -8,7 +8,7 @@ use gnitz_wire::Circuit;
 use gnitz_zset::schema::{Placement, Slot};
 
 pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
-    LoadedCircuit::new(circuit).expect("test circuit within the node limit")
+    LoadedCircuit(circuit)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].

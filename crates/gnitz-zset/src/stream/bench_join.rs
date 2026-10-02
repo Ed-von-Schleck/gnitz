@@ -469,7 +469,6 @@ fn join_range_dt_bench() {
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
         for shape in &RANGE_SHAPES {
             let schema = schema_for(shape.pk_types, p);
-            let n_eq = (shape.pk_types.len() - 1) as u8;
             let (delta_rows, trace_rows) = range_rows(shape);
             let delta = build(&schema, p, &delta_rows);
             for &rel in RangeRel::ALL {
@@ -481,7 +480,7 @@ fn join_range_dt_bench() {
                                 shape.name,
                                 p.tag()
                             ),
-                            JoinKind::Range { n_eq, rel },
+                            JoinKind::Range { rel },
                             right,
                             &schema,
                             &delta,

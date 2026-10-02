@@ -157,9 +157,9 @@ impl JoinPlan {
                 same_pk_types(delta, trace)?;
                 Walk::Equi
             }
-            JoinKind::Range { n_eq, rel } => {
+            JoinKind::Range { rel } => {
                 same_pk_types(delta, trace)?;
-                Walk::Range(RangeProbe::new(trace, n_eq, rel, delta_is_right)?)
+                Walk::Range(RangeProbe::new(trace, rel, delta_is_right))
             }
             JoinKind::Cross => {
                 let (d_key, t_key) = halves(left.pk_stride(), out_schema.pk_stride());
@@ -217,15 +217,12 @@ struct RangeProbe {
 
 impl RangeProbe {
     /// Resolve a wire `left REL right` against the trace schema's key region.
-    fn new(trace: &SchemaDescriptor, n_eq: u8, rel: RangeRel, delta_is_right: bool) -> Result<RangeProbe, String> {
-        // The reindexed key is `[eq slots…, range slot]`.
-        if n_eq as usize + 1 != trace.pk_cols().len() {
-            return Err("range join: n_eq does not match trace key arity".to_string());
-        }
-        // In PK order, so the range slot always keeps a span of its own.
+    fn new(trace: &SchemaDescriptor, rel: RangeRel, delta_is_right: bool) -> RangeProbe {
+        // The key is `[eq slots…, range slot]`, in PK order: the equality prefix
+        // is every key column but the last.
         let eq_size = trace
             .pk_columns()
-            .take(n_eq as usize)
+            .take(trace.pk_cols().len() - 1)
             .map(|(_, c)| c.size() as usize)
             .sum();
         // `rel` relates left to right; the probe relates trace to delta.
@@ -233,11 +230,11 @@ impl RangeProbe {
             true => rel,
             false => rel.converse(),
         };
-        Ok(RangeProbe {
+        RangeProbe {
             eq_size,
             above: rel.bounds_below(),
             cuts_below: rel.bounds_below() == rel.admits_equal(),
-        })
+        }
     }
 
     /// The trace key range this probe covers for a delta row whose PK region is

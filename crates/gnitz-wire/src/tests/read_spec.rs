@@ -83,6 +83,61 @@ fn roundtrips_every_bound_against_every_sink() {
     }
 }
 
+/// The request blob's bytes, one spec per sink kind: a layout an old client and a
+/// new worker disagree on has no version word to refuse it.
+#[test]
+fn the_encoded_bytes_are_pinned() {
+    let rows = ReadSpec {
+        bound: ReadBound::None,
+        predicate: vec![1, 2],
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Rows {
+                order: vec![OrderKey { col: 3, desc: true, nulls_first: true }],
+                limit_k: 5,
+            },
+        },
+    };
+    #[rustfmt::skip]
+    let want = [
+        0,                      // bound: none
+        2, 0, 0, 0, 1, 2,       // predicate
+        0,                      // no map
+        0,                      // sink: rows
+        5, 0, 0, 0, 0, 0, 0, 0, // limit_k
+        1, 0,                   // order keys
+        3, 0, 0b11,             // column, desc | nulls first
+    ];
+    assert_eq!(rows.encode(), want);
+
+    let fold = ReadSpec {
+        bound: ReadBound::PkSet(PkKeys::from_sorted(1, vec![4, 9])),
+        predicate: vec![],
+        sink: ReadSink {
+            map: Some(ComputeMap {
+                program: vec![7],
+                out_cols: vec![(TypeCode::I64, true)],
+            }),
+            kind: SinkKind::Fold(AggReadSpec {
+                group_cols: vec![2],
+                aggs: vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
+            }),
+        },
+    };
+    #[rustfmt::skip]
+    let want = [
+        2, 1, 2, 0, 0, 0, 4, 9, // bound: PK set, stride, count, keys
+        0, 0, 0, 0,             // predicate
+        1,                      // a map
+        1, 0, 9, 1,             // one output slot: I64, nullable
+        1, 0, 0, 0, 7,          // program
+        1,                      // sink: fold
+        1, 0, 2, 0, 0, 0,       // group columns
+        1, 0, 3, 4, 0, 0, 0,    // aggregates: MIN over column 4
+    ];
+    assert_eq!(fold.encode(), want);
+}
+
 /// `from_keys` is the one sort: duplicates collapse and the list comes out
 /// ascending whatever order it went in; `from_sorted` takes that order as given.
 #[test]
@@ -122,7 +177,7 @@ fn pk_set_blob(stride: u8, count: u32, keys: &[u8]) -> Vec<u8> {
 
 /// Every decode guard, against the forgery that trips it. The substring is what
 /// separates the guards: a merged table that only asserted "an error" would pass
-/// on the wrong one. The counted lists' caps are the circuit codec's, tested there.
+/// on the wrong one.
 #[test]
 fn each_decode_guard_rejects_its_own_forgery() {
     // Layout of the empty Rows spec: bound tag 0 | predicate len 1..5 | map
@@ -181,7 +236,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
             order_without_cut.encode(),
             "an order key without a cut",
         ),
-        ("unknown aggregate", bad_agg_op, "unknown agg func id"),
+        ("unknown aggregate", bad_agg_op, "unknown AggFunc"),
         (
             "aggregate cap",
             fold(vec![min; MAX_COLUMNS + 1]).encode(),

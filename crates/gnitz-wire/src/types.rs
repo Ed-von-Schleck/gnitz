@@ -197,15 +197,8 @@ impl TypeCode {
         }
     }
 
-    /// True iff `target` is a value-preserving *widening promotion* of `self` —
-    /// the only type change a column copy performs (`widen_native_le`
-    /// sign/zero-extends a narrower integer into a wider slot; there is no
-    /// narrowing and no representation change). The `is_fixed_int(target)` gate
-    /// is this caller's own scope, not a screen on the rule: a column copy only
-    /// ever widens into a ≤8-byte slot. The expression validator's
-    /// `check_copy_types` asks it of every column sink, and the SQL planner asks
-    /// it of a set-op pair's promotion target so the two agree on what a copy may
-    /// do.
+    /// True iff a column copy may widen `self` into `target`: a fixed-width
+    /// integer slot whose domain holds every value of `self`.
     #[inline]
     pub const fn is_widening_promotion(self, target: TypeCode) -> bool {
         target.is_fixed_int() && self.int_domain_fits(target)

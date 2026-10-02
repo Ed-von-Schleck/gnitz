@@ -200,10 +200,10 @@ fn check_circuit_rows(batch: &Batch, mut created: Vec<u64>) -> Result<(), String
     // the 64 MB frame.
     created.sort_unstable();
     for i in batch.live_rows() {
-        let view_id = SysFamily::CircuitNodes.leading_id(batch.get_pk(i));
+        let view_id = SysFamily::Circuit.leading_id(batch.get_pk(i));
         if created.binary_search(&view_id).is_err() {
             return Err(format!(
-                "circuit row names view {view_id}, which this transaction does not create"
+                "a circuit names view {view_id}, which this transaction does not create"
             ));
         }
     }
@@ -615,7 +615,7 @@ impl CatalogEngine {
             SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &net_dead),
             SysFamily::Column => self.precheck_column_family(batch, &sigs),
             SysFamily::Index => self.precheck_index_family(batch, &net_dead),
-            SysFamily::Sequence | SysFamily::CircuitNodes => Ok(()),
+            SysFamily::Sequence | SysFamily::Circuit => Ok(()),
         }?;
         Ok(net_dead)
     }
@@ -628,7 +628,7 @@ impl CatalogEngine {
         if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
             self.check_column_owners(cols, families)?;
         }
-        if let Some(b) = families[SysFamily::CircuitNodes.index()].as_ref() {
+        if let Some(b) = families[SysFamily::Circuit.index()].as_ref() {
             let views = families[SysFamily::View.index()].as_ref();
             let created = views.map(|v| family_pk_partition(SysFamily::View, v).creates);
             check_circuit_rows(b, created.unwrap_or_default())?;
@@ -734,10 +734,6 @@ impl CatalogEngine {
                 (r.schema_id, r.name, r.pk, r.kind, Some(r.facts.serial))
             } else {
                 let v = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
-                // `topo_priority` applies CircuitNodes (2) before View (6) in a
-                // creating bundle, so the view's sources resolve here; an
-                // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
-                // row to validate.
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View(v.props), None)

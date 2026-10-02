@@ -101,7 +101,7 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
     let signed = pk_payload_schema(&[TypeCode::I64]);
     let unsigned = pk_payload_schema(&[TypeCode::U64]);
     let narrow = pk_payload_schema(&[TypeCode::U32]);
-    for kind in [JoinKind::Equi, JoinKind::Range { n_eq: 0, rel: RangeRel::Lt }] {
+    for kind in [JoinKind::Equi, JoinKind::Range { rel: RangeRel::Lt }] {
         for (a, b) in [(&signed, &unsigned), (&unsigned, &narrow)] {
             let err = JoinPlan::from_wire(kind, false, a, b)
                 .err()
@@ -112,22 +112,6 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
     }
     // The keyless join reads neither key, so it takes any pair.
     assert!(JoinPlan::from_wire(JoinKind::Cross, false, &signed, &narrow).is_ok());
-}
-
-/// A range join's reindexed key is `[eq slots…, range slot]`, so an `n_eq` that
-/// leaves no range slot, or more than one, is refused.
-#[test]
-fn a_range_join_refuses_an_n_eq_that_is_not_one_short_of_the_key() {
-    let key = pk_payload_schema(&[TypeCode::U64; 2]);
-    let plan = |n_eq| JoinPlan::from_wire(JoinKind::Range { n_eq, rel: RangeRel::Lt }, false, &key, &key);
-    assert!(plan(1).is_ok());
-    for n_eq in [0, 2] {
-        assert_eq!(
-            plan(n_eq).err().expect("a refused arity").to_string(),
-            "range join: n_eq does not match trace key arity",
-            "n_eq {n_eq}"
-        );
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -164,8 +148,8 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
 
 /// The range join with the delta on the right, so the wire's `left REL right`
 /// reads as `trace_slot REL delta_slot` — how every literal case below is spelled.
-fn range_join(schema: &SchemaDescriptor, n_eq: usize, rel: RangeRel, delta: &Batch, cursor: &mut ReadCursor) -> Batch {
-    let kind = JoinKind::Range { n_eq: n_eq as u8, rel };
+fn range_join(schema: &SchemaDescriptor, rel: RangeRel, delta: &Batch, cursor: &mut ReadCursor) -> Batch {
+    let kind = JoinKind::Range { rel };
     join(kind, true, schema, schema, delta, cursor)
 }
 
@@ -183,7 +167,7 @@ fn range_join_cuts_the_span_each_rel_names() {
     ] {
         let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]));
         let delta = make_batch(&schema, &[(20, 1, 200)]);
-        let out = range_join(&schema, 0, rel, &delta, &mut ch);
+        let out = range_join(&schema, rel, &delta, &mut ch);
 
         // Delta on the right, so the trace payload leads each output row.
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
@@ -206,7 +190,7 @@ fn range_join_orders_a_signed_key_by_its_opk_image() {
     let delta = make_batch(&schema, &[(0, 1, 9)]);
     for (rel, want) in [(RangeRel::Gt, vec![3]), (RangeRel::Lt, vec![1])] {
         let mut ch = trace_cursor(make_batch(&schema, &trace_rows));
-        let out = range_join(&schema, 0, rel, &delta, &mut ch);
+        let out = range_join(&schema, rel, &delta, &mut ch);
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
         assert_eq!(got, want, "rel {rel:?}");
     }
@@ -226,7 +210,7 @@ fn a_used_trace_cursor_yields_the_fresh_cursor_output() {
         (vec![3], 0, 1, 30),
         (vec![3], 9, 1, 39),
     ];
-    let ranges = RangeRel::ALL.iter().map(|&rel| JoinKind::Range { n_eq: 1, rel });
+    let ranges = RangeRel::ALL.iter().map(|&rel| JoinKind::Range { rel });
     for kind in ranges.chain([JoinKind::Cross]) {
         let out_schema = plan(kind, true, &schema, &schema).out_schema;
         let cursor = || trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated());
@@ -308,7 +292,7 @@ fn range_join_fixtures_match_the_reference() {
         let trace = make_range_batch(&schema, &owned(trace_rows));
         let mut total = 0;
         for &rel in RangeRel::ALL {
-            let kind = JoinKind::Range { n_eq: n_eq as u8, rel };
+            let kind = JoinKind::Range { rel };
             total += assert_matches_reference(kind, true, schema, schema, &delta, &trace, name);
         }
         assert!(
@@ -372,7 +356,7 @@ proptest! {
         (kind, delta_is_right, d_wide, t_wide, (d_eq, t_eq, delta_rows, trace_rows)) in (
             prop_oneof![
                 Just(JoinKind::Equi),
-                prop::sample::select(RangeRel::ALL).prop_map(|rel| JoinKind::Range { n_eq: 0, rel }),
+                prop::sample::select(RangeRel::ALL).prop_map(|rel| JoinKind::Range { rel }),
                 Just(JoinKind::Cross),
             ],
             any::<bool>(), any::<bool>(), any::<bool>(),
@@ -387,10 +371,6 @@ proptest! {
             (Just(kind), Just(delta_is_right), Just(d_wide), Just(t_wide), rows)
         }),
     ) {
-        let kind = match kind {
-            JoinKind::Range { rel, .. } => JoinKind::Range { n_eq: t_eq as u8, rel },
-            k => k,
-        };
         let (d_schema, t_schema) = (make_range_schema(d_eq, d_wide), make_range_schema(t_eq, t_wide));
         let delta = make_range_batch(&d_schema, &delta_rows);
         let trace = make_range_batch(&t_schema, &trace_rows);
@@ -512,8 +492,7 @@ fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)
     let mut pk = eq.to_vec();
     pk.extend_from_slice(d);
     let schema = pk_only_schema(&vec![TypeCode::U8; pk.len()]);
-    RangeProbe::new(&schema, eq.len() as u8, rel, true)
-        .expect("u8-slot fixture is a well-formed range key")
+    RangeProbe::new(&schema, rel, true)
         .cut_points(&pk)
         .map(|(s, e)| (s.pk_bytes().to_vec(), e.map(|e| e.pk_bytes().to_vec())))
 }

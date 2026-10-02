@@ -25,12 +25,8 @@ pub trait SysRowSink {
     fn begin_row(&mut self, pk: &[u128], weight: i64);
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);
-    /// A variable-length column that is not UTF-8 (a circuit node's encoded
-    /// parameters).
+    /// A variable-length column that is not UTF-8 (a view's encoded circuit).
     fn put_bytes(&mut self, b: &[u8]);
-    /// A NULL in the next payload slot. The slot still consumes its position —
-    /// the writers below emit one value per payload column either way.
-    fn put_null(&mut self);
     fn end_row(&mut self);
 }
 
@@ -171,86 +167,14 @@ pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64)
 }
 
 // ---------------------------------------------------------------------------
-// CIRCUIT_NODES
+// CIRCUIT_TAB
 // ---------------------------------------------------------------------------
 
-/// One `CircuitNodes` row: node `node_id` of view `view_id`. Keyed by
-/// `(view_id, node_id)`, so the per-view prefix seek reads the leading half.
-pub struct CircuitNodeRow<'a> {
-    pub view_id: u64,
-    pub node_id: u64,
-    pub opcode: u64,
-    /// `Some` exactly for `ScanDelta`.
-    pub source_table: Option<u64>,
-    /// The producers feeding this node's input slots, in port order: `None` past
-    /// the operator's arity. A port takes one producer, which is why it is a
-    /// column and not a row of its own.
-    pub inputs: [Option<u64>; 2],
-    /// The node's per-opcode parameters (`encode_op_node`), or `None` for an
-    /// operator that carries none.
-    pub params: Option<&'a [u8]>,
-}
-
-pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, weight: i64) {
-    sink.begin_row(&[r.view_id as u128, r.node_id as u128], weight);
-    sink.put_u64(r.opcode);
-    // Every nullable column still takes its payload slot when absent.
-    match r.source_table {
-        Some(t) => sink.put_u64(t),
-        None => sink.put_null(),
-    }
-    for input in r.inputs {
-        match input {
-            Some(src) => sink.put_u64(src),
-            None => sink.put_null(),
-        }
-    }
-    match r.params {
-        Some(b) => sink.put_bytes(b),
-        None => sink.put_null(),
-    }
+/// `view_id`'s circuit as its one `CIRCUIT_TAB` row, at `+1`.
+pub fn write_circuit_row(sink: &mut impl SysRowSink, view_id: u64, circuit: &crate::Circuit) {
+    sink.begin_row(&[view_id as u128], 1);
+    sink.put_bytes(&circuit.encode());
     sink.end_row();
-}
-
-/// Write every node of `view_id`'s circuit at `+1`, each keyed by its index.
-pub fn write_circuit_rows(sink: &mut impl SysRowSink, view_id: u64, circuit: &crate::Circuit) {
-    for (node_id, node) in circuit.nodes().iter().enumerate() {
-        let (opcode, source_table, params) = crate::encode_op_node(&node.op);
-        write_circuit_node_row(
-            sink,
-            &CircuitNodeRow {
-                view_id,
-                node_id: node_id as u64,
-                opcode: opcode.as_wire(),
-                source_table,
-                inputs: node.inputs.to_slots(),
-                params: params.as_deref(),
-            },
-            1,
-        );
-    }
-}
-
-impl CircuitNodeRow<'_> {
-    /// The relation a `ScanDelta` row scans; `None` for every other opcode and for a
-    /// `ScanDelta` whose cell is NULL.
-    pub fn scan_source(&self) -> Option<u64> {
-        self.source_table
-            .filter(|_| self.opcode == crate::Opcode::ScanDelta.as_wire())
-    }
-}
-
-impl crate::Circuit {
-    /// Append the node `row` describes: [`write_circuit_rows`]'s inverse, fed one row at a
-    /// time in `node_id` order. Refuses a row whose id is not the next index, and whatever
-    /// [`crate::decode_op_node`], [`crate::NodeInputs::from_slots`] or [`Self::push`] refuses.
-    pub fn push_row(&mut self, row: &CircuitNodeRow) -> Result<crate::NodeId, String> {
-        if row.node_id != self.nodes().len() as u64 {
-            return Err("circuit node ids are not dense from 0".into());
-        }
-        let op = crate::decode_op_node(row.opcode, row.source_table, row.params)?;
-        self.push(op, crate::NodeInputs::from_slots(row.inputs)?)
-    }
 }
 
 #[cfg(test)]
