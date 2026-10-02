@@ -1,4 +1,4 @@
-use crate::runtime::wire::{decode_client_rows, decode_sal_rows, WireMsg, WireSchema};
+use crate::runtime::wire::{decode_client_rows, decode_sal_frame, WireMsg, WireSchema};
 use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows,
 };
@@ -8,9 +8,19 @@ use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
+/// `rest` addressed to `rel`: its target id and schema block, with the caller's
+/// own header fields kept.
+fn frame<'a>(rel: &'a WireSchema, rest: WireMsg<'a>) -> WireMsg<'a> {
+    WireMsg {
+        target_id: rel.tid(),
+        schema_block: Some(rel.block()),
+        ..rest
+    }
+}
+
 /// A SAL slot's rows, its record decoded.
 fn sal_rows(wire: &[u8]) -> Result<Option<Batch>, String> {
-    decode_sal_rows(wire, &peek_control_block(wire)?, |_, _| None)
+    decode_sal_frame(wire, |_, _| None).map(|(_, rows)| rows)
 }
 
 /// Eight rows of unequal region strides: a 4-byte PK, then stride-4 and
@@ -129,7 +139,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     ];
 
     for (shape, (rel, msg, sent)) in shapes.into_iter().enumerate() {
-        let msg = rel.map_or(msg, |r| r.frame(msg));
+        let msg = rel.map_or(msg, |r| frame(r, msg));
         let wire = msg.encode_to_vec();
         let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         let rows = sal_rows(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
@@ -180,22 +190,25 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema_or_its_record() {
         ..Default::default()
     }
     .encode_to_vec();
-    let control = peek_control_block(&wire).expect("a control block");
-    let got = decode_sal_rows(&wire, &control, |tid, record| {
+    let got = decode_sal_frame(&wire, |tid, record| {
         assert_eq!((tid, record), (77, junk.as_slice()));
         Some(sd)
     })
     .expect("the known schema lays the rows out")
+    .1
     .expect("rows");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
     assert!(sal_rows(&wire).is_err(), "the junk record itself does not decode");
 
-    let framed = WireSchema::encoded(77, &sd)
-        .frame(WireMsg {
+    let rel = WireSchema::encoded(77, &sd);
+    let framed = frame(
+        &rel,
+        WireMsg {
             data: batch.wire_whole(),
             ..Default::default()
-        })
-        .encode_to_vec();
+        },
+    )
+    .encode_to_vec();
     let got = sal_rows(&framed).expect("the record decodes").expect("rows");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
 
@@ -221,29 +234,34 @@ fn a_client_frames_rows_are_a_foreign_block_under_the_callers_schema() {
     let rel = WireSchema::encoded(3, &sd);
     let decode = |wire: &[u8]| decode_client_rows(wire, &peek_control_block(wire).expect("a control block"), &sd);
 
-    let framed = rel
-        .frame(WireMsg {
+    let framed = frame(
+        &rel,
+        WireMsg {
             data: batch.wire_whole(),
             ..Default::default()
-        })
-        .encode_to_vec();
+        },
+    )
+    .encode_to_vec();
     let got = decode(&framed).expect("decodes").expect("rows");
     assert!(!got.is_consolidated(), "a decoded frame carries no claim");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
 
-    let dataless = rel.frame(WireMsg::default()).encode_to_vec();
+    let dataless = frame(&rel, WireMsg::default()).encode_to_vec();
     assert!(decode(&dataless).expect("decodes").is_none(), "no data block, no rows");
 
     let mut bb = BatchBuilder::new(&sd);
     bb.begin_row(1, 1);
     bb.put_null();
     bb.end_row();
-    let nulled = rel
-        .frame(WireMsg {
-            data: bb.finish().wire_whole(),
+    let nulled = bb.finish();
+    let nulled = frame(
+        &rel,
+        WireMsg {
+            data: nulled.wire_whole(),
             ..Default::default()
-        })
-        .encode_to_vec();
+        },
+    )
+    .encode_to_vec();
     assert_eq!(decode(&nulled).err(), Some("a null bit on a NOT NULL column"));
 
     // A well-formed block of zero rows, which `WireMsg` never emits.

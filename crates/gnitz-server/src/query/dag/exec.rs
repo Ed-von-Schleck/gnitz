@@ -187,16 +187,21 @@ impl DagEngine {
 }
 
 /// Run `what` over `delta` and ingest every view's output into its family.
-pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Result<(), String> {
+/// `None`: this process has no rows of the source this time, and drives an empty
+/// delta, so its exchange rounds run all the same.
+pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>) -> Result<(), String> {
     let (source, schedule, round, unfed) = match what {
         Drive::Tick { source, round } => {
             let (dag, _) = host.parts();
             (source, dag.tick_schedule(source), Some(round), Vec::new())
         }
         Drive::Backfill { view, source } => {
+            let dag = host.parts().0;
+            // Its ticks run from its first chunk on.
+            dag.rebuild.remove(&view);
             // A backfill feeds the view its sources in this order, one after the
             // other: the ones behind `source` have reached it with nothing yet.
-            let sources = host.parts().0.sources_of(view);
+            let sources = dag.sources_of(view);
             let behind = sources.iter().position(|&s| s == source).map_or(0, |at| at + 1);
             let unfed = sources[behind..].to_vec();
             (source, vec![Step { view, producer: source }], None, unfed)
@@ -207,6 +212,10 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
     for step in &schedule {
         *readers.entry(step.producer).or_default() += 1;
     }
+    let delta = match delta {
+        Some(delta) => delta,
+        None => Batch::empty_with_schema(&host.parts().1.relation_or_err(source)?.schema()),
+    };
     let mut outputs: FxHashMap<u64, Batch> = FxHashMap::default();
     outputs.insert(source, delta);
     for step in &schedule {

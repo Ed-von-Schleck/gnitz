@@ -122,7 +122,7 @@ impl MasterDispatcher {
 
         // A replicated owner is read on one worker: every worker's copy would
         // pop each value `nw` times.
-        let lease = self.scan(DirectGroup::key_spans(owner_id, cols)).await?;
+        let lease = self.scan(Read::KeySpans { tid: owner_id, cols }).await?;
 
         let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
             let cat = self.cat();

@@ -58,7 +58,8 @@ pub(crate) struct DagEngine {
     /// Every registered view, from its registration to its drop. `plan` is `None`
     /// until its first compile.
     views: FxHashMap<u64, RegisteredView>,
-    /// Views the boot verdict rejected, until their rebuild backfill starts.
+    /// Views the boot verdict rejected, each until its rebuild backfill's first
+    /// drive.
     rebuild: FxHashSet<u64>,
 }
 
@@ -108,18 +109,7 @@ impl DagEngine {
         std::mem::take(&mut self.rebuild)
     }
 
-    /// `id`'s rebuild backfill has started: its ticks run from here.
-    pub(crate) fn rebuild_started(&mut self, id: u64) {
-        self.rebuild.remove(&id);
-    }
-
     // ── Compilation ─────────────────────────────────────────────────────
-
-    /// [`ensure_compiled`] for a caller that cannot name a compiled plan:
-    /// compile `view_id` now and open its operator state.
-    pub(crate) fn open_plan(&mut self, registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
-        ensure_compiled(&mut self.views, registry, view_id).map(drop)
-    }
 
     /// The routing metadata derived when `view_id` registered. `Err` for an id
     /// that is not a registered view.

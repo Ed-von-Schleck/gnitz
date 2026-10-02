@@ -32,8 +32,8 @@ pub struct ControlHeader {
     pub status: WireStatus,
     pub target_id: u64,
     pub flags: WireFlags,
-    /// Per-verb arguments; each `ClientVerb`, `WireStatus` and `SalMessageKind`
-    /// variant documents what it reads here.
+    /// Per-verb arguments; each `ClientVerb` and `WireStatus` variant documents
+    /// what it reads here.
     pub arg0: u64,
     pub arg1: u64,
 }

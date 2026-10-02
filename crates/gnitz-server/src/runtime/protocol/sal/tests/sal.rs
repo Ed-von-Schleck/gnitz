@@ -1,9 +1,9 @@
 use super::fixtures::{group_at, TestLog};
 use super::{
-    anchor_stores, epoch_word, group_header_size, prefix_atomic, stamp_digest, DirectGroup, EpochGate, GroupData,
-    GroupHead, GroupTargets, SalLog, SalMessageKind, SalReader, SalStep, WorkerSet, ANCHOR_BYTES, ANCHOR_RECORD,
-    CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX, KNOWN_FLAGS, MAX_WORKERS,
-    OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
+    anchor_stores, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, DirectGroup, EpochGate,
+    GroupData, GroupHead, GroupTargets, Read, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, WorkerSet,
+    ANCHOR_BYTES, ANCHOR_RECORD, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
+    KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::sal_wake_seq;
@@ -16,10 +16,12 @@ use std::sync::atomic::Ordering;
 
 /// A control-only group addressed to `target_id`.
 fn to(target_id: u64) -> DirectGroup<'static> {
-    DirectGroup {
-        template: WireMsg { target_id, ..Default::default() },
-        ..DirectGroup::new(SalMessageKind::DdlSync)
-    }
+    DirectGroup::new(Apply::DdlSync { family: target_id })
+}
+
+/// A read of `tid` under the blob `spec`.
+fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
+    Read::ScanSpec { tid, reply_layout: 0, spec: spec.into() }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,13 +265,14 @@ fn zone_lsns_rise_with_the_log_and_the_watermark_follows_the_commits() {
 /// group is.
 #[test]
 fn a_reader_leaves_its_epoch_on_stepping_past_a_flush() {
-    for kind in [SalMessageKind::Flush, SalMessageKind::FlushEph] {
+    for round in [Apply::Flush, Apply::FlushEph { generation: 0 }] {
+        let kind = SalRequest::from(round.clone()).kind();
         let log = TestLog::new(1 << 20, 2, 1);
         let reader = SalReader::new(log.log(), 0, 1);
         let read = || reader.next().map(|(m, _)| (m.kind, m.target_id));
         let mut excl = log.excl();
         excl.write(&to(1)).expect("group fits");
-        excl.write(&DirectGroup::new(kind)).expect("group fits");
+        excl.write(&DirectGroup::new(round)).expect("group fits");
         excl.write(&to(2)).expect("group fits");
 
         assert_eq!(read(), Some((SalMessageKind::DdlSync, 1)));
@@ -294,16 +297,19 @@ fn sal_cross_process_checkpoint() {
         let reader = SalReader::new(log.log(), 0, 1);
         let writer = W2mWriter::new(ring);
         for _ in 0..2 {
-            let msg = loop {
+            let slot = loop {
                 writer.sal_park().park(|| reader.is_empty());
-                if let Some((msg, _)) = reader.next() {
-                    break msg;
+                if let Some((_, slot)) = reader.next() {
+                    break slot;
                 }
+            };
+            let Ok(control) = peek_control_block(slot) else {
+                panic!()
             };
             writer.send_msg(
                 0,
                 &WireMsg {
-                    target_id: msg.target_id,
+                    arg0: control.hdr.arg0,
                     ..Default::default()
                 },
             );
@@ -317,7 +323,7 @@ fn sal_cross_process_checkpoint() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if let Some(slot) = receiver.try_read_slot(0) {
-                return slot.control().hdr.target_id;
+                return slot.control().hdr.arg0;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -330,11 +336,8 @@ fn sal_cross_process_checkpoint() {
             excl.checkpoint_reset();
         }
         // Round 1 ends its epoch, so round 2 is read at cursor 0 of the next.
-        excl.write(&DirectGroup {
-            template: WireMsg { target_id: round, ..Default::default() },
-            ..DirectGroup::new(SalMessageKind::Flush)
-        })
-        .expect("group fits");
+        excl.write(&DirectGroup::new(Apply::FlushEph { generation: round }))
+            .expect("group fits");
         // Dropping the lock is the wake.
         drop(excl);
         assert_eq!(report(), round, "round {round}");
@@ -376,12 +379,11 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
             request_id: 40,
             in_request_order: true,
         },
-        ..DirectGroup::new(SalMessageKind::ScanSpec)
+        ..DirectGroup::new(scan(0, &[]))
     };
     let excl = log.excl();
     excl.write(&group).expect("group fits");
-    excl.write(&DirectGroup::new(SalMessageKind::ScanSpec))
-        .expect("group fits");
+    excl.write(&DirectGroup::new(scan(0, &[]))).expect("group fits");
 
     for w in 0..4u32 {
         let reader = SalReader::new(log.log(), w, 1);
@@ -398,6 +400,30 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
     }
 }
 
+/// Every member of a cut reads one count, two cuts read two, and a worker a
+/// cut's first member does not address reads the same count as one it does.
+#[test]
+fn every_worker_numbers_a_cut_alike() {
+    let log = TestLog::new(1 << 20, 2, 1);
+    let member = |set, request_id, in_request_order| DirectGroup {
+        targets: GroupTargets { set, request_id, in_request_order },
+        ..DirectGroup::new(scan(0, &[]))
+    };
+    let excl = log.excl();
+    // One cut whose first member addresses worker 0 alone, then a cut of one.
+    excl.write(&member(WorkerSet::one(0), 1, false)).expect("group fits");
+    excl.write(&member(WorkerSet::ALL, 2, true)).expect("group fits");
+    excl.write(&member(WorkerSet::ALL, 3, true)).expect("group fits");
+    excl.write(&member(WorkerSet::ALL, 4, false)).expect("group fits");
+
+    let cuts = |w| {
+        let reader = SalReader::new(log.log(), w, 1);
+        std::iter::from_fn(|| reader.next().map(|(m, _)| (m.request_id, reader.cut()))).collect::<Vec<_>>()
+    };
+    assert_eq!(cuts(0), [(1, 1), (2, 1), (3, 1), (4, 2)]);
+    assert_eq!(cuts(1), [(2, 1), (3, 1), (4, 2)]);
+}
+
 /// Dropping a `SalExcl` wakes each worker a group written under it reached —
 /// once, however many groups reached it — and no other.
 #[test]
@@ -410,7 +436,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
             request_id: 1,
             in_request_order: false,
         },
-        ..DirectGroup::new(SalMessageKind::ScanSpec)
+        ..DirectGroup::new(scan(0, &[]))
     };
 
     drop(log.excl());
@@ -425,7 +451,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     assert_eq!(seqs(), [1, 0, 1, 0], "a worker reached twice is woken once");
 
     log.excl()
-        .write(&DirectGroup::new(SalMessageKind::Shutdown))
+        .write(&DirectGroup::new(SalRequest::Shutdown))
         .expect("group fits");
     assert_eq!(
         seqs(),
@@ -457,19 +483,14 @@ fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
 }
 
 /// A group carrying per-worker extras sends each worker its own blob in place
-/// of the template's.
+/// of the request's.
 #[test]
 fn a_group_with_per_worker_extras_sends_each_worker_its_own_blob() {
     let log = TestLog::new(1 << 20, 3, 1);
     let extras: Vec<Vec<u8>> = vec![vec![1; 40], Vec::new(), vec![3; 400]];
     let group = DirectGroup {
-        template: WireMsg {
-            target_id: 16,
-            blob: &[9; 7],
-            ..Default::default()
-        },
         extras: Some(&extras),
-        ..DirectGroup::new(SalMessageKind::ScanSpec)
+        ..DirectGroup::new(scan(16, &[9; 7]))
     };
     log.excl().write(&group).expect("group fits");
 
@@ -826,7 +847,7 @@ fn sal_read_bench() {
                     request_id: 1,
                     in_request_order: false,
                 },
-                ..DirectGroup::new(SalMessageKind::ScanSpec)
+                ..DirectGroup::new(scan(0, &[]))
             };
             let excl = log.excl();
             for _ in 0..GROUPS {

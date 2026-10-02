@@ -96,7 +96,7 @@ pub struct PendingPush {
 /// The committer task loop. Never returns.
 ///
 /// For checkpoint flush rounds the lock is held across the ENTIRE round
-/// (write + ACK wait + reset; see `MasterDispatcher::flush`), but released across the
+/// (write + ACK wait + reset), but released across the
 /// sequence's drain step so the tick loop can acquire it per tick.
 pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
     loop {
@@ -390,12 +390,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
     for g in units.iter().flat_map(|u| u.live()) {
-        let lease = g.lease.as_ref().expect("a live group was laid out");
-        if let Err(e) = lease.acks().await {
-            // The group is durable and the other workers applied it: answering it
-            // would leave the SAL and this worker's partition disagreeing.
-            gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
-        }
+        g.lease.as_ref().expect("a live group was laid out").acks().await;
     }
 
     // ------------------------------------------------------------------

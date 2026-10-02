@@ -11,24 +11,33 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{SalMessageKind, SalReader};
+use crate::runtime::sal::{Apply, Read, SalMessageKind, SalReader, SalRequest};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::{Relation, RelationRegistry};
-use gnitz_wire::control::{peek_control_block, ControlHeader};
-use gnitz_wire::{WireFlags, WireStatus};
+use gnitz_store::relation::RelationRegistry;
+use gnitz_wire::{WireFault, WireFlags};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::SchemaDescriptor;
 
-/// One dispatched request. Fully owned — a parked request must not borrow the
-/// SAL mapping, which an inline `Flush` resets.
+/// One SAL group addressed to this worker. Owned: a parked read outlives the SAL
+/// bytes it was decoded from, which an inline `Flush` lets the master rewrite.
 struct Request {
-    kind: SalMessageKind,
     route: ReplyRoute,
-    hdr: ControlHeader,
-    blob: Vec<u8>,
-    batch: Option<Batch>,
+    what: SalRequest<'static>,
+    /// Boxed, so a request moves from its decode to where it is served or parked
+    /// as a few words: held inline, the batch would be copied whole at each of
+    /// those moves, for a request that carries none as well.
+    rows: Option<Box<Batch>>,
+}
+
+/// Where a reply goes.
+#[derive(Clone, Copy)]
+struct ReplyRoute {
+    target_id: u64,
+    /// `0`: nothing answers.
+    request_id: u32,
+    /// The cut the request was written in; see [`SalReader::cut`].
+    cut: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,12 +50,11 @@ pub struct WorkerProcess<'c> {
     w2m_writer: W2mWriter,
     /// Where this worker trades its exchange rounds with its peers.
     mesh: Mesh,
-    /// Requests an exchange wait deferred, in SAL order: replayed at top level
-    /// right after the request whose drive deferred them.
-    deferred: Vec<Request>,
-    /// Reply trains, one frame emitted per SAL drain, front first: the master
-    /// reads one lease at a time and a ring frees only in order.
-    pending_streams: VecDeque<PendingScan>,
+    /// Replies this worker owes, in the order they reach the ring. A cut's reader
+    /// drains its leases in request order and a ring frees only a released prefix,
+    /// so within a cut ring order must be request order. Replies of different cuts
+    /// go to different leases and need no order between them.
+    replies: VecDeque<Owed>,
     /// Per-frame wire budget of every W2M train. `GNITZ_REPLY_FRAME_BUDGET`
     /// lowers it, so tests reach multi-frame trains on small tables.
     reply_frame_budget: usize,
@@ -55,35 +63,19 @@ pub struct WorkerProcess<'c> {
 mod exchange;
 mod reply;
 
-use exchange::DagExchangeCtx;
-pub(crate) use reply::send_span_train;
-use reply::PendingScan;
+use reply::{Owed, Rows};
 
 /// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request.
 static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
-/// Where one reply goes and how, read off its request.
-#[derive(Clone, Copy)]
-pub(crate) struct ReplyRoute {
-    pub(crate) target_id: u64,
-    /// The id the master routes the reply by.
-    pub(crate) request_id: u32,
-    /// Queue the reply behind earlier trains even when it fits one frame.
-    pub(crate) fifo: bool,
-}
-
 impl<'c> WorkerProcess<'c> {
     pub fn new(catalog: &'c mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
-        // Worker rank/count (and role) are latched in the fork child before any
-        // catalog work — see `server_main`, not here: boot-compiled plans
-        // would otherwise carry rank 0 / num_workers 1.
         WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
             mesh,
-            deferred: Vec::new(),
-            pending_streams: VecDeque::new(),
+            replies: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
                 "GNITZ_REPLY_FRAME_BUDGET",
                 gnitz_wire::MAX_FRAME_PAYLOAD,
@@ -94,15 +86,11 @@ impl<'c> WorkerProcess<'c> {
 
     // ── Main event loop ────────────────────────────────────────────────
 
-    /// Never returns normally. A boot that failed does not reach here at all:
-    /// the fork child reports it on the W2M ring and exits. The ready ACK answers
-    /// `ready_request_id`, which the master leases before it collects.
-    pub fn run(&mut self, ready_request_id: u32) -> i32 {
-        self.send_ack(ready_request_id);
-
+    /// Serve the SAL until a `Shutdown` exits the process.
+    pub fn run(&mut self) -> ! {
         loop {
-            // A queued train emits its next frame without waiting on the SAL.
-            if self.pending_streams.is_empty() {
+            // An owed reply emits its next frame without waiting on the SAL.
+            if self.replies.is_empty() {
                 self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
             }
 
@@ -112,313 +100,150 @@ impl<'c> WorkerProcess<'c> {
 
     /// Process all pending SAL message groups. Shutdown `_exit`s inline.
     fn drain_sal(&mut self) {
-        // One frame per pass, so requests keep being served between frames.
-        self.emit_pending_scan_chunk();
+        self.emit_reply_frame();
         while let Some(req) = self.next_request() {
             self.handle_request(req);
-            // Before the next group, so a deferred read sees the state it was
-            // sent against.
-            for req in std::mem::take(&mut self.deferred) {
-                self.handle_request(req);
+            if !self.replies.is_empty() {
+                // Before the next group: a parked read answers from the state its
+                // drive left.
+                self.answer_parked();
+                // One frame per request served: neither waits for the other to
+                // run dry.
+                self.emit_reply_frame();
             }
-            assert!(self.deferred.is_empty(), "a replayed request deferred another");
         }
     }
 
     /// The next SAL group this worker acts on, decoded into an owned
-    /// [`Request`]: the single decode point of both drain loops.
+    /// [`Request`]: the single decode point of both drain loops. The master
+    /// authored the frame, so one that does not decode is corruption.
     fn next_request(&mut self) -> Option<Request> {
         let (msg, wire) = self.sal_reader.next()?;
         // The kinds the master frames with their target's catalog record.
         let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
         let known = |tid, record: &[u8]| catalog_record.then(|| self.catalog.known_decode(tid, record)).flatten();
         // Fail-stop: a dropped group diverges this worker from the master.
-        let decoded =
-            peek_control_block(wire).and_then(|control| Ok((ipc::decode_sal_rows(wire, &control, known)?, control)));
-        match decoded {
-            Ok((batch, control)) => Some(Request {
-                kind: msg.kind,
-                route: ReplyRoute {
-                    target_id: control.hdr.target_id,
-                    request_id: msg.request_id,
-                    fifo: msg.in_request_order,
-                },
-                hdr: control.hdr,
-                blob: wire[control.blob].to_vec(),
-                batch,
-            }),
-            Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
-        }
+        let undecodable =
+            |e: String| -> ! { gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id) };
+        // Read in place: the rows move once, out of the decoded frame.
+        let mut decoded = ipc::decode_sal_frame(wire, known);
+        let (control, rows) = match &mut decoded {
+            Ok(frame) => frame,
+            Err(e) => undecodable(std::mem::take(e)),
+        };
+        let what = match SalRequest::decode(msg.kind, &control.hdr, &wire[control.blob.clone()]) {
+            Ok(what) => what,
+            Err(e) => undecodable(e),
+        };
+        Some(Request {
+            route: ReplyRoute {
+                target_id: control.hdr.target_id,
+                request_id: msg.request_id,
+                cut: self.sal_reader.cut(),
+            },
+            what,
+            rows: rows.take().map(Box::new),
+        })
     }
 
-    /// Run one request, with a failure sent back on its own request id — the one
-    /// place a worker's reply status is chosen.
+    /// Run one request — the one place its outcome is chosen: a read's failure
+    /// is a fault frame to its asker, a state change's a fail-stop.
     fn handle_request(&mut self, req: Request) {
-        let request_id = req.route.request_id;
-        if let Err(fault) = self.dispatch_inner(req) {
-            self.send_fault(&fault, request_id);
+        match req.what {
+            SalRequest::Shutdown => unsafe { libc::_exit(0) },
+            SalRequest::Read(read) => {
+                let answer = answer(self.catalog, &read, req.rows.as_deref());
+                self.reply(req.route, answer);
+            }
+            SalRequest::Apply(apply) => self.apply_request(req.route, apply, req.rows),
         }
     }
 
-    fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
-        let Request { kind, route, hdr, blob, batch } = req;
-        let (target_id, request_id) = (route.target_id, route.request_id);
+    /// Apply a state change and ACK it. The SAL holds the change and every other
+    /// worker applies it: a worker that cannot has diverged from the log, and only
+    /// a restart brings it back.
+    fn apply_request(&mut self, route: ReplyRoute, apply: Apply<'_>, rows: Option<Box<Batch>>) {
+        if let Err(e) = self.apply(&apply, rows) {
+            gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
+        }
+        if route.request_id != 0 {
+            self.w2m_writer.send_ack(route.request_id);
+        }
+    }
 
-        match kind {
-            SalMessageKind::Shutdown => unsafe { libc::_exit(0) },
-
-            SalMessageKind::Flush => {
-                self.catalog.registry.checkpoint_base()?;
-                self.send_ack(request_id);
+    fn apply(&mut self, apply: &Apply<'_>, rows: Option<Box<Batch>>) -> Result<(), String> {
+        match *apply {
+            Apply::Flush => self.catalog.registry.checkpoint_base(),
+            Apply::FlushEph { generation } => self.catalog.flush_ephemeral_round(generation),
+            // A group without a data block carries an empty delta.
+            Apply::DdlSync { family } => {
+                let Some(rows) = rows else { return Ok(()) };
+                self.catalog.ddl_sync(family, *rows)?;
+                gnitz_debug!("ddl_sync tid={}", family);
                 Ok(())
             }
-
-            SalMessageKind::FlushEph => {
-                self.catalog.flush_ephemeral_round(hdr.arg0)?;
-                self.send_ack(request_id);
+            Apply::Push { tid } => {
+                let Some(rows) = rows else { return Ok(()) };
+                let row_count = rows.len();
+                self.catalog.ingest_unticked(tid, *rows)?;
+                gnitz_debug!("push tid={} rows={}", tid, row_count);
                 Ok(())
             }
-
-            // Unaddressed, so a failure has no one to answer: DDL application
-            // failure on trusted master→worker IPC means memory corruption or an
-            // engine bug, and continuing would leave this worker with a
-            // permanently stale catalog — silently wrong results.
-            SalMessageKind::DdlSync => {
-                if let Some(batch) = batch {
-                    if let Err(e) = self.catalog.ddl_sync(target_id, batch) {
-                        gnitz_fatal_abort!("DdlSync application failed for tid={target_id}: {e}");
-                    }
-                    gnitz_debug!("ddl_sync tid={}", target_id);
+            Apply::Tick { first_round, ref tids } => {
+                for (i, tid) in tids.as_chunks::<8>().0.iter().enumerate() {
+                    let source = u64::from_le_bytes(*tid);
+                    let delta = self.catalog.registry.seal(source)?;
+                    self.drive(Drive::Tick { source, round: first_round + i as u64 }, delta)?;
                 }
                 Ok(())
             }
-
-            SalMessageKind::Backfill => {
-                // Stop-the-world (the DDL parks the reactor): no yield.
-                self.handle_backfill(target_id, hdr.arg0)?;
-                self.send_ack(request_id);
-                Ok(())
-            }
-
-            SalMessageKind::HasPk => {
-                let Some(batch) = batch else {
-                    return Err("has_pk: a probe carries its keys".into());
-                };
-                let probe = gnitz_wire::Probe::from_wire(hdr.flags.probe_mode, hdr.arg0, hdr.arg1)
-                    .map_err(|e| format!("has_pk: {e}"))?;
-                let result = self.catalog.registry.probe(target_id, probe, &batch)?;
-                self.send_reply(route, result);
-                Ok(())
-            }
-
-            SalMessageKind::Push => {
-                if let Some(batch) = batch {
-                    self.handle_push(target_id, batch);
-                }
-                self.send_ack(request_id);
-                Ok(())
-            }
-
-            SalMessageKind::Tick => {
-                let (tids, rest) = blob.as_chunks::<8>();
-                if !rest.is_empty() {
-                    return Err("tick: the blob is not whole tids".into());
-                }
-                for (i, tid) in tids.iter().enumerate() {
-                    self.handle_tick(u64::from_le_bytes(*tid), hdr.arg0 + i as u64);
-                }
-                self.send_ack(request_id);
-                Ok(())
-            }
-
-            SalMessageKind::ScanSpec => {
-                let keeper = self
-                    .catalog
-                    .scan_spec(target_id, gnitz_wire::ReadSpec::decode(&blob)?, hdr.arg0)?;
-                self.send_reply(route, keeper);
-                Ok(())
-            }
-
-            // Its deltas in rounds `(arg1, arg0]`.
-            SalMessageKind::DeltaRead => {
-                let reply_layout = gnitz_wire::decode_all(&blob, "delta read", |r| r.u64())?;
-                let keeper = self
-                    .catalog
-                    .registry
-                    .delta_read(target_id, hdr.arg1, hdr.arg0, reply_layout)?;
-                self.send_reply(route, keeper);
-                Ok(())
-            }
-
-            SalMessageKind::KeySpans => {
-                let cols = gnitz_wire::PkColList::unpack(hdr.arg1).map_err(|e| {
-                    format!(
-                        "key spans of table {target_id}: {}",
-                        e.for_role(gnitz_wire::PkListRole::ColumnList)
-                    )
-                })?;
-                self.handle_key_spans(target_id, cols.as_slice(), request_id)?;
-                Ok(())
+            Apply::Backfill { source, view } => {
+                let mut cursor = self.catalog.open_source_cursor(view, source)?;
+                let chunk_rows = self.catalog.registry.scan_chunk_rows();
+                // A drained worker keeps driving pad chunks, so every worker runs the
+                // same exchange rounds until every source is drained.
+                while !self.drive(Drive::Backfill { view, source }, cursor.drain_chunk(chunk_rows))? {}
+                let cat = &mut *self.catalog;
+                cat.dag.finish_backfill(&mut cat.registry, view)
             }
         }
-    }
-
-    // ── Request handlers ───────────────────────────────────────────────
-
-    fn handle_push(&mut self, target_id: u64, batch: Batch) {
-        let row_count = batch.len();
-        // The master admitted this group against the catalog it committed under, and
-        // the SAL holds it durably: any failure here leaves this worker diverged from
-        // it. Only a restart replays it.
-        let res = match self.catalog.registry.relation_or_err(target_id).map(Relation::kind) {
-            Ok(kind) if kind.is_ingestion_point() => self.catalog.ingest_unticked(target_id, batch),
-            Ok(kind) => Err(format!(
-                "relation {target_id} is a {}, not an ingestion point",
-                kind.noun()
-            )),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = res {
-            gnitz_fatal_abort!(
-                "worker: push apply failed (table_id={}): {} — aborting for restart+replay",
-                target_id,
-                e,
-            );
-        }
-        gnitz_debug!("push tid={} rows={}", target_id, row_count);
-    }
-
-    /// Drive one view-maintenance tick of `target_id`'s dependent closure.
-    /// `round` is the tick round the master allocated for this tid; every fed
-    /// view's captured delta is stamped with it.
-    fn handle_tick(&mut self, target_id: u64, round: u64) {
-        let Some(schema) = self.catalog.registry.relation(target_id).map(Relation::schema) else {
-            return;
-        };
-        let delta = match self.catalog.registry.seal(target_id) {
-            Ok(delta) => delta.unwrap_or_else(|| Batch::empty_with_schema(&schema)),
-            Err(e) => gnitz_fatal_abort!(
-                "worker: seal failed (table_id={}): {} — aborting for restart",
-                target_id,
-                e
-            ),
-        };
-        self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
-    }
-
-    /// Distributed CREATE-VIEW backfill, worker side: drives this worker's
-    /// committed slice of `source_tid` through the plan one chunk at a time. A
-    /// worker whose slice is drained drives empty pad chunks, so every worker runs
-    /// the same exchange rounds, until [`Self::drive_dag`] reports the backfill done.
-    ///
-    /// View-scoped: see [`Drive::Backfill`].
-    fn handle_backfill(&mut self, source_tid: u64, view_id: u64) -> Result<(), String> {
-        self.catalog.dag.rebuild_started(view_id);
-        // Compiled before the first chunk: a failure here is an error reply, where the
-        // same failure inside a chunk's epoch is a fatal abort mid-round.
-        let cat = &mut *self.catalog;
-        cat.dag.open_plan(&cat.registry, view_id)?;
-        let chunk_rows = self.catalog.registry.scan_chunk_rows();
-        // Needed to synthesize empty pad chunks. An unregistered source is a
-        // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
-        // the source has diverged from the catalog.
-        let schema = self.catalog.registry.relation_or_err(source_tid)?.schema();
-        let mut handle = self.catalog.open_source_cursor(view_id, source_tid)?;
-
-        loop {
-            let chunk = handle.drain_chunk(chunk_rows);
-            let drained = chunk.is_none();
-            let chunk = chunk.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            if self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, drained) {
-                break;
-            }
-        }
-
-        // A spill fault leaves the view store unbounded, so the process cannot
-        // continue.
-        let cat = &mut *self.catalog;
-        if let Err(e) = cat.dag.finish_backfill(&mut cat.registry, view_id) {
-            gnitz_fatal_abort!(
-                "worker: {} — view state cannot be bounded; aborting for restart+re-derive",
-                e,
-            );
-        }
-        Ok(())
-    }
-
-    /// Stream the sorted `col_indices` key spans of this worker's rows of
-    /// `owner_id`: off the index on those columns where one exists, else from a
-    /// spill sort of the table. `Err` before the first frame.
-    fn handle_key_spans(&mut self, owner_id: u64, col_indices: &[u32], request_id: u32) -> Result<(), String> {
-        if KEY_SPANS_ERROR.armed() {
-            return Err("injected key-spans fault".to_string());
-        }
-        let registry = &self.catalog.registry;
-        let relation = registry.relation_or_err(owner_id)?;
-        let spec = gnitz_zset::schema::KeySpec::new(col_indices, &relation.schema())?;
-        let frame_schema = spec.span_schema();
-        let chunk_rows = registry.scan_chunk_rows();
-        let route = ReplyRoute {
-            target_id: owner_id,
-            request_id,
-            fifo: false,
-        };
-        let (w2m, budget) = (&self.w2m_writer, self.reply_frame_budget);
-
-        if let Some(index) = relation.index_on(col_indices) {
-            let mut cursor = index.cursor();
-            send_span_train(w2m, route, &frame_schema, budget, |chunk| {
-                match cursor.drain_chunk(chunk_rows) {
-                    Some(entries) => *chunk = entries.keyed_by_prefix(&frame_schema),
-                    None => chunk.clear(),
-                }
-                chunk.is_empty()
-            });
-            return Ok(());
-        }
-
-        let dir = gnitz_store::relation::relation_dir(registry.base_dir(), owner_id);
-        let mut sorter = gnitz_zset::repr::SpillSort::new(&dir, spec.key_size(), key_spans_spill_bytes());
-        let mut rows = relation.cursor();
-        while let Some(chunk) = rows.drain_chunk(chunk_rows) {
-            sorter.push_spans(&chunk, &spec)?;
-        }
-        let mut spans = sorter.finish()?;
-        send_span_train(w2m, route, &frame_schema, budget, |chunk| {
-            spans.fill(chunk, chunk_rows);
-            spans.remaining() == 0
-        });
-        Ok(())
-    }
-
-    /// Run one DAG drive with the exchange context, returning its
-    /// [`DagExchangeCtx::all_drained`]. `drained`: this worker's partition is.
-    fn drive_dag(&mut self, what: Drive, delta: Batch, drained: bool) -> bool {
-        let mut ctx = DagExchangeCtx {
-            worker: self,
-            own_drained: drained,
-            all_drained: drained,
-        };
-        let res = crate::query::drive(&mut ctx, what, delta);
-        let all_drained = ctx.all_drained;
-        // The one site that answers a storage fault during view maintenance:
-        // restart re-derives every view from its durable base tables.
-        if let Err(e) = res {
-            gnitz_fatal_abort!(
-                "worker: view maintenance failed ({:?}): {} — aborting for restart+re-derive",
-                what,
-                e,
-            );
-        }
-        all_drained
     }
 }
 
-const KEY_SPANS_SPILL_BYTES: usize = 128 * 1024 * 1024;
-
-/// The span sort's run size in bytes: `GNITZ_KEY_SPANS_SPILL_BYTES`.
-fn key_spans_spill_bytes() -> usize {
-    gnitz_foundation::env::env_num("GNITZ_KEY_SPANS_SPILL_BYTES", KEY_SPANS_SPILL_BYTES)
+/// Answer `read`; `rows` are the keys a probe carries. A function of the catalog
+/// alone: it cannot reach the mesh, so answering a read never enters an exchange
+/// wait.
+fn answer(cat: &mut CatalogEngine, read: &Read<'_>, rows: Option<&Batch>) -> Result<Rows, WireFault> {
+    // Each arm builds its own `Ok`: wrapped around the whole match, every answer
+    // would be copied at the width of the widest one.
+    match *read {
+        Read::HasPk { tid, probe } => {
+            let keys = rows.ok_or("has_pk: a probe carries its keys")?;
+            Ok(Rows::Own(cat.registry.probe(tid, probe, keys)?))
+        }
+        Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::Shared(cat.scan_spec(
+            tid,
+            gnitz_wire::ReadSpec::decode(spec)?,
+            reply_layout,
+        )?)),
+        Read::Delta {
+            view,
+            after_tick,
+            cut_round,
+            reply_layout,
+        } => Ok(Rows::Shared(cat.registry.delta_read(
+            view,
+            after_tick,
+            cut_round,
+            reply_layout,
+        )?)),
+        Read::KeySpans { tid, cols } => {
+            if KEY_SPANS_ERROR.armed() {
+                return Err("injected key-spans fault".into());
+            }
+            Ok(Rows::Spans(Box::new(cat.registry.key_spans(tid, cols.as_slice())?)))
+        }
+    }
 }
 
 #[cfg(test)]

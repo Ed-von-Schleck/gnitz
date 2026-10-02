@@ -2,11 +2,10 @@ use std::rc::Rc;
 
 use super::super::fixtures::test_dispatcher;
 use crate::catalog::{CatalogEngine, SysFamily};
-use crate::runtime::sal::{DirectGroup, SalMessageKind};
+use crate::runtime::sal::{Apply, DirectGroup};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
-use crate::runtime::wire::WireMsg;
 use gnitz_foundation::posix_io::retry_eintr;
-use gnitz_wire::WireStatus;
+use gnitz_wire::{WireFault, WireStatus};
 
 /// Fork a child that exits immediately, and wait until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` finds it on the first call.
@@ -62,43 +61,30 @@ fn worker_death_names_the_dead_worker() {
     });
 }
 
-/// A group written on an ACK lease is answered by every worker's ACK or by the
-/// first error ACK, without waiting on the other workers; one the SAL has no
-/// room for is refused with the SAL's own status.
+/// A group written on an ACK lease ends on every worker's ACK; one the SAL has
+/// no room for is refused with the SAL's own status.
 #[test]
-fn an_acked_group_ends_on_its_acks_or_its_first_failure() {
-    #[derive(Clone, Copy, Debug)]
-    enum Answer {
-        Acks,
-        Refused,
-        ErrorAck,
-    }
+fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
-        for answer in [Answer::Acks, Answer::Refused, Answer::ErrorAck] {
+        for refused in [false, true] {
             let (disp, writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
             let disp = Rc::new(disp);
             let d = Rc::clone(&disp);
             let got = disp.reactor().block_on(async move {
                 // Wider than the fixture's whole SAL.
-                let blob = vec![0u8; if let Answer::Refused = answer { 2 << 20 } else { 0 }];
-                let group = DirectGroup {
-                    template: WireMsg { blob: &blob, ..Default::default() },
-                    ..DirectGroup::new(SalMessageKind::Backfill)
+                let tick = Apply::Tick {
+                    first_round: 2,
+                    tids: vec![0u8; if refused { 2 << 20 } else { 8 }].into(),
                 };
-                let lease = d.write_acked(&d.sal().lock().await, "backfill", group)?;
-                match answer {
-                    Answer::Acks => writers
-                        .iter()
-                        .for_each(|w| w.send_status(lease.id(), WireStatus::Ok, b"")),
-                    _ => writers[0].send_status(lease.id(), WireStatus::Error, b"boom"),
-                }
-                lease.acks().await
+                let lease = d.write_acked(&d.sal().lock().await, DirectGroup::new(tick))?;
+                writers.iter().for_each(|w| w.send_ack(lease.id()));
+                lease.acks().await;
+                Ok::<(), WireFault>(())
             });
-            match (answer, got) {
-                (Answer::Acks, Ok(())) => {}
-                (Answer::Refused, Err(e)) => assert_eq!(e.status, WireStatus::SalFull, "{e}"),
-                (Answer::ErrorAck, Err(e)) => assert!(e.text.contains("worker 0") && e.text.contains("boom"), "{e}"),
-                (answer, got) => panic!("{answer:?}: {got:?}"),
+            match (refused, got) {
+                (false, Ok(())) => {}
+                (true, Err(e)) => assert_eq!(e.status, WireStatus::SalFull, "{e}"),
+                (refused, got) => panic!("refused={refused}: {got:?}"),
             }
         }
     });

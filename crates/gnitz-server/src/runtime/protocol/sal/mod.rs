@@ -4,11 +4,14 @@
 //! behind it — and every reader and writer of it. The recovery walk over the
 //! ring is the [`zone`] child module.
 //!
-//! A group's kind byte is this module's alone: callers name a
-//! [`SalMessageKind`], and the encode/decode below is the only code entitled to
-//! know how it is stored.
+//! A group's kind byte and its frame head are this module's alone: callers name
+//! a [`SalRequest`], and the encode/decode below and in [`request`] is the only
+//! code entitled to know how either is stored.
 
+mod request;
 pub(crate) mod zone;
+
+pub(crate) use request::{Apply, Read, SalRequest};
 
 use std::cell::Cell;
 use std::future::Future;
@@ -239,76 +242,49 @@ impl<'a> GroupData<'a> {
     }
 }
 
-/// One SAL group as [`SalWriter::lay_out`] encodes it: its header fields, the
-/// [`WireMsg`] every payload shares, plus what varies by worker.
-#[derive(Clone, Copy)]
+/// One SAL group as [`SalWriter::lay_out`] encodes it: the request every payload
+/// carries, plus what varies by worker.
+#[derive(Clone)]
 pub(crate) struct DirectGroup<'a> {
-    pub(crate) kind: SalMessageKind,
-    /// Every payload's message; `msg` fills in `data` per worker, and drops
-    /// `schema_block` from a payload that carries no rows.
-    pub(crate) template: WireMsg<'a>,
+    pub(crate) request: SalRequest<'a>,
+    /// The schema record of the rows in `data`; dropped from a payload that
+    /// carries none.
+    pub(crate) schema: Option<&'a [u8]>,
     pub(crate) data: GroupData<'a>,
-    /// Worker `w`'s blob in place of the template's, when every worker is sent
-    /// its own.
+    /// Worker `w`'s blob in place of the request's, when every worker is sent its own.
     pub(crate) extras: Option<&'a [Vec<u8>]>,
     pub(crate) targets: GroupTargets,
 }
 
 impl<'a> DirectGroup<'a> {
-    /// A control-only silent broadcast of `kind`. Callers override what varies
+    /// A control-only silent broadcast of `request`. Callers override what varies
     /// by struct update.
-    pub(crate) fn new(kind: SalMessageKind) -> Self {
+    pub(crate) fn new(request: impl Into<SalRequest<'a>>) -> Self {
         DirectGroup {
-            kind,
-            template: WireMsg::default(),
+            request: request.into(),
+            schema: None,
             data: GroupData::NONE,
             extras: None,
             targets: GroupTargets::UNADDRESSED,
         }
     }
 
-    /// A read of `target_id` under the encoded `ReadSpec` `spec`, replied in the
-    /// layout whose digest is `reply_layout`.
-    pub(crate) fn scan_spec(target_id: u64, spec: &'a [u8], reply_layout: u64) -> Self {
-        DirectGroup {
-            template: WireMsg {
-                target_id,
-                arg0: reply_layout,
-                blob: spec,
-                ..Default::default()
-            },
-            ..Self::new(SalMessageKind::ScanSpec)
-        }
-    }
-
-    /// The sorted key spans of `cols` over `target_id`.
-    pub(crate) fn key_spans(target_id: u64, cols: gnitz_wire::PkColList) -> Self {
-        DirectGroup {
-            template: WireMsg {
-                target_id,
-                arg1: cols.pack(),
-                ..Default::default()
-            },
-            ..Self::new(SalMessageKind::KeySpans)
-        }
-    }
-
     /// A push of `data` into `relation`, written to `targets`.
     pub(crate) fn push(relation: &'a WireSchema, data: GroupData<'a>, targets: GroupTargets) -> Self {
         DirectGroup {
-            template: relation.frame(WireMsg::default()),
+            schema: Some(relation.block()),
             data,
             targets,
-            ..Self::new(SalMessageKind::Push)
+            ..Self::new(Apply::Push { tid: relation.tid() })
         }
     }
 
     /// A catalog mutation of `relation`: `batch`, sent whole to every worker.
     pub(crate) fn ddl_sync(relation: &'a WireSchema, batch: &'a Batch) -> Self {
         DirectGroup {
-            template: relation.frame(WireMsg::default()),
+            schema: Some(relation.block()),
             data: GroupData::Same(batch.wire_whole()),
-            ..Self::new(SalMessageKind::DdlSync)
+            ..Self::new(Apply::DdlSync { family: relation.tid() })
         }
     }
 
@@ -317,23 +293,20 @@ impl<'a> DirectGroup<'a> {
         matches!(self.data, GroupData::Same(_)) && self.extras.is_none()
     }
 
-    /// Worker `w`'s message. The one definition — sizing and encoding both go
-    /// through it, so a payload's size and its bytes cannot disagree.
+    /// Worker `w`'s message over `head`, the request's template. The one
+    /// definition — sizing and encoding both go through it, so a payload's size
+    /// and its bytes cannot disagree.
     #[inline]
-    fn msg(&self, w: usize) -> WireMsg<'a> {
-        debug_assert!(
-            self.template.data.is_none(),
-            "DirectGroup template must leave `data` to the per-worker fill"
-        );
+    fn msg<'m>(&'m self, head: &WireMsg<'m>, w: usize) -> WireMsg<'m> {
         let data = match self.data {
             GroupData::Same(d) => d,
             GroupData::Each(each) => each[w],
         };
         WireMsg {
             data,
-            schema_block: self.template.schema_block.filter(|_| data.is_some()),
-            blob: self.extras.map_or(self.template.blob, |e| &e[w]),
-            ..self.template
+            schema_block: self.schema.filter(|_| data.is_some()),
+            blob: self.extras.map_or(head.blob, |e| &e[w]),
+            ..*head
         }
     }
 }
@@ -418,44 +391,26 @@ pub(in crate::runtime) fn sal_mmap_size() -> usize {
 // ---------------------------------------------------------------------------
 
 gnitz_wire::wire_enum! {
-    /// What a SAL group asks a worker to do. Stored as one ordinal byte in the
-    /// group header; `ALL`/`from_wire` come from the one variant list, so a
-    /// decode cannot fall behind the enum.
+    /// What a SAL group asks a worker to do: the [`SalRequest`] variant its
+    /// payloads decode to. Stored as one ordinal byte in the group header;
+    /// `ALL`/`from_wire` come from the one variant list, so a decode cannot fall
+    /// behind the enum.
     pub(crate) enum SalMessageKind: u8 {
         Shutdown = 1,
-        /// Base round of a checkpoint: flush base and system tables.
         Flush = 2,
-        /// Ephemeral round of a checkpoint: flush every view's traces and output
-        /// stores, stamped with the generation in `arg0`.
         FlushEph = 3,
-        /// Catalog mutation.
         DdlSync = 4,
-        /// Initial full-source scan feeding a newly created view: `target_id` =
-        /// the source, `arg0` = the view.
         Backfill = 6,
-        /// Answer a [`gnitz_wire::Probe`] at a scattered or broadcast key list.
         HasPk = 7,
-        /// Stream the sorted key spans of the column list in `arg1`.
         KeySpans = 8,
         Push = 9,
-        /// Drive one view-maintenance tick per tid: `arg0` = the first tid's
-        /// round; the blob = the tids, `u64` LE, rounds consecutive.
         Tick = 10,
-        /// A parameterized bounded read: the blob = the encoded `ReadSpec`,
-        /// `arg0` = the reply layout digest.
         ScanSpec = 11,
-        /// One DELTA_POLL view: `arg1` = `after_tick`, `arg0` = the cut round, the
-        /// blob = the reply layout digest, `u64` LE.
         DeltaRead = 12,
     }
 }
 
 impl SalMessageKind {
-    /// Whether the template's blob is a `ReadSpec` whose bound routes the read.
-    pub(crate) const fn carries_read_bound(self) -> bool {
-        matches!(self, SalMessageKind::ScanSpec)
-    }
-
     /// Whether a group of this kind is the last of its epoch.
     pub(crate) const fn ends_epoch(self) -> bool {
         matches!(self, SalMessageKind::Flush | SalMessageKind::FlushEph)
@@ -517,7 +472,8 @@ pub(crate) struct SalMessage {
     end: u64,
     /// `0` = nothing answers.
     pub(crate) request_id: u32,
-    pub(crate) in_request_order: bool,
+    /// Whether the group is a later member of its cut.
+    in_request_order: bool,
     /// The workers the group addresses.
     pub(crate) targets: WorkerSet,
     /// Whether the group holds one payload for every addressed worker.
@@ -988,29 +944,30 @@ impl SalWriter {
         };
         assert_eq!(per_worker, nw, "per-worker payloads={per_worker} != num_workers={nw}");
         debug_assert!(
-            g.template.schema_block.is_some() || g.data.is_dataless(),
-            "data without a schema — `decode_sal_rows` rejects a data block without a schema block",
+            g.schema.is_some() || g.data.is_dataless(),
+            "data without a schema — `decode_sal_frame` rejects a data block without a schema block",
         );
 
         let set = g.targets.set.within(nw);
         let shared = g.shared();
+        let template = g.request.template();
         debug_assert!(
             matches!(g.data, GroupData::Same(_)) || g.data.holders().union(set) == set,
             "a group addresses every worker it has rows for"
         );
         let mut sizes = [0usize; MAX_WORKERS];
         let n = if shared {
-            sizes[0] = g.msg(0).size();
+            sizes[0] = g.msg(&template, 0).size();
             1
         } else {
             for (i, w) in set.iter().enumerate() {
-                sizes[i] = g.msg(w).size();
+                sizes[i] = g.msg(&template, w).size();
             }
             set.len()
         };
         let head = GroupHead {
             lsn,
-            kind: g.kind,
+            kind: g.request.kind(),
             flags: if shared { FLAG_SHARED } else { 0 }
                 | if g.targets.in_request_order {
                     FLAG_IN_REQUEST_ORDER
@@ -1018,7 +975,7 @@ impl SalWriter {
                     0
                 },
             request_id: g.targets.request_id,
-            target_id: g.template.target_id,
+            target_id: template.target_id,
             targets: set,
         };
         let mut workers = set.iter();
@@ -1028,7 +985,7 @@ impl SalWriter {
             } else {
                 workers.next().expect("one payload per addressed worker")
             };
-            g.msg(w).encode(slot)
+            g.msg(&template, w).encode(slot)
         })?;
         self.reached.set(self.reached.get().union(set));
         Ok(base)
@@ -1265,6 +1222,8 @@ pub(crate) struct SalReader {
     /// arithmetic.
     read_cursor: Cell<u64>,
     expected_epoch: Cell<u32>,
+    /// The cut of the group [`Self::next`] last returned.
+    cut: Cell<u64>,
 }
 
 impl SalReader {
@@ -1275,6 +1234,7 @@ impl SalReader {
             worker_id,
             read_cursor: Cell::new(0),
             expected_epoch: Cell::new(live_epoch),
+            cut: Cell::new(0),
         }
     }
 
@@ -1295,6 +1255,11 @@ impl SalReader {
                     } else {
                         self.read_cursor.set(msg.end);
                     }
+                    // Counted whether or not the group addresses this worker, so
+                    // every worker numbers a cut alike.
+                    if !msg.in_request_order {
+                        self.cut.set(self.cut.get() + 1);
+                    }
                     if let Some(slot) = msg.slot(self.worker_id) {
                         return Some((msg, slot));
                     }
@@ -1305,6 +1270,14 @@ impl SalReader {
                 SalStep::Absent => return None,
             }
         }
+    }
+
+    /// The cut of the group [`Self::next`] last returned: how many groups not
+    /// flagged in request order the drain has passed. A cut's groups are
+    /// consecutive and only its first is unflagged, so every member of a cut reads
+    /// one count and no two cuts share one.
+    pub(crate) fn cut(&self) -> u64 {
+        self.cut.get()
     }
 
     /// No group is readable or corrupt at the cursor.

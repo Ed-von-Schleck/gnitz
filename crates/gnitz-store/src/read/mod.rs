@@ -17,8 +17,11 @@
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover.
 
+mod key_spans;
 mod scan_spec;
 mod store_io;
+
+pub use key_spans::KeySpans;
 
 #[cfg(test)]
 mod bench_index_probe;

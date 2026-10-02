@@ -314,7 +314,6 @@ fn view_traces_resume_with_their_output_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let view_weight = |engine: &CatalogEngine| sum_weights(engine.registry.relation(vid).unwrap().cursor());
     assert_eq!(view_weight(&engine), N, "the output store resumes");
-    engine.dag.open_plan(&engine.registry, vid).unwrap();
 
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(&schema);
@@ -322,7 +321,7 @@ fn view_traces_resume_with_their_output_store() {
     bb.put_u64(0);
     bb.end_row();
     let what = crate::query::Drive::Tick { source: tid, round: 1 };
-    crate::query::drive(&mut LocalDrive(&mut engine), what, bb.finish()).unwrap();
+    crate::query::drive(&mut LocalDrive(&mut engine), what, Some(bb.finish())).unwrap();
     assert_eq!(view_weight(&engine), N, "a resumed trace already holds the row");
 
     engine.close();

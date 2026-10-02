@@ -27,26 +27,19 @@ pub(super) struct AckRoute {
     /// The workers that answer.
     expected: WorkerSet,
     answered: WorkerSet,
-    /// The fault of the lowest-numbered worker that failed.
-    fault: Option<(usize, WireFault)>,
     /// The `acks` awaiter parked on this id.
     waker: Option<Waker>,
 }
 
 impl AckRoute {
     /// Record worker `w`'s answer.
-    fn record(&mut self, w: usize, fault: Option<WireFault>) {
+    fn record(&mut self, w: usize) {
         debug_assert!(
             self.expected.contains(w),
             "worker {w} answered a request it was not sent"
         );
         debug_assert!(!self.answered.contains(w), "worker {w} answered one request id twice");
         self.answered = self.answered.with(w);
-        if let Some(f) = fault {
-            if self.fault.as_ref().is_none_or(|&(fw, _)| w < fw) {
-                self.fault = Some((w, f));
-            }
-        }
     }
 }
 
@@ -82,8 +75,8 @@ impl Reactor {
                 }
             }
             Some(Route::Acks(r)) => {
-                r.record(w, slot.control().fault(slot.bytes()));
-                if r.fault.is_some() || r.answered == r.expected {
+                r.record(w);
+                if r.answered == r.expected {
                     if let Some(waker) = r.waker.take() {
                         waker.wake();
                     }
@@ -105,24 +98,18 @@ impl Reactor {
         id
     }
 
-    /// One request id, answered by one ACK from every worker in `set`, awaited
-    /// under the label `ctx`. See [`AckLease`].
-    pub(crate) fn lease_acks(&self, ctx: &'static str, set: WorkerSet) -> AckLease {
+    /// One request id, answered by one ACK from every worker in `set`. See
+    /// [`AckLease`].
+    pub(crate) fn lease_acks(&self, set: WorkerSet) -> AckLease {
         let set = set.within(self.w2m.num_workers());
         let id = self.alloc_request_id();
         let route = AckRoute {
             expected: set,
             answered: WorkerSet::EMPTY,
-            fault: None,
             waker: None,
         };
         self.routes.borrow_mut().insert(id, Route::Acks(route));
-        AckLease {
-            reactor: self.clone(),
-            id,
-            workers: set,
-            ctx,
-        }
+        AckLease { reactor: self.clone(), id, workers: set }
     }
 
     /// One request id, answered by a train of frames from every worker in `set`,
@@ -155,8 +142,6 @@ pub(crate) struct AckLease {
     id: u32,
     /// The set its route was built over.
     workers: WorkerSet,
-    /// What the ACKs answer, named in every fault the lease reports.
-    ctx: &'static str,
 }
 
 impl AckLease {
@@ -173,20 +158,16 @@ impl AckLease {
         }
     }
 
-    /// `Ok` once every worker of the set has ACKed; `Err` as soon as one has
-    /// failed, without waiting for the rest — the fault of the lowest-numbered
-    /// failed worker among those that answered.
-    pub(crate) async fn acks(&self) -> Result<(), WireFault> {
+    /// Resolves once every worker of the set has ACKed. A worker that cannot
+    /// apply what it is to ACK exits instead, which the master's death watch sees.
+    pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
             let mut routes = self.reactor.routes.borrow_mut();
             let Some(Route::Acks(r)) = routes.get_mut(&self.id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
-            if let Some((w, f)) = &r.fault {
-                return Poll::Ready(Err(worker_fault(*w, self.ctx, f.clone())));
-            }
             if r.answered == r.expected {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(());
             }
             r.waker = Some(cx.waker().clone());
             Poll::Pending

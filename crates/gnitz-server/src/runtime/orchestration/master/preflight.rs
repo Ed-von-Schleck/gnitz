@@ -378,14 +378,11 @@ async fn execute_probe_burst<P>(
     let leases = disp
         .scan_cut(|cut| {
             for check in checks.iter() {
-                let (probe_mode, arg0, arg1) = check.probe.wire();
                 let schema = wire::WireSchema::encoded(check.tid, check.keys.schema());
-                let template = schema.frame(wire::WireMsg {
-                    arg1,
-                    arg0,
-                    flags: WireFlags { probe_mode, ..Default::default() },
-                    ..Default::default()
-                });
+                let probe = DirectGroup {
+                    schema: Some(schema.block()),
+                    ..DirectGroup::new(Read::HasPk { tid: check.tid, probe: check.probe })
+                };
                 match check.probe {
                     // Each worker is sent the keys it holds; one holding none is
                     // not sent the probe.
@@ -396,22 +393,14 @@ async fn execute_probe_burst<P>(
                             .relation(check.tid)
                             .expect("a probed relation is registered under the catalog lock");
                         with_routed(&check.keys, probe_placement(rel), nw, |data| {
-                            cut.push(
-                                data.holders(),
-                                DirectGroup {
-                                    template,
-                                    data,
-                                    ..DirectGroup::new(SalMessageKind::HasPk)
-                                },
-                            )
+                            cut.push(data.holders(), DirectGroup { data, ..probe.clone() })
                         })?
                     }
                     // Index entries are partitioned independently of the probe
                     // key, so every worker holding the relation is probed.
                     Probe::Index(..) => cut.read(DirectGroup {
-                        template,
                         data: GroupData::Same(check.keys.wire_whole()),
-                        ..DirectGroup::new(SalMessageKind::HasPk)
+                        ..probe
                     })?,
                 }
             }

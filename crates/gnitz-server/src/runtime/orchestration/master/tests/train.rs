@@ -1,10 +1,11 @@
 use super::*;
 use crate::runtime::reactor::{client_pair, framed, reactor_with_rings, read_nonblocking};
+use crate::runtime::sal::SalMessageKind;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_schema_u64_i64, weighted_rows};
-use gnitz_wire::WireStatus;
+use gnitz_wire::{WireFlags, WireStatus};
 use gnitz_zset::repr::Batch;
 
 /// A scan lease over `n` workers' fresh rings, with each ring's writer.
@@ -81,7 +82,14 @@ fn drain_rows_stops_at_the_first_error() {
         if sink_fails {
             frame(&writers[0], req, true, Some(&rows));
         } else {
-            writers[0].send_status(req, WireStatus::Error, b"boom");
+            writers[0].send_msg(
+                req,
+                &WireMsg {
+                    status: WireStatus::Error,
+                    blob: b"boom",
+                    ..Default::default()
+                },
+            );
         }
         frame(&writers[1], req, true, Some(&rows));
 

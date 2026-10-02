@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::control::DecodedControl;
+use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
@@ -45,14 +45,13 @@ impl WireSchema {
         }
     }
 
-    /// `rest` addressed to this relation: its target id and schema block, with
-    /// the caller's own header fields kept.
-    pub(crate) fn frame<'a>(&'a self, rest: WireMsg<'a>) -> WireMsg<'a> {
-        WireMsg {
-            target_id: self.tid,
-            schema_block: Some(&self.block),
-            ..rest
-        }
+    pub(crate) fn tid(&self) -> u64 {
+        self.tid
+    }
+
+    /// The encoded schema record a frame of this relation's rows carries.
+    pub(crate) fn block(&self) -> &[u8] {
+        &self.block
     }
 }
 
@@ -137,24 +136,25 @@ pub fn decode_client_rows(
         .transpose()
 }
 
-/// The rows of a SAL slot's data block under the slot's own schema record;
-/// `known` answers what that record decodes to when the caller already knows.
-pub fn decode_sal_rows(
-    data: &[u8],
-    control: &DecodedControl,
+/// A SAL slot's control block, and the rows of its data block under the slot's
+/// own schema record; `known` answers what that record decodes to when the
+/// caller already knows.
+pub fn decode_sal_frame(
+    bytes: &[u8],
     known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
-) -> Result<Option<Batch>, String> {
+) -> Result<(DecodedControl, Option<Batch>), String> {
+    let control = peek_control_block(bytes)?;
     let Some(r) = control.data.clone() else {
-        return Ok(None);
+        return Ok((control, None));
     };
-    let record = &data[control.schema.clone().ok_or("a data block without a schema block")?];
+    let record = &bytes[control.schema.clone().ok_or("a data block without a schema block")?];
     let schema = match known(control.hdr.target_id, record) {
         Some(s) => s,
         None => decode_schema_block(record)?,
     };
-    let batch = Batch::decode_from_wal_block(&data[r], &schema)?;
+    let batch = Batch::decode_from_wal_block(&bytes[r], &schema)?;
     batch.debug_verify_null_bits();
-    Ok(Some(batch))
+    Ok((control, Some(batch)))
 }
 
 #[cfg(test)]

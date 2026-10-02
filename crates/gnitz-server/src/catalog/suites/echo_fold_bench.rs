@@ -47,7 +47,7 @@ fn echo_fold_bench() {
             }
             let effective = engine.registry.ingest_returning(t, bb.finish()).unwrap();
             let what = Drive::Tick { source: t, round: round + 1 };
-            let (res, n) = counter.measure(|| crate::query::drive(&mut LocalDrive(&mut engine), what, effective));
+            let (res, n) = counter.measure(|| crate::query::drive(&mut LocalDrive(&mut engine), what, Some(effective)));
             res.unwrap();
             instructions += n;
         }

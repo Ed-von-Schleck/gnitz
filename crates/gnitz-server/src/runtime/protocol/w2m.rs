@@ -699,16 +699,9 @@ impl W2mWriter {
         }
     }
 
-    /// Send a bare control frame: a status and optional error text, no schema
-    /// and no rows. Every ACK and error reply on the ring has this shape.
-    pub fn send_status(&self, request_id: u32, status: gnitz_wire::WireStatus, text: &[u8]) {
-        let msg = WireMsg {
-            flags: gnitz_wire::WireFlags::default(),
-            status,
-            blob: text,
-            ..Default::default()
-        };
-        self.send_msg(request_id, &msg);
+    /// ACK `request_id`: the bare `Ok` control frame.
+    pub fn send_ack(&self, request_id: u32) {
+        self.send_msg(request_id, &WireMsg::default());
     }
 
     /// Encode `msg` into one ring slot, parking on `release_cursor` while the
@@ -718,15 +711,38 @@ impl W2mWriter {
         let sz = msg.size();
         // SAFETY: a worker process is the sole producer on its own ring.
         unsafe {
-            let mut wc = self.cursor.get();
-            let mut reservation = match try_reserve(&wc, sz, ring_req) {
+            let wc = self.cursor.get();
+            let reservation = match try_reserve(&wc, sz, ring_req) {
                 Some(r) => r,
                 None => park_for_room(&wc, sz, ring_req),
             };
-            msg.encode(reservation.slot());
-            commit(&mut wc, reservation);
-            self.cursor.set(wc);
+            self.fill(wc, reservation, msg);
         }
+    }
+
+    /// [`Self::send_msg`], unless the ring has no room for the frame now.
+    pub fn try_send_msg(&self, ring_req: u32, msg: &WireMsg<'_>) -> bool {
+        // SAFETY: a worker process is the sole producer on its own ring.
+        unsafe {
+            let wc = self.cursor.get();
+            match try_reserve(&wc, msg.size(), ring_req) {
+                Some(reservation) => {
+                    self.fill(wc, reservation, msg);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Encode `msg` into `reservation` and publish it.
+    ///
+    /// # Safety
+    /// `reservation` comes from a [`try_reserve`] against `wc`, this writer's cursor.
+    unsafe fn fill(&self, mut wc: RingCursor, mut reservation: Reservation, msg: &WireMsg<'_>) {
+        msg.encode(reservation.slot());
+        commit(&mut wc, reservation);
+        self.cursor.set(wc);
     }
 }
 

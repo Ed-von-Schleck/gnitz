@@ -374,6 +374,8 @@ pub struct StoreConfig {
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold; bounds the
     /// accumulator matrix at `cap × aggregates × size_of::<Accumulator>()`.
     pub adhoc_group_cap: usize,
+    /// Bytes a key-span sort holds in RAM before it spills a run.
+    pub key_spans_spill_bytes: usize,
 }
 
 impl Default for StoreConfig {
@@ -382,19 +384,22 @@ impl Default for StoreConfig {
             ram_tier_bytes: crate::storage::DEFAULT_RAM_TIER_BYTES,
             scan_chunk_rows: 65_536,
             adhoc_group_cap: 65_536,
+            key_spans_spill_bytes: 128 << 20,
         }
     }
 }
 
 impl StoreConfig {
-    /// Every field from `<prefix>RAM_TIER_BYTES`, `<prefix>SCAN_CHUNK_ROWS` and
-    /// `<prefix>ADHOC_GROUP_CAP`, each falling back to [`Default`].
+    /// Every field from `<prefix>RAM_TIER_BYTES`, `<prefix>SCAN_CHUNK_ROWS`,
+    /// `<prefix>ADHOC_GROUP_CAP` and `<prefix>KEY_SPANS_SPILL_BYTES`, each falling
+    /// back to [`Default`].
     pub fn from_env(prefix: &str) -> Self {
         let d = StoreConfig::default();
         StoreConfig {
             ram_tier_bytes: env_num(&format!("{prefix}RAM_TIER_BYTES"), d.ram_tier_bytes),
             scan_chunk_rows: env_num(&format!("{prefix}SCAN_CHUNK_ROWS"), d.scan_chunk_rows),
             adhoc_group_cap: env_num(&format!("{prefix}ADHOC_GROUP_CAP"), d.adhoc_group_cap),
+            key_spans_spill_bytes: env_num(&format!("{prefix}KEY_SPANS_SPILL_BYTES"), d.key_spans_spill_bytes),
         }
     }
 }

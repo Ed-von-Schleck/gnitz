@@ -91,7 +91,7 @@ fn times(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)], k: i64) -> 
 
 /// One tick of `source` over `delta`.
 fn tick(engine: &mut CatalogEngine, source: u64, round: u64, delta: Batch) {
-    drive(&mut LocalDrive(engine), Drive::Tick { source, round }, delta).unwrap();
+    drive(&mut LocalDrive(engine), Drive::Tick { source, round }, Some(delta)).unwrap();
 }
 
 // ── The schedule ────────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     // A rebuild set is closed under dependents.
     dag.set_rebuild([2, 4, 5].into_iter().collect());
     assert_eq!(dag.tick_schedule(1), [step(3, 1)]);
-    dag.rebuild_started(2);
+    dag.rebuild.remove(&2);
     assert_eq!(dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
 }
 
@@ -151,15 +151,14 @@ fn backfill_chunk_runs_only_the_named_view() {
     let rows = [(1, 1, 10)];
 
     let chunk = delta_for(&engine, base, &rows);
-    drive(&mut LocalDrive(&mut engine), backfill(views.twice), chunk).unwrap();
-    let empty = delta_for(&engine, base, &[]);
-    drive(&mut LocalDrive(&mut engine), backfill(views.twice), empty.clone()).unwrap();
+    drive(&mut LocalDrive(&mut engine), backfill(views.twice), Some(chunk)).unwrap();
+    drive(&mut LocalDrive(&mut engine), backfill(views.twice), None).unwrap();
     assert_eq!(held(&mut engine, views.twice), times(&engine, base, &rows, 2));
     for vid in views.all().into_iter().filter(|&v| v != views.twice) {
         assert!(held(&mut engine, vid).is_empty(), "view {vid}");
     }
 
-    let err = drive(&mut LocalDrive(&mut engine), backfill(999_999), empty).unwrap_err();
+    let err = drive(&mut LocalDrive(&mut engine), backfill(999_999), None).unwrap_err();
     assert!(err.contains("is not registered"), "{err}");
 }
 

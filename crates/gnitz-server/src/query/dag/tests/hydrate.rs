@@ -21,7 +21,12 @@ fn tick(engine: &mut CatalogEngine, tid: u64) {
         .seal(tid)
         .unwrap()
         .expect("a view scans the pushed table");
-    drive(&mut LocalDrive(engine), Drive::Tick { source: tid, round: 1 }, delta).unwrap();
+    drive(
+        &mut LocalDrive(engine),
+        Drive::Tick { source: tid, round: 1 },
+        Some(delta),
+    )
+    .unwrap();
 }
 
 /// `view`'s rows recomputed for the U64 keys `ids`, as a Z-set.

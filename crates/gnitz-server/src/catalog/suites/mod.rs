@@ -165,15 +165,20 @@ fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, Str
     (engine, tid, dir)
 }
 
-/// Compile `view` and backfill it from each of `sources` in turn.
+/// Backfill `view` from each of `sources` in turn, each ending with the pad
+/// chunk a drained worker drives.
 fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
-    engine.dag.open_plan(&engine.registry, view).unwrap();
     let chunk_rows = engine.registry.scan_chunk_rows();
     for &source in sources {
         let mut cursor = engine.open_source_cursor(view, source).unwrap();
-        while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
+        loop {
+            let chunk = cursor.drain_chunk(chunk_rows);
+            let drained = chunk.is_none();
             let what = crate::query::Drive::Backfill { view, source };
             crate::query::drive(&mut LocalDrive(engine), what, chunk).unwrap();
+            if drained {
+                break;
+            }
         }
     }
     engine.dag.finish_backfill(&mut engine.registry, view).unwrap();

@@ -21,9 +21,11 @@ use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Reactor, TrainLease};
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalExcl, SalMessageKind, SalWriter, WorkerSet};
+use crate::runtime::sal::{
+    Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter, WorkerSet,
+};
 use crate::runtime::wire;
-use gnitz_wire::{BoundPeek, PkColList, WireFault, WireFlags};
+use gnitz_wire::{BoundPeek, PkColList, WireFault};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};
 
@@ -67,7 +69,7 @@ pub struct MasterDispatcher {
 // ---------------------------------------------------------------------------
 
 /// Which workers answer a read, and what each is sent: `per_worker[w]` replaces
-/// the template's blob for worker `w` when present.
+/// the request's blob for worker `w` when present.
 struct ReadRoute {
     set: WorkerSet,
     per_worker: Option<Vec<Vec<u8>>>,
@@ -118,7 +120,7 @@ pub(crate) struct ScanCut<'d> {
 impl<'d> ScanCut<'d> {
     /// Lease a reply id for `set`, then write `group` to it.
     pub(crate) fn push(&mut self, set: WorkerSet, group: DirectGroup<'_>) -> Result<(), WireFault> {
-        let lease = self.disp.reactor.lease_train(set, group.kind);
+        let lease = self.disp.reactor.lease_train(set, group.request.kind());
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         self.excl.write(&DirectGroup {
             // Only a later scan of a cut has a train of the cut to stay behind.
@@ -129,11 +131,17 @@ impl<'d> ScanCut<'d> {
         Ok(())
     }
 
-    /// `group` written to the workers its target and bound reach, each sent its
-    /// own key set when the bound splits one.
+    /// `group`, a read, written to the workers its target and bound reach, each
+    /// sent its own key set when the bound splits one.
     pub(crate) fn read(&mut self, group: DirectGroup<'_>) -> Result<(), WireFault> {
-        let bound = group.kind.carries_read_bound().then_some(group.template.blob);
-        let tid = group.template.target_id;
+        let SalRequest::Read(read) = &group.request else {
+            unreachable!("a cut routes reads; {:?} is none", group.request)
+        };
+        let bound = match read {
+            Read::ScanSpec { spec, .. } => Some(&spec[..]),
+            _ => None,
+        };
+        let tid = read.target();
         let (schema, placement) = self
             .disp
             .cat()
@@ -169,8 +177,8 @@ impl MasterDispatcher {
     }
 
     /// One scan-shaped read under its own SAL hold.
-    pub(crate) async fn scan(&self, group: DirectGroup<'_>) -> Result<TrainLease, WireFault> {
-        let mut leases = self.scan_cut(|cut| cut.read(group)).await?;
+    pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
+        let mut leases = self.scan_cut(|cut| cut.read(DirectGroup::new(read))).await?;
         Ok(leases.pop().expect("one read, one lease"))
     }
 }

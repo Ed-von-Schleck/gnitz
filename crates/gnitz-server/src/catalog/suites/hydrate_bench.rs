@@ -260,7 +260,8 @@ fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
     let effective = engine.registry.ingest_returning(base, bb.finish()).unwrap();
     let counter = perf::Counter::instructions().expect("instructions counter");
     let what = Drive::Tick { source: base, round: id };
-    let (_, instructions) = counter.measure(|| crate::query::drive(&mut LocalDrive(engine), what, effective).unwrap());
+    let (_, instructions) =
+        counter.measure(|| crate::query::drive(&mut LocalDrive(engine), what, Some(effective)).unwrap());
     instructions
 }
 

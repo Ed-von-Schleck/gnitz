@@ -42,14 +42,12 @@ fn decode_group_slot(
     data: &[u8],
     known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<Option<Batch>, String> {
-    gnitz_wire::control::peek_control_block(data)
-        .and_then(|control| ipc::decode_sal_rows(data, &control, known))
-        .map_err(|e| {
-            format!(
-                "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-                msg.base, msg.lsn, msg.target_id
-            )
-        })
+    ipc::decode_sal_frame(data, known).map(|(_, batch)| batch).map_err(|e| {
+        format!(
+            "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
+            msg.base, msg.lsn, msg.target_id
+        )
+    })
 }
 
 /// Stage every committed DdlSync group above its family's replay floor into the
@@ -93,9 +91,8 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
 static RECOVERY_PANIC: Seam = Seam::new("GNITZ_INJECT_RECOVERY_PANIC");
 
 /// `GNITZ_INJECT_BOOT_FLUSH_ERROR`: fail a worker's boot recovery after its base
-/// flush, so the error rides the startup ACK as a real flush failure's would —
-/// one that, swallowed, would let the SAL reset destroy the replayed rows' only
-/// durable copy.
+/// flush, as a real flush failure would — one that, swallowed, would let the SAL
+/// reset destroy the replayed rows' only durable copy.
 static BOOT_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_BOOT_FLUSH_ERROR");
 
 fn inject_recovery_panic(stage: &str) {
@@ -196,9 +193,9 @@ fn recover_from_sal(
     Ok(())
 }
 
-/// Worker-boot catalog recovery. The `Err` rides the startup ACK, which fails
-/// the boot before the master rewinds the SAL — otherwise the rewind destroys
-/// the replayed rows' only durable copy.
+/// Worker-boot catalog recovery. On `Err` the worker exits without its ready
+/// ACK, which fails the boot before the master rewinds the SAL — otherwise the
+/// rewind destroys the replayed rows' only durable copy.
 fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
     tail: CommittedTail,
@@ -340,10 +337,8 @@ fn run_worker_child(
         .map_or(Ok(()), |p| p.enter_worker(w))
         .and_then(|()| worker_boot_recovery(catalog, ipc.tail, slot, swept_bases));
     if let Err(e) = boot {
-        // The master reads this frame off the shared ring, which outlives the
-        // process that wrote it.
+        // No frame: the master's death watch fails the boot.
         gnitz_error!("{e}");
-        w2m_writer.send_status(BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
         unsafe { libc::_exit(1) };
     }
 
@@ -356,12 +351,9 @@ fn run_worker_child(
         let wakes = ipc.w2m_ptrs.iter().map(|&p| SalWake::new(p)).collect();
         Mesh::new(ipc.mesh, w, wakes)
     };
-    let mut worker = WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh);
-    let rc = worker.run(BOOT_READY_REQUEST_ID);
-
-    unsafe {
-        libc::_exit(rc);
-    }
+    // The id the master leased before it collects.
+    w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
+    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
@@ -424,10 +416,7 @@ async fn master_post_fork_recovery(
     swept_bases: Vec<u64>,
 ) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
-    ready
-        .acks()
-        .await
-        .map_err(|e| format!("Error collecting worker acks: {e}"))?;
+    ready.acks().await;
     drop(ready);
 
     disp.sal().lock().await.boot_rewind(live_epoch);
@@ -513,7 +502,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     // The workers' ready ACKs. Leased before the loop first runs, which drops
     // every W2M frame no lease routes.
-    let ready = dispatcher.reactor().lease_acks("recovery sync", WorkerSet::ALL);
+    let ready = dispatcher.reactor().lease_acks(WorkerSet::ALL);
     assert_eq!(
         ready.id(),
         BOOT_READY_REQUEST_ID,
@@ -521,12 +510,15 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     );
     let live_epoch = tail.live_epoch();
     let d = Rc::clone(&dispatcher);
+    let logs = data_dir.to_owned();
     // Raced against a worker's death, which would leave recovery waiting forever.
     dispatcher.reactor().block_on(async move {
         let recovery = master_post_fork_recovery(&d, ready, live_epoch, swept_bases);
         match select2(recovery, d.worker_death()).await {
             Either::A(r) => r,
-            Either::B(w) => Err(format!("worker {w} exited during recovery")),
+            Either::B(w) => Err(format!(
+                "worker {w} exited during recovery (log: {logs}/worker_{w}.log)"
+            )),
         }
     })?;
 

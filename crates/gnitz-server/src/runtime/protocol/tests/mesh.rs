@@ -62,7 +62,8 @@ fn publish_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool
             mesh.iter().all(|m| !m.complete()),
             "round {round}: incomplete before worker {w}"
         );
-        mesh[w].publish(9, drained[w], &partition(w, round), spec, true);
+        mesh[w].set_drained(drained[w]);
+        mesh[w].publish(9, &partition(w, round), spec, true);
     }
     assert!(
         mesh.iter().all(Mesh::complete),
@@ -75,7 +76,8 @@ fn publish_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool
 fn gather_one(mesh: &mut Mesh, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
     let r = mesh.rank;
     let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round)).collect();
-    let (got, all_drained) = mesh.advance(None).expect("a round that fits one part");
+    let got = mesh.advance(None).expect("a round that fits one part");
+    let all_drained = mesh.drained();
     assert_eq!(
         weighted_rows(&got),
         weighted_rows(&expected_of(&parts, spec, r)),
@@ -94,7 +96,8 @@ fn run_round(
     fold: bool,
 ) -> (Vec<(Batch, bool)>, usize) {
     for ((m, batch), &d) in mesh.iter_mut().zip(parts).zip(drained) {
-        m.publish(9, d, batch, spec, fold);
+        m.set_drained(d);
+        m.publish(9, batch, spec, fold);
     }
     finish_round(mesh, parts)
 }
@@ -105,9 +108,13 @@ fn finish_round(mesh: &mut [Mesh], parts: &[Batch]) -> (Vec<(Batch, bool)>, usiz
     let mut count = 1;
     loop {
         assert!(mesh.iter().all(Mesh::complete), "part {count} completes");
-        let out: Vec<Option<(Batch, bool)>> = mesh.iter_mut().zip(parts).map(|(m, b)| m.advance(Some(b))).collect();
+        let out: Vec<Option<Batch>> = mesh.iter_mut().zip(parts).map(|(m, b)| m.advance(Some(b))).collect();
         if out.iter().all(Option::is_some) {
-            return (out.into_iter().map(Option::unwrap).collect(), count);
+            let closed = out
+                .into_iter()
+                .zip(mesh.iter())
+                .map(|(rows, m)| (rows.unwrap(), m.drained()));
+            return (closed.collect(), count);
         }
         assert!(
             out.iter().all(Option::is_none),
@@ -129,16 +136,48 @@ fn every_worker_gathers_each_round_from_every_peer() {
     publish_all(&mut mesh, 0, routes[0], drained[0]);
     for w in 0..NW - 1 {
         gather_one(&mut mesh[w], 0, routes[0], drained[0]);
-        mesh[w].publish(9, drained[1][w], &partition(w, 1), routes[1], true);
+        mesh[w].set_drained(drained[1][w]);
+        mesh[w].publish(9, &partition(w, 1), routes[1], true);
     }
     assert!(
         !mesh[0].complete(),
         "round 1 is incomplete until the last worker publishes it"
     );
     gather_one(&mut mesh[NW - 1], 0, routes[0], drained[0]);
-    mesh[NW - 1].publish(9, drained[1][NW - 1], &partition(NW - 1, 1), routes[1], true);
+    mesh[NW - 1].set_drained(drained[1][NW - 1]);
+    mesh[NW - 1].publish(9, &partition(NW - 1, 1), routes[1], true);
     for m in mesh.iter_mut() {
         gather_one(m, 1, routes[1], drained[1]);
+    }
+}
+
+/// `drained` is a worker's own claim until a round closes, and from then whether
+/// every worker claimed it — which a later round of the same drive republishes
+/// to the same answer.
+#[test]
+fn drained_is_the_own_claim_before_a_round_and_every_workers_after_one() {
+    let spec = ScatterPlan::broadcast();
+    for claims in [[true, true, false], [true; NW]] {
+        let mut mesh = meshes(NW);
+        for (m, &claim) in mesh.iter_mut().zip(&claims) {
+            m.set_drained(claim);
+            assert_eq!(m.drained(), claim, "no round has run");
+        }
+        let all = claims.iter().all(|&c| c);
+        for round in 0..2 {
+            for (w, m) in mesh.iter_mut().enumerate() {
+                m.publish(9, &partition(w, round), &spec, true);
+                assert_eq!(
+                    m.drained(),
+                    if round == 0 { claims[w] } else { all },
+                    "round {round} is open"
+                );
+            }
+            for m in mesh.iter_mut() {
+                m.advance(None).expect("a round that fits one part");
+                assert_eq!(m.drained(), all, "round {round} closed");
+            }
+        }
     }
 }
 
@@ -149,8 +188,8 @@ fn every_worker_gathers_each_round_from_every_peer() {
 fn a_second_publish_before_the_round_closes_is_refused() {
     let mut mesh = meshes(NW);
     let batch = partition(0, 0);
-    mesh[0].publish(9, false, &batch, &ScatterPlan::broadcast(), true);
-    mesh[0].publish(9, false, &batch, &ScatterPlan::broadcast(), true);
+    mesh[0].publish(9, &batch, &ScatterPlan::broadcast(), true);
+    mesh[0].publish(9, &batch, &ScatterPlan::broadcast(), true);
 }
 
 /// An advance before every worker published would read outboxes not yet written.
@@ -158,7 +197,7 @@ fn a_second_publish_before_the_round_closes_is_refused() {
 #[should_panic(expected = "advanced before every worker published")]
 fn an_advance_before_the_part_completes_is_refused() {
     let mut mesh = meshes(NW);
-    mesh[0].publish(9, false, &partition(0, 0), &ScatterPlan::broadcast(), true);
+    mesh[0].publish(9, &partition(0, 0), &ScatterPlan::broadcast(), true);
     mesh[0].advance(None);
 }
 
@@ -307,7 +346,8 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let spec = &pk;
     let parts = vec![full, Batch::empty_with_schema(&schema)];
     for (m, batch) in mesh.iter_mut().zip(&parts) {
-        m.publish(9, true, batch, spec, true);
+        m.set_drained(true);
+        m.publish(9, batch, spec, true);
     }
     // SAFETY: worker 0 wrote its head before its arrival.
     let head = unsafe { &*mesh[0].outbox(0).cast::<Head>() };

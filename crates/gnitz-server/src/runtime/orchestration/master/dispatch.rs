@@ -85,13 +85,8 @@ impl MasterDispatcher {
     }
 
     /// Write `group` to every worker on a fresh ACK lease.
-    fn write_acked(
-        &self,
-        excl: &SalExcl<'_>,
-        ctx: &'static str,
-        group: DirectGroup<'_>,
-    ) -> Result<AckLease, WireFault> {
-        let lease = self.reactor.lease_acks(ctx, WorkerSet::ALL);
+    fn write_acked(&self, excl: &SalExcl<'_>, group: DirectGroup<'_>) -> Result<AckLease, WireFault> {
+        let lease = self.reactor.lease_acks(WorkerSet::ALL);
         excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
         Ok(lease)
     }
@@ -107,12 +102,7 @@ impl MasterDispatcher {
         self.cat_mut().advance_durable_generation()?;
         let mut excl = self.sal.lock().await;
         self.unflushed_pushes.set(false);
-        self.flush_round(
-            &mut excl,
-            "checkpoint base round",
-            DirectGroup::new(SalMessageKind::Flush),
-        )
-        .await
+        self.flush_round(&mut excl, Apply::Flush).await
     }
 
     /// A checkpoint's second half: the round that flushes every view's traces
@@ -123,27 +113,16 @@ impl MasterDispatcher {
             !self.unflushed_pushes.get(),
             "an ephemeral round's reset would discard pushes no base round flushed"
         );
-        let group = DirectGroup {
-            template: wire::WireMsg {
-                arg0: self.cat().durable_generation(),
-                ..Default::default()
-            },
-            ..DirectGroup::new(SalMessageKind::FlushEph)
-        };
-        self.flush_round(&mut excl, "checkpoint ephemeral round", group).await
+        let generation = self.cat().durable_generation();
+        self.flush_round(&mut excl, Apply::FlushEph { generation }).await
     }
 
-    /// Write `group`, wait for every worker's ACK, finalize.
-    async fn flush_round(
-        &self,
-        excl: &mut SalExcl<'_>,
-        ctx: &'static str,
-        group: DirectGroup<'_>,
-    ) -> Result<(), WireFault> {
-        let lease = self.write_acked(excl, ctx, group)?;
+    /// Write `round`'s group, wait for every worker's ACK, finalize.
+    async fn flush_round(&self, excl: &mut SalExcl<'_>, round: Apply<'_>) -> Result<(), WireFault> {
+        let lease = self.write_acked(excl, DirectGroup::new(round))?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
-        lease.acks().await?;
+        lease.acks().await;
         self.checkpoint_post_ack(excl)
     }
 
@@ -154,17 +133,11 @@ impl MasterDispatcher {
     /// Distributed backfill of ONE view from `source_id`; view-scoped, see
     /// [`crate::query::Drive::Backfill`].
     async fn fan_out_backfill(&self, view_id: u64, source_id: u64) -> Result<(), WireFault> {
-        let group = DirectGroup {
-            template: wire::WireMsg {
-                target_id: source_id,
-                arg0: view_id,
-                ..Default::default()
-            },
-            ..DirectGroup::new(SalMessageKind::Backfill)
-        };
+        let group = DirectGroup::new(Apply::Backfill { source: source_id, view: view_id });
         // Two statements: the `SalExcl`'s drop is the wake.
-        let lease = self.write_acked(&self.sal.lock().await, "backfill", group)?;
-        lease.acks().await
+        let lease = self.write_acked(&self.sal.lock().await, group)?;
+        lease.acks().await;
+        Ok(())
     }
 
     /// Backfill every view in `view_ids`, in dependency order, from each of its
@@ -203,8 +176,9 @@ impl MasterDispatcher {
         if tids.is_empty() {
             return Ok(());
         }
-        let lease = self.emit_tick(&self.sal.lock().await, "view tick drain", tids)?;
-        lease.acks().await
+        let lease = self.emit_tick(&self.sal.lock().await, tids)?;
+        lease.acks().await;
+        Ok(())
     }
 
     /// Log a DDL batch of `family` inside `scope`'s zone — one LSN across a DDL's
@@ -228,21 +202,17 @@ impl MasterDispatcher {
 
     /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
     /// lease. A refused write burns its rounds.
-    pub(crate) fn emit_tick(&self, excl: &SalExcl<'_>, ctx: &'static str, tids: &[u64]) -> Result<AckLease, WireFault> {
+    pub(crate) fn emit_tick(&self, excl: &SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
         let first = self.tick_round.get() + 1;
         self.tick_round.set(first + tids.len() as u64 - 1);
         for (i, &tid) in tids.iter().enumerate() {
             self.record_delta_round(tid, first + i as u64);
         }
-        let group = DirectGroup {
-            template: wire::WireMsg {
-                arg0: first,
-                blob: gnitz_wire::as_le_bytes(tids),
-                ..Default::default()
-            },
-            ..DirectGroup::new(SalMessageKind::Tick)
+        let tick = Apply::Tick {
+            first_round: first,
+            tids: gnitz_wire::as_le_bytes(tids).into(),
         };
-        self.write_acked(excl, ctx, group)
+        self.write_acked(excl, DirectGroup::new(tick))
     }
 
     /// Raise the last-reached round of every fed view in `tid`'s **forward**
@@ -337,9 +307,8 @@ impl MasterDispatcher {
     /// await separates the write from the reap, so [`Self::worker_death`] never
     /// probes workers that exited on request.
     pub(crate) async fn shutdown_workers(&self) {
-        // No schema block: the worker's `Shutdown` arm takes no arguments. A
-        // refusal would hang the reap below, so it must not vanish.
-        if let Err(e) = self.sal.lock().await.write(&DirectGroup::new(SalMessageKind::Shutdown)) {
+        // A refusal would hang the reap below, so it must not vanish.
+        if let Err(e) = self.sal.lock().await.write(&DirectGroup::new(SalRequest::Shutdown)) {
             gnitz_warn!("SAL refused the Shutdown broadcast: {}; the worker reap will block", e);
         }
         self.reap_workers();
@@ -380,7 +349,7 @@ impl MasterDispatcher {
             .placement();
         with_routed(batch, placement, self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
-            let lease = self.reactor.lease_acks("commit", data.holders());
+            let lease = self.reactor.lease_acks(data.holders());
             scope.write(&DirectGroup::push(&relation, data, lease.targets()), recoverable)?;
             Ok(lease)
         })

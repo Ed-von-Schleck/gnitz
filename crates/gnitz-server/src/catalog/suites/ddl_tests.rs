@@ -871,7 +871,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 /// absent.
 ///
 /// The reason is not cost and not effort. A bounded view's read hydrates its
-/// missing keys from the *source relation's live store*, which `handle_push`
+/// missing keys from the *source relation's live store*, which a push
 /// advances outside any tick — so a `Delta(0)` over a partly-dehydrated view
 /// reports round `T` while already carrying an un-ticked push, and the next poll
 /// delivers that same push again as round `T+1`, at double weight, with no error

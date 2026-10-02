@@ -7,16 +7,15 @@ use super::test_support::*;
 use super::*;
 use crate::runtime::sal::{SalMessageKind, WorkerSet};
 use crate::runtime::test_support::fork_child;
-use gnitz_wire::WireStatus;
 
 /// An ACK drained before anything awaits it is kept for the awaiter, and `acks`
 /// parks until the last worker has answered OK.
 #[test]
 fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
     let (r, writers) = reactor_with_rings(3);
-    let lease = r.lease_acks("test", WorkerSet::ALL);
-    writers[0].send_status(lease.id(), WireStatus::Ok, &[]);
-    writers[1].send_status(lease.id(), WireStatus::Ok, &[]);
+    let lease = r.lease_acks(WorkerSet::ALL);
+    writers[0].send_ack(lease.id());
+    writers[1].send_ack(lease.id());
     r.drain_all_w2m(); // before any awaiter
 
     let mut fut = std::pin::pin!(lease.acks());
@@ -27,31 +26,10 @@ fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
         "two of three ACKs must not resolve"
     );
 
-    writers[2].send_status(lease.id(), WireStatus::Ok, &[]);
+    writers[2].send_ack(lease.id());
     r.drain_all_w2m();
     assert!(flag.woken(), "the last ACK wakes the awaiter");
-    assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
-}
-
-/// A fault resolves `acks` without waiting for the other workers, reported as the
-/// lowest-numbered failed worker's whatever the arrival order.
-#[test]
-fn acks_resolve_on_a_fault_naming_the_lowest_failed_worker() {
-    let (r, writers) = reactor_with_rings(3);
-    let lease = r.lease_acks("test", WorkerSet::ALL);
-    let mut fut = std::pin::pin!(lease.acks());
-    let (flag, waker) = WakeFlag::new();
-    assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
-
-    writers[2].send_status(lease.id(), WireStatus::Error, b"late");
-    r.drain_all_w2m();
-    assert!(flag.woken(), "a fault wakes the awaiter with workers still to answer");
-    writers[1].send_status(lease.id(), WireStatus::Error, b"boom");
-    r.drain_all_w2m();
-    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(Err(e)) => assert_eq!(e.text, "worker 1: test: boom"),
-        _ => panic!("the fault must resolve the wait"),
-    }
+    assert!(fut.as_mut().poll(&mut cx).is_ready());
 }
 
 /// A frame for an id no lease routes is released at the ring undecoded — here a
@@ -60,8 +38,8 @@ fn acks_resolve_on_a_fault_naming_the_lowest_failed_worker() {
 #[test]
 fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
     let (r, writers) = reactor_with_rings(3);
-    let id = r.lease_acks("test", WorkerSet::ALL).id();
-    writers[0].send_status(id, WireStatus::Ok, &[]);
+    let id = r.lease_acks(WorkerSet::ALL).id();
+    writers[0].send_ack(id);
     r.drain_all_w2m();
     assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
 
@@ -80,9 +58,9 @@ fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
 fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let (r, _writers) = reactor_with_rings(1);
     r.next_request_id.set(u32::MAX);
-    let top = r.lease_acks("test", WorkerSet::ALL);
+    let top = r.lease_acks(WorkerSet::ALL);
     assert_eq!(top.id(), u32::MAX);
-    let wrapped = r.lease_acks("test", WorkerSet::ALL);
+    let wrapped = r.lease_acks(WorkerSet::ALL);
     assert_eq!(wrapped.id(), 1, "the id after u32::MAX is 1, not 0");
 
     r.next_request_id.set(1);
@@ -97,14 +75,14 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let writer = writers.pop().expect("one ring");
-        let lease = r.lease_acks("test", WorkerSet::ALL);
+        let lease = r.lease_acks(WorkerSet::ALL);
         let id = lease.id();
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
-            writer.send_status(id, WireStatus::Ok, &[]);
-            lease.acks().await.expect("an OK ACK");
+            writer.send_ack(id);
+            lease.acks().await;
             d.set(true);
         });
         r.tick(true);
@@ -162,12 +140,12 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     // under pressure.
     let child = || {
         for req_id in (2..=N_MESSAGES).chain([1]) {
-            writers[0].send_status(req_id, WireStatus::Ok, &[]);
+            writers[0].send_ack(req_id);
         }
     };
     let pid = unsafe { fork_child(child) };
 
-    let lease = reactor.lease_acks("stress", WorkerSet::ALL);
+    let lease = reactor.lease_acks(WorkerSet::ALL);
     assert_eq!(lease.id(), 1);
     let timer = reactor.sleep(TIMEOUT);
     let out = reactor.block_on(async move { select2(lease.acks(), timer).await });
@@ -175,7 +153,6 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?} — lost-wake symptom");
     }
-    assert!(matches!(out, Either::A(Ok(()))), "every ACK is OK");
     unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 }
 
@@ -192,25 +169,24 @@ fn a_publish_on_a_later_ring_wakes_the_reactor() {
     let r1 = test_ring(64 * 1024);
 
     let child = || {
-        W2mWriter::new(r0).send_status(1, WireStatus::Ok, &[]);
+        W2mWriter::new(r0).send_ack(1);
         let deadline = Instant::now() + TIMEOUT;
         while !unsafe { master_parked(r1) } {
             assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
             std::thread::yield_now();
         }
-        W2mWriter::new(r1).send_status(1, WireStatus::Ok, &[]);
+        W2mWriter::new(r1).send_ack(1);
     };
     let pid = unsafe { fork_child(child) };
 
     let r = make_reactor_over(W2mReceiver::new(vec![r0, r1]));
     // Request id 1 is a fresh reactor's first.
-    let lease = r.lease_acks("later ring", WorkerSet::ALL);
+    let lease = r.lease_acks(WorkerSet::ALL);
     let timer = r.sleep(TIMEOUT);
     let out = r.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: ring 1's wake never reached it");
     }
-    assert!(matches!(out, Either::A(Ok(()))), "both ACKs are OK");
     unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 }

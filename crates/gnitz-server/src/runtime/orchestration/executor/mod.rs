@@ -28,7 +28,7 @@ use crate::runtime::listen::ClientListener;
 use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, SalMessageKind};
+use crate::runtime::sal::{DirectGroup, Read};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::control::DecodedControl;
@@ -556,7 +556,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
             if TICK_EMIT_ERROR.take_once() {
                 return Err("injected tick emit error".into());
             }
-            shared.disp().emit_tick(&excl, "tick", tids)
+            shared.disp().emit_tick(&excl, tids)
         })
     };
     // A refused write publishes nothing, so no worker took any tid's delta.
@@ -571,7 +571,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
     if TICK_HOLD_FOR_DDL.take_once() {
         hold_tick_for_ddl(shared).await;
     }
-    lease.acks().await?;
+    lease.acks().await;
     shared.last_tick_lsn.set(snapshot_lsn);
     Ok(())
 }
@@ -1027,14 +1027,14 @@ async fn fan_out_scan(
     peer: &Peer,
     guard: ReadGuard,
     kind: RelationKind,
-    group: DirectGroup<'_>,
+    read: Read<'_>,
 ) -> Result<u64, WireFault> {
     let mut lsn = 0;
     let mut leases = shared
         .disp()
         .scan_cut(|cut| {
             lsn = read_watermark(shared, kind);
-            cut.read(group)
+            cut.read(DirectGroup::new(read))
         })
         .await?;
     drop(guard);
@@ -1077,8 +1077,12 @@ async fn handle_scan_spec(
         );
         return Ok(());
     }
-    let group = DirectGroup::scan_spec(target_id, blob, reply_layout);
-    let result = fan_out_scan(shared, peer, g, kind, group).await;
+    let read = Read::ScanSpec {
+        tid: target_id,
+        reply_layout,
+        spec: blob.into(),
+    };
+    let result = fan_out_scan(shared, peer, g, kind, read).await;
     finish_scan_fanout(peer, target_id, 0, result);
     Ok(())
 }
@@ -1136,17 +1140,12 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
             disp.scan_cut(|cut| {
                 round = disp.last_tick_round();
                 for item in &moved {
-                    let reply_layout = item.reply_layout.to_le_bytes();
-                    cut.read(DirectGroup {
-                        template: ipc::WireMsg {
-                            target_id: item.view_id,
-                            arg0: round,
-                            arg1: item.after_tick,
-                            blob: &reply_layout,
-                            ..Default::default()
-                        },
-                        ..DirectGroup::new(SalMessageKind::DeltaRead)
-                    })?;
+                    cut.read(DirectGroup::new(Read::Delta {
+                        view: item.view_id,
+                        after_tick: item.after_tick,
+                        cut_round: round,
+                        reply_layout: item.reply_layout,
+                    }))?;
                 }
                 Ok(())
             })
@@ -1247,7 +1246,11 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
             .scan_cut(|cut| {
                 for plan in &mut plans {
                     plan.lsn = read_watermark(shared, plan.kind);
-                    cut.read(DirectGroup::scan_spec(plan.tid, &spec, plan.reply_layout))?;
+                    cut.read(DirectGroup::new(Read::ScanSpec {
+                        tid: plan.tid,
+                        reply_layout: plan.reply_layout,
+                        spec: spec.as_slice().into(),
+                    }))?;
                 }
                 Ok(())
             })
@@ -1261,7 +1264,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
     // ── Phase 2: sequential per-relation drain (no locks; holds all leases) ──
     for (plan, d) in plans.iter().zip(&dispatches) {
         // Drain this relation's train (all workers, ascending) before the next —
-        // the FIFO reply contract makes request order == ring order.
+        // within a cut each worker's ring order is request order.
         forward_scan(peer, d).await?;
         // Terminal frame for this relation (tid + its watermark).
         send_msg(peer, terminal_scan_msg(plan.tid, plan.lsn, 0));

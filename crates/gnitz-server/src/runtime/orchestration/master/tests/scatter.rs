@@ -1,12 +1,11 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{DirectGroup, GroupTargets, WorkerSet};
-use crate::runtime::wire::{decode_sal_rows, WireSchema};
+use crate::runtime::wire::{decode_sal_frame, WireSchema};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
 };
-use gnitz_wire::control::peek_control_block;
 use gnitz_wire::TypeCode;
 use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
@@ -104,8 +103,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
         let sent: Vec<(usize, Batch)> = (0..nw)
             .filter_map(|w| {
                 let bytes = msg.slot(w as u32)?;
-                let control = peek_control_block(bytes).expect("every payload decodes");
-                let rows = decode_sal_rows(bytes, &control, |_, _| None).expect("every payload decodes");
+                let (control, rows) = decode_sal_frame(bytes, |_, _| None).expect("every payload decodes");
                 assert_eq!(
                     control.schema.is_some(),
                     rows.is_some(),
@@ -181,8 +179,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
     let sent: Vec<Batch> = (0..nw)
         .filter_map(|w| {
             let bytes = msg.slot(w as u32)?;
-            let control = peek_control_block(bytes).expect("every payload decodes");
-            decode_sal_rows(bytes, &control, |_, _| None).expect("every payload decodes")
+            decode_sal_frame(bytes, |_, _| None).expect("every payload decodes").1
         })
         .collect();
     assert!(
@@ -209,8 +206,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
 #[test]
 #[ignore]
 fn push_group_layout_bench() {
-    use crate::runtime::sal::SalMessageKind;
-    use crate::runtime::wire::WireMsg;
+    use crate::runtime::sal::Apply;
     use gnitz_foundation::perf::Counter;
     use gnitz_zset::repr::BatchBuilder;
     use std::hint::black_box;
@@ -300,16 +296,14 @@ fn push_group_layout_bench() {
         let tids = [16u64];
         let (instructions, bytes) = measure(&mut |scope| {
             let tick = DirectGroup {
-                template: WireMsg {
-                    arg0: 2,
-                    blob: gnitz_wire::as_le_bytes(&tids),
-                    ..Default::default()
-                },
                 targets: GroupTargets {
                     request_id: 1,
                     ..GroupTargets::UNADDRESSED
                 },
-                ..DirectGroup::new(SalMessageKind::Tick)
+                ..DirectGroup::new(Apply::Tick {
+                    first_round: 2,
+                    tids: gnitz_wire::as_le_bytes(&tids).into(),
+                })
             };
             scope.write(&tick, false).expect("group fits");
         });

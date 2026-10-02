@@ -124,7 +124,7 @@ impl MasterDispatcher {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }
-            let lease = self.scan(DirectGroup::key_spans(table_id, cols)).await?;
+            let lease = self.scan(Read::KeySpans { tid: table_id, cols }).await?;
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
             'train: while let Some(frame) = lease.next().await? {

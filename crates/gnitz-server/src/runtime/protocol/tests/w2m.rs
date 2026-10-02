@@ -2,7 +2,6 @@ use super::fixtures::{make_ring, master_parked};
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
-use gnitz_wire::WireStatus;
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -167,7 +166,7 @@ fn a_retired_slot_unparks_the_writer() {
         let ptr = ring as *mut u8;
         let receiver = W2mReceiver::new(vec![ptr]);
         let writer = std::thread::spawn(move || {
-            W2mWriter::new(ring as *mut u8).send_status(1, WireStatus::Ok, &[]);
+            W2mWriter::new(ring as *mut u8).send_ack(1);
         });
         while receiver.header(0).writer_park.flags.load(Ordering::Acquire) & FLAG_WRITER_PARKED == 0 {
             std::thread::yield_now();
@@ -240,7 +239,7 @@ fn w2m_publish_drain_bench() {
             if hdr.master_park.armed() {
                 woke_master += 1;
             }
-            writer.send_status(req as u32, gnitz_wire::WireStatus::Ok, &[]);
+            writer.send_ack(req as u32);
         }
         unsafe {
             cptr.write(woke_master);
@@ -303,7 +302,7 @@ fn concurrent_publishes_drain_in_order() {
         let writer = std::thread::spawn(move || {
             let writer = W2mWriter::new(ring as *mut u8);
             for req_id in 1..=n {
-                writer.send_status(req_id, WireStatus::Ok, &pad_w);
+                writer.send_msg(req_id, &WireMsg { blob: &pad_w, ..Default::default() });
             }
         });
 
@@ -335,10 +334,37 @@ fn concurrent_publishes_drain_in_order() {
 #[test]
 fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
     let (a, b) = (make_ring(CTRL_HEADER_SIZE, 2, 8), make_ring(CTRL_HEADER_SIZE, 2, 8));
-    W2mWriter::new(b).send_status(7, WireStatus::Ok, b"");
+    W2mWriter::new(b).send_ack(7);
     let receiver = W2mReceiver::new(vec![a, b]);
     assert!(receiver.try_read_slot(0).is_none());
     assert_eq!(receiver.try_read_slot(1).expect("worker 1's frame").worker, 1);
+}
+
+/// `try_send_msg` on a full ring writes nothing and answers false; with room
+/// again it sends.
+#[test]
+fn try_send_msg_on_a_full_ring_writes_nothing() {
+    let ring = make_ring(CTRL_HEADER_SIZE, 2, 0);
+    let writer = W2mWriter::new(ring);
+    let receiver = W2mReceiver::new(vec![ring]);
+    let msg = WireMsg { arg0: 7, ..Default::default() };
+    assert!(
+        writer.try_send_msg(1, &msg) && writer.try_send_msg(2, &msg),
+        "two frames fit"
+    );
+    let full = receiver.write_cursor(0);
+    assert!(!writer.try_send_msg(3, &msg), "the ring has no room for a third");
+    assert_eq!(receiver.write_cursor(0), full, "a refused frame publishes nothing");
+
+    let ids = |n: usize| -> Vec<u32> {
+        (0..n)
+            .map(|_| receiver.try_read_slot(0).expect("a frame").internal_req_id)
+            .collect()
+    };
+    assert_eq!(ids(2), [1, 2]);
+    assert!(receiver.try_read_slot(0).is_none(), "nothing of the refused frame");
+    assert!(writer.try_send_msg(3, &msg), "the released slots make room");
+    assert_eq!(ids(1), [3]);
 }
 
 /// A park whose re-test behind the armed flag finds a group returns without

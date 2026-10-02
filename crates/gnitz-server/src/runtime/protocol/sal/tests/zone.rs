@@ -1,9 +1,9 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{
-    DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES,
+    Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES,
 };
-use crate::runtime::wire::{WireMsg, WireSchema};
+use crate::runtime::wire::WireSchema;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 
@@ -317,10 +317,7 @@ impl TestLog {
     fn zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
         let groups: Vec<DirectGroup> = targets
             .iter()
-            .map(|&target_id| DirectGroup {
-                template: WireMsg { target_id, ..Default::default() },
-                ..DirectGroup::new(SalMessageKind::DdlSync)
-            })
+            .map(|&family| DirectGroup::new(Apply::DdlSync { family }))
             .collect();
         self.commit_zone(&groups)
     }

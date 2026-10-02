@@ -61,26 +61,26 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
 #[test]
 fn an_ack_lease_completes_on_its_own_sets_acks() {
     let (r, writers) = reactor_with_rings(4);
-    let lease = r.lease_acks("test", WorkerSet::one(1).with(3));
+    let lease = r.lease_acks(WorkerSet::one(1).with(3));
     let targets = lease.targets();
     assert_eq!(
         (targets.set, targets.request_id),
         (WorkerSet::one(1).with(3), lease.id())
     );
 
-    writers[3].send_status(lease.id(), gnitz_wire::WireStatus::Ok, &[]);
+    writers[3].send_ack(lease.id());
     r.drain_all_w2m();
     assert!(try_poll_once(lease.acks()).is_none(), "one of the two has answered");
-    writers[1].send_status(lease.id(), gnitz_wire::WireStatus::Ok, &[]);
+    writers[1].send_ack(lease.id());
     r.drain_all_w2m();
-    assert!(matches!(try_poll_once(lease.acks()), Some(Ok(()))));
+    assert!(try_poll_once(lease.acks()).is_some());
 
-    let none = r.lease_acks("test", WorkerSet::EMPTY);
+    let none = r.lease_acks(WorkerSet::EMPTY);
     assert!(
-        matches!(try_poll_once(none.acks()), Some(Ok(()))),
+        try_poll_once(none.acks()).is_some(),
         "nothing is owed, so nothing is waited on"
     );
-    let clipped = r.lease_acks("test", WorkerSet::ALL);
+    let clipped = r.lease_acks(WorkerSet::ALL);
     assert_eq!(clipped.targets().set.len(), 4, "clipped to the launched");
 }
 
