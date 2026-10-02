@@ -63,7 +63,7 @@ fn plan_and_reads<'a>(
         .get_mut(&view_id)
         .and_then(|v| v.plan.as_mut())
         .expect("compiled on the epoch's entry");
-    (plan, vm::SourceReads { registry, unfed })
+    (plan, vm::SourceReads { registry, view: view_id, unfed })
 }
 
 /// Run one view's epoch over `src_id`'s delta. `unfed`: the sources the view

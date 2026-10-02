@@ -332,7 +332,10 @@ pub(super) fn compile_view(
         &mut layout,
         self_contained,
         &seeds,
-        PlanOut::Node(loaded.sink()?),
+        match bounded {
+            true => PlanOut::Node(loaded.sink()?),
+            false => PlanOut::Store(loaded.sink()?),
+        },
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.

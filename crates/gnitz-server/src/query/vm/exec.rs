@@ -13,6 +13,8 @@ use gnitz_zset::{algebra, stream};
 /// stores behind its [`Integral::Source`]s.
 pub(in crate::query) struct SourceReads<'a> {
     pub(in crate::query) registry: &'a RelationRegistry,
+    /// The view the plan computes.
+    pub(in crate::query) view: u64,
     /// The scanned relations this view has been fed no row of: the sources a
     /// backfill has yet to reach. Each reads empty.
     pub(in crate::query) unfed: &'a [u64],
@@ -31,6 +33,15 @@ impl SourceReads<'_> {
             return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
         }
         Ok(relation.cursor_for_keys(delta, Cut::Sealed))
+    }
+
+    /// A cursor over a reduce's or top-N's output history: its own trace, or the
+    /// view's store, which every earlier epoch's output was ingested into.
+    fn out_trace(&self, state: &CircuitState, own: Option<StateIdx>) -> Result<ReadCursor, String> {
+        match own {
+            Some(trace) => Ok(state.cursor(trace)),
+            None => Ok(self.registry.relation_or_err(self.view)?.cursor()),
+        }
     }
 
     /// Every live row of `keys` in `integral`: a source's as the view last
@@ -237,7 +248,7 @@ fn run_instructions(
                         avi_cursor.is_some()
                     );
 
-                    let mut to_cursor = state.cursor(*out_trace);
+                    let mut to_cursor = sources.out_trace(state, *out_trace)?;
                     stream::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan)
                 }
 
@@ -246,7 +257,7 @@ fn run_instructions(
                     let mut history = state
                         .ingest_then_cursor(idx, plan.plan.index_batch(&batches[in_reg.at()]))
                         .map_err(|e| ingest_err("topn index", idx, e))?;
-                    let mut to_cursor = state.cursor(*out_trace);
+                    let mut to_cursor = sources.out_trace(state, *out_trace)?;
                     stream::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)
                 }
             }

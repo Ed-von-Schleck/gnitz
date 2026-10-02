@@ -341,8 +341,9 @@ pub(super) struct ShardIndex {
     /// [`Self::unlink_retired`].
     retired: Vec<u64>,
     /// `R`, the unit every byte target is stated in: the running max of the
-    /// registered L0 bytes one `run_compact` consumed and of one terminal run,
-    /// floored at [`MIN_GUARD_BYTES`] and persisted in the manifest header.
+    /// registered L0 bytes one `run_compact` consumed, of one shard its fold
+    /// wrote and of one terminal run, floored at [`MIN_GUARD_BYTES`] and
+    /// persisted in the manifest header.
     l0_run_bytes: u64,
     /// What bounds this store's registered on-disk shard bytes, and how a sweep
     /// evicts. Unbounded for every store but a capacity-bounded view's output

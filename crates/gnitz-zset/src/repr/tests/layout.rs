@@ -164,29 +164,39 @@ fn dict_entries(n: usize) -> Vec<[u8; 16]> {
     (0..n as u128).map(|i| (i * 0x0101 + 7).to_le_bytes()).collect()
 }
 
-/// A dictionary reads back per row and in bulk, at both code widths and at the
-/// entry counts either side of where the width changes.
+/// A dictionary reads back per row and in bulk, at codes of one bit, of a whole
+/// byte and of more than one, and at the entry counts either side of where the
+/// width changes.
 #[test]
-fn dict_roundtrips_at_both_code_widths() {
+fn dict_roundtrips_at_every_code_width() {
     for n in [1, 2, 255, 256, 257, 4000] {
         let entries = dict_entries(n);
         let ids: Vec<u32> = (0..3 * n as u32 + 5).map(|i| (i * 7 + i / 3) % n as u32).collect();
         let image = dict_encode(&entries, &ids);
         assert_eq!(image.len(), dict_image_len(ids.len(), n));
+        let bits = [(1, 1), (2, 1), (255, 8), (256, 8), (257, 9), (4000, 12)];
+        let bits = bits.iter().find(|&&(entries, _)| entries == n).unwrap().1;
         assert_eq!(
             image.len() - 8 - n * 16,
-            ids.len() * if n <= 256 { 1 } else { 2 },
+            (ids.len() * bits).div_ceil(8) + 3,
             "{n} entries: code width"
         );
         let dict = DictImage::parse(&image, ids.len()).unwrap();
         for (row, &id) in ids.iter().enumerate() {
             assert_eq!(dict.cell(row), &entries[id as usize], "{n} entries: row {row}");
         }
-        for window in [0..ids.len(), 3..ids.len() - 1, 2..2] {
-            let mut out = vec![0u8; window.len() * 16];
-            dict.decode(window.start, &mut out);
-            let want: Vec<u8> = ids[window].iter().flat_map(|&id| entries[id as usize]).collect();
-            assert_eq!(out, want, "{n} entries: bulk decode");
+        // A cell narrower than an entry is the entry's leading bytes.
+        for width in [2, 4, 8, 16] {
+            for window in [0..ids.len(), 3..ids.len() - 1, 2..2] {
+                let mut out = vec![0u8; window.len() * width];
+                dict.decode(window.start, width, &mut out);
+                let want: Vec<u8> = ids[window]
+                    .iter()
+                    .flat_map(|&id| &entries[id as usize][..width])
+                    .copied()
+                    .collect();
+                assert_eq!(out, want, "{n} entries: bulk decode at {width} bytes");
+            }
         }
     }
 }
@@ -195,17 +205,18 @@ fn dict_roundtrips_at_both_code_widths() {
 #[test]
 fn dict_parse_refuses_a_size_its_entry_count_does_not_give() {
     let entries = dict_entries(3);
-    let image = dict_encode(&entries, &[0, 1, 2, 1]);
-    assert!(DictImage::parse(&image, 4).is_some());
-    for count in [3, 5] {
+    // Eight codes of two bits: two bytes.
+    let image = dict_encode(&entries, &[0, 1, 2, 1, 0, 2, 2, 1]);
+    assert!(DictImage::parse(&image, 8).is_some());
+    for count in [4, 9] {
         assert!(DictImage::parse(&image, count).is_none(), "row count {count}");
     }
-    assert!(DictImage::parse(&image[..image.len() - 1], 4).is_none());
-    assert!(DictImage::parse(&image[..7], 4).is_none(), "shorter than its own count");
-    for forged in [0u64, 2, 4, DICT_MAX_ENTRIES as u64 + 1, u64::MAX] {
+    assert!(DictImage::parse(&image[..image.len() - 1], 8).is_none());
+    assert!(DictImage::parse(&image[..7], 8).is_none(), "shorter than its own count");
+    for forged in [0u64, 2, 5, DICT_MAX_ENTRIES as u64 + 1, u64::MAX] {
         let mut image = image.clone();
         write_u64_le(&mut image, 0, forged);
-        assert!(DictImage::parse(&image, 4).is_none(), "entry count {forged}");
+        assert!(DictImage::parse(&image, 8).is_none(), "entry count {forged}");
     }
 }
 
@@ -215,12 +226,11 @@ fn a_dict_code_past_the_last_entry_reads_the_last() {
     for n in [3, 300] {
         let entries = dict_entries(n);
         let mut image = dict_encode(&entries, &[0, 1]);
-        let codes = image.len() - 2 * if n <= 256 { 1 } else { 2 };
-        image[codes..].fill(0xFF);
+        image[8 + n * 16..].fill(0xFF);
         let dict = DictImage::parse(&image, 2).unwrap();
         assert_eq!(dict.cell(1), &entries[n - 1], "{n} entries");
         let mut out = [0u8; 32];
-        dict.decode(0, &mut out);
+        dict.decode(0, 16, &mut out);
         assert_eq!(out[16..], entries[n - 1], "{n} entries: bulk decode");
     }
 }

@@ -83,17 +83,24 @@ def read_shard(path, relation=0, store="rows"):
     return Shard(Path(path), relation, store, rows, len(image), regions)
 
 
+def store_of(path):
+    """The `(relation, store)` whose shard `path` names, or None for any other file."""
+    path = Path(path)
+    parts = path.parts
+    if "_relations" not in parts or not re.fullmatch(r"shard_\d+\.db", path.name):
+        return None
+    relation, *children = parts[parts.index("_relations") + 1:-1]
+    m = _SLOT.match(children[-1]) if children else None
+    return int(relation), (m.group(1) if m else None) or "rows"
+
+
 def read_shards(data_dir, min_relation=0):
     """Every shard under `data_dir` of a relation id at or past `min_relation`."""
     out = []
-    for rel_dir in sorted((Path(data_dir) / "_relations").iterdir()):
-        if not rel_dir.name.isdigit() or int(rel_dir.name) < min_relation:
-            continue
-        for path in sorted(rel_dir.rglob("shard_*.db")):
-            child = path.parent.name if path.parent != rel_dir else ""
-            m = _SLOT.match(child)
-            store = (m.group(1) if m else None) or "rows"
-            out.append(read_shard(path, int(rel_dir.name), store))
+    for path in sorted((Path(data_dir) / "_relations").rglob("shard_*.db")):
+        relation, store = store_of(path)
+        if relation >= min_relation:
+            out.append(read_shard(path, relation, store))
     return out
 
 

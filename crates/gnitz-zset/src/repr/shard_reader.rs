@@ -18,7 +18,7 @@ use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 use gnitz_foundation::posix_io::Mmap;
-use gnitz_wire::{read_i64_le, read_u64_le};
+use gnitz_wire::read_u64_le;
 
 use StorageError::Corrupt;
 
@@ -51,10 +51,10 @@ pub(crate) struct PackedRegion {
     blocks: Box<[OnceCell<Box<[u8]>>]>,
 }
 
-/// The weight region — the only role that may use the two-value encoding.
-pub(crate) enum WeightRegion {
+/// A region of one 8-byte word per row: the weights, or the null words.
+pub(crate) enum WordRegion {
     Mapped(ColPtr),
-    /// Exactly two distinct weights, selected per row by `bits`.
+    /// Exactly two distinct words, selected per row by `bits`.
     TwoValue {
         value_a: i64,
         value_b: i64,
@@ -67,6 +67,26 @@ pub(crate) enum WeightRegion {
     },
 }
 
+impl WordRegion {
+    /// The region `span` holds for `count` rows.
+    fn bind(data: &[u8], span: &Span, count: usize) -> Result<Self, StorageError> {
+        Ok(match span.encoding {
+            Encoding::TwoValue => {
+                if span.size != two_value_image_len(count) {
+                    return Err(Corrupt("region size"));
+                }
+                let (value_a, value_b, bits) = two_value_decode(span.bytes(data));
+                WordRegion::TwoValue { value_a, value_b, bits }
+            }
+            Encoding::For => {
+                let bw = for_image_bw(span.size, count, FIXED_REGION_BYTES).ok_or(Corrupt("region size"))?;
+                WordRegion::For { image: span.bytes(data), bw }
+            }
+            _ => WordRegion::Mapped(direct_region(data, span, count, FIXED_REGION_BYTES)?),
+        })
+    }
+}
+
 pub struct MappedShard {
     /// The mapping every pointer below points into, shared by every handle
     /// [`rebind`](Self::rebind) derives from this one.
@@ -74,8 +94,8 @@ pub struct MappedShard {
     header: ShardHeader,
     schema: SchemaDescriptor,
     pk: ColPtr,
-    weight: WeightRegion,
-    null_bmp: ColPtr,
+    weight: WordRegion,
+    null_bmp: WordRegion,
     /// Non-PK column regions indexed by payload position, always one per payload
     /// column of `schema`, a column the file predates included.
     col_regions: Vec<PayloadRegion>,
@@ -198,22 +218,8 @@ impl MappedShard {
         let spans = region_spans(data, file_npc)?;
 
         let pk = direct_region(data, &spans[REG_PK], count, schema.pk_stride())?;
-        let w = &spans[REG_WEIGHT];
-        let weight = match w.encoding {
-            Encoding::TwoValue => {
-                if w.size != two_value_image_len(count) {
-                    return Err(Corrupt("region size"));
-                }
-                let (value_a, value_b, bits) = two_value_decode(w.bytes(data));
-                WeightRegion::TwoValue { value_a, value_b, bits }
-            }
-            Encoding::For => {
-                let bw = for_image_bw(w.size, count, FIXED_REGION_BYTES).ok_or(Corrupt("region size"))?;
-                WeightRegion::For { image: w.bytes(data), bw }
-            }
-            _ => WeightRegion::Mapped(direct_region(data, w, count, FIXED_REGION_BYTES)?),
-        };
-        let null_bmp = direct_region(data, &spans[REG_NULL_BMP], count, FIXED_REGION_BYTES)?;
+        let weight = WordRegion::bind(data, &spans[REG_WEIGHT], count)?;
+        let null_bmp = WordRegion::bind(data, &spans[REG_NULL_BMP], count)?;
 
         let col_regions = schema
             .payload_columns()
@@ -225,7 +231,7 @@ impl MappedShard {
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
                 if span.encoding == Encoding::Dict {
-                    if !col.type_code.is_german_string() {
+                    if width < 2 {
                         return Err(Corrupt("encoding"));
                     }
                     // SAFETY: the image lies in the mapping `mmap` keeps alive,
@@ -308,6 +314,30 @@ impl MappedShard {
     fn mapped(&self, span: *const [u8]) -> &[u8] {
         // SAFETY: every span is `Span::bytes` of this handle's mapping, which `self.mmap` keeps alive.
         unsafe { &*span }
+    }
+
+    /// Row `row`'s word of `region`.
+    #[inline(always)]
+    fn word(&self, region: &WordRegion, row: usize) -> u64 {
+        match region {
+            WordRegion::Mapped(cp) => read_u64_le(unsafe { cp.row(row, 8) }, 0),
+            WordRegion::TwoValue { value_a, value_b, bits } => {
+                two_value_at(*value_a, *value_b, self.mapped(*bits), row) as u64
+            }
+            WordRegion::For { image, bw } => for_at(self.mapped(*image), *bw, row),
+        }
+    }
+
+    /// Rows `start..` of `region` as they stand in a batch, `dst.len() / 8` rows.
+    fn decode_words(&self, region: &WordRegion, start: usize, dst: &mut [u8]) {
+        match region {
+            WordRegion::For { image, bw } => for_decode(self.mapped(*image), *bw, FIXED_REGION_BYTES, start, dst),
+            WordRegion::Mapped(_) | WordRegion::TwoValue { .. } => {
+                for (i, cell) in dst.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    *cell = self.word(region, start + i).to_le_bytes();
+                }
+            }
+        }
     }
 
     /// Row `row`'s `size`-byte cell of packed column `p`, from the block holding
@@ -405,15 +435,12 @@ impl MappedShard {
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
             let (pk, weight, null_bmp) = w.fixed_mut();
             copy_rows(self.pk, schema.pk_stride(), pk);
-            match &self.weight {
-                WeightRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, weight),
-                WeightRegion::TwoValue { .. } | WeightRegion::For { .. } => {
-                    for (i, cell) in weight.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                        *cell = self.get_weight(start + i).to_le_bytes();
-                    }
+            for (region, dst) in [(&self.weight, weight), (&self.null_bmp, null_bmp)] {
+                match region {
+                    WordRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, dst),
+                    packed => self.decode_words(packed, start, dst),
                 }
             }
-            copy_rows(self.null_bmp, FIXED_REGION_BYTES, null_bmp);
             if self.null_pad_mask != 0 {
                 for word in null_bmp.as_chunks_mut::<8>().0 {
                     *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
@@ -427,12 +454,12 @@ impl MappedShard {
                         continue;
                     }
                     PayloadRegion::Dict(d) => {
-                        if relocate {
+                        if relocate && col.type_code.is_german_string() {
                             for i in 0..row_count {
                                 w.write_string_cell(pi, d.cell(start + i), blob, None, i);
                             }
                         } else {
-                            d.decode(start, w.col_mut(pi));
+                            d.decode(start, col.size() as usize, w.col_mut(pi));
                         }
                         continue;
                     }
@@ -467,7 +494,7 @@ impl RowSource for MappedShard {
     #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         debug_assert!(row < self.header.row_count);
-        read_u64_le(unsafe { self.null_bmp.row(row, 8) }, 0) | self.null_pad_mask
+        self.word(&self.null_bmp, row) | self.null_pad_mask
     }
 
     #[inline(always)]
@@ -504,7 +531,8 @@ impl ColumnarSource for MappedShard {
         cols.extend(
             self.col_regions[..schema.num_payload_cols()]
                 .iter()
-                .map(|region| match region {
+                .zip(self.schema.payload_columns())
+                .map(|(region, (_, col))| match region {
                     PayloadRegion::Mapped(cp) => *cp,
                     PayloadRegion::Packed(p) => {
                         let w = p.elem_width;
@@ -518,19 +546,32 @@ impl ColumnarSource for MappedShard {
                         }
                     }
                     PayloadRegion::Dict(d) => {
+                        let w = col.size() as usize;
                         // SAFETY: `decode` writes every cell of `column`.
-                        let mut column = unsafe { PooledBuf::uninit(window.len() * 16) };
-                        d.decode(window.start, &mut column);
+                        let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
+                        d.decode(window.start, w, &mut column);
                         ColPtr {
-                            base: decoded.hold(column).wrapping_sub(window.start * 16),
-                            stride: 16,
+                            base: decoded.hold(column).wrapping_sub(window.start * w),
+                            stride: w,
                         }
                     }
                 }),
         );
+        let null_bmp = match &self.null_bmp {
+            WordRegion::Mapped(cp) => *cp,
+            packed => {
+                // SAFETY: `decode_words` writes every word of `words`.
+                let mut words = unsafe { PooledBuf::uninit(window.len() * FIXED_REGION_BYTES) };
+                self.decode_words(packed, window.start, &mut words);
+                ColPtr {
+                    base: decoded.hold(words).wrapping_sub(window.start * FIXED_REGION_BYTES),
+                    stride: FIXED_REGION_BYTES,
+                }
+            }
+        };
         UnifiedSource {
             pk: self.pk,
-            null_bmp: self.null_bmp,
+            null_bmp,
             null_pad_mask: self.null_pad_mask,
             cols_off,
             blob: self.blob(),
@@ -541,13 +582,7 @@ impl ColumnarSource for MappedShard {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         debug_assert!(row < self.header.row_count);
-        match &self.weight {
-            WeightRegion::Mapped(cp) => read_i64_le(unsafe { cp.row(row, 8) }, 0),
-            WeightRegion::TwoValue { value_a, value_b, bits } => {
-                two_value_at(*value_a, *value_b, self.mapped(*bits), row)
-            }
-            WeightRegion::For { image, bw } => for_at(self.mapped(*image), *bw, row) as i64,
-        }
+        self.word(&self.weight, row) as i64
     }
 
     #[inline(always)]

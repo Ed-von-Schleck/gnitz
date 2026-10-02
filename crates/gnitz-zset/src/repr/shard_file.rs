@@ -4,14 +4,14 @@ use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
-use super::batch::{Batch, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::batch::{Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::shard_filter;
 use super::string_heap::{relocate_german_string_vec, BlobCache};
 use crate::repr::error::StorageError;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{german_string_content, write_u64_le};
+use gnitz_wire::{german_string_content, write_u64_le, FixedInt};
 use rustc_hash::{FxHashMap, FxHashSet};
 use xorf::BinaryFuse8;
 
@@ -23,7 +23,8 @@ fn is_constant(region: &[u8], width: usize) -> bool {
 }
 
 /// Fixed-width region `i`'s on-disk encoding and image. `pack_ints` admits FoR
-/// on fixed-int payload regions.
+/// on fixed-int payload regions, and on any payload region but a string's a
+/// dictionary no larger than half of what the region would else take.
 fn encode_region<'a>(
     schema: &SchemaDescriptor,
     i: usize,
@@ -35,15 +36,24 @@ fn encode_region<'a>(
     if is_constant(src, width) {
         return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
-    let packed = if i == REG_WEIGHT {
+    let packed = if i == REG_WEIGHT || i == REG_NULL_BMP {
+        let word = if i == REG_WEIGHT { FixedInt::I64 } else { FixedInt::U64 };
         two_value_encode(src)
             .map(|image| (Encoding::TwoValue, image))
-            .or_else(|| for_encode(src, gnitz_wire::FixedInt::I64).map(|image| (Encoding::For, image)))
+            .or_else(|| for_encode(src, word).map(|image| (Encoding::For, image)))
     } else if pack_ints && i >= REG_PAYLOAD_START {
         let col = &schema.columns[schema.payload_col_idx(i - REG_PAYLOAD_START)];
-        col.fixed_int()
-            .and_then(|fi| for_encode(src, fi))
-            .map(|image| (Encoding::For, image))
+        let framed = col.fixed_int().and_then(|fi| for_encode(src, fi));
+        let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
+        let dict = (!col.type_code.is_german_string()
+            && dict_image_len(n, 2) < limit
+            && sample_repeats(n, |row| &src[row * width..][..width]))
+        .then(|| dict_fixed_column(src, width, limit))
+        .flatten();
+        match dict {
+            Some(image) => Some((Encoding::Dict, image)),
+            None => framed.map(|image| (Encoding::For, image)),
+        }
     } else {
         None
     };
@@ -68,18 +78,42 @@ impl std::hash::Hash for Content<'_> {
 const SAMPLE_RUN: usize = 64;
 const SAMPLE_RUNS: usize = 64;
 
-/// Whether a sample of `cells` holds one content twice. The sample is runs of
-/// adjacent cells spread evenly over the column, so it sees a value repeated
-/// across the column and one repeated only in a run of neighbours. A NULL cell
-/// reads as the empty string, so a column of mostly NULLs repeats.
-fn sample_repeats(cells: &[[u8; 16]], heap: &[u8]) -> bool {
-    let stride = (cells.len() / SAMPLE_RUNS).max(SAMPLE_RUN);
+/// Whether a sample of a column's `n` rows holds one content twice. The sample
+/// is runs of adjacent rows spread evenly over the column, so it sees a value
+/// repeated across the column and one repeated only in a run of neighbours. A
+/// NULL cell reads as zeroes or the empty string, so a column of mostly NULLs
+/// repeats.
+fn sample_repeats<'a>(n: usize, content: impl Fn(usize) -> &'a [u8]) -> bool {
+    let stride = (n / SAMPLE_RUNS).max(SAMPLE_RUN);
     let mut seen = FxHashSet::default();
-    cells
-        .chunks(stride)
-        .flat_map(|run| &run[..run.len().min(SAMPLE_RUN)])
-        .map(|cell| german_string_content(cell, heap))
-        .any(|content| !seen.insert(Content(content)))
+    (0..n)
+        .step_by(stride)
+        .flat_map(|run| run..(run + SAMPLE_RUN).min(n))
+        .any(|row| !seen.insert(Content(content(row))))
+}
+
+/// The Dict image of a column of `width`-byte cells, or `None` unless it is
+/// smaller than `limit` bytes — which the pass stops at, so a column of values
+/// that seldom repeat costs the rows up to its first entry too many.
+fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> {
+    let n = src.len() / width;
+    let mut index: FxHashMap<Content<'_>, u32> = FxHashMap::default();
+    let mut entries: Vec<[u8; 16]> = Vec::new();
+    let mut ids = Vec::with_capacity(n);
+    for cell in src.chunks_exact(width) {
+        let next = entries.len();
+        let id = *index.entry(Content(cell)).or_insert(next as u32);
+        if id as usize == next {
+            if next == DICT_MAX_ENTRIES || region_start(dict_image_len(n, next + 1)) >= region_start(limit) {
+                return None;
+            }
+            let mut entry = [0u8; 16];
+            entry[..width].copy_from_slice(cell);
+            entries.push(entry);
+        }
+        ids.push(id);
+    }
+    Some(dict_encode(&entries, &ids))
 }
 
 /// A string column's image over `heap`, which gains each of the column's
@@ -130,7 +164,10 @@ fn pack_strings(batch: &Batch) -> ShardStrings<'_> {
     let cells_of = |pi: usize| mb.col_data(pi, 16).as_chunks::<16>().0;
     let slots = schema.string_payload_slots();
     let repeating = gnitz_wire::BitIter(slots)
-        .filter(|&pi| sample_repeats(cells_of(pi), mb.blob))
+        .filter(|&pi| {
+            let cells = cells_of(pi);
+            sample_repeats(cells.len(), |row| german_string_content(&cells[row], mb.blob))
+        })
         .fold(0u64, |mask, pi| mask | 1 << pi);
     let mut heap = Vec::new();
     let mut columns: Vec<(usize, Encoding, Vec<u8>)> = gnitz_wire::BitIter(repeating)
@@ -193,7 +230,7 @@ fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<B
 /// Per-call policy for [`Batch::write_as_shard`].
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts {
-    /// FoR on fixed-int payload regions.
+    /// FoR on fixed-int payload regions, and a dictionary on any but a string's.
     pub pack_ints: bool,
     /// Stamp [`SHARD_FLAG_SKELETON`].
     pub skeleton: bool,

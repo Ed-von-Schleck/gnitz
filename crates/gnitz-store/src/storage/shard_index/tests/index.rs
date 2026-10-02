@@ -402,6 +402,36 @@ fn spills_and_compaction_outputs_pack() {
     assert_all_found(&idx, 0..1500);
 }
 
+/// A run above every key L1 holds folds into one fresh guard and stays that
+/// guard's one shard, although it outweighs the spills it was written from: a
+/// frame spanned one spill in each of them and spans the run in it.
+#[test]
+fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
+    const SPILL: u64 = 14_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = fresh(dir.path(), make_schema_u64_i64());
+    let mut guards_before = 0;
+    for run in 0..3u64 {
+        for spill in run * 5..run * 5 + 5 {
+            let pks: Vec<u64> = (spill * SPILL..(spill + 1) * SPILL).collect();
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
+        }
+        let spilled = idx.levels[L0].bytes();
+        idx.run_compact().unwrap();
+        let guards = &idx.levels[L1].guards;
+        // The first run found L1 empty, and was routed by its spills' own bounds.
+        if run > 0 {
+            assert_eq!(guards.len(), guards_before + 1, "run {run}");
+            let folded = guards.last().unwrap();
+            assert_eq!(folded.entries.len(), 1, "run {run}");
+            assert!(folded.bytes() > spilled, "premise: the fold's frame is the wider");
+        }
+        guards_before = guards.len();
+    }
+    assert_all_found(&idx, (0..15 * SPILL).step_by(997));
+}
+
 /// A compaction that cannot write an output — its first, or one past outputs it
 /// had already written and opened — leaves no output behind and its inputs
 /// registered, so the next trigger retries against intact inputs.

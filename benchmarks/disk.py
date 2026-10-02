@@ -13,7 +13,12 @@ worker at the checkpoint. `compacted` shrinks the tier so the same rows spill,
 fold and compact into the deeper levels.
 
 "Value bytes" is what the live rows hold: each number at its column's width,
-each string at its length, a NULL at nothing.
+each string at its length, a NULL at nothing. "Pushed" is the same measure over
+every row a scenario sent, the rewritten and the deleted ones included.
+
+What each store wrote — the shards it superseded on the way included — comes
+from an `strace` attached to the workers; without one, or without the right to
+attach it, the written columns are empty.
 
 Run through `make bench-disk`, which builds the server and the extension first.
 """
@@ -25,10 +30,11 @@ import compression.zstd as zstd
 import json
 import os
 import random
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from collections import defaultdict
@@ -42,7 +48,7 @@ sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
 import gnitz  # noqa: E402
 from _serverproc import ServerProc, disk_usage  # noqa: E402
-from helpers.shards import read_shards, region_class  # noqa: E402
+from helpers.shards import read_shards, region_class, store_of  # noqa: E402
 
 WIDTHS = {"U8": 1, "I8": 1, "U16": 2, "I16": 2, "U32": 4, "I32": 4, "F32": 4, "U64": 8, "I64": 8,
           "F64": 8, "U128": 16, "UUID": 16, "I128": 16, "DATE": 4, "TIMESTAMP": 8, "DECIMAL": 16}
@@ -57,6 +63,7 @@ class Loader:
 
     def __init__(self, conn, batch_rows):
         self.conn, self.batch_rows = conn, batch_rows
+        self.pushed = 0
         self._tables = {}
 
     def _table(self, name):
@@ -84,6 +91,7 @@ class Loader:
                 batch, held = gnitz.ZSetBatch(schema), 0
         if held:
             self.conn.push(tid, batch)
+        self.pushed += total
         return total
 
 
@@ -202,6 +210,15 @@ def load_uuid_pk(ld, rows, rng):
         for k in range(rows)))
 
 
+def load_operators(ld, rows, rng):
+    users = max(rows // 40, 1)
+    total = ld.push("banned", (dict(user_id=u) for u in rng.sample(range(users), users // 10)))
+    return total + ld.push("visits", (
+        dict(id=k + 1, user_id=rng.randrange(users), page=rng.randrange(200), day=19_000 + k * 365 // rows,
+             ms=rng.randrange(60_000))
+        for k in range(rows)))
+
+
 SCENARIOS = [
     Scenario(
         "strings_repeated",
@@ -277,6 +294,18 @@ SCENARIOS = [
          "hits INT NOT NULL)",
          "CREATE VIEW v_user AS SELECT user_ref, COUNT(*) AS n, SUM(hits) AS total FROM sessions GROUP BY user_ref"],
         ["sessions", "v_user"], load_uuid_pk),
+    Scenario(
+        "operators",
+        "the operator state no other scenario holds: a DISTINCT and an EXCEPT, whose leaves are keyed on "
+        "a hash of the row, and a per-group top-N",
+        ["CREATE TABLE visits (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
+         "day INT NOT NULL, ms INT NOT NULL)",
+         "CREATE TABLE banned (user_id BIGINT NOT NULL PRIMARY KEY)",
+         "CREATE VIEW v_pairs AS SELECT DISTINCT user_id, page FROM visits",
+         "CREATE VIEW v_clean AS SELECT user_id FROM visits EXCEPT SELECT user_id FROM banned",
+         "CREATE VIEW v_latest AS SELECT id, user_id, page, day FROM visits "
+         "QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY day DESC) <= 3"],
+        ["visits", "banned", "v_pairs", "v_clean", "v_latest"], load_operators),
 ]
 
 
@@ -284,27 +313,42 @@ SCENARIOS = [
 # Running and reporting
 # ---------------------------------------------------------------------------
 
-class WriteVolume(threading.Thread):
-    """Bytes the workers have passed to `write`, sampled until they exit: the
-    shards a store wrote, the superseded ones included."""
+class WriteTrace:
+    """Every `pwrite64` of the traced processes, summed by the store whose shard
+    it lands in."""
 
-    def __init__(self, pids):
-        super().__init__(daemon=True)
-        self.pids, self.seen = pids, {}
+    _CALL = re.compile(r"^pwrite64\(\d+<([^>]*)>.*\) = (\d+)$")
 
-    def run(self):
-        while self.pids:
-            for pid in list(self.pids):
-                try:
-                    with open(f"/proc/{pid}/io") as f:
-                        self.seen[pid] = int(f.read().split("wchar:")[1].split()[0])
-                except (OSError, IndexError, ValueError):
-                    self.pids.remove(pid)
-            time.sleep(0.005)
+    def __init__(self, pids, prefix):
+        self.prefix = Path(prefix)
+        self.proc = None
+        if not shutil.which("strace"):
+            return
+        args = ["strace", "-ff", "-y", "-e", "trace=pwrite64", "-o", str(prefix)]
+        self.proc = subprocess.Popen(args + [f"--attach={pid}" for pid in pids],
+                                     stderr=subprocess.PIPE, text=True)
+        # A row pushed before the last attach would be written unseen.
+        for _ in pids:
+            if "attached" not in self.proc.stderr.readline():
+                self.proc.kill()
+                self.proc = None
+                return
 
-    def total(self):
-        self.join()
-        return sum(self.seen.values())
+    def by_store(self):
+        """`{(relation, store): bytes}` once every traced process has exited, or
+        None when nothing was traced."""
+        if self.proc is None:
+            return None
+        self.proc.wait()
+        written = defaultdict(int)
+        for log in self.prefix.parent.glob(self.prefix.name + ".*"):
+            for line in log.read_text(errors="replace").splitlines():
+                m = self._CALL.match(line)
+                store = m and store_of(m.group(1))
+                if store:
+                    written[store] += int(m.group(2))
+            log.unlink()
+        return written
 
 
 def zstd_bytes(blobs):
@@ -330,16 +374,16 @@ def run(scenario, regime, args):
             # Views first: a view maintains only the deltas pushed after it exists.
             for stmt in scenario.ddl:
                 conn.execute_sql(stmt)
-            value_bytes = scenario.load(Loader(conn, args.batch_rows), args.rows, random.Random(7))
+            trace = WriteTrace(list(server.worker_pids().values()), tmp / "writes")
+            loader = Loader(conn, args.batch_rows)
+            value_bytes = scenario.load(loader, args.rows, random.Random(7))
             names = {}
             for name in scenario.relations:
                 tid, schema = conn.resolve_table(name)
                 names[tid] = (name, len(conn.scan(tid, schema)))
-        volume = WriteVolume(list(server.worker_pids().values()))
-        volume.start()
         # Its final checkpoint puts every store on disk.
         server.stop_graceful(timeout=600)
-        written = volume.total()
+        written = trace.by_store()
     finally:
         server.stop()
 
@@ -365,16 +409,18 @@ def run(scenario, regime, args):
     for (rel, store), classes in sorted(by_store.items()):
         rows, retractions = classes.pop("rows"), classes.pop("retractions")
         store_records.append({
-            "relation": rel, "name": names.get(rel, ("?", 0))[0], "store": store, "rows": rows,
-            "retractions": retractions,
+            "relation": rel, "name": names.get(rel, (f"relation {rel}", 0))[0], "store": store, "rows": rows,
+            "retractions": retractions, "written": None if written is None else written[(rel, store)],
             "bytes": sum(classes.values()), "zstd3": zstd_bytes(blobs[(rel, store)]),
             "classes": dict(sorted(classes.items())),
         })
     identical = sum(int(line.split()[4]) for line in report.splitlines() if line.startswith("identical shards:"))
     record = {
         "scenario": scenario.name, "regime": regime, "rows": args.rows, "workers": args.workers,
-        "ram_tier_bytes": ram_tier, "value_bytes": value_bytes, "shard_bytes": shard_bytes,
-        "identical_bytes": identical, "written_bytes": written,
+        "ram_tier_bytes": ram_tier, "value_bytes": value_bytes, "pushed_bytes": loader.pushed,
+        "shard_bytes": shard_bytes, "identical_bytes": identical,
+        "written_bytes": None if written is None else sum(
+            n for (rel, _), n in written.items() if rel >= gnitz.FIRST_USER_TABLE_ID),
         "relations": {name: live for name, live in names.values()},
         "stores": store_records,
         "report": "\n".join(line for line in report.splitlines() if line not in system),
@@ -396,29 +442,34 @@ def print_record(rec):
         print(f"  {name}: {live} rows")
     print(rec["report"])
     classes = sorted({c for s in rec["stores"] for c in s["classes"]})
-    # `retract` is the rows of negative weight; `live` the rows a scan of the relation returns.
-    head = (f"{'store':<28} {'rows':>9} {'retract':>8} {'live':>8} {'bytes':>11} {'B/row':>6} {'zstd-3':>6}  "
-            + " ".join(f"{c:>16}" for c in classes))
+    # `retract` is the rows of negative weight; `live` the rows a scan of the relation
+    # returns; `written` every shard byte the store wrote to hold `bytes`.
+    head = (f"{'store':<28} {'rows':>9} {'retract':>8} {'live':>8} {'bytes':>11} {'B/row':>6} {'zstd-3':>6} "
+            f"{'written':>11}  " + " ".join(f"{c:>16}" for c in classes))
     print(head)
     for s in rec["stores"]:
         label = f"{s['name']} {s['store']}"
         live = rec["relations"].get(s["name"], "") if s["store"] == "rows" else ""
         cells = " ".join(f"{s['classes'].get(c, 0):>16}" for c in classes)
         print(f"{label:<28} {s['rows']:>9} {s['retractions']:>8} {live:>8} {s['bytes']:>11} "
-              f"{s['bytes'] / max(s['rows'], 1):>6.1f} {s['zstd3'] / max(s['bytes'], 1):>6.2f}  {cells}")
+              f"{s['bytes'] / max(s['rows'], 1):>6.1f} {s['zstd3'] / max(s['bytes'], 1):>6.2f} "
+              f"{'' if s['written'] is None else s['written']:>11}  {cells}")
     print(f"shard bytes per value byte: {rec['shard_bytes'] / rec['value_bytes']:.2f}"
-          f"; the workers wrote {rec['written_bytes'] / max(rec['shard_bytes'], 1):.2f}x the shard bytes"
+          + ("" if rec["written_bytes"] is None else
+             f"; the workers wrote {rec['written_bytes'] / rec['pushed_bytes']:.2f} bytes per value byte pushed")
           + (f"; {rec['identical_bytes']} bytes are a second copy of an identical shard" if rec["identical_bytes"] else "")
           + (f"; kept: {rec['kept']}" if "kept" in rec else ""))
 
 
 def print_summary(records):
     print(f"\n{'scenario':<18} {'regime':<10} {'value bytes':>12} {'shard bytes':>12} {'per value':>9} "
-          f"{'base':>12} {'views':>12} {'traces+idx':>12} {'zstd-3':>6} {'dead rows':>9} {'written':>12}")
+          f"{'base':>12} {'views':>12} {'traces+idx':>12} {'zstd-3':>6} {'dead rows':>9} {'pushed':>12} "
+          f"{'written':>12} {'per pushed':>10}")
     for rec in records:
-        # Every scenario names its views `v_…`.
+        # Every scenario names its views `v_…`; a relation it did not name is one
+        # the planner put under a view.
         tables = [s for s in rec["stores"] if s["store"] == "rows"]
-        views = sum(s["bytes"] for s in tables if s["name"].startswith("v_"))
+        views = sum(s["bytes"] for s in tables if s["name"].startswith(("v_", "relation ")))
         base = sum(s["bytes"] for s in tables) - views
         other = sum(s["bytes"] for s in rec["stores"] if s["store"] != "rows")
         z = sum(s["zstd3"] for s in rec["stores"]) / max(rec["shard_bytes"], 1)
@@ -426,7 +477,9 @@ def print_summary(records):
         dead = 2 * sum(s["retractions"] for s in rec["stores"]) / max(sum(s["rows"] for s in rec["stores"]), 1)
         print(f"{rec['scenario']:<18} {rec['regime']:<10} {rec['value_bytes']:>12} {rec['shard_bytes']:>12} "
               f"{rec['shard_bytes'] / rec['value_bytes']:>9.2f} {base:>12} {views:>12} {other:>12} {z:>6.2f} "
-              f"{dead:>8.0%} {rec['written_bytes']:>12}")
+              f"{dead:>8.0%} {rec['pushed_bytes']:>12} "
+              + ("" if rec["written_bytes"] is None else
+                 f"{rec['written_bytes']:>12} {rec['written_bytes'] / rec['pushed_bytes']:>10.2f}"))
 
 
 def main():

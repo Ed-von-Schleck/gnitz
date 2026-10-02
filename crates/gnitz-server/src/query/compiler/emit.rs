@@ -38,6 +38,8 @@ pub(super) struct EmitCtx<'a> {
     /// drops NULL-keyed rows, and its output.
     rekeys: Vec<(DeltaReg, &'a gnitz_wire::MapKind, bool, DeltaReg)>,
     source_reg_map: FxHashMap<u64, DeltaReg>,
+    /// The plan's [`PlanOut::Store`] sink.
+    store_sink: Option<NodeId>,
 }
 
 impl EmitCtx<'_> {
@@ -52,6 +54,15 @@ impl EmitCtx<'_> {
     /// a producer outside this side has no register at all.
     fn reg_of(&self, src: NodeId) -> Result<DeltaReg, String> {
         self.out_reg_of[src].ok_or_else(|| "operand is produced outside this plan".to_string())
+    }
+
+    /// The output trace of reduce or top-N `nid`, declared under `kind` — or
+    /// `None` where the sink alone reads the node, so that the view's store holds
+    /// the same rows.
+    fn out_trace(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> Option<StateIdx> {
+        let mut readers = self.loaded.readers(nid);
+        let feeds_store = self.store_sink.is_some() && readers.next() == self.store_sink && readers.next().is_none();
+        (!feeds_store).then(|| self.declare_child(kind, nid, schema))
     }
 
     fn reads_partials(&self, nid: NodeId) -> bool {
@@ -357,7 +368,7 @@ fn push_reduce(
     plan: gnitz_zset::stream::ReducePlan,
 ) -> DeltaReg {
     let out_schema = *plan.output_schema();
-    let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
+    let out_trace = ctx.out_trace(trace_kind, nid, out_schema);
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
     // share a table_id, scratch dir and compaction namespace and cannot collide on
     // a memory-pressure flush.
@@ -377,7 +388,7 @@ fn push_topn(
     plan: gnitz_zset::stream::TopNPlan,
 ) -> DeltaReg {
     let out_schema = plan.output_schema;
-    let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
+    let out_trace = ctx.out_trace(trace_kind, nid, out_schema);
     // The ordered index of every input row — the operator's whole history.
     let index_table = ctx.declare_child(index_kind, nid, plan.index.schema);
     let baked = Box::new(BakedTopN { plan, index_table });
@@ -409,6 +420,10 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
 #[derive(Clone, Copy)]
 pub(super) enum PlanOut {
     Node(NodeId),
+    /// The sink of a view whose store holds every row it is fed — a bounded one
+    /// may hold a skeleton row in their place — and is so the integral of the
+    /// register the sink reads.
+    Store(NodeId),
     /// The per-worker partial of `consumer`, a global reduce or top-N behind an
     /// empty-keyed shard — or the shard's input, when it has none.
     Split {
@@ -458,6 +473,10 @@ pub(super) fn build_plan(
         integrals: vec![None; loaded.len()],
         rekeys: Vec::new(),
         source_reg_map: FxHashMap::default(),
+        store_sink: match out {
+            PlanOut::Store(sink) => Some(sink),
+            PlanOut::Node(_) | PlanOut::Split { .. } => None,
+        },
     };
     let seed_regs = seeds
         .iter()
@@ -472,7 +491,7 @@ pub(super) fn build_plan(
         ctx.out_reg_of[nid] = Some(reg);
     }
     let (out_reg, partial) = match out {
-        PlanOut::Node(nid) => (ctx.reg_of(nid)?, false),
+        PlanOut::Node(nid) | PlanOut::Store(nid) => (ctx.reg_of(nid)?, false),
         PlanOut::Split { consumer } => match emit_partial(&mut ctx, consumer)? {
             Some(reg) => (reg, true),
             None => (ctx.unary_delta_in(loaded.inputs(consumer)[0])?, false),

@@ -9,7 +9,7 @@ use StorageError::Corrupt;
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 23;
+pub(crate) const SHARD_EPOCH: u64 = 24;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
@@ -172,8 +172,8 @@ fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
     bitvec[row / 8] |= 1 << (row % 8);
 }
 
-/// A weight region's TwoValue image, bit *i* set ⇔ row *i* holds `value_b`; or
-/// `None` at a third distinct weight.
+/// A word region's TwoValue image, bit *i* set ⇔ row *i* holds `value_b`; or
+/// `None` at a third distinct word.
 pub(crate) fn two_value_encode(src: &[u8]) -> Option<Vec<u8>> {
     let n = src.len() / 8;
     let first = read_i64_le(src, 0);
@@ -212,7 +212,7 @@ pub(crate) fn two_value_decode(image: &[u8]) -> (i64, i64, &[u8]) {
     )
 }
 
-/// Row `row`'s weight, from a [`two_value_decode`]d image.
+/// Row `row`'s word, from a [`two_value_decode`]d image.
 #[inline(always)]
 pub(crate) fn two_value_at(a: i64, b: i64, bits: &[u8], row: usize) -> i64 {
     if two_value_bit(bits, row) {
@@ -330,23 +330,27 @@ fn for_decode_cells<const W: usize>(image: &[u8], bw: usize, first_row: usize, o
     }
 }
 
-// A Dict image: the entry count (u64 LE), the 16-byte entries, then each row's
-// code — one byte while every code fits one, else two (LE).
+// A Dict image: the entry count (u64 LE), the 16-byte entries — a narrower cell
+// zero-padded — then each row's code in the fewest bits that tell the entries
+// apart, row 0 in the lowest, then zero slack so the last code also loads as one
+// u32.
 const DICT_ENTRIES_AT: usize = 8;
+const DICT_SLACK: usize = size_of::<u32>() - 1;
 
-/// The most entries a dictionary holds: what a two-byte code addresses.
+/// The most entries a dictionary holds: what a 16-bit code addresses, which at
+/// any bit offset in its byte still lies inside one u32.
 pub(crate) const DICT_MAX_ENTRIES: usize = 1 << 16;
 
-const fn dict_code_width(entries: usize) -> usize {
-    if entries <= 1 << 8 {
-        1
-    } else {
-        2
+/// Bits per code of a dictionary of `entries`.
+const fn dict_code_bits(entries: usize) -> usize {
+    match entries {
+        0..=2 => 1,
+        n => (usize::BITS - (n - 1).leading_zeros()) as usize,
     }
 }
 
 pub(crate) const fn dict_image_len(count: usize, entries: usize) -> usize {
-    DICT_ENTRIES_AT + entries * 16 + count * dict_code_width(entries)
+    DICT_ENTRIES_AT + entries * 16 + (count * dict_code_bits(entries)).div_ceil(8) + DICT_SLACK
 }
 
 /// The Dict image of a column whose row `i` holds `entries[ids[i]]`.
@@ -355,10 +359,12 @@ pub(crate) fn dict_encode(entries: &[[u8; 16]], ids: &[u32]) -> Vec<u8> {
     let mut image = Vec::with_capacity(dict_image_len(ids.len(), entries.len()));
     image.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     image.extend_from_slice(entries.as_flattened());
-    if dict_code_width(entries.len()) == 1 {
-        image.extend(ids.iter().map(|&id| id as u8));
-    } else {
-        image.extend(ids.iter().flat_map(|&id| (id as u16).to_le_bytes()));
+    let (codes_at, bits) = (image.len(), dict_code_bits(entries.len()));
+    image.resize(dict_image_len(ids.len(), entries.len()), 0);
+    for (row, &id) in ids.iter().enumerate() {
+        let at = row * bits;
+        let word: &mut [u8; 4] = image[codes_at + at / 8..].first_chunk_mut().unwrap();
+        *word = (u32::from_le_bytes(*word) | id << (at % 8)).to_le_bytes();
     }
     image
 }
@@ -368,7 +374,7 @@ pub(crate) fn dict_encode(entries: &[[u8; 16]], ids: &[u32]) -> Vec<u8> {
 pub(crate) struct DictImage<'a> {
     entries: &'a [[u8; 16]],
     codes: &'a [u8],
-    wide: bool,
+    bits: usize,
 }
 
 impl<'a> DictImage<'a> {
@@ -383,41 +389,49 @@ impl<'a> DictImage<'a> {
         Some(DictImage {
             entries: entries.as_chunks().0,
             codes,
-            wide: dict_code_width(n) == 2,
+            bits: dict_code_bits(n),
         })
     }
 
-    /// The entry `code` names. The codes are body bytes no open verifies, so a
-    /// code past the last entry reads the last.
+    /// Row `row`'s cell. The codes are body bytes no open verifies, so a code
+    /// past the last entry reads the last.
     #[inline(always)]
-    fn entry(&self, code: usize) -> &'a [u8; 16] {
+    pub(crate) fn cell(&self, row: usize) -> &'a [u8; 16] {
+        let at = row * self.bits;
+        let word = u32::from_le_bytes(*self.codes[at / 8..].first_chunk().unwrap());
+        let code = (word >> (at % 8)) as usize & ((1 << self.bits) - 1);
         // SAFETY: `parse` admits no empty dictionary, and the index is clamped into it.
         unsafe { self.entries.get_unchecked(code.min(self.entries.len() - 1)) }
     }
 
-    /// Row `row`'s cell.
-    #[inline(always)]
-    pub(crate) fn cell(&self, row: usize) -> &'a [u8; 16] {
-        if self.wide {
-            self.entry(u16::from_le_bytes(self.codes.as_chunks::<2>().0[row]) as usize)
-        } else {
-            self.entry(self.codes[row] as usize)
+    /// Decode rows `first_row..` to their `width`-byte cells, `out.len() / width`
+    /// rows.
+    pub(crate) fn decode(&self, first_row: usize, width: usize, out: &mut [u8]) {
+        match width {
+            2 => self.decode_cells::<2>(first_row, out),
+            4 => self.decode_cells::<4>(first_row, out),
+            8 => self.decode_cells::<8>(first_row, out),
+            16 => self.decode_cells::<16>(first_row, out),
+            _ => unreachable!("open admits a dictionary only on 2/4/8/16-byte columns"),
         }
     }
 
-    /// Decode rows `first_row..` to their cells, `out.len() / 16` rows.
-    pub(crate) fn decode(&self, first_row: usize, out: &mut [u8]) {
-        let out = out.as_chunks_mut::<16>().0;
-        if self.wide {
-            let codes = &self.codes.as_chunks::<2>().0[first_row..first_row + out.len()];
-            for (cell, code) in out.iter_mut().zip(codes) {
-                *cell = *self.entry(u16::from_le_bytes(*code) as usize);
-            }
-        } else {
-            let codes = &self.codes[first_row..first_row + out.len()];
-            for (cell, &code) in out.iter_mut().zip(codes) {
-                *cell = *self.entry(code as usize);
-            }
+    fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8]) {
+        let cells = out.as_chunks_mut::<W>().0;
+        let Some(last) = cells.len().checked_sub(1) else {
+            return;
+        };
+        assert!((first_row + last) * self.bits / 8 + size_of::<u32>() <= self.codes.len());
+        let (mask, top) = ((1u32 << self.bits) - 1, self.entries.len() - 1);
+        for (i, cell) in cells.iter_mut().enumerate() {
+            let at = (first_row + i) * self.bits;
+            // SAFETY: row `first_row + i` is at most `first_row + last`, whose load the assert bounds.
+            let word = unsafe { self.codes.as_ptr().add(at / 8).cast::<u32>().read_unaligned() };
+            let code = ((u32::from_le(word) >> (at % 8)) & mask) as usize;
+            // SAFETY: `parse` admits no empty dictionary, and the index is clamped into it.
+            *cell = *unsafe { self.entries.get_unchecked(code.min(top)) }
+                .first_chunk()
+                .unwrap();
         }
     }
 }
@@ -442,13 +456,13 @@ pub(crate) enum Encoding {
     Raw = 0,
     /// One element, read at stride 0.
     Constant = 1,
-    /// A weight region of exactly two distinct weights.
+    /// A weight or null region of exactly two distinct words.
     TwoValue = 2,
     /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type,
-    /// or a weight region of three or more distinct weights.
+    /// or a weight or null region of three or more distinct words.
     For = 3,
-    /// Dictionary: a German-string payload column as its distinct cells and one
-    /// code per row.
+    /// Dictionary: a payload column of 2 bytes or wider as its distinct cells and
+    /// one code per row.
     Dict = 4,
 }
 

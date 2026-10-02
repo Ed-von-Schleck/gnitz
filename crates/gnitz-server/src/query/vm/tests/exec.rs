@@ -415,7 +415,7 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
         r0,
         out_schema,
         Op::TopN {
-            out_trace,
+            out_trace: Some(out_trace),
             plan: Box::new(BakedTopN { plan, index_table }),
         },
     );

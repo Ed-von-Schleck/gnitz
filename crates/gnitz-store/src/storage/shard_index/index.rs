@@ -247,6 +247,14 @@ impl ShardIndex {
             self.retire(opened.into_iter().map(|(_, entry)| entry));
             return Err(e);
         }
+        if kind == CompactionKind::L0Fold {
+            // A run that lands in one guard is one shard, and can outweigh the
+            // shards it was spilled as: a frame spans the whole run where it
+            // spanned one spill. Unobserved, every such guard would be over
+            // target as written and be rewritten at once to be cut in two.
+            let largest = opened.iter().map(|(_, e)| e.shard.file_len()).max();
+            self.l0_run_bytes = self.l0_run_bytes.max(largest.unwrap_or(0));
+        }
         #[cfg(test)]
         super::cstats::record(
             kind,

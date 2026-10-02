@@ -206,6 +206,13 @@ fn shapes() -> Vec<Shape> {
     let u64_i64 = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
+    let u64_f64 = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
+    let u64_u128 = u64_pk_schema(SchemaColumn::new(TypeCode::U128, false));
+    let opt_i64 = SchemaColumn::new(TypeCode::I64, true);
+    let three_nullable = SchemaDescriptor::new(
+        &[SchemaColumn::new(TypeCode::U64, false), opt_i64, opt_i64, opt_i64],
+        &[0],
+    );
     let u128_i64 = make_schema_u128_i64();
     let all_pk = pk_only_schema(&[TypeCode::U64; 3]);
     let string = make_schema_pk_u64_payload_string();
@@ -238,7 +245,7 @@ fn shapes() -> Vec<Shape> {
             ],
         },
         Shape {
-            label: "for weight, nullable raw i64",
+            label: "for weight, two-value null, raw i64",
             written: build(nullable_i64, 30, |b, i| {
                 b.begin_row(i as u128 * 5, [1, -1, 2][i % 3]);
                 match i % 4 {
@@ -251,9 +258,64 @@ fn shapes() -> Vec<Shape> {
             encodings: vec![
                 (REG_PK, Raw),
                 (REG_WEIGHT, For),
-                (REG_NULL_BMP, Raw),
+                (REG_NULL_BMP, TwoValue),
                 (REG_PAYLOAD_START, Raw),
             ],
+        },
+        // Eight null words: more than two, in a frame of one byte.
+        Shape {
+            label: "for null across decode blocks",
+            written: build(three_nullable, DECODE_BLOCK_ROWS + 9, |b, i| {
+                b.begin_row(i as u128, 1);
+                for bit in 0..3 {
+                    b.put_opt_int((i >> bit & 1 == 0).then_some(i as u128 * 0x0101_0101_0101));
+                }
+            }),
+            reader: three_nullable,
+            pack: true,
+            encodings: vec![(REG_NULL_BMP, For)],
+        },
+        Shape {
+            label: "dictionary of floats",
+            written: build(u64_f64, 300, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(((i % 7) as f64 * 0.25 - 1.0).to_bits() as u128);
+            }),
+            reader: u64_f64,
+            pack: true,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
+        },
+        Shape {
+            label: "dictionary of 16-byte integers, two-byte codes",
+            written: build(u64_u128, 1200, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(((i % 300) as u128 + 1) * (u128::MAX / 301));
+            }),
+            reader: u64_u128,
+            pack: true,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
+        },
+        // Five values a frame of four bytes spans: the dictionary is the smaller.
+        Shape {
+            label: "dictionary of i64 under a wider frame",
+            written: build(u64_i64, 300, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(((i % 5) as i64 * 500_000_000 - 7) as u128);
+            }),
+            reader: u64_i64,
+            pack: true,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
+        },
+        // The same values unpacked.
+        Shape {
+            label: "repeating i64 a writer may not pack",
+            written: build(u64_i64, 300, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(((i % 5) as i64 * 500_000_000 - 7) as u128);
+            }),
+            reader: u64_i64,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Raw)],
         },
         // Three weights spanning more than a FoR offset holds.
         Shape {
@@ -378,7 +440,7 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: nullable_string,
             pack: false,
-            encodings: vec![(REG_NULL_BMP, Raw), (REG_PAYLOAD_START, Dict)],
+            encodings: vec![(REG_NULL_BMP, TwoValue), (REG_PAYLOAD_START, Dict)],
         },
         // The second column's sample repeats nothing, so it is copied onto the
         // heap the first one's dictionary is packed over.
@@ -620,14 +682,11 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
         (REG_PK, 0x10), // not an encoding at all
         (REG_PK, Encoding::TwoValue as u8),
         (REG_PK, Encoding::For as u8),
-        (REG_NULL_BMP, Encoding::For as u8),
         (blob, Encoding::For as u8),
         (REG_PAYLOAD_START, Encoding::TwoValue as u8),
         (REG_PK, Encoding::Dict as u8),
         (REG_WEIGHT, Encoding::Dict as u8),
         (REG_NULL_BMP, Encoding::Dict as u8),
-        // An integer column: only a string column may be a dictionary.
-        (REG_PAYLOAD_START, Encoding::Dict as u8),
         (blob, Encoding::Dict as u8),
         (blob, Encoding::Constant as u8),
         (filter, Encoding::Constant as u8),

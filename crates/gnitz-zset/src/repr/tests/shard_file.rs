@@ -7,7 +7,7 @@ use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_sc
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (23, 2353607708009914047);
+    const PINNED: (u64, u64) = (24, 11567886519790207916);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let schema = SchemaDescriptor::new(
         &[
@@ -156,7 +156,8 @@ fn more_values_than_a_dictionary_holds_stay_raw_over_a_shared_heap() {
     let cells: Vec<[u8; 16]> = (0..2 * values)
         .map(|i| gnitz_wire::encode_german_string(format!("value-{:012}", i % values).as_bytes(), &mut src_heap))
         .collect();
-    assert!(sample_repeats(&cells, &src_heap) || cells.len() > SAMPLE_RUN * SAMPLE_RUNS);
+    let content = |row: usize| gnitz_wire::german_string_content(&cells[row], &src_heap);
+    assert!(sample_repeats(cells.len(), content) || cells.len() > SAMPLE_RUN * SAMPLE_RUNS);
     let mut heap = Vec::new();
     let (encoding, image) = pack_string_column(&cells, &src_heap, &mut heap);
     assert_eq!(encoding, Encoding::Raw);
@@ -183,7 +184,7 @@ fn the_sample_sees_spread_and_adjacent_repeats() {
         let cells: Vec<[u8; 16]> = (0..n)
             .map(|i| gnitz_wire::encode_german_string(format!("value-{:012}", value(i)).as_bytes(), &mut heap))
             .collect();
-        sample_repeats(&cells, &heap)
+        sample_repeats(n, |row| gnitz_wire::german_string_content(&cells[row], &heap))
     };
     assert!(!column(&|i| i), "distinct");
     assert!(column(&|i| i % 1000), "a thousand values, spread");

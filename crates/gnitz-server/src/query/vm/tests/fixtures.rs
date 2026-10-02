@@ -28,6 +28,9 @@ impl std::ops::DerefMut for TestPlan {
     }
 }
 
+/// The view a [`TestPlan`]'s children are opened under.
+const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
+
 impl TestPlan {
     /// One child store, declared the way a compile declares one.
     pub(super) fn table(&mut self, name: &str, schema: SchemaDescriptor) -> StateIdx {
@@ -43,7 +46,8 @@ impl TestPlan {
         let avi_table = plan.index_schema().map(|schema| self.table("avidx", *schema));
         let plan = Box::new(BakedReduce::new(plan, avi_table));
         (
-            self.prog.push(in_reg, out_schema, Op::Reduce { out_trace, plan }),
+            self.prog
+                .push(in_reg, out_schema, Op::Reduce { out_trace: Some(out_trace), plan }),
             out_trace,
         )
     }
@@ -51,7 +55,6 @@ impl TestPlan {
     /// Finish the program with output `out`, opening every declared child store
     /// in a fresh directory as the DAG opens a compiled view's.
     pub(super) fn open(self, out: DeltaReg) -> TestVm {
-        const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
         let schema = crate::test_support::make_schema_u128_i64();
@@ -88,6 +91,7 @@ impl TestVm {
     pub(super) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Batch {
         let reads = SourceReads {
             registry: &self.registry,
+            view: VIEW_ID,
             unfed: &self.unfed,
         };
         execute_epoch_multi(&mut self.vm, &mut self.state, &reads, inputs).unwrap()
@@ -97,6 +101,7 @@ impl TestVm {
         let entry = self.vm.program.replay_entry(reg).unwrap();
         let reads = SourceReads {
             registry: &self.registry,
+            view: VIEW_ID,
             unfed: &self.unfed,
         };
         replay_chunk(&mut self.vm, &mut self.state, &reads, entry, seed).unwrap()

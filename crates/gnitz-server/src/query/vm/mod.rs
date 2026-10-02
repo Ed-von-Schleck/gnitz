@@ -81,14 +81,16 @@ pub(in crate::query) enum Op {
     NullExtend {
         nulls_first: bool,
     },
+    /// `out_trace`: the integral of the output register, or `None` where that
+    /// register is the view's output and so the view's own store is its integral.
     Reduce {
-        out_trace: StateIdx,
+        out_trace: Option<StateIdx>,
         plan: Box<BakedReduce>,
     },
     /// Per-group top-N: the ordered index of every input row is populated with
-    /// the delta before the walk.
+    /// the delta before the walk. `out_trace` as [`Op::Reduce`]'s.
     TopN {
-        out_trace: StateIdx,
+        out_trace: Option<StateIdx>,
         plan: Box<BakedTopN>,
     },
 }
@@ -202,7 +204,7 @@ impl Instr {
     fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
         match &self.op {
             Op::WeightClamp { hist, .. } => Some((self.in_reg, *hist)),
-            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => Some((self.out_reg, *out_trace)),
+            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => out_trace.map(|trace| (self.out_reg, trace)),
             Op::Filter(_)
             | Op::Map(_)
             | Op::Negate

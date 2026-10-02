@@ -348,3 +348,55 @@ fn a_rekey_that_drops_no_row_is_emitted_once() {
     assert_eq!(maps(1), 3, "a NOT NULL key");
     assert_eq!(maps(2), 4, "a nullable key");
 }
+
+// ── A reduce or top-N whose output is the view's ──────────────────────────
+
+/// The children declared by a plan over table 10 `(id | v)` that feeds `tip`'s
+/// node to the sink and outputs what `out` makes of that sink.
+fn children_of(tip: fn(&mut Circuit, NodeId) -> NodeId, out: fn(NodeId) -> PlanOut) -> Vec<String> {
+    let mut c = Circuit::default();
+    let a = scan(&mut c, 10);
+    let tip = tip(&mut c, a);
+    c.sink(tip);
+    let loaded = loaded(c);
+    let mut layout = StateLayout::default();
+    build_plan(
+        &loaded,
+        &loaded.ordered_where(|_| true),
+        &sources([(10, make_schema_u64_i64())]),
+        &mut layout,
+        true,
+        &[],
+        out(loaded.sink().unwrap()),
+    )
+    .unwrap();
+    layout.names().map(str::to_string).collect()
+}
+
+/// A reduce or top-N the sink alone reads declares no output trace where the
+/// view's store holds every row the sink is fed. A bounded view's does not, and
+/// behind another operator the store holds other rows than the trace would.
+#[test]
+fn a_view_store_stands_in_for_the_output_trace_of_the_node_the_sink_reads() {
+    use gnitz_wire::{AggDescriptor, OpNode, OrderKey};
+    let reduce = |c: &mut Circuit, a| c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
+    // No exchange in front of it: the plan is one worker's.
+    let top = |c: &mut Circuit, a| {
+        let op = OpNode::TopN {
+            group_cols: vec![1],
+            order: vec![OrderKey { col: 0, desc: true, nulls_first: false }],
+            limit: 3,
+            offset: 0,
+        };
+        c.push(op, &[a]).unwrap()
+    };
+    let negated = |c: &mut Circuit, a| {
+        let r = c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
+        c.negate(r)
+    };
+    assert_eq!(children_of(reduce, PlanOut::Store), [""; 0]);
+    assert_eq!(children_of(reduce, PlanOut::Node), ["reduce_1"]);
+    assert_eq!(children_of(top, PlanOut::Store), ["topnidx_1"]);
+    assert_eq!(children_of(top, PlanOut::Node), ["topn_1", "topnidx_1"]);
+    assert_eq!(children_of(negated, PlanOut::Store), ["reduce_1"]);
+}

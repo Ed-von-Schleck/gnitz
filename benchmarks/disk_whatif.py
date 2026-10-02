@@ -174,11 +174,11 @@ def price_shard(shard, acc):
             pass
         elif r.encoding == "dict":
             entries, d = dict_cells(r.data, rows, heap)
-            code = 1 if d <= 256 else 2
-            acc["string dict: bit-packed codes"] += rows * code - packed(rows, bits_for(d))
-            acc["string dict: entries as length + bytes"] += sum(16 - (1 + (len(e) if len(e) <= 12 else 0))
-                                                               for e in entries)
-            long_contents += [e for e in entries if len(e) > 12]
+            # A dictionary of numbers reads as one of strings only by accident.
+            if entries is not None:
+                acc["string dict: entries as length + bytes"] += sum(16 - (1 + (len(e) if len(e) <= 12 else 0))
+                                                                   for e in entries)
+                long_contents += [e for e in entries if len(e) > 12]
         elif r.encoding in ("raw", "for"):
             cells = string_cells(r.data, rows, heap) if r.encoding == "raw" else None
             if cells is not None:
