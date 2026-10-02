@@ -115,6 +115,12 @@ impl Table {
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
             self.spill_ram_tier(run)?;
         }
+        // Rows above the cut go to a shard of their own, which no compaction
+        // folds below it.
+        if let Some(run) = self.pending.fold_to_single(&self.shard_index.schema) {
+            self.shard_index.append_pending_run(&run)?;
+            self.pending.clear();
+        }
         let bytes = manifest::encode(&Manifest {
             checkpoint_mark,
             caller_record: self.caller_record.clone(),

@@ -821,7 +821,7 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, L1, gk(base), &dense_batch(base, 200), i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk))
+        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), true)
             .count()
     };
 
@@ -1347,7 +1347,7 @@ fn shard_probe_bench() {
             let mut found = 0usize;
             let ((), instructions) = counter.measure(|| {
                 for &(lo, hi) in &ranges {
-                    found += idx.shard_arcs_in_range(lo, hi).count();
+                    found += idx.shard_arcs_in_range(lo, hi, true).count();
                 }
             });
             black_box(found);

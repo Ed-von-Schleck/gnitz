@@ -67,7 +67,6 @@ impl TestPlan {
             state: CircuitState::open(&registry, VIEW_ID, self.layout).unwrap(),
             vm: self.prog.finish(out),
             registry,
-            unticked: Default::default(),
             unfed: Vec::new(),
             _dir: dir,
         }
@@ -80,8 +79,6 @@ pub(super) struct TestVm {
     pub(super) vm: Vm,
     pub(super) state: CircuitState,
     pub(super) registry: RelationRegistry,
-    /// What each source's store holds that the program has not been run over.
-    pub(super) unticked: rustc_hash::FxHashMap<u64, Batch>,
     /// The sources the program has been fed no row of.
     pub(super) unfed: Vec<u64>,
     _dir: tempfile::TempDir,
@@ -91,7 +88,6 @@ impl TestVm {
     pub(super) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Batch {
         let reads = SourceReads {
             registry: &self.registry,
-            unticked: &self.unticked,
             unfed: &self.unfed,
         };
         execute_epoch_multi(&mut self.vm, &mut self.state, &reads, inputs).unwrap()
@@ -101,7 +97,6 @@ impl TestVm {
         let entry = self.vm.program.replay_entry(reg).unwrap();
         let reads = SourceReads {
             registry: &self.registry,
-            unticked: &self.unticked,
             unfed: &self.unfed,
         };
         replay_chunk(&mut self.vm, &mut self.state, &reads, entry, seed).unwrap()

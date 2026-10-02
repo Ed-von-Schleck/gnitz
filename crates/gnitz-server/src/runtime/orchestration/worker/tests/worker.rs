@@ -172,8 +172,18 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     let schema = make_schema_u64_i64();
     for tid in [500, 501] {
         engine
-            .dag
-            .buffer_unticked(tid, make_batch_raw(&schema, &[(tid, 1, 10)]));
+            .registry
+            .register(gnitz_store::relation::RelationSpec {
+                id: tid,
+                kind: gnitz_store::relation::RelationKind::BaseTable,
+                schema,
+                placement: gnitz_zset::schema::Placement::full_pk(&schema),
+            })
+            .unwrap();
+        engine
+            .registry
+            .ingest_pending(tid, make_batch_raw(&schema, &[(tid, 1, 10)]))
+            .unwrap();
     }
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -193,7 +203,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     wp.drain_sal();
 
     for tid in [500, 501] {
-        assert!(wp.cat().dag.take_unticked(tid).is_none(), "tid {tid} was ticked");
+        assert!(wp.cat().registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
     }
     let out = frames(&rx);
     assert_eq!(out.len(), 1, "the group ACKs once");

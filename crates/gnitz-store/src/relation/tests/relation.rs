@@ -268,10 +268,8 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
     ];
     registry.ingest(50, rows(&before)).unwrap();
     // (1, 2) replaced, (3, 7) removed, (2, 9) and (4, 4) new.
-    let unticked = registry
-        .ingest_returning(50, rows(&[(1, 2, 1, 21), (3, 7, -1, 40), (2, 9, 1, 60), (4, 4, 1, 70)]))
-        .unwrap();
-    let relation = registry.relation(50).unwrap();
+    let pushed = rows(&[(1, 2, 1, 21), (3, 7, -1, 40), (2, 9, 1, 60), (4, 4, 1, 70)]);
+    registry.ingest_pending(50, pushed).unwrap();
     let now = [
         (1, 1, 1, 10),
         (1, 2, 1, 21),
@@ -285,7 +283,8 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
         zset_of(&rows(&kept), &schema)
     };
 
-    for (state, held) in [(&now[..], None), (&before[..], Some(&unticked))] {
+    let check = |registry: &RelationRegistry, state: &[(u64, u64, i64, i64)], cut: Cut, what: &str| {
+        let relation = registry.relation(50).unwrap();
         let keys = [1u64, 3, 4];
         let pk_keys = PkKeys::from_keys(
             8,
@@ -295,12 +294,12 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
                 .iter()
                 .map(|k| &k[..]),
         );
-        let mut gather = relation.gather(pk_keys, held);
+        let mut gather = relation.gather(pk_keys, cut);
         let mut gathered = std::collections::HashMap::new();
         while let Some(chunk) = gather.drain_chunk(2) {
             gathered.extend(zset_of(&chunk, &schema));
         }
-        assert_eq!(gathered, under(state, &keys), "gather, unticked={}", held.is_some());
+        assert_eq!(gathered, under(state, &keys), "gather, {cut:?}, {what}");
 
         // Positioned on the first key's first row and exact at each key: the
         // rows of every other key are a walk's to skip.
@@ -309,9 +308,63 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
             probe.begin_row_opk(&[k as u128], 1);
             probe.end_row();
         }
-        let cursor = relation.cursor_for_keys(&probe.finish().into_consolidated(), held);
+        let cursor = relation.cursor_for_keys(&probe.finish().into_consolidated(), cut);
         let mut read = zset_of(&cursor.materialize(), &schema);
         read.retain(|row, _| keys.iter().any(|k| row.0[..8] == k.to_be_bytes()));
-        assert_eq!(read, under(state, &keys), "cursor, unticked={}", held.is_some());
+        assert_eq!(read, under(state, &keys), "cursor, {cut:?}, {what}");
+        assert_eq!(
+            zset_of(&relation.full_scan(), &schema),
+            zset_of(&rows(&now), &schema),
+            "{what}"
+        );
+    };
+    check(&registry, &now, Cut::Now, "pending in RAM");
+    check(&registry, &before, Cut::Sealed, "pending in RAM");
+
+    // A flush with rows above the cut makes them durable and leaves the cut.
+    registry.checkpoint_base().unwrap();
+    check(&registry, &now, Cut::Now, "pending in a shard");
+    check(&registry, &before, Cut::Sealed, "pending in a shard");
+
+    // A reopen finds the flushed rows whole, with nothing above the cut.
+    {
+        let mut reopened = solo(tmp.path());
+        reopened.register(table(50, schema)).unwrap();
+        check(&reopened, &now, Cut::Now, "reopened");
+        check(&reopened, &now, Cut::Sealed, "reopened");
+        assert!(reopened.seal(50).unwrap().is_none());
     }
+
+    // More above the cut, beside the flushed ones: (5, 1) removed.
+    registry.ingest_pending(50, rows(&[(5, 1, -1, 50)])).unwrap();
+    let now = [
+        (1, 1, 1, 10),
+        (1, 2, 1, 21),
+        (2, 1, 1, 30),
+        (2, 9, 1, 60),
+        (4, 4, 1, 70),
+    ];
+    let delta = registry.seal(50).unwrap().expect("rows sat above the cut");
+    let want = [
+        (1, 2, -1, 20),
+        (1, 2, 1, 21),
+        (3, 7, -1, 40),
+        (2, 9, 1, 60),
+        (4, 4, 1, 70),
+        (5, 1, -1, 50),
+    ];
+    assert_eq!(zset_of(&delta, &schema), zset_of(&rows(&want), &schema));
+    assert!(delta.consolidated_verified());
+    assert!(registry.seal(50).unwrap().is_none(), "a seal drains the pending rows");
+    let relation = registry.relation(50).unwrap();
+    for cut in [Cut::Now, Cut::Sealed] {
+        let pk_keys = PkKeys::from_keys(8, [&1u64.to_be_bytes()[..], &5u64.to_be_bytes()[..]]);
+        let mut gathered = std::collections::HashMap::new();
+        let mut gather = relation.gather(pk_keys, cut);
+        while let Some(chunk) = gather.drain_chunk(2) {
+            gathered.extend(zset_of(&chunk, &schema));
+        }
+        assert_eq!(gathered, under(&now, &[1, 5]), "after the seal, {cut:?}");
+    }
+    assert_eq!(zset_of(&relation.full_scan(), &schema), zset_of(&rows(&now), &schema));
 }

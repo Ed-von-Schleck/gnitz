@@ -8,14 +8,14 @@ use gnitz_wire::PkKeys;
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String> {
         let view_schema = registry.relation_or_err(view_id)?.schema();
-        let DagEngine { views, unticked, .. } = self;
+        let DagEngine { views, .. } = self;
         let (_, ViewPlan { code, state }) = ensure_compiled(views, registry, view_id)?;
         let hydration = code
             .hydration
             .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");
 
         let vm = &mut code.post.vm;
-        let reads = vm::SourceReads { registry, unticked, unfed: &[] };
+        let reads = vm::SourceReads { registry, unfed: &[] };
         let mut gather = reads.gather(state, hydration.seed, keys)?;
         let mut out = Batch::empty_with_schema(&view_schema);
         while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {

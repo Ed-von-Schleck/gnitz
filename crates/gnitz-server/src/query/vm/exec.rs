@@ -2,19 +2,15 @@
 
 use super::*;
 use gnitz_expr::SchemaFacts;
-use gnitz_store::relation::RelationRegistry;
+use gnitz_store::relation::{Cut, RelationRegistry};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::{algebra, stream};
-use rustc_hash::FxHashMap;
 
 /// What an epoch reads of the relations its plan scans beyond their deltas: the
 /// stores behind its [`Integral::Source`]s.
 pub(in crate::query) struct SourceReads<'a> {
     pub(in crate::query) registry: &'a RelationRegistry,
-    /// Each relation's ingests its dependents have not been ticked over, which a
-    /// probe reads its store without.
-    pub(in crate::query) unticked: &'a FxHashMap<u64, Batch>,
     /// The scanned relations this view has been fed no row of: the sources a
     /// backfill has yet to reach. Each reads empty.
     pub(in crate::query) unfed: &'a [u64],
@@ -32,7 +28,7 @@ impl SourceReads<'_> {
         if self.unfed.contains(&source) {
             return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
         }
-        Ok(relation.cursor_for_keys(delta, self.unticked.get(&source)))
+        Ok(relation.cursor_for_keys(delta, Cut::Sealed))
     }
 
     /// Every live row of `keys` in `integral`: a source's as the view last
@@ -45,10 +41,7 @@ impl SourceReads<'_> {
     ) -> Result<PkSetGather, String> {
         Ok(match integral {
             Integral::Own(trace) => state.gather(trace, keys),
-            Integral::Source(source) => self
-                .registry
-                .relation_or_err(source)?
-                .gather(keys, self.unticked.get(&source)),
+            Integral::Source(source) => self.registry.relation_or_err(source)?.gather(keys, Cut::Sealed),
         })
     }
 }

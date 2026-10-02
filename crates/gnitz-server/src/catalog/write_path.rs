@@ -96,12 +96,10 @@ impl CatalogEngine {
     /// Apply a push to ingestion point `tid`'s store, and hold its effect for the
     /// next tick of the views that scan `tid`.
     pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch) -> Result<(), String> {
-        if !self.dag.is_scanned(tid) {
-            return self.registry.ingest(tid, batch);
+        match self.dag.is_scanned(tid) {
+            true => self.registry.ingest_pending(tid, batch),
+            false => self.registry.ingest(tid, batch),
         }
-        let effective = self.registry.ingest_returning(tid, batch)?;
-        self.dag.buffer_unticked(tid, effective);
-        Ok(())
     }
 
     /// Apply one DdlSync group. Never queues.

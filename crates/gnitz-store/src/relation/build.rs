@@ -31,6 +31,7 @@ impl RelationRegistry {
             Relation {
                 id,
                 store,
+                unsealed: None,
                 delta,
                 indexes: Vec::new(),
                 kind,

@@ -247,3 +247,33 @@ fn run_set_fold_strings_bench() {
         }
     }
 }
+
+/// Runs that ascend past one another fold to their rows in order, whichever of
+/// them dominates; one run reaching back into another's keys folds by merge to
+/// the same Z-set.
+#[test]
+fn ascending_runs_fold_to_their_rows_in_order() {
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+    let schema = make_schema_u64_i64();
+    for (first_run, reach_back) in [(10u64, false), (10, true), (1000, false), (1000, true)] {
+        let mut set = RunSet::new(usize::MAX);
+        let mut pushed: Vec<Batch> = Vec::new();
+        let mut next = 0u64;
+        let mut push = |set: &mut RunSet, rows: Vec<(u64, i64, i64)>| {
+            let run = make_batch_raw(&schema, &rows).into_consolidated();
+            pushed.push(run.clone());
+            set.push(TrimmedRun::new(run), &schema);
+        };
+        for n in std::iter::once(first_run).chain(std::iter::repeat_n(10, 9)) {
+            push(&mut set, (next..next + n).map(|k| (k, 1, k as i64)).collect());
+            next += n;
+        }
+        if reach_back {
+            push(&mut set, vec![(3, -1, 3), (next, 1, 0)]);
+        }
+        let folded = set.fold_to_single(&schema).expect("rows survive");
+        assert!(folded.consolidated_verified());
+        assert_eq!(zset_of(&folded, &schema), zset_sum(&pushed, &schema));
+        assert_eq!(folded.len(), next as usize);
+    }
+}

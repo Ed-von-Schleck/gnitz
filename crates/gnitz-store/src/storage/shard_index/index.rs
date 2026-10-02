@@ -30,6 +30,11 @@ const COMPACTED: ShardWriteOpts = ShardWriteOpts {
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
+        self.settled_entries().chain(&self.pending)
+    }
+
+    /// Every shard at or below the store's cut.
+    fn settled_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.levels.iter().flat_map(FLSMLevel::entries)
     }
 
@@ -40,6 +45,7 @@ impl ShardIndex {
         self.levels
             .iter_mut()
             .flat_map(|l| l.guards.iter_mut().flat_map(|g| g.entries.iter_mut()))
+            .chain(&mut self.pending)
     }
 
     /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
@@ -76,6 +82,31 @@ impl ShardIndex {
         let whole = PkBuf::zeroed(self.schema.pk_stride());
         self.levels[L0].get_or_create_guard(whole).entries.push(entry);
         Ok(())
+    }
+
+    /// Write `run`, rows above the store's cut, as one unpublished shard outside
+    /// every level.
+    pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        let entry = self.write_shard(run, ShardWriteOpts::default(), None)?;
+        self.pending.push(entry);
+        Ok(())
+    }
+
+    /// The shards above the cut.
+    pub(crate) fn pending_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.pending.iter().map(|e| Rc::clone(&e.shard))
+    }
+
+    /// Move the cut past every pending shard: each enters L0 as it stands.
+    /// Answers whether one did, so the caller owes the upkeep a spill does.
+    pub(crate) fn seal_pending(&mut self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let whole = PkBuf::zeroed(self.schema.pk_stride());
+        let pending = std::mem::take(&mut self.pending);
+        self.levels[L0].get_or_create_guard(whole).entries.extend(pending);
+        true
     }
 
     /// The disk tier's upkeep after a spill.
@@ -130,14 +161,20 @@ impl ShardIndex {
         self.all_entries().map(|e| Rc::clone(&e.shard))
     }
 
-    /// Every shard whose PK extent meets `[lo, hi]`.
-    pub(crate) fn shard_arcs_in_range(&self, lo: PkBuf, hi: PkBuf) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    /// Every shard whose PK extent meets `[lo, hi]`; the pending ones iff `pending`.
+    pub(crate) fn shard_arcs_in_range(
+        &self,
+        lo: PkBuf,
+        hi: PkBuf,
+        pending: bool,
+    ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.levels
             .iter()
             .flat_map(move |level| {
                 let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
                 level.guards[run].iter().flat_map(|g| g.entries.iter())
             })
+            .chain(self.pending.iter().filter(move |_| pending))
             .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
             .map(|e| Rc::clone(&e.shard))
     }
@@ -180,6 +217,11 @@ impl ShardIndex {
                 if let Some(row) = e.probe_pk_bytes(key, filter_key) {
                     visitor(&e.shard, row);
                 }
+            }
+        }
+        for e in &self.pending {
+            if let Some(row) = e.probe_pk_bytes(key, filter_key) {
+                visitor(&e.shard, row);
             }
         }
     }

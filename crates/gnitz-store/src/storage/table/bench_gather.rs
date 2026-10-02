@@ -40,7 +40,7 @@ fn pk_set_gather_bench() {
         let counter = Counter::instructions().expect("instructions counter");
         let mut instructions = 0;
         for _ in 0..ITERS {
-            let (out, i) = counter.measure(|| t.gather(keys.clone(), None).drain_chunk(usize::MAX));
+            let (out, i) = counter.measure(|| t.gather(keys.clone(), super::Cut::Now).drain_chunk(usize::MAX));
             std::hint::black_box(out);
             instructions += i;
         }

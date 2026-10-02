@@ -58,9 +58,6 @@ pub(crate) struct DagEngine {
     /// Every registered view, from its registration to its drop. `plan` is `None`
     /// until its first compile.
     views: FxHashMap<u64, RegisteredView>,
-    /// Each relation's effective ingests since its last tick: what its store holds
-    /// beyond the state every view over it was last maintained at.
-    unticked: FxHashMap<u64, Batch>,
     /// Views the boot verdict rejected, until their rebuild backfill starts.
     rebuild: FxHashSet<u64>,
 }
@@ -85,7 +82,6 @@ impl DagEngine {
     /// Drop everything this layer holds for relation `id`.
     pub(crate) fn forget(&mut self, id: u64) {
         self.views.remove(&id);
-        self.unticked.remove(&id);
         self.rebuild.remove(&id);
     }
 
@@ -109,24 +105,6 @@ impl DagEngine {
     /// `id`'s rebuild backfill has started: its ticks run from here.
     pub(crate) fn rebuild_started(&mut self, id: u64) {
         self.rebuild.remove(&id);
-    }
-
-    // ── Unticked deltas ─────────────────────────────────────────────────
-
-    /// Append `delta`, one effective ingest into `tid`, to what its next tick
-    /// drains.
-    pub(crate) fn buffer_unticked(&mut self, tid: u64, delta: Batch) {
-        match self.unticked.get_mut(&tid) {
-            Some(existing) => existing.append_batch(&delta),
-            None => {
-                self.unticked.insert(tid, delta);
-            }
-        }
-    }
-
-    /// Everything buffered for `tid` since its last tick, removed.
-    pub(crate) fn take_unticked(&mut self, tid: u64) -> Option<Batch> {
-        self.unticked.remove(&tid)
     }
 
     // ── Compilation ─────────────────────────────────────────────────────

@@ -61,7 +61,29 @@ impl RelationRegistry {
     /// Kind-uniform: a base table's PK rule runs, everything else is written as
     /// it stands.
     pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        // Rows left above the cut would stay there: nothing seals a relation no
+        // view reads.
+        if self.relation(id).is_some_and(|r| r.has_pending()) {
+            self.seal(id)?;
+        }
         self.ingest_at(id, batch, None, false).map(drop)
+    }
+
+    /// [`Self::ingest`] above `id`'s cut: every reader sees the rows but one at
+    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them.
+    pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        self.apply(id, batch, None, false, true).map(drop)
+    }
+
+    /// Move `id`'s cut past every row ingested as pending since the last seal,
+    /// and answer those rows: the relation's delta, consolidated for a table and
+    /// as pushed for a stream. `None` when there is none.
+    pub fn seal(&mut self, id: u64) -> Result<Option<Batch>, String> {
+        let entry = self.relation_mut_or_err(id)?;
+        match entry.store.table_mut() {
+            Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
+            None => Ok(entry.unsealed.take()),
+        }
     }
 
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
@@ -80,6 +102,18 @@ impl RelationRegistry {
         round: Option<u64>,
         echo: bool,
     ) -> Result<Option<Batch>, String> {
+        self.apply(id, batch, round, echo, false)
+    }
+
+    /// [`Self::ingest_at`], the store's rows landing above its cut iff `above`.
+    fn apply(
+        &mut self,
+        id: u64,
+        batch: Batch,
+        round: Option<u64>,
+        echo: bool,
+        above: bool,
+    ) -> Result<Option<Batch>, String> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
@@ -94,6 +128,13 @@ impl RelationRegistry {
         let kind = entry.kind;
         let effective = match kind {
             // A stream's rows exist only as the deltas they produce.
+            RelationKind::Stream if above => {
+                match &mut entry.unsealed {
+                    Some(held) => held.append_batch(&batch),
+                    held => *held = Some(batch),
+                }
+                return Ok(None);
+            }
             RelationKind::Stream => return Ok(echo.then_some(batch)),
             RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
             // Folded once for the store, the delta capture and every reader of the
@@ -127,9 +168,13 @@ impl RelationRegistry {
         }
 
         let store = entry.store.held_mut();
-        let (res, applied) = match echo {
-            true => (store.ingest_borrowed_batch(&effective), Some(effective)),
-            false => (store.ingest_owned_batch(effective), None),
+        let (res, applied) = match (above, echo) {
+            (true, _) => {
+                store.ingest_pending(effective);
+                (Ok(()), None)
+            }
+            (false, true) => (store.ingest_borrowed_batch(&effective), Some(effective)),
+            (false, false) => (store.ingest_owned_batch(effective), None),
         };
         inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
 

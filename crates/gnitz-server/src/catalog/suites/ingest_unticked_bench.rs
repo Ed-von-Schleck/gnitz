@@ -9,7 +9,7 @@ use gnitz_foundation::perf;
 
 /// Rows every arm pushes, however it splits them.
 const TOTAL_ROWS: u64 = 500_000;
-/// Rows between two takes of the unticked buffer, standing in for auto-ticks.
+/// Rows between two seals, standing in for auto-ticks.
 const TICK_ROWS: u64 = 10_000;
 
 #[test]
@@ -46,7 +46,7 @@ fn ingest_unticked_bench() {
             for (p, b) in batches.into_iter().enumerate() {
                 engine.ingest_unticked(tid, b).unwrap();
                 if (p + 1) % tick_every == 0 {
-                    black_box(engine.dag.take_unticked(tid));
+                    black_box(engine.registry.seal(tid).unwrap());
                 }
             }
         });

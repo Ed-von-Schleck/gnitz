@@ -1121,12 +1121,12 @@ fn only_a_scanned_table_holds_a_push_for_its_tick() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     engine.ingest_unticked(tid, make_batch(&schema, &[(1, 1, 10)])).unwrap();
-    assert!(engine.dag.take_unticked(tid).is_none());
+    assert!(engine.registry.seal(tid).unwrap().is_none());
     assert_eq!(scan_all(&mut engine, tid).len(), 1);
 
     try_register_identity_view(&mut engine, tid, "v", &cols, 0, 0).unwrap();
     engine.ingest_unticked(tid, make_batch(&schema, &[(2, 1, 20)])).unwrap();
-    assert_eq!(engine.dag.take_unticked(tid).map(|b| b.len()), Some(1));
+    assert_eq!(engine.registry.seal(tid).unwrap().map(|b| b.len()), Some(1));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

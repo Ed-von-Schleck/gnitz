@@ -1182,8 +1182,15 @@ impl Batch {
             blob += src.blob.len();
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
-        for src in sources {
-            out.append_ranges(&src, &[(0, src.count)]);
+        if rows > 0 {
+            // One session for every source: its setup would otherwise be paid
+            // per source, which a fold of one-row runs is made of.
+            let mut session = out.append_session(rows);
+            for src in sources.filter(|src| src.count > 0) {
+                let whole = [(0, src.count)];
+                let heap_at = session.carry(&src, &whole);
+                session.push_ranges(&src, heap_at, &whole);
+            }
         }
         out
     }

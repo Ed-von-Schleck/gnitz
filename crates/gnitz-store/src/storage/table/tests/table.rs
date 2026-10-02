@@ -91,7 +91,7 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
         }
     }
 
-    let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), None);
+    let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), Cut::Now);
     let mut gathered: HashMap<RowKey, i64> = HashMap::new();
     while let Some(b) = gather.drain_chunk(3) {
         gathered.extend(zset_of(&b, &s));

@@ -1471,11 +1471,12 @@ fn an_expired_cursor_reseeds_inside_the_poll() {
     // Push the workers' retention floor past the copy's cursor, without polling.
     // Wide rows and many rounds, so what the sweep drops is measured in hundreds
     // of kilobytes against a one-kilobyte budget.
-    let body = "x".repeat(200);
+    // Each body distinct: a fold shares one heap span among equal strings, and
+    // rows that collapsed that way would never fill a memtable.
     for k in 0..20 {
         let lo = 1_000 + k * 200;
         let rows: Vec<String> = (lo..lo + 200)
-            .map(|i| format!("({i}, {}, {i}, 0.5, '{body}')", i % 7))
+            .map(|i| format!("({i}, {}, {i}, 0.5, '{i:x>200}')", i % 7))
             .collect();
         sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
     }

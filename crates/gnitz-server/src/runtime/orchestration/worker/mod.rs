@@ -298,13 +298,16 @@ impl WorkerProcess {
     /// `round` is the tick round the master allocated for this tid; every fed
     /// view's captured delta is stamped with it.
     fn handle_tick(&mut self, target_id: u64, round: u64) {
-        let delta = if let Some(d) = self.cat().dag.take_unticked(target_id) {
-            d
-        } else {
-            match self.cat().registry.relation(target_id) {
-                Some(r) => Batch::empty_with_schema(&r.schema()),
-                None => return,
-            }
+        let Some(schema) = self.cat().registry.relation(target_id).map(Relation::schema) else {
+            return;
+        };
+        let delta = match self.cat().registry.seal(target_id) {
+            Ok(delta) => delta.unwrap_or_else(|| Batch::empty_with_schema(&schema)),
+            Err(e) => gnitz_fatal_abort!(
+                "worker: seal failed (table_id={}): {} — aborting for restart",
+                target_id,
+                e
+            ),
         };
         self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
     }

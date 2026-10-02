@@ -34,11 +34,22 @@ fn pk_max(run: &Batch) -> &[u8] {
 
 /// A batch as a [`RunSet`] holds it: [`Batch::trimmed`], since the set charges
 /// only its rows' bytes.
+#[derive(Clone)]
 pub(super) struct TrimmedRun(Rc<Batch>);
 
 impl TrimmedRun {
     pub(super) fn new(batch: Batch) -> Self {
         TrimmedRun(Rc::new(batch.trimmed()))
+    }
+
+    /// The run itself, shared.
+    pub(super) fn rc(&self) -> Rc<Batch> {
+        Rc::clone(&self.0)
+    }
+
+    /// The run's rows, copied only while a set still holds the run.
+    pub(super) fn into_batch(self) -> Batch {
+        Rc::try_unwrap(self.0).unwrap_or_else(|rc| Batch::clone(&rc))
     }
 }
 
@@ -163,7 +174,9 @@ impl RunSet {
         // against the fold of the rest, so its stretches are bulk-copied.
         let big = (0..self.runs.len()).max_by_key(|&i| self.runs[i].len()).unwrap();
         let merged = if self.runs[big].len() * 2 >= input_rows {
-            let dominant = self.runs.swap_remove(big);
+            // `remove`, not `swap_remove`: the rest stay in push order, which
+            // is what lets an ascending load's runs fold by concatenation.
+            let dominant = self.runs.remove(big);
             match &self.runs[..] {
                 [one] => dominant.merged_consolidated(one, schema),
                 _ => dominant.merged_consolidated(&self.consolidate_all(schema), schema),
@@ -186,6 +199,14 @@ impl RunSet {
 
     /// Every run folded N-way into one consolidated batch.
     fn consolidate_all(&self, schema: &SchemaDescriptor) -> Batch {
+        // Runs that each end below where the next begins share no row and hold
+        // none out of order across them: as they stand they are the merge,
+        // copied whole. An ascending load folds this way.
+        if self.runs.windows(2).all(|w| pk_max(&w[0]) < pk_min(&w[1])) {
+            let mut out = Batch::concat(schema, self.runs.iter().map(|r| r.as_mem_batch()));
+            out.certify_consolidated();
+            return out;
+        }
         let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
         merge_consolidated(&views, schema)
     }

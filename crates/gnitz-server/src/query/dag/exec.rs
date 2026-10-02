@@ -58,12 +58,12 @@ fn plan_and_reads<'a>(
     unfed: &'a [u64],
 ) -> (&'a mut ViewPlan, vm::SourceReads<'a>) {
     let (dag, registry) = host.parts();
-    let DagEngine { views, unticked, .. } = dag;
+    let DagEngine { views, .. } = dag;
     let plan = views
         .get_mut(&view_id)
         .and_then(|v| v.plan.as_mut())
         .expect("compiled on the epoch's entry");
-    (plan, vm::SourceReads { registry, unticked, unfed })
+    (plan, vm::SourceReads { registry, unfed })
 }
 
 /// Run one view's epoch over `src_id`'s delta. `unfed`: the sources the view

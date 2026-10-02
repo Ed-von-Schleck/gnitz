@@ -38,8 +38,8 @@ fn false_positive_rate() {
     for i in 0u64..1000 {
         bf.add(key(i));
     }
-    // BITS_PER_KEY bits per key over NUM_PROBES probes puts the theoretical
-    // rate near 1%; the bound is loose enough to survive a hash change.
+    // BITS_PER_KEY bits per key in split blocks puts the rate near 1%; the
+    // bound is loose enough to survive a hash change.
     assert!(fp(&bf) < 50, "FPR too high: {}/1000", fp(&bf));
 }
 
@@ -48,7 +48,7 @@ fn false_positive_rate() {
 #[test]
 fn a_filter_is_stale_once_overfull_and_half_gone() {
     let mut bf = BloomFilter::new(100);
-    let sized_for = bf.num_bits as usize / BITS_PER_KEY;
+    let sized_for = bf.words.len() * 32 / BITS_PER_KEY;
     for i in 0..sized_for as u64 {
         bf.add(key(i));
     }

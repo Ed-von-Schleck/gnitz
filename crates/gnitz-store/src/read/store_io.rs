@@ -41,7 +41,7 @@ impl RelationRegistry {
                 let relation = self.relation_or_err(id)?;
                 keyed_as(relation.schema())?;
                 let keys = PkKeys::from_sorted(stride, keys.pk_data().to_vec());
-                return relation.gather(keys, None).project_live(&[col]);
+                return relation.gather(keys, crate::relation::Cut::Now).project_live(&[col]);
             }
             Probe::Index(cols, holders) => (cols, holders),
         };
@@ -90,7 +90,7 @@ impl RelationRegistry {
                     ));
                 }
                 // A key this worker holds no row for copies nothing.
-                SourceCursor::PkSet(Box::new(entry.gather(keys, None)))
+                SourceCursor::PkSet(Box::new(entry.gather(keys, crate::relation::Cut::Now)))
             }
             ReadBound::Range(r) => return open_range(entry, r),
         };

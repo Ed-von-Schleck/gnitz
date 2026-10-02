@@ -1,8 +1,12 @@
-//! Unified Table: two RAM-tier [`RunSet`]s over a `ShardIndex`.
+//! Unified Table: three RAM-tier [`RunSet`]s over a `ShardIndex`.
 //!
 //! Ingest lands in the `memtable` run set and folds into the `ram_tier` once it
 //! passes its byte budget; the RAM tier spills to a shard past its own
 //! ([`StoreBudgets`]), and a checkpoint folds it into one durable shard.
+//!
+//! A store's runs are its history in order, so a read may stop short of the
+//! newest: a pending ingest lands in the `pending` run set, above the store's
+//! [`Cut`], and [`Table::seal`] moves the cut past it.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -93,7 +97,21 @@ pub(crate) enum RecoverySource {
 // Table
 // ---------------------------------------------------------------------------
 
+/// Which time-prefix of a store's ingests a read sees. A store's runs are its
+/// history in order, so a prefix of them is the Z-set the store held then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cut {
+    /// Every ingest.
+    Now,
+    /// Every ingest up to the last [`Table::seal`]: the rows ingested as
+    /// pending since are left out.
+    Sealed,
+}
+
 pub(crate) struct Table {
+    /// Runs ingested above the cut, folded among themselves only: [`Self::seal`]
+    /// moves them into `memtable` as one run.
+    pending: RunSet,
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
@@ -174,6 +192,8 @@ impl Table {
         // Only a `SalReplay` store is point-probed by PK.
         let skip_pk_filter = rederived;
         Ok(Table {
+            // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
+            pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
             shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, &shards)?,
@@ -234,6 +254,7 @@ impl Table {
     /// only the shard index's swap can fail, and it runs first.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         self.shard_index.swap_schema(schema)?;
+        self.pending.widen_runs(&schema);
         self.memtable.widen_runs(&schema);
         self.ram_tier.widen_runs(&schema);
         self.cached_full_scan.set(None);
@@ -279,6 +300,56 @@ impl Table {
         Ok(())
     }
 
+    /// [`Self::ingest_owned_batch`] above the cut: every reader sees the rows
+    /// but one at [`Cut::Sealed`], until [`Self::seal`].
+    pub(crate) fn ingest_pending(&mut self, batch: Batch) {
+        let batch = batch.into_consolidated();
+        if batch.is_empty() {
+            return;
+        }
+        self.cached_full_scan.set(None);
+        self.pending.push(TrimmedRun::new(batch), &self.shard_index.schema);
+    }
+
+    /// Whether any row sits above the cut.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.len() > 0 || self.shard_index.pending_arcs().next().is_some()
+    }
+
+    /// Move the cut past every pending row and answer them, consolidated: the
+    /// store's delta since the last seal. `None` when there is none. The row set
+    /// a [`Cut::Now`] reader sees does not move.
+    pub(crate) fn seal(&mut self) -> Result<Option<Batch>, StorageError> {
+        let schema = self.shard_index.schema;
+        let run = self.pending.fold_to_single(&schema);
+        self.pending.clear();
+        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
+        // A flush since the last seal left part of the delta in shards.
+        let merged = (!shards.is_empty()).then(|| {
+            let cap = shards.len() + 1;
+            let mem = run.iter().map(|r| Run::Mem(r.rc()));
+            from_runs(mem.chain(shards), schema, cap).materialize()
+        });
+        if let Some(run) = &run {
+            self.memtable.push(run.clone(), &schema);
+            // Left as a run of its own, each seal's delta would lengthen every PK
+            // probe until the memtable next folded.
+            self.memtable.fold(&schema);
+        }
+        let entered = self.shard_index.seal_pending();
+        if self.memtable.is_full() {
+            self.fold_to_ram()?;
+        } else if entered {
+            self.shard_index.maintain()?;
+        }
+        let delta = match (merged, run) {
+            (Some(merged), _) => Rc::try_unwrap(merged).unwrap_or_else(|rc| Batch::clone(&rc)),
+            (None, Some(run)) => run.into_batch(),
+            (None, None) => return Ok(None),
+        };
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+
     /// The checkpoint mark of the manifest this open loaded; 0 without one.
     pub(crate) fn checkpoint_mark(&self) -> u64 {
         self.checkpoint_mark
@@ -293,16 +364,17 @@ impl Table {
     // Cursor
     // ------------------------------------------------------------------
 
-    /// The heap-resident tiers, newest first.
-    fn ram_tiers(&self) -> [&RunSet; 2] {
-        [&self.memtable, &self.ram_tier]
+    /// The heap-resident tiers `cut` reads, newest first.
+    fn ram_tiers(&self, cut: Cut) -> impl Iterator<Item = &RunSet> + Clone {
+        [&self.pending, &self.memtable, &self.ram_tier]
+            .into_iter()
+            .skip(usize::from(cut == Cut::Sealed))
     }
 
     /// The heap-resident runs whose PK extent meets the inclusive `bound`; `None`
     /// takes them all.
-    fn mem_runs(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = Run> + '_ {
-        self.ram_tiers()
-            .into_iter()
+    fn mem_runs(&self, bound: Option<(PkBuf, PkBuf)>, cut: Cut) -> impl Iterator<Item = Run> + '_ {
+        self.ram_tiers(cut)
             .flat_map(move |set| set.runs_overlapping(bound))
             .cloned()
             .map(Run::Mem)
@@ -310,12 +382,12 @@ impl Table {
 
     /// How many cursor sources [`Self::mem_runs`] can yield.
     fn mem_run_count(&self) -> usize {
-        self.ram_tiers().iter().map(|s| s.len()).sum()
+        self.ram_tiers(Cut::Now).map(|s| s.len()).sum()
     }
 
     /// Every run this table reads through.
     pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
-        self.mem_runs(None)
+        self.mem_runs(None, Cut::Now)
             .chain(self.shard_index.all_shard_arcs_iter().map(Run::Shard))
     }
 
@@ -326,33 +398,38 @@ impl Table {
     }
 
     /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
-    /// columns of one — positioned on the first, with `extra` as one more run.
-    pub(crate) fn cursor_for_keys(&self, keys: &Batch, extra: Option<Rc<Batch>>) -> ReadCursor {
+    /// columns of one — positioned on the first, over the rows `cut` reads.
+    pub(crate) fn cursor_for_keys(&self, keys: &Batch, cut: Cut) -> ReadCursor {
         debug_assert!(keys.is_consolidated() && !keys.is_empty());
         let (first, last) = (keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1));
-        let (runs, cap, start) = self.runs_over_prefixes(first, last, extra);
+        let (runs, cap, start) = self.runs_over_prefixes(first, last, cut);
         from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
     }
 
-    /// The runs that can hold a row whose PK begins with a key in `[first,
-    /// last]`, then `extra`; a capacity hint for a cursor over them; and the
-    /// least PK such a row can have.
+    /// The runs `cut` reads that can hold a row whose PK begins with a key in
+    /// `[first, last]`; a capacity hint for a cursor over them; and the least PK
+    /// such a row can have.
     fn runs_over_prefixes<'a>(
         &'a self,
         first: &[u8],
         last: &[u8],
-        extra: Option<Rc<Batch>>,
+        cut: Cut,
     ) -> (impl Iterator<Item = Run> + 'a, usize, PkBuf) {
         let stride = self.shard_index.schema.pk_stride();
         let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
-        (runs.chain(extra.map(Run::Mem)), cap + 1, start)
+        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes), cut);
+        (runs, cap, start)
     }
 
     /// The runs that can hold a key in `[start, end]` (`None`: the top of the key
     /// space), and a capacity hint for a cursor over them.
-    fn runs_in_range<'a>(&'a self, start: &[u8], end: Option<&[u8]>) -> (impl Iterator<Item = Run> + 'a, usize) {
+    fn runs_in_range<'a>(
+        &'a self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        cut: Cut,
+    ) -> (impl Iterator<Item = Run> + 'a, usize) {
         let stride = self.shard_index.schema.pk_stride();
         debug_assert_eq!(start.len(), stride, "runs_in_range: start is not pk_stride wide");
         debug_assert!(
@@ -363,9 +440,11 @@ impl Table {
             PkBuf::from_bytes(start),
             end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes),
         );
-        let runs = self
-            .mem_runs(Some((lo, hi)))
-            .chain(self.shard_index.shard_arcs_in_range(lo, hi).map(Run::Shard));
+        let runs = self.mem_runs(Some((lo, hi)), cut).chain(
+            self.shard_index
+                .shard_arcs_in_range(lo, hi, cut == Cut::Now)
+                .map(Run::Shard),
+        );
         (runs, self.mem_run_count() + self.shard_index.narrow_range_shards())
     }
 
@@ -375,18 +454,18 @@ impl Table {
             return empty_cursor(self.shard_index.schema);
         };
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end);
+        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end, Cut::Now);
         from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of
-    /// one — over the runs the span they cover can reach.
-    pub(crate) fn gather(&self, keys: PkKeys, extra: Option<Rc<Batch>>) -> PkSetGather {
+    /// one — over the runs `cut` reads that the span they cover can reach.
+    pub(crate) fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
         let schema = self.shard_index.schema;
         let Some((first, last)) = keys.bounds() else {
             return PkSetGather::over_runs(std::iter::empty(), schema, 0, keys);
         };
-        let (runs, cap, _) = self.runs_over_prefixes(first, last, extra);
+        let (runs, cap, _) = self.runs_over_prefixes(first, last, cut);
         PkSetGather::over_runs(runs, schema, cap, keys)
     }
 
@@ -402,7 +481,7 @@ impl Table {
 
     /// Raw rows across every tier, cross-run duplicates and ghosts included.
     pub(crate) fn estimated_rows(&self) -> usize {
-        self.ram_tiers().iter().map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
+        self.ram_tiers(Cut::Now).map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
     }
 
     /// Every registered shard.
@@ -440,7 +519,7 @@ impl Table {
             }
         };
         let fingerprint = probe_key(key);
-        for set in self.ram_tiers() {
+        for set in [&self.pending, &self.memtable, &self.ram_tier] {
             set.find_pk_bytes(key, fingerprint, |batch, start| {
                 visit(Run::Mem(Rc::clone(batch)), start)
             });

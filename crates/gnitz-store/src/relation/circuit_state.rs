@@ -75,12 +75,12 @@ impl CircuitState {
 
     /// Every live row of `keys` in `idx`.
     pub fn gather(&self, idx: StateIdx, keys: PkKeys) -> PkSetGather {
-        self.at(idx).gather(keys, None)
+        self.at(idx).gather(keys, super::Cut::Now)
     }
 
     /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
-        self.at(idx).cursor_for_keys(keys, None)
+        self.at(idx).cursor_for_keys(keys, super::Cut::Now)
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

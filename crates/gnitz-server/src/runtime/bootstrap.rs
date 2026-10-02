@@ -120,8 +120,8 @@ fn swept_base_tables(catalog: &CatalogEngine) -> Vec<u64> {
 
 /// Per-worker post-fork user-table replay for `slot`, applying each Push group
 /// through the registry's ingest, whose PK rule makes retractions cancel. Each
-/// swept base's effective delta is buffered as unticked, for the master's tick
-/// sweep to drain into the views.
+/// swept base's effective delta lands above its store's cut, for the master's
+/// tick sweep to seal and drain into the views.
 ///
 /// No LSN floor: `enforce_unique_pk` makes re-applying a group the shards
 /// already hold a no-op.

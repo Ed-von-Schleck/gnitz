@@ -341,14 +341,9 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
     };
     // A table write lands in the store at once and reaches the program at its tick.
     let write = |vm: &mut TestVm, rows: &[(u128, i64, i64)]| {
-        let effective = vm
-            .registry
-            .ingest_returning(TABLE, make_batch_u128(&schema, rows))
+        vm.registry
+            .ingest_pending(TABLE, make_batch_u128(&schema, rows))
             .unwrap();
-        match vm.unticked.get_mut(&TABLE) {
-            Some(held) => held.append_batch(&effective),
-            None => drop(vm.unticked.insert(TABLE, effective)),
-        }
     };
     type Rows = &'static [(u128, i64, i64)];
     let steps: [(Rows, Rows); 4] = [
@@ -361,24 +356,13 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
         (&[], &[(1, -1, 10)]),
     ];
     for (i, (table_rows, a_rows)) in steps.into_iter().enumerate() {
+        // What the term may pair with is the table before its un-ticked writes.
+        let table_then = vm.registry.relation(TABLE).unwrap().cursor().materialize();
         if !table_rows.is_empty() {
             write(&mut vm, table_rows);
         }
-        let before = vm.unticked.get(&TABLE).map(|held| held.to_consolidated().negated());
         let a_delta = make_batch_u128_raw(&schema, a_rows);
         let ticked = vm.epoch([(a, a_delta.clone())]);
-        // What the term may pair with is the table less its un-ticked writes.
-        let mut table_then = vm
-            .registry
-            .relation(TABLE)
-            .unwrap()
-            .cursor()
-            .materialize()
-            .as_ref()
-            .clone();
-        if let Some(undo) = &before {
-            table_then.append_batch(undo);
-        }
         let (want, _) = join_reference(
             gnitz_wire::JoinKind::Equi,
             false,
@@ -390,7 +374,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
         assert_eq!(zset_of(&ticked, &out_schema), want, "step {i}: A's epoch");
         absorb(ticked);
         a_all.append_batch(&a_delta);
-        if let Some(delta) = vm.unticked.remove(&TABLE) {
+        if let Some(delta) = vm.registry.seal(TABLE).unwrap() {
             absorb(vm.epoch([(b, delta)]));
         }
     }

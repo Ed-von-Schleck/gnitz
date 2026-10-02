@@ -10,6 +10,7 @@ use gnitz_zset::algebra::index_entries;
 use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 
+pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, StoreBudgets, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
@@ -32,30 +33,6 @@ use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use store::Store;
-
-/// What cancels `unticked`'s rows at `keys` when merged into a read of the
-/// store that ingested them; `None` when it holds none there. `keys` ascend,
-/// each `width` bytes and naming every row whose PK it begins.
-fn undo_at(unticked: &Batch, keys: &[u8], width: usize) -> Option<std::rc::Rc<Batch>> {
-    let key = |i: usize| &keys[i * width..(i + 1) * width];
-    let named = |pk: &[u8]| {
-        let (mut lo, mut hi) = (0, keys.len() / width);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match key(mid).cmp(&pk[..width]) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return true,
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        false
-    };
-    let at_keys: Vec<u32> = (0..unticked.len())
-        .filter(|&i| unticked.get_weight(i) != 0 && named(unticked.get_pk_bytes(i)))
-        .map(|i| i as u32)
-        .collect();
-    (!at_keys.is_empty()).then(|| std::rc::Rc::new(unticked.ascending_subset(&at_keys).into_consolidated().negated()))
-}
 
 // ---------------------------------------------------------------------------
 // Secondary index
@@ -259,6 +236,9 @@ pub struct Relation {
     /// threaded in beside it to log or to phrase an error.
     id: u64,
     store: Store,
+    /// A stream's pushes since its last seal. Nothing reads them before it, so
+    /// they are held as they arrived.
+    unsealed: Option<Batch>,
     delta: Option<Box<Table>>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
@@ -303,19 +283,15 @@ impl Relation {
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of one,
-    /// each then naming every row it prefixes. With `unticked`, the store is read
-    /// as it was before those ingests.
-    pub fn gather(&self, keys: PkKeys, unticked: Option<&Batch>) -> PkSetGather {
-        let undo = unticked.and_then(|b| undo_at(b, keys.as_bytes(), keys.stride()));
-        self.table().gather(keys, undo)
+    /// each then naming every row it prefixes — among the rows `cut` reads.
+    pub fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
+        self.table().gather(keys, cut)
     }
 
     /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
-    /// columns of one — positioned on the first. With `unticked`, the store is
-    /// read at those keys as it was before those ingests.
-    pub fn cursor_for_keys(&self, keys: &Batch, unticked: Option<&Batch>) -> ReadCursor {
-        let undo = unticked.and_then(|b| undo_at(b, keys.pk_data(), keys.schema().pk_stride()));
-        self.table().cursor_for_keys(keys, undo)
+    /// columns of one — positioned on the first, over the rows `cut` reads.
+    pub fn cursor_for_keys(&self, keys: &Batch, cut: Cut) -> ReadCursor {
+        self.table().cursor_for_keys(keys, cut)
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`.
@@ -348,6 +324,14 @@ impl Relation {
     /// list is deduped by ordered column list, so at most one entry matches.
     pub fn index_on(&self, cols: &[u32]) -> Option<&SecondaryIndex> {
         self.indexes.iter().find(|ix| ix.cols.as_slice() == cols)
+    }
+
+    /// Whether rows sit above this relation's cut.
+    pub(crate) fn has_pending(&self) -> bool {
+        match &self.store {
+            Store::Held(t) => t.has_pending(),
+            Store::Absent(_) => self.unsealed.is_some(),
+        }
     }
 
     /// This process's store of the relation; panics when it holds none.

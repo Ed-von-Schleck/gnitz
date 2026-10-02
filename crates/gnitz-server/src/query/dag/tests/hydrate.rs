@@ -16,7 +16,11 @@ fn push(engine: &mut CatalogEngine, tid: u64, rows: &[(u64, i64, i64)]) {
 
 /// Tick `tid` over everything pushed into it since its last tick.
 fn tick(engine: &mut CatalogEngine, tid: u64) {
-    let delta = engine.dag.take_unticked(tid).expect("a view scans the pushed table");
+    let delta = engine
+        .registry
+        .seal(tid)
+        .unwrap()
+        .expect("a view scans the pushed table");
     drive(&mut LocalDrive(engine), Drive::Tick { source: tid, round: 1 }, delta).unwrap();
 }
 
