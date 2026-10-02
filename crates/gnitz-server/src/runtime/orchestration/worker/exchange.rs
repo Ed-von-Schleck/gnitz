@@ -7,8 +7,8 @@ use gnitz_zset::algebra::ScatterPlan;
 use std::borrow::Cow;
 
 /// The worker as a drive's [`DriveHost`].
-pub(super) struct DagExchangeCtx<'a> {
-    pub(super) worker: &'a mut WorkerProcess,
+pub(super) struct DagExchangeCtx<'a, 'c> {
+    pub(super) worker: &'a mut WorkerProcess<'c>,
     /// This worker's source partition is already drained, so its rounds are empty
     /// pads.
     pub(super) own_drained: bool,
@@ -16,9 +16,9 @@ pub(super) struct DagExchangeCtx<'a> {
     pub(super) all_drained: bool,
 }
 
-impl DriveHost for DagExchangeCtx<'_> {
+impl DriveHost for DagExchangeCtx<'_, '_> {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
-        let cat = self.worker.cat();
+        let cat = &mut *self.worker.catalog;
         (&mut cat.dag, &mut cat.registry)
     }
 
@@ -29,7 +29,7 @@ impl DriveHost for DagExchangeCtx<'_> {
     }
 }
 
-impl WorkerProcess {
+impl WorkerProcess<'_> {
     /// Publish `batch` as this worker's round of `view_id` and block until every
     /// part of it is complete, returning the rows this worker owns and whether
     /// every worker's partition was drained. SAL groups arriving mid-wait are
@@ -73,7 +73,7 @@ impl WorkerProcess {
         use SalMessageKind::*;
         match req.kind {
             // Answered mid-drive, a read would see a half-run tick.
-            ScanSpec | DeltaRead => self.deferred.push(req),
+            ScanSpec | DeltaRead | KeySpans => self.deferred.push(req),
             // The master holds the SAL writer until every worker ACKs a flush.
             Flush => self.handle_request(req),
             // Deferred, the ingest ACK would wait for the drive.
@@ -82,7 +82,7 @@ impl WorkerProcess {
             HasPk => self.handle_request(req),
             Shutdown => self.handle_request(req),
             // Never sent beside a drive.
-            DdlSync | Tick | FlushEph | Backfill | UniquePreflight => {
+            DdlSync | Tick | FlushEph | Backfill => {
                 gnitz_fatal_abort!("{:?} inside an exchange wait — diverged from the master", req.kind)
             }
         }

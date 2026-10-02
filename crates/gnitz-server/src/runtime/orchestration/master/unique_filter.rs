@@ -1,33 +1,22 @@
-//! Master-side unique-index filter cache: for each `(table_id, col_indices)`,
-//! the OPK spans known to exist in that unique index. `plan_unique_checks`
-//! consults it to skip an occupancy broadcast whose every span is provably
-//! absent.
-//!
-//! The filter must never prove a present span absent; every other inaccuracy
-//! costs one spurious broadcast.
+//! Master-side unique-index filters: for each `(table_id, col_indices)`, the
+//! spans that unique index holds, so a write probes only the spans it cannot
+//! prove absent.
 
 use rustc_hash::FxHashSet;
 
-use super::train::drain_rows;
 use super::*;
-use gnitz_expr::SchemaFacts;
-use gnitz_wire::{ReadBound, ReadSpec};
 use gnitz_zset::schema::key::{probe_key, PkBuf};
 use gnitz_zset::schema::KeySpec;
 
-/// Spans tracked per filter before it disables itself: `FxHashSet<u64>`'s
-/// 2^23-bucket table at its 7/8 load factor, the largest count that never grows
-/// to the next power of two.
-const UNIQUE_FILTER_CAP: usize = (1 << 23) * 7 / 8;
+/// Spans a filter tracks before it disables itself.
+const UNIQUE_FILTER_CAP: usize = 7 << 20;
 
 pub(crate) struct UniqueFilter {
-    /// `probe_key` fingerprints of the spans known present, or `None` once the
-    /// filter capped.
+    /// `probe_key` fingerprints of every span the index holds, or `None` once
+    /// the filter capped.
     values: Option<FxHashSet<u64>>,
     /// [`UNIQUE_FILTER_CAP`], held per filter so a test can reach it in a few spans.
     cap: usize,
-    /// Whether `values` holds every committed span, and so may prove absence.
-    warm: bool,
 }
 
 impl UniqueFilter {
@@ -35,17 +24,7 @@ impl UniqueFilter {
         UniqueFilter {
             values: Some(FxHashSet::default()),
             cap: UNIQUE_FILTER_CAP,
-            warm: false,
         }
-    }
-
-    pub(super) fn is_warm(&self) -> bool {
-        self.warm
-    }
-
-    /// Declares the span set complete, so the filter may now prove absence.
-    pub(super) fn mark_warm(&mut self) {
-        self.warm = true;
     }
 
     /// Records `span`; false once the cap has dropped the set and disabled the
@@ -64,14 +43,9 @@ impl UniqueFilter {
         true
     }
 
-    /// True when every span in `spans` is definitely absent.
-    pub(super) fn proves_all_absent<'k>(&self, mut spans: impl Iterator<Item = &'k [u8]>) -> bool {
-        self.warm && spans.all(|s| !self.may_contain(s))
-    }
-
     /// A fingerprint probe: a collision, and every span once the filter has
     /// capped, answers true.
-    fn may_contain(&self, span: &[u8]) -> bool {
+    pub(super) fn may_contain(&self, span: &[u8]) -> bool {
         self.values
             .as_ref()
             .is_none_or(|values| values.contains(&probe_key(span)))
@@ -96,27 +70,21 @@ pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset:
 }
 
 impl MasterDispatcher {
-    // -----------------------------------------------------------------------
-    // Unique-index filter
-    // -----------------------------------------------------------------------
-
-    /// True if every span in `spans` is definitely absent from the filter for
-    /// `(table_id, cols)`.
-    pub(super) fn unique_filter_all_absent<'k>(
+    /// Keep in `order` the entries whose `span` the filter for
+    /// `(table_id, cols)` cannot prove absent: all of them where it has none.
+    pub(super) fn unique_filter_retain_possible<'k>(
         &self,
         table_id: u64,
         cols: PkColList,
-        spans: impl Iterator<Item = &'k [u8]>,
-    ) -> bool {
-        self.unique_filters
-            .borrow()
-            .get(&(table_id, cols))
-            .is_some_and(|f| f.proves_all_absent(spans))
+        order: &mut Vec<u32>,
+        span: impl Fn(u32) -> &'k [u8],
+    ) {
+        if let Some(f) = self.unique_filters.borrow().get(&(table_id, cols)) {
+            order.retain(|&x| f.may_contain(span(x)));
+        }
     }
 
-    /// Record every indexed span of a successfully-flushed `batch` on
-    /// `table_id`. A filter that is not yet warm is ingested into too, so a span
-    /// committed during a warm-up window is not lost.
+    /// Record every indexed span of a durable `batch` on `table_id`.
     pub(crate) fn unique_filter_ingest_batch(&self, table_id: u64, batch: &Batch) {
         let Some(relation) = self.cat().registry.relation(table_id) else {
             return;
@@ -124,14 +92,13 @@ impl MasterDispatcher {
         let mb = batch.as_mem_batch();
         let mut filters = self.unique_filters.borrow_mut();
         for ic in relation.unique_indexes_to_check() {
-            let Some(filter) = filters.get_mut(&(table_id, ic.cols())) else {
-                continue; // no entry yet; warmup builds it
-            };
-            extract_into_filter(filter, &mb, &ic.key_spec());
+            if let Some(filter) = filters.get_mut(&(table_id, ic.cols())) {
+                extract_into_filter(filter, &mb, &ic.key_spec());
+            }
         }
     }
 
-    /// Drop every filter entry for `table_id`; lazy warm-up rebuilds them.
+    /// Drop every filter of `table_id`.
     pub(crate) fn unique_filter_invalidate_table(&self, table_id: u64) {
         self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
     }
@@ -141,58 +108,35 @@ impl MasterDispatcher {
         self.unique_filters.borrow_mut().remove(&(owner_id, cols));
     }
 
-    /// Publish the filter the CREATE-time pre-flight built: it scanned every
-    /// worker under the catalog write lock, so the set is complete.
-    pub(crate) fn unique_filter_seed(&self, table_id: u64, cols: PkColList, mut filter: UniqueFilter) {
-        filter.mark_warm();
+    /// Publish a filter holding every span of the index on `cols`.
+    pub(crate) fn unique_filter_seed(&self, table_id: u64, cols: PkColList, filter: UniqueFilter) {
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
 
-    /// Warm every not-yet-warm filter of `uniques`, the unique indexes a write
-    /// to `table_id` checks, from a scan of the table, one reply frame at a time.
+    /// Build the filter of each index of `uniques` that has none, from the
+    /// spans the workers' index stores hold.
     pub(super) async fn ensure_unique_filters_warm(
         &self,
         table_id: u64,
         uniques: &[(PkColList, SchemaDescriptor, KeySpec)],
     ) -> Result<(), WireFault> {
-        let missing: Vec<(PkColList, KeySpec)> = {
-            let mut filters = self.unique_filters.borrow_mut();
-            let missing: Vec<(PkColList, KeySpec)> = uniques
-                .iter()
-                .filter(|(cols, ..)| !filters.get(&(table_id, *cols)).is_some_and(UniqueFilter::is_warm))
-                .map(|&(cols, _, spec)| (cols, spec))
-                .collect();
-            for &(cols, _) in &missing {
-                filters.entry((table_id, cols)).or_insert_with(UniqueFilter::new);
+        for &(cols, _, spec) in uniques {
+            if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
+                continue;
             }
-            missing
-        };
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let schema = self.schema_desc_for(table_id);
-
-        let spec = ReadSpec::all_rows(ReadBound::None).encode();
-        let lease = self
-            .scan(DirectGroup::scan_spec(table_id, &spec, schema.layout_digest()))
-            .await?;
-
-        drain_rows(&lease, &schema, |mb| {
-            let mut filters = self.unique_filters.borrow_mut();
-            for (cols, spec) in &missing {
-                if let Some(filter) = filters.get_mut(&(table_id, *cols)) {
-                    extract_into_filter(filter, mb, spec);
+            let lease = self.scan(DirectGroup::key_spans(table_id, cols.as_slice())).await?;
+            let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
+            // A capped filter reads no further; the lease drop discards the rest.
+            'train: while let Some(frame) = lease.next().await? {
+                let rows = frame.rows(&span_schema);
+                let spans = rows.view();
+                for i in 0..spans.len() {
+                    if !filter.insert(spans.get_pk_bytes(i)) {
+                        break 'train;
+                    }
                 }
             }
-            Ok(())
-        })
-        .await?;
-
-        let mut filters = self.unique_filters.borrow_mut();
-        for &(cols, _) in &missing {
-            if let Some(f) = filters.get_mut(&(table_id, cols)) {
-                f.mark_warm();
-            }
+            self.unique_filter_seed(table_id, cols, filter);
         }
         Ok(())
     }

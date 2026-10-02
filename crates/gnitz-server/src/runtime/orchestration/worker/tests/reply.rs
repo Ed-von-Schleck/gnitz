@@ -1,4 +1,4 @@
-use super::send_unique_preflight_keys;
+use super::{send_span_train, ReplyRoute};
 use crate::runtime::test_support::key_producer;
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
@@ -6,7 +6,7 @@ use crate::test_support::pk_only_schema;
 use gnitz_wire::{TypeCode, WireStatus};
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// Read one pre-flight train off `receiver`, checking the flag and schema
+/// Read one span train off `receiver`, checking the flag and schema
 /// discipline the master's merge relies on: the spans, decoded against
 /// `frame_schema`, and the train's frame count.
 fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_id: u32) -> (Vec<Vec<u8>>, usize) {
@@ -17,10 +17,7 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_
         assert_eq!(slot.internal_req_id, request_id);
         let ctrl = slot.control();
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
-        assert!(
-            ctrl.hdr.flags.continuation,
-            "every pre-flight frame carries continuation"
-        );
+        assert!(ctrl.hdr.flags.continuation, "every span frame carries continuation");
         assert!(ctrl.schema.is_none(), "the master builds the frame schema itself");
         if let Some(data) = ctrl.data.clone() {
             let block = gnitz_zset::repr::WalBlock::parse(&slot.bytes()[data], frame_schema).expect("frame decodes");
@@ -39,7 +36,7 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_
 /// terminal frame for an empty partition, and no trailing empty frame after a
 /// full one.
 #[test]
-fn a_preflight_train_carries_every_span_and_ends_once() {
+fn a_span_train_carries_every_span_and_ends_once() {
     // Two U64 index columns → a 16-byte composite span.
     let frame_schema = pk_only_schema(&[TypeCode::U64; 2]);
     let extremes = [
@@ -65,15 +62,16 @@ fn a_preflight_train_carries_every_span_and_ends_once() {
         // Room for a whole train, so the writer never parks on backpressure.
         let ptr = make_ring(1 << 16, 16, 8);
         let receiver = W2mReceiver::new(vec![ptr]);
-        send_unique_preflight_keys(
-            &W2mWriter::new(ptr),
-            77,
-            &frame_schema,
-            9,
-            budget,
-            chunk_rows,
-            &mut key_producer(16, &keys),
-        );
+        let route = ReplyRoute {
+            target_id: 77,
+            request_id: 9,
+            fifo: false,
+        };
+        let mut spans = key_producer(16, &keys);
+        send_span_train(&W2mWriter::new(ptr), route, &frame_schema, budget, |chunk| {
+            spans.fill(chunk, chunk_rows);
+            spans.remaining() == 0
+        });
         let (got, n) = drain_train(&receiver, &frame_schema, 9);
         assert_eq!(got, keys);
         assert!(frames.contains(&n), "{} spans: {n} frames", keys.len());

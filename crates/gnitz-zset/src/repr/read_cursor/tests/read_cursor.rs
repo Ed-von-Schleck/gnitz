@@ -136,11 +136,6 @@ proptest! {
                 let mut positive = Vec::new();
                 open().for_each_positive_with_prefix(&k[..n], |c| positive.push(current(c)));
                 prop_assert_eq!(&positive, &want);
-                for max in [0, 1, 3] {
-                    let mut capped = Vec::new();
-                    open().for_each_positive_with_prefix_capped(&k[..n], max, |c| capped.push(current(c)));
-                    prop_assert_eq!(&capped[..], &want[..max.min(want.len())]);
-                }
             }
         }
 
@@ -158,9 +153,28 @@ proptest! {
             prop_assert_eq!(got, rows_where(&|p, _| in_range(p)));
         }
 
-        // A key-set gather, drained across chunk boundaries.
         keys.sort();
         keys.dedup();
+
+        // A capped gather takes each key's positive rows up to the cap, whole
+        // PKs and leading bytes of one alike.
+        for n in [1, stride] {
+            let mut prefixes: Vec<&[u8]> = keys.iter().map(|k| &k[..n]).collect();
+            prefixes.dedup();
+            for max in [0, 1, 3] {
+                let want: Vec<_> = prefixes
+                    .iter()
+                    .flat_map(|prefix| rows_where(&|p, w| &p[..n] == *prefix && w > 0).into_iter().take(max))
+                    .collect();
+                let keys = PkKeys::from_sorted(n, prefixes.concat());
+                let mut capped = Vec::new();
+                PkSetGather::over_runs(runs.iter().cloned(), s, runs.len(), keys)
+                    .for_each_positive_capped(max, |c| capped.push(current(c)));
+                prop_assert_eq!(capped, want);
+            }
+        }
+
+        // A key-set gather, drained across chunk boundaries.
         let mut gather = PkSetGather::new(open(), PkKeys::from_sorted(stride, keys.concat()));
         let mut gathered = Vec::new();
         while let Some(b) = gather.drain_chunk(chunk) {

@@ -189,8 +189,8 @@ _STATEMENTS = {
         _CODE_PAIR, _NULL_CODE, "DELETE FROM p WHERE pid = 1; DELETE FROM p WHERE pid = 999",
         {"p": [(2, 500)], "c": [(1, 500)]}),
     "a referenced code beside a NULL one": (_CODE_PAIR, _NULL_CODE, "DELETE FROM p WHERE pid = 2", None),
-    # Two children through two UNIQUE columns: the one hoisted gather resolves
-    # both, so each child's check sees its own referenced value.
+    # Two children through two UNIQUE columns: each child's check sees its own
+    # referenced value.
     "a row the code child references": (_TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 1", None),
     "a row the email child references": (_TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 2", None),
     "a row neither child references": (
@@ -267,6 +267,20 @@ def test_a_binary_write_lands_only_if_every_reference_survives_its_fold(
         else:
             client.delete(tid, schema, payload)
     assert _held(client, seed) == _want(after or seed)
+
+
+def test_a_refused_parent_write_names_its_verb(client):
+    """Through a non-PK unique column: moving a referenced code is refused as an
+    update, removing its row as a delete, and an unreferenced code moves."""
+    _seed(client, _CODE_PAIR, _CODE_ROWS)
+    refused = lambda verb: pytest.raises(gnitz.GnitzIntegrityError, match=f"cannot {verb} ")
+    with refused("update"):
+        client.execute_sql("UPDATE p SET code = 5 WHERE pid = 3")
+    with refused("delete from"):
+        client.execute_sql("DELETE FROM p WHERE pid = 3")
+    client.execute_sql("UPDATE p SET code = 5 WHERE pid = 15")
+    moved = [(15, 5) if pid == 15 else (pid, code) for pid, code in _CODES]
+    assert _held(client, _CODE_ROWS) == _want({"p": moved, "c": _CODES[:10]})
 
 
 def test_restrict_over_more_values_than_one_write_carries(client):

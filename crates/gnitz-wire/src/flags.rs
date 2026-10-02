@@ -77,7 +77,7 @@ impl WireFlags {
             conflict_mode: WireConflictMode::Update,
             continuation: true,
             scan_last: last,
-            probe_mode: WireProbeMode::Exists,
+            probe_mode: WireProbeMode::Pk,
         }
     }
 
@@ -132,10 +132,9 @@ wire_enum! {
     #[derive(Default)]
     pub enum WireProbeMode: u8 {
         #[default]
-        Exists = 0,
-        FirstHolder = 1,
-        AllHolders = 2,
-        Project = 3,
+        Pk = 0,
+        PkColumn = 1,
+        Index = 2,
     }
 }
 

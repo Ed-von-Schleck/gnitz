@@ -1,11 +1,12 @@
 use std::rc::Rc;
 
 use super::super::fixtures::test_dispatcher;
-use super::FlushRound;
 use crate::catalog::{CatalogEngine, SysFamily};
+use crate::runtime::sal::{DirectGroup, SalMessageKind};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
+use crate::runtime::wire::WireMsg;
 use gnitz_foundation::posix_io::retry_eintr;
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::WireStatus;
 
 /// Fork a child that exits immediately, and wait until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` finds it on the first call.
@@ -61,12 +62,11 @@ fn worker_death_names_the_dead_worker() {
     });
 }
 
-/// A round ends on every worker's ACK, and fails — without waiting on the other
-/// workers' ACKs — on a refused write, keeping its status, and on a worker's
-/// error ACK. The ACKs come from a task spawned once the group is written, so
-/// the round must let other tasks run.
+/// A group written on an ACK lease is answered by every worker's ACK or by the
+/// first error ACK, without waiting on the other workers; one the SAL has no
+/// room for is refused with the SAL's own status.
 #[test]
-fn a_round_ends_on_its_acks_or_its_first_failure() {
+fn an_acked_group_ends_on_its_acks_or_its_first_failure() {
     #[derive(Clone, Copy, Debug)]
     enum Answer {
         Acks,
@@ -79,24 +79,20 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
             let disp = Rc::new(disp);
             let d = Rc::clone(&disp);
             let got = disp.reactor().block_on(async move {
-                d.broadcast_round("backfill", |_, targets| {
-                    if let Answer::Refused = answer {
-                        return Err(WireFault {
-                            status: WireStatus::SalFull,
-                            text: "SAL full".into(),
-                        });
-                    }
-                    let id = targets.request_id;
-                    d.reactor().spawn(async move {
-                        match answer {
-                            Answer::Acks => writers.iter().for_each(|w| w.send_status(id, WireStatus::Ok, b"")),
-                            Answer::ErrorAck => writers[0].send_status(id, WireStatus::Error, b"boom"),
-                            Answer::Refused => {}
-                        }
-                    });
-                    Ok(())
-                })
-                .await
+                // Wider than the fixture's whole SAL.
+                let blob = vec![0u8; if let Answer::Refused = answer { 2 << 20 } else { 0 }];
+                let group = DirectGroup {
+                    template: WireMsg { blob: &blob, ..Default::default() },
+                    ..DirectGroup::new(SalMessageKind::Backfill)
+                };
+                let lease = d.write_acked(&d.sal().lock().await, "backfill", group)?;
+                match answer {
+                    Answer::Acks => writers
+                        .iter()
+                        .for_each(|w| w.send_status(lease.id(), WireStatus::Ok, b"")),
+                    _ => writers[0].send_status(lease.id(), WireStatus::Error, b"boom"),
+                }
+                lease.acks().await
             });
             match (answer, got) {
                 (Answer::Acks, Ok(())) => {}
@@ -161,7 +157,7 @@ fn a_checkpoint_bumps_the_generation_once() {
     disp.reactor()
         .block_on(async move {
             d.checkpoint_base().await?;
-            d.flush(FlushRound::Ephemeral).await?;
+            d.checkpoint_ephemeral().await?;
             d.boot_checkpoint().await
         })
         .unwrap();

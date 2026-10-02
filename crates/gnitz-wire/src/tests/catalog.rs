@@ -35,13 +35,12 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
 #[test]
 fn a_probe_roundtrips_through_its_wire_words() {
     let cols = PkColList::from_slice(&[2, 5]);
-    let cap = std::num::NonZeroU64::new(9).unwrap();
+    let cap = |n| std::num::NonZeroU64::new(n).unwrap();
     let probes = [
         Probe::Pk,
         Probe::PkColumn(4),
-        Probe::Index(cols, Holders::Echo),
-        Probe::Index(cols, Holders::First),
-        Probe::Index(cols, Holders::UpTo(cap)),
+        Probe::Index(cols, cap(1)),
+        Probe::Index(cols, cap(9)),
     ];
     for probe in probes {
         let (mode, arg0, arg1) = probe.wire();
@@ -49,15 +48,14 @@ fn a_probe_roundtrips_through_its_wire_words() {
     }
     let index = pack_pk_cols(cols.as_slice());
     for (mode, arg0, arg1) in [
-        (WireProbeMode::Exists, 5, 0),
-        (WireProbeMode::FirstHolder, 0, 0),
-        (WireProbeMode::Exists, 5, index),
-        (WireProbeMode::FirstHolder, 1, index),
-        (WireProbeMode::AllHolders, 9, 0),
-        (WireProbeMode::Project, 1 << 32, 0),
-        (WireProbeMode::Project, 4, index),
-        (WireProbeMode::AllHolders, 0, index),
-        (WireProbeMode::Exists, 0, 7),
+        (WireProbeMode::Pk, 5, 0),
+        (WireProbeMode::Pk, 0, index),
+        (WireProbeMode::Pk, 0, 7),
+        (WireProbeMode::PkColumn, 1 << 32, 0),
+        (WireProbeMode::PkColumn, 4, index),
+        (WireProbeMode::Index, 0, index),
+        (WireProbeMode::Index, 9, 0),
+        (WireProbeMode::Index, 9, 7),
     ] {
         assert!(Probe::from_wire(mode, arg0, arg1).is_err(), "{mode:?} {arg0} {arg1}");
     }

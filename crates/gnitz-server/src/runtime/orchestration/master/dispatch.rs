@@ -10,33 +10,6 @@ use crate::catalog::SysFamily;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
 use gnitz_foundation::posix_io::retry_eintr;
-use gnitz_store::relation::Relation;
-
-/// One round of a checkpoint.
-#[derive(Clone, Copy)]
-pub(crate) enum FlushRound {
-    /// Flush base and system tables.
-    Base,
-    /// Flush every view's traces and output stores, stamped with the durable
-    /// generation.
-    Ephemeral,
-}
-
-impl FlushRound {
-    fn kind(self) -> SalMessageKind {
-        match self {
-            FlushRound::Base => SalMessageKind::Flush,
-            FlushRound::Ephemeral => SalMessageKind::FlushEph,
-        }
-    }
-
-    fn phase(self) -> &'static str {
-        match self {
-            FlushRound::Base => "checkpoint base round",
-            FlushRound::Ephemeral => "checkpoint ephemeral round",
-        }
-    }
-}
 
 /// How often a worker's death is probed for.
 pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
@@ -52,15 +25,7 @@ fn boot_nonce() -> u64 {
 }
 
 impl MasterDispatcher {
-    /// `last_ephemeral_gen` seeds `note_flush_round`'s ordering check: the
-    /// boot's recovered durable generation.
-    pub(crate) fn new(
-        worker_pids: Vec<i32>,
-        catalog: *mut CatalogEngine,
-        last_ephemeral_gen: u64,
-        sal: SalWriter,
-        reactor: Reactor,
-    ) -> Self {
+    pub(crate) fn new(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
         debug_assert_eq!(
             sal.num_workers(),
             worker_pids.len(),
@@ -72,7 +37,6 @@ impl MasterDispatcher {
             reactor,
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
-            last_ephemeral_gen: Cell::new(last_ephemeral_gen),
             unflushed_pushes: Cell::new(false),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
@@ -80,14 +44,15 @@ impl MasterDispatcher {
         }
     }
 
-    /// The catalog behind the raw pointer the dispatcher was constructed with.
-    /// The pointer is dereferenced here and nowhere else on the master side —
-    /// every other master-side name for the catalog is a wrapper around this
-    /// accessor, not a second owner of the pointer. The catalog outlives the
-    /// dispatcher. No reference this returns may be alive across another `cat()`
-    /// call, in an argument list or in a callee.
+    /// The catalog, which outlives the dispatcher.
+    pub(crate) fn cat(&self) -> &CatalogEngine {
+        unsafe { &*self.catalog }
+    }
+
+    /// The catalog, exclusively: no reference from this or [`Self::cat`] may be
+    /// alive across a call.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) fn cat(&self) -> &mut CatalogEngine {
+    pub(crate) fn cat_mut(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
     }
 
@@ -119,77 +84,67 @@ impl MasterDispatcher {
         }
     }
 
-    /// Write the group `write` builds on a fresh ACK lease, then wait for every
-    /// worker's ACK. A refused write fails before any worker is woken, keeping
-    /// its status.
-    async fn broadcast_round(
+    /// Write `group` to every worker on a fresh ACK lease.
+    fn write_acked(
         &self,
+        excl: &SalExcl<'_>,
         ctx: &'static str,
-        write: impl FnOnce(&SalExcl<'_>, GroupTargets) -> Result<(), WireFault>,
-    ) -> Result<(), WireFault> {
+        group: DirectGroup<'_>,
+    ) -> Result<AckLease, WireFault> {
         let lease = self.reactor.lease_acks(ctx, WorkerSet::ALL);
-        write(&self.sal.lock().await, lease.targets())?;
-        lease.acks().await
+        excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
+        Ok(lease)
     }
 
     // -----------------------------------------------------------------------
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
-    /// A checkpoint's first half: a generation bump, then a base round. Every
-    /// checkpointed view and index is invalid until the next ephemeral round
-    /// restamps it.
+    /// A checkpoint's first half: a generation bump, then the round that flushes
+    /// base and system tables. Every checkpointed view and index is invalid
+    /// until the next ephemeral round restamps it.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
-        self.cat().advance_durable_generation()?;
-        self.flush(FlushRound::Base).await
+        self.cat_mut().advance_durable_generation()?;
+        let mut excl = self.sal.lock().await;
+        self.unflushed_pushes.set(false);
+        self.flush_round(
+            &mut excl,
+            "checkpoint base round",
+            DirectGroup::new(SalMessageKind::Flush),
+        )
+        .await
     }
 
-    /// [`Self::checkpoint_round`] under a SAL hold of its own.
-    pub(crate) async fn flush(&self, round: FlushRound) -> Result<(), WireFault> {
-        self.checkpoint_round(&mut self.sal.lock().await, round).await
+    /// A checkpoint's second half: the round that flushes every view's traces
+    /// and output stores, stamped with the durable generation.
+    pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
+        let mut excl = self.sal.lock().await;
+        debug_assert!(
+            !self.unflushed_pushes.get(),
+            "an ephemeral round's reset would discard pushes no base round flushed"
+        );
+        let group = DirectGroup {
+            template: wire::WireMsg {
+                arg0: self.cat().durable_generation(),
+                ..Default::default()
+            },
+            ..DirectGroup::new(SalMessageKind::FlushEph)
+        };
+        self.flush_round(&mut excl, "checkpoint ephemeral round", group).await
     }
 
-    /// Write `round`'s flush group, wait for every worker's ACK, finalize.
-    pub(crate) async fn checkpoint_round(&self, excl: &mut SalExcl<'_>, round: FlushRound) -> Result<(), WireFault> {
-        let lease = self.reactor.lease_acks(round.phase(), WorkerSet::ALL);
-        let generation = self.note_flush_round(round);
-        excl.write(&DirectGroup {
-            template: wire::WireMsg { arg0: generation, ..Default::default() },
-            targets: lease.targets(),
-            ..DirectGroup::new(round.kind())
-        })?;
+    /// Write `group`, wait for every worker's ACK, finalize.
+    async fn flush_round(
+        &self,
+        excl: &mut SalExcl<'_>,
+        ctx: &'static str,
+        group: DirectGroup<'_>,
+    ) -> Result<(), WireFault> {
+        let lease = self.write_acked(excl, ctx, group)?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
         lease.acks().await?;
         self.checkpoint_post_ack(excl)
-    }
-
-    /// Record `round`, asserting the checkpoint ordering. Returns the generation
-    /// workers stamp their manifests with: the durable one for an ephemeral round,
-    /// 0 for a base round, which stamps none.
-    fn note_flush_round(&self, round: FlushRound) -> u64 {
-        let durable = self.cat().durable_generation();
-        match round {
-            FlushRound::Ephemeral => {
-                debug_assert!(
-                    !self.unflushed_pushes.get(),
-                    "an ephemeral round's reset would discard pushes no base round flushed"
-                );
-                self.last_ephemeral_gen.set(durable);
-                durable
-            }
-            FlushRound::Base => {
-                self.unflushed_pushes.set(false);
-                debug_assert!(
-                    durable > self.last_ephemeral_gen.get(),
-                    "base round at generation {} publishes past the last ephemeral round ({}): \
-                     derived state would resume from a cut older than its base",
-                    durable,
-                    self.last_ephemeral_gen.get(),
-                );
-                0
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -199,21 +154,17 @@ impl MasterDispatcher {
     /// Distributed backfill of ONE view from `source_id`; view-scoped, see
     /// [`crate::query::Drive::Backfill`].
     async fn fan_out_backfill(&self, view_id: u64, source_id: u64) -> Result<(), WireFault> {
-        // Dataless, and schema-less: the worker reads the source's schema off its
-        // own catalog.
-        let template = wire::WireMsg {
-            target_id: source_id,
-            arg0: view_id,
-            ..Default::default()
+        let group = DirectGroup {
+            template: wire::WireMsg {
+                target_id: source_id,
+                arg0: view_id,
+                ..Default::default()
+            },
+            ..DirectGroup::new(SalMessageKind::Backfill)
         };
-        self.broadcast_round("backfill", |excl, t| {
-            excl.write(&DirectGroup {
-                template,
-                targets: t,
-                ..DirectGroup::new(SalMessageKind::Backfill)
-            })
-        })
-        .await
+        // Two statements: the `SalExcl`'s drop is the wake.
+        let lease = self.write_acked(&self.sal.lock().await, "backfill", group)?;
+        lease.acks().await
     }
 
     /// Backfill every view in `view_ids`, in dependency order, from each of its
@@ -235,7 +186,7 @@ impl MasterDispatcher {
         ordered.sort_unstable();
         ordered.dedup();
         for vid in ordered {
-            // Owned: the loop body calls `cat()` again.
+            // Owned: no catalog reference is held across the await.
             let sources = self.cat().dag.sources_of(vid).to_vec();
             for src in sources {
                 self.fan_out_backfill(vid, src).await.map_err(|e| WireFault {
@@ -247,13 +198,13 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Tick every one of `tids`, in order, in one [`Self::broadcast_round`].
+    /// Tick every one of `tids`, in order, in one group, and await its ACKs.
     pub(crate) async fn drain_tick(&self, tids: &[u64]) -> Result<(), WireFault> {
         if tids.is_empty() {
             return Ok(());
         }
-        self.broadcast_round("view tick drain", |excl, t| self.write_tick_group(excl, tids, t))
-            .await
+        let lease = self.emit_tick(&self.sal.lock().await, "view tick drain", tids)?;
+        lease.acks().await
     }
 
     /// Log a DDL batch of `family` inside `scope`'s zone — one LSN across a DDL's
@@ -275,32 +226,23 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Tick group writer (used by the async tick task in executor.rs)
-    // -----------------------------------------------------------------------
-
-    /// Write one Tick group for `tids` at consecutive tick rounds. A refused
-    /// write burns its rounds.
-    pub(crate) fn write_tick_group(
-        &self,
-        excl: &SalExcl<'_>,
-        tids: &[u64],
-        targets: GroupTargets,
-    ) -> Result<(), WireFault> {
+    /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
+    /// lease. A refused write burns its rounds.
+    pub(crate) fn emit_tick(&self, excl: &SalExcl<'_>, ctx: &'static str, tids: &[u64]) -> Result<AckLease, WireFault> {
         let first = self.tick_round.get() + 1;
         self.tick_round.set(first + tids.len() as u64 - 1);
         for (i, &tid) in tids.iter().enumerate() {
             self.record_delta_round(tid, first + i as u64);
         }
-        excl.write(&DirectGroup {
+        let group = DirectGroup {
             template: wire::WireMsg {
                 arg0: first,
                 blob: gnitz_wire::as_le_bytes(tids),
                 ..Default::default()
             },
-            targets,
             ..DirectGroup::new(SalMessageKind::Tick)
-        })
+        };
+        self.write_acked(excl, ctx, group)
     }
 
     /// Raise the last-reached round of every fed view in `tid`'s **forward**
@@ -334,11 +276,8 @@ impl MasterDispatcher {
     /// The cursor tag a delta reply carries: distinct for every (boot, view), so a
     /// cursor from another boot or from a dropped view is recognizably foreign.
     pub(crate) fn delta_cursor_tag(&self, view_id: u64) -> u64 {
-        // splitmix64's finalizer: the view id is a small dense integer, and an
-        // unmixed XOR would make neighbouring ids' tags differ in one bit. It is
-        // a **bijection** on u64 — `x ^ (x >> k)` is invertible and both
-        // multipliers are odd — so distinct view ids cannot collide within a
-        // boot, which a general hash (XXH3 over 8 bytes) would not guarantee.
+        // splitmix64's finalizer, a bijection on u64: two views of one boot
+        // never share a tag.
         let mut z = view_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -365,13 +304,6 @@ impl MasterDispatcher {
 
     /// The first dead worker, reported on every probe: a reaped pid answers
     /// ECHILD.
-    ///
-    /// Probes each worker by its own pid, not `waitpid(-1)`. A per-pid `waitpid`
-    /// returns ECHILD — a detected death — even if the zombie was reaped
-    /// elsewhere, whereas `waitpid(-1)` returns 0 ("some child is alive") and
-    /// silently misses one worker's death while others run, so it would go blind
-    /// the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is ever added. It
-    /// also names the exact dead worker for the error/log.
     pub(crate) fn check_workers(&self) -> Option<usize> {
         for (w, &pid) in self.worker_pids.iter().enumerate() {
             if pid <= 0 {
@@ -469,7 +401,7 @@ impl MasterDispatcher {
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
     /// leaves the SAL intact and aborts or fails the boot.
     pub(crate) fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
-        let cat = self.cat();
+        let cat = self.cat_mut();
         debug_assert!(
             !cat.has_uncommitted_families(),
             "a checkpoint's system-table flush would make an uncommitted DDL durable"
@@ -487,20 +419,9 @@ impl MasterDispatcher {
     /// and index at the generation reserved pre-fork. The workers published their
     /// base stores during recovery, and no push is admitted yet.
     pub(crate) async fn boot_checkpoint(&self) -> Result<(), WireFault> {
-        let cat = self.cat();
+        let cat = self.cat_mut();
         cat.record_topology(cat.registry.slot().of)?;
-        self.flush(FlushRound::Ephemeral).await
-    }
-
-    /// The descriptor `target_id` is registered with. Panics on an unregistered
-    /// id: every caller reaches it holding the catalog lock the registry's own
-    /// writers take, so a miss is broken lock discipline, not a bad client id.
-    pub(crate) fn schema_desc_for(&self, target_id: u64) -> SchemaDescriptor {
-        self.cat()
-            .registry
-            .relation(target_id)
-            .map(Relation::schema)
-            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
+        self.checkpoint_ephemeral().await
     }
 }
 

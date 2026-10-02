@@ -26,7 +26,6 @@
 use super::executor::{request_drain, Shared};
 use super::guard_panic;
 use super::TxnFamily;
-use crate::runtime::master::FlushRound;
 use crate::runtime::reactor::{chan, oneshot, AckLease};
 use crate::runtime::sal::SalScope;
 use gnitz_wire::WireFault;
@@ -208,7 +207,7 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     let _park = shared.tick_gate.write().await;
     shared
         .disp()
-        .flush(FlushRound::Ephemeral)
+        .checkpoint_ephemeral()
         .await
         .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 }
@@ -316,7 +315,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         } else {
             guard_panic("commit_merge", || {
                 Ok::<_, String>(Batch::concat(
-                    &shared.disp().schema_desc_for(tid),
+                    head.schema(),
                     std::iter::once(&head).chain(tail.iter()).map(Batch::as_mem_batch),
                 ))
             })

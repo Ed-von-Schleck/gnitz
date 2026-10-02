@@ -294,6 +294,18 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
+    /// The sorted key spans of `cols` over `target_id`.
+    pub(crate) fn key_spans(target_id: u64, cols: &[u32]) -> Self {
+        DirectGroup {
+            template: WireMsg {
+                target_id,
+                arg1: gnitz_wire::pack_pk_cols(cols),
+                ..Default::default()
+            },
+            ..Self::new(SalMessageKind::KeySpans)
+        }
+    }
+
     /// A push of `data` into `relation`, written to `targets`.
     pub(crate) fn push(relation: &'a WireSchema, data: GroupData<'a>, targets: GroupTargets) -> Self {
         DirectGroup {
@@ -437,9 +449,8 @@ gnitz_wire::wire_enum! {
         Backfill = 6,
         /// Answer a [`gnitz_wire::Probe`] at a scattered or broadcast key list.
         HasPk = 7,
-        /// CREATE UNIQUE INDEX pre-flight: stream the sorted key spans of the
-        /// column list in `arg1` for the master's merge.
-        UniquePreflight = 8,
+        /// Stream the sorted key spans of the column list in `arg1`.
+        KeySpans = 8,
         Push = 9,
         /// Drive one view-maintenance tick per tid: `arg0` = the first tid's
         /// round; the blob = the tids, `u64` LE, rounds consecutive.

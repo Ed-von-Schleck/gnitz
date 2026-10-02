@@ -209,10 +209,8 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         shared.disp().unique_filter_remove(owner_id, cols);
     }
 
-    // Publish the pre-flight's filters so the first INSERT skips a redundant
-    // full-cluster warmup scan. Post-fsync only: a broadcast/fsync failure
-    // aborts the process before this point, so no filter is published for an
-    // index that never committed.
+    // Post-fsync: a broadcast or fsync failure aborts the process before this
+    // point, so no filter is published for an index that never committed.
     for (owner_id, cols, filter) in filter_seeds {
         shared.disp().unique_filter_seed(owner_id, cols, filter);
     }

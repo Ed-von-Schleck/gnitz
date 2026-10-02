@@ -105,11 +105,10 @@ impl MasterDispatcher {
         owner_id: u64,
         col_indices: &[u32],
     ) -> Result<Option<UniqueFilter>, WireFault> {
-        let (spec, packed) = {
+        let spec = {
             let cat = self.cat();
             let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
-                // Created in this same bundle, so empty: seed it and spare the
-                // first INSERT a warm-up scan.
+                // Created in this same bundle, so empty.
                 return Ok(Some(UniqueFilter::new()));
             };
             // What the IDX_TAB precheck refuses is refused before any scan.
@@ -118,31 +117,13 @@ impl MasterDispatcher {
             if owner_schema.covers_pk(col_indices) {
                 return Ok(None);
             }
-            (spec, gnitz_wire::pack_pk_cols(col_indices))
+            spec
         };
         let frame_schema = spec.span_schema();
 
-        // The read routes a REPLICATED owner to one worker: under a fan-out each
-        // distinct value would arrive `nw` times and pop adjacently in the merge
-        // — the merge reads that as a duplicate and fails the
-        // CREATE on a genuinely unique table. The count-agnostic merge still
-        // catches real within-copy duplicates via the same adjacent-equal
-        // check, and the seed reflects true cardinality. Hashed owners keep the
-        // full fan-out (genuine cross-partition duplicates surface as equal
-        // spans from different workers).
-        //
-        // The worker's `UniquePreflight` arm resolves the owner's schema from its
-        // own catalog.
-        let lease = self
-            .scan(DirectGroup {
-                template: wire::WireMsg {
-                    target_id: owner_id,
-                    arg1: packed,
-                    ..Default::default()
-                },
-                ..DirectGroup::new(SalMessageKind::UniquePreflight)
-            })
-            .await?;
+        // A replicated owner is read on one worker: every worker's copy would
+        // pop each value `nw` times.
+        let lease = self.scan(DirectGroup::key_spans(owner_id, col_indices)).await?;
 
         let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
             let cat = self.cat();

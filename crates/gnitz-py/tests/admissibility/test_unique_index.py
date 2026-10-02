@@ -185,7 +185,7 @@ _MERGES = {
     # spilled runs and a k-way merge over them. The budget is honoured in every
     # build, so this bites a release server too.
     "external sort spill": (
-        {"GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES": "256"}, [(i * 7 + 1, i) for i in range(_n)],
+        {"GNITZ_KEY_SPANS_SPILL_BYTES": "256"}, [(i * 7 + 1, i) for i in range(_n)],
         (_n * 10, 5), (_n * 10 + 3, 0)),
 }
 
@@ -211,10 +211,8 @@ def test_the_preflight_merge_stays_exact_across_its_own_boundaries(own_server, e
 
 
 def test_unique_index_over_a_long_text_table_past_one_frame(own_server):
-    """The pre-flight warms its cold filters from a whole-table scan, so a table
-    with a long TEXT column reaches that scan's 16 KiB frame budget on rows the
-    user never asked to read. Every frame carries a heap compacted to its own
-    rows, so the DDL completes and the index it builds enforces uniqueness."""
+    """An index created over a table of long TEXT rows, each worker's spans
+    past one reply frame, enforces uniqueness."""
     srv, n = gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target), 800
     srv.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, u BIGINT NOT NULL, body TEXT NOT NULL)")
@@ -233,7 +231,7 @@ def test_worker_fault_mid_preflight(own_server):
     client error with no index created, no filter seeded, and every worker
     drained (not wedged): the table stays fully usable, and the PK
     short-circuit — which never fans out — still succeeds."""
-    srv = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR": "1"}).target)
+    srv = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_KEY_SPANS_ERROR": "1"}).target)
     srv.execute_sql(_T)
     seed = [(pk, pk) for pk in range(1, 33)]
     insert(srv, "t", seed)
@@ -255,6 +253,23 @@ def test_worker_fault_mid_preflight(own_server):
 
 
 # ── Enforcement once the index exists ────────────────────────────────────────
+
+def test_the_index_enforces_after_a_restart(own_server):
+    """After a restart the index still refuses a held value, on an INSERT and
+    on an UPDATE, and admits a fresh one."""
+    srv = gnitz.connect(own_server.start().target)
+    srv.execute_sql(_T + "; CREATE UNIQUE INDEX ON t(val)")
+    seed = [(pk, pk * 10) for pk in _SPREAD]
+    insert(srv, "t", seed)
+
+    srv = gnitz.connect(own_server.restart(graceful=True).target)
+    with _violation():
+        srv.execute_sql(f"INSERT INTO t VALUES (5, {_SPREAD[3] * 10})")
+    srv.execute_sql("INSERT INTO t VALUES (5, 55)")
+    with _violation():
+        srv.execute_sql(f"UPDATE t SET val = {_SPREAD[0] * 10} WHERE pk = {_SPREAD[5]}")
+    assert bag(scanned(srv, "t")) == dict.fromkeys(seed + [(5, 55)], 1)
+
 
 @pytest.mark.parametrize("ddl", [
     _T + "; CREATE UNIQUE INDEX ON t(val)",

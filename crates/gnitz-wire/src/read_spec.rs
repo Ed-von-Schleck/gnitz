@@ -132,11 +132,16 @@ impl PkKeys {
     pub fn from_sorted(stride: usize, bytes: Vec<u8>) -> Self {
         assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
         assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
-        assert!(
-            strictly_ascending(&bytes, stride),
-            "PkKeys: keys are not strictly ascending"
-        );
-        PkKeys { stride: stride as u8, bytes }
+        Self::checked(stride, bytes).expect("PkKeys")
+    }
+
+    /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
+    /// strictly ascend.
+    pub fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
+        match strictly_ascending(&bytes, stride) {
+            true => Ok(PkKeys { stride: stride as u8, bytes }),
+            false => Err("keys are not strictly ascending".to_string()),
+        }
     }
 
     pub fn stride(&self) -> usize {
@@ -171,7 +176,7 @@ impl PkKeys {
 }
 
 /// Whether `bytes`, read as keys of `stride`, strictly ascend.
-fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
+pub fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
     bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 
@@ -307,13 +312,7 @@ impl Wire for ReadBound {
             BOUND_RANGE => ReadBound::Range(r.get()?),
             BOUND_PK_SET => {
                 let (stride, bytes) = read_pk_set(r)?;
-                if !strictly_ascending(bytes, stride) {
-                    return Err("PkSet keys are not strictly ascending".to_string());
-                }
-                ReadBound::PkSet(PkKeys {
-                    stride: stride as u8,
-                    bytes: bytes.to_vec(),
-                })
+                ReadBound::PkSet(PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))?)
             }
             other => return Err(format!("unknown bound kind {other}")),
         })

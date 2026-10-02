@@ -28,7 +28,7 @@ use crate::runtime::listen::ClientListener;
 use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, SalMessageKind, WorkerSet};
+use crate::runtime::sal::{DirectGroup, SalMessageKind};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::control::DecodedControl;
@@ -175,20 +175,13 @@ impl HeldTables {
 }
 
 impl Shared {
-    /// Shared access to the catalog, which is what the great majority of this
-    /// file's catalog touches want. Split from [`Shared::cat_mut`] so the two are
-    /// distinguishable at the call site: an accessor that hands out `&mut`
-    /// unconditionally makes every read look like a mutation, and manufactures
-    /// exclusive-borrow hazards at sites that only read.
     fn cat(&self) -> &CatalogEngine {
         self.dispatcher.cat()
     }
 
-    /// Exclusive access, for the catalog methods that genuinely take `&mut self`.
-    /// Reaches the catalog through the dispatcher's accessor, like [`Self::cat`].
     #[allow(clippy::mut_from_ref)]
     fn cat_mut(&self) -> &mut CatalogEngine {
-        self.dispatcher.cat()
+        self.dispatcher.cat_mut()
     }
 
     pub(super) fn disp(&self) -> &MasterDispatcher {
@@ -557,21 +550,23 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
         return Ok(());
     }
 
-    let lease = shared.disp().reactor().lease_acks("tick", WorkerSet::ALL);
     let emit = {
         let excl = shared.disp().sal().lock().await;
         guard_panic("tick", || {
             if TICK_EMIT_ERROR.take_once() {
                 return Err("injected tick emit error".into());
             }
-            shared.disp().write_tick_group(&excl, tids, lease.targets())
+            shared.disp().emit_tick(&excl, "tick", tids)
         })
     };
     // A refused write publishes nothing, so no worker took any tid's delta.
-    if let Err(e) = emit {
-        shared.requeue_tick_tids(tids);
-        return Err(e);
-    }
+    let lease = match emit {
+        Ok(lease) => lease,
+        Err(e) => {
+            shared.requeue_tick_tids(tids);
+            return Err(e);
+        }
+    };
 
     if TICK_HOLD_FOR_DDL.take_once() {
         hold_tick_for_ddl(shared).await;
@@ -1037,7 +1032,7 @@ async fn fan_out_scan(
     let mut lsn = 0;
     let mut leases = shared
         .disp()
-        .scan_cut(1, |cut| {
+        .scan_cut(|cut| {
             lsn = read_watermark(shared, kind);
             cut.read(group)
         })
@@ -1138,7 +1133,7 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let dispatches = if moved.is_empty() {
             Vec::new()
         } else {
-            disp.scan_cut(moved.len(), |cut| {
+            disp.scan_cut(|cut| {
                 round = disp.last_tick_round();
                 for item in &moved {
                     let reply_layout = item.reply_layout.to_le_bytes();
@@ -1249,7 +1244,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let spec = ReadSpec::all_rows(ReadBound::None).encode();
         let disp = shared.disp();
         let dispatches = disp
-            .scan_cut(plans.len(), |cut| {
+            .scan_cut(|cut| {
                 for plan in &mut plans {
                     plan.lsn = read_watermark(shared, plan.kind);
                     cut.read(DirectGroup::scan_spec(plan.tid, &spec, plan.reply_layout))?;

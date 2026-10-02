@@ -552,59 +552,35 @@ pub enum Probe {
     Pk,
     /// The own PK store: each key a live row carries, with that row's column.
     PkColumn(u32),
-    /// The secondary index on this exact column list.
-    Index(PkColList, Holders),
-}
-
-/// What an index probe answers a probe key whose span is held with.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Holders {
-    /// The probe key.
-    Echo,
-    /// The first stored entry under the span, `[span ‖ holder PK]`.
-    First,
-    /// Every stored entry under the span, up to this many.
-    UpTo(std::num::NonZeroU64),
+    /// The secondary index on this exact column list: each key answered with up
+    /// to this many of the stored entries under its span, each
+    /// `[span ‖ holder PK]`.
+    Index(PkColList, std::num::NonZeroU64),
 }
 
 impl Probe {
     /// The probe mode, `arg0` and `arg1` a `HasPk` group carries this as.
     pub fn wire(self) -> (WireProbeMode, u64, u64) {
         match self {
-            Probe::Pk => (WireProbeMode::Exists, 0, 0),
-            Probe::PkColumn(col) => (WireProbeMode::Project, col as u64, 0),
-            Probe::Index(cols, holders) => {
-                let (mode, arg0) = match holders {
-                    Holders::Echo => (WireProbeMode::Exists, 0),
-                    Holders::First => (WireProbeMode::FirstHolder, 0),
-                    Holders::UpTo(cap) => (WireProbeMode::AllHolders, cap.get()),
-                };
-                (mode, arg0, pack_pk_cols(cols.as_slice()))
-            }
+            Probe::Pk => (WireProbeMode::Pk, 0, 0),
+            Probe::PkColumn(col) => (WireProbeMode::PkColumn, col as u64, 0),
+            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), pack_pk_cols(cols.as_slice())),
         }
     }
 
     /// The inverse of [`Self::wire`], refusing every other triple.
-    /// [`pack_pk_cols`] sets [`PK_LIST_PACKED_FLAG`], so an `arg1` of `0` is the
-    /// own PK store.
     pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
         let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
-        let probe = match (mode, arg0, arg1) {
-            (WireProbeMode::Exists, 0, 0) => Probe::Pk,
-            (WireProbeMode::Project, col, 0) => Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?),
-            (_, _, 0) | (WireProbeMode::Project, ..) => return Err(refused()),
-            (mode, arg0, cols) => {
+        match (mode, arg0, arg1) {
+            (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
+            (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
+            (WireProbeMode::Index, cap, cols) => {
+                let cap = std::num::NonZeroU64::new(cap).ok_or_else(refused)?;
                 let cols = unpack_pk_cols(cols).map_err(|e| e.for_role(crate::PkListRole::ColumnList))?;
-                let holders = match (mode, std::num::NonZeroU64::new(arg0)) {
-                    (WireProbeMode::Exists, None) => Holders::Echo,
-                    (WireProbeMode::FirstHolder, None) => Holders::First,
-                    (WireProbeMode::AllHolders, Some(cap)) => Holders::UpTo(cap),
-                    _ => return Err(refused()),
-                };
-                Probe::Index(cols, holders)
+                Ok(Probe::Index(cols, cap))
             }
-        };
-        Ok(probe)
+            _ => Err(refused()),
+        }
     }
 }
 

@@ -10,7 +10,7 @@ fn probe_header() -> ControlHeader {
             conflict_mode: crate::WireConflictMode::Error,
             continuation: true,
             scan_last: true,
-            probe_mode: crate::WireProbeMode::AllHolders,
+            probe_mode: crate::WireProbeMode::Index,
         },
         arg0: 0xDDDD_EEEE_FFFF_0011,
         arg1: 0xAA_BB_CC_DD_EE_FF_00_11,

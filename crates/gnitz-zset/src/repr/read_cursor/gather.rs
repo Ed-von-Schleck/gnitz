@@ -83,6 +83,25 @@ impl PkSetGather {
         visited
     }
 
+    /// Call `f` on up to `cap` positive-weight rows of each remaining key's
+    /// group, in key order.
+    pub fn for_each_positive_capped(&mut self, cap: usize, mut f: impl FnMut(&ReadCursor)) {
+        for key in self.keys.iter().skip(self.next) {
+            if !self.cursor.seek_pk_group_ascending(key) {
+                continue;
+            }
+            let taken = std::cell::Cell::new(0);
+            self.cursor.for_each_positive_while(
+                |pk| taken.get() < cap && pk.starts_with(key),
+                |c| {
+                    f(c);
+                    taken.set(taken.get() + 1);
+                },
+            );
+        }
+        self.next = self.keys.len();
+    }
+
     /// The next chunk with skeleton rows split out, as [`ReadCursor::drain_live_chunk`].
     pub(super) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
         if self.remaining_keys() == 0 {

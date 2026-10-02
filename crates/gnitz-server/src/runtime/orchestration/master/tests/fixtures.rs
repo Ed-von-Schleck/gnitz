@@ -20,6 +20,6 @@ pub(super) fn test_dispatcher(
     let sal = test_writer(1 << 20, &rings);
     try_poll_once(sal.lock()).expect("uncontended").boot_rewind(1);
     let reactor = make_reactor_over(W2mReceiver::new(rings));
-    let disp = MasterDispatcher::new(worker_pids, catalog, 0, sal, reactor);
+    let disp = MasterDispatcher::new(worker_pids, catalog, sal, reactor);
     (disp, writers)
 }

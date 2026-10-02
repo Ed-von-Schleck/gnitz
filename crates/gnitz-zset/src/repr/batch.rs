@@ -1021,6 +1021,13 @@ impl Batch {
         self.rekeyed(out_schema, |src, dst| dst.copy_from_slice(&src[cut..]))
     }
 
+    /// Every row copied into `out_schema`, whose payload space is this batch's,
+    /// keyed by its leading key bytes — as many as `out_schema`'s stride. Left
+    /// unconsolidated: rows may now share a key.
+    pub fn keyed_by_prefix(&self, out_schema: &SchemaDescriptor) -> Batch {
+        self.rekeyed(out_schema, |src, dst| dst.copy_from_slice(&src[..dst.len()]))
+    }
+
     /// Every row copied into `out_schema`, whose payload space is this batch's;
     /// each output key written by `rekey(src_key, dst_key)`. Left unconsolidated.
     fn rekeyed(&self, out_schema: &SchemaDescriptor, rekey: impl Fn(&[u8], &mut [u8])) -> Batch {

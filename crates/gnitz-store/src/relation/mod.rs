@@ -97,6 +97,11 @@ impl SecondaryIndex {
         self.store.held().open_cursor()
     }
 
+    /// Every stored entry of `spans`, each this index's leading key bytes.
+    pub(crate) fn gather(&self, spans: PkKeys) -> PkSetGather {
+        self.store.held().gather(spans, Cut::Now)
+    }
+
     /// A cursor positioned on the key band `r` names under this index's key spec.
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
         let t = self.store.held();

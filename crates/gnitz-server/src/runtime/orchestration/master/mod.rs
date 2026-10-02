@@ -27,7 +27,7 @@ use gnitz_wire::{BoundPeek, PkColList, WireFault, WireFlags};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};
 
-pub(crate) use dispatch::{FlushRound, WORKER_WATCH};
+pub(crate) use dispatch::WORKER_WATCH;
 pub(crate) use train::forward_scan;
 pub(crate) use unique_filter::UniqueFilter;
 
@@ -40,17 +40,12 @@ pub struct MasterDispatcher {
     sal: SalWriter,
     /// The master's one event loop, which reads every worker's replies.
     reactor: Reactor,
-    /// Dereferenced by [`MasterDispatcher::cat`] alone.
+    /// Dereferenced by [`MasterDispatcher::cat`] and [`MasterDispatcher::cat_mut`] alone.
     catalog: *mut CatalogEngine,
-    /// Per-(table_id, column list) filter skipping redundant unique-index
-    /// occupancy broadcasts. Keyed by the decoded list, so a composite index is
-    /// identified by its whole column list and dropping `(a, b)` never touches
-    /// a distinct single-column filter on `a`.
+    /// The filter of each unique index that has one, by (table_id, column
+    /// list). Every entry holds all of its index's spans.
     unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
 
-    /// The generation the last ephemeral round stamped, which every base round
-    /// must publish past.
-    last_ephemeral_gen: Cell<u64>,
     /// A push group was written since the last base round.
     unflushed_pushes: Cell<bool>,
 
@@ -117,7 +112,6 @@ fn route_read(schema: &SchemaDescriptor, placement: Placement, blob: Option<&[u8
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
-    in_request_order: bool,
     scans: Vec<TrainLease>,
 }
 
@@ -127,7 +121,8 @@ impl<'d> ScanCut<'d> {
         let lease = self.disp.reactor.lease_train(set, group.kind);
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         self.excl.write(&DirectGroup {
-            targets: lease.targets(self.in_request_order),
+            // Only a later scan of a cut has a train of the cut to stay behind.
+            targets: lease.targets(!self.scans.is_empty()),
             ..group
         })?;
         self.scans.push(lease);
@@ -158,27 +153,24 @@ impl<'d> ScanCut<'d> {
 }
 
 impl MasterDispatcher {
-    /// `n` scan-shaped requests written under one SAL hold, one lease each. At
-    /// `n > 1` each worker replies in request order.
+    /// The scan-shaped requests `build` writes under one SAL hold, one lease
+    /// each; each worker replies in request order.
     pub(crate) async fn scan_cut(
         &self,
-        n: usize,
         build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
     ) -> Result<Vec<TrainLease>, WireFault> {
         let mut cut = ScanCut {
             disp: self,
             excl: self.sal.lock().await,
-            in_request_order: n > 1,
-            scans: Vec::with_capacity(n),
+            scans: Vec::new(),
         };
         build(&mut cut)?;
-        debug_assert_eq!(cut.scans.len(), n);
         Ok(cut.scans)
     }
 
     /// One scan-shaped read under its own SAL hold.
     pub(crate) async fn scan(&self, group: DirectGroup<'_>) -> Result<TrainLease, WireFault> {
-        let mut leases = self.scan_cut(1, |cut| cut.read(group)).await?;
+        let mut leases = self.scan_cut(|cut| cut.read(group)).await?;
         Ok(leases.pop().expect("one read, one lease"))
     }
 }

@@ -334,7 +334,6 @@ fn run_worker_child(
     gnitz_foundation::log::set_tag(gnitz_foundation::log::Tag::Worker(w as u32));
 
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
-    let catalog_ptr: *mut CatalogEngine = catalog;
 
     // Pinned before the recovery below allocates, so its pages land on this core's node.
     let boot = pinning
@@ -357,7 +356,7 @@ fn run_worker_child(
         let wakes = ipc.w2m_ptrs.iter().map(|&p| SalWake::new(p)).collect();
         Mesh::new(ipc.mesh, w, wakes)
     };
-    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, mesh);
+    let mut worker = WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh);
     let rc = worker.run(BOOT_READY_REQUEST_ID);
 
     unsafe {
@@ -446,7 +445,7 @@ async fn master_post_fork_recovery(
 
     // Rebuild the views the boot verdict rejected, through the driver a live
     // CREATE VIEW uses; they opened empty and the sweep above skipped them.
-    let invalid: Vec<u64> = disp.cat().dag.take_rebuild().into_iter().collect();
+    let invalid: Vec<u64> = disp.cat_mut().dag.take_rebuild().into_iter().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
@@ -500,9 +499,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     // --- Parent process ---
     let SharedIpc { sal_fd, sal, tail, w2m_ptrs, .. } = ipc;
 
-    // Pre-fork recovery has already advanced the generation, so this is the floor
-    // every base round must publish past.
-    let boot_generation = catalog.durable_generation();
     // SAFETY: every ring was initialized by `create_region` and is never unmapped.
     let wakes = w2m_ptrs.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
@@ -511,7 +507,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
-        boot_generation,
         SalWriter::new(sal, sal_fd, wakes),
         reactor,
     ));

@@ -4,8 +4,9 @@
 //! [`RelationRegistry::probe`] answers a HasPk probe.
 
 use crate::relation::{Relation, RelationKind, RelationRegistry};
+use crate::storage::Table;
 use gnitz_expr::ColumnTable;
-use gnitz_wire::{Holders, KeyRange, PkKeys, Probe, ReadBound};
+use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -22,28 +23,25 @@ impl RelationRegistry {
                 store.pk_stride()
             )),
         };
-        let (cols, holders) = match probe {
+        let (cols, cap) = match probe {
             Probe::Pk => {
-                let mut held = Batch::empty_with_schema(keys.schema());
+                let mut echo = Batch::empty_with_schema(keys.schema());
                 // An id this process has not registered holds no row.
                 if let Some(relation) = self.relation(id) {
                     keyed_as(relation.schema())?;
-                    let table = relation.table();
-                    for key in (0..keys.len()).map(|i| keys.get_pk_bytes(i)) {
-                        if table.has_pk_bytes(key) {
-                            held.push_key_row(key, 1);
-                        }
-                    }
+                    held(keys, relation.table()).for_each(|key| echo.push_key_row(key, 1));
                 }
-                return Ok(held);
+                return Ok(echo);
             }
             Probe::PkColumn(col) => {
                 let relation = self.relation_or_err(id)?;
                 keyed_as(relation.schema())?;
-                let keys = PkKeys::from_sorted(stride, keys.pk_data().to_vec());
-                return relation.gather(keys, crate::relation::Cut::Now).project_live(&[col]);
+                let mut live = Vec::with_capacity(keys.pk_data().len());
+                held(keys, relation.table()).for_each(|key| live.extend_from_slice(key));
+                let live = PkKeys::from_sorted(stride, live);
+                return relation.gather(live, crate::relation::Cut::Now).project_live(&[col]);
             }
-            Probe::Index(cols, holders) => (cols, holders),
+            Probe::Index(cols, cap) => (cols, cap),
         };
         let index = self
             .relation(id)
@@ -51,20 +49,16 @@ impl RelationRegistry {
             .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), id))?;
         keyed_as(index.schema())?;
         let span = index.key_spec().key_size();
-        let mut cursor = index.cursor();
-        let mut entries = Batch::empty_with_schema(keys.schema());
-        for key in (0..keys.len()).map(|i| keys.get_pk_bytes(i)) {
-            match holders {
-                Holders::UpTo(cap) => {
-                    cursor.for_each_positive_with_prefix_capped(&key[..span], cap.get() as usize, |c| {
-                        entries.push_key_row(c.current_pk_bytes(), 1)
-                    })
-                }
-                _ if !cursor.seek_first_positive_with_prefix(&key[..span]) => {}
-                Holders::First => entries.push_key_row(cursor.current_pk_bytes(), 1),
-                Holders::Echo => entries.push_key_row(key, 1),
-            }
+        let mut spans = Vec::with_capacity(keys.len() * span);
+        for i in 0..keys.len() {
+            spans.extend_from_slice(&keys.get_pk_bytes(i)[..span]);
         }
+        let spans = PkKeys::checked(span, spans).map_err(|e| format!("probe: index {e} (table {id})"))?;
+        let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
+        let mut entries = Batch::empty_with_schema(keys.schema());
+        index
+            .gather(spans)
+            .for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));
         Ok(entries)
     }
 
@@ -96,6 +90,13 @@ impl RelationRegistry {
         };
         Ok((cursor, ReadBound::None))
     }
+}
+
+/// The keys of `keys` a live row of `table` carries.
+fn held<'a>(keys: &'a Batch, table: &'a Table) -> impl Iterator<Item = &'a [u8]> {
+    (0..keys.len())
+        .map(|i| keys.get_pk_bytes(i))
+        .filter(|key| table.has_pk_bytes(key))
 }
 
 /// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.

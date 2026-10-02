@@ -380,6 +380,27 @@ fn a_key_prefix_round_trips() {
     }
 }
 
+/// Rows keyed by their leading key bytes keep their weights, and two that
+/// differed only past the cut both remain.
+#[test]
+fn keyed_by_prefix_cuts_each_key_to_the_output_stride() {
+    let wide = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
+    let narrow = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
+    let rows = [(1u64, 5u64, 1i64), (1, 9, -2), (3, 0, 4)];
+    let mut b = Batch::empty_with_schema(&wide);
+    for &(a, c, w) in &rows {
+        b.push_key_row(&[a.to_be_bytes(), c.to_be_bytes()].concat(), w);
+    }
+
+    let out = b.keyed_by_prefix(&narrow);
+    assert!(!out.consolidated);
+    let got: Vec<_> = (0..out.count)
+        .map(|i| (out.get_pk_bytes(i).to_vec(), out.get_weight(i)))
+        .collect();
+    let want: Vec<_> = rows.iter().map(|&(a, _, w)| (a.to_be_bytes().to_vec(), w)).collect();
+    assert_eq!(got, want);
+}
+
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else
 /// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴.
 #[test]

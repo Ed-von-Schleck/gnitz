@@ -5,10 +5,8 @@ use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
 
-/// The filter never proves a present span absent. The cap is tested before the
-/// insert, so a repeat span still fits at exactly `cap`; the first distinct span
-/// past it drops the whole set rather than truncating it, since a partial set
-/// would prove a present span absent.
+/// A filter proves absence until it caps: a repeat span costs no capacity, and
+/// the first distinct span past the cap drops the whole set.
 #[test]
 fn filter_proves_absence_only_until_it_caps() {
     let mut f = UniqueFilter { cap: 3, ..UniqueFilter::new() };
@@ -17,19 +15,11 @@ fn filter_proves_absence_only_until_it_caps() {
         assert!(f.insert(&span(k)));
     }
     assert!(f.insert(&span(2)), "a repeat span costs no capacity");
-    assert!(
-        !f.proves_all_absent([&span(9)[..]].into_iter()),
-        "a cold filter proves nothing"
-    );
-    f.mark_warm();
-    assert!(!f.proves_all_absent([&span(9)[..], &span(1)[..]].into_iter()));
-    assert!(f.proves_all_absent([&span(4)[..], &span(5)[..]].into_iter()));
+    assert!(f.may_contain(&span(1)));
+    assert!(!f.may_contain(&span(4)));
 
     assert!(!f.insert(&span(4)), "the first distinct span past the cap");
-    assert!(
-        !f.proves_all_absent([&span(5)[..]].into_iter()),
-        "a capped filter proves nothing"
-    );
+    assert!(f.may_contain(&span(5)), "a capped filter proves nothing");
     assert!(!f.insert(&span(1)), "and records nothing more");
 }
 
@@ -50,21 +40,20 @@ fn extract_into_filter_takes_only_live_non_null_spans() {
         let spec = KeySpec::new(&[col], &schema).unwrap();
         let mut f = UniqueFilter::new();
         extract_into_filter(&mut f, &batch.as_mem_batch(), &spec);
-        f.mark_warm();
-        let proves_absent = |v: u128| f.proves_all_absent([spec.seek_prefix(&[v]).pk_bytes()].into_iter());
+        let held = |v: u128| f.may_contain(spec.seek_prefix(&[v]).pk_bytes());
         for &v in present {
-            assert!(!proves_absent(v), "column {col}: {v} is present");
+            assert!(held(v), "column {col}: {v} is present");
         }
         for &v in absent {
-            assert!(proves_absent(v), "column {col}: {v} is absent");
+            assert!(!held(v), "column {col}: {v} is absent");
         }
     }
 }
 
-/// A published seed proves absence at once, with no warm-up scan, and only for
-/// its own `(table, columns)`, until its index or its table drops it.
+/// A published seed drops the spans it proves absent, only for its own
+/// `(table, columns)`, until it caps or its index or its table drops it.
 #[test]
-fn a_seed_is_published_warm_under_its_own_index() {
+fn a_seed_drops_absent_spans_under_its_own_index() {
     let (disp, _) = test_dispatcher(Vec::new(), std::ptr::null_mut());
     let (a, ab) = (PkColList::from_slice(&[0]), PkColList::from_slice(&[0, 1]));
     let mut seed = UniqueFilter::new();
@@ -72,14 +61,24 @@ fn a_seed_is_published_warm_under_its_own_index() {
     disp.unique_filter_seed(7, a, seed);
     disp.unique_filter_seed(7, ab, UniqueFilter::new());
     disp.unique_filter_seed(8, a, UniqueFilter::new());
-    let absent = |tid, cols, k: u64| disp.unique_filter_all_absent(tid, cols, [&k.to_be_bytes()[..]].into_iter());
+    // Of spans 1 and 5, the ones the filter keeps.
+    let kept = |tid, cols| {
+        let spans = [1u64.to_be_bytes(), 5u64.to_be_bytes()];
+        let mut order = vec![0, 1];
+        disp.unique_filter_retain_possible(tid, cols, &mut order, |i| &spans[i as usize]);
+        order
+    };
 
-    assert!(absent(7, a, 5));
-    assert!(!absent(7, a, 1), "a seeded span");
+    assert_eq!(kept(7, a), [0], "the seeded span alone");
     disp.unique_filter_remove(7, a);
-    assert!(!absent(7, a, 5), "a removed filter proves nothing");
-    assert!(absent(7, ab, 5), "the composite index keeps its own");
+    assert_eq!(kept(7, a), [0, 1], "a removed filter proves nothing");
+    assert_eq!(kept(7, ab), [], "the composite index keeps its own");
     disp.unique_filter_invalidate_table(7);
-    assert!(!absent(7, ab, 5));
-    assert!(absent(8, a, 5), "another table's filter survives");
+    assert_eq!(kept(7, ab), [0, 1]);
+    assert_eq!(kept(8, a), [], "another table's filter survives");
+
+    let mut capped = UniqueFilter { cap: 0, ..UniqueFilter::new() };
+    assert!(!capped.insert(&9u64.to_be_bytes()));
+    disp.unique_filter_seed(8, a, capped);
+    assert_eq!(kept(8, a), [0, 1], "a capped filter proves nothing");
 }

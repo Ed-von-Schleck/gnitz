@@ -38,7 +38,7 @@ impl PendingScan {
     }
 }
 
-impl WorkerProcess {
+impl WorkerProcess<'_> {
     // ── W2M response helpers ───────────────────────────────────────────
 
     pub(super) fn send_ack(&self, request_id: u32) {
@@ -114,24 +114,19 @@ fn send_train_frame(
     Ok(end)
 }
 
-/// Send `keys` to the master as one train over `frame_schema`, a span per row's
-/// PK region, `chunk_rows` spans in RAM at a time.
-pub(crate) fn send_unique_preflight_keys(
+/// Send one train of key spans over `frame_schema`, a span per row's PK region.
+/// `next_chunk` refills the chunk and answers whether it was the last.
+pub(crate) fn send_span_train(
     w2m_writer: &W2mWriter,
-    target_id: u64,
+    route: ReplyRoute,
     frame_schema: &SchemaDescriptor,
-    request_id: u32,
     budget: usize,
-    chunk_rows: usize,
-    keys: &mut gnitz_zset::repr::KeyProducer,
+    mut next_chunk: impl FnMut(&mut Batch) -> bool,
 ) {
-    let route = ReplyRoute { target_id, request_id, fifo: false };
-    let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(chunk_rows));
+    let mut chunk = Batch::empty_with_schema(frame_schema);
     loop {
-        keys.fill(&mut chunk, chunk_rows);
-        let drained = keys.remaining() == 0;
-        // Every chunk sends at least one frame, so an empty key set still ends
-        // its train.
+        let drained = next_chunk(&mut chunk);
+        // Every chunk sends at least one frame, so an empty one still ends the train.
         let mut start = 0;
         loop {
             start =
@@ -141,7 +136,7 @@ pub(crate) fn send_unique_preflight_keys(
             }
         }
         if drained {
-            break;
+            return;
         }
     }
 }

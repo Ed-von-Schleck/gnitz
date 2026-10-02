@@ -70,15 +70,51 @@ fn check_batch_build_bench() {
 }
 
 #[test]
-fn rows_of_names_every_row_a_key_prefixes() {
+fn row_of_names_the_row_a_key_prefixes() {
     let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let key = |a: u64, b: u64| opk_pk(&schema, &[a as u128, b as u128]);
-    let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
-    let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..]));
-    let check = PipelinedCheck::new(1, Probe::Pk, batch);
-    assert_eq!(check.rows_of(&key(3, 1)), 1..3, "a duplicate key");
-    assert_eq!(check.rows_of(&key(3, 2)), 3..3, "an absent key");
-    assert_eq!(check.rows_of(&key(9, 0)), 5..5, "an absent key past the last row");
-    assert_eq!(check.rows_of(&3u64.to_be_bytes()), 1..4, "a span prefix");
-    assert_eq!(check.rows_of(&0u64.to_be_bytes()), 0..0, "a span below every row");
+    let rows = [key(1, 0), key(3, 1), key(5, 9), key(7, 0)];
+    let keys = build_check_batch_pk_bytes(&schema, rows.iter().map(|k| &k[..]));
+    assert_eq!(row_of(&keys, &key(3, 1)), Some(1), "a present key");
+    assert_eq!(row_of(&keys, &key(3, 2)), None, "an absent key");
+    assert_eq!(row_of(&keys, &key(9, 0)), None, "an absent key past the last row");
+    assert_eq!(row_of(&keys, &5u64.to_be_bytes()), Some(2), "a span prefix");
+    assert_eq!(row_of(&keys, &0u64.to_be_bytes()), None, "a span below every row");
+}
+
+/// A write to a parent referenced through its lone PK column probes nothing
+/// unless it deletes: an upsert resolves with no worker answering, and a
+/// retraction waits on the child-index probe of the key it removes.
+#[test]
+fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
+    use super::super::fixtures::test_dispatcher;
+    use crate::runtime::test_support::try_poll_once;
+    use crate::test_support::{col_def, fk_def, make_batch_raw};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let cols = [col_def("pid", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let parent = engine.create_table("public.parent", &cols, &[0]).unwrap();
+    let cols = [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)];
+    engine.create_table("public.child", &cols, &[0]).unwrap();
+    let schema = engine.registry.relation(parent).unwrap().schema();
+    let (disp, _) = test_dispatcher(vec![0], &mut engine);
+
+    let write = |rows: &[(u64, i64, i64)]| {
+        [TxnFamily {
+            tid: parent,
+            mode: WireConflictMode::Update,
+            batch: make_batch_raw(&schema, rows),
+        }]
+    };
+    let upsert = write(&[(1, 1, 10), (2, 1, 20)]);
+    assert!(matches!(
+        try_poll_once(disp.validate_txn_distributed(&upsert)),
+        Some(Ok(()))
+    ));
+    let retraction = write(&[(1, -1, 10)]);
+    assert!(try_poll_once(disp.validate_txn_distributed(&retraction)).is_none());
+
+    drop(disp);
+    engine.close();
 }

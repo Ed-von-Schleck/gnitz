@@ -186,7 +186,7 @@ fn reply_rows(reply: &Batch) -> Vec<(Vec<u8>, i64)> {
 }
 
 /// A column probe answers each named key's live row at weight 1 with that
-/// column, and nothing for a key with no row.
+/// column, and nothing for a key with no row — one retracted, one never held.
 #[test]
 fn a_column_probe_answers_each_live_key_with_its_column() {
     let mut r = fixture(|id| id as i64 * 10);
@@ -212,39 +212,79 @@ fn a_pk_probe_echoes_the_keys_a_live_row_carries() {
     assert!(r.probe(999_999, Probe::Pk, &keys).unwrap().is_empty());
 }
 
-/// Each answer an index probe gives, over one span two rows hold and one none
-/// does.
+/// The index of [`fixture`], with what builds a stored entry and a probe key
+/// of it.
+struct ValIndex {
+    spec: gnitz_zset::schema::KeySpec,
+    schema: SchemaDescriptor,
+}
+
+impl ValIndex {
+    fn of(r: &RelationFixture) -> Self {
+        let ix = r.relation(TID).unwrap().index_on(&[1]).unwrap();
+        ValIndex { spec: ix.key_spec(), schema: ix.schema() }
+    }
+
+    /// The entry row `id` stores under `val`.
+    fn entry(&self, id: u64, val: i64) -> Vec<u8> {
+        let rows = make_batch_raw(&make_schema_u64_i64(), &[(id, 1, val)]);
+        let entries = gnitz_zset::algebra::index_entries(&rows, &self.spec, &self.schema);
+        entries.get_pk_bytes(0).to_vec()
+    }
+
+    /// The probe keys of `vals`, each span over a holder no row has.
+    fn keys(&self, vals: &[i64]) -> Batch {
+        let mut keys = Batch::empty_with_schema(&self.schema);
+        for &val in vals {
+            let mut key = self.entry(0, val);
+            key[self.spec.key_size()..].fill(0xAB);
+            keys.push_key_row(&key, 1);
+        }
+        keys
+    }
+}
+
+fn cap(n: u64) -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(n).unwrap()
+}
+
+/// An index probe answers a held span with its stored entries, up to the cap,
+/// and a span no row holds with nothing.
 #[test]
 fn an_index_probe_answers_a_held_span_with_its_holders() {
     // Ids 2k and 2k + 1 share `val = 10k`.
     let r = fixture(|id| (id / 2) as i64 * 10);
-    let schema = make_schema_u64_i64();
     let cols = PkColList::from_slice(&[1]);
-    let ix = r.relation(TID).unwrap().index_on(&[1]).unwrap();
-    let (ix_schema, span) = (ix.schema(), ix.key_spec().key_size());
-    let entry = |id: u64, val: i64| {
-        let rows = make_batch_raw(&schema, &[(id, 1, val)]);
-        let entries = gnitz_zset::algebra::index_entries(&rows, &ix.key_spec(), &ix_schema);
-        entries.get_pk_bytes(0).to_vec()
-    };
-    let probe_key = |val: i64| {
-        let mut key = entry(0, val);
-        key[span..].fill(0xAB);
-        key
-    };
-    let (held, absent) = (probe_key(20), probe_key(25));
-    let mut keys = Batch::empty_with_schema(&ix_schema);
-    for key in [&held, &absent] {
-        keys.push_key_row(key, 1);
-    }
-    let probe = |holders| reply_rows(&r.probe(TID, Probe::Index(cols, holders), &keys).unwrap());
-    let up_to = |cap| Holders::UpTo(std::num::NonZeroU64::new(cap).unwrap());
-    let (first, second) = (entry(4, 20), entry(5, 20));
+    let ix = ValIndex::of(&r);
+    let keys = ix.keys(&[20, 25]);
+    let probe = |n| reply_rows(&r.probe(TID, Probe::Index(cols, cap(n)), &keys).unwrap());
+    let (first, second) = (ix.entry(4, 20), ix.entry(5, 20));
 
-    assert_eq!(probe(Holders::Echo), [(held, 1)]);
-    assert_eq!(probe(Holders::First), [(first.clone(), 1)]);
-    assert_eq!(probe(up_to(1)), [(first.clone(), 1)]);
-    assert_eq!(probe(up_to(8)), [(first, 1), (second, 1)]);
+    assert_eq!(probe(1), [(first.clone(), 1)]);
+    assert_eq!(probe(2), [(first.clone(), 1), (second.clone(), 1)]);
+    assert_eq!(probe(8), [(first, 1), (second, 1)]);
+}
+
+/// An index probe's one cursor answers each key as a seek of its own does: a
+/// run of misses ahead of a hit, a hit ahead of its neighbour, and a miss past
+/// the last entry. Keys that do not strictly ascend are refused.
+#[test]
+fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
+    // Ids 2k and 2k + 1 share `val = 10k`.
+    let r = fixture(|id| (id / 2) as i64 * 10);
+    let cols = PkColList::from_slice(&[1]);
+    let ix = ValIndex::of(&r);
+    let vals = [-5, 1, 2, 3, 10, 20, 21, 30, 5000];
+    for n in [1, 2, 8] {
+        let probe = |vals: &[i64]| r.probe(TID, Probe::Index(cols, cap(n)), &ix.keys(vals));
+        let alone: Vec<_> = vals.iter().flat_map(|&v| reply_rows(&probe(&[v]).unwrap())).collect();
+        assert_eq!(reply_rows(&probe(&vals).unwrap()), alone, "cap {n}");
+        assert_eq!(alone.len(), 3 * (n as usize).min(2), "cap {n}: three held values");
+    }
+    for vals in [&[10, 10][..], &[20, 10]] {
+        let got = r.probe(TID, Probe::Index(cols, cap(1)), &ix.keys(vals));
+        assert!(got.is_err(), "{vals:?}");
+    }
 }
 
 /// A probe is refused when no index is on its column list, and when its keys are
@@ -252,7 +292,7 @@ fn an_index_probe_answers_a_held_span_with_its_holders() {
 #[test]
 fn a_probe_refuses_a_missing_index_and_a_foreign_key_stride() {
     let r = fixture(|id| id as i64);
-    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), Holders::Echo);
+    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), cap(1));
     let pk_keys = pk_probe(&[2]);
     for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1])), (TID, index(&[1]))] {
         assert!(r.probe(id, probe, &pk_keys).is_err(), "{id} {probe:?}");

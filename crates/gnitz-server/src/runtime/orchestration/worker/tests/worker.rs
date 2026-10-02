@@ -15,7 +15,7 @@ use gnitz_wire::control::{peek_control_block, DecodedControl};
 /// so a new field cannot be missed here, with the receiver that reads its ring. The budget is pinned rather than read from the environment,
 /// so a shell that exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these
 /// frames.
-fn test_worker(catalog: *mut CatalogEngine) -> (WorkerProcess, TestLog, W2mReceiver) {
+fn test_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
     let ring = w2m::fixtures::test_ring(1 << 22);
     let sal = TestLog::with_rings(1 << 20, vec![ring], 1);
     let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
@@ -123,6 +123,7 @@ fn in_wait_dispositions() {
     let groups = [
         (SalMessageKind::ScanSpec, 76),
         (SalMessageKind::DeltaRead, 77),
+        (SalMessageKind::KeySpans, 78),
         (SalMessageKind::HasPk, 7),
         (SalMessageKind::Push, 7),
         (SalMessageKind::DdlSync, seq),
@@ -149,7 +150,11 @@ fn in_wait_dispositions() {
     let parked: Vec<_> = wp.deferred.iter().map(|r| (r.kind, r.route.target_id)).collect();
     assert_eq!(
         parked,
-        [(SalMessageKind::ScanSpec, 76), (SalMessageKind::DeltaRead, 77)]
+        [
+            (SalMessageKind::ScanSpec, 76),
+            (SalMessageKind::DeltaRead, 77),
+            (SalMessageKind::KeySpans, 78)
+        ]
     );
     let out = frames(&rx);
     let statuses: Vec<_> = out.iter().map(|f| f.ctrl.hdr.status).collect();
@@ -187,8 +192,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     }
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    // The first round in `arg0`, the tids in the blob, as `write_tick_group`
-    // lays them out.
+    // A Tick group: the first round in `arg0`, the tids in the blob.
     let tids: Vec<u8> = [500u64, 501].iter().flat_map(|t| t.to_le_bytes()).collect();
     sal.excl()
         .write(&DirectGroup {
@@ -203,7 +207,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     wp.drain_sal();
 
     for tid in [500, 501] {
-        assert!(wp.cat().registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
+        assert!(wp.catalog.registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
     }
     let out = frames(&rx);
     assert_eq!(out.len(), 1, "the group ACKs once");
@@ -245,7 +249,9 @@ fn reply_trains_drain_fifo_and_reassemble_exactly() {
         (66, &empty, fixed),
     ];
 
-    let (mut wp, _sal, rx) = test_worker(std::ptr::null_mut());
+    let dir = crate::test_support::scratch_dir("worker", "reply_trains");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = budget;
     wp.send_reply(route(1, 11), a.clone());
     wp.send_reply(route(2, 22), b.clone());
@@ -340,7 +346,9 @@ fn fifo_emits_a_fitting_reply_over_the_source_batch() {
         "the fixture must have dead heap bytes for the size test to discriminate"
     );
 
-    let (mut wp, _sal, rx) = test_worker(std::ptr::null_mut());
+    let dir = crate::test_support::scratch_dir("worker", "fifo_reply");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.send_reply(fifo_route(1, 5), Rc::clone(&batch));
     drain_trains(&mut wp);
     let out = frames(&rx);
@@ -365,7 +373,9 @@ fn a_row_wider_than_the_frame_cap_faults_its_train_alone() {
     );
     let next = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
 
-    let (mut wp, _sal, rx) = test_worker(std::ptr::null_mut());
+    let dir = crate::test_support::scratch_dir("worker", "oversized_row");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.send_reply(route(1, 5), batch);
     wp.send_reply(fifo_route(2, 6), next);
     drain_trains(&mut wp);

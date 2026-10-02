@@ -21,6 +21,8 @@ mod scan_spec;
 mod store_io;
 
 #[cfg(test)]
+mod bench_index_probe;
+#[cfg(test)]
 mod bench_scan_spec;
 
 use crate::relation::RelationRegistry;
