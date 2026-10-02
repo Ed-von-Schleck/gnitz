@@ -1,13 +1,4 @@
 //! `RunSet` — a set of in-heap sorted runs with a PK bloom and a fold trigger.
-//!
-//! Both RAM tiers of a [`Table`](super::table::Table) are this: the memtable
-//! accepts ingest batches and folds them into one run past its byte budget; the
-//! RAM tier accepts those folded runs and spills to a shard past its ceiling.
-//! The two are separate sets, not one, because the memtable's small budget is
-//! what keeps the RAM tier's big fold off the per-push path: the memtable
-//! absorbs many pushes per drain, so the tier below it folds its whole
-//! window far less often than a single set folding every [`FOLD_THRESHOLD`]
-//! pushes would.
 
 use std::cell::OnceCell;
 use std::rc::Rc;
@@ -32,35 +23,8 @@ fn pk_max(run: &Batch) -> &[u8] {
     run.get_pk_bytes(run.len() - 1)
 }
 
-/// A batch as a [`RunSet`] holds it: [`Batch::trimmed`], since the set charges
-/// only its rows' bytes.
-#[derive(Clone)]
-pub(super) struct TrimmedRun(Rc<Batch>);
-
-impl TrimmedRun {
-    pub(super) fn new(batch: Batch) -> Self {
-        TrimmedRun(Rc::new(batch.trimmed()))
-    }
-
-    /// The run itself, shared.
-    pub(super) fn rc(&self) -> Rc<Batch> {
-        Rc::clone(&self.0)
-    }
-
-    /// The run's rows, copied only while a set still holds the run.
-    pub(super) fn into_batch(self) -> Batch {
-        Rc::try_unwrap(self.0).unwrap_or_else(|rc| Batch::clone(&rc))
-    }
-}
-
-impl std::ops::Deref for TrimmedRun {
-    type Target = Batch;
-    fn deref(&self) -> &Batch {
-        &self.0
-    }
-}
-
 pub(super) struct RunSet {
+    /// Each [`Batch::trimmed`], since the set charges only its rows' bytes.
     runs: Vec<Rc<Batch>>,
     /// PK bloom over every key pushed since it was built — a superset of the
     /// live runs' keys — built on the first probe.
@@ -73,7 +37,7 @@ pub(super) struct RunSet {
 }
 
 impl RunSet {
-    pub(crate) fn new(budget: usize) -> Self {
+    pub(super) fn new(budget: usize) -> Self {
         RunSet {
             runs: Vec::with_capacity(FOLD_THRESHOLD),
             bloom: OnceCell::new(),
@@ -84,8 +48,13 @@ impl RunSet {
 
     /// Append a consolidated run, folding the set when it gets crowded. Empty
     /// runs are never stored.
-    pub(crate) fn push(&mut self, TrimmedRun(run): TrimmedRun, schema: &SchemaDescriptor) {
+    pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
         debug_assert!(run.consolidated_verified(), "RunSet::push requires a consolidated run",);
+        self.push_run(Rc::new(run.trimmed()), schema);
+    }
+
+    /// [`Self::push`] for a run another set held.
+    fn push_run(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
         if run.is_empty() {
             return;
         }
@@ -155,7 +124,7 @@ impl RunSet {
                     widened.consolidated_verified(),
                     "widen_runs: the widened run must still be consolidated",
                 );
-                *run = TrimmedRun::new(widened).0;
+                *run = Rc::new(widened.trimmed());
             }
             bytes += run.total_bytes();
         }
@@ -191,7 +160,7 @@ impl RunSet {
         }
         self.bytes = 0;
         if !merged.is_empty() {
-            let run = TrimmedRun::new(merged).0;
+            let run = Rc::new(merged.trimmed());
             self.bytes = run.total_bytes();
             self.runs.push(run);
         }
@@ -199,24 +168,36 @@ impl RunSet {
 
     /// Every run folded N-way into one consolidated batch.
     fn consolidate_all(&self, schema: &SchemaDescriptor) -> Batch {
-        // Runs that each end below where the next begins share no row and hold
-        // none out of order across them: as they stand they are the merge,
-        // copied whole. An ascending load folds this way.
-        if self.runs.windows(2).all(|w| pk_max(&w[0]) < pk_min(&w[1])) {
-            let mut out = Batch::concat(schema, self.runs.iter().map(|r| r.as_mem_batch()));
-            out.certify_consolidated();
-            return out;
-        }
         let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
         merge_consolidated(&views, schema)
     }
 
-    /// Fold to a single run and return it, **retained** — a consumer whose write
-    /// fails leaves the data intact for retry, and clears the set itself once the
-    /// run is safely elsewhere. `None` when the set is empty or fully cancelled.
-    pub(super) fn fold_to_single(&mut self, schema: &SchemaDescriptor) -> Option<TrimmedRun> {
+    /// Fold to a single run and hand it to `write`, emptying the set once that
+    /// succeeds. `Ok(false)` when the set held no row to write.
+    pub(super) fn spill<E>(
+        &mut self,
+        schema: &SchemaDescriptor,
+        write: impl FnOnce(&Batch) -> Result<(), E>,
+    ) -> Result<bool, E> {
         self.fold(schema);
-        self.runs.first().map(|run| TrimmedRun(Rc::clone(run)))
+        let Some(run) = self.runs.first() else {
+            return Ok(false);
+        };
+        write(run)?;
+        self.clear();
+        Ok(true)
+    }
+
+    /// Fold to a single run, move it into `dst` and answer it; this set is left
+    /// empty. `None` when the set is empty or fully cancelled.
+    pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+        self.fold(schema);
+        let run = self.runs.pop();
+        self.clear();
+        if let Some(run) = &run {
+            dst.push_run(Rc::clone(run), schema);
+        }
+        run
     }
 
     /// Bloom probe for a PK by its [`probe_key`]. The first probe builds the

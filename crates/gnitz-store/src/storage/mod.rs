@@ -1,20 +1,6 @@
-//! The storage LSM — the on-disk lifecycle of one store: the in-memory shard
-//! index + compaction trigger (`shard_index`), the RAM-tier run sets
-//! (`run_set`), the RAM tier's PK-probe filter (`bloom`), the manifest serde, the
-//! store directory's file names and the primitives over them (`manifest`), and
-//! the `Table` facade.
-//!
-//! The batch, the shard image, the run, the read cursor that merges runs and the
-//! guard-routed merge a compaction drives are `gnitz_zset::repr`'s; what lives
-//! here is their lifecycle — which runs a store holds, when they flush, compact
-//! and publish a manifest.
-//!
-//! Nothing here is published: `relation` and `read` reach the `pub(crate) use`s
-//! below, and other crates reach a store through `relation`.
-//!
-//! Tests no single module owns live in `suites/`, a declared `mod suites;` child
-//! of this module: they reach this subsystem's surface, not any one module's
-//! private items.
+//! The storage LSM — the lifecycle of one store: which runs it holds, and when
+//! they flush, compact and publish a manifest. The runs themselves, and the
+//! cursor and merges over them, are `gnitz_zset::repr`'s.
 
 mod batch_fsync;
 mod bloom;

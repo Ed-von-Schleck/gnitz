@@ -502,11 +502,28 @@ pub(crate) fn run_merge<S: ColumnarSource>(
 
 /// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
 pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
-    run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
-    let mut out = super::scatter::materialize_carrying(sources, schema, &rows);
+    let held = sources.iter().filter(|s| s.count > 0);
+    let ascending = held
+        .clone()
+        .zip(held.skip(1))
+        .all(|(a, b)| a.get_pk_bytes(a.count - 1) < b.get_pk_bytes(0));
+    let mut out = match ascending {
+        // Sources that each end below the PK the next begins at share no row
+        // and hold none out of order across them: in order, they are the merge.
+        true => Batch::concat(schema, sources.iter().cloned()),
+        false => merge_rows(sources, schema),
+    };
     out.certify_consolidated();
     out
+}
+
+/// The N-way fold of `sources`, each sorted by (PK, payload). Out of line, so
+/// the loop compiles as it does without [`merge_consolidated`]'s test ahead of it.
+#[inline(never)]
+fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
+    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
+    run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
+    super::scatter::materialize_carrying(sources, schema, &rows)
 }
 
 /// A `RowSource` that also carries the Z-set weight: a storage row the N-way

@@ -440,8 +440,8 @@ impl ShardIndex {
         }
         idx.shard_seq = idx.all_entries().map(|e| e.seq).max().unwrap_or(0);
         idx.published_through = idx.shard_seq;
-        let live: HashSet<String> = idx.all_entries().map(|e| manifest::shard_name(e.seq)).collect();
-        manifest::remove_stale_files(output_dir, &live)?;
+        let live: HashSet<u64> = idx.all_entries().map(|e| e.seq).collect();
+        manifest::remove_stale_files(output_dir, |seq| live.contains(&seq))?;
         Ok(idx)
     }
 

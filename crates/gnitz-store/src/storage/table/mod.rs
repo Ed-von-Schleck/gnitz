@@ -15,7 +15,7 @@ use gnitz_foundation::posix_io::create_dir;
 use gnitz_wire::PkKeys;
 
 use super::manifest::Manifest;
-use super::run_set::{RunSet, TrimmedRun};
+use super::run_set::RunSet;
 use super::shard_index::{ShardBudget, ShardIndex};
 use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::Batch;
@@ -119,10 +119,11 @@ pub(crate) struct Table {
     /// The disk tier, and the one owner of this store's schema and directory.
     shard_index: ShardIndex,
 
-    recovery_source: RecoverySource,
+    /// Whether this store is rebuilt from its sources at open.
+    rederived: bool,
 
-    /// The checkpoint mark of the manifest this open loaded; 0 without one.
-    checkpoint_mark: u64,
+    /// The checkpoint mark of the manifest this open loaded.
+    loaded_mark: Option<u64>,
 
     /// What the next publish writes as the manifest's caller record.
     caller_record: Vec<u8>,
@@ -182,13 +183,8 @@ impl Table {
             // So a later re-open cannot reload what this one rejected.
             super::manifest::unlink(dir)?;
         }
-        let recovery_source = match recovery_source {
-            RecoverySource::Rederive { resume_at } => RecoverySource::Rederive {
-                resume_at: resume_at.filter(|_| loaded.is_some()),
-            },
-            s => s,
-        };
-        let Manifest { checkpoint_mark, caller_record, shards } = loaded.unwrap_or_default();
+        let loaded_mark = loaded.as_ref().map(|m| m.checkpoint_mark);
+        let Manifest { caller_record, shards, .. } = loaded.unwrap_or_default();
         // Only a `SalReplay` store is point-probed by PK.
         let skip_pk_filter = rederived;
         Ok(Table {
@@ -197,8 +193,8 @@ impl Table {
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
             shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, &shards)?,
-            recovery_source,
-            checkpoint_mark,
+            rederived,
+            loaded_mark,
             caller_record,
             held_in_ram: false,
             live_row_scratch: Cell::new(Vec::new()),
@@ -226,17 +222,20 @@ impl Table {
 
     /// True when this store is rebuilt from its sources at open.
     pub(crate) fn is_rederived(&self) -> bool {
-        matches!(self.recovery_source, RecoverySource::Rederive { .. })
+        self.rederived
     }
 
     /// The policy this open's on-disk state was accepted under.
     pub(crate) fn recovery_source(&self) -> RecoverySource {
-        self.recovery_source
+        match self.rederived {
+            true => RecoverySource::Rederive { resume_at: self.loaded_mark },
+            false => RecoverySource::SalReplay,
+        }
     }
 
     /// Whether this open reloaded checkpointed state rather than starting empty.
     pub(crate) fn resumed_from_checkpoint(&self) -> bool {
-        matches!(self.recovery_source, RecoverySource::Rederive { resume_at: Some(_) })
+        self.rederived && self.loaded_mark.is_some()
     }
 
     /// See [`ShardIndex::append_terminal_run`].
@@ -293,7 +292,7 @@ impl Table {
             return Ok(());
         }
         self.cached_full_scan.set(None);
-        self.memtable.push(TrimmedRun::new(batch), &self.shard_index.schema);
+        self.memtable.push(batch, &self.shard_index.schema);
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -318,7 +317,7 @@ impl Table {
             return;
         }
         self.cached_full_scan.set(None);
-        self.pending.push(TrimmedRun::new(batch), &self.shard_index.schema);
+        self.pending.push(batch, &self.shard_index.schema);
     }
 
     /// Whether any row sits above the cut.
@@ -331,38 +330,43 @@ impl Table {
     /// a [`Cut::Now`] reader sees does not move.
     pub(crate) fn seal(&mut self) -> Result<Option<Batch>, StorageError> {
         let schema = self.shard_index.schema;
-        let run = self.pending.fold_to_single(&schema);
-        self.pending.clear();
-        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
-        // A flush since the last seal left part of the delta in shards.
-        let merged = (!shards.is_empty()).then(|| {
-            let cap = shards.len() + 1;
-            let mem = run.iter().map(|r| Run::Mem(r.rc()));
-            from_runs(mem.chain(shards), schema, cap).materialize()
-        });
-        if let Some(run) = &run {
-            self.memtable.push(run.clone(), &schema);
+        let run = self.pending.drain_into(&mut self.memtable, &schema);
+        if run.is_some() {
             // Left as a run of its own, each seal's delta would lengthen every PK
             // probe until the memtable next folded.
             self.memtable.fold(&schema);
         }
+        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
+        let delta = match shards.is_empty() {
+            true => run,
+            // A flush since the last seal left part of the delta in shards.
+            false => {
+                let cap = shards.len() + 1;
+                let mem = run.into_iter().map(Run::Mem);
+                Some(from_runs(mem.chain(shards), schema, cap).materialize())
+            }
+        };
         let entered = self.shard_index.seal_pending();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
-        } else if entered {
-            self.shard_index.maintain()?;
         }
-        let delta = match (merged, run) {
-            (Some(merged), _) => Rc::try_unwrap(merged).unwrap_or_else(|rc| Batch::clone(&rc)),
-            (None, Some(run)) => run.into_batch(),
-            (None, None) => return Ok(None),
-        };
-        Ok((!delta.is_empty()).then_some(delta))
+        if entered {
+            self.upkeep()?;
+        }
+        // Copied only while the memtable still holds the run.
+        Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
+    }
+
+    /// The disk tier's upkeep once a shard entered L0.
+    fn upkeep(&mut self) -> Result<(), StorageError> {
+        // The sweep in `maintain` can dehydrate or drop live rows.
+        self.cached_full_scan.set(None);
+        self.shard_index.maintain()
     }
 
     /// The checkpoint mark of the manifest this open loaded; 0 without one.
     pub(crate) fn checkpoint_mark(&self) -> u64 {
-        self.checkpoint_mark
+        self.loaded_mark.unwrap_or(0)
     }
 
     /// The bytes this store's next published manifest carries for its owner.
@@ -428,27 +432,18 @@ impl Table {
         let stride = self.shard_index.schema.pk_stride();
         let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes), cut);
+        let (runs, cap) = self.runs_in_range(start, end, cut);
         (runs, cap, start)
     }
 
     /// The runs that can hold a key in `[start, end]` (`None`: the top of the key
     /// space), and a capacity hint for a cursor over them.
-    fn runs_in_range<'a>(
-        &'a self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        cut: Cut,
-    ) -> (impl Iterator<Item = Run> + 'a, usize) {
+    fn runs_in_range(&self, lo: PkBuf, end: Option<PkBuf>, cut: Cut) -> (impl Iterator<Item = Run> + '_, usize) {
         let stride = self.shard_index.schema.pk_stride();
-        debug_assert_eq!(start.len(), stride, "runs_in_range: start is not pk_stride wide");
+        let hi = end.unwrap_or_else(|| PkBuf::max(stride));
         debug_assert!(
-            end.is_none_or(|e| e.len() == stride),
-            "runs_in_range: end is not pk_stride wide",
-        );
-        let (lo, hi) = (
-            PkBuf::from_bytes(start),
-            end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes),
+            lo.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
+            "runs_in_range: a bound is not pk_stride wide",
         );
         let runs = self.mem_runs(Some((lo, hi)), cut).chain(
             self.shard_index
@@ -463,8 +458,8 @@ impl Table {
         let Some((start, end)) = range else {
             return empty_cursor(self.shard_index.schema);
         };
+        let (runs, cap) = self.runs_in_range(start, end, Cut::Now);
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end, Cut::Now);
         from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
     }
 
@@ -529,7 +524,7 @@ impl Table {
             }
         };
         let fingerprint = probe_key(key);
-        for set in [&self.pending, &self.memtable, &self.ram_tier] {
+        for set in self.ram_tiers(Cut::Now) {
             set.find_pk_bytes(key, fingerprint, |batch, start| {
                 visit(Run::Mem(Rc::clone(batch)), start)
             });

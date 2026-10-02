@@ -2,13 +2,13 @@
 //! primitives over them. A store owns its directory, so every shard and staging
 //! file in it is the store's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 
 use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::MAX_PK_BYTES;
-use gnitz_wire::{decode_all, Reader, Writer};
+use gnitz_wire::{Reader, Writer};
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::schema::key::PkBuf;
 
@@ -18,9 +18,6 @@ const VERSION: u64 = 17;
 const MANIFEST_FILE: &str = "manifest.bin";
 /// The one file a manifest is staged under before its rename.
 const STAGING_FILE: &str = "manifest.bin.tmp";
-
-/// Every shard basename's prefix.
-pub(super) const SHARD_PREFIX: &str = "shard_";
 
 /// What a shard index publishes and reopens from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -86,7 +83,7 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
     if gnitz_wire::checksum(covered) != u64::from_le_bytes(*digest) {
         return Err(StorageError::Corrupt("manifest checksum"));
     }
-    decode_all(&covered[r.pos()..], "manifest body", decode_body).map_err(|_| StorageError::Corrupt("manifest body"))
+    decode_body(&mut r).map_err(|_| StorageError::Corrupt("manifest body"))
 }
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
@@ -130,7 +127,23 @@ pub(super) fn staging_path(dir: &str) -> String {
 
 /// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
 pub(super) fn shard_name(seq: u64) -> String {
-    format!("{SHARD_PREFIX}{seq}.db")
+    format!("shard_{seq}.db")
+}
+
+/// The seq `name` denotes, or `None` unless [`shard_name`] gives that seq
+/// exactly this name.
+fn shard_seq(name: &str) -> Option<u64> {
+    let seq = name.strip_prefix("shard_")?.strip_suffix(".db")?.parse().ok()?;
+    (shard_name(seq) == name).then_some(seq)
+}
+
+/// The seq of every shard file in `dir`.
+pub(super) fn shard_seqs(dir: &str) -> io::Result<Vec<u64>> {
+    let mut seqs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        seqs.extend(entry?.file_name().to_str().and_then(shard_seq));
+    }
+    Ok(seqs)
 }
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
@@ -146,14 +159,12 @@ fn absent_ok(r: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Remove the staging file and every shard not in `keep` from `dir`.
-pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<String>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name == STAGING_FILE || (name.starts_with(SHARD_PREFIX) && !keep.contains(name)) {
-            absent_ok(fs::remove_file(entry.path()))?;
+/// Remove the staging file and every shard `live` does not hold from `dir`.
+pub(super) fn remove_stale_files(dir: &str, live: impl Fn(u64) -> bool) -> io::Result<()> {
+    absent_ok(fs::remove_file(staging_path(dir)))?;
+    for seq in shard_seqs(dir)? {
+        if !live(seq) {
+            absent_ok(fs::remove_file(shard_path(dir, seq)))?;
         }
     }
     Ok(())
@@ -163,16 +174,11 @@ pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<String>) -> io::Resul
 /// places it at — `None` for one the manifest does not name.
 pub(crate) fn shard_files(dir: &str) -> Result<Vec<(String, Option<u64>)>, StorageError> {
     let entries = read_intact(dir)?.map_or(Vec::new(), |m| m.shards.entries);
-    let levels: HashMap<String, u64> = entries.iter().map(|e| (shard_name(e.seq), e.level)).collect();
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let Some(name) = name.to_str().filter(|n| n.starts_with(SHARD_PREFIX)) else {
-            continue;
-        };
-        files.push((format!("{dir}/{name}"), levels.get(name).copied()));
-    }
-    Ok(files)
+    let levels: HashMap<u64, u64> = entries.iter().map(|e| (e.seq, e.level)).collect();
+    let seqs = shard_seqs(dir)?.into_iter();
+    Ok(seqs
+        .map(|seq| (shard_path(dir, seq), levels.get(&seq).copied()))
+        .collect())
 }
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;

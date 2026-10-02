@@ -32,11 +32,10 @@ fn dir_names(dir: &Path) -> Vec<String> {
 
 /// The shard files physically in `dir` — where a leak shows, since
 /// `resident_bytes` counts registered entries only.
-fn shard_names(dir: &Path) -> Vec<String> {
-    dir_names(dir)
-        .into_iter()
-        .filter(|n| n.starts_with(manifest::SHARD_PREFIX))
-        .collect()
+fn shard_seqs(dir: &Path) -> Vec<u64> {
+    let mut seqs = manifest::shard_seqs(dir.to_str().unwrap()).unwrap();
+    seqs.sort_unstable();
+    seqs
 }
 
 /// Guard key for a native u64 PK value — its OPK bytes.
@@ -418,14 +417,14 @@ fn a_corrupt_input_body_fails_the_compaction() {
     for i in 0..5u64 {
         idx.append_l0_run(&dense_batch(i * 100, 20)).unwrap();
     }
-    let before = shard_names(dir.path());
+    let before = shard_seqs(dir.path());
     let third = idx.unsynced_paths().nth(2).unwrap();
     crate::test_support::flip_last_byte_in_place(Path::new(&third));
 
     assert_eq!(idx.run_compact(), Err(StorageError::Corrupt("body checksum")));
     assert_eq!(idx.level_shape().0, 5, "every input stays registered");
     assert_eq!(
-        shard_names(dir.path()),
+        shard_seqs(dir.path()),
         before,
         "no input retired, no output left behind"
     );
@@ -492,11 +491,11 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
         idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
         // A directory at an output's name: that shard cannot be created.
         std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + failing))).unwrap();
-        let before = shard_names(dir.path());
+        let before = shard_seqs(dir.path());
 
         assert!(idx.run_compact().is_err(), "output {failing} cannot be written");
         assert_eq!(
-            shard_names(dir.path()),
+            shard_seqs(dir.path()),
             before,
             "output {failing}: no input retired, no output left behind"
         );
@@ -1112,7 +1111,7 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
         gk(LAST_KEY),
         "the watermark is the HIGHEST key dropped, taken from the victim's pk_max"
     );
-    assert!(shard_names(tmp.path()).is_empty(), "every dropped shard is unlinked");
+    assert!(shard_seqs(tmp.path()).is_empty(), "every dropped shard is unlinked");
 }
 
 /// Only `enforce_capacity` drops: a delta store's ordinary compactions keep
@@ -1166,7 +1165,7 @@ fn a_published_shard_a_fold_supersedes_waits_for_the_barrier() {
         "the post-publish drain removes it"
     );
     assert_eq!(
-        shard_names(tmp.path()).len(),
+        shard_seqs(tmp.path()).len(),
         idx.shard_count(),
         "only the live shards remain"
     );
@@ -1198,11 +1197,7 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
     );
     assert!(idx.dropped_max() > PkBuf::zeroed(8), "the sweep dropped something");
     // Nothing left behind on disk beyond what the index still registers.
-    assert_eq!(
-        shard_names(tmp.path()).len(),
-        idx.shard_count(),
-        "no orphan shard files"
-    );
+    assert_eq!(shard_seqs(tmp.path()).len(), idx.shard_count(), "no orphan shard files");
 }
 
 /// A drop removes only rows at or below the floor it raises — why a delta
@@ -1821,7 +1816,7 @@ fn shard_index_model() {
                             floor = floor.max(idx.dropped_max());
                             idx = reopened_under(idx, budget);
                             (published, published_floor) = (m.clone(), floor);
-                            assert_eq!(shard_names(tmp.path()).len(), idx.shard_count(), "{what}: shard files");
+                            assert_eq!(shard_seqs(tmp.path()).len(), idx.shard_count(), "{what}: shard files");
                         }
                         8 => {
                             // Crash: reopen from the last published manifest.

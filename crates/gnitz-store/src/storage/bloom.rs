@@ -6,7 +6,7 @@ const SALT: [u32; 8] = [
 ];
 
 /// A split-block filter: a key sets one bit in each of the eight words of one
-/// 256-bit block, so an add or a probe touches one cache line.
+/// 256-bit block.
 ///
 /// A key is already a well-mixed 64-bit fingerprint (`probe_key`): its high
 /// half picks the block, its low half the bits.

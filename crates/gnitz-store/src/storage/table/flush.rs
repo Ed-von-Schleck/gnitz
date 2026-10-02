@@ -8,7 +8,6 @@ use io_uring::types::FsyncFlags;
 
 use super::super::batch_fsync::{new_ring, sync_paths};
 use super::super::manifest::{self, Manifest};
-use super::super::run_set::TrimmedRun;
 use super::Table;
 use gnitz_zset::repr::StorageError;
 
@@ -46,19 +45,17 @@ pub(crate) fn flush_barrier<'a>(
         FsyncFlags::DATASYNC,
     )?;
     let mut dirs = BTreeSet::new();
-    let mut published = Vec::with_capacity(work.len());
-    for (t, w) in work {
+    for (t, w) in &mut work {
         // The rename publishes every shard the manifest names.
         manifest::commit(&t.shard_index.output_dir)?;
         t.shard_index.mark_published();
-        dirs.extend(w.dirs);
-        published.push((t, w.bytes));
+        dirs.extend(std::mem::take(&mut w.dirs));
     }
     // A rename is metadata: a full fsync, not fdatasync.
     sync_paths(&mut ring, &dirs, FsyncFlags::empty())?;
     // No durable manifest names a superseded shard any more.
-    for (t, bytes) in published {
-        t.durable_manifest = Some(bytes);
+    for (t, w) in work {
+        t.durable_manifest = Some(w.bytes);
         t.shard_index.unlink_retired();
     }
     Ok(())
@@ -80,10 +77,7 @@ impl Table {
     /// `cached_full_scan` survives it: both tiers are merged and
     /// ghost-eliminated alike, so the row set does not move.
     fn fold_memtable_into_ram_tier(&mut self) {
-        if let Some(run) = self.memtable.fold_to_single(&self.shard_index.schema) {
-            self.ram_tier.push(run, &self.shard_index.schema);
-        }
-        self.memtable.clear();
+        self.memtable.drain_into(&mut self.ram_tier, &self.shard_index.schema);
     }
 
     /// Fold the memtable into the RAM tier, spilling the tier to an unsynced
@@ -93,14 +87,12 @@ impl Table {
         if self.held_in_ram || !self.ram_tier.is_full() {
             return Ok(());
         }
-        let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) else {
-            return Ok(());
-        };
         // The fold's cancellation can bring the tier back under its ceiling.
+        self.ram_tier.fold(&self.shard_index.schema);
         if !self.ram_tier.is_full() {
             return Ok(());
         }
-        self.spill_ram_tier(run)
+        self.spill_ram_tier()
     }
 
     // ------------------------------------------------------------------
@@ -112,15 +104,12 @@ impl Table {
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
-        if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
-            self.spill_ram_tier(run)?;
-        }
+        self.spill_ram_tier()?;
         // Rows above the cut go to a shard of their own, which no compaction
         // folds below it.
-        if let Some(run) = self.pending.fold_to_single(&self.shard_index.schema) {
-            self.shard_index.append_pending_run(&run)?;
-            self.pending.clear();
-        }
+        let schema = self.shard_index.schema;
+        self.pending
+            .spill(&schema, |run| self.shard_index.append_pending_run(run))?;
         let bytes = manifest::encode(&Manifest {
             checkpoint_mark,
             caller_record: self.caller_record.clone(),
@@ -137,7 +126,7 @@ impl Table {
         // Unknown until the barrier records it: a failed publish may have renamed.
         self.durable_manifest = None;
         manifest::prepare(&self.shard_index.output_dir, &bytes)?;
-        // A first publish also makes the store's and its relation's directory entries durable.
+        // A first publish also makes the directory's own entry and its parent's durable.
         let entry_dirs = if first_publish { 2 } else { 0 };
         let dirs = Path::new(&self.shard_index.output_dir)
             .ancestors()
@@ -148,15 +137,16 @@ impl Table {
         Ok(Some(FlushWork { bytes, dirs }))
     }
 
-    /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk
+    /// Move the RAM tier's rows to an unsynced L0 shard, then run the disk
     /// tier's upkeep.
-    fn spill_ram_tier(&mut self, run: TrimmedRun) -> Result<(), StorageError> {
-        self.shard_index.append_l0_run(&run)?;
-        self.ram_tier.clear();
-        // Free the spilled rows before compaction allocates.
-        drop(run);
-        // The sweep in `maintain` can dehydrate or drop live rows.
-        self.cached_full_scan.set(None);
-        self.shard_index.maintain()
+    fn spill_ram_tier(&mut self) -> Result<(), StorageError> {
+        let schema = self.shard_index.schema;
+        if self
+            .ram_tier
+            .spill(&schema, |run| self.shard_index.append_l0_run(run))?
+        {
+            self.upkeep()?;
+        }
+        Ok(())
     }
 }

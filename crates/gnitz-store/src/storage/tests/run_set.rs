@@ -6,7 +6,8 @@ use proptest::prelude::*;
 
 proptest! {
     /// A set holds the Z-set sum of its pushes since the last clear, in fewer
-    /// than `FOLD_THRESHOLD` runs, and its PK probe reaches each key's rows.
+    /// than `FOLD_THRESHOLD` runs, its PK probe reaches each key's rows, and a
+    /// spill empties it only once its rows are written.
     #[test]
     fn a_run_set_holds_the_zset_of_its_pushes(
         (si, rows) in arb_fold_case(),
@@ -19,7 +20,7 @@ proptest! {
         for (n, action) in steps {
             let run = fold_batch(&s, &rows.by_ref().take(n).cloned().collect::<Vec<_>>()).into_consolidated();
             pushed.push(run.clone());
-            set.push(TrimmedRun::new(run), &s);
+            set.push(run, &s);
             match action {
                 0 => set.fold(&s),
                 1 => {
@@ -43,9 +44,17 @@ proptest! {
                 prop_assert_eq!(sum, want_sum);
             }
         }
-        if let Some(folded) = set.fold_to_single(&s) {
-            prop_assert_eq!(zset_of(&folded, &s), zset_sum(&pushed, &s));
-        }
+        let held = zset_sum(&pushed, &s);
+        let failed = set.spill(&s, |_| Err(()));
+        prop_assert_eq!(failed, if held.is_empty() { Ok(false) } else { Err(()) });
+        let mut written = Default::default();
+        let wrote = set.spill(&s, |run| {
+            written = zset_of(run, &s);
+            Ok::<(), ()>(())
+        });
+        prop_assert_eq!(wrote, Ok(!held.is_empty()));
+        prop_assert_eq!(written, held, "the failed write left every row held");
+        prop_assert_eq!((set.len(), set.bytes), (0, 0));
     }
 }
 
@@ -58,10 +67,7 @@ fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
     let mut set = RunSet::new(0);
     let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
         let rows: Vec<_> = keys.map(|k| (k, w, 7)).collect();
-        set.push(
-            TrimmedRun::new(make_batch_raw(&schema, &rows).into_consolidated()),
-            &schema,
-        );
+        set.push(make_batch_raw(&schema, &rows).into_consolidated(), &schema);
     };
     let holds = |set: &RunSet, k: u64| {
         let key = opk_pk(&schema, &[k as u128]);
@@ -110,7 +116,7 @@ fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
         }
         let mut b = b.finish();
         b.certify_consolidated();
-        TrimmedRun::new(b)
+        b
     };
 
     let mut set = RunSet::new(1 << 20);
@@ -154,7 +160,7 @@ fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
     let mut set = RunSet::new(usize::MAX);
     let mut latest = vec![0u64; KEYS as usize];
     let initial: Vec<_> = (0..KEYS).map(|pk| (pk, 1, churn_value(pk, 0))).collect();
-    set.push(TrimmedRun::new(string_run(&schema, &initial)), &schema);
+    set.push(string_run(&schema, &initial), &schema);
 
     let mut saw_dead = false;
     for generation in 1..=300u64 {
@@ -166,7 +172,7 @@ fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
             latest[pk as usize] = generation;
         }
         rows.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
-        set.push(TrimmedRun::new(string_run(&schema, &rows)), &schema);
+        set.push(string_run(&schema, &rows), &schema);
         for run in &set.runs {
             saw_dead |= run.dead_heap() > 0;
             assert!(
@@ -182,10 +188,11 @@ fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
         "the churn must drive a fold that carries a heap with dead bytes"
     );
 
-    let folded = set.fold_to_single(&schema).expect("every key survives");
+    set.fold(&schema);
+    let folded = &**set.runs.first().expect("every key survives");
     let got: Vec<(u128, i64, Vec<u8>)> = (0..folded.len())
         .map(|row| {
-            let s = crate::test_support::read_german_string(&folded, 0, row);
+            let s = crate::test_support::read_german_string(folded, 0, row);
             (folded.get_pk(row), folded.get_weight(row), s)
         })
         .collect();
@@ -234,9 +241,9 @@ fn run_set_fold_strings_bench() {
     for (shape, small) in [("append", &append), ("churn", &churn)] {
         for _ in 0..5 {
             let mut set = RunSet::new(usize::MAX);
-            set.push(TrimmedRun::new(dominant.clone()), &schema);
+            set.push(dominant.clone(), &schema);
             for run in small {
-                set.push(TrimmedRun::new(run.clone()), &schema);
+                set.push(run.clone(), &schema);
             }
             assert_eq!(set.len(), 1 + RUNS as usize, "the fold must not have run yet");
             let t = Instant::now();
@@ -262,7 +269,7 @@ fn ascending_runs_fold_to_their_rows_in_order() {
         let mut push = |set: &mut RunSet, rows: Vec<(u64, i64, i64)>| {
             let run = make_batch_raw(&schema, &rows).into_consolidated();
             pushed.push(run.clone());
-            set.push(TrimmedRun::new(run), &schema);
+            set.push(run, &schema);
         };
         for n in std::iter::once(first_run).chain(std::iter::repeat_n(10, 9)) {
             push(&mut set, (next..next + n).map(|k| (k, 1, k as i64)).collect());
@@ -271,9 +278,10 @@ fn ascending_runs_fold_to_their_rows_in_order() {
         if reach_back {
             push(&mut set, vec![(3, -1, 3), (next, 1, 0)]);
         }
-        let folded = set.fold_to_single(&schema).expect("rows survive");
+        set.fold(&schema);
+        let folded = &**set.runs.first().expect("rows survive");
         assert!(folded.consolidated_verified());
-        assert_eq!(zset_of(&folded, &schema), zset_sum(&pushed, &schema));
+        assert_eq!(zset_of(folded, &schema), zset_sum(&pushed, &schema));
         assert_eq!(folded.len(), next as usize);
     }
 }

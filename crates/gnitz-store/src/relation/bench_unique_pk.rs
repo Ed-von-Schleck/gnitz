@@ -227,3 +227,83 @@ fn unique_pk_bench() {
         );
     }
 }
+
+/// The scanned-table write path: each push lands above the cut and is sealed
+/// by its tick, then a reader gathers as many random held keys at the cut.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn sealed_tick_bench() {
+    use crate::storage::Cut;
+    use gnitz_wire::PkKeys;
+    use std::hint::black_box;
+
+    const ROWS: usize = 200_000;
+    let dir = tempfile::tempdir().unwrap();
+    let ints = make_schema_u64_i64();
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    println!(
+        "{:>10} {:>8} {:>16} {:>16}",
+        "shape", "per_tick", "write instr/row", "read instr/row"
+    );
+    for shape in ["insert", "update"] {
+        for per in [1usize, 10, 100, 1000] {
+            let mut table = Table::new(
+                dir.path().join(format!("{shape}{per}")).to_str().unwrap(),
+                ints,
+                RecoverySource::SalReplay,
+                StoreBudgets::new(DEFAULT_RAM_TIER_BYTES),
+            )
+            .unwrap();
+            let held = if shape == "update" { HOT_KEYS } else { 0 };
+            for b in pushes(&ints, false, 0..held, 1000, |s| (s, 1, 0)) {
+                let eff = enforce_unique_pk(&table, b);
+                table.ingest_pending(eff);
+                table.seal().unwrap();
+            }
+            let row: Box<dyn FnMut(u64) -> (u64, i64, u64)> = match shape {
+                "insert" => Box::new(|s| (s, 1, s)),
+                _ => Box::new(random_key(HOT_KEYS)),
+            };
+            let batches = pushes(&ints, false, 0..ROWS as u64, per, row);
+            let mut rng = Rng::new(0xABCDEF);
+            let reads: Vec<PkKeys> = (0..batches.len())
+                .map(|t| {
+                    let top = if shape == "update" {
+                        HOT_KEYS
+                    } else {
+                        ((t + 1) * per) as u64
+                    };
+                    let keys: Vec<[u8; 8]> = (0..per).map(|_| rng.gen_range(top).to_be_bytes()).collect();
+                    PkKeys::from_keys(8, keys.iter().map(|k| &k[..]))
+                })
+                .collect();
+            let (mut write, mut read, mut got) = (0u64, 0u64, 0usize);
+            for (b, keys) in batches.into_iter().zip(reads) {
+                let ((), w) = counter.measure(|| {
+                    let eff = enforce_unique_pk(&table, b);
+                    table.ingest_pending(eff);
+                    black_box(table.seal().unwrap());
+                });
+                write += w;
+                let (n, r) = counter.measure(|| {
+                    let mut g = table.gather(keys, Cut::Sealed);
+                    let mut n = 0;
+                    while let Some(chunk) = g.drain_chunk(4096) {
+                        n += chunk.len();
+                    }
+                    n
+                });
+                read += r;
+                got += n;
+            }
+            assert!(got > 0, "the reads found no row");
+            println!(
+                "{:>10} {:>8} {:>16.1} {:>16.1}",
+                shape,
+                per,
+                write as f64 / ROWS as f64,
+                read as f64 / got as f64
+            );
+        }
+    }
+}

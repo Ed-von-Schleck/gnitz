@@ -164,19 +164,18 @@ fn merge_relocating<S: ColumnarSource>(batches: &[S], schema: &SchemaDescriptor)
     super::super::scatter::UnifiedSet::whole(batches, schema).materialize(&survivors, total)
 }
 
-/// Every fold the engine runs over `runs`, each sorted by (PK, payload): in-batch
-/// consolidation of their concatenation, both N-way scatters over batches, the
-/// relocating one over each run folded into a shard (every other one FoR-packed),
-/// and the pairwise merge. Each is checked to reach their Z-set sum.
+/// Every fold the engine runs over `runs`, each sorted by (PK, payload), checked
+/// to reach their Z-set sum.
 fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, Batch)> {
     let mem: Vec<MemBatch> = runs.iter().map(Batch::as_mem_batch).collect();
-    let pairwise = runs.iter().fold(Batch::empty_with_schema(schema), |acc, b| {
-        acc.merged_consolidated(&b.clone().into_consolidated(), schema)
+    let consolidated: Vec<Batch> = runs.iter().map(|b| b.clone().into_consolidated()).collect();
+    let consolidated_mem: Vec<MemBatch> = consolidated.iter().map(Batch::as_mem_batch).collect();
+    let pairwise = consolidated.iter().fold(Batch::empty_with_schema(schema), |acc, b| {
+        acc.merged_consolidated(b, schema)
     });
     let dir = tempfile::tempdir().unwrap();
-    let shards: Vec<_> = runs
+    let shards: Vec<_> = consolidated
         .iter()
-        .map(|b| b.clone().into_consolidated())
         .filter(|b| b.count > 0)
         .enumerate()
         .map(|(i, b)| {
@@ -184,7 +183,7 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
                 pack_ints: i % 2 == 1,
                 ..ShardWriteOpts::default()
             };
-            map_shard(&dir.path().join(format!("{i}.db")), &b, opts)
+            map_shard(&dir.path().join(format!("{i}.db")), b, opts)
         })
         .collect();
     let shards: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
@@ -194,7 +193,8 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
             Batch::concat(schema, mem.iter().cloned()).into_consolidated(),
         ),
         ("N-way relocating", merge_relocating(&mem, schema)),
-        ("N-way carrying", merge_consolidated(&mem, schema)),
+        ("N-way carrying", merge_rows(&mem, schema)),
+        ("N-way sum", merge_consolidated(&consolidated_mem, schema)),
         ("N-way over shards", merge_relocating(&shards, schema)),
         ("pairwise", pairwise),
     ];
@@ -349,4 +349,32 @@ fn a_carried_merge_reads_back_every_string() {
             "a wasteful side relocates rather than carrying its padding"
         );
     }
+}
+
+/// Sources that ascend past one another merge to their rows in order, an empty
+/// one among them or not; two that meet at one PK are folded.
+#[test]
+fn ascending_sources_merge_to_their_rows_in_order() {
+    use crate::test_support::{make_batch, weighted_rows};
+    let schema = make_schema_u64_i64();
+    let (low, empty) = (make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]), make_batch(&schema, &[]));
+    let high = make_batch(&schema, &[(3, 1, 30), (4, 1, 40)]);
+    let merge = |sources: &[&Batch]| {
+        let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
+        let out = merge_consolidated(&mem, &schema);
+        assert!(out.consolidated_verified());
+        weighted_rows(&out)
+    };
+    let all = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    assert_eq!(merge(&[&low, &empty, &high]), weighted_rows(&all));
+    assert_eq!(
+        merge(&[&high, &low]),
+        weighted_rows(&all),
+        "descending sources interleave"
+    );
+
+    let meets = make_batch(&schema, &[(2, -1, 20), (5, 1, 50)]);
+    let folded = make_batch(&schema, &[(1, 1, 10), (5, 1, 50)]);
+    assert_eq!(merge(&[&low, &meets]), weighted_rows(&folded));
+    assert_eq!(merge(&[]), vec![]);
 }

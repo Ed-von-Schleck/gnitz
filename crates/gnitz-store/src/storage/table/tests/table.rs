@@ -3,12 +3,13 @@ use super::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use super::super::manifest::{manifest_path, SHARD_PREFIX};
+use super::super::manifest::{manifest_path, shard_seqs};
 use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, fold_schemas, make_batch_raw, make_schema_u64_i64, row_key, zset_of, FoldRow, RowKey,
+    arb_fold_case, fold_batch, fold_schemas, make_batch_raw, make_schema_u64_i64, row_key, zset_of, zset_sum, FoldRow,
+    RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -24,22 +25,15 @@ fn rows(rows: &[(u64, i64, i64)]) -> Batch {
 
 /// Every shard file in `dir`.
 fn shard_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(SHARD_PREFIX)
-        })
-        .count()
+    shard_seqs(dir.to_str().unwrap()).unwrap().len()
 }
 
 /// A model step: ingest the next `n` generated rows, or move the tiers.
 #[derive(Clone, Debug)]
 enum Op {
     Ingest(usize),
+    IngestPending(usize),
+    Seal,
     FoldToRam,
     Flush,
     Crash,
@@ -48,6 +42,8 @@ enum Op {
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => (1usize..8).prop_map(Op::Ingest),
+        3 => (1usize..8).prop_map(Op::IngestPending),
+        2 => Just(Op::Seal),
         2 => Just(Op::FoldToRam),
         1 => Just(Op::Flush),
         1 => Just(Op::Crash),
@@ -64,11 +60,16 @@ fn elem(schema: &SchemaDescriptor, (pk, _, s, v): &FoldRow) -> Elem {
     }
 }
 
-/// Every read `t` serves agrees with `live`, and L0 is under its trigger.
-fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
+/// The Z-set `model` holds, keyed as a batch of `schema` is.
+fn zset(schema: &SchemaDescriptor, model: &BTreeMap<Elem, i64>) -> HashMap<RowKey, i64> {
+    let rows: Vec<FoldRow> = model.iter().map(|((pk, st, v), &w)| (pk.clone(), w, *st, *v)).collect();
+    zset_of(&fold_batch(schema, &rows), schema)
+}
+
+/// Every read `t` serves agrees with `live`, and one at the cut with `sealed`.
+fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
     let s = *t.schema();
-    let rows: Vec<FoldRow> = live.iter().map(|((pk, st, v), &w)| (pk.clone(), w, *st, *v)).collect();
-    let want = zset_of(&fold_batch(&s, &rows), &s);
+    let want = zset(&s, live);
     let where_pk = |f: &dyn Fn(&[u8]) -> bool| -> HashMap<RowKey, i64> {
         want.iter()
             .filter(|(k, _)| f(&k.0))
@@ -91,26 +92,28 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
         }
     }
 
-    let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), Cut::Now);
-    let mut gathered: HashMap<RowKey, i64> = HashMap::new();
-    while let Some(b) = gather.drain_chunk(3) {
-        gathered.extend(zset_of(&b, &s));
+    for (cut, want) in [(Cut::Now, want.clone()), (Cut::Sealed, zset(&s, sealed))] {
+        let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), cut);
+        let mut gathered: HashMap<RowKey, i64> = HashMap::new();
+        while let Some(b) = gather.drain_chunk(3) {
+            gathered.extend(zset_of(&b, &s));
+        }
+        assert_eq!(gathered, want, "gather at {cut:?}");
     }
-    assert_eq!(gathered, where_pk(&|p| keys.iter().any(|k| &k[..] == p)), "gather");
 
     for w in keys.windows(2) {
         let (lo, hi) = (PkBuf::from_bytes(&w[0]), PkBuf::from_bytes(&w[1]));
         let got = zset_of(&t.range_cursor(Some((lo, Some(hi)))).materialize(), &s);
         assert_eq!(got, where_pk(&|p| &w[0][..] <= p && p < &w[1][..]), "range cursor");
     }
-    assert!(t.level_shape().0 <= L0_COMPACT_THRESHOLD, "L0 over its trigger");
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// Under any sequence of ingests, folds, barriers and crashes, a table
-    /// serves the Z-set its ingests sum to; a crash reopens at the last barrier.
+    /// Under any sequence of ingests, seals, folds, barriers and crashes, a table
+    /// serves the Z-set its ingests sum to, a seal answers the rows ingested
+    /// above the cut since the last, and a crash reopens at the last barrier.
     #[test]
     fn a_table_serves_the_zset_its_ingests_sum_to(
         (si, stream) in arb_fold_case(),
@@ -132,11 +135,14 @@ proptest! {
         keys.dedup();
 
         let mut t = open();
-        let (mut live, mut durable) = (BTreeMap::new(), BTreeMap::new());
+        let (mut live, mut sealed, mut durable) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut stream = stream.into_iter().cycle();
+        // A reopen finds the pending shards its last barrier published in L0,
+        // however many they are, until the next upkeep.
+        let mut reopened_over = false;
         for op in ops {
             match op {
-                Op::Ingest(n) => {
+                Op::Ingest(n) | Op::IngestPending(n) => {
                     // Base-table positivity: a retraction never takes an element
                     // below zero.
                     let mut batch = Vec::new();
@@ -147,7 +153,28 @@ proptest! {
                         batch.push(r);
                     }
                     live.retain(|_, w| *w != 0);
-                    t.ingest_owned_batch(fold_batch(&s, &batch)).unwrap();
+                    let batch = fold_batch(&s, &batch);
+                    match op {
+                        Op::IngestPending(_) => t.ingest_pending(batch),
+                        // Below the cut, as the registry ingests: no row is left above it.
+                        _ => {
+                            t.seal().unwrap();
+                            t.ingest_owned_batch(batch).unwrap();
+                            sealed = live.clone();
+                        }
+                    }
+                }
+                Op::Seal => {
+                    let mut moved = live.clone();
+                    for (e, w) in &sealed {
+                        *moved.entry(e.clone()).or_insert(0) -= w;
+                    }
+                    moved.retain(|_, w| *w != 0);
+                    let delta = t.seal().unwrap();
+                    let delta = delta.map(|d| zset_of(&d, &s)).unwrap_or_default();
+                    prop_assert_eq!(delta, zset(&s, &moved), "the seal's delta");
+                    prop_assert!(!t.has_pending());
+                    sealed = live.clone();
                 }
                 Op::FoldToRam => t.fold_to_ram().unwrap(),
                 Op::Flush => {
@@ -159,10 +186,14 @@ proptest! {
                     drop(t);
                     t = open();
                     live = durable.clone();
+                    sealed = durable.clone();
+                    reopened_over = true;
                     prop_assert_eq!(shard_files(dir.path()), t.shard_index.shard_count());
                 }
             }
-            assert_serves(&t, &live, &keys);
+            assert_serves(&t, &live, &sealed, &keys);
+            reopened_over &= t.level_shape().0 > L0_COMPACT_THRESHOLD;
+            prop_assert!(reopened_over || t.level_shape().0 <= L0_COMPACT_THRESHOLD, "L0 over its trigger");
         }
     }
 }
@@ -365,4 +396,40 @@ fn a_store_held_in_ram_never_spills() {
     }
     assert_eq!(shard_files(dir.path()), 0, "no shard file was written");
     assert_eq!(t.full_scan().len(), 200, "every row held in RAM");
+}
+
+/// A seal that moves pending shards into L0 runs the disk tier's upkeep,
+/// whether or not its delta also overflows the memtable.
+#[test]
+fn a_seal_that_enters_shards_into_l0_compacts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    for overflow in [false, true] {
+        let mut t = new_table(
+            &dir.path().join(format!("{overflow}")),
+            schema,
+            RecoverySource::SalReplay,
+            1 << 20,
+        );
+        let mut pushed = Vec::new();
+        let mut push = |t: &mut Table, keys: std::ops::Range<u64>| {
+            pushed.push(rows(&keys.map(|k| (k, 1, 0)).collect::<Vec<_>>()));
+            t.ingest_pending(pushed.last().unwrap().clone());
+        };
+        for k in 0..=L0_COMPACT_THRESHOLD as u64 {
+            push(&mut t, k..k + 1);
+            flush_barrier([&mut t], 0).unwrap();
+        }
+        if overflow {
+            // Past the memtable's budget, under the RAM tier's.
+            push(&mut t, 100..10_100);
+        }
+        assert_eq!(t.level_shape().0, 0, "pending shards sit outside L0");
+        let delta = t.seal().unwrap().expect("rows were pending");
+        assert_eq!(t.level_shape().0, 0, "overflow={overflow}: the seal folded L0 into L1");
+        assert_eq!(t.level_shape().1[0], 1, "overflow={overflow}: L1 holds the fold");
+        let want = zset_sum(&pushed, &schema);
+        assert_eq!(zset_of(&delta, &schema), want, "overflow={overflow}: the delta");
+        assert_eq!(zset_of(&t.full_scan(), &schema), want, "overflow={overflow}: the rows");
+    }
 }

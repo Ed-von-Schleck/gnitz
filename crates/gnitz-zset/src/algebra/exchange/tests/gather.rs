@@ -8,16 +8,19 @@ use std::hint::black_box;
 
 proptest! {
     /// Z-set `+` over the slices at every PK width, with NULLs and heap strings:
-    /// consolidated slices fold into one consolidated batch — a retraction
-    /// cancels its insert, a repeated (PK, payload) sums, two payloads at one key
-    /// stay two elements — and raw ones are concatenated in order.
+    /// consolidated slices fold into one consolidated batch, raw ones are
+    /// concatenated in order.
     #[test]
     fn the_gather_is_the_zset_sum_of_its_slices(
-        (si, rows) in arb_fold_case(),
+        (si, mut rows) in arb_fold_case(),
         senders in 1usize..6,
         consolidated in any::<bool>(),
+        ascending in any::<bool>(),
     ) {
         let schema = fold_schemas()[si];
+        if ascending {
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
         let slices: Vec<Batch> = rows
             .chunks(rows.len().div_ceil(senders).max(1))
             .map(|rows| fold_batch(&schema, rows))
