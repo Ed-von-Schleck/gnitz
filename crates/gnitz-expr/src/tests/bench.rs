@@ -6,6 +6,10 @@
 //!   GNITZ_BENCH_PASSES=<1, then 201> <GNITZ_BENCH_* selectors> \
 //!     perf stat -e instructions:u cargo test -p gnitz-expr --release <bench> \
 //!     -- --ignored --nocapture --test-threads=1
+//!
+//! Beside each bench's own selectors, `GNITZ_BENCH_LEVEL` names the instruction
+//! set every evaluator's kernels run at and `GNITZ_BENCH_ROWS` the rows of a
+//! batch.
 
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -176,13 +180,19 @@ fn bench_passes() -> usize {
     std::env::var("GNITZ_BENCH_PASSES").map_or(1, |v| v.parse().expect("GNITZ_BENCH_PASSES must be a count"))
 }
 
+/// The rows a batch of the evaluator benches holds, from `GNITZ_BENCH_ROWS`: a
+/// count below [`MORSEL`] measures what a small delta pays per batch.
+fn bench_rows() -> usize {
+    std::env::var("GNITZ_BENCH_ROWS").map_or(200_000, |v| v.parse().expect("GNITZ_BENCH_ROWS must be a count"))
+}
+
 /// The filter kernels, per `GNITZ_BENCH_SHAPE`.
 #[test]
 #[ignore]
 fn filter_kernel_bench() {
     let passes = bench_passes();
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
-    let n = 200_000usize;
+    let n = bench_rows();
 
     // `col <op> k` over one column of `schema`.
     let col_cmp = |schema: &TestSchema, col: u32, op, val| {
@@ -386,7 +396,7 @@ fn is_null_arm_bench() {
     let passes = bench_passes();
     let mut arm = Selector::new("GNITZ_BENCH_ARM");
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
-    let n = 200_000usize;
+    let n = bench_rows();
     let schema = is_null_bench_schema();
 
     // NULLs 16 per morsel, 4 per morsel, and none in 7 of every 8 morsels.
@@ -455,6 +465,28 @@ fn is_null_arm_bench() {
     println!("is_null_arm_bench map: passes={passes} n={n}");
 }
 
+/// A range walk over one nullable `I64` payload column and no predicate: the
+/// null exclusion and the range compare of `RangeMembership`.
+#[test]
+#[ignore]
+fn range_walk_bench() {
+    use gnitz_wire::{key_image, Cut, KeyRange, PkColList, ReadBound};
+    let passes = bench_passes();
+    let n = bench_rows();
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]);
+    let view = make_n_col_view(&schema, n, |row, _| (row % 1000) as i64, |row, _| row % 16 == 0);
+    let range = KeyRange::new(
+        PkColList::from_slice(&[1]),
+        &[],
+        Cut::before(key_image(TypeCode::I64, 100)),
+        Cut::after(key_image(TypeCode::I64, 600)),
+    );
+    let mut f = RowFilter::for_read(&[], &ReadBound::Range(range), &schema).expect("a walk");
+    let hits = passing_rows(&mut f, &view).iter().filter(|&&p| p).count();
+    drive_filter(&mut f, &view, passes);
+    println!("range_walk_bench passes={passes} n={n} hits={hits}");
+}
+
 /// `n` rows of `unit` repeated to `len` bytes, one ASCII byte per row turned
 /// into a digit so no matcher hoists out of the row loop.
 fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) -> TestView {
@@ -488,14 +520,14 @@ fn str_bench_view(schema: &TestSchema, n: usize) -> TestView {
     )
 }
 
-/// The kernels whose result is not a predicate, per `GNITZ_BENCH_SHAPE`; a
+/// The kernels read as values, per `GNITZ_BENCH_SHAPE`; a
 /// numeric suffix is the haystack length the family's cost is a slope in.
 #[test]
 #[ignore]
 fn expr_kernel_bench() {
     let passes = bench_passes();
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
-    let n = 200_000usize;
+    let n = bench_rows();
 
     // --- scalar shapes over two nullable I64 columns ---
     let ints = schema_pk_ints(2, true);
@@ -817,6 +849,44 @@ fn expr_kernel_bench() {
         vec![],
     );
 
+    // --- booleans read as values, where a compare writes lanes and `IN` and
+    //     `IS NULL` unpack their bits.
+    let cmp_value = |schema: &TestSchema| {
+        scalar_prog(
+            schema,
+            vec![
+                load2(1),
+                load2(2),
+                LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+            ],
+            vec![],
+        )
+    };
+    let in_value = |k: usize| {
+        let mut b = ExprBuilder::new();
+        let set_idx = b.add_const_int_set((0..k as i64).map(|i| i * (1000 / k as i64) + 1).collect());
+        let col = b.emit(LogicalInstr::LoadCol { col: 1 });
+        let hit = b.emit(LogicalInstr::IntInSet { value_reg: col, set_idx });
+        b.build(vec![Sink::Reg(hit)])
+            .expect("a well-formed program")
+            .resolve_scalar(&map_in)
+            .expect("resolves")
+    };
+    // `GREATEST` over floats, which orders by `total_cmp`.
+    let fminmax = |schema: &TestSchema| {
+        scalar_prog(
+            schema,
+            vec![
+                load2(1),
+                load2(2),
+                LogicalInstr::IntToFloat { a: Reg(0) },
+                LogicalInstr::IntToFloat { a: Reg(1) },
+                LogicalInstr::FloatMinMax2 { a: Reg(2), b: Reg(3), is_max: true },
+            ],
+            vec![],
+        )
+    };
+
     let mut acc = 0i64;
     if shape.drives("map") {
         let mut out = TestView::for_schema(&map_out, n);
@@ -835,6 +905,13 @@ fn expr_kernel_bench() {
         ("select_nn".into(), select_nn, &map_view),
         ("minmax".into(), minmax, &int_view),
         ("minmax_nn".into(), minmax_nn, &map_view),
+        ("cmp_value".into(), cmp_value(&ints), &int_view),
+        ("cmp_value_nn".into(), cmp_value(&map_in), &map_view),
+        ("in2_value".into(), in_value(2), &map_view),
+        ("in8_value".into(), in_value(8), &map_view),
+        ("in64_value".into(), in_value(64), &map_view),
+        ("fminmax".into(), fminmax(&ints), &int_view),
+        ("fminmax_nn".into(), fminmax(&map_in), &map_view),
         ("cal_year_date".into(), cal(CalendarOp::Year, false), &map_view),
         ("cal_year_ts".into(), cal(CalendarOp::Year, true), &map_view),
         ("cal_hour_ts".into(), cal(CalendarOp::Hour, true), &map_view),
@@ -1052,6 +1129,8 @@ fn mask_kernel_bench() {
             simd::pred_bits::<simd::GtUnsigned>(level, a, b, &mut bits)
         );
         drive!("gt_float", simd::pred_bits::<simd::GtFloat>(level, fa, fb, &mut bits));
+        drive!("ne", simd::pred_bits::<simd::Not<simd::Eq>>(level, a, b, &mut bits));
+        drive!("gt_total", simd::pred_bits::<simd::GtTotal>(level, fa, fb, &mut bits));
         drive!("truthy", simd::truthy_bits(level, a, &mut bits));
         for k in [2, 4, 8, 32] {
             drive!(

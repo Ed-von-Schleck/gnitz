@@ -51,28 +51,36 @@ fn tail_mask(m: usize) -> u64 {
 // EvalScratch — the SoA register file for batch evaluation
 // ---------------------------------------------------------------------------
 
-pub(crate) struct EvalScratch {
-    /// Register buffers, register-major layout: regs[reg * MORSEL + row].
-    ///
+/// One register: a lane per row, and a null bit and a truth bit per row.
+///
+/// On a cache-line boundary: lanes that start off a 32-byte one split the
+/// loaders' stores and the kernels' loads across lines, which the filter
+/// benches count as `ls_misal_loads`.
+#[derive(Clone)]
+#[repr(align(64))]
+pub(crate) struct Reg {
     /// A lane at a NULL row holds whatever its kernel computed from the row's
     /// stored bytes: kernels run unconditionally to stay branch-free, so a
-    /// consumer must read `regs` against [`Self::null_bits`], never alone.
+    /// consumer must read `lanes` against [`Self::nulls`], never alone.
     ///
     /// The lanes between a morsel's last row and the end of its last 64-row
     /// word hold no row: [`crate::simd`]'s kernels read and write them with
-    /// the rest of the word.
-    regs: Vec<i64>,
-    /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
-    /// Empty (capacity 0) when `no_nulls` is true.
-    null_bits: Vec<u64>,
-    /// Packed truthy bits, register-major like [`Self::null_bits`]: what a
-    /// boolean consumer reads a register through, on both arms. A producer
-    /// writes whole words, so the bits past a morsel's last row are undefined.
-    bool_bits: Vec<u64>,
-    /// String register lanes, register-major like [`Self::regs`]:
-    /// `str_views[reg * MORSEL + row]`. Empty (capacity 0) unless the program
-    /// has string instructions; a zero-length default view reads as `""`.
-    str_views: Vec<StrView>,
+    /// the rest of the word. A string register leaves its lanes unused.
+    lanes: [i64; MORSEL],
+    /// All zero for the life of a `no_nulls` scratch, which writes none.
+    nulls: [u64; NULL_WORDS_PER_REG],
+    /// Packed truthy bits: what a boolean consumer reads a register through,
+    /// on both arms. A producer writes whole words, so the bits past a
+    /// morsel's last row are undefined.
+    bools: [u64; NULL_WORDS_PER_REG],
+}
+
+pub(crate) struct EvalScratch {
+    regs: Vec<Reg>,
+    /// One view per row, per string register. Empty (capacity 0) unless the
+    /// program has string instructions; a zero-length default view reads as
+    /// `""`.
+    str_views: Vec<[StrView; MORSEL]>,
     /// Computed string bytes — case folds, concatenations, numeric text —
     /// behind the program's string constants, which occupy a prefix the
     /// per-morsel reset does not clear. A view lives as long as the
@@ -86,41 +94,42 @@ pub(crate) struct EvalScratch {
     level: Level,
 }
 
-/// Register `reg`'s lanes for every word a morsel of `words` words reaches —
-/// the window [`crate::simd`]'s kernels read, which runs past the morsel's last
-/// row to the end of its last word.
-fn word_lanes(regs: &[i64], reg: u16, words: usize) -> &[i64] {
-    &regs[reg as usize * MORSEL..][..words * 64]
+/// String register `reg`'s views for a morsel's `m` rows, cut from the
+/// flattened file: sliced off its own array a lane costs the view loops an
+/// instruction a row, which the `str_len` and `str_like` shapes of
+/// `expr_kernel_bench` measure.
+#[inline(always)]
+fn str_lane(views: &[[StrView; MORSEL]], reg: usize, m: usize) -> &[StrView] {
+    &views.as_flattened()[reg * MORSEL..][..m]
 }
 
-/// `N` shared windows plus one mutable window into the same register-major
-/// buffer, each `len` elements wide at `index * stride`. The one unsafe split in
-/// this file: `regs`, `null_bits` and `str_views` differ only in element type
-/// and stride, and the opcodes only in how many sources they read.
+#[inline(always)]
+fn str_lane_mut(views: &mut [[StrView; MORSEL]], reg: usize, m: usize) -> &mut [StrView] {
+    &mut views.as_flattened_mut()[reg * MORSEL..][..m]
+}
+
+/// `N` shared registers plus one mutable register of the same file. The one
+/// unsafe split in this file, over the scalar registers and the string lanes
+/// alike.
 ///
 /// Sound because `d` is none of `srcs`: a register *is* the index of its writing
 /// instruction, and `LogicalProgram::from_instrs` — which every constructor
 /// routes through — rejects an operand not written before its reader. Duplicate
 /// *sources* alias harmlessly. The `debug_assert`s restate both halves.
-fn split_windows<T, const N: usize>(
-    buf: &mut [T],
-    stride: usize,
-    srcs: [u16; N],
-    d: u16,
-    len: usize,
-) -> ([&[T]; N], &mut [T]) {
-    debug_assert!(!srcs.contains(&d), "split_windows: dst aliases a src register");
+#[inline(always)]
+fn split_regs<T, const N: usize>(buf: &mut [T], srcs: [u16; N], d: u16) -> ([&T; N], &mut T) {
+    debug_assert!(!srcs.contains(&d), "split_regs: dst aliases a src register");
     debug_assert!(
         srcs.iter()
             .chain(std::iter::once(&d))
-            .all(|&i| i as usize * stride + len <= buf.len()),
-        "split_windows: window runs past the scratch buffer",
+            .all(|&i| (i as usize) < buf.len()),
+        "split_regs: a register past the scratch buffer",
     );
     let ptr = buf.as_mut_ptr();
     unsafe {
         (
-            std::array::from_fn(|k| std::slice::from_raw_parts(ptr.add(srcs[k] as usize * stride), len)),
-            std::slice::from_raw_parts_mut(ptr.add(d as usize * stride), len),
+            std::array::from_fn(|k| &*ptr.add(srcs[k] as usize)),
+            &mut *ptr.add(d as usize),
         )
     }
 }
@@ -129,21 +138,17 @@ impl EvalScratch {
     /// The whole register file for `prog`, sized and seeded once — every buffer
     /// is a function of the program alone, and a scratch belongs to exactly one
     /// evaluator, hence to one program.
-    /// A zero capacity is how a buffer stays unallocated for a program that never
-    /// touches it.
     pub(crate) fn new(prog: &ResolvedProgram) -> Self {
-        let null_cap = if prog.no_nulls {
-            0
-        } else {
-            prog.num_regs() * NULL_WORDS_PER_REG
+        const ZERO: Reg = Reg {
+            lanes: [0; MORSEL],
+            nulls: [0; NULL_WORDS_PER_REG],
+            bools: [0; NULL_WORDS_PER_REG],
         };
         let mut scratch = EvalScratch {
-            regs: vec![0; prog.scalar_lanes as usize * MORSEL],
-            null_bits: vec![0; null_cap],
-            bool_bits: vec![0; prog.num_regs() * NULL_WORDS_PER_REG],
-            str_views: vec![StrView::default(); prog.str_lanes as usize * MORSEL],
+            regs: vec![ZERO; prog.num_regs()],
+            str_views: vec![[StrView::default(); MORSEL]; prog.str_lanes as usize],
             str_arena: prog.const_arena.clone(),
-            level: Level::new(),
+            level: simd::level(),
         };
         scratch.install_consts(prog);
         scratch
@@ -151,43 +156,37 @@ impl EvalScratch {
 
     /// Write the constant registers at full [`MORSEL`] width, once: a register
     /// *is* the index of the instruction that writes it, so no morsel can
-    /// overwrite the lane. The buffers are freshly zeroed, so no null clear.
+    /// overwrite the lane.
     fn install_consts(&mut self, prog: &ResolvedProgram) {
         for &(dst, val) in &prog.const_regs {
-            let base_r = dst as usize * MORSEL;
-            self.regs[base_r..base_r + MORSEL].fill(val);
+            let r = &mut self.regs[dst as usize];
+            r.lanes.fill(val);
             if prog.needs_bool_pack(dst as usize) {
-                let base_b = dst as usize * NULL_WORDS_PER_REG;
-                simd::truthy_bits(
-                    self.level,
-                    &self.regs[base_r..base_r + MORSEL],
-                    &mut self.bool_bits[base_b..base_b + NULL_WORDS_PER_REG],
-                );
+                simd::truthy_bits(self.level, &r.lanes, &mut r.bools);
             }
         }
         for &(dst, off, len) in &prog.const_str_regs {
-            let base_d = dst as usize * MORSEL;
-            self.str_views[base_d..base_d + MORSEL].fill(StrView { off: off as u64, len, src: SRC_ARENA });
+            self.str_views[dst as usize].fill(StrView { off: off as u64, len, src: SRC_ARENA });
         }
     }
 
     fn reg_mut(&mut self, reg: u16, m: usize) -> &mut [i64] {
-        let base = reg as usize * MORSEL;
-        &mut self.regs[base..base + m]
+        &mut self.regs[reg as usize].lanes[..m]
     }
 
-    /// Split borrows over `regs`: `N` shared source windows + one mutable
-    /// destination. Backs every unary opcode (`N = 1`), every binary one
-    /// (`N = 2`).
+    /// The first `m` lanes of `N` source registers and of one destination.
+    /// Backs every unary opcode (`N = 1`), every binary one (`N = 2`).
+    #[inline(always)]
     fn regs_split<const N: usize>(&mut self, srcs: [u16; N], d: u16, m: usize) -> ([&[i64]; N], &mut [i64]) {
-        split_windows(&mut self.regs, MORSEL, srcs, d, m)
+        let (srcs, d) = split_regs(&mut self.regs, srcs, d);
+        (srcs.map(|r| &r.lanes[..m]), &mut d.lanes[..m])
     }
 
-    /// The same split over `null_bits`, whose windows are `NULL_WORDS_PER_REG`
-    /// words rather than `MORSEL` values. Fixed at two sources: both callers
-    /// propagate a binary operand pair.
-    fn null_split(&mut self, srcs: [u16; 2], d: u16, words: usize) -> ([&[u64]; 2], &mut [u64]) {
-        split_windows(&mut self.null_bits, NULL_WORDS_PER_REG, srcs, d, words)
+    /// The same split over the null words.
+    #[inline(always)]
+    fn null_split<const N: usize>(&mut self, srcs: [u16; N], d: u16, words: usize) -> ([&[u64]; N], &mut [u64]) {
+        let (srcs, d) = split_regs(&mut self.regs, srcs, d);
+        (srcs.map(|r| &r.nulls[..words]), &mut d.nulls[..words])
     }
 
     /// This morsel's registers.
@@ -195,8 +194,7 @@ impl EvalScratch {
     pub(crate) fn morsel_out<'a>(&'a self, prog: &ResolvedProgram, bufs: StrBufs<'a>, m: usize) -> MorselOut<'a> {
         MorselOut {
             regs: &self.regs,
-            null_bits: (!prog.no_nulls).then_some(&self.null_bits[..]),
-            bool_bits: &self.bool_bits,
+            no_nulls: prog.no_nulls,
             str_views: &self.str_views,
             str_arena: &self.str_arena,
             bufs,
@@ -209,18 +207,15 @@ impl EvalScratch {
         if mo.no_nulls() {
             return;
         }
-        let base = reg as usize * NULL_WORDS_PER_REG;
-        self.null_bits[base..base + mo.m.div_ceil(64)].fill(0);
+        self.regs[reg as usize].nulls[..mo.m.div_ceil(64)].fill(0);
     }
 }
 
 /// One morsel's results, read out of the register file.
 pub(crate) struct MorselOut<'a> {
-    regs: &'a [i64],
-    /// `None` on the `no_nulls` arm, which tracks no null bits.
-    null_bits: Option<&'a [u64]>,
-    bool_bits: &'a [u64],
-    str_views: &'a [StrView],
+    regs: &'a [Reg],
+    no_nulls: bool,
+    str_views: &'a [[StrView; MORSEL]],
     str_arena: &'a [u8],
     bufs: StrBufs<'a>,
     m: usize,
@@ -237,14 +232,12 @@ impl MorselOut<'_> {
     /// the value is true and not NULL.
     pub(crate) fn filter_words(&self, reg: usize, out: &mut [u64]) {
         debug_assert_eq!(out.len(), self.m.div_ceil(64), "one bit per row");
-        let base = reg * NULL_WORDS_PER_REG;
-        let bool_bits = &self.bool_bits[base..base + out.len()];
-        match self.null_bits {
-            None => out.copy_from_slice(bool_bits),
-            Some(null_bits) => {
-                for (w, word) in out.iter_mut().enumerate() {
-                    *word = bool_bits[w] & !null_bits[base + w];
-                }
+        let r = &self.regs[reg];
+        if self.no_nulls {
+            out.copy_from_slice(&r.bools[..out.len()]);
+        } else {
+            for (w, word) in out.iter_mut().enumerate() {
+                *word = r.bools[w] & !r.nulls[w];
             }
         }
         // Boolean producers write whole words.
@@ -254,8 +247,7 @@ impl MorselOut<'_> {
     /// Register `reg`'s values for this morsel's rows, in row order.
     #[inline(always)]
     pub(crate) fn reg_values(&self, reg: usize) -> &[i64] {
-        let base = reg * MORSEL;
-        &self.regs[base..base + self.m]
+        &self.regs[reg].lanes[..self.m]
     }
 
     /// The same values as their little-endian byte image.
@@ -304,7 +296,7 @@ impl MorselOut<'_> {
     #[inline(always)]
     pub(crate) fn str_bytes(&self, reg: usize, i: usize) -> &[u8] {
         debug_assert!(i < self.m, "str_bytes row {i} is outside the morsel's {} rows", self.m);
-        view_bytes(self.str_views[reg * MORSEL + i], self.str_arena, self.bufs)
+        view_bytes(self.str_views[reg][i], self.str_arena, self.bufs)
     }
 
     /// Zero each NULL row's `stride`-byte cell in `win` and set its bit
@@ -330,13 +322,11 @@ impl MorselOut<'_> {
     /// Call `f(i)` for each of the morsel's rows where register `reg` is NULL.
     #[inline(always)]
     pub(crate) fn for_each_null_row(&self, reg: usize, mut f: impl FnMut(usize)) {
-        let Some(null_bits) = self.null_bits else {
+        if self.no_nulls {
             return;
-        };
-        let base = reg * NULL_WORDS_PER_REG;
+        }
         let words = self.m.div_ceil(64);
-        for w in 0..words {
-            let word = null_bits[base + w];
+        for (w, &word) in self.regs[reg].nulls[..words].iter().enumerate() {
             debug_assert!(
                 w + 1 < words || self.m.is_multiple_of(64) || (word >> (self.m % 64)) == 0,
                 "null_bits tail word has bits set beyond m={}",
@@ -443,7 +433,7 @@ fn null_or2(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16) {
 
 /// Propagate null over any sequence of source registers: dst_null = OR of
 /// theirs (word-at-a-time). Plain indexing rather than a split: the source count
-/// is not a `const N`, so [`split_windows`] does not apply, and at four words
+/// is not a `const N`, so [`split_regs`] does not apply, and at four words
 /// per morsel the bounds checks cost nothing that matters.
 #[inline]
 fn null_or_all(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, srcs: impl Iterator<Item = u16> + Clone) {
@@ -452,10 +442,8 @@ fn null_or_all(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, srcs: impl Iterat
     }
     let words = mo.m.div_ceil(64);
     for w in 0..words {
-        let acc = srcs
-            .clone()
-            .fold(0u64, |acc, r| acc | s.null_bits[r as usize * NULL_WORDS_PER_REG + w]);
-        s.null_bits[dst as usize * NULL_WORDS_PER_REG + w] = acc;
+        let acc = srcs.clone().fold(0u64, |acc, r| acc | s.regs[r as usize].nulls[w]);
+        s.regs[dst as usize].nulls[w] = acc;
     }
 }
 
@@ -466,9 +454,8 @@ fn null_copy1(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, src: u16) {
     if mo.no_nulls() {
         return;
     }
-    let base_s = src as usize * NULL_WORDS_PER_REG;
-    s.null_bits
-        .copy_within(base_s..base_s + mo.m.div_ceil(64), dst as usize * NULL_WORDS_PER_REG);
+    let ([ns], nd) = s.null_split([src], dst, mo.m.div_ceil(64));
+    nd.copy_from_slice(ns);
 }
 
 /// Fill null bits into register `di` for the payload columns selected by
@@ -492,9 +479,8 @@ fn fill_null_bits_mask(s: &mut EvalScratch, di: u16, mo: &Morsel<'_>, cols: u64)
         s.clear_null_reg(mo, di);
         return;
     }
-    let base = di as usize * NULL_WORDS_PER_REG;
     let rows = mo.null_words();
-    simd::null_bits(s.level, rows, mask, &mut s.null_bits[base..base + mo.m.div_ceil(64)]);
+    simd::null_bits(s.level, rows, mask, &mut s.regs[di as usize].nulls[..mo.m.div_ceil(64)]);
 }
 
 /// `IS [NOT] NULL` (`invert` for IS NOT NULL): payload column `pi`'s bit of the
@@ -524,16 +510,11 @@ fn fill_is_null_regs(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usize, 
 #[inline(never)]
 fn is_null_packed(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usize, invert: bool) {
     let words = mo.m.div_ceil(64);
-    let base = dst as usize * NULL_WORDS_PER_REG;
     let flip = if invert { u64::MAX } else { 0 };
-    simd::null_bits(
-        scratch.level,
-        mo.null_words(),
-        1u64 << pi,
-        &mut scratch.bool_bits[base..base + words],
-    );
-    for w in 0..words {
-        scratch.bool_bits[base + w] ^= flip;
+    let bools = &mut scratch.regs[dst as usize].bools[..words];
+    simd::null_bits(scratch.level, mo.null_words(), 1u64 << pi, bools);
+    for w in bools {
+        *w ^= flip;
     }
     // Whole words; a verdict's reader masks past the last row.
     scratch.clear_null_reg(mo, dst);
@@ -545,39 +526,38 @@ fn is_null_packed(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usiz
 /// NULL, so every row is the constant `invert`.
 fn eval_is_null_reg(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, invert: bool) {
     let flip = if invert { u64::MAX } else { 0 };
-    let base_a = a as usize * NULL_WORDS_PER_REG;
-    let base_d = dst as usize * NULL_WORDS_PER_REG;
     if mo.no_nulls() {
-        scratch.bool_bits[base_d..base_d + mo.m.div_ceil(64)].fill(flip);
+        scratch.regs[dst as usize].bools[..mo.m.div_ceil(64)].fill(flip);
         return maybe_unpack_bool_to_regs(scratch, mo, dst);
     }
     for w in 0..mo.m.div_ceil(64) {
-        scratch.bool_bits[base_d + w] = scratch.null_bits[base_a + w] ^ flip;
-        scratch.null_bits[base_d + w] = 0;
+        scratch.regs[dst as usize].bools[w] = scratch.regs[a as usize].nulls[w] ^ flip;
+        scratch.regs[dst as usize].nulls[w] = 0;
     }
     maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
 
-/// `BoolBinary`'s word-level kernel, both selectors: three-valued over
-/// `bool_bits` and `null_bits`, and plain AND / OR over `bool_bits` under
-/// `no_nulls`, which has no null words to read or write.
+/// `BoolBinary`'s word-level kernel, both selectors: three-valued over the
+/// truth and null words, and plain AND / OR over the truth words under
+/// `no_nulls`, which reads and writes no null word.
 fn bool_and_or_word_loop(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16, is_or: bool) {
     let words = mo.m.div_ceil(64);
-    let base_a_n = a as usize * NULL_WORDS_PER_REG;
-    let base_b_n = b as usize * NULL_WORDS_PER_REG;
-    let base_d_n = dst as usize * NULL_WORDS_PER_REG;
     if mo.no_nulls() {
-        let (ba, bd) = split_windows(&mut scratch.bool_bits, NULL_WORDS_PER_REG, [a, b], dst, words);
-        for ((d, &va), &vb) in bd.iter_mut().zip(ba[0]).zip(ba[1]) {
+        let ([ra, rb], rd) = split_regs(&mut scratch.regs, [a, b], dst);
+        for ((d, &va), &vb) in rd.bools[..words]
+            .iter_mut()
+            .zip(&ra.bools[..words])
+            .zip(&rb.bools[..words])
+        {
             *d = if is_or { va | vb } else { va & vb };
         }
         return;
     }
     for w in 0..words {
-        let va = scratch.bool_bits[base_a_n + w];
-        let vb = scratch.bool_bits[base_b_n + w];
-        let na = scratch.null_bits[base_a_n + w];
-        let nb = scratch.null_bits[base_b_n + w];
+        let va = scratch.regs[a as usize].bools[w];
+        let vb = scratch.regs[b as usize].bools[w];
+        let na = scratch.regs[a as usize].nulls[w];
+        let nb = scratch.regs[b as usize].nulls[w];
         let (result_bits, nd) = if is_or {
             // SQL 3VL OR: definite_true wherever a non-null side is true;
             // result-null only when neither side is definitely-true and at
@@ -591,30 +571,24 @@ fn bool_and_or_word_loop(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a
             let result_bits = !nd & va & vb;
             (result_bits, nd)
         };
-        scratch.bool_bits[base_d_n + w] = result_bits;
-        scratch.null_bits[base_d_n + w] = nd;
+        scratch.regs[dst as usize].bools[w] = result_bits;
+        scratch.regs[dst as usize].nulls[w] = nd;
     }
 }
 
-/// Unpack `bool_bits[dst]` into `regs[dst]` unless `dst` is bit_only, whose
+/// Unpack `dst`'s packed bits into its lanes unless `dst` is bit_only, whose
 /// readers take the packed bits directly. The counterpart to
 /// [`maybe_pack_bool_bits`].
 fn maybe_unpack_bool_to_regs(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
     if mo.prog.is_bit_only(dst as usize) {
         return;
     }
-    let EvalScratch { regs, bool_bits, level, .. } = scratch;
     let words = mo.m.div_ceil(64);
-    let base_b = dst as usize * NULL_WORDS_PER_REG;
-    let base_r = dst as usize * MORSEL;
-    simd::bit_lanes(
-        *level,
-        &bool_bits[base_b..base_b + words],
-        &mut regs[base_r..base_r + words * 64],
-    );
+    let r = &mut scratch.regs[dst as usize];
+    simd::bit_lanes(scratch.level, &r.bools[..words], &mut r.lanes[..words * 64]);
 }
 
-/// Bridge for producers that wrote `regs[dst]` and may have a downstream BOOL
+/// Bridge for producers that wrote `dst`'s lanes and may have a downstream BOOL
 /// consumer, a filter's verdict included. Non-bool producers reach a BOOL
 /// consumer through this path without restructuring their inner loop.
 ///
@@ -628,14 +602,9 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
 }
 
 fn pack_bool_bits(scratch: &mut EvalScratch, m: usize, dst: u16) {
-    let EvalScratch { regs, bool_bits, level, .. } = scratch;
     let words = m.div_ceil(64);
-    let base_b = dst as usize * NULL_WORDS_PER_REG;
-    simd::truthy_bits(
-        *level,
-        word_lanes(regs, dst, words),
-        &mut bool_bits[base_b..base_b + words],
-    );
+    let r = &mut scratch.regs[dst as usize];
+    simd::truthy_bits(scratch.level, &r.lanes[..words * 64], &mut r.bools[..words]);
 }
 
 /// OR a per-row failure flag into `dst`'s null words. A byte per row, packed
@@ -654,9 +623,8 @@ fn merge_fail_mask(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, bad: &[
     );
     let mut failed = [0u64; NULL_WORDS_PER_REG];
     pack_bytes(bad, &mut failed);
-    let base = dst as usize * NULL_WORDS_PER_REG;
     for (w, f) in failed.iter().enumerate().take(mo.m.div_ceil(64)) {
-        scratch.null_bits[base + w] |= f;
+        scratch.regs[dst as usize].nulls[w] |= f;
     }
 }
 
@@ -681,8 +649,7 @@ fn pack_bytes(src: &[u8; MORSEL], out: &mut [u64]) {
 /// Offsets rather than pointers, because `Vec` growth would dangle a pointer;
 /// `u64` because the arena is bounded only by the data flowing through a morsel.
 /// A `&[u8]` lane is not expressible at all — [`EvalScratch`] has no lifetime
-/// parameter, is `Default`-constructed once per evaluator, and outlives every
-/// batch it is driven over.
+/// parameter and outlives every batch it is driven over.
 #[derive(Clone, Copy, Default)]
 struct StrView {
     off: u64,
@@ -845,9 +812,9 @@ fn in_trim_set(set: &[u64; 4], b: u8) -> bool {
 impl IntReg {
     /// The register's first `m` rows.
     #[inline]
-    fn lane(self, regs: &[i64], m: usize) -> IntLane<'_> {
+    fn lane(self, regs: &[Reg], m: usize) -> IntLane<'_> {
         IntLane {
-            rows: &regs[self.reg as usize * MORSEL..][..m],
+            rows: &regs[self.reg as usize].lanes[..m],
             signed: self.signed,
         }
     }
@@ -958,10 +925,10 @@ fn arena_push_float(arena: &mut Vec<u8>, v: f64) -> StrView {
 /// string arms share it.
 ///
 /// Returns the per-row "take `a`" bits: `cond` truthy AND non-null. `cond` may be
-/// bit_only (its producer skips the unpack to `regs`), so its truthiness comes
-/// from `bool_bits`, not `regs`. `dst`'s null word is written here: `dst` is null
-/// wherever the chosen branch is null. Under `no_nulls` the mask is `cond`'s
-/// bits and there is no null word.
+/// bit_only (its producer skips the unpack to lanes), so its truthiness comes
+/// from its packed bits, not its lanes. `dst`'s null word is written here:
+/// `dst` is null wherever the chosen branch is null. Under `no_nulls` the mask
+/// is `cond`'s bits and no null word is written.
 fn select_take_mask(
     s: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -971,14 +938,13 @@ fn select_take_mask(
     b: u16,
 ) -> [u64; NULL_WORDS_PER_REG] {
     let words = mo.m.div_ceil(64);
-    let base_cond = cond as usize * NULL_WORDS_PER_REG;
     let mut take_a = [0u64; NULL_WORDS_PER_REG];
     if mo.no_nulls() {
-        take_a[..words].copy_from_slice(&s.bool_bits[base_cond..base_cond + words]);
+        take_a[..words].copy_from_slice(&s.regs[cond as usize].bools[..words]);
         return take_a;
     }
     for (w, t) in take_a.iter_mut().enumerate().take(words) {
-        *t = s.bool_bits[base_cond + w] & !s.null_bits[base_cond + w];
+        *t = s.regs[cond as usize].bools[w] & !s.regs[cond as usize].nulls[w];
     }
     let ([na, nb], nd) = s.null_split([a, b], dst, words);
     for w in 0..words {
@@ -991,18 +957,17 @@ fn select_take_mask(
 /// high bits never read as null. The inverse of [`EvalScratch::clear_null_reg`],
 /// and what backs both `LoadNull` opcodes.
 ///
-/// No `no_nulls` arm: `null_bits` is unallocated there, so the fill below panics
-/// rather than losing a NULL.
+/// No `no_nulls` arm: a result's reader skips the null words there, so this
+/// panics rather than losing a NULL.
 fn set_null_reg(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
-    debug_assert!(
+    assert!(
         !mo.no_nulls(),
         "set_null_reg under no_nulls: its caller must set `makes_null`"
     );
     let m = mo.m;
     let words = m.div_ceil(64);
-    let base = dst as usize * NULL_WORDS_PER_REG;
-    s.null_bits[base..base + words].fill(u64::MAX);
-    s.null_bits[base + words - 1] = tail_mask(m);
+    s.regs[dst as usize].nulls[..words].fill(u64::MAX);
+    s.regs[dst as usize].nulls[words - 1] = tail_mask(m);
 }
 
 /// Measure every row of string register `a` into scalar register `dst`. `f` is
@@ -1022,10 +987,7 @@ fn str_to_scalar(
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         // Both windows cut to the morsel: the destination already was, and
         // relating the two is what lets LLVM drop the source's per-row bound.
-        let (va, rd) = (
-            &str_views[ai * MORSEL..ai * MORSEL + mo.m],
-            &mut regs[d * MORSEL..d * MORSEL + mo.m],
-        );
+        let (va, rd) = (str_lane(str_views, ai, mo.m), &mut regs[d].lanes[..mo.m]);
         for (i, r) in rd.iter_mut().enumerate() {
             *r = f(view_bytes(va[i], str_arena, bufs));
         }
@@ -1040,8 +1002,8 @@ fn str_to_scalar(
 fn str_byte_len(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16) {
     {
         let EvalScratch { regs, str_views, .. } = &mut *scratch;
-        let va = &str_views[a as usize * MORSEL..][..mo.m];
-        let rd = &mut regs[dst as usize * MORSEL..][..mo.m];
+        let va = str_lane(str_views, a as usize, mo.m);
+        let rd = &mut regs[dst as usize].lanes[..mo.m];
         for (r, v) in rd.iter_mut().zip(va) {
             *r = v.len as i64;
         }
@@ -1065,10 +1027,7 @@ fn str_parse_to_scalar(
     let mut bad = [0u8; MORSEL];
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
-        let (va, rd) = (
-            &str_views[ai * MORSEL..ai * MORSEL + mo.m],
-            &mut regs[d * MORSEL..d * MORSEL + mo.m],
-        );
+        let (va, rd) = (str_lane(str_views, ai, mo.m), &mut regs[d].lanes[..mo.m]);
         for (i, r) in rd.iter_mut().enumerate() {
             match f(view_bytes(va[i], str_arena, bufs)) {
                 Some(v) => *r = v,
@@ -1091,10 +1050,7 @@ fn num_to_str(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, f: i
     let (d, ai, m) = (dst as usize, a as usize, mo.m);
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
-        let (ra, vd) = (
-            &regs[ai * MORSEL..ai * MORSEL + m],
-            &mut str_views[d * MORSEL..d * MORSEL + m],
-        );
+        let (ra, vd) = (&regs[ai].lanes[..m], str_lane_mut(str_views, d, m));
         for (i, r) in vd.iter_mut().enumerate() {
             *r = f(str_arena, ra[i]);
         }
@@ -1115,13 +1071,15 @@ fn str2_to_scalar(
     b: u16,
     f: impl Fn(&[u8], &[u8]) -> i64,
 ) {
-    let (base_a, base_b, base_d) = (a as usize * MORSEL, b as usize * MORSEL, dst as usize * MORSEL);
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         // All three windows cut to the morsel: indexing the lane `Vec` directly
         // costs two bounds checks and two counter bumps per row.
-        let (sa, sb) = (&str_views[base_a..base_a + mo.m], &str_views[base_b..base_b + mo.m]);
-        let rd = &mut regs[base_d..base_d + mo.m];
+        let (sa, sb) = (
+            str_lane(str_views, a as usize, mo.m),
+            str_lane(str_views, b as usize, mo.m),
+        );
+        let rd = &mut regs[dst as usize].lanes[..mo.m];
         for ((r, &va), &vb) in rd.iter_mut().zip(sa).zip(sb) {
             *r = f(view_bytes(va, str_arena, bufs), view_bytes(vb, str_arena, bufs));
         }
@@ -1184,7 +1142,8 @@ fn str_kernel_rows<const S: usize, const I: usize>(
 ) {
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
-        let (srcs, vd) = split_windows(str_views, MORSEL, strs, dst, mo.m);
+        let (srcs, vd) = split_regs(str_views, strs, dst);
+        let (srcs, vd) = (srcs.map(|s| &s[..mo.m]), &mut vd[..mo.m]);
         let lanes = ints.map(|r| r.lane(regs, vd.len()));
         for (i, r) in vd.iter_mut().enumerate() {
             let views = srcs.map(|w| w[i]);
@@ -1210,7 +1169,8 @@ fn eval_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, 
 /// [`eval_select`] over string lanes instead of scalar registers.
 fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u16, a: u16, b: u16) {
     let take_a = select_take_mask(scratch, mo, dst, cond, a, b);
-    let ([sa, sb], sd) = split_windows(&mut scratch.str_views, MORSEL, [a, b], dst, mo.m);
+    let ([sa, sb], sd) = split_regs(&mut scratch.str_views, [a, b], dst);
+    let (sa, sb, sd) = (&sa[..mo.m], &sb[..mo.m], &mut sd[..mo.m]);
     for ((sd, (sa, sb)), &word) in sd.chunks_mut(64).zip(sa.chunks(64).zip(sb.chunks(64))).zip(&take_a) {
         for (j, (v, (&x, &y))) in sd.iter_mut().zip(sa.iter().zip(sb)).enumerate() {
             *v = if (word >> j) & 1 != 0 { x } else { y };
@@ -1232,13 +1192,14 @@ fn eval_str_substr(
     len: Option<IntReg>,
 ) {
     let m = mo.m;
-    let (base_s, base_d) = (si as usize * MORSEL, d as usize * MORSEL);
     let mut bad = [0u8; MORSEL];
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         let (start, len) = (start.lane(regs, m), len.map(|l| l.lane(regs, m)));
+        let ([sv], dv) = split_regs(str_views, [si], d);
+        let (sv, dv) = (&sv[..m], &mut dv[..m]);
         for i in 0..m {
-            let v = str_views[base_s + i];
+            let v = sv[i];
             let (s, base_off) = view_bytes_at(v, str_arena, bufs);
             // 0-based character indices, clamped to the byte length, which
             // bounds the character count.
@@ -1253,7 +1214,7 @@ fn eval_str_substr(
                 None => n,
             };
             let (t_lo, t_hi) = (lo.clamp(0, n) as usize, hi.clamp(0, n) as usize);
-            str_views[base_d + i] = if t_lo >= t_hi {
+            dv[i] = if t_lo >= t_hi {
                 StrView::default()
             } else {
                 let b_lo = char_offset(s, t_lo);
@@ -1290,7 +1251,7 @@ fn eval_str_concat(
     skip_null: bool,
 ) {
     // `StrConcat` sets `makes_null` (a combined length above `u32::MAX`), so the
-    // `null_bits` read below is always in bounds.
+    // null words read below are maintained.
     debug_assert!(
         !mo.no_nulls(),
         "eval_str_concat under no_nulls: `StrConcat` must set `makes_null`"
@@ -1298,14 +1259,14 @@ fn eval_str_concat(
     let m = mo.m;
     let mut bad = [0u8; MORSEL];
     {
-        let EvalScratch { str_views, str_arena, null_bits, .. } = &mut *scratch;
-        let b_null_base = b as usize * NULL_WORDS_PER_REG;
-        let ([sa, sb], sd) = split_windows(str_views, MORSEL, [a, b], d, m);
+        let EvalScratch { str_views, str_arena, regs, .. } = &mut *scratch;
+        let ([sa, sb], sd) = split_regs(str_views, [a, b], d);
+        let (sa, sb, sd) = (&sa[..m], &sb[..m], &mut sd[..m]);
         for i in 0..m {
             let va = sa[i];
             // Under CONCAT's rule a NULL argument contributes the empty string,
             // whatever view its lane happens to carry.
-            let b_is_null = skip_null && (null_bits[b_null_base + i / 64] >> (i % 64)) & 1 != 0;
+            let b_is_null = skip_null && (regs[b as usize].nulls[i / 64] >> (i % 64)) & 1 != 0;
             let vb = if b_is_null { StrView::default() } else { sb[i] };
             // Each operand's extent is resolved once and reused for both the
             // length sum and the copy. Widened before summing: two near-u32::MAX
@@ -1419,8 +1380,7 @@ fn eval_str_cmp<A: Cells, B: Cells>(
     pred: impl Fn(Ordering) -> bool,
 ) {
     fill_null_bits_mask(scratch, dst, mo, a.null_bit | b.null_bit);
-    let base_d = dst as usize * MORSEL;
-    let rd = &mut scratch.regs[base_d..base_d + mo.m];
+    let rd = &mut scratch.regs[dst as usize].lanes[..mo.m];
     for (i, r) in rd.iter_mut().enumerate() {
         *r = pred(compare_german_strings(a.cells.cell(i), a.blob, b.cells.cell(i), b.blob)) as i64;
     }
@@ -1476,10 +1436,9 @@ fn eval_str_eq<A: Cells, B: Cells>(
         }
     }
     let flip = if ne { u64::MAX } else { 0 };
-    let base = dst as usize * NULL_WORDS_PER_REG;
     for (w, &bits) in eq_bits.iter().enumerate().take(words) {
         // Whole words; a verdict's reader masks past the last row.
-        scratch.bool_bits[base + w] = bits ^ flip;
+        scratch.regs[dst as usize].bools[w] = bits ^ flip;
     }
     maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
@@ -1521,21 +1480,27 @@ fn bin_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, f:
 }
 
 /// [`bin_op`] for a predicate. A bit_only destination takes its packed bits
-/// straight off the operands and no lane is written.
-#[inline]
+/// straight off the operands and no lane is written; any other gets its lanes
+/// from the scalar loop, which the `cmp_value` shapes of `expr_kernel_bench`
+/// measure against packing and unpacking.
+///
+/// `#[inline(always)]`: left to LLVM some instantiations are called, a call a
+/// compare a morsel; the `nullable` and `literals` shapes of
+/// `filter_kernel_bench` measure it.
+#[inline(always)]
 fn bin_pred<P: LanePred>(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16) {
     if !mo.prog.is_bit_only(d as usize) {
         return bin_op(scratch, mo, d, a, b, |x, y| P::scalar(x, y) as i64);
     }
     let words = mo.m.div_ceil(64);
     {
-        let EvalScratch { regs, bool_bits, level, .. } = &mut *scratch;
-        let base = d as usize * NULL_WORDS_PER_REG;
+        let level = scratch.level;
+        let ([ra, rb], rd) = split_regs(&mut scratch.regs, [a, b], d);
         simd::pred_bits::<P>(
-            *level,
-            word_lanes(regs, a, words),
-            word_lanes(regs, b, words),
-            &mut bool_bits[base..base + words],
+            level,
+            &ra.lanes[..words * 64],
+            &rb.lanes[..words * 64],
+            &mut rd.bools[..words],
         );
     }
     null_or2(scratch, mo, d, a, b);
@@ -1555,45 +1520,23 @@ fn un_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, f: impl Fn(
     maybe_pack_bool_bits(scratch, mo, d);
 }
 
-/// The largest IN set tested a value at a time into a register's lanes; a
-/// larger one is searched per row. [`IN_SET_BITS_MAX`] is the same limit for a
-/// bit_only destination, whose scan costs less a value. The `in*` shapes of
-/// `filter_kernel_bench` place both crossovers, a filter's verdict being
-/// bit_only.
-const IN_SET_SCAN_MAX: usize = 32;
+/// The largest IN set scanned a value at a time, and only by a morsel of at
+/// least as many rows: a scan compares every lane of the morsel's words with
+/// every value, where a search probes once per row. The `in*` shapes of
+/// `filter_kernel_bench` and `expr_kernel_bench` place both, the second under
+/// `GNITZ_BENCH_ROWS`.
 const IN_SET_BITS_MAX: usize = 64;
 
-/// `a IN set` for a bit_only destination: its packed bits straight off the
-/// operand, and no lane written.
+/// `a IN set` by scanning the set: the packed bits straight off the operand.
 fn in_set_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, set: &[i64]) {
     let words = mo.m.div_ceil(64);
     {
-        let EvalScratch { regs, bool_bits, level, .. } = &mut *scratch;
-        let base = d as usize * NULL_WORDS_PER_REG;
-        simd::in_set_bits(
-            *level,
-            word_lanes(regs, a, words),
-            set,
-            &mut bool_bits[base..base + words],
-        );
+        let level = scratch.level;
+        let ([ra], rd) = split_regs(&mut scratch.regs, [a], d);
+        simd::in_set_bits(level, &ra.lanes[..words * 64], set, &mut rd.bools[..words]);
     }
     null_copy1(scratch, mo, d, a);
-}
-
-/// `a IN set` for a small set: one equality pass over the whole lane per set
-/// value, each a branch-free loop, rather than a search per row.
-fn in_small_set(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, set: &[i64]) {
-    {
-        let ([ra], rd) = scratch.regs_split([a], d, mo.m);
-        rd.fill(0);
-        for &v in set {
-            for (r, &x) in rd.iter_mut().zip(ra) {
-                *r |= (x == v) as i64;
-            }
-        }
-    }
-    null_copy1(scratch, mo, d, a);
-    maybe_pack_bool_bits(scratch, mo, d);
+    maybe_unpack_bool_to_regs(scratch, mo, d);
 }
 
 /// DIV-shaped op: compute per-row, mark divide-by-zero rows null, substitute a
@@ -1660,40 +1603,27 @@ fn unary_null_like(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, f
     maybe_pack_bool_bits(scratch, mo, d);
 }
 
-/// Null-skipping 2-ary extremum: NULL only when both operands are. `pick`
-/// returns true when `a` wins on value.
+/// Null-skipping 2-ary extremum: NULL only when both operands are. `P` holds
+/// where `a` wins on value; a NULL operand loses whatever its lane holds.
 #[inline]
-fn minmax2(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, pick: impl Fn(i64, i64) -> bool) {
-    let m = mo.m;
-    let words = m.div_ceil(64);
-    if mo.no_nulls() {
-        let ([ra, rb], rd) = scratch.regs_split([a, b], d, m);
-        for ((r, &x), &y) in rd.iter_mut().zip(ra).zip(rb) {
-            *r = if pick(x, y) { x } else { y };
-        }
-    } else {
-        let base_a = a as usize * NULL_WORDS_PER_REG;
-        let base_b = b as usize * NULL_WORDS_PER_REG;
-        let mut na = [0u64; NULL_WORDS_PER_REG];
-        let mut nb = [0u64; NULL_WORDS_PER_REG];
-        na[..words].copy_from_slice(&scratch.null_bits[base_a..base_a + words]);
-        nb[..words].copy_from_slice(&scratch.null_bits[base_b..base_b + words]);
-        {
-            let ([ra, rb], rd) = scratch.regs_split([a, b], d, m);
-            // A NULL operand loses outright; only two live ones consult `pick`.
-            let words = rd.chunks_mut(64).zip(ra.chunks(64).zip(rb.chunks(64)));
-            for ((rd, (ra, rb)), (&na, &nb)) in words.zip(na.iter().zip(&nb)) {
-                for (j, (r, (&x, &y))) in rd.iter_mut().zip(ra.iter().zip(rb)).enumerate() {
-                    let (a_null, b_null) = ((na >> j) & 1, (nb >> j) & 1);
-                    let take_a = (1 - a_null) & (b_null | pick(x, y) as u64);
-                    let take_a = 0i64.wrapping_sub(take_a as i64);
-                    *r = (x & take_a) | (y & !take_a);
-                }
+fn minmax2<P: LanePred>(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16) {
+    let (level, words) = (scratch.level, mo.m.div_ceil(64));
+    {
+        let ([ra, rb], rd) = split_regs(&mut scratch.regs, [a, b], d);
+        if mo.no_nulls() {
+            let m = mo.m;
+            for ((r, &x), &y) in rd.lanes[..m].iter_mut().zip(&ra.lanes[..m]).zip(&rb.lanes[..m]) {
+                *r = if P::scalar(x, y) { x } else { y };
             }
-        }
-        let base_d = d as usize * NULL_WORDS_PER_REG;
-        for w in 0..words {
-            scratch.null_bits[base_d + w] = na[w] & nb[w];
+        } else {
+            let (la, lb) = (&ra.lanes[..words * 64], &rb.lanes[..words * 64]);
+            let mut take_a = [0u64; NULL_WORDS_PER_REG];
+            simd::pred_bits::<P>(level, la, lb, &mut take_a[..words]);
+            for (w, take) in take_a[..words].iter_mut().enumerate() {
+                *take = !ra.nulls[w] & (rb.nulls[w] | *take);
+                rd.nulls[w] = ra.nulls[w] & rb.nulls[w];
+            }
+            simd::blend(level, &take_a[..words], la, lb, &mut rd.lanes[..words * 64]);
         }
     }
     maybe_pack_bool_bits(scratch, mo, d);
@@ -1756,7 +1686,8 @@ fn load_pk(
 }
 
 /// Evaluate `prog` over one morsel of `mb` (`morsel_start..morsel_start+m`).
-/// Results land in `scratch.regs`; null bits in `scratch.null_bits`.
+/// Results land in `scratch.regs`: a register's values in its lanes, its null
+/// bits beside them.
 ///
 /// Callers loop over morsels and call this function once per morsel.
 pub(crate) fn eval_batch(
@@ -1912,35 +1843,26 @@ pub(crate) fn eval_batch(
                 }
             }
             Instr::IntMinMax2 { a, b, is_max, signed } => match (is_max, signed) {
-                (true, true) => minmax2(scratch, mo, dst, a, b, |x, y| x > y),
-                (false, true) => minmax2(scratch, mo, dst, a, b, |x, y| x < y),
-                (true, false) => minmax2(scratch, mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
-                (false, false) => minmax2(scratch, mo, dst, a, b, |x, y| (x as u64) < (y as u64)),
+                (true, true) => minmax2::<simd::GtSigned>(scratch, mo, dst, a, b),
+                (false, true) => minmax2::<simd::Not<simd::GtSigned>>(scratch, mo, dst, a, b),
+                (true, false) => minmax2::<simd::GtUnsigned>(scratch, mo, dst, a, b),
+                (false, false) => minmax2::<simd::Not<simd::GtUnsigned>>(scratch, mo, dst, a, b),
             },
             // `total_cmp` and nothing else: -0.0 and +0.0 are `==`-equal but
             // total_cmp-distinct, so an `==`-based pick would let operand order
             // decide which bit pattern survives.
-            Instr::FloatMinMax2 { a, b, is_max } => {
-                if is_max {
-                    minmax2(scratch, mo, dst, a, b, |x, y| {
-                        decode_f64(x).total_cmp(&decode_f64(y)).is_gt()
-                    })
-                } else {
-                    minmax2(scratch, mo, dst, a, b, |x, y| {
-                        decode_f64(x).total_cmp(&decode_f64(y)).is_lt()
-                    })
-                }
-            }
+            Instr::FloatMinMax2 { a, b, is_max } => match is_max {
+                true => minmax2::<simd::GtTotal>(scratch, mo, dst, a, b),
+                false => minmax2::<simd::Not<simd::GtTotal>>(scratch, mo, dst, a, b),
+            },
 
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
             // ----------------------------------------------------------------
             Instr::IntInSet { value_reg, set_idx } => {
                 let set = &prog.int_sets[set_idx as usize];
-                if prog.is_bit_only(dst as usize) && set.len() <= IN_SET_BITS_MAX {
+                if set.len() <= IN_SET_BITS_MAX.min(m) {
                     in_set_bits(scratch, mo, dst, value_reg, set);
-                } else if set.len() <= IN_SET_SCAN_MAX {
-                    in_small_set(scratch, mo, dst, value_reg, set);
                 } else {
                     un_op(scratch, mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
                 }
@@ -1975,13 +1897,13 @@ pub(crate) fn eval_batch(
                     bin_pred::<simd::Not<simd::Eq>>(scratch, mo, dst, a, b)
                 }
                 (CmpOp::Gt, IntOrder::Signed) => bin_pred::<simd::GtSigned>(scratch, mo, dst, a, b),
-                (CmpOp::Ge, IntOrder::Signed) => bin_pred::<simd::GeSigned>(scratch, mo, dst, a, b),
+                (CmpOp::Ge, IntOrder::Signed) => bin_pred::<simd::Not<simd::GtSigned>>(scratch, mo, dst, b, a),
                 (CmpOp::Lt, IntOrder::Signed) => bin_pred::<simd::GtSigned>(scratch, mo, dst, b, a),
-                (CmpOp::Le, IntOrder::Signed) => bin_pred::<simd::GeSigned>(scratch, mo, dst, b, a),
+                (CmpOp::Le, IntOrder::Signed) => bin_pred::<simd::Not<simd::GtSigned>>(scratch, mo, dst, a, b),
                 (CmpOp::Gt, IntOrder::Unsigned) => bin_pred::<simd::GtUnsigned>(scratch, mo, dst, a, b),
-                (CmpOp::Ge, IntOrder::Unsigned) => bin_pred::<simd::GeUnsigned>(scratch, mo, dst, a, b),
+                (CmpOp::Ge, IntOrder::Unsigned) => bin_pred::<simd::Not<simd::GtUnsigned>>(scratch, mo, dst, b, a),
                 (CmpOp::Lt, IntOrder::Unsigned) => bin_pred::<simd::GtUnsigned>(scratch, mo, dst, b, a),
-                (CmpOp::Le, IntOrder::Unsigned) => bin_pred::<simd::GeUnsigned>(scratch, mo, dst, b, a),
+                (CmpOp::Le, IntOrder::Unsigned) => bin_pred::<simd::Not<simd::GtUnsigned>>(scratch, mo, dst, a, b),
                 (CmpOp::Eq, IntOrder::UnsignedSigned) => bin_pred::<simd::EqUnsignedSigned>(scratch, mo, dst, a, b),
                 (CmpOp::Ne, IntOrder::UnsignedSigned) => {
                     bin_pred::<simd::Not<simd::EqUnsignedSigned>>(scratch, mo, dst, a, b)
@@ -2014,24 +1936,22 @@ pub(crate) fn eval_batch(
             // Boolean 3VL
             // ----------------------------------------------------------------
             // Word operations over the packed bits on both arms. The unpack to
-            // `regs[dst]` is skipped for a bit_only destination, whose only
+            // `dst`'s lanes is skipped for a bit_only destination, whose only
             // readers are boolean.
             Instr::BoolBinary { a, b, is_or } => {
                 bool_and_or_word_loop(scratch, mo, dst, a, b, is_or);
                 maybe_unpack_bool_to_regs(scratch, mo, dst);
             }
             Instr::BoolNot { a } => {
-                let base_a = a as usize * NULL_WORDS_PER_REG;
-                let base_d = dst as usize * NULL_WORDS_PER_REG;
                 for w in 0..m.div_ceil(64) {
-                    let va = scratch.bool_bits[base_a + w];
+                    let va = scratch.regs[a as usize].bools[w];
                     if mo.no_nulls() {
-                        scratch.bool_bits[base_d + w] = !va;
+                        scratch.regs[dst as usize].bools[w] = !va;
                     } else {
                         // 3VL: NOT NULL = NULL, its truth bit cleared.
-                        let na = scratch.null_bits[base_a + w];
-                        scratch.bool_bits[base_d + w] = !va & !na;
-                        scratch.null_bits[base_d + w] = na;
+                        let na = scratch.regs[a as usize].nulls[w];
+                        scratch.regs[dst as usize].bools[w] = !va & !na;
+                        scratch.regs[dst as usize].nulls[w] = na;
                     }
                 }
                 maybe_unpack_bool_to_regs(scratch, mo, dst);
@@ -2060,8 +1980,7 @@ pub(crate) fn eval_batch(
             // live row. Only ever reached on the nullable arm (LoadNull forces
             // `no_nulls` off via its `Operands::makes_null` flag).
             Instr::LoadNull => {
-                let base_d = dst as usize * MORSEL;
-                scratch.regs[base_d..base_d + m].fill(0);
+                scratch.regs[dst as usize].lanes[..m].fill(0);
                 set_null_reg(scratch, mo, dst);
                 maybe_pack_bool_bits(scratch, mo, dst);
             }
@@ -2104,9 +2023,8 @@ pub(crate) fn eval_batch(
                 // it, because `resolve_program` recorded `pi` in the same mask.
                 let buf = SRC_COL_BASE + pi as u32;
                 let cells = bufs.region(buf).expect("a column slot names a buffer");
-                let base_d = dst as usize * MORSEL;
                 let rows = cells[morsel_start * 16..(morsel_start + m) * 16].as_chunks::<16>().0;
-                let lane = &mut scratch.str_views[base_d..base_d + m];
+                let lane = str_lane_mut(&mut scratch.str_views, dst as usize, m);
                 for (i, (v, cell)) in lane.iter_mut().zip(rows).enumerate() {
                     *v = cell_to_view(cell, (morsel_start + i) * 16, buf, blob_len);
                 }
@@ -2117,8 +2035,7 @@ pub(crate) fn eval_batch(
             // every live row, with the tail word masked so stale high bits never
             // read as null.
             Instr::LoadNullStr => {
-                let base_d = dst as usize * MORSEL;
-                scratch.str_views[base_d..base_d + m].fill(StrView::default());
+                str_lane_mut(&mut scratch.str_views, dst as usize, m).fill(StrView::default());
                 set_null_reg(scratch, mo, dst);
             }
 

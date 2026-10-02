@@ -396,9 +396,31 @@ pub(crate) fn simd_levels() -> Vec<(&'static str, crate::simd::Level)> {
     use crate::simd::Level;
     #[allow(unused_mut)]
     let mut levels = vec![("native", Level::new())];
+    // A build that itself targets the wider set compiles no narrower kernel.
     #[cfg(target_arch = "x86_64")]
-    if let (Some(_), Some(avx2)) = (Level::new().as_avx512(), Level::new().as_avx2()) {
+    if let (Some(_), None, Some(avx2)) = (
+        Level::new().as_avx512(),
+        Level::baseline().as_avx512(),
+        Level::new().as_avx2(),
+    ) {
         levels.push(("avx2", Level::Avx2(avx2)));
     }
     levels
+}
+
+/// The level an evaluator's kernels run at under test: the CPU's, or the one
+/// of [`simd_levels`] that `GNITZ_BENCH_LEVEL` names, so an evaluator bench
+/// reads the level a CPU without the wider set runs. On such a CPU `avx2` is
+/// the level it has.
+pub(crate) fn eval_level() -> crate::simd::Level {
+    let want = std::env::var("GNITZ_BENCH_LEVEL").unwrap_or_else(|_| "native".to_string());
+    let levels = simd_levels();
+    match levels.iter().find(|(name, _)| *name == want) {
+        Some(&(_, level)) => level,
+        None if want == "avx2" && levels[0].1.as_avx2().is_some() => levels[0].1,
+        None => panic!(
+            "GNITZ_BENCH_LEVEL={want:?} names no level of {:?}",
+            levels.iter().map(|l| l.0).collect::<Vec<_>>()
+        ),
+    }
 }

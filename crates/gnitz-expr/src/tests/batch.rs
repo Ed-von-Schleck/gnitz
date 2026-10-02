@@ -585,6 +585,9 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     // A NULL side yields the other, whatever it stores; both NULL is NULL.
     assert_eq!(fold(a(), b(), true), [Some(2), Some(5), Some(9), Some(7), None]);
     assert_eq!(fold(a(), b(), false), [Some(1), Some(3), Some(9), Some(7), None]);
+    // A negative value is the minimum signed and would be the maximum unsigned.
+    assert_eq!(fold(i64s([-7]), i64s([3]), true), [Some(3)]);
+    assert_eq!(fold(i64s([-7]), i64s([3]), false), [Some(-7)]);
 
     // The unsigned arm, which the signed corpus above cannot reach: as `u64`,
     // `u64::MAX` is the maximum, while read as `i64` the same bits are `-1` and
@@ -594,19 +597,25 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     assert_eq!(fold(u64s(-1), u64s(1), false), [Some(1)]);
 }
 
+/// Pairs an IEEE compare and `total_cmp` order differently — a NaN of either
+/// sign on either side, the two zeros both ways round — so each row tells the
+/// two apart for `GREATEST`, for `LEAST`, or for both.
 #[test]
 fn float_minmax2_uses_total_cmp_order() {
+    const NAN: f64 = f64::NAN;
+    const INF: f64 = f64::INFINITY;
+    let a = [5.0, NAN, 5.0, -0.0, 0.0, INF, NAN, -NAN, -INF];
+    let b = [NAN, 5.0, 2.0, 0.0, -0.0, NAN, INF, -INF, -NAN];
     let fold = |is_max| {
-        let a = f64s([5.0, 5.0, -0.0, f64::INFINITY]);
-        let b = f64s([f64::NAN, 2.0, 0.0, f64::NAN]);
-        float_bits(&ints(&[a, b], |r| {
+        ints(&[f64s(a), f64s(b)], |r| {
             vec![LogicalInstr::FloatMinMax2 { a: r[0], b: r[1], is_max }]
-        }))
+        })
     };
-    let bits = |xs: [f64; 4]| xs.map(|x| Some(canonical_bits(x))).to_vec();
-    // NaN is the total-order max, and +0.0 beats -0.0.
-    assert_eq!(fold(true), bits([f64::NAN, 5.0, 0.0, f64::NAN]));
-    assert_eq!(fold(false), bits([5.0, 2.0, -0.0, f64::INFINITY]));
+    let bits = |xs: [f64; 9]| xs.map(|x| Some(encode_f64(x))).to_vec();
+    // A positive NaN is the total-order maximum and a negative one the
+    // minimum; `0.0` is above `-0.0`.
+    assert_eq!(fold(true), bits([NAN, NAN, 5.0, 0.0, 0.0, NAN, NAN, -INF, -INF]));
+    assert_eq!(fold(false), bits([5.0, 5.0, 2.0, -0.0, -0.0, INF, INF, -NAN, -NAN]));
 }
 
 /// A calendar op reads a DATE column as days and a TIMESTAMP one as
@@ -741,7 +750,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
             None => super::SRC_BLOB,
         };
         assert_eq!(
-            scratch.str_views[c * MORSEL].src,
+            scratch.str_views[c][0].src,
             want,
             "column {c} ({} bytes) loaded through the wrong buffer",
             val.len(),

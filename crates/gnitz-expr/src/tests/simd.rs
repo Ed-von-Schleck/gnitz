@@ -3,7 +3,7 @@ use crate::test_support::simd_levels;
 
 /// The bit patterns a lane predicate has to get right: the integer extremes
 /// either side of the sign, and the floats that do not order like their bits.
-const EDGES: [i64; 14] = [
+const EDGES: [i64; 15] = [
     0,
     1,
     -1,
@@ -12,6 +12,7 @@ const EDGES: [i64; 14] = [
     i64::MAX,
     i64::MIN + 1,
     f64::NAN.to_bits() as i64,
+    (-f64::NAN).to_bits() as i64,
     (-0.0f64).to_bits() as i64,
     f64::INFINITY.to_bits() as i64,
     f64::NEG_INFINITY.to_bits() as i64,
@@ -55,9 +56,13 @@ fn packed(n: usize, bit: impl Fn(usize) -> bool) -> Vec<u64> {
     out
 }
 
-fn check_pred<P: LanePred>(name: &str) {
+/// `P` against the operator it stands for, per row and at every level.
+fn check_pred<P: LanePred>(name: &str, holds: impl Fn(i64, i64) -> bool) {
     let (a, b) = operand_lanes();
-    let want = packed(a.len(), |i| P::scalar(a[i], b[i]));
+    for (&x, &y) in a.iter().zip(&b) {
+        assert_eq!(P::scalar(x, y), holds(x, y), "{name} of {x:#x}, {y:#x}");
+    }
+    let want = packed(a.len(), |i| holds(a[i], b[i]));
     for (level_name, level) in simd_levels() {
         let mut got = vec![0u64; want.len()];
         pred_bits::<P>(level, &a, &b, &mut got);
@@ -66,46 +71,28 @@ fn check_pred<P: LanePred>(name: &str) {
 }
 
 #[test]
-fn a_predicate_packs_what_it_says_per_row() {
-    check_pred::<Eq>("Eq");
-    check_pred::<Not<Eq>>("Not<Eq>");
-    check_pred::<GtSigned>("GtSigned");
-    check_pred::<GeSigned>("GeSigned");
-    check_pred::<GtUnsigned>("GtUnsigned");
-    check_pred::<GeUnsigned>("GeUnsigned");
-    check_pred::<EqUnsignedSigned>("EqUnsignedSigned");
-    check_pred::<Not<EqUnsignedSigned>>("Not<EqUnsignedSigned>");
-    check_pred::<LtUnsignedSigned>("LtUnsignedSigned");
-    check_pred::<Not<LtUnsignedSigned>>("Not<LtUnsignedSigned>");
-    check_pred::<LeUnsignedSigned>("LeUnsignedSigned");
-    check_pred::<Not<LeUnsignedSigned>>("Not<LeUnsignedSigned>");
-    check_pred::<EqFloat>("EqFloat");
-    check_pred::<Not<EqFloat>>("Not<EqFloat>");
-    check_pred::<GtFloat>("GtFloat");
-    check_pred::<GeFloat>("GeFloat");
-}
-
-/// The spellings `eval_batch` relies on for the operators it has no predicate
-/// of its own for.
-#[test]
-fn a_mirrored_or_complemented_predicate_is_the_operator() {
-    for &x in &EDGES {
-        for &y in &EDGES {
-            let (fx, fy) = (f64::from_bits(x as u64), f64::from_bits(y as u64));
-            assert_eq!(GtSigned::scalar(y, x), x < y);
-            assert_eq!(GeSigned::scalar(y, x), x <= y);
-            assert_eq!(GtUnsigned::scalar(y, x), (x as u64) < (y as u64));
-            assert_eq!(GeUnsigned::scalar(y, x), (x as u64) <= (y as u64));
-            assert_eq!(GtFloat::scalar(y, x), fx < fy, "{fx} < {fy}");
-            assert_eq!(GeFloat::scalar(y, x), fx <= fy, "{fx} <= {fy}");
-            assert_eq!(<Not<EqFloat>>::scalar(x, y), fx != fy, "{fx} <> {fy}");
-            // An unsigned `x` against a signed `y`, widened so both fit.
-            let (wx, wy) = (x as u64 as i128, y as i128);
-            assert_eq!(EqUnsignedSigned::scalar(x, y), wx == wy);
-            assert_eq!(LtUnsignedSigned::scalar(x, y), wx < wy);
-            assert_eq!(LeUnsignedSigned::scalar(x, y), wx <= wy);
-        }
-    }
+fn a_predicate_is_its_operator_per_row_and_per_vector() {
+    let f = |x: i64| f64::from_bits(x as u64);
+    // An unsigned `x` against a signed `y`, widened so both fit.
+    let wide = |x: i64, y: i64| (x as u64 as i128, y as i128);
+    check_pred::<Eq>("Eq", |x, y| x == y);
+    check_pred::<Not<Eq>>("Not<Eq>", |x, y| x != y);
+    check_pred::<GtSigned>("GtSigned", |x, y| x > y);
+    check_pred::<Not<GtSigned>>("Not<GtSigned>", |x, y| x <= y);
+    check_pred::<GtUnsigned>("GtUnsigned", |x, y| (x as u64) > (y as u64));
+    check_pred::<Not<GtUnsigned>>("Not<GtUnsigned>", |x, y| (x as u64) <= (y as u64));
+    check_pred::<EqUnsignedSigned>("EqUnsignedSigned", |x, y| wide(x, y).0 == wide(x, y).1);
+    check_pred::<Not<EqUnsignedSigned>>("Not<EqUnsignedSigned>", |x, y| wide(x, y).0 != wide(x, y).1);
+    check_pred::<LtUnsignedSigned>("LtUnsignedSigned", |x, y| wide(x, y).0 < wide(x, y).1);
+    check_pred::<Not<LtUnsignedSigned>>("Not<LtUnsignedSigned>", |x, y| wide(x, y).0 >= wide(x, y).1);
+    check_pred::<LeUnsignedSigned>("LeUnsignedSigned", |x, y| wide(x, y).0 <= wide(x, y).1);
+    check_pred::<Not<LeUnsignedSigned>>("Not<LeUnsignedSigned>", |x, y| wide(x, y).0 > wide(x, y).1);
+    check_pred::<EqFloat>("EqFloat", |x, y| f(x) == f(y));
+    check_pred::<Not<EqFloat>>("Not<EqFloat>", |x, y| f(x) != f(y));
+    check_pred::<GtFloat>("GtFloat", |x, y| f(x) > f(y));
+    check_pred::<GeFloat>("GeFloat", |x, y| f(x) >= f(y));
+    check_pred::<GtTotal>("GtTotal", |x, y| f(x).total_cmp(&f(y)).is_gt());
+    check_pred::<Not<GtTotal>>("Not<GtTotal>", |x, y| f(x).total_cmp(&f(y)).is_le());
 }
 
 #[test]

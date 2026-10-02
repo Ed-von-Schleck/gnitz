@@ -62,10 +62,14 @@ impl RangeMembership {
             return;
         }
         if self.null_mask != 0 {
-            let mask = self.null_mask;
-            and_cells(words, mb.null_bmp(), 8, 0, |w: [u8; 8]| {
-                u64::from_le_bytes(w) & mask == 0
-            });
+            let level = crate::simd::level();
+            for (words, rows) in words.chunks_mut(4).zip(mb.null_bmp().chunks(4 * 64 * 8)) {
+                let mut nulls = [0u64; 4];
+                crate::simd::null_bits(level, rows, self.null_mask, &mut nulls[..words.len()]);
+                for (w, n) in words.iter_mut().zip(nulls) {
+                    *w &= !n;
+                }
+            }
         }
         for &(loc, lo, span) in &self.bounds {
             match loc.size() {

@@ -1718,8 +1718,8 @@ impl LogicalProgram {
         Ok(ProgramFacts {
             bit_only: bool_produced & !non_bool_read,
             // `bool_input` alone: a register in `bit_only \ bool_input` has
-            // `IsNullReg` as its only possible reader, which reads `null_bits`
-            // and never the packed bit.
+            // `IsNullReg` as its only possible reader, which reads the null
+            // words and never the packed bit.
             bool_pack: bool_input,
             no_nulls,
             reg_u64,
@@ -1762,17 +1762,17 @@ fn check_const_idx(const_idx: u32, n: usize) -> Result<(), ExprValidateErr> {
 /// How a kernel consumes a register operand.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadAs {
-    /// The register's i64 / f64 image out of `regs`.
+    /// The register's i64 / f64 image out of its lanes.
     Value,
     /// A German-string view out of `str_views`.
     Str,
-    /// A packed truth bit out of `bool_bits`, never the i64 image — which is
-    /// what lets a producer whose every reader is a `Bool` skip the unpack
+    /// A packed truth bit out of the truth words, never the i64 image — which
+    /// is what lets a producer whose every reader is a `Bool` skip the unpack
     /// (`bit_only`).
     Bool,
-    /// The register's null lane alone, out of `null_bits`: neither its value
-    /// nor its truth bit, so the operand's class is not constrained and its
-    /// producer need not unpack.
+    /// The register's null words alone: neither its value nor its truth bit,
+    /// so the operand's class is not constrained and its producer need not
+    /// unpack.
     NullBit,
 }
 
@@ -1784,8 +1784,8 @@ enum WriteAs {
     /// A scalar value, together with how the register inherits U64-ness.
     Value(U64Rule),
     /// A scalar whose i64 image is exactly its truth bit, 0 or 1. A reader may
-    /// therefore take the packed `bool_bits` bit instead, and the kernel may
-    /// skip writing `regs` when the register is `bit_only`. A mask-style `-1`
+    /// therefore take the packed truth bit instead, and the kernel may skip
+    /// writing the lanes when the register is `bit_only`. A mask-style `-1`
     /// for true is the violation this rules out.
     Bool,
     /// A German-string view.
@@ -2405,13 +2405,14 @@ pub(crate) struct ResolvedProgram {
     /// over the bit the batch carries for it.
     pub(crate) nullable_slots: u64,
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
-    /// reads `regs[r]`. A permission, not an obligation: the compares, the
-    /// string equalities, `BoolBinary`, `BoolNot` and the null tests skip the
-    /// lane and write `bool_bits` natively.
+    /// reads its lanes. A permission, not an obligation: the compares, the IN
+    /// scan, the string equalities, `BoolBinary`, `BoolNot` and the null tests
+    /// skip the lanes and write the packed truth bits natively.
     bit_only_mask: u64,
-    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
-    /// consumer reads it as a truth bit. A filter's result register is covered
-    /// because `analyze` forces it into that set, whatever opcode writes it.
+    /// Bit `r` set iff `r`'s producer must write its packed truth bits: some
+    /// downstream consumer reads it as a truth bit. A filter's result register
+    /// is covered because `analyze` forces it into that set, whatever opcode
+    /// writes it.
     bool_pack_mask: u64,
     /// Bit `r` set iff register `r`'s i64 image is to be read as a `u64`.
     pub(crate) reg_u64: u64,
@@ -2428,8 +2429,8 @@ impl ResolvedProgram {
         (self.bit_only_mask >> reg) & 1 != 0
     }
 
-    /// True iff `reg`'s producer must write `bool_bits[reg]`. Per instruction
-    /// per morsel, from `maybe_pack_bool_bits`.
+    /// True iff `reg`'s producer must write its packed truth bits. Per
+    /// instruction per morsel, from `maybe_pack_bool_bits`.
     pub(crate) fn needs_bool_pack(&self, reg: usize) -> bool {
         (self.bool_pack_mask >> reg) & 1 != 0
     }
@@ -2438,10 +2439,11 @@ impl ResolvedProgram {
 /// What [`analyze`] derives in its one pass over the instruction stream.
 struct ProgramFacts {
     /// Bit `r` set iff `r` is only consumed by boolean ops, so nothing reads
-    /// `regs[r]`. [`ResolvedProgram::bit_only_mask`] states what it permits.
+    /// its lanes. [`ResolvedProgram::bit_only_mask`] states what it permits.
     bit_only: u64,
-    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
-    /// consumer reads it as a truth bit, a filter's result register included.
+    /// Bit `r` set iff `r`'s producer must write its packed truth bits: some
+    /// downstream consumer reads it as a truth bit, a filter's result register
+    /// included.
     bool_pack: u64,
     /// True iff no instruction can produce a NULL against the schema, so the
     /// evaluator skips null-bit tracking entirely.

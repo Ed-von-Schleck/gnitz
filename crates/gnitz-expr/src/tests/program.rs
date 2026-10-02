@@ -739,8 +739,8 @@ fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval, RowFil
 
 /// IN over every pool shape that can change the answer; a NULL operand is NULL.
 /// A U64 column holding `u64::MAX` matches `-1` bit for bit, as `col = -1` does.
-/// Each verdict is read back as a filter too, whose packed bits come from a
-/// kernel of their own.
+/// Each verdict is read back as a filter too, which takes the packed bits where
+/// the value reading takes the lanes unpacked from them.
 #[test]
 fn int_in_set_membership_over_every_pool_shape() {
     for (col_tc, pool, probes) in [
@@ -756,18 +756,8 @@ fn int_in_set_membership_over_every_pool_shape() {
             (0..1000).collect(),
             vec![(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)],
         ),
-        // Either side of the sizes at which the kernel stops scanning the set
-        // and searches it: one for a value, a larger one for a filter.
-        (
-            TypeCode::I64,
-            (0..32).map(|v| v * 3).collect(),
-            vec![(0, 1), (93, 1), (45, 1), (46, 0), (94, 0), (-3, 0)],
-        ),
-        (
-            TypeCode::I64,
-            (0..33).map(|v| v * 3).collect(),
-            vec![(0, 1), (96, 1), (45, 1), (46, 0), (97, 0), (-3, 0)],
-        ),
+        // Either side of the size at which the kernel stops scanning the set
+        // and searches it.
         (
             TypeCode::I64,
             (0..64).map(|v| v * 3).collect(),
