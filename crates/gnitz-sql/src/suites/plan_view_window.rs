@@ -6,7 +6,8 @@ use super::*;
 
 /// `t(id BIGINT PK, k BIGINT, a BIGINT, b BIGINT NULL, s TEXT, f DOUBLE)`,
 /// `u(uid BIGINT PK, k BIGINT)`, `st`, a stream with `t`'s columns, `x(id
-/// BIGINT PK, a BIGINT, big UINT128)` and `wk(big UINT128 PK, k BIGINT, a BIGINT)`.
+/// BIGINT PK, a BIGINT, big UINT128)`, `wk(big UINT128 PK, k BIGINT, a BIGINT)` and
+/// `td(id BIGINT PK, dt DATE, a BIGINT)`.
 fn cat() -> Catalog<'static> {
     let i = TypeCode::I64;
     let t_cols = || {
@@ -31,6 +32,10 @@ fn cat() -> Catalog<'static> {
         (
             "wk",
             table(5, vec![col("big", TypeCode::U128), col("k", i), col("a", i)], vec![0]),
+        ),
+        (
+            "td",
+            table(6, vec![col("id", i), col("dt", TypeCode::Date), col("a", i)], vec![0]),
         ),
     ])
 }
@@ -77,6 +82,16 @@ fn a_window_call_types_and_names_like_the_aggregate_it_is() {
         (
             "SELECT id, MAX(s) OVER (PARTITION BY k) AS m FROM t",
             vec![c("id", i, false), c("m", TypeCode::String, false)],
+        ),
+        // A computed DATE is stored through a range check into its 4-byte slot,
+        // which is NULL for a day count past it.
+        (
+            "SELECT id, MIN(dt + a) OVER () AS m, MIN(dt) OVER () AS n FROM td",
+            vec![
+                c("id", i, false),
+                c("m", TypeCode::Date, true),
+                c("n", TypeCode::Date, false),
+            ],
         ),
     ] {
         assert_eq!(visible(&view(&cat, body)), want, "{body}");

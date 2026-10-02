@@ -237,7 +237,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                     BExpr::bin(a_null.clone(), BinOp::Or, b_null.clone()),
                     BExpr::bin(a_null, op, b_null),
                 )],
-                else_: Some(Box::new(cmp)),
+                else_: Box::new(cmp),
             })
         }
         // LIKE and ILIKE differ only in `ci`.
@@ -277,7 +277,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         },
         // Searched CASE binds each `(condition, result)`; the simple-operand form
         // desugars each WHEN value `w` to `operand = w`. A missing ELSE is the
-        // implicit ELSE NULL (`else_ = None`, lowered to `load_null`).
+        // implicit ELSE NULL.
         //
         // The operand binds once and is cloned per branch. Re-binding it is not
         // the same thing: each bind of a subquery records a second subquery,
@@ -298,12 +298,11 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 };
                 branches.push((cond, bind_structural(result, leaf)?));
             }
-            let else_ = else_result
-                .as_ref()
-                .map(|e| bind_structural(e, leaf))
-                .transpose()?
-                .map(Box::new);
-            Ok(BExpr::Case { branches, else_ })
+            let else_ = match else_result {
+                Some(e) => bind_structural(e, leaf)?,
+                None => BExpr::LitNull,
+            };
+            Ok(BExpr::Case { branches, else_: Box::new(else_) })
         }
         Expr::BinaryOp { left, op, right } => {
             let l = bind_structural(left, leaf)?;
@@ -623,20 +622,18 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
             let b = bind_structural(args[1], leaf)?;
             Ok(BExpr::Case {
                 branches: vec![(BExpr::bin(a.clone(), BinOp::Eq, b), BExpr::LitNull)],
-                else_: Some(Box::new(a)),
+                else_: Box::new(a),
             })
         }
         Call::Unary(op) => Ok(BExpr::Func {
             f: NumFunc::Unary(op),
             arg: Box::new(bind_structural(args[0], leaf)?),
         }),
-        // The scale rides the IR node rather than desugaring here: which form
-        // `ROUND` takes depends on the argument's type, and the binder is
-        // schema-free. Read first, so `ROUND(x, 2.5)` names its own defect.
+        // The scale is read first, so `ROUND(x, 2.5)` names its own defect.
         Call::Round => {
-            let f = match args.get(1) {
-                Some(n) => NumFunc::Round(round_scale(n)?),
-                None => NumFunc::Unary(FloatUnaryOp::Round),
+            let f = match args.get(1).map(|n| round_scale(n)).transpose()? {
+                Some(n) if n != 0 => NumFunc::Round(n),
+                _ => NumFunc::Unary(FloatUnaryOp::Round),
             };
             Ok(BExpr::Func {
                 f,
@@ -658,7 +655,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
             let b = bind_structural(args[2], leaf)?;
             Ok(BExpr::Case {
                 branches: vec![(c, a)],
-                else_: Some(Box::new(b)),
+                else_: Box::new(b),
             })
         }
         // The subject binds before the set is decoded, so `LTRIM(bad, 'x')`
@@ -719,8 +716,8 @@ fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
 }
 
 /// `CEIL(x)` / `FLOOR(x)`. Only the bare-call parse binds: `CEIL(x TO DAY)` and
-/// `CEIL(x, 2)` carry a field this plan's opcode has no place for, so they are
-/// rejected rather than having the field dropped.
+/// `CEIL(x, 2)` carry a field the node has no place for, so they are rejected
+/// rather than having the field dropped.
 fn bind_ceil_floor<R: Clone, L: LeafBinder<R>>(
     f: FloatUnaryOp,
     name: &str,

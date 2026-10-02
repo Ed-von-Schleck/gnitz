@@ -204,6 +204,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
             col("ts", TypeCode::Timestamp),
             ncol("nts", TypeCode::Timestamp),
             ncol("nu", TypeCode::U64),
+            ColumnDef::typed("p", ColType::decimal(2), false),
         ],
         &[0],
     );
@@ -273,6 +274,14 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         // GREATEST skips the DATE it NULLed, so another argument must hold.
         ("GREATEST(d, ts)", true),
         ("GREATEST(d, nts)", false),
+        // A DECIMAL is an `i64`, so an unsigned operand brought to one is range-cast.
+        ("p + n", true),
+        ("p = n", true),
+        ("p + pk", false),
+        ("p = pk", false),
+        ("pk IN (p, p)", false),
+        ("CASE WHEN n = 1 THEN p ELSE pk END", false),
+        ("GREATEST(p, pk)", true),
     ] {
         assert_eq!(never_null(sql), want, "{sql}");
     }

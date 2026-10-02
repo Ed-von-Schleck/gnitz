@@ -99,6 +99,21 @@ fn the_string_forms_compute_their_values() {
             ("COALESCE(c1, c2)", &[Null, Str("y")], Str("y")),
         ],
     );
+    // A NULL literal beside a string is a string NULL.
+    check(
+        &[T::String],
+        &[
+            ("c1 = NULL", &[Str("a")], Null),
+            ("NULL = 'abc'", &[Str("a")], Null),
+            ("UPPER(c1) <> NULL", &[Str("a")], Null),
+            ("NULLIF(c1, NULL)", &[Str("a")], Str("a")),
+            ("c1 IN ('a', NULL)", &[Str("a")], Int(1)),
+            ("c1 IN ('a', NULL)", &[Str("b")], Null),
+            ("c1 IS DISTINCT FROM NULL", &[Str("a")], Int(1)),
+            ("c1 IS DISTINCT FROM NULL", &[Null], Int(0)),
+            ("CAST(NULL AS VARCHAR) IS NULL", &[Str("a")], Int(1)),
+        ],
+    );
     check(
         &[T::String],
         &[
@@ -210,8 +225,9 @@ fn the_numeric_forms_compute_their_values() {
             ("SIGN(c1)", &[F64(-2.0)], F64(-1.0)),
             ("c1 > 0.5", &[F64(1.0)], Int(1)),
             ("c1 IN (1, 2)", &[F64(2.0)], Int(1)),
-            // An unsigned constant lifts to the float it is.
+            // An integer constant is the float it spells, past any register's range.
             ("c1 < 18446744073709551615", &[F64(1e19)], Int(1)),
+            ("c1 < 100000000000000000000", &[F64(1e19)], Int(1)),
             ("CAST(c1 AS INT)", &[F64(2.7)], Int(2)),
             ("CAST(c1 AS VARCHAR)", &[F64(1.5)], Str("1.5")),
             ("CAST(c1 AS DECIMAL(10, 2))", &[F64(2.675)], Int(268)),
@@ -234,8 +250,12 @@ fn the_temporal_forms_compute_their_values() {
         &[
             ("EXTRACT(YEAR FROM c1)", &[Int(18262)], Int(2020)),
             ("CAST(c1 AS TIMESTAMP)", &[Int(18262)], Int(18262 * day)),
-            // A computed DATE is an unchecked i64 register, so no range is assumed.
+            // A computed DATE is an unchecked i64 register, so no range is assumed,
+            // and a CAST of one to DATE checks it.
             ("(c1 + 1) IN (2147483648, 5)", &[Int(2147483647)], Int(1)),
+            ("CAST(c1 + 1 AS DATE) IN (2147483648, 5)", &[Int(2147483647)], Null),
+            ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(2147483647)], Null),
+            ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(5)], Int(0)),
             ("COALESCE(c1, 3000000000) = 3000000000", &[Null], Int(1)),
         ],
     );
@@ -510,17 +530,22 @@ fn an_operand_takes_the_signedness_of_its_result() {
 // Where the instruction is the contract
 // ------------------------------------------------------------------
 
-/// The elision rule keys on the register IMAGE, not value-domain containment.
-/// A U32 value fits U64's domain, but the engine taints a register U64 only
-/// for a U64-typed load, so eliding U32 -> U64 would leave the register
-/// signed while the client declares it U64 — flipping downstream compares and
-/// vacating a later range check.
+/// An integer cast is elided where the operand's values all lie in the target
+/// and the register keeps its signedness. A U32 value fits U64's domain, but the
+/// engine reads a register as U64 only for a U64-typed load, so eliding
+/// U32 -> U64 would leave the register signed while the client declares it U64
+/// — flipping downstream compares and vacating a later range check.
 #[test]
 fn cast_elision_preserves_u64_tracking() {
     for (sql, emits) in [
         ("CAST(c1 AS BIGINT)", false),
         ("CAST(c2 AS BIGINT)", false),
         ("CAST(c1 AS INT)", false),
+        ("CAST(c3 AS INT)", false),
+        ("CAST(c1 AS TIMESTAMP)", false),
+        ("CAST(c1 AS DATE)", false),
+        ("CAST(c1 + 1 AS DATE)", true),
+        ("CAST(CAST(c1 + 1 AS TINYINT) AS INT)", true),
         ("CAST(c4 AS BIGINT UNSIGNED)", false),
         ("CAST(c2 AS BIGINT UNSIGNED)", true),
         ("CAST(c3 AS BIGINT UNSIGNED)", true),
@@ -528,7 +553,7 @@ fn cast_elision_preserves_u64_tracking() {
         ("CAST(c4 AS BIGINT)", true),
         ("CAST(-c1 AS INT)", true),
         ("CAST(NULL AS BIGINT)", false),
-        ("CAST(NULL AS TINYINT)", true),
+        ("CAST(NULL AS TINYINT)", false),
         ("CAST(5 AS INT)", false),
         ("CAST(5 AS BIGINT UNSIGNED)", true),
         ("CAST(300 AS TINYINT)", true),
@@ -585,6 +610,36 @@ fn a_float_round_scales_by_a_positive_power_in_either_direction() {
     };
     assert_eq!(steps("ROUND(c1, 2)"), "MRD");
     assert_eq!(steps("ROUND(c1, -2)"), "DRM");
+}
+
+/// An operand is lowered at the type its node combines it at, so a literal is
+/// loaded once, as the constant it is there.
+#[test]
+fn a_literal_operand_is_the_constant_of_its_position() {
+    let one = L::LoadConst {
+        val: 1f64.to_bits() as i64,
+        unsigned: false,
+    };
+    assert_eq!(
+        instrs("c1 > 1", &[T::F64]),
+        [
+            L::LoadCol { col: 1 },
+            one,
+            L::FCmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }
+        ]
+    );
+    assert_eq!(
+        instrs("CASE WHEN c1 > 1 THEN c1 END", &[T::F64]).last(),
+        Some(&L::Select { cond: Reg(2), a: Reg(0), b: Reg(3) })
+    );
+    assert_eq!(
+        instrs("c1 = NULL", &[dec(2)]),
+        [
+            L::LoadCol { col: 1 },
+            L::LoadNull,
+            L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) }
+        ]
+    );
 }
 
 /// GREATEST/LEAST is a left chain of 2-ary opcodes in written order, so its

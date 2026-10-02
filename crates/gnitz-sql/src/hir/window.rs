@@ -61,7 +61,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::rules::{first_duplicate, reject_float_key};
 use crate::tail::parse_order_key;
-use gnitz_wire::{ColType, ColumnDef, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, Select, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec, WindowType,
@@ -151,7 +151,10 @@ impl Windows {
             return it.out.id;
         }
         let ty = e.infer_ty_with(&|r| leaf.type_of(r));
-        let nullable = !e.never_null_with(&|r| leaf.is_nullable(r), &|r| leaf.type_of(r));
+        // A slot narrower than the register is written through a range check,
+        // which is NULL for a value past it.
+        let checked = FixedInt::from_type_code(ty.tc).is_some_and(|fi| !e.within_with(fi, &|r| leaf.type_of(r)));
+        let nullable = checked || !e.never_null_with(&|r| leaf.is_nullable(r), &|r| leaf.type_of(r));
         let name = as_col(e)
             .and_then(|id| col_by_id(leaf.env(), id))
             .filter(|c| !c.def.is_hidden)

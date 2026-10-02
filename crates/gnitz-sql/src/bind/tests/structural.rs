@@ -128,14 +128,14 @@ fn plain_forms_bind_to_their_node() {
             "CASE WHEN c > 0 THEN 1 ELSE 3 END",
             E::Case {
                 branches: vec![(E::bin(C, BinOp::Gt, E::LitInt(0)), E::LitInt(1))],
-                else_: Some(bx(E::LitInt(3))),
+                else_: bx(E::LitInt(3)),
             },
         ),
         (
             "CASE WHEN c > 0 THEN 1 END",
             E::Case {
                 branches: vec![(E::bin(C, BinOp::Gt, E::LitInt(0)), E::LitInt(1))],
-                else_: None,
+                else_: bx(E::LitNull),
             },
         ),
         (
@@ -243,6 +243,7 @@ fn unary_numeric_functions_bind_to_their_numfunc() {
         ("FLOOR(c)", F::Floor),
         ("TRUNC(c)", F::Trunc),
         ("ROUND(c)", F::Round),
+        ("ROUND(c, 0)", F::Round),
         ("SQRT(c)", F::Sqrt),
         ("ln(c)", F::Ln),
         ("LOG(c)", F::Log10),

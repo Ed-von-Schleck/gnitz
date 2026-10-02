@@ -127,7 +127,7 @@ pub(crate) fn finalize_agg_bexpr<R>(value: BExpr<R>, count: Option<BExpr<R>>, fu
         let present = BExpr::bin(cnt, BinOp::Ne, BExpr::LitInt(0));
         BExpr::Case {
             branches: vec![(present, value)],
-            else_: None,
+            else_: Box::new(BExpr::LitNull),
         }
     }
 }

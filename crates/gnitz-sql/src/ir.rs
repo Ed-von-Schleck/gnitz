@@ -37,15 +37,15 @@ pub(crate) enum BExpr<R> {
         tc: TypeCode,
         v: i64,
     },
-    /// SQL `NULL` literal / an implicit CASE ELSE. Lowers to `load_null`; its
-    /// inferred type is `I64`, the neutral element of `unify_blend_type` (so a NULL
-    /// branch never drags a U64/float sibling back down).
+    /// SQL `NULL` literal / an implicit CASE ELSE. Its inferred type is `I64`,
+    /// the neutral element of `unify_blend_type` (so a NULL branch never drags a
+    /// U64/float sibling back down).
     LitNull,
     BinOp(Box<BExpr<R>>, BinOp, Box<BExpr<R>>),
     /// Boolean `NOT`. Negation is `Func` with `NumFunc::Unary(Neg)`.
     Not(Box<BExpr<R>>),
     /// `EXTRACT` / `DATE_PART` / `DATE_TRUNC` over a DATE or TIMESTAMP
-    /// argument; lowering checks the argument's type, the binder is schema-free.
+    /// argument; lowering checks the argument's type.
     Calendar {
         op: CalendarOp,
         arg: Box<BExpr<R>>,
@@ -57,12 +57,12 @@ pub(crate) enum BExpr<R> {
         inner: Box<BExpr<R>>,
         want_null: bool,
     },
-    /// Searched CASE: `(condition, result)` branches taken in order, with an
-    /// optional ELSE (implicit ELSE NULL when absent). `COALESCE`/`NULLIF`
-    /// desugar into this variant during binding.
+    /// Searched CASE: `(condition, result)` branches taken in order, then the
+    /// ELSE — `LitNull` where none is written. `COALESCE`/`NULLIF` desugar into
+    /// this variant during binding.
     Case {
         branches: Vec<(BExpr<R>, BExpr<R>)>,
-        else_: Option<Box<BExpr<R>>>,
+        else_: Box<BExpr<R>>,
     },
     /// `inner IN (items…)` bound faithfully (un-desugared): lowering decides the
     /// form — an operand stored as a ≤8-byte integer whose items are all literals
@@ -161,9 +161,7 @@ impl StrArg {
 }
 
 impl StrFunc {
-    /// What this function produces. Read both by `infer_ty_with`, to type the
-    /// column a view declares, and by lowering, to class the register it writes
-    /// — so a declared STRING column and a scalar register cannot disagree.
+    /// What this function produces.
     pub(crate) fn result_type(self) -> TypeCode {
         match self {
             StrFunc::LenBytes | StrFunc::LenChars | StrFunc::Pos => TypeCode::I64,
@@ -242,16 +240,14 @@ pub(crate) enum NumFunc {
     /// to F64 for the transcendentals — the split [`NumFunc::result_type`]
     /// states and lowering follows.
     Unary(FloatUnaryOp),
-    /// `ROUND(x, n)` — `ROUND(x)` is `Unary(Round)`. The scale rides the node so
-    /// lowering, which knows the argument's type, can fold the integer case
-    /// instead of the binder committing to float arithmetic it cannot type.
+    /// `ROUND(x, n)` for a non-zero `n` — `ROUND(x)` and `ROUND(x, 0)` are
+    /// `Unary(Round)`. Which form the rounding takes depends on the argument's
+    /// type, so the scale rides the node to lowering.
     Round(i8),
 }
 
 impl NumFunc {
-    /// What this function produces over an argument of type `arg`. Read both by
-    /// `infer_ty_with`, to type the column a view declares, and by lowering,
-    /// to class the register it writes — so the two cannot disagree.
+    /// What this function produces over an argument of type `arg`.
     pub(crate) fn result_type(self, arg: ColType) -> ColType {
         use FloatUnaryOp as F;
         match self {
@@ -311,18 +307,38 @@ impl std::fmt::Display for NumLit {
     }
 }
 
-/// Common type for arithmetic and conditional blends, matching the engine's
-/// runtime register rule (`reg_u64`): any float operand → F64; else any DECIMAL
-/// operand → the DECIMAL of the wider scale; else any U64 operand → U64 (so the
-/// materialized column re-seeds a downstream unsigned compare); else I64. Those
-/// are all 8-byte slots — a pure type-label decision (the integer arithmetic
-/// itself is bit-identical either way).
+/// The register class a value of a type is computed in: `Int`, `Dec` and `Float`
+/// are the scalar shapes — `Dec(s)` an integer holding a DECIMAL times `10^s`,
+/// `Float` an f64 bit pattern — and `Str` is the string register class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RegClass {
+    Int,
+    Dec(u8),
+    Float,
+    Str,
+}
+
+impl RegClass {
+    pub(crate) fn of(ty: ColType) -> Self {
+        match ty.tc {
+            TypeCode::String => RegClass::Str,
+            TypeCode::Decimal => RegClass::Dec(ty.scale),
+            t if t.is_float() => RegClass::Float,
+            _ => RegClass::Int,
+        }
+    }
+}
+
+/// Common type for arithmetic and conditional blends: any float operand → F64;
+/// else any DECIMAL operand → the DECIMAL of the wider scale; else any U64
+/// operand → U64 (so the materialized column re-seeds a downstream unsigned
+/// compare); else I64. Those are all 8-byte slots — a pure type-label decision
+/// (the integer arithmetic itself is bit-identical either way).
 ///
 /// A STRING operand wins outright, because the two are different register
 /// classes rather than two widths of one: a CASE with any string branch is a
 /// string CASE, and lowering rejects the genuinely mixed shapes when it reads
-/// the branches. Ranking it above F64 is what lets a string CASE be typed by
-/// this one fold instead of a second pass beside it.
+/// the branches.
 pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
     // Per-operand this is exactly `register_image`; unifying a pair is the
     // String > F64 > DECIMAL > U64 > I64 join of the two images. Past the
@@ -353,7 +369,7 @@ pub(crate) fn reads_unsigned(t: ColType) -> bool {
 /// integer keeps its type, and the difference of two is an integer — in
 /// microseconds when one of them is a TIMESTAMP. `None` for every other
 /// arithmetic, which has no temporal meaning.
-pub(crate) fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> Option<ColType> {
+fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> Option<ColType> {
     let is_int = |t: ColType| matches!(t.register_image().tc, TypeCode::I64 | TypeCode::U64);
     match (lt.tc.is_temporal(), rt.tc.is_temporal(), op) {
         (true, true, BinOp::Sub) => Some(ColType::of(TypeCode::I64)),
@@ -363,17 +379,129 @@ pub(crate) fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> Option
     }
 }
 
-/// The type a binary node with a DECIMAL operand computes in — arithmetic's
-/// result, and the scale a comparison's operands meet at.
-pub(crate) fn decimal_compute_type(op: BinOp, lt: ColType, rt: ColType) -> ColType {
+/// How a comparison, an arithmetic operator or `||` combines operands of two
+/// types: the type each operand is brought to, and the type of the result.
+pub(crate) struct BinTypes {
+    pub(crate) l: ColType,
+    pub(crate) r: ColType,
+    pub(crate) out: ColType,
+}
+
+/// The [`BinTypes`] of `lt op rt`, the operand types read through
+/// [`operand_ty_pair`]; `Err` names the rule a pair the operator does not take
+/// breaks. `op` is any operator but `AND`/`OR`, which read two booleans.
+pub(crate) fn bin_types(op: BinOp, lt: ColType, rt: ColType) -> Result<BinTypes, String> {
+    let (int, f64, string) = (
+        ColType::of(TypeCode::I64),
+        ColType::of(TypeCode::F64),
+        ColType::of(TypeCode::String),
+    );
+    let is_cmp = op.as_cmp().is_some();
+    // Both operands at `t`; a comparison is a boolean whatever it compares.
+    let both = |t: ColType, arith: ColType| {
+        Ok(BinTypes {
+            l: t,
+            r: t,
+            out: if is_cmp { int } else { arith },
+        })
+    };
+    if op == BinOp::Concat {
+        return both(string, string);
+    }
+    if lt.tc.is_temporal() || rt.tc.is_temporal() {
+        let arith = match is_cmp {
+            true => int,
+            false => temporal_arith_type(op, lt, rt)
+                .ok_or_else(|| format!("operator {op:?} is not supported on a DATE/TIMESTAMP operand"))?,
+        };
+        // Days meet microseconds at TIMESTAMP.
+        if lt.tc.is_temporal() && rt.tc.is_temporal() && lt.tc != rt.tc {
+            return both(ColType::of(TypeCode::Timestamp), arith);
+        }
+        // Temporal arithmetic is signed.
+        if !is_cmp {
+            let signed = |t: ColType| if reads_unsigned(t) { int } else { t };
+            return Ok(BinTypes { l: signed(lt), r: signed(rt), out: arith });
+        }
+    }
     let blend = unify_blend_type(lt, rt);
-    match op {
-        _ if !blend.is_decimal() => blend,
-        // Neither has a scale of its own: truncating a quotient to one would
-        // make `1 / 3.0` read `0.3`.
-        BinOp::Div | BinOp::Pow => ColType::of(TypeCode::F64),
-        BinOp::Mul => ColType::decimal(lt.scale.saturating_add(rt.scale)),
-        _ => blend,
+    if blend.tc == TypeCode::String {
+        if lt.is_decimal() || rt.is_decimal() {
+            return Err(format!(
+                "operator {op:?} is not supported between a DECIMAL and a string"
+            ));
+        }
+        // Only the comparisons are defined on strings, and one carries no
+        // implicit cast. The operator is reported before the operand types, so
+        // `strcol + 1` reads as "no such operator on strings" rather than as a
+        // demand that its right-hand side become one.
+        if !is_cmp {
+            return Err(format!("operator {op:?} is not supported on a string operand"));
+        }
+        if !(lt.tc.is_german_string() && rt.tc.is_german_string()) {
+            return Err(format!(
+                "comparison {op:?} against a string needs both operands to be strings"
+            ));
+        }
+        return both(string, int);
+    }
+    // POWER has no integer form, and a DECIMAL quotient no scale of its own:
+    // truncating it to one would make `1 / 3.0` read `0.3`.
+    if blend.tc == TypeCode::F64 || op == BinOp::Pow || (blend.is_decimal() && op == BinOp::Div) {
+        if op == BinOp::Mod {
+            return Err("float modulo not supported".to_string());
+        }
+        return both(f64, f64);
+    }
+    if blend.is_decimal() {
+        return match op {
+            // A product's operands keep their own scales, which it adds.
+            BinOp::Mul => Ok(BinTypes {
+                l: ColType::decimal(lt.scale),
+                r: ColType::decimal(rt.scale),
+                out: ColType::decimal(lt.scale.saturating_add(rt.scale)),
+            }),
+            _ => both(blend, blend),
+        };
+    }
+    // A quotient read unsigned takes both operands unsigned.
+    if matches!(op, BinOp::Div | BinOp::Mod) && reads_unsigned(blend) {
+        return both(blend, blend);
+    }
+    // Every other integer operator reads each operand as it stands: the
+    // arithmetic is the same bits either way, and a comparison reads each side
+    // with its own signedness.
+    Ok(BinTypes {
+        l: lt,
+        r: rt,
+        out: if is_cmp { int } else { blend },
+    })
+}
+
+/// The range check that brings an operand of type `from` to `to`, where the
+/// integer it holds needs one. Each makes a NULL of a value `to` cannot hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RangeStep {
+    None,
+    /// A day count as microseconds.
+    ToMicros,
+    Cast(FixedInt),
+}
+
+/// The [`RangeStep`] from `from` to `to`. `never_negative` is whether the
+/// operand's value is known to be, which a signed type alone does not say.
+pub(crate) fn range_step(from: ColType, to: ColType, never_negative: bool) -> RangeStep {
+    match (RegClass::of(from), RegClass::of(to)) {
+        (RegClass::Int, RegClass::Int) if (from.tc, to.tc) == (TypeCode::Date, TypeCode::Timestamp) => {
+            RangeStep::ToMicros
+        }
+        (RegClass::Int, RegClass::Int) if reads_unsigned(to) => match never_negative {
+            true => RangeStep::None,
+            false => RangeStep::Cast(FixedInt::U64),
+        },
+        // A signed integer and a DECIMAL are both an `i64`.
+        (RegClass::Int, RegClass::Int | RegClass::Dec(_)) if reads_unsigned(from) => RangeStep::Cast(FixedInt::I64),
+        _ => RangeStep::None,
     }
 }
 
@@ -391,26 +519,33 @@ pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), crate::error::GnitzSq
 /// The types of a node's operands as it combines them: each its own, except a
 /// float literal beside a DECIMAL operand, which is read as the exact decimal
 /// it spells — so `price * 1.1` stays exact over a DECIMAL column where it
-/// stays a float over a DOUBLE one. Typing and lowering both read operands
-/// through here, so they cannot disagree on which literal was adopted.
+/// stays a float over a DOUBLE one.
 pub(crate) fn operand_tys<R, F: Fn(&R) -> ColType>(items: &[&BExpr<R>], leaf_ty: &F) -> Vec<ColType> {
     let mut tys: Vec<ColType> = items.iter().map(|e| e.infer_ty_with(leaf_ty)).collect();
     adopt_decimal_literals(items, &mut tys);
     tys
 }
 
-/// [`operand_tys`] for a binary node's two operands, which needs no heap — the
-/// shape every `BinOp` reads, in typing and in lowering alike.
+/// [`operand_tys`] for a binary node's two operands. A NULL literal beside a
+/// string is a string NULL here: a blend needs no such rule, its neutral I64
+/// yielding to a string sibling, but a comparison takes two operands of one
+/// class.
 pub(crate) fn operand_ty_pair<R, F: Fn(&R) -> ColType>(l: &BExpr<R>, r: &BExpr<R>, leaf_ty: &F) -> (ColType, ColType) {
     let mut tys = [l.infer_ty_with(leaf_ty), r.infer_ty_with(leaf_ty)];
     adopt_decimal_literals(&[l, r], &mut tys);
+    let string = ColType::of(TypeCode::String);
+    match (l, r) {
+        (BExpr::LitNull, _) if tys[1] == string => tys[0] = string,
+        (_, BExpr::LitNull) if tys[0] == string => tys[1] = string,
+        _ => {}
+    }
     (tys[0], tys[1])
 }
 
 /// Re-read each float literal of `items` as the exact decimal it spells, where
 /// any operand is a DECIMAL and the literal is itself a DECIMAL value — a scale
 /// a register holds and an unscaled value in `i64`. A literal past that keeps
-/// its float type. The adoption both [`operand_tys`] shapes share.
+/// its float type.
 fn adopt_decimal_literals<R>(items: &[&BExpr<R>], tys: &mut [ColType]) {
     if !tys.iter().any(|t| t.is_decimal()) {
         return;
@@ -467,7 +602,7 @@ impl<R> BExpr<R> {
                 },
                 value,
             )],
-            else_: Some(Box::new(fallback)),
+            else_: Box::new(fallback),
         }
     }
 
@@ -547,26 +682,15 @@ impl<R> BExpr<R> {
             BExpr::LitFloat { .. } => ColType::of(TypeCode::F64),
             BExpr::LitStr(_) => ColType::of(TypeCode::String),
             BExpr::LitTemporal { tc, .. } => ColType::of(*tc),
+            BExpr::BinOp(_, BinOp::And | BinOp::Or, _) => int,
+            // A pair the operator does not take is refused by lowering.
             BExpr::BinOp(l, op, r) => {
                 let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
-                match op {
-                    // Comparisons and the connectives are boolean.
-                    o if o.as_cmp().is_some() => int,
-                    BinOp::And | BinOp::Or => int,
-                    BinOp::Concat => ColType::of(TypeCode::String),
-                    BinOp::Pow => ColType::of(TypeCode::F64),
-                    // A pair this does not type is refused by lowering.
-                    _ if lt.tc.is_temporal() || rt.tc.is_temporal() => temporal_arith_type(*op, lt, rt).unwrap_or(int),
-                    _ if lt.is_decimal() || rt.is_decimal() => decimal_compute_type(*op, lt, rt),
-                    // Arithmetic preserves U64 (and floats), mirroring the engine's
-                    // `reg_u64`: a materialized `u64 + u64` column must stay
-                    // U64 so a downstream compare re-seeds the unsigned variant.
-                    _ => unify_blend_type(lt, rt),
-                }
+                bin_types(*op, lt, rt).map_or(int, |t| t.out)
             }
             BExpr::Not(_) | BExpr::NullTest { .. } => int,
             BExpr::Case { branches, else_ } => {
-                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain(else_.as_deref()).collect();
+                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
                 blend_type(&operand_tys(&results, leaf_ty))
             }
             // The membership and pattern tests are booleans, like the comparison
@@ -583,14 +707,31 @@ impl<R> BExpr<R> {
         }
     }
 
-    /// Whether this value is never negative, so reading its register unsigned is
-    /// exact: an unsigned type, a non-negative integer literal, or NULL.
-    pub(crate) fn never_negative_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> bool {
-        match self {
-            BExpr::LitInt(v) => *v >= 0,
-            BExpr::LitNull => true,
-            e => FixedInt::from_type_code(e.infer_ty_with(leaf_ty).tc).is_some_and(|fi| !fi.is_signed()),
-        }
+    /// Whether every integer this value's register can hold is a value of `fi`,
+    /// so a range check into `fi` refuses none and reading it as `fi` is exact.
+    pub(crate) fn within_with<F: Fn(&R) -> ColType>(&self, fi: FixedInt, leaf_ty: &F) -> bool {
+        let ((lo, hi), (min, max)) = (self.int_range_with(leaf_ty), fi.range());
+        min <= lo && hi <= max
+    }
+
+    /// The interval the integer this value's register holds lies in. A column
+    /// holds its type's, a CAST its target's and a literal is a point; anything
+    /// computed may hold whatever its register does, a DATE sum included.
+    fn int_range_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> (i128, i128) {
+        let point = |v: i128| (v, v);
+        let stored = match self {
+            BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => return point(i128::from(*v)),
+            // No value at all, so every interval holds it.
+            BExpr::LitNull => return point(0),
+            BExpr::ColRef(r) => FixedInt::from_type_code(leaf_ty(r).tc),
+            BExpr::Cast { to, .. } => FixedInt::from_type_code(to.tc),
+            _ => None,
+        };
+        let register = match reads_unsigned(self.infer_ty_with(leaf_ty)) {
+            true => FixedInt::U64,
+            false => FixedInt::I64,
+        };
+        stored.unwrap_or(register).range()
     }
 
     /// Whether the expression can never evaluate to NULL, parameterized over
@@ -603,21 +744,9 @@ impl<R> BExpr<R> {
         T: Fn(&R) -> ColType,
     {
         let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable, leaf_ty);
-        let is = |e: &BExpr<R>, tc: TypeCode| e.infer_ty_with(leaf_ty).tc == tc;
-        // Operands lowering brings to one type: a DATE among them beside a
-        // TIMESTAMP is widened to microseconds, which is NULL past `i64`.
-        let widens_a_date = |operands: &mut dyn Iterator<Item = &BExpr<R>>| {
-            let (mut date, mut timestamp) = (false, false);
-            for e in operands {
-                date |= is(e, TypeCode::Date);
-                timestamp |= is(e, TypeCode::Timestamp);
-            }
-            date && timestamp
-        };
-        // Operands of a result read unsigned: lowering range-casts one that may
-        // be negative, which is NULL for a negative value.
-        let casts = |operands: &mut dyn Iterator<Item = &BExpr<R>>, blend: ColType| {
-            reads_unsigned(blend) && operands.fold(false, |any, e| any | !e.never_negative_with(leaf_ty))
+        // An operand of type `from` that lowering brings to `to` unchecked.
+        let whole = |e: &BExpr<R>, from: ColType, to: ColType| {
+            go(e) && range_step(from, to, e.within_with(FixedInt::U64, leaf_ty)) == RangeStep::None
         };
         match self {
             BExpr::ColRef(r) => !leaf_nullable(r),
@@ -627,48 +756,37 @@ impl<R> BExpr<R> {
             | BExpr::LitWide(_)
             | BExpr::LitTemporal { .. } => true,
             BExpr::LitNull => false,
-            BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => {
-                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
-                matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0)
-                    && go(l)
-                    && !casts(&mut [l.as_ref(), r.as_ref()].into_iter(), unify_blend_type(lt, rt))
-            }
+            BExpr::BinOp(l, BinOp::And | BinOp::Or, r) => go(l) && go(r),
             // A concatenation past `u32::MAX` bytes is NULL.
             BExpr::BinOp(_, BinOp::Concat, _) => false,
             BExpr::BinOp(l, op, r) => {
                 let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
-                // Temporal arithmetic is signed: an unsigned operand is range-cast.
-                let casts_unsigned = op.as_cmp().is_none()
-                    && (lt.tc.is_temporal() || rt.tc.is_temporal())
-                    && (reads_unsigned(lt) || reads_unsigned(rt));
-                go(l) && go(r) && !widens_a_date(&mut [l.as_ref(), r.as_ref()].into_iter()) && !casts_unsigned
+                // A zero divisor is NULL.
+                let divides =
+                    !matches!(op, BinOp::Div | BinOp::Mod) || matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0);
+                divides && bin_types(*op, lt, rt).is_ok_and(|t| whole(l, lt, t.l) && whole(r, rt, t.r))
             }
             BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
-                let results = || branches.iter().map(|(_, result)| result).chain(else_.as_deref());
-                else_.is_some()
-                    && results().all(go)
-                    && !widens_a_date(&mut results())
-                    && !casts(
-                        &mut results(),
-                        blend_type(&operand_tys(&results().collect::<Vec<_>>(), leaf_ty)),
-                    )
+                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
+                let tys = operand_tys(&results, leaf_ty);
+                let blend = blend_type(&tys);
+                results.iter().zip(&tys).all(|(e, ty)| whole(e, *ty, blend))
             }
             // The numeric kernels, LIKE and TRIM introduce no NULL of their own.
             BExpr::Func { arg, .. } | BExpr::Like { s: arg, .. } | BExpr::TrimCall { s: arg, .. } => go(arg),
             BExpr::Calendar { op, arg } => !op.may_null() && go(arg),
-            BExpr::InList { inner, items } => {
-                let operands = || std::iter::once(inner.as_ref()).chain(items);
-                operands().all(go) && !widens_a_date(&mut operands())
-            }
-            // GREATEST/LEAST skip a NULL argument, a DATE widened or a negative
-            // value range-cast to one included.
+            // Each item is compared with `inner` as `=` compares the pair.
+            BExpr::InList { inner, items } => items.iter().all(|item| {
+                let (lt, rt) = operand_ty_pair(inner, item, leaf_ty);
+                bin_types(BinOp::Eq, lt, rt).is_ok_and(|t| whole(inner, lt, t.l) && whole(item, rt, t.r))
+            }),
+            // GREATEST/LEAST skip a NULL argument, one a range check made included.
             BExpr::MinMaxN { args, .. } => {
-                let widens = widens_a_date(&mut args.iter());
-                let blend = blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty));
-                args.iter()
-                    .any(|a| go(a) && !(widens && is(a, TypeCode::Date)) && !casts(&mut std::iter::once(a), blend))
+                let tys = operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty);
+                let blend = blend_type(&tys);
+                args.iter().zip(&tys).any(|(a, ty)| whole(a, *ty, blend))
             }
             BExpr::StrCall { f, args } => !f.may_null(args.len()) && args.iter().all(go),
             // Text is a total rendering of any scalar; the other targets can refuse a value.
@@ -711,7 +829,7 @@ impl<R> BExpr<R> {
                     .iter()
                     .map(|(c, r)| Ok((go(c)?, go(r)?)))
                     .collect::<Result<_, E>>()?,
-                else_: else_.as_deref().map(|e| go(e).map(Box::new)).transpose()?,
+                else_: Box::new(go(else_)?),
             },
             BExpr::InList { inner, items } => BExpr::InList {
                 inner: Box::new(go(inner)?),
@@ -762,9 +880,7 @@ impl<R> BExpr<R> {
                     c.for_each_ref(f);
                     r.for_each_ref(f);
                 }
-                if let Some(e) = else_ {
-                    e.for_each_ref(f);
-                }
+                else_.for_each_ref(f);
             }
             BExpr::InList { inner, items } => {
                 inner.for_each_ref(f);
