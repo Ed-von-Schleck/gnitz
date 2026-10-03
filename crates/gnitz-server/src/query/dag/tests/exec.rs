@@ -108,13 +108,21 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     }
 
     let every = [step(2, 1), step(3, 1), step(4, 2), step(4, 3), step(5, 4)];
-    assert_eq!(dag.tick_schedule(1), every);
+    assert_eq!(*dag.tick_schedule(1), every);
 
     // A rebuild set is closed under dependents.
     dag.set_rebuild([2, 4, 5].into_iter().collect());
-    assert_eq!(dag.tick_schedule(1), [step(3, 1)]);
+    assert_eq!(*dag.tick_schedule(1), [step(3, 1)]);
     dag.rebuild.remove(&2);
-    assert_eq!(dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
+    assert_eq!(*dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
+
+    // A view linked or dropped after a schedule was read moves that schedule.
+    dag.take_rebuild();
+    dag.dep.link(8, [5].into_iter());
+    assert_eq!(dag.tick_schedule(1)[..5], every);
+    assert_eq!(dag.tick_schedule(1)[5..], [step(8, 5)]);
+    dag.dep.unlink(4);
+    assert_eq!(*dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────
@@ -160,6 +168,40 @@ fn backfill_chunk_runs_only_the_named_view() {
 
     let err = drive(&mut LocalDrive(&mut engine), backfill(999_999), None).unwrap_err();
     assert!(err.contains("is not registered"), "{err}");
+}
+
+/// A tick that brings this process no row still mints the ground row a global
+/// aggregate owes, once; past that it lands nothing, in that view or any other.
+#[test]
+fn an_empty_tick_lands_only_an_owed_ground_row() {
+    let (mut engine, base) = engine_with_base("empty_tick");
+    let once = register_identity_view(&mut engine, base, "once", &view_cols());
+    let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
+    let aggs = [gnitz_wire::AggDescriptor::COUNT_STAR];
+    let counted = *gnitz_zset::stream::ReducePlan::from_wire(&base_schema, &[], &aggs, true)
+        .unwrap()
+        .output_schema();
+    let mut circuit = gnitz_wire::Circuit::default();
+    let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
+    let reduced = circuit.reduce_multi(scan, &[], &aggs);
+    circuit.sink(reduced);
+    let count = try_register_view(&mut engine, circuit, "count", &cols_of(&counted), 0, 0).unwrap();
+
+    for round in 1..=2 {
+        drive(&mut LocalDrive(&mut engine), Drive::Tick { source: base, round }, None).unwrap();
+        assert_eq!(net_weight(&mut engine, count), 1, "round {round}: the ground row, once");
+        assert!(held(&mut engine, once).is_empty(), "round {round}");
+    }
+
+    let rows = [(1, 1, 10)];
+    let delta = delta_for(&engine, base, &rows);
+    tick(&mut engine, base, 3, delta);
+    assert_eq!(held(&mut engine, once), times(&engine, base, &rows, 1));
+    assert_eq!(
+        net_weight(&mut engine, count),
+        1,
+        "the count moved, its row count did not"
+    );
 }
 
 // ── A side's output relay ───────────────────────────────────────────────────
@@ -343,8 +385,9 @@ fn net_weight(engine: &mut CatalogEngine, tid: u64) -> u64 {
     held(engine, tid).values().sum::<i64>() as u64
 }
 
-/// Instructions per one-row tick through every plan shape, and per wide tick
-/// into eight readers beside its seven batch copies.
+/// Instructions per one-row tick through every plan shape, per tick that brings
+/// this worker no row, and per wide tick into eight readers beside its seven
+/// batch copies.
 ///
 /// ```text
 /// cd crates && cargo test -p gnitz-server --release drive_tick_bench \
@@ -370,6 +413,24 @@ fn drive_tick_bench() {
     assert_eq!(net_weight(&mut engine, once), BENCH_TICKS + 1, "every tick landed");
     println!(
         "one-row ticks, every plan shape  {:>10} instr/tick",
+        instr / BENCH_TICKS
+    );
+    let ((), instr) = counter.measure(|| {
+        for round in 0..BENCH_TICKS {
+            let what = Drive::Tick {
+                source: base,
+                round: BENCH_TICKS + 2 + round,
+            };
+            drive(&mut LocalDrive(&mut engine), what, None).unwrap();
+        }
+    });
+    assert_eq!(
+        net_weight(&mut engine, once),
+        BENCH_TICKS + 1,
+        "an empty tick lands nothing"
+    );
+    println!(
+        "empty ticks, every plan shape    {:>10} instr/tick",
         instr / BENCH_TICKS
     );
 

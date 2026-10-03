@@ -15,11 +15,16 @@ impl SkeletonHydrator for DagEngine {
             .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");
 
         let vm = &mut code.post.vm;
-        let reads = vm::SourceReads { registry, view: view_id, unfed: &[] };
-        let mut gather = reads.gather(state, hydration.seed, keys)?;
+        let mut stores = vm::Stores {
+            own: state,
+            registry,
+            view: view_id,
+            unfed: &[],
+        };
+        let mut gather = stores.gather(hydration.seed, keys)?;
         let mut out = Batch::empty_with_schema(&view_schema);
         while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
-            let produced = vm::replay_chunk(vm, state, &reads, hydration.entry, seed)?;
+            let produced = vm::replay_chunk(vm, &mut stores, hydration.entry, seed)?;
             out.append_above(produced.into_consolidated());
         }
         Ok(out)

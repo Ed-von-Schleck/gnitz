@@ -1,8 +1,9 @@
 //! Incremental TOP-N: δ_out = TopN(history + δ_in) − TopN(history), per group
 //! the delta touched.
 
-use crate::repr::{Batch, ReadCursor};
+use crate::repr::Batch;
 use crate::schema::MAX_PK_BYTES;
+use crate::stream::OpenAt;
 
 use super::plan::TopNPlan;
 
@@ -12,9 +13,10 @@ const MAX_TOPN_CAP_HINT: usize = 1 << 16;
 /// Visits only the groups `delta` touched — the only ones whose window can have
 /// moved — retracting each stored window and re-emitting the post-delta one,
 /// both `O(offset + limit)`; the output fold cancels a row that held its slot.
-/// `history` is the operator's index, populated with this epoch's rows before the
-/// call.
-pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCursor, plan: &TopNPlan) -> Batch {
+/// `trace_out` opens the output's history and `history` the operator's index,
+/// populated with this epoch's rows before the call; each is opened at the
+/// touched groups.
+pub fn op_topn(delta: &Batch, trace_out: OpenAt<'_>, history: OpenAt<'_>, plan: &TopNPlan) -> Batch {
     let output_schema = &plan.output_schema;
     let n = delta.count;
     let mb = delta.as_mem_batch();
@@ -30,6 +32,20 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
         }
     }
 
+    // Groups ascend in output-PK order, so the `trace_out` probes do too.
+    let touched = || {
+        groups.by_pk.iter().filter_map(|&g| match exemplars[g as usize] {
+            UNTOUCHED => None,
+            row => Some(row as usize),
+        })
+    };
+    let (Some(lo), Some(hi)) = (touched().next(), touched().next_back()) else {
+        return Batch::empty_with_schema(output_schema);
+    };
+    let mut trace_out = trace_out(plan.key.out_pk(&mb, lo).bytes(), plan.key.out_pk(&mb, hi).bytes());
+    let (first, last) = plan.index.group_span(&mb, touched()).expect("a touched group");
+    let mut history = history(first.pk_bytes(), last.pk_bytes());
+
     // A retracted and a re-emitted window per touched group.
     let window = usize::try_from(plan.limit).map_or(usize::MAX, |l| l.saturating_mul(2));
     let cap = window
@@ -40,12 +56,7 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
     let mut out = Batch::with_capacity(output_schema, cap);
     let mut key = [0u8; MAX_PK_BYTES];
 
-    // Groups ascend in output-PK order, so the `trace_out` probes do too.
-    for &g in &groups.by_pk {
-        let exemplar = match exemplars[g as usize] {
-            UNTOUCHED => continue,
-            row => row as usize,
-        };
+    for exemplar in touched() {
         let out_pk = plan.key.out_pk(&mb, exemplar);
         let out_pk_bytes = out_pk.bytes();
 

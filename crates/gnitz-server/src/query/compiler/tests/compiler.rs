@@ -297,7 +297,7 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     let replicated = keyed.placed(Placement::Replicated);
     let split = |circuit: Circuit, source: Source, of: u32| {
         let out = compile_global(circuit, source, Slot::new(0, of)).expect("the fixture compiles");
-        !out.sides[0].plan.vm.program.out_schema().same_layout(&source.schema)
+        !out.sides[0].plan.vm.out_schema().same_layout(&source.schema)
     };
     for (why, op, source, of, want) in [
         ("a partitioned SUM", global_reduce(AggFunc::Sum), keyed, 4, true),

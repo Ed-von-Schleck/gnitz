@@ -22,8 +22,8 @@ use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 /// included. An index-bounded backfill takes that path on every chunk: the
 /// access path already satisfies the predicate the circuit still carries.
 pub fn op_filter(batch: &Batch, pred: &mut RowFilter) -> Option<Batch> {
-    // A per-call `Vec`: measured against a reused one it is a wash. `ranges`
-    // lends `out` so a *chunked* scan can carry one list; this caller has one batch.
+    // `ranges` lends `out` so a *chunked* scan can carry one list; this caller
+    // has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     pred.ranges(&batch.as_mem_batch(), &mut ranges);
     if ranges == [(0, batch.count)] {
@@ -70,29 +70,42 @@ pub fn null_extend_output_schema(
 
 /// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an
 /// O(N) merge that sums equal elements' weights, so the output is consolidated and
-/// may hold *fewer* rows than the two inputs together. Anything else concatenates
+/// may hold *fewer* rows than the two inputs together. An operand counts as
+/// consolidated where its rows stand so without the claim. Anything else concatenates
 /// and stays unconsolidated: the outer- and band-join lowering chains `op_union` over unconsolidated
 /// operands, and sorting each link would pay for a fold the consumer runs once.
 ///
+/// An empty operand passes the other through — moved when it is owned, with its
+/// consolidated claim kept.
+///
 /// `out_schema` is the UNION's own, not either input's — it is the comparator the
 /// merge folds and certifies under.
-pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
-    if batch_a.consolidated_verified() && batch_b.consolidated_verified() && batch_b.count > 0 {
-        return batch_a.merged_consolidated(batch_b, out_schema);
-    }
-    let mut batch_a = match batch_a {
-        // Both operands sized once, where a clone would be grown by the append.
-        Cow::Borrowed(a) if batch_b.count > 0 => {
-            return Batch::concat(out_schema, [a.as_mem_batch(), batch_b.as_mem_batch()].into_iter());
-        }
-        a => a.into_owned(),
+pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: Cow<'_, Batch>, out_schema: &SchemaDescriptor) -> Batch {
+    // Addition commutes, so the one pass-through below serves an empty operand
+    // on either side.
+    let (batch_a, batch_b) = match batch_a.is_empty() {
+        true => (batch_b, batch_a),
+        false => (batch_a, batch_b),
     };
-    // An empty `b` passes `a` through with no allocation, its consolidated claim
-    // preserved: `out_schema` only ORs in nullability, which reorders nothing
-    // `a` holds.
-    batch_a.set_schema(out_schema);
-    batch_a.append_batch(batch_b);
-    batch_a
+    if batch_b.is_empty() {
+        // `out_schema` only ORs in nullability, which reorders nothing the
+        // operand holds, so its claim stands.
+        let mut out = batch_a.into_owned();
+        out.set_schema(out_schema);
+        return out;
+    }
+    if batch_a.stands_consolidated() && batch_b.stands_consolidated() {
+        return batch_a.merged_consolidated(&batch_b, out_schema);
+    }
+    match batch_a {
+        // Both operands sized once, where a clone would be grown by the append.
+        Cow::Borrowed(a) => Batch::concat(out_schema, [a.as_mem_batch(), batch_b.as_mem_batch()].into_iter()),
+        Cow::Owned(mut a) => {
+            a.set_schema(out_schema);
+            a.append_batch(&batch_b);
+            a
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

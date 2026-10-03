@@ -21,6 +21,7 @@ use crate::repr::Batch;
 use crate::schema::{oob_col, ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
+use gnitz_wire::PkBuf;
 
 use crate::algebra::{append_image, image_slot_col, write_image_slot, ImageKind, IMAGE_COL};
 
@@ -104,6 +105,16 @@ impl TopNIndex {
     #[inline]
     pub(super) fn group_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], src: &R, row: usize) -> &'a [u8] {
         self.key_packer.pack_prefix(buf, src, row)
+    }
+
+    /// The least and the greatest [`Self::group_prefix`] among `rows`; `None` for
+    /// no row.
+    pub(super) fn group_span<R: RowSource>(
+        &self,
+        src: &R,
+        rows: impl Iterator<Item = usize>,
+    ) -> Option<(PkBuf, PkBuf)> {
+        self.key_packer.prefix_span(src, rows)
     }
 
     /// The index entries `delta` contributes, one per row at its weight,

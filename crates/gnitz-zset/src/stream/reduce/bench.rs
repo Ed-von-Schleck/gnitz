@@ -21,7 +21,6 @@
 use std::time::{Duration, Instant};
 
 use super::avi::{avi_batch, AviBake};
-use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
@@ -316,9 +315,9 @@ fn index_entries_bench() {
 /// `op_reduce` over `delta` against `h`'s state, alone on the clock: the index
 /// population the VM runs ahead of it is not.
 fn time_op_reduce(h: &mut Harness, delta: &Batch) -> (Batch, Duration) {
-    let (mut trace_out, mut history) = h.cursors(delta);
+    h.index(delta);
     let start = Instant::now();
-    let out = op_reduce(delta, &mut trace_out, history.as_mut(), &h.plan);
+    let out = h.reduce(delta);
     (out, start.elapsed())
 }
 
@@ -329,9 +328,9 @@ fn time_second_epoch(plan: ReducePlan, d1: &Batch, d2: &Batch) -> (Duration, u64
     let mut h = Harness::new(plan);
     let (out, _) = time_op_reduce(&mut h, d1);
     h.trace_out.ingest(out);
-    let (mut trace_out, mut history) = h.cursors(d2);
+    h.index(d2);
     let start = Instant::now();
-    let (out, instructions) = counter.measure(|| op_reduce(d2, &mut trace_out, history.as_mut(), &h.plan));
+    let (out, instructions) = counter.measure(|| h.reduce(d2));
     let warm = start.elapsed();
     std::hint::black_box(out);
     (warm, instructions)
@@ -588,8 +587,7 @@ fn op_reduce_multi_run_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
     let mut instructions = 0;
     for _ in 0..RUNS {
-        let (mut trace_out, _) = h.cursors(&delta);
-        let (out, n) = counter.measure(|| op_reduce(&delta, &mut trace_out, None, &h.plan));
+        let (out, n) = counter.measure(|| h.reduce(&delta));
         std::hint::black_box(out);
         instructions += n;
     }

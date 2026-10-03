@@ -36,10 +36,10 @@ pub(super) use hydration::Hydration;
 pub(super) use load::load_circuit;
 pub(super) use routing::{Relay, ViewMeta};
 
-// Registers — up to three per node, plus the seeds — and child stores — up to
-// two per node — are `u16` ids.
-const _: () = assert!(3 * MAX_CIRCUIT_NODES + 2 < u16::MAX as usize);
-const _: () = assert!(2 * MAX_CIRCUIT_NODES <= u16::MAX as usize);
+// Register and child-store ids are `u16`. A plan allocates at most one register
+// per node and one per seed; a node declares at most three children — an output
+// trace, an index, and the integral a join probes.
+const _: () = assert!(3 * MAX_CIRCUIT_NODES < u16::MAX as usize);
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -232,7 +232,7 @@ pub(super) struct SubPlan {
 impl SubPlan {
     /// `src`'s delta seeds a register here that folds it.
     pub(in crate::query) fn seed_folds(&self, src: u64) -> bool {
-        self.source_reg_map.get(&src).is_some_and(|&r| self.vm.program.folds(r))
+        self.source_reg_map.get(&src).is_some_and(|&r| self.vm.folds(r))
     }
 }
 
@@ -251,7 +251,7 @@ fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
     plan.source_reg_map
         .keys()
         .all(|tid| registry.relation(*tid).is_some_and(|r| r.placement().is_replicated()))
-        && !plan.vm.program.trims_per_worker()
+        && !plan.vm.trims_per_worker()
 }
 
 /// Output from `compile_view`, consumed directly by DagEngine as the cached
@@ -270,14 +270,6 @@ pub(super) struct CompileOutput {
     /// This worker computes the view's whole result locally: it is replicated, or
     /// this process is the only worker.
     pub(in crate::query) self_contained: bool,
-}
-
-impl CompileOutput {
-    /// Every sub-plan of the view, for whole-plan register clears.
-    pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
-        let Self { sides, post, .. } = self;
-        sides.iter_mut().map(|s| &mut s.plan).chain(std::iter::once(post))
-    }
 }
 
 /// Compile one view's already-loaded circuit: carve it at its exchanges, then
@@ -303,7 +295,7 @@ pub(super) fn compile_view(
         };
         let Built { plan, partial, .. } =
             build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], out)?;
-        let schema = *plan.vm.program.out_schema();
+        let schema = *plan.vm.out_schema();
         let scatter = Rc::new(ScatterPlan::group(&schema, side.cols)?);
         let stays = self_contained
             || (carve.sides.len() == 1 && routing::skips_output_exchange(loaded, side.shard, &scatter, registry));
@@ -339,7 +331,7 @@ pub(super) fn compile_view(
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
-    if !post.vm.program.out_schema().same_layout(view_schema) {
+    if !post.vm.out_schema().same_layout(view_schema) {
         return Err("sink schema does not match view output schema".into());
     }
     let sides = side_plans

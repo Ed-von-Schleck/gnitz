@@ -19,7 +19,7 @@ use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
 use super::string_heap::{relocate_german_string_vec, BlobCache};
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
-use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
+use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::read_u64_le;
@@ -753,7 +753,7 @@ impl Batch {
     /// consolidated input repeats none internally.
     pub fn merged_consolidated(&self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
         debug_assert!(
-            self.is_consolidated() && other.is_consolidated(),
+            self.stands_consolidated() && other.stands_consolidated(),
             "merged_consolidated: both inputs must be consolidated",
         );
         let mut out = with_payload_cmp!(schema, merged_consolidated_body, self, other, schema);
@@ -884,6 +884,28 @@ pub(crate) fn consolidate_groups(batch: &MemBatch, schema: &SchemaDescriptor, ou
     }
 
     with_payload_cmp!(schema, consolidate_groups_inner, n, batch, schema, out)
+}
+
+/// Whether `batch`'s rows already stand as [`consolidate_groups`] would leave
+/// them: strictly (PK, payload)-ascending, with no ghost. One forward pass, which
+/// the first pair out of order ends.
+pub(crate) fn stands_consolidated(batch: &Batch) -> bool {
+    if batch.count == 0 {
+        return true;
+    }
+    let schema = batch.schema();
+    let stride = schema.pk_stride();
+    let ascending = pk_width_dispatch!(stride, |K| {
+        let mut keys = batch.pk_data().chunks_exact(stride).map(K::from_opk);
+        let mut prev = keys.next().expect("a batch of at least one row");
+        keys.zip(1..).all(|(key, i)| {
+            // The payload order is read only where two rows share a PK.
+            let below = Ord::cmp(&prev, &key).then_with(|| compare_full_rows(schema, batch, i - 1, batch, i));
+            prev = key;
+            below.is_lt()
+        })
+    });
+    ascending && !batch.has_ghost()
 }
 
 /// A `(sort key, row-index)` pair. Keeps the key co-located with its index so the

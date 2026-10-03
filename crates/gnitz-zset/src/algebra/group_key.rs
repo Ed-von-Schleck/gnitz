@@ -319,6 +319,12 @@ impl GroupRuns {
         self.ends.len()
     }
 
+    /// The first row of the last group; row 0 for no group.
+    #[inline]
+    pub(crate) fn last_start(&self) -> usize {
+        self.ends.iter().rev().nth(1).map_or(0, |&e| e as usize)
+    }
+
     /// Each group's row range, ascending.
     pub(crate) fn iter(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         let starts = std::iter::once(0).chain(self.ends.iter().map(|&e| e as usize));

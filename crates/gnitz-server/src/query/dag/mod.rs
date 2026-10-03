@@ -7,6 +7,7 @@
 //! private items.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -23,7 +24,7 @@ mod meta;
 
 pub(crate) use exec::{drive, Drive};
 
-use meta::DepMap;
+use meta::{DepMap, Step};
 
 /// What a drive needs from the process running it: the engine it drives, and
 /// the other workers.
@@ -97,12 +98,9 @@ impl DagEngine {
     /// that scan it and by nothing else: its circuit keeps what it needs of them in
     /// traces, and a tick hands its delta to its readers directly.
     fn passes_through(&self, id: u64) -> bool {
-        self.views.get(&id).is_some_and(|v| {
-            v.owner != 0
-                && v.plan
-                    .as_ref()
-                    .is_some_and(|p| !p.code.post.vm.program.reads_view_store())
-        })
+        self.views
+            .get(&id)
+            .is_some_and(|v| v.owner != 0 && v.plan.as_ref().is_some_and(|p| !p.code.post.vm.reads_view_store()))
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.

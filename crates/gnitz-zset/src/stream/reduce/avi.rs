@@ -19,6 +19,7 @@ use crate::repr::{range_rows, Batch, ReadCursor};
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
+use gnitz_wire::PkBuf;
 
 // ---------------------------------------------------------------------------
 // Key layout
@@ -94,6 +95,15 @@ impl AviBake {
         &buf[..self.key_packer.out_stride + ORDINAL_BYTES]
     }
 
+    /// The least and the greatest `group` prefix among `rows`; `None` for no row.
+    pub(super) fn group_span<R: RowSource>(
+        &self,
+        src: &R,
+        rows: impl Iterator<Item = usize>,
+    ) -> Option<(PkBuf, PkBuf)> {
+        self.key_packer.prefix_span(src, rows)
+    }
+
     /// Seed every value-indexed accumulator of `row`'s group with its extreme
     /// out of the index, resetting one whose ordinal has no positive entry.
     pub(super) fn seed_extremes<R: RowSource>(
@@ -130,7 +140,7 @@ impl AviBake {
 /// The index entries `delta` contributes, each at its row's weight, unsorted:
 /// one ordinal at a time, each of its regions in one pass.
 pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
-    // The VM folds this register before any reader, so no row is a ghost.
+    // Consolidated, so no row is a ghost.
     debug_assert!(delta.is_consolidated());
     let mb = delta.as_mem_batch();
     let n = delta.count;

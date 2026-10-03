@@ -45,8 +45,7 @@ fn a_filter_feeds_the_negate_only_its_passing_rows() {
 }
 
 /// `A + B` over both operands' empty and non-empty shapes, epoch after epoch on
-/// one program — so each epoch also sees nothing of the one before. An empty left
-/// operand takes the VM's own `0 + B` arm.
+/// one program — so each epoch also sees nothing of the one before.
 #[test]
 fn a_union_sums_its_operands_in_every_epoch() {
     let schema = make_schema_u128_i64();
@@ -75,8 +74,7 @@ fn a_union_sums_its_operands_in_every_epoch() {
     }
 }
 
-/// A `Union` with `in_a == in_b` is `Z + Z`: taking operand 0 and then reading
-/// the emptied operand 1 would yield +1 where +2 is due. The double saturates,
+/// A `Union` with `in_a == in_b` is `Z + Z`, which doubles every weight. The double saturates,
 /// so a consolidated operand's `i64::MIN` row stays a row where a wrapping
 /// double would leave a ghost under the claim.
 #[test]
@@ -98,9 +96,9 @@ fn a_self_union_doubles_every_weight() {
 /// A UNION whose sides disagree on a payload column's nullability runs, and
 /// leaves, under its own merged schema. Only that schema selects the null-aware
 /// comparator, which sorts a NULL below -3 where the left side's null-blind one
-/// reads the cell's zero bytes as 0. And an identity path hands an operand back
-/// label and all, so the epilogue stamps the output register's — the label the
-/// exchange wire carries to a master that cannot re-derive it.
+/// reads the cell's zero bytes as 0. An empty operand passes the other through,
+/// and that too leaves under the merged schema — the label an exchange round
+/// gathers the peers' rows under.
 #[test]
 fn a_union_runs_and_leaves_under_its_merged_schema() {
     let pk = SchemaColumn::new(TypeCode::U128, false);
@@ -209,17 +207,15 @@ fn a_non_empty_first_epoch_spends_the_ground_latch_too() {
     assert!(vm.epoch([(r0, Batch::empty_with_schema(&schema))]).is_empty());
 }
 
-/// Without a ground row an empty epoch produces nothing and runs no dispatch —
-/// but it still clears the previous epoch's registers, which is the one thing
-/// the skipped prologue would otherwise have done.
+/// An epoch ends with every register free, one nothing reads included; and
+/// without a ground row an empty epoch produces nothing.
 #[test]
-fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
+fn an_epoch_leaves_every_register_free() {
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
     let out = p.push(r0, schema, Op::WorkerFilter { slot: Slot::SOLO });
-    // Written and never read, so nothing frees it: what still holds rows when
-    // the epoch ends.
+    // Written and never read, so no reader frees it.
     let dead = p.push(r0, schema, Op::Negate);
     let mut vm = p.open(out);
 
@@ -227,13 +223,13 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
         &vm.epoch([(r0, make_batch_u128(&schema, &[(1, 1, 10)]))]),
         &[(1, 1, 10)],
     );
-    assert_eq!(vm.batches[dead.at()].len(), 1);
-
-    assert!(vm.epoch([(r0, Batch::empty_with_schema(&schema))]).is_empty());
     assert!(
         vm.batches.iter().all(|b| b.is_empty()),
-        "the skipped epoch still released the previous one's batches",
+        "register {} included",
+        dead.at()
     );
+
+    assert!(vm.epoch([(r0, Batch::empty_with_schema(&schema))]).is_empty());
 }
 
 // ── The two-term DBSP join, end to end ────────────────────────────────────
@@ -416,7 +412,8 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
         out_schema,
         Op::TopN {
             out_trace: Some(out_trace),
-            plan: Box::new(BakedTopN { plan, index_table }),
+            index: index_table,
+            plan: Box::new(plan),
         },
     );
     let mut vm = p.open(out);
@@ -471,8 +468,8 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
     let reduced_schema = p.schema_of(reduced);
     let out = p.push(reduced, reduced_schema, Op::WorkerFilter { slot: Slot::SOLO });
     let vm = p.open(out);
-    assert!(vm.program.replay_entry(r0).is_err(), "the reduce reads the seed");
-    assert!(vm.program.replay_entry(reduced).is_ok());
+    assert!(vm.replay_entry(r0).is_err(), "the reduce reads the seed");
+    assert!(vm.replay_entry(reduced).is_ok());
 
     // A clamp reads its input's history, which the seed never entered.
     let mut p = TestPlan::default();
@@ -486,10 +483,7 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    assert!(
-        p.open(out).program.replay_entry(r0).is_err(),
-        "the clamp reads the seed"
-    );
+    assert!(p.open(out).replay_entry(r0).is_err(), "the clamp reads the seed");
 }
 
 /// A stateful operator the seed does not reach sits on an empty register for
@@ -512,7 +506,7 @@ fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
     );
     let out = p.push(negated, schema, Op::Union { in_b: clamped });
     let mut vm = p.open(out);
-    assert!(vm.program.replay_entry(b).is_err(), "the clamp reads this seed");
+    assert!(vm.replay_entry(b).is_err(), "the clamp reads this seed");
 
     vm.epoch([(b, make_batch_u128(&schema, &[(1, 1, 10)]))]);
     let before = vm.trace(hist);

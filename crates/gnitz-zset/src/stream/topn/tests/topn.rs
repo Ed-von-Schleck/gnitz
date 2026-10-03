@@ -87,9 +87,13 @@ impl Harness {
     /// One epoch: populate, run, integrate the output. Returns the raw delta.
     fn tick(&mut self, delta: &Batch) -> Batch {
         self.index.ingest(self.plan.index_batch(delta));
-        let mut history = self.index.cursor();
-        let mut trace_out = self.trace_out.cursor();
-        let out = op_topn(delta, &mut trace_out, &mut history, &self.plan);
+        let (index, trace_out) = (&self.index, &self.trace_out);
+        let out = op_topn(
+            delta,
+            &mut |first, last| trace_out.cursor_within(first, last),
+            &mut |first, last| index.cursor_within(first, last),
+            &self.plan,
+        );
         assert_folds(std::slice::from_ref(&out), &out, "op_topn's delta");
         self.trace_out.ingest(out.clone());
         out

@@ -47,6 +47,11 @@ pub struct JoinProbe {
     t_cols: Box<[ColCopy]>,
     /// The null bits `t_cols` carries, from a walked row's word to the output's.
     t_nulls: NullPerm,
+    /// The trace's columns lead the output payload: the delta is the right side.
+    trace_leads: bool,
+    /// The walked rows are the trace's own, so they arrive in the order the
+    /// output gives their columns.
+    trace_ordered: bool,
 }
 
 impl JoinProbe {
@@ -103,7 +108,7 @@ impl JoinPlan {
         delta: &SchemaDescriptor,
         trace: &SchemaDescriptor,
     ) -> Result<JoinPlan, String> {
-        Self::new(kind, delta_is_right, delta, trace, trace, trace.payload_locators())
+        Self::new(kind, delta_is_right, delta, trace, Walked::Trace)
     }
 
     /// [`Self::from_wire`] for an equi join whose trace is not stored: the trace
@@ -119,19 +124,28 @@ impl JoinPlan {
         let cols = rekey
             .rekeys_onto_pk_prefix()
             .ok_or("join: the trace is not its source re-keyed onto leading primary-key columns")?;
-        Self::new(JoinKind::Equi, delta_is_right, delta, rekey.out_schema(), source, cols)
+        Self::new(
+            JoinKind::Equi,
+            delta_is_right,
+            delta,
+            rekey.out_schema(),
+            Walked::Source(source, cols),
+        )
     }
 
-    /// The plan of `delta` against `trace`, whose payload columns the cursor's
-    /// rows — in schema `walked` — hold at `t_cols`.
+    /// The plan of `delta` against `trace`, read out of the rows `walked` names.
     fn new(
         kind: JoinKind,
         delta_is_right: bool,
         delta: &SchemaDescriptor,
         trace: &SchemaDescriptor,
-        walked: &SchemaDescriptor,
-        t_cols: Vec<ColumnLocator>,
+        walked: Walked<'_>,
     ) -> Result<JoinPlan, String> {
+        let trace_ordered = matches!(walked, Walked::Trace);
+        let (walked, t_cols) = match walked {
+            Walked::Trace => (trace, trace.payload_locators()),
+            Walked::Source(source, cols) => (source, cols),
+        };
         let (left, right) = match delta_is_right {
             true => (trace, delta),
             false => (delta, trace),
@@ -180,9 +194,20 @@ impl JoinPlan {
             d_first: d_slots.start,
             t_cols,
             t_nulls,
+            trace_leads: delta_is_right,
+            trace_ordered,
         };
         Ok(JoinPlan { probe, out_schema })
     }
+}
+
+/// The rows a probe's cursor walks.
+enum Walked<'a> {
+    /// The trace's own.
+    Trace,
+    /// The rows of the relation the trace re-keys, in this schema, which hold
+    /// the trace's payload columns at these locators.
+    Source(&'a SchemaDescriptor, Vec<ColumnLocator>),
 }
 
 /// A keyed walk reads one side's PK region as the other's, so the two key
@@ -294,17 +319,19 @@ impl Pairing {
 /// The walk only records which delta run meets which trace row; the output is
 /// then written one region at a time over that list. Emission is trace-major
 /// under every probe: each trace row is walked once and producted against a
-/// contiguous delta run. So the output is unfolded and not (PK, payload)-sorted
-/// — under `Cross` not even PK-sorted, since each trace row re-emits the whole
-/// delta; it carries no consolidated claim, and downstream re-sorts and
-/// consolidates.
+/// contiguous delta run. So the output is in general unfolded and not
+/// (PK, payload)-sorted — under `Cross` not even PK-sorted, since each trace row
+/// re-emits the whole delta — and downstream re-sorts and consolidates it.
+///
+/// An equal-key walk claims its output consolidated where that order is the
+/// output's own: each delta run met one trace row, or the trace's rows arrived
+/// in output order and either lead the payload or met single delta rows.
 pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     out_schema: &SchemaDescriptor,
     probe: &JoinProbe,
 ) -> Batch {
-    // The VM folds this register before any reader.
     debug_assert!(delta.is_consolidated());
     let n = delta.count;
     if n == 0 {
@@ -313,10 +340,17 @@ pub fn op_join_delta_trace(
     // Grown, not pre-sized: a walk can match nothing.
     let mut pairs: Vec<Pairing> = Vec::new();
     let mut rows = 0usize;
+    let mut ordered = matches!(probe.walk, Walk::Equi);
+    let mut last_run = usize::MAX;
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         if rs == re {
             return;
         }
+        // A delta run's second trace row: its rows follow the first's.
+        if ordered && rs == last_run {
+            ordered = probe.trace_ordered && (probe.trace_leads || re - rs == 1);
+        }
+        last_run = rs;
         let (src, row) = c.current_position();
         pairs.push(Pairing {
             rs: rs as u32,
@@ -335,10 +369,15 @@ pub fn op_join_delta_trace(
             cursor.for_each_row_while(|_| true, |c| emit(0, n, c));
         }
     }
-    write_pairings(delta, cursor, out_schema, probe, &pairs, rows)
+    let mut out = write_pairings(delta, cursor, out_schema, probe, &pairs, rows);
+    if ordered && !out.is_empty() {
+        out.certify_consolidated();
+    }
+    out
 }
 
-/// The `rows` output rows `pairs` names, in list order, one region at a time.
+/// The `rows` output rows `pairs` names, in list order, one region at a time,
+/// less any whose weight product is zero.
 fn write_pairings(
     delta: &Batch,
     cursor: &ReadCursor,

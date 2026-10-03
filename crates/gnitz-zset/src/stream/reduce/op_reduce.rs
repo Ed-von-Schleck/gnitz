@@ -11,6 +11,7 @@ use super::plan::ReducePlan;
 use crate::algebra::emit_reduce_row;
 use crate::algebra::ground_pk;
 use crate::algebra::{Accumulator, GroupOrdinals, GroupedState};
+use crate::stream::OpenAt;
 
 /// A group with more delta rows than this skips the pre-step and probes the
 /// value index: one seek in place of stepping every row.
@@ -22,17 +23,15 @@ const PRESTEP_CAP: usize = 128;
 /// The delta is folded a column at a time, each aggregate over its own column:
 /// over row ranges where the delta already stands in group order and its groups
 /// are long enough to pay for a range each, else over one group ordinal per row.
-pub fn op_reduce(
-    delta: &Batch,
-    trace_out_cursor: &mut ReadCursor,
-    // Over the value index `plan.avi` describes, this epoch's entries included.
-    history: Option<&mut ReadCursor>,
-    plan: &ReducePlan,
-) -> Batch {
+///
+/// `trace_out` opens the output's history, at the groups the delta touches.
+/// `history` opens the value index `plan.avi` describes, this epoch's entries
+/// included, at the groups whose extremes are read off it; a delta with none
+/// leaves it unopened.
+pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_>>, plan: &ReducePlan) -> Batch {
     let shape = &plan.shape;
     let output_schema = &shape.output_schema;
 
-    // The VM folds this register before any reader.
     debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
     if delta.count == 0 {
@@ -40,7 +39,7 @@ pub fn op_reduce(
         // here, by a worker `seeds_ground` names, and only while no V₀ row is stored.
         if plan.seeds_ground {
             let v0 = ground_pk();
-            if !trace_out_cursor.seek_pk_group_ascending(v0.bytes()) {
+            if !trace_out(v0.bytes(), v0.bytes()).seek_pk_group_ascending(v0.bytes()) {
                 let mut out = Batch::with_capacity(output_schema, 1);
                 emit_reduce_row(&mut out, None, v0.bytes(), &shape.acc_template);
                 return out;
@@ -52,23 +51,31 @@ pub fn op_reduce(
     let mb = delta.as_mem_batch();
     let weights = mb.weight().as_chunks::<8>().0;
     let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
-    let avi = plan.avi.as_ref().map(|bake| {
-        let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
-        (bake, cursor)
-    });
-    let indexed = avi.is_some();
+    let indexed = plan.avi.is_some();
     let mut accs = shape.acc_template.clone();
 
     let groups = match shape.key.runs(delta) {
         Some(runs) if runs.len() == 1 || 2 * runs.len() <= delta.count => {
-            let mut groups = GroupEmit::new(plan, &mb, trace_out_cursor, avi, runs.len());
-            for run in runs.iter() {
+            // An extreme recedes only on a retraction, so an all-insert group's
+            // extremes are its rows' and its stored row's: no probe.
+            let probes: Vec<bool> = match indexed {
+                true => runs
+                    .iter()
+                    .map(|run| run.len() > PRESTEP_CAP || weights[run].iter().any(retracts))
+                    .collect(),
+                false => Vec::new(),
+            };
+            let probed = runs
+                .iter()
+                .zip(&probes)
+                .filter_map(|(run, &probe)| probe.then_some(run.start));
+            let ends = (0, runs.last_start());
+            let mut groups = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, runs.len());
+            for (g, run) in runs.iter().enumerate() {
                 accs.iter_mut().for_each(Accumulator::reset);
-                // An extreme recedes only on a retraction, so an all-insert group's
-                // extremes are its rows' and its stored row's: no probe.
-                let prestep = indexed && run.len() <= PRESTEP_CAP && !weights[run.clone()].iter().any(retracts);
-                Accumulator::fold_rows(&mut accs, &mb, run.clone(), prestep);
-                groups.emit(run.start, &mut accs, indexed && !prestep);
+                let probe = indexed && probes[g];
+                Accumulator::fold_rows(&mut accs, &mb, run.clone(), indexed && !probe);
+                groups.emit(run.start, &mut accs, probe);
             }
             return groups.finish();
         }
@@ -94,7 +101,14 @@ pub fn op_reduce(
         }
     }
 
-    let mut emit = GroupEmit::new(plan, &mb, trace_out_cursor, avi, groups.len());
+    let row_of = |g: Option<&u32>| groups.first[*g.expect("a delta with a row has a group") as usize] as usize;
+    let ends = (row_of(groups.by_pk.first()), row_of(groups.by_pk.last()));
+    let probed = groups
+        .first
+        .iter()
+        .zip(&probes)
+        .filter_map(|(&row, &probe)| probe.then_some(row as usize));
+    let mut emit = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, groups.len());
     for &g in &groups.by_pk {
         let g = g as usize;
         for (acc, state) in accs.iter_mut().zip(&mut states) {
@@ -107,23 +121,35 @@ pub fn op_reduce(
 
 /// The output of one `op_reduce` call under construction: each group's folded
 /// delta is merged with its history and written as a retraction and a new row.
-struct GroupEmit<'a, 'c> {
+struct GroupEmit<'a> {
     plan: &'a ReducePlan,
     delta: &'a MemBatch<'a>,
-    trace_out: &'c mut ReadCursor,
-    avi: Option<(&'a AviBake, &'c mut ReadCursor)>,
+    trace_out: ReadCursor,
+    /// The value index, open when some group reads its extremes off it.
+    avi: Option<(&'a AviBake, ReadCursor)>,
     groups: usize,
     out: Batch,
 }
 
-impl<'a, 'c> GroupEmit<'a, 'c> {
+impl<'a> GroupEmit<'a> {
+    /// `ends`: a row of the group least in output-PK order, and one of the
+    /// greatest. `probed`: one row of each group that reads the value index.
     fn new(
         plan: &'a ReducePlan,
         delta: &'a MemBatch<'a>,
-        trace_out: &'c mut ReadCursor,
-        avi: Option<(&'a AviBake, &'c mut ReadCursor)>,
+        trace_out: OpenAt<'_>,
+        history: Option<OpenAt<'_>>,
+        (lo, hi): (usize, usize),
+        probed: impl Iterator<Item = usize>,
         groups: usize,
     ) -> Self {
+        let key = &plan.shape.key;
+        let trace_out = trace_out(key.out_pk(delta, lo).bytes(), key.out_pk(delta, hi).bytes());
+        let avi = plan.avi.as_ref().and_then(|bake| {
+            let (lo, hi) = bake.group_span(delta, probed)?;
+            let open = history.expect("a value-indexed reduce is handed the index its plan describes");
+            Some((bake, open(lo.pk_bytes(), hi.pk_bytes())))
+        });
         // A group emits at most its retraction and its new row.
         let out = Batch::with_capacity(&plan.shape.output_schema, 2 * groups);
         GroupEmit { plan, delta, trace_out, avi, groups, out }
@@ -148,9 +174,8 @@ impl<'a, 'c> GroupEmit<'a, 'c> {
             }
         }
         if probe {
-            if let Some((bake, cursor)) = &mut self.avi {
-                bake.seed_extremes(cursor, self.delta, first, accs);
-            }
+            let (bake, cursor) = self.avi.as_mut().expect("opened for every group that probes");
+            bake.seed_extremes(cursor, self.delta, first, accs);
         }
 
         let cardinality = accs[self.plan.cardinality].count_value();

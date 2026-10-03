@@ -43,13 +43,13 @@ impl TestPlan {
     pub(super) fn reduce(&mut self, in_reg: DeltaReg, plan: stream::ReducePlan) -> (DeltaReg, StateIdx) {
         let out_schema = *plan.output_schema();
         let out_trace = self.table("reduce", out_schema);
-        let avi_table = plan.index_schema().map(|schema| self.table("avidx", *schema));
-        let plan = Box::new(BakedReduce::new(plan, avi_table));
-        (
-            self.prog
-                .push(in_reg, out_schema, Op::Reduce { out_trace: Some(out_trace), plan }),
-            out_trace,
-        )
+        let index = plan.index_schema().map(|schema| self.table("avidx", *schema));
+        let op = Op::Reduce {
+            out_trace: Some(out_trace),
+            index,
+            plan: Box::new(plan),
+        };
+        (self.prog.push(in_reg, out_schema, op), out_trace)
     }
 
     /// Finish the program with output `out`, opening every declared child store
@@ -88,23 +88,26 @@ pub(super) struct TestVm {
 }
 
 impl TestVm {
-    pub(super) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Batch {
-        let reads = SourceReads {
+    /// The program, beside the stores an epoch of it runs over.
+    fn parts(&mut self) -> (&mut Vm, Stores<'_>) {
+        let stores = Stores {
+            own: &mut self.state,
             registry: &self.registry,
             view: VIEW_ID,
             unfed: &self.unfed,
         };
-        execute_epoch_multi(&mut self.vm, &mut self.state, &reads, inputs).unwrap()
+        (&mut self.vm, stores)
+    }
+
+    pub(super) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Batch {
+        let (vm, mut stores) = self.parts();
+        execute_epoch(vm, &mut stores, inputs).unwrap()
     }
 
     pub(super) fn replay(&mut self, reg: DeltaReg, seed: Batch) -> Batch {
-        let entry = self.vm.program.replay_entry(reg).unwrap();
-        let reads = SourceReads {
-            registry: &self.registry,
-            view: VIEW_ID,
-            unfed: &self.unfed,
-        };
-        replay_chunk(&mut self.vm, &mut self.state, &reads, entry, seed).unwrap()
+        let entry = self.vm.replay_entry(reg).unwrap();
+        let (vm, mut stores) = self.parts();
+        replay_chunk(vm, &mut stores, entry, seed).unwrap()
     }
 
     /// The net contents of one child store, as a Z-set — how a test sees what an

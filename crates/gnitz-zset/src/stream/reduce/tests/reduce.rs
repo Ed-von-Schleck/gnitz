@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
-use crate::repr::{Batch, BatchBuilder, ReadCursor};
+use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::test_support::{assert_folds, cell, le_cell, TestTrace};
 use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind};
@@ -104,17 +104,25 @@ impl Harness {
         Harness { plan, index, trace_out }
     }
 
-    /// `delta`'s entries added to the value index, and the cursors `op_reduce`
-    /// reads: the output trace, and the index when a non-empty delta reads it.
-    pub(super) fn cursors(&mut self, delta: &Batch) -> (ReadCursor, Option<ReadCursor>) {
-        let history = match (&mut self.index, &self.plan.avi) {
-            (Some(index), Some(bake)) if delta.count > 0 => {
+    /// Add `delta`'s entries to the value index, as the VM does ahead of
+    /// `op_reduce`.
+    pub(super) fn index(&mut self, delta: &Batch) {
+        if let (Some(index), Some(bake)) = (&mut self.index, &self.plan.avi) {
+            if delta.count > 0 {
                 index.ingest(avi_batch(delta, bake));
-                Some(index.cursor())
             }
-            _ => None,
+        }
+    }
+
+    /// `op_reduce` over `delta` against the two traces, each opened at exactly
+    /// the keys the operator asks for.
+    pub(super) fn reduce(&self, delta: &Batch) -> Batch {
+        let mut trace_out = |first: &[u8], last: &[u8]| self.trace_out.cursor_within(first, last);
+        let mut index = |first: &[u8], last: &[u8]| {
+            let index = self.index.as_ref().expect("a plan with a value index");
+            index.cursor_within(first, last)
         };
-        (self.trace_out.cursor(), history)
+        op_reduce(delta, &mut trace_out, Some(&mut index), &self.plan)
     }
 
     /// One epoch: fold the delta unless every aggregate is exact linear, index
@@ -124,8 +132,8 @@ impl Harness {
             true => delta,
             false => delta.into_consolidated(),
         };
-        let (mut trace_out, mut history) = self.cursors(&delta);
-        let out = op_reduce(&delta, &mut trace_out, history.as_mut(), &self.plan);
+        self.index(&delta);
+        let out = self.reduce(&delta);
         assert_folds(std::slice::from_ref(&out), &out, "op_reduce's delta");
         self.trace_out.ingest(out.clone());
         out

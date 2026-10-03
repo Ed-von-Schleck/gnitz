@@ -299,6 +299,13 @@ impl Relation {
         self.table().cursor_for_keys(keys, cut)
     }
 
+    /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
+    /// same leading bytes of one — positioned on the first, over the rows `cut`
+    /// reads.
+    pub fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
+        self.table().cursor_between(first, last, cut)
+    }
+
     /// Visit every positive-weight row whose OPK key begins with `prefix`.
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
         let table = self.table();

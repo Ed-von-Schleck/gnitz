@@ -17,7 +17,6 @@ fn cap(kind: ClampKind) -> i64 {
 /// per-element weight clamp to its delta.
 pub fn op_weight_clamp(delta: &Batch, cursor: &mut ReadCursor, kind: ClampKind) -> Batch {
     let cap = cap(kind);
-    // The VM folds this register before any reader.
     debug_assert!(delta.is_consolidated());
     let mb = delta.as_mem_batch();
     let mut rows: Vec<(u32, u32, i64)> = Vec::new();

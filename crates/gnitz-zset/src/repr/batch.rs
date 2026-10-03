@@ -1259,8 +1259,9 @@ impl Batch {
     /// Consume this batch, consolidating it under its own label if needed.
     ///
     /// Fast path: an already-consolidated (or empty) `self` is returned by move,
-    /// allocating nothing. Slow path: sorts and weight-folds into a fresh batch,
-    /// then drops `self`.
+    /// allocating nothing. A batch that stands in consolidated order without the
+    /// claim is certified and returned the same way. Slow path: sorts and
+    /// weight-folds into a fresh batch, then drops `self`.
     ///
     /// `#[inline]`: the move copies the whole struct.
     #[inline]
@@ -1268,12 +1269,21 @@ impl Batch {
         if self.consolidated_verified() {
             return self;
         }
-        Self::consolidate_into_new(&self)
+        self.into_folded()
+    }
+
+    /// [`Self::into_consolidated`] of a batch without the claim.
+    #[inline(never)]
+    fn into_folded(mut self) -> Batch {
+        match self.certify_if_standing() {
+            true => self,
+            false => Self::consolidate_into_new(&self),
+        }
     }
 
     /// Consolidate this batch where it stands.
     pub fn consolidate_in_place(&mut self) {
-        if !self.is_consolidated() {
+        if !self.is_consolidated() && !self.certify_if_standing() {
             *self = Self::consolidate_into_new(self);
         }
     }
@@ -1281,10 +1291,34 @@ impl Batch {
     /// An owned consolidated copy: folds if needed, else clones. The borrowed
     /// counterpart of [`Self::into_consolidated`].
     pub fn to_consolidated(&self) -> Batch {
-        match self.consolidated_verified() {
-            true => self.clone(),
+        if self.consolidated_verified() {
+            return self.clone();
+        }
+        match merge::stands_consolidated(self) {
+            true => {
+                let mut copy = self.clone();
+                copy.certify_consolidated();
+                copy
+            }
             false => Self::consolidate_into_new(self),
         }
+    }
+
+    /// Whether the rows are consolidated, with the claim or without it: a
+    /// producer that wrote them in order leaves them unclaimed, and one forward
+    /// pass finds that out.
+    pub(crate) fn stands_consolidated(&self) -> bool {
+        self.consolidated_verified() || merge::stands_consolidated(self)
+    }
+
+    /// Raise the claim on a batch whose rows stand consolidated without it;
+    /// whether they do.
+    fn certify_if_standing(&mut self) -> bool {
+        let stands = merge::stands_consolidated(self);
+        if stands {
+            self.certify_consolidated();
+        }
+        stands
     }
 
     /// Sort and weight-fold `batch` into a fresh certified batch — the

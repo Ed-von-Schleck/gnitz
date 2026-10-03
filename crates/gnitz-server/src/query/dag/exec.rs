@@ -3,15 +3,6 @@
 
 use super::*;
 
-/// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
-/// is the sort order, and sorting puts a view after every view it reads, because
-/// ids ascend along scan edges.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Step {
-    view: u64,
-    producer: u64,
-}
-
 /// What one drive runs: a tick of `source`'s whole dependent closure, stamping
 /// fed views' deltas with `round`; or one backfill chunk of `source` into `view`
 /// alone, which captures no delta.
@@ -44,26 +35,24 @@ fn relay(host: &mut impl DriveHost, view_id: u64, batch: Cow<'_, Batch>, how: Op
     }
 }
 
-/// `view_id`'s compiled plan, which its epoch compiled on entry.
-fn plan_of(host: &mut impl DriveHost, view_id: u64) -> &mut ViewPlan {
-    host.parts().0.plan_mut(view_id).expect("compiled on the epoch's entry")
-}
-
 // ── Epoch execution ─────────────────────────────────────────────────────
 
-/// `view_id`'s plan and state, beside what its epoch reads of its sources.
-fn plan_and_reads<'a>(
+/// `view_id`'s plan, which its epoch compiled on entry, beside the stores an
+/// epoch of it runs over.
+fn plan_and_stores<'a>(
     host: &'a mut impl DriveHost,
     view_id: u64,
     unfed: &'a [u64],
-) -> (&'a mut ViewPlan, vm::SourceReads<'a>) {
+) -> (&'a mut CompileOutput, vm::Stores<'a>) {
     let (dag, registry) = host.parts();
-    let DagEngine { views, .. } = dag;
-    let plan = views
-        .get_mut(&view_id)
-        .and_then(|v| v.plan.as_mut())
-        .expect("compiled on the epoch's entry");
-    (plan, vm::SourceReads { registry, view: view_id, unfed })
+    let ViewPlan { code, state } = dag.plan_mut(view_id).expect("compiled on the epoch's entry");
+    let stores = vm::Stores {
+        own: state,
+        registry,
+        view: view_id,
+        unfed,
+    };
+    (code, stores)
 }
 
 /// Run one view's epoch over `src_id`'s delta. `unfed`: the sources the view
@@ -87,6 +76,16 @@ fn run_view_epoch(
             true => code.post.seed_folds(src_id),
             false => code.sides.iter().any(|s| s.plan.seed_folds(src_id)),
         };
+        // An empty delta into a plan that runs no exchange round and owes no
+        // ground row is an epoch every sub-plan would answer empty.
+        let sub_plans = || code.sides.iter().map(|s| &s.plan).chain([&code.post]);
+        if input.is_empty()
+            && route.is_none()
+            && code.sides.iter().all(|s| s.relay.is_none())
+            && sub_plans().all(|p| !p.vm.pending_ground_row)
+        {
+            return Ok(Batch::empty_with_schema(code.post.vm.out_schema()));
+        }
         (route, fold)
     };
     let input = relay(host, view_id, input, route.as_ref(), fold);
@@ -101,7 +100,7 @@ fn run_plan(
     src_id: u64,
     unfed: &[u64],
 ) -> Result<Batch, String> {
-    let code = &plan_of(host, view_id).code;
+    let (code, _) = plan_and_stores(host, view_id, unfed);
     if code.sides.is_empty() {
         let seed = sub_seed(&code.post, input, src_id);
         return run_post(host, view_id, [seed], unfed);
@@ -127,8 +126,8 @@ fn run_post(
     seeds: impl IntoIterator<Item = (vm::DeltaReg, Batch)>,
     unfed: &[u64],
 ) -> Result<Batch, String> {
-    let (ViewPlan { code, state }, reads) = plan_and_reads(host, view_id, unfed);
-    vm::execute_epoch_multi(&mut code.post.vm, state, &reads, seeds)
+    let (code, mut stores) = plan_and_stores(host, view_id, unfed);
+    vm::execute_epoch(&mut code.post.vm, &mut stores, seeds)
 }
 
 /// Side `i`'s seed for the post phase: its relayed output.
@@ -141,11 +140,11 @@ fn run_side(
     unfed: &[u64],
 ) -> Result<(vm::DeltaReg, Batch), String> {
     let (pre, seed_reg, how, fold) = {
-        let (ViewPlan { code, state }, reads) = plan_and_reads(host, view_id, unfed);
-        let fold = code.post.vm.program.folds(code.sides[i].seed_reg);
+        let (code, mut stores) = plan_and_stores(host, view_id, unfed);
+        let fold = code.post.vm.folds(code.sides[i].seed_reg);
         let side = &mut code.sides[i];
         let seed = sub_seed(&side.plan, delta, src_id);
-        let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, &reads, [seed])?;
+        let pre = vm::execute_epoch(&mut side.plan.vm, &mut stores, [seed])?;
         (pre, side.seed_reg, side.relay.clone(), fold)
     };
     Ok((seed_reg, relay(host, view_id, Cow::Owned(pre), how.as_ref(), fold)))
@@ -158,24 +157,19 @@ impl DagEngine {
     /// execution order, skipping non-resumable views: their backfill fills them.
     /// The skipped set is closed under dependents, so no step reads a skipped
     /// producer. Worker-identical, which keeps the workers in lockstep.
-    fn tick_schedule(&self, source_id: u64) -> Vec<Step> {
-        let mut schedule: Vec<Step> = Vec::new();
-        for producer in std::iter::once(source_id).chain(self.dependent_closure(vec![source_id])) {
-            for &view in self.dependents_of(producer) {
-                if !self.awaits_rebuild(view) {
-                    schedule.push(Step { view, producer });
-                }
-            }
+    fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
+        let steps = self.dep.tick_steps(source_id);
+        match self.rebuild.is_empty() {
+            true => steps,
+            false => steps.iter().filter(|s| !self.awaits_rebuild(s.view)).copied().collect(),
         }
-        schedule.sort_unstable();
-        schedule
     }
 
     /// End `view_id`'s backfill from `source`.
     ///
-    /// Releases the last chunk's pinned registers and trace cursors, then folds
-    /// the view's memtable into its RAM tier once — so the view's first reads open
-    /// over fewer sources, at one fold per backfill rather than one per chunk.
+    /// Folds the view's memtable into its RAM tier once — so the view's first
+    /// reads open over fewer sources, at one fold per backfill rather than one per
+    /// chunk.
     ///
     /// A source that [passes through](Self::passes_through) held its rows for the
     /// backfills of the views scanning it. Those run in ascending id order, so the
@@ -186,11 +180,6 @@ impl DagEngine {
         view_id: u64,
         source: u64,
     ) -> Result<(), String> {
-        if let Some(plan) = self.plan_mut(view_id) {
-            for sub in plan.code.sub_plans_mut() {
-                sub.vm.release();
-            }
-        }
         registry.fold_to_ram(view_id)?;
         if self.passes_through(source) && self.dependents_of(source).iter().max() == Some(&view_id) {
             registry.clear_rows(source)?;
@@ -217,21 +206,22 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>
             let sources = dag.sources_of(view);
             let behind = sources.iter().position(|&s| s == source).map_or(0, |at| at + 1);
             let unfed = sources[behind..].to_vec();
-            (source, vec![Step { view, producer: source }], None, unfed)
+            (source, Rc::from([Step { view, producer: source }]), None, unfed)
         }
     };
-    // How many steps still read each producer's output.
-    let mut readers: FxHashMap<u64, usize> = FxHashMap::default();
-    for step in &schedule {
+    // How many steps still read each producer's output. Sized for the schedule,
+    // as `outputs` is: growing either rehashes it once per doubling.
+    let mut readers: FxHashMap<u64, usize> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
+    for step in schedule.iter() {
         *readers.entry(step.producer).or_default() += 1;
     }
     let delta = match delta {
         Some(delta) => delta,
         None => Batch::empty_with_schema(&host.parts().1.relation_or_err(source)?.schema()),
     };
-    let mut outputs: FxHashMap<u64, Batch> = FxHashMap::default();
+    let mut outputs: FxHashMap<u64, Batch> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
     outputs.insert(source, delta);
-    for step in &schedule {
+    for step in schedule.iter() {
         let left = readers.get_mut(&step.producer).expect("counted above");
         *left -= 1;
         // The last reader takes the batch; an earlier one borrows it, and copies
@@ -253,12 +243,12 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
             let merged = match outputs.remove(&step.view) {
-                Some(held) if !held.is_empty() => {
+                Some(held) => {
                     // The held batch's schema: the union is certified under it.
                     let schema = *held.schema();
-                    algebra::op_union(Cow::Owned(held), &out, &schema)
+                    algebra::op_union(Cow::Owned(held), Cow::Owned(out), &schema)
                 }
-                _ => out,
+                None => out,
             };
             outputs.insert(step.view, merged);
         }

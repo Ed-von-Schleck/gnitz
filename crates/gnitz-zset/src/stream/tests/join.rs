@@ -146,6 +146,39 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
     }
 }
 
+/// An equal-key walk claims its output consolidated exactly where it wrote the
+/// rows in output order: a delta run against one trace row, one delta row
+/// against several, and several against several only where the trace's columns
+/// lead the payload. The claim is verified as it is raised, and the rows are
+/// the reference's either way.
+#[test]
+fn an_equi_join_claims_the_output_it_writes_in_order() {
+    let schema = make_schema_u64_i64();
+    let trace = make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (2, 1, 300)]);
+    /// `(what, delta rows, claimed with the delta on the left, on the right)`.
+    type Case = (&'static str, &'static [(u64, i64, i64)], bool, bool);
+    let cases: [Case; 4] = [
+        ("one delta row per key", &[(1, 1, 10), (2, 1, 20)], true, true),
+        ("a delta run on a one-row key", &[(2, 1, 20), (2, 1, 21)], true, true),
+        ("a delta run on a two-row key", &[(1, 1, 10), (1, 1, 11)], false, true),
+        ("no match", &[(3, 1, 30)], false, false),
+    ];
+    for (what, rows, left, right) in cases {
+        let delta = make_batch(&schema, rows);
+        for (delta_is_right, claimed) in [(false, left), (true, right)] {
+            let mut cursor = trace_cursor(Batch::clone(&trace));
+            let out = join(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, &mut cursor);
+            assert_eq!(
+                out.is_consolidated(),
+                claimed || out.is_empty(),
+                "{what}, right={delta_is_right}"
+            );
+            let (want, _) = join_reference(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, &trace);
+            assert_eq!(zset_of(&out, out.schema()), want, "{what}, right={delta_is_right}");
+        }
+    }
+}
+
 /// The range join with the delta on the right, so the wire's `left REL right`
 /// reads as `trace_slot REL delta_slot` — how every literal case below is spelled.
 fn range_join(schema: &SchemaDescriptor, rel: RangeRel, delta: &Batch, cursor: &mut ReadCursor) -> Batch {

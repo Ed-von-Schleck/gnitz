@@ -9,6 +9,7 @@
 use std::cell::Cell;
 
 use gnitz_expr::{BatchView, RowSource};
+use gnitz_wire::PkBuf;
 
 use crate::repr::{range_rows, runs_where, Batch, MemBatch};
 
@@ -343,6 +344,21 @@ impl ReindexPacker {
         let n = self.out_stride;
         self.pack_into(&mut buf[..n], batch, row);
         &buf[..n]
+    }
+
+    /// The least and the greatest [`Self::pack_prefix`] among `rows`; `None` for
+    /// no row.
+    pub(crate) fn prefix_span<R: RowSource>(
+        &self,
+        batch: &R,
+        rows: impl Iterator<Item = usize>,
+    ) -> Option<(PkBuf, PkBuf)> {
+        let mut key = [0u8; MAX_PK_BYTES];
+        rows.map(|row| PkBuf::from_bytes(self.pack_prefix(&mut key, batch, row)))
+            .fold(None, |span, prefix| match span {
+                None => Some((prefix, prefix)),
+                Some((lo, hi)) => Some((lo.min(prefix), hi.max(prefix))),
+            })
     }
 
     /// Pack `row`'s key into `dst`, all `out_stride` bytes of it.

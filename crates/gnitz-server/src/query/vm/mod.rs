@@ -20,21 +20,21 @@ mod exec;
 mod fixtures;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{execute_epoch_multi, replay_chunk, SourceReads};
+pub(in crate::query) use exec::{execute_epoch, replay_chunk, Stores};
 
 // ---------------------------------------------------------------------------
 // Instruction set
 // ---------------------------------------------------------------------------
 
 /// A register whose batch an instruction reads or writes — the one index space
-/// a `Program` has, a trace being named by its [`Integral`]. Minted only by
+/// a [`Vm`] has, a trace being named by its [`Integral`]. Minted only by
 /// [`ProgramBuilder`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::query) struct DeltaReg(u16);
 
 impl DeltaReg {
     #[inline]
-    pub(in crate::query) fn at(self) -> usize {
+    fn at(self) -> usize {
         self.0 as usize
     }
 }
@@ -45,8 +45,8 @@ struct Instr {
     in_reg: DeltaReg,
     out_reg: DeltaReg,
     op: Op,
-    /// [`OpFacts::inert_on_empty`], baked.
-    inert_on_empty: bool,
+    /// `op`'s, classified once when the instruction is pushed.
+    facts: OpFacts,
 }
 
 /// The operators, each boxing whatever the emitter baked for it.
@@ -83,15 +83,18 @@ pub(in crate::query) enum Op {
     },
     /// `out_trace`: the integral of the output register, or `None` where that
     /// register is the view's output and so the view's own store is its integral.
+    /// `index`: the table the value index of its MIN/MAX aggregates lives in.
     Reduce {
         out_trace: Option<StateIdx>,
-        plan: Box<BakedReduce>,
+        index: Option<StateIdx>,
+        plan: Box<stream::ReducePlan>,
     },
-    /// Per-group top-N: the ordered index of every input row is populated with
-    /// the delta before the walk. `out_trace` as [`Op::Reduce`]'s.
+    /// Per-group top-N: `index`, the ordered index of every input row, is
+    /// populated with the delta before the walk. `out_trace` as [`Op::Reduce`]'s.
     TopN {
         out_trace: Option<StateIdx>,
-        plan: Box<BakedTopN>,
+        index: StateIdx,
+        plan: Box<stream::TopNPlan>,
     },
 }
 
@@ -107,33 +110,9 @@ pub(in crate::query) enum Integral {
     Source(u64),
 }
 
-/// One `Op::Reduce`'s baked operator data: the plan and the table its combined
-/// value index lives in.
-pub(in crate::query) struct BakedReduce {
-    plan: stream::ReducePlan,
-    avi_table: Option<StateIdx>,
-}
-
-impl BakedReduce {
-    pub(in crate::query) fn new(plan: stream::ReducePlan, avi_table: Option<StateIdx>) -> BakedReduce {
-        assert_eq!(
-            plan.index_schema().is_some(),
-            avi_table.is_some(),
-            "a reduce's value index and its table are set together",
-        );
-        BakedReduce { plan, avi_table }
-    }
-}
-
-/// One `Op::TopN`'s baked operator data: the plan and the table its ordered
-/// index lives in.
-pub(in crate::query) struct BakedTopN {
-    pub(in crate::query) plan: gnitz_zset::stream::TopNPlan,
-    pub(in crate::query) index_table: StateIdx,
-}
-
 /// Everything the VM's passes need to know about one operator, classified in one
 /// place.
+#[derive(Clone, Copy)]
 struct OpFacts {
     /// It reads its input at net weights, so the VM folds that register when it
     /// is written.
@@ -167,10 +146,10 @@ fn facts(op: &Op) -> OpFacts {
         },
         Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
         Op::Reduce { plan, .. } => OpFacts {
-            consolidates_in: !plan.plan.is_exact_linear(),
+            consolidates_in: !plan.is_exact_linear(),
             stateful: true,
             // A global-ground reduce mints V₀ from an empty delta.
-            inert_on_empty: !plan.plan.seeds_ground,
+            inert_on_empty: !plan.seeds_ground,
         },
         Op::TopN { .. } => OpFacts { stateful: true, ..linear },
     }
@@ -191,8 +170,8 @@ impl Instr {
             | Op::JoinDT { trace: _, probe: _ }
             | Op::WorkerFilter { slot: _ }
             | Op::NullExtend { nulls_first: _ }
-            | Op::Reduce { out_trace: _, plan: _ }
-            | Op::TopN { out_trace: _, plan: _ } => None,
+            | Op::Reduce { out_trace: _, index: _, plan: _ }
+            | Op::TopN { out_trace: _, index: _, plan: _ } => None,
         };
         [Some(self.in_reg), second]
     }
@@ -216,43 +195,28 @@ impl Instr {
     }
 }
 
-/// A compiled program with the registers it runs over.
+// ---------------------------------------------------------------------------
+// Vm
+// ---------------------------------------------------------------------------
+
+/// A compiled DBSP program and the registers it runs over. It owns every
+/// resource its instructions name except the stores: the view's own children
+/// ([`CircuitState`]) and the relations an [`Integral::Source`] reads.
 pub(in crate::query) struct Vm {
-    pub(in crate::query) program: Program,
-    /// One batch per delta register.
-    batches: Box<[Batch]>,
-    /// No epoch has been dispatched yet and some instruction is not inert on an
-    /// empty delta (a global-ground `Reduce` this worker owns) — the one reason
-    /// an all-empty epoch is worth dispatching.
-    pub(in crate::query) pending_ground_row: bool,
-}
-
-impl Vm {
-    /// Free every register's buffer. For the end of a backfill, whose last chunk
-    /// would otherwise stay resident for the cached plan's lifetime.
-    pub(super) fn release(&mut self) {
-        for batch in self.batches.iter_mut() {
-            batch.release_buffers();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Program
-// ---------------------------------------------------------------------------
-
-/// A compiled DBSP program, owning every resource its instructions name except
-/// the stores: the view's own children ([`CircuitState`]) and the relations an
-/// [`Integral::Source`] reads.
-pub(in crate::query) struct Program {
     instructions: Box<[Instr]>,
     /// Each tick's accumulation of a register into its trace. Run after the
     /// whole instruction range — and not at all by a replay, which is what makes
     /// a replay read-only.
     integrates: Box<[(DeltaReg, StateIdx)]>,
     regs: Box<[Reg]>,
+    /// One batch per register.
+    batches: Box<[Batch]>,
     /// The register the epoch's output is extracted from.
     out_reg: DeltaReg,
+    /// No epoch has been dispatched yet and some instruction is not inert on an
+    /// empty delta (a global-ground `Reduce` this worker owns) — the one reason
+    /// an all-empty epoch is worth dispatching.
+    pub(in crate::query) pending_ground_row: bool,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -282,15 +246,13 @@ pub(in crate::query) struct ReplayEntry {
     pc: usize,
 }
 
-impl Program {
-    /// The schema register `reg` is labelled with. By reference: the dispatch
-    /// loop hands it straight to kernels, and a `SchemaDescriptor` is not cheap
-    /// to copy.
+impl Vm {
+    /// The schema register `reg` is labelled with.
     pub(in crate::query) fn schema_of(&self, reg: DeltaReg) -> &SchemaDescriptor {
         &self.regs[reg.at()].schema
     }
 
-    /// The schema of the register this program's output leaves in.
+    /// The schema of the register the epoch's output leaves in.
     pub(in crate::query) fn out_schema(&self) -> &SchemaDescriptor {
         self.schema_of(self.out_reg)
     }
@@ -338,7 +300,7 @@ impl Program {
         seeded[reg.at()] = true;
         for instr in &self.instructions[pc..] {
             let reads_seed = instr.reads().into_iter().flatten().any(|r| seeded[r.at()]);
-            if facts(&instr.op).stateful && (reads_seed || !instr.inert_on_empty) {
+            if instr.facts.stateful && (reads_seed || !instr.facts.inert_on_empty) {
                 return Err("replay: the seed reaches a stateful operator".into());
             }
             seeded[instr.out_reg.at()] |= reads_seed;

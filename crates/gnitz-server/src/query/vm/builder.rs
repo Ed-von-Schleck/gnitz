@@ -30,8 +30,8 @@ impl ProgramBuilder {
     /// Push `op` over `in_reg`, writing a fresh register of `out_schema`.
     pub(in crate::query) fn push(&mut self, in_reg: DeltaReg, out_schema: SchemaDescriptor, op: Op) -> DeltaReg {
         let out_reg = self.seed(out_schema);
-        let inert_on_empty = facts(&op).inert_on_empty;
-        self.instructions.push(Instr { in_reg, out_reg, op, inert_on_empty });
+        let facts = facts(&op);
+        self.instructions.push(Instr { in_reg, out_reg, op, facts });
         out_reg
     }
 
@@ -50,8 +50,8 @@ impl ProgramBuilder {
         let ProgramBuilder { instructions, mut integrates, schemas } = self;
         integrates.extend(instructions.iter().filter_map(Instr::own_integral));
 
-        // Over the EMITTED instructions — so an elided node's register aliasing is
-        // seen through, not re-derived from graph edges.
+        // Over the emitted instructions, which already name the register an
+        // elided node's readers read.
         let mut regs: Vec<Reg> = schemas
             .into_iter()
             .map(|schema| Reg {
@@ -65,7 +65,7 @@ impl ProgramBuilder {
             for reg in instr.reads().into_iter().flatten() {
                 regs[reg.at()].last_read = LastRead::Instr(pc);
             }
-            regs[instr.in_reg.at()].fold |= facts(&instr.op).consolidates_in;
+            regs[instr.in_reg.at()].fold |= instr.facts.consolidates_in;
         }
         for (i, &(reg, _)) in integrates.iter().enumerate() {
             regs[reg.at()].last_read = LastRead::Integrate(i);
@@ -73,17 +73,13 @@ impl ProgramBuilder {
         // After the scan, not before: the sink can itself be an operand.
         regs[out_reg.at()].last_read = LastRead::Nobody;
 
-        let pending_ground_row = instructions.iter().any(|i| !i.inert_on_empty);
-
         Vm {
+            pending_ground_row: instructions.iter().any(|i| !i.facts.inert_on_empty),
             batches: regs.iter().map(|r| Batch::empty_with_schema(&r.schema)).collect(),
-            program: Program {
-                instructions: instructions.into_boxed_slice(),
-                integrates: integrates.into_boxed_slice(),
-                regs: regs.into_boxed_slice(),
-                out_reg,
-            },
-            pending_ground_row,
+            instructions: instructions.into_boxed_slice(),
+            integrates: integrates.into_boxed_slice(),
+            regs: regs.into_boxed_slice(),
+            out_reg,
         }
     }
 }

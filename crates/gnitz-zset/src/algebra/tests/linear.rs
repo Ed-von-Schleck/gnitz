@@ -5,25 +5,42 @@ use crate::test_support::{
     assert_folds, make_batch, make_schema_u64_i64, pk_payload_schema, weighted_rows, zset_of, zset_sum,
 };
 
-/// `(pk, weight, payload)` rows over `schema`, `None` a NULL payload, certified
-/// consolidated when `consolidated` (the rows are in (PK, payload) order).
-fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], consolidated: bool) -> Batch {
+/// How a fixture batch holds rows given in (PK, payload) order.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Rows {
+    /// In that order, certified consolidated.
+    Claimed,
+    /// In that order, without the claim.
+    InOrder,
+    /// Reversed.
+    Scrambled,
+}
+
+/// `(pk, weight, payload)` rows over `schema`, `None` a NULL payload, held as
+/// `how` says.
+fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], how: Rows) -> Batch {
+    let mut rows = rows.to_vec();
+    if how == Rows::Scrambled {
+        rows.reverse();
+    }
     let mut b = BatchBuilder::new(schema);
-    for &(pk, w, v) in rows {
+    for (pk, w, v) in rows {
         b.begin_row(pk as u128, w);
         b.put_opt_int(v.map(|v| v as u128));
         b.end_row();
     }
     let mut b = b.finish();
-    if consolidated {
+    if how == Rows::Claimed {
         b.certify_consolidated();
     }
     b
 }
 
 /// Union is Z-Set `+` under the union's own schema, whichever way it gets
-/// there: two consolidated inputs merge into a consolidated fold, anything else
-/// concatenates and stays unconsolidated, and an empty side keeps the other's claim. A
+/// there: two inputs in consolidated order merge into a consolidated fold, with
+/// the claim or without it, anything else
+/// concatenates and stays unconsolidated, and an empty operand on either side keeps the
+/// other's claim. A
 /// NULL and a zero hold the same bytes, so only the nullability the union
 /// merges in keeps them two elements; equal elements at opposite weights cancel.
 #[test]
@@ -41,24 +58,22 @@ fn union_is_the_zset_sum_under_every_input_layout() {
     let out_schema = union_nullability_merge(&nonnull, &nullable).unwrap();
     let a_rows = [(1, 1, Some(0)), (2, 1, Some(10)), (3, 2, Some(30)), (5, 1, Some(50))];
     let b_rows = [(1, -1, None), (2, -1, Some(10)), (3, 1, Some(31)), (4, 1, Some(40))];
-    for (a_cons, b_cons, b_rows) in [
-        (true, true, &b_rows[..]),
-        (true, false, &b_rows),
-        (false, true, &b_rows),
-        (false, false, &b_rows),
-        (true, true, &[]),
-        (false, true, &[]),
+    use Rows::*;
+    for (a_how, b_how, b_rows) in [
+        (Claimed, Claimed, &b_rows[..]),
+        (Claimed, InOrder, &b_rows),
+        (InOrder, InOrder, &b_rows),
+        (Claimed, Scrambled, &b_rows),
+        (Scrambled, Claimed, &b_rows),
+        (Scrambled, Scrambled, &b_rows),
+        (Claimed, Claimed, &[]),
+        (InOrder, Claimed, &[]),
+        (Scrambled, Claimed, &[]),
     ] {
-        let what = format!(
-            "a consolidated {a_cons}, b consolidated {b_cons}, b rows {}",
-            b_rows.len()
-        );
-        let (a, b) = (
-            opt_batch(&nonnull, &a_rows, a_cons),
-            opt_batch(&nullable, b_rows, b_cons),
-        );
-        let out = op_union(Cow::Owned(Batch::clone(&a)), &b, &out_schema);
-        let lent = op_union(Cow::Borrowed(&a), &b, &out_schema);
+        let what = format!("a {a_how:?}, b {b_how:?}, b rows {}", b_rows.len());
+        let (a, b) = (opt_batch(&nonnull, &a_rows, a_how), opt_batch(&nullable, b_rows, b_how));
+        let out = op_union(Cow::Owned(Batch::clone(&a)), Cow::Owned(Batch::clone(&b)), &out_schema);
+        let lent = op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &out_schema);
         assert_eq!(lent.schema(), &out_schema, "{what}");
         assert_eq!(lent.is_consolidated(), out.is_consolidated(), "{what}");
         assert_eq!(
@@ -67,8 +82,19 @@ fn union_is_the_zset_sum_under_every_input_layout() {
             "{what}: a lent operand unions as an owned one"
         );
         assert_eq!(out.schema(), &out_schema, "{what}");
-        let consolidated = a_cons && (b_cons || b_rows.is_empty());
+        let consolidated = match b_rows.is_empty() {
+            true => a_how == Claimed,
+            false => a_how != Scrambled && b_how != Scrambled,
+        };
         assert_eq!(out.is_consolidated(), consolidated, "{what}");
+        let flipped = op_union(Cow::Borrowed(&b), Cow::Owned(Batch::clone(&a)), &out_schema);
+        assert_eq!(flipped.schema(), &out_schema, "{what}");
+        assert_eq!(flipped.is_consolidated(), consolidated, "{what}: flipped");
+        assert_eq!(
+            zset_of(&flipped, &out_schema),
+            zset_of(&out, &out_schema),
+            "{what}: the operands commute"
+        );
         match consolidated {
             true => assert_folds(&[a, b], &out, &what),
             false => assert_eq!(zset_of(&out, &out_schema), zset_sum(&[a, b], &out_schema), "{what}"),
@@ -153,7 +179,7 @@ fn union_merge_bench() {
         let t = Instant::now();
         let mut acc = 0usize;
         for _ in 0..ITERS {
-            acc += black_box(op_union(Cow::Borrowed(&a), &b, &schema).count);
+            acc += black_box(op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &schema).count);
         }
         let secs = t.elapsed().as_secs_f64();
         println!(

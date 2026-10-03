@@ -427,7 +427,13 @@ impl Table {
     /// columns of one — positioned on the first, over the rows `cut` reads.
     pub(crate) fn cursor_for_keys(&self, keys: &Batch, cut: Cut) -> ReadCursor {
         debug_assert!(keys.is_consolidated() && !keys.is_empty());
-        let (first, last) = (keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1));
+        self.cursor_between(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), cut)
+    }
+
+    /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
+    /// same leading bytes of one — positioned on the first, over the rows `cut`
+    /// reads.
+    pub(crate) fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
         let (runs, cap, start) = self.runs_over_prefixes(first, last, cut);
         from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
     }

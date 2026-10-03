@@ -9,9 +9,10 @@ use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::{algebra, stream};
 
-/// What an epoch reads of the relations its plan scans beyond their deltas: the
-/// stores behind its [`Integral::Source`]s.
-pub(in crate::query) struct SourceReads<'a> {
+/// The stores an epoch reads and writes: the view's own children, and the
+/// relations behind its plan's [`Integral::Source`]s.
+pub(in crate::query) struct Stores<'a> {
+    pub(in crate::query) own: &'a mut CircuitState,
     pub(in crate::query) registry: &'a RelationRegistry,
     /// The view the plan computes.
     pub(in crate::query) view: u64,
@@ -20,14 +21,17 @@ pub(in crate::query) struct SourceReads<'a> {
     pub(in crate::query) unfed: &'a [u64],
 }
 
-impl SourceReads<'_> {
-    /// A cursor over `integral` for probing at `delta`'s keys: a source's rows
-    /// there as the view last absorbed them.
-    fn cursor_for_keys(&self, state: &CircuitState, integral: Integral, delta: &Batch) -> Result<ReadCursor, String> {
+impl Stores<'_> {
+    /// A cursor over `integral` for a join probing it with `delta`: at `delta`'s
+    /// keys when `keyed`, over every row otherwise. A source's rows are there as
+    /// the view last absorbed them.
+    fn probe_cursor(&self, integral: Integral, delta: &Batch, keyed: bool) -> Result<ReadCursor, String> {
         let source = match integral {
-            Integral::Own(trace) => return Ok(state.cursor_for_keys(trace, delta)),
+            Integral::Own(trace) if keyed => return Ok(self.own.cursor_for_keys(trace, delta)),
+            Integral::Own(trace) => return Ok(self.own.cursor(trace)),
             Integral::Source(source) => source,
         };
+        debug_assert!(keyed, "the compiler bakes a source under an equi probe alone");
         let relation = self.registry.relation_or_err(source)?;
         if self.unfed.contains(&source) {
             return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
@@ -35,25 +39,26 @@ impl SourceReads<'_> {
         Ok(relation.cursor_for_keys(delta, Cut::Sealed))
     }
 
-    /// A cursor over a reduce's or top-N's output history: its own trace, or the
+    /// The opener of a reduce's or top-N's output history: its own trace, or the
     /// view's store, which every earlier epoch's output was ingested into.
-    fn out_trace(&self, state: &CircuitState, own: Option<StateIdx>) -> Result<ReadCursor, String> {
-        match own {
-            Some(trace) => Ok(state.cursor(trace)),
-            None => Ok(self.registry.relation_or_err(self.view)?.cursor()),
-        }
+    fn out_trace(&self, own: Option<StateIdx>) -> Result<impl FnMut(&[u8], &[u8]) -> ReadCursor + '_, String> {
+        let view = self.registry.relation_or_err(self.view)?;
+        Ok(move |first: &[u8], last: &[u8]| match own {
+            Some(trace) => self.own.cursor_between(trace, first, last),
+            None => view.cursor_between(first, last, Cut::Now),
+        })
+    }
+
+    /// The opener of a reduce's or top-N's index.
+    fn index(&self, idx: StateIdx) -> impl FnMut(&[u8], &[u8]) -> ReadCursor + '_ {
+        move |first: &[u8], last: &[u8]| self.own.cursor_between(idx, first, last)
     }
 
     /// Every live row of `keys` in `integral`: a source's as the view last
     /// absorbed them.
-    pub(in crate::query) fn gather(
-        &self,
-        state: &CircuitState,
-        integral: Integral,
-        keys: PkKeys,
-    ) -> Result<PkSetGather, String> {
+    pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys) -> Result<PkSetGather, String> {
         Ok(match integral {
-            Integral::Own(trace) => state.gather(trace, keys),
+            Integral::Own(trace) => self.own.gather(trace, keys),
             Integral::Source(source) => self.registry.relation_or_err(source)?.gather(keys, Cut::Sealed),
         })
     }
@@ -66,12 +71,11 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
 }
 
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
-/// two for a set-op post phase, one everywhere else. Returns the output
-/// register's batch, empty when the epoch produced nothing.
-pub(in crate::query) fn execute_epoch_multi(
+/// one per exchange side for a post phase, one everywhere else. Returns the
+/// output register's batch, empty when the epoch produced nothing.
+pub(in crate::query) fn execute_epoch(
     vm: &mut Vm,
-    state: &mut CircuitState,
-    sources: &SourceReads<'_>,
+    stores: &mut Stores<'_>,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
 ) -> Result<Batch, String> {
     let all_empty = seed_inputs(vm, inputs);
@@ -79,36 +83,32 @@ pub(in crate::query) fn execute_epoch_multi(
     // runs either way and leaves V₀ in its output trace.
     let ground_pending = std::mem::take(&mut vm.pending_ground_row);
     if all_empty && !ground_pending {
-        return Ok(Batch::empty_with_schema(vm.program.out_schema()));
+        return Ok(take_output(vm));
     }
-    run_instructions(vm, state, sources, 0)?;
-    run_integrates(vm, state)?;
-    Ok(take_output(vm))
+    let ran = run_instructions(vm, stores, 0).and_then(|()| run_integrates(vm, stores.own));
+    let out = take_output(vm);
+    ran.map(|()| out)
 }
 
 /// One chunk of a capacity-bounded view's hydration replay, which runs no
 /// integrate.
 pub(in crate::query) fn replay_chunk(
     vm: &mut Vm,
-    state: &mut CircuitState,
-    sources: &SourceReads<'_>,
+    stores: &mut Stores<'_>,
     entry: ReplayEntry,
     seed: Batch,
 ) -> Result<Batch, String> {
     seed_inputs(vm, std::iter::once((entry.reg, seed)));
-    run_instructions(vm, state, sources, entry.pc)?;
+    let ran = run_instructions(vm, stores, entry.pc);
     let out = take_output(vm);
-    // Frees the seed, which no integrate took, before the next chunk is gathered.
-    vm.release();
-    Ok(out)
+    ran.map(|()| out)
 }
 
-/// Clear the registers and move each seed into its own, reporting whether every
-/// seed was empty. Split from [`run_instructions`] so only these lines are
-/// generic over the seed iterator, not the whole loop below.
+/// Move each seed into its own register, reporting whether every seed was
+/// empty. Every register is empty on entry: [`take_output`] ends each run by
+/// freeing them. Split from [`run_instructions`] so only these lines are generic
+/// over the seed iterator, not the whole loop below.
 fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>) -> bool {
-    vm.release();
-
     let mut all_empty = true;
     for (input_reg, input_batch) in inputs {
         all_empty &= input_batch.is_empty();
@@ -117,13 +117,13 @@ fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>)
         if !input_batch.is_empty() {
             assert_eq!(
                 input_batch.schema().num_columns(),
-                vm.program.schema_of(input_reg).num_columns(),
+                vm.schema_of(input_reg).num_columns(),
                 "VM register {} schema/batch column-count mismatch",
                 input_reg.0,
             );
         }
         vm.batches[input_reg.at()] = input_batch;
-        fold_written(&mut vm.batches, &vm.program.regs, input_reg);
+        fold_written(&mut vm.batches, &vm.regs, input_reg);
     }
     all_empty
 }
@@ -132,93 +132,75 @@ fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>)
 /// after the write, so each sees the folded form.
 #[inline]
 fn fold_written(batches: &mut [Batch], regs: &[Reg], reg: DeltaReg) {
-    let written = &regs[reg.at()];
-    if written.fold {
+    if regs[reg.at()].fold {
         batches[reg.at()].consolidate_in_place();
     }
 }
 
-/// Register `reg`'s batch, moved out when `take` and copied otherwise.
+/// A register's batch as an operand: moved out when `take`, lent otherwise.
 #[inline]
-fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
-    let batch = &mut batches[reg.at()];
+fn operand(batch: &mut Batch, take: bool) -> Cow<'_, Batch> {
     match take {
-        true => batch.take(),
-        false => Batch::clone(batch),
+        true => Cow::Owned(batch.take()),
+        false => Cow::Borrowed(batch),
     }
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(
-    vm: &mut Vm,
-    state: &mut CircuitState,
-    sources: &SourceReads<'_>,
-    start_pc: usize,
-) -> Result<(), String> {
-    let Vm { program, batches, .. } = vm;
+fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Result<(), String> {
+    let Vm { instructions, regs, batches, out_reg, .. } = vm;
 
-    gnitz_debug!(
-        "vm: dispatch out_reg={} instrs={}",
-        program.out_reg.0,
-        program.instructions.len()
-    );
+    gnitz_debug!("vm: dispatch out_reg={} instrs={}", out_reg.0, instructions.len());
 
-    let Program { instructions, regs, .. } = program;
     for (pc, instr) in instructions.iter_mut().enumerate().skip(start_pc) {
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
         let takes = |r: DeltaReg| regs[r.at()].last_read == LastRead::Instr(pc);
 
         let all_empty = instr.reads().into_iter().flatten().all(|r| batches[r.at()].is_empty());
         // The kernel would return exactly this, so skip it and its trace cursor.
-        let out = if instr.inert_on_empty && all_empty {
+        let out = if instr.facts.inert_on_empty && all_empty {
             Batch::empty_with_schema(&regs[out_reg.at()].schema)
         } else {
             match &mut instr.op {
                 Op::Filter(pred) => algebra::op_filter(&batches[in_reg.at()], pred)
-                    .unwrap_or_else(|| take_or_clone(batches, in_reg, takes(in_reg))),
+                    .unwrap_or_else(|| operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned()),
 
                 Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
 
-                Op::Negate => take_or_clone(batches, in_reg, takes(in_reg)).negated(),
+                Op::Negate => operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned().negated(),
+
+                Op::Union { in_b } if in_reg == *in_b => {
+                    // One register cannot be lent as two operands, and Z + Z
+                    // doubles every weight. Saturating: a wrapping double sends
+                    // `i64::MIN` to 0, a ghost under the claim `map_weights` keeps.
+                    let mut batch = operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned();
+                    batch.map_weights(|w| w.saturating_mul(2));
+                    batch
+                }
 
                 Op::Union { in_b } => {
-                    if in_reg == *in_b {
-                        // Z + Z doubles every weight; delegating would take
-                        // operand 0 and add the emptied operand 1 to it.
-                        // Saturating: a wrapping double sends `i64::MIN` to 0, a
-                        // ghost under the claim `map_weights` keeps.
-                        let mut batch = take_or_clone(batches, in_reg, takes(in_reg));
-                        batch.map_weights(|w| w.saturating_mul(2));
-                        batch
-                    } else if batches[in_reg.at()].is_empty() {
-                        // `0 + B = B`, taking B rather than cloning it — which is
-                        // why the arm is here and not in `op_union`.
-                        take_or_clone(batches, *in_b, takes(*in_b))
-                    } else {
-                        // The union's own (nullability-merged) schema, not the
-                        // left input's — see `union_nullability_merge` for why a
-                        // narrower one mis-sorts nulls.
-                        let a = match takes(in_reg) {
-                            true => Cow::Owned(batches[in_reg.at()].take()),
-                            false => Cow::Borrowed(&batches[in_reg.at()]),
-                        };
-                        algebra::op_union(a, &batches[in_b.at()], &regs[out_reg.at()].schema)
-                    }
+                    let [a, b] = batches
+                        .get_disjoint_mut([in_reg.at(), in_b.at()])
+                        .expect("the arm above took a union of one register with itself");
+                    // The union's own (nullability-merged) schema, not the
+                    // left input's — see `union_nullability_merge` for why a
+                    // narrower one mis-sorts nulls.
+                    algebra::op_union(
+                        operand(a, takes(in_reg)),
+                        operand(b, takes(*in_b)),
+                        &regs[out_reg.at()].schema,
+                    )
                 }
 
                 Op::WeightClamp { hist, kind } => {
                     let delta = &batches[in_reg.at()];
-                    let mut cursor = state.cursor_for_keys(*hist, delta);
+                    let mut cursor = stores.own.cursor_for_keys(*hist, delta);
                     stream::op_weight_clamp(delta, &mut cursor, *kind)
                 }
 
                 Op::JoinDT { trace, probe } => {
                     let delta = &batches[in_reg.at()];
-                    let mut cursor = match (*trace, probe.probes_delta_keys()) {
-                        (Integral::Own(trace), false) => state.cursor(trace),
-                        // The compiler bakes a source under an equi probe alone.
-                        (integral, _) => sources.cursor_for_keys(state, integral, delta)?,
-                    };
+                    let mut cursor = stores.probe_cursor(*trace, delta, probe.probes_delta_keys())?;
                     stream::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, probe)
                 }
 
@@ -228,37 +210,36 @@ fn run_instructions(
                     batches[in_reg.at()].widened_with_nulls(&regs[out_reg.at()].schema, *nulls_first)
                 }
 
-                Op::Reduce { out_trace, plan } => {
+                Op::Reduce { out_trace, index, plan } => {
+                    let delta = &batches[in_reg.at()];
                     // An empty delta touches no group; only a ground-seeding
                     // reduce reaches here with one.
-                    let delta = &batches[in_reg.at()];
-                    let mut avi_cursor = match plan.avi_table {
-                        Some(idx) if !delta.is_empty() => plan
-                            .plan
-                            .index_batch(delta)
-                            .map(|entries| state.ingest_then_cursor(idx, entries))
-                            .transpose()
-                            .map_err(|e| ingest_err("avi", idx, e))?,
-                        _ => None,
+                    let entries = match delta.is_empty() {
+                        true => None,
+                        false => index.zip(plan.index_batch(delta)),
                     };
+                    // Ingested before the index is opened, so a prefix seek over
+                    // it sees the rows this epoch wrote.
+                    if let Some((idx, entries)) = entries {
+                        let res = stores.own.ingest_owned(idx, entries);
+                        res.map_err(|e| ingest_err("avi", idx, e))?;
+                    }
 
-                    gnitz_debug!(
-                        "vm: REDUCE in_count={} avi={}",
-                        batches[in_reg.at()].len(),
-                        avi_cursor.is_some()
-                    );
+                    gnitz_debug!("vm: REDUCE in_count={} avi={}", delta.len(), index.is_some());
 
-                    let mut to_cursor = sources.out_trace(state, *out_trace)?;
-                    stream::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan)
+                    let mut open_out = stores.out_trace(*out_trace)?;
+                    let mut open_index = index.map(|idx| stores.index(idx));
+                    let history = open_index.as_mut().map(|open| open as stream::OpenAt<'_>);
+                    stream::op_reduce(delta, &mut open_out, history, plan)
                 }
 
-                Op::TopN { out_trace, plan } => {
-                    let idx = plan.index_table;
-                    let mut history = state
-                        .ingest_then_cursor(idx, plan.plan.index_batch(&batches[in_reg.at()]))
-                        .map_err(|e| ingest_err("topn index", idx, e))?;
-                    let mut to_cursor = sources.out_trace(state, *out_trace)?;
-                    stream::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)
+                Op::TopN { out_trace, index, plan } => {
+                    let delta = &batches[in_reg.at()];
+                    // Ingested before the index is opened, as the reduce's is.
+                    let res = stores.own.ingest_owned(*index, plan.index_batch(delta));
+                    res.map_err(|e| ingest_err("topn index", *index, e))?;
+                    let mut open_out = stores.out_trace(*out_trace)?;
+                    stream::op_topn(delta, &mut open_out, &mut stores.index(*index), plan)
                 }
             }
         };
@@ -286,41 +267,42 @@ fn run_instructions(
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
 fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), String> {
-    let Vm { program, batches, .. } = vm;
-    for (i, &(reg, trace)) in program.integrates.iter().enumerate() {
-        let take = program.regs[reg.at()].last_read == LastRead::Integrate(i);
+    let Vm { integrates, regs, batches, .. } = vm;
+    for (i, &(reg, trace)) in integrates.iter().enumerate() {
+        let take = regs[reg.at()].last_read == LastRead::Integrate(i);
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
-        // Not `take_or_clone`: for an unconsolidated register its clone arm would cost a
-        // clone plus the trace's own consolidate, where moving costs one.
-        let res = match take {
-            true => state.ingest_owned(trace, batches[reg.at()].take()),
-            false => state.ingest_borrowed(trace, &batches[reg.at()]),
+        let res = match operand(&mut batches[reg.at()], take) {
+            Cow::Owned(batch) => state.ingest_owned(trace, batch),
+            Cow::Borrowed(batch) => state.ingest_borrowed(trace, batch),
         };
         res.map_err(|e| ingest_err("integrate", trace, e))?;
     }
     Ok(())
 }
 
-/// Extract the output, labelled with the output register's own schema. An
-/// operator's identity path can hand an input batch straight back (see
-/// `op_union`), so the label on it may be an operand's; downstream — the
-/// exchange mesh, the dag driver — cannot re-derive it.
+/// End a run: extract the output, labelled with the output register's own
+/// schema, and free every register — so none holds rows between runs, whether
+/// the run completed, failed, or left a register nothing reads. A seed arrives
+/// under its producer's label and the operators that hand their input through
+/// keep it, so the label here may be narrower in nullability than the
+/// register's.
 fn take_output(vm: &mut Vm) -> Batch {
-    let Vm { program, batches, .. } = vm;
-    let want = program.out_schema();
-    let out = &mut batches[program.out_reg.at()];
-    if out.is_empty() {
-        out.release_buffers();
+    let Vm { regs, batches, out_reg, .. } = vm;
+    let want = &regs[out_reg.at()].schema;
+    let mut batch = batches[out_reg.at()].take();
+    for held in batches.iter_mut() {
+        held.release_buffers();
+    }
+    if batch.is_empty() {
         return Batch::empty_with_schema(want);
     }
-    let mut batch = out.take();
     // Only a narrower nullability may legitimately arrive here. A different
     // physical layout means the batch was built against another schema
     // entirely, which the stamp would hide from the wire encode.
     debug_assert!(
         batch.schema().same_layout(want),
         "VM output register {}: batch label is not the register's physical layout",
-        program.out_reg.0,
+        out_reg.0,
     );
     batch.set_schema(want);
     batch

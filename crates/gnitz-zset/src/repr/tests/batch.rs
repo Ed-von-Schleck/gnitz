@@ -411,6 +411,49 @@ fn consolidate_in_place_folds_only_an_uncertified_batch() {
     assert_eq!(already.data.as_ptr(), arena, "no refold");
 }
 
+/// A batch whose rows stand consolidated without the claim is certified where it
+/// is, by all three entry points; a ghost, a repeated row or a PK tie whose
+/// payloads descend sends it through the fold.
+#[test]
+fn consolidation_certifies_rows_already_in_order() {
+    let schema = make_schema_u64_i64();
+    let ordered: &[(u64, i64, i64)] = &[(1, 1, 10), (1, -1, 11), (2, 1, 5)];
+    let folded = weighted_rows(&make_batch(&schema, ordered));
+
+    let mut in_place = make_batch_raw(&schema, ordered);
+    let arena = in_place.data.as_ptr();
+    in_place.consolidate_in_place();
+    assert!(in_place.consolidated);
+    assert_eq!(in_place.data.as_ptr(), arena, "no refold");
+
+    let owned = make_batch_raw(&schema, ordered);
+    let arena = owned.data.as_ptr();
+    let owned = owned.into_consolidated();
+    assert!(owned.consolidated);
+    assert_eq!(owned.data.as_ptr(), arena, "returned by move");
+
+    let copy = make_batch_raw(&schema, ordered).to_consolidated();
+    assert!(copy.consolidated);
+    assert_eq!(weighted_rows(&copy), folded);
+
+    for (what, rows, want) in [
+        (
+            "a ghost",
+            &[(1, 1, 10), (2, 0, 20), (3, 1, 30)][..],
+            &[(1, 1, 10), (3, 1, 30)][..],
+        ),
+        ("a repeated row", &[(1, 1, 10), (1, 1, 10)], &[(1, 2, 10)]),
+        (
+            "a descending payload",
+            &[(1, 1, 11), (1, 1, 10)],
+            &[(1, 1, 10), (1, 1, 11)],
+        ),
+    ] {
+        let out = make_batch_raw(&schema, rows).into_consolidated();
+        assert_eq!(weighted_rows(&out), weighted_rows(&make_batch(&schema, want)), "{what}");
+    }
+}
+
 /// `release_buffers` against `drop(take())` on the case that dominates: clearing
 /// a register that is already free. The VM does that for every register of every
 /// plan once per epoch, so the per-call constant is the whole comparison.
@@ -438,6 +481,43 @@ fn batch_release_bench() {
         release.as_nanos() as f64 / ITERS as f64,
         take.as_nanos() as f64 / ITERS as f64,
     );
+}
+
+/// `into_consolidated` over a batch with no claim, by the order its rows stand
+/// in: ascending already, ascending but for its last row, descending, and
+/// scattered. The second is the input a check for the first costs the most on.
+///
+/// `cd crates && cargo test -p gnitz-zset --release consolidate_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn consolidate_bench() {
+    use std::hint::black_box;
+    const N: u64 = 65_536;
+    const ITERS: u64 = 20;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let schema = make_schema_u64_i64();
+    let scatter = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8;
+    type Key = fn(u64) -> u64;
+    let shapes: [(&str, Key); 4] = [
+        ("ascending", |i| i + 1),
+        ("ascending but the last", |i| if i == N - 1 { 0 } else { i + 1 }),
+        ("descending", |i| N - i),
+        ("scattered", scatter),
+    ];
+    for (label, key) in shapes {
+        let rows: Vec<(u64, i64, i64)> = (0..N).map(|i| (key(i), 1, i as i64)).collect();
+        let mut instructions = 0;
+        for _ in 0..ITERS {
+            let batch = make_batch_raw(&schema, &rows);
+            let (out, n) = counter.measure(|| black_box(batch).into_consolidated());
+            assert_eq!(out.count as u64, N);
+            instructions += n;
+        }
+        println!(
+            "into_consolidated, {label:<22} {:>6.1} instr/row",
+            instructions as f64 / (ITERS * N) as f64
+        );
+    }
 }
 
 /// Stamping a delta key on and off through `rekeyed` gives back every row whole:

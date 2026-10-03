@@ -8,10 +8,13 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::repr::{from_runs, from_runs_at, Batch, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts};
+use crate::repr::{
+    from_runs, from_runs_at, from_runs_in_band, Batch, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
+};
+use crate::schema::key::{key_range_between_cuts, KeyCut};
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::TypeCode;
+use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
 
@@ -88,6 +91,18 @@ impl TestTrace {
     /// A cursor over every run.
     pub(crate) fn cursor(&self) -> ReadCursor {
         create_read_cursor(&self.runs, &[], self.schema)
+    }
+
+    /// A cursor over the rows whose PK begins with a key in `[first, last]` and
+    /// over no other: an operator that reads outside the keys it opened its
+    /// history at finds nothing there.
+    pub(crate) fn cursor_within(&self, first: &[u8], last: &[u8]) -> ReadCursor {
+        let stride = self.schema.pk_stride();
+        let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+            .expect("`first <= last`, so the band holds a key");
+        let runs = self.runs.iter().cloned().map(Run::Mem);
+        let end = end.as_ref().map(PkBuf::pk_bytes);
+        from_runs_in_band(runs, self.schema, self.runs.len(), start.pk_bytes(), end)
     }
 
     /// A cursor positioned on the first live row `>= first`.

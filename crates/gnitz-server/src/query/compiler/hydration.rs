@@ -125,9 +125,9 @@ pub(super) fn derive_hydration(
             (in_node, seed, delta)
         }
     };
-    let entry = plan.vm.program.replay_entry(reg(in_node))?;
+    let entry = plan.vm.replay_entry(reg(in_node))?;
     // The view's own keys gather the seed.
-    if plan.vm.program.schema_of(reg(keyed)).pk_stride() != view_schema.pk_stride() {
+    if plan.vm.schema_of(reg(keyed)).pk_stride() != view_schema.pk_stride() {
         return Err(UNSUPPORTED.into());
     }
     Ok(Hydration { entry, seed })

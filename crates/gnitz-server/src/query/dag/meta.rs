@@ -3,6 +3,15 @@
 use super::*;
 use std::collections::hash_map::Entry;
 
+/// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
+/// is the sort order, and sorting puts a view after every view it reads, because
+/// ids ascend along scan edges.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) struct Step {
+    pub(super) view: u64,
+    pub(super) producer: u64,
+}
+
 /// The bidirectional view-dependency index, kept current by every view registration
 /// and drop. A `forward` / `reverse` entry exists only while it holds an id.
 #[derive(Default)]
@@ -11,11 +20,14 @@ pub(super) struct DepMap {
     forward: FxHashMap<u64, Vec<u64>>,
     /// view_id → [source_table_ids]
     reverse: FxHashMap<u64, Vec<u64>>,
+    /// source id → [`Self::tick_steps`] of it, each kept until an edge moves.
+    tick_steps: FxHashMap<u64, Rc<[Step]>>,
 }
 
 impl DepMap {
     /// Link `view` to each relation its circuit scans. A source may repeat.
     pub(super) fn link(&mut self, view: u64, sources: impl Iterator<Item = u64>) {
+        self.tick_steps.clear();
         for source in sources {
             let srcs = self.reverse.entry(view).or_default();
             if !srcs.contains(&source) {
@@ -27,6 +39,7 @@ impl DepMap {
 
     /// Forget `view`'s edges.
     pub(super) fn unlink(&mut self, view: u64) {
+        self.tick_steps.clear();
         for source in self.reverse.remove(&view).into_iter().flatten() {
             if let Entry::Occupied(mut views) = self.forward.entry(source) {
                 views.get_mut().retain(|&v| v != view);
@@ -35,6 +48,26 @@ impl DepMap {
                 }
             }
         }
+    }
+
+    /// One [`Step`] per dependency edge out of `source`'s forward closure, in
+    /// execution order. A tick runs these every time, so they are derived once
+    /// per shape of the graph.
+    pub(super) fn tick_steps(&mut self, source: u64) -> Rc<[Step]> {
+        if let Some(steps) = self.tick_steps.get(&source) {
+            return Rc::clone(steps);
+        }
+        let producers = std::iter::once(source).chain(Self::closure(&self.forward, vec![source]));
+        let mut steps: Vec<Step> = producers
+            .flat_map(|producer| {
+                let views = self.forward.get(&producer).into_iter().flatten();
+                views.map(move |&view| Step { view, producer })
+            })
+            .collect();
+        steps.sort_unstable();
+        let steps: Rc<[Step]> = steps.into();
+        self.tick_steps.insert(source, Rc::clone(&steps));
+        steps
     }
 
     /// Every id one or more edges from some seed over one half of the map — a

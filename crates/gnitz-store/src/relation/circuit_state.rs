@@ -83,21 +83,18 @@ impl CircuitState {
         self.at(idx).cursor_for_keys(keys, super::Cut::Now)
     }
 
+    /// A cursor over `idx` for probing at the keys in `[first, last]` — whole
+    /// PKs, or the same leading bytes of one — positioned on the first.
+    pub fn cursor_between(&self, idx: StateIdx, first: &[u8], last: &[u8]) -> ReadCursor {
+        self.at(idx).cursor_between(first, last, super::Cut::Now)
+    }
+
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
         self.at_mut(idx).ingest_owned_batch(batch)
     }
 
     pub fn ingest_borrowed(&mut self, idx: StateIdx, batch: &Batch) -> Result<(), StorageError> {
         self.at_mut(idx).ingest_borrowed_batch(batch)
-    }
-
-    /// Ingest, then open a cursor — in that order, so a prefix seek over an
-    /// operator's own index sees the rows this epoch just wrote. A caller that
-    /// opened the cursor first would read its own writes out.
-    pub fn ingest_then_cursor(&mut self, idx: StateIdx, batch: Batch) -> Result<ReadCursor, StorageError> {
-        let t = self.at_mut(idx);
-        t.ingest_owned_batch(batch)?;
-        Ok(t.open_cursor())
     }
 
     /// Every child store, for the checkpoint round that publishes them.

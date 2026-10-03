@@ -240,7 +240,6 @@ fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
             .unwrap()
             .plan
             .vm
-            .program
             .out_schema();
         let (out, _) = compile_view(&loaded, &registry, &view, Placement::full_pk(&view), true).unwrap();
         out.hydration.expect("a bounded view").seed
@@ -332,7 +331,7 @@ fn two_joins_probing_one_integrand_declare_one_child() {
     distinct.sort_unstable();
     distinct.dedup();
     assert_eq!(distinct.len(), names.len(), "{names:?}");
-    assert_eq!(built.plan.vm.program.count_ops(|op| matches!(op, Op::JoinDT { .. })), 4);
+    assert_eq!(built.plan.vm.count_ops(|op| matches!(op, Op::JoinDT { .. })), 4);
 }
 
 /// The preserved side's two re-keys differ only in whether a NULL-keyed row
@@ -343,7 +342,7 @@ fn a_rekey_that_drops_no_row_is_emitted_once() {
     // B's re-key, B's key projection, and A's.
     let maps = |key: u32| {
         let (built, ..) = left_join_plan(key);
-        built.plan.vm.program.count_ops(|op| matches!(op, Op::Map(_)))
+        built.plan.vm.count_ops(|op| matches!(op, Op::Map(_)))
     };
     assert_eq!(maps(1), 3, "a NOT NULL key");
     assert_eq!(maps(2), 4, "a nullable key");

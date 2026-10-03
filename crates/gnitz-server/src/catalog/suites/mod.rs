@@ -19,6 +19,7 @@ mod stream_tests;
 mod sys_retraction_tests;
 mod uuid_tests;
 mod view_preflight_tests;
+mod view_tick_bench;
 mod wide_pk_validation;
 
 use super::sys_tables::*;

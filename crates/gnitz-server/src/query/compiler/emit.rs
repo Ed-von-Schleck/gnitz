@@ -8,7 +8,7 @@
 //! read them.
 
 use super::*;
-use crate::query::vm::{BakedReduce, BakedTopN, Op, ProgramBuilder};
+use crate::query::vm::{Op, ProgramBuilder};
 use gnitz_store::relation::StateLayout;
 use gnitz_zset::stream::JoinPlan;
 
@@ -212,7 +212,7 @@ pub(super) fn emit_node<'a>(
 
         gnitz_wire::OpNode::IntegrateSink => {
             // Emits no instruction: the sink register's batch is what
-            // `execute_epoch_multi` extracts at epoch end.
+            // the epoch extracts at its end.
             ctx.unary_delta_in(nid)
         }
 
@@ -372,11 +372,11 @@ fn push_reduce(
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
     // share a table_id, scratch dir and compaction namespace and cannot collide on
     // a memory-pressure flush.
-    let avi_table = plan
+    let index = plan
         .index_schema()
         .map(|schema| ctx.declare_child(index_kind, nid, *schema));
-    let baked = Box::new(BakedReduce::new(plan, avi_table));
-    ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked })
+    let plan = Box::new(plan);
+    ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan })
 }
 
 /// Declare `plan`'s children under `kinds`, and push the top-N over `in_reg`.
@@ -390,9 +390,9 @@ fn push_topn(
     let out_schema = plan.output_schema;
     let out_trace = ctx.out_trace(trace_kind, nid, out_schema);
     // The ordered index of every input row — the operator's whole history.
-    let index_table = ctx.declare_child(index_kind, nid, plan.index.schema);
-    let baked = Box::new(BakedTopN { plan, index_table });
-    ctx.prog.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked })
+    let index = ctx.declare_child(index_kind, nid, plan.index.schema);
+    let plan = Box::new(plan);
+    ctx.prog.push(in_reg, out_schema, Op::TopN { out_trace, index, plan })
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce
