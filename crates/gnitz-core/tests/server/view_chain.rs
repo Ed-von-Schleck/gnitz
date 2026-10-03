@@ -16,7 +16,7 @@ use gnitz_wire::{Circuit, ViewProps, VIEWTAB_PAY_OWNER_VIEW_ID, VIEW_TAB};
 fn make_base(client: &mut GnitzClient) -> (String, u64, Arc<Schema>) {
     let (sn, tid, schema) = create_table(client, schema_of(&[("pk", TypeCode::I64), ("v", TypeCode::I64)]));
     client
-        .push(tid, &schema, &base_rows(&schema), WireConflictMode::Update)
+        .push(tid, &schema, base_rows(&schema), WireConflictMode::Update)
         .unwrap();
     (sn, tid, schema)
 }

@@ -7,18 +7,19 @@ use crate::error::GnitzSqlError;
 use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
+use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-/// A client's resolve of one relation name under a schema.
-type ClientResolve = fn(&mut GnitzClient, &str, &str) -> Result<Option<Arc<RelDescriptor>>, ClientError>;
+/// A client's answer for one relation name under a schema.
+type Resolved = Result<Option<Arc<RelDescriptor>>, ClientError>;
 
 /// Plan against a catalog that resolves each name through `resolve` on first use.
 fn planned<T>(
     client: &mut GnitzClient,
     schema_name: &str,
-    resolve: ClientResolve,
+    resolve: impl Fn(&mut GnitzClient, &str, &str) -> Resolved,
     plan: impl FnOnce(&Catalog<'_>) -> Result<T, GnitzSqlError>,
 ) -> Result<T, GnitzSqlError> {
     let client = RefCell::new(client);
@@ -26,7 +27,60 @@ fn planned<T>(
     plan(&Catalog::new(schema_name, &ask))
 }
 
-/// Route one statement. Only a read resolves local-first.
+/// Times [`planned_kept`] plans a statement before its `StaleCatalog` refusal
+/// is the caller's to see.
+const STALE_MAX_ATTEMPTS: usize = 4;
+
+/// Plan and `run` a statement, the first time against the descriptors the
+/// client keeps and every later time against `resolve`'s answers alone. A kept
+/// descriptor may be stale, and only a request carrying its token finds that
+/// out, so:
+///
+/// - a `run` refused `StaleCatalog` wrote nothing, and the statement is planned
+///   and run again;
+/// - a plan that fails, or one `checked` denies sends such a request, stands
+///   only when no kept descriptor went into it; otherwise the statement is
+///   planned again.
+fn planned_kept<P>(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    resolve: fn(&mut GnitzClient, &str, &str) -> Resolved,
+    plan: impl Fn(&Catalog<'_>) -> Result<P, GnitzSqlError>,
+    checked: impl Fn(&P) -> bool,
+    run: impl Fn(&mut GnitzClient, P) -> Result<SqlResult, GnitzSqlError>,
+) -> Result<SqlResult, GnitzSqlError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let from_kept = Cell::new(false);
+        let planned = planned(
+            client,
+            schema_name,
+            |client, schema_name, name| match (attempt == 1).then(|| client.kept(schema_name, name)).flatten() {
+                Some(kept) => {
+                    from_kept.set(true);
+                    Ok(Some(kept))
+                }
+                None => resolve(client, schema_name, name),
+            },
+            &plan,
+        );
+        let plan = match planned {
+            Ok(plan) if !from_kept.get() || checked(&plan) => plan,
+            Err(e) if !from_kept.get() => return Err(e),
+            _ => continue,
+        };
+        match run(client, plan) {
+            Err(GnitzSqlError::Client(ClientError::Refused(WireFault {
+                status: WireStatus::StaleCatalog, ..
+            }))) if attempt < STALE_MAX_ATTEMPTS => {}
+            done => return done,
+        }
+    }
+}
+
+/// Route one statement. Only a read resolves local-first, and only DML and a
+/// `SELECT` plan from kept descriptors: an EXPLAIN sends no request to check one.
 pub(crate) fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
@@ -35,15 +89,20 @@ pub(crate) fn execute_statement(
     match stmt {
         // Bare `DESC t` is `Statement::ExplainTable`, table introspection, and falls to
         // the catch-all below; `plan_read` rejects the EXPLAIN of a non-SELECT.
-        Statement::Query(_) | Statement::Explain { .. } => {
+        Statement::Explain { .. } => {
             let plan = planned(client, schema_name, GnitzClient::resolve_local_first, |cat| {
                 dml::plan_read(stmt, cat)
             })?;
-            match stmt {
-                Statement::Explain { .. } => Ok(dml::execute_explain(client, &plan)),
-                _ => dml::execute_select(client, plan),
-            }
+            Ok(dml::execute_explain(client, &plan))
         }
+        Statement::Query(_) => planned_kept(
+            client,
+            schema_name,
+            GnitzClient::resolve_local_first,
+            |cat| dml::plan_read(stmt, cat),
+            |plan| !plan.answers_from_schema(),
+            dml::execute_select,
+        ),
         // Transaction control is a pure client-state-machine transition, so the
         // arm is the whole consumer: `transaction already open` and `no
         // transaction open` come from the `client.txn_*` calls below.
@@ -80,7 +139,8 @@ pub(crate) fn execute_statement(
             // are stale by definition. `txn_commit` already took the buffer out
             // (transaction closed), so surfacing the `TxnConflict` refusal leaves
             // nothing open; the application re-runs the whole transaction from
-            // BEGIN.
+            // BEGIN. `txn_commit` reports a written relation altered since this
+            // client resolved it as the same conflict.
             Ok(SqlResult::TransactionCommitted { lsn: client.txn_commit()? })
         }
         Statement::Rollback { chain, savepoint } => {
@@ -90,24 +150,32 @@ pub(crate) fn execute_statement(
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
-        Statement::Insert(insert) => {
-            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
-                dml::plan_insert(insert, cat)
-            })?;
-            dml::execute_insert(client, plan)
-        }
-        Statement::Update(update) => {
-            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
-                dml::plan_update(update, cat)
-            })?;
-            dml::execute_mutation(client, plan)
-        }
-        Statement::Delete(del) => {
-            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
-                dml::plan_delete(del, cat)
-            })?;
-            dml::execute_mutation(client, plan)
-        }
+        // A write is checked wherever it lands: sent, by its own request;
+        // buffered in a transaction, by the COMMIT that ships it.
+        Statement::Insert(insert) => planned_kept(
+            client,
+            schema_name,
+            GnitzClient::resolve,
+            |cat| dml::plan_insert(insert, cat),
+            |_| true,
+            dml::execute_insert,
+        ),
+        Statement::Update(update) => planned_kept(
+            client,
+            schema_name,
+            GnitzClient::resolve,
+            |cat| dml::plan_update(update, cat),
+            |_| true,
+            dml::execute_mutation,
+        ),
+        Statement::Delete(del) => planned_kept(
+            client,
+            schema_name,
+            GnitzClient::resolve,
+            |cat| dml::plan_delete(del, cat),
+            |_| true,
+            dml::execute_mutation,
+        ),
         // Refused, not failed: the transaction stays open.
         _ if client.txn_active() => Err(GnitzSqlError::Rejected(
             "this statement is not allowed inside a transaction".to_string(),

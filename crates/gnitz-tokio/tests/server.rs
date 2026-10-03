@@ -214,7 +214,7 @@ fn clones_share_one_blocking_client() {
     // ticks, so the rounds a mirror reads already exist.
     let mut push_and_tick = |pks| {
         blocking
-            .push(tid, &schema, &rows(&schema, pks), WireConflictMode::Update)
+            .push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)
             .unwrap();
         blocking.scan_spec(vid, &all_rows(), &schema).unwrap();
     };

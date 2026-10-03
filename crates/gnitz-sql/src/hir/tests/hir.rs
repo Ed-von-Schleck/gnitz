@@ -45,6 +45,7 @@ fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
             serial: false,
             schema: Arc::new(schema(vec![col("id", i), col("k", i)], &[0])),
             indexes: Vec::new(),
+            token: 0,
         };
         RelExpr::get(&ids, Arc::new(desc))
     };

@@ -260,6 +260,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             serial: false,
             schema: Arc::clone(&schema),
             indexes: Vec::new(),
+            token: 0,
         };
         client.bind("s", name, Arc::new(desc)).unwrap();
     }

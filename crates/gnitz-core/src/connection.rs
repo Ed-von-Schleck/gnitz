@@ -56,6 +56,31 @@ pub struct RelDescriptor {
     pub serial: bool,
     pub schema: Arc<Schema>,
     pub indexes: Vec<RelIndex>,
+    /// The RESOLVE answer's descriptor token: what a request built from this
+    /// descriptor carries, for the server to refuse it once the relation
+    /// resolves differently.
+    pub token: u64,
+}
+
+/// The relation a request names: its id, and the [`RelDescriptor::token`] of the
+/// descriptor the request was built from — `0` for a request built from none,
+/// which is what a bare id converts to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub tid: u64,
+    pub token: u64,
+}
+
+impl From<u64> for Target {
+    fn from(tid: u64) -> Self {
+        Target { tid, token: 0 }
+    }
+}
+
+impl From<&RelDescriptor> for Target {
+    fn from(rel: &RelDescriptor) -> Self {
+        Target { tid: rel.tid, token: rel.token }
+    }
 }
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
@@ -171,14 +196,14 @@ pub enum Request<'a> {
     /// PUSH. The frame always carries `schema`'s record. Completes as
     /// [`Reply::Ack`], its LSN.
     Push {
-        target_id: u64,
+        target: Target,
         schema: &'a Schema,
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
     },
     /// SCAN_SPEC, replied in `reply_schema`'s layout.
     ScanSpec {
-        target_id: u64,
+        target: Target,
         spec: &'a gnitz_wire::ReadSpec,
         reply_schema: &'a Arc<Schema>,
     },
@@ -227,14 +252,15 @@ impl Request<'_> {
     pub fn encode(self) -> Result<Encoded, ClientError> {
         let (frame, kind) = match self {
             Request::Alloc(run) => {
-                let (target_id, verb, count) = match run {
-                    IdRun::Ids(n) => (0, ClientVerb::AllocIds, n),
-                    IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
+                let (Target { tid: target_id, token }, verb, count) = match run {
+                    IdRun::Ids(n) => (Target::from(0), ClientVerb::AllocIds, n),
+                    IdRun::Serial { table, count } => (table, ClientVerb::AllocSerialRange, count),
                 };
                 let hdr = ControlHeader {
                     flags: WireFlags { verb, ..Default::default() },
                     target_id,
-                    arg1: count,
+                    arg0: count,
+                    arg1: token,
                     ..Default::default()
                 };
                 (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: target_id })
@@ -264,7 +290,8 @@ impl Request<'_> {
                 };
                 (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
             }
-            Request::Push { target_id, schema, batch, mode } => {
+            Request::Push { target, schema, batch, mode } => {
+                let Target { tid: target_id, token } = target;
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
@@ -277,13 +304,19 @@ impl Request<'_> {
                     conflict_mode: mode,
                     ..Default::default()
                 };
-                let hdr = ControlHeader { flags, target_id, ..Default::default() };
+                let hdr = ControlHeader {
+                    flags,
+                    target_id,
+                    arg1: token,
+                    ..Default::default()
+                };
                 (
                     encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
                     SlotKind::Ack { tid: target_id },
                 )
             }
-            Request::ScanSpec { target_id, spec, reply_schema } => {
+            Request::ScanSpec { target, spec, reply_schema } => {
+                let Target { tid: target_id, token } = target;
                 let hdr = ControlHeader {
                     flags: WireFlags {
                         verb: ClientVerb::ScanSpec,
@@ -291,6 +324,7 @@ impl Request<'_> {
                     },
                     target_id,
                     arg0: reply_schema.layout_digest(),
+                    arg1: token,
                     ..Default::default()
                 };
                 (
@@ -326,8 +360,8 @@ impl Request<'_> {
 pub enum IdRun {
     /// A run of catalog object ids.
     Ids(u64),
-    /// The SERIAL sequence of `table_id`.
-    Serial { table_id: u64, count: u64 },
+    /// The SERIAL sequence of `table`.
+    Serial { table: Target, count: u64 },
 }
 
 /// What a slot's verb asked for. The spine resolves a reply against the request
@@ -838,6 +872,7 @@ fn resolve_descriptor(
         serial: desc.serial,
         schema,
         indexes: desc.indexes,
+        token: ctrl.hdr.arg0,
     })))
 }
 

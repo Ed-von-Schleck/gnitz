@@ -112,6 +112,12 @@ impl ReadPlan {
         }
     }
 
+    /// Whether the result is `LIMIT 0`'s: answered from the schema alone, with
+    /// no request issued.
+    pub(crate) fn answers_from_schema(&self) -> bool {
+        self.window.limit == Some(0)
+    }
+
     /// The schema the finished result is built under.
     fn out_schema(&self) -> &Arc<Schema> {
         match &self.case {
@@ -330,8 +336,7 @@ fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<
 /// Run one planned `SELECT`, reading local-first: a relation the client's copy
 /// holds is answered off it, and every other one over the wire.
 pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
-    // `LIMIT 0` answers from the schema alone, with no request issued.
-    if plan.window.limit == Some(0) {
+    if plan.answers_from_schema() {
         let schema = Arc::clone(plan.out_schema());
         return Ok(SqlResult::Rows { batch: ZSetBatch::new(&schema), schema });
     }
@@ -340,7 +345,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
         ReadCase::Constant { schema, row } => (schema, row),
         ReadCase::Rows { read, reply_schema } => {
             let batch = client
-                .scan_spec_local_first(read.desc.tid, read.spec, &reply_schema)?
+                .scan_spec_local_first(&*read.desc, read.spec, &reply_schema)?
                 .batch;
             (reply_schema, batch)
         }
@@ -348,7 +353,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
             let partial = client
-                .scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?
+                .scan_spec_local_first(&*read.desc, read.spec, &finish.partial_schema)?
                 .batch;
             (Arc::clone(finish.out_schema()), finish.finish(partial))
         }

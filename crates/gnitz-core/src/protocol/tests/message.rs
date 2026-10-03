@@ -30,7 +30,13 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let b1 = kv_rows(&[(3, 30, 1)]);
     let b2 = retraction_batch(&schema, PkColumn::from_natives(&schema, [4]));
 
-    let family = |tid, batch, mode, basis| PushFamily { tid, schema: &schema, batch, mode, basis };
+    let family = |tid: u64, batch, mode, basis| PushFamily {
+        target: tid.into(),
+        schema: &schema,
+        batch,
+        mode,
+        basis,
+    };
     let blind = gnitz_wire::txn_frame::BLIND;
     let families = [
         family(16, &b0, WireConflictMode::Update, 42),
@@ -44,7 +50,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     assert_eq!(decoded.len(), families.len());
     for ((frame, fam), want) in decoded.iter().zip(&families) {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
-        assert_eq!(got, (want.tid, want.mode, want.basis));
+        assert_eq!(got, (want.target.tid, want.mode, want.basis));
         let block_schema = frame_schema(frame, fam).unwrap();
         assert_eq!(block_schema, schema);
         assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(want.batch));

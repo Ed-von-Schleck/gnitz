@@ -274,11 +274,17 @@ fn emit_zone_to_sal<'w>(
 /// is synchronous, so catalog readers never block across an `fdatasync`.
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
 /// its post-fsync catalog cleanup and the backfill.
-pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: u64, count: u64) -> Result<i64, String> {
+pub(super) async fn commit_serial_range_durable(
+    shared: &Rc<Shared>,
+    seq_id: u64,
+    count: u64,
+    token: u64,
+) -> Result<i64, WireFault> {
     let (base, synced) = {
         // Lock order catalog -> SAL, matching INSERT and every read, so acquiring
         // SAL under catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
+        shared.cat().check_token(seq_id, token)?;
 
         let mut excl = shared.disp().sal().lock().await;
 

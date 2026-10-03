@@ -12,18 +12,23 @@ impl CatalogEngine {
     /// store, so the caller applies those families first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         self.raise_next_id(family, batch);
-        match family {
-            SysFamily::Schema => self.apply_schema_names(batch),
+        let hooked = match family {
+            SysFamily::Schema => {
+                self.apply_schema_names(batch);
+                Ok(())
+            }
             SysFamily::Table | SysFamily::View => {
                 self.apply_relation_names(batch);
-                self.hook_relation_register(family, batch)?;
+                self.hook_relation_register(family, batch)
             }
-            SysFamily::Column => self.hook_column_change(batch)?,
-            SysFamily::Index => self.hook_index_register(batch)?,
+            SysFamily::Column => self.hook_column_change(batch),
+            SysFamily::Index => self.hook_index_register(batch),
             // `_sequences` rows drive no cache; a view's registration reads its `_circuits` row.
-            SysFamily::Sequence | SysFamily::Circuit => {}
-        }
-        Ok(())
+            SysFamily::Sequence | SysFamily::Circuit => return Ok(()),
+        };
+        // Every family that reaches here can change what a RESOLVE answers.
+        self.caches.resolve_tokens.get_mut().clear();
+        hooked
     }
 
     // -- Hook handlers ---------------------------------------------------------

@@ -121,7 +121,7 @@ fn syscall_count_child() {
     let schema = pk_a();
     for i in 0..n {
         client
-            .push(tid, &schema, &rows(&schema, [i]), WireConflictMode::Update)
+            .push(tid, &schema, rows(&schema, [i]), WireConflictMode::Update)
             .unwrap();
     }
 }

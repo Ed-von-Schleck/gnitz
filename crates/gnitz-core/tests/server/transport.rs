@@ -254,7 +254,7 @@ fn both_transports_carry_every_cell_at_its_net_weight() {
     let (mut tls, _, tid, schema) = client_with_table(&srv.tls_target());
     let mut unix = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    tls.push(tid, &schema, &rows(&schema, 0..700_000), WireConflictMode::Update)
+    tls.push(tid, &schema, rows(&schema, 0..700_000), WireConflictMode::Update)
         .unwrap();
     let mut retract = rows(&schema, [500]);
     retract.weights[0] = -1;
@@ -340,7 +340,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
         with_watchdog(120, move || {
             let (mut setup, _, tid, schema) = client_with_table(&target);
             setup
-                .push(tid, &schema, &rows(&schema, 0..200_000), WireConflictMode::Update)
+                .push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)
                 .unwrap();
 
             let mut s = Session::connect(&target).unwrap();
@@ -353,7 +353,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
 
             // Everyone else kept going.
             setup
-                .push(tid, &schema, &rows(&schema, [200_000]), WireConflictMode::Update)
+                .push(tid, &schema, rows(&schema, [200_000]), WireConflictMode::Update)
                 .unwrap();
             assert_eq!(scan_all(&mut setup, tid, &schema).len(), 200_001);
         });
@@ -370,7 +370,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
     with_watchdog(120, move || {
         let (mut setup, _, tid, schema) = client_with_table(&target);
         setup
-            .push(tid, &schema, &rows(&schema, 0..200_000), WireConflictMode::Update)
+            .push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)
             .unwrap();
 
         let mut s = Session::connect(&target).unwrap();

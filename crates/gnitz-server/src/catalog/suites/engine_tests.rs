@@ -619,6 +619,49 @@ fn the_relation_name_index_follows_renames_and_drops() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A relation's descriptor token changes exactly when a RESOLVE of its name
+/// would answer differently: an index, a rename and a drop each move it, and DDL
+/// on another relation or an advance of its own sequence do not.
+#[test]
+fn a_descriptor_token_follows_the_resolve_answer() {
+    let dir = temp_dir("descriptor_token");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::I64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let token = engine.resolve_token(tid).unwrap();
+    assert_ne!(token, 0);
+    engine.check_token(tid, token).unwrap();
+    engine.check_token(tid, 0).unwrap();
+
+    let other = engine.create_table("public.other", &cols, &[0]).unwrap();
+    engine.create_index("public.other", &["a"], false).unwrap();
+    assert_eq!(engine.resolve_token(tid), Some(token));
+    assert_ne!(engine.resolve_token(other), Some(token));
+
+    let serial = engine.create_serial_table("public.sr").unwrap();
+    let before = engine.resolve_token(serial);
+    let (_, reserved) = engine.reserve_user_sequence(serial, 64).unwrap();
+    engine.submit(SysFamily::Sequence, reserved).unwrap();
+    assert_eq!(engine.resolve_token(serial), before);
+    assert_eq!(engine.resolve_token(tid), Some(token));
+
+    let stale = |engine: &CatalogEngine, token| {
+        let fault = engine.check_token(tid, token).unwrap_err();
+        assert_eq!(fault.status, gnitz_wire::WireStatus::StaleCatalog);
+        engine.resolve_token(tid)
+    };
+    let pair = table_tab_batch(&[(tid, "t", -1), (tid, "renamed", 1)]);
+    engine.submit(SysFamily::Table, pair).unwrap();
+    let renamed = stale(&engine, token).unwrap();
+    engine.create_index("public.renamed", &["id"], false).unwrap();
+    let indexed = stale(&engine, renamed).unwrap();
+    engine.drop_table("public.renamed").unwrap();
+    assert_eq!(stale(&engine, indexed), None);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// An index name is taken by a live index and by an earlier row of the same batch,
 /// and free again once its index is dropped.
 #[test]

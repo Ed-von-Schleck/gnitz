@@ -38,7 +38,8 @@ pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
 
 // A refusal whose status a caller branches on.
 
-// WireStatus::TxnConflict.
+// WireStatus::TxnConflict, and WireStatus::StaleCatalog: nothing was written,
+// and the caller's recovery is to run it again.
 pyo3::create_exception!(_native, GnitzConflictError, GnitzRefusedError);
 // WireStatus::DeltaExpired.
 pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzRefusedError);
@@ -61,7 +62,7 @@ pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
 pub(crate) fn client_err(e: ClientError) -> PyErr {
     match e {
         ClientError::Refused(f) => match f.status {
-            WireStatus::TxnConflict => GnitzConflictError::new_err(f.text),
+            WireStatus::TxnConflict | WireStatus::StaleCatalog => GnitzConflictError::new_err(f.text),
             WireStatus::DeltaExpired => GnitzDeltaExpiredError::new_err(f.text),
             WireStatus::SalFull => GnitzSalFullError::new_err(f.text),
             WireStatus::NotFound => GnitzNotFoundError::new_err(f.text),

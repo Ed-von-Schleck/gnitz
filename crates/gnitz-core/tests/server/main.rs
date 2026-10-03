@@ -79,7 +79,7 @@ fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
 /// A read of `tid` under `spec`, replied in `schema`'s layout.
 fn scan_req<'a>(tid: u64, spec: &'a ReadSpec, schema: &'a Arc<Schema>) -> Request<'a> {
     Request::ScanSpec {
-        target_id: tid,
+        target: tid.into(),
         spec,
         reply_schema: schema,
     }
@@ -88,7 +88,7 @@ fn scan_req<'a>(tid: u64, spec: &'a ReadSpec, schema: &'a Arc<Schema>) -> Reques
 /// `batch` pushed into `tid` as an upsert.
 fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'a> {
     Request::Push {
-        target_id: tid,
+        target: tid.into(),
         schema,
         batch,
         mode: WireConflictMode::Update,

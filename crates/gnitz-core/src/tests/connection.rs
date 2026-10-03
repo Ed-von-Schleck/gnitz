@@ -12,7 +12,7 @@ use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode};
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<SlotId, ClientError> {
     let spec = ReadSpec::all_rows(ReadBound::None);
     s.submit(Request::ScanSpec {
-        target_id: tid,
+        target: tid.into(),
         spec: &spec,
         reply_schema: schema,
     })
@@ -220,7 +220,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         (
             "a push whose batch is not in its schema's layout",
             Request::Push {
-                target_id: 4,
+                target: 4.into(),
                 schema: &sa,
                 batch: &wrong_layout,
                 mode: WireConflictMode::Update,
@@ -229,7 +229,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         (
             "a push whose frame is past the server's ingress cap",
             Request::Push {
-                target_id: 4,
+                target: 4.into(),
                 schema: &sb,
                 batch: &oversize,
                 mode: WireConflictMode::Update,
@@ -276,7 +276,7 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     let a = s.submit(COMMIT).unwrap();
     let b = s
         .submit(Request::Push {
-            target_id: 5,
+            target: 5.into(),
             schema: &sa,
             batch: &rows,
             mode: WireConflictMode::Update,
@@ -385,7 +385,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let b = batch_a(&(0..32_768).collect::<Vec<_>>());
     let push = |s: &mut Session| {
         s.submit(Request::Push {
-            target_id: 4,
+            target: 4.into(),
             schema: &sa,
             batch: &b,
             mode: WireConflictMode::Update,

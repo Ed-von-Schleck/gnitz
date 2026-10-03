@@ -18,14 +18,14 @@ pub fn encode_frame(hdr: ControlHeader, blob: &[u8], schema: Option<&[u8]>, data
     out
 }
 
-/// One family of a user-table push transaction: a batch into `tid` under
+/// One family of a user-table push transaction: a batch into `target` under
 /// `mode`.
 pub struct PushFamily<'a> {
-    pub tid: u64,
+    pub target: crate::Target,
     pub schema: &'a Schema,
     pub batch: &'a ZSetBatch,
     pub mode: WireConflictMode,
-    /// The commit fails if `tid` was written after `basis`, the watermark of the
+    /// The commit fails if `target` was written after `basis`, the watermark of the
     /// read this family was built from; `BLIND` for a family built from no read.
     pub basis: u64,
 }
@@ -40,12 +40,13 @@ pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
         .zip(&schemas)
         .map(|(f, schema)| FrameItem {
             hdr: ControlHeader {
-                target_id: f.tid,
+                target_id: f.target.tid,
                 flags: WireFlags {
                     conflict_mode: f.mode,
                     ..Default::default()
                 },
                 arg0: f.basis,
+                arg1: f.target.token,
                 ..Default::default()
             },
             schema: Some(schema),

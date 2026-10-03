@@ -248,7 +248,7 @@ fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
     let batch = kv_rows(&[(1, 10, 1)]);
     for push in [
         c.push(16, &signed, &batch, Update),
-        c.push_owned(16, &signed, batch.clone(), Update),
+        c.push(16, &signed, batch.clone(), Update),
     ] {
         let err = push.unwrap_err().to_string();
         assert!(err.contains("mismatched key column types"), "{err}");

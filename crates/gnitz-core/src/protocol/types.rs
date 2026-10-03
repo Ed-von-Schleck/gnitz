@@ -1,4 +1,5 @@
 use gnitz_expr::{ColumnTable, SchemaFacts};
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use gnitz_wire::{ColumnDef, PkKeys, TypeCode};
@@ -352,6 +353,18 @@ pub struct ZSetBatch {
     pub payload: Vec<PayloadColumn>,
     /// The arena the German cells in `payload` point into.
     pub blob: Vec<u8>,
+}
+
+impl From<ZSetBatch> for Cow<'_, ZSetBatch> {
+    fn from(batch: ZSetBatch) -> Self {
+        Cow::Owned(batch)
+    }
+}
+
+impl<'a> From<&'a ZSetBatch> for Cow<'a, ZSetBatch> {
+    fn from(batch: &'a ZSetBatch) -> Self {
+        Cow::Borrowed(batch)
+    }
 }
 
 impl ZSetBatch {

@@ -7,7 +7,7 @@
 //! | Verb         | Item header                                              | Sections                  |
 //! |--------------|----------------------------------------------------------|---------------------------|
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
-//! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis       | schema record, data block |
+//! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | schema record, data block |
 //! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest                | none                      |
 //! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | none   |
 //!

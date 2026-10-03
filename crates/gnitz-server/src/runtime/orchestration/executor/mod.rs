@@ -617,7 +617,7 @@ async fn dispatch_request(
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {
-            let base = commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await?;
+            let base = commit_serial_range_durable(shared, target_id, ctrl.hdr.arg0, ctrl.hdr.arg1).await?;
             send_ack(peer, target_id, base as u64);
             Ok(())
         }
@@ -626,13 +626,14 @@ async fn dispatch_request(
         // and a frame that sets one is still allocated, rather than falling
         // through to a scan of that id.
         ClientVerb::AllocIds => {
-            let base = shared.cat_mut().allocate_ids(ctrl.hdr.arg1);
+            let base = shared.cat_mut().allocate_ids(ctrl.hdr.arg0);
             send_ack(peer, target_id, base.map_err(|e| format!("id allocation failed: {e}"))?);
             Ok(())
         }
 
         ClientVerb::ScanSpec => {
-            handle_scan_spec(shared, peer, target_id, &data[ctrl.blob.clone()], ctrl.hdr.arg0).await
+            let (reply_layout, token) = (ctrl.hdr.arg0, ctrl.hdr.arg1);
+            handle_scan_spec(shared, peer, target_id, token, &data[ctrl.blob.clone()], reply_layout).await
         }
 
         // A plain read guard, not `read_lock`: a resolve answers catalog shape,
@@ -647,8 +648,10 @@ async fn dispatch_request(
     }
 }
 
-/// Decode a push frame against the catalog: its record must lay out its target's
-/// columns, and the target's record is answered for [`CatalogEngine::recheck_record`].
+/// Decode a push frame against the catalog: its token must still name its target,
+/// its record must lay out its target's columns, and the target's record is
+/// answered for [`CatalogEngine::recheck_record`]. The token comes first, as in
+/// [`target_kind`], which checks it again under the guard.
 /// Runs before the catalog read guard, and off it: `AsyncRwLock` is
 /// writer-preferring, so a bulk load's multi-megabyte decode under the guard
 /// would stall every DDL writer behind it.
@@ -658,6 +661,7 @@ fn decode_push_frame(
     ctrl: DecodedControl,
 ) -> Result<(Option<Batch>, Rc<[u8]>), WireFault> {
     let tid = ctrl.hdr.target_id;
+    cat.check_token(tid, ctrl.hdr.arg1)?;
     let target = cat.schema_record(tid).ok_or_else(|| not_found(tid))?;
     let schema = cat
         .registry
@@ -686,6 +690,7 @@ fn decode_push_frame(
 async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: DecodedControl) -> Result<(), WireFault> {
     let target_id = ctrl.hdr.target_id;
     let mode = ctrl.hdr.flags.conflict_mode;
+    let token = ctrl.hdr.arg1;
 
     let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared.cat(), data, ctrl));
     let (batch, seen) = decoded?;
@@ -695,7 +700,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     let catalog = shared.catalog_rwlock.read().await;
     // Under the catalog guard, not at decode: a dropped id can be re-created as
     // a stream between the two, and the stream rules below read the kind.
-    let is_stream = target_kind(shared, target_id, Access::Write)? == RelationKind::Stream;
+    let is_stream = target_kind(shared, target_id, token, Access::Write)? == RelationKind::Stream;
     if is_stream {
         check_stream_push(target_id, batch.as_ref(), mode)?;
     }
@@ -767,7 +772,7 @@ async fn handle_push_txn(
     //    catalog-dependent rules per family.
     let catalog = shared.catalog_rwlock.read().await;
     for head in &heads {
-        target_kind(shared, head.tid, Access::TxnWrite)?;
+        target_kind(shared, head.tid, head.token, Access::TxnWrite)?;
         shared.cat().recheck_record(head.tid, &head.seen)?;
     }
 
@@ -809,6 +814,7 @@ struct DecodedTxn {
 struct TxnHead {
     tid: u64,
     basis: u64,
+    token: u64,
     seen: Rc<[u8]>,
 }
 
@@ -819,13 +825,14 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
     let mut families: Vec<TxnFamily> = Vec::with_capacity(items.len());
     let mut heads = Vec::with_capacity(items.len());
     for (frame, ctrl) in items {
-        let (tid, mode, basis) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
+        let (tid, mode) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode);
+        let (basis, token) = (ctrl.hdr.arg0, ctrl.hdr.arg1);
         let (batch, seen) = decode_push_frame(cat, frame, ctrl).map_err(|e| WireFault {
             text: format!("TXN family {tid}: {}", e.text),
             ..e
         })?;
         let batch = batch.expect("a PUSH_TXN item carries a data block");
-        heads.push(TxnHead { tid, basis, seen });
+        heads.push(TxnHead { tid, basis, token, seen });
         families.push(TxnFamily { tid, mode, batch });
     }
     Ok(DecodedTxn { families, heads })
@@ -853,7 +860,10 @@ enum Access {
     TxnWrite,
 }
 
-/// Resolve `target_id`'s kind, rejecting one that cannot serve `access`.
+/// Resolve `target_id`'s kind, rejecting a request whose descriptor `token` is
+/// stale and a target that cannot serve `access`. The token comes first: a stale
+/// one names a relation whose absence or kind is not the client's error. `0` is
+/// a request that carries none.
 ///
 /// A stream holds no rows, so it may be written (outside a transaction) but not
 /// read. A view may be read
@@ -865,7 +875,8 @@ enum Access {
 /// **Only the absent-relation arm carries a status of its own**
 /// ([`WireStatus::NotFound`]): the arms below name a relation that exists, which a
 /// client must not recover from the way it recovers from a vanished one.
-fn target_kind(shared: &Shared, target_id: u64, access: Access) -> Result<RelationKind, WireFault> {
+fn target_kind(shared: &Shared, target_id: u64, token: u64, access: Access) -> Result<RelationKind, WireFault> {
+    shared.cat().check_token(target_id, token)?;
     let Some(kind) = shared.cat().registry.relation(target_id).map(Relation::kind) else {
         return Err(not_found(target_id));
     };
@@ -901,11 +912,11 @@ fn resolve_request_target(shared: &Rc<Shared>, name_blob: &[u8]) -> Result<Optio
     Ok(cat.relation_id(sid, name))
 }
 
-/// Answer a RESOLVE with the relation's schema block and descriptor.
+/// Answer a RESOLVE with the relation's schema block, descriptor and token.
 fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
     let answer =
         resolve_request_target(shared, name_blob)?.and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
-    let Some((tid, (desc, schema_block))) = answer else {
+    let Some((tid, (desc, schema_block, token))) = answer else {
         // No such relation: a successful reply naming none.
         send_msg(peer, ipc::WireMsg::default());
         return Ok(());
@@ -914,8 +925,9 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Re
         peer,
         ipc::WireMsg {
             target_id: tid,
+            arg0: token,
             schema_block: Some(&schema_block),
-            blob: &desc.encode(),
+            blob: &desc,
             ..Default::default()
         },
     );
@@ -970,20 +982,20 @@ async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadG
 ///
 /// The one read-lock entry point for every single-target read verb: each passes
 /// the `Access` its realization can serve and routes on the returned kind, rather
-/// than re-deciding the system/user split from the id. A stale view re-resolves
-/// after the drain, since a DDL may have dropped it meanwhile.
+/// than re-deciding the system/user split from the id. The target is validated
+/// under the guard handed back, so after the drain: a DDL may have dropped or
+/// altered it meanwhile, and [`read_is_fresh`] holds an absent one fresh.
 async fn read_lock(
     shared: &Rc<Shared>,
     target_id: u64,
+    token: u64,
     access: Access,
 ) -> Result<(ReadGuard, RelationKind), WireFault> {
-    let g = shared.catalog_rwlock.read().await;
-    let kind = target_kind(shared, target_id, access)?;
-    if read_is_fresh(shared, target_id) {
-        return Ok((g, kind));
+    let mut g = shared.catalog_rwlock.read().await;
+    if !read_is_fresh(shared, target_id) {
+        g = drain_and_relock(shared, g).await?;
     }
-    let g = drain_and_relock(shared, g).await?;
-    let kind = target_kind(shared, target_id, access)?;
+    let kind = target_kind(shared, target_id, token, access)?;
     Ok((g, kind))
 }
 
@@ -1048,10 +1060,11 @@ async fn handle_scan_spec(
     shared: &Rc<Shared>,
     peer: &Peer,
     target_id: u64,
+    token: u64,
     blob: &[u8],
     reply_layout: u64,
 ) -> Result<(), WireFault> {
-    let (g, kind) = read_lock(shared, target_id, Access::Read).await?;
+    let (g, kind) = read_lock(shared, target_id, token, Access::Read).await?;
     if kind == RelationKind::SystemCatalog {
         let spec = ReadSpec::decode(blob).map_err(|e| format!("decode error: {e}"))?;
         let rows = guard_panic("read", || {
@@ -1113,7 +1126,7 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let mut moved: Vec<DeltaPollItem> = Vec::with_capacity(views.len());
         for &item in &views {
             let tid = item.view_id;
-            let position = match target_kind(shared, tid, Access::UserRead) {
+            let position = match target_kind(shared, tid, 0, Access::UserRead) {
                 Err(f) => PollPosition::Fault(f),
                 Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
                 Ok(_) => {
@@ -1223,7 +1236,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let _cat = cat;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
         for r in &relations {
-            let kind = target_kind(shared, r.tid, Access::UserRead)?;
+            let kind = target_kind(shared, r.tid, 0, Access::UserRead)?;
             plans.push(ScanMultiRelPlan {
                 tid: r.tid,
                 reply_layout: r.reply_layout,

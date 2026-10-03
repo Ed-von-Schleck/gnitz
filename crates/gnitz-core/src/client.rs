@@ -1,6 +1,6 @@
 use crate::connection::{
     DeltaCursor, Encoded, IdRun, Interest, PollEnd, Polled, RawBlock, RelDescriptor, Reply, Request, ScanReply,
-    Session, SlotId,
+    Session, SlotId, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -8,6 +8,7 @@ use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Sche
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,9 +17,9 @@ use gnitz_wire::sys_rows::{CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    PkColList, PkListRole, RelClass, TableProps, ViewProps, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
-    COLTAB_PAY_NAME, COL_TAB, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
-    IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    PkColList, PkListRole, TableProps, ViewProps, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
+    COL_TAB, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB,
+    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -202,6 +203,9 @@ pub struct GnitzClient {
     /// The local copy this client reads through, if a host attached one. Boxed,
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
+    /// Qualified name → the descriptor its last RESOLVE answered, for
+    /// [`Self::kept`]. This client's own DDL empties it.
+    kept: HashMap<String, Arc<RelDescriptor>>,
 }
 
 // The client-facing types must stay `Send`: `gnitz-py` drops the GIL inside
@@ -240,6 +244,7 @@ impl GnitzClient {
             serial_cache: HashMap::new(),
             txn: None,
             mirror: None,
+            kept: HashMap::new(),
         }
     }
 
@@ -260,12 +265,12 @@ impl GnitzClient {
         await_slot(&mut self.session, &mut self.park_hook, slot)
     }
 
-    /// Reserve `count` contiguous SERIAL ids for `table_id` and return the first,
+    /// Reserve `count` contiguous SERIAL ids for `table` and return the first,
     /// so an INSERT that knows its row count pays one fsynced durable advance
     /// rather than `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
     /// range's, or this reservation's — is the intentional PostgreSQL-style gap.
-    pub fn reserve_serial_ids(&mut self, table_id: u64, count: u64) -> Result<u64, ClientError> {
-        match self.serial_cache.get_mut(&table_id) {
+    pub fn reserve_serial_ids(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
+        match self.serial_cache.get_mut(&table.tid) {
             Some(r) if r.end - r.start >= count => {
                 let base = r.start;
                 r.start += count;
@@ -274,8 +279,8 @@ impl GnitzClient {
             // Refill, abandoning whatever tail the old range still held.
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
-                let base = self.alloc(IdRun::Serial { table_id, count: want })?;
-                self.serial_cache.insert(table_id, base + count..base + want);
+                let base = self.alloc(IdRun::Serial { table: table.into(), count: want })?;
+                self.serial_cache.insert(table.tid, base + count..base + want);
                 Ok(base)
             }
         }
@@ -293,63 +298,40 @@ impl GnitzClient {
         self.alloc(IdRun::Ids(1))
     }
 
-    /// Push `batch` under `mode`. SQL `INSERT` uses `Error` to get SQL-standard
-    /// rejection semantics; every other caller passes `Update`.
+    /// Push `batch` into `target` under `mode`. SQL `INSERT` uses `Error` to get
+    /// SQL-standard rejection semantics; every other caller passes `Update`.
     ///
     /// Inside an open transaction the batch is buffered instead of sent, and the
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
-    /// the one zone LSN covering the whole bundle.
-    pub fn push(
+    /// the one zone LSN covering the whole bundle. A batch passed by value moves
+    /// into the buffer; a borrowed one is cloned into it.
+    pub fn push<'a>(
         &mut self,
-        table_id: u64,
+        target: impl Into<Target>,
         schema: &Schema,
-        batch: &ZSetBatch,
+        batch: impl Into<Cow<'a, ZSetBatch>>,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
+        let (target, batch) = (target.into(), batch.into());
         if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch.clone(), mode, BLIND)?;
+            txn.push(target, schema, batch.into_owned(), mode, BLIND)?;
             return Ok(0);
         }
-        self.send_push(table_id, schema, batch, mode)
-    }
-
-    /// [`Self::push`] for a caller that owns the batch and drops it:
-    /// inside a transaction the rows move into the buffer instead of being deep
-    /// cloned. The borrowing form stays for callers that keep the batch.
-    pub fn push_owned(
-        &mut self,
-        table_id: u64,
-        schema: &Schema,
-        batch: ZSetBatch,
-        mode: WireConflictMode,
-    ) -> Result<u64, ClientError> {
-        if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch, mode, BLIND)?;
-            return Ok(0);
-        }
-        self.send_push(table_id, schema, &batch, mode)
-    }
-
-    fn send_push(
-        &mut self,
-        target_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        mode: WireConflictMode,
-    ) -> Result<u64, ClientError> {
+        let batch = &*batch;
         Ok(self
-            .round_trip(Request::Push { target_id, schema, batch, mode })?
+            .round_trip(Request::Push { target, schema, batch, mode })?
             .into_ack())
     }
 
     /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
     pub fn scan_spec(
         &mut self,
-        table_id: u64,
+        target: impl Into<Target>,
         spec: &ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ScanReply, ClientError> {
-        self.round_trip(Request::ScanSpec { target_id: table_id, spec, reply_schema })
+        let target = target.into();
+        self.round_trip(Request::ScanSpec { target, spec, reply_schema })
             .map(Reply::into_scan)
     }
 
@@ -394,21 +376,22 @@ impl GnitzClient {
         }
     }
 
-    /// [`Self::scan_spec`], answered off the copy when it holds `table_id`, with
+    /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
     /// no served LSN: a copy's freshness is [`Self::cursor_of`].
     pub fn scan_spec_local_first(
         &mut self,
-        table_id: u64,
+        target: impl Into<Target>,
         spec: ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ScanReply, ClientError> {
+        let target = target.into();
         match self.mirror.as_deref_mut() {
-            Some(m) if m.cursor_of(table_id).is_some() => Ok(ScanReply {
-                batch: m.store.scan_spec(table_id, spec, reply_schema)?,
+            Some(m) if m.cursor_of(target.tid).is_some() => Ok(ScanReply {
+                batch: m.store.scan_spec(target.tid, spec, reply_schema)?,
                 schema: Arc::clone(reply_schema),
                 lsn: None,
             }),
-            _ => self.scan_spec(table_id, &spec, reply_schema),
+            _ => self.scan_spec(target, &spec, reply_schema),
         }
     }
 
@@ -584,14 +567,13 @@ impl GnitzClient {
     }
 
     /// Delete `pks` from `table_id` (retraction rows). Buffered like any other
-    /// write while a transaction is open, through the by-value entry point:
-    /// this call builds the batch and drops it, so nothing is cloned.
+    /// write while a transaction is open.
     pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
         if pks.is_empty() {
             return Ok(());
         }
         let batch = retraction_batch(schema, pks);
-        self.push_owned(table_id, schema, batch, WireConflictMode::Update)?;
+        self.push(table_id, schema, batch, WireConflictMode::Update)?;
         Ok(())
     }
 
@@ -626,9 +608,25 @@ impl GnitzClient {
     /// Commit the open transaction atomically and return its durable zone LSN, `0`
     /// when it wrote nothing. Errors if no transaction is open; the transaction is
     /// closed even when the commit fails.
+    ///
+    /// A `StaleCatalog` refusal is reported as `TxnConflict`: a relation the
+    /// transaction wrote has been altered since this client resolved it — which
+    /// may have been before BEGIN, a write buffered under a kept descriptor
+    /// sending no request of its own. The recovery is a conflict's: nothing was
+    /// written, and the transaction run again resolves the relations it wrote
+    /// afresh.
     pub fn txn_commit(&mut self) -> Result<u64, ClientError> {
         let buf = self.txn.take().ok_or_else(no_transaction)?;
-        self.push_txn(&buf)
+        self.push_txn(&buf).map_err(|e| match e {
+            ClientError::Refused(WireFault { status: WireStatus::StaleCatalog, text }) => {
+                self.kept.retain(|_, rel| !buf.families_of.contains_key(&rel.tid));
+                ClientError::Refused(WireFault {
+                    status: WireStatus::TxnConflict,
+                    text: format!("transaction conflict: {text}; retry"),
+                })
+            }
+            e => e,
+        })
     }
 
     /// Ship `buf` as one `PUSH_TXN` frame, whose families land together under one
@@ -641,7 +639,7 @@ impl GnitzClient {
             .families
             .iter()
             .map(|f| PushFamily {
-                tid: f.tid,
+                target: Target { tid: f.tid, token: f.token },
                 schema: &f.schema,
                 batch: &f.batch,
                 mode: f.mode,
@@ -692,7 +690,7 @@ impl GnitzClient {
                         sink: spec.sink.clone(),
                     });
                     let ScanReply { batch, lsn, .. } =
-                        self.scan_spec(tid, narrowed.as_ref().unwrap_or(&spec), &reply)?;
+                        self.scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)?;
                     (batch, lsn.expect("a server read carries its watermark"))
                 }
             };
@@ -700,7 +698,7 @@ impl GnitzClient {
             let txn = self.txn.as_mut().unwrap_or(&mut own);
             let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
             let count = batch.len();
-            txn.push(tid, schema, batch, WireConflictMode::Update, basis)?;
+            txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
             let pushed = match self.txn {
                 Some(_) => Ok(0),
                 None => self.push_txn(&own),
@@ -727,6 +725,7 @@ impl GnitzClient {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
         self.round_trip(Request::DdlTxn(&bundle.0))?;
+        self.kept.clear();
         self.after_ddl_commit(&bundle.0);
         Ok(())
     }
@@ -1156,21 +1155,29 @@ impl GnitzClient {
 
     // --- Relation resolution ---
 
-    /// The descriptor for `schema_name.name`, or `None` when no such relation
-    /// exists; `Err` is a missing schema or a decode error. Inside a transaction a
-    /// table's name resolves once, so every statement writes it under one layout.
+    /// The descriptor for `schema_name.name` as the server answers it now, or
+    /// `None` when no such relation exists; `Err` is a missing schema or a decode
+    /// error.
     pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         let qname = qualified_name(schema_name, name);
-        if let Some(bound) = self.txn.as_ref().and_then(|t| t.bound.get(&qname)) {
-            return Ok(Some(Arc::clone(bound)));
-        }
         let found = self.round_trip(Request::Resolve(&qname)).map(Reply::into_resolve)?;
-        if let (Some(txn), Some(desc)) = (self.txn.as_mut(), &found) {
-            if desc.class == RelClass::Table {
-                txn.bound.insert(qname, Arc::clone(desc));
-            }
-        }
+        match &found {
+            Some(desc) => self.kept.insert(qname, Arc::clone(desc)),
+            None => self.kept.remove(&qname),
+        };
         Ok(found)
+    }
+
+    /// What the last [`Self::resolve`] of `schema_name.name` answered, if it
+    /// answered a relation and this client has run no DDL since.
+    ///
+    /// That answer may be stale, and only the server can tell: a request that
+    /// carries the descriptor's token is refused `StaleCatalog` when it is.
+    /// Whatever else a caller concludes from a kept descriptor — a planning
+    /// error, an answer that needs no request — is unchecked, and is the caller's
+    /// to repeat from [`Self::resolve`].
+    pub fn kept(&self, schema_name: &str, name: &str) -> Option<Arc<RelDescriptor>> {
+        self.kept.get(&qualified_name(schema_name, name)).cloned()
     }
 
     // --- Private catalog-lookup helpers ---
@@ -1280,6 +1287,9 @@ pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Int
 /// One buffered family: a maximal run of same-mode ops on one relation.
 struct BufferedFamily {
     tid: u64,
+    /// The descriptor token of the first of the family's batches built from a
+    /// descriptor; `0` while none was.
+    token: u64,
     schema: Schema,
     batch: ZSetBatch,
     mode: WireConflictMode,
@@ -1314,8 +1324,6 @@ struct TxnBuffer {
     /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
     /// as the engine's fold treats them.
     last_op_of: HashMap<u64, HashMap<PkBuf, (usize, usize)>>,
-    /// Qualified name → the descriptor [`GnitzClient::resolve`] found for it.
-    bound: HashMap<String, Arc<RelDescriptor>>,
 }
 
 impl TxnBuffer {
@@ -1334,12 +1342,13 @@ impl TxnBuffer {
     /// Refused when `batch` is not in the layout `tid` already holds.
     fn push(
         &mut self,
-        tid: u64,
+        target: impl Into<Target>,
         schema: &Schema,
         batch: ZSetBatch,
         mode: WireConflictMode,
         basis: u64,
     ) -> Result<(), ClientError> {
+        let Target { tid, token } = target.into();
         batch
             .layout_matches(schema)
             .map_err(|e| ClientError::from(format!("relation {tid}: the batch is not in its schema's layout: {e}")))?;
@@ -1354,11 +1363,15 @@ impl TxnBuffer {
                 let f = &mut self.families[i];
                 f.batch.extend_from_owned(batch);
                 f.basis = f.basis.min(basis);
+                if f.token == 0 {
+                    f.token = token;
+                }
             }
             None => {
                 self.families_of.entry(tid).or_default().push(self.families.len());
                 self.families.push(BufferedFamily {
                     tid,
+                    token,
                     schema: schema.clone(),
                     batch,
                     mode,

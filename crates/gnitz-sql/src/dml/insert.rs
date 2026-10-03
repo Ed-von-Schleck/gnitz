@@ -388,11 +388,11 @@ fn first_per_key(rows: ZSetBatch, schema: &Schema, refuse_repeat: bool) -> Resul
 
 pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Result<SqlResult, GnitzSqlError> {
     let InsertPlan { target, mut rows, conflict, returning } = plan;
-    let (tid, schema) = (target.tid, &target.schema);
+    let schema = &target.schema;
     if serial_col(&target).is_some() {
         // One durable advance for the whole statement.
         let n = rows.len();
-        rows.pks = serial_keys(client.reserve_serial_ids(tid, n as u64)?, n, schema)?;
+        rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64)?, n, schema)?;
     }
     match conflict {
         ConflictPlan::Error => {
@@ -404,11 +404,11 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
             } else {
                 WireConflictMode::Error
             };
-            // Split on RETURNING: `push_owned` gives the batch away when nothing
-            // will project it, saving a deep clone inside a transaction.
+            // Split on RETURNING: the batch is given away when nothing will
+            // project it, saving a deep clone inside a transaction.
             match returning {
                 Some((schema_out, map)) => {
-                    client.push(tid, schema, &rows, mode)?;
+                    client.push(&*target, schema, &rows, mode)?;
                     Ok(SqlResult::Rows {
                         schema: schema_out,
                         batch: match map {
@@ -419,7 +419,7 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
                 }
                 None => {
                     let count = rows.len();
-                    client.push_owned(tid, schema, rows, mode)?;
+                    client.push(&*target, schema, rows, mode)?;
                     Ok(SqlResult::RowsAffected { count })
                 }
             }

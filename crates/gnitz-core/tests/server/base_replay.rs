@@ -23,7 +23,7 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
     let push_each = |client: &mut GnitzClient, keys: &[u64]| {
         for &k in keys {
             client
-                .push(tid, &schema, &rows(&schema, [k]), WireConflictMode::Update)
+                .push(tid, &schema, rows(&schema, [k]), WireConflictMode::Update)
                 .unwrap();
         }
     };

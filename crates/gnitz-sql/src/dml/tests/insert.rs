@@ -47,6 +47,7 @@ fn cat() -> Catalog<'static> {
                 serial: true,
                 schema: Arc::new(schema(sr, &[0])),
                 indexes: Vec::new(),
+                token: 0,
             }),
         ),
         ("st", rel(6, RelClass::Stream, idv(), vec![0], vec![])),

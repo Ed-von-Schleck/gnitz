@@ -1,9 +1,10 @@
 use super::*;
 use gnitz_expr::payload_str;
 use gnitz_wire::schema_block::check_same_types;
-use gnitz_wire::{RelDescriptorBlob, RelIndex};
+use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus};
 use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 
 // ---------------------------------------------------------------------------
@@ -65,9 +66,13 @@ impl CatalogEngine {
         check_same_types(seen, current)
     }
 
-    /// What a RESOLVE of `tid` answers: its descriptor and its named record.
-    /// `None` for an unregistered id.
-    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(RelDescriptorBlob, Rc<[u8]>)> {
+    /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record
+    /// and its descriptor token. `None` for an unregistered id.
+    ///
+    /// The token digests the relation's qualified name and the other two, so it
+    /// changes exactly when a RESOLVE of that name would answer differently. It is
+    /// never `0`.
+    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(Vec<u8>, Rc<[u8]>, u64)> {
         let rel = self.registry.relation(tid)?;
         let entry = self.relation_entry(tid);
         let desc = RelDescriptorBlob {
@@ -83,7 +88,34 @@ impl CatalogEngine {
                 })
                 .collect(),
         };
-        Some((desc, entry.record.clone()))
+        let desc = desc.encode();
+        let token = *self.caches.resolve_tokens.borrow_mut().entry(tid).or_insert_with(|| {
+            let mut h = gnitz_wire::RowHasher::default();
+            h.update(self.qualified_name(tid).as_bytes());
+            h.update(&desc);
+            h.update(&entry.record);
+            h.digest() | 1
+        });
+        Some((desc, entry.record.clone(), token))
+    }
+
+    /// `tid`'s descriptor token (see [`Self::resolve_answer`]); `None` for an
+    /// unregistered id.
+    pub(crate) fn resolve_token(&self, tid: u64) -> Option<u64> {
+        let memo = self.caches.resolve_tokens.borrow().get(&tid).copied();
+        memo.or_else(|| self.resolve_answer(tid).map(|(_, _, token)| token))
+    }
+
+    /// Refuse a request built under `token` once `tid` answers a RESOLVE
+    /// differently. `0` is a request built from no RESOLVE.
+    pub(crate) fn check_token(&self, tid: u64, token: u64) -> Result<(), WireFault> {
+        if token == 0 || self.resolve_token(tid) == Some(token) {
+            return Ok(());
+        }
+        Err(WireFault {
+            status: WireStatus::StaleCatalog,
+            text: format!("relation {tid} no longer resolves as this request was planned; resolve it again"),
+        })
     }
 }
 
@@ -97,6 +129,9 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
     pub(in crate::catalog) fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
+    /// [`CatalogEngine::resolve_token`] by relation, computed on first use and
+    /// emptied by every hook of a family that can change a RESOLVE answer.
+    pub(in crate::catalog) resolve_tokens: RefCell<FxHashMap<u64, u64>>,
 }
 
 // ---------------------------------------------------------------------------

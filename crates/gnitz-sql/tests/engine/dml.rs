@@ -108,7 +108,7 @@ fn a_concurrent_add_column_fails_the_commit_cleanly() {
     );
     b.exec("ALTER TABLE t ADD COLUMN c BIGINT");
     a.exec("INSERT INTO t (id, v) VALUES (3, 30)");
-    a.refuses("COMMIT", Refused(Error), "Schema mismatch");
+    a.refuses("COMMIT", Refused(WireStatus::TxnConflict), "no longer resolves");
     assert!(!a.client.txn_active());
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1]]);
 }

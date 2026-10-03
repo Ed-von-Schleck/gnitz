@@ -1,6 +1,6 @@
-//! The RESOLVE verb, and a statement resolves each relation once: *what* one
-//! reply carries, and *what it costs* — each relation exactly once per statement,
-//! and nothing retained across statements to go stale under another client's DDL.
+//! The RESOLVE verb, and the descriptor a client keeps of it: *what* one reply
+//! carries, *what it costs* — a name is resolved once and kept — and what finds
+//! a kept descriptor out once another client's DDL has made it stale.
 
 use super::*;
 use gnitz_wire::{RelClass, WireStatus::NotFound};
@@ -110,14 +110,11 @@ fn cost(db: &mut Db, sql: &str) -> u64 {
     db.client.requests_sent() - before
 }
 
-/// A statement resolves each relation exactly once — on the success path and on
-/// a miss alike, whatever its shape and however many segments its plan has —
-/// and a DDL verb acts on the descriptor its statement resolved. A transaction
-/// binds each table's name once: after its first statement on a table an INSERT
-/// sends nothing until COMMIT and an UPDATE sends only its read; a view takes no
-/// writes, so it is resolved afresh each statement. An equality, not a bound,
-/// so a regression to a second resolve fails here instead of fitting under a
-/// slack ceiling.
+/// DML resolves a name once and keeps the answer: the statements after the
+/// first send their own requests alone, inside a transaction and out. A miss is
+/// not kept, a DDL statement always resolves, and this client's own DDL forgets
+/// what it kept. An equality, not a bound, so a regression to a second resolve
+/// fails here instead of fitting under a slack ceiling.
 #[test]
 fn a_statement_resolves_each_relation_once() {
     let mut db = Db::boot(1);
@@ -130,15 +127,34 @@ fn a_statement_resolves_each_relation_once() {
     );
     for (sql, want, what) in [
         ("SELECT * FROM t", 2, "resolve, read"),
-        ("SELECT * FROM t WHERE id = 2", 2, "resolve, read"),
-        ("SELECT * FROM t WHERE x = 10", 2, "resolve, read"),
-        ("SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g", 2, "resolve, read"),
+        ("SELECT * FROM t WHERE id = 2", 1, "read"),
+        ("SELECT * FROM t WHERE x = 10", 1, "read"),
+        ("SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g", 1, "read"),
         (
             "SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g HAVING COUNT(*) > 0",
-            2,
-            "resolve, read",
+            1,
+            "read",
+        ),
+        ("UPDATE t SET x = 10 WHERE id = 2", 2, "read, PUSH_TXN"),
+        ("INSERT INTO t VALUES (6, 1, 60)", 1, "push"),
+        ("DELETE FROM t WHERE id = 6", 2, "read, PUSH_TXN"),
+        (
+            "SELECT * FROM t LIMIT 0",
+            1,
+            "resolve: no request checks a kept descriptor",
+        ),
+        (
+            "EXPLAIN SELECT * FROM t",
+            1,
+            "resolve: no request checks a kept descriptor",
+        ),
+        (
+            "SELECT nope FROM t",
+            1,
+            "resolve: a kept descriptor's refusal is planned again",
         ),
         ("INSERT INTO nope (id) VALUES (1)", 1, "resolve"),
+        ("INSERT INTO nope (id) VALUES (1)", 1, "resolve: a miss is not kept"),
         (
             "ALTER TABLE w ADD CONSTRAINT _bad UNIQUE (id)",
             0,
@@ -149,27 +165,27 @@ fn a_statement_resolves_each_relation_once() {
         (
             "BEGIN; INSERT INTO t VALUES (3, 1, 30); INSERT INTO t VALUES (4, 1, 40); COMMIT",
             2,
-            "resolve, PUSH_TXN",
+            "resolve, PUSH_TXN: this client's DDL forgot `t`",
         ),
         (
             "BEGIN; UPDATE t SET x = x + 1 WHERE id = 3; UPDATE t SET x = x + 1 WHERE id = 4; COMMIT",
-            4,
-            "resolve, two reads, PUSH_TXN",
+            3,
+            "two reads, PUSH_TXN",
         ),
         (
             "BEGIN; UPDATE t SET x = x + 1 WHERE id = 3; UPDATE t SET x = x + 1 WHERE id = 3; COMMIT",
-            3,
-            "resolve, one read, PUSH_TXN: the second UPDATE reads the first one's row",
+            2,
+            "one read, PUSH_TXN: the second UPDATE reads the first one's row",
         ),
         (
             "BEGIN; INSERT INTO t VALUES (5, 1, 50); UPDATE t SET x = x + 1 WHERE id = 5; COMMIT",
-            2,
-            "resolve, PUSH_TXN: the UPDATE reads the INSERT's row",
+            1,
+            "PUSH_TXN: the UPDATE reads the INSERT's row",
         ),
         (
             "BEGIN; SELECT * FROM v; SELECT * FROM v; ROLLBACK",
-            4,
-            "a resolve and a read per SELECT",
+            3,
+            "resolve, two reads",
         ),
         ("ALTER TABLE t RENAME TO u", 3, "resolve, seek, push"),
         ("ALTER VIEW v AS SELECT id FROM u", 5, "two resolves, seek, alloc, push"),
@@ -178,6 +194,8 @@ fn a_statement_resolves_each_relation_once() {
             5,
             "two resolves, seek, alloc, push",
         ),
+        ("SELECT * FROM u", 2, "resolve, read"),
+        ("SELECT * FROM u", 1, "read"),
     ] {
         assert_eq!(cost(&mut db, sql), want, "`{sql}`: {what}");
     }
@@ -204,11 +222,12 @@ fn drop_schema_is_four_requests_whatever_the_member_count() {
     assert!(!db.exists("m0") && !db.exists("vw0"));
 }
 
-// ── DDL that a client-side descriptor cache would get wrong ──────────────────
+// ── A kept descriptor under another client's DDL ─────────────────────────────
 
-/// `ALTER … RENAME TO` then recreating the old name: an idle second client's
-/// next statement must see the *new* relation — nothing is retained across
-/// statements to go stale.
+/// `ALTER … RENAME TO` then recreating the old name: a second client's next
+/// statement must see the *new* relation, though the descriptor it kept names
+/// the old one, which still exists under its new name. The stale read is
+/// refused, and the statement resolves and reads again.
 #[test]
 fn a_second_client_sees_a_rename_then_recreate() {
     let mut a = Db::boot(4);
@@ -216,13 +235,14 @@ fn a_second_client_sees_a_rename_then_recreate() {
     a.exec(T_ID_V);
     a.exec("INSERT INTO t (id, v) VALUES (1, 100)");
     assert_eq!(b.scan("t", &["id", "v"]), [[1, 100, 1]]);
-    let old_tid = b.rel("t").tid;
+    assert_eq!(cost(&mut b, "SELECT * FROM t"), 1, "`t` is kept");
 
     a.exec(&format!(
         "ALTER TABLE t RENAME TO u; {T_ID_V}; INSERT INTO t (id, v) VALUES (2, 200), (3, 300)"
     ));
-    assert_ne!(b.rel("t").tid, old_tid, "the name now binds a different relation");
+    let before = b.client.requests_sent();
     assert_eq!(b.scan("t", &["id", "v"]), [[2, 200, 1], [3, 300, 1]]);
+    assert_eq!(b.client.requests_sent() - before, 3, "refused read, resolve, read");
 
     b.exec("INSERT INTO t (id, v) VALUES (4, 400)");
     assert_eq!(a.scan("t", &["id", "v"]), [[2, 200, 1], [3, 300, 1], [4, 400, 1]]);
@@ -276,4 +296,106 @@ fn a_recreated_schema_resolves_its_new_members() {
     let rel = db.rel("t");
     assert_ne!(rel.tid, old_tid);
     assert_eq!(visible_names(&rel.schema), ["id", "v"]);
+}
+
+/// A stale kept descriptor reaches no row: each write below is planned from the
+/// descriptor of a relation another client has since renamed away, dropped and
+/// recreated, or dropped an index of, and lands in the relation its name
+/// resolves to now.
+#[test]
+fn a_stale_write_is_refused_before_it_lands() {
+    let mut a = Db::boot(4);
+    let mut b = a.peer();
+    a.exec(&format!(
+        "{T_ID_V}; CREATE TABLE sr (id SERIAL PRIMARY KEY, v BIGINT NOT NULL)"
+    ));
+    a.exec("CREATE INDEX ix ON t(v); INSERT INTO t VALUES (1, 100), (2, 100)");
+    b.exec("INSERT INTO t VALUES (3, 300)");
+
+    a.exec(&format!("ALTER TABLE t RENAME TO u; {T_ID_V}"));
+    b.exec("INSERT INTO t VALUES (4, 400)");
+    assert_eq!(b.affected("UPDATE t SET v = 401 WHERE id = 4"), 1);
+    assert_eq!(b.affected("DELETE FROM t WHERE id = 1"), 0, "row 1 is `u`'s");
+    assert_eq!(a.scan("t", &["id", "v"]), [[4, 401, 1]]);
+    assert_eq!(a.scan("u", &["id", "v"]), [[1, 100, 1], [2, 100, 1], [3, 300, 1]]);
+
+    // A SERIAL insert reserves ids before it pushes, and `b` holds none for
+    // `sr`: the reservation is refused too, rather than advancing the sequence
+    // of the table `sr` named before.
+    assert!(b.scan("sr", &["v"]).is_empty());
+    a.exec("ALTER TABLE sr RENAME TO old; CREATE TABLE sr (id SERIAL PRIMARY KEY, v BIGINT NOT NULL)");
+    assert_eq!(
+        cost(&mut b, "INSERT INTO sr (v) VALUES (2)"),
+        4,
+        "refused reservation, resolve, reservation, push"
+    );
+    a.exec("INSERT INTO old (v) VALUES (3)");
+    assert_eq!(a.scan("sr", &["id", "v"]), [[1, 2, 1]]);
+    assert_eq!(a.scan("old", &["id", "v"]), [[1, 3, 1]], "no id of `old` was taken");
+
+    // The kept descriptor of `u` (resolved here) lists `ix`; the read planned
+    // through it is refused once the index is gone.
+    assert_eq!(b.rows("SELECT * FROM u WHERE v = 100", &["id"]), [[1, 1], [2, 1]]);
+    a.exec("DROP INDEX ix");
+    assert_eq!(b.rows("SELECT * FROM u WHERE v = 100", &["id"]), [[1, 1], [2, 1]]);
+}
+
+/// What a statement concludes from a kept descriptor without sending a request
+/// does not stand: a planning error, a `LIMIT 0` answered from the schema and
+/// an EXPLAIN are all planned again from the server's answer.
+#[test]
+fn a_kept_descriptor_answers_nothing_without_a_request() {
+    let mut a = Db::boot(4);
+    let mut b = a.peer();
+    a.exec(&format!("{T_ID_V}; INSERT INTO t VALUES (1, 100)"));
+    assert_eq!(b.scan("t", &["id", "v"]), [[1, 100, 1]]);
+
+    a.exec("ALTER TABLE t ADD COLUMN c BIGINT");
+    assert_eq!(
+        b.rows("SELECT c FROM t", &["c"]),
+        [[NULL, 1]],
+        "`c` is not in the kept descriptor"
+    );
+    a.exec("ALTER TABLE t ADD COLUMN d BIGINT");
+    b.exec("INSERT INTO t (id, v, d) VALUES (2, 200, 7)");
+    assert_eq!(a.scan("t", &["id", "d"]), [[1, NULL, 1], [2, 7, 1]]);
+
+    a.exec("ALTER TABLE t ADD COLUMN e BIGINT");
+    let (schema, batch) = b.read("SELECT * FROM t LIMIT 0");
+    assert_eq!(visible_names(&schema), ["id", "v", "c", "d", "e"]);
+    assert!(batch.is_empty());
+
+    let plan = |db: &mut Db| {
+        let (_, batch) = db.read("EXPLAIN SELECT * FROM t WHERE v = 100");
+        format!("{batch:?}")
+    };
+    let unindexed = plan(&mut b);
+    a.exec("CREATE INDEX ix ON t(v)");
+    assert_ne!(
+        plan(&mut b),
+        unindexed,
+        "the EXPLAIN names the index another client created"
+    );
+}
+
+/// A descriptor is stale only when its own relation resolves differently:
+/// another client's DDL elsewhere refuses nothing, and an open transaction
+/// commits across it. DDL on a relation the transaction wrote fails the COMMIT.
+#[test]
+fn ddl_elsewhere_refuses_nothing() {
+    let mut a = Db::boot(4);
+    let mut b = a.peer();
+    a.exec(&format!("{T_ID_V}; CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY)"));
+    b.exec("INSERT INTO t VALUES (1, 100)");
+
+    b.exec("BEGIN; INSERT INTO t VALUES (2, 200)");
+    a.exec("CREATE TABLE other (id BIGINT NOT NULL PRIMARY KEY); CREATE INDEX wx ON w(id); DROP TABLE other");
+    assert_eq!(cost(&mut b, "SELECT * FROM t WHERE id = 1"), 1, "read");
+    b.exec("COMMIT");
+    assert_eq!(a.scan("t", &["id", "v"]), [[1, 100, 1], [2, 200, 1]]);
+
+    b.exec("BEGIN; INSERT INTO t VALUES (3, 300)");
+    a.exec("CREATE INDEX ix ON t(v)");
+    b.refuses("COMMIT", Refused(WireStatus::TxnConflict), "no longer resolves");
+    assert_eq!(a.scan("t", &["id", "v"]), [[1, 100, 1], [2, 200, 1]]);
 }

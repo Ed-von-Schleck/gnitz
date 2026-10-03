@@ -193,7 +193,7 @@ impl PyAsyncTransport {
         Self::submit(
             slf,
             Request::Push {
-                target_id,
+                target: target_id.into(),
                 schema: batch.schema.as_ref(),
                 batch: &batch.batch,
                 mode: WireConflictMode::Update,
@@ -206,7 +206,7 @@ impl PyAsyncTransport {
         Self::submit(
             slf,
             Request::ScanSpec {
-                target_id,
+                target: target_id.into(),
                 spec: &spec,
                 reply_schema: &schema.rust,
             },
@@ -227,7 +227,7 @@ impl PyAsyncTransport {
         Self::submit(
             slf,
             Request::ScanSpec {
-                target_id,
+                target: target_id.into(),
                 spec: &spec,
                 reply_schema: &schema.rust,
             },

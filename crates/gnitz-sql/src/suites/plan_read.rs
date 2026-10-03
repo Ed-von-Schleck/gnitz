@@ -508,6 +508,7 @@ fn a_distinct_reads_as_rows_only_over_a_sets_whole_key() {
         serial: false,
         schema: std::sync::Arc::clone(&tv.schema),
         indexes: Vec::new(),
+        token: 0,
     };
     cat.insert("bv", Some(std::sync::Arc::new(bag)));
     for (sql, shape) in [

@@ -56,6 +56,7 @@ pub(crate) fn rel(
         serial: false,
         schema: Arc::new(schema(columns, &pk_cols)),
         indexes,
+        token: 0,
     })
 }
 
@@ -90,6 +91,7 @@ pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass,
             serial: false,
             schema: Arc::clone(&view.schema),
             indexes: Vec::new(),
+            token: 0,
         })),
     );
 }

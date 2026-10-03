@@ -10,29 +10,34 @@ wire_enum! {
     #[derive(Default)]
     pub enum ClientVerb: u8 {
         /// A parameterized bounded read (`ReadSpec`) of one relation, replied in
-        /// the layout whose digest is `arg0`.
+        /// the layout whose digest is `arg0`, under the descriptor token `arg1`.
         #[default]
         ScanSpec = 0,
-        /// A data push, ACKed with its LSN in `arg0`. An empty batch is still a
-        /// push, ACKed at LSN 0.
+        /// A data push under the descriptor token `arg1`, ACKed with its LSN in
+        /// `arg0`. An empty batch is still a push, ACKed at LSN 0.
         Push = 1,
         /// A delta read of N views: one frame naming N fed views, each with its
         /// own cursor and client-authored reply schema.
         DeltaPoll = 4,
         /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
-        /// name in the blob.
+        /// name in the blob; the reply's `arg0` is its descriptor token.
+        ///
+        /// A descriptor token names one answer to a RESOLVE. A request built
+        /// from that answer carries it, and is refused
+        /// [`WireStatus::StaleCatalog`] once a RESOLVE would answer otherwise;
+        /// `0` is a request built from no RESOLVE, which nothing compares.
         Resolve = 5,
         /// System-table batches committed as one SAL zone.
         DdlTxn = 6,
         /// User-table batches committed as one SAL zone; each family carries
-        /// its own OCC basis.
+        /// its own OCC basis in `arg0` and its descriptor token in `arg1`.
         PushTxn = 7,
         /// N relations read at one SAL cut.
         ScanMulti = 8,
-        /// `arg1` SERIAL ids of table `target_id`; the reply's `arg0` is the
-        /// run's base.
+        /// `arg0` SERIAL ids of table `target_id`, under the descriptor token
+        /// `arg1`; the reply's `arg0` is the run's base.
         AllocSerialRange = 9,
-        /// `arg1` catalog object ids (schema, relation or index); the reply's
+        /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
     }
@@ -178,6 +183,10 @@ wire_enum! {
         /// The write would break a PK, unique-index or foreign-key constraint.
         /// Nothing was written.
         IntegrityViolation = 7,
+        /// The request carries a descriptor token its relation no longer
+        /// answers a RESOLVE with. Nothing was read or written, so the request
+        /// is retryable once it is built again from a fresh RESOLVE.
+        StaleCatalog = 8,
     }
 }
 
