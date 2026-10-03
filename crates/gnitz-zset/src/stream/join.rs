@@ -13,8 +13,8 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::repr::{
-    copy_runs, copy_string_cells, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where,
-    should_relocate_blob, width_dispatch, Batch, BlobCache, ReadCursor,
+    copy_runs, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
+    width_dispatch, Batch, ReadCursor,
 };
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
@@ -390,61 +390,7 @@ fn write_pairings(
         return Batch::empty_with_schema(out_schema);
     }
     let d_schema = delta.schema();
-    let d_first = probe.d_first as usize;
-    let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
     let mut out = Batch::with_capacity(out_schema, rows);
-    out.grow_rows(rows);
-
-    match probe.walk {
-        // No key decides a match, so the pair `[left PK…, right PK…]` is minted
-        // per row.
-        Walk::Cross { pk_len, d_key, t_key } => {
-            let (d_key, t_key) = (d_key.range(), t_key.range());
-            let mut keys = out.pk_data_mut().chunks_exact_mut(pk_len as usize);
-            for p in pairs {
-                let (t_src, t_row) = trace_row(p);
-                let t_pk = t_src.get_pk_bytes(t_row);
-                for i in p.delta_rows() {
-                    let key = keys.next().expect("one key per output row");
-                    key[d_key.clone()].copy_from_slice(delta.get_pk_bytes(i));
-                    key[t_key.clone()].copy_from_slice(t_pk);
-                }
-            }
-        }
-        // A keyed probe's output key is the delta's PK region verbatim.
-        _ => width_dispatch!(
-            d_schema.pk_stride(),
-            copy_runs,
-            delta.pk_data(),
-            out.pk_data_mut(),
-            delta_runs(pairs)
-        ),
-    }
-
-    let mut any_ghost = false;
-    {
-        let src = delta.weight_data().as_chunks::<8>().0;
-        let mut dst = out.weight_data_mut().as_chunks_mut::<8>().0.iter_mut();
-        for p in pairs {
-            for (w_delta, w_out) in src[p.delta_rows()].iter().zip(&mut dst) {
-                let w = i64::from_le_bytes(*w_delta).wrapping_mul(p.w_trace);
-                any_ghost |= w == 0;
-                *w_out = w.to_le_bytes();
-            }
-        }
-    }
-    {
-        // Each half's null bits rebase onto the slot its columns land at.
-        let src = delta.null_bmp_data().as_chunks::<8>().0;
-        let mut dst = out.null_bmp_data_mut().as_chunks_mut::<8>().0.iter_mut();
-        for p in pairs {
-            let (t_src, t_row) = trace_row(p);
-            let t_bits = probe.t_nulls.apply(t_src.get_null_word(t_row));
-            for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
-                *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
-            }
-        }
-    }
 
     // The delta's heap rides whole unless relocating the emitted cells is
     // cheaper; the rows no pairing names are what it then holds dead.
@@ -458,62 +404,103 @@ fn write_pairings(
         }
         false => None,
     };
-    let mut cache = BlobCache::new(out.string_cells(rows));
 
-    for (pi, col) in d_schema.payload_columns() {
-        let src = delta.col_data(pi);
-        let (dst, _, dst_blob) = out.col_null_and_blob_mut(d_first + pi);
-        if !col.type_code.is_german_string() {
-            width_dispatch!(col.size() as usize, copy_runs, src, dst, delta_runs(pairs));
-            continue;
-        }
-        let mut at = 0;
-        for p in pairs {
-            let (run, end) = (p.delta_rows(), at + p.len());
-            copy_string_cells(
-                &mut dst[at * 16..end * 16],
-                &src[run.start * 16..run.end * 16],
-                delta.blob(),
-                dst_blob,
-                heap_at,
-                &mut cache,
-            );
-            at = end;
-        }
-    }
-
-    for &ColCopy { src, slot, .. } in &probe.t_cols {
-        let (dst, _, dst_blob) = out.col_null_and_blob_mut(slot);
-        // Destructured once per column, so no pairing dispatches on the locator.
-        match src {
-            ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {
-                // One relocation per trace row, whatever its fan-out.
-                let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
+    let d_first = probe.d_first as usize;
+    let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
+    let any_ghost = out.append_session(rows).write(rows, |w| {
+        let mut any_ghost = false;
+        let (pk, weights, nulls) = w.fixed_mut();
+        match probe.walk {
+            // No key decides a match, so the pair `[left PK…, right PK…]` is minted
+            // per row.
+            Walk::Cross { pk_len, d_key, t_key } => {
+                let (d_key, t_key) = (d_key.range(), t_key.range());
+                let mut keys = pk.chunks_exact_mut(pk_len as usize);
                 for p in pairs {
                     let (t_src, t_row) = trace_row(p);
-                    let cell = relocate_german_string_vec(
-                        t_src.get_col_ptr(t_row, pi as usize, 16),
-                        t_src.blob(),
-                        dst_blob,
-                        Some(&mut cache),
-                    );
-                    cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+                    let t_pk = t_src.get_pk_bytes(t_row);
+                    for i in p.delta_rows() {
+                        let key = keys.next().expect("one key per output row");
+                        key[d_key.clone()].copy_from_slice(delta.get_pk_bytes(i));
+                        key[t_key.clone()].copy_from_slice(t_pk);
+                    }
                 }
             }
-            ColumnLocator::Payload { slot: pi, size, .. } => {
-                width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, dst, pairs)
-            }
-            ColumnLocator::Pk { byte_off, size, type_code } => width_dispatch!(
-                size as usize,
-                repeat_pk_cells,
-                cursor,
-                byte_off as usize,
-                type_code.is_signed_int(),
-                dst,
-                pairs
-            ),
+            // A keyed probe's output key is the delta's PK region verbatim.
+            _ => width_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk_data(), pk, delta_runs(pairs)),
         }
-    }
+        {
+            let src = delta.weight_data().as_chunks::<8>().0;
+            let mut dst = weights.as_chunks_mut::<8>().0.iter_mut();
+            for p in pairs {
+                for (w_delta, w_out) in src[p.delta_rows()].iter().zip(&mut dst) {
+                    let w = i64::from_le_bytes(*w_delta).wrapping_mul(p.w_trace);
+                    any_ghost |= w == 0;
+                    *w_out = w.to_le_bytes();
+                }
+            }
+        }
+        {
+            // Each half's null bits rebase onto the slot its columns land at.
+            let src = delta.null_bmp_data().as_chunks::<8>().0;
+            let mut dst = nulls.as_chunks_mut::<8>().0.iter_mut();
+            for p in pairs {
+                let (t_src, t_row) = trace_row(p);
+                let t_bits = probe.t_nulls.apply(t_src.get_null_word(t_row));
+                for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
+                    *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
+                }
+            }
+        }
+
+        for (pi, col) in d_schema.payload_columns() {
+            let slot = d_first + pi;
+            width_dispatch!(
+                col.size() as usize,
+                copy_runs,
+                delta.col_data(pi),
+                w.col_mut(slot),
+                delta_runs(pairs)
+            );
+            if col.type_code.is_german_string() {
+                w.rebase_string_col(slot, delta.blob(), heap_at);
+            }
+        }
+
+        for &ColCopy { src, slot, .. } in &probe.t_cols {
+            // Destructured once per column, so no pairing dispatches on the locator.
+            match src {
+                ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {
+                    // One relocation per trace row, whatever its fan-out.
+                    let (dst, dst_blob, mut cache) = w.string_col_mut(slot);
+                    let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
+                    for p in pairs {
+                        let (t_src, t_row) = trace_row(p);
+                        let cell = relocate_german_string_vec(
+                            t_src.get_col_ptr(t_row, pi as usize, 16),
+                            t_src.blob(),
+                            dst_blob,
+                            cache.as_deref_mut(),
+                        );
+                        cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+                    }
+                }
+                ColumnLocator::Payload { slot: pi, size, .. } => {
+                    width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, w.col_mut(slot), pairs)
+                }
+                ColumnLocator::Pk { byte_off, size, type_code } => width_dispatch!(
+                    size as usize,
+                    repeat_pk_cells,
+                    cursor,
+                    byte_off as usize,
+                    type_code.is_signed_int(),
+                    w.col_mut(slot),
+                    pairs
+                ),
+            }
+        }
+        any_ghost
+    });
 
     if any_ghost {
         // A weight product that wrapped to zero is not a Z-set element.
@@ -523,10 +510,10 @@ fn write_pairings(
     out
 }
 
-/// Each pairing's delta run as the `(start, rows)` [`copy_runs`] takes.
+/// Each pairing's delta run, as [`copy_runs`] takes it.
 #[inline(always)]
 fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
-    pairs.iter().map(|p| (p.rs as usize, p.len()))
+    pairs.iter().map(|p| (p.rs as usize, p.re as usize))
 }
 
 /// Each pairing's trace cell of payload column `pi`, written once per row of its

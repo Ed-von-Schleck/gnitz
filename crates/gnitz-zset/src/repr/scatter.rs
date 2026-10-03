@@ -9,10 +9,13 @@
 
 use std::ops::Range;
 
-use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
+use super::batch::{range_rows, write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
-use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
-use super::string_heap::{carried_dead, prorated_blob_cap, relocate_german_string_vec, row_long_bytes};
+use super::merge::{ColPtr, ColumnarSource, MemBatch, UnifiedSource};
+use super::string_heap::{
+    carried_dead, prorated_blob_cap, rebase_string_cells, relocate_german_string_vec, row_long_bytes,
+};
+use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
@@ -34,7 +37,7 @@ macro_rules! width_dispatch {
 }
 pub(crate) use width_dispatch;
 
-/// Each `(start, rows)` run of `width`-byte cells of `src`, copied onto `dst`
+/// Each `[start, end)` run of `width`-byte cells of `src`, copied onto `dst`
 /// back to back.
 #[inline(always)]
 pub(crate) fn copy_runs<const N: usize>(
@@ -46,15 +49,64 @@ pub(crate) fn copy_runs<const N: usize>(
     // `N = 0` is the runtime width a compound PK stride takes.
     let w = if N == 0 { width } else { N };
     let mut at = 0usize;
-    for (start, n) in runs {
+    for (start, end) in runs {
+        let n = end - start;
         if n == 1 && N != 0 {
             // A constant width keeps the one-row run a load and a store.
             let cell: [u8; N] = src[start * N..start * N + N].try_into().unwrap();
             dst[at * N..at * N + N].copy_from_slice(&cell);
         } else {
-            dst[at * w..(at + n) * w].copy_from_slice(&src[start * w..(start + n) * w]);
+            dst[at * w..(at + n) * w].copy_from_slice(&src[start * w..end * w]);
         }
         at += n;
+    }
+}
+
+/// Copy every `[start, end)` range of `src`, a batch of the writer's layout, in
+/// list order: exactly the writer's rows. String cells are shifted onto `src`'s
+/// heap carried at `heap_at`, or relocated.
+pub(crate) fn copy_ranges(
+    src: &MemBatch<'_>,
+    heap_at: Option<usize>,
+    ranges: &[(usize, usize)],
+    writer: &mut DirectWriter<'_>,
+) {
+    let schema = writer.schema;
+    debug_assert!(
+        schema.same_regions(src.schema),
+        "copy_ranges: a source of another layout"
+    );
+    match *ranges {
+        // One run is one bulk copy per region.
+        [(start, end)] => {
+            for r in 0..schema.num_regions() {
+                let stride = schema.region_stride(r);
+                writer
+                    .region_mut(r)
+                    .copy_from_slice(&src.region(r)[start * stride..end * stride]);
+            }
+        }
+        // Many runs land back to back, a region at a time: a run of one row is
+        // then a load and a store, where a bulk copy is a `memcpy` call.
+        _ => {
+            debug_assert_eq!(
+                range_rows(ranges),
+                writer.rows(),
+                "copy_ranges: a writer of another row count"
+            );
+            for r in 0..schema.num_regions() {
+                width_dispatch!(
+                    schema.region_stride(r),
+                    copy_runs,
+                    src.region(r),
+                    writer.region_mut(r),
+                    ranges.iter().copied()
+                );
+            }
+        }
+    }
+    for pi in gnitz_wire::BitIter(schema.string_payload_slots()) {
+        writer.rebase_string_col(pi, src.blob, heap_at);
     }
 }
 
@@ -175,10 +227,12 @@ pub(crate) fn scatter_unified_sources(
     for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if col.type_code.is_german_string() {
-            for (out, &(si, ri, _)) in rows.iter().enumerate() {
+            let (cells, blob, mut cache) = writer.string_col_mut(pi);
+            for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(rows) {
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                writer.write_string_cell(pi, src_struct, src.blob, src.heap_at, out);
+                cell.copy_from_slice(&src_struct[..16]);
+                rebase_string_cells(cell, src.blob, blob, src.heap_at, cache.as_deref_mut());
             }
         } else {
             width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));

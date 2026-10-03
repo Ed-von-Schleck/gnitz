@@ -15,7 +15,7 @@ use crate::algebra::{
     IMAGE_COL,
 };
 use crate::algebra::{Accumulator, ExtremeSpec};
-use crate::repr::{range_rows, Batch, ReadCursor};
+use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
@@ -159,8 +159,6 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             ColumnLocator::Payload { slot, .. } => 1 << slot,
             ColumnLocator::Pk { .. } => 0,
         });
-        let rows = range_rows(&runs);
-        let base = out.grow_rows(rows);
         let live = || runs.iter().flat_map(|&(s, e)| s..e);
 
         if let ImageKind::Wide(WideKind::Bytes) = kind {
@@ -172,56 +170,53 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             }
         }
 
-        bake.key_packer
-            .pack_rows(&mut out.pk_data_mut()[base * width..], width, &mb, &runs);
-        let mut at = base;
-        for &(s, e) in &runs {
-            out.weight_data_mut()[at * 8..(at + (e - s)) * 8].copy_from_slice(&delta.weight_data()[s * 8..e * 8]);
-            at += e - s;
-        }
-        let keys = out.pk_data_mut()[base * width..].chunks_exact_mut(width);
-        match kind {
-            ImageKind::Scalar(kind) => {
-                for (key, row) in keys.zip(live()) {
-                    key[stride] = j as u8;
-                    write_image_slot(
-                        &mut key[value.clone()],
-                        &scalar_image(&loc, kind, max, &mb, row).to_be_bytes(),
-                    );
-                }
-            }
-            ImageKind::Wide(WideKind::Fixed(_)) => {
-                for (key, row) in keys.zip(live()) {
-                    key[stride] = j as u8;
-                    write_image_slot(&mut key[value.clone()], &int16_image(&loc, max, &mb, row));
-                }
-            }
-            ImageKind::Wide(WideKind::Bytes) => {
-                let mut start = 0;
-                for (key, &end) in keys.zip(&ends) {
-                    key[stride] = j as u8;
-                    write_image_slot(&mut key[value.clone()], &images[start..end]);
-                    start = end;
-                }
-            }
-        }
-
-        if has_payload {
-            // The whole image of a string ordinal; nothing for any other.
-            let (cells, _, blob) = out.col_null_and_blob_mut(IMAGE_SLOT);
-            let cells = &mut cells[base * 16..];
+        let rows = range_rows(&runs);
+        out.append_session(rows).write(rows, |w| {
+            bake.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs);
+            copy_runs::<8>(delta.weight_data(), w.weight_mut(), runs.iter().copied(), 8);
+            w.null_bmp_mut().fill(0);
+            let keys = w.pk_mut().chunks_exact_mut(width);
             match kind {
+                ImageKind::Scalar(kind) => {
+                    for (key, row) in keys.zip(live()) {
+                        key[stride] = j as u8;
+                        write_image_slot(
+                            &mut key[value.clone()],
+                            &scalar_image(&loc, kind, max, &mb, row).to_be_bytes(),
+                        );
+                    }
+                }
+                ImageKind::Wide(WideKind::Fixed(_)) => {
+                    for (key, row) in keys.zip(live()) {
+                        key[stride] = j as u8;
+                        write_image_slot(&mut key[value.clone()], &int16_image(&loc, max, &mb, row));
+                    }
+                }
                 ImageKind::Wide(WideKind::Bytes) => {
                     let mut start = 0;
-                    for (cell, &end) in cells.as_chunks_mut::<16>().0.iter_mut().zip(&ends) {
-                        *cell = gnitz_wire::encode_german_string(&images[start..end], blob);
+                    for (key, &end) in keys.zip(&ends) {
+                        key[stride] = j as u8;
+                        write_image_slot(&mut key[value.clone()], &images[start..end]);
                         start = end;
                     }
                 }
-                _ => cells.fill(0),
             }
-        }
+
+            if has_payload {
+                // The whole image of a string ordinal; nothing for any other.
+                let (cells, blob, _) = w.string_col_mut(IMAGE_SLOT);
+                match kind {
+                    ImageKind::Wide(WideKind::Bytes) => {
+                        let mut start = 0;
+                        for (cell, &end) in cells.as_chunks_mut::<16>().0.iter_mut().zip(&ends) {
+                            *cell = gnitz_wire::encode_german_string(&images[start..end], blob);
+                            start = end;
+                        }
+                    }
+                    _ => cells.fill(0),
+                }
+            }
+        });
     }
-    out.null_bmp_data_mut().fill(0);
     out
 }

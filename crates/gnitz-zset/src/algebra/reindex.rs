@@ -11,7 +11,7 @@ use std::cell::Cell;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::PkBuf;
 
-use crate::repr::{range_rows, runs_where, Batch, MemBatch};
+use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
 
 use crate::schema::{
     oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
@@ -667,39 +667,30 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
     let mb = source.as_mem_batch();
     let runs = indexed_runs(&mb, spec, |w| w != 0);
     let rows = range_rows(&runs);
-    if rows == 0 {
-        return Batch::empty_with_schema(idx_schema);
-    }
-    let mut out = Batch::with_capacity(idx_schema, rows);
-    out.grow_rows(rows);
-    let entries = &mut out.pk_data_mut()[..rows * idx_stride];
-    ReindexPacker::of_span(spec).pack_rows(entries, idx_stride, &mb, &runs);
-    let pks = source.pk_data();
-    match src_stride {
-        4 => suffix::<4>(entries, idx_stride, key_size, pks, &runs),
-        8 => suffix::<8>(entries, idx_stride, key_size, pks, &runs),
-        16 => suffix::<16>(entries, idx_stride, key_size, pks, &runs),
-        24 => suffix::<24>(entries, idx_stride, key_size, pks, &runs),
-        32 => suffix::<32>(entries, idx_stride, key_size, pks, &runs),
-        _ => {
-            let mut entries = entries.chunks_exact_mut(idx_stride);
-            for &(s, e) in &runs {
-                let pks = pks[s * src_stride..e * src_stride].chunks_exact(src_stride);
-                for (pk, entry) in pks.zip(entries.by_ref()) {
-                    entry[key_size..].copy_from_slice(pk);
+    write_to_batch(idx_schema, rows, 0, |w| {
+        let (entries, weights, nulls) = w.fixed_mut();
+        ReindexPacker::of_span(spec).pack_rows(entries, idx_stride, &mb, &runs);
+        let pks = source.pk_data();
+        match src_stride {
+            4 => suffix::<4>(entries, idx_stride, key_size, pks, &runs),
+            8 => suffix::<8>(entries, idx_stride, key_size, pks, &runs),
+            16 => suffix::<16>(entries, idx_stride, key_size, pks, &runs),
+            24 => suffix::<24>(entries, idx_stride, key_size, pks, &runs),
+            32 => suffix::<32>(entries, idx_stride, key_size, pks, &runs),
+            _ => {
+                let mut entries = entries.chunks_exact_mut(idx_stride);
+                for &(s, e) in &runs {
+                    let pks = pks[s * src_stride..e * src_stride].chunks_exact(src_stride);
+                    for (pk, entry) in pks.zip(entries.by_ref()) {
+                        entry[key_size..].copy_from_slice(pk);
+                    }
                 }
             }
         }
-    }
-    let mut at = 0;
-    for &(s, e) in &runs {
-        let end = at + (e - s);
-        out.weight_data_mut()[at * 8..end * 8].copy_from_slice(&source.weight_data()[s * 8..e * 8]);
-        at = end;
-    }
-    // An index entry is all key: it has no payload column to be NULL.
-    out.null_bmp_data_mut().fill(0);
-    out
+        copy_runs::<8>(source.weight_data(), weights, runs.iter().copied(), 8);
+        // An index entry is all key: it has no payload column to be NULL.
+        nulls.fill(0);
+    })
 }
 
 #[cfg(test)]

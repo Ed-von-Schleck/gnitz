@@ -15,7 +15,7 @@ use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
 use super::mmap::Mmap;
 use super::scatter::DecodedColumns;
 use super::shard_filter;
-use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap, relocate_german_string_vec};
+use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
@@ -467,21 +467,15 @@ impl MappedShard {
                     *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
                 }
             }
+            // A carried heap lands first in the fresh one, so its cells stand as
+            // the shard holds them.
+            let heap_at = (!relocate).then(|| w.adopt_heap(blob));
+            debug_assert!(heap_at.is_none_or(|base| base == 0), "a fresh writer's heap is empty");
             for (pi, col) in schema.payload_columns() {
-                if relocate && col.type_code.is_german_string() {
-                    // The cells as the shard holds them, then each onto this batch's heap.
-                    let (cells, heap, mut cache) = w.string_col_mut(pi);
-                    self.decode_payload(pi, 16, start, cells);
-                    for cell in cells.as_chunks_mut::<16>().0 {
-                        *cell = relocate_german_string_vec(&*cell, blob, heap, cache.as_deref_mut());
-                    }
-                } else {
-                    self.decode_payload(pi, col.size() as usize, start, w.col_mut(pi));
+                self.decode_payload(pi, col.size() as usize, start, w.col_mut(pi));
+                if col.type_code.is_german_string() {
+                    w.rebase_string_col(pi, blob, heap_at);
                 }
-            }
-            if !relocate {
-                let base = w.adopt_heap(blob);
-                debug_assert_eq!(base, 0, "a fresh writer's heap is empty");
             }
         });
         batch.charge_dead(carried.unwrap_or(0));

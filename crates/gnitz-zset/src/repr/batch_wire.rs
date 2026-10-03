@@ -3,10 +3,12 @@
 
 use std::ops::Range;
 
-use super::batch::{Batch, REG_PAYLOAD_START};
+use super::batch::Batch;
 use super::batch_pool::PooledBuf;
-use super::merge::{DirectWriter, MemBatch};
-use super::string_heap::{blob_span_key, copy_string_cells, prorated_blob_cap, walk_heap_spans, BlobCache};
+use super::merge::MemBatch;
+use super::scatter::{copy_ranges, scatter_copy};
+use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
+use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, TypeCode};
@@ -56,8 +58,10 @@ impl WireRows<'_> {
                 wal::write_block(&b.wire_regions(), b.dead_heap, out)
             }
             Pick::Range { start, rows } => b
-                .encode_relocating(rows, self.heap, out, |fixed, heap| {
-                    b.copy_range(start, rows, fixed, heap)
+                .encode_relocating(rows, self.heap, out, true, |writer| {
+                    // An empty heap is carried: its cells name no byte of it.
+                    let heap_at = b.blob.is_empty().then_some(0);
+                    copy_ranges(&b.as_mem_batch(), heap_at, &[(start, start + rows)], writer);
                 })
                 .expect("a sized range fits the bytes its size reserved"),
             Pick::Listed { rows, dedup } => b
@@ -206,23 +210,6 @@ impl Batch {
         out
     }
 
-    /// Rows `[start, start + rows)` into `fixed`, a block's fixed bytes for
-    /// them, their string cells relocated into `heap`.
-    fn copy_range(&self, start: usize, rows: usize, fixed: &mut [u8], heap: &mut Vec<u8>) {
-        let schema = self.schema();
-        let slots = self.heap_referencing_slots();
-        let mut cache = BlobCache::new(self.string_cells(rows));
-        for r in 0..schema.num_regions() {
-            let stride = schema.region_stride(r);
-            let src = &self.region_at(r)[start * stride..][..rows * stride];
-            let dst = &mut fixed[schema.region_start(r, rows)..][..rows * stride];
-            match r.checked_sub(REG_PAYLOAD_START) {
-                Some(pi) if (slots >> pi) & 1 != 0 => copy_string_cells(dst, src, &self.blob, heap, None, &mut cache),
-                _ => dst.copy_from_slice(src),
-            }
-        }
-    }
-
     /// The rows `indices` selects, in order, as one WAL block at the front of
     /// `out`, their strings relocated into the block's own heap, for which
     /// `heap_bytes` are reserved: under span dedup when `dedup`, else each cell
@@ -230,24 +217,22 @@ impl Batch {
     /// `out`.
     fn encode_listed(&self, indices: &[u32], heap_bytes: usize, out: &mut [u8], dedup: bool) -> Option<usize> {
         let count = indices.len();
-        self.encode_relocating(count, heap_bytes, out, |fixed, heap| {
-            let mut writer = DirectWriter::over(fixed, count, count, self.schema(), heap);
-            if !dedup {
-                writer.copy_every_span();
-            }
-            super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
+        self.encode_relocating(count, heap_bytes, out, dedup, |writer| {
+            scatter_copy(&self.as_mem_batch(), indices, writer);
         })
     }
 
-    /// A WAL block of `count` rows at the front of `out`, whose fixed bytes
-    /// `fill` writes and whose heap, reserved at `heap_bytes`, it relocates
-    /// into. `None` when the block does not fit `out`.
+    /// A WAL block of `count` rows at the front of `out`, which `fill` writes
+    /// through a writer over its fixed bytes and a heap reserved at
+    /// `heap_bytes`, relocating under span dedup when `dedup`. `None` when the
+    /// block does not fit `out`.
     fn encode_relocating(
         &self,
         count: usize,
         heap_bytes: usize,
         out: &mut [u8],
-        fill: impl FnOnce(&mut [u8], &mut Vec<u8>),
+        dedup: bool,
+        fill: impl FnOnce(&mut DirectWriter<'_>),
     ) -> Option<usize> {
         let fixed = count * self.schema().row_width();
         let heap_at = wal::WAL_HEADER_SIZE + fixed;
@@ -255,7 +240,18 @@ impl Batch {
             return None;
         }
         let mut heap = PooledBuf::with_capacity(heap_bytes);
-        fill(&mut out[wal::WAL_HEADER_SIZE..heap_at], &mut heap);
+        let mut cache = BlobCache::new(self.string_cells(count));
+        let block = &mut out[wal::WAL_HEADER_SIZE..heap_at];
+        let cache = dedup.then_some(&mut cache);
+        fill(&mut DirectWriter::over(
+            block,
+            count,
+            0,
+            count,
+            self.schema(),
+            &mut heap,
+            cache,
+        ));
         let total = heap_at + heap.len();
         out.get_mut(heap_at..total)?.copy_from_slice(&heap);
         // Relocated cell by cell, so every heap byte is referenced.

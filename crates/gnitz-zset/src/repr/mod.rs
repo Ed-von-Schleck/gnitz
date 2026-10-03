@@ -4,8 +4,8 @@
 //! The pure batch representation and the operations that work directly on it:
 //! region layout (`batch`), wire serialization (`batch_wire`), TLS buffer
 //! recycling (`batch_pool`), the OPK lower-bound search (`seek`), sort-merge
-//! consolidation (`merge`), the German-string heap (`string_heap`), the
-//! column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
+//! consolidation (`merge`), the German-string heap (`string_heap`), the direct
+//! row writer (`writer`), the column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
 //! shard PK-probe filter (`shard_filter`), the shard writer (`shard_file`), the
 //! shard file's framing (`layout`) and its region encodings (`encoding`), and the
 //! guard-routed shard merge a compaction runs (`compact`), the bounded external sort of
@@ -47,6 +47,7 @@ mod shard_filter;
 mod shard_reader;
 mod spill;
 mod string_heap;
+mod writer;
 
 pub use batch::Batch;
 pub use batch_builder::BatchBuilder;
@@ -65,9 +66,8 @@ pub use shard_file::ShardWriteOpts;
 pub use shard_reader::{MappedShard, ShardDirectory};
 pub use spill::{KeyProducer, SpillSort};
 
-pub(crate) use batch::{range_rows, runs_where, RowMark};
+pub(crate) use batch::{range_rows, runs_where, write_to_batch, RowMark};
 pub(crate) use scatter::{copy_runs, materialize_carrying, width_dispatch};
 pub(crate) use seek::pk_prefix_group_end;
-pub(crate) use string_heap::{
-    copy_string_cells, prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCache,
-};
+pub(crate) use string_heap::{prorated_blob_cap, relocate_german_string_vec, should_relocate_blob};
+pub(crate) use writer::DirectWriter;

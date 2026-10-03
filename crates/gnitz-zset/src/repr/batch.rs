@@ -8,8 +8,9 @@ use std::ops::Range;
 use super::batch_pool::{is_tight, PooledBuf};
 use super::merge::{self, ColPtr, MemBatch};
 use super::run::StoredRow;
-use super::scatter::{copy_runs, width_dispatch};
-use super::string_heap::{self, copy_string_cells, relocate_german_string_vec, BlobCache};
+use super::scatter::copy_ranges;
+use super::string_heap::{self, relocate_german_string_vec, BlobCache};
+use super::writer::DirectWriter;
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
@@ -285,37 +286,9 @@ impl Batch {
 
     // ── Mutable slice accessors ─────────────────────────────────────────
 
-    #[inline]
-    pub(crate) fn pk_data_mut(&mut self) -> &mut [u8] {
-        self.region_at_mut(REG_PK)
-    }
-    #[inline]
-    pub(crate) fn weight_data_mut(&mut self) -> &mut [u8] {
-        self.region_at_mut(REG_WEIGHT)
-    }
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn null_bmp_data_mut(&mut self) -> &mut [u8] {
         self.region_at_mut(REG_NULL_BMP)
-    }
-    #[inline]
-    pub(crate) fn col_data_mut(&mut self, pi: usize) -> &mut [u8] {
-        self.region_at_mut(REG_PAYLOAD_START + pi)
-    }
-
-    /// Split borrow of payload column `pi`'s region, the NULL bitmap, and the
-    /// blob heap: what a writer of one column's cells, their null bits and
-    /// their strings holds at once.
-    #[inline]
-    pub(crate) fn col_null_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
-        self.consolidated = false;
-        let n_off = self.region_start(REG_NULL_BMP);
-        let n_end = n_off + self.count * FIXED_REGION_BYTES;
-        let r = REG_PAYLOAD_START + pi;
-        let c_off = self.region_start(r);
-        let c_end = c_off + self.count * self.schema.region_stride(r);
-        debug_assert!(n_end <= c_off, "null bitmap region must precede payload region {pi}");
-        let (lo, hi) = self.data.split_at_mut(c_off);
-        (&mut hi[..c_end - c_off], &mut lo[n_off..n_end], &mut self.blob.0)
     }
 
     // ── Row accessors ───────────────────────────────────────────────────
@@ -449,17 +422,6 @@ impl Batch {
         self.debug_poison_rows(self.count..new_cap);
     }
 
-    /// Count `n` more rows and return the first one's index. Their regions are
-    /// uninitialized (see [`Self::with_capacity`]): the caller writes every one
-    /// through the region accessors, which reach a row only once it is counted.
-    pub(crate) fn grow_rows(&mut self, n: usize) -> usize {
-        self.reserve_rows(n);
-        let at = self.count;
-        self.count += n;
-        self.consolidated = false;
-        at
-    }
-
     /// In debug builds, fill `rows` of every region with `0xA5`, so reading a row
     /// nothing wrote sees an implausible value rather than a plausible leftover.
     fn debug_poison_rows(&mut self, rows: Range<usize>) {
@@ -555,14 +517,6 @@ impl Batch {
         self.commit_row();
     }
 
-    /// Rows `[start, end)` of `src_region`, a source's region `r`, onto this
-    /// batch's tail.
-    fn bulk_copy_region(&mut self, r: usize, src_region: &[u8], start: usize, end: usize) {
-        let stride = self.schema.region_stride(r);
-        let first = self.region_start(r) + self.count * stride;
-        self.data[first..first + (end - start) * stride].copy_from_slice(&src_region[start * stride..end * stride]);
-    }
-
     /// Open an [`AppendSession`] over this batch; `hint_rows` sizes its blob
     /// dedup cache.
     pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
@@ -608,55 +562,33 @@ impl AppendSession<'_> {
         if total == 0 {
             return;
         }
-        dst.reserve_rows(total);
         if heap_at.is_none() && !src.blob.is_empty() {
             // The rows this call copies, not the whole source heap: a many-run merge
             // appends into one output, and the whole heap per run ratchets capacity.
             dst.reserve_blob(string_heap::prorated_blob_cap(src.blob.len(), src.count, total));
         }
-        let strings = dst.schema.string_payload_slots();
-        let at = dst.count;
-        let nr = dst.schema.num_regions();
-        if let [(start, end)] = *ranges {
-            // One run is one bulk copy per region.
-            dst.bulk_copy_region(REG_PK, src.pk(), start, end);
-            dst.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
-            dst.bulk_copy_region(REG_NULL_BMP, src.null_bmp(), start, end);
-            for r in REG_PAYLOAD_START..nr {
-                let pi = r - REG_PAYLOAD_START;
-                if (strings >> pi) & 1 != 0 {
-                    let first = dst.region_start(r) + at * 16;
-                    let cells = &src.col_data(pi, 16)[start * 16..end * 16];
-                    let out = &mut dst.data[first..first + total * 16];
-                    copy_string_cells(out, cells, src.blob, &mut dst.blob, heap_at, &mut self.cache);
-                } else {
-                    dst.bulk_copy_region(r, src.region(r), start, end);
-                }
-            }
-        } else {
-            // Many runs land back to back, column-first: a run of a row or two is
-            // then a load and a store, where a bulk copy is a `memcpy` call.
-            let runs = || ranges.iter().map(|&(start, end)| (start, end - start));
-            for r in 0..nr {
-                let stride = dst.schema.region_stride(r);
-                let first = dst.region_start(r) + at * stride;
-                let (cells, from) = (&mut dst.data[first..first + total * stride], src.region(r));
-                match r.checked_sub(REG_PAYLOAD_START) {
-                    Some(pi) if (strings >> pi) & 1 != 0 => {
-                        let mut done = 0;
-                        for (start, n) in runs() {
-                            let run = &from[start * 16..(start + n) * 16];
-                            let out = &mut cells[done * 16..(done + n) * 16];
-                            copy_string_cells(out, run, src.blob, &mut dst.blob, heap_at, &mut self.cache);
-                            done += n;
-                        }
-                    }
-                    _ => width_dispatch!(stride, copy_runs, from, cells, runs()),
-                }
-            }
-        }
-        dst.count += total;
+        self.write(total, |w| copy_ranges(src, heap_at, ranges, w));
+    }
+
+    /// Write `rows` rows past the destination's last through `fill`, relocating
+    /// strings under the session's cache. They are counted once `fill` returns,
+    /// so no reader reaches a row before its regions are written.
+    #[inline(always)]
+    pub(crate) fn write<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
+        let dst = &mut *self.dst;
+        dst.reserve_rows(rows);
         dst.consolidated = false;
+        let out = fill(&mut DirectWriter::over(
+            &mut dst.data,
+            dst.capacity,
+            dst.count,
+            rows,
+            &dst.schema,
+            &mut dst.blob,
+            Some(&mut self.cache),
+        ));
+        dst.count += rows;
+        out
     }
 
     /// Append one row of `src` at an explicit weight, under the session's own
@@ -671,11 +603,10 @@ impl AppendSession<'_> {
         match heap_at {
             _ if weight == 0 => self.leave_out(src, heap_at, row),
             None => self.push_row(src, row, weight),
-            Some(_) => {
-                self.push_ranges(src, heap_at, &[(row, row + 1)]);
-                let last = self.dst.count - 1;
-                self.dst.weight_data_mut()[last * 8..].copy_from_slice(&weight.to_le_bytes());
-            }
+            Some(_) => self.write(1, |w| {
+                copy_ranges(src, heap_at, &[(row, row + 1)], w);
+                w.weight_mut().copy_from_slice(&weight.to_le_bytes());
+            }),
         }
     }
 
@@ -862,32 +793,34 @@ impl Batch {
         out
     }
 
-    /// A fresh `out_schema` batch of this batch's rows carrying everything but
-    /// the PK and NULL regions: blob heap, weights, and every payload column,
-    /// landed at output slot `first_slot + pi`.
-    ///
-    /// **`count` is published while the PK and NULL regions are unwritten** — the
-    /// caller must write both, or a release build reads uninitialized arena bytes.
-    fn shell_for(&self, out_schema: &SchemaDescriptor, first_slot: usize) -> Batch {
+    /// Every row copied into a fresh `out_schema` batch: its weight, and every
+    /// payload column landed at output slot `first_slot + pi` over this batch's
+    /// heap. `rest` writes what remains — the PK region, the null words, and
+    /// any output column no input column lands in.
+    fn copied_into(
+        &self,
+        out_schema: &SchemaDescriptor,
+        first_slot: usize,
+        rest: impl FnOnce(&mut DirectWriter<'_>),
+    ) -> Batch {
         let in_schema = &self.schema;
         debug_assert!(
             out_schema.num_payload_cols() >= first_slot + in_schema.num_payload_cols(),
-            "shell_for copies every payload column at first_slot + its own index",
+            "copied_into lands every payload column at first_slot + its own index",
         );
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
-        out.grow_rows(n);
         let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)]);
-        let mut cache = BlobCache::new(self.string_cells(n));
-        out.weight_data_mut().copy_from_slice(self.weight_data());
-        for (pi, col) in in_schema.payload_columns() {
-            let src = &self.col_data(pi)[..n * col.size() as usize];
-            let (dst, _, dst_blob) = out.col_null_and_blob_mut(first_slot + pi);
-            match col.type_code.is_german_string() {
-                true => copy_string_cells(dst, src, &self.blob, dst_blob, heap_at, &mut cache),
-                false => dst.copy_from_slice(src),
+        out.append_session(n).write(n, |w| {
+            w.weight_mut().copy_from_slice(self.weight_data());
+            for (pi, col) in in_schema.payload_columns() {
+                w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
+                if col.type_code.is_german_string() {
+                    w.rebase_string_col(first_slot + pi, &self.blob, heap_at);
+                }
             }
-        }
+            rest(w);
+        });
         out
     }
 
@@ -925,18 +858,14 @@ impl Batch {
     /// each output key written by `rekey(src_key, dst_key)`. Left unconsolidated.
     fn rekeyed(&self, out_schema: &SchemaDescriptor, rekey: impl Fn(&[u8], &mut [u8])) -> Batch {
         debug_assert_eq!(out_schema.num_payload_cols(), self.schema.num_payload_cols());
-        let mut output = self.shell_for(out_schema, 0);
-        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
-        let out_stride = out_schema.pk_stride();
-        let in_stride = self.schema.pk_stride();
-        for (dst, src) in output
-            .pk_data_mut()
-            .chunks_exact_mut(out_stride)
-            .zip(self.pk_data().chunks_exact(in_stride))
-        {
-            rekey(src, dst);
-        }
-        output
+        self.copied_into(out_schema, 0, |w| {
+            let (pk, _, nulls) = w.fixed_mut();
+            nulls.copy_from_slice(self.null_bmp_data());
+            let keys = pk.chunks_exact_mut(out_schema.pk_stride());
+            for (dst, src) in keys.zip(self.pk_data().chunks_exact(self.schema.pk_stride())) {
+                rekey(src, dst);
+            }
+        })
     }
 
     /// Copy every row into `out_schema`, which extends this batch's schema with
@@ -952,30 +881,29 @@ impl Batch {
         let out_npc = out_schema.num_payload_cols();
         debug_assert!(out_npc >= in_npc);
         let n_new = out_npc - in_npc;
-
-        let first_slot = if nulls_first { n_new } else { 0 };
-        let mut output = self.shell_for(out_schema, first_slot);
-        output.pk_data_mut().copy_from_slice(self.pk_data());
-
-        // The appended columns are NULL, and a NULL cell is zeroed.
-        let new_slots = match nulls_first {
-            true => 0..n_new,
-            false => in_npc..out_npc,
+        let (first_slot, new_slots) = match nulls_first {
+            true => (n_new, 0..n_new),
+            false => (0, in_npc..out_npc),
         };
-        for pi in new_slots {
-            output.col_data_mut(pi).fill(0);
-        }
         let new_null_bits = gnitz_wire::low_bits_mask(n_new);
-        let out_words = output.null_bmp_data_mut().as_chunks_mut::<8>().0;
-        for (out, word) in out_words.iter_mut().zip(self.null_bmp_data().as_chunks::<8>().0) {
-            let in_null = u64::from_le_bytes(*word);
-            let out_null = match nulls_first {
-                true => new_null_bits | gnitz_wire::null_word_at(in_null, n_new),
-                false => in_null | gnitz_wire::null_word_at(new_null_bits, in_npc),
-            };
-            *out = out_null.to_le_bytes();
-        }
 
+        let mut output = self.copied_into(out_schema, first_slot, |w| {
+            // The appended columns are NULL, and a NULL cell is zeroed.
+            for pi in new_slots {
+                w.col_mut(pi).fill(0);
+            }
+            let (pk, _, nulls) = w.fixed_mut();
+            pk.copy_from_slice(self.pk_data());
+            let out_words = nulls.as_chunks_mut::<8>().0.iter_mut();
+            for (out, word) in out_words.zip(self.null_bmp_data().as_chunks::<8>().0) {
+                let in_null = u64::from_le_bytes(*word);
+                let out_null = match nulls_first {
+                    true => new_null_bits | gnitz_wire::null_word_at(in_null, n_new),
+                    false => in_null | gnitz_wire::null_word_at(new_null_bits, in_npc),
+                };
+                *out = out_null.to_le_bytes();
+            }
+        });
         output.inherit_consolidated(self);
         output
     }
@@ -1375,37 +1303,19 @@ impl RowSource for Batch {
     }
 }
 
-impl gnitz_expr::MapTarget for Batch {
-    #[inline(always)]
-    fn null_bmp_mut(&mut self) -> &mut [u8] {
-        self.null_bmp_data_mut()
-    }
-    #[inline(always)]
-    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
-        self.col_null_and_blob_mut(pi)
-    }
-}
-
 /// A batch of `rows` rows, every one written in place by `write_fn` through a
-/// [`merge::DirectWriter`] over its uninitialized arena.
+/// [`DirectWriter`] over its uninitialized arena.
 pub(crate) fn write_to_batch(
     schema: &SchemaDescriptor,
     rows: usize,
     max_blob: usize,
-    write_fn: impl FnOnce(&mut merge::DirectWriter),
+    write_fn: impl FnOnce(&mut DirectWriter),
 ) -> Batch {
     if rows == 0 {
         return Batch::empty_with_schema(schema);
     }
     let mut b = Batch::with_capacity_blob(schema, rows, max_blob);
-    write_fn(&mut merge::DirectWriter::over(
-        &mut b.data,
-        b.capacity,
-        rows,
-        &b.schema,
-        &mut b.blob,
-    ));
-    b.count = rows;
+    b.append_session(rows).write(rows, write_fn);
     if b.blob.is_empty() {
         b.blob = PooledBuf::default();
     }

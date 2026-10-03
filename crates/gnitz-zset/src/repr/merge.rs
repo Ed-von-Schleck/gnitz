@@ -1,6 +1,6 @@
-//! The borrowed batch view [`MemBatch`], the columnar source abstraction and
-//! the direct row writer over it, and the merges built on them: the N-way run
-//! merge, in-batch consolidation, and the two-way batch merge.
+//! The borrowed batch view [`MemBatch`], the columnar source abstraction, and
+//! the merges built on them: the N-way run merge, in-batch consolidation, and
+//! the two-way batch merge.
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
@@ -17,7 +17,6 @@ use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, R
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
-use super::string_heap::{relocate_german_string_vec, BlobCache};
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
@@ -352,138 +351,6 @@ impl PosCursor {
     #[inline]
     pub(crate) fn advance(&mut self) {
         self.position += 1;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DirectWriter: writes into pre-allocated output buffers
-// ---------------------------------------------------------------------------
-
-/// Writes the first `rows` rows of a pre-allocated arena: a `write_to_batch`
-/// batch's, or a wire block's fixed bytes.
-///
-/// **Whoever fills a writer writes every byte of every one of its rows** — the
-/// batch invariant (see `Batch::with_capacity`): the arena skips its memset, so
-/// a skipped cell leaks the recycled buffer's previous contents rather than
-/// reading back a zero. Hence the `repr::scatter` kernels take exactly `rows`
-/// rows and write every payload cell unconditionally, a null cell included.
-pub(crate) struct DirectWriter<'a> {
-    /// An arena of `cap` rows under `schema`, of which rows `[0, rows)` are
-    /// this writer's to fill.
-    data: &'a mut [u8],
-    cap: usize,
-    rows: usize,
-    /// Growable blob arena; capacity is reserved up-front by `write_to_batch`,
-    /// and `blob.len()` doubles as the next-write offset.
-    blob: &'a mut Vec<u8>,
-    /// `None` relocates every cell on its own.
-    blob_cache: Option<BlobCache>,
-    /// Borrowed, not owned: the scatter reads it per column, and copying it in
-    /// would put a `memcpy` on every writer open.
-    pub schema: &'a SchemaDescriptor,
-}
-
-impl<'a> DirectWriter<'a> {
-    /// A writer of the first `rows` rows of `data`, an arena of `cap` rows under
-    /// `schema`.
-    pub(crate) fn over(
-        data: &'a mut [u8],
-        cap: usize,
-        rows: usize,
-        schema: &'a SchemaDescriptor,
-        blob: &'a mut Vec<u8>,
-    ) -> Self {
-        debug_assert!(rows <= cap && data.len() >= cap * schema.row_width());
-        let cells = rows * schema.string_payload_slots().count_ones() as usize;
-        DirectWriter {
-            data,
-            cap,
-            rows,
-            blob,
-            blob_cache: Some(BlobCache::new(cells)),
-            schema,
-        }
-    }
-
-    /// Rows this writer fills.
-    #[inline]
-    pub(super) fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// The PK, weight and null-word regions, each bounded to this writer's rows.
-    #[inline]
-    pub(super) fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
-        let pk_stride = self.schema.pk_stride();
-        let (pk, rest) = self.data.split_at_mut(self.cap * pk_stride);
-        let (weight, rest) = rest.split_at_mut(self.cap * 8);
-        (
-            &mut pk[..self.rows * pk_stride],
-            &mut weight[..self.rows * 8],
-            &mut rest[..self.rows * 8],
-        )
-    }
-
-    /// Payload column `pi`'s region, bounded to this writer's rows.
-    #[inline]
-    pub(super) fn col_mut(&mut self, pi: usize) -> &mut [u8] {
-        let r = REG_PAYLOAD_START + pi;
-        let start = self.schema.region_start(r, self.cap);
-        &mut self.data[start..start + self.rows * self.schema.region_stride(r)]
-    }
-
-    /// String column `pi`'s region, with the heap a relocation into it appends
-    /// to and the dedup cache it runs under.
-    #[inline]
-    pub(super) fn string_col_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>, Option<&mut BlobCache>) {
-        let start = self.schema.region_start(REG_PAYLOAD_START + pi, self.cap);
-        (
-            &mut self.data[start..start + self.rows * 16],
-            &mut *self.blob,
-            self.blob_cache.as_mut(),
-        )
-    }
-
-    /// Relocate every string cell on its own from here on: two cells naming one
-    /// source span each get a copy. For rows whose spans rarely repeat, where
-    /// the dedup probe costs more than the copy it saves.
-    pub(super) fn copy_every_span(&mut self) {
-        self.blob_cache = None;
-    }
-
-    /// Write one German-string cell at `out_row`: shifted onto `src_blob`
-    /// carried at `heap_at`, or relocated into this writer's heap.
-    #[inline]
-    pub(super) fn write_string_cell(
-        &mut self,
-        payload_col: usize,
-        src_struct: &[u8],
-        src_blob: &[u8],
-        heap_at: Option<usize>,
-        out_row: usize,
-    ) {
-        let start = self.schema.region_start(REG_PAYLOAD_START + payload_col, self.cap);
-        let dst = &mut self.data[start..start + self.rows * 16][out_row * 16..(out_row + 1) * 16];
-        match heap_at {
-            Some(base) => {
-                dst.copy_from_slice(&src_struct[..16]);
-                gnitz_wire::shift_german_string_heaps(dst, base);
-            }
-            None => dst.copy_from_slice(&relocate_german_string_vec(
-                src_struct,
-                src_blob,
-                self.blob,
-                self.blob_cache.as_mut(),
-            )),
-        }
-    }
-
-    /// Carry a source heap whole onto the end of this writer's heap. Returns the
-    /// base the caller shifts its copied cells' offsets by.
-    pub(super) fn adopt_heap(&mut self, src_blob: &[u8]) -> usize {
-        let base = self.blob.len();
-        self.blob.extend_from_slice(src_blob);
-        base
     }
 }
 

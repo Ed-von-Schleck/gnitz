@@ -8,7 +8,7 @@
 use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
-use crate::repr::{copy_string_cells, Batch, BlobCache};
+use crate::repr::{Batch, DirectWriter};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use gnitz_wire::{zip_cells, FixedInt};
 
@@ -52,18 +52,16 @@ enum PkSource {
 // ---------------------------------------------------------------------------
 
 /// Copy a single column from `in_batch` to `output` over `w`, a German-string
-/// cell rebased per [`copy_string_cells`]. The source is read at its own
+/// cell verbatim: the caller rebases the column. The source is read at its own
 /// type's width and sign/zero-extended into a wider (promoted) destination slot.
 fn copy_column(
     in_batch: &Batch,
-    output: &mut Batch,
+    output: &mut DirectWriter<'_>,
     &ColCopy {
         src: src_loc,
         slot: dst_payload,
         width: stride,
     }: &ColCopy,
-    heap_at: Option<usize>,
-    cache: &mut BlobCache,
     w: RowWindow,
 ) {
     let RowWindow { src: src_start, dst: dst_base, n } = w;
@@ -74,7 +72,7 @@ fn copy_column(
             // source column's own width.
             let pk_stride = in_batch.schema().pk_stride();
             let pk = &in_batch.pk_data()[src_start * pk_stride..(src_start + n) * pk_stride];
-            let dst = &mut output.col_data_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
+            let dst = &mut output.col_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
             let (off, src_stride) = (byte_off as usize, size as usize);
             if src_stride == stride {
                 gnitz_wire::decode_pk_cells(pk, pk_stride, off, stride, type_code.is_signed_int(), dst);
@@ -85,28 +83,17 @@ fn copy_column(
         ColumnLocator::Payload { slot, size, type_code } => {
             let in_pi = slot as usize;
             let src_stride = size as usize; // source read width
-            if type_code.is_german_string() {
-                // STRING and BLOB share the 16-byte German-string struct, whose
-                // heap-offset field points into the source batch's blob.
-                debug_assert_eq!(
-                    (src_stride, stride),
-                    (16, 16),
-                    "German-string column moved at a non-16-byte stride",
-                );
-                let src = &in_batch.col_data(in_pi)[src_start * 16..(src_start + n) * 16];
-                // One split borrow, so the destination region is resolved once.
-                let (dst_col, _, dst_blob) = output.col_null_and_blob_mut(dst_payload);
-                let dst = &mut dst_col[dst_base * 16..(dst_base + n) * 16];
-                copy_string_cells(dst, src, in_batch.blob(), dst_blob, heap_at, cache);
-                return;
-            }
+            debug_assert!(
+                !type_code.is_german_string() || (src_stride, stride) == (16, 16),
+                "German-string column moved at a non-16-byte stride",
+            );
             debug_assert!(
                 (src_start + n) * src_stride <= in_batch.col_data(in_pi).len(),
                 "copy_column: source column {in_pi} is shorter than rows [{src_start}, {}) at stride {src_stride}",
                 src_start + n
             );
             let src = &in_batch.col_data(in_pi)[src_start * src_stride..(src_start + n) * src_stride];
-            let dst = &mut output.col_data_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
+            let dst = &mut output.col_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
             if src_stride == stride {
                 dst.copy_from_slice(src);
             } else {
@@ -162,18 +149,15 @@ pub struct MapPlan {
     out_schema: SchemaDescriptor,
 }
 
-/// Set every row's PK to the [`FoldCols`] digest of its payload columns, so equal
-/// rows share a PK. Two distinct rows whose 128-bit digests collide become one
+/// Set the PK of each of `output`'s rows, whose payload and null words are
+/// written, to the [`FoldCols`] digest of its payload columns, so equal rows
+/// share a PK. Two distinct rows whose 128-bit digests collide become one
 /// element; accepted, not checked.
-fn reindex_hash_row(output: &mut Batch, fold: &FoldCols) {
-    let n = output.count;
+fn reindex_hash_row(output: &mut DirectWriter<'_>, fold: &FoldCols) {
+    let (first, n) = (output.first_row(), output.rows());
     // The PK *is* the digest, so the OPK region is its big-endian bytes.
     const KEY_BYTES: usize = std::mem::size_of::<u128>();
-    assert_eq!(
-        output.schema().pk_stride(),
-        KEY_BYTES,
-        "a hash-row PK is one U128 column"
-    );
+    assert_eq!(output.schema.pk_stride(), KEY_BYTES, "a hash-row PK is one U128 column");
     // Hashing borrows `output` and the write-back mutates it, so keys are staged
     // per chunk.
     const CHUNK: usize = 256;
@@ -182,12 +166,12 @@ fn reindex_hash_row(output: &mut Batch, fold: &FoldCols) {
     while start < n {
         let end = (start + CHUNK).min(n);
         {
-            let mb = output.as_mem_batch();
-            for row in start..end {
-                keys[row - start] = fold.key_row(&mb, row, mb.get_null_word(row));
+            let mb = output.written();
+            for (key, row) in keys.iter_mut().zip(first + start..first + end) {
+                *key = fold.key_row(&mb, row, mb.get_null_word(row));
             }
         }
-        let pk = &mut output.pk_data_mut()[start * KEY_BYTES..end * KEY_BYTES];
+        let pk = &mut output.pk_mut()[start * KEY_BYTES..end * KEY_BYTES];
         for (key, dst) in keys.iter().zip(pk.as_chunks_mut::<KEY_BYTES>().0) {
             *dst = key.to_be_bytes();
         }
@@ -346,10 +330,6 @@ impl MapPlan {
     /// Map every `[start, end)` range of `src`, in order, onto `keeper`'s tail;
     /// `keeper` is in this plan's output schema.
     pub(crate) fn append_map_ranges(&mut self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
-        debug_assert!(
-            matches!(self.pk_source, PkSource::Inherit),
-            "append_map_ranges: any other source leaves the keeper's PK region unwritten",
-        );
         self.map_ranges_into(src, keeper, ranges);
     }
 
@@ -373,10 +353,6 @@ impl MapPlan {
         // and the calls below cover the PK, weight and null regions.
         let mut output = Batch::with_capacity(&self.out_schema, n);
         self.map_ranges_into(in_batch, &mut output, ranges);
-        // The one source that keys on the finished output row.
-        if let PkSource::HashRow(fold) = &self.pk_source {
-            reindex_hash_row(&mut output, fold);
-        }
         output
     }
 
@@ -400,37 +376,35 @@ impl MapPlan {
             None => (src, ranges),
         };
         let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
-
-        let blob_cap = crate::repr::prorated_blob_cap(src.blob().len(), src.count, total);
-        let old = out.grow_rows(total);
-
-        let mut cache = BlobCache::new(out.string_cells(total));
         // For relocated copies and string emits alike.
-        if out.schema().has_german_string() && heap_at.is_none() && blob_cap != 0 {
-            out.reserve_blob(blob_cap);
+        if out.schema().has_german_string() && heap_at.is_none() {
+            out.reserve_blob(crate::repr::prorated_blob_cap(src.blob().len(), src.count, total));
         }
-        let mut dst = old;
-        for &(start, end) in ranges {
-            let w = RowWindow { src: start, dst, n: end - start };
-            self.map_rows_into(src, out, w, heap_at, &mut cache);
-            dst += w.n;
-        }
+        out.append_session(total).write(total, |out| {
+            let mut dst = 0;
+            for &(start, end) in ranges {
+                let w = RowWindow { src: start, dst, n: end - start };
+                self.map_rows_into(src, out, w);
+                dst += w.n;
+            }
+            for c in self.ev.copies() {
+                if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
+                    out.rebase_string_col(c.slot, src.blob(), heap_at);
+                }
+            }
+            // The one source that keys on the finished output row.
+            if let PkSource::HashRow(fold) = &self.pk_source {
+                reindex_hash_row(out, fold);
+            }
+        });
     }
 
-    /// Map one row window: PK, weight, column moves, then the null words and
-    /// computed columns. `out.count` must already cover the destination window —
-    /// every `*_mut` accessor is `count`-bounded.
+    /// Map one row window of `output`'s rows: PK, weight, column moves, then the
+    /// null words and computed columns.
     ///
     /// `#[inline(always)]`: it runs once per window, and a window can be one row.
     #[inline(always)]
-    fn map_rows_into(
-        &mut self,
-        in_batch: &Batch,
-        output: &mut Batch,
-        w: RowWindow,
-        heap_at: Option<usize>,
-        cache: &mut BlobCache,
-    ) {
+    fn map_rows_into(&mut self, in_batch: &Batch, output: &mut DirectWriter<'_>, w: RowWindow) {
         let RowWindow { src: src_start, dst: dst_base, n } = w;
         // Both PK sources that read the *input* row, so both belong to the
         // window rather than to a pass over the finished batch.
@@ -439,27 +413,27 @@ impl MapPlan {
                 let pk_st = in_batch.schema().pk_stride();
                 debug_assert_eq!(
                     pk_st,
-                    output.schema().pk_stride(),
+                    output.schema.pk_stride(),
                     "PkSource::Inherit: PK stride mismatch"
                 );
-                output.pk_data_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
+                output.pk_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
                     .copy_from_slice(&in_batch.pk_data()[src_start * pk_st..(src_start + n) * pk_st]);
             }
             PkSource::Pack(packer) => {
-                debug_assert_eq!(output.schema().pk_stride(), packer.out_stride);
+                debug_assert_eq!(output.schema.pk_stride(), packer.out_stride);
                 let stride = packer.out_stride;
-                let pk = &mut output.pk_data_mut()[dst_base * stride..];
+                let pk = &mut output.pk_mut()[dst_base * stride..];
                 packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), &[(src_start, src_start + n)]);
             }
-            // Hashes the finished output row, so `evaluate_map_batch` stamps it
-            // once the payload below is written.
+            // Hashes the finished output row, so `map_ranges_into` stamps it
+            // once every window's payload is written.
             PkSource::HashRow(_) => {}
         }
-        output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
+        output.weight_mut()[dst_base * 8..(dst_base + n) * 8]
             .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);
 
         for c in self.ev.copies() {
-            copy_column(in_batch, output, c, heap_at, cache, w);
+            copy_column(in_batch, output, c, w);
         }
         self.ev
             .write_computed(&in_batch.as_mem_batch(), src_start, n, output, dst_base);
