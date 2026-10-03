@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use super::reindex::{locate_key_col, FoldCols};
+use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::key::{pk_width_dispatch, NarrowPkOpk, PkSortKey};
 use crate::schema::{
@@ -15,14 +15,18 @@ use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 
-/// A row's group key, as the output PK a reduce over the group set stamps.
+/// A row's key as the PK bytes its consumer gives it: a group as the output PK a
+/// reduce over the group set stamps, a join key as its `_join_pk`.
 pub(crate) enum GroupKey {
-    /// The leading `n` PK bytes.
-    PkPrefix(usize),
-    /// One column's OPK image, at that column's width.
+    /// The `n` PK bytes at `at`: consecutive PK columns' own images.
+    PkRange { at: usize, n: usize },
+    /// One payload column's OPK image, at that column's width.
     Image(ColumnLocator),
-    /// The NULL-distinct XXH3 fold of the group columns, as the 16-byte
-    /// `_group_pk`. Over no columns it is V₀.
+    /// The group's packed key, NULLs marked: at most 16 bytes, held by the
+    /// `_group_pk` — also a join key packed off the PK region, at any width.
+    Packed(ReindexPacker),
+    /// The NULL-distinct XXH3 fold of the group columns: the `_group_pk` of a
+    /// group whose own images do not fit one. Over no columns it is V₀.
     Fold(FoldCols),
 }
 
@@ -34,13 +38,31 @@ impl GroupKey {
             .map(|&c| locate_key_col(schema, c, "group key"))
             .collect::<Result<_, _>>()?;
         Ok(match (schema.reduce_out_key(group_cols), &locs[..]) {
-            (ReduceOutKey::SyntheticFold, _) => GroupKey::Fold(FoldCols::new(locs)),
-            (ReduceOutKey::Natural, &[ColumnLocator::Pk { byte_off: 0, size, .. }]) => {
-                GroupKey::PkPrefix(size as usize)
-            }
-            (ReduceOutKey::Natural, &[loc]) => GroupKey::Image(loc),
-            (ReduceOutKey::Natural, _) => GroupKey::PkPrefix(schema.pk_stride()),
+            (ReduceOutKey::Natural, &[loc]) => Self::column(loc),
+            (ReduceOutKey::Natural, _) => GroupKey::PkRange { at: 0, n: schema.pk_stride() },
+            // A `_group_pk` holds the group itself where its packed key fits one.
+            (ReduceOutKey::SyntheticFold, _) => match ReindexPacker::new_group_key(schema, group_cols, &[])?.0 {
+                p if p.packs_whole() && (1..=GROUP_PK_BYTES).contains(&p.out_stride) => Self::packed(p),
+                _ => GroupKey::Fold(FoldCols::new(locs)),
+            },
         })
+    }
+
+    /// One column as its own key.
+    fn column(loc: ColumnLocator) -> Self {
+        match loc {
+            ColumnLocator::Pk { byte_off, size, .. } => GroupKey::PkRange { at: byte_off as usize, n: size as usize },
+            ColumnLocator::Payload { .. } => GroupKey::Image(loc),
+        }
+    }
+
+    /// The key `packer` packs, read in place where the batch already spells it.
+    pub(crate) fn packed(packer: ReindexPacker) -> Self {
+        match (packer.pk_range(), packer.identity_columns().as_deref()) {
+            (Some((at, n)), _) => GroupKey::PkRange { at, n },
+            (None, Some(&[loc])) => Self::column(loc),
+            _ => GroupKey::Packed(packer),
+        }
     }
 
     /// This key as one cell per row of `mb`, where it is 1 to 16 bytes of one region.
@@ -54,8 +76,7 @@ impl GroupKey {
             signed: false,
         };
         match *self {
-            GroupKey::PkPrefix(n) if (1..=NARROW_PK_MAX_BYTES).contains(&n) => Some(pk(0, n)),
-            GroupKey::Image(ColumnLocator::Pk { byte_off, size, .. }) => Some(pk(byte_off as usize, size as usize)),
+            GroupKey::PkRange { at, n } if (1..=NARROW_PK_MAX_BYTES).contains(&n) => Some(pk(at, n)),
             GroupKey::Image(ColumnLocator::Payload { slot, size, type_code }) => Some(KeyCells {
                 region: mb.col_data(slot as usize, size as usize),
                 stride: size as usize,
@@ -64,7 +85,8 @@ impl GroupKey {
                 opk: false,
                 signed: type_code.is_signed_int(),
             }),
-            GroupKey::PkPrefix(_) | GroupKey::Fold(_) => None,
+            GroupKey::Image(ColumnLocator::Pk { .. }) => unreachable!("a PK column keys as a PK range"),
+            GroupKey::PkRange { .. } | GroupKey::Packed(_) | GroupKey::Fold(_) => None,
         }
     }
 }
@@ -156,6 +178,8 @@ pub(crate) fn ground_pk() -> NarrowPkOpk {
 /// top-N) groups its input and keys its output. A group is its output PK.
 pub(crate) struct GroupOutKey {
     key: GroupKey,
+    /// The output PK is a hidden `_group_pk`, which the key is widened to.
+    synthetic: bool,
     /// The input columns the output carries after its key, as the input locates them.
     carried: Vec<ColumnLocator>,
 }
@@ -169,10 +193,7 @@ impl GroupOutKey {
         row: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, DerivedSchema), String> {
         let key = GroupKey::new(input, group_cols)?;
-        let kind = match key {
-            GroupKey::Fold(_) => ReduceOutKey::SyntheticFold,
-            _ => ReduceOutKey::Natural,
-        };
+        let kind = input.reduce_out_key(group_cols);
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
         for slot in kind.output_layout(group_cols, row) {
@@ -185,7 +206,8 @@ impl GroupOutKey {
                 }
             }
         }
-        Ok((GroupOutKey { key, carried }, b))
+        let synthetic = kind == ReduceOutKey::SyntheticFold;
+        Ok((GroupOutKey { key, synthetic, carried }, b))
     }
 
     /// Grouped by the empty set: one group, V₀.
@@ -197,13 +219,15 @@ impl GroupOutKey {
     /// The output PK of `row`'s group.
     #[inline]
     pub(crate) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
+        let group_pk = |image| OutPk::Narrow(NarrowPkOpk::new(image, GROUP_PK_BYTES));
         match &self.key {
-            &GroupKey::PkPrefix(w) => OutPk::Borrowed(mb.get_pk_prefix(row, w)),
+            &GroupKey::PkRange { at, n } if self.synthetic => {
+                group_pk(gnitz_wire::widen_pk_be(mb.get_pk_range(row, at, n)))
+            }
+            &GroupKey::PkRange { at, n } => OutPk::Borrowed(mb.get_pk_range(row, at, n)),
             &GroupKey::Image(loc) => OutPk::Narrow(NarrowPkOpk::new(loc.opk_image(mb, row), loc.size())),
-            GroupKey::Fold(f) => OutPk::Narrow(NarrowPkOpk::new(
-                f.key_row(mb, row, mb.get_null_word(row)),
-                GROUP_PK_BYTES,
-            )),
+            GroupKey::Packed(p) => group_pk(p.narrow_image(mb, row)),
+            GroupKey::Fold(f) => group_pk(f.key_row(mb, row, mb.get_null_word(row))),
         }
     }
 
@@ -219,7 +243,8 @@ impl GroupOutKey {
         }
         match &self.key {
             GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r, mb.get_null_word(r))),
-            &GroupKey::PkPrefix(w) => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_prefix(r, w))),
+            GroupKey::Packed(p) => packed_identity(p, mb, body),
+            &GroupKey::PkRange { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
             GroupKey::Image(_) => unreachable!("an image key is one cell"),
         }
     }
@@ -252,8 +277,8 @@ impl GroupOutKey {
             // One run, with no key to compute.
             _ if n <= 1 || self.is_global() => Some(GroupRuns::of(n, |_| ())),
             // A consolidated batch is in PK order, so already grouped by any PK prefix.
-            &GroupKey::PkPrefix(w) if batch.consolidated_verified() => Some(pk_width_dispatch!(w, |K| {
-                GroupRuns::of(n, |i| K::from_opk(mb.get_pk_prefix(i, w)))
+            &GroupKey::PkRange { at: 0, n: w } if batch.consolidated_verified() => Some(pk_width_dispatch!(w, |K| {
+                GroupRuns::of(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)))
             })),
             _ => None,
         }
@@ -272,20 +297,35 @@ impl GroupOutKey {
     pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
         let mb = &batch.as_mem_batch();
         let n = mb.count;
-        // A wide prefix's identity is a digest, and a sort compares the bytes.
-        let hashes = !matches!(self.key, GroupKey::PkPrefix(w) if w > NARROW_PK_MAX_BYTES);
+        // A wide key's identity is a digest, and a sort compares the bytes.
+        let hashes = !matches!(self.key, GroupKey::PkRange { n: w, .. } if w > NARROW_PK_MAX_BYTES);
         if let Some(groups) = hashes.then(|| self.with_identity(mb, Hashed { n })).flatten() {
             return groups;
         }
         match &self.key {
-            &GroupKey::PkPrefix(w) => {
-                pk_width_dispatch!(w, |K| GroupOrdinals::sorted(n, |i| K::from_opk(mb.get_pk_prefix(i, w))))
+            &GroupKey::PkRange { at, n: w } => {
+                pk_width_dispatch!(w, |K| GroupOrdinals::sorted(n, |i| K::from_opk(
+                    mb.get_pk_range(i, at, w)
+                )))
             }
             &GroupKey::Image(loc) if loc.size() <= 8 => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64),
             &GroupKey::Image(loc) => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i)),
+            GroupKey::Packed(p) => {
+                let (keys, w) = (p.keys(mb), p.out_stride);
+                GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]))
+            }
             GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i, mb.get_null_word(i))),
         }
     }
+}
+
+/// [`GroupOutKey::with_identity`] over a packed `_group_pk`: the keys packed a
+/// column at a time, once for the whole loop. Out of line, so the loops that
+/// read their key in place compile as they do without it.
+#[inline(never)]
+fn packed_identity<L: IdentityLoop>(p: &ReindexPacker, mb: &MemBatch, body: L) -> L::Out {
+    let (keys, w) = (p.keys(mb), p.out_stride);
+    body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]))
 }
 
 /// A batch's groups as contiguous row runs, in ascending output-PK order.

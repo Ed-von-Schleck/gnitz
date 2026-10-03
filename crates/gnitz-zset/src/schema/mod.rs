@@ -42,8 +42,8 @@ pub(crate) mod payload_order;
 pub use key::KeySpec;
 
 mod route;
-pub(crate) use route::worker_for_key;
-pub use route::{ground_owner, worker_for_pk_bytes, Placement, Slot};
+pub use route::{ground_owner, Placement, Slot};
+pub(crate) use route::{worker_for_key, worker_for_pk_bytes};
 
 /// Accumulator for an operator's output schema: its PK columns, then its
 /// payload columns.

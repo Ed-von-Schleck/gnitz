@@ -323,7 +323,7 @@ impl MapPlan {
         let PkSource::Pack(packer) = &self.pk_source else {
             return None;
         };
-        packer.pk_prefix_len()?;
+        packer.pk_range().filter(|&(at, _)| at == 0)?;
         // A PK column is never NULL, and a reindex copies each kept column at
         // its own type.
         debug_assert!(self.null_key_mask == 0 && !self.ev.emits_anything());

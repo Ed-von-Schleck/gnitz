@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::park::WorkerParks;
 use crate::runtime::sal::MAX_WORKERS;
 use gnitz_foundation::posix_io;
-use gnitz_zset::algebra::{op_exchange_gather, ScatterPlan};
-use gnitz_zset::repr::{Batch, MemBatch};
+use gnitz_zset::algebra::ScatterPlan;
+use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The default and largest virtual size of one outbox.
@@ -206,7 +206,7 @@ impl Mesh {
         (self.part % 2) as usize
     }
 
-    /// Open a round of `view`: send the live rows of `batch` split by `plan` as its
+    /// Open a round of `view`: send the nonzero-weight rows of `batch` split by `plan` as its
     /// first part. `fold` is [`crate::query::DriveHost::exchange`]'s; `drained` is
     /// this worker's claim, which [`Self::step`] answers with every worker's.
     /// Fatal while a round is open, or on a row larger than an outbox.
@@ -384,7 +384,12 @@ impl Mesh {
                     .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
             })
             .collect();
-        let rows = op_exchange_gather(&slices, &schema, consolidated);
+        // Z-set `+` over the round's slices: merged where every sender's were
+        // consolidated, else concatenated in order.
+        let rows = match consolidated {
+            true => merge_consolidated(&slices, &schema),
+            false => Batch::concat(&schema, slices.iter().cloned()),
+        };
         self.part += 1;
         self.in_round = false;
         Some((rows, drained))

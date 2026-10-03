@@ -3,7 +3,6 @@ use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
 use crate::test_support::{
     arb_fold_case, cell, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema, pk_payload_schema,
-    wide_pk_3xu64_schema,
 };
 use proptest::prelude::*;
 
@@ -71,21 +70,25 @@ fn sorted_ordinals_number_groups_by_key_and_keep_the_first_row() {
     assert_eq!((groups.ord, groups.first, groups.by_pk), (vec![0; 5], vec![0], vec![0]));
 }
 
-/// Under every key form — the empty set, the whole PK, each single column
-/// (the leading PK column among them) and all of them — over `raw` and its
+/// Under every key form — the empty set, every leading run of the PK list, each
+/// single column, each pair of columns and all of them — over `raw` and its
 /// consolidation: `ordinals` gives two rows one ordinal iff they share an
 /// `out_pk`, names each group's first row, and lists the groups in strictly
 /// ascending `out_pk` order; two rows share an `out_pk` iff they share their
 /// group columns' values, and iff they share an identity. `runs`, where it
 /// answers, cuts the rows at exactly the ordinals' boundaries, and it answers
-/// for a consolidated batch grouped by a PK prefix.
+/// for a consolidated batch grouped by leading PK columns whose bytes are its
+/// output PK.
 fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let schema = *raw.schema();
     let consolidated = Batch::clone(raw).into_consolidated();
     let pk: Vec<u32> = schema.pk_cols().to_vec();
     let all: Vec<u32> = (0..schema.num_columns() as u32).collect();
-    let mut forms = vec![vec![], pk.clone(), all];
-    forms.extend((0..schema.num_columns() as u32).map(|c| vec![c]));
+    let n = schema.num_columns() as u32;
+    let mut forms = vec![vec![], all];
+    forms.extend((1..=pk.len()).map(|lead| pk[..lead].to_vec()));
+    forms.extend((0..n).map(|c| vec![c]));
+    forms.extend((0..n).flat_map(|a| (0..n).filter(move |&b| b != a).map(move |b| vec![a, b])));
     for cols in &forms {
         let (key, _) = GroupOutKey::new(&schema, cols, []).unwrap();
         for batch in [raw, &consolidated] {
@@ -121,7 +124,10 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                     );
                 }
             }
-            if std::ptr::eq(batch, &consolidated) && (cols[..] == pk[..1] || *cols == pk) {
+            // A longer proper prefix is a fold, which no PK order groups.
+            let bytes: usize = cols.iter().map(|&c| schema.columns[c as usize].size() as usize).sum();
+            let in_place = *cols == pk || bytes <= GROUP_PK_BYTES;
+            if std::ptr::eq(batch, &consolidated) && !cols.is_empty() && pk.starts_with(cols) && in_place {
                 prop_assert!(runs.is_some(), "{:?}: a PK prefix of a consolidated batch", cols);
             }
 
@@ -193,64 +199,66 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     assert_groups_follow_out_pk(&bb.finish()).unwrap();
 }
 
-/// A shuffled ~1M-row batch of distinct keys, `stride` PK bytes each.
-fn bench_rows(n: usize, stride: usize) -> Vec<Vec<u8>> {
-    (0..n)
-        .map(|i| {
-            let mut v = vec![0u8; stride];
-            for chunk in 0..stride.div_ceil(8) {
-                let seed = (i as u64)
-                    .wrapping_add((chunk as u64).wrapping_mul(0x1000))
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let start = chunk * 8;
-                let end = (start + 8).min(stride);
-                v[start..end].copy_from_slice(&seed.to_be_bytes()[..end - start]);
-            }
-            v
-        })
-        .collect()
-}
-
-/// Regression guard — time `ordinals` over a shuffled ~1M-row batch of distinct
-/// keys, which every arm sorts: a whole PK per keyed width, a narrow image
-/// (`u64`), a wide image (`u128`), and the multi-column fold. `#[ignore]`; run
-/// release:
-///   cargo test -p gnitz-zset --release reduce_sort -- --ignored --nocapture --test-threads=1
+/// Instructions per row of [`GroupOutKey::ordinals`] over 262 144 unconsolidated
+/// rows, per key form: every key column drawn from 1024 values, where the rows
+/// hash into groups, and from all of `u64`, where they are sorted.
+///
+/// `cd crates && cargo test -p gnitz-zset --release group_ordinals_bench -- --ignored --nocapture --test-threads=1`
 #[test]
 #[ignore]
-fn reduce_sort_argsort_bench() {
-    let n = 1_000_000usize;
-    let (u64pk, u128pk, wide) = (
-        pk_payload_schema(&[TypeCode::U64]),
-        pk_payload_schema(&[TypeCode::U128]),
-        wide_pk_3xu64_schema(),
-    );
-    let mixed = pk_payload_schema(&[TypeCode::U64, TypeCode::U128]);
-    // A non-leading PK column is an image; a partial PK is a fold.
+fn group_ordinals_bench() {
+    use TypeCode::{U128, U64};
+    const N: u64 = 1 << 18;
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let three = pk_payload_schema(&[U64, U64, U64]);
+    let nullable = {
+        let mut cols = [SchemaColumn::new(U64, false); 4];
+        cols[3] = SchemaColumn::new(TypeCode::I64, true);
+        SchemaDescriptor::new(&cols, &[0, 1, 2])
+    };
+    let wide = pk_payload_schema(&[U128, U128]);
+    let mixed = pk_payload_schema(&[U128, U64, U64]);
     for (label, schema, group_cols) in [
-        ("pk stride 8", &u64pk, &[0u32][..]),
-        ("pk stride 16", &u128pk, &[0]),
-        ("pk stride 24", &wide, &[0, 1, 2]),
-        ("image u64", &wide, &[1]),
-        ("image u128", &mixed, &[1]),
-        ("fold 2-col", &wide, &[0, 1]),
+        ("leading PK column", &three, &[0u32][..]),
+        ("two leading PK columns", &three, &[0, 1]),
+        ("whole 24-byte PK", &three, &[0, 1, 2]),
+        ("PK column past the first", &three, &[1]),
+        ("payload column", &three, &[3]),
+        ("two PK columns past the first", &three, &[1, 2]),
+        ("PK column and payload column", &three, &[1, 3]),
+        ("nullable payload column", &nullable, &[3]),
+        ("leading U128 PK column", &wide, &[0]),
+        ("second U128 PK column", &wide, &[1]),
+        ("24-byte PK prefix (fold)", &mixed, &[0, 1]),
     ] {
-        let mut batch = crate::repr::BatchBuilder::new(schema);
-        for pk in bench_rows(n, schema.pk_stride()) {
-            batch.begin_row_bytes(&pk, 1);
-            (0..schema.num_payload_cols()).for_each(|_| batch.put_int(0));
-            batch.end_row();
-        }
-        let batch = batch.finish();
         let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
-
-        let t = std::time::Instant::now();
-        let groups = key.ordinals(&batch);
-        let dt = t.elapsed();
-        std::hint::black_box(&groups.ord);
-
-        let mrps = n as f64 / dt.as_secs_f64() / 1e6;
-        println!("argsort {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
+        let last_pk = schema.pk_cols().len() - 1;
+        for groups in [1024, u64::MAX] {
+            let draw = |i: u64, c: u64| (i ^ c << 40).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29) % groups;
+            let mut bb = BatchBuilder::new(schema);
+            for i in 0..N {
+                // The last PK column is the row number where no group reads it.
+                let natives: Vec<u128> = (0..=last_pk)
+                    .map(|c| match c == last_pk && !group_cols.contains(&(c as u32)) {
+                        true => i as u128,
+                        false => draw(i, c as u64) as u128,
+                    })
+                    .collect();
+                bb.begin_row_natives(&natives, 1);
+                bb.put_int(draw(i, 7) as u128);
+                bb.end_row();
+            }
+            let batch = bb.finish();
+            std::hint::black_box(key.ordinals(&batch));
+            let (ordinals, instructions) = counter.measure(|| key.ordinals(&batch));
+            std::hint::black_box(&ordinals.ord);
+            println!(
+                "group_ordinals_bench {label:<30} {:>20} values: {:7} groups, {:6.1} instr/row",
+                groups,
+                ordinals.len(),
+                instructions as f64 / N as f64
+            );
+        }
     }
 }
 

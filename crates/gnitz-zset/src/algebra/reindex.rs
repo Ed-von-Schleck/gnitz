@@ -253,20 +253,44 @@ impl ReindexPacker {
             .then(|| cols.iter().map(|c| c.loc).collect())
     }
 
-    /// The key's width, when it is the leading bytes of the input's own PK
-    /// region: the PK columns' own images, in PK order from the first.
-    pub(crate) fn pk_prefix_len(&self) -> Option<usize> {
-        let mut at = 0;
-        self.identity_columns()?
-            .iter()
+    /// Every column is packed: none is folded into the trailing hash slot.
+    pub(crate) fn packs_whole(&self) -> bool {
+        self.fold.is_empty()
+    }
+
+    /// Where the key lies in the input's own PK region, as `(at, n)`, when it is
+    /// consecutive PK columns' own images.
+    pub(crate) fn pk_range(&self) -> Option<(usize, usize)> {
+        let locs = self.identity_columns()?;
+        let &ColumnLocator::Pk { byte_off: at, .. } = locs.first()? else {
+            return None;
+        };
+        let mut end = at as usize;
+        locs.iter()
             .all(|l| match *l {
-                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == at => {
-                    at += size as usize;
+                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == end => {
+                    end += size as usize;
                     true
                 }
                 _ => false,
             })
-            .then_some(at)
+            .then_some((at as usize, end - at as usize))
+    }
+
+    /// `row`'s packed key of at most 16 bytes, widened as `widen_pk_be` does.
+    #[inline]
+    pub(crate) fn narrow_image<R: RowSource>(&self, batch: &R, row: usize) -> u128 {
+        let mut be = [0u8; 16];
+        self.pack_into(&mut be[16 - self.out_stride..], batch, row);
+        u128::from_be_bytes(be)
+    }
+
+    /// Every row's packed key, `out_stride` bytes each.
+    pub(crate) fn keys<B: BatchView>(&self, batch: &B) -> Vec<u8> {
+        let n = batch.row_count();
+        let mut keys = vec![0u8; n * self.out_stride];
+        self.pack_rows(&mut keys, self.out_stride, batch, &[(0, n)]);
+        keys
     }
 
     /// The reindex Map's output schema: [`Self::key_columns`], then

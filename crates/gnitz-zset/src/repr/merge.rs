@@ -222,11 +222,11 @@ impl<'a> MemBatch<'a> {
         let off = row * stride;
         &self.data[off..off + stride]
     }
-    /// The leading `n` bytes of row `row`'s PK.
+    /// The `n` bytes at `at` of row `row`'s PK.
     #[inline(always)]
-    pub(crate) fn get_pk_prefix(&self, row: usize, n: usize) -> &'a [u8] {
-        debug_assert!(n <= self.pk_stride());
-        let off = row * self.pk_stride();
+    pub(crate) fn get_pk_range(&self, row: usize, at: usize, n: usize) -> &'a [u8] {
+        debug_assert!(at + n <= self.pk_stride());
+        let off = row * self.pk_stride() + at;
         &self.data[off..off + n]
     }
     #[inline(always)]

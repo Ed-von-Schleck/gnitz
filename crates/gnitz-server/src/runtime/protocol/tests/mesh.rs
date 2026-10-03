@@ -4,7 +4,7 @@ use crate::test_support::{
     opk_pk, weighted_rows,
 };
 use gnitz_wire::wal::WAL_HEADER_SIZE;
-use gnitz_zset::schema::Slot;
+use gnitz_zset::schema::{Placement, Slot};
 
 const NW: usize = 3;
 
@@ -23,7 +23,9 @@ fn by_pk(schema: &SchemaDescriptor) -> ScatterPlan {
 /// The receiver of 2 that [`by_pk`] routes a U64 `pk` to.
 fn owner(pk: u64) -> usize {
     let schema = make_schema_u64_i64();
-    gnitz_zset::schema::worker_for_pk_bytes(&opk_pk(&schema, &[pk as u128]), 2)
+    Placement::full_pk(&schema)
+        .owner(&opk_pk(&schema, &[pk as u128]), 2)
+        .expect("a keyed placement owns every key")
 }
 
 /// The first `n` pks from `from` up that [`owner`] routes to receiver `r`.

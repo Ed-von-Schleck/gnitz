@@ -68,12 +68,15 @@ impl Frame {
     }
 
     /// The group list to send a reduce or top-N grouped by `ids`' slots: SQL's
-    /// GROUP BY is unordered, so a permutation of the PK is sent as the PK list.
+    /// GROUP BY is unordered, so a permutation of leading PK columns is sent in PK
+    /// order.
     pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
         let group: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
-        let pk = &self.schema.pk_cols;
-        let is_pk = group.len() == pk.len() && pk.iter().all(|p| group.contains(p));
-        Ok(if is_pk { pk.clone() } else { group })
+        let lead = self.schema.pk_cols.get(..group.len());
+        Ok(match lead {
+            Some(lead) if lead.iter().all(|p| group.contains(p)) => lead.to_vec(),
+            _ => group,
+        })
     }
 
     /// `expr` with every `ColId` leaf substituted by `ColRef(its slot)`.

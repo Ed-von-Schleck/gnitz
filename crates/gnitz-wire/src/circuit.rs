@@ -205,8 +205,8 @@ pub enum ReduceOutKey {
     /// The group columns are the output PK: the source's whole PK list, or one
     /// non-nullable PK-eligible column.
     Natural,
-    /// A leading hidden `_group_pk` U128, the NULL-distinct XXH3 fold of the
-    /// group columns, which ride as payload. Every other group set, the empty
+    /// A leading hidden `_group_pk` U128, a NULL-distinct key of the group
+    /// columns, which ride as payload. Every other group set, the empty
     /// (global) one included.
     SyntheticFold,
 }

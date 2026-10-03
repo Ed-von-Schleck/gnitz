@@ -542,8 +542,9 @@ fn op_reduce_group_sweep_bench() {
             let aggs = [AggDescriptor { col_idx: val, agg_op }, AggDescriptor::COUNT_STAR];
             let plan = ReducePlan::from_wire(&schema, &group_cols, &aggs, false).unwrap();
             let (d1, d2) = (as_read(&plan, rows(1)), as_read(&plan, rows(2)));
-            let (warm, _) = time_second_epoch(plan, &d1, &d2);
-            println!("op_reduce_group_sweep {label}: populated trace {warm:?}");
+            let (warm, instructions) = time_second_epoch(plan, &d1, &d2);
+            let per_row = instructions as f64 / d2.count as f64;
+            println!("op_reduce_group_sweep {label}: populated trace {warm:?}, {per_row:.1} instr/row");
         }
     }
     assert!(ran > 0, "REDUCE_SWEEP names no shape");

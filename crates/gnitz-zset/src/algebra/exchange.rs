@@ -1,5 +1,5 @@
-//! Exchange worker routing: [`ScatterPlan`] and the per-row routing-key
-//! kernels.
+//! The scatter plan of a worker exchange: [`ScatterPlan`] and the per-row
+//! routing-key kernels.
 
 use crate::algebra::group_key::{cell_image, for_cell_width, GroupKey, KeyCells};
 use crate::algebra::reindex::{FoldCols, ReindexPacker};
@@ -9,44 +9,27 @@ use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{Placement, SchemaDescriptor};
 use gnitz_wire::zip_cells;
 
-/// Keep only the live rows `slot` owns: those whose PK `worker_for_pk_bytes`
+/// Keep only the nonzero-weight rows `slot` owns: those whose PK `worker_for_pk_bytes`
 /// routes to it, the hash the equality scatter routes a join key by. A broadcast
 /// delta filtered here integrates into a trace partitioned like a scattered one.
 pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
-    ScatterPlan::whole_pk(batch.schema()).share(batch, slot)
+    ScatterPlan::native(Placement::full_pk(batch.schema())).share(batch, slot)
 }
 
 /// A scatter key resolved against one schema: each row goes to the owner of the
-/// PK its consumer gives it.
-pub struct ScatterPlan(Key);
-
-enum Key {
-    /// The output PK a reduce over the columns stamps — also what a join key
-    /// packing a PK prefix or one column's own image packs to.
-    Group(GroupKey),
-    /// The `_join_pk` the reindex Map packs.
-    Packed(ReindexPacker),
-    /// No key: every worker is sent every live row, as list 0.
-    Broadcast,
-}
+/// PK its consumer gives it. Without a key every worker is sent every
+/// nonzero-weight row, as list 0.
+pub struct ScatterPlan(Option<GroupKey>);
 
 impl ScatterPlan {
     /// Rows grouped by `cols`, keyed by the output PK a reduce over them stamps.
     pub fn group(schema: &SchemaDescriptor, cols: &[u32]) -> Result<Self, String> {
-        Ok(ScatterPlan(Key::Group(GroupKey::new(schema, cols)?)))
+        Ok(ScatterPlan(Some(GroupKey::new(schema, cols)?)))
     }
 
     /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
-        let packer = ReindexPacker::new(schema, slots)?;
-        let key = match packer.pk_prefix_len() {
-            Some(n) => Some(GroupKey::PkPrefix(n)),
-            None => match packer.identity_columns().as_deref() {
-                Some(&[loc]) => Some(GroupKey::Image(loc)),
-                _ => None,
-            },
-        };
-        Ok(ScatterPlan(key.map_or(Key::Packed(packer), Key::Group)))
+        Ok(ScatterPlan(Some(GroupKey::packed(ReindexPacker::new(schema, slots)?))))
     }
 
     /// The route a relation's own rows are placed by. Panics on `Placement::Local`,
@@ -54,35 +37,30 @@ impl ScatterPlan {
     pub fn native(placement: Placement) -> Self {
         match placement {
             Placement::Replicated => Self::broadcast(),
-            Placement::Keyed { dist_stride } => ScatterPlan(Key::Group(GroupKey::PkPrefix(dist_stride as usize))),
+            Placement::Keyed { dist_stride } => ScatterPlan(Some(GroupKey::PkRange { at: 0, n: dist_stride as usize })),
             Placement::Local => panic!("ScatterPlan::native: a Local relation's rows have no key owner"),
         }
     }
 
-    /// Every live row to every worker.
+    /// Every nonzero-weight row to every worker.
     pub fn broadcast() -> Self {
-        ScatterPlan(Key::Broadcast)
-    }
-
-    /// The whole PK — what [`op_worker_filter`] keeps a broadcast delta's share by.
-    fn whole_pk(schema: &SchemaDescriptor) -> Self {
-        ScatterPlan(Key::Group(GroupKey::PkPrefix(schema.pk_stride())))
+        ScatterPlan(None)
     }
 
     /// True when this plan hashes exactly the bytes `placement` places rows by,
     /// so an exchange by it over rows so placed moves nothing.
     pub fn routes_to_native_owner(&self, placement: Placement) -> bool {
         matches!((&self.0, placement),
-            (Key::Group(GroupKey::PkPrefix(n)), Placement::Keyed { dist_stride }) if *n == dist_stride as usize)
+            (Some(GroupKey::PkRange { at: 0, n }), Placement::Keyed { dist_stride }) if *n == dist_stride as usize)
     }
 
-    /// Reset `out` to one ascending list per worker of the live rows of `batch`
-    /// that worker owns — a weight-0 row is not a Z-set element. A broadcast is
-    /// the one list every worker is sent.
+    /// Reset `out` to one ascending list per worker of the nonzero-weight rows of
+    /// `batch` that worker owns — a weight-0 row is not a Z-set element. A
+    /// broadcast is the one list every worker is sent.
     pub fn route<'a>(&self, batch: &Batch, out: &'a mut Vec<Vec<u32>>, num_workers: usize) -> &'a [Vec<u32>] {
         let lists = match self.0 {
-            Key::Broadcast => 1,
-            _ => num_workers,
+            None => 1,
+            Some(_) => num_workers,
         };
         // Reset to `lists` empty lists, keeping their allocations.
         if out.len() < lists {
@@ -94,14 +72,14 @@ impl ScatterPlan {
         slots
     }
 
-    /// The live rows of `batch` that `slot` owns: its share of a batch every
-    /// worker holds whole, and what a round under this plan would hand it.
+    /// The nonzero-weight rows of `batch` that `slot` owns: its share of a batch
+    /// every worker holds whole, and what a round under this plan would hand it.
     pub fn share(&self, batch: &Batch, slot: Slot) -> Batch {
         let nw = slot.of as usize;
         let mut share = Share {
             rank: match self.0 {
-                Key::Broadcast => 0,
-                _ => slot.rank as usize,
+                None => 0,
+                Some(_) => slot.rank as usize,
             },
             rows: Vec::with_capacity(batch.count / nw + 1),
         };
@@ -113,19 +91,19 @@ impl ScatterPlan {
         match self.0 {
             // One worker owns every key, so no key is read or hashed.
             _ if nw == 1 => route_rows(mb, sink, ListZero),
-            Key::Group(ref key) => match key.cells(mb) {
+            Some(ref key) => match key.cells(mb) {
                 Some(cells) => for_cell_width!(cells.width, |W| match cells.opk {
                     true => route_cells::<W, true>(&cells, mb.weight(), sink, nw),
                     false => route_cells::<W, false>(&cells, mb.weight(), sink, nw),
                 }),
                 None => match *key {
-                    GroupKey::PkPrefix(n) => route_rows(mb, sink, PrefixW { n, nw }),
+                    GroupKey::PkRange { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
+                    GroupKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
                     GroupKey::Fold(ref fold) => route_rows(mb, sink, FoldW { fold, nw }),
                     GroupKey::Image(_) => unreachable!("an image key is one cell"),
                 },
             },
-            Key::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
-            Key::Broadcast => route_rows(mb, sink, ListZero),
+            None => route_rows(mb, sink, ListZero),
         }
     }
 }
@@ -166,16 +144,17 @@ trait RowWorker {
     fn worker(&self, mb: &MemBatch, row: usize) -> usize;
 }
 
-/// A PK prefix [`GroupKey::cells`] does not answer for.
-struct PrefixW {
+/// A PK range [`GroupKey::cells`] does not answer for.
+struct PkRangeW {
+    at: usize,
     n: usize,
     nw: usize,
 }
 
-impl RowWorker for PrefixW {
+impl RowWorker for PkRangeW {
     #[inline(always)]
     fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        worker_for_pk_bytes(&mb.get_pk_bytes(row)[..self.n], self.nw)
+        worker_for_pk_bytes(mb.get_pk_range(row, self.at, self.n), self.nw)
     }
 }
 
@@ -209,7 +188,7 @@ fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
     }
 }
 
-/// [`route_rows`] for a key that is one `W`-byte cell per row: each live row to the
+/// [`route_rows`] for a key that is one `W`-byte cell per row: each nonzero-weight row to the
 /// owner of its cell's image.
 #[inline(never)]
 fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8], sink: &mut impl RowSink, nw: usize) {
@@ -221,7 +200,7 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
     });
 }
 
-/// [`route_rows`] for a packed join key, packed a chunk of rows at a time.
+/// [`route_rows`] for a packed key, packed a chunk of rows at a time.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &ReindexPacker, nw: usize) {
     packer.for_each_key(mb, packer.out_stride, |row, key| {
@@ -236,5 +215,5 @@ fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &ReindexPac
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "tests/router.rs"]
+#[path = "tests/exchange.rs"]
 mod tests;

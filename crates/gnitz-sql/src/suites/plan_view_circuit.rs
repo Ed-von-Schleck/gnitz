@@ -413,3 +413,43 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
         ["one"]
     );
 }
+
+/// GROUP BY and PARTITION BY are unordered, so a permutation of leading PK
+/// columns is planned in PK order; any other group list keeps the order written.
+#[test]
+fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
+    let cat = base();
+    let i = TypeCode::I64;
+    cat.insert(
+        "ck3",
+        Some(table(
+            30,
+            vec![col("k1", i), col("k2", i), col("k3", i), col("v", i)],
+            vec![0, 1, 2],
+        )),
+    );
+    for (body, want) in [
+        ("SELECT k2, k1, COUNT(*) AS n FROM ck3 GROUP BY k2, k1", &[0u32, 1][..]),
+        ("SELECT k1, k2, COUNT(*) AS n FROM ck3 GROUP BY k1, k2", &[0, 1]),
+        (
+            "SELECT k1, k2, k3, COUNT(*) AS n FROM ck3 GROUP BY k3, k1, k2",
+            &[0, 1, 2],
+        ),
+        ("SELECT k3, k2, COUNT(*) AS n FROM ck3 GROUP BY k3, k2", &[2, 1]),
+        (
+            "SELECT k1, k2, k3, v FROM ck3 QUALIFY ROW_NUMBER() OVER (PARTITION BY k2, k1 ORDER BY v) <= 2",
+            &[0, 1],
+        ),
+    ] {
+        let chain = view(&cat, body);
+        let groups: Vec<&[u32]> = all_views(&chain)
+            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
+            .filter_map(|op| match op {
+                OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => Some(group_cols.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(!groups.is_empty(), "{body}: no reduce or top-N");
+        assert!(groups.iter().all(|g| *g == want), "{body}: {groups:?}");
+    }
+}

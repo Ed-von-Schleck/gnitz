@@ -44,7 +44,7 @@ fn batch(schema: &SchemaDescriptor) -> Batch {
     b.finish()
 }
 
-/// `plan` sends each live row of `b` to its `owner` of `nw` workers and no
+/// `plan` sends each nonzero-weight row of `b` to its `owner` of `nw` workers and no
 /// weight-0 row anywhere, as one ascending list per worker, and hands each rank
 /// the same rows as its share.
 fn assert_routes(plan: &ScatterPlan, b: &Batch, nw: usize, what: &str, owner: impl Fn(&MemBatch, usize) -> usize) {
@@ -68,7 +68,8 @@ fn assert_routes(plan: &ScatterPlan, b: &Batch, nw: usize, what: &str, owner: im
 const NW: usize = 4;
 
 /// A group scatter sends each row to the owner of the output PK the reduce keys
-/// its group by: a PK prefix, one column's image, or the NULL-distinct fold.
+/// its group by: a PK range, one column's image, the packed key, or the
+/// NULL-distinct fold.
 #[test]
 fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
     let schema = schema();
@@ -123,7 +124,8 @@ fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
 
 /// A join scatter sends each row where the `_join_pk` the reindex Map packs for
 /// it hashes, and runs the packer only for a key that is not the row's own OPK
-/// bytes: a promoted slot, string content, or several columns off the PK prefix.
+/// bytes: a promoted slot, string content, or several columns that are not
+/// consecutive PK columns.
 #[test]
 fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
     use TypeCode::{I64, U128};
@@ -135,6 +137,9 @@ fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
         (own(&[0, 1]), false),
         (own(&[0, 1, 2, 3]), false),
         (own(&[1]), false),
+        (own(&[1, 2]), false),
+        (own(&[2, 3]), false),
+        (own(&[1, 2, 3]), false),
         (own(&[4]), false),
         (own(&[5]), false),
         (own(&[7]), false),
@@ -146,7 +151,7 @@ fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
         (vec![(5, I64), (6, U128)], true),
     ] {
         let plan = ScatterPlan::join(&schema, &slots).expect("the fixture key routes");
-        assert_eq!(matches!(plan.0, Key::Packed(_)), packed, "{slots:?}");
+        assert_eq!(matches!(plan.0, Some(GroupKey::Packed(_))), packed, "{slots:?}");
         let packer = ReindexPacker::new(&schema, &slots).expect("the fixture key packs");
         assert_routes(&plan, &b, NW, &format!("join {slots:?}"), |mb, row| {
             worker_for_pk_bytes(packer.pack_prefix(&mut [0u8; MAX_PK_BYTES], mb, row), NW)
@@ -228,9 +233,8 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
     ] {
         for cols in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[0, 1, 2, 3], &[1], &[1, 0]] {
             let on_prefix = dist == Some(cols);
-            let natural = cols.len() == 1 || cols.len() == pk.len();
             for (kind, plan, want) in [
-                ("group", ScatterPlan::group(&schema, cols), on_prefix && natural),
+                ("group", ScatterPlan::group(&schema, cols), on_prefix),
                 (
                     "join",
                     ScatterPlan::join(&schema, &self_typed_slots(&schema, cols)),
@@ -259,22 +263,6 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
     }
 }
 
-/// The refusal of a group key over a several-column proper prefix is about the
-/// hash, not the width: the fold does land rows off their table's worker.
-#[test]
-fn a_proper_prefix_group_key_routes_off_the_tables_worker() {
-    let schema = schema();
-    let placement = Placement::keyed(&schema, 2);
-    let b = batch(&schema);
-    let mb = b.as_mem_batch();
-    let (gk, _) = GroupOutKey::new(&schema, &[0, 1], []).unwrap();
-    assert!(
-        (0..mb.count).any(|row| Some(worker_for_pk_bytes(gk.out_pk(&mb, row).bytes(), NW))
-            != placement.owner(mb.get_pk_bytes(row), NW)),
-        "the fold must disagree with the prefix hash somewhere"
-    );
-}
-
 /// A slot typed at the storage integer of a DATE, TIMESTAMP or DECIMAL PK
 /// column packs that column's own OPK bytes, so it keeps the unpacked route.
 #[test]
@@ -295,7 +283,7 @@ fn a_layout_identical_promotion_routes_natively() {
     }
 }
 
-/// `n` rows over a U64-PK-columns, all-I64-payload `schema`, the last PK column
+/// `n` rows, none NULL, over a U64-PK-columns, all-I64-payload `schema`, the last PK column
 /// `0..n`, every other column a spread function of it.
 fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
     use crate::schema::ColumnTable;
@@ -315,10 +303,10 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
     b.finish()
 }
 
-/// Each live row lands in the slot of the worker its placement owns it by —
+/// Each nonzero-weight row lands in the slot of the worker its placement owns it by —
 /// one slot for a replicated relation — and a weight-0 row in none.
 #[test]
-fn the_native_plan_places_each_live_row_by_its_placement() {
+fn the_native_plan_places_each_nonzero_weight_row_by_its_placement() {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
     let mut bb = BatchBuilder::new(&schema);
     for b in 0..8u128 {
@@ -366,6 +354,7 @@ fn exchange_route_bench() {
     let instructions = gnitz_foundation::perf::Counter::instructions().unwrap();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
     let wide = crate::test_support::wide_pk_3xu64_schema();
+    let nullable = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let prefix = |n: u8| Ok(ScatterPlan::native(Placement::Keyed { dist_stride: n }));
     for (name, schema, plan) in [
         ("pk", &one, ScatterPlan::group(&one, &[0])),
@@ -380,7 +369,14 @@ fn exchange_route_bench() {
             &two,
             ScatterPlan::join(&two, &[(1, TypeCode::I64), (2, TypeCode::I64)]),
         ),
-        ("fold", &two, ScatterPlan::group(&two, &[1, 2])),
+        ("packed group", &two, ScatterPlan::group(&two, &[1, 2])),
+        ("pk prefix group", &wide, ScatterPlan::group(&wide, &[0, 1])),
+        (
+            "pk range past the start",
+            &wide,
+            ScatterPlan::join(&wide, &[(1, TypeCode::U64), (2, TypeCode::U64)]),
+        ),
+        ("nullable column group", &nullable, ScatterPlan::group(&nullable, &[1])),
     ] {
         let plan = plan.unwrap();
         for (n, workers, iters) in [

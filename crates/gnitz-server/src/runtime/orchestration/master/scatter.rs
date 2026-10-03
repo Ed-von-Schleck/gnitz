@@ -14,7 +14,7 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Route `batch`'s live rows to the workers `placement` names, and hand `f` the
+/// Route `batch`'s nonzero-weight rows to the workers `placement` names, and hand `f` the
 /// group data that carries them, framed straight from `batch`.
 pub(crate) fn with_routed<R>(
     batch: &Batch,
@@ -28,6 +28,14 @@ pub(crate) fn with_routed<R>(
     let shared = num_workers == 1 || matches!(placement, Placement::Replicated);
     if shared && !batch.has_ghost() {
         return f(GroupData::Same(batch.wire_whole()));
+    }
+    // One row has one owner, named by the placement's point query: no list is built.
+    if batch.len() == 1 && !batch.has_ghost() {
+        if let Some(owner) = placement.owner(batch.as_mem_batch().get_pk_bytes(0), num_workers) {
+            let mut each = [None; MAX_WORKERS];
+            each[owner] = batch.wire_whole();
+            return f(GroupData::Each(&each[..num_workers]));
+        }
     }
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();

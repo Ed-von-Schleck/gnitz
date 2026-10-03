@@ -2,7 +2,7 @@
 //!
 //!   - `linear`      — filter, union (Theorem 3.3: no state added)
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
-//!   - `exchange`    — the scatter plan and the gather of a worker exchange
+//!   - `exchange`    — the scatter plan of a worker exchange
 //!   - `aggregate`   — the accumulators, a reduce's row shape, and the ad-hoc fold
 //!   - `group_key`   — a group as the output PK a reduce over it stamps
 //!   - `reindex`     — the key composers a reindex Map and an exchange scatter share, and a
@@ -33,7 +33,7 @@ mod order_image;
 mod reindex;
 mod sink;
 
-pub use exchange::{op_exchange_gather, op_worker_filter, ScatterPlan};
+pub use exchange::{op_worker_filter, ScatterPlan};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
 pub use reindex::{append_spans, index_entries};

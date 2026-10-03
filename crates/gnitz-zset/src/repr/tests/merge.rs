@@ -152,6 +152,47 @@ fn merge_consolidated_skewed_bench() {
     }
 }
 
+/// Instructions per call of the two Z-set sums an exchange round ends in —
+/// `merge_consolidated` and `Batch::concat` — over N rows in K stripes of one
+/// ascending key space, so the merge interleaves them.
+///
+/// `cd crates && cargo test -p gnitz-zset --release striped_sum_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn striped_sum_bench() {
+    use std::hint::black_box;
+
+    let instructions = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let schema = pk_u64_two_i64_schema();
+    for (n, iters) in [(4usize, 10_000usize), (64, 10_000), (4096, 1000), (1_000_000, 10)] {
+        for k in [1usize, 4, 16] {
+            let per = (n / k).max(1);
+            let stripes: Vec<Batch> = (0..k)
+                .map(|j| bench_flush_batch(&schema, per, |i| (i * k + j) as u64))
+                .collect();
+            let mem: Vec<MemBatch<'_>> = stripes.iter().map(|b| b.as_mem_batch()).collect();
+            let rows = per * k;
+            assert_eq!(merge_consolidated(&mem, &schema).count, rows, "the merge dropped rows");
+            assert_eq!(Batch::concat(&schema, mem.iter().cloned()).count, rows);
+            let ((), merged) = instructions.measure(|| {
+                for _ in 0..iters {
+                    black_box(merge_consolidated(&mem, &schema));
+                }
+            });
+            let ((), concatenated) = instructions.measure(|| {
+                for _ in 0..iters {
+                    black_box(Batch::concat(&schema, mem.iter().cloned()));
+                }
+            });
+            println!(
+                "striped_sum N{n} K{k}: merge {} instructions per call, concat {}",
+                merged / iters as u64,
+                concatenated / iters as u64
+            );
+        }
+    }
+}
+
 // ── The Z-set fold, over every path that runs it ────────────────────────
 
 /// The N-way merge's survivors, materialized with every string relocated.
@@ -283,9 +324,20 @@ fn every_fold_path_reaches_each_fold_case() {
 
 proptest::proptest! {
     #[test]
-    fn every_fold_path_reaches_the_zset((si, rows) in arb_fold_case()) {
+    fn every_fold_path_reaches_the_zset(
+        (si, mut rows) in arb_fold_case(),
+        runs in 1usize..6,
+        ascending in proptest::prelude::any::<bool>(),
+    ) {
         let s = fold_schemas()[si];
-        let runs: Vec<Batch> = rows.chunks(13).map(|c| fold_batch(&s, c).into_consolidated()).collect();
+        // In PK order the runs ascend, and a PK group can straddle two of them.
+        if ascending {
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let runs: Vec<Batch> = rows
+            .chunks(rows.len().div_ceil(runs).max(1))
+            .map(|c| fold_batch(&s, c).into_consolidated())
+            .collect();
         every_fold(&s, &runs);
     }
 }

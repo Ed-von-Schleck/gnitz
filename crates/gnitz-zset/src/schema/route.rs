@@ -127,7 +127,7 @@ pub(crate) fn worker_for_key(pk: u128, num_workers: usize) -> usize {
 /// Which of `num_workers` workers owns an OPK PK region: a narrow one by its
 /// `u128` image, a wide one by its hash.
 #[inline(always)]
-pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
+pub(crate) fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     if bytes.len() <= NARROW_PK_MAX_BYTES {
         worker_for_key(widen_pk_be(bytes), num_workers)
     } else {
