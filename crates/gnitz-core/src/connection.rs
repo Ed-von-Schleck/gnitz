@@ -490,21 +490,6 @@ pub(crate) enum Polled {
 /// matched onto a live view of the same id.
 pub(crate) type PollSink<'a> = dyn FnMut(SlotId, Polled) + 'a;
 
-/// Why a session refuses work.
-enum Ended {
-    Closed,
-    Lost(ProtocolError),
-}
-
-impl Ended {
-    fn error(&self) -> ClientError {
-        match self {
-            Ended::Closed => ClientError::Closed,
-            Ended::Lost(cause) => ClientError::ConnectionLost(cause.clone()),
-        }
-    }
-}
-
 /// A protocol session: the transport plus all per-connection protocol state
 /// (the pending queue and reply accumulator, and the continuation reassembly
 /// and status→error policy that read/write them). Exactly one owner of that
@@ -515,8 +500,9 @@ pub struct Session {
     pending: VecDeque<Slot>,
     next_slot: u64,
     accum: Accumulator,
-    /// Why this session refuses work; `None` while it is open.
-    ended: Option<Ended>,
+    /// The error every request gets once the session has ended — `Closed` or
+    /// `ConnectionLost`; `None` while it is open.
+    ended: Option<ClientError>,
 }
 
 impl Session {
@@ -595,7 +581,7 @@ impl Session {
     }
 
     fn check_open(&self) -> Result<(), ClientError> {
-        self.ended.as_ref().map_or(Ok(()), |e| Err(e.error()))
+        self.ended.clone().map_or(Ok(()), Err)
     }
 
     fn open_slot(&mut self, Encoded { frame, kind }: Encoded) -> SlotId {
@@ -627,7 +613,7 @@ impl Session {
             if let Err(e) = self.transport.flush() {
                 // A peer gone after answering is still readable.
                 self.read_frames(sink, &mut done);
-                self.end(Ended::Lost(e), &mut done);
+                self.end(ClientError::ConnectionLost(e), &mut done);
             }
         }
         done
@@ -643,7 +629,7 @@ impl Session {
             let more = match read {
                 Ok(more) => more,
                 Err(e) => {
-                    self.end(Ended::Lost(e), done);
+                    self.end(ClientError::ConnectionLost(e), done);
                     false
                 }
             };
@@ -688,32 +674,23 @@ impl Session {
         self.ended.is_some()
     }
 
-    /// Fail every pending slot with `how`'s error and refuse further work. The
-    /// shutdown shows the server EOF now rather than when the session drops.
-    fn end(&mut self, how: Ended, done: &mut Completions) {
+    /// Fail every pending slot with `why` and refuse further work. The shutdown
+    /// shows the server EOF now rather than when the session drops.
+    fn end(&mut self, why: ClientError, done: &mut Completions) {
         if self.ended.is_some() {
             return;
         }
         self.transport.close();
         self.accum = Accumulator::default();
-        done.extend(self.pending.drain(..).map(|s| (s.id, Err(how.error()))));
-        self.ended = Some(how);
+        done.extend(self.pending.drain(..).map(|s| (s.id, Err(why.clone()))));
+        self.ended = Some(why);
     }
 
     /// Close the session; returns every slot it abandoned, failed `Closed`.
     #[must_use]
     pub fn close(&mut self) -> Completions {
         let mut done = Vec::new();
-        self.end(Ended::Closed, &mut done);
-        done
-    }
-
-    /// Fail the session with `cause`, met outside `step`; returns every slot it
-    /// abandoned, failed `ConnectionLost(cause)`.
-    #[must_use]
-    pub fn abort(&mut self, cause: ProtocolError) -> Completions {
-        let mut done = Vec::new();
-        self.end(Ended::Lost(cause), &mut done);
+        self.end(ClientError::Closed, &mut done);
         done
     }
 }

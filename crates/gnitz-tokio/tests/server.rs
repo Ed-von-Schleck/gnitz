@@ -2,7 +2,7 @@
 
 //! The tokio client against a real server: what needs real replies — verbs
 //! pipelined over both transports, the syscalls a burst costs, and the blocking
-//! client every clone shares.
+//! client its clones share.
 
 mod support;
 
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
+use gnitz_tokio::BlockingClient;
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
 use support::settled;
 use tokio::runtime::Runtime;
@@ -222,10 +223,11 @@ fn clones_share_one_blocking_client() {
     settled(&Runtime::new().unwrap(), async {
         let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
         let driver = tokio::spawn(conn);
+        let shared = BlockingClient::connect(srv.sock_path()).await.expect("connect");
         {
-            let read = |tid| client.scan_spec_local_first(tid, all_rows(), Arc::clone(&schema));
+            let read = |tid| shared.scan_spec_local_first(&client, tid, all_rows(), Arc::clone(&schema));
 
-            // No blocking client yet, so nothing is mirrored: the server answers.
+            // Nothing is mirrored yet: the server answers.
             let served = read(vid).await.unwrap();
             assert!(served.lsn.is_some(), "a served read carries the server's LSN");
             assert_eq!(unit_rows(&served.batch), 50);
@@ -234,9 +236,9 @@ fn clones_share_one_blocking_client() {
             let dir = tempfile::tempdir().unwrap();
             let store = Mirror::open(dir.path().to_str().unwrap(), MirrorConfig::default()).unwrap();
             let name = sn.clone();
-            let mirrored = client
+            let mirrored = shared
                 .clone()
-                .with_blocking_client(move |c| {
+                .run(move |c| {
                     c.attach_mirror(store)?;
                     c.mirror_view(&name, "v")
                 })
@@ -246,25 +248,22 @@ fn clones_share_one_blocking_client() {
 
             // Two clones polling at once: the second waits for the first's lock.
             push_and_tick(50..100);
-            let (a, b) = (client.clone(), client.clone());
-            let (polled_a, polled_b) = tokio::join!(
-                a.with_blocking_client(GnitzClient::poll_mirror),
-                b.with_blocking_client(GnitzClient::poll_mirror),
-            );
+            let (a, b) = (shared.clone(), shared.clone());
+            let (polled_a, polled_b) = tokio::join!(a.run(GnitzClient::poll_mirror), b.run(GnitzClient::poll_mirror));
             for outcome in polled_a.unwrap().into_iter().chain(polled_b.unwrap()) {
                 assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");
             }
 
             // A panic in a call resumes on its caller and takes neither the lock
             // nor the client with it: the reads below still find the copy.
-            let panicking = client.clone();
+            let panicking = shared.clone();
             let panicked = tokio::spawn(async move {
                 let boom = |_: &mut GnitzClient| -> Result<(), ClientError> { panic!("inside the blocking call") };
-                panicking.with_blocking_client(boom).await
+                panicking.run(boom).await
             });
             assert!(panicked.await.unwrap_err().is_panic());
 
-            let sent = || client.with_blocking_client(|c| Ok(c.requests_sent()));
+            let sent = || shared.run(|c| Ok(c.requests_sent()));
             let before = sent().await.unwrap();
             let local = read(vid).await.unwrap();
             assert!(local.lsn.is_none(), "a local answer carries no served LSN");

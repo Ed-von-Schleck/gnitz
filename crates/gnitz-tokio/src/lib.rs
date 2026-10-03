@@ -5,8 +5,8 @@
 //! resolving each reply against the request that asked for it. This crate owns
 //! how it waits.
 //!
-//! The wire verbs run on the driver; every other `GnitzClient` verb, mirroring
-//! included, runs through [`AsyncClient::with_blocking_client`].
+//! The wire verbs run on the driver. Every other `GnitzClient` verb, mirroring
+//! included, runs on a [`BlockingClient`], which is a connection of its own.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -30,9 +30,8 @@ struct Submission {
     reply: oneshot::Sender<Result<Reply, ClientError>>,
 }
 
-/// A channel sender, plus the blocking client every clone shares:
-/// `Send + Sync + Clone`. Every method takes `&self`, so sharing one
-/// is a clone.
+/// The handle to a [`Connection`]: `Send + Sync + Clone`. Every method takes
+/// `&self`, so sharing one is a clone.
 ///
 /// Calling a wire verb encodes and submits it, so verbs reach the server in
 /// call order; the future it returns only waits for the reply. A request waits
@@ -41,18 +40,19 @@ struct Submission {
 #[derive(Clone)]
 pub struct AsyncClient {
     tx: mpsc::UnboundedSender<Submission>,
-    /// What the blocking client connects to.
-    target: Arc<str>,
-    /// The blocking client, `None` until the first
-    /// [`AsyncClient::with_blocking_client`].
-    client: Arc<tokio::sync::Mutex<Option<GnitzClient>>>,
 }
 
-// The handle is shared by cloning, so this is what it promises; the client field
-// is the one thing that could take it away silently.
+/// A [`GnitzClient`] for async callers, shared by cloning: `Send + Sync +
+/// Clone`. Its connection is its own, so it neither waits for a [`Connection`]
+/// nor ends with one.
+#[derive(Clone)]
+pub struct BlockingClient(Arc<tokio::sync::Mutex<GnitzClient>>);
+
+// Both handles are shared by cloning, so this is what they promise.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<AsyncClient>();
+    assert_send_sync::<BlockingClient>();
 };
 
 /// Run `f` on a blocking pool thread. A panic in it resumes on the caller.
@@ -74,20 +74,15 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 /// The TCP connect, TLS handshake and HELLO block under one connect deadline,
 /// after name resolution, so they run on `spawn_blocking`.
 pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
-    let target: Arc<str> = Arc::from(target);
-    let connect_to = Arc::clone(&target);
-    let session = blocking(move || Session::connect(&connect_to)).await??;
+    let target = target.to_owned();
+    let session = blocking(move || Session::connect(&target)).await??;
     // A `dup`, so the reactor deregisters a descriptor whose life it owns
     // rather than a number the session may already have closed and the kernel
     // handed out again.
     let fd = AsyncFd::new(session.try_clone_fd()?)?;
     let (tx, rx) = mpsc::unbounded_channel();
     Ok((
-        AsyncClient {
-            tx,
-            target,
-            client: Arc::new(tokio::sync::Mutex::new(None)),
-        },
+        AsyncClient { tx },
         Connection {
             session,
             fd,
@@ -151,45 +146,42 @@ impl AsyncClient {
         let qname = qualified_name(schema_name, name);
         self.call(Request::Resolve(&qname), Reply::into_resolve)
     }
+}
 
-    /// Run `f` on a blocking thread against the handle's `GnitzClient`, which
-    /// every clone shares and whose connection opens on first use. Callers
-    /// serialize for the whole of `f`.
-    pub async fn with_blocking_client<T: Send + 'static>(
+impl BlockingClient {
+    /// Connect to `target`, on a blocking thread.
+    pub async fn connect(target: &str) -> Result<Self, ClientError> {
+        let target = target.to_owned();
+        let client = blocking(move || GnitzClient::connect(&target)).await??;
+        Ok(BlockingClient(Arc::new(tokio::sync::Mutex::new(client))))
+    }
+
+    /// Run `f` against the client on a blocking thread. Callers serialize for
+    /// the whole of `f`, across every clone.
+    pub async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut GnitzClient) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
-        let target = Arc::clone(&self.target);
-        let mut slot = Arc::clone(&self.client).lock_owned().await;
-        blocking(move || {
-            let client = match slot.take() {
-                Some(c) => c,
-                None => GnitzClient::connect(&target)?,
-            };
-            f(slot.insert(client))
-        })
-        .await?
+        let mut client = Arc::clone(&self.0).lock_owned().await;
+        blocking(move || f(&mut client)).await?
     }
 
-    /// [`Self::scan_spec`], answered off the copy when it holds `tid`. It waits
-    /// for the blocking client first, so it submits when polled, not when called.
+    /// [`AsyncClient::scan_spec`] on `driver`, answered off this client's copy
+    /// instead when it holds `tid`. It waits for this client first, so it
+    /// submits when polled, not when called.
     pub async fn scan_spec_local_first(
         &self,
+        driver: &AsyncClient,
         tid: u64,
         spec: ReadSpec,
         reply_schema: Arc<Schema>,
     ) -> Result<ScanReply, ClientError> {
-        let mut slot = Arc::clone(&self.client).lock_owned().await;
-        if !slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
-            drop(slot);
-            return self.scan_spec(tid, &spec, &reply_schema).await;
+        let mut client = Arc::clone(&self.0).lock_owned().await;
+        if !client.mirrors(tid) {
+            drop(client);
+            return driver.scan_spec(tid, &spec, &reply_schema).await;
         }
-        blocking(move || {
-            slot.as_mut()
-                .expect("held above")
-                .scan_spec_local_first(tid, spec, &reply_schema)
-        })
-        .await?
+        blocking(move || client.scan_spec_local_first(tid, spec, &reply_schema)).await?
     }
 }
 
@@ -215,9 +207,10 @@ pub struct Connection {
 
 impl Connection {
     /// Enqueue every submission the channel holds; `true` when the last handle is
-    /// gone. At either of `enqueue`'s caps the channel is left unpolled — that is
-    /// what makes them back-pressure rather than the error `enqueue` raises — and
-    /// queued bytes arm `write`, so the next step brings the loop back round.
+    /// gone. At either of `enqueue`'s caps the channel is left unpolled, so a
+    /// verb past a cap waits there instead of taking the error `enqueue` raises.
+    /// Either cap implies an interest bit, so the next step brings the loop back
+    /// round.
     fn drain_channel(&mut self, cx: &mut Context<'_>) -> bool {
         while !self.session.at_capacity() {
             match self.rx.poll_recv(cx) {
@@ -291,7 +284,8 @@ impl Future for Connection {
             }
 
             let done = match poll_ready(&this.fd, want, cx) {
-                Err(e) => this.session.abort(e.into()),
+                // Readiness fails only once the runtime is shutting down.
+                Err(_) => this.session.close(),
                 Ok((read, write)) => {
                     let ready = Interest {
                         read: read.is_some(),
