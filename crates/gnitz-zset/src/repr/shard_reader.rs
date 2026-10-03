@@ -9,12 +9,13 @@ use std::rc::Rc;
 
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::batch_pool::PooledBuf;
+use super::encoding::*;
 use super::layout::*;
 use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
 use super::mmap::Mmap;
 use super::scatter::DecodedColumns;
 use super::shard_filter;
-use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
+use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap, relocate_german_string_vec};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
@@ -48,11 +49,7 @@ pub(crate) struct PackedRegion {
 
 /// A [`PackedRegion`]'s image, a region of the mapping.
 enum PackedImage {
-    /// [`Encoding::For`], of `bw`-byte offsets.
-    For {
-        image: &'static [u8],
-        bw: usize,
-    },
+    For(ForImage<'static>),
     Seq(SeqImage<'static>),
     Sparse(SparseImage<'static>),
 }
@@ -92,45 +89,52 @@ impl DecodedBlocks {
     }
 }
 
-/// A region of one 8-byte word per row: the weights, or the null words.
+/// A region of one 8-byte word per row: the weights, or the null words. A
+/// packed one is a region of the mapping, read per row in place.
 pub(crate) enum WordRegion {
     Mapped(ColPtr),
-    /// Exactly two distinct words, selected per row by `bits`.
-    TwoValue {
-        value_a: i64,
-        value_b: i64,
-        bits: *const [u8],
-    },
-    /// An [`Encoding::For`] image of `bw`-byte offsets, read per row in place.
-    For {
-        image: *const [u8],
-        bw: usize,
-    },
+    TwoValue(TwoValueImage<'static>),
+    For(ForImage<'static>),
 }
 
 impl WordRegion {
     /// The region `span` holds for `count` rows.
-    fn bind(data: &[u8], span: &Span, count: usize) -> Result<Self, StorageError> {
-        Ok(match span.encoding {
-            Encoding::TwoValue => {
-                if span.size != two_value_image_len(count) {
-                    return Err(Corrupt("region size"));
-                }
-                let (value_a, value_b, bits) = two_value_decode(span.bytes(data));
-                WordRegion::TwoValue { value_a, value_b, bits }
-            }
-            Encoding::For => {
-                let bw = for_image_bw(span.size, count, FIXED_REGION_BYTES).ok_or(Corrupt("region size"))?;
-                WordRegion::For { image: span.bytes(data), bw }
-            }
-            _ => WordRegion::Mapped(direct_region(data, span, count, FIXED_REGION_BYTES)?),
-        })
+    fn bind(data: &'static [u8], span: &Span, count: usize) -> Result<Self, StorageError> {
+        let image = span.bytes(data);
+        match span.encoding {
+            Encoding::TwoValue => TwoValueImage::parse(image, count).map(WordRegion::TwoValue),
+            Encoding::For => ForImage::parse(image, count, FIXED_REGION_BYTES - 1).map(WordRegion::For),
+            _ => return direct_region(data, span, count, FIXED_REGION_BYTES).map(WordRegion::Mapped),
+        }
+        .ok_or(Corrupt("region size"))
+    }
+
+    /// Row `row`'s word, `row` a row of the shard.
+    #[inline(always)]
+    fn word(&self, row: usize) -> u64 {
+        match self {
+            // SAFETY: the region holds a word for every row of the shard.
+            WordRegion::Mapped(cp) => read_u64_le(unsafe { cp.row(row, FIXED_REGION_BYTES) }, 0),
+            WordRegion::TwoValue(two) => two.at(row),
+            WordRegion::For(frame) => frame.at(row),
+        }
+    }
+
+    /// Rows `start..` as they stand in a batch, `dst.len() / 8` rows of the
+    /// shard.
+    fn decode(&self, start: usize, dst: &mut [u8]) {
+        match self {
+            // SAFETY: the region holds a word for every row of the shard.
+            WordRegion::Mapped(cp) => unsafe { cp.copy_rows(start, FIXED_REGION_BYTES, dst) },
+            WordRegion::TwoValue(two) => two.decode(start, dst),
+            WordRegion::For(frame) => frame.decode(start, FIXED_REGION_BYTES, dst),
+        }
     }
 }
 
 pub struct MappedShard {
-    /// The mapping every pointer below points into, shared by every handle
-    /// [`rebind`](Self::rebind) derives from this one.
+    /// The mapping every pointer and `'static` slice below points into, shared
+    /// by every handle [`rebind`](Self::rebind) derives from this one.
     mmap: Rc<Mmap>,
     header: ShardHeader,
     schema: SchemaDescriptor,
@@ -143,9 +147,9 @@ pub struct MappedShard {
     /// The null bits of `schema`'s payload columns past the file's own, OR'd
     /// into every null word read: a column the file predates reads NULL.
     null_pad_mask: u64,
-    blob: *const [u8],
+    blob: &'static [u8],
     /// The PK filter region, or `None` when the file carries none.
-    shard_filter: Option<*const [u8]>,
+    shard_filter: Option<&'static [u8]>,
 }
 
 /// A shard's header and directory, read under no schema.
@@ -221,14 +225,6 @@ impl MappedShard {
         self.header.retractions
     }
 
-    /// Whether payload column `pi` is stored frame-of-reference packed.
-    pub fn packs_payload(&self, pi: usize) -> bool {
-        matches!(
-            self.col_regions[pi],
-            PayloadRegion::Packed(PackedRegion { image: PackedImage::For { .. }, .. })
-        )
-    }
-
     pub fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
         let (mmap, header) = Self::map(path)?;
         mmap.advise_hugepage();
@@ -262,7 +258,9 @@ impl MappedShard {
     /// A handle on `mmap` under `schema`. Trusts the descriptive prefix
     /// [`open`](Self::open) checked.
     fn bind(mmap: Rc<Mmap>, header: ShardHeader, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
-        let data = mmap.as_slice();
+        // SAFETY: `mmap` moves into the handle built here, which keeps the
+        // mapping alive, and every read of a slice of it borrows that handle.
+        let data: &'static [u8] = unsafe { &*(mmap.as_slice() as *const [u8]) };
         let (file_npc, count) = (header.file_npc, header.row_count);
         let spans = region_spans(data, file_npc)?;
 
@@ -279,22 +277,20 @@ impl MappedShard {
                     return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
-                // SAFETY: the image lies in the mapping `mmap` keeps alive, and
-                // every read of the region borrows this handle.
-                let image: &'static [u8] = unsafe { &*(span.bytes(data) as *const [u8]) };
+                let image = span.bytes(data);
                 let string = col.type_code.is_german_string();
                 let image = match span.encoding {
                     Encoding::Raw | Encoding::Constant => {
                         return direct_region(data, span, count, width).map(PayloadRegion::Mapped);
                     }
-                    Encoding::Dict if width >= 2 => {
+                    Encoding::Dict => {
                         return DictImage::parse(image, count)
                             .map(PayloadRegion::Dict)
                             .ok_or(Corrupt("region size"));
                     }
                     Encoding::For => {
                         let fi = col.fixed_int().ok_or(Corrupt("encoding"))?;
-                        for_image_bw(span.size, count, fi.width()).map(|bw| PackedImage::For { image, bw })
+                        ForImage::parse(image, count, fi.width() - 1).map(PackedImage::For)
                     }
                     Encoding::Seq if string => SeqImage::parse(image, count).map(PackedImage::Seq),
                     Encoding::Sparse if col.nullable && !string => {
@@ -324,7 +320,7 @@ impl MappedShard {
                 if !shard_filter::is_valid(region) {
                     return Err(Corrupt("filter descriptor"));
                 }
-                Some(region as *const [u8])
+                Some(region)
             }
         };
 
@@ -362,34 +358,15 @@ impl MappedShard {
         self.mmap.as_slice().len() as u64
     }
 
-    /// `span`, a sub-slice of `self.mmap` taken at bind.
-    #[inline(always)]
-    fn mapped(&self, span: *const [u8]) -> &[u8] {
-        // SAFETY: every span is `Span::bytes` of this handle's mapping, which `self.mmap` keeps alive.
-        unsafe { &*span }
-    }
-
-    /// Row `row`'s word of `region`.
-    #[inline(always)]
-    fn word(&self, region: &WordRegion, row: usize) -> u64 {
-        match region {
-            WordRegion::Mapped(cp) => read_u64_le(unsafe { cp.row(row, 8) }, 0),
-            WordRegion::TwoValue { value_a, value_b, bits } => {
-                two_value_at(*value_a, *value_b, self.mapped(*bits), row) as u64
-            }
-            WordRegion::For { image, bw } => for_at(self.mapped(*image), *bw, row),
-        }
-    }
-
-    /// Rows `start..` of `region` as they stand in a batch, `dst.len() / 8` rows.
-    fn decode_words(&self, region: &WordRegion, start: usize, dst: &mut [u8]) {
-        match region {
-            WordRegion::For { image, bw } => for_decode(self.mapped(*image), *bw, FIXED_REGION_BYTES, start, dst),
-            WordRegion::Mapped(_) | WordRegion::TwoValue { .. } => {
-                for (i, cell) in dst.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                    *cell = self.word(region, start + i).to_le_bytes();
-                }
-            }
+    /// Rows `first..` of payload column `pi` as they stand in a batch:
+    /// `out.len() / width` rows of the shard, at its `width`-byte cells.
+    fn decode_payload(&self, pi: usize, width: usize, first: usize, out: &mut [u8]) {
+        debug_assert!(first + out.len() / width <= self.header.row_count);
+        match &self.col_regions[pi] {
+            // SAFETY: the region holds a cell for every row of the shard.
+            PayloadRegion::Mapped(cp) => unsafe { cp.copy_rows(first, width, out) },
+            PayloadRegion::Dict(dict) => dict.decode(first, width, out),
+            PayloadRegion::Packed(p) => self.decode_packed(p, pi, first, out),
         }
     }
 
@@ -397,15 +374,15 @@ impl MappedShard {
     /// `out.len() / p.width` rows.
     fn decode_packed(&self, p: &PackedRegion, pi: usize, first: usize, out: &mut [u8]) {
         match &p.image {
-            PackedImage::For { image, bw } => for_decode(image, *bw, p.width, first, out),
-            PackedImage::Seq(seq) => seq.decode(self.blob(), first, out),
+            PackedImage::For(frame) => frame.decode(first, p.width, out),
+            PackedImage::Seq(seq) => seq.decode(self.blob, first, out),
             PackedImage::Sparse(sparse) => {
                 // From the block's first row on: the decode counts the values before `first`.
                 let from = first - first % DECODE_BLOCK_ROWS;
                 let rows = first - from + out.len() / p.width;
-                // SAFETY: `decode_words` writes every word of `nulls`.
+                // SAFETY: the decode writes every word of `nulls`.
                 let mut nulls = unsafe { PooledBuf::uninit(rows * FIXED_REGION_BYTES) };
-                self.decode_words(&self.null_bmp, from, &mut nulls);
+                self.null_bmp.decode(from, &mut nulls);
                 sparse.decode(first, p.width, out, &nulls, pi)
             }
         }
@@ -435,7 +412,7 @@ impl MappedShard {
     /// A shard carrying no filter admits every key.
     pub fn shard_filter_may_contain(&self, probe_key: u64) -> bool {
         self.shard_filter
-            .is_none_or(|region| shard_filter::may_contain(self.mapped(region), probe_key))
+            .is_none_or(|region| shard_filter::may_contain(region, probe_key))
     }
 
     /// [`seek_lower_bound`](super::seek::seek_lower_bound) over this shard's PKs.
@@ -472,23 +449,7 @@ impl MappedShard {
         assert!(start + row_count <= self.header.row_count, "slice out of range");
 
         let schema = &self.schema;
-        let blob = self.blob();
-        // A constant region (stride 0) is its one element repeated: write it once,
-        // then double the written prefix, so any element width costs O(log rows)
-        // copies. Any other region is contiguous.
-        let copy_rows = |cp: ColPtr, width: usize, dst: &mut [u8]| {
-            if cp.stride == 0 {
-                dst[..width].copy_from_slice(unsafe { cp.row(0, width) });
-                let mut filled = width;
-                while filled < dst.len() {
-                    let n = filled.min(dst.len() - filled);
-                    dst.copy_within(..n, filled);
-                    filled += n;
-                }
-            } else {
-                dst.copy_from_slice(unsafe { std::slice::from_raw_parts(cp.row_ptr(start), dst.len()) });
-            }
-        };
+        let blob = self.blob;
         let relocate = carried.is_none();
         let blob_cap = if relocate {
             prorated_blob_cap(blob.len(), self.header.row_count, row_count)
@@ -497,50 +458,25 @@ impl MappedShard {
         };
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
             let (pk, weight, null_bmp) = w.fixed_mut();
-            copy_rows(self.pk, schema.pk_stride(), pk);
-            for (region, dst) in [(&self.weight, weight), (&self.null_bmp, null_bmp)] {
-                match region {
-                    WordRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, dst),
-                    packed => self.decode_words(packed, start, dst),
-                }
-            }
+            // SAFETY: the assert above keeps the slice inside the shard.
+            unsafe { self.pk.copy_rows(start, schema.pk_stride(), pk) };
+            self.weight.decode(start, weight);
+            self.null_bmp.decode(start, null_bmp);
             if self.null_pad_mask != 0 {
                 for word in null_bmp.as_chunks_mut::<8>().0 {
                     *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
                 }
             }
             for (pi, col) in schema.payload_columns() {
-                let cp = match &self.col_regions[pi] {
-                    PayloadRegion::Mapped(cp) => *cp,
-                    PayloadRegion::Packed(p) => {
-                        if relocate && col.type_code.is_german_string() {
-                            let mut cells = vec![0u8; row_count * 16];
-                            self.decode_packed(p, pi, start, &mut cells);
-                            for (i, cell) in cells.as_chunks::<16>().0.iter().enumerate() {
-                                w.write_string_cell(pi, cell, blob, None, i);
-                            }
-                        } else {
-                            self.decode_packed(p, pi, start, w.col_mut(pi));
-                        }
-                        continue;
-                    }
-                    PayloadRegion::Dict(d) => {
-                        if relocate && col.type_code.is_german_string() {
-                            for i in 0..row_count {
-                                w.write_string_cell(pi, d.cell(start + i), blob, None, i);
-                            }
-                        } else {
-                            d.decode(start, col.size() as usize, w.col_mut(pi));
-                        }
-                        continue;
-                    }
-                };
                 if relocate && col.type_code.is_german_string() {
-                    for i in 0..row_count {
-                        w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, blob, None, i);
+                    // The cells as the shard holds them, then each onto this batch's heap.
+                    let (cells, heap, mut cache) = w.string_col_mut(pi);
+                    self.decode_payload(pi, 16, start, cells);
+                    for cell in cells.as_chunks_mut::<16>().0 {
+                        *cell = relocate_german_string_vec(&*cell, blob, heap, cache.as_deref_mut());
                     }
                 } else {
-                    copy_rows(cp, col.size() as usize, w.col_mut(pi));
+                    self.decode_payload(pi, col.size() as usize, start, w.col_mut(pi));
                 }
             }
             if !relocate {
@@ -565,7 +501,7 @@ impl RowSource for MappedShard {
     #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         debug_assert!(row < self.header.row_count);
-        self.word(&self.null_bmp, row) | self.null_pad_mask
+        self.null_bmp.word(row) | self.null_pad_mask
     }
 
     #[inline(always)]
@@ -580,7 +516,7 @@ impl RowSource for MappedShard {
 
     #[inline(always)]
     fn blob(&self) -> &[u8] {
-        self.mapped(self.blob)
+        self.blob
     }
 
     #[inline(always)]
@@ -603,31 +539,27 @@ impl ColumnarSource for MappedShard {
             self.col_regions[..schema.num_payload_cols()]
                 .iter()
                 .zip(self.schema.payload_columns())
-                .map(|(region, (pi, col))| {
-                    let w = col.size() as usize;
-                    let mut held = |decode: &dyn Fn(&mut [u8])| {
-                        // SAFETY: either decode writes every cell of `column`.
+                .map(|(region, (pi, col))| match region {
+                    PayloadRegion::Mapped(cp) => *cp,
+                    _ => {
+                        let w = col.size() as usize;
+                        // SAFETY: the decode writes every cell of `column`.
                         let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
-                        decode(&mut column);
+                        self.decode_payload(pi, w, window.start, &mut column);
                         // Rebased so that row `window.start` reads the column's first cell.
                         ColPtr {
                             base: decoded.hold(column).wrapping_sub(window.start * w),
                             stride: w,
                         }
-                    };
-                    match region {
-                        PayloadRegion::Mapped(cp) => *cp,
-                        PayloadRegion::Packed(p) => held(&|out| self.decode_packed(p, pi, window.start, out)),
-                        PayloadRegion::Dict(d) => held(&|out| d.decode(window.start, w, out)),
                     }
                 }),
         );
         let null_bmp = match &self.null_bmp {
             WordRegion::Mapped(cp) => *cp,
             packed => {
-                // SAFETY: `decode_words` writes every word of `words`.
+                // SAFETY: the decode writes every word of `words`.
                 let mut words = unsafe { PooledBuf::uninit(window.len() * FIXED_REGION_BYTES) };
-                self.decode_words(packed, window.start, &mut words);
+                packed.decode(window.start, &mut words);
                 ColPtr {
                     base: decoded.hold(words).wrapping_sub(window.start * FIXED_REGION_BYTES),
                     stride: FIXED_REGION_BYTES,
@@ -647,7 +579,7 @@ impl ColumnarSource for MappedShard {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         debug_assert!(row < self.header.row_count);
-        self.word(&self.weight, row) as i64
+        self.weight.word(row) as i64
     }
 
     #[inline(always)]

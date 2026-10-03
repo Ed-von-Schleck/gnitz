@@ -58,10 +58,11 @@ proptest! {
             .iter()
             .enumerate()
             .map(|(i, b)| match as_shard >> (i % 16) & 1 == 1 && b.count > 0 {
-                true => {
-                    let opts = ShardWriteOpts { pack_ints: i % 2 == 1, ..ShardWriteOpts::default() };
-                    Run::Shard(map_shard(&dir.path().join(format!("{i}.db")), b, opts))
-                }
+                true => Run::Shard(map_shard(
+                    &dir.path().join(format!("{i}.db")),
+                    b,
+                    ShardWriteOpts::default(),
+                )),
                 false => Run::Mem(Rc::new(b.clone())),
             })
             .collect();

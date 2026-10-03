@@ -14,21 +14,28 @@ fn pack(vals: &[i128], fi: FixedInt) -> Vec<u8> {
     b
 }
 
-/// Encode → recover `bw` from the image geometry → decode → assert
-/// byte-exact reproduction of the input region. Returns the chosen `bw`
-/// (None ⇒ region stays Raw).
+/// Encode, parse, decode per row and in bulk, and assert each reproduces the
+/// input region. Returns the offset width chosen (None ⇒ the encoder declined).
 fn roundtrip(vals: &[i128], fi: FixedInt) -> Option<usize> {
     let raw = pack(vals, fi);
-    let n = vals.len();
+    let (n, w) = (vals.len(), fi.width());
     let image = for_encode(&raw, fi)?;
-    let bw = for_image_bw(image.len(), n, fi.width()).expect("the encoder's image has FoR geometry");
-    let mut decoded = vec![0u8; n * fi.width()];
-    for_decode(&image, bw, fi.width(), 0, &mut decoded);
+    let frame = ForImage::parse(&image, n, w - 1).expect("the encoder's image parses");
+    let bw = frame.bw;
+    assert!(
+        ForImage::parse(&image, n, bw - 1).is_none(),
+        "wider than the offsets admitted"
+    );
+    assert!(ForImage::parse(&image, n + 1, w - 1).is_none(), "another row count");
+    let mut decoded = vec![0u8; n * w];
+    frame.decode(0, w, &mut decoded);
     assert_eq!(decoded, raw, "byte-exact roundtrip (bw={bw}, {fi:?})");
+    for (row, cell) in raw.chunks_exact(w).enumerate() {
+        assert_eq!(frame.at(row).to_le_bytes()[..w], *cell, "row {row} (bw={bw}, {fi:?})");
+    }
     if n >= 10 {
-        let w = fi.width();
         let mut window = vec![0u8; 7 * w];
-        for_decode(&image, bw, w, 3, &mut window);
+        frame.decode(3, w, &mut window);
         assert_eq!(
             window,
             raw[3 * w..10 * w],
@@ -39,11 +46,11 @@ fn roundtrip(vals: &[i128], fi: FixedInt) -> Option<usize> {
 }
 
 /// The offset width `for_encode` must choose: the bytes `vals`' span needs, if
-/// packing at that width drops an aligned block of the raw region.
+/// the image at that width is smaller than the raw region.
 fn expected_bw(vals: &[i128], fi: FixedInt) -> Option<usize> {
     let span = vals.iter().max()? - vals.iter().min()?;
     let bw = (128 - span.leading_zeros() as usize).div_ceil(8);
-    (bw > 0 && region_start(for_image_len(vals.len(), bw)) < region_start(vals.len() * fi.width())).then_some(bw)
+    (bw > 0 && for_image_len(vals.len(), bw) < vals.len() * fi.width()).then_some(bw)
 }
 
 #[test]
@@ -83,8 +90,9 @@ fn for_packs_at_the_width_the_span_needs() {
             I32,
             Some(3),
         ),
-        // Raw 40 B, packed 8 + 10·2 + 7 B: both align to 64, so nothing is saved.
-        ("aligned footprints tie", series(10, |i| i * 1000), U32, None),
+        // Raw 20 B, packed 8 + 5·1 + 7 B.
+        ("no smaller", series(5, |i| i * 50), U32, None),
+        ("a byte smaller", series(6, |i| i * 40), U32, Some(1)),
     ];
     for (what, vals, fi, want) in cases {
         assert_eq!(roundtrip(&vals, fi), want, "{what}");
@@ -121,42 +129,64 @@ fn random_regions_pack_at_the_expected_width() {
     assert!(packed > 50 && declined > 50, "{packed} packed, {declined} declined");
 }
 
-/// FoR decode-throughput + compression-ratio microbench. Run in release:
-/// `cargo test -p gnitz-zset --release for_decode_bench --
-///   --ignored --nocapture --test-threads=1`
+/// Instructions per value to decode a framed region in bulk, at each cell
+/// width and each offset width it admits.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_decode_bench() {
+    use gnitz_foundation::perf::Counter;
     use std::hint::black_box;
+    const N: usize = 1_000_000;
+    let instructions = Counter::instructions().unwrap();
+    for fi in [FixedInt::I16, FixedInt::I32, FixedInt::I64] {
+        let w = fi.width();
+        for bw in 1..w {
+            // Offsets that span all of `bw` bytes, on a frame below zero.
+            let span = 1i128 << (8 * bw - 1);
+            let mut vals: Vec<i128> = (0..N as i128)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % span - span / 2)
+                .collect();
+            (vals[0], vals[1]) = (-span / 2, span / 2 - 1);
+            let raw = pack(&vals, fi);
+            let image = for_encode(&raw, fi).expect("region must pack");
+            let frame = ForImage::parse(&image, N, w - 1).expect("the encoder's image parses");
+            assert_eq!(frame.bw, bw);
+            let mut decoded = vec![0u8; N * w];
+            let ((), i) = instructions.measure(|| black_box(&frame).decode(0, w, black_box(&mut decoded)));
+            assert_eq!(decoded, raw);
+            println!(
+                "{fi:?} at {bw}-byte offsets: {:.2} instructions per value, {:.2}x smaller",
+                i as f64 / N as f64,
+                raw.len() as f64 / image.len() as f64
+            );
+        }
+    }
+}
 
-    // A representative re-keyed ex-PK column: 1M I64 rows over a narrow
-    // range far from zero (the `_int_`/`_hist_`/`_reduce_` shape).
-    let n = 1_000_000usize;
-    let vals: Vec<i128> = (0..n).map(|i| 3_000_000_000i128 + (i % 4000) as i128).collect();
-    let raw = pack(&vals, FixedInt::I64);
-    let image = for_encode(&raw, FixedInt::I64).expect("region must pack");
-    let bw = for_image_bw(image.len(), n, 8).expect("FoR geometry");
-
-    let raw_bytes = (n * 8).next_multiple_of(ALIGNMENT);
-    let packed_bytes = for_image_len(n, bw).next_multiple_of(ALIGNMENT);
-    println!(
-        "FoR ratio: {n} I64 rows, bw={bw}, raw(aligned)={raw_bytes}B packed(aligned)={packed_bytes}B \
-         ({:.2}x)",
-        raw_bytes as f64 / packed_bytes as f64
-    );
-
-    let iters = 200;
-    let mut decoded = vec![0u8; n * 8];
-    let elapsed = crate::test_support::bench_time(iters, || {
-        for_decode(black_box(&image), bw, 8, 0, &mut decoded);
-        black_box(&decoded);
-    });
-    let vals_per_s = (n as f64 * iters as f64) / elapsed.as_secs_f64();
-    println!(
-        "FoR decode: {:.1} M values/s ({:.2} ms per {n}-row region)",
-        vals_per_s / 1e6,
-        elapsed.as_secs_f64() * 1e3 / iters as f64
-    );
+/// A region of two words reads back per row and in bulk from any row on, and a
+/// region of one word or of three has no such image.
+#[test]
+fn two_value_roundtrips_from_any_row() {
+    let (a, b) = (1u64, -1i64 as u64);
+    let words = |n: usize, f: &dyn Fn(usize) -> u64| (0..n).flat_map(|i| f(i).to_le_bytes()).collect::<Vec<u8>>();
+    for n in [2, 7, 8, 9, 64, 131] {
+        let src = words(n, &|i| if i % 3 == 1 || i % 11 == 5 { b } else { a });
+        let image = two_value_encode(&src).unwrap();
+        let two = TwoValueImage::parse(&image, n).unwrap();
+        assert!(TwoValueImage::parse(&image, n + 8).is_none(), "{n}: another row count");
+        for row in 0..n {
+            assert_eq!(two.at(row).to_le_bytes(), src[row * 8..][..8], "{n}: row {row}");
+        }
+        for first in 0..n.min(20) {
+            for rows in [0, 1, n - first, (n - first) / 2] {
+                let mut out = vec![0xAAu8; rows * 8];
+                two.decode(first, &mut out);
+                assert_eq!(out, src[first * 8..][..rows * 8], "{n}: {rows} rows from {first}");
+            }
+        }
+    }
+    assert!(two_value_encode(&words(9, &|_| a)).is_none(), "one word");
+    assert!(two_value_encode(&words(9, &|i| i as u64 % 3)).is_none(), "three words");
 }
 
 /// `n` distinct cells, cell `i` holding `i` in its low bytes.
@@ -186,7 +216,7 @@ fn dict_roundtrips_at_every_code_width() {
             assert_eq!(dict.cell(row), &entries[id as usize], "{n} entries: row {row}");
         }
         // A cell narrower than an entry is the entry's leading bytes.
-        for width in [2, 4, 8, 16] {
+        for width in [1, 2, 4, 8, 16] {
             for window in [0..ids.len(), 3..ids.len() - 1, 2..2] {
                 let mut out = vec![0u8; window.len() * width];
                 dict.decode(window.start, width, &mut out);
@@ -400,17 +430,30 @@ fn sparse_roundtrips_framed_and_unframed() {
     for (width, fi, value, bw) in cases {
         for rows in [1, 40, DECODE_BLOCK_ROWS, 3 * DECODE_BLOCK_ROWS + 5] {
             let src = sparse_region(rows, width, is_null, value);
-            let held = (0..rows).filter(|&row| !is_null(row)).count();
+            let held: Vec<u128> = (0..rows).filter(|&row| !is_null(row)).map(value).collect();
             let image = sparse_encode(&src, width, fi, is_null);
             let values = image.len() - SPARSE_RANKS_AT - rows.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY;
-            // Too few values for a frame to shrink them stay cells.
-            let framed = bw < width && held > 0 && values != held * width;
+            // The bytes the values' span needs, and whether a frame of them is the smaller.
+            let span = held
+                .iter()
+                .max()
+                .zip(held.iter().min())
+                .map_or(0, |(max, min)| max - min);
+            let need = (128 - span.leading_zeros() as usize).div_ceil(8);
+            let framed = fi.is_some() && need > 0 && for_image_len(held.len(), need) < held.len() * width;
             assert_eq!(
                 values,
-                if framed { for_image_len(held, bw) } else { held * width },
+                if framed {
+                    for_image_len(held.len(), need)
+                } else {
+                    held.len() * width
+                },
                 "{width}: {rows} rows"
             );
-            assert!(framed || bw == width || rows <= 40, "{width}: {rows} rows frame");
+            if rows > DECODE_BLOCK_ROWS {
+                assert_eq!(framed, bw < width, "{width}: {rows} rows frame");
+                assert!(!framed || need == bw, "{width}: {rows} rows frame at {need} bytes");
+            }
 
             let sparse = SparseImage::parse(&image, rows, width).unwrap();
             for window in [
@@ -429,6 +472,39 @@ fn sparse_roundtrips_framed_and_unframed() {
                 );
             }
         }
+    }
+}
+
+/// A frame the size of the cells it would replace is not taken, so that a
+/// parse tells the two apart by size alone.
+#[test]
+fn sparse_keeps_cells_a_frame_would_not_shrink() {
+    // `held` values spanning `bw` bytes: a frame of them takes `15 + held * bw`.
+    for (width, fi, held, bw) in [
+        (8, FixedInt::U64, 15, 7),
+        (8, FixedInt::U64, 5, 5),
+        (8, FixedInt::U64, 3, 3),
+        (4, FixedInt::U32, 5, 1),
+        // One value more, and the frame is the smaller.
+        (8, FixedInt::U64, 16, 7),
+        (4, FixedInt::U32, 6, 1),
+    ] {
+        let rows = 3 * held;
+        let is_null = |row: usize| row % 3 != 1;
+        let top = (1u128 << (8 * bw)) - 1;
+        let src = sparse_region(rows, width, is_null, |row| if row == 1 { top } else { row as u128 });
+        let image = sparse_encode(&src, width, Some(fi), is_null);
+        let values = image.len() - SPARSE_RANKS_AT - SPARSE_RANK_ENTRY;
+        let framed = for_image_len(held, bw) < held * width;
+        assert_eq!(
+            values,
+            if framed { for_image_len(held, bw) } else { held * width },
+            "{held} values of {bw} bytes"
+        );
+        let sparse = SparseImage::parse(&image, rows, width).unwrap();
+        let mut out = vec![0xAAu8; src.len()];
+        sparse_decode(&sparse, 0, width, &mut out, is_null);
+        assert_eq!(out, src, "{held} values of {bw} bytes");
     }
 }
 

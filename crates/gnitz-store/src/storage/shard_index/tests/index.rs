@@ -430,23 +430,6 @@ fn a_corrupt_input_body_fails_the_compaction() {
     );
 }
 
-/// A spill packs its integer payloads as a compaction output does.
-#[test]
-fn spills_and_compaction_outputs_pack() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut idx = fresh(dir.path(), make_schema_u64_i64());
-    let packed = |e: &ShardEntry| e.shard.packs_payload(0);
-    for i in 0..5u64 {
-        let pks: Vec<u64> = (i * 300..(i + 1) * 300).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
-    }
-    assert!(idx.levels[L0].entries().all(packed));
-    idx.run_compact().unwrap();
-    assert!(idx.all_entries().all(packed));
-    assert_all_found(&idx, 0..1500);
-}
-
 /// A run above every key L1 holds folds into one fresh guard and stays that
 /// guard's one shard, although it outweighs the spills it was written from: a
 /// frame spanned one spill in each of them and spans the run in it.

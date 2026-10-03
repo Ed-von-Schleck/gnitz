@@ -54,6 +54,29 @@ impl ColPtr {
     pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
         std::slice::from_raw_parts(self.row_ptr(i), len)
     }
+
+    /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
+    /// `dst.len() / width` rows.
+    ///
+    /// # Safety
+    /// Those rows are rows of a live column this addresses.
+    pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
+        if self.stride != 0 {
+            return dst.copy_from_slice(std::slice::from_raw_parts(self.row_ptr(start), dst.len()));
+        }
+        if dst.is_empty() {
+            return;
+        }
+        // One element repeated: write it once, then double the written prefix,
+        // so any element width costs O(log rows) copies.
+        dst[..width].copy_from_slice(self.row(0, width));
+        let mut filled = width;
+        while filled < dst.len() {
+            let n = filled.min(dst.len() - filled);
+            dst.copy_within(..n, filled);
+            filled += n;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

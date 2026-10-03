@@ -1,9 +1,8 @@
 use super::super::batch::{Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::batch_builder::BatchBuilder;
-use super::super::layout::*;
 use super::super::merge::ColumnarSource;
 use super::super::scatter::UnifiedSet;
-use super::super::shard_file::{region_dir, ShardWriteOpts};
+use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::repr::error::StorageError;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
@@ -14,13 +13,10 @@ use crate::test_support::{
 use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, write_u64_le};
 
-/// Write `batch` through the production writer to `dir/name`; `pack` admits FoR
-/// on its integer payload columns.
-fn write(dir: &std::path::Path, name: &str, batch: &Batch, pack: bool) -> String {
+/// Write `batch` through the production writer to `dir/name`.
+fn write(dir: &std::path::Path, name: &str, batch: &Batch) -> String {
     let path = dir.join(name).to_str().unwrap().to_owned();
-    batch
-        .write_as_shard(&path, ShardWriteOpts { pack_ints: pack, ..Default::default() })
-        .unwrap();
+    batch.write_as_shard(&path, ShardWriteOpts::default()).unwrap();
     path
 }
 
@@ -28,7 +24,7 @@ fn write(dir: &std::path::Path, name: &str, batch: &Batch, pack: bool) -> String
 /// `dir/test.db` — the fixture the integrity tests patch.
 fn small_shard(dir: &std::path::Path, rows: u64, mul: i64) -> String {
     let rows: Vec<(u64, i64, i64)> = (1..=rows).map(|i| (i, 1, i as i64 * mul)).collect();
-    write(dir, "test.db", &make_batch(&make_schema_u64_i64(), &rows), false)
+    write(dir, "test.db", &make_batch(&make_schema_u64_i64(), &rows))
 }
 
 /// Open `base` patched and written back over `path`: the digest is left stale,
@@ -65,11 +61,6 @@ fn patch_entry(data: &mut [u8], i: usize, patch: impl FnOnce(&mut DirEntry)) {
     let mut e = DirEntry::read(data, i);
     patch(&mut e);
     e.write(data, i);
-}
-
-/// Every region of `image` placed in it.
-fn spans_of(image: &[u8]) -> Vec<Span> {
-    region_spans(image, ShardHeader::read(image).unwrap().file_npc).unwrap()
 }
 
 /// `(U64 PK, I64, <tail>)` where `tail` is nullable — the shape an
@@ -186,13 +177,12 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     }
 }
 
-/// A shape: its label, the batch written, the schema it is read under, whether
-/// the writer may pack, and the encodings its directory must carry.
+/// A shape: its label, the batch written, the schema it is read under, and the
+/// encodings its directory must carry.
 struct Shape {
     label: &'static str,
     written: Batch,
     reader: SchemaDescriptor,
-    pack: bool,
     encodings: Vec<(usize, Encoding)>,
 }
 
@@ -212,6 +202,7 @@ fn shapes() -> Vec<Shape> {
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
     let u64_f64 = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
+    let u64_u8 = u64_pk_schema(SchemaColumn::new(TypeCode::U8, false));
     let u64_u128 = u64_pk_schema(SchemaColumn::new(TypeCode::U128, false));
     let opt_i64 = SchemaColumn::new(TypeCode::I64, true);
     let three_nullable = SchemaDescriptor::new(
@@ -250,7 +241,6 @@ fn shapes() -> Vec<Shape> {
             label: "all-constant",
             written: make_batch(&u64_i64, &[(1, 1, 7)]),
             reader: u64_i64,
-            pack: false,
             encodings: vec![
                 (REG_PK, Constant),
                 (REG_WEIGHT, Constant),
@@ -268,7 +258,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: nullable_i64,
-            pack: true,
             encodings: vec![
                 (REG_PK, Raw),
                 (REG_WEIGHT, For),
@@ -286,7 +275,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: three_nullable,
-            pack: true,
             encodings: vec![(REG_NULL_BMP, For)],
         },
         // One row in six holds a value: the frame over those alone is two bytes,
@@ -298,7 +286,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_opt_int((i % 6 == 2).then_some(1_700_000_000_000 + i as u128 * 13));
             }),
             reader: nullable_i64,
-            pack: true,
             encodings: vec![(REG_NULL_BMP, TwoValue), (REG_PAYLOAD_START, Sparse)],
         },
         // The first holds its cells, a u128 taking no frame; the third is under
@@ -312,23 +299,21 @@ fn shapes() -> Vec<Shape> {
                 b.put_opt_int((i % 3 != 0).then_some(40_000 + i as u128));
             }),
             reader: sparse_mix,
-            pack: true,
             encodings: vec![
                 (REG_PAYLOAD_START, Sparse),
                 (REG_PAYLOAD_START + 1, Sparse),
                 (REG_PAYLOAD_START + 2, For),
             ],
         },
-        // The same column a writer may not pack.
+        // Two bits a row, where no frame is narrower than the cell.
         Shape {
-            label: "mostly-NULL i64 a writer may not pack",
-            written: build(nullable_i64, 300, |b, i| {
+            label: "dictionary of one-byte cells",
+            written: build(u64_u8, 2000, |b, i| {
                 b.begin_row(i as u128, 1);
-                b.put_opt_int((i % 6 == 2).then_some(1_700_000_000_000 + i as u128 * 13));
+                b.put_int((i % 3) as u128 * 100);
             }),
-            reader: nullable_i64,
-            pack: false,
-            encodings: vec![(REG_PAYLOAD_START, Raw)],
+            reader: u64_u8,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
         },
         Shape {
             label: "dictionary of floats",
@@ -337,7 +322,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(((i % 7) as f64 * 0.25 - 1.0).to_bits() as u128);
             }),
             reader: u64_f64,
-            pack: true,
             encodings: vec![(REG_PAYLOAD_START, Dict)],
         },
         Shape {
@@ -347,7 +331,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(((i % 300) as u128 + 1) * (u128::MAX / 301));
             }),
             reader: u64_u128,
-            pack: true,
             encodings: vec![(REG_PAYLOAD_START, Dict)],
         },
         // Five values a frame of four bytes spans: the dictionary is the smaller.
@@ -358,19 +341,7 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(((i % 5) as i64 * 500_000_000 - 7) as u128);
             }),
             reader: u64_i64,
-            pack: true,
             encodings: vec![(REG_PAYLOAD_START, Dict)],
-        },
-        // The same values unpacked.
-        Shape {
-            label: "repeating i64 a writer may not pack",
-            written: build(u64_i64, 300, |b, i| {
-                b.begin_row(i as u128, 1);
-                b.put_int(((i % 5) as i64 * 500_000_000 - 7) as u128);
-            }),
-            reader: u64_i64,
-            pack: false,
-            encodings: vec![(REG_PAYLOAD_START, Raw)],
         },
         // Three weights spanning more than a FoR offset holds.
         Shape {
@@ -380,7 +351,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(i as u128);
             }),
             reader: u64_i64,
-            pack: false,
             encodings: vec![(REG_WEIGHT, Raw)],
         },
         Shape {
@@ -390,7 +360,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(42);
             }),
             reader: u64_i64,
-            pack: false,
             encodings: vec![
                 (REG_WEIGHT, Constant),
                 (REG_NULL_BMP, Constant),
@@ -404,7 +373,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int((1_000_000 + (i % 300) as i64) as u128);
             }),
             reader: u64_i64,
-            pack: true,
             encodings: vec![(REG_WEIGHT, TwoValue), (REG_PAYLOAD_START, For)],
         },
         Shape {
@@ -414,14 +382,12 @@ fn shapes() -> Vec<Shape> {
                 b.put_int((-70_000i32 + (i % 250) as i32) as i64 as u128);
             }),
             reader: u64_i32,
-            pack: true,
             encodings: vec![(REG_PAYLOAD_START, For)],
         },
         Shape {
             label: "for i64 across decode blocks",
             written: build(u64_i64, 2 * DECODE_BLOCK_ROWS + 17, for_i64),
             reader: u64_i64,
-            pack: true,
             encodings: vec![(REG_PAYLOAD_START, For)],
         },
         Shape {
@@ -434,7 +400,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: string,
-            pack: true,
             // One value in a third of the rows: a dictionary's entries outweigh the lengths.
             encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
@@ -448,7 +413,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
         // Two rows: their lengths would not be the smaller image.
@@ -459,7 +423,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_string(&wide_string(i, 20 + i));
             }),
             reader: string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Raw)],
         },
         // Lengths of two bytes, and a NULL the sample's runs do not reach twice.
@@ -475,7 +438,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: nullable_string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
         Shape {
@@ -485,7 +447,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_string(&wide_string(0, 40));
             }),
             reader: string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Constant)],
         },
         // Too few rows for a dictionary to be the smaller image.
@@ -496,7 +457,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_string(&wide_string(i / 2, 40));
             }),
             reader: string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Raw)],
         },
         Shape {
@@ -509,7 +469,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: string,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Dict)],
         },
         Shape {
@@ -522,7 +481,6 @@ fn shapes() -> Vec<Shape> {
                 }
             }),
             reader: nullable_string,
-            pack: false,
             encodings: vec![(REG_NULL_BMP, TwoValue), (REG_PAYLOAD_START, Dict)],
         },
         // The second column's sample repeats nothing, so its long values follow the
@@ -535,7 +493,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_string(&wide_string(i, 25));
             }),
             reader: two_strings,
-            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Dict), (REG_PAYLOAD_START + 1, Seq)],
         },
         Shape {
@@ -545,7 +502,6 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(i as u128);
             }),
             reader: u128_i64,
-            pack: false,
             encodings: vec![(REG_PK, Raw)],
         },
         Shape {
@@ -554,7 +510,6 @@ fn shapes() -> Vec<Shape> {
                 b.begin_row_natives(&[1, (i / 4) as u128, (i * 7) as u128], 1)
             }),
             reader: all_pk,
-            pack: false,
             encodings: vec![(REG_PK, Raw)],
         },
         Shape {
@@ -564,22 +519,19 @@ fn shapes() -> Vec<Shape> {
                 b.put_int(i as u128 * 3);
             }),
             reader: u64_i64,
-            pack: false,
             encodings: vec![(REG_PK, Constant)],
         },
         Shape {
             label: "widened by i64",
             written: w1,
             reader: schema_with_appended(TypeCode::I64),
-            pack: false,
-            encodings: vec![(REG_PAYLOAD_START, Raw)],
+            encodings: vec![(REG_PAYLOAD_START, For)],
         },
         Shape {
             label: "widened by string",
             written: w2,
             reader: schema_with_appended(TypeCode::String),
-            pack: false,
-            encodings: vec![(REG_PAYLOAD_START, Raw)],
+            encodings: vec![(REG_PAYLOAD_START, For)],
         },
     ]
 }
@@ -590,7 +542,7 @@ fn written_shapes(dir: &std::path::Path) -> Vec<(Shape, String)> {
         .into_iter()
         .enumerate()
         .map(|(i, s)| {
-            let path = write(dir, &format!("shape_{i}.db"), &s.written, s.pack);
+            let path = write(dir, &format!("shape_{i}.db"), &s.written);
             (s, path)
         })
         .collect()
@@ -602,11 +554,65 @@ fn every_shape_reads_back_through_every_surface() {
     for (s, path) in written_shapes(dir.path()) {
         let image = std::fs::read(&path).unwrap();
         for &(region, enc) in &s.encodings {
-            assert_eq!(region_dir(&image, region).1, enc, "{}: region {region}", s.label);
+            assert_eq!(spans_of(&image)[region].encoding, enc, "{}: region {region}", s.label);
         }
         let shard = MappedShard::open(&path, &s.reader).unwrap();
         assert_reads_as(s.label, &shard, &s.written.widened_with_nulls(&s.reader, false));
     }
+}
+
+/// Whatever image the writer picks for a column the reader admits and reads
+/// back: every fixed-width payload type, nullable or not, over values that
+/// repeat, that span little, that are mostly NULL and that are arbitrary.
+#[test]
+fn every_column_type_reads_back_whatever_its_values() {
+    use TypeCode::*;
+    type Value = fn(usize) -> Option<u128>;
+    let values: [(&str, Value); 5] = [
+        ("two values", |i| Some((i % 2) as u128 * 77)),
+        ("forty values", |i| Some((i % 40) as u128 * 3)),
+        ("a narrow span", |i| Some(100 + (i as u128 * 7919) % 150)),
+        ("mostly NULL", |i| {
+            (i % 9 == 4).then_some(1 + i as u128 * 0x0101_0101_0101_0101_0101)
+        }),
+        ("arbitrary", |i| {
+            Some((i as u128 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835))
+        }),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for tc in [
+        U8, I8, U16, I16, U32, I32, F32, U64, I64, F64, U128, UUID, I128, Date, Timestamp, Decimal,
+    ] {
+        for nullable in [false, true] {
+            let schema = u64_pk_schema(SchemaColumn::new(tc, nullable));
+            let mask = u128::MAX >> (128 - 8 * schema.columns[1].size());
+            for (what, value) in values {
+                for n in [1, 700, DECODE_BLOCK_ROWS + 3] {
+                    let batch = build(schema, n, |b, i| {
+                        b.begin_row(i as u128, 1);
+                        // A column that takes no NULL holds a zero in its place.
+                        b.put_opt_int(value(i).map(|v| v & mask).or((!nullable).then_some(0)));
+                    });
+                    let label = format!("{tc:?} nullable={nullable}, {what}, {n} rows");
+                    let path = write(dir.path(), "column.db", &batch);
+                    seen.insert(
+                        spans_of(&std::fs::read(&path).unwrap())[REG_PAYLOAD_START]
+                            .encoding
+                            .name(),
+                    );
+                    let shard = MappedShard::open(&path, &schema).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                    assert_reads_as(&label, &shard, &batch);
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["constant", "dict", "for", "raw", "sparse"],
+        "every encoding a fixed-width column takes"
+    );
 }
 
 /// The schema-free directory read agrees with the image on every shape, and
@@ -631,11 +637,8 @@ fn the_directory_reads_without_a_schema() {
         let roles = roles.chain((0..npc).map(|pi| format!("p{pi}")));
         let want: Vec<(String, &str, usize)> = roles
             .chain(["blob", "filter"].map(String::from))
-            .enumerate()
-            .map(|(i, role)| {
-                let (size, enc) = region_dir(&image, i);
-                (role, enc.name(), size)
-            })
+            .zip(spans_of(&image))
+            .map(|(role, span)| (role, span.encoding.name(), span.size))
             .collect();
         assert_eq!(d.regions, want, "{}", s.label);
     }
@@ -665,7 +668,7 @@ fn packed_three_blocks(dir: &std::path::Path) -> MappedShard {
         b.begin_row(i as u128, 1);
         b.put_int((5_000 + (i % 200) as i64) as u128);
     });
-    let shard = MappedShard::open(&write(dir, "blocks.db", &batch, true), &schema).unwrap();
+    let shard = MappedShard::open(&write(dir, "blocks.db", &batch), &schema).unwrap();
     assert!(matches!(shard.col_regions[0], PayloadRegion::Packed(_)));
     shard
 }
@@ -726,7 +729,7 @@ fn shard_wider_than_reader_schema_opens() {
         b.put_int((i as u128 + 1) * 10);
         b.put_int((i as u128 + 1) * 11);
     });
-    let shard_path = write(dir.path(), "wide.db", &wide, false);
+    let shard_path = write(dir.path(), "wide.db", &wide);
 
     let shard = MappedShard::open(&shard_path, &make_schema_u64_i64()).unwrap();
     for row in 0..3 {
@@ -743,7 +746,7 @@ fn a_widened_all_pk_shard_is_not_a_skeleton() {
     let dir = tempfile::tempdir().unwrap();
     let all_pk = build(pk_only_schema(&[TypeCode::U64]), 1, |b, _| b.begin_row(1, 1));
     let widened = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    let shard = MappedShard::open(&write(dir.path(), "allpk.db", &all_pk, false), &widened).unwrap();
+    let shard = MappedShard::open(&write(dir.path(), "allpk.db", &all_pk), &widened).unwrap();
     assert!(gnitz_wire::null_word_get(shard.get_null_word(0), 0));
     assert!(!shard.is_skeleton());
 }
@@ -804,7 +807,7 @@ fn slice_relocates_only_its_own_strings() {
         b.begin_row(i as u128 + 1, 1);
         b.put_string(&wide_string(i, W));
     });
-    let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch, false), &schema).unwrap();
+    let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
     assert_eq!(shard.blob().len(), N * W);
     let string = |b: &Batch, i: usize| String::from_utf8(read_german_string(b, 0, i)).unwrap();
 
@@ -840,7 +843,7 @@ fn a_relocating_slice_copies_a_shared_span_once() {
         b.begin_row(i as u128 + 1, 1);
         b.put_string(&wide_string(i % 2, 40));
     });
-    let shard = MappedShard::open(&write(dir.path(), "shared.db", &batch, false), &schema).unwrap();
+    let shard = MappedShard::open(&write(dir.path(), "shared.db", &batch), &schema).unwrap();
     assert_eq!(shard.blob().len(), 2 * 40, "premise: rows 0 and 2 share one span");
     let slice = shard.slice_to_owned_batch_with(0, 3, None);
     assert_eq!(slice.blob.len(), 2 * 40);
@@ -878,7 +881,7 @@ fn slice_blob_relocate_bench() {
             b.begin_row(i as u128 + 1, 1);
             b.put_string(&wide_string(i, w));
         });
-        let shard = MappedShard::open(&write(dir.path(), &format!("bench_{w}.db"), &batch, false), &schema).unwrap();
+        let shard = MappedShard::open(&write(dir.path(), &format!("bench_{w}.db"), &batch), &schema).unwrap();
         for &pct in &[
             1usize, 2, 3, 4, 6, 8, 12, 16, 20, 25, 33, 40, 50, 60, 68, 75, 85, 90, 99,
         ] {
@@ -912,8 +915,7 @@ fn each_forgery_is_refused_with_its_own_verdict() {
     let path = small_shard(dir.path(), 10, 100);
     let base = std::fs::read(&path).unwrap();
     let filter = num_regions(schema.num_payload_cols());
-    let (fsz, _) = region_dir(&base, filter);
-    let xoff = spans_of(&base)[filter].off;
+    let Span { off: xoff, size: fsz, .. } = spans_of(&base)[filter];
 
     type Forge = Box<dyn Fn(&mut Vec<u8>)>;
     let npc = |v: u64| -> Forge { Box::new(move |d| write_u64_le(d, OFF_FILE_NPC, v)) };
@@ -989,10 +991,8 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
         .write_as_shard(&shard_path, no_filter)
         .unwrap();
     let image = std::fs::read(&shard_path).unwrap();
-    assert_eq!(
-        region_dir(&image, num_regions(schema.num_payload_cols())),
-        (0, Encoding::Raw)
-    );
+    let filter = spans_of(&image).pop().unwrap();
+    assert_eq!((filter.size, filter.encoding), (0, Encoding::Raw));
     let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert!(!shard.has_shard_filter());
     assert_eq!(shard.verify_body(), Ok(()));
@@ -1111,7 +1111,7 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
         let schema = s.written.schema();
         let base = std::fs::read(&path).unwrap();
         for region in REG_PK..REG_PAYLOAD_START + schema.num_payload_cols() {
-            let (sz, enc) = region_dir(&base, region);
+            let Span { size: sz, encoding: enc, .. } = spans_of(&base)[region];
             for delta in [-1isize, 1] {
                 let forged = sz.checked_add_signed(delta).unwrap();
                 let got = open_patched_restamped(&path, schema, &base, |d| patch_entry(d, region, |e| e.size = forged));
@@ -1163,7 +1163,7 @@ fn for_slice_bench() {
             b.begin_row(i as u128, 1);
             b.put_opt_int(value(i));
         });
-        let path = write(dir.path(), "for_slice.db", &batch, true);
+        let path = write(dir.path(), "for_slice.db", &batch);
         let handles: Vec<MappedShard> = (0..HANDLES)
             .map(|_| MappedShard::open(&path, &schema).unwrap())
             .collect();
@@ -1186,6 +1186,52 @@ fn for_slice_bench() {
     }
 }
 
+/// Instructions per row to read a weight and a null word through the per-row
+/// accessors, and to decode both regions in one whole slice, by the encoding
+/// the two regions take.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn word_region_bench() {
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const N: usize = 1_000_000;
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    type Row = fn(usize) -> (i64, Option<u128>);
+    let shapes: [(&str, Row); 3] = [
+        ("constant", |i| (1, Some(i as u128))),
+        ("two-value", |i| {
+            (if i % 3 == 0 { -1 } else { 1 }, (i % 5 != 0).then_some(i as u128))
+        }),
+        ("for", |i| ((i % 7) as i64 + 1, (i % 5 != 0).then_some(i as u128))),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let instructions = Counter::instructions().unwrap();
+    for (label, row) in shapes {
+        let batch = build(schema, N, |b, i| {
+            let (weight, value) = row(i);
+            b.begin_row(i as u128, weight);
+            b.put_opt_int(value);
+        });
+        let path = write(dir.path(), "words.db", &batch);
+        let shard = MappedShard::open(&path, &schema).unwrap();
+        let (sum, per_row) = instructions.measure(|| {
+            let mut sum = 0u64;
+            for r in 0..N {
+                sum = sum.wrapping_add(shard.get_weight(black_box(r)) as u64 ^ shard.get_null_word(r));
+            }
+            sum
+        });
+        black_box(sum);
+        let (_, slice) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
+        println!(
+            "{label} weight: {:.2} instructions per row for both per-row reads, {:.2} for a whole slice",
+            per_row as f64 / N as f64,
+            slice as f64 / N as f64,
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
 /// First-touch cost of a per-row read on a packed column: a fresh handle, one
 /// `get_col_ptr` per FoR column at a mid row, then the same read again.
 #[test]
@@ -1202,7 +1248,7 @@ fn for_point_touch_bench() {
         b.put_int((i % 1000) as u128);
         b.put_int(3 * i as u128);
     });
-    let path = write(dir.path(), "point.db", &batch, true);
+    let path = write(dir.path(), "point.db", &batch);
     let shard = MappedShard::open(&path, &schema).unwrap();
     let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
     let read = || {
@@ -1253,6 +1299,7 @@ fn shard_string_footprint_bench() {
         &[0],
     );
     let one_string = make_schema_pk_u64_payload_string();
+    let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
 
     let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
     let urls: Vec<String> = (0..2_000)
@@ -1292,6 +1339,26 @@ fn shard_string_footprint_bench() {
             }),
         ),
         (
+            "one nullable column, distinct inline values, one row in twenty NULL",
+            build(nullable_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                match i % 20 {
+                    7 => b.put_null(),
+                    _ => b.put_string(&format!("r{i:09}")),
+                }
+            }),
+        ),
+        (
+            "one nullable column, distinct 60-byte values, one row in twenty NULL",
+            build(nullable_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                match i % 20 {
+                    7 => b.put_null(),
+                    _ => b.put_string(&wide_string(i, 60)),
+                }
+            }),
+        ),
+        (
             "one column, 60-byte values drawn from N/2",
             build(one_string, N, |b, i| {
                 b.begin_row(i as u128 + 1, 1);
@@ -1305,12 +1372,12 @@ fn shard_string_footprint_bench() {
     for (si, (label, batch)) in shapes.iter().enumerate() {
         let schema = *batch.schema();
         let name = format!("{si}.db");
-        let (path, write_i) = instructions.measure(|| write(dir.path(), &name, batch, false));
+        let (path, write_i) = instructions.measure(|| write(dir.path(), &name, batch));
         let image = std::fs::read(&path).unwrap();
         let regions: Vec<String> = (0..=num_regions(schema.num_payload_cols()))
             .map(|r| {
-                let (size, enc) = region_dir(&image, r);
-                format!("{size}/{enc:?}")
+                let Span { size, encoding, .. } = spans_of(&image)[r];
+                format!("{size}/{encoding:?}")
             })
             .collect();
         let shard = MappedShard::open(&path, &schema).unwrap();

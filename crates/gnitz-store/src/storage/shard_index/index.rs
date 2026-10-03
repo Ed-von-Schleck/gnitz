@@ -41,8 +41,8 @@ impl ShardIndex {
             .chain(&mut self.pending)
     }
 
-    /// Write `batch` as an unpublished shard named by a fresh seq, its integer
-    /// payload regions FoR-packed. `newest` defaults to that seq.
+    /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
+    /// defaults to that seq.
     fn write_shard(&mut self, batch: &Batch, skeleton: bool, newest: Option<u64>) -> Result<ShardEntry, StorageError> {
         self.shard_seq += 1;
         let seq = self.shard_seq;
@@ -51,7 +51,6 @@ impl ShardIndex {
             .write_as_shard(
                 &path,
                 ShardWriteOpts {
-                    pack_ints: true,
                     skeleton,
                     skip_pk_filter: self.skip_pk_filter,
                 },

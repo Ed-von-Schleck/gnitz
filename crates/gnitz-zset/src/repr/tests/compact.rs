@@ -1,6 +1,7 @@
 use super::super::batch::REG_NULL_BMP;
-use super::super::layout::{Encoding, ShardHeader};
-use super::super::shard_file::{region_dir, ShardWriteOpts};
+use super::super::encoding::Encoding;
+use super::super::layout::{spans_of, ShardHeader};
+use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_u64_i64, map_shard, FoldRow,
@@ -82,10 +83,7 @@ proptest! {
         let shards: Vec<Rc<MappedShard>> = runs
             .iter()
             .enumerate()
-            .map(|(i, b)| {
-                let opts = ShardWriteOpts { pack_ints: i % 2 == 1, ..ShardWriteOpts::default() };
-                map_shard(&dir.path().join(format!("{i}.db")), b, opts)
-            })
+            .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b, ShardWriteOpts::default()))
             .collect();
 
         // Guard keys drawn from the rows' own keys, so boundaries land on live
@@ -154,18 +152,15 @@ fn a_skeleton_output_is_payload_free_on_disk() {
     batch
         .write_as_shard(
             path.to_str().unwrap(),
-            ShardWriteOpts {
-                pack_ints: true,
-                skeleton: true,
-                ..Default::default()
-            },
+            ShardWriteOpts { skeleton: true, ..Default::default() },
         )
         .unwrap();
     let raw = std::fs::read(&path).unwrap();
     let header = ShardHeader::read(&raw).unwrap();
     assert_eq!(header.file_npc, 0, "zero payload arity");
     assert!(header.skeleton, "declared skeleton");
-    assert_eq!(region_dir(&raw, REG_NULL_BMP), (8, Encoding::Constant));
+    let nulls = &spans_of(&raw)[REG_NULL_BMP];
+    assert_eq!((nulls.size, nulls.encoding), (8, Encoding::Constant));
 }
 
 /// A skeleton input makes every output a skeleton, asked or not: its rows carry
@@ -244,11 +239,7 @@ fn for_compaction_bench() {
                     b.end_row();
                 }
                 let name = format!("in_{sources}_{guards}_{skeleton}_{s}.db");
-                map_shard(
-                    &dir.path().join(name),
-                    &b.finish(),
-                    ShardWriteOpts { pack_ints: true, ..Default::default() },
-                )
+                map_shard(&dir.path().join(name), &b.finish(), ShardWriteOpts::default())
             })
             .collect();
         let guard_keys: Vec<PkBuf> = (0..guards)

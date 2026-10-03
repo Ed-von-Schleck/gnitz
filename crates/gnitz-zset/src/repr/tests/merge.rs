@@ -178,13 +178,7 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
         .iter()
         .filter(|b| b.count > 0)
         .enumerate()
-        .map(|(i, b)| {
-            let opts = ShardWriteOpts {
-                pack_ints: i % 2 == 1,
-                ..ShardWriteOpts::default()
-            };
-            map_shard(&dir.path().join(format!("{i}.db")), b, opts)
-        })
+        .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b, ShardWriteOpts::default()))
         .collect();
     let shards: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
     let folds = vec![

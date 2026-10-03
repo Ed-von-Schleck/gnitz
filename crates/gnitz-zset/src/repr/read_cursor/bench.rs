@@ -812,7 +812,7 @@ fn for_range_drain_bench() {
             map_shard(
                 &dir.path().join(format!("range_{s}.db")),
                 &b.finish(),
-                ShardWriteOpts { pack_ints: true, ..Default::default() },
+                ShardWriteOpts::default(),
             )
         })
         .collect();

@@ -1,13 +1,13 @@
 use super::*;
 use crate::repr::{BatchBuilder, MappedShard};
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch};
 
 /// Any change to the written bytes, the writer's own or a dependency's, needs a
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (26, 2877720371824318169);
+    const PINNED: (u64, u64) = (27, 8259605191670743709);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let schema = SchemaDescriptor::new(
         &[
@@ -39,23 +39,19 @@ fn shard_bytes_are_pinned() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("golden.db");
     b.finish()
-        .write_as_shard(
-            path.to_str().unwrap(),
-            ShardWriteOpts { pack_ints: true, ..Default::default() },
-        )
+        .write_as_shard(path.to_str().unwrap(), ShardWriteOpts::default())
         .unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
 
-    let encodings: Vec<Encoding> = (0..=gnitz_wire::num_regions(6))
-        .map(|i| region_dir(&bytes, i).1)
-        .collect();
+    let spans = spans_of(&bytes);
+    let encodings: Vec<Encoding> = spans.iter().map(|s| s.encoding).collect();
     use Encoding::*;
     assert_eq!(
         encodings,
         [Raw, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Raw, Raw],
         "the batch covers every encoding"
     );
-    assert!(region_dir(&bytes, gnitz_wire::num_regions(6)).0 > 0, "and a PK filter");
+    assert!(spans.last().unwrap().size > 0, "and a PK filter");
 
     // Both vary with things other than the writer: the system schema, the path.
     write_u64_le(&mut bytes, OFF_VERSION, 0);
@@ -119,7 +115,7 @@ fn written_strings(rows: &[(u64, i64, &[u8])]) -> (usize, Encoding) {
     for (row, &(_, _, want)) in rows.iter().enumerate() {
         assert_eq!(gnitz_expr::payload_bytes(&shard, row, 0), want, "row {row}");
     }
-    (shard.blob().len(), region_dir(&image, REG_PAYLOAD_START).1)
+    (shard.blob().len(), spans_of(&image)[REG_PAYLOAD_START].encoding)
 }
 
 /// A long value several rows hold reaches the heap once, whichever image the

@@ -6,16 +6,17 @@
 //! recycling (`batch_pool`), the OPK lower-bound search (`seek`), sort-merge
 //! consolidation (`merge`), the German-string heap (`string_heap`), the
 //! column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
-//! shard PK-probe filter (`shard_filter`), the shard-image encoder and writer
-//! (`shard_file`), the shard-format constants (`layout`), and the guard-routed
-//! shard merge a compaction runs (`compact`), the bounded external sort of
+//! shard PK-probe filter (`shard_filter`), the shard writer (`shard_file`), the
+//! shard file's framing (`layout`) and its region encodings (`encoding`), and the
+//! guard-routed shard merge a compaction runs (`compact`), the bounded external sort of
 //! key records (`spill`), and the read-only file mapping (`mmap`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
 //! engine share). The row-at-a-time system-table writer over a batch is
 //! `batch_builder`.
 //!
-//! The shard *image* has one owner: `shard_file` encodes it, `shard_reader`
-//! mmaps and validates it, and `layout` holds the format rules both call.
+//! The shard *image* has one owner: `shard_file` writes it, `shard_reader`
+//! mmaps and validates it, and `layout` and `encoding` hold the format rules
+//! both call.
 //!
 //! Above the representation sit the sorted run, whatever backs it (`run`), and
 //! the opaque read cursor that merges runs (`read_cursor`). Which runs a store
@@ -31,6 +32,7 @@ mod batch_builder;
 mod batch_pool;
 mod batch_wire;
 mod compact;
+mod encoding;
 mod error;
 mod layout;
 mod loser_tree;
