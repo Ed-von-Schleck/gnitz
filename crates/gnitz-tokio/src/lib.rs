@@ -111,7 +111,7 @@ impl AsyncClient {
     /// Push a batch and resolve to its ingest LSN.
     pub fn push(&self, tid: u64, schema: &Schema, batch: &ZSetBatch) -> impl Future<Output = Result<u64, ClientError>> {
         let mode = WireConflictMode::Update;
-        self.call(Request::Push { target_id: tid, schema, batch, mode }, Reply::into_lsn)
+        self.call(Request::Push { target_id: tid, schema, batch, mode }, Reply::into_ack)
     }
 
     /// Read `tid` under `spec`, replied in `reply_schema`'s layout.

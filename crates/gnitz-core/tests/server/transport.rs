@@ -317,7 +317,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
 
         let (done, _) = drive_all(&mut s, pushes.len() + 1);
         for id in pushes {
-            assert!(matches!(done[&id], Ok(Reply::Lsn(_))), "{:?}", done[&id]);
+            assert!(matches!(done[&id], Ok(Reply::Ack(_))), "{:?}", done[&id]);
         }
         let Ok(Reply::Scan(data)) = &done[&scan] else {
             panic!("{:?}", done[&scan])

@@ -1,5 +1,5 @@
 use crate::connection::{
-    DeltaCursor, IdRun, Interest, PollEnd, PollSink, Polled, RawBlock, RelDescriptor, Reply, Request, ScanReply,
+    DeltaCursor, Encoded, IdRun, Interest, PollEnd, Polled, RawBlock, RelDescriptor, Reply, Request, ScanReply,
     Session, SlotId,
 };
 use crate::error::ClientError;
@@ -257,7 +257,7 @@ impl GnitzClient {
 
     pub(crate) fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
         let slot = self.session.submit(req)?;
-        await_slot(&mut self.session, &mut self.park_hook, slot, None)
+        await_slot(&mut self.session, &mut self.park_hook, slot)
     }
 
     /// Reserve `count` contiguous SERIAL ids for `table_id` and return the first,
@@ -285,7 +285,7 @@ impl GnitzClient {
 
     /// Allocate `run`, returning its first id.
     fn alloc(&mut self, run: IdRun) -> Result<u64, ClientError> {
-        self.round_trip(Request::Alloc(run)).map(Reply::into_id)
+        self.round_trip(Request::Alloc(run)).map(Reply::into_ack)
     }
 
     /// Allocate one catalog object id (schema, relation or index).
@@ -339,7 +339,7 @@ impl GnitzClient {
     ) -> Result<u64, ClientError> {
         Ok(self
             .round_trip(Request::Push { target_id, schema, batch, mode })?
-            .into_lsn())
+            .into_ack())
     }
 
     /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
@@ -649,7 +649,7 @@ impl GnitzClient {
             })
             .collect();
         self.round_trip(Request::PushTxn { families: &families })
-            .map(Reply::into_lsn)
+            .map(Reply::into_ack)
     }
 
     /// Read `target`'s rows under `bound` and `predicate` — only their keys when
@@ -1213,17 +1213,15 @@ impl GnitzClient {
     }
 }
 
-/// Step and park until `slot` completes, handing `sink` what the steps read of
-/// a delta poll.
+/// Step and park until `slot` completes.
 pub(crate) fn await_slot(
     session: &mut Session,
     hook: &mut Option<ParkHook>,
     slot: SlotId,
-    mut sink: Option<&mut PollSink<'_>>,
 ) -> Result<Reply, ClientError> {
     let mut ready = Interest::WRITE;
     loop {
-        let mut done = session.step_polling(ready, sink.as_deref_mut());
+        let mut done = session.step(ready);
         if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
             return done.swap_remove(i).1;
         }
@@ -1240,22 +1238,24 @@ pub(crate) fn delta_read_blocks(
     item: DeltaPollItem,
     mut on_block: impl FnMut(RawBlock) -> Result<(), ClientError>,
 ) -> Result<DeltaCursor, ClientError> {
-    let slot = session.submit_delta_poll(&[item])?;
+    let slot = session.enqueue(Encoded::delta_poll(&[item])?)?;
+    let mut refused: Option<ClientError> = None;
     let mut end: Option<PollEnd> = None;
-    let mut sink = |s: SlotId, polled: Polled| {
-        let refused = matches!(end, Some(Err(_)));
-        if s != slot || refused {
-            return;
-        }
-        end = match polled {
-            Polled::Block(b) => on_block(b).err().map(Err),
-            Polled::End(e) => Some(e),
+    let mut ready = Interest::WRITE;
+    // The view's end is the whole answer; the slot's own completion repeats it.
+    loop {
+        let mut sink = |s: SlotId, polled: Polled| match polled {
+            _ if s != slot => {}
+            Polled::Block(b) if refused.is_none() => refused = on_block(b).err(),
+            Polled::Block(_) => {}
+            Polled::End(e) => end = Some(e),
         };
-    };
-    // A per-view fault ends the position and completes the slot `Ok`; a
-    // frame-level rejection completes it `Err` with no position ended.
-    await_slot(session, hook, slot, Some(&mut sink))?;
-    end.expect("a one-view poll completes by ending its position")
+        session.step_polling(ready, Some(&mut sink));
+        if let Some(end) = end {
+            return refused.map_or(end, Err);
+        }
+        ready = park(session, hook)?;
+    }
 }
 
 /// Wait for the session's interest, running `hook` on every `EINTR`.

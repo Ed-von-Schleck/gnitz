@@ -617,17 +617,19 @@ async fn dispatch_request(
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {
-            send_id(
-                peer,
-                commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await? as u64,
-            );
+            let base = commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await?;
+            send_ack(peer, target_id, base as u64);
             Ok(())
         }
 
-        // An id allocation names no relation, so `target_id` is not read — and a
-        // frame that sets one is still allocated, rather than falling through to
-        // a scan of that id.
-        ClientVerb::AllocIds => reply_allocation(peer, shared.cat_mut().allocate_ids(ctrl.hdr.arg1)),
+        // An id allocation names no relation, so `target_id` is only echoed —
+        // and a frame that sets one is still allocated, rather than falling
+        // through to a scan of that id.
+        ClientVerb::AllocIds => {
+            let base = shared.cat_mut().allocate_ids(ctrl.hdr.arg1);
+            send_ack(peer, target_id, base.map_err(|e| format!("id allocation failed: {e}"))?);
+            Ok(())
+        }
 
         ClientVerb::ScanSpec => {
             handle_scan_spec(shared, peer, target_id, &data[ctrl.blob.clone()], ctrl.hdr.arg0).await
@@ -643,13 +645,6 @@ async fn dispatch_request(
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
     }
-}
-
-/// Reply to an id allocation. The new id rides back as the reply's *target* id —
-/// that id is the whole answer, so the frame carries no schema and no data.
-fn reply_allocation(peer: &Peer, alloc: Result<u64, String>) -> Result<(), WireFault> {
-    send_id(peer, alloc.map_err(|e| format!("id allocation failed: {e}"))?);
-    Ok(())
 }
 
 /// Decode a push frame against the catalog: its record must lay out its target's
@@ -706,7 +701,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     }
 
     let Some(batch) = batch else {
-        send_push_ack(peer, target_id, 0);
+        send_ack(peer, target_id, 0);
         return Ok(());
     };
 
@@ -751,7 +746,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     // whether this batch happened to open a zone, so a stream push the committer
     // coalesced with a base-table push still answers `0`.
     let reply_lsn = if is_stream { 0 } else { zone_lsn };
-    send_push_ack(peer, target_id, reply_lsn);
+    send_ack(peer, target_id, reply_lsn);
     Ok(())
 }
 
@@ -800,8 +795,7 @@ async fn handle_push_txn(
             CommitRequest::Txn(PendingTxn { families, done })
         })
         .await?;
-    // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
-    send_msg(peer, ipc::WireMsg { arg0: lsn, ..Default::default() });
+    send_ack(peer, 0, lsn);
     Ok(())
 }
 
@@ -1308,21 +1302,17 @@ fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
     peer.cork_with(|out| encode_response_into(out, msg));
 }
 
-/// A push's ACK: the target and the LSN the write reports, and no schema.
-fn send_push_ack(peer: &Peer, target_id: u64, lsn: u64) {
+/// A control-only ACK: the request's own `target_id`, and its one value — a
+/// write's LSN or an allocation's base id — in `arg0`.
+pub(super) fn send_ack(peer: &Peer, target_id: u64, value: u64) {
     send_msg(
         peer,
         ipc::WireMsg {
             target_id,
-            arg0: lsn,
+            arg0: value,
             ..Default::default()
         },
     )
-}
-
-/// A successful control-only reply whose answer is the target id.
-fn send_id(peer: &Peer, id: u64) {
-    send_msg(peer, ipc::WireMsg { target_id: id, ..Default::default() })
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.

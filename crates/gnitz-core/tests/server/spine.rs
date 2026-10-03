@@ -58,7 +58,7 @@ fn concurrent_pushes_and_scans(target: &str) {
             .expect("no server error");
         if is_push {
             pushed += per;
-            assert!(matches!(r, Reply::Lsn(_)), "a push completes as its ingest LSN");
+            assert!(matches!(r, Reply::Ack(_)), "a push completes as its ingest LSN");
         } else {
             let Reply::Scan(data) = r else { panic!("scan") };
             assert_eq!(

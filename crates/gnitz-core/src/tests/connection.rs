@@ -18,7 +18,7 @@ fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<SlotId
     })
 }
 
-/// An uncorrelated request whose reply is [`Reply::Lsn`].
+/// A request ACKed at target 0, whose reply is [`Reply::Ack`].
 const COMMIT: Request<'static> = Request::PushTxn { families: &[] };
 
 fn schema_a() -> Arc<Schema> {
@@ -118,7 +118,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert!(s.step(Interest::READ).is_empty(), "one of two trains");
     peer.send(&reply_rows(2, &batch_b(&[20]), 0, true));
     peer.send(&reply_rows(2, &batch_b(&[21]), 0, false));
-    let Reply::Multi(replies) = await_slot(&mut s, &mut None, slot, None).unwrap() else {
+    let Reply::Multi(replies) = await_slot(&mut s, &mut None, slot).unwrap() else {
         panic!("multi")
     };
     assert_eq!(replies.len(), 2);
@@ -144,7 +144,7 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
         Some(&sa.to_block()),
         Some(&batch_a(&[5])),
     ));
-    let e = await_slot(&mut s, &mut None, slot, None).expect_err("a schema block on a read is a decode error");
+    let e = await_slot(&mut s, &mut None, slot).expect_err("a schema block on a read is a decode error");
     assert!(
         matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
         "{e:?}"
@@ -181,7 +181,7 @@ fn a_status_frame_fails_its_slot_alone() {
             peer.send(&reply_rows(tid, &batch_a(&[tid]), 0, false));
         }
         peer.send(&reply_status(0, status, "refused"));
-        let r = await_slot(&mut s, &mut None, slot, None);
+        let r = await_slot(&mut s, &mut None, slot);
         assert!(
             matches!(&r, Err(ClientError::Refused(f)) if f.status == status && f.text == "refused"),
             "{what}: {r:?}"
@@ -193,7 +193,7 @@ fn a_status_frame_fails_its_slot_alone() {
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
-        let Reply::Scan(r) = await_slot(&mut s, &mut None, slot, None).unwrap() else {
+        let Reply::Scan(r) = await_slot(&mut s, &mut None, slot).unwrap() else {
             panic!("scan")
         };
         assert_eq!(r.lsn, Some(42), "{what}: the next request completes normally");
@@ -292,7 +292,7 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     let done = s.step(Interest::READ);
     assert_eq!(done.len(), 2);
     assert_eq!(done[0].0, a);
-    assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
+    assert!(matches!(done[0].1, Ok(Reply::Ack(11))), "{:?}", done[0].1);
     assert_eq!(done[1].0, b);
     assert!(
         matches!(
@@ -325,7 +325,7 @@ fn a_reply_readable_behind_a_failed_flush_is_delivered() {
     let done = s.step(Interest::WRITE);
     assert_eq!(done.len(), 2, "{done:?}");
     assert_eq!(done[0].0, a);
-    assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
+    assert!(matches!(done[0].1, Ok(Reply::Ack(11))), "{:?}", done[0].1);
     assert_eq!(done[1].0, b);
     assert!(
         matches!(&done[1].1, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
@@ -444,12 +444,12 @@ fn in_flight_cap_raises_rather_than_hanging() {
 /// unwind left.
 fn poll_whose_sink_panics(behind: &[Vec<u8>]) -> (Session, crate::test_support::Peer) {
     let (mut s, peer) = pair();
-    s.submit_delta_poll(&[txn_frame::DeltaPollItem {
+    let poll = Encoded::delta_poll(&[txn_frame::DeltaPollItem {
         view_id: 7,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
-    }])
-    .unwrap();
+    }]);
+    s.enqueue(poll.unwrap()).unwrap();
     s.step(Interest::WRITE);
     peer.recv();
     let mut wire = framed(&reply_rows(7, &batch_a(&[1]), 0, true));
@@ -487,7 +487,7 @@ fn a_panicking_sink_leaves_the_frames_behind_its_block_fed() {
     peer.send(&reply_ctrl(0, 11));
     let done = s.step(Interest::READ);
     assert!(
-        matches!(&done[..], [(id, Ok(Reply::Lsn(11)))] if *id == slot),
+        matches!(&done[..], [(id, Ok(Reply::Ack(11)))] if *id == slot),
         "{done:?}"
     );
 }
@@ -500,4 +500,93 @@ fn a_panicking_sink_finds_a_failure_behind_its_block_already_recorded() {
     let (mut s, _peer) = poll_whose_sink_panics(&[reply_ctrl(8, 1)]);
     assert!(s.is_closed());
     assert!(matches!(s.submit(COMMIT), Err(ClientError::ConnectionLost(_))));
+}
+
+/// A delta poll that fails whole — refused at target 0, or cut off by the
+/// connection — still ends every view it had yet to answer, once each.
+#[test]
+fn a_poll_that_fails_whole_ends_each_unanswered_view() {
+    let item = |view_id| txn_frame::DeltaPollItem {
+        view_id,
+        after_tick: 4,
+        reply_layout: schema_a().layout_digest(),
+    };
+    for refused in [true, false] {
+        let (mut s, peer) = pair();
+        let slot = s
+            .enqueue(Encoded::delta_poll(&[item(7), item(8), item(9)]).unwrap())
+            .unwrap();
+        s.step(Interest::WRITE);
+        peer.recv();
+        // View 7 is answered; the failure finds 8 and 9 open.
+        let mut wire = framed(&encode_frame(
+            ControlHeader {
+                target_id: 7,
+                arg0: 9,
+                arg1: 1,
+                ..Default::default()
+            },
+            &[],
+            None,
+            None,
+        ));
+        if refused {
+            wire.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
+        }
+        peer.send_bytes(&wire);
+        if !refused {
+            drop(peer);
+        }
+        let mut ends = Vec::new();
+        let mut sink = |id: SlotId, p: Polled| {
+            assert_eq!(id, slot);
+            match p {
+                Polled::End(end) => ends.push(end),
+                Polled::Block(_) => panic!("no view sent a block"),
+            }
+        };
+        let mut done = Vec::new();
+        while done.is_empty() {
+            done = s.step_polling(Interest::READ, Some(&mut sink));
+        }
+        assert!(matches!(&done[..], [(id, Err(_))] if *id == slot), "{done:?}");
+        assert_eq!(s.is_closed(), !refused);
+        assert_eq!(ends.len(), 3, "one end per view: {ends:?}");
+        assert!(ends[0].is_ok(), "{ends:?}");
+        for end in &ends[1..] {
+            match end {
+                Err(ClientError::Refused(f)) => assert!(refused && f.text == "refused"),
+                Err(ClientError::ConnectionLost(_)) => assert!(!refused),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}
+
+/// A RESOLVE reply that does not decode ends the session, whichever of its
+/// sections is the malformed one.
+#[test]
+fn a_resolve_reply_that_does_not_decode_ends_the_session() {
+    let schema = schema_a().to_block();
+    let named = ControlHeader { target_id: 7, ..Default::default() };
+    for (what, frame) in [
+        ("no schema block", encode_frame(named, &[], None, None)),
+        ("a truncated descriptor", encode_frame(named, &[], Some(&schema), None)),
+        (
+            "a truncated schema block",
+            encode_frame(named, &[], Some(&schema[..2]), None),
+        ),
+    ] {
+        let (mut s, peer) = pair();
+        let slot = s.submit(Request::Resolve("s.t")).unwrap();
+        s.step(Interest::WRITE);
+        peer.recv();
+        peer.send(&frame);
+        let e = await_slot(&mut s, &mut None, slot).expect_err(what);
+        assert!(
+            matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
+            "{what}: {e:?}"
+        );
+        assert!(s.is_closed(), "{what}");
+    }
 }

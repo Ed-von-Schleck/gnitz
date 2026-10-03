@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{guard_panic, park_until, request_barrier, send_msg, Shared};
+use super::{guard_panic, park_until, request_barrier, send_ack, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::master::UniqueFilter;
@@ -226,7 +226,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     });
 
     drop(locks);
-    send_msg(peer, ipc::WireMsg { arg0: zone_lsn, ..Default::default() });
+    send_ack(peer, 0, zone_lsn);
     let total = t_ddl_start.elapsed();
     if total > Duration::from_millis(20) {
         gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);

@@ -40,7 +40,7 @@ pub(crate) struct PyAsyncTransport {
 /// narrowed it against the request, so nothing here needs the session.
 fn narrow(py: Python<'_>, reply: Reply) -> PyResult<Py<PyAny>> {
     match reply {
-        Reply::Lsn(lsn) => lsn.into_py_any(py),
+        Reply::Ack(lsn) => lsn.into_py_any(py),
         Reply::Scan(r) => Ok(scan_result(py, r)?.into_any()),
         // One PyScanResult per relation, in request order → a Python list,
         // resolving the single scan_many future.
@@ -49,7 +49,7 @@ fn narrow(py: Python<'_>, reply: Reply) -> PyResult<Py<PyAny>> {
             .map(|r| scan_result(py, r))
             .collect::<PyResult<Vec<_>>>()?
             .into_py_any(py),
-        Reply::Resolve(_) | Reply::Id(_) | Reply::Polled => {
+        Reply::Resolve(_) | Reply::Polled => {
             unreachable!("this transport submits no verb with another reply shape")
         }
     }

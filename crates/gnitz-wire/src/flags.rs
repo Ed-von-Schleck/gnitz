@@ -13,7 +13,8 @@ wire_enum! {
         /// the layout whose digest is `arg0`.
         #[default]
         ScanSpec = 0,
-        /// A data push. An empty batch is still a push, ACKed at LSN 0.
+        /// A data push, ACKed with its LSN in `arg0`. An empty batch is still a
+        /// push, ACKed at LSN 0.
         Push = 1,
         /// A delta read of N views: one frame naming N fed views, each with its
         /// own cursor and client-authored reply schema.
@@ -28,11 +29,11 @@ wire_enum! {
         PushTxn = 7,
         /// N relations read at one SAL cut.
         ScanMulti = 8,
-        /// `arg1` SERIAL ids of table `target_id`; the reply's `target_id` is the
+        /// `arg1` SERIAL ids of table `target_id`; the reply's `arg0` is the
         /// run's base.
         AllocSerialRange = 9,
         /// `arg1` catalog object ids (schema, relation or index); the reply's
-        /// `target_id` is the run's base.
+        /// `arg0` is the run's base.
         AllocIds = 10,
     }
 }

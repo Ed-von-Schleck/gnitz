@@ -34,7 +34,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::client::{delta_read_blocks, park, GnitzClient};
-use crate::connection::{DeltaCursor, Interest, Polled, RawBlock, RelDescriptor, SlotId};
+use crate::connection::{DeltaCursor, Encoded, Interest, Polled, RawBlock, RelDescriptor, SlotId};
 use crate::error::ClientError;
 use crate::{Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
@@ -308,8 +308,8 @@ impl MirrorState {
 /// A delta poll request the session has yet to finish.
 struct OpenPoll {
     slot: SlotId,
-    /// The positions of the call's views it has yet to answer. A tail: the
-    /// session answers a request's positions in order.
+    /// The call's views it has yet to answer. A tail: the session answers a
+    /// request's views in order.
     unanswered: Range<usize>,
     /// The blocks of the position being answered, held until its terminal.
     blocks: Vec<RawBlock>,
@@ -317,18 +317,6 @@ struct OpenPoll {
 
 /// One poll's per-view outcomes, `(view id, that view's own result)`.
 type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
-
-/// Every unanswered view of the request fails with `cause`.
-fn fail_range(
-    applied: &mut ViewPollResults,
-    views: &[(DeltaCursor, DeltaPollItem)],
-    unanswered: Range<usize>,
-    cause: ClientError,
-) {
-    for i in unanswered {
-        applied.push((views[i].1.view_id, Err(cause.clone())));
-    }
-}
 
 /// A mirror verb on a client that never attached a store. The message names no
 /// method — each binding spells the attach differently.
@@ -643,43 +631,34 @@ impl GnitzClient {
             let start = chunk_at * DELTA_POLL_MAX_VIEWS;
             let batch: Vec<DeltaPollItem> = chunk.iter().map(|&(_, item)| item).collect();
             let unanswered = start..start + chunk.len();
-            match session.submit_delta_poll(&batch) {
+            match Encoded::delta_poll(&batch).and_then(|poll| session.enqueue(poll)) {
                 Ok(slot) => open.push(OpenPoll { slot, unanswered, blocks: Vec::new() }),
-                Err(e) => fail_range(&mut applied, views, unanswered, e),
+                // A request that never left answers every view it carried.
+                Err(e) => applied.extend(chunk.iter().map(|(_, item)| (item.view_id, Err(e.clone())))),
             }
         }
 
+        // The session ends every view exactly once, so the views' ends are the
+        // whole answer and the slots' own completions repeat them.
         let mut ready = Interest::WRITE;
-        while !open.is_empty() {
-            let done = {
-                // Addressed by slot, so a train an earlier call abandoned is
-                // recognised rather than matched onto a live view of the same id.
-                let mut sink = |slot: SlotId, polled: Polled| {
-                    let Some(poll) = open.iter_mut().find(|p| p.slot == slot) else {
-                        return;
-                    };
-                    let end = match polled {
-                        Polled::Block(b) => return poll.blocks.push(b),
-                        Polled::End(end) => end,
-                    };
-                    let answered = poll.unanswered.next().expect("the session answers no position twice");
-                    let (prev, DeltaPollItem { view_id: tid, .. }) = views[answered];
-                    let blocks = std::mem::take(&mut poll.blocks);
-                    applied.push((tid, end.and_then(|at| mirror.advance_from(tid, prev, blocks, at))));
+        while applied.len() < views.len() {
+            // Addressed by slot, so a train an earlier call abandoned is
+            // recognised rather than matched onto a live view of the same id.
+            let mut sink = |slot: SlotId, polled: Polled| {
+                let Some(poll) = open.iter_mut().find(|p| p.slot == slot) else {
+                    return;
                 };
-                session.step_polling(ready, Some(&mut sink))
+                let end = match polled {
+                    Polled::Block(b) => return poll.blocks.push(b),
+                    Polled::End(end) => end,
+                };
+                let answered = poll.unanswered.next().expect("the session answers no position twice");
+                let (prev, DeltaPollItem { view_id: tid, .. }) = views[answered];
+                let blocks = std::mem::take(&mut poll.blocks);
+                applied.push((tid, end.and_then(|at| mirror.advance_from(tid, prev, blocks, at))));
             };
-            // Every view of a rejected request it had yet to answer fails with it.
-            for (slot, result) in done {
-                let Some(at) = open.iter().position(|p| p.slot == slot) else {
-                    continue; // an earlier call's abandoned train
-                };
-                let poll = open.remove(at);
-                if let Err(e) = result {
-                    fail_range(&mut applied, views, poll.unanswered, e);
-                }
-            }
-            if !open.is_empty() {
+            session.step_polling(ready, Some(&mut sink));
+            if applied.len() < views.len() {
                 ready = park(session, park_hook)?;
             }
         }
