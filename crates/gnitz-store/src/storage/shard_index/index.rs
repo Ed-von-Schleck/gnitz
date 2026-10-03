@@ -123,7 +123,7 @@ impl ShardIndex {
     /// guard keyed by its first PK.
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
         assert!(
-            !run.is_empty() && run.consolidated_verified(),
+            !run.is_empty() && run.is_consolidated(),
             "a terminal run is consolidated"
         );
         let first = PkBuf::from_bytes(run.get_pk_bytes(0));

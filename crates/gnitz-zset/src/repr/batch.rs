@@ -10,7 +10,7 @@ use super::merge::{self, ColPtr, MemBatch};
 use super::run::StoredRow;
 use super::scatter::{copy_runs, width_dispatch};
 use super::string_heap::{self, copy_string_cells, relocate_german_string_vec, BlobCache};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
 
@@ -63,11 +63,13 @@ fn copy_regions(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, dst: &mut
     }
 }
 
-/// A batch's end at one moment: its row count and blob length.
+/// A batch's end at one moment: its row count, and its heap's length and
+/// dead-byte bound.
 #[derive(Clone, Copy)]
 pub(crate) struct RowMark {
     count: usize,
     blob_len: usize,
+    dead_heap: usize,
 }
 
 /// Owned columnar batch.  All fixed-stride column data lives in a single
@@ -79,10 +81,6 @@ pub(crate) struct RowMark {
 /// 8 for U64, 16 for U128, wider for compound PKs.
 ///
 /// **2 heap allocations**: `data` and `blob`.
-///
-/// A row is appended through `begin_row`/`commit_row`, one of
-/// the `push_*_row` shorthands, or [`super::batch_builder::BatchBuilder`]; the
-/// region writers and `count` are internal.
 pub struct Batch {
     data: PooledBuf,
     pub(in crate::repr) blob: PooledBuf,
@@ -98,7 +96,8 @@ pub struct Batch {
     /// every mutable region borrow and every append, and kept by
     /// [`Self::map_weights`]; raised by [`Self::certify_consolidated`], by
     /// copying a source's claim, and by [`Self::append_above`], which checks the
-    /// order it extends.
+    /// order it extends. A debug build verifies the rows wherever the claim is
+    /// raised or kept, so a reader takes it as it stands.
     consolidated: bool,
     /// The schema this batch's rows were laid out under, and the one every
     /// operation on this batch alone runs under. Replaced by
@@ -185,17 +184,14 @@ impl Batch {
         &self.schema
     }
 
-    /// Install a schema on this batch after verifying it lays the batch's
-    /// regions out as the one it replaces. Every code path that wants to move a
-    /// batch's schema after construction MUST go through this helper: it turns
-    /// a latent "batch shape != declared shape" bug into a localized panic at
-    /// the first assignment, instead of a cryptic OOB slice panic several
-    /// call-frames later — or a shard whose regions its reader mis-sizes.
+    /// Relabel this batch under `s`, a schema of its own layout: the same PK
+    /// list and column types, so its regions and its (PK, payload) order are
+    /// unchanged, and only nullability may differ. A debug build asserts that.
     #[inline]
     pub fn set_schema(&mut self, s: &SchemaDescriptor) {
         debug_assert!(
-            self.schema.same_regions(s),
-            "Batch::set_schema: the schema lays the regions out differently",
+            self.schema.same_layout(s),
+            "Batch::set_schema: a schema of another layout",
         );
         self.schema = *s;
     }
@@ -307,15 +303,8 @@ impl Batch {
     }
 
     /// Split borrow of payload column `pi`'s region, the NULL bitmap, and the
-    /// blob heap. One call resolves all three, hoisting the region arithmetic out
-    /// of the row loops that would otherwise reach for them one at a time — the
-    /// per-cell string relocators (column + blob), and the map's emit, which writes a
-    /// computed column's slots and sets that column's bit for the same rows
-    /// (column + bitmap, plus the heap for a string register).
-    ///
-    /// Regions are laid out in region-index order and `REG_NULL_BMP` always
-    /// precedes any payload region, so the split is a plain `split_at_mut` at the
-    /// column's offset; `blob` is a field beside `data` and splits off with it.
+    /// blob heap: what a writer of one column's cells, their null bits and
+    /// their strings holds at once.
     #[inline]
     pub(crate) fn col_null_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         self.consolidated = false;
@@ -365,7 +354,7 @@ impl Batch {
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
     /// consolidated claim is untouched: weights are not part of element identity, so
-    /// callers only need a map that sends no non-zero weight to zero.
+    /// `f` must send no non-zero weight to zero.
     #[inline]
     pub fn map_weights(&mut self, f: impl Fn(i64) -> i64) {
         let off = self.region_start(REG_WEIGHT);
@@ -375,6 +364,10 @@ impl Batch {
         {
             *chunk = f(i64::from_le_bytes(*chunk)).to_le_bytes();
         }
+        debug_assert!(
+            !(self.consolidated && self.has_ghost()),
+            "map_weights: a weight mapped to zero under the consolidated claim",
+        );
     }
     /// Every weight's sign flipped: the Z-set inverse. `wrapping_neg` because
     /// `i64::MIN` must not panic; element identity is untouched, so the
@@ -726,22 +719,8 @@ impl Batch {
         self.count == 0 || self.consolidated || (self.count == 1 && self.get_weight(0) != 0)
     }
 
-    /// `is_consolidated()`, additionally asserting in debug builds that the data
-    /// really is consolidated whenever the cached claim says so. Prefer this over
-    /// `is_consolidated()` at any skip-point that trusts the claim to avoid a
-    /// re-fold.
-    ///
-    /// The one exception is a run its store already verified on the way in.
-    #[inline]
-    pub fn consolidated_verified(&self) -> bool {
-        if self.consolidated {
-            self.debug_verify_consolidated();
-        }
-        self.is_consolidated()
-    }
-
-    /// Raise the claim, the only way it goes up. A debug build verifies it; a
-    /// release build takes it on trust.
+    /// Raise the claim. A debug build verifies it; a release build takes it on
+    /// trust.
     #[inline]
     pub fn certify_consolidated(&mut self) {
         self.debug_verify_null_bits();
@@ -755,6 +734,7 @@ impl Batch {
         RowMark {
             count: self.count,
             blob_len: self.blob.len(),
+            dead_heap: self.dead_heap,
         }
     }
 
@@ -766,13 +746,14 @@ impl Batch {
 
     /// Drop every row, and every blob byte, appended since `mark`. The dropped
     /// rows must reference only heap bytes appended since it, as relocated or
-    /// carried cells do, so the heap left behind holds no new dead bytes.
+    /// carried cells do, so the heap left behind is as dead as it was then.
     #[inline]
     pub(crate) fn truncate_to(&mut self, mark: RowMark) {
         debug_assert!(mark.count <= self.count && mark.blob_len <= self.blob.len());
         self.debug_poison_rows(mark.count..self.count);
         self.count = mark.count;
         self.blob.truncate(mark.blob_len);
+        self.dead_heap = mark.dead_heap;
     }
 
     /// Exchange rows `a` and `b`. Their strings index this batch's own blob, so
@@ -790,20 +771,15 @@ impl Batch {
         }
     }
 
-    /// Copy `src`'s claim without re-verifying: sound for a copy of `src` that
-    /// keeps its (PK, payload) order, distinctness and weights.
+    /// Copy `src`'s claim: sound for a copy of `src` that keeps its
+    /// (PK, payload) order, distinctness and weights, which a debug build
+    /// verifies.
     #[inline]
     pub(crate) fn inherit_consolidated(&mut self, src: &Batch) {
         self.consolidated = src.consolidated;
-    }
-
-    /// Test-only: raise the claim without verifying the data — for tests that
-    /// deliberately construct an inconsistent (spoofed) batch to exercise a
-    /// consumer's debug verifier, which only a debug build has. Production has no
-    /// such path: `certify_consolidated` always verifies.
-    #[cfg(all(test, debug_assertions))]
-    pub(crate) fn set_consolidated_unchecked(&mut self) {
-        self.consolidated = true;
+        if self.consolidated {
+            self.debug_verify_consolidated();
+        }
     }
 
     /// Debug-only: every null bit sits under a nullable payload column, over a
@@ -1004,11 +980,8 @@ impl Batch {
         output
     }
 
-    /// The PK region as a uniform [`ColPtr`] view (always Raw for an owned
-    /// `Batch`): the single addressing source for the OPK seeks via
-    /// [`ColPtr::row`], hoisting the `data`/stride reload out of the
-    /// per-probe closure. The base aliases `self.data`; keep `self` alive while
-    /// the view is read (the seek closures run synchronously within the call).
+    /// The PK region as the [`ColPtr`] the OPK seeks read through. Its base
+    /// aliases `self.data`, so it is read only while `self` is borrowed.
     #[inline]
     fn pk_col_ptr(&self) -> ColPtr {
         ColPtr {
@@ -1149,8 +1122,7 @@ impl Batch {
             return;
         }
         // The data buffer stays allocated, at its capacity.
-        self.truncate_to(RowMark { count: 0, blob_len: 0 });
-        self.dead_heap = 0;
+        self.truncate_to(RowMark { count: 0, blob_len: 0, dead_heap: 0 });
         self.consolidated = false;
     }
 
@@ -1256,69 +1228,53 @@ impl Batch {
         }
     }
 
-    /// Consume this batch, consolidating it under its own label if needed.
-    ///
-    /// Fast path: an already-consolidated (or empty) `self` is returned by move,
-    /// allocating nothing. A batch that stands in consolidated order without the
-    /// claim is certified and returned the same way. Slow path: sorts and
-    /// weight-folds into a fresh batch, then drops `self`.
+    /// Consume this batch, consolidating it if needed. An already-consolidated
+    /// (or empty) `self` is returned by move, allocating nothing.
     ///
     /// `#[inline]`: the move copies the whole struct.
     #[inline]
-    pub fn into_consolidated(self) -> Batch {
-        if self.consolidated_verified() {
-            return self;
-        }
-        self.into_folded()
-    }
-
-    /// [`Self::into_consolidated`] of a batch without the claim.
-    #[inline(never)]
-    fn into_folded(mut self) -> Batch {
-        match self.certify_if_standing() {
-            true => self,
-            false => Self::consolidate_into_new(&self),
-        }
+    pub fn into_consolidated(mut self) -> Batch {
+        self.consolidate_in_place();
+        self
     }
 
     /// Consolidate this batch where it stands.
+    #[inline]
     pub fn consolidate_in_place(&mut self) {
-        if !self.is_consolidated() && !self.certify_if_standing() {
-            *self = Self::consolidate_into_new(self);
+        if !self.is_consolidated() {
+            self.consolidate_unclaimed();
+        }
+    }
+
+    /// [`Self::consolidate_in_place`] of a batch without the claim: rows that
+    /// stand in consolidated order are certified where they are, and any others
+    /// are sorted and weight-folded into a fresh batch.
+    #[inline(never)]
+    fn consolidate_unclaimed(&mut self) {
+        match merge::in_consolidated_order(self) {
+            true => self.certify_consolidated(),
+            false => *self = Self::consolidate_into_new(self),
         }
     }
 
     /// An owned consolidated copy: folds if needed, else clones. The borrowed
     /// counterpart of [`Self::into_consolidated`].
     pub fn to_consolidated(&self) -> Batch {
-        if self.consolidated_verified() {
-            return self.clone();
+        if !self.stands_consolidated() {
+            return Self::consolidate_into_new(self);
         }
-        match merge::stands_consolidated(self) {
-            true => {
-                let mut copy = self.clone();
-                copy.certify_consolidated();
-                copy
-            }
-            false => Self::consolidate_into_new(self),
+        let mut copy = self.clone();
+        if !copy.consolidated {
+            copy.certify_consolidated();
         }
+        copy
     }
 
     /// Whether the rows are consolidated, with the claim or without it: a
     /// producer that wrote them in order leaves them unclaimed, and one forward
     /// pass finds that out.
     pub(crate) fn stands_consolidated(&self) -> bool {
-        self.consolidated_verified() || merge::stands_consolidated(self)
-    }
-
-    /// Raise the claim on a batch whose rows stand consolidated without it;
-    /// whether they do.
-    fn certify_if_standing(&mut self) -> bool {
-        let stands = merge::stands_consolidated(self);
-        if stands {
-            self.certify_consolidated();
-        }
-        stands
+        self.is_consolidated() || merge::in_consolidated_order(self)
     }
 
     /// Sort and weight-fold `batch` into a fresh certified batch — the
@@ -1430,23 +1386,25 @@ impl gnitz_expr::MapTarget for Batch {
     }
 }
 
-/// A batch of up to `max_rows` rows, written in place by `write_fn` through a
+/// A batch of `rows` rows, every one written in place by `write_fn` through a
 /// [`merge::DirectWriter`] over its uninitialized arena.
 pub(crate) fn write_to_batch(
     schema: &SchemaDescriptor,
-    max_rows: usize,
+    rows: usize,
     max_blob: usize,
     write_fn: impl FnOnce(&mut merge::DirectWriter),
 ) -> Batch {
-    if max_rows == 0 {
+    if rows == 0 {
         return Batch::empty_with_schema(schema);
     }
-    let mut b = Batch::with_capacity_blob(schema, max_rows, max_blob);
-    let rows = {
-        let mut writer = merge::DirectWriter::over(&mut b.data, b.capacity, max_rows, &b.schema, &mut b.blob);
-        write_fn(&mut writer);
-        writer.count
-    };
+    let mut b = Batch::with_capacity_blob(schema, rows, max_blob);
+    write_fn(&mut merge::DirectWriter::over(
+        &mut b.data,
+        b.capacity,
+        rows,
+        &b.schema,
+        &mut b.blob,
+    ));
     b.count = rows;
     if b.blob.is_empty() {
         b.blob = PooledBuf::default();

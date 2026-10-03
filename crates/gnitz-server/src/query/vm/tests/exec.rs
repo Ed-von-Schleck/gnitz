@@ -89,7 +89,7 @@ fn a_self_union_doubles_every_weight() {
 
     let got = vm.epoch([(r0, make_batch_u128(&schema, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]))]);
     assert!(!got.has_ghost());
-    assert!(got.consolidated_verified());
+    assert!(got.is_consolidated());
     assert_rows(&got, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]);
 }
 

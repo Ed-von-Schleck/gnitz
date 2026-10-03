@@ -50,7 +50,7 @@ impl RunSet {
     /// Append a consolidated run, folding the set when it gets crowded. Empty
     /// runs are never stored.
     pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
-        debug_assert!(run.consolidated_verified(), "RunSet::push requires a consolidated run",);
+        debug_assert!(run.is_consolidated(), "RunSet::push requires a consolidated run",);
         self.push_run(Rc::new(run.trimmed()), schema);
     }
 
@@ -122,7 +122,7 @@ impl RunSet {
             if run.num_payload_cols() < npc {
                 let widened = run.widened_with_nulls(schema, false);
                 debug_assert!(
-                    widened.consolidated_verified(),
+                    widened.is_consolidated(),
                     "widen_runs: the widened run must still be consolidated",
                 );
                 *run = Rc::new(widened.trimmed());

@@ -146,7 +146,8 @@ fn schema_facts_match_the_column_table() {
         );
         assert_eq!(
             s.not_null_payload_slots(),
-            want_not_null,
+            // Every bit past the last payload slot is one no batch may set.
+            want_not_null | !gnitz_wire::low_bits_mask(next_slot),
             "{ctx}: not_null_payload_slots()"
         );
     }

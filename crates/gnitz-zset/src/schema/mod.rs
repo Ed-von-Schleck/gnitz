@@ -350,7 +350,7 @@ impl SchemaDescriptor {
     /// [`SchemaFacts::not_null_payload_slots`], from the same mask.
     #[inline]
     pub fn not_null_payload_slots(&self) -> u64 {
-        gnitz_wire::low_bits_mask(self.num_payload_cols()) & !self.nullable_slots
+        !self.nullable_slots
     }
 
     /// Fixed regions of a batch: PK, weight, null words, one per payload column.

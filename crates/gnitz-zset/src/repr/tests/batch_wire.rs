@@ -1,4 +1,4 @@
-use super::super::batch::REG_PAYLOAD_START;
+use super::super::batch::{REG_NULL_BMP, REG_PAYLOAD_START};
 use super::*;
 use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
@@ -74,9 +74,15 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
     let mut valued_null = clean.clone();
     valued_null[cell..cell + 8].fill(0xFF);
+    // A bit past the schema's two payload slots: no column's, so no reader
+    // agrees with another on what it means.
+    let nulls = region_offset(&schema, 2, REG_NULL_BMP);
+    let mut stray_bit = clean.clone();
+    stray_bit[nulls] |= 0b100;
     for (forged, why) in [
         (valued_null, "a non-zero cell under a NULL"),
         (block(true), "a null bit on a NOT NULL column"),
+        (stray_bit, "a null bit on a NOT NULL column"),
     ] {
         assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok(), "{why}");
         assert_eq!(Batch::decode_foreign_wal_block(&forged, &schema).err(), Some(why));

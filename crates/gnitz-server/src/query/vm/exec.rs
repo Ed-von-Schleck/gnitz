@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 
 use super::*;
-use gnitz_expr::SchemaFacts;
 use gnitz_store::relation::{Cut, RelationRegistry};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
@@ -296,14 +295,6 @@ fn take_output(vm: &mut Vm) -> Batch {
     if batch.is_empty() {
         return Batch::empty_with_schema(want);
     }
-    // Only a narrower nullability may legitimately arrive here. A different
-    // physical layout means the batch was built against another schema
-    // entirely, which the stamp would hide from the wire encode.
-    debug_assert!(
-        batch.schema().same_layout(want),
-        "VM output register {}: batch label is not the register's physical layout",
-        out_reg.0,
-    );
     batch.set_schema(want);
     batch
 }

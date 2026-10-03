@@ -7,8 +7,7 @@
 /// order, close it — so this is the shape they have, not a new one.
 ///
 /// `end_row` is where a builder that defers per-row bookkeeping (the engine's
-/// null word, its row count) does it; a builder that writes eagerly implements
-/// it as a no-op.
+/// row count) does it; a builder that writes eagerly implements it as a no-op.
 pub trait SysRowSink {
     /// Begin a row keyed by `pk`: the family's PK columns in PK-list order, each
     /// as its native value widened to `u128`. Both sinks OPK-encode them into

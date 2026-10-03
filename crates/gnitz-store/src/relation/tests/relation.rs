@@ -372,7 +372,7 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
         (5, 1, -1, 50),
     ];
     assert_eq!(zset_of(&delta, &schema), zset_of(&rows(&want), &schema));
-    assert!(delta.consolidated_verified());
+    assert!(delta.is_consolidated());
     assert!(registry.seal(50).unwrap().is_none(), "a seal drains the pending rows");
     let relation = registry.relation(50).unwrap();
     for cut in [Cut::Now, Cut::Sealed] {

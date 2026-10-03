@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::repr::{Batch, WireRows};
+use gnitz_zset::repr::Batch;
 
 use crate::runtime::sal::{GroupData, MAX_WORKERS};
 use gnitz_zset::schema::Placement;
@@ -31,7 +31,7 @@ pub(crate) fn with_routed<R>(
     }
     // One row has one owner, named by the placement's point query: no list is built.
     if batch.len() == 1 && !batch.has_ghost() {
-        if let Some(owner) = placement.owner(batch.as_mem_batch().get_pk_bytes(0), num_workers) {
+        if let Some(owner) = placement.owner(batch.get_pk_bytes(0), num_workers) {
             let mut each = [None; MAX_WORKERS];
             each[owner] = batch.wire_whole();
             return f(GroupData::Each(&each[..num_workers]));
@@ -40,25 +40,16 @@ pub(crate) fn with_routed<R>(
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
         match plan.route(batch, &mut pool, num_workers) {
-            [live] => f(GroupData::Same(listed(batch, live))),
+            [live] => f(GroupData::Same(batch.wire_listed(live))),
             lists => {
                 let mut each = [None; MAX_WORKERS];
                 for (rows, list) in each.iter_mut().zip(lists) {
-                    *rows = listed(batch, list);
+                    *rows = batch.wire_listed(list);
                 }
                 f(GroupData::Each(&each[..lists.len()]))
             }
         }
     })
-}
-
-/// The rows of `batch` one of `route`'s lists names. A list of every row,
-/// ascending as `route` builds it, is the batch itself.
-fn listed<'a>(batch: &'a Batch, list: &'a [u32]) -> Option<WireRows<'a>> {
-    match list.len() == batch.len() {
-        true => batch.wire_whole(),
-        false => batch.wire_listed(list),
-    }
 }
 
 #[cfg(test)]

@@ -124,10 +124,10 @@ pub trait SchemaFacts: ColumnTable {
             .fold(0u64, |m, pi| m | 1u64 << pi)
     }
 
-    /// The null bits a conforming batch never sets: every payload slot's but
-    /// the nullable ones'.
+    /// The null bits a conforming batch never sets: every bit but the nullable
+    /// slots', those past the last payload slot included.
     fn not_null_payload_slots(&self) -> u64 {
-        gnitz_wire::low_bits_mask(self.num_payload_cols()) & !self.nullable_payload_slots()
+        !self.nullable_payload_slots()
     }
 
     /// The output-key kind a reduce grouped by `group` over this schema warrants.

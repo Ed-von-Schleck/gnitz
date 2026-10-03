@@ -24,30 +24,29 @@ fn append_row_from_source_carries_the_callers_weight() {
     assert_eq!(payload0_i64(&dst, 0), 0x4242);
 }
 
-/// `rows` claimed consolidated unverified: a lying claim for the debug verifier
-/// to catch.
-#[cfg(debug_assertions)]
-fn flagged_batch(rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = make_batch_raw(&make_schema_u64_i64(), rows);
-    b.set_consolidated_unchecked();
-    b
-}
-
-// The consolidated short-circuit trusts the claim: an adjacent-equal
-// (PK, payload) duplicate under it must trip the verifier.
+// Raising the claim verifies it: an adjacent-equal (PK, payload) duplicate
+// trips the verifier.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "not strictly")]
-fn into_consolidated_panics_on_lying_consolidated_dup() {
-    let _ = flagged_batch(&[(1, 1, 5), (1, 1, 5)]).into_consolidated();
+fn certify_consolidated_panics_on_a_duplicate() {
+    make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 5), (1, 1, 5)]).certify_consolidated();
 }
 
-// Ghost clause: strictly ordered, but carrying a net-zero row under the claim.
+// Ghost clause: strictly ordered, but carrying a net-zero row.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "ghost not eliminated")]
-fn into_consolidated_panics_on_consolidated_ghost() {
-    let _ = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)]).into_consolidated();
+fn certify_consolidated_panics_on_a_ghost() {
+    make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 0), (2, 0, 0), (3, 1, 0)]).certify_consolidated();
+}
+
+// A weight map that makes a ghost falsifies the claim it keeps.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "mapped to zero")]
+fn map_weights_panics_on_a_ghost_under_the_claim() {
+    make_batch(&make_schema_u64_i64(), &[(1, 1, 5), (2, 1, 6)]).map_weights(|_| 0);
 }
 
 /// `is_consolidated` holds structurally for a batch nothing can mis-fold, and

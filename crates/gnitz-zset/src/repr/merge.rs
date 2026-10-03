@@ -359,17 +359,14 @@ impl PosCursor {
 // DirectWriter: writes into pre-allocated output buffers
 // ---------------------------------------------------------------------------
 
-/// Writes rows into a pre-allocated arena: a `write_to_batch` batch's, or a
-/// wire block's fixed bytes.
+/// Writes the first `rows` rows of a pre-allocated arena: a `write_to_batch`
+/// batch's, or a wire block's fixed bytes.
 ///
-/// **Every entry point must write each live byte of each row it counts** — the
-/// batch invariant (see `Batch::with_capacity`), and here the whole reason the
-/// arena can skip its memset. A skipped cell within a counted row leaks the
-/// recycled buffer's previous contents rather than reading back a zero. Hence
-/// the `repr::scatter` kernels write PK/weight/null in one fused pass and every
-/// payload cell unconditionally, a null cell included. Rows the writer declines
-/// to count (a ghost weight) need nothing: every reader bounds the batch to
-/// `count`.
+/// **Whoever fills a writer writes every byte of every one of its rows** — the
+/// batch invariant (see `Batch::with_capacity`): the arena skips its memset, so
+/// a skipped cell leaks the recycled buffer's previous contents rather than
+/// reading back a zero. Hence the `repr::scatter` kernels take exactly `rows`
+/// rows and write every payload cell unconditionally, a null cell included.
 pub(crate) struct DirectWriter<'a> {
     /// An arena of `cap` rows under `schema`, of which rows `[0, rows)` are
     /// this writer's to fill.
@@ -381,7 +378,6 @@ pub(crate) struct DirectWriter<'a> {
     blob: &'a mut Vec<u8>,
     /// `None` relocates every cell on its own.
     blob_cache: Option<BlobCache>,
-    pub(super) count: usize,
     /// Borrowed, not owned: the scatter reads it per column, and copying it in
     /// would put a `memcpy` on every writer open.
     pub schema: &'a SchemaDescriptor,
@@ -405,9 +401,14 @@ impl<'a> DirectWriter<'a> {
             rows,
             blob,
             blob_cache: Some(BlobCache::new(cells)),
-            count: 0,
             schema,
         }
+    }
+
+    /// Rows this writer fills.
+    #[inline]
+    pub(super) fn rows(&self) -> usize {
+        self.rows
     }
 
     /// The PK, weight and null-word regions, each bounded to this writer's rows.
@@ -889,7 +890,7 @@ pub(crate) fn consolidate_groups(batch: &MemBatch, schema: &SchemaDescriptor, ou
 /// Whether `batch`'s rows already stand as [`consolidate_groups`] would leave
 /// them: strictly (PK, payload)-ascending, with no ghost. One forward pass, which
 /// the first pair out of order ends.
-pub(crate) fn stands_consolidated(batch: &Batch) -> bool {
+pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
     if batch.count == 0 {
         return true;
     }

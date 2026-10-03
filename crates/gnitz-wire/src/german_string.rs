@@ -87,8 +87,7 @@ pub fn german_string_heap(cell: &[u8], blob_len: usize) -> Option<std::ops::Rang
 
 /// Decode a 16-byte German String struct into raw bytes, or `None` if a
 /// long string's blob offset/length overruns `blob`. The owned, fallible
-/// counterpart of [`german_string_content`] — for the trust boundaries that
-/// must reject a corrupt cell rather than degrade it to empty.
+/// counterpart of [`german_string_content`].
 pub fn try_decode_german_string(st: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     match german_string_inline(st) {
         Some(inline) => Some(inline.to_vec()),

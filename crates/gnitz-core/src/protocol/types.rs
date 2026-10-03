@@ -663,11 +663,15 @@ impl ZSetBatch {
     }
 }
 
-/// No row sets a null bit on a NOT NULL payload column of `schema`, whose declaration
-/// every reader past the decoder trusts.
+/// No row sets a null bit `schema` does not admit: one on a NOT NULL payload
+/// column, whose declaration every reader past the decoder trusts, or one past
+/// the last payload column.
 pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), String> {
     match gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), gnitz_wire::as_le_bytes(nulls)) {
         None => Ok(()),
+        Some((row, slot)) if slot >= schema.num_payload_cols() => {
+            Err(format!("row {row} sets null bit {slot}, past the last payload column"))
+        }
         Some((row, slot)) => Err(format!(
             "row {row} sets a null bit on NOT NULL column '{}'",
             schema.columns[schema.payload_col_idx(slot)].name

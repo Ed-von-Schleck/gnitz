@@ -107,13 +107,17 @@ impl Batch {
         Some(out)
     }
 
-    /// The rows `indices` lists, in that order; `None` for an empty list. Each
-    /// row is sent with its own copy of its long strings, unless that would
-    /// send more heap than the batch holds: listed cells then share spans, and
-    /// the block keeps each span once.
+    /// The rows `indices` lists, in that order; `None` for an empty list. A
+    /// list of every row in batch order is the batch itself, over its heap as
+    /// it stands. Any other sends each row with its own copy of its long
+    /// strings, unless that would send more heap than the batch holds: listed
+    /// cells then share spans, and the block keeps each span once.
     pub fn wire_listed<'a>(&'a self, indices: &'a [u32]) -> Option<WireRows<'a>> {
         if indices.is_empty() {
             return None;
+        }
+        if indices.len() == self.count && indices.iter().zip(0..).all(|(&row, at)| row == at) {
+            return self.wire_whole();
         }
         let slots = self.heap_referencing_slots();
         let rows = || indices.iter().map(|&row| row as usize);

@@ -280,7 +280,7 @@ fn ascending_runs_fold_to_their_rows_in_order() {
         }
         set.fold(&schema);
         let folded = &**set.runs.first().expect("rows survive");
-        assert!(folded.consolidated_verified());
+        assert!(folded.is_consolidated());
         assert_eq!(zset_of(folded, &schema), zset_sum(&pushed, &schema));
         assert_eq!(folded.len(), next as usize);
     }

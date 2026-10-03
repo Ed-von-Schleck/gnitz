@@ -35,7 +35,6 @@ fn both_kernels_gather_rows_at_every_pk_width() {
             want.map(|(k, w, v)| (k.clone(), w, v)),
             "stride {stride}: copy"
         );
-        assert_eq!(write_to_batch(&schema, 1, 0, |w| scatter_copy(&mb0, &[], w)).len(), 0);
 
         let mut cols = Vec::new();
         let sources = [

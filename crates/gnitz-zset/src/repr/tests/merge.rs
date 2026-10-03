@@ -408,7 +408,7 @@ fn ascending_sources_merge_to_their_rows_in_order() {
     let merge = |sources: &[&Batch]| {
         let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
         let out = merge_consolidated(&mem, &schema);
-        assert!(out.consolidated_verified());
+        assert!(out.is_consolidated());
         weighted_rows(&out)
     };
     let all = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);

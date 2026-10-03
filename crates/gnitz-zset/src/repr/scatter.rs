@@ -59,11 +59,20 @@ pub(crate) fn copy_runs<const N: usize>(
 }
 
 /// Copy the rows `indices` names, in the order given, each carrying its own
-/// weight. A caller supplying its own weights wants [`scatter_unified_sources`].
+/// weight: exactly the writer's rows. A caller supplying its own weights wants
+/// [`scatter_unified_sources`].
 pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut DirectWriter) {
-    if indices.is_empty() {
-        return;
-    }
+    assert_eq!(
+        indices.len(),
+        writer.rows(),
+        "scatter_copy: a writer of another row count"
+    );
+    // Checked once, so the per-row copies below read inside the source.
+    let last = indices.iter().fold(0u32, |max, &i| max.max(i));
+    assert!(
+        indices.is_empty() || (last as usize) < batch.count,
+        "scatter_copy: an index past the source's rows"
+    );
 
     #[cfg(debug_assertions)]
     for &idx in indices {
@@ -74,43 +83,28 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
         );
     }
 
-    let n = indices.len();
-    let base = writer.count; // first output row for this scatter
-
-    width_dispatch!(
-        writer.schema.pk_stride(),
-        scatter_pk_wt_nbm,
-        batch,
-        indices,
-        base,
-        writer
-    );
+    width_dispatch!(writer.schema.pk_stride(), scatter_pk_wt_nbm, batch, indices, writer);
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if col.type_code.is_german_string() {
-            // Blob relocation is sequential per-row; no way to batch.
+            let src = batch.col_data(pi, 16).as_chunks::<16>().0;
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
-            for (cell, &idx) in cells[base * 16..].as_chunks_mut::<16>().0.iter_mut().zip(indices) {
-                let src = batch.get_col_ptr(idx as usize, pi, 16);
-                *cell = relocate_german_string_vec(src, batch.blob, blob, cache.as_deref_mut());
+            for (cell, &idx) in cells.as_chunks_mut::<16>().0.iter_mut().zip(indices) {
+                *cell = relocate_german_string_vec(&src[idx as usize], batch.blob, blob, cache.as_deref_mut());
             }
         } else {
             let src_col = batch.col_data(pi, cs);
-            let dst_col = &mut writer.col_mut(pi)[base * cs..];
-            width_dispatch!(cs, gather_col, src_col, dst_col, indices);
+            width_dispatch!(cs, gather_col, src_col, writer.col_mut(pi), indices);
         }
     }
-
-    writer.count += n;
 }
 
 #[inline(always)]
 fn scatter_pk_wt_nbm<const PKS: usize>(
     batch: &MemBatch<'_>,
     indices: &[u32],
-    base: usize,
     writer: &mut DirectWriter<'_>,
     width: usize,
 ) {
@@ -120,12 +114,7 @@ fn scatter_pk_wt_nbm<const PKS: usize>(
     let wt_src = batch.weight();
     let nb_src = batch.null_bmp();
     let (pk_dst, wt_dst, nb_dst) = writer.fixed_mut();
-    let pk_dst = &mut pk_dst[base * pks..];
-    let wt_dst = &mut wt_dst[base * FB..];
-    let nb_dst = &mut nb_dst[base * FB..];
-    debug_assert!(pk_dst.len() >= indices.len() * pks);
-    debug_assert!(wt_dst.len() >= indices.len() * FB);
-    debug_assert!(nb_dst.len() >= indices.len() * FB);
+    assert!(pk_dst.len() == indices.len() * pks && wt_dst.len() == indices.len() * FB);
     for (out, &idx) in indices.iter().enumerate() {
         let i = idx as usize;
         debug_assert!((i + 1) * pks <= pk_src.len());
@@ -142,7 +131,7 @@ fn scatter_pk_wt_nbm<const PKS: usize>(
 #[inline(always)]
 fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32], width: usize) {
     assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
-    debug_assert!(dst.len() >= indices.len() * N);
+    assert_eq!(dst.len(), indices.len() * N);
     for (out, &idx) in indices.iter().enumerate() {
         let i = idx as usize;
         debug_assert!((i + 1) * N <= src.len());
@@ -153,7 +142,8 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32], width
 }
 
 /// Copy the rows `rows` names, in the order given, each at the weight its triple
-/// carries. The sources may be any mix of `MemBatch` and shard backings.
+/// carries: exactly the writer's rows. The sources may be any mix of `MemBatch`
+/// and shard backings.
 ///
 /// `cols` is the flat payload-`ColPtr` table the sources were built against;
 /// source `si`'s column `pi` is `cols[sources[si].cols_off + pi]`.
@@ -163,22 +153,21 @@ pub(crate) fn scatter_unified_sources(
     rows: &[(u32, u32, i64)],
     writer: &mut DirectWriter<'_>,
 ) {
-    if rows.is_empty() {
-        return;
-    }
+    assert_eq!(
+        rows.len(),
+        writer.rows(),
+        "scatter_unified_sources: a writer of another row count"
+    );
     #[cfg(debug_assertions)]
     for &(_si, _ri, w) in rows {
         debug_assert_ne!(w, 0, "scatter_unified_sources: zero-weight row (filter before scatter)");
     }
-    let n = rows.len();
-    let base = writer.count;
 
     width_dispatch!(
         writer.schema.pk_stride(),
         scatter_unified_pk_wt_nbm,
         sources,
         rows,
-        base,
         writer
     );
 
@@ -189,15 +178,12 @@ pub(crate) fn scatter_unified_sources(
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                writer.write_string_cell(pi, src_struct, src.blob, src.heap_at, base + out);
+                writer.write_string_cell(pi, src_struct, src.blob, src.heap_at, out);
             }
         } else {
-            let dst = &mut writer.col_mut(pi)[base * cs..];
-            width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, dst);
+            width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));
         }
     }
-
-    writer.count += n;
 }
 
 // The destination stride is the writer's; source reads keep `src.pk.stride`, so a
@@ -207,7 +193,6 @@ pub(crate) fn scatter_unified_sources(
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     sources: &[UnifiedSource<'_>],
     rows: &[(u32, u32, i64)],
-    base: usize,
     writer: &mut DirectWriter<'_>,
     width: usize,
 ) {
@@ -215,11 +200,10 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     let pks = if PKS == 0 { width } else { PKS };
     let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols());
     let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
-    debug_assert!(pk_dst.len() >= (base + rows.len()) * pks && wt_dst.len() >= (base + rows.len()) * FB);
+    assert!(pk_dst.len() == rows.len() * pks && wt_dst.len() == rows.len() * FB);
     let (pk_dst, wt_dst, nbm_dst) = (pk_dst.as_mut_ptr(), wt_dst.as_mut_ptr(), nbm_dst.as_mut_ptr());
-    for (out, &(si, ri, w)) in rows.iter().enumerate() {
+    for (dst_row, &(si, ri, w)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
-        let dst_row = base + out;
         let pk_ptr = src.pk.row_ptr(ri as usize);
         let nbm_ptr = src.null_bmp.row_ptr(ri as usize);
         let wb = w.to_le_bytes();
@@ -242,6 +226,7 @@ fn gather_unified_col<const N: usize>(
     width: usize,
 ) {
     assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+    assert_eq!(dst.len(), rows.len() * N);
     for (out, &(si, ri, _)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
         let ptr = unsafe { cols.get_unchecked(src.cols_off + pi).row_ptr(ri as usize) };
@@ -250,7 +235,7 @@ fn gather_unified_col<const N: usize>(
 }
 
 /// Copy the rows `picks` names out of `sources`, in the order given, each at
-/// the weight its triple carries, into a fresh batch claiming no layout.
+/// the weight its triple carries, into a fresh unconsolidated batch.
 ///
 /// Every cell is read through its source's row accessor, so a packed shard
 /// column decodes only the blocks the picks land in: the kernel for picks
@@ -274,7 +259,6 @@ pub(crate) fn gather_rows(
                 width_dispatch!(col.size() as usize, gather_cells, sources, picks, pi, dst);
             }
         }
-        w.count = picks.len();
     })
 }
 
@@ -387,9 +371,9 @@ impl<'a> UnifiedSet<'a> {
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
-    /// triple carries, into a fresh batch under the set's schema claiming no
-    /// layout. `of_rows` is the row count of the whole output `rows` is a share
-    /// of; it sizes the heap reserved.
+    /// triple carries, into a fresh unconsolidated batch under the set's schema.
+    /// `of_rows` is the row count of the whole output `rows` is a share of; it
+    /// sizes the heap reserved.
     pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], of_rows: usize) -> Batch {
         #[cfg(debug_assertions)]
         for &(si, ri, _) in rows {

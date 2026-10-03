@@ -483,7 +483,6 @@ impl MappedShard {
                 let base = w.adopt_heap(blob);
                 debug_assert_eq!(base, 0, "a fresh writer's heap is empty");
             }
-            w.count = row_count;
         });
         batch.charge_dead(carried.unwrap_or(0));
         batch.certify_consolidated();

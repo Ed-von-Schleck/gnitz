@@ -277,7 +277,7 @@ impl GroupOutKey {
             // One run, with no key to compute.
             _ if n <= 1 || self.is_global() => Some(GroupRuns::of(n, |_| ())),
             // A consolidated batch is in PK order, so already grouped by any PK prefix.
-            &GroupKey::PkRange { at: 0, n: w } if batch.consolidated_verified() => Some(pk_width_dispatch!(w, |K| {
+            &GroupKey::PkRange { at: 0, n: w } if batch.is_consolidated() => Some(pk_width_dispatch!(w, |K| {
                 GroupRuns::of(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)))
             })),
             _ => None,
