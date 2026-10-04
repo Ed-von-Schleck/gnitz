@@ -20,7 +20,7 @@ fn shard_probe_bench() {
     const ROWS: u64 = 2000;
     const PROBES: u64 = 200_000;
     const STEP: u64 = (SPAN / ROWS) & !1;
-    let counter = Counter::instructions().expect("instructions counter");
+    let counter = Counter::instructions();
     for pk_cols in [1usize, 3] {
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = fresh(tmp.path(), stride_schema(pk_cols));

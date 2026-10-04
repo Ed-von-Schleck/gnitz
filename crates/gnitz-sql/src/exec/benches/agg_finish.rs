@@ -9,7 +9,7 @@ use gnitz_core::BatchAppender;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn agg_combine_bench() {
     const N: u64 = 1_000_000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let two = "SELECT g, COUNT(*), SUM(x) FROM t GROUP BY g";
     let four = "SELECT g, COUNT(*), SUM(x), MIN(x), MAX(x) FROM t GROUP BY g";
     let worker_order = |i: u64| i % (N / 4);

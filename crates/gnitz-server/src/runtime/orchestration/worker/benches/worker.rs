@@ -36,7 +36,7 @@ fn worker_request_bench() {
     use gnitz_wire::{PkKeys, ReadBound, ReadSpec};
     use std::hint::black_box;
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let cols = table_cols();
 
     // One arm: a fresh table of `rows` rows, the groups `write` puts on the SAL,

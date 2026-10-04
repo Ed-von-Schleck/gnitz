@@ -9,7 +9,7 @@ use gnitz_wire::TypeCode;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn client_map_bench() {
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let src = schema(vec![col("k", TypeCode::I64), ncol("v", TypeCode::I64)], &[0]);
     for n in [1_000_000usize, 256] {
         let mut b = ZSetBatch::new(&src);

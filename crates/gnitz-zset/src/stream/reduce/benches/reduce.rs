@@ -259,7 +259,7 @@ fn index_entries_bench() {
     use crate::algebra::index_entries;
     use crate::schema::index_spec_and_schema;
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let measure = |label: &str, input: &Batch, cols: &[u32]| {
         let (spec, idx_schema) = index_spec_and_schema(cols, input.schema()).unwrap();
         std::hint::black_box(index_entries(input, &spec, &idx_schema));
@@ -324,7 +324,7 @@ fn time_op_reduce(h: &mut Harness, delta: &Batch) -> (Batch, Duration) {
 /// `op_reduce` over `d2`, against the state `d1` left behind: its wall time and
 /// the instructions it retired.
 fn time_second_epoch(plan: ReducePlan, d1: &Batch, d2: &Batch) -> (Duration, u64) {
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let mut h = Harness::new(plan);
     let (out, _) = time_op_reduce(&mut h, d1);
     h.trace_out.ingest(out);
@@ -585,7 +585,7 @@ fn op_reduce_multi_run_bench() {
         h.trace_out.ingest(out);
     }
     let delta = rows(&(2 * G..4 * G).collect::<Vec<_>>());
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let mut instructions = 0;
     for _ in 0..RUNS {
         let (out, n) = counter.measure(|| h.reduce(&delta));

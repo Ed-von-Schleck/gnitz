@@ -36,7 +36,7 @@ fn run_set_fold_strings_bench() {
             string_run(&schema, &rows)
         })
         .collect();
-    let instructions = Counter::instructions().unwrap();
+    let instructions = Counter::instructions();
     for (shape, small) in [("append", &append), ("churn", &churn)] {
         for _ in 0..5 {
             let mut set = RunSet::new(usize::MAX);

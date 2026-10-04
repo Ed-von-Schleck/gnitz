@@ -11,7 +11,7 @@ fn sal_read_bench() {
     use std::hint::black_box;
 
     const GROUPS: u64 = 10_000;
-    let counter = Counter::instructions().expect("instructions counter");
+    let counter = Counter::instructions();
     for nw in [1usize, 4, 16] {
         for (case, set) in [
             ("addressed", WorkerSet::ALL),

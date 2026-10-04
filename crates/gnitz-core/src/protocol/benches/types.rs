@@ -6,7 +6,7 @@ use super::*;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_column_push_bench() {
     const ROWS: usize = 1_000_000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let key_schema = |types: &[TypeCode]| Schema {
         columns: types.iter().map(|&tc| ColumnDef::new("k", tc, false)).collect(),
         pk_cols: (0..types.len() as u32).collect(),

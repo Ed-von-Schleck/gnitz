@@ -31,9 +31,7 @@ def _dicts(ncols):
 
 
 def _count(bench_timer, f, per=N):
-    n, counts_kernel = instructions_retired(f)
-    bench_timer.extra["instructions"] = round(n / per, 1)
-    bench_timer.extra["counts_kernel"] = counts_kernel
+    bench_timer.extra["instructions"] = round(instructions_retired(f) / per, 1)
 
 
 # ---------------------------------------------------------------------------

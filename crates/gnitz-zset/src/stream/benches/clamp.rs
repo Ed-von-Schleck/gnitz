@@ -126,7 +126,7 @@ fn weight_clamp_bench() {
         ));
     }
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     for shape in shapes {
         let schema = bench_schema(shape.payload_cols, shape.strings);
         let mut trace = crate::test_support::TestTrace::new(schema);

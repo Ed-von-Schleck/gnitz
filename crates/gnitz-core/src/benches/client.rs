@@ -19,7 +19,7 @@ fn one_row(schema: &Schema) -> ZSetBatch {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn txn_buffer_push_bench() {
     const ROUNDS: u64 = 2000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     for ncols in [4usize, 64] {
         let mut columns = vec![ColumnDef::new("pk", TypeCode::U64, false)];
         columns.extend((1..ncols).map(|i| ColumnDef::new(format!("column_{i}"), TypeCode::I64, false)));

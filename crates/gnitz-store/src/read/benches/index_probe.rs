@@ -52,7 +52,7 @@ fn probe_keys(r: &RelationFixture, vals: impl Iterator<Item = i64>) -> Batch {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn index_probe_bench() {
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let cols = PkColList::from_slice(&[1]);
     let cell = |label: &str, r: &RelationFixture, keys: &Batch, cap: u64, want: usize| {
         let probe = Probe::Index(cols, NonZeroU64::new(cap).unwrap());

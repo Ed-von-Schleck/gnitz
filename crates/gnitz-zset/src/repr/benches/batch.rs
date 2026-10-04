@@ -41,7 +41,7 @@ fn consolidate_bench() {
     use std::hint::black_box;
     const N: u64 = 65_536;
     const ITERS: u64 = 20;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let schema = make_schema_u64_i64();
     let scatter = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8;
     type Key = fn(u64) -> u64;
@@ -77,7 +77,7 @@ fn append_batch_strings_bench() {
     let values: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("{i:040}").into_bytes()).collect();
     let rows: Vec<(u64, i64, &[u8])> = values.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
     let src = make_string_batch(&rows);
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let (dst, instructions) = counter.measure(|| {
         let mut dst = Batch::empty_with_schema(src.schema());
         for _ in 0..APPENDS {
@@ -109,7 +109,7 @@ fn from_ranges_run_length_bench() {
         b.end_row();
     }
     let src = b.finish();
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     for run in [1usize, 2, 4, 16, 256] {
         let ranges: Vec<(usize, usize)> = (0..ROWS).step_by(2 * run).map(|s| (s, s + run)).collect();
         let (copied, instructions) = counter.measure(|| {
@@ -158,14 +158,8 @@ fn blob_cache_session_bench() {
     // A relocating session over every row of `src`: `compacted` carries no heap.
     let session = |src: &Batch| std::hint::black_box(std::hint::black_box(src).compacted()).count;
     let counters = [
-        (
-            "instr",
-            gnitz_foundation::perf::Counter::instructions().expect("instructions counter"),
-        ),
-        (
-            "cycles",
-            gnitz_foundation::perf::Counter::cycles().expect("cycles counter"),
-        ),
+        ("instr", gnitz_foundation::perf::Counter::instructions()),
+        ("cycles", gnitz_foundation::perf::Counter::cycles()),
     ];
     for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
         for (unit, counter) in &counters {

@@ -15,7 +15,7 @@ const TICK_ROWS: u64 = 10_000;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn ingest_unticked_bench() {
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     println!("{:>6} {:>10} {:>10} {:>12}", "rows", "pushes", "ns/row", "instr/row");
 
     for rows_per_push in [1_000u64, 1] {

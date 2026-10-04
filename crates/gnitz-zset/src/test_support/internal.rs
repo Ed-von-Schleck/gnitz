@@ -112,14 +112,6 @@ impl TestTrace {
     }
 }
 
-/// This process's resident set once the allocator has handed its free memory
-/// back, so a later delta counts what is still referenced.
-pub fn settled_rss() -> u64 {
-    // SAFETY: `malloc_trim` only releases memory the allocator holds free.
-    unsafe { libc::malloc_trim(0) };
-    gnitz_foundation::perf::rss_bytes()
-}
-
 /// One column of one row as its native little-endian cell, a string as its
 /// content; `None` for NULL.
 pub(crate) fn cell(mb: &MemBatch, loc: ColumnLocator, row: usize) -> Option<Vec<u8>> {

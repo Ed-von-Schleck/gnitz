@@ -121,7 +121,7 @@ fn merge_consolidated_skewed_bench() {
 fn striped_sum_bench() {
     use std::hint::black_box;
 
-    let instructions = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let instructions = gnitz_foundation::perf::Counter::instructions();
     let schema = pk_u64_two_i64_schema();
     for (n, iters) in [(4usize, 10_000usize), (64, 10_000), (4096, 1000), (1_000_000, 10)] {
         for k in [1usize, 4, 16] {

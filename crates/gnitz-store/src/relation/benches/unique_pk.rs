@@ -174,7 +174,7 @@ fn unique_pk_bench() {
         arm("fifo_big", 800_000, 1, fifo_rand(800_000)),
     ];
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     println!(
         "{:>12} {:>10} {:>12} {:>12} {:>12} {:>12}",
         "arm", "rows", "eff_rows", "ns/row", "instr/row", "instr/miss"
@@ -240,7 +240,7 @@ fn sealed_tick_bench() {
     const ROWS: usize = 200_000;
     let dir = tempfile::tempdir().unwrap();
     let ints = make_schema_u64_i64();
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     println!(
         "{:>10} {:>8} {:>16} {:>16}",
         "shape", "per_tick", "write instr/row", "read instr/row"

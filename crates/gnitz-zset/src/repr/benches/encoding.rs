@@ -10,7 +10,7 @@ fn for_decode_bench() {
     use gnitz_foundation::perf::Counter;
     use std::hint::black_box;
     const N: usize = 1_000_000;
-    let instructions = Counter::instructions().unwrap();
+    let instructions = Counter::instructions();
     for fi in [FixedInt::I16, FixedInt::I32, FixedInt::I64] {
         let w = fi.width();
         for bw in 1..w {

@@ -262,7 +262,7 @@ fn join_equi_dt_bench() {
 fn join_over_source_bench() {
     use crate::test_support::rekey_plan;
     use gnitz_foundation::perf::Counter;
-    let instructions = Counter::instructions().unwrap();
+    let instructions = Counter::instructions();
     // `runs` round-robin slices of `rows`, each mapped by `run`, under one cursor.
     let cursor_of = |rows: &Batch, runs: usize, run: &mut dyn FnMut(Batch) -> Batch| {
         let parts: Vec<Rc<Batch>> = (0..runs)

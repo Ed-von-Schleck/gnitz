@@ -24,7 +24,7 @@ use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::WireStatus;
-use gnitz_zset_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
+use gnitz_zset_testkit::{assert_child_ok, run_test_in_child};
 use support::common::{block_copy, has_copy, has_manifest, manifest_path, unblock_copy};
 use support::{canonical, canonical_rows, cost, differential, query, sql, Answer, Reply};
 
@@ -429,7 +429,7 @@ fn many_views_of_one_table_advance_in_one_poll() {
 /// for one. A mirrored SELECT issues none, and neither does its `EXPLAIN` —
 /// routed to the connection it would fail with the server down, and describe a
 /// plan against a relation the statement will not read. A delegated read
-/// resolves its relation once.
+/// resolves its relation once, and a poll of both views is one request.
 #[test]
 fn each_mirror_call_costs_what_it_must() {
     let mut fx = Fixture::start();
@@ -457,6 +457,9 @@ fn each_mirror_call_costs_what_it_must() {
 
     let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM t WHERE a = 7"));
     assert_eq!(sent, 2, "a delegated read costs one RESOLVE and one read");
+
+    let (_, sent) = cost(m, |m| m.poll_mirror().expect("poll"));
+    assert_eq!(sent, 1, "a poll of both views is one request");
 }
 
 /// A `CREATE VIEW` over a mirrored view binds the server's id, not the local
@@ -596,62 +599,6 @@ fn storage_fault_child() {
         matches!(&report[..], [o] if o.view_id == tid && matches!(o.result, PollResult::Failed(_))),
         "the armed seam refuses every re-bootstrap too: {report:?}",
     );
-    println!("{CHILD_OK}");
-}
-
-/// Runs only in the child `resident_footprint_bench` spawns.
-#[test]
-fn resident_footprint_child() {
-    let Some((sock, dir)) = child_target() else { return };
-    let mut direct = GnitzClient::connect(&sock).unwrap();
-    // In slices, so no one statement carries tens of thousands of value tuples.
-    for lo in (41..40_000).step_by(2_000) {
-        churn(&mut direct, lo, lo + 1_999);
-    }
-    let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
-
-    let base = gnitz_foundation::perf::rss_bytes();
-    let mut config = MirrorConfig::default();
-    config.store.ram_tier_bytes = 256 * 1024;
-    let mut mirror = GnitzClient::connect(&sock).unwrap();
-    mirror
-        .attach_mirror(Mirror::open(&dir, config).expect("a store opens"))
-        .expect("a fresh client attaches it");
-    gnitz_foundation::perf::reset_peak_rss();
-    let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
-    let peak = gnitz_foundation::perf::peak_rss_bytes();
-    mirror.checkpoint_mirror().expect("checkpoint");
-    let rows = query(&mut mirror, "s", "SELECT a, b, v FROM v_keyed WHERE a = 2100")
-        .1
-        .weights
-        .len();
-    let held = gnitz_foundation::perf::rss_bytes();
-    let on_disk = dir_bytes(std::path::Path::new(&dir));
-    println!(
-        "copy of view {tid}: {on_disk} bytes on disk, host RSS {base} -> {held} \
-         (+{}), bootstrap peak +{}, point read returned {rows} row(s)",
-        held.saturating_sub(base),
-        peak.saturating_sub(base),
-    );
-    println!("{CHILD_OK}");
-}
-
-/// Every byte under `dir`, recursively.
-fn dir_bytes(dir: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| {
-            let p = e.path();
-            if p.is_dir() {
-                dir_bytes(&p)
-            } else {
-                std::fs::metadata(&p).map_or(0, |m| m.len())
-            }
-        })
-        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,7 +1660,6 @@ fn poisoned_read_child() {
         .expect("a later attach on the same connection is legal");
     let recovered = mirror.mirror_view("s", "v_repl").expect("and it bootstraps again");
     assert!(recovered.result.reseeded());
-    println!("{CHILD_OK}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,9 +1667,8 @@ fn poisoned_read_child() {
 // ---------------------------------------------------------------------------
 
 /// Start a child on `name` against a seeded, churned server and an empty mirror
-/// directory, with `envs` on top, and assert it ran to its sentinel. Returns the
-/// child's stdout, which the footprint bench prints.
-fn run_child(name: &str, envs: &[(&str, &str)], what: &str) -> String {
+/// directory, with `envs` on top, and assert it ran and passed.
+fn run_child(name: &str, envs: &[(&str, &str)], what: &str) {
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     // So the rounds a bootstrap reads already exist.
@@ -1738,7 +1683,6 @@ fn run_child(name: &str, envs: &[(&str, &str)], what: &str) -> String {
     all.extend_from_slice(envs);
     let out = run_test_in_child(module_path!(), name, &all);
     assert_child_ok(&out, what);
-    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// What a parent handed this child, or `None` in the parent's own run of the

@@ -183,7 +183,7 @@ fn map_ranges_bench() {
     .into_iter()
     .chain(hash_rows.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)))
     .chain(col_copies.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)));
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     for (name, plan, src) in whole {
         if !driven(name) {
             continue;
@@ -296,12 +296,9 @@ fn reindex_drop_null_keys_bench() {
             }
             let t = crate::test_support::bench_time(ITERS, &mut *f);
             let per_row = |v: f64| v / N as f64;
-            let [instrs, cycles] = counters.each_ref().map(|c| {
-                c.as_ref()
-                    .map_or("-".into(), |c| format!("{:.1}", per_row(c.measure(&mut *f).1 as f64)))
-            });
+            let [instrs, cycles] = counters.each_ref().map(|c| per_row(c.measure(&mut *f).1 as f64));
             println!(
-                "{pct:>4.1}% NULL  {name:<28} {:>7.2} ns/row  {instrs:>7} instr/row  {cycles:>7} cycles/row",
+                "{pct:>4.1}% NULL  {name:<28} {:>7.2} ns/row  {instrs:>7.1} instr/row  {cycles:>7.1} cycles/row",
                 per_row(t.as_nanos() as f64 / ITERS as f64),
             );
         };

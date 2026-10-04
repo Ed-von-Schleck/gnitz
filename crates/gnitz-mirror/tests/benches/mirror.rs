@@ -1,113 +1,159 @@
 use super::*;
 
-/// The round trip, measured as instructions retired: a narrowly-bounded read
-/// against the mirror versus the same read against the server.
-///
-/// `#[ignore]`d and run with `--nocapture`, like the engine's other timing
-/// tests: it prints a measurement rather than asserting a threshold, and needs a
-/// `perf_event_open` the sandbox may refuse.
-///
-/// The counter's scope is **the calling thread**, kernel time included where the
-/// kernel allows it. That is the right scope for what is being claimed: what a
-/// mirror removes from a caller is the caller's own syscall, socket and wakeup
-/// work. The W workers' work behind a served read is outside it by construction,
-/// and the falsifiable form of "no round trip at all" is the request count that
-/// `each_mirror_call_costs_what_it_must` pins, not this.
-///
-/// **The read must be one the bound narrows.** A full scan measures the wrong
-/// thing: the mirror does on one thread what the server splits W ways, so
-/// instructions retired would come out level while wall-clock moved *against*
-/// the mirror. The full-scan number is recorded too, as the statement of that
-/// trade rather than as a target.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn round_trip_cost_bench() {
-    let mut fx = Fixture::start();
-    let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
-        println!("perf_event_open refused; skipping the instruction count");
-        return;
-    };
-    if !counter.counts_kernel {
-        println!("note: perf_event_paranoid forbids kernel-mode counting, so a served read's syscall and");
-        println!("      wakeup path are invisible here and its figure is an under-count.");
-    }
+use std::hint::black_box;
 
-    churn(&mut fx.direct, 1, 2_000);
-    fx.mirror_both();
-    fx.quiesce();
+use gnitz_foundation::perf;
+use gnitz_wire::{key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 
-    for (label, q) in [
-        ("point", "SELECT a, b, v FROM v_keyed WHERE a = 977"),
-        ("narrow", "SELECT a, b, v FROM v_keyed WHERE a > 900 AND a < 940"),
-        ("full", "SELECT a, b, v FROM v_keyed"),
-    ] {
-        // One warm pass each: the first read of a relation pays cache fills on
-        // both sides, and neither is what this measures.
-        let _ = fx.local(q);
-        let _ = query(&mut fx.direct, "s", q);
-
-        let (_, local) = counter.measure(|| fx.local(q));
-        let (_, remote) = counter.measure(|| query(&mut fx.direct, "s", q));
-        println!("{label:>7}: mirror {local:>12} instr, server {remote:>12} instr (client side)");
-    }
-}
-
-/// The client-side cost of one idle poll over M views — the steady state of a
-/// subscription: one request and one park, whatever M is. Instructions retired
-/// is the same claim, immune to machine frequency.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn idle_poll_client_cost_bench() {
-    const M: usize = 16;
-    const K: usize = 200;
-
-    let mut fx = Fixture::start();
-    let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
-        println!("perf_event_open refused; skipping the instruction count");
-        return;
-    };
-
-    churn(&mut fx.direct, 1, 2_000);
-    fx.many_views("i", M, "a, b, v, f, body");
-    // Poll once more after the drain, so the measured run is wholly idle.
-    fx.mirror().poll_mirror().expect("poll");
-
-    let before = gnitz_foundation::perf::voluntary_ctx_switches();
-    let (_, insns) = counter.measure(|| {
-        for _ in 0..K {
-            fx.mirror().poll_mirror().expect("poll");
-        }
-    });
-    let switches = gnitz_foundation::perf::voluntary_ctx_switches() - before;
-
+/// One row of the cost table: `calls` runs of `f` on `client`, as what one of
+/// them costs the calling thread — user-space instructions retired, parks and
+/// requests sent.
+fn cell(label: &str, calls: u64, client: &mut GnitzClient, mut f: impl FnMut(&mut GnitzClient)) {
+    let counter = perf::Counter::instructions();
+    let (parks, sent) = (perf::voluntary_ctx_switches(), client.requests_sent());
+    let ((), instructions) = counter.measure(|| (0..calls).for_each(|_| f(client)));
     println!(
-        "idle poll over M={M} K={K}: {:.0} instr/poll ({}), {:.2} voluntary ctx switches/poll",
-        insns as f64 / K as f64,
-        if counter.counts_kernel {
-            "kernel included"
-        } else {
-            "user-space only"
-        },
-        switches as f64 / K as f64,
+        "{label:<28} {:>10} instr {:>5.2} parks {:>5.2} requests",
+        instructions / calls,
+        (perf::voluntary_ctx_switches() - parks) as f64 / calls as f64,
+        (client.requests_sent() - sent) as f64 / calls as f64,
     );
 }
 
-/// The copy is a store, not a resident Z-set.
+/// What each mirror call costs its caller: a bootstrap, a poll that carries a
+/// round, a read off the copy beside the same read served, and an idle poll by
+/// how many views it covers.
 ///
-/// `#[ignore]`d, run with `--nocapture`, and in a child process, so the host RSS
-/// measured is the child's alone. **It is not a gate**: a checkpoint publishes shard files
-/// whatever the RAM ceiling is, so their presence proves nothing, and an RSS
-/// threshold is not sound enough to fail a build on. The number is the
-/// statement of the claim.
+/// The reads are `ReadSpec`s, so no figure carries the SQL front end, and the
+/// local ones run against the copy's RAM tier and again against its shards. The
+/// W workers' share of a served read is on no counter here: its row is what the
+/// read costs the client.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn mirror_call_cost_bench() {
+    const CALLS: u64 = 200;
+
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 2_000);
+    fx.tick("s", &["v_keyed"]);
+    cell("bootstrap", 1, fx.mirror(), |m| {
+        m.mirror_view("s", "v_keyed").expect("mirror");
+    });
+    churn(&mut fx.direct, 2_001, 4_000);
+    fx.tick("s", &["v_keyed"]);
+    cell("poll carrying a round", 1, fx.mirror(), |m| {
+        m.poll_mirror().expect("poll");
+    });
+
+    let rel = fx.mirror().resolve_relation("s", "v_keyed").expect("resolve");
+    let image = |v: i64| key_image(TypeCode::I64, v as u128);
+    let point: Vec<u8> = [977, 977 % 7]
+        .iter()
+        .flat_map(|&v| (image(v) as u64).to_be_bytes())
+        .collect();
+    let band = KeyRange::new(
+        PkColList::from_slice(&[0, 1]),
+        &[],
+        Cut::after(image(900)),
+        Cut::before(image(940)),
+    );
+    let reads = [
+        ("point", ReadBound::PkSet(PkKeys::from_sorted(point.len(), point)), 1),
+        ("range", ReadBound::Range(band), 39),
+        ("full", ReadBound::None, 3_000),
+    ]
+    .map(|(label, bound, rows)| (label, ReadSpec::all_rows(bound), rows));
+
+    for (label, spec, rows) in &reads {
+        let served = fx.direct.scan_spec(&*rel, spec, &rel.schema).expect("served read");
+        assert_eq!(
+            served.batch.weights.len(),
+            *rows,
+            "{label}: the bound walks what its label says"
+        );
+        cell(&format!("served {label}, {rows} rows"), CALLS, &mut fx.direct, |c| {
+            black_box(c.scan_spec(&*rel, spec, &rel.schema).expect("served read"));
+        });
+    }
+    for tier in ["RAM tier", "shards"] {
+        if tier == "shards" {
+            fx.mirror().checkpoint_mirror().expect("checkpoint");
+        }
+        for (label, spec, rows) in &reads {
+            cell(&format!("local {label}, {tier}"), CALLS, fx.mirror(), |m| {
+                let local = m.scan_spec_local_first(&*rel, spec.clone(), &rel.schema);
+                assert_eq!(black_box(local.expect("local read")).batch.weights.len(), *rows);
+            });
+        }
+    }
+
+    // Three steps of one registry, each view bootstrapped and drained before the
+    // polls over it are measured.
+    for (prefix, more) in [("a", 1), ("b", 15), ("c", 46)] {
+        fx.many_views(prefix, more, "a, b, v");
+        let views = fx.mirror().mirrored_ids().len();
+        cell(&format!("idle poll, {views} views"), CALLS, fx.mirror(), |m| {
+            m.poll_mirror().expect("poll");
+        });
+    }
+}
+
+/// The copy is a store, not a resident Z-set: what a bootstrap and the copy it
+/// leaves keep resident, beside the bytes the copy holds on disk.
+///
+/// The view is far larger than the copy's RAM tier and arrives in frames far
+/// smaller than the view, so neither a copy held in memory nor a bootstrap that
+/// buffered its reply could stay near the tier.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn resident_footprint_bench() {
+    const ROWS: u128 = 200_000;
+    const SLICE: u128 = 10_000;
+
+    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "65536")]);
+    sql(
+        &mut fx.direct,
+        "s",
+        "CREATE TABLE big (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+    );
+    let big = fx.direct.resolve_relation("s", "big").expect("resolve");
+    for lo in (0..ROWS).step_by(SLICE as usize) {
+        let mut batch = gnitz_core::ZSetBatch::new(&big.schema);
+        let mut rows = gnitz_core::BatchAppender::new(&mut batch);
+        for id in lo..lo + SLICE {
+            // Distinct per row, or a shard stores the column as one value.
+            rows.add_row(id, 1).str_val(&format!("{id:0>200}"));
+        }
+        fx.direct
+            .push(big.tid, &big.schema, &batch, gnitz_wire::WireConflictMode::Update)
+            .expect("push");
+    }
+    fed_view(&mut fx.direct, "s", "v_big", "SELECT id, body FROM big WHERE id >= 0");
+
+    // The fixture's own store is at the default tier; this one is far below the view.
+    fx.mirror = None;
+    let dir = fx.base_dir();
+    let mut config = MirrorConfig::default();
+    config.store.ram_tier_bytes = 256 * 1024;
+    let mut mirror = GnitzClient::connect(fx.server.sock_path()).unwrap();
+    mirror
+        .attach_mirror(Mirror::open(&dir, config).expect("a store opens"))
+        .expect("a fresh client attaches it");
+
+    let base = perf::rss_bytes();
+    perf::reset_peak_rss();
+    mirror.mirror_view("s", "v_big").expect("mirror");
+    let peak = perf::peak_rss_bytes();
+    mirror.checkpoint_mirror().expect("checkpoint");
+    let held = perf::rss_bytes();
+
     print!(
         "{}",
-        run_child(
-            "resident_footprint_child",
-            &[],
-            "the footprint child must run to the end",
-        )
+        gnitz_store::relation::disk_usage(&support::common::root(&dir)).expect("the copy's directory")
+    );
+    println!(
+        "{ROWS} rows mirrored: host RSS +{} held, +{} at the bootstrap's peak",
+        held.saturating_sub(base),
+        peak.saturating_sub(base),
     );
 }

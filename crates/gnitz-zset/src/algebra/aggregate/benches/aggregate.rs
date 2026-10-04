@@ -54,7 +54,7 @@ fn adhoc_fold_bench() {
             ],
         ),
     ];
-    let counter = Counter::instructions().expect("instructions counter");
+    let counter = Counter::instructions();
     for groups in [16u64, 4096, 60_000] {
         let chunks: Vec<Batch> = (0..N / CHUNK)
             .map(|c| {

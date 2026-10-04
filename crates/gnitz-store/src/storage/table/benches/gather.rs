@@ -37,7 +37,7 @@ fn pk_set_gather_bench() {
         let step = ROWS / (n + 1);
         let key_bytes: Vec<[u8; 8]> = (1..=n).map(|i| (i * step).to_be_bytes()).collect();
         let keys = gnitz_wire::PkKeys::from_keys(8, key_bytes.iter().map(|k| &k[..]));
-        let counter = Counter::instructions().expect("instructions counter");
+        let counter = Counter::instructions();
         let mut instructions = 0;
         for _ in 0..ITERS {
             let (out, i) = counter.measure(|| t.gather(keys.clone(), super::Cut::Now).drain_chunk(usize::MAX));

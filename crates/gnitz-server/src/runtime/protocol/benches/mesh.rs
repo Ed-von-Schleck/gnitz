@@ -13,7 +13,7 @@ fn mesh_round_bench() {
 
     const ROUNDS: u64 = 200;
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let pk = by_pk(&make_schema_u64_i64());
     for nw in [2, 4] {
         for rows in [1, 1_000, 100_000] {

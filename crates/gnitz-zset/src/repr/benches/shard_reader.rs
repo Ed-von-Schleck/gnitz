@@ -81,7 +81,7 @@ fn for_slice_bench() {
         ("a value in one row of ten, the rest NULL", nullable, tenth),
     ];
     let dir = tempfile::tempdir().unwrap();
-    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
     for (label, schema, value) in shapes {
         let batch = build(schema, N, |b, i| {
             b.begin_row(i as u128, 1);
@@ -129,7 +129,7 @@ fn word_region_bench() {
         ("for", |i| ((i % 7) as i64 + 1, (i % 5 != 0).then_some(i as u128))),
     ];
     let dir = tempfile::tempdir().unwrap();
-    let instructions = Counter::instructions().unwrap();
+    let instructions = Counter::instructions();
     for (label, row) in shapes {
         let batch = build(schema, N, |b, i| {
             let (weight, value) = row(i);
@@ -161,8 +161,8 @@ fn word_region_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_point_touch_bench() {
-    use crate::test_support::{pk_u64_two_i64_schema, settled_rss};
-    use gnitz_foundation::perf::Counter;
+    use crate::test_support::pk_u64_two_i64_schema;
+    use gnitz_foundation::perf::{rss_bytes, Counter};
     use std::hint::black_box;
     const N: usize = 1_000_000;
     let schema = pk_u64_two_i64_schema();
@@ -174,16 +174,16 @@ fn for_point_touch_bench() {
     });
     let path = write(dir.path(), "point.db", &batch);
     let shard = MappedShard::open(&path, &schema).unwrap();
-    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
     let read = || {
         for pi in 0..2 {
             black_box(shard.get_col_ptr(black_box(N / 2), pi, 8));
         }
     };
-    let rss0 = settled_rss();
+    let rss0 = rss_bytes();
     for label in ["cold", "warm"] {
         let (((), i), c) = cycles.measure(|| instructions.measure(read));
-        let retained = settled_rss().saturating_sub(rss0);
+        let retained = rss_bytes().saturating_sub(rss0);
         println!("{label}: {i} instructions, {c} cycles; {retained} bytes retained");
     }
     // Every block: the second pass is the read of a block already held.
@@ -291,7 +291,7 @@ fn shard_string_footprint_bench() {
         ),
     ];
 
-    let instructions = Counter::instructions().unwrap();
+    let instructions = Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
     for (si, (label, batch)) in shapes.iter().enumerate() {
         let schema = *batch.schema();

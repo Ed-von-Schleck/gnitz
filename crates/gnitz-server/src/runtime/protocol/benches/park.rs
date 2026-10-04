@@ -14,7 +14,7 @@ use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 fn park_wake_bench() {
     const N: u64 = 200_000;
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let empty = (0..N).map(|_| counter.measure(|| ()).1).sum::<u64>();
     for wait_for_arm in [true, false] {
         let parks = WorkerParks::create(1).unwrap();
@@ -57,11 +57,10 @@ fn park_wake_bench() {
         }
         unsafe { assert_child_exited_ok(pid) };
         println!(
-            "park_wake_bench {:<12} {:>7.1} instr/wake (kernel counted: {}), {:.1}% of wakes found the park armed, \
+            "park_wake_bench {:<12} {:>7.1} instr/wake, {:.1}% of wakes found the park armed, \
              {} child context switches",
             if wait_for_arm { "armed" } else { "back_to_back" },
             instructions as f64 / N as f64,
-            counter.counts_kernel,
             found_armed as f64 * 100.0 / N as f64,
             unsafe { switches.read() },
         );

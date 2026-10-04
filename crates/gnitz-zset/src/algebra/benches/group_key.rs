@@ -11,7 +11,7 @@ use crate::test_support::pk_payload_schema;
 fn group_ordinals_bench() {
     use TypeCode::{U128, U64};
     const N: u64 = 1 << 18;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let three = pk_payload_schema(&[U64, U64, U64]);
     let nullable = {
         let mut cols = [SchemaColumn::new(U64, false); 4];
@@ -72,7 +72,7 @@ fn group_identity_bench() {
     use TypeCode::{I32, I64, U32, U64};
     const N: u64 = 1_000_000;
     const GROUPS: u64 = 1000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let schema = |pk: &[TypeCode], payload: TypeCode| {
         let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
         cols.push(SchemaColumn::new(payload, false));

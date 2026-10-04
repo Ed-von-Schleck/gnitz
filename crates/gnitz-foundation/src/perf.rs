@@ -36,48 +36,42 @@ const IOC_ENABLE: libc::c_ulong = 0x2400;
 const IOC_DISABLE: libc::c_ulong = 0x2401;
 const IOC_RESET: libc::c_ulong = 0x2403;
 
-/// An open hardware counter for the calling thread.
-pub struct Counter {
-    fd: File,
-    /// Whether kernel-mode instructions are counted; `perf_event_paranoid` can
-    /// refuse them.
-    pub counts_kernel: bool,
-}
+/// An open hardware counter over the calling thread's user-space execution.
+///
+/// Kernel mode is excluded on every machine, so a figure does not depend on
+/// `perf_event_paranoid`. What a call costs in the kernel is counted as requests
+/// and as [`voluntary_ctx_switches`].
+pub struct Counter(File);
 
 impl Counter {
-    /// Instructions retired; `None` where the kernel refuses the counter outright.
-    pub fn instructions() -> Option<Self> {
+    /// Instructions retired. Panics where the kernel refuses the counter.
+    pub fn instructions() -> Self {
         Self::open(PERF_COUNT_HW_INSTRUCTIONS)
     }
 
-    /// Core cycles; `None` where the kernel refuses the counter outright.
-    pub fn cycles() -> Option<Self> {
+    /// Core cycles. Panics where the kernel refuses the counter.
+    pub fn cycles() -> Self {
         Self::open(PERF_COUNT_HW_CPU_CYCLES)
     }
 
-    fn open(config: u64) -> Option<Self> {
-        Self::open_with(config, false)
-            .map(|fd| Counter { fd, counts_kernel: true })
-            .or_else(|| Self::open_with(config, true).map(|fd| Counter { fd, counts_kernel: false }))
-    }
-
-    fn open_with(config: u64, exclude_kernel: bool) -> Option<File> {
+    fn open(config: u64) -> Self {
         let attr = PerfEventAttr {
             type_: PERF_TYPE_HARDWARE,
             size: std::mem::size_of::<PerfEventAttr>() as u32,
             config,
-            flags: FLAG_DISABLED | FLAG_EXCLUDE_HV | if exclude_kernel { FLAG_EXCLUDE_KERNEL } else { 0 },
+            flags: FLAG_DISABLED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV,
             ..Default::default()
         };
         // pid 0 = this thread, cpu -1 = any, no group, no flags.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const _, 0, -1, -1, 0) };
+        assert!(fd >= 0, "perf_event_open: {}", std::io::Error::last_os_error());
         // SAFETY: a descriptor the syscall just returned, owned by nothing else.
-        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd as libc::c_int) })
+        Counter(unsafe { File::from_raw_fd(fd as libc::c_int) })
     }
 
     /// The events `f` counted on this thread.
     pub fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, u64) {
-        let fd = self.fd.as_raw_fd();
+        let fd = self.0.as_raw_fd();
         unsafe {
             libc::ioctl(fd, IOC_RESET, 0);
             libc::ioctl(fd, IOC_ENABLE, 0);
@@ -85,7 +79,7 @@ impl Counter {
         let out = f();
         unsafe { libc::ioctl(fd, IOC_DISABLE, 0) };
         let mut buf = [0u8; 8];
-        (&self.fd).read_exact(&mut buf).expect("read the perf counter");
+        (&self.0).read_exact(&mut buf).expect("read the perf counter");
         (out, u64::from_le_bytes(buf))
     }
 }
@@ -114,8 +108,12 @@ fn status_bytes(field: &str) -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-/// This process's resident set, in bytes. `0` where `/proc` does not answer.
+/// This process's resident set, in bytes, once the allocator has handed its
+/// free memory back — so a delta of two readings counts what is still
+/// referenced. `0` where `/proc` does not answer.
 pub fn rss_bytes() -> u64 {
+    // SAFETY: `malloc_trim` only releases memory the allocator holds free.
+    unsafe { libc::malloc_trim(0) };
     status_bytes("VmRSS")
 }
 
@@ -126,7 +124,8 @@ pub fn peak_rss_bytes() -> u64 {
 }
 
 /// Reset [`peak_rss_bytes`] to the current resident set, so a peak measures one
-/// region. A no-op where `/proc/self/clear_refs` is not writable.
+/// region; take the [`rss_bytes`] baseline first, since that reading lowers the
+/// resident set. A no-op where `/proc/self/clear_refs` is not writable.
 pub fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }

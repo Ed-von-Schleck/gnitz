@@ -54,7 +54,7 @@ fn push_group_layout_bench() {
         ("keyed fixed", true, Cell::Int, 1),
     ];
 
-    let counter = Counter::instructions().expect("instructions counter");
+    let counter = Counter::instructions();
     for nw in [1usize, 4, 16] {
         let log = TestLog::new(256 << 20, nw, 1);
         // One scope's write and commit, the `SalExcl` taken and dropped around it.

@@ -105,7 +105,7 @@ fn reply_chunk_strings_bench() {
     }
     let wide = b.finish();
 
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let mut buf = vec![0u8; 2 * BUDGET];
     for (name, batch) in [("long", &long), ("wide_short", &wide)] {
         let ((frames, bytes), instructions) = counter.measure(|| {

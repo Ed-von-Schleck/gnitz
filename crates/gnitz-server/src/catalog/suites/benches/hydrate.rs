@@ -71,15 +71,15 @@ fn checkpoint(engine: &mut CatalogEngine) {
 
 /// One measured read of `engine`.
 fn cell(label: &str, engine: &mut CatalogEngine, read: impl Fn(&RelationRegistry, &mut Counting) -> usize) {
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     black_box(read(
         &engine.registry,
         &mut Counting { dag: &mut engine.dag, hydrated: 0 },
     ));
 
     let mut hydrator = Counting { dag: &mut engine.dag, hydrated: 0 };
-    perf::reset_peak_rss();
     let before = perf::rss_bytes();
+    perf::reset_peak_rss();
     let (rows, instructions) = counter.measure(|| read(&engine.registry, &mut hydrator));
     let peak = perf::peak_rss_bytes().saturating_sub(before);
     let hydrated = hydrator.hydrated;
@@ -258,7 +258,7 @@ fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
     bb.put_u64(scramble(id - ROWS));
     bb.end_row();
     let effective = engine.registry.ingest_returning(base, bb.finish()).unwrap();
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     let what = Drive::Tick { source: base, round: id };
     let (_, instructions) =
         counter.measure(|| crate::query::drive(&mut LocalDrive(engine), what, Some(effective)).unwrap());

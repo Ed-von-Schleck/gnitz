@@ -11,13 +11,13 @@ use std::rc::Rc;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_compaction_bench() {
     use crate::repr::BatchBuilder;
-    use crate::test_support::{pk_u64_two_i64_schema, settled_rss};
-    use gnitz_foundation::perf::Counter;
+    use crate::test_support::pk_u64_two_i64_schema;
+    use gnitz_foundation::perf::{rss_bytes, Counter};
     use std::hint::black_box;
     const TOTAL: usize = 1 << 20;
     let schema = pk_u64_two_i64_schema();
     let dir = tempfile::tempdir().unwrap();
-    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
     for (sources, guards, skeleton) in [(4, 1, false), (32, 32, false), (64, 64, false), (32, 32, true)] {
         let per = TOTAL / sources;
         let inputs: Vec<Rc<MappedShard>> = (0..sources)
@@ -37,7 +37,7 @@ fn for_compaction_bench() {
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
         let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
-        let rss0 = settled_rss();
+        let rss0 = rss_bytes();
         let (((), i), c) = cycles.measure(|| {
             instructions.measure(|| {
                 merge_and_route(&inputs, &guard_keys, skeleton, &schema, &mut |_, _, batch| {
@@ -50,7 +50,7 @@ fn for_compaction_bench() {
         println!(
             "{sources} sources x {guards} guards{}: {i} instructions, {c} cycles; {} bytes retained",
             if skeleton { ", all skeleton" } else { "" },
-            settled_rss().saturating_sub(rss0),
+            rss_bytes().saturating_sub(rss0),
         );
     }
 }

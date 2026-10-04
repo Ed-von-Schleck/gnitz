@@ -108,7 +108,7 @@ fn reindex_pack_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn append_spans_bench() {
     const N: usize = 500_000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),

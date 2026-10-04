@@ -794,8 +794,8 @@ fn read_cursor_advance_to_rebuild_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_range_drain_bench() {
-    use crate::test_support::{pk_u64_two_i64_schema, settled_rss};
-    use gnitz_foundation::perf::Counter;
+    use crate::test_support::pk_u64_two_i64_schema;
+    use gnitz_foundation::perf::{rss_bytes, Counter};
     use std::hint::black_box;
     const N: usize = 1_000_000;
     let schema = pk_u64_two_i64_schema();
@@ -816,8 +816,8 @@ fn for_range_drain_bench() {
             )
         })
         .collect();
-    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
-    let rss0 = settled_rss();
+    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
+    let rss0 = rss_bytes();
     let key = (N as u64).to_be_bytes();
     let (((), i), c) = cycles.measure(|| {
         instructions.measure(|| {
@@ -828,7 +828,7 @@ fn for_range_drain_bench() {
     });
     println!(
         "seek + drain_chunk(100): {i} instructions, {c} cycles; {} bytes retained",
-        settled_rss().saturating_sub(rss0)
+        rss_bytes().saturating_sub(rss0)
     );
     for pass in 1..=2 {
         let (((), i), c) = cycles.measure(|| {
@@ -838,7 +838,7 @@ fn for_range_drain_bench() {
         });
         println!(
             "full drain {pass}: {i} instructions, {c} cycles; {} bytes retained after the cursor drops",
-            settled_rss().saturating_sub(rss0)
+            rss_bytes().saturating_sub(rss0)
         );
     }
 }
@@ -853,7 +853,7 @@ fn pk_set_gather_drain_bench() {
     use gnitz_wire::PkKeys;
 
     const N: u64 = 1 << 20;
-    let counter = Counter::instructions().expect("instructions counter");
+    let counter = Counter::instructions();
     for (label, with_str) in [("3xI64", false), ("2xI64+string", true)] {
         let last = if with_str { TypeCode::String } else { TypeCode::I64 };
         let schema = SchemaDescriptor::new(

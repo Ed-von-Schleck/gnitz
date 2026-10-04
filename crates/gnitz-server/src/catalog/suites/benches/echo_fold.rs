@@ -19,7 +19,7 @@ const ROWS: u64 = 10_000;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn echo_fold_bench() {
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     let cols = vec![col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     for readers in [0usize, 1, 2, 4] {
         let (mut engine, t, dir) = table_fixture(&format!("echo_fold_{readers}"), &cols);

@@ -83,7 +83,7 @@ fn net_weight(engine: &mut CatalogEngine, tid: u64) -> i64 {
 fn projection_view_tick_bench() {
     const TICK_ROWS: u64 = 10_000;
     const TICKS: u64 = 20;
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     let cols = vec![
         col_def("id", TypeCode::U64),
         col_def("a", TypeCode::U64),
@@ -128,7 +128,7 @@ fn grouped_view_ticks(
 ) {
     const GROUPS: u64 = 100_000;
     const TICKS: u64 = 2_000;
-    let counter = perf::Counter::instructions().expect("instructions counter");
+    let counter = perf::Counter::instructions();
     let cells = |id: u64| [spread(id) % GROUPS, id + 10];
     // The RAM tier every store of the fixture spills past, and the backfill's
     // chunk size: small chunks leave small shards, and so many of them.

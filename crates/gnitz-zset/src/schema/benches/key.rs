@@ -51,7 +51,7 @@ fn pk_compare_bench() {
 
     const ROWS: usize = 512 * 1024;
     const PROBES: usize = 100_000;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     println!("\npk_compare_bench — instructions per compare / per probe ({ROWS} rows):");
     for stride in [2usize, 4, 8, 9, 10, 12, 16, 24] {
         let types: Vec<TypeCode> = match stride {

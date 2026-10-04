@@ -107,15 +107,12 @@ fn type_codes() -> Vec<(&'static str, u8)> {
     TypeCode::ALL.iter().map(|&tc| (tc.wire_name(), tc.as_wire())).collect()
 }
 
-/// Instructions retired on this thread while `f()` runs, and whether the
-/// count includes the kernel's.
+/// User-space instructions retired on this thread while `f()` runs.
 #[pyfunction]
-fn instructions_retired(f: &Bound<'_, PyAny>) -> PyResult<(u64, bool)> {
-    let counter = gnitz_foundation::perf::Counter::instructions()
-        .ok_or_else(|| gnitz_err("the kernel refused the instructions counter"))?;
-    let (out, n) = counter.measure(|| f.call0());
+fn instructions_retired(f: &Bound<'_, PyAny>) -> PyResult<u64> {
+    let (out, n) = gnitz_foundation::perf::Counter::instructions().measure(|| f.call0());
     out?;
-    Ok((n, counter.counts_kernel))
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------

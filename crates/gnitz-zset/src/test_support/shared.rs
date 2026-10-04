@@ -117,11 +117,6 @@ pub fn in_child_test() -> bool {
     std::env::var(CHILD_TEST_VAR).is_ok()
 }
 
-/// What a child prints once it has run every assertion — see [`assert_child_ok`].
-/// A child that must fail-stop instead never reaches it, and its caller asserts
-/// on the exit code.
-pub const CHILD_OK: &str = "the child ran every assertion";
-
 /// Re-run the current test binary filtered to `internal_test`, with `envs` set,
 /// and hand back the child's exit status and captured output.
 ///
@@ -151,15 +146,14 @@ pub fn run_test_in_child(module: &str, internal_test: &str, envs: &[(&str, &str)
     cmd.output().unwrap()
 }
 
-/// Assert the child exited cleanly **and** reached its final [`CHILD_OK`] print.
-/// The exit code alone proves nothing: `libtest` exits 0 when its filter matches
-/// nothing, so renaming a child would otherwise leave its caller green covering
-/// nothing.
+/// Assert the child exited cleanly **and** ran its one test. The exit code alone
+/// proves nothing: `libtest` exits 0 when its filter matches nothing, so
+/// renaming a child would otherwise leave its caller green covering nothing.
 pub fn assert_child_ok(out: &std::process::Output, what: &str) {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.code() == Some(0) && stdout.contains(CHILD_OK),
+        out.status.code() == Some(0) && stdout.contains("1 passed"),
         "{what}\n-- child stdout --\n{stdout}-- child stderr --\n{stderr}",
     );
 }

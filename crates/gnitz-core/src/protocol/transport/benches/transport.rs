@@ -8,7 +8,7 @@ use gnitz_foundation::posix_io::set_sockopt_int;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn read_burst_bench() {
     const ROUNDS: u64 = 200;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions();
     let (unix, peer) = transport_pair();
     // The largest burst is written with nobody reading.
     set_sockopt_int(peer.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 1 << 20).unwrap();
