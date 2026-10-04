@@ -8,15 +8,11 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, fold_schemas, make_batch_raw, make_schema_u64_i64, row_key, zset_of, zset_sum, FoldRow,
-    RowKey,
+    arb_fold_case, fold_batch, fold_schemas, make_batch_raw, make_schema_u64_i64, new_table, row_key, zset_of,
+    zset_sum, FoldRow, RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
-
-fn new_table(dir: &Path, schema: SchemaDescriptor, rs: RecoverySource, ram_tier_bytes: usize) -> Table {
-    Table::new(dir.to_str().unwrap(), schema, rs, StoreBudgets::new(ram_tier_bytes)).unwrap()
-}
 
 /// unconsolidated rows over [`make_schema_u64_i64`]; the ingest path runs the sort+fold.
 fn rows(rows: &[(u64, i64, i64)]) -> Batch {
@@ -406,7 +402,7 @@ fn a_seal_that_enters_shards_into_l0_compacts_it() {
     let schema = make_schema_u64_i64();
     for overflow in [false, true] {
         let mut t = new_table(
-            &dir.path().join(format!("{overflow}")),
+            dir.path().join(format!("{overflow}")),
             schema,
             RecoverySource::SalReplay,
             1 << 20,

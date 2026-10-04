@@ -4,23 +4,38 @@
 use std::path::Path;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use crate::storage::{RecoverySource, StoreBudgets, Table};
+use crate::storage::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, SinkKind};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
+/// A table under `dir` at a RAM tier of `ram_tier_bytes`, its shards unbounded.
+pub(crate) fn new_table(
+    dir: impl AsRef<Path>,
+    schema: SchemaDescriptor,
+    recovery: RecoverySource,
+    ram_tier_bytes: usize,
+) -> Table {
+    Table::new(
+        dir.as_ref().to_str().unwrap(),
+        schema,
+        recovery,
+        StoreBudgets::new(ram_tier_bytes),
+    )
+    .unwrap()
+}
+
 /// A rederived table under `dir` at the default budgets — nothing a test puts
 /// here spills, since that needs the whole RAM tier. For a test that just
 /// needs somewhere to put rows.
 pub(crate) fn scratch_table(dir: impl AsRef<Path>, schema: SchemaDescriptor) -> Table {
-    Table::new(
-        dir.as_ref().to_str().unwrap(),
+    new_table(
+        dir,
         schema,
         RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::default(),
+        DEFAULT_RAM_TIER_BYTES,
     )
-    .unwrap()
 }
 
 /// Flip the low bit of `path`'s last byte with a `pwrite`, which a live mapping

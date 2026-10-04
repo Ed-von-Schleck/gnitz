@@ -82,6 +82,8 @@ fn probe_bench() {
     let unheld = keys(&span, (0..ROWS).filter(|v| v % 16 != 0));
     cell("index, runs of misses", &unique, index(1), unheld, 0);
     cell("pk", &unique, Probe::Pk, keys(&pk, 0..ROWS), ROWS);
+    // Above every run.
+    cell("pk, misses", &unique, Probe::Pk, keys(&pk, ROWS..2 * ROWS), 0);
     cell("pk column", &unique, Probe::PkColumn(1), keys(&pk, 0..ROWS), ROWS);
 
     // Four holders per value, every value probed: the group ends the walk, then

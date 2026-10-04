@@ -1,5 +1,5 @@
-use super::{Cut, RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64};
+use super::{Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
@@ -50,13 +50,8 @@ fn table_ingest_bench() {
             })
             .collect();
         let rows: usize = ticks.iter().map(Batch::len).sum();
-        let mut table = Table::new(
-            dir.path().join(case.to_string()).to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::new(tier),
-        )
-        .unwrap();
+        let rederive = RecoverySource::Rederive { resume_at: None };
+        let mut table = new_table(dir.path().join(case.to_string()), schema, rederive, tier);
         let ((), instructions) = counter.measure(|| {
             for tick in ticks {
                 table.ingest_owned_batch(tick).unwrap();
@@ -86,13 +81,12 @@ fn pk_set_gather_bench() {
     let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
     // A tier of half a round, so every round spills.
-    let mut t = Table::new(
-        dir.path().to_str().unwrap(),
+    let mut t = new_table(
+        dir.path(),
         schema,
         RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::new(1 << 19),
-    )
-    .unwrap();
+        1 << 19,
+    );
     for r in 0..8u64 {
         let rows: Vec<(u64, i64, i64)> = (0..ROWS / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
         t.ingest_owned_batch(make_batch(&schema, &rows)).unwrap();
