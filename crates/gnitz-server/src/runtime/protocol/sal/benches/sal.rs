@@ -1,40 +1,40 @@
 use super::fixtures::TestLog;
 use super::tests::scan;
 use super::{DirectGroup, GroupTargets, SalReader, WorkerSet};
+use gnitz_foundation::perf::Counter;
+use std::hint::black_box;
 
-/// Instructions retired per [`SalReader::next`] over control-only groups: ones
-/// addressed to the reader, and ones it steps over.
+/// Instructions the reader spends per control-only group: ones addressed to it,
+/// and ones it steps over. A shared group holds one payload at every worker
+/// count; a per-worker group holds one per addressed worker, and the reader is
+/// the last of them.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn sal_read_bench() {
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
-
     const GROUPS: u64 = 10_000;
+
     let counter = Counter::instructions();
-    for nw in [1usize, 4, 16] {
-        for (case, set) in [
-            ("addressed", WorkerSet::ALL),
-            ("stepped over", WorkerSet::ALL.without(0)),
-        ] {
-            if set.within(nw).len() == 0 {
-                continue;
-            }
+    for (layout, nw, per_worker) in [("shared", 2, false), ("per worker", 4, true), ("per worker", 16, true)] {
+        let blobs = vec![Vec::new(); nw];
+        for addressed in [true, false] {
+            let me = nw - 1;
+            let set = if addressed {
+                WorkerSet::ALL
+            } else {
+                WorkerSet::ALL.without(me)
+            };
             let log = TestLog::new(32 << 20, nw, 1);
             let group = DirectGroup {
-                targets: GroupTargets {
-                    set,
-                    request_id: 1,
-                    in_request_order: false,
-                },
+                extras: per_worker.then_some(&blobs[..]),
+                targets: GroupTargets { set, ..GroupTargets::UNADDRESSED },
                 ..DirectGroup::new(scan(0, &[]))
             };
             let excl = log.excl();
             for _ in 0..GROUPS {
                 excl.write(&group).expect("group fits");
             }
-            let reader = SalReader::new(log.log(), 0, 1);
-            let (read, n) = counter.measure(|| {
+            let reader = SalReader::new(log.log(), me as u32, 1);
+            let (read, instructions) = counter.measure(|| {
                 let mut read = 0;
                 while let Some((msg, slot)) = reader.next() {
                     black_box((msg.request_id, slot.len()));
@@ -42,8 +42,17 @@ fn sal_read_bench() {
                 }
                 read
             });
-            assert_eq!(read, if set.contains(0) { GROUPS } else { 0 }, "{case} at NW={nw}");
-            eprintln!("sal_read_bench NW={nw:<2} {case}: {} instructions/group", n / GROUPS);
+            let case = if addressed { "addressed" } else { "stepped over" };
+            assert_eq!(read, if addressed { GROUPS } else { 0 }, "{layout} {case} at nw={nw}");
+            assert_eq!(
+                reader.cut(),
+                GROUPS,
+                "{layout} {case} at nw={nw}: every group was walked"
+            );
+            println!(
+                "sal_read_bench nw={nw:<2} {layout:<10} {case:<12} {:>6.1} instr/group",
+                instructions as f64 / GROUPS as f64
+            );
         }
     }
 }

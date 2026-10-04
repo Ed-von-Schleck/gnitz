@@ -93,7 +93,7 @@ fn push_group_layout_bench() {
                 })
                 .expect("group fits");
             });
-            eprintln!(
+            println!(
                 "push_group_layout_bench NW={nw:<2} {name}, {rows} rows ({layout}): \
                  {instructions} instructions/push, {bytes} SAL bytes"
             );
@@ -113,7 +113,7 @@ fn push_group_layout_bench() {
             };
             scope.write(&tick, false).expect("group fits");
         });
-        eprintln!(
+        println!(
             "push_group_layout_bench NW={nw:<2} one-tid Tick: {instructions} instructions/group, {bytes} SAL bytes"
         );
     }

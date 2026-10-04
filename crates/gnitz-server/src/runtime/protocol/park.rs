@@ -64,7 +64,7 @@ fn futex_wake_u32(ptr: *const AtomicU32, site: &str) {
 /// Sleep on `word` while it reads `expected` (v1 `FUTEX_WAIT`, no
 /// `FUTEX_PRIVATE_FLAG` — a park word is shared). A wake, a moved value and a
 /// signal all return; anything else aborts.
-pub(super) fn futex_wait_u32(word: *const AtomicU32, expected: u32, site: &str) {
+fn futex_wait_u32(word: *const AtomicU32, expected: u32, site: &str) {
     let rc = unsafe {
         libc::syscall(
             libc::SYS_futex,

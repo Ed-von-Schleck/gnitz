@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 
 use super::super::test_support::*;
 use super::*;
@@ -95,4 +95,51 @@ fn reactor_pass_bench() {
     };
     let next = async move || assert!(matches!(black_box(lease.next().await), Ok(Some(_))));
     arm(&counter, "train", r, next, || writers[0].send_msg(id, &frame));
+}
+
+/// What a flood of worker frames costs the master through its `FUTEX_WAITV`
+/// park, and what that park costs the workers.
+///
+/// Each worker publishes `N` frames from a thread of its own while the reactor
+/// runs its loop: frames no lease takes, then the ACK the run ends on. A publish
+/// that finds the park armed spends a `FUTEX_WAKE`, sampled just before each. The
+/// park arms every ring and a publish takes it from its own ring alone, so one
+/// master sleep can cost a wake per worker.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn reactor_flood_bench() {
+    const N: u32 = 200_000;
+
+    let counter = Counter::instructions();
+    for nw in [1, 4, 16] {
+        let (r, writers) = reactor_with_rings(nw);
+        let lease = r.lease_ready();
+        let (instructions, sleeps, wakes) = std::thread::scope(|s| {
+            let floods: Vec<_> = writers
+                .into_iter()
+                .map(|mut writer| {
+                    s.spawn(move || {
+                        let mut wakes = 0u64;
+                        for id in (BOOT_READY_REQUEST_ID + 1..=N).chain([BOOT_READY_REQUEST_ID]) {
+                            wakes += writer.master_parked() as u64;
+                            writer.send_ack(id);
+                        }
+                        wakes
+                    })
+                })
+                .collect();
+            let before = voluntary_ctx_switches();
+            let ((), instructions) = counter.measure(|| r.block_on(async move { lease.acks().await }));
+            let sleeps = voluntary_ctx_switches() - before;
+            let wakes: u64 = floods.into_iter().map(|f| f.join().expect("a flood thread")).sum();
+            (instructions, sleeps, wakes)
+        });
+        let kmsgs = (nw as u64 * N as u64) as f64 / 1000.0;
+        println!(
+            "reactor_flood_bench nw={nw:<2} {:>6.1} instr/msg, per 1k msgs {:>6.2} master sleeps and {:>6.2} worker wakes",
+            instructions as f64 / (kmsgs * 1000.0),
+            sleeps as f64 / kmsgs,
+            wakes as f64 / kmsgs,
+        );
+    }
 }
