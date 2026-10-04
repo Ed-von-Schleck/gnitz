@@ -7,8 +7,9 @@ use super::tests::trailing_key_batch;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
 use gnitz_zset::schema::key::probe_key;
 
-/// `ShardIndex::find_pk_bytes` over a tree the upkeep built from scattered
-/// spills, at a PK stride in each width arm: instructions per probe.
+/// The two read entries over a tree the upkeep built from scattered spills, at
+/// a PK stride in each width arm: instructions per `ShardIndex::find_pk_bytes`,
+/// and per `ShardIndex::shard_arcs_in_range` with the shards it hands a cursor.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_probe_bench() {
@@ -62,18 +63,53 @@ fn shard_probe_bench() {
             );
             println!("  {label}: {:.1} instr/probe", instructions as f64 / keys.len() as f64);
         }
+        // Label, the range at a held key, the fewest and the most shards it may select.
+        type Range = (&'static str, fn(u64) -> (u64, u64), usize, usize);
+        let ranges: [Range; 3] = [
+            ("one key", |k| (k, k), 1, idx.narrow_range_shards()),
+            ("a 1/1024 band", |k| (k, k + KEYSPACE / 1024), 1, idx.shard_count()),
+            ("the key line", |_| (0, KEYSPACE), idx.shard_count(), idx.shard_count()),
+        ];
+        for (label, range, at_least, at_most) in ranges {
+            let bounds: Vec<(PkBuf, PkBuf)> = held
+                .iter()
+                .step_by(64)
+                .map(|&k| range(k))
+                .map(|(lo, hi)| (trailing_gk(pk_cols, lo), trailing_gk(pk_cols, hi)))
+                .collect();
+            let (selected, instructions) = counter.measure(|| {
+                let mut selected = Vec::with_capacity(bounds.len());
+                for &(lo, hi) in &bounds {
+                    selected.push(idx.shard_arcs_in_range(lo, hi, true).count());
+                }
+                selected
+            });
+            assert!(
+                selected.iter().all(|n| (at_least..=at_most).contains(n)),
+                "{label}: a range selected under {at_least} or over {at_most} shards"
+            );
+            println!(
+                "  range, {label}: {:.1} instr/open, {:.1} of {} shards",
+                instructions as f64 / bounds.len() as f64,
+                selected.iter().sum::<usize>() as f64 / bounds.len() as f64,
+                idx.shard_count()
+            );
+        }
     }
 }
 
 /// What the FLSM compactions read and write per spilled byte, by trigger, and
-/// the largest single input of each in units of `R`.
+/// the largest single input of each in units of `R`; beside them the
+/// instructions a spilled row costs to write and to keep up.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn compaction_amplification_bench() {
+    use gnitz_foundation::perf::Counter;
     use CompactionKind::*;
     const RUN_ROWS: u64 = 8192;
     const KEYSPACE: u64 = 200_000_000;
     const HOT: u64 = 8 * RUN_ROWS;
+    const UPDATED: u64 = 1_000_000;
     type Rows = Vec<(u64, i64, i64)>;
     // Fresh ascending keys: an INSERT stream, and every delta store.
     let ascending = |run: u64, _: &mut Rng| -> Rows {
@@ -96,35 +132,83 @@ fn compaction_amplification_bench() {
             .flatten()
             .collect()
     };
-    // Label, the rows of a run, the budget, the runs spilled, the triggers that must run.
+    // Update `u` rewrites one of `UPDATED` keys, in an order that scatters them
+    // over the key space, retracting the row update `u - UPDATED` left there:
+    // a retraction's row sits wherever the tree has since moved it.
+    let updates = |run: u64, _: &mut Rng| -> Rows {
+        let key = |u: u64| u % UPDATED * 0x9E37_79B1 % UPDATED;
+        let retraction = |u: u64| u.checked_sub(UPDATED).map(|old| (key(u), -1, spread(old)));
+        (run * RUN_ROWS / 2..(run + 1) * RUN_ROWS / 2)
+            .flat_map(|u| [retraction(u), Some((key(u), 1, spread(u)))])
+            .flatten()
+            .collect()
+    };
+    // Label, the rows of a run, the budget, whether the store ends within it,
+    // the runs spilled, the triggers that must run.
     type Arm = (
         &'static str,
         fn(u64, &mut Rng) -> Rows,
         ShardBudget,
+        bool,
         u64,
         &'static [CompactionKind],
     );
-    let arms: [Arm; 6] = [
-        ("ascending", ascending, ShardBudget::Unbounded, 400, &[L0Fold]),
+    let arms: [Arm; 9] = [
+        (
+            "scattered, under the L1 floor",
+            scattered,
+            ShardBudget::Unbounded,
+            true,
+            60,
+            &[L0Fold, GuardSplit],
+        ),
+        (
+            "scattered updates",
+            updates,
+            ShardBudget::Unbounded,
+            true,
+            400,
+            &[L0Fold, GuardSplit, TierFold],
+        ),
+        ("ascending", ascending, ShardBudget::Unbounded, true, 400, &[L0Fold]),
         (
             "scattered",
             scattered,
             ShardBudget::Unbounded,
+            true,
             400,
-            &[L0Fold, GuardSplit, Vertical],
+            &[L0Fold, GuardSplit, TierFold, Vertical],
         ),
         (
             "scattered, 4x",
             scattered,
             ShardBudget::Unbounded,
+            true,
             1600,
-            &[L0Fold, GuardSplit, Vertical],
+            &[L0Fold, GuardSplit, TierFold, Vertical],
         ),
-        ("churn", churn, ShardBudget::Unbounded, 400, &[L0Fold, GuardSplit]),
+        (
+            "churn",
+            churn,
+            ShardBudget::Unbounded,
+            true,
+            400,
+            &[L0Fold, GuardSplit, GuardMerge],
+        ),
         (
             "scattered, dehydrating",
             scattered,
+            ShardBudget::Dehydrate(40 << 20),
+            true,
+            400,
+            &[BandCut, Dehydrate],
+        ),
+        // A capacity under what the skeleton rows alone take.
+        (
+            "scattered, at the skeleton floor",
+            scattered,
             ShardBudget::Dehydrate(16 << 20),
+            false,
             400,
             &[BandCut, Dehydrate],
         ),
@@ -132,6 +216,7 @@ fn compaction_amplification_bench() {
             "ascending, dropping",
             ascending,
             ShardBudget::Drop(16 << 20),
+            true,
             400,
             &[L0Fold],
         ),
@@ -139,18 +224,21 @@ fn compaction_amplification_bench() {
 
     let schema = make_schema_u64_i64();
     let tmp = tempfile::tempdir().unwrap();
-    for (label, rows, budget, runs, reaches) in arms {
+    let counter = Counter::instructions();
+    for (label, rows, budget, fits, runs, reaches) in arms {
         let dir = tmp.path().join(label);
         std::fs::create_dir(&dir).unwrap();
         let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, budget, true, &ShardSet::default()).unwrap();
         let mut rng = Rng::new(0x5EED_1234);
-        let mut spilled = 0;
+        let (mut spilled, mut spilled_rows) = (0, 0);
+        let (mut spill, mut upkeep) = (0, 0);
         cstats::reset();
         for run in 0..runs {
             let run = make_batch_raw(&schema, &rows(run, &mut rng)).into_consolidated();
-            idx.append_l0_run(&run).unwrap();
+            spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
             spilled += idx.levels[L0].entries().last().unwrap().shard.file_len();
-            idx.maintain().unwrap();
+            spilled_rows += run.len();
+            upkeep += counter.measure(|| idx.maintain().unwrap()).1;
         }
 
         let phases = cstats::dump();
@@ -162,6 +250,12 @@ fn compaction_amplification_bench() {
             matches!(budget, ShardBudget::Drop(_)),
             "{label}: dropped a guard"
         );
+        let resident = idx.resident_bytes();
+        assert_eq!(
+            budget.cap().is_none_or(|cap| resident <= cap),
+            fits,
+            "{label}: {resident} B resident"
+        );
         let r = idx.l0_run_bytes;
         let levels: Vec<String> = idx
             .levels
@@ -169,9 +263,29 @@ fn compaction_amplification_bench() {
             .map(|l| format!("{}B/{}g/{}f", l.bytes(), l.guards.len(), l.entries().count()))
             .collect();
         println!(
-            "compaction_amplification_bench {label}: {spilled} B spilled, R={r}, L1 target {}, levels {}",
+            "compaction_amplification_bench {label}: {spilled} B spilled, R={r}, L1 target {}, levels {}, \
+             {resident} B resident{}",
             idx.l1_target_bytes(),
-            levels.join(" ")
+            levels.join(" "),
+            budget.cap().map_or(String::new(), |cap| format!(" of {cap}")),
+        );
+        println!(
+            "  {} rows resident, {} of them retractions",
+            idx.total_rows(),
+            idx.all_entries().map(|e| e.shard.retraction_rows()).sum::<usize>()
+        );
+        println!(
+            "  {:.1} instr/row to spill and {:.1} to keep up",
+            spill as f64 / spilled_rows as f64,
+            upkeep as f64 / spilled_rows as f64
+        );
+        let (read, wrote) = phases
+            .values()
+            .fold((0, 0), |(i, o), p| (i + p.in_bytes, o + p.out_bytes));
+        println!(
+            "  every trigger: read {:6.2} and wrote {:6.2} per spilled byte",
+            read as f64 / spilled as f64,
+            wrote as f64 / spilled as f64
         );
         for (kind, p) in &phases {
             assert!(p.max_in <= 2 * r, "{label}: a {kind:?} read {} B, past 2 R", p.max_in);

@@ -377,9 +377,10 @@ impl ShardIndex {
         }
     }
 
-    /// L1's two rewrite terms — one per guard fold, one per vertical — balance at
-    /// `2√(|L2|·R)`. The `16 R` floor under it is a chosen minimum, not a derived
-    /// one: it keeps a small store from draining L1 on every spill.
+    /// `2√(|L2|·R)`, a chosen size and not a derived optimum: a larger L1 saves
+    /// vertical rewrites and holds more shards for a scan to merge. The `16 R`
+    /// floor under it is chosen too: it keeps a small store from draining L1 on
+    /// every spill.
     ///
     /// `l2_bytes × r` overflows a `u64` at the design point, hence the `u128`;
     /// the `2` stays outside the root so the extremes saturate rather than
@@ -451,24 +452,57 @@ impl ShardIndex {
         self.merge_underfull_guards(level)
     }
 
-    /// Fold every guard in `level_idx` that is over the file threshold or its
-    /// byte target, or whose retractions are expected to cancel
-    /// [`CANCEL_PERCENT`] of its rows, cutting the byte-overfull ones at their own
-    /// key quantiles — any other folds to one shard in place.
+    /// Fold every guard in `level_idx` that is over its byte target, or whose
+    /// retractions are expected to cancel [`CANCEL_PERCENT`] of its rows, cutting
+    /// the byte-overfull ones at their own key quantiles and the others to one
+    /// shard in place; then the newest shards of each guard over the file
+    /// threshold.
     fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
         let target = self.guard_target_bytes(level_idx);
         // Descending, so each fold reshapes only indices above the guards still to go.
         for gi in (0..self.levels[level_idx].guards.len()).rev() {
             let guard = &self.levels[level_idx].guards[gi];
             let keys = fold_destinations(guard.guard_key, guard.entries.iter(), target);
-            if keys.len() > 1
-                || guard.entries.len() > GUARD_FILE_THRESHOLD
-                || self.cancels(guard.retractions(), guard.rows())
-            {
+            if keys.len() > 1 || self.cancels(guard.retractions(), guard.rows()) {
                 self.compact(&[(level_idx, gi..gi + 1)], level_idx, &keys, CompactionKind::GuardSplit)?;
+            } else if guard.entries.len() > GUARD_FILE_THRESHOLD {
+                self.fold_newest(level_idx, gi)?;
             }
         }
         Ok(())
+    }
+
+    /// Bring a guard over the file threshold back under it by folding its newest
+    /// shards into one: the two newest, then each older one no larger than the
+    /// shards already taken. A shard is rewritten once the ones above it have
+    /// grown to its size, so a byte is rewritten a logarithmic number of times
+    /// over the guard's growth; folding the whole guard each time would rewrite
+    /// its oldest shard at every fold.
+    ///
+    /// The shards left out stay registered, ahead of the folded one.
+    fn fold_newest(&mut self, level_idx: usize, gi: usize) -> Result<(), StorageError> {
+        let guard = &mut self.levels[level_idx].guards[gi];
+        debug_assert!(!guard.dehydrated(), "a skeleton shard is folded with its whole guard");
+        let key = guard.guard_key;
+        let bytes = |e: &ShardEntry| e.shard.file_len();
+        let mut start = guard.entries.len() - 2;
+        let mut taken: u64 = guard.entries[start..].iter().map(bytes).sum();
+        while start > 0 && bytes(&guard.entries[start - 1]) <= taken {
+            start -= 1;
+            taken += bytes(&guard.entries[start]);
+        }
+        let older: Vec<ShardEntry> = guard.entries.drain(..start).collect();
+        let kind = match older.is_empty() {
+            true => CompactionKind::GuardSplit,
+            false => CompactionKind::TierFold,
+        };
+        let folded = self.compact(&[(level_idx, gi..gi + 1)], level_idx, &[key], kind);
+        if !older.is_empty() {
+            // The fold drained the guard it read, and wrote none if every row cancelled.
+            let guard = self.levels[level_idx].get_or_create_guard(key);
+            guard.entries.splice(0..0, older);
+        }
+        folded.map(|_| ())
     }
 
     /// Maximal runs of two or more adjacent guards whose combined bytes fit

@@ -17,12 +17,14 @@ mod index;
 /// Which trigger a compaction is serving. Only [`Dehydrate`](Self::Dehydrate)
 /// changes what is written. The index learns its run size from an
 /// [`L0Fold`](Self::L0Fold) and its cancel yield from a
-/// [`GuardSplit`](Self::GuardSplit); the rest label the byte accounting of
-/// [`cstats`].
+/// [`GuardSplit`](Self::GuardSplit), the one fold that reads a whole guard in
+/// place; the rest label the byte accounting of [`cstats`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum CompactionKind {
     L0Fold,
     GuardSplit,
+    /// The newest shards of a guard over the file threshold, folded into one.
+    TierFold,
     /// An L1 guard cut into bands before a vertical.
     BandCut,
     Vertical,
@@ -89,14 +91,14 @@ const LEVELS: usize = 3;
 /// Spills as they arrive: at most one guard, keyed zero and so owning every key,
 /// whose shards overlap. Folded down into L1, never in place.
 pub(super) const L0: usize = 0;
-/// Guards of overlapping shards, each folded in place past
+/// Guards of overlapping shards, each folding its newest ones in place past
 /// [`GUARD_FILE_THRESHOLD`] and drained into the terminal level.
 pub(super) const L1: usize = 1;
 /// The deepest level: one shard per guard, and the only one a sweep dehydrates.
 pub(super) const TERMINAL: usize = 2;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
-/// Files one guard holds before it folds.
+/// Files one guard holds at rest.
 const GUARD_FILE_THRESHOLD: usize = 4;
 /// The share of its rows a guard, or of the store's rows L0, may hold that a
 /// fold is expected to cancel before it folds for that alone: the rows a

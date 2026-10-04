@@ -1731,3 +1731,89 @@ fn shard_index_model() {
         }
     }
 }
+
+/// Scattered updates through every trigger, tier folds included, also over a
+/// budgeted store: the shards sum to the Z-set the runs summed to, a guard
+/// never rests over the file threshold, and a reopen holds the same rows.
+#[test]
+fn tier_folds_keep_the_zset() {
+    use crate::test_support::Rng;
+    use gnitz_zset::repr::merge_and_route;
+    use std::collections::BTreeMap;
+    const KEYS: u64 = 400_000;
+    for budget in [ShardBudget::Unbounded, ShardBudget::Dehydrate(4 << 20)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let mut idx = open(tmp.path(), schema, budget);
+        let mut rng = Rng::new(7);
+        let mut version = vec![0u64; KEYS as usize];
+        let mut model: BTreeMap<(u64, i64), i64> = BTreeMap::new();
+        cstats::reset();
+        for _ in 0..200 {
+            let mut rows = Vec::new();
+            for _ in 0..2048 {
+                // Half the keys are hit often, so retractions land in every tier.
+                let k = if rng.gen_range(2) == 0 {
+                    rng.gen_range(KEYS / 50)
+                } else {
+                    rng.gen_range(KEYS)
+                };
+                let v = &mut version[k as usize];
+                if *v > 0 && rng.gen_range(4) > 0 {
+                    rows.push((k, -1, spread(k ^ *v << 40)));
+                }
+                *v += 1;
+                rows.push((k, 1, spread(k ^ *v << 40)));
+            }
+            for &(k, w, val) in &rows {
+                *model.entry((k, val)).or_default() += w;
+            }
+            idx.append_l0_run(&make_batch_raw(&schema, &rows).into_consolidated())
+                .unwrap();
+            idx.maintain().unwrap();
+            for level in &idx.levels[L1..] {
+                assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
+            }
+        }
+        let stats = cstats::dump();
+        for kind in [
+            CompactionKind::TierFold,
+            CompactionKind::GuardSplit,
+            CompactionKind::Vertical,
+        ] {
+            assert!(stats.contains_key(&kind), "no {kind:?} ran");
+        }
+        model.retain(|_, w| *w != 0);
+        let skeleton = idx.has_skeleton_shard();
+        assert_eq!(skeleton, matches!(budget, ShardBudget::Dehydrate(_)));
+        for reopen in [false, true] {
+            if reopen {
+                idx = reopened_under(idx, budget);
+            }
+            let shards: Vec<Rc<MappedShard>> = idx.all_shard_arcs_iter().collect();
+            let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
+            let mut held: BTreeMap<(u64, i64), i64> = BTreeMap::new();
+            let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();
+            merge_and_route(&inputs, &[gk(0)], false, &schema, &mut |_, _, batch| {
+                for row in 0..batch.len() {
+                    let k = u64::from_be_bytes(batch.get_pk_bytes(row).try_into().unwrap());
+                    *per_key.entry(k).or_default() += batch.get_weight(row);
+                    if !skeleton {
+                        let val = i64::from_le_bytes(batch.get_col_ptr(row, 0, 8).try_into().unwrap());
+                        *held.entry((k, val)).or_default() += batch.get_weight(row);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            let mut expect: BTreeMap<u64, i64> = BTreeMap::new();
+            for (&(k, _), &w) in &model {
+                *expect.entry(k).or_default() += w;
+            }
+            assert_eq!(per_key, expect, "summed weight per key, reopen {reopen}");
+            if !skeleton {
+                assert_eq!(held, model, "rows, reopen {reopen}");
+            }
+        }
+    }
+}
