@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::MemBatch;
-use crate::repr::merge::{self, ColumnarSource, PosCursor};
+use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
 use crate::repr::seek::gallop_by;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
@@ -70,7 +70,7 @@ pub struct ReadCursor {
     mode: Option<usize>,
     pub(crate) schema: SchemaDescriptor,
     /// At least one source is a capacity-bounded view's skeleton shard, so the
-    /// merge runs with payload coarsening on (see [`merge::merge_less`]).
+    /// merge runs with payload coarsening on (see [`MergeOrder`]).
     any_skeleton: bool,
     /// The drain's merge-order scratch, reused across chunks.
     merge_order: Vec<(u32, u32, i64)>,
@@ -96,6 +96,13 @@ impl ReadCursor {
             (Some(a), None) => Some(a),
             _ => None,
         }
+    }
+
+    /// The merge order of a cursor over `schema`, coarsened iff a source is a
+    /// skeleton run. Keyed by the PK's leading bytes: finding a shared prefix
+    /// would read every run's last row at each open.
+    fn order(schema: &SchemaDescriptor, any_skeleton: bool) -> MergeOrder {
+        MergeOrder::leading(schema.pk_stride(), any_skeleton)
     }
 
     /// Positioned by `position` before it is returned, so no caller moves a cursor it
@@ -139,10 +146,10 @@ impl ReadCursor {
     }
 
     /// One payload dispatch for the tournament re-play and the advance after it.
-    /// The leaf is keyless — [`merge::merge_less`] reads each player's OPK bytes
-    /// through `(source_idx, row)` — and it is the comparator the advance and
-    /// forward-seek paths key the tree through, so a tree maintained in place
-    /// cannot order rows differently from how it was played.
+    /// A leaf is keyed under [`Self::order`] and ties go to
+    /// [`merge::merge_less`], the pair the advance and forward-seek paths step
+    /// the tree through, so a tree maintained in place cannot order rows
+    /// differently from how it was played.
     #[inline]
     fn rebuild_and_advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         {
@@ -157,8 +164,15 @@ impl ReadCursor {
                 ..
             } = &mut *self;
             tree.rebuild(
-                |i| states[i].is_valid().then(|| states[i].position as u32),
-                merge::merge_less(schema, sources, payload, *any_skeleton),
+                |i| {
+                    states[i].is_valid().then(|| {
+                        (
+                            states[i].position as u32,
+                            Self::order(schema, *any_skeleton).key(sources, i, states[i].position),
+                        )
+                    })
+                },
+                merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload),
             );
         }
         self.advance_merge_with(payload);
@@ -258,10 +272,11 @@ impl ReadCursor {
             any_skeleton,
             ..
         } = &mut *self;
-        let less = merge::merge_less(schema, sources, payload, *any_skeleton);
+        let less = merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload);
         Self::seek_phase(
             tree,
             sources,
+            Self::order(schema, *any_skeleton),
             states,
             |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less,
             |s: &Run, pos: usize| s.advance_to(key, pos),
@@ -278,19 +293,26 @@ impl ReadCursor {
     fn seek_phase(
         heap: &mut LoserTree,
         sources: &[Run],
+        order: MergeOrder,
         states: &mut [PosCursor],
         lags: impl Fn(&Run, usize) -> bool,
         gallop: impl Fn(&Run, usize) -> usize,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        while let Some(HeapNode { source_idx: src, row }) = heap.peek() {
+        while let Some(HeapNode { source_idx: src, row, .. }) = heap.peek() {
             let (src, row) = (src as usize, row as usize);
             // The root is the global min, so once it no longer lags neither does any head.
             if !lags(&sources[src], row) {
                 break;
             }
             states[src].position = gallop(&sources[src], states[src].position);
-            heap.step_top(states[src].is_valid().then_some(states[src].position as u32), less);
+            let next = states[src].is_valid().then(|| {
+                (
+                    states[src].position as u32,
+                    order.key(sources, src, states[src].position),
+                )
+            });
+            heap.step_top(next, less);
         }
     }
 
@@ -490,8 +512,16 @@ impl ReadCursor {
             // The other sources' windows are empty, and a forward seek keeps them so.
             Some(src) => states[src].position = gallop(&sources[src], states[src].position),
             None => {
-                let less = merge::merge_less(schema, sources, payload, *any_skeleton);
-                Self::seek_phase(tree, sources, states, lags, gallop, &less);
+                let less = merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload);
+                Self::seek_phase(
+                    tree,
+                    sources,
+                    Self::order(schema, *any_skeleton),
+                    states,
+                    lags,
+                    gallop,
+                    &less,
+                );
             }
         }
         self.advance_with(payload);
@@ -645,8 +675,8 @@ impl ReadCursor {
             any_skeleton,
             ..
         } = &mut *self;
-        let coarsen = *any_skeleton;
-        merge::drive(tree, schema, sources, states, payload, coarsen, emit);
+        let order = Self::order(schema, *any_skeleton);
+        merge::drive(tree, schema, sources, order, states, payload, emit);
     }
 
     /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.

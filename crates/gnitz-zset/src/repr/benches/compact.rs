@@ -53,3 +53,82 @@ fn for_compaction_bench() {
         );
     }
 }
+
+/// Compaction over inputs that share no key, the shape a fold of scattered
+/// spills has: every match is settled on the PK. By what the PK is — 8 bytes,
+/// then 24 that differ in their leading or only in their trailing column — and
+/// by how the rows are dealt to the sources. The merge alone is the run walk
+/// without the output batch.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn distinct_compaction_bench() {
+    use crate::repr::BatchBuilder;
+    use crate::test_support::pk_payload_schema;
+    use gnitz_foundation::perf::Counter;
+    use gnitz_wire::TypeCode;
+    use std::hint::black_box;
+    const TOTAL: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let instructions = Counter::instructions();
+    let mix = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // Label, PK columns, the column the key is in.
+    let pks = [
+        ("8-byte PK", 1, 0),
+        ("24-byte PK, leading column", 3, 0),
+        ("24-byte PK, trailing column", 3, 2),
+    ];
+    // Label, source count, the source a row lands in.
+    type Deal = (&'static str, u64, fn(u64) -> u64);
+    let deals: [Deal; 3] = [
+        ("2 equal sources", 2, |h| h % 2),
+        ("5 equal sources", 5, |h| h % 5),
+        ("1 large and 4 small sources", 5, |h| {
+            if h % 16 < 12 {
+                0
+            } else {
+                1 + h % 4
+            }
+        }),
+    ];
+    for (pk, (pk_label, pk_cols, key_col)) in pks.into_iter().enumerate() {
+        let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
+        for (deal, (deal_label, sources, source_of)) in deals.into_iter().enumerate() {
+            let mut builders: Vec<BatchBuilder> = (0..sources).map(|_| BatchBuilder::new(&schema)).collect();
+            for k in 0..TOTAL {
+                let mut key = vec![0u8; pk_cols * 8];
+                key[key_col * 8..][..8].copy_from_slice(&k.to_be_bytes());
+                let b = &mut builders[source_of(mix(k) >> 20) as usize];
+                b.begin_row_bytes(&key, 1);
+                b.put_int(mix(k) as u128);
+                b.end_row();
+            }
+            let inputs: Vec<Rc<MappedShard>> = (0..)
+                .zip(builders)
+                .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
+                .collect();
+            let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
+            let guard_keys = [PkBuf::zeroed(schema.pk_stride())];
+            let ((), whole) = instructions.measure(|| {
+                merge_and_route(&inputs, &guard_keys, false, &schema, &mut |_, _, batch| {
+                    assert_eq!(batch.len() as u64, TOTAL);
+                    black_box(batch);
+                    Ok(())
+                })
+                .unwrap()
+            });
+            let (rows, merge) = instructions.measure(|| {
+                let mut rows = 0u64;
+                run_merge(&inputs, &schema, |src, row, w| {
+                    rows += black_box((src, row, w)).2 as u64
+                });
+                rows
+            });
+            assert_eq!(rows, TOTAL);
+            println!(
+                "{pk_label}, {deal_label}: {:.1} instr/row, the merge alone {:.1}",
+                whole as f64 / TOTAL as f64,
+                merge as f64 / TOTAL as f64,
+            );
+        }
+    }
+}

@@ -271,3 +271,52 @@ fn ascending_sources_merge_to_their_rows_in_order() {
     assert_eq!(merge(&[&low, &meets]), weighted_rows(&folded));
     assert_eq!(merge(&[]), vec![]);
 }
+
+/// A merge over wide PKs folds to the Z-set its sources sum to, in (PK,
+/// payload) order, wherever the keys differ: in the bytes every row shares
+/// (none do, then), in the span the tournament is keyed by, and behind it.
+#[test]
+fn wide_pk_merges_fold_to_the_sum_of_their_sources() {
+    use crate::test_support::{make_batch_opk, pk_payload_schema, Rng};
+    use std::collections::BTreeMap;
+    let mut rng = Rng::new(11);
+    for pk_cols in [3usize, 5] {
+        let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
+        // The columns that vary; the others are one value in every row.
+        for varying in 0..1u32 << pk_cols {
+            let mut model: BTreeMap<(Vec<u8>, i64), i64> = BTreeMap::new();
+            let sources: Vec<Batch> = (0..1 + rng.gen_range(5))
+                .map(|_| {
+                    let rows: Vec<(Vec<u8>, i64, i64)> = (0..rng.gen_range(60))
+                        .map(|_| {
+                            let pk = (0..pk_cols).flat_map(|c| {
+                                let v = if varying >> c & 1 == 1 { rng.gen_range(3) } else { 7 };
+                                v.to_be_bytes()
+                            });
+                            (
+                                pk.collect(),
+                                [-1, 1, 2][rng.gen_range(3) as usize],
+                                rng.gen_range(2) as i64,
+                            )
+                        })
+                        .collect();
+                    for (pk, w, val) in &rows {
+                        *model.entry((pk.clone(), *val)).or_default() += w;
+                    }
+                    make_batch_opk(&schema, &rows).into_consolidated()
+                })
+                .collect();
+            model.retain(|_, w| *w != 0);
+            let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
+            let out = merge_consolidated(&mem, &schema);
+            let got: Vec<((Vec<u8>, i64), i64)> = (0..out.len())
+                .map(|r| ((out.get_pk_bytes(r).to_vec(), payload0_i64(&out, r)), out.get_weight(r)))
+                .collect();
+            assert_eq!(
+                got,
+                model.into_iter().collect::<Vec<_>>(),
+                "{pk_cols} columns, varying {varying:b}"
+            );
+        }
+    }
+}

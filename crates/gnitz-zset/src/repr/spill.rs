@@ -143,6 +143,13 @@ fn record_index(n: &HeapNode, run_len: usize) -> usize {
     n.source_idx as usize * run_len + n.row as usize
 }
 
+/// Record `index`'s tournament key: its leading word, the order of every record
+/// that differs in it.
+#[inline(always)]
+fn record_key(bytes: &[u8], slot: usize, index: usize) -> u128 {
+    u128::from(u64::from_be_bytes(*bytes[index * slot..].first_chunk().unwrap()))
+}
+
 fn less(bytes: &[u8], slot: usize, run_len: usize) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
     let rec = move |n: &HeapNode| &bytes[record_index(n, run_len) * slot..][..slot];
     move |a, b| cmp_records(rec(a), rec(b)).is_lt()
@@ -164,7 +171,7 @@ impl KeyProducer {
         let total = records.as_slice().len() / slot;
         let tree = LoserTree::build(
             total.div_ceil(run_len),
-            |_| Some(0),
+            |run| Some((0, record_key(records.as_slice(), slot, run * run_len))),
             less(records.as_slice(), slot, run_len),
         );
         KeyProducer {
@@ -187,8 +194,10 @@ impl KeyProducer {
         let g = record_index(&top, self.run_len);
         let more = (top.row as usize + 1) < self.run_len && g + 1 < self.total;
         let bytes = self.records.as_slice();
-        self.tree
-            .step_top(more.then_some(top.row + 1), &less(bytes, self.slot, self.run_len));
+        self.tree.step_top(
+            more.then(|| (top.row + 1, record_key(bytes, self.slot, g + 1))),
+            &less(bytes, self.slot, self.run_len),
+        );
         self.remaining -= 1;
         Some(&bytes[g * self.slot..][..self.stride])
     }

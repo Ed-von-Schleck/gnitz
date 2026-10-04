@@ -2,25 +2,53 @@
 //! of the last match between its two subtrees' champions, so `tree[0]` is the
 //! overall champion and replacing it costs one compare per level.
 
-/// A player: an index into the caller's sources, and its current row.
+/// A player: an index into the caller's sources, its current row, and the key
+/// the caller gave that row.
 #[derive(Clone, Copy)]
 pub(crate) struct HeapNode {
+    /// A lower key wins its match outright; the caller's `less` settles a tie.
+    /// Two words, most significant first, so the node carries no padding.
+    key: [u64; 2],
     pub(crate) source_idx: u32,
     pub(crate) row: u32,
 }
 
 // `step_top` swaps whole nodes on every merge step.
-const _: () = assert!(std::mem::size_of::<HeapNode>() == 8);
+const _: () = assert!(std::mem::size_of::<HeapNode>() == 24);
+
+impl HeapNode {
+    #[inline(always)]
+    fn new(key: u128, source_idx: u32, row: u32) -> Self {
+        HeapNode {
+            key: [(key >> 64) as u64, key as u64],
+            source_idx,
+            row,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u128 {
+        (self.key[0] as u128) << 64 | self.key[1] as u128
+    }
+}
 
 /// Not a player: a padding leaf, or a source that has run out. `row` is unread.
 const SENTINEL: u32 = u32::MAX;
 
-const SENTINEL_NODE: HeapNode = HeapNode { source_idx: SENTINEL, row: 0 };
+const SENTINEL_NODE: HeapNode = HeapNode {
+    key: [u64::MAX; 2],
+    source_idx: SENTINEL,
+    row: 0,
+};
 
-/// `a` wins its match against `b`. A sentinel loses to every real player, so
-/// `less` never sees one.
+/// `a` wins its match against `b`. A sentinel holds the highest key, so it
+/// loses to every real player below that key and ties with one at it, where
+/// `source_idx` tells them apart: `less` never sees a sentinel.
 #[inline(always)]
 fn beats(a: &HeapNode, b: &HeapNode, less: &impl Fn(&HeapNode, &HeapNode) -> bool) -> bool {
+    if a.key != b.key {
+        return a.key < b.key;
+    }
     a.source_idx != SENTINEL && (b.source_idx == SENTINEL || less(a, b))
 }
 
@@ -51,7 +79,7 @@ impl LoserTree {
     /// Allocate a tournament over `n` sources and play it.
     pub(crate) fn build(
         n: usize,
-        init_fn: impl Fn(usize) -> Option<u32>,
+        init_fn: impl Fn(usize) -> Option<(u32, u128)>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) -> Self {
         let mut this = Self::empty(n);
@@ -63,7 +91,7 @@ impl LoserTree {
     /// O(n) compares, no allocation.
     pub(crate) fn rebuild(
         &mut self,
-        init_fn: impl Fn(usize) -> Option<u32>,
+        init_fn: impl Fn(usize) -> Option<(u32, u128)>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
         let n_pad = self.tree.len();
@@ -71,8 +99,8 @@ impl LoserTree {
 
         self.winners[leaf(0)..].fill(SENTINEL_NODE);
         for i in 0..self.n {
-            if let Some(row) = init_fn(i) {
-                self.winners[leaf(i)] = HeapNode { source_idx: i as u32, row };
+            if let Some((row, key)) = init_fn(i) {
+                self.winners[leaf(i)] = HeapNode::new(key, i as u32, row);
             }
         }
         for idx in (1..n_pad).rev() {
@@ -100,11 +128,11 @@ impl LoserTree {
 
     /// Step the champion to `next_row`, or drop it when its source is exhausted.
     #[inline(always)]
-    pub(crate) fn step_top(&mut self, next_row: Option<u32>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         let source_idx = self.tree[0].source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
-            Some(row) => HeapNode { source_idx, row },
+            Some((row, key)) => HeapNode::new(key, source_idx, row),
             None => SENTINEL_NODE,
         };
         let mut idx = self.leaf_parent(source_idx);

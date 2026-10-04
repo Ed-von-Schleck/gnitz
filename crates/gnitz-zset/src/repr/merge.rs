@@ -17,11 +17,12 @@ use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, R
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
+use crate::schema::key::{compare_pk_ordering, pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::read_u64_le;
+use gnitz_wire::NARROW_PK_MAX_BYTES;
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors, one `(base, stride)`
@@ -371,8 +372,8 @@ impl PosCursor {
 ///
 /// Selects the payload order once via `with_payload_cmp!`, seats one
 /// [`PosCursor`] per source, and drives [`drive`]; the PK axis is settled by
-/// `compare_pk_ordering` (one byte comparator at every width). Each source's
-/// walk bound is its own [`RowSource::row_count`].
+/// each row's key under a [`MergeOrder`], and past it by [`merge_less`]. Each source's walk
+/// bound is its own [`RowSource::row_count`].
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
 /// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
 /// flush, a guard-routed shard append for compaction).
@@ -387,7 +388,7 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     let mut cursors: Vec<PosCursor> = sources.iter().map(|s| PosCursor::new(s.row_count())).collect();
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
-    // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
+    // merge loop.
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
@@ -463,37 +464,40 @@ impl<T: ColumnarSource + ?Sized> ColumnarSource for &T {
     }
 }
 
-/// The heap order [`drive`] and the read cursor share. Generic over the source
-/// type, so each caller monomorphizes its own branch-free copy.
+/// The order of two players whose keys under `order` tie, which [`drive`] and
+/// the read cursor share. Generic over the source type, so each caller
+/// monomorphizes its own branch-free copy.
 ///
-/// `compare_pk_ordering` on each player's full OPK bytes (exact at every width —
-/// no cached key, no stride dispatch), then the `payload` order.
-///
-/// `coarsen` collapses the payload axis for a cursor holding a skeleton run: a
-/// skeleton row sorts before every hydrated row of its PK, making it the exemplar
-/// [`drive`] folds the whole PK group into. Tested ahead of `payload`, so a
-/// skeleton row's absent columns are never read. A runtime flag, not a second
-/// monomorphisation axis: it is constant for a cursor's life and reached only on
-/// a PK tie.
+/// The PK bytes behind the key span, which only a wide PK has, then the
+/// `payload` order — unless `order` coarsens and one row is a skeleton row,
+/// which is tested ahead of `payload`, so a skeleton row's absent columns are
+/// never read.
 #[inline]
 pub(crate) fn merge_less<'a, S, P>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
+    order: MergeOrder,
     payload: P,
-    coarsen: bool,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
 where
     S: ColumnarSource,
     P: PayloadOrder + 'a,
 {
+    let wide = order.has_tail(schema.pk_stride());
     move |a, b| {
         let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
         let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
-        match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
+        let pk = match wide {
+            true => order
+                .tail(&sources[a_src], a_row)
+                .cmp(order.tail(&sources[b_src], b_row)),
+            false => Ordering::Equal,
+        };
+        match pk {
             Ordering::Less => true,
             Ordering::Greater => false,
             Ordering::Equal => {
-                if coarsen {
+                if order.coarsen {
                     let (sa, sb) = (sources[a_src].is_skeleton(), sources[b_src].is_skeleton());
                     if sa || sb {
                         return sa && !sb;
@@ -505,16 +509,86 @@ where
     }
 }
 
+/// How a merge orders its rows ahead of their payloads.
+///
+/// The PK bytes it keys its tournament by are all of a PK up to
+/// [`NARROW_PK_MAX_BYTES`] wide and that many bytes of a wider one: the bytes
+/// ahead of that span are the same in every row the merge reads, and the ones
+/// behind it break a key tie.
+#[derive(Clone, Copy)]
+pub(crate) struct MergeOrder {
+    /// Where the key span starts in a wide PK; `None` for a narrow one.
+    wide_at: Option<usize>,
+    /// Collapse the payload axis at a skeleton row: it sorts before every
+    /// hydrated row of its PK, making it the exemplar [`drive`] folds the whole
+    /// PK group into. A runtime flag, not a second monomorphisation axis: it is
+    /// constant for a merge's life and reached only on a PK tie.
+    coarsen: bool,
+}
+
+impl MergeOrder {
+    /// Keyed by the leading bytes of a `stride`-byte PK.
+    pub(crate) fn leading(stride: usize, coarsen: bool) -> Self {
+        MergeOrder {
+            wide_at: (stride > NARROW_PK_MAX_BYTES).then_some(0),
+            coarsen,
+        }
+    }
+
+    /// Keyed past the prefix every row of `sources` shares, so that keys of
+    /// small values in wide columns do not all tie. A source is sorted, so what
+    /// its first and last rows share, all of its rows share. Never coarsened:
+    /// a compaction that writes skeleton rows merges under the PK-only schema
+    /// instead (`compact::merge_and_route`).
+    fn past_shared_prefix<S: ColumnarSource>(sources: &[S], stride: usize) -> Self {
+        if stride <= NARROW_PK_MAX_BYTES {
+            return Self::leading(stride, false);
+        }
+        let mut bounds = sources
+            .iter()
+            .filter(|s| s.row_count() > 0)
+            .flat_map(|s| [s.get_pk_bytes(0), s.get_pk_bytes(s.row_count() - 1)]);
+        let first = bounds.next().unwrap_or(&[]);
+        let shared = |pk: &[u8]| first.iter().zip(pk).take_while(|(a, b)| a == b).count();
+        let at = bounds.map(shared).min().unwrap_or(0);
+        MergeOrder {
+            wide_at: Some(at.min(stride - NARROW_PK_MAX_BYTES)),
+            coarsen: false,
+        }
+    }
+
+    /// Whether a PK has bytes behind the key span.
+    #[inline(always)]
+    fn has_tail(self, stride: usize) -> bool {
+        self.wide_at.is_some_and(|at| at + NARROW_PK_MAX_BYTES < stride)
+    }
+
+    /// A row's tournament key.
+    #[inline(always)]
+    pub(crate) fn key<S: ColumnarSource>(self, sources: &[S], src: usize, row: usize) -> u128 {
+        let pk = sources[src].get_pk_bytes(row);
+        match self.wide_at {
+            None => pack_pk_be(pk),
+            Some(at) => u128::from_be_bytes(*pk[at..].first_chunk().unwrap()),
+        }
+    }
+
+    /// The PK bytes behind a row's key, where there [are any](Self::has_tail).
+    #[inline(always)]
+    fn tail<S: ColumnarSource>(self, source: &S, row: usize) -> &[u8] {
+        &source.get_pk_bytes(row)[self.wide_at.unwrap_or(0) + NARROW_PK_MAX_BYTES..]
+    }
+}
+
 /// Drive an N-way (PK, payload) merge to completion over `sources`, folding each
 /// group's weights and calling `emit(group_src, group_row, net_weight)` once per
 /// surviving (net ≠ 0) group; a `Break` returns immediately. The output PK is
-/// re-derived from `(group_src, group_row)` by the caller — there is no cached
-/// key to hand it.
+/// re-derived from `(group_src, group_row)` by the caller.
 ///
 /// Every merge in the tree runs through this — the flush/compaction kernel
 /// ([`run_merge`]) and the read cursor's advance and drain — and it builds all
 /// four closures itself, so no caller can pair a heap order with a mismatched
-/// group boundary. `coarsen` is [`merge_less`]'s flag and means the same here.
+/// group boundary. `order` is [`merge_less`]'s and means the same here.
 ///
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
@@ -523,9 +597,9 @@ pub(crate) fn drive<S, P>(
     tree: &mut LoserTree,
     schema: &SchemaDescriptor,
     sources: &[S],
+    order: MergeOrder,
     cursors: &mut [PosCursor],
     payload: P,
-    coarsen: bool,
     mut emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
 ) where
     S: ColumnarSource,
@@ -533,12 +607,14 @@ pub(crate) fn drive<S, P>(
 {
     // `less` and `same_group` read `(source_idx, row)` out of the heap node and
     // never touch `cursors`, so they coexist with the `&mut cursors` `step!` holds.
-    let less = merge_less(schema, sources, payload, coarsen);
+    let less = merge_less(schema, sources, order, payload);
+    let wide = order.has_tail(schema.pk_stride());
+    // Of two rows whose keys tie, as `less` is.
     let same_group = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        if !pk_bytes_eq(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
+        if wide && order.tail(&sources[a_src], a_row) != order.tail(&sources[b_src], b_row) {
             return false;
         }
-        if coarsen && (sources[a_src].is_skeleton() || sources[b_src].is_skeleton()) {
+        if order.coarsen && (sources[a_src].is_skeleton() || sources[b_src].is_skeleton()) {
             return true;
         }
         payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
@@ -548,13 +624,15 @@ pub(crate) fn drive<S, P>(
         ($src:expr) => {{
             let c = &mut cursors[$src];
             c.advance();
-            let next = c.is_valid().then(|| c.position as u32);
+            let next = c
+                .is_valid()
+                .then(|| (c.position as u32, order.key(sources, $src, c.position)));
             tree.step_top(next, &less);
         }};
     }
 
     while let Some(top) = tree.peek() {
-        let (group_src, group_row) = (top.source_idx as usize, top.row as usize);
+        let (group_src, group_row, group_key) = (top.source_idx as usize, top.row as usize, top.key());
 
         // Open the group: take the root's weight and step past it. The first row
         // is the exemplar, so `same_group` would be tautologically true — and its
@@ -566,7 +644,7 @@ pub(crate) fn drive<S, P>(
         // boundary, otherwise accumulates weight and steps again.
         while let Some(top) = tree.peek() {
             let (cur_src, cur_row) = (top.source_idx as usize, top.row as usize);
-            if !same_group(group_src, group_row, cur_src, cur_row) {
+            if top.key() != group_key || !same_group(group_src, group_row, cur_src, cur_row) {
                 break;
             }
             net_weight += sources[cur_src].get_weight(cur_row);
@@ -592,16 +670,17 @@ fn run_merge_body<S, P>(
     S: ColumnarSource,
     P: PayloadOrder,
 {
+    let order = MergeOrder::past_shared_prefix(sources, schema.pk_stride());
     let mut tree = LoserTree::build(
         cursors.len(),
-        |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
-        merge_less(schema, sources, payload, false),
+        |i| {
+            cursors[i]
+                .is_valid()
+                .then(|| (cursors[i].position as u32, order.key(sources, i, cursors[i].position)))
+        },
+        merge_less(schema, sources, order, payload),
     );
-    // `coarsen: false` — skeleton folding is a read-path concern; a compaction
-    // that writes skeleton rows merges under the PK-only schema instead
-    // (`compact::merge_and_route`). The literal also const-folds the skeleton
-    // test out of this monomorphisation.
-    drive(&mut tree, schema, sources, cursors, payload, false, |src, row, w| {
+    drive(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
         emit(src, row, w);
         ControlFlow::Continue(())
     });

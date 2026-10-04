@@ -1,8 +1,14 @@
 use super::*;
 use crate::test_support::Rng;
 
-/// The tree is keyless, so the key lives out here: the value at
-/// `(source_idx, row)`, then `source_idx` for a stable tiebreak.
+/// A value's node key: coarser than the value, so adjacent values tie on it,
+/// and `u128::MAX` for the highest, which is the sentinel's.
+fn key(value: u128) -> u128 {
+    value | 1
+}
+
+/// The order of two nodes whose keys tie: the value at `(source_idx, row)`,
+/// then `source_idx` for a stable tiebreak.
 fn run_less(runs: &[Vec<u128>]) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
     move |a, b| {
         let ka = (runs[a.source_idx as usize][a.row as usize], a.source_idx);
@@ -22,7 +28,7 @@ fn drain(runs: &[Vec<u128>], t: &mut LoserTree, pos: &mut [usize], limit: usize)
         let (src, row) = (n.source_idx as usize, n.row as usize);
         out.push((runs[src][row], n.source_idx));
         pos[src] = row + 1;
-        t.step_top((row + 1 < runs[src].len()).then(|| (row + 1) as u32), &less);
+        t.step_top(runs[src].get(row + 1).map(|&next| ((row + 1) as u32, key(next))), &less);
     }
     out
 }
@@ -36,7 +42,7 @@ fn random_kway_merges_drain_in_key_then_source_order() {
             let mut rng = Rng::new(seed.wrapping_mul(1_000_003) + k as u64 * 7);
 
             // `u128::MAX` is a real key here — only `source_idx` discriminates
-            // the sentinel. Small values force ties.
+            // the sentinel. Small values force ties, on the value and on its key.
             let runs: Vec<Vec<u128>> = (0..k)
                 .map(|_| {
                     // Empty runs leave adjacent sentinel losers for a drop to walk past.
@@ -65,10 +71,13 @@ fn random_kway_merges_drain_in_key_then_source_order() {
             expected.sort();
 
             let mut pos = vec![0usize; k];
-            let mut t = LoserTree::build(k, |i| (!runs[i].is_empty()).then_some(0), run_less(&runs));
+            let mut t = LoserTree::build(k, |i| runs[i].first().map(|&v| (0, key(v))), run_less(&runs));
             let cut = rng.gen_range(expected.len() as u64 + 1) as usize;
             let mut got = drain(&runs, &mut t, &mut pos, cut);
-            t.rebuild(|i| (pos[i] < runs[i].len()).then(|| pos[i] as u32), run_less(&runs));
+            t.rebuild(
+                |i| runs[i].get(pos[i]).map(|&v| (pos[i] as u32, key(v))),
+                run_less(&runs),
+            );
             got.extend(drain(&runs, &mut t, &mut pos, usize::MAX));
             assert_eq!(got, expected, "k={k}, seed={seed}, cut={cut}, runs={runs:?}");
         }
