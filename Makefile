@@ -158,9 +158,12 @@ distclean: clean ## clean + cargo target cache + post-mortem logs
 #
 # `--tests` excludes doctests: `--ignored` makes an ```ignore fenced example
 # compile, and those are illustrative fragments that do not.
+#
+# The `_bench` filter keeps out the fault-seam tests, which a release build
+# ignores because the seam folds away, and which `--ignored` alone would run.
 bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs one)
 	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) \
-		cargo test --release --workspace --exclude gnitz-py --tests $(T) \
+		cargo test --release --workspace --exclude gnitz-py --tests $(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1
 
 bench: release-server pyext-release ## Run the SQL benchmark suite

@@ -218,3 +218,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>, rows: Option<&Batch>) -> Res
 #[cfg(test)]
 #[path = "tests/worker.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/worker.rs"]
+mod bench;

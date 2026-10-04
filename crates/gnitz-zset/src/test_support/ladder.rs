@@ -46,16 +46,16 @@ pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
 
 /// Every `.rs` file of a rung, its directory walked recursively.
 ///
-/// `tests/` directories are skipped: a unit test asserting about a rung may name
-/// a higher one to build its fixture, which is not the dependency the ladder is
-/// about.
+/// `tests/` and `benches/` directories are skipped: a unit test or benchmark of a
+/// rung may name a higher one to build its fixture, which is not the dependency
+/// the ladder is about.
 pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut dirs = vec![src_root.join(rung)];
     while let Some(dir) = dirs.pop() {
         for p in entries(&dir) {
             if p.is_dir() {
-                if !p.ends_with("tests") {
+                if !p.ends_with("tests") && !p.ends_with("benches") {
                     dirs.push(p);
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {

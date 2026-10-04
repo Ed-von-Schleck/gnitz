@@ -634,7 +634,9 @@ cd crates && cargo test -p gnitz-zset --release <name>_bench \
 # LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz-server
 ```
 
-Add one alongside the others: name the test `*_bench`, mark it `#[ignore]`,
+A module's benchmarks live in `<dir>/benches/<module>.rs`, attached the way its
+unit tests are and beside them, so they keep private access; no benchmark lives
+in a `tests/` file. Add one there: name the test `*_bench`, mark it `#[ignore]`,
 measure only the hot region — instructions retired where the question is cost,
 wall clock where it is latency — and `std::hint::black_box` anything the
 optimizer could elide.

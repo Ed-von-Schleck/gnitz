@@ -1,6 +1,5 @@
 use super::*;
 use crate::protocol::transport::poll_fd;
-use crate::protocol::transport::tests::{bench_bursts, bench_pass, bench_wire};
 use crate::test_support::{flush_all, framed, io_kind, pass, read_frame, recv_frames, write_frame};
 use crate::ClientError;
 use gnitz_foundation::posix_io::set_sockopt_int;
@@ -12,7 +11,7 @@ use std::time::Duration;
 
 /// A rustls server on a loopback thread with a freshly minted `127.0.0.1` cert,
 /// reached through the public `tls://…?ca=` target.
-struct Loopback {
+pub(super) struct Loopback {
     target: String,
     thread: std::thread::JoinHandle<()>,
     /// Releases a [`Self::start`] script once [`Self::connect`] has returned.
@@ -49,7 +48,7 @@ fn drain(mut r: impl std::io::Read) {
 impl Loopback {
     /// A peer that completes the handshake and the HELLO exchange, then runs
     /// `script` once the client has connected.
-    fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
+    pub(super) fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
         let (connected, go) = mpsc::channel();
         let mut lb = Self::serve(None, move |sock, cfg| {
             let end = hello(handshake(sock, cfg));
@@ -97,7 +96,7 @@ impl Loopback {
         }
     }
 
-    fn connect(&self) -> ClientTransport {
+    pub(super) fn connect(&self) -> ClientTransport {
         let t = ClientTransport::connect(&self.target, Instant::now() + CONNECT_TIMEOUT).unwrap();
         if let Some(connected) = &self.connected {
             connected.send(()).unwrap();
@@ -105,7 +104,7 @@ impl Loopback {
         t
     }
 
-    fn join(self) {
+    pub(super) fn join(self) {
         drop(self.connected);
         self.thread.join().unwrap();
     }
@@ -349,41 +348,4 @@ fn parse_target_rejects_malformed() {
             "{bad:?} must be rejected by the target parser"
         );
     }
-}
-
-/// Instructions per burst over the reading passes that take it, each burst
-/// written whole before the first pass.
-#[test]
-#[ignore]
-fn tls_read_burst_bench() {
-    const ROUNDS: u64 = 200;
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-    let (burst_tx, burst_rx) = mpsc::channel::<Vec<u8>>();
-    let (written_tx, written_rx) = mpsc::channel::<()>();
-    let lb = Loopback::start(move |mut end| {
-        for wire in burst_rx {
-            end.write_all(&wire).unwrap();
-            end.flush().unwrap();
-            written_tx.send(()).unwrap();
-        }
-    });
-    let mut t = lb.connect();
-    for (name, frames) in bench_bursts() {
-        let wire = bench_wire(&frames);
-        let mut total = 0;
-        for _ in 0..ROUNDS {
-            burst_tx.send(wire.clone()).unwrap();
-            written_rx.recv().unwrap();
-            let mut left = frames.len();
-            while left > 0 {
-                poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
-                let (got, instr) = counter.measure(|| bench_pass(&mut t));
-                left = left.checked_sub(got).expect("no frame past the burst");
-                total += instr;
-            }
-        }
-        println!("tls read {name}: {} instr/burst", total / ROUNDS);
-    }
-    drop(burst_tx);
-    lb.join();
 }

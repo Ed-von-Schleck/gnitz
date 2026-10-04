@@ -46,3 +46,7 @@ pub fn op_weight_clamp(delta: &Batch, cursor: &mut ReadCursor, kind: ClampKind) 
 #[cfg(test)]
 #[path = "tests/clamp.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/clamp.rs"]
+mod bench;

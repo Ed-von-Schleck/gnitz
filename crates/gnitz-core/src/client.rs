@@ -1540,3 +1540,7 @@ fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks:
 #[cfg(test)]
 #[path = "tests/client.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/client.rs"]
+mod bench;

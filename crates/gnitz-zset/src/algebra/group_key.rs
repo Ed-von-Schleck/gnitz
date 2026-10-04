@@ -496,3 +496,7 @@ impl IdentityLoop for Hashed {
 #[cfg(test)]
 #[path = "tests/group_key.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/group_key.rs"]
+mod bench;

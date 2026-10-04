@@ -217,3 +217,7 @@ fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &ReindexPac
 #[cfg(test)]
 #[path = "tests/exchange.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/exchange.rs"]
+mod bench;

@@ -16,4 +16,5 @@ pub(crate) use emit::emit_reduce_row;
 pub(crate) use shape::ReduceShape;
 
 #[cfg(test)]
+#[path = "benches/aggregate.rs"]
 mod bench;

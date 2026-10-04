@@ -101,3 +101,7 @@ fn move_payload(dst: &mut [PayloadColumn], src: &mut [PayloadColumn], moves: &[(
 #[cfg(test)]
 #[path = "tests/client_map.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/client_map.rs"]
+mod bench;

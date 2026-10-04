@@ -114,7 +114,7 @@ fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
 }
 
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn secondary_index_avi_decomposition_bench() {
     let schema = src_schema();
     decompose(
@@ -126,7 +126,7 @@ fn secondary_index_avi_decomposition_bench() {
 
 /// The wide shape, under the scalar one's group key.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn secondary_index_avi_wide_decomposition_bench() {
     let schema = wide_src_schema();
     decompose(
@@ -138,7 +138,7 @@ fn secondary_index_avi_wide_decomposition_bench() {
 
 /// One MIN over an I64 across packed group-key shapes.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn secondary_index_avi_group_shape_bench() {
     for (label, group) in [
         ("I32 NOT NULL", &[(TypeCode::I32, false)][..]),
@@ -230,7 +230,7 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
 
 /// The sort of a batch keyed on one 8-byte column.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn secondary_index_single_u64_pk_sort_bench() {
     let schema = SchemaDescriptor::new(
         &[
@@ -254,7 +254,7 @@ fn secondary_index_single_u64_pk_sort_bench() {
 /// PK, and an index on a nullable column at three NULL densities, which cut the
 /// rows into runs.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn index_entries_bench() {
     use crate::algebra::index_entries;
     use crate::schema::index_spec_and_schema;
@@ -349,7 +349,7 @@ fn as_read(plan: &ReducePlan, delta: Batch) -> Batch {
 /// populated trace. `OP_REDUCE_BENCH_SHAPE=<label>` runs one shape alone, for
 /// `perf stat`.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_bench() {
     const N: u64 = 1 << 20;
     let only = std::env::var("OP_REDUCE_BENCH_SHAPE").ok();
@@ -495,7 +495,7 @@ fn op_reduce_bench() {
 /// MIN across packed group-key shapes. `REDUCE_SWEEP=<label>` runs one alone,
 /// for `perf stat`.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_group_sweep_bench() {
     const N: u64 = 1 << 20;
     let only = std::env::var("REDUCE_SWEEP").ok();
@@ -554,7 +554,7 @@ fn op_reduce_group_sweep_bench() {
 /// delta's first output key: the delta touches every group of the newest run and
 /// adds a new group between each pair.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_multi_run_bench() {
     const G: u64 = 1 << 14;
     const RUNS: usize = 200;

@@ -186,3 +186,7 @@ fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, merge: Mer
 #[cfg(test)]
 #[path = "tests/agg_finish.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/agg_finish.rs"]
+mod bench;

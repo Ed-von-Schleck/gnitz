@@ -94,3 +94,7 @@ pub fn merge_and_route(
 #[cfg(test)]
 #[path = "tests/compact.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/compact.rs"]
+mod bench;

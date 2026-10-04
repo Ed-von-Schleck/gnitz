@@ -891,3 +891,7 @@ async fn txn_check_fk_restrict(
 #[cfg(test)]
 #[path = "tests/preflight.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/preflight.rs"]
+mod bench;

@@ -130,3 +130,10 @@ pub fn peak_rss_bytes() -> u64 {
 pub fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
+
+/// The pass count a benchmark loops over, from `GNITZ_BENCH_PASSES`; `1` when
+/// unset. Two runs at different counts, differenced, cancel everything that
+/// happens once per process.
+pub fn bench_passes() -> usize {
+    crate::env::env_num("GNITZ_BENCH_PASSES", 1)
+}

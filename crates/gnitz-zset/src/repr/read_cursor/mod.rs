@@ -735,6 +735,7 @@ pub fn empty_cursor(schema: SchemaDescriptor) -> ReadCursor {
 }
 
 #[cfg(test)]
+#[path = "benches/read_cursor.rs"]
 mod bench;
 #[cfg(test)]
 #[path = "tests/read_cursor.rs"]

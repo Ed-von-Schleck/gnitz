@@ -447,3 +447,7 @@ impl MapPlan {
 #[cfg(test)]
 #[path = "tests/map.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/map.rs"]
+mod bench;

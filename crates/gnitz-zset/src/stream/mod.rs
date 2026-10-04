@@ -21,6 +21,7 @@ mod reduce;
 mod topn;
 
 #[cfg(test)]
+#[path = "benches/join.rs"]
 mod bench_join;
 
 use crate::repr::ReadCursor;

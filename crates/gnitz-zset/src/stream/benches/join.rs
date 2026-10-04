@@ -228,7 +228,7 @@ fn equi_rows(shape: &EquiShape) -> (Vec<Row>, Vec<Row>) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn join_equi_dt_bench() {
     println!("\n=== equi delta-trace join ({ITERS} iters) ===");
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
@@ -258,7 +258,7 @@ fn join_equi_dt_bench() {
 /// keyed one column wider, where the walk matches a prefix and the kept key
 /// column is read out of the PK.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn join_over_source_bench() {
     use crate::test_support::rekey_plan;
     use gnitz_foundation::perf::Counter;
@@ -325,7 +325,7 @@ fn join_over_source_bench() {
 const CROSS_SHAPES: [(&str, usize, usize); 3] = [("64x64", 64, 64), ("512x8", 512, 8), ("8x512", 8, 512)];
 
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn join_cross_dt_bench() {
     println!("\n=== cross delta-trace join ({ITERS} iters) ===");
     let rows = |n: usize| -> Vec<Row> { (0..n as u128).map(|k| (vec![k], k as i64)).collect() };
@@ -463,7 +463,7 @@ fn range_rows(shape: &RangeShape) -> (Vec<Row>, Vec<Row>) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn join_range_dt_bench() {
     println!("\n=== range delta-trace join ({ITERS} iters) ===");
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {

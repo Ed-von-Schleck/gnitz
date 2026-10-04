@@ -272,3 +272,7 @@ fn sub_seed(sub: &SubPlan, input: Batch, source_id: u64) -> (vm::DeltaReg, Batch
 #[cfg(test)]
 #[path = "tests/exec.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/exec.rs"]
+mod bench;

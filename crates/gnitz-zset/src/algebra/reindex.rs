@@ -696,3 +696,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
 #[cfg(test)]
 #[path = "tests/reindex.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/reindex.rs"]
+mod bench;

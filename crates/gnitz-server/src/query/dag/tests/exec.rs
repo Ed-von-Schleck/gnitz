@@ -10,12 +10,12 @@ use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::schema::Slot;
 use std::collections::HashMap;
 
-fn view_cols() -> Vec<CatalogColumn> {
+pub(super) fn view_cols() -> Vec<CatalogColumn> {
     vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
 }
 
 /// A base table `(id U64 PK, v I64)` in a fresh catalog.
-fn engine_with_base(name: &str) -> (CatalogEngine, u64) {
+pub(super) fn engine_with_base(name: &str) -> (CatalogEngine, u64) {
     let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), 1).unwrap();
     let base = engine.create_table("public.base", &view_cols(), &[0]).unwrap();
     (engine, base)
@@ -23,11 +23,11 @@ fn engine_with_base(name: &str) -> (CatalogEngine, u64) {
 
 /// The views of [`engine_with_views`], each holding a multiple of the base's
 /// delta so that reading the wrong input shows in its weights.
-struct Views {
+pub(super) struct Views {
     /// `base UNION ALL base` through two sharded sides: 2×.
     twice: u64,
     /// Identity over the base: 1×.
-    once: u64,
+    pub(super) once: u64,
     /// Identity over `twice`: 2×, where reading the base would give 1×.
     deep: u64,
     /// `twice UNION ALL once`, a view two producers feed: 3×.
@@ -43,7 +43,7 @@ impl Views {
 }
 
 /// [`engine_with_base`] plus [`Views`].
-fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
+pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
     let (mut engine, base) = engine_with_base(name);
     let cols = view_cols();
     let mut circuit = gnitz_wire::Circuit::default();
@@ -67,7 +67,7 @@ fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
 }
 
 /// `(pk, weight, payload)` rows in `tid`'s own registered schema.
-fn delta_for(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)]) -> Batch {
+pub(super) fn delta_for(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)]) -> Batch {
     let schema = engine
         .registry
         .relation(tid)
@@ -90,7 +90,7 @@ fn times(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)], k: i64) -> 
 }
 
 /// One tick of `source` over `delta`.
-fn tick(engine: &mut CatalogEngine, source: u64, round: u64, delta: Batch) {
+pub(super) fn tick(engine: &mut CatalogEngine, source: u64, round: u64, delta: Batch) {
     drive(&mut LocalDrive(engine), Drive::Tick { source, round }, Some(delta)).unwrap();
 }
 
@@ -268,7 +268,7 @@ fn a_replica_sides_output_is_shared_without_a_round() {
 
 /// Tables `a (id | nn, nullable)` and `b (k | w)`, every column a U64, under the
 /// view `a LEFT JOIN b ON a.<key> = b.k`: `[key | id, nn, nullable, w]`.
-fn left_join_engine(name: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
+pub(super) fn left_join_engine(name: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
     use crate::test_support::nullable_def;
     use TypeCode::U64;
     let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), 1).unwrap();
@@ -290,7 +290,7 @@ fn left_join_engine(name: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
 }
 
 /// `rows` of `tid`'s schema at weight `weight`, each a PK and its payload cells.
-fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option<u64>])]) -> Batch {
+pub(super) fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option<u64>])]) -> Batch {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = gnitz_zset::repr::BatchBuilder::new(&schema);
     for &(pk, cells) in rows {
@@ -305,7 +305,7 @@ fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option
 
 /// Ingest `delta` into table `tid`, as a push does, and answer what the tick of
 /// it is driven over.
-fn ingested(engine: &mut CatalogEngine, tid: u64, delta: Batch) -> Batch {
+pub(super) fn ingested(engine: &mut CatalogEngine, tid: u64, delta: Batch) -> Batch {
     engine.registry.ingest_returning(tid, delta).unwrap()
 }
 
@@ -347,11 +347,8 @@ fn a_left_join_null_fills_its_null_keyed_preserved_row() {
 
 // ── Per-epoch cost ──────────────────────────────────────────────────────────
 
-/// One-row ticks per cost cell, and rows in the wide tick.
-const BENCH_TICKS: u64 = 10_000;
-
 /// Column records for a view whose output is `schema`.
-fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
+pub(super) fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
     (0..schema.num_columns())
         .map(|ci| {
             let c = schema.column(ci).expect("in range");
@@ -363,147 +360,7 @@ fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> 
         .collect()
 }
 
-/// [`engine_with_views`] plus a GROUP BY view over the base.
-fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, u64, u64) {
-    let (mut engine, base, views) = engine_with_views(name);
-    let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
-
-    let (group, aggs) = ([1u32], [gnitz_wire::AggDescriptor::COUNT_STAR]);
-    let grouped = *gnitz_zset::stream::ReducePlan::from_wire(&base_schema, &group, &aggs, false)
-        .unwrap()
-        .output_schema();
-    let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
-    let reduced = circuit.reduce_multi(scan, &group, &aggs);
-    circuit.sink(reduced);
-    try_register_view(&mut engine, circuit, "vgroup", &cols_of(&grouped), 0, 0).unwrap();
-    (engine, base, views.once)
-}
-
 /// The net weight `tid` holds.
-fn net_weight(engine: &mut CatalogEngine, tid: u64) -> u64 {
+pub(super) fn net_weight(engine: &mut CatalogEngine, tid: u64) -> u64 {
     held(engine, tid).values().sum::<i64>() as u64
-}
-
-/// Instructions per one-row tick through every plan shape, per tick that brings
-/// this worker no row, and per wide tick into eight readers beside its seven
-/// batch copies.
-///
-/// ```text
-/// cd crates && cargo test -p gnitz-server --release drive_tick_bench \
-///     -- --ignored --nocapture --test-threads=1
-/// ```
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn drive_tick_bench() {
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-
-    let (mut engine, base, once) = engine_with_every_plan_shape("tick_bench_shapes");
-    // Compiles every plan outside the measurement.
-    let warm = delta_for(&engine, base, &[(0, 1, 0)]);
-    tick(&mut engine, base, 1, warm);
-    let deltas: Vec<Batch> = (1..=BENCH_TICKS)
-        .map(|i| delta_for(&engine, base, &[(i, 1, i as i64)]))
-        .collect();
-    let ((), instr) = counter.measure(|| {
-        for (i, delta) in deltas.into_iter().enumerate() {
-            tick(&mut engine, base, i as u64 + 2, delta);
-        }
-    });
-    assert_eq!(net_weight(&mut engine, once), BENCH_TICKS + 1, "every tick landed");
-    println!(
-        "one-row ticks, every plan shape  {:>10} instr/tick",
-        instr / BENCH_TICKS
-    );
-    let ((), instr) = counter.measure(|| {
-        for round in 0..BENCH_TICKS {
-            let what = Drive::Tick {
-                source: base,
-                round: BENCH_TICKS + 2 + round,
-            };
-            drive(&mut LocalDrive(&mut engine), what, None).unwrap();
-        }
-    });
-    assert_eq!(
-        net_weight(&mut engine, once),
-        BENCH_TICKS + 1,
-        "an empty tick lands nothing"
-    );
-    println!(
-        "empty ticks, every plan shape    {:>10} instr/tick",
-        instr / BENCH_TICKS
-    );
-
-    let (mut engine, base) = engine_with_base("tick_bench_fanout");
-    let cols = view_cols();
-    let readers: Vec<u64> = (0..8)
-        .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &cols))
-        .collect();
-    let warm = delta_for(&engine, base, &[(0, 1, 0)]);
-    tick(&mut engine, base, 1, warm);
-    let rows: Vec<(u64, i64, i64)> = (1..=BENCH_TICKS).map(|i| (i, 1, i as i64)).collect();
-    let delta = delta_for(&engine, base, &rows);
-    let (copies, clone_instr) = counter.measure(|| (0..7).map(|_| Batch::clone(&delta)).collect::<Vec<_>>());
-    drop(copies);
-    let ((), instr) = counter.measure(|| tick(&mut engine, base, 2, delta));
-    assert_eq!(net_weight(&mut engine, readers[7]), BENCH_TICKS + 1, "the tick landed");
-    println!("{BENCH_TICKS}-row tick, 8 readers        {instr:>10} instr, of which 7 copies {clone_instr}");
-}
-
-/// Instructions per wide tick into the preserved side of `a LEFT JOIN b`, by join
-/// key and by whether the other side matches.
-///
-/// ```text
-/// cd crates && cargo test -p gnitz-server --release left_join_tick_bench \
-///     -- --ignored --nocapture --test-threads=1
-/// ```
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn left_join_tick_bench() {
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-    let ids = 1..=BENCH_TICKS;
-    for (key_name, key) in [("NOT NULL payload key", 1), ("PK key", 0), ("nullable payload key", 2)] {
-        for matched in [false, true] {
-            let name = format!("left_join_bench_{key}_{matched}");
-            let (mut engine, [a, b], view) = left_join_engine(&name, key);
-            if matched {
-                let rows: Vec<(u64, [Option<u64>; 1])> = ids.clone().map(|i| (i, [Some(i)])).collect();
-                let rows: Vec<(u64, &[Option<u64>])> = rows.iter().map(|(k, w)| (*k, &w[..])).collect();
-                let delta = rows_of(&engine, b, 1, &rows);
-                let delta = ingested(&mut engine, b, delta);
-                tick(&mut engine, b, 1, delta);
-            }
-            // Compiles the plan outside the measurement, and nets to nothing.
-            for (round, weight) in [(2, 1), (3, -1)] {
-                let warm = rows_of(&engine, a, weight, &[(0, &[Some(0), Some(0)])]);
-                let warm = ingested(&mut engine, a, warm);
-                tick(&mut engine, a, round, warm);
-            }
-            let rows: Vec<(u64, [Option<u64>; 2])> = ids.clone().map(|i| (i, [Some(i), Some(i)])).collect();
-            let rows: Vec<(u64, &[Option<u64>])> = rows.iter().map(|(id, c)| (*id, &c[..])).collect();
-            let delta = rows_of(&engine, a, 1, &rows);
-            let delta = ingested(&mut engine, a, delta);
-            let ((), instr) = counter.measure(|| tick(&mut engine, a, 4, delta));
-
-            let out = scan_all(&mut engine, view);
-            let w = out.schema().num_payload_cols() - 1;
-            let live = |i: &usize| out.get_weight(*i) == 1;
-            let null_filled = (0..out.len())
-                .filter(live)
-                .filter(|&i| gnitz_expr::payload_is_null(&*out, i, w))
-                .count() as u64;
-            assert_eq!(
-                net_weight(&mut engine, view),
-                BENCH_TICKS,
-                "{key_name}: every row landed"
-            );
-            assert_eq!(null_filled, if matched { 0 } else { BENCH_TICKS }, "{key_name}");
-            let other = if matched {
-                "every row matches"
-            } else {
-                "empty other side"
-            };
-            println!("{BENCH_TICKS}-row tick, {key_name:<22} {other:<18} {instr:>11} instr");
-        }
-    }
 }

@@ -947,3 +947,7 @@ impl gnitz_expr::MapTarget for ZSetBatch {
 #[cfg(test)]
 #[path = "tests/types.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/types.rs"]
+mod bench;

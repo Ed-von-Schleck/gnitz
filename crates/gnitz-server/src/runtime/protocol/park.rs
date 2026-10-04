@@ -247,3 +247,7 @@ impl WorkerPark {
 #[cfg(test)]
 #[path = "tests/park.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/park.rs"]
+mod bench;

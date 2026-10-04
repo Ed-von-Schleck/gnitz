@@ -12,5 +12,9 @@ memchr = "2.8.3"
 # Dependency-free.
 fearless_simd = "1.0"
 
+[dev-dependencies]
+# The benches' shared pass-count knob.
+gnitz-foundation = { path = "../gnitz-foundation" }
+
 [lints]
 workspace = true

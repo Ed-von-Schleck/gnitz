@@ -115,3 +115,7 @@ pub(super) fn drain_pool() -> VecDeque<Vec<u8>> {
 #[cfg(test)]
 #[path = "tests/batch_pool.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/batch_pool.rs"]
+mod bench;

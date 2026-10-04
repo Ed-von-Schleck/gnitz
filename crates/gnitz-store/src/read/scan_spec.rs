@@ -225,3 +225,7 @@ fn drain_ramp(first: usize, chunk_rows: usize) -> impl Iterator<Item = usize> {
 #[cfg(test)]
 #[path = "tests/scan_spec.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/scan_spec.rs"]
+mod bench;

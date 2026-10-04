@@ -6,11 +6,14 @@ mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
 mod ddl_tests;
 mod dir_deletion_tests;
+#[path = "benches/echo_fold.rs"]
 mod echo_fold_bench;
 mod engine_tests;
 mod fk_tests;
+#[path = "benches/hydrate.rs"]
 mod hydrate_bench;
 mod index_tests;
+#[path = "benches/ingest_unticked.rs"]
 mod ingest_unticked_bench;
 mod reopen_rebuild_tests;
 mod schema_codec;
@@ -19,6 +22,7 @@ mod stream_tests;
 mod sys_retraction_tests;
 mod uuid_tests;
 mod view_preflight_tests;
+#[path = "benches/view_tick.rs"]
 mod view_tick_bench;
 mod wide_pk_validation;
 

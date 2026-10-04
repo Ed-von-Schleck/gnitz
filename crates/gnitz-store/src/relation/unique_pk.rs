@@ -74,5 +74,5 @@ fn complement(mut rows: Vec<usize>, count: usize) -> Vec<(usize, usize)> {
 mod tests;
 
 #[cfg(test)]
-#[path = "bench_unique_pk.rs"]
+#[path = "benches/unique_pk.rs"]
 mod bench;

@@ -11,6 +11,7 @@
 //! set every evaluator's kernels run at and `GNITZ_BENCH_ROWS` the rows of a
 //! batch.
 
+use gnitz_foundation::perf::bench_passes;
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::batch::MORSEL;
@@ -101,7 +102,7 @@ fn drive_filter(f: &mut RowFilter, view: &TestView, passes: usize) {
 /// whether the prefix the fused compare short-circuits on collides; `long` and
 /// `long-distinct` only in whether the heap strings share theirs.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn str_const_filter_bench() {
     let passes = bench_passes();
     let mut channel = Selector::new("GNITZ_BENCH_CHANNEL");
@@ -173,13 +174,6 @@ fn str_const_filter_bench() {
     }
 }
 
-/// The pass count the `#[ignore]`d benches loop over, from `GNITZ_BENCH_PASSES`.
-/// Two runs at different counts, differenced, cancel everything that happens
-/// once per process.
-fn bench_passes() -> usize {
-    std::env::var("GNITZ_BENCH_PASSES").map_or(1, |v| v.parse().expect("GNITZ_BENCH_PASSES must be a count"))
-}
-
 /// The rows a batch of the evaluator benches holds, from `GNITZ_BENCH_ROWS`: a
 /// count below [`MORSEL`] measures what a small delta pays per batch.
 fn bench_rows() -> usize {
@@ -188,7 +182,7 @@ fn bench_rows() -> usize {
 
 /// The filter kernels, per `GNITZ_BENCH_SHAPE`.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn filter_kernel_bench() {
     let passes = bench_passes();
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
@@ -391,7 +385,7 @@ fn is_null_bench_schema() -> TestSchema {
 /// `IS [NOT] NULL` predicate, per `GNITZ_BENCH_SHAPE`. Take `cycles:u` too: only
 /// it sees a stall.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn is_null_arm_bench() {
     let passes = bench_passes();
     let mut arm = Selector::new("GNITZ_BENCH_ARM");
@@ -468,7 +462,7 @@ fn is_null_arm_bench() {
 /// A range walk over one nullable `I64` payload column and no predicate: the
 /// null exclusion and the range compare of `RangeMembership`.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn range_walk_bench() {
     use gnitz_wire::{key_image, Cut, KeyRange, PkColList, ReadBound};
     let passes = bench_passes();
@@ -523,7 +517,7 @@ fn str_bench_view(schema: &TestSchema, n: usize) -> TestView {
 /// The kernels read as values, per `GNITZ_BENCH_SHAPE`; a
 /// numeric suffix is the haystack length the family's cost is a slope in.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn expr_kernel_bench() {
     let passes = bench_passes();
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
@@ -1011,7 +1005,7 @@ fn expr_kernel_bench() {
 /// per `GNITZ_BENCH_SHAPE`: a column prefix, every column moved one slot down,
 /// and the columns reversed.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn null_perm_bench() {
     let passes = bench_passes();
     let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
@@ -1051,7 +1045,7 @@ fn null_perm_bench() {
 /// The decode a predicate-only read pays per request per worker: `from_blob`
 /// and the `resolve_filter` that decodes an IN list's pool entry.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn from_blob_bench() {
     let passes = bench_passes();
     let schema = schema_pk_ints(1, false);
@@ -1083,7 +1077,7 @@ fn from_blob_bench() {
 /// what a CPU without it runs. Between levels compare `cycles:u`: a wider
 /// instruction retires as one whatever it costs to execute.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn mask_kernel_bench() {
     use std::hint::black_box;
     let passes = bench_passes();

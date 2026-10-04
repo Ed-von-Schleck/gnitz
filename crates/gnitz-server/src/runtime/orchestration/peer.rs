@@ -143,3 +143,7 @@ impl Peer {
 #[cfg(test)]
 #[path = "tests/peer.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/peer.rs"]
+mod bench;

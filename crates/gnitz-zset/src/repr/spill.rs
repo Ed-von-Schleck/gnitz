@@ -211,3 +211,7 @@ impl KeyProducer {
 #[cfg(test)]
 #[path = "tests/spill.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/spill.rs"]
+mod bench;

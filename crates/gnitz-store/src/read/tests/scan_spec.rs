@@ -16,7 +16,7 @@ use gnitz_zset::schema::{Placement, SchemaColumn};
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
 /// may repeat and a weight above 1 is admitted verbatim.
-fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
+pub(super) fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let kind = RelationKind::View(ViewProps::Plain);
     relation_fixture(kind, schema, &[], make_batch_raw(&schema, rows))
@@ -33,7 +33,7 @@ fn rows_of(b: &Batch) -> Vec<(u64, i64, i64)> {
 }
 
 /// `spec` over `TID`, replying in the relation's own layout.
-fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
+pub(super) fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
     let layout = r.relation(TID).unwrap().schema().layout_digest();
     r.scan_spec(TID, spec, layout, None)
 }
@@ -51,7 +51,7 @@ fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
 }
 
 /// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
-fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
+pub(super) fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
     let mut eb = ExprBuilder::new();
     let v = eb.emit(LogicalInstr::LoadCol { col });
     let lo_c = eb.emit(LogicalInstr::LoadConst { val: lo, unsigned: false });
@@ -65,7 +65,7 @@ fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
 }
 
 /// `v`'s key image in an I64 column.
-fn img(v: i64) -> u128 {
+pub(super) fn img(v: i64) -> u128 {
     key_image(TypeCode::I64, v as u64 as u128)
 }
 
@@ -786,56 +786,4 @@ fn drain_ramp_doubles_onto_the_chunk_grid() {
         drain_ramp(chunk, chunk).take(4).all(|rows| rows == chunk),
         "an unwindowed drain stays flat"
     );
-}
-
-/// 1M rows narrowed to `val ∈ [0, sel% · N)` by an index walk's membership
-/// (`GNITZ_BENCH_SHAPE=membership`) or by the VM predicate `val >= lo AND val < hi`
-/// (`predicate`), or by both (`both`, the predicate keeping the walk's upper half).
-/// Difference two pass counts, one shape per process:
-///
-///   cargo build -p gnitz-store --release --tests
-///   for s in membership predicate both; do for p in 1 21; do \
-///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_SEL=10 GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///     cargo test -p gnitz-store --release survivors_membership_bench -- --ignored --nocapture
-///   done; done
-#[test]
-#[ignore]
-fn survivors_membership_bench() {
-    use std::hint::black_box;
-
-    const N: u64 = 1_000_000;
-    let shape = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "membership".to_string());
-    let sel: u64 = std::env::var("GNITZ_BENCH_SEL").map_or(10, |s| s.parse().unwrap());
-    let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |s| s.parse().unwrap());
-    let hi = (N * sel / 100) as i64;
-    let r = view(&(0..N).map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
-    let walk = ReadBound::Range(KeyRange::new(
-        PkColList::from_slice(&[1]),
-        &[],
-        Cut::before(img(0)),
-        Cut::before(img(hi)),
-    ));
-    let (spec, want) = match shape.as_str() {
-        "membership" => (ReadSpec::all_rows(walk), hi),
-        "predicate" => (
-            ReadSpec {
-                predicate: between(1, 0, Some(hi)),
-                ..ReadSpec::all_rows(ReadBound::None)
-            },
-            hi,
-        ),
-        "both" => (
-            ReadSpec {
-                predicate: between(1, hi / 2, None),
-                ..ReadSpec::all_rows(walk)
-            },
-            hi - hi / 2,
-        ),
-        other => panic!("GNITZ_BENCH_SHAPE={other}: membership, predicate or both"),
-    };
-    for _ in 0..passes {
-        let got = black_box(run(&r, spec.clone()).unwrap());
-        assert_eq!(got.len() as i64, want);
-    }
-    println!("survivors {shape} sel {sel}% passes {passes}");
 }

@@ -687,3 +687,7 @@ impl ShardIndex {
 #[cfg(test)]
 #[path = "tests/index.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/index.rs"]
+mod bench;

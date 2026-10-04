@@ -548,3 +548,7 @@ impl SchemaDescriptor {
 #[cfg(test)]
 #[path = "tests/key.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/key.rs"]
+mod bench;

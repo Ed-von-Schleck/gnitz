@@ -607,3 +607,7 @@ impl<'a> SparseImage<'a> {
 #[cfg(test)]
 #[path = "tests/encoding.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/encoding.rs"]
+mod bench;

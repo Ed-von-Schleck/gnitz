@@ -846,7 +846,7 @@ fn for_range_drain_bench() {
 /// Instructions per gathered row of a `pk IN (…)` drain, over one and four
 /// in-memory runs, fixed-width and string payloads, dense and sparse key lists.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_set_gather_drain_bench() {
     use crate::repr::Run;
     use gnitz_foundation::perf::Counter;

@@ -414,3 +414,7 @@ impl From<FrameLenError> for ProtocolError {
 #[cfg(test)]
 #[path = "tests/transport.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/transport.rs"]
+mod bench;

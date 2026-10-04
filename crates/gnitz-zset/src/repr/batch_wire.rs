@@ -368,3 +368,7 @@ impl<'a> MemBatch<'a> {
 #[cfg(test)]
 #[path = "tests/batch_wire.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/batch_wire.rs"]
+mod bench;

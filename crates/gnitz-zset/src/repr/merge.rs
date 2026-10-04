@@ -847,3 +847,7 @@ fn drain_groups<K: Copy + Eq, P: PayloadOrder>(
 #[cfg(test)]
 #[path = "tests/merge.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/merge.rs"]
+mod bench;

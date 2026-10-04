@@ -149,12 +149,15 @@ mod flush;
 pub(crate) use flush::flush_barrier;
 
 #[cfg(test)]
+#[path = "benches/flush.rs"]
 mod bench_flush;
 
 #[cfg(test)]
+#[path = "benches/gather.rs"]
 mod bench_gather;
 
 #[cfg(test)]
+#[path = "benches/ingest.rs"]
 mod bench_ingest;
 
 impl Table {

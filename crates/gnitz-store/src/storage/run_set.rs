@@ -230,3 +230,7 @@ fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
 #[cfg(test)]
 #[path = "tests/run_set.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/run_set.rs"]
+mod bench;

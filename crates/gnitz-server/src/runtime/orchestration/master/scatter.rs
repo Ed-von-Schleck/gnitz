@@ -55,3 +55,7 @@ pub(crate) fn with_routed<R>(
 #[cfg(test)]
 #[path = "tests/scatter.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/scatter.rs"]
+mod bench;

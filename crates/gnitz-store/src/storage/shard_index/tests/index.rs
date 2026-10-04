@@ -16,7 +16,7 @@ fn open(dir: &Path, schema: SchemaDescriptor, budget: ShardBudget) -> ShardIndex
 }
 
 /// An unbounded store at `dir`, reloaded from its manifest if it has one.
-fn fresh(dir: &Path, schema: SchemaDescriptor) -> ShardIndex {
+pub(super) fn fresh(dir: &Path, schema: SchemaDescriptor) -> ShardIndex {
     open(dir, schema, ShardBudget::Unbounded)
 }
 
@@ -94,7 +94,7 @@ fn assert_stable(len: u64) {
 
 /// Write `batch` as a published entry of `level_idx`'s guard `key`, creating it,
 /// stamped `stamp`.
-fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
+pub(super) fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
     let entry = idx.write_shard(batch, false, Some(stamp)).unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.mark_published();
@@ -640,14 +640,14 @@ fn a_guard_of_one_distinct_key_neither_splits_nor_refolds() {
 
 /// A `pk_cols`×U64 PK plus an I64 payload — strides 8, 24 and 32, so a guard key
 /// is narrow, wide, and wide-with-a-16-byte-boundary in turn.
-fn stride_schema(pk_cols: usize) -> SchemaDescriptor {
+pub(super) fn stride_schema(pk_cols: usize) -> SchemaDescriptor {
     pk_payload_schema(&vec![TypeCode::U64; pk_cols])
 }
 
 /// Row `i`'s key over `stride_schema(pk_cols)`: ascending in the **last** PK
 /// column, so at every stride but 8 the keys agree on their leading bytes and
 /// differ only in the trailing ones — past byte 16 for `pk_cols >= 3`.
-fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
+pub(super) fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
     let mut pk = vec![0u8; (pk_cols - 1) * 8];
     pk.extend_from_slice(&i.to_be_bytes());
     PkBuf::from_bytes(&pk)
@@ -1356,98 +1356,6 @@ fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
         "two bands, each read with the one terminal guard it meets"
     );
     assert_all_found(&idx, [5, 10, 20, 100, 105, 110, 160]);
-}
-
-/// `ShardIndex::find_pk_bytes` over a tree holding all three levels, at a narrow
-/// and a wide PK stride: instructions per probe for present and absent keys.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn shard_probe_bench() {
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
-    const TERMINAL_GUARDS: u64 = 64;
-    const L1_GUARDS: u64 = 16;
-    const SPAN: u64 = 1 << 20; // keys one terminal guard covers
-    const ROWS: u64 = 2000;
-    const PROBES: u64 = 200_000;
-    const STEP: u64 = (SPAN / ROWS) & !1;
-    let counter = Counter::instructions().expect("instructions counter");
-    for pk_cols in [1usize, 3] {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut idx = fresh(tmp.path(), stride_schema(pk_cols));
-        let total = TERMINAL_GUARDS * SPAN;
-        let run = |base: u64, step: u64| -> Batch {
-            let rows: Vec<_> = (0..ROWS)
-                .map(|i| (trailing_gk(pk_cols, base + i * step).pk_bytes().to_vec(), 1, i as i64))
-                .collect();
-            make_batch_opk(&stride_schema(pk_cols), &rows)
-        };
-        // Terminal keys are even, so an odd key inside the range is absent there.
-        for g in 0..TERMINAL_GUARDS {
-            let base = g * SPAN;
-            seed_guard(&mut idx, TERMINAL, trailing_gk(pk_cols, base), &run(base, STEP), 1);
-        }
-        let l1_span = total / L1_GUARDS;
-        for g in 0..L1_GUARDS {
-            for f in 0..4u64 {
-                let base = g * l1_span;
-                seed_guard(
-                    &mut idx,
-                    L1,
-                    trailing_gk(pk_cols, base),
-                    &run(base + 2 * f, l1_span / ROWS),
-                    2,
-                );
-            }
-        }
-        for f in 0..4u64 {
-            idx.append_l0_run(&run(2 * f, total / ROWS)).unwrap();
-        }
-        {
-            let mut rng = crate::test_support::Rng::new(0x5EED_1234);
-            let ranges: Vec<(PkBuf, PkBuf)> = (0..PROBES)
-                .map(|_| {
-                    let key = rng.gen_range(TERMINAL_GUARDS) * SPAN + rng.gen_range(ROWS) * STEP;
-                    (trailing_gk(pk_cols, key), trailing_gk(pk_cols, key + 4 * STEP))
-                })
-                .collect();
-            let mut found = 0usize;
-            let ((), instructions) = counter.measure(|| {
-                for &(lo, hi) in &ranges {
-                    found += idx.shard_arcs_in_range(lo, hi, true).count();
-                }
-            });
-            black_box(found);
-            println!(
-                "shard_range stride {}: {:.1} instr/open ({:.2} shards each)",
-                pk_cols * 8,
-                instructions as f64 / PROBES as f64,
-                found as f64 / PROBES as f64
-            );
-        }
-        for (label, odd) in [("present", 0u64), ("absent", 1)] {
-            let mut rng = crate::test_support::Rng::new(0x5EED_1234);
-            let keys: Vec<PkBuf> = (0..PROBES)
-                .map(|_| {
-                    let key = rng.gen_range(TERMINAL_GUARDS) * SPAN + rng.gen_range(ROWS) * STEP;
-                    trailing_gk(pk_cols, key | odd)
-                })
-                .collect();
-            let mut hits = 0usize;
-            let ((), instructions) = counter.measure(|| {
-                for k in &keys {
-                    let key = k.pk_bytes();
-                    idx.find_pk_bytes(key, probe_key(key), |_, _| hits += 1);
-                }
-            });
-            black_box(hits);
-            println!(
-                "shard_probe stride {} {label}: {:.1} instr/probe ({hits} hits)",
-                pk_cols * 8,
-                instructions as f64 / PROBES as f64
-            );
-        }
-    }
 }
 
 /// Keys above everything L1 holds fold into a guard of their own, and a guard

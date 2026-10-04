@@ -353,3 +353,7 @@ impl Drop for TimerFuture {
 #[cfg(test)]
 #[path = "tests/futures.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/futures.rs"]
+mod bench;

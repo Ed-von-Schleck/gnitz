@@ -25,10 +25,17 @@ use std::hint::black_box;
 use std::rc::Rc;
 use std::time::Instant;
 
+use super::tests::between;
+use super::tests::img;
+use super::tests::run;
+use super::tests::view;
 use crate::relation::{IndexClaim, RelationKind};
 use crate::test_support::{map_of, relation_fixture, rows_spec, RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, SchemaFacts, Sink};
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, OrderKey, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
+use gnitz_wire::{
+    AggDescriptor, AggFunc, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, SinkKind,
+    TypeCode,
+};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -335,4 +342,56 @@ fn scan_spec_index_range_bench() {
     cell("index range, 16K-row chunks", rows as u64, || {
         e.scan_spec(TID, spec.clone(), src.layout_digest(), None).unwrap()
     });
+}
+
+/// 1M rows narrowed to `val ∈ [0, sel% · N)` by an index walk's membership
+/// (`GNITZ_BENCH_SHAPE=membership`) or by the VM predicate `val >= lo AND val < hi`
+/// (`predicate`), or by both (`both`, the predicate keeping the walk's upper half).
+/// Difference two pass counts, one shape per process:
+///
+///   cargo build -p gnitz-store --release --tests
+///   for s in membership predicate both; do for p in 1 21; do \
+///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_SEL=10 GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///     cargo test -p gnitz-store --release survivors_membership_bench -- --ignored --nocapture
+///   done; done
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn survivors_membership_bench() {
+    use std::hint::black_box;
+
+    const N: u64 = 1_000_000;
+    let shape = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "membership".to_string());
+    let sel: u64 = std::env::var("GNITZ_BENCH_SEL").map_or(10, |s| s.parse().unwrap());
+    let passes = gnitz_foundation::perf::bench_passes();
+    let hi = (N * sel / 100) as i64;
+    let r = view(&(0..N).map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
+    let walk = ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[1]),
+        &[],
+        Cut::before(img(0)),
+        Cut::before(img(hi)),
+    ));
+    let (spec, want) = match shape.as_str() {
+        "membership" => (ReadSpec::all_rows(walk), hi),
+        "predicate" => (
+            ReadSpec {
+                predicate: between(1, 0, Some(hi)),
+                ..ReadSpec::all_rows(ReadBound::None)
+            },
+            hi,
+        ),
+        "both" => (
+            ReadSpec {
+                predicate: between(1, hi / 2, None),
+                ..ReadSpec::all_rows(walk)
+            },
+            hi - hi / 2,
+        ),
+        other => panic!("GNITZ_BENCH_SHAPE={other}: membership, predicate or both"),
+    };
+    for _ in 0..passes {
+        let got = black_box(run(&r, spec.clone()).unwrap());
+        assert_eq!(got.len() as i64, want);
+    }
+    println!("survivors {shape} sel {sel}% passes {passes}");
 }

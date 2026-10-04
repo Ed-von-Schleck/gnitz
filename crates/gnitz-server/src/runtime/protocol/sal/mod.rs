@@ -1456,3 +1456,7 @@ pub(crate) mod fixtures;
 #[cfg(test)]
 #[path = "tests/sal.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/sal.rs"]
+mod bench;

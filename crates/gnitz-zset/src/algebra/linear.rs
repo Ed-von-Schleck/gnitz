@@ -115,3 +115,7 @@ pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: Cow<'_, Batch>, out_schema: &S
 #[cfg(test)]
 #[path = "tests/linear.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/linear.rs"]
+mod bench;

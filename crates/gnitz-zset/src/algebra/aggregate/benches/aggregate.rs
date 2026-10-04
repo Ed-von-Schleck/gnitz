@@ -18,7 +18,7 @@ const CHUNK: u64 = 65_536;
 /// `[U64 pk | I64 grp | I64 a | I32 b NULL | F64 c]` grouped by `grp`, across
 /// group counts and aggregate sets.
 #[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn adhoc_fold_bench() {
     let schema = SchemaDescriptor::new(
         &[

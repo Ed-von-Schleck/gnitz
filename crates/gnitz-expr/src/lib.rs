@@ -33,9 +33,9 @@
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
-//! private items. `tests/bench.rs` is the exception: its `#[ignore]`d
-//! retired-instruction benches span several modules' kernels, so it attaches at
-//! the crate root instead.
+//! private items. The `#[ignore]`d retired-instruction benches are in
+//! `benches/eval.rs`: they span several modules' kernels, so it attaches at the
+//! crate root.
 //!
 //! # Inlining
 //!
@@ -86,5 +86,5 @@ pub use view::*;
 mod test_support;
 
 #[cfg(test)]
-#[path = "tests/bench.rs"]
+#[path = "benches/eval.rs"]
 mod bench;

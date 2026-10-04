@@ -9,6 +9,7 @@ mod op_reduce;
 mod plan;
 
 #[cfg(test)]
+#[path = "benches/reduce.rs"]
 mod bench;
 
 #[cfg(test)]

@@ -1325,3 +1325,7 @@ pub(crate) fn write_to_batch(
 #[cfg(test)]
 #[path = "tests/batch.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/batch.rs"]
+mod bench;

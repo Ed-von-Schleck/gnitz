@@ -641,3 +641,7 @@ pub(crate) mod fixtures;
 #[cfg(test)]
 #[path = "tests/w2m.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/w2m.rs"]
+mod bench;

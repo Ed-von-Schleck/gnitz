@@ -425,3 +425,7 @@ pub(crate) mod fixtures;
 #[cfg(test)]
 #[path = "tests/mesh.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/mesh.rs"]
+mod bench;

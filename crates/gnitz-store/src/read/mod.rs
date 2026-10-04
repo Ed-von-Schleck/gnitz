@@ -24,9 +24,8 @@ mod store_io;
 pub use key_spans::KeySpans;
 
 #[cfg(test)]
+#[path = "benches/index_probe.rs"]
 mod bench_index_probe;
-#[cfg(test)]
-mod bench_scan_spec;
 
 use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;

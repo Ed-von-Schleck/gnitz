@@ -584,3 +584,7 @@ impl ColumnarSource for MappedShard {
 #[cfg(test)]
 #[path = "tests/shard_reader.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/shard_reader.rs"]
+mod bench;

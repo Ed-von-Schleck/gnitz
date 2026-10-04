@@ -16,7 +16,7 @@ fn meshes(nw: usize) -> Vec<Mesh> {
 }
 
 /// Routing by the leading PK column of `schema`.
-fn by_pk(schema: &SchemaDescriptor) -> ScatterPlan {
+pub(super) fn by_pk(schema: &SchemaDescriptor) -> ScatterPlan {
     ScatterPlan::group(schema, &[0]).unwrap()
 }
 
@@ -192,7 +192,7 @@ fn a_step_before_the_part_completes_is_refused() {
 /// `n` rows over `(U64 PK, I64)` from worker `w`, consolidated: every worker
 /// sends the same `(pk, payload)` elements at its own weight, so the gather must
 /// sum across senders.
-fn wide_partition(w: usize, n: u64) -> Batch {
+pub(super) fn wide_partition(w: usize, n: u64) -> Batch {
     let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (i, 1 + w as i64, (i % 7) as i64)).collect();
     make_batch(&make_schema_u64_i64(), &rows)
 }
@@ -394,41 +394,4 @@ fn trim_returns_the_pages_past_a_part() {
     m.trim(BLOCKS_AT);
     assert_eq!(unsafe { m.outbox(0).add(resident - 1).read() }, 0);
     assert_eq!(m.resident[0], BLOCKS_AT);
-}
-
-/// One exchange round's cost on the mesh, in instructions: every worker opens the
-/// round and every worker steps it to its close. The outboxes hold a whole
-/// partition, so every round is one part.
-///
-/// `cd crates && cargo test -p gnitz-server --release mesh_round_bench -- --ignored --nocapture --test-threads=1`
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn mesh_round_bench() {
-    use std::hint::black_box;
-
-    const ROUNDS: u64 = 200;
-
-    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-    let pk = by_pk(&make_schema_u64_i64());
-    for nw in [2, 4] {
-        for rows in [1, 1_000, 100_000] {
-            let mut mesh = super::fixtures::meshes(nw, 64 << 20);
-            let parts: Vec<Batch> = (0..nw).map(|w| wide_partition(w, rows)).collect();
-            let mut rounds: Vec<Round> = Vec::with_capacity(nw);
-            let ((), instructions) = counter.measure(|| {
-                for _ in 0..ROUNDS {
-                    rounds.clear();
-                    let opened = mesh.iter_mut().zip(&parts);
-                    rounds.extend(opened.map(|(m, batch)| m.open(9, Cow::Borrowed(batch), &pk, true, true)));
-                    for (m, round) in mesh.iter_mut().zip(&mut rounds) {
-                        black_box(m.step(round).expect("a round that fits one part"));
-                    }
-                }
-            });
-            println!(
-                "mesh_round_bench nw={nw} rows={rows:<6} {:>12.1} instr/round",
-                instructions as f64 / ROUNDS as f64
-            );
-        }
-    }
 }
