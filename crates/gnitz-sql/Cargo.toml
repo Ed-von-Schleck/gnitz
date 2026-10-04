@@ -1,17 +1,23 @@
 [package]
-name    = "gnitz-sql"
-version = "0.1.0"
-edition = "2021"
+name = "gnitz-sql"
+description = "SQL front end for the gnitz database: parser, binder and query planner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 integration = []
 
 [dependencies]
 sqlparser  = "0.62"
-gnitz-core = { path = "../gnitz-core" }
-gnitz-expr = { path = "../gnitz-expr" }
-gnitz-wire = { path = "../gnitz-wire" }
+gnitz-core.workspace = true
+gnitz-expr.workspace = true
+gnitz-wire.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]

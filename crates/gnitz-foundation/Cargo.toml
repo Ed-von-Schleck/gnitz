@@ -1,8 +1,14 @@
 [package]
 name = "gnitz-foundation"
-version = "0.1.0"
-edition = "2021"
+description = "Process and OS primitives shared by the gnitz crates: logging, environment overrides, fault injection and syscall helpers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 libc.workspace = true

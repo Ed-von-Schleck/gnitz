@@ -1,8 +1,14 @@
 [package]
-name    = "gnitz-wire"
-version = "0.1.0"
-edition = "2021"
+name = "gnitz-wire"
+description = "Wire-protocol constants, codecs and the circuit graph shared by gnitz clients and the gnitz engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -1,19 +1,25 @@
 [package]
 name = "gnitz-server"
-version = "0.1.0"
-edition = "2021"
+description = "The gnitz database server: SQL with incrementally maintained materialized views, implementing DBSP"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "gnitz-server"
 path = "src/main.rs"
 
 [dependencies]
-gnitz-foundation = { path = "../gnitz-foundation" }
-gnitz-store = { path = "../gnitz-store" }
-gnitz-zset = { path = "../gnitz-zset" }
-gnitz-wire = { path = "../gnitz-wire" }
-gnitz-expr = { path = "../gnitz-expr" }
+gnitz-foundation.workspace = true
+gnitz-store.workspace = true
+gnitz-zset.workspace = true
+gnitz-wire.workspace = true
+gnitz-expr.workspace = true
 libc.workspace = true
 io-uring.workspace = true
 rustc-hash.workspace = true

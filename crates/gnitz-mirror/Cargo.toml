@@ -1,15 +1,21 @@
 [package]
 name = "gnitz-mirror"
-version = "0.1.0"
-edition = "2021"
+description = "Local mirror store for gnitz views: a copy fed by a view's delta feed and read in the client's process"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gnitz-foundation = { path = "../gnitz-foundation" }
-gnitz-core = { path = "../gnitz-core" }
-gnitz-store = { path = "../gnitz-store" }
-gnitz-zset = { path = "../gnitz-zset" }
-gnitz-wire = { path = "../gnitz-wire" }
+gnitz-foundation.workspace = true
+gnitz-core.workspace = true
+gnitz-store.workspace = true
+gnitz-zset.workspace = true
+gnitz-wire.workspace = true
 
 [dev-dependencies]
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }

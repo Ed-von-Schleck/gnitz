@@ -1,8 +1,9 @@
 [package]
-name    = "gnitz-py"
-version = "0.1.0"
-edition = "2021"
+name = "gnitz-py"
+version.workspace = true
+edition.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 name       = "gnitz"

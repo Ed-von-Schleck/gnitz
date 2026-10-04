@@ -1,11 +1,17 @@
 [package]
-name    = "gnitz-expr"
-version = "0.1.0"
-edition = "2021"
+name = "gnitz-expr"
+description = "The expression evaluator of the gnitz database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gnitz-wire = { path = "../gnitz-wire" }
+gnitz-wire.workspace = true
 # The substring scan.
 # `no_std` and itself dependency-free, so it pulls nothing into this leaf crate.
 memchr = "2.8.3"

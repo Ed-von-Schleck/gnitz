@@ -1,8 +1,9 @@
 [package]
 name = "gnitz-zset-testkit"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 license.workspace = true
+publish = false
 
 # A library of helpers: no unit tests and no doctests of its own to build.
 [lib]

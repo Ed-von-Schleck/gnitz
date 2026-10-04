@@ -1,15 +1,21 @@
 [package]
 name = "gnitz-tokio"
-version = "0.1.0"
-edition = "2021"
+description = "Async Rust client for the gnitz database, on tokio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 integration = []
 
 [dependencies]
-gnitz-core = { path = "../gnitz-core" }
-gnitz-wire = { path = "../gnitz-wire" }
+gnitz-core.workspace = true
+gnitz-wire.workspace = true
 # `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
 # `spawn_blocking`, and `sync` the mpsc and the oneshot the handle and
 # driver share, and the mutex over the blocking client.

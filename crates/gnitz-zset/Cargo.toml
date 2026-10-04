@@ -1,13 +1,19 @@
 [package]
 name = "gnitz-zset"
-version = "0.1.0"
-edition = "2021"
+description = "The Z-set kernel of the gnitz database: schema, columnar batches, cursors and operators"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gnitz-foundation = { path = "../gnitz-foundation" }
-gnitz-wire = { path = "../gnitz-wire" }
-gnitz-expr = { path = "../gnitz-expr" }
+gnitz-foundation.workspace = true
+gnitz-wire.workspace = true
+gnitz-expr.workspace = true
 xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
 rustc-hash.workspace = true
 # `O_TMPFILE`, for the spill sort's nameless run file.
