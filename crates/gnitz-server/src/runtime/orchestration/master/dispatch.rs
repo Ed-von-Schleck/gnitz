@@ -211,10 +211,7 @@ impl MasterDispatcher {
         for (i, &tid) in tids.iter().enumerate() {
             self.record_delta_round(tid, first + i as u64);
         }
-        let tick = Apply::Tick {
-            first_round: first,
-            tids: gnitz_wire::as_le_bytes(tids).into(),
-        };
+        let tick = Apply::Tick { first_round: first, tids: tids.into() };
         self.write_acked(excl, DirectGroup::new(tick))
     }
 

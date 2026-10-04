@@ -45,8 +45,8 @@ pub(crate) enum Apply<'a> {
     Backfill { source: u64, view: u64 },
     /// The rows the group carries.
     Push { tid: u64 },
-    /// One tick per tid (`u64` LE), at consecutive rounds from `first_round`.
-    Tick { first_round: u64, tids: Cow<'a, [u8]> },
+    /// One tick per tid, at consecutive rounds from `first_round`.
+    Tick { first_round: u64, tids: Cow<'a, [u64]> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,9 +93,11 @@ impl SalRequest<'_> {
                 WireMsg { target_id, ..head }
             }
             SalRequest::Apply(Apply::Backfill { source, view }) => WireMsg { target_id: source, arg0: view, ..head },
-            SalRequest::Apply(Apply::Tick { first_round, ref tids }) => {
-                WireMsg { arg0: first_round, blob: tids, ..head }
-            }
+            SalRequest::Apply(Apply::Tick { first_round, ref tids }) => WireMsg {
+                arg0: first_round,
+                blob: gnitz_wire::as_le_bytes(tids),
+                ..head
+            },
             SalRequest::Read(Read::HasPk { tid, probe }) => {
                 let (probe_mode, arg0, arg1) = probe.wire();
                 WireMsg {
@@ -149,11 +151,9 @@ impl SalRequest<'static> {
                 if !blob.len().is_multiple_of(8) {
                     return Err("tick: the blob is not whole tids".into());
                 }
-                Apply::Tick {
-                    first_round: hdr.arg0,
-                    tids: blob.to_vec().into(),
-                }
-                .into()
+                let mut tids = Vec::new();
+                gnitz_wire::extend_from_le_bytes(&mut tids, blob);
+                Apply::Tick { first_round: hdr.arg0, tids: tids.into() }.into()
             }
             SalMessageKind::HasPk => {
                 let probe =

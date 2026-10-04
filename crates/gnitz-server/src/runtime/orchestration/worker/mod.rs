@@ -159,8 +159,7 @@ impl<'c> WorkerProcess<'c> {
                 Ok(())
             }
             Apply::Tick { first_round, ref tids } => {
-                for (i, tid) in tids.as_chunks::<8>().0.iter().enumerate() {
-                    let source = u64::from_le_bytes(*tid);
+                for (i, &source) in tids.iter().enumerate() {
                     let delta = self.catalog.registry.seal(source)?;
                     self.drive(Drive::Tick { source, round: first_round + i as u64 }, delta)?;
                 }

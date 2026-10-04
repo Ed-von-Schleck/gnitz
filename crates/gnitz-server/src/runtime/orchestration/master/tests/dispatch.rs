@@ -74,7 +74,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                 // Wider than the fixture's whole SAL.
                 let tick = Apply::Tick {
                     first_round: 2,
-                    tids: vec![0u8; if refused { 2 << 20 } else { 8 }].into(),
+                    tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
                 let lease = d.write_acked(&d.sal().lock().await, DirectGroup::new(tick))?;
                 writers.iter_mut().for_each(|w| w.send_ack(lease.id()));

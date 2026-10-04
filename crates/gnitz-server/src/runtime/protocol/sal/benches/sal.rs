@@ -4,13 +4,13 @@ use super::{DirectGroup, GroupTargets, SalReader, WorkerSet};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
-/// Instructions the reader spends per control-only group: ones addressed to it,
-/// and ones it steps over. A shared group holds one payload at every worker
-/// count; a per-worker group holds one per addressed worker, and the reader is
-/// the last of them.
+/// Instructions per control-only group: what the writer spends on one, and
+/// what the reader spends on one addressed to it and on one it steps over. A
+/// shared group holds one payload at every worker count; a per-worker group
+/// holds one per addressed worker, and the reader is the last of them.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn sal_read_bench() {
+fn sal_group_bench() {
     const GROUPS: u64 = 10_000;
 
     let counter = Counter::instructions();
@@ -30,11 +30,13 @@ fn sal_read_bench() {
                 ..DirectGroup::new(scan(0, &[]))
             };
             let excl = log.excl();
-            for _ in 0..GROUPS {
-                excl.write(&group).expect("group fits");
-            }
+            let ((), written) = counter.measure(|| {
+                for _ in 0..GROUPS {
+                    excl.write(&group).expect("group fits");
+                }
+            });
             let reader = SalReader::new(log.log(), me as u32, 1);
-            let (read, instructions) = counter.measure(|| {
+            let (read, walked) = counter.measure(|| {
                 let mut read = 0;
                 while let Some((msg, slot)) = reader.next() {
                     black_box((msg.request_id, slot.len()));
@@ -50,8 +52,9 @@ fn sal_read_bench() {
                 "{layout} {case} at nw={nw}: every group was walked"
             );
             println!(
-                "sal_read_bench nw={nw:<2} {layout:<10} {case:<12} {:>6.1} instr/group",
-                instructions as f64 / GROUPS as f64
+                "sal_group_bench nw={nw:<2} {layout:<10} {case:<12} {:>6.1} instr/group written, {:>6.1} read",
+                written as f64 / GROUPS as f64,
+                walked as f64 / GROUPS as f64
             );
         }
     }

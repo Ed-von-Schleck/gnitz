@@ -58,7 +58,7 @@ pub(super) fn table_cols() -> [CatalogColumn; 2] {
 }
 
 /// A fresh catalog holding `public.t` over [`table_cols`]; its id.
-fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
+pub(super) fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
     let dir = crate::test_support::scratch_dir("worker", name);
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let tid = engine.create_table("public.t", &table_cols(), &[0]).unwrap();
@@ -108,7 +108,7 @@ pub(super) fn probe<'a>(tid: u64, keys: &'a (Vec<u8>, Batch), request_id: u32, l
 
 /// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
 /// `request_id`.
-fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> DirectGroup<'a> {
+pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> DirectGroup<'a> {
     let targets = GroupTargets { request_id, ..GroupTargets::UNADDRESSED };
     DirectGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
 }
@@ -117,7 +117,7 @@ fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> Dir
 /// bytes.
 pub(super) struct Frame {
     req: u32,
-    ctrl: DecodedControl,
+    pub(super) ctrl: DecodedControl,
     bytes: Vec<u8>,
 }
 
@@ -286,11 +286,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 
     let tick = Apply::Tick {
         first_round: 7,
-        tids: [500u64, 501]
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect::<Vec<u8>>()
-            .into(),
+        tids: vec![500, 501].into(),
     };
     sal.excl().write(&addressed(tick, 9, false)).expect("group fits");
     wp.drain_sal();

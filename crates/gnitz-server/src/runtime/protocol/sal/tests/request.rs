@@ -20,11 +20,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Apply::Push { tid: 15 }.into(),
         Apply::Tick {
             first_round: 16,
-            tids: [17u64, 18]
-                .iter()
-                .flat_map(|t| t.to_le_bytes())
-                .collect::<Vec<u8>>()
-                .into(),
+            tids: vec![17, 18].into(),
         }
         .into(),
         Read::HasPk { tid: 19, probe: Probe::Pk }.into(),

@@ -1,172 +1,129 @@
-use super::tests::addressed;
-use super::tests::frames;
-use super::tests::pk_keys;
-use super::tests::probe;
-use super::tests::table_cols;
-use super::tests::worker_over;
+use super::tests::{addressed, engine_with_table, frames, pk_keys, probe, push, table_cols, worker_over};
 use super::*;
-use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
-use crate::runtime::w2m::W2mReceiver;
-use crate::test_support::make_batch_raw;
+use crate::runtime::sal::SalExcl;
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view};
 use gnitz_expr::SchemaFacts;
-use gnitz_wire::PkColList;
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_foundation::perf::Counter;
+use gnitz_store::relation::IndexClaim;
+use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
 
-/// [`test_worker`] over a SAL and a ring that hold a whole bench arm.
-fn bench_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
-    worker_over(catalog, 1 << 26, 32 << 20)
+/// Requests an arm writes, unless it says otherwise.
+const REQUESTS: u32 = 10_000;
+
+/// Rows the table of a read arm holds.
+const HELD: u64 = 1024;
+
+/// One arm: a table `prepare` dresses and `held` rows are then ingested into,
+/// `requests` groups on the SAL, each written by `request` from the table's id, its schema
+/// record and the group's request id, and `drain_sal` until nothing is owed.
+/// The worker must answer in `frames` frames, none a fault, and leave the table
+/// at net weight `holds`.
+fn arm(
+    label: &str,
+    held: u64,
+    prepare: impl FnOnce(&mut CatalogEngine, u64),
+    requests: u32,
+    request: impl Fn(&SalExcl, u64, &[u8], u32) -> Result<(), WireFault>,
+    frames_owed: usize,
+    holds: u64,
+) {
+    let (mut engine, tid) = engine_with_table(&format!("request_bench_{label}"));
+    prepare(&mut engine, tid);
+    let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
+    let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
+    engine.registry.ingest(tid, batch).unwrap();
+    let record = engine.schema_record(tid).expect("a registered table");
+    let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
+    let excl = sal.excl();
+    for id in 1..=requests {
+        request(&excl, tid, &record, id).expect("group fits");
+    }
+    let ((), instructions) = Counter::instructions().measure(|| loop {
+        wp.drain_sal();
+        if wp.replies.is_empty() {
+            break;
+        }
+    });
+    let sent = frames(&rx);
+    assert_eq!(sent.len(), frames_owed, "{label}");
+    assert!(sent.iter().all(|f| f.ctrl.hdr.status == WireStatus::Ok), "{label}");
+    assert_eq!(net_weight(wp.catalog, tid), holds as i64, "{label}");
+    println!(
+        "worker_request_bench {label:<11} {:>9.1} instr/frame",
+        instructions as f64 / frames_owed as f64
+    );
+    drop(wp);
+    let dir = engine.registry.base_dir().to_owned();
+    drop(engine);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Writes a bench arm's groups to the SAL: its table's schema record, schema and id.
-type WriteGroups<'a> = &'a dyn Fn(&TestLog, &[u8], &SchemaDescriptor, u64);
-
-/// Groups each arm of [`worker_request_bench`] writes.
-const BENCH_GROUPS: u64 = 10_000;
-
-/// Rows a chunk of the bench's span train holds.
-const BENCH_CHUNK_ROWS: u64 = 1024;
-
-/// The worker's own request path, in instructions per request: a group read off
-/// the SAL, decoded, applied or answered, and its reply on the ring.
+/// The worker's own request path, in instructions per reply frame: a group read
+/// off the SAL, decoded, applied or answered, and its reply on the ring. Every
+/// arm but `key_spans` answers a request in one frame.
+///
+/// `ack` is a push that carries no rows, the floor under the others. `tick` runs
+/// one identity view over an empty delta. The `spans` arms are one train over
+/// the table's second column, a chunk of spans per frame: sorted out of the
+/// table's rows, and read off an index of that column.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn worker_request_bench() {
-    use gnitz_store::relation::IndexClaim;
-    use gnitz_wire::{PkKeys, ReadBound, ReadSpec};
-    use std::hint::black_box;
+    const CHUNK_ROWS: usize = 1024;
+    const CHUNKS: usize = 64;
 
-    let counter = gnitz_foundation::perf::Counter::instructions();
-    let cols = table_cols();
+    let schema = make_schema_u64_i64();
+    let n = REQUESTS as usize;
+    let bare = |_: &mut CatalogEngine, _: u64| ();
 
-    // One arm: a fresh table of `rows` rows, the groups `write` puts on the SAL,
-    // and `drain_sal` until nothing is owed. `per` is what the count is divided by.
-    let arm = |label: &str, rows: u64, index: bool, write: WriteGroups, per: &dyn Fn(usize) -> (u64, &'static str)| {
-        if std::env::var("GNITZ_BENCH_ARM").is_ok_and(|only| only != label) {
-            return;
-        }
-        let dir = crate::test_support::scratch_dir("worker", &format!("request_bench_{label}"));
-        let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-        let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-        let schema = engine.registry.relation(tid).unwrap().schema();
-        engine.registry.set_scan_chunk_rows(BENCH_CHUNK_ROWS as usize);
-        if index {
-            let claim = IndexClaim::Index { id: tid + 1, unique: false };
-            engine
-                .registry
-                .add_index(tid, claim, PkColList::from_slice(&[1]))
-                .unwrap();
-        }
-        if rows > 0 {
-            let held: Vec<_> = (0..rows).map(|i| (i, 1, i as i64)).collect();
-            engine.registry.ingest(tid, make_batch_raw(&schema, &held)).unwrap();
-        }
-        let record = engine.schema_record(tid).expect("a registered table");
-        let (mut wp, sal, rx) = bench_worker(&mut engine);
-        write(&sal, &record, &schema, tid);
-        let ((), instructions) = counter.measure(|| loop {
-            wp.drain_sal();
-            if wp.replies.is_empty() {
-                break;
-            }
-        });
-        let sent = frames(&rx).len();
-        black_box(&wp);
-        let (n, unit) = per(sent);
-        println!(
-            "worker_request_bench {label:<14} {:>9.1} instr/{unit}  ({sent} frames)",
-            instructions as f64 / n as f64
-        );
-        drop(wp);
-        engine.close();
-        let _ = std::fs::remove_dir_all(&dir);
+    let ack = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid }, id, false));
+    arm("ack", 0, bare, REQUESTS, ack, n, 0);
+
+    let one_row = |excl: &SalExcl, tid, record: &[u8], id: u32| {
+        let row = make_batch_raw(&schema, &[(id as u64, 1, id as i64)]);
+        excl.write(&push(tid, record, &row, id))
     };
-    let per_group = |_: usize| (BENCH_GROUPS, "request");
+    arm("push", 0, bare, REQUESTS, one_row, n, REQUESTS as u64);
 
-    arm(
-        "push",
-        0,
-        false,
-        &|sal, record, schema, tid| {
-            let excl = sal.excl();
-            for i in 0..BENCH_GROUPS {
-                let row = make_batch_raw(schema, &[(i, 1, i as i64)]);
-                let targets = GroupTargets {
-                    request_id: i as u32 + 1,
-                    ..GroupTargets::UNADDRESSED
-                };
-                excl.write(&DirectGroup::push(
-                    tid,
-                    record,
-                    GroupData::Same(row.wire_whole()),
-                    targets,
-                ))
-                .expect("group fits");
-            }
-        },
-        &per_group,
-    );
-    for (label, cut) in [("has_pk", 1), ("has_pk_cut2", 2)] {
-        arm(
-            label,
-            1024,
-            false,
-            &|sal, _, _, tid| {
-                let excl = sal.excl();
-                for i in 0..BENCH_GROUPS {
-                    excl.write(&probe(tid, &pk_keys(&[i % 1024]), i as u32 + 1, i % cut != 0))
-                        .expect("group fits");
-                }
-            },
-            &per_group,
-        );
-    }
-    arm(
-        "scan_spec",
-        1024,
-        false,
-        &|sal, _, schema, tid| {
-            let excl = sal.excl();
-            for i in 0..BENCH_GROUPS {
-                let key = (i % 1024).to_be_bytes();
-                let spec = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]]))).encode();
-                let read = Read::ScanSpec {
-                    tid,
-                    reply_layout: schema.layout_digest(),
-                    spec: spec.into(),
-                };
-                excl.write(&addressed(read, i as u32 + 1, false)).expect("group fits");
-            }
-        },
-        &per_group,
-    );
-    arm(
-        "tick",
-        0,
-        false,
-        &|sal, _, _, tid| {
-            let excl = sal.excl();
-            for i in 0..BENCH_GROUPS {
-                let tick = Apply::Tick {
-                    first_round: i + 2,
-                    tids: tid.to_le_bytes().to_vec().into(),
-                };
-                excl.write(&addressed(tick, i as u32 + 1, false)).expect("group fits");
-            }
-        },
-        &per_group,
-    );
-    // One train over an indexed table of 64 chunks, per frame.
-    arm(
-        "key_spans",
-        64 * BENCH_CHUNK_ROWS,
-        true,
-        &|sal, _, _, tid| {
-            let cols = PkColList::from_slice(&[1]);
-            sal.excl()
-                .write(&addressed(Read::KeySpans { tid, cols }, 1, false))
-                .expect("group fits");
-        },
-        &|frames| (frames as u64, "frame"),
-    );
+    let has_pk =
+        |excl: &SalExcl, tid, _: &[u8], id: u32| excl.write(&probe(tid, &pk_keys(&[id as u64 % HELD]), id, false));
+    arm("has_pk", HELD, bare, REQUESTS, has_pk, n, HELD);
+
+    let scan = |excl: &SalExcl, tid, _: &[u8], id: u32| {
+        let key = (id as u64 % HELD).to_be_bytes();
+        let read = Read::ScanSpec {
+            tid,
+            reply_layout: schema.layout_digest(),
+            spec: ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]])))
+                .encode()
+                .into(),
+        };
+        excl.write(&addressed(read, id, false))
+    };
+    arm("scan_spec", HELD, bare, REQUESTS, scan, n, HELD);
+
+    let viewed = |engine: &mut CatalogEngine, tid| {
+        register_identity_view(engine, tid, "v", &table_cols());
+    };
+    let tick = |excl: &SalExcl, tid, _: &[u8], id: u32| {
+        let tick = Apply::Tick {
+            first_round: id as u64 + 1,
+            tids: vec![tid].into(),
+        };
+        excl.write(&addressed(tick, id, false))
+    };
+    arm("tick", 0, viewed, REQUESTS, tick, n, 0);
+
+    let cols = PkColList::from_slice(&[1]);
+    let chunked = |engine: &mut CatalogEngine, _| engine.registry.set_scan_chunk_rows(CHUNK_ROWS);
+    let indexed = |engine: &mut CatalogEngine, tid| {
+        chunked(engine, tid);
+        let claim = IndexClaim::Index { id: tid + 1, unique: false };
+        engine.registry.add_index(tid, claim, cols).unwrap();
+    };
+    let spans = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols }, id, false));
+    let held = (CHUNKS * CHUNK_ROWS) as u64;
+    // A frame per chunk, then the train's end.
+    arm("spans_sort", held, chunked, 1, spans, CHUNKS + 1, held);
+    arm("spans_index", held, indexed, 1, spans, CHUNKS + 1, held);
 }
