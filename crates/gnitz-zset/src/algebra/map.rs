@@ -327,12 +327,6 @@ impl MapPlan {
         matches!(self.pk_source, PkSource::Inherit) && self.ev.is_identity()
     }
 
-    /// Map every `[start, end)` range of `src`, in order, onto `keeper`'s tail;
-    /// `keeper` is in this plan's output schema.
-    pub(crate) fn append_map_ranges(&mut self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
-        self.map_ranges_into(src, keeper, ranges);
-    }
-
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
     /// NULL-keyed rows, into a fresh unconsolidated output.
     pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
@@ -352,13 +346,14 @@ impl MapPlan {
         // Uninitialized: `validate` makes every map write every payload slot,
         // and the calls below cover the PK, weight and null regions.
         let mut output = Batch::with_capacity(&self.out_schema, n);
-        self.map_ranges_into(in_batch, &mut output, ranges);
+        self.append_map_ranges(in_batch, &mut output, ranges);
         output
     }
 
-    /// Map `ranges` of `src` onto `out`'s tail, window by window. Ranges too
-    /// short to feed the per-window kernel are gathered into one first.
-    fn map_ranges_into(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+    /// Map every `[start, end)` range of `src`, in order, onto the tail of `out`,
+    /// which is in this plan's output schema. Ranges too short to feed the
+    /// per-window kernel are gathered into one first.
+    pub(crate) fn append_map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
         let total = crate::repr::range_rows(ranges);
         if total == 0 {
             return;
@@ -425,7 +420,7 @@ impl MapPlan {
                 let pk = &mut output.pk_mut()[dst_base * stride..];
                 packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), &[(src_start, src_start + n)]);
             }
-            // Hashes the finished output row, so `map_ranges_into` stamps it
+            // Hashes the finished output row, so `append_map_ranges` stamps it
             // once every window's payload is written.
             PkSource::HashRow(_) => {}
         }

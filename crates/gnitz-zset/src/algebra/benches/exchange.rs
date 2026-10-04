@@ -1,13 +1,12 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{Placement, SchemaColumn, TypeCode};
-use crate::test_support::{make_schema_u64_i64, pk_u64_two_i64_schema};
+use crate::schema::{ColumnTable, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::test_support::{make_schema_u64_i64, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
 use std::hint::black_box;
 
 /// `n` rows, none NULL, over a U64-PK-columns, all-I64-payload `schema`, the last PK column
 /// `0..n`, every other column a spread function of it.
 fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
-    use crate::schema::ColumnTable;
     let mut b = BatchBuilder::new(schema);
     let lead = schema.pk_cols().len() as u64 - 1;
     for pk in 0..n as u64 {
@@ -25,46 +24,41 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
 }
 
 /// Instructions per [`ScatterPlan::route`] call, and per row, for each routing
-/// kernel: on small deltas, where the per-call fixed cost a round adds shows, and
-/// at 1M rows.
+/// kernel: on a one-row delta, where the per-call fixed cost a round adds shows,
+/// and at 1M rows.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn exchange_route_bench() {
     let instructions = gnitz_foundation::perf::Counter::instructions();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
-    let wide = crate::test_support::wide_pk_3xu64_schema();
-    let nullable = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let wide = pk_payload_schema(&[TypeCode::U64; 3]);
+    let nullable = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let mut three = vec![SchemaColumn::new(TypeCode::I64, false); 4];
+    three[0] = SchemaColumn::new(TypeCode::U64, false);
+    let three = SchemaDescriptor::new(&three, &[0]);
     let prefix = |n: u8| Ok(ScatterPlan::native(Placement::Keyed { dist_stride: n }));
-    for (name, schema, plan) in [
-        ("pk", &one, ScatterPlan::group(&one, &[0])),
-        ("prefix 3", &wide, prefix(3)),
-        ("prefix 5", &wide, prefix(5)),
-        ("prefix 12", &wide, prefix(12)),
-        ("prefix 16", &wide, prefix(16)),
-        ("pk column in a 24-byte pk", &wide, ScatterPlan::group(&wide, &[1])),
-        ("image", &one, ScatterPlan::group(&one, &[1])),
-        (
-            "packed",
-            &two,
-            ScatterPlan::join(&two, &[(1, TypeCode::I64), (2, TypeCode::I64)]),
-        ),
-        ("packed group", &two, ScatterPlan::group(&two, &[1, 2])),
-        ("pk prefix group", &wide, ScatterPlan::group(&wide, &[0, 1])),
+    for (name, schema, plan, workers) in [
+        ("pk", &one, ScatterPlan::group(&one, &[0]), 4),
+        ("prefix 3", &wide, prefix(3), 4),
+        ("prefix 12", &wide, prefix(12), 4),
+        ("prefix 16", &wide, prefix(16), 4),
+        ("pk column in a 24-byte pk", &wide, ScatterPlan::group(&wide, &[1]), 4),
         (
             "pk range past the start",
             &wide,
             ScatterPlan::join(&wide, &[(1, TypeCode::U64), (2, TypeCode::U64)]),
+            4,
         ),
-        ("nullable column group", &nullable, ScatterPlan::group(&nullable, &[1])),
+        ("whole 24-byte pk", &wide, ScatterPlan::group(&wide, &[0, 1, 2]), 4),
+        ("image", &one, ScatterPlan::group(&one, &[1]), 4),
+        ("packed", &two, ScatterPlan::group(&two, &[1, 2]), 4),
+        ("packed nullable", &nullable, ScatterPlan::group(&nullable, &[1]), 4),
+        ("fold", &three, ScatterPlan::group(&three, &[1, 2, 3]), 4),
+        // Reads no key, whatever the plan.
+        ("one worker", &one, ScatterPlan::group(&one, &[0]), 1),
     ] {
         let plan = plan.unwrap();
-        for (n, workers, iters) in [
-            (1, 4, 10_000),
-            (64, 16, 10_000),
-            (1024, 16, 10_000),
-            (1_000_000, 4, 20),
-            (1_000_000, 1, 20),
-        ] {
+        for (n, iters) in [(1, 10_000), (1_000_000, 20)] {
             let batch = bench_stripe(schema, n);
             let mut pool = Vec::new();
             let routed: usize = plan.route(&batch, &mut pool, workers).iter().map(Vec::len).sum();
@@ -75,7 +69,7 @@ fn exchange_route_bench() {
                 }
             });
             println!(
-                "{name}: {n} rows -> {workers} workers: {} instructions per call, {:.1} per row",
+                "exchange_route_bench {name:<26} {n:>7} rows -> {workers} workers: {:>9} instr/call, {:>7.1} instr/row",
                 i / iters,
                 i as f64 / (iters as usize * n) as f64
             );

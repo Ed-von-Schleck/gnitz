@@ -1,19 +1,18 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{index_spec_and_schema, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::test_support::pk_payload_schema;
+use gnitz_foundation::perf::Counter;
+use std::hint::black_box;
 
-/// Release-only microbench for `pack_rows` in `KEY_CHUNK`-row chunks, as
-/// `for_each_key` runs it, over join- and group-key shapes.
-/// `REINDEX_PACK=<name>` times one shape alone, for `perf stat`.
+const N: usize = 500_000;
+
+/// Instructions per row of [`ReindexPacker::for_each_key`], over join- and
+/// group-key shapes.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reindex_pack_bench() {
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    const N: usize = 1_000_000;
-    const ITERS: usize = 20;
-
+    let counter = Counter::instructions();
     let join_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -36,22 +35,24 @@ fn reindex_pack_bench() {
         jb.end_row();
     }
     let jb = jb.finish();
-    let jmb = jb.as_mem_batch();
     let join3 = ReindexPacker::new(
         &join_schema,
         &[(1, TypeCode::U64), (2, TypeCode::U64), (3, TypeCode::U64)],
     )
     .unwrap();
-    assert_eq!(join3.out_stride, 24);
     let promoted = ReindexPacker::new(&join_schema, &[(4, TypeCode::I64)]).unwrap();
     let string = ReindexPacker::new(&join_schema, &[(5, TypeCode::U128)]).unwrap();
 
-    // --- Nullable 2-column group key: [U64 PK, I64, U32 NULL], group on (1, 2).
+    // Group keys over [U64 PK, I64, U32 NULL, I64, I64, I64]: (1, 2) packs under a
+    // bitmap, and all five overflow the PK column budget into a fold slot.
     let grp_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::U32, true),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -59,56 +60,68 @@ fn reindex_pack_bench() {
     for i in 0..N as u64 {
         gb.begin_row(i as u128, 1);
         gb.put_int((i as i64).wrapping_mul(-7) as u128);
-        // Every 8th row is NULL in the nullable group column.
-        match i % 8 {
-            0 => gb.put_null(),
-            _ => gb.put_int(i as u32 as u128),
-        }
+        gb.put_opt_int((i % 8 != 0).then_some(i as u32 as u128));
+        gb.put_int(i.wrapping_mul(2_654_435_761) as u128);
+        gb.put_int((!i) as u128);
+        gb.put_int(i as u128);
         gb.end_row();
     }
     let gb = gb.finish();
-    let gmb = gb.as_mem_batch();
-    let group2 = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[])
-        .expect("integer group columns")
-        .0;
+    let group = |cols: &[u32]| ReindexPacker::new_group_key(&grp_schema, cols, &[]).unwrap().0;
+    let (group2, group5) = (group(&[1, 2]), group(&[1, 2, 3, 4, 5]));
+    assert!(group2.packs_whole() && !group5.packs_whole());
 
-    for (name, packer, mb) in [
-        ("join3", &join3, &jmb),
-        ("promoted-i32", &promoted, &jmb),
-        ("string", &string, &jmb),
-        ("group2-nullable", &group2, &gmb),
+    for (name, packer, batch) in [
+        ("join3", &join3, &jb),
+        ("promoted-i32", &promoted, &jb),
+        ("string", &string, &jb),
+        ("group2-nullable", &group2, &gb),
+        ("group5-fold", &group5, &gb),
     ] {
-        if std::env::var("REINDEX_PACK").is_ok_and(|o| o != name) {
-            continue;
-        }
-        let stride = packer.out_stride;
-        let mut buf = vec![0u8; KEY_CHUNK * stride];
-        // Warm up.
-        packer.pack_rows(&mut buf, stride, mb, &[(0, KEY_CHUNK)]);
-
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for _ in 0..ITERS {
-            for start in (0..N).step_by(KEY_CHUNK) {
-                let n = (N - start).min(KEY_CHUNK);
-                packer.pack_rows(&mut buf, stride, mb, &[(start, start + n)]);
-                acc = acc.wrapping_add(black_box(buf[0]) as u64);
-            }
-        }
-        let secs = t.elapsed().as_secs_f64();
+        let mb = &batch.as_mem_batch();
+        let pack = || {
+            packer.for_each_key(mb, packer.out_stride, |_, key| {
+                black_box(key);
+            })
+        };
+        pack();
+        let ((), instructions) = counter.measure(pack);
         println!(
-            "reindex_pack_bench[{name}]: {:.1} Mrows/s ({N} rows x {ITERS} iters in {secs:.3}s, stride {stride}, checksum {acc})",
-            (N * ITERS) as f64 / secs / 1e6,
+            "reindex_pack_bench {name:<16} {:6.1} instr/row (stride {})",
+            instructions as f64 / N as f64,
+            packer.out_stride
         );
     }
 }
 
-/// Instructions per input row of `append_spans`, by span shape and NULL density.
+/// Instructions per input row of a secondary index's projection — the span
+/// alone ([`append_spans`]) and the whole entry ([`index_entries`]) — by span
+/// shape, NULL density of the indexed columns, and width of the source PK the
+/// entry ends in.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn append_spans_bench() {
-    const N: usize = 500_000;
-    let counter = gnitz_foundation::perf::Counter::instructions();
+fn index_entries_bench() {
+    let counter = Counter::instructions();
+    let measure = |label: &str, batch: &Batch, cols: &[u32]| {
+        let (spec, idx_schema) = index_spec_and_schema(cols, batch.schema()).unwrap();
+        let mb = batch.as_mem_batch();
+        let slot = spec.key_size().next_multiple_of(8);
+        let mut spans = Vec::with_capacity(N * slot);
+        append_spans(&mut spans, slot, &mb, &spec, |_| true);
+        spans.clear();
+        let ((), span) = counter.measure(|| append_spans(&mut spans, slot, &mb, &spec, |_| true));
+        black_box(&spans);
+        black_box(index_entries(batch, &spec, &idx_schema));
+        let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
+        println!(
+            "index_entries_bench {label:<40} spans {:5.1}, entries {:5.1} instr/row ({} entries)",
+            span as f64 / N as f64,
+            entry as f64 / N as f64,
+            entries.len()
+        );
+    };
+    let spread = |row: usize| (row as u64).wrapping_mul(2_654_435_761);
+
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -120,34 +133,33 @@ fn append_spans_bench() {
     for null_every in [0usize, 8, 2] {
         let mut b = BatchBuilder::new(&schema);
         for row in 0..N {
+            let live = null_every == 0 || row % null_every != 0;
             b.begin_row(row as u128, 1);
-            let v = (row as u64).wrapping_mul(2_654_435_761);
-            match null_every != 0 && row % null_every == 0 {
-                true => (b.put_null(), b.put_null()),
-                false => (b.put_int(v as i64 as u128), b.put_int(v as u32 as u128)),
-            };
+            b.put_opt_int(live.then(|| spread(row) as i64 as u128));
+            b.put_opt_int(live.then(|| spread(row) as u32 as u128));
             b.end_row();
         }
         let batch = b.finish();
-        let mb = batch.as_mem_batch();
-        for (label, cols) in [
-            ("U64 PK", &[0u32][..]),
-            ("I64 payload", &[1]),
-            ("compound (PK, I64)", &[0, 1]),
+        for (shape, cols) in [
+            ("I64 payload", &[1u32][..]),
             ("U32 payload, 8-byte slot", &[2]),
+            ("compound (PK, I64)", &[0, 1]),
+            // No indexed column is nullable, so one density is every density.
+            ("U64 PK", &[0]),
         ] {
-            let spec = KeySpec::new(cols, &schema).unwrap();
-            let slot = spec.key_size().next_multiple_of(8);
-            let mut spans = Vec::with_capacity(N * slot);
-            append_spans(&mut spans, slot, &mb, &spec, |_| true);
-            spans.clear();
-            let ((), instructions) = counter.measure(|| append_spans(&mut spans, slot, &mb, &spec, |_| true));
-            std::hint::black_box(&spans);
-            println!(
-                "append_spans_bench null_every={null_every} {label:<26} {:6.1} instr/row ({} spans)",
-                instructions as f64 / N as f64,
-                spans.len() / slot
-            );
+            if cols == [0] && null_every != 0 {
+                continue;
+            }
+            measure(&format!("{shape}, NULL every {null_every}"), &batch, cols);
         }
     }
+
+    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+    let mut b = BatchBuilder::new(&wide);
+    for row in 0..N {
+        b.begin_row_natives(&[(row >> 8) as u128, row as u128], 1);
+        b.put_int(spread(row) as i64 as u128);
+        b.end_row();
+    }
+    measure("I64 payload, 16-byte source PK", &b.finish(), &[2]);
 }

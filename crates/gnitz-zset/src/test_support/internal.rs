@@ -190,12 +190,6 @@ pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
     u64_pk_schema(SchemaColumn::new(TypeCode::Blob, false))
 }
 
-/// The canonical wide-PK test schema: a 3×U64 compound primary key
-/// (`pk_stride = 24`, wide) with a single I64 payload column.
-pub(crate) fn wide_pk_3xu64_schema() -> SchemaDescriptor {
-    pk_payload_schema(&[TypeCode::U64; 3])
-}
-
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {
