@@ -8,7 +8,6 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use super::*;
-use gnitz_core::IdRun;
 use gnitz_foundation::posix_io::set_sockopt_int;
 
 /// `(client, schema_name, table_id, schema)` for a fresh `(pk BIGINT, a
@@ -43,7 +42,7 @@ fn evicted_within(s: &mut Session, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if s.submit(Request::Alloc(IdRun::Ids(1))).is_err() || !write_out(s) {
+        if s.submit(Request::AllocIds(1)).is_err() || !write_out(s) {
             return true;
         }
     }

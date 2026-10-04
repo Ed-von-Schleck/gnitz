@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use gnitz_core::{BatchAppender, ClientError, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES};
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::control::{append_frame, peek_control_block, ControlHeader};
-use gnitz_wire::{frame_len_prefix, ColumnDef, ReadBound, ReadSpec, TypeCode, FRAME_LEN_PREFIX_BYTES};
+use gnitz_wire::{
+    frame_len_prefix, ColumnDef, ReadBound, ReadSpec, TypeCode, WireConflictMode, FRAME_LEN_PREFIX_BYTES,
+};
 use support::{settled, PATIENCE};
 use tokio::runtime::Runtime;
 
@@ -165,7 +167,9 @@ fn past_a_cap_a_verb_waits() {
         let schema = schema();
         let batch = batch(&schema, rows);
         let pushes = pushes as u64;
-        let verbs: Vec<_> = (1..=pushes).map(|tid| client.push(tid, &schema, &batch)).collect();
+        let verbs: Vec<_> = (1..=pushes)
+            .map(|tid| client.push(tid, &schema, &batch, WireConflictMode::Update))
+            .collect();
         // As many as may be in flight arrive and go unanswered, which is what
         // holds the rest back; they follow as the answers free slots.
         let held = pushes.min(MAX_IN_FLIGHT as u64);
@@ -195,7 +199,7 @@ fn a_refused_verb_reaches_no_wire() {
     let schema = schema();
     let mut keyless = ZSetBatch::new(&schema);
     keyless.weights.push(1);
-    let refused = settled(&rt, client.push(1, &schema, &keyless));
+    let refused = settled(&rt, client.push(1, &schema, &keyless, WireConflictMode::Update));
     assert!(matches!(refused, Err(ClientError::Refused(_))), "{refused:?}");
 
     let next = scan(&client, 2);
@@ -309,7 +313,7 @@ fn a_waiting_driver_is_not_polled() {
     // To a peer that reads no further than the length prefix: the socket takes
     // what it buffers and refuses the rest.
     let schema = schema();
-    let stuck = client.push(3, &schema, &batch(&schema, BIG));
+    let stuck = client.push(3, &schema, &batch(&schema, BIG), WireConflictMode::Update);
     let len = read_len(&mut peer);
     assert_waiting("bytes the socket refused");
     assert!(unread(&peer, len) < len, "the socket took the whole push");

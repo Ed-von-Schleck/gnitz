@@ -63,6 +63,7 @@ fn transaction_control_refuses_what_it_cannot_honour() {
         ("CREATE VIEW v AS SELECT id FROM t", "not allowed inside a transaction"),
         ("CREATE INDEX ON t (v)", "not allowed inside a transaction"),
         ("DROP TABLE t", "not allowed inside a transaction"),
+        ("SHOW TABLES", "unsupported SQL statement"),
     ]) {
         db.refuses(sql, Rejected, needle);
         assert!(db.client.txn_active(), "`{sql}` closed the transaction");

@@ -131,11 +131,11 @@ async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
 @pytest.mark.asyncio
 async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn, table):
     """A refused request leaves the connection usable, whether it is a lone
-    request the server refuses whole (an empty `scan_many`, whose one error frame
-    answers a request with no position to fill) or one refused inside a gathered
-    group — where the good pushes must not swallow the bad one."""
-    with pytest.raises(gnitz.GnitzRefusedError, match="empty item list"):
-        await aconn.scan_many([])
+    request the server refuses whole (a `scan_many` past the item cap, whose one
+    error frame answers a request with every position unfilled) or one refused
+    inside a gathered group — where the good pushes must not swallow the bad one."""
+    with pytest.raises(gnitz.GnitzRefusedError, match="too many items"):
+        await aconn.scan_many([(table, KV)] * 1000)
 
     bad = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzNotFoundError):

@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 
 use gnitz_core::{
     qualified_name, ClientError, Encoded, GnitzClient, Interest, RelDescriptor, Reply, Request, ScanReply, Schema,
-    Session, SlotId, ZSetBatch,
+    Session, SlotId, Target, ZSetBatch,
 };
 use gnitz_wire::{ReadSpec, WireConflictMode};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
@@ -109,25 +109,26 @@ impl AsyncClient {
     }
 
     /// Push a batch and resolve to its ingest LSN.
-    pub fn push(&self, tid: u64, schema: &Schema, batch: &ZSetBatch) -> impl Future<Output = Result<u64, ClientError>> {
-        let mode = WireConflictMode::Update;
-        self.call(
-            Request::Push { target: tid.into(), schema, batch, mode },
-            Reply::into_ack,
-        )
+    pub fn push(
+        &self,
+        target: impl Into<Target>,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        mode: WireConflictMode,
+    ) -> impl Future<Output = Result<u64, ClientError>> {
+        let target = target.into();
+        self.call(Request::Push { target, schema, batch, mode }, Reply::into_ack)
     }
 
-    /// Read `tid` under `spec`, replied in `reply_schema`'s layout.
+    /// Read `target` under `spec`, replied in `reply_schema`'s layout.
     pub fn scan_spec(
         &self,
-        tid: u64,
+        target: impl Into<Target>,
         spec: &ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> impl Future<Output = Result<ScanReply, ClientError>> {
-        self.call(
-            Request::ScanSpec { target: tid.into(), spec, reply_schema },
-            Reply::into_scan,
-        )
+        let target = target.into();
+        self.call(Request::ScanSpec { target, spec, reply_schema }, Reply::into_scan)
     }
 
     /// Snapshot N relations at one server-side SAL cut, in request order, each
@@ -170,21 +171,22 @@ impl BlockingClient {
     }
 
     /// [`AsyncClient::scan_spec`] on `driver`, answered off this client's copy
-    /// instead when it holds `tid`. It waits for this client first, so it
+    /// instead when it holds `target`. It waits for this client first, so it
     /// submits when polled, not when called.
     pub async fn scan_spec_local_first(
         &self,
         driver: &AsyncClient,
-        tid: u64,
+        target: impl Into<Target>,
         spec: ReadSpec,
         reply_schema: Arc<Schema>,
     ) -> Result<ScanReply, ClientError> {
+        let target = target.into();
         let mut client = Arc::clone(&self.0).lock_owned().await;
-        if !client.mirrors(tid) {
+        if !client.mirrors(target.tid) {
             drop(client);
-            return driver.scan_spec(tid, &spec, &reply_schema).await;
+            return driver.scan_spec(target, &spec, &reply_schema).await;
         }
-        blocking(move || client.scan_spec_local_first(tid, spec, &reply_schema)).await?
+        blocking(move || client.scan_spec_local_first(target, spec, &reply_schema)).await?
     }
 }
 

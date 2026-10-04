@@ -84,7 +84,12 @@ fn pipelined_verbs() {
             let rounds: Vec<_> = (0..n)
                 .map(|i| {
                     (
-                        client.push(tid, &schema, &rows(&schema, i * per..(i + 1) * per)),
+                        client.push(
+                            tid,
+                            &schema,
+                            &rows(&schema, i * per..(i + 1) * per),
+                            WireConflictMode::Update,
+                        ),
                         client.scan_spec(tid, &all_rows(), &schema),
                     )
                 })
@@ -104,7 +109,7 @@ fn pipelined_verbs() {
             BatchAppender::new(&mut replaced).add_row(7, 1).i64_val(-1);
             let key = PkColumn::from_natives(&schema, [7]);
             let (_, one, many, found, missing) = tokio::join!(
-                client.push(tid, &schema, &replaced),
+                client.push(tid, &schema, &replaced, WireConflictMode::Update),
                 client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
                 client.scan_many(vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))]),
                 client.resolve(&sn, "t"),
@@ -151,7 +156,7 @@ fn syscall_count_child() {
     settled(&rt, async {
         let (client, conn) = gnitz_tokio::connect(&target).await.unwrap();
         let pushes: Vec<_> = (0..BURST)
-            .map(|pk| client.push(tid, &schema, &rows(&schema, pk..pk + 1)))
+            .map(|pk| client.push(tid, &schema, &rows(&schema, pk..pk + 1), WireConflictMode::Update))
             .collect();
         // The last handle goes, which is what lets the driver finish.
         drop(client);

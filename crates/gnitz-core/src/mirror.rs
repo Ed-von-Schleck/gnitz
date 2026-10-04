@@ -30,14 +30,13 @@
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::Arc;
 
-use crate::client::{delta_read_blocks, park, GnitzClient};
-use crate::connection::{DeltaCursor, Encoded, Interest, Polled, RawBlock, RelDescriptor, SlotId};
+use crate::client::{delta_read_blocks, poll_deltas, GnitzClient};
+use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor};
 use crate::error::ClientError;
 use crate::{Schema, ZSetBatch};
-use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
+use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::RelClass;
 
 // ---------------------------------------------------------------------------
@@ -305,16 +304,6 @@ impl MirrorState {
 // calls through `MirrorStore` — which is also what makes it exist once for the
 // blocking, async and Python clients alike.
 
-/// A delta poll request the session has yet to finish.
-struct OpenPoll {
-    slot: SlotId,
-    /// The call's views it has yet to answer. A tail: the session answers a
-    /// request's views in order.
-    unanswered: Range<usize>,
-    /// The blocks of the position being answered, held until its terminal.
-    blocks: Vec<RawBlock>,
-}
-
 /// One poll's per-view outcomes, `(view id, that view's own result)`.
 type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
 
@@ -394,7 +383,7 @@ impl GnitzClient {
         let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
         let m = self.mirror_state()?;
         // The store's verdict, not a second scan: this map and the store's
-        // records must name the same displaced id, or `resolve_local_first`
+        // records must name the same displaced id, or `held`
         // picks one of two live entries out of a `HashMap`.
         if let Some(old) = retracted {
             m.views.remove(&old);
@@ -602,7 +591,7 @@ impl GnitzClient {
     /// The host's word for [`Invalidate::Registration`].
     pub fn forget_view(&mut self, table_id: u64) -> Result<(), ClientError> {
         // The client-side entry goes first: it is the read gate
-        // `resolve_local_first` consults. The store is asked whether or not
+        // `held` consults. The store is asked whether or not
         // there was one, because a reopened store holds copies this client has
         // not registered — and forgetting one is exactly the call that erases it.
         let m = self.mirror_state()?;
@@ -625,43 +614,18 @@ impl GnitzClient {
         let Some(mirror) = mirror.as_deref_mut() else {
             return Err(no_mirror_store());
         };
+        let items: Vec<DeltaPollItem> = views.iter().map(|&(_, item)| item).collect();
         let mut applied = Vec::with_capacity(views.len());
-        let mut open: Vec<OpenPoll> = Vec::new();
-        for (chunk_at, chunk) in views.chunks(DELTA_POLL_MAX_VIEWS).enumerate() {
-            let start = chunk_at * DELTA_POLL_MAX_VIEWS;
-            let batch: Vec<DeltaPollItem> = chunk.iter().map(|&(_, item)| item).collect();
-            let unanswered = start..start + chunk.len();
-            match Encoded::delta_poll(&batch).and_then(|poll| session.enqueue(poll)) {
-                Ok(slot) => open.push(OpenPoll { slot, unanswered, blocks: Vec::new() }),
-                // A request that never left answers every view it carried.
-                Err(e) => applied.extend(chunk.iter().map(|(_, item)| (item.view_id, Err(e.clone())))),
-            }
-        }
-
-        // The session ends every view exactly once, so the views' ends are the
-        // whole answer and the slots' own completions repeat them.
-        let mut ready = Interest::WRITE;
-        while applied.len() < views.len() {
-            // Addressed by slot, so a train an earlier call abandoned is
-            // recognised rather than matched onto a live view of the same id.
-            let mut sink = |slot: SlotId, polled: Polled| {
-                let Some(poll) = open.iter_mut().find(|p| p.slot == slot) else {
-                    return;
-                };
-                let end = match polled {
-                    Polled::Block(b) => return poll.blocks.push(b),
-                    Polled::End(end) => end,
-                };
-                let answered = poll.unanswered.next().expect("the session answers no position twice");
-                let (prev, DeltaPollItem { view_id: tid, .. }) = views[answered];
-                let blocks = std::mem::take(&mut poll.blocks);
+        // The blocks of the view being answered, held until its end.
+        let mut blocks = Vec::new();
+        poll_deltas(session, park_hook, &items, |i, polled| match polled {
+            Polled::Block(b) => blocks.push(b),
+            Polled::End(end) => {
+                let (prev, DeltaPollItem { view_id: tid, .. }) = views[i];
+                let blocks = std::mem::take(&mut blocks);
                 applied.push((tid, end.and_then(|at| mirror.advance_from(tid, prev, blocks, at))));
-            };
-            session.step_polling(ready, Some(&mut sink));
-            if applied.len() < views.len() {
-                ready = park(session, park_hook)?;
             }
-        }
+        })?;
         Ok(applied)
     }
 

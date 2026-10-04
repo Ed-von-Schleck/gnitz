@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_expr::payload_str;
+use gnitz_wire::control::Target;
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus};
 use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
@@ -108,7 +109,7 @@ impl CatalogEngine {
 
     /// Refuse a request built under `token` once `tid` answers a RESOLVE
     /// differently. `0` is a request built from no RESOLVE.
-    pub(crate) fn check_token(&self, tid: u64, token: u64) -> Result<(), WireFault> {
+    pub(crate) fn check_token(&self, Target { tid, token }: Target) -> Result<(), WireFault> {
         if token == 0 || self.resolve_token(tid) == Some(token) {
             return Ok(());
         }

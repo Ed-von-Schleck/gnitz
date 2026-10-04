@@ -1862,3 +1862,24 @@ fn child_target() -> Option<(String, String)> {
         std::env::var("GNITZ_MIRROR_DIR").ok()?,
     ))
 }
+
+/// A name whose copy answers reads is planned from the copy's descriptor, kept
+/// descriptor or not: the read and its EXPLAIN agree, and neither asks the
+/// server.
+#[test]
+fn a_mirrored_name_is_read_off_its_copy_whatever_is_kept() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let old = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
+    fx.quiesce();
+
+    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+    fed_view(&mut fx.direct, "s", "v_keyed", "SELECT a, b, v FROM t WHERE b = 3");
+    let new = fx.mirror().resolve_relation("s", "v_keyed").expect("resolve").tid;
+    assert_ne!(new, old, "the kept descriptor names the recreated view");
+
+    let (_, requests) = cost(fx.mirror(), |c| query(c, "s", "SELECT * FROM v_keyed"));
+    assert_eq!(requests, 0, "the copy answers the read");
+    let (_, plan) = query(fx.mirror(), "s", "EXPLAIN SELECT * FROM v_keyed");
+    assert!(String::from_utf8_lossy(&plan.blob).contains("local copy"));
+}

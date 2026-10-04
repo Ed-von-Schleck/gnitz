@@ -40,14 +40,11 @@ pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
         .zip(&schemas)
         .map(|(f, schema)| FrameItem {
             hdr: ControlHeader {
-                target_id: f.target.tid,
                 flags: WireFlags {
                     conflict_mode: f.mode,
                     ..Default::default()
                 },
-                arg0: f.basis,
-                arg1: f.target.token,
-                ..Default::default()
+                ..ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis)
             },
             schema: Some(schema),
             data: Some(f.batch.wire_regions()),

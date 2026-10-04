@@ -153,8 +153,8 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
 }
 
 /// A status frame completes the slot at the head as that status's refusal —
-/// whether it replaces a later train of a multi-read, answers a multi-read with
-/// no train at all, or answers a commit — and the connection keeps serving.
+/// whether it replaces a later train of a multi-read or answers a commit — and
+/// the connection keeps serving.
 #[test]
 fn a_status_frame_fails_its_slot_alone() {
     let sa = schema_a();
@@ -164,12 +164,6 @@ fn a_status_frame_fails_its_slot_alone() {
             Request::ScanMulti((1..=3).map(|tid| (tid, Arc::clone(&sa))).collect()),
             1,
             WireStatus::Error,
-        ),
-        (
-            "an empty multi-read",
-            Request::ScanMulti(Vec::new()),
-            0,
-            WireStatus::NotFound,
         ),
         ("a commit", COMMIT, 0, WireStatus::TxnConflict),
     ] {
@@ -217,6 +211,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         .f64_val(0.0);
     for (what, req) in [
         ("a DDL family that is no system table", Request::DdlTxn(&ddl)),
+        ("an empty multi-read", Request::ScanMulti(Vec::new())),
         (
             "a push whose batch is not in its schema's layout",
             Request::Push {

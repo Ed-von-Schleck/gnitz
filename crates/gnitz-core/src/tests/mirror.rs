@@ -9,6 +9,7 @@
 //! test see.
 
 use super::*;
+use crate::connection::Encoded;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{interrupt_self_until, kv_schema, reply_ctrl, reply_status, session_pair, Peer};

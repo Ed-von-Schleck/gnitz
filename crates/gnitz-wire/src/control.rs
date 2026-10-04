@@ -38,6 +38,39 @@ pub struct ControlHeader {
     pub arg1: u64,
 }
 
+/// The relation a request names: its id, and the token of the RESOLVE answer
+/// the request was built from — `0` for a request built from none, which is what
+/// a bare id converts to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub tid: u64,
+    pub token: u64,
+}
+
+impl From<u64> for Target {
+    fn from(tid: u64) -> Self {
+        Target { tid, token: 0 }
+    }
+}
+
+impl ControlHeader {
+    /// A `verb` request naming `target`, whose token rides `arg1`.
+    pub fn naming(verb: ClientVerb, target: Target, arg0: u64) -> Self {
+        ControlHeader {
+            flags: WireFlags { verb, ..Default::default() },
+            target_id: target.tid,
+            arg0,
+            arg1: target.token,
+            ..Default::default()
+        }
+    }
+
+    /// The relation a [`Self::naming`] header names.
+    pub fn target(&self) -> Target {
+        Target { tid: self.target_id, token: self.arg1 }
+    }
+}
+
 #[derive(Debug)]
 pub struct DecodedControl {
     pub hdr: ControlHeader,

@@ -11,7 +11,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use gnitz_core::{ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema};
+use gnitz_core::{retraction_batch, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::SqlResult;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
@@ -189,9 +189,9 @@ impl PyGnitzClient {
     pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<u64> {
         let m: WireConflictMode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
         // Hold the `PyRef` guard here (it is `!Ungil`) and pass only the plain
-        // `&Schema`/`&ZSetBatch` into the closure, so the GIL is free during
+        // `&Arc<Schema>`/`&ZSetBatch` into the closure, so the GIL is free during
         // the blocking push without cloning the batch.
-        let schema = batch.schema.as_ref();
+        let schema = &batch.schema;
         let b = &batch.batch;
         self.call(py, move |c| c.push(target_id, schema, b, m))
     }
@@ -206,7 +206,11 @@ impl PyGnitzClient {
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let pk_col = py_pks_to_column(&schema.rust, &pks)?;
-        self.call(py, move |c| c.delete(target_id, &schema.rust, pk_col))
+        let batch = retraction_batch(&schema.rust, pk_col);
+        self.call(py, move |c| {
+            c.push(target_id, &schema.rust, batch, WireConflictMode::Update)
+        })?;
+        Ok(())
     }
 
     /// A context manager around one transaction of this client's: a clean exit

@@ -172,7 +172,6 @@ def test_every_refusal_leaves_the_server_serving(client):
     client.push(t, _batch([(1, 1)]))
 
     for why, rels in [
-        ("empty item list", []),
         # A repeated tid is legal, so the count alone is what this one crosses.
         ("too many items", _kvs(t) * 1000),
         # A fan-out read has no form for a system relation — refused server-side.

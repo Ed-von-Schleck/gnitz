@@ -62,20 +62,7 @@ pub struct RelDescriptor {
     pub token: u64,
 }
 
-/// The relation a request names: its id, and the [`RelDescriptor::token`] of the
-/// descriptor the request was built from — `0` for a request built from none,
-/// which is what a bare id converts to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Target {
-    pub tid: u64,
-    pub token: u64,
-}
-
-impl From<u64> for Target {
-    fn from(tid: u64) -> Self {
-        Target { tid, token: 0 }
-    }
-}
+pub use gnitz_wire::control::Target;
 
 impl From<&RelDescriptor> for Target {
     fn from(rel: &RelDescriptor) -> Self {
@@ -180,8 +167,12 @@ pub struct SlotId(u64);
 /// where the verb names do. It borrows its inputs; the borrow ends at
 /// [`Request::encode`].
 pub enum Request<'a> {
-    /// An id allocation. Completes as [`Reply::Ack`], the run's base id.
-    Alloc(IdRun),
+    /// A run of this many catalog object ids. Completes as [`Reply::Ack`], the
+    /// run's base id.
+    AllocIds(u64),
+    /// A run of `count` ids from the SERIAL sequence of `table`. Completes as
+    /// [`Reply::Ack`], the run's base id.
+    AllocSerial { table: Target, count: u64 },
     /// An atomic DDL transaction: system-table batches, each named by its table
     /// id, under one durable SAL zone. Completes as [`Reply::Ack`], its LSN.
     DdlTxn(&'a [(u64, ZSetBatch)]),
@@ -239,6 +230,9 @@ impl Encoded {
     /// of a [`Session::step_polling`] drain. Not a [`Request`], because a driver
     /// stepping without a sink drops them.
     pub(crate) fn delta_poll(views: &[txn_frame::DeltaPollItem]) -> Result<Self, ClientError> {
+        if views.is_empty() {
+            return Err(ClientError::from("a delta poll names no view".to_string()));
+        }
         let kind = SlotKind::DeltaPoll {
             views: views.iter().map(|v| v.view_id).collect(),
             at: 0,
@@ -251,19 +245,20 @@ impl Request<'_> {
     /// Validate and encode, for [`Session::enqueue`].
     pub fn encode(self) -> Result<Encoded, ClientError> {
         let (frame, kind) = match self {
-            Request::Alloc(run) => {
-                let (Target { tid: target_id, token }, verb, count) = match run {
-                    IdRun::Ids(n) => (Target::from(0), ClientVerb::AllocIds, n),
-                    IdRun::Serial { table, count } => (table, ClientVerb::AllocSerialRange, count),
-                };
+            Request::AllocIds(n) => {
                 let hdr = ControlHeader {
-                    flags: WireFlags { verb, ..Default::default() },
-                    target_id,
-                    arg0: count,
-                    arg1: token,
+                    flags: WireFlags {
+                        verb: ClientVerb::AllocIds,
+                        ..Default::default()
+                    },
+                    arg0: n,
                     ..Default::default()
                 };
-                (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: target_id })
+                (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: 0 })
+            }
+            Request::AllocSerial { table, count } => {
+                let hdr = ControlHeader::naming(ClientVerb::AllocSerialRange, table, count);
+                (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: table.tid })
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
@@ -291,7 +286,6 @@ impl Request<'_> {
                 (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
             }
             Request::Push { target, schema, batch, mode } => {
-                let Target { tid: target_id, token } = target;
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
@@ -299,44 +293,28 @@ impl Request<'_> {
                 // The push verb marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
-                let flags = WireFlags {
-                    verb: ClientVerb::Push,
-                    conflict_mode: mode,
-                    ..Default::default()
-                };
-                let hdr = ControlHeader {
-                    flags,
-                    target_id,
-                    arg1: token,
-                    ..Default::default()
-                };
+                let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
+                hdr.flags.conflict_mode = mode;
                 (
                     encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
-                    SlotKind::Ack { tid: target_id },
+                    SlotKind::Ack { tid: target.tid },
                 )
             }
             Request::ScanSpec { target, spec, reply_schema } => {
-                let Target { tid: target_id, token } = target;
-                let hdr = ControlHeader {
-                    flags: WireFlags {
-                        verb: ClientVerb::ScanSpec,
-                        ..Default::default()
-                    },
-                    target_id,
-                    arg0: reply_schema.layout_digest(),
-                    arg1: token,
-                    ..Default::default()
-                };
+                let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout_digest());
                 (
                     encode_frame(hdr, &spec.encode(), None, None),
                     SlotKind::Scan {
-                        tid: target_id,
+                        tid: target.tid,
                         reply_schema: Arc::clone(reply_schema),
                         data: None,
                     },
                 )
             }
             Request::ScanMulti(rels) => {
+                if rels.is_empty() {
+                    return Err(ClientError::from("a multi-read names no relation".to_string()));
+                }
                 let items: Vec<txn_frame::ScanMultiItem> = rels
                     .iter()
                     .map(|(tid, schema)| txn_frame::ScanMultiItem {
@@ -353,15 +331,6 @@ impl Request<'_> {
         };
         Encoded::new(frame, kind)
     }
-}
-
-/// A run of ids from one server-side sequence.
-#[derive(Clone, Copy, Debug)]
-pub enum IdRun {
-    /// A run of catalog object ids.
-    Ids(u64),
-    /// The SERIAL sequence of `table`.
-    Serial { table: Target, count: u64 },
 }
 
 /// What a slot's verb asked for. The spine resolves a reply against the request
@@ -737,8 +706,8 @@ impl Slot {
         // silently; make it loud.
         let want = match &self.kind {
             SlotKind::Ack { tid } | SlotKind::Scan { tid, .. } => Some(*tid),
-            SlotKind::Multi { rels, replies, .. } => rels.get(replies.len()).map(|r| r.0),
-            SlotKind::DeltaPoll { views, at } => views.get(*at).copied(),
+            SlotKind::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
+            SlotKind::DeltaPoll { views, at } => Some(views[*at]),
             SlotKind::Resolve => None,
         };
         if let Some(fault) = ctrl.fault(&buf) {
@@ -755,15 +724,8 @@ impl Slot {
                 _ => Ok(Some(Err(refused))),
             };
         }
-        match want {
-            Some(want) if want != named => return Err(out_of_order(want, named)),
-            // A request naming no relation is answered by its refusal alone.
-            None if !matches!(self.kind, SlotKind::Resolve) => {
-                return Err(ProtocolError::DecodeError(
-                    "a reply train for a request that named no relation".into(),
-                ))
-            }
-            _ => {}
+        if let Some(want) = want.filter(|&want| want != named) {
+            return Err(out_of_order(want, named));
         }
         // Only a RESOLVE is answered in the server's schema; every read decodes
         // under the schema its request named.

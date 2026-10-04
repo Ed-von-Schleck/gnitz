@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_wire::control::Target;
 
 // ── test_orphaned_metadata_recovery ─────────────────────────────────
 
@@ -630,8 +631,8 @@ fn a_descriptor_token_follows_the_resolve_answer() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let token = engine.resolve_token(tid).unwrap();
     assert_ne!(token, 0);
-    engine.check_token(tid, token).unwrap();
-    engine.check_token(tid, 0).unwrap();
+    engine.check_token(Target { tid, token }).unwrap();
+    engine.check_token(tid.into()).unwrap();
 
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
     engine.create_index("public.other", &["a"], false).unwrap();
@@ -646,7 +647,7 @@ fn a_descriptor_token_follows_the_resolve_answer() {
     assert_eq!(engine.resolve_token(tid), Some(token));
 
     let stale = |engine: &CatalogEngine, token| {
-        let fault = engine.check_token(tid, token).unwrap_err();
+        let fault = engine.check_token(Target { tid, token }).unwrap_err();
         assert_eq!(fault.status, gnitz_wire::WireStatus::StaleCatalog);
         engine.resolve_token(tid)
     };

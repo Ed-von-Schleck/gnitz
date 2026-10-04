@@ -26,7 +26,7 @@ use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
-use gnitz_wire::control::DecodedControl;
+use gnitz_wire::control::{DecodedControl, Target};
 use gnitz_wire::{ClientVerb, PkColList, WireFault};
 use gnitz_zset::repr::Batch;
 
@@ -266,7 +266,7 @@ fn emit_zone_to_sal<'w>(
     (zone_lsn, excl.sync(disp.reactor(), op))
 }
 
-/// Durably reserve a SERIAL id range for `seq_id` and return its base. It commits
+/// Durably reserve a SERIAL id range for `seq` and return its base. It commits
 /// through a DDL SAL zone because the master holds no user-table rows to re-derive
 /// a lost high-water from.
 ///
@@ -276,19 +276,18 @@ fn emit_zone_to_sal<'w>(
 /// its post-fsync catalog cleanup and the backfill.
 pub(super) async fn commit_serial_range_durable(
     shared: &Rc<Shared>,
-    seq_id: u64,
+    seq: Target,
     count: u64,
-    token: u64,
 ) -> Result<i64, WireFault> {
     let (base, synced) = {
         // Lock order catalog -> SAL, matching INSERT and every read, so acquiring
         // SAL under catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
-        shared.cat().check_token(seq_id, token)?;
+        shared.cat().check_token(seq)?;
 
         let mut excl = shared.disp().sal().lock().await;
 
-        let (base, delta) = shared.cat().reserve_user_sequence(seq_id, count)?;
+        let (base, delta) = shared.cat().reserve_user_sequence(seq.tid, count)?;
 
         // A sys_sequences advance is a pure system-table write (no view tick,
         // no rollback); a hook failure on a well-formed 2-row delta is an

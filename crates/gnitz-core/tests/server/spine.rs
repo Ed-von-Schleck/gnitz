@@ -118,7 +118,7 @@ fn syscall_count_child() {
     let tid: u64 = tid.parse().unwrap();
     let n: u64 = n.parse().unwrap();
     let mut client = GnitzClient::connect(&target).unwrap();
-    let schema = pk_a();
+    let schema = Arc::new(pk_a());
     for i in 0..n {
         client
             .push(tid, &schema, rows(&schema, [i]), WireConflictMode::Update)
