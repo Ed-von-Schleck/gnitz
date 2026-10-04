@@ -1,14 +1,15 @@
 //! Client-side finishing for an ad-hoc aggregate / DISTINCT SELECT, and for a
 //! FROM-less SELECT's constant row.
 
+use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
+use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::ColumnDef;
-use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use rustc_hash::FxHashMap;
 
 use crate::error::GnitzSqlError;
@@ -22,8 +23,9 @@ use crate::project::reply_program;
 pub(crate) struct FoldFinish {
     /// The partial reply layout; the combined groups keep it, HAVING and finalize read it.
     pub(crate) partial_schema: Arc<Schema>,
-    /// Per aggregate column, in partial order.
-    merge: Vec<Merge>,
+    /// Per aggregate column, in partial order: the ordering by which an extreme's later
+    /// partial replaces the kept one, `None` for a linear aggregate, whose partials add.
+    merge: Vec<Option<Ordering>>,
     pub(crate) having: Option<RowFilter>,
     finalize: ClientMap,
 }
@@ -38,9 +40,9 @@ impl FoldFinish {
         let merge = ops
             .into_iter()
             .map(|op| match op.merge_op() {
-                WireAggFunc::Min => Merge::Min,
-                WireAggFunc::Max => Merge::Max,
-                _ => Merge::Add,
+                WireAggFunc::Min => Some(Ordering::Less),
+                WireAggFunc::Max => Some(Ordering::Greater),
+                _ => None,
             })
             .collect();
         let having = compile_filter_program(having, &partial_schema.columns)?
@@ -73,47 +75,39 @@ impl FoldFinish {
     fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
         let schema = self.partial_schema.as_ref();
         let n_group = schema.num_payload_cols() - self.merge.len();
-        let payload = schema.payload_locators();
-        let agg_locs = &payload[n_group..];
         debug_assert!(
             partial.weights.iter().all(|&w| w == 1),
             "a fold partial is one reduce row"
         );
         let n = partial.len();
-        let (stride, region) = (partial.pks.stride(), partial.pks.region());
-        // A narrow key groups by its image, a wide one by its bytes.
-        let (first, keep) = match stride <= gnitz_wire::NARROW_PK_MAX_BYTES {
-            true => firsts(region.chunks_exact(stride).map(gnitz_wire::widen_pk_be)),
-            false => firsts(region.chunks_exact(stride)),
-        };
+        let (first, keep) = firsts(&partial);
         // Every row its own group: nothing to merge or drop.
         if keep == [(0, n)] {
             return partial;
         }
         let absorbed = || first.iter().enumerate().filter(|&(row, &f)| f as usize != row);
-        for (k, (loc, &merge)) in agg_locs.iter().zip(&self.merge).enumerate() {
-            let pi = n_group + k;
-            match merge {
-                // An integer wraps mod 2^64 as the engine accumulator does.
-                Merge::Add if !loc.type_code().is_float() => {
-                    let nulls = &mut partial.nulls;
+        let locs = schema.payload_locators();
+        let aggs = locs[n_group..].iter().zip(&self.merge);
+        for ((pi, _, col), (loc, &extreme)) in schema.payload_columns().skip(n_group).zip(aggs) {
+            match extreme {
+                Some(wins) => {
+                    absorbed().for_each(|(row, &f)| take_extreme(&mut partial, f as usize, row, pi, wins, loc))
+                }
+                // An integer wraps mod 2^64 as the engine accumulator does; a float adds in
+                // reply order, so its low bits follow the worker count.
+                None => {
+                    debug_assert!(!col.is_nullable, "a linear partial is never NULL");
+                    let float = loc.type_code().is_float();
                     let cells = partial.payload[pi].bytes.as_chunks_mut::<8>().0;
                     for (row, &f) in absorbed() {
-                        let f = f as usize;
-                        if gnitz_wire::null_word_get(nulls[row], pi) {
-                            continue;
-                        }
-                        if gnitz_wire::null_word_get(nulls[f], pi) {
-                            cells[f] = cells[row];
-                            gnitz_wire::null_word_set(&mut nulls[f], pi, false);
-                        } else {
-                            let sum = u64::from_le_bytes(cells[f]).wrapping_add(u64::from_le_bytes(cells[row]));
-                            cells[f] = sum.to_le_bytes();
-                        }
+                        let (acc, add) = (u64::from_le_bytes(cells[f as usize]), u64::from_le_bytes(cells[row]));
+                        let sum = match float {
+                            true => (f64::from_bits(acc) + f64::from_bits(add)).to_bits(),
+                            false => acc.wrapping_add(add),
+                        };
+                        cells[f as usize] = sum.to_le_bytes();
                     }
                 }
-                // Row order, so a float sum adds in reply order.
-                _ => absorbed().for_each(|(row, &f)| merge_cell(&mut partial, f as usize, row, pi, merge, loc)),
             }
         }
         partial.retain_ranges(&keep);
@@ -121,10 +115,19 @@ impl FoldFinish {
     }
 }
 
-/// Each key's first position, per position, and the runs of first positions.
-fn firsts<K: Hash + Eq>(keys: impl ExactSizeIterator<Item = K>) -> (Vec<u32>, Vec<(usize, usize)>) {
+/// Each row's key's first position, and the runs of first positions.
+pub(crate) fn firsts(rows: &ZSetBatch) -> (Vec<u32>, Vec<(usize, usize)>) {
+    let (stride, region) = (rows.pks.stride(), rows.pks.region());
+    // A narrow key groups by its image, a wide one by its bytes.
+    match stride <= gnitz_wire::NARROW_PK_MAX_BYTES {
+        true => firsts_of(region.chunks_exact(stride).map(gnitz_wire::widen_pk_be)),
+        false => firsts_of(region.chunks_exact(stride)),
+    }
+}
+
+fn firsts_of<K: Hash + Eq>(keys: impl ExactSizeIterator<Item = K>) -> (Vec<u32>, Vec<(usize, usize)>) {
     let n = keys.len();
-    assert!(n <= u32::MAX as usize, "partial row count exceeds u32");
+    assert!(n <= u32::MAX as usize, "row count exceeds u32");
     let mut first_of: FxHashMap<K, u32> = FxHashMap::with_capacity_and_hasher(n, Default::default());
     let mut first = Vec::with_capacity(n);
     let mut keep: Vec<(usize, usize)> = Vec::new();
@@ -144,38 +147,13 @@ fn firsts<K: Hash + Eq>(keys: impl ExactSizeIterator<Item = K>) -> (Vec<u32>, Ve
     (first, keep)
 }
 
-/// How two partials of one aggregate combine.
-#[derive(Clone, Copy)]
-enum Merge {
-    Add,
-    Min,
-    Max,
-}
-
-/// Merge row `row`'s cell at payload slot `pi` into row `first`; NULL is every merge's identity.
-fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, merge: Merge, loc: &ColumnLocator) {
+/// Row `row`'s cell at payload slot `pi` replaces row `first`'s when it compares `wins`
+/// against it; a NULL cell loses to any value.
+fn take_extreme(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Ordering, loc: &ColumnLocator) {
     if loc.is_null_word(b.nulls[row]) {
         return;
     }
-    let replace = match merge {
-        _ if loc.is_null_word(b.nulls[first]) => true,
-        Merge::Min => loc.cmp_non_null(&*b, row, &*b, first).is_lt(),
-        Merge::Max => loc.cmp_non_null(&*b, row, &*b, first).is_gt(),
-        // F64 adds in reply order, so its low bits follow the worker count. An integer
-        // sum takes `combine`'s column loop; this arm states the same wrap.
-        Merge::Add => {
-            let col = &mut b.payload[pi].bytes;
-            let (acc, add) = (read_u64_le(col, first * 8), read_u64_le(col, row * 8));
-            let sum = if loc.type_code().is_float() {
-                (f64::from_bits(acc) + f64::from_bits(add)).to_bits()
-            } else {
-                acc.wrapping_add(add)
-            };
-            write_u64_le(col, first * 8, sum);
-            false
-        }
-    };
-    if replace {
+    if loc.is_null_word(b.nulls[first]) || loc.cmp_non_null(&*b, row, &*b, first) == wins {
         // Both rows share one arena, so a string cell moves verbatim.
         let w = loc.size();
         b.payload[pi].bytes.copy_within(row * w..(row + 1) * w, first * w);

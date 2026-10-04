@@ -6,7 +6,7 @@
 //! [`plan_insert`] reads only the catalog, so a refused statement issues no
 //! request and consumes no SERIAL id; [`execute_insert`] runs what it planned.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -345,7 +345,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
 
     // SERIAL keys are distinct by construction, and unknown until execute.
     if let (ConflictPlan::Resolve { set }, None) = (&conflict, serial_ci) {
-        rows = first_per_key(rows, schema, set.is_some())?;
+        rows = first_per_key(rows, set.is_some())?;
     }
     let returning = insert
         .returning
@@ -364,26 +364,17 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
 
 /// `rows` down to each key's first row, the one an ON CONFLICT resolves; under
 /// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
-fn first_per_key(rows: ZSetBatch, schema: &Schema, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(rows.len());
-    let firsts: Vec<usize> = (0..rows.len())
-        .filter(|&i| seen.insert(rows.pks.get_bytes(i)))
-        .collect();
-    if firsts.len() == rows.len() {
-        return Ok(rows);
-    }
-    if refuse_repeat {
+fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
+    let (_, keep) = crate::exec::agg_finish::firsts(&rows);
+    if refuse_repeat && keep != [(0, rows.len())] {
         return Err(GnitzSqlError::Rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \
              (duplicate PK in the same batch)"
                 .to_string(),
         ));
     }
-    let mut out = ZSetBatch::with_capacity(schema, firsts.len());
-    for i in firsts {
-        out.copy_row_at(&rows, i, 1);
-    }
-    Ok(out)
+    rows.retain_ranges(&keep);
+    Ok(rows)
 }
 
 pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Result<SqlResult, GnitzSqlError> {
