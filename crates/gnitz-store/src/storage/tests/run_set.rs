@@ -145,7 +145,7 @@ fn churn_value(pk: u64, generation: u64) -> Vec<u8> {
 }
 
 /// A consolidated `(U64 pk, STRING)` run of `(pk, weight, bytes)` rows.
-pub(super) fn string_run(schema: &SchemaDescriptor, rows: &[(u64, i64, Vec<u8>)]) -> Batch {
+fn string_run(schema: &SchemaDescriptor, rows: &[(u64, i64, Vec<u8>)]) -> Batch {
     let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(k, w, v)| (*k, *w, &v[..])).collect();
     crate::test_support::make_batch_bytes(schema, &rows)
 }

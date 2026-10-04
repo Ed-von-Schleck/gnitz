@@ -1,111 +1,72 @@
 use super::super::*;
 use super::tests::fresh;
-use super::tests::seed_guard;
 use super::tests::spread;
 use super::tests::stride_schema;
 use super::tests::trailing_gk;
-use crate::test_support::{make_batch_opk, make_batch_raw, make_schema_u64_i64, Rng};
-use gnitz_zset::repr::Batch;
+use super::tests::trailing_key_batch;
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
 use gnitz_zset::schema::key::probe_key;
 
-/// `ShardIndex::find_pk_bytes` over a tree holding all three levels, at a narrow
-/// and a wide PK stride: instructions per probe for present and absent keys.
+/// `ShardIndex::find_pk_bytes` over a tree the upkeep built from scattered
+/// spills, at a PK stride in each width arm: instructions per probe.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_probe_bench() {
     use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
-    const TERMINAL_GUARDS: u64 = 64;
-    const L1_GUARDS: u64 = 16;
-    const SPAN: u64 = 1 << 20; // keys one terminal guard covers
-    const ROWS: u64 = 2000;
-    const PROBES: u64 = 200_000;
-    const STEP: u64 = (SPAN / ROWS) & !1;
+    const RUN_ROWS: u64 = 8192;
+    const KEYSPACE: u64 = 200_000_000;
+    const RUNS: usize = 81 * (L0_COMPACT_THRESHOLD + 1) - 1;
+    type Probed = fn(held: u64) -> u64;
+    let arms: [(&str, Probed, bool); 3] = [
+        ("held", |k| k, true),
+        ("absent, inside the extents", |k| k | 1, false),
+        ("absent, above every shard", |k| KEYSPACE + k, false),
+    ];
     let counter = Counter::instructions();
-    for pk_cols in [1usize, 3] {
+    for pk_cols in [1usize, 2, 3, 5] {
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = fresh(tmp.path(), stride_schema(pk_cols));
-        let total = TERMINAL_GUARDS * SPAN;
-        let run = |base: u64, step: u64| -> Batch {
-            let rows: Vec<_> = (0..ROWS)
-                .map(|i| (trailing_gk(pk_cols, base + i * step).pk_bytes().to_vec(), 1, i as i64))
-                .collect();
-            make_batch_opk(&stride_schema(pk_cols), &rows)
-        };
-        // Terminal keys are even, so an odd key inside the range is absent there.
-        for g in 0..TERMINAL_GUARDS {
-            let base = g * SPAN;
-            seed_guard(&mut idx, TERMINAL, trailing_gk(pk_cols, base), &run(base, STEP), 1);
+        let mut rng = Rng::new(0x5EED_1234);
+        let mut held = Vec::new();
+        for _ in 0..RUNS {
+            let mut keys: Vec<u64> = (0..RUN_ROWS).map(|_| 2 * rng.gen_range(KEYSPACE / 2)).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            held.extend(keys.iter().step_by(16));
+            idx.append_l0_run(&trailing_key_batch(pk_cols, keys).into_consolidated())
+                .unwrap();
+            idx.maintain().unwrap();
         }
-        let l1_span = total / L1_GUARDS;
-        for g in 0..L1_GUARDS {
-            for f in 0..4u64 {
-                let base = g * l1_span;
-                seed_guard(
-                    &mut idx,
-                    L1,
-                    trailing_gk(pk_cols, base),
-                    &run(base + 2 * f, l1_span / ROWS),
-                    2,
-                );
-            }
-        }
-        for f in 0..4u64 {
-            idx.append_l0_run(&run(2 * f, total / ROWS)).unwrap();
-        }
-        {
-            let mut rng = Rng::new(0x5EED_1234);
-            let ranges: Vec<(PkBuf, PkBuf)> = (0..PROBES)
-                .map(|_| {
-                    let key = rng.gen_range(TERMINAL_GUARDS) * SPAN + rng.gen_range(ROWS) * STEP;
-                    (trailing_gk(pk_cols, key), trailing_gk(pk_cols, key + 4 * STEP))
-                })
-                .collect();
-            let mut found = 0usize;
-            let ((), instructions) = counter.measure(|| {
-                for &(lo, hi) in &ranges {
-                    found += idx.shard_arcs_in_range(lo, hi, true).count();
-                }
-            });
-            black_box(found);
-            println!(
-                "shard_range stride {}: {:.1} instr/open ({:.2} shards each)",
-                pk_cols * 8,
-                instructions as f64 / PROBES as f64,
-                found as f64 / PROBES as f64
-            );
-        }
-        for (label, odd) in [("present", 0u64), ("absent", 1)] {
-            let mut rng = Rng::new(0x5EED_1234);
-            let keys: Vec<PkBuf> = (0..PROBES)
-                .map(|_| {
-                    let key = rng.gen_range(TERMINAL_GUARDS) * SPAN + rng.gen_range(ROWS) * STEP;
-                    trailing_gk(pk_cols, key | odd)
-                })
-                .collect();
-            let mut hits = 0usize;
-            let ((), instructions) = counter.measure(|| {
+        let (l0, [l1, terminal]) = idx.level_shape();
+        assert!(
+            l0 == L0_COMPACT_THRESHOLD && l1 > 1 && terminal > 1,
+            "L0 must be full over a guarded L1 and terminal level, got {l0}/{l1}/{terminal}",
+        );
+        println!(
+            "shard_probe_bench stride {}: {l0} L0 shards, {l1} L1 and {terminal} terminal guards",
+            pk_cols * 8
+        );
+        for (label, probed, is_held) in arms {
+            let keys: Vec<PkBuf> = held.iter().map(|&k| trailing_gk(pk_cols, probed(k))).collect();
+            let (hits, instructions) = counter.measure(|| {
+                let mut hits = 0;
                 for k in &keys {
                     let key = k.pk_bytes();
                     idx.find_pk_bytes(key, probe_key(key), |_, _| hits += 1);
                 }
+                hits
             });
-            black_box(hits);
-            println!(
-                "shard_probe stride {} {label}: {:.1} instr/probe ({hits} hits)",
-                pk_cols * 8,
-                instructions as f64 / PROBES as f64
+            assert!(
+                if is_held { hits >= keys.len() } else { hits == 0 },
+                "{label}: {hits} hits"
             );
+            println!("  {label}: {:.1} instr/probe", instructions as f64 / keys.len() as f64);
         }
     }
 }
 
 /// What the FLSM compactions read and write per spilled byte, by trigger, and
-/// the largest single input of each in units of `R` — the two quantities the
-/// byte targets bound, the second asserted. A spill arrives as `Table` delivers one: a consolidated
-/// run into L0, then the upkeep. One arm per arrival order and budget a store
-/// meets, each asserting the triggers it exists to reach; the two scattered arms
-/// are the same store at one and four times the data.
+/// the largest single input of each in units of `R`.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn compaction_amplification_bench() {

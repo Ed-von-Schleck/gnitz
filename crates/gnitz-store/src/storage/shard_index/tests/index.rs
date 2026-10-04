@@ -94,7 +94,7 @@ fn assert_stable(len: u64) {
 
 /// Write `batch` as a published entry of `level_idx`'s guard `key`, creating it,
 /// stamped `stamp`.
-pub(super) fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
+fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
     let entry = idx.write_shard(batch, false, Some(stamp)).unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.mark_published();
@@ -653,9 +653,10 @@ pub(super) fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
     PkBuf::from_bytes(&pk)
 }
 
-/// One batch of rows `base..base + n` at [`trailing_gk`]'s keys.
-fn trailing_key_batch(pk_cols: usize, base: u64, n: u64) -> Batch {
-    let rows: Vec<_> = (base..base + n)
+/// One batch of the rows at [`trailing_gk`]'s `keys`, in the order given.
+pub(super) fn trailing_key_batch(pk_cols: usize, keys: impl IntoIterator<Item = u64>) -> Batch {
+    let rows: Vec<_> = keys
+        .into_iter()
         .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, spread(i)))
         .collect();
     make_batch_opk(&stride_schema(pk_cols), &rows)
@@ -670,7 +671,7 @@ fn the_byte_target_bounds_a_guard_at_every_stride() {
         let schema = stride_schema(pk_cols);
         assert_eq!(schema.pk_stride(), pk_cols * 8);
         let mut idx = fresh(tmp.path(), schema);
-        let batch = trailing_key_batch(pk_cols, 1, OVER_TARGET_ROWS);
+        let batch = trailing_key_batch(pk_cols, 1..=OVER_TARGET_ROWS);
         seed_guard(&mut idx, L1, trailing_gk(pk_cols, 1), &batch, 1);
 
         let target = idx.guard_target_bytes(L1);
@@ -702,7 +703,7 @@ fn underfull_guards_merge_at_every_stride() {
         let mut idx = fresh(tmp.path(), schema);
         for i in 0..4u64 {
             let base = 1 + i * 1000;
-            let batch = trailing_key_batch(pk_cols, base, 100);
+            let batch = trailing_key_batch(pk_cols, base..base + 100);
             seed_guard(&mut idx, L1, trailing_gk(pk_cols, base), &batch, i + 1);
         }
         assert_eq!(idx.levels[L1].guards.len(), 4);
