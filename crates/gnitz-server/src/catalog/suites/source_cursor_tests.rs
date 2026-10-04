@@ -10,7 +10,7 @@ use gnitz_zset::repr::SourceCursor;
 /// `(engine, base tid, view id)`.
 fn fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, u64, u64) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let (mut engine, tid) = ingest_fixture(name, &cols, 200, |bb, id| bb.put_u64(id * 10));
+    let (mut engine, tid) = ingest_fixture(name, &cols, 200, |id| [id * 10]);
     engine.create_index("public.t", &["val"], false).unwrap();
 
     let vid = engine.allocate_ids(1).unwrap();

@@ -3,10 +3,11 @@
 use super::*;
 use crate::catalog::{CatalogColumn, CatalogEngine};
 use crate::test_support::{
-    col_def, make_batch, register_identity_view, scan_all, scratch_dir, try_register_view, zset_of, LocalDrive, RowKey,
+    col_def, cols_of, make_batch, register_identity_view, scan_all, scratch_dir, try_register_view, zset_of,
+    LocalDrive, RowKey,
 };
 use gnitz_store::relation::Relation;
-use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_wire::TypeCode;
 use gnitz_zset::schema::Slot;
 use std::collections::HashMap;
 
@@ -346,19 +347,6 @@ fn a_left_join_null_fills_its_null_keyed_preserved_row() {
 }
 
 // ── Per-epoch cost ──────────────────────────────────────────────────────────
-
-/// Column records for a view whose output is `schema`.
-pub(super) fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
-    (0..schema.num_columns())
-        .map(|ci| {
-            let c = schema.column(ci).expect("in range");
-            CatalogColumn {
-                def: ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable),
-                fk: None,
-            }
-        })
-        .collect()
-}
 
 /// The net weight `tid` holds.
 pub(super) fn net_weight(engine: &mut CatalogEngine, tid: u64) -> u64 {

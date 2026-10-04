@@ -6,8 +6,6 @@ mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
 mod ddl_tests;
 mod dir_deletion_tests;
-#[path = "benches/echo_fold.rs"]
-mod echo_fold_bench;
 mod engine_tests;
 mod fk_tests;
 #[path = "benches/hydrate.rs"]
@@ -51,10 +49,11 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    cmp_const, col_def, col_tab_batch, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk,
-    pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, register_identity_view, scan_all, schema_tab_batch,
-    scratch_dir, seek_by_index, seek_by_index_range, sum_weights, table_tab_batch, try_register_identity_view,
-    try_register_view, uuid_def, write_circuit, write_identity_circuit, LocalDrive,
+    cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit, fk_def, idx_tab_batch,
+    negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_sys_row, push_view_tab_row, read_rows,
+    register_identity_view, scan_all, schema_tab_batch, scratch_dir, seek_by_index, seek_by_index_range, sum_weights,
+    table_tab_batch, try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, write_circuit,
+    write_identity_circuit, LocalDrive,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -187,24 +186,48 @@ fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
     }
 }
 
+/// `ids` as rows of `tid` at `weight`, in the order given; `cells(id)` is one
+/// row's payload columns.
+fn rows<const N: usize>(
+    engine: &CatalogEngine,
+    tid: u64,
+    weight: i64,
+    ids: impl IntoIterator<Item = u64>,
+    cells: impl Fn(u64) -> [u64; N],
+) -> Batch {
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
+    let mut bb = BatchBuilder::new(&schema);
+    for id in ids {
+        bb.begin_row(id as u128, weight);
+        cells(id).into_iter().for_each(|c| bb.put_u64(c));
+        bb.end_row();
+    }
+    bb.finish()
+}
+
 /// [`table_fixture`] holding ids `0..n`, every row at weight 1, ingested as one
-/// batch. `put_row` writes one row's payload columns.
-fn ingest_fixture(
+/// batch.
+fn ingest_fixture<const N: usize>(
     name: &str,
     cols: &[CatalogColumn],
     n: u64,
-    mut put_row: impl FnMut(&mut BatchBuilder, u64),
+    cells: impl Fn(u64) -> [u64; N],
 ) -> (CatalogEngine, u64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    for id in 0..n {
-        bb.begin_row(id as u128, 1);
-        put_row(&mut bb, id);
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, rows(&engine, tid, 1, 0..n, cells)).unwrap();
     (engine, tid)
+}
+
+/// A value spread over the whole `u64` range, a bijection of `id`.
+fn scramble(id: u64) -> u64 {
+    id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Drop `engine` unflushed and remove its data directory.
+fn discard(engine: CatalogEngine) {
+    let dir = engine.registry.base_dir().to_owned();
+    drop(engine);
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and

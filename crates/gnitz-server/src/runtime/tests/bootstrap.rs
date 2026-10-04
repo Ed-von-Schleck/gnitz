@@ -29,7 +29,7 @@ fn table_tab(tid: u64, weight: i64) -> Batch {
 
 /// Boot the catalog at `dir` over `log`'s committed tail.
 fn recover(log: &TestLog, dir: &str) -> CatalogEngine {
-    let mut opened = CatalogEngine::open_master(dir, 1).unwrap();
+    let mut opened = CatalogEngine::open_master(dir, 1, Default::default()).unwrap();
     stage_system_tail(CommittedTail::read(log.log()).unwrap(), &mut opened).unwrap();
     opened.replay().unwrap()
 }

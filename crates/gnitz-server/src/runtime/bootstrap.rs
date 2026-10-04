@@ -24,7 +24,7 @@ use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWrit
 use crate::runtime::tls::TlsArgs;
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
-use gnitz_store::relation::Residency;
+use gnitz_store::relation::{Residency, StoreConfig};
 use gnitz_zset::schema::Slot;
 
 // ---------------------------------------------------------------------------
@@ -459,8 +459,8 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    let mut opened =
-        CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
+    let mut opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
+        .map_err(|e| format!("failed to open catalog: {e}"))?;
     listen::clear_published(data_dir)?;
 
     gnitz_note!("Starting {num_workers} workers");

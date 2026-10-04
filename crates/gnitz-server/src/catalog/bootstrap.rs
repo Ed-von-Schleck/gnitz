@@ -35,13 +35,17 @@ impl CatalogEngine {
 
     /// Opens or creates the database at `base_dir`, laid out for `num_workers`
     /// workers, as the master: registers the system families and opens their
-    /// stores.
-    pub(crate) fn open_master(base_dir: &str, num_workers: u32) -> Result<UnreplayedCatalog, String> {
+    /// stores, every store of the engine sized by `config`.
+    pub(crate) fn open_master(
+        base_dir: &str,
+        num_workers: u32,
+        config: StoreConfig,
+    ) -> Result<UnreplayedCatalog, String> {
         // Before any store opens.
         let dir_lock = lock_data_dir(base_dir)?;
 
         let mut engine = CatalogEngine {
-            registry: RelationRegistry::master(base_dir, num_workers, StoreConfig::from_env("GNITZ_")),
+            registry: RelationRegistry::master(base_dir, num_workers, config),
             dag: DagEngine::default(),
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
@@ -75,11 +79,17 @@ impl CatalogEngine {
         Ok(UnreplayedCatalog(engine))
     }
 
+    /// [`Self::open_with`] under the environment's [`StoreConfig`].
+    #[cfg(test)]
+    pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
+        Self::open_with(base_dir, num_workers, StoreConfig::from_env("GNITZ_"))
+    }
+
     /// [`Self::open_master`] and its replay, then the rest of a store-owning
     /// boot, as a standalone host at rank 0.
     #[cfg(test)]
-    pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
-        let mut engine = Self::open_master(base_dir, num_workers)?.replay()?;
+    pub(crate) fn open_with(base_dir: &str, num_workers: u32, config: StoreConfig) -> Result<Self, String> {
+        let mut engine = Self::open_master(base_dir, num_workers, config)?.replay()?;
         engine.registry.reconcile_child_dirs()?;
         engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)

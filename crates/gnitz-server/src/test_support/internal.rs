@@ -90,6 +90,24 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
     sum
 }
 
+/// The summed weight of relation `id`'s rows.
+pub fn net_weight(engine: &CatalogEngine, id: u64) -> i64 {
+    sum_weights(engine.registry.relation(id).expect("a registered relation").cursor())
+}
+
+/// Column records for a view whose output is `schema`.
+pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
+    (0..schema.num_columns())
+        .map(|ci| {
+            let c = schema.column(ci).expect("in range");
+            CatalogColumn {
+                def: ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable),
+                fk: None,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Circuit + view fixtures
 // ---------------------------------------------------------------------------
@@ -121,6 +139,15 @@ pub fn identity_circuit(source_tid: u64, bound: gnitz_wire::ReadBound) -> Circui
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source_tid, bound);
     circuit.sink(scan);
+    circuit
+}
+
+/// `ScanDelta(source) → Distinct → sink`.
+pub fn distinct_circuit(source: u64) -> Circuit {
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
+    let distinct = circuit.distinct(scan);
+    circuit.sink(distinct);
     circuit
 }
 

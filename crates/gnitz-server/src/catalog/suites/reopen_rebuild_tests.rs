@@ -21,14 +21,8 @@ const N: i64 = 7;
 fn seed_base(engine: &mut CatalogEngine, name: &str) -> (u64, Vec<CatalogColumn>) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table(name, &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 0..N as u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 10);
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    let batch = rows(engine, tid, 1, 0..N as u64, |id| [id * 10]);
+    engine.registry.ingest(tid, batch).unwrap();
     (tid, cols)
 }
 
@@ -61,14 +55,8 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 0..N as u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 10);
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    let batch = rows(&engine, tid, 1, 0..N as u64, |id| [id * 10]);
+    engine.registry.ingest(tid, batch).unwrap();
 
     // Secondary index on val, filled from the N committed rows.
     engine.create_index("public.base", &["val"], false).unwrap();
@@ -275,29 +263,11 @@ fn index_rebuild_forced_by_topology_change() {
 // registration, the traces at compile — so a checkpoint landing between them is
 // what these two tests put there.
 
-/// `ScanDelta(source) → Distinct → sink`.
-fn distinct_circuit(source: u64) -> gnitz_wire::Circuit {
-    let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    let distinct = circuit.distinct(scan);
-    circuit.sink(distinct);
-    circuit
-}
-
-/// The summed weight of relation `id`'s rows.
-fn weight(engine: &CatalogEngine, id: u64) -> i64 {
-    sum_weights(engine.registry.relation(id).unwrap().cursor())
-}
-
 /// One tick of [`seed_base`]'s table `tid` carrying row `id` at weight 1.
 fn tick(engine: &mut CatalogEngine, tid: u64, id: u64) {
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(id as u128, 1);
-    bb.put_u64(id * 10);
-    bb.end_row();
+    let delta = rows(engine, tid, 1, [id], |id| [id * 10]);
     let what = crate::query::Drive::Tick { source: tid, round: 1 };
-    crate::query::drive(&mut LocalDrive(engine), what, Some(bb.finish())).unwrap();
+    crate::query::drive(&mut LocalDrive(engine), what, Some(delta)).unwrap();
 }
 
 /// `public.vbase` plus a backfilled `DISTINCT` view over it, whose operator trace
@@ -333,10 +303,10 @@ fn view_traces_resume_with_their_output_store() {
     let (tid, vid) = checkpointed_traced_view(&dir);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(weight(&engine, vid), N, "the output store resumes");
+    assert_eq!(net_weight(&engine, vid), N, "the output store resumes");
 
     tick(&mut engine, tid, 0);
-    assert_eq!(weight(&engine, vid), N, "a resumed trace already holds the row");
+    assert_eq!(net_weight(&engine, vid), N, "a resumed trace already holds the row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -410,20 +380,20 @@ fn a_chain_resumes_or_rebuilds_as_one() {
 
     backfill(&mut engine, seg, &[tid]);
     assert_eq!(
-        weight(&engine, seg),
+        net_weight(&engine, seg),
         N,
         "a segment holds its rows for its chain's build"
     );
     backfill(&mut engine, top, &[seg]);
     assert_eq!(
-        (weight(&engine, seg), weight(&engine, top)),
+        (net_weight(&engine, seg), net_weight(&engine, top)),
         (0, N),
         "its last reader's backfill drops them"
     );
 
     tick(&mut engine, tid, N as u64);
     assert_eq!(
-        (weight(&engine, seg), weight(&engine, top)),
+        (net_weight(&engine, seg), net_weight(&engine, top)),
         (0, N + 1),
         "a tick passes through it"
     );
@@ -442,7 +412,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     let g2 = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g2).unwrap();
     tick(&mut engine, tid, N as u64 + 1);
-    assert_eq!(weight(&engine, seg), 0, "a kept chain's segment stays empty");
+    assert_eq!(net_weight(&engine, seg), 0, "a kept chain's segment stays empty");
     engine.close();
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();

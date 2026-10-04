@@ -1,4 +1,3 @@
-use super::tests::cols_of;
 use super::tests::delta_for;
 use super::tests::engine_with_base;
 use super::tests::engine_with_views;
@@ -10,7 +9,7 @@ use super::tests::tick;
 use super::tests::view_cols;
 use super::*;
 use crate::catalog::CatalogEngine;
-use crate::test_support::{register_identity_view, scan_all, try_register_view, LocalDrive};
+use crate::test_support::{cols_of, register_identity_view, scan_all, try_register_view, LocalDrive};
 use gnitz_store::relation::Relation;
 
 /// [`engine_with_views`] plus a GROUP BY view over the base.

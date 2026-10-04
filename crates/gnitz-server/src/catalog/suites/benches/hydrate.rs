@@ -2,25 +2,66 @@
 //! hydrate a capacity-bounded view's skeleton rows.
 //!
 //! ```text
-//! cd crates && cargo test -p gnitz-server --release hydrate_ \
+//! cd crates && cargo test -p gnitz-server --release hydrate_bench \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use std::hint::black_box;
+use std::rc::Rc;
 
 use super::*;
-use crate::query::{DagEngine, Drive};
+use crate::query::DagEngine;
 use gnitz_foundation::perf;
 use gnitz_store::read::SkeletonHydrator;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 
 /// Base rows, and so view rows.
 const ROWS: u64 = 1_000_000;
-/// Incompressible payload columns, so a skeleton row is a fraction of a full one.
-const PAYLOAD_COLS: u64 = 4;
-/// The RAM tier every store of the fixture spills past.
-const RAM_TIER_BYTES: u64 = 1 << 20;
+
+/// Row `id`'s payload: incompressible columns, so a skeleton row is a fraction
+/// of a full one.
+fn payload(id: u64) -> [u64; 4] {
+    std::array::from_fn(|c| scramble(id ^ c as u64))
+}
+
+/// An empty engine whose every store spills past a small RAM tier.
+fn spilling_engine(name: &str) -> CatalogEngine {
+    let config = StoreConfig {
+        ram_tier_bytes: 1 << 20,
+        ..Default::default()
+    };
+    CatalogEngine::open_with(&temp_dir(name), 1, config).unwrap()
+}
+
+/// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
+/// swept. Returns the engine, the base and the view.
+fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
+    let mut cols = vec![col_def("id", TypeCode::U64)];
+    cols.extend((0..payload(0).len()).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
+    let mut engine = spilling_engine(name);
+    let base = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let loaded = rows(&engine, base, 1, 0..ROWS, payload);
+    engine.registry.ingest(base, loaded).unwrap();
+
+    let view = try_register_identity_view(&mut engine, base, "bounded", &cols, capacity, 0).unwrap();
+    backfill(&mut engine, view, &[base]);
+    sweep(&mut engine);
+    (engine, base, view)
+}
+
+/// Run the ephemeral checkpoint round, whose sweep skeletonizes every bounded
+/// view past its capacity.
+fn sweep(engine: &mut CatalogEngine) {
+    engine.flush_ephemeral_round(1).unwrap();
+}
+
+/// The read of every row of `view` at PK `key`.
+fn point(engine: &CatalogEngine, view: u64, key: u64) -> ReadSpec {
+    let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
+    let pk = PkColList::from_slice(schema.pk_cols());
+    ReadSpec::all_rows(ReadBound::Range(KeyRange::point(pk, &[], key as u128)))
+}
 
 /// The engine's own hydrator, counting the rows it recomputes.
 struct Counting<'a> {
@@ -41,46 +82,20 @@ impl SkeletonHydrator for Counting<'_> {
     }
 }
 
-/// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
-/// checkpointed, so the sweep has skeletonized it. Returns the engine, the base and
-/// the view.
-fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
-    let mut cols = vec![col_def("id", TypeCode::U64)];
-    cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
-    std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
-    let (mut engine, base) = ingest_fixture(name, &cols, ROWS, |bb, id| {
-        for c in 0..PAYLOAD_COLS {
-            bb.put_u64(scramble(id ^ c));
-        }
-    });
-    std::env::remove_var("GNITZ_RAM_TIER_BYTES");
-
-    let circuit = crate::test_support::identity_circuit(base, ReadBound::None);
-    let view = try_register_view(&mut engine, circuit, "bounded", &cols, capacity, 0).unwrap();
-    backfill(&mut engine, view, &[base]);
-    checkpoint(&mut engine);
-    (engine, base, view)
-}
-
-/// Checkpoint every store, so the sweep has skeletonized every bounded view.
-fn checkpoint(engine: &mut CatalogEngine) {
-    engine.record_topology(1).unwrap();
-    let g = engine.advance_durable_generation().unwrap();
-    engine.flush_ephemeral_round(g).unwrap();
-}
-
-/// One measured read of `engine`.
-fn cell(label: &str, engine: &mut CatalogEngine, read: impl Fn(&RelationRegistry, &mut Counting) -> usize) {
+/// One measured read of `view` under `spec`, after an unmeasured one of the same
+/// that leaves the shards it touches resident. Returns its rows and how many it
+/// hydrated.
+fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> (Rc<Batch>, usize) {
     let counter = perf::Counter::instructions();
-    black_box(read(
-        &engine.registry,
-        &mut Counting { dag: &mut engine.dag, hydrated: 0 },
-    ));
+    let registry = &engine.registry;
+    let digest = registry.relation(view).map(Relation::schema).unwrap().layout_digest();
+    let read = |hydrator: &mut Counting| registry.scan_spec(view, spec.clone(), digest, Some(hydrator)).unwrap();
+    black_box(read(&mut Counting { dag: &mut engine.dag, hydrated: 0 }));
 
     let mut hydrator = Counting { dag: &mut engine.dag, hydrated: 0 };
     let before = perf::rss_bytes();
     perf::reset_peak_rss();
-    let (rows, instructions) = counter.measure(|| read(&engine.registry, &mut hydrator));
+    let (rows, instructions) = counter.measure(|| read(&mut hydrator));
     let peak = perf::peak_rss_bytes().saturating_sub(before);
     let hydrated = hydrator.hydrated;
     assert!(
@@ -88,29 +103,32 @@ fn cell(label: &str, engine: &mut CatalogEngine, read: impl Fn(&RelationRegistry
         "{label}: the read hydrated nothing, so it measured no hydration"
     );
     println!(
-        "{label:<30} rows {rows:>8}  hydrated {hydrated:>8}  peak +{:>7.1} MiB  {:>12} instr",
+        "{label:<30} rows {:>8}  hydrated {hydrated:>8}  peak +{:>7.1} MiB  {instructions:>12} instr",
+        rows.len(),
         peak as f64 / (1 << 20) as f64,
-        instructions,
     );
+    (rows, hydrated)
 }
 
-/// The whole-relation scan, at the capacities that skeletonize this fixture
-/// nearly entirely and about half.
+/// The whole-relation scan, at a capacity that skeletonizes this fixture nearly
+/// entirely and at one that leaves part of it resident.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_full_scan_bench() {
-    for (label, capacity) in [("full scan, L ≈ 0", 64 << 10), ("full scan, L ≈ H", 24 << 20)] {
+    let all = ReadSpec::all_rows(ReadBound::None);
+    let mut hydrated = [64 << 10, 24 << 20].map(|capacity: u64| {
         let (mut engine, _, view) = bounded_fixture("hydrate_full_scan", capacity);
-        let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
-        cell(label, &mut engine, |registry, h| {
-            let spec = ReadSpec::all_rows(ReadBound::None);
-            registry
-                .scan_spec(view, spec, schema.layout_digest(), Some(h))
-                .unwrap()
-                .len()
-        });
-        engine.close();
-    }
+        let label = format!("full scan, capacity {} KiB", capacity >> 10);
+        let (rows, hydrated) = cell(&label, &mut engine, view, &all);
+        assert_eq!(rows.len() as u64, ROWS, "{label}: every row read");
+        discard(engine);
+        hydrated as u64
+    });
+    hydrated.reverse();
+    assert!(
+        hydrated[0] < hydrated[1] && hydrated[1] > ROWS * 9 / 10,
+        "the small capacity hydrates nearly every row and the large one fewer: {hydrated:?}"
+    );
 }
 
 /// Ids upserted into the base without a tick, centred on the sought key.
@@ -122,37 +140,25 @@ const UNTICKED_IDS: u64 = 10_000;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_seek_bench() {
     let (mut engine, base, view) = bounded_fixture("hydrate_seek", 64 << 10);
-    let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let key = ROWS / 2;
-    let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
-        PkColList::from_slice(schema.pk_cols()),
-        &[],
-        key as u128,
-    )));
-    let seek = |registry: &RelationRegistry, h: &mut Counting| {
-        let out = registry
-            .scan_spec(view, spec.clone(), schema.layout_digest(), Some(h))
-            .unwrap();
-        assert_eq!(out.len(), 1, "one row at the sought key");
-        let v0 = u64::from_le_bytes(out.get_col_ptr(0, 0, 8).try_into().unwrap());
-        assert_eq!(v0, scramble(key), "the payload the view last ticked over");
-        out.len()
+    let spec = point(&engine, view, key);
+    let seek = |label: &str, engine: &mut CatalogEngine| {
+        let (rows, _) = cell(label, engine, view, &spec);
+        assert_eq!(rows.len(), 1, "one row at the sought key");
+        assert_eq!(
+            gnitz_expr::payload_u64(&*rows, 0, 0),
+            payload(key)[0],
+            "the payload the view last ticked over"
+        );
     };
-    cell("single-key seek", &mut engine, seek);
+    seek("single-key seek", &mut engine);
 
     // Each upsert takes effect as a retraction and an insert.
-    let mut bb = BatchBuilder::new(&engine.registry.relation(base).map(Relation::schema).unwrap());
-    for id in key - UNTICKED_IDS / 2..key + UNTICKED_IDS / 2 {
-        bb.begin_row(id as u128, 1);
-        for c in 0..PAYLOAD_COLS {
-            bb.put_u64(scramble(id ^ c).wrapping_add(1));
-        }
-        bb.end_row();
-    }
-    engine.ingest_unticked(base, bb.finish()).unwrap();
-    let label = format!("single-key seek, {}k unticked", 2 * UNTICKED_IDS / 1000);
-    cell(&label, &mut engine, seek);
-    engine.close();
+    let ids = key - UNTICKED_IDS / 2..key + UNTICKED_IDS / 2;
+    let upserts = rows(&engine, base, 1, ids, |id| payload(id).map(|c| c.wrapping_add(1)));
+    engine.ingest_unticked(base, upserts).unwrap();
+    seek("single-key seek, unticked base", &mut engine);
+    discard(engine);
 }
 
 /// A filtered `LIMIT 1` whose one match sits at merge position `M`: the rows it
@@ -162,145 +168,54 @@ fn hydrate_seek_bench() {
 fn hydrate_filtered_limit_bench() {
     const M: u64 = 1000;
     let (mut engine, _, view) = bounded_fixture("hydrate_filtered_limit", 64 << 10);
-    let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let spec = ReadSpec {
         bound: ReadBound::None,
-        predicate: cmp_const(gnitz_expr::CmpOp::Eq, 1, scramble(M) as i64).to_blob_bytes(),
+        predicate: cmp_const(gnitz_expr::CmpOp::Eq, 1, payload(M)[0] as i64).to_blob_bytes(),
         sink: gnitz_wire::ReadSink {
             map: None,
             kind: gnitz_wire::SinkKind::Rows { order: Vec::new(), limit_k: 1 },
         },
     };
-    cell("filtered LIMIT 1", &mut engine, |registry, h| {
-        let rows = registry
-            .scan_spec(view, spec.clone(), schema.layout_digest(), Some(h))
-            .unwrap()
-            .len();
-        assert_eq!(rows, 1, "the predicate matches one row");
-        rows
-    });
-    engine.close();
+    let (rows, hydrated) = cell("filtered LIMIT 1", &mut engine, view, &spec);
+    assert_eq!(rows.len(), 1, "the predicate matches one row");
+    assert!(
+        (hydrated as u64) < ROWS / 10,
+        "the drain stopped at its match: hydrated {hydrated}"
+    );
+    discard(engine);
 }
 
-// ── Trace probes ────────────────────────────────────────────────────────────
-
-/// A `[id, k]` base of `ROWS` rows, `k` a bijective scramble of `id`, so two such
-/// bases join one-to-one on `k`.
-fn join_base(engine: &mut CatalogEngine, name: &str) -> u64 {
+/// One key of a bounded inner equi-join over two `ROWS`-row bases, which
+/// hydrates from the join's own operator traces.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn hydrate_join_seek_bench() {
+    let mut engine = spilling_engine("hydrate_join_seek");
+    // `k` is a bijection of `id`, so the two bases join one-to-one.
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
-    let tid = engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    for id in 0..ROWS {
-        bb.begin_row(id as u128, 1);
-        bb.put_u64(scramble(id));
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    tid
-}
-
-fn scramble(id: u64) -> u64 {
-    id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-/// A bounded inner equi-join over two `ROWS`-row bases, and a `distinct` view over a
-/// third, every store spilled under the 1 MiB RAM tier and checkpointed.
-struct ProbeFixture {
-    engine: CatalogEngine,
-    dir: String,
-    join: u64,
-    join_bases: [u64; 2],
-    distinct_base: u64,
-}
-
-fn probe_fixture() -> ProbeFixture {
-    std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
-    let dir = temp_dir("hydrate_trace_probe");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    std::env::remove_var("GNITZ_RAM_TIER_BYTES");
-
-    let join_bases = [join_base(&mut engine, "a"), join_base(&mut engine, "b")];
+    let bases = ["public.a", "public.b"].map(|name| {
+        let t = engine.create_table(name, &cols, &[0]).unwrap();
+        let loaded = rows(&engine, t, 1, 0..ROWS, |id| [scramble(id)]);
+        engine.registry.ingest(t, loaded).unwrap();
+        t
+    });
     let join_cols = [
         col_def("k", TypeCode::U64),
         col_def("a_id", TypeCode::U64),
         col_def("b_id", TypeCode::U64),
     ];
-    let circuit = crate::test_support::two_term_join_circuit(join_bases[0], join_bases[1], TypeCode::U64);
+    let circuit = two_term_join_circuit(bases[0], bases[1], TypeCode::U64);
     let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 64 << 10, 0).unwrap();
-    backfill(&mut engine, join, &join_bases);
+    backfill(&mut engine, join, &bases);
+    sweep(&mut engine);
+    // Shows where the traces the seek reads sit.
+    print!(
+        "{}",
+        gnitz_store::relation::disk_usage(engine.registry.base_dir()).unwrap()
+    );
 
-    let distinct_base = join_base(&mut engine, "c");
-    let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(distinct_base, ReadBound::None);
-    let distinct = circuit.distinct(scan);
-    circuit.sink(distinct);
-    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
-    let view = try_register_view(&mut engine, circuit, "distinct", &cols, 0, 0).unwrap();
-    backfill(&mut engine, view, &[distinct_base]);
-
-    checkpoint(&mut engine);
-    ProbeFixture {
-        engine,
-        dir,
-        join,
-        join_bases,
-        distinct_base,
-    }
-}
-
-/// One tick of `base` over a one-row push of a fresh `id`, keyed onto an existing
-/// `k` so every probe finds a match; its instructions, ingest excluded.
-fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
-    let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(id as u128, 1);
-    bb.put_u64(scramble(id - ROWS));
-    bb.end_row();
-    let effective = engine.registry.ingest_returning(base, bb.finish()).unwrap();
-    let counter = perf::Counter::instructions();
-    let what = Drive::Tick { source: base, round: id };
-    let (_, instructions) =
-        counter.measure(|| crate::query::drive(&mut LocalDrive(engine), what, Some(effective)).unwrap());
-    instructions
-}
-
-/// Trace probes: a point seek hydrating the bounded join, and one-row push epochs
-/// into a join base and into the distinct view's base.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn hydrate_trace_probe_bench() {
-    let ProbeFixture {
-        mut engine,
-        dir,
-        join,
-        join_bases,
-        distinct_base,
-    } = probe_fixture();
-    // The regime check: every trace was measured on disk.
-    print!("{}", gnitz_store::relation::disk_usage(&dir).unwrap());
-
-    let schema = engine.registry.relation(join).map(Relation::schema).unwrap();
-    let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
-        PkColList::from_slice(schema.pk_cols()),
-        &[],
-        scramble(ROWS / 2) as u128,
-    )));
-    cell("join point seek", &mut engine, |registry, h| {
-        registry
-            .scan_spec(join, spec.clone(), schema.layout_digest(), Some(h))
-            .unwrap()
-            .len()
-    });
-
-    for (label, base) in [
-        ("join push epoch", join_bases[0]),
-        ("distinct push epoch", distinct_base),
-    ] {
-        push_epoch(&mut engine, base, ROWS);
-        let instructions = push_epoch(&mut engine, base, ROWS + 1);
-        println!("{label:<20} {instructions:>12} instr");
-    }
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    let spec = point(&engine, join, scramble(ROWS / 2));
+    let (rows, _) = cell("join point seek", &mut engine, join, &spec);
+    assert_eq!(rows.len(), 1, "one match at the sought key");
+    discard(engine);
 }

@@ -398,7 +398,7 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
 #[test]
 fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let dir = temp_dir("catalog_ddl_sync_pin");
-    let mut unreplayed = CatalogEngine::open_master(&dir, 1).unwrap();
+    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
 
     unreplayed
         .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(100, "synced", 1)]))
@@ -421,7 +421,10 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
 #[test]
 fn test_master_holds_no_user_store() {
     let dir = temp_dir("catalog_master_no_user_store");
-    let mut engine = CatalogEngine::open_master(&dir, 1).unwrap().replay().unwrap();
+    let mut engine = CatalogEngine::open_master(&dir, 1, Default::default())
+        .unwrap()
+        .replay()
+        .unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
