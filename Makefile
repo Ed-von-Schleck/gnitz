@@ -52,7 +52,7 @@ test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integrat
 	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
-	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz-server $(T)
+	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz $(T)
 
 fmt: ## Format the whole workspace
 	cd crates && cargo fmt --all
@@ -73,15 +73,15 @@ verify: fmt-check clippy test ## Pre-commit gate: format + lint + tests
 # ---------------------------------------------------------------------------
 
 server: ## Build the debug server binary -> ./gnitz-server
-	cd crates && cargo build -p gnitz-server
+	cd crates && cargo build -p gnitz
 	cp crates/target/debug/gnitz-server gnitz-server
 
 release-server: ## Build the release server binary -> ./gnitz-server-release
-	cd crates && cargo build --release -p gnitz-server
+	cd crates && cargo build --release -p gnitz
 	cp crates/target/release/gnitz-server gnitz-server-release
 
 checked-server: ## Build the release server WITH the Z-set layout verifiers -> ./gnitz-server-checked
-	cd crates && cargo build --profile release-checked -p gnitz-server
+	cd crates && cargo build --profile release-checked -p gnitz
 	cp crates/target/release-checked/gnitz-server gnitz-server-checked
 
 pyext: ## Build & install the Python extension (debug) into the uv venv
@@ -221,7 +221,7 @@ bench-perf-dwarf: bench ## Full + perf with DWARF call graphs
 
 profiling-server: ## Build frame-pointer release server -> ./gnitz-server-profiling (accurate perf call graphs)
 	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-frame-pointers=yes" CARGO_TARGET_DIR=target/profiling \
-		cargo build --release -p gnitz-server
+		cargo build --release -p gnitz
 	cp crates/target/profiling/release/gnitz-server gnitz-server-profiling
 
 bench-profile: profiling-server pyext-release ## Profile incremental view maintenance under perf (frame pointers, W=4)
@@ -231,7 +231,7 @@ bench-profile: profiling-server pyext-release ## Profile incremental view mainte
 
 profiling-server-dwarf: ## Build release server with DWARF unwind tables + line info -> ./gnitz-server-profiling-dwarf
 	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-unwind-tables=yes -C debuginfo=1" CARGO_TARGET_DIR=target/profiling-dwarf \
-		cargo build --release -p gnitz-server
+		cargo build --release -p gnitz
 	cp crates/target/profiling-dwarf/release/gnitz-server gnitz-server-profiling-dwarf
 
 # The flagship profiling command: sweep over the {1,4}×{1,4} worker×client

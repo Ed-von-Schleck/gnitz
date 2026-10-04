@@ -2,7 +2,7 @@
 //! hydrate a capacity-bounded view's skeleton rows.
 //!
 //! ```text
-//! cd crates && cargo test -p gnitz-server --release hydrate_bench \
+//! cd crates && cargo test -p gnitz --release hydrate_bench \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 

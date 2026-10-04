@@ -46,8 +46,9 @@ pub(super) mod worker;
 /// compensation, view backfill — turns it into
 /// `gnitz_fatal_abort!`. Which one a site is, is in its `Err` arm, not here.
 ///
-/// Debug and test builds only: release is `panic = "abort"` (`crates/Cargo.toml`),
-/// where the process dies at the panic and no `Err` arm below ever runs.
+/// Debug and test builds only: an optimized build dies at the panic — by
+/// `panic = "abort"` (`crates/Cargo.toml`), or by `main`'s panic hook under a
+/// profile without it — and no `Err` arm below ever runs.
 pub(crate) fn guard_panic<T, E: From<String>>(op: &'static str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err(panicked(op)))
 }

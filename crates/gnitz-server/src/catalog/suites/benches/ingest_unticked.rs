@@ -2,7 +2,7 @@
 //! which hold above the table's cut until the seal its next tick opens with.
 //!
 //! ```text
-//! cd crates && cargo test -p gnitz-server --release ingest_unticked_bench \
+//! cd crates && cargo test -p gnitz --release ingest_unticked_bench \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 

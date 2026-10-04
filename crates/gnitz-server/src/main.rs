@@ -178,7 +178,25 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     })
 }
 
+/// Ends the process at a panic in every optimized build, whichever profile
+/// compiled it: the workspace's release profile is `panic = "abort"`, and a
+/// build outside the workspace (`cargo install`) does not get that profile.
+/// Workers inherit the hook across the fork.
+///
+/// A debug build keeps unwinding, which `guard_panic` and `#[should_panic]`
+/// tests observe.
+#[cfg(not(debug_assertions))]
+fn abort_on_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        process::abort();
+    }));
+}
+
 fn main() {
+    #[cfg(not(debug_assertions))]
+    abort_on_panic();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP_TEXT}");

@@ -3,7 +3,7 @@
 //! read the source.
 //!
 //! ```text
-//! cd crates && cargo test -p gnitz-server --release drive_tick_bench \
+//! cd crates && cargo test -p gnitz --release drive_tick_bench \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 

@@ -4,7 +4,7 @@
 //! for the operators that keep state, with that state in RAM and spilled.
 //!
 //! ```text
-//! cd crates && cargo test -p gnitz-server --release view_tick_bench \
+//! cd crates && cargo test -p gnitz --release view_tick_bench \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 

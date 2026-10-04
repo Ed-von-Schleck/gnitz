@@ -1,5 +1,5 @@
 [package]
-name = "gnitz-server"
+name = "gnitz"
 description = "The gnitz database server: SQL with incrementally maintained materialized views, implementing DBSP"
 version.workspace = true
 edition.workspace = true

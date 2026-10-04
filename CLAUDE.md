@@ -345,7 +345,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
 | `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
-| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
+| `gnitz-server` | The multi-process server binary, whose cargo package is `gnitz`: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
 | `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
@@ -631,7 +631,7 @@ the whole workspace in release, so iterate on a single crate with cargo directly
 ```bash
 cd crates && cargo test -p gnitz-zset --release <name>_bench \
     -- --ignored --nocapture --test-threads=1
-# LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz-server
+# LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz
 ```
 
 A module's benchmarks live in `<dir>/benches/<module>.rs`, attached the way its
