@@ -16,6 +16,9 @@ members = [
     "gnitz-test-harness",
 ]
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 # One lint policy for the workspace, taken by every crate with
 # `[lints] workspace = true`. `gnitz-zset` and `gnitz-store` are the exceptions:
 # each spells its own table out so it can add `unreachable_pub`, which cargo does

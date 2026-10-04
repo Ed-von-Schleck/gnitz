@@ -2,6 +2,7 @@
 name    = "gnitz-expr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 gnitz-wire = { path = "../gnitz-wire" }
