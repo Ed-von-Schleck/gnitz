@@ -289,7 +289,7 @@ fn an_integrand_outside_the_plan_is_refused_even_as_a_source_store() {
 
 // ── One integral per integrand, one register per re-key ───────────────────
 
-/// [`left_join_circuit`] of table 10 `(id | nn, nullable)` and table 11 `(k | w)`,
+/// [`left_join_circuit`] of table 10 `(id | nn, nullable)` and table 11 `(id | k, w)`,
 /// every column a U64, on column `key` of 10, compiled whole for one worker.
 /// Answers 10's join re-key beside the plan.
 fn left_join_plan(key: u32) -> (Built, StateLayout, NodeId) {
@@ -297,7 +297,7 @@ fn left_join_plan(key: u32) -> (Built, StateLayout, NodeId) {
     use gnitz_zset::schema::SchemaColumn;
     let (nn, nullable) = (SchemaColumn::new(U64, false), SchemaColumn::new(U64, true));
     let a = SchemaDescriptor::new(&[nn, nn, nullable], &[0]);
-    let b = SchemaDescriptor::new(&[nn, nn], &[0]);
+    let b = SchemaDescriptor::new(&[nn, nn, nn], &[0]);
     let (c, ra) = crate::test_support::left_join_circuit(10, 11, key);
     let loaded = loaded(c);
     let mut layout = StateLayout::default();

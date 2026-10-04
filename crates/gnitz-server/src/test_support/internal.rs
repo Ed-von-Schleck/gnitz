@@ -209,8 +209,10 @@ pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circui
     circuit
 }
 
-/// `a (c0, c1, c2) LEFT JOIN b (c0, c1) ON a.<key> = b.c0` over U64 keys, as
-/// `[key, a.c0, a.c1, a.c2, b.c1]`. Answers the circuit and `a`'s join re-key.
+/// `a (c0, c1, c2) LEFT JOIN b (c0, c1, c2) ON a.<key> = b.c1` over U64 keys, as
+/// `[key, a.c0, a.c1, a.c2, b.c2]`: `b` is not unique on its key, so `a`'s
+/// matched rows are its re-key against `b`'s key set. Answers the circuit and
+/// `a`'s join re-key.
 pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::NodeId) {
     use gnitz_wire::{JoinKind, NullKeys, ReindexRole};
     let mut c = Circuit::default();
@@ -218,13 +220,12 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
     let role = || ReindexRole::ScatterKey { source_key: a_key.to_vec() };
     let sa = c.input_delta(a, gnitz_wire::ReadBound::None);
     let sb = c.input_delta(b, gnitz_wire::ReadBound::None);
-    let b_key = [(0, TypeCode::U64)];
+    let b_key = [(1, TypeCode::U64)];
     let b_role = ReindexRole::ScatterKey { source_key: b_key.to_vec() };
-    let rb = c.map_reindex(sb, &b_key, &[1], b_role, NullKeys::Drop);
+    let rb = c.map_reindex(sb, &b_key, &[2], b_role, NullKeys::Drop);
     let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Drop);
     let all = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep);
     let inner = c.join_terms([ra, rb], [ra, rb], JoinKind::Equi);
-    // `a`'s rows some row of `b` matches: its re-key against `b`'s key set.
     let keys = c.map(rb, &[]);
     let set = c.distinct(keys);
     let matched = c.join_terms([ra, set], [ra, set], JoinKind::Equi);
@@ -233,6 +234,28 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
     let out = c.union(filled, inner);
     c.sink(out);
     (c, ra)
+}
+
+/// Tables `a (id | nn, nullable)` and `b (id | k, w)`, every column a U64, in a
+/// fresh catalog at `dir`, under the view of [`left_join_circuit`] on `a`'s
+/// column `key`: `[key | id, nn, nullable, w]`.
+pub fn left_join_engine(dir: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
+    use TypeCode::U64;
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    let a_cols = [col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)];
+    let a = engine.create_table("public.a", &a_cols, &[0]).unwrap();
+    let b_cols = [col_def("id", U64), col_def("k", U64), col_def("w", U64)];
+    let b = engine.create_table("public.b", &b_cols, &[0]).unwrap();
+    let view_cols = [
+        col_def("key", U64),
+        col_def("id", U64),
+        col_def("nn", U64),
+        nullable_def("nullable", U64),
+        nullable_def("w", U64),
+    ];
+    let (circuit, _) = left_join_circuit(a, b, key);
+    let view = try_register_view(&mut engine, circuit, "v", &view_cols, 0, 0).unwrap();
+    (engine, [a, b], view)
 }
 
 /// A drive host for circuits that exchange nothing.

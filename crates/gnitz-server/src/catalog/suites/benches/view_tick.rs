@@ -1,7 +1,7 @@
 //! Release benchmarks: instructions a view's maintenance costs per source row of
-//! a wide tick, for a projection and for a view `distinct` readers consume, and
-//! per one-row tick for the operators that keep state, with that state in RAM
-//! and spilled.
+//! a wide tick, for a projection, for a view `distinct` readers consume and for
+//! the preserved side of a left join, and per one-row tick for an identity and
+//! for the operators that keep state, with that state in RAM and spilled.
 //!
 //! ```text
 //! cd crates && cargo test -p gnitz-server --release view_tick_bench \
@@ -122,6 +122,48 @@ fn echo_fold_view_tick_bench() {
     }
 }
 
+/// The wide ticks into the preserved side of `a LEFT JOIN b ON a.<key> = b.k`, by
+/// `a`'s key column and by whether `b` holds one match for every row: the PK
+/// reaches the join in order and a payload key scattered, a nullable key is
+/// re-keyed once for the join and once for the null-fill, and a matched row is
+/// found in `b`'s trace and again in its key set.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn left_join_view_tick_bench() {
+    let counter = perf::Counter::instructions();
+    let total = WIDE_TICKS * WIDE_TICK_ROWS;
+    for (label, key, matched) in [
+        ("PK key, no match", 0, false),
+        ("NOT NULL payload key, no match", 1, false),
+        ("nullable payload key, no match", 2, false),
+        ("NOT NULL payload key, one match", 1, true),
+    ] {
+        let dir = temp_dir(&format!("left_join_view_tick_bench_{key}_{matched}"));
+        let (mut engine, [a, b], v) = left_join_engine(&dir, key);
+        if matched {
+            let held = rows(&engine, b, 1, 0..total, |id| [scramble(id), id]);
+            tick(&mut engine, &counter, b, held);
+        }
+        // Compiles the plan outside the measurement.
+        let warm = Drive::Tick { source: a, round: 1 };
+        crate::query::drive(&mut LocalDrive(&mut engine), warm, None).unwrap();
+
+        let ticks = wide_ticks(&mut engine, &counter, a, 0, false, |id| [scramble(id); 2]);
+        let out = scan_all(&mut engine, v);
+        let b_w = out.schema().num_payload_cols() - 1;
+        let null_filled = (0..out.len())
+            .filter(|&i| gnitz_expr::payload_is_null(&*out, i, b_w))
+            .count() as u64;
+        assert_eq!(
+            (net_weight(&engine, v) as u64, null_filled),
+            (total, if matched { 0 } else { total }),
+            "{label}"
+        );
+        println!("left join view, {label:<31}: {ticks:>6.1} instr/row");
+        discard(engine);
+    }
+}
+
 // ── One-row ticks ───────────────────────────────────────────────────────────
 
 /// Distinct values of `k` in a [`one_row_ticks`] base.
@@ -209,6 +251,16 @@ fn one_row_ticks(what: &str, register: impl Fn(&mut CatalogEngine, u64) -> u64) 
         );
         discard(engine);
     }
+}
+
+/// `SELECT * FROM t`: the tick and the ingest of its one row with no operator
+/// state under them, the floor of every cell beside it.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn identity_view_tick_bench() {
+    one_row_ticks("identity", |engine, t| {
+        register_identity_view(engine, t, "v", &group_cols())
+    });
 }
 
 /// `SELECT k, COUNT(*), MIN(v) FROM t GROUP BY k`: an insert lowers its group's

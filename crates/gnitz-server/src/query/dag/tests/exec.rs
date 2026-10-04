@@ -3,8 +3,8 @@
 use super::*;
 use crate::catalog::{CatalogColumn, CatalogEngine};
 use crate::test_support::{
-    col_def, cols_of, make_batch, register_identity_view, scan_all, scratch_dir, try_register_view, zset_of,
-    LocalDrive, RowKey,
+    col_def, cols_of, left_join_engine, make_batch, net_weight, register_identity_view, scan_all, scratch_dir,
+    try_register_view, zset_of, LocalDrive, RowKey,
 };
 use gnitz_store::relation::Relation;
 use gnitz_wire::TypeCode;
@@ -28,13 +28,13 @@ pub(super) struct Views {
     /// `base UNION ALL base` through two sharded sides: 2×.
     twice: u64,
     /// Identity over the base: 1×.
-    pub(super) once: u64,
+    once: u64,
     /// Identity over `twice`: 2×, where reading the base would give 1×.
     deep: u64,
     /// `twice UNION ALL once`, a view two producers feed: 3×.
     union: u64,
     /// Identity over `union`: 3×.
-    over_union: u64,
+    pub(super) over_union: u64,
 }
 
 impl Views {
@@ -90,9 +90,9 @@ fn times(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)], k: i64) -> 
     zset_of(&batch, batch.schema())
 }
 
-/// One tick of `source` over `delta`.
-pub(super) fn tick(engine: &mut CatalogEngine, source: u64, round: u64, delta: Batch) {
-    drive(&mut LocalDrive(engine), Drive::Tick { source, round }, Some(delta)).unwrap();
+/// One tick of `source` over `delta`; `None` where it brings this process no row.
+pub(super) fn tick(engine: &mut CatalogEngine, source: u64, delta: impl Into<Option<Batch>>) {
+    drive(&mut LocalDrive(engine), Drive::Tick { source, round: 1 }, delta.into()).unwrap();
 }
 
 // ── The schedule ────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ fn a_tick_drives_the_whole_closure() {
     let rows = [(1, 1, 10), (2, 1, 20), (3, -1, 30)];
 
     let delta = delta_for(&engine, base, &rows);
-    tick(&mut engine, base, 1, delta);
+    tick(&mut engine, base, delta);
 
     for (vid, k) in [
         (views.twice, 2),
@@ -189,20 +189,16 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     let count = try_register_view(&mut engine, circuit, "count", &cols_of(&counted), 0, 0).unwrap();
 
     for round in 1..=2 {
-        drive(&mut LocalDrive(&mut engine), Drive::Tick { source: base, round }, None).unwrap();
-        assert_eq!(net_weight(&mut engine, count), 1, "round {round}: the ground row, once");
+        tick(&mut engine, base, None);
+        assert_eq!(net_weight(&engine, count), 1, "round {round}: the ground row, once");
         assert!(held(&mut engine, once).is_empty(), "round {round}");
     }
 
     let rows = [(1, 1, 10)];
     let delta = delta_for(&engine, base, &rows);
-    tick(&mut engine, base, 3, delta);
+    tick(&mut engine, base, delta);
     assert_eq!(held(&mut engine, once), times(&engine, base, &rows, 1));
-    assert_eq!(
-        net_weight(&mut engine, count),
-        1,
-        "the count moved, its row count did not"
-    );
+    assert_eq!(net_weight(&engine, count), 1, "the count moved, its row count did not");
 }
 
 // ── A side's output relay ───────────────────────────────────────────────────
@@ -267,31 +263,8 @@ fn a_replica_sides_output_is_shared_without_a_round() {
 
 // ── A LEFT JOIN's two re-keys ───────────────────────────────────────────────
 
-/// Tables `a (id | nn, nullable)` and `b (k | w)`, every column a U64, under the
-/// view `a LEFT JOIN b ON a.<key> = b.k`: `[key | id, nn, nullable, w]`.
-pub(super) fn left_join_engine(name: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
-    use crate::test_support::nullable_def;
-    use TypeCode::U64;
-    let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), 1).unwrap();
-    let a_cols = [col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)];
-    let a = engine.create_table("public.a", &a_cols, &[0]).unwrap();
-    let b = engine
-        .create_table("public.b", &[col_def("k", U64), col_def("w", U64)], &[0])
-        .unwrap();
-    let view_cols = [
-        col_def("key", U64),
-        col_def("id", U64),
-        col_def("nn", U64),
-        nullable_def("nullable", U64),
-        nullable_def("w", U64),
-    ];
-    let (circuit, _) = crate::test_support::left_join_circuit(a, b, key);
-    let view = try_register_view(&mut engine, circuit, "v", &view_cols, 0, 0).unwrap();
-    (engine, [a, b], view)
-}
-
 /// `rows` of `tid`'s schema at weight `weight`, each a PK and its payload cells.
-pub(super) fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option<u64>])]) -> Batch {
+fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option<u64>])]) -> Batch {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = gnitz_zset::repr::BatchBuilder::new(&schema);
     for &(pk, cells) in rows {
@@ -304,10 +277,10 @@ pub(super) fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u6
     bb.finish()
 }
 
-/// Ingest `delta` into table `tid`, as a push does, and answer what the tick of
-/// it is driven over.
-pub(super) fn ingested(engine: &mut CatalogEngine, tid: u64, delta: Batch) -> Batch {
-    engine.registry.ingest_returning(tid, delta).unwrap()
+/// Push `rows` into table `tid`, and answer what the tick of it is driven over.
+fn pushed(engine: &mut CatalogEngine, tid: u64, rows: Batch) -> Option<Batch> {
+    engine.ingest_unticked(tid, rows).unwrap();
+    engine.registry.seal(tid).unwrap()
 }
 
 /// Over a nullable key the preserved side's two re-keys differ in exactly the
@@ -315,10 +288,10 @@ pub(super) fn ingested(engine: &mut CatalogEngine, tid: u64, delta: Batch) -> Ba
 /// such a row once, null-filled, beside a matched row and an unmatched one.
 #[test]
 fn a_left_join_null_fills_its_null_keyed_preserved_row() {
-    let (mut engine, [a, b], view) = left_join_engine("left_join_null_key", 2);
-    let delta = rows_of(&engine, b, 1, &[(7, &[Some(70)])]);
-    let delta = ingested(&mut engine, b, delta);
-    tick(&mut engine, b, 1, delta);
+    let (mut engine, [a, b], view) = left_join_engine(&scratch_dir("dag_exec", "left_join_null_key"), 2);
+    let delta = rows_of(&engine, b, 1, &[(1, &[Some(7), Some(70)])]);
+    let delta = pushed(&mut engine, b, delta);
+    tick(&mut engine, b, delta);
     let delta = rows_of(
         &engine,
         a,
@@ -329,8 +302,8 @@ fn a_left_join_null_fills_its_null_keyed_preserved_row() {
             (3, &[Some(30), Some(9)]),
         ],
     );
-    let delta = ingested(&mut engine, a, delta);
-    tick(&mut engine, a, 2, delta);
+    let delta = pushed(&mut engine, a, delta);
+    tick(&mut engine, a, delta);
 
     let want = rows_of(
         &engine,
@@ -344,11 +317,4 @@ fn a_left_join_null_fills_its_null_keyed_preserved_row() {
         ],
     );
     assert_eq!(held(&mut engine, view), zset_of(&want, want.schema()));
-}
-
-// ── Per-epoch cost ──────────────────────────────────────────────────────────
-
-/// The net weight `tid` holds.
-pub(super) fn net_weight(engine: &mut CatalogEngine, tid: u64) -> u64 {
-    held(engine, tid).values().sum::<i64>() as u64
 }
