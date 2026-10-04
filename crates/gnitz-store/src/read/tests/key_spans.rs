@@ -29,7 +29,7 @@ fn fixture(indexed: bool) -> RelationFixture {
         bb.end_row();
     }
     let indexed: &[u32] = if indexed { &[1] } else { &[] };
-    relation_fixture(RelationKind::BaseTable, schema, indexed, bb.finish())
+    relation_fixture(RelationKind::BaseTable, schema, indexed, [bb.finish()])
 }
 
 /// Every span of `spans` in order, and the row count of each chunk.

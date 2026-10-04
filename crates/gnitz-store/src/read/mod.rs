@@ -23,10 +23,6 @@ mod store_io;
 
 pub use key_spans::KeySpans;
 
-#[cfg(test)]
-#[path = "benches/index_probe.rs"]
-mod bench_index_probe;
-
 use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;

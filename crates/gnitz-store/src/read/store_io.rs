@@ -115,3 +115,7 @@ fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound)
 #[cfg(test)]
 #[path = "tests/store_io.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/store_io.rs"]
+mod bench;

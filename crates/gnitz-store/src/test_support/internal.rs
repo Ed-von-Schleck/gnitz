@@ -57,12 +57,12 @@ impl std::ops::DerefMut for RelationFixture {
 }
 
 /// A registry holding [`TID`] as a `kind` relation over `schema`, with an index
-/// on each column of `indexed`, holding `rows`.
+/// on each column of `indexed`, holding `rounds`, one ingest each.
 pub(crate) fn relation_fixture(
     kind: RelationKind,
     schema: SchemaDescriptor,
     indexed: &[u32],
-    rows: Batch,
+    rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
@@ -83,8 +83,15 @@ pub(crate) fn relation_fixture(
             )
             .unwrap();
     }
-    registry.ingest(TID, rows).unwrap();
+    for rows in rounds {
+        registry.ingest(TID, rows).unwrap();
+    }
     RelationFixture { registry, _dir: dir }
+}
+
+/// `v`'s key image in an I64 column.
+pub(crate) fn img(v: i64) -> u128 {
+    gnitz_wire::key_image(gnitz_wire::TypeCode::I64, v as u64 as u128)
 }
 
 /// A rows spec with no bound and no predicate.

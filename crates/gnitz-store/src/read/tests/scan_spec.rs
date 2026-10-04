@@ -1,14 +1,14 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec};
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec, RelationFixture,
-    TID,
+    img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
+    RelationFixture, TID,
 };
 use gnitz_expr::{
     payload_is_null, payload_string, payload_u64, CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink,
 };
 use gnitz_wire::TypeCode;
-use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
+use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{Placement, SchemaColumn};
@@ -16,10 +16,10 @@ use gnitz_zset::schema::{Placement, SchemaColumn};
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
 /// may repeat and a weight above 1 is admitted verbatim.
-pub(super) fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
+fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let kind = RelationKind::View(ViewProps::Plain);
-    relation_fixture(kind, schema, &[], make_batch_raw(&schema, rows))
+    relation_fixture(kind, schema, &[], [make_batch_raw(&schema, rows)])
 }
 
 /// A `(id U64 PK | val I64)` reply's `(id, weight, val)` rows, sorted: a reply's
@@ -32,14 +32,14 @@ fn rows_of(b: &Batch) -> Vec<(u64, i64, i64)> {
     rows
 }
 
-/// `spec` over `TID`, replying in the relation's own layout.
-pub(super) fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
-    let layout = r.relation(TID).unwrap().schema().layout_digest();
+/// `spec` over `TID`, replying in the layout its sink produces.
+fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
+    let layout = layout_of(&r.relation(TID).unwrap().schema(), &spec.sink);
     r.scan_spec(TID, spec, layout, None)
 }
 
 /// The layout `sink` replies in over `schema`.
-fn fold_layout(schema: &SchemaDescriptor, sink: &ReadSink) -> u64 {
+pub(super) fn layout_of(schema: &SchemaDescriptor, sink: &ReadSink) -> u64 {
     SinkPlan::from_wire(schema, sink, usize::MAX)
         .unwrap()
         .output_schema()
@@ -51,7 +51,7 @@ fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
 }
 
 /// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
-pub(super) fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
+fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
     let mut eb = ExprBuilder::new();
     let v = eb.emit(LogicalInstr::LoadCol { col });
     let lo_c = eb.emit(LogicalInstr::LoadConst { val: lo, unsigned: false });
@@ -62,11 +62,6 @@ pub(super) fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
         keep = eb.emit(LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
     }
     eb.build(vec![Sink::Reg(keep)]).unwrap().to_blob_bytes()
-}
-
-/// `v`'s key image in an I64 column.
-pub(super) fn img(v: i64) -> u128 {
-    key_image(TypeCode::I64, v as u64 as u128)
 }
 
 /// A `pk IN (…)` bound over a U64 PK.
@@ -101,7 +96,7 @@ fn every_sink_answers_only_in_its_own_layout() {
         sink: ReadSink { map: None, kind: SinkKind::Fold(agg) },
         ..whole.clone()
     };
-    let fold_layout = fold_layout(&schema, &fold.sink);
+    let fold_layout = layout_of(&schema, &fold.sink);
     let own = schema.layout_digest();
     let sinks = [
         (whole, own),
@@ -196,20 +191,13 @@ fn a_fold_counts_the_survivors_of_every_chunk() {
         group_cols: vec![1],
         aggs: vec![AggDescriptor::COUNT_STAR],
     };
-    let layout = fold_layout(
-        &schema,
-        &ReadSink {
-            map: None,
-            kind: SinkKind::Fold(agg.clone()),
-        },
-    );
     for map in [None, map_of(LogicalProgram::copy_cols(&[1]), &schema)] {
         let spec = ReadSpec {
             bound: ReadBound::None,
             predicate: between(1, 0, Some(2)),
             sink: ReadSink { map, kind: SinkKind::Fold(agg.clone()) },
         };
-        let got = r.scan_spec(TID, spec, layout, None).unwrap();
+        let got = run(&r, spec).unwrap();
         let mut groups: Vec<(i64, i64, i64)> = (0..got.len())
             .map(|i| {
                 (
@@ -233,7 +221,7 @@ fn a_malformed_request_is_refused() {
     let col = |tc| SchemaColumn::new(tc, false);
     let schema = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::F64)], &[0]);
     let kind = RelationKind::View(ViewProps::Plain);
-    let r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
+    let r = relation_fixture(kind, schema, &[], []);
     let walk = |c: u32| {
         let r = KeyRange::new(PkColList::from_slice(&[c]), &[], Cut::before(0), Cut::after(9));
         ReadSpec::all_rows(ReadBound::Range(r))
@@ -333,7 +321,7 @@ fn an_index_walk_returns_exactly_its_range() {
         bb.put_opt_int(big);
         bb.end_row();
     }
-    let r = relation_fixture(RelationKind::BaseTable, schema, &[1, 2], bb.finish());
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[1, 2], [bb.finish()]);
 
     let vals = |keep: &dyn Fn(i64) -> bool| -> Vec<u64> {
         (0..WALK_ROWS).filter(|&id| walk_row(id).0.is_some_and(keep)).collect()
@@ -365,7 +353,7 @@ fn an_index_walk_returns_exactly_its_range() {
         ),
         (2, Cut::before(3 << 70), Cut::before(6 << 70), true, vec![3, 4, 5]),
     ];
-    let ids = |spec: ReadSpec| rows_of_walk(&r.scan_spec(TID, spec, schema.layout_digest(), None).unwrap());
+    let ids = |spec: ReadSpec| rows_of_walk(&run(&r, spec).unwrap());
     for (col, start, end, walks, want) in walks {
         let bound = ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
         let (cursor, _) = r.open_bound(TID, bound.clone()).unwrap();
@@ -417,7 +405,7 @@ fn map_fixture(
         put_row(&mut bb, id);
         bb.end_row();
     }
-    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], bb.finish());
+    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], [bb.finish()]);
     r.set_scan_chunk_rows(chunk_rows);
     r
 }
@@ -438,7 +426,7 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
     let reply = SchemaDescriptor::new(&cols, &[0]);
     let copies: Vec<u32> = (1..=P as u32).collect();
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&copies), &reply), vec![], 0);
-    let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
+    let got = run(&r, spec).unwrap();
     assert_eq!(got.len(), 40);
     for row in 0..got.len() {
         let id = got.get_pk(row) as u64;
@@ -456,7 +444,7 @@ fn a_pk_sourced_map_zeroes_every_null_word() {
     r.set_scan_chunk_rows(32);
     let reply = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), vec![], 0);
-    let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
+    let got = run(&r, spec).unwrap();
     assert_eq!(got.len(), 300);
     for row in 0..got.len() {
         assert_eq!(got.get_null_word(row), 0, "row {row}");
@@ -495,7 +483,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
         &[0],
     );
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[2, 0, 1]), &reply), vec![], 0);
-    let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
+    let got = run(&r, spec).unwrap();
     let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let nv = (!payload_is_null(&*got, row, 2)).then(|| payload_u64(&*got, row, 2) as i64);
@@ -543,7 +531,7 @@ fn a_computed_map_writes_at_the_keepers_tail() {
         predicate: between(2, 0, Some(1000)),
         ..rows_spec(map_of(program, &reply), vec![], 0)
     };
-    let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
+    let got = run(&r, spec).unwrap();
     let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let doubled = (!payload_is_null(&*got, row, 0)).then(|| payload_u64(&*got, row, 0) as i64);
@@ -568,7 +556,7 @@ fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64
     let kind = RelationKind::View(ViewProps::Bounded {
         capacity_bytes: std::num::NonZeroU64::MIN,
     });
-    let mut registry = relation_fixture(kind, schema, &[], rows(on_disk));
+    let mut registry = relation_fixture(kind, schema, &[], [rows(on_disk)]);
     registry.checkpoint_ephemeral([], 1).unwrap();
     assert!(
         registry.relation(TID).unwrap().table().has_skeleton_rows(),
@@ -737,7 +725,7 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let kind = RelationKind::View(ViewProps::Fed {
         delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
     });
-    let mut r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
+    let mut r = relation_fixture(kind, schema, &[], []);
     r.ingest_at(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
     r.ingest_at(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)

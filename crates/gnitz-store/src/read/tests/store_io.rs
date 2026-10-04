@@ -1,9 +1,10 @@
 use super::*;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_only_schema, relation_fixture, RelationFixture, TID,
+    img, make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_only_schema, relation_fixture, RelationFixture,
+    TID,
 };
 use gnitz_wire::TypeCode;
-use gnitz_wire::{key_image, Cut, PkColList};
+use gnitz_wire::{Cut, PkColList};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -15,12 +16,7 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let rows: Vec<_> = (0..NBASE).map(|id| (id, 1, val_of(id))).collect();
     let rows = make_batch_raw(&schema, &rows);
-    relation_fixture(RelationKind::BaseTable, schema, &[1], rows)
-}
-
-/// `v`'s key image in the I64 `val` column.
-fn img(v: i64) -> u128 {
-    key_image(TypeCode::I64, v as u64 as u128)
+    relation_fixture(RelationKind::BaseTable, schema, &[1], [rows])
 }
 
 /// The bound `val ∈ [lo, hi)`.
@@ -150,7 +146,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
             bb.end_row();
         }
     }
-    let r = relation_fixture(RelationKind::BaseTable, schema, &[0], bb.finish());
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[0], [bb.finish()]);
 
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
     let (mut cur, unapplied) = r.open_bound(TID, ReadBound::Range(range)).unwrap();
@@ -228,18 +224,17 @@ impl ValIndex {
 
     /// The entry row `id` stores under `val`.
     fn entry(&self, id: u64, val: i64) -> Vec<u8> {
-        let rows = make_batch_raw(&make_schema_u64_i64(), &[(id, 1, val)]);
-        let entries = gnitz_zset::algebra::index_entries(&rows, &self.spec, &self.schema);
-        entries.get_pk_bytes(0).to_vec()
+        opk_pk(&self.schema, &[val as u128, id as u128])
     }
 
     /// The probe keys of `vals`: each one's span.
     fn keys(&self, vals: &[i64]) -> Batch {
-        let mut keys = Batch::empty_with_schema(&self.spec.span_schema());
+        let mut keys = BatchBuilder::new(&self.spec.span_schema());
         for &val in vals {
-            keys.push_key_row(&self.entry(0, val)[..self.spec.key_size()], 1);
+            keys.begin_row(val as u128, 1);
+            keys.end_row();
         }
-        keys
+        keys.finish()
     }
 }
 
