@@ -83,7 +83,7 @@ proptest! {
         let shards: Vec<Rc<MappedShard>> = runs
             .iter()
             .enumerate()
-            .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b, ShardWriteOpts::default()))
+            .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b))
             .collect();
 
         // Guard keys drawn from the rows' own keys, so boundaries land on live
@@ -143,7 +143,6 @@ fn a_skeleton_output_is_payload_free_on_disk() {
     let src = map_shard(
         &dir.path().join("in.db"),
         &make_batch(&schema, &[(1, 1, 10), (1, 2, 20), (2, 5, 30)]),
-        ShardWriteOpts::default(),
     );
     let [(_, true, batch)] = &route(&[src], &[PkBuf::zeroed(8)], true, &schema)[..] else {
         panic!("one skeleton guard, one output");
@@ -171,11 +170,7 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     let schema = make_schema_u64_i64();
     let hydrated = make_batch(&schema, &[(1, 1, 10), (9, 1, 90)]);
     let [(_, true, coarse)] = &route(
-        &[map_shard(
-            &dir.path().join("a.db"),
-            &hydrated,
-            ShardWriteOpts::default(),
-        )],
+        &[map_shard(&dir.path().join("a.db"), &hydrated)],
         &[PkBuf::zeroed(8)],
         true,
         &schema,
@@ -190,7 +185,6 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     let fresh = map_shard(
         &dir.path().join("c.db"),
         &make_batch(&schema, &[(1, 2, 11), (5, 1, 50)]),
-        ShardWriteOpts::default(),
     );
 
     let guards = [PkBuf::zeroed(8), PkBuf::from_bytes(&5u64.to_be_bytes())];

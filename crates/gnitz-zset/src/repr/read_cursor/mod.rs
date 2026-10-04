@@ -196,7 +196,7 @@ impl ReadCursor {
     ///
     /// `Self::advance_to` lands identically, galloping from where the cursor
     /// stands; this one's landing owes nothing to where the cursor stood, which
-    /// is what makes it the tests' and benches' independent oracle.
+    /// is what makes it the tests' independent oracle.
     #[cfg(test)]
     pub(crate) fn seek_bytes(&mut self, key: &[u8]) {
         self.seek_range_bytes(key, None);

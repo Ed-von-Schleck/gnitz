@@ -1031,7 +1031,7 @@ impl Batch {
     /// Reset to empty and return both buffers to the pool, in place. Leaves what
     /// [`Self::empty_with_schema`] would build, without `take`'s two moves of the
     /// whole struct — and returns immediately when the batch is already free, which is
-    /// what the VM's per-epoch register clear mostly does (`batch_release_bench`).
+    /// what the VM's per-epoch register clear mostly does.
     pub fn release_buffers(&mut self) {
         if self.data.capacity() == 0 && self.blob.capacity() == 0 {
             return;

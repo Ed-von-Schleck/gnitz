@@ -1,5 +1,4 @@
 use super::*;
-use crate::repr::shard_file::ShardWriteOpts;
 use crate::repr::shard_reader::MappedShard;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
@@ -67,7 +66,7 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
         .iter()
         .filter(|b| b.count > 0)
         .enumerate()
-        .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b, ShardWriteOpts::default()))
+        .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b))
         .collect();
     let shards: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
     let folds = vec![

@@ -226,11 +226,11 @@ pub(crate) fn bench_time_each<S>(
     total
 }
 
-/// `batch` written to `path` under `opts` and mapped back, as a store maps the
-/// shards it writes.
-pub(crate) fn map_shard(path: &Path, batch: &Batch, opts: ShardWriteOpts) -> Rc<MappedShard> {
+/// `batch` written to `path` and mapped back, as a store maps the shards it
+/// writes.
+pub(crate) fn map_shard(path: &Path, batch: &Batch) -> Rc<MappedShard> {
     let path = path.to_str().unwrap();
-    batch.write_as_shard(path, opts).unwrap();
+    batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
     Rc::new(MappedShard::open(path, batch.schema()).unwrap())
 }
 

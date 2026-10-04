@@ -2,67 +2,50 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch};
-
-/// `release_buffers` against `drop(take())` on the case that dominates: clearing
-/// a register that is already free. The VM does that for every register of every
-/// plan once per epoch, so the per-call constant is the whole comparison.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn batch_release_bench() {
-    use crate::test_support::bench_time;
-    const ITERS: usize = 2_000_000;
-    let schema = make_schema_u64_i64();
-
-    let mut regs: Vec<Batch> = (0..64).map(|_| Batch::empty_with_schema(&schema)).collect();
-    let release = bench_time(ITERS / 64, || {
-        for b in &mut regs {
-            std::hint::black_box(&mut *b).release_buffers();
-        }
-    });
-    let take = bench_time(ITERS / 64, || {
-        for b in &mut regs {
-            drop(std::hint::black_box(&mut *b).take());
-        }
-    });
-
-    println!(
-        "already-empty register clear: release_buffers {:.1} ns, drop(take()) {:.1} ns",
-        release.as_nanos() as f64 / ITERS as f64,
-        take.as_nanos() as f64 / ITERS as f64,
-    );
-}
+use gnitz_foundation::perf::Counter;
+use std::hint::black_box;
 
 /// `into_consolidated` over a batch with no claim, by the order its rows stand
-/// in: ascending already, ascending but for its last row, descending, and
-/// scattered. The second is the input a check for the first costs the most on.
+/// in and by how many of them share a PK. "Ascending but the last" is the input
+/// a check for "ascending" costs the most on; the last two shapes are the only
+/// ones whose sort breaks PK ties on the payload, and the last the only one that
+/// folds rows.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn consolidate_bench() {
-    use std::hint::black_box;
     const N: u64 = 65_536;
-    const ITERS: u64 = 20;
-    let counter = gnitz_foundation::perf::Counter::instructions();
+    const SCATTER: u64 = 0x9E37_79B9_7F4A_7C15;
+    let counter = Counter::instructions();
     let schema = make_schema_u64_i64();
-    let scatter = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8;
-    type Key = fn(u64) -> u64;
-    let shapes: [(&str, Key); 4] = [
-        ("ascending", |i| i + 1),
-        ("ascending but the last", |i| if i == N - 1 { 0 } else { i + 1 }),
-        ("descending", |i| N - i),
-        ("scattered", scatter),
+    /// Row `i` as `(pk, payload)`.
+    type Row = fn(u64) -> (u64, u64);
+    let shapes: [(&str, Row, u64); 6] = [
+        ("ascending", |i| (i + 1, i), N),
+        ("ascending but the last", |i| (if i == N - 1 { 0 } else { i + 1 }, i), N),
+        ("descending", |i| (N - i, i), N),
+        ("scattered", |i| (i.wrapping_mul(SCATTER) >> 8, i), N),
+        (
+            "scattered, 8 payloads per PK",
+            |i| ((i / 8).wrapping_mul(SCATTER) >> 8, i.wrapping_mul(SCATTER)),
+            N,
+        ),
+        (
+            "scattered, every row twice",
+            |i| ((i / 2).wrapping_mul(SCATTER) >> 8, i / 2),
+            N / 2,
+        ),
     ];
-    for (label, key) in shapes {
-        let rows: Vec<(u64, i64, i64)> = (0..N).map(|i| (key(i), 1, i as i64)).collect();
-        let mut instructions = 0;
-        for _ in 0..ITERS {
+    for (label, row, survivors) in shapes {
+        let rows: Vec<(u64, i64, i64)> = (0..N).map(row).map(|(pk, v)| (pk, 1, v as i64)).collect();
+        // The first pass takes the pool's first allocations.
+        let [_, (out, instructions)] = [(); 2].map(|()| {
             let batch = make_batch_raw(&schema, &rows);
-            let (out, n) = counter.measure(|| black_box(batch).into_consolidated());
-            assert_eq!(out.count as u64, N);
-            instructions += n;
-        }
+            counter.measure(|| black_box(batch).into_consolidated())
+        });
+        assert_eq!(out.count as u64, survivors);
         println!(
-            "into_consolidated, {label:<22} {:>6.1} instr/row",
-            instructions as f64 / (ITERS * N) as f64
+            "into_consolidated, {label:<28} {:>6.1} instr/row",
+            instructions as f64 / N as f64
         );
     }
 }
@@ -77,11 +60,11 @@ fn append_batch_strings_bench() {
     let values: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("{i:040}").into_bytes()).collect();
     let rows: Vec<(u64, i64, &[u8])> = values.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
     let src = make_string_batch(&rows);
-    let counter = gnitz_foundation::perf::Counter::instructions();
+    let counter = Counter::instructions();
     let (dst, instructions) = counter.measure(|| {
         let mut dst = Batch::empty_with_schema(src.schema());
         for _ in 0..APPENDS {
-            dst.append_batch(std::hint::black_box(&src));
+            dst.append_batch(black_box(&src));
         }
         dst
     });
@@ -109,14 +92,14 @@ fn from_ranges_run_length_bench() {
         b.end_row();
     }
     let src = b.finish();
-    let counter = gnitz_foundation::perf::Counter::instructions();
+    let counter = Counter::instructions();
     for run in [1usize, 2, 4, 16, 256] {
         let ranges: Vec<(usize, usize)> = (0..ROWS).step_by(2 * run).map(|s| (s, s + run)).collect();
         let (copied, instructions) = counter.measure(|| {
             let mut copied = 0;
             for _ in 0..PASSES {
-                let out = Batch::from_ranges(std::hint::black_box(&src), std::hint::black_box(&ranges), 0);
-                copied += std::hint::black_box(&out).count;
+                let out = Batch::from_ranges(black_box(&src), black_box(&ranges), 0);
+                copied += black_box(&out).count;
             }
             copied
         });
@@ -156,11 +139,8 @@ fn blob_cache_session_bench() {
     };
     let (one, hundred, many) = (make_string_batch(&[(1, 1, &[b'x'; 40])]), build(100), build(25_000));
     // A relocating session over every row of `src`: `compacted` carries no heap.
-    let session = |src: &Batch| std::hint::black_box(std::hint::black_box(src).compacted()).count;
-    let counters = [
-        ("instr", gnitz_foundation::perf::Counter::instructions()),
-        ("cycles", gnitz_foundation::perf::Counter::cycles()),
-    ];
+    let session = |src: &Batch| black_box(black_box(src).compacted()).count;
+    let counters = [("instr", Counter::instructions()), ("cycles", Counter::cycles())];
     for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
         for (unit, counter) in &counters {
             let small: u64 = (0..SESSIONS)

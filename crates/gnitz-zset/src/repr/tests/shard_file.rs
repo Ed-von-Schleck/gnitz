@@ -96,7 +96,7 @@ fn a_shard_drops_its_runs_dead_heap() {
     assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
 
     let dir = tempfile::tempdir().unwrap();
-    let shard = map_shard(&dir.path().join("s.db"), &run, ShardWriteOpts::default());
+    let shard = map_shard(&dir.path().join("s.db"), &run);
     assert_eq!(shard.blob().len(), y.len(), "only the referenced span reaches disk");
     assert_eq!(read_strings(&shard.slice_to_owned_batch(0, 1)), [y.to_vec()]);
 }
@@ -146,7 +146,7 @@ fn a_packed_shard_drops_its_runs_dead_heap() {
     assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
 
     let dir = tempfile::tempdir().unwrap();
-    let shard = map_shard(&dir.path().join("s.db"), &run, ShardWriteOpts::default());
+    let shard = map_shard(&dir.path().join("s.db"), &run);
     assert_eq!(shard.blob().len(), y.len());
     assert_eq!(shard.row_count(), 3);
 }

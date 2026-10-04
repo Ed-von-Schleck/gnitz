@@ -60,9 +60,7 @@ proptest! {
             .map(|(i, b)| match as_shard >> (i % 16) & 1 == 1 && b.count > 0 {
                 true => Run::Shard(map_shard(
                     &dir.path().join(format!("{i}.db")),
-                    b,
-                    ShardWriteOpts::default(),
-                )),
+                    b)),
                 false => Run::Mem(Rc::new(b.clone())),
             })
             .collect();
@@ -303,7 +301,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
     let shards: Vec<Rc<MappedShard>> = (0..2u64)
         .map(|s| {
             let run = string_run((1..=100).map(|i| s * 10_000 + i), 40, 1);
-            map_shard(&dir.path().join(format!("s{s}.db")), &run, ShardWriteOpts::default())
+            map_shard(&dir.path().join(format!("s{s}.db")), &run)
         })
         .collect();
 

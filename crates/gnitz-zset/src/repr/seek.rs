@@ -114,3 +114,7 @@ pub(crate) fn pk_prefix_group_end<S: RowSource>(src: &S, start: usize, width: us
 #[cfg(test)]
 #[path = "tests/seek.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/seek.rs"]
+mod bench;

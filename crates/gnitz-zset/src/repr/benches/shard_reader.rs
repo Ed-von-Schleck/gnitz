@@ -1,215 +1,70 @@
 use super::super::batch::Batch;
 use super::super::scatter::UnifiedSet;
-use super::tests::build;
-use super::tests::wide_string;
-use super::tests::write;
+use super::super::string_heap::should_relocate_blob;
+use super::tests::{build, wide_string, write};
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, u64_pk_schema};
-use gnitz_wire::num_regions;
+use crate::test_support::{
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, Rng,
+};
+use gnitz_foundation::perf::Counter;
+use std::hint::black_box;
 
-/// The measurement `RELOCATE_CELL_COST_BYTES` is set from: whole-region memcpy
-/// against per-cell relocation on the *same* slice, swept over slice fraction ×
-/// string width.
+/// The measurement `RELOCATE_CELL_COST_BYTES` is set from: cycles of a
+/// whole-heap memcpy against per-cell relocation on the *same* slice, swept over
+/// slice fraction × string width, beside the arm the constant picks.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn slice_blob_relocate_bench() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_pk_u64_payload_string();
     const N: usize = 20_000;
     const ITERS: usize = 50;
-
-    let time_arm = |shard: &MappedShard, rc: usize, relocate: bool| -> f64 {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_pk_u64_payload_string();
+    let cycles = Counter::cycles();
+    let arm = |shard: &MappedShard, rc: usize, relocate: bool| {
         let carried = (!relocate).then(|| shard.blob().len());
-        // The untimed warmup faults in the cold mmap pages.
-        let t = crate::test_support::bench_time(ITERS, || {
-            std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, carried));
-        });
-        t.as_secs_f64() * 1e9 / ITERS as f64
+        let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried)));
+        // The first slice faults in the cold mmap pages.
+        slice();
+        cycles.measure(|| (0..ITERS).for_each(|_| slice())).1 as f64 / ITERS as f64
     };
 
-    for &w in &[16usize, 40, 256, 1024] {
+    for w in [16usize, 40, 256, 1024] {
         let batch = build(schema, N, |b, i| {
             b.begin_row(i as u128 + 1, 1);
             b.put_string(&wide_string(i, w));
         });
         let shard = MappedShard::open(&write(dir.path(), &format!("bench_{w}.db"), &batch), &schema).unwrap();
-        for &pct in &[
+        for pct in [
             1usize, 2, 3, 4, 6, 8, 12, 16, 20, 25, 33, 40, 50, 60, 68, 75, 85, 90, 99,
         ] {
             let rc = (N * pct / 100).max(1);
-            let reloc = time_arm(&shard, rc, true);
-            let copy = time_arm(&shard, rc, false);
-            let picks = if super::super::string_heap::should_relocate_blob(shard.blob().len(), shard.row_count(), rc) {
-                "relocate"
-            } else {
-                "memcpy  "
+            let (reloc, copy) = (arm(&shard, rc, true), arm(&shard, rc, false));
+            let picks = match should_relocate_blob(shard.blob().len(), shard.row_count(), rc) {
+                true => "relocate",
+                false => "memcpy  ",
             };
             println!(
                 "width={w:>5} slice={pct:>3}% picks {picks}: \
-                 relocate {reloc:9.0} ns  memcpy {copy:9.0} ns  speedup {:5.2}x",
+                 relocate {reloc:9.0} cycles  memcpy {copy:9.0} cycles  speedup {:5.2}x",
                 copy / reloc,
             );
         }
     }
 }
 
-/// Per-pass cost of slicing a packed shard window by window: a framed column,
-/// and a column holding a value in one row of ten as a frame over its zeroes
-/// and as its non-NULL cells alone.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn for_slice_bench() {
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
-    const N: usize = 1_000_000;
-    const WINDOW: usize = 1024;
-    const HANDLES: usize = 20;
-    let nullable = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    fn value(i: usize) -> Option<u128> {
-        Some(3_000_000_000 + i as u128)
-    }
-    fn tenth(i: usize) -> Option<u128> {
-        value(i).filter(|_| i.is_multiple_of(10))
-    }
-    type Value = fn(usize) -> Option<u128>;
-    let shapes: [(&str, SchemaDescriptor, Value); 3] = [
-        ("framed", make_schema_u64_i64(), value),
-        ("a value in one row of ten, framed", make_schema_u64_i64(), |i| {
-            tenth(i).or(Some(0))
-        }),
-        ("a value in one row of ten, the rest NULL", nullable, tenth),
-    ];
-    let dir = tempfile::tempdir().unwrap();
-    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
-    for (label, schema, value) in shapes {
-        let batch = build(schema, N, |b, i| {
-            b.begin_row(i as u128, 1);
-            b.put_opt_int(value(i));
-        });
-        let path = write(dir.path(), "for_slice.db", &batch);
-        let handles: Vec<MappedShard> = (0..HANDLES)
-            .map(|_| MappedShard::open(&path, &schema).unwrap())
-            .collect();
-        assert!(matches!(handles[0].col_regions[0], PayloadRegion::Packed(_)));
-        let slice_all = |shard: &MappedShard| {
-            for start in (0..N).step_by(WINDOW) {
-                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
-            }
-        };
-        println!("{label}: {} bytes", handles[0].file_len());
-        for pass in ["first pass", "second pass"] {
-            let (((), i), c) = cycles.measure(|| instructions.measure(|| handles.iter().for_each(slice_all)));
-            println!(
-                "  {pass}: {} cycles, {} instructions per pass",
-                c / HANDLES as u64,
-                i / HANDLES as u64,
-            );
-        }
-        std::fs::remove_file(&path).unwrap();
-    }
-}
-
-/// Instructions per row to read a weight and a null word through the per-row
-/// accessors, and to decode both regions in one whole slice, by the encoding
-/// the two regions take.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn word_region_bench() {
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
-    const N: usize = 1_000_000;
-    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    type Row = fn(usize) -> (i64, Option<u128>);
-    let shapes: [(&str, Row); 3] = [
-        ("constant", |i| (1, Some(i as u128))),
-        ("two-value", |i| {
-            (if i % 3 == 0 { -1 } else { 1 }, (i % 5 != 0).then_some(i as u128))
-        }),
-        ("for", |i| ((i % 7) as i64 + 1, (i % 5 != 0).then_some(i as u128))),
-    ];
-    let dir = tempfile::tempdir().unwrap();
-    let instructions = Counter::instructions();
-    for (label, row) in shapes {
-        let batch = build(schema, N, |b, i| {
-            let (weight, value) = row(i);
-            b.begin_row(i as u128, weight);
-            b.put_opt_int(value);
-        });
-        let path = write(dir.path(), "words.db", &batch);
-        let shard = MappedShard::open(&path, &schema).unwrap();
-        let (sum, per_row) = instructions.measure(|| {
-            let mut sum = 0u64;
-            for r in 0..N {
-                sum = sum.wrapping_add(shard.get_weight(black_box(r)) as u64 ^ shard.get_null_word(r));
-            }
-            sum
-        });
-        black_box(sum);
-        let (_, slice) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
-        println!(
-            "{label} weight: {:.2} instructions per row for both per-row reads, {:.2} for a whole slice",
-            per_row as f64 / N as f64,
-            slice as f64 / N as f64,
-        );
-        std::fs::remove_file(&path).unwrap();
-    }
-}
-
-/// First-touch cost of a per-row read on a packed column: a fresh handle, one
-/// `get_col_ptr` per FoR column at a mid row, then the same read again.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn for_point_touch_bench() {
-    use crate::test_support::pk_u64_two_i64_schema;
-    use gnitz_foundation::perf::{rss_bytes, Counter};
-    use std::hint::black_box;
-    const N: usize = 1_000_000;
-    let schema = pk_u64_two_i64_schema();
-    let dir = tempfile::tempdir().unwrap();
-    let batch = build(schema, N, |b, i| {
-        b.begin_row(i as u128, 1);
-        b.put_int((i % 1000) as u128);
-        b.put_int(3 * i as u128);
-    });
-    let path = write(dir.path(), "point.db", &batch);
-    let shard = MappedShard::open(&path, &schema).unwrap();
-    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
-    let read = || {
-        for pi in 0..2 {
-            black_box(shard.get_col_ptr(black_box(N / 2), pi, 8));
-        }
-    };
-    let rss0 = rss_bytes();
-    for label in ["cold", "warm"] {
-        let (((), i), c) = cycles.measure(|| instructions.measure(read));
-        let retained = rss_bytes().saturating_sub(rss0);
-        println!("{label}: {i} instructions, {c} cycles; {retained} bytes retained");
-    }
-    // Every block: the second pass is the read of a block already held.
-    for pass in ["every row, first pass", "every row, second pass"] {
-        let ((), i) = instructions.measure(|| {
-            for row in 0..N {
-                for pi in 0..2 {
-                    black_box(shard.get_col_ptr(black_box(row), pi, 8));
-                }
-            }
-        });
-        println!("{pass}: {} instructions per read", i / (2 * N as u64));
-    }
-}
-
-/// What one shard of each string shape costs on disk, to write and to read
+/// What one shard of each column shape costs on disk, to write and to read
 /// back. Per row: the file's bytes, then instructions to write it, to slice it
-/// whole and in 1024-row windows, to read every string cell through the per-row
-/// accessor, and to materialize it through a `UnifiedSet` as a compaction does.
+/// whole and in 1024-row windows, to read every payload cell through the per-row
+/// accessor on a fresh handle and again once its blocks are decoded, to read
+/// every weight and null word, and to materialize it through a `UnifiedSet` as a
+/// compaction does. The regions' stored sizes and encodings name what each
+/// shape packed to.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn shard_string_footprint_bench() {
-    use crate::test_support::Rng;
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
+fn shard_read_bench() {
     const N: usize = 200_000;
+    const WINDOW: usize = 1024;
     let str_col = SchemaColumn::new(TypeCode::String, false);
     let events = SchemaDescriptor::new(
         &[
@@ -224,6 +79,9 @@ fn shard_string_footprint_bench() {
     );
     let one_string = make_schema_pk_u64_payload_string();
     let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
+    let i64_col = make_schema_u64_i64();
+    let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let one_in_ten = |i: usize| i.is_multiple_of(10).then_some(3_000_000_000 + i as u128);
 
     let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
     let urls: Vec<String> = (0..2_000)
@@ -289,6 +147,56 @@ fn shard_string_footprint_bench() {
                 b.put_string(&wide_string(pick(N / 2), 60));
             }),
         ),
+        (
+            "an i64, ascending",
+            build(i64_col, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(3_000_000_000 + i as u128);
+            }),
+        ),
+        (
+            "an i64, a value in one row of ten and zero in the rest",
+            build(i64_col, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int(one_in_ten(i).unwrap_or(0));
+            }),
+        ),
+        (
+            "a nullable i64, a value in one row of ten and NULL in the rest",
+            build(nullable_i64, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int(one_in_ten(i));
+            }),
+        ),
+        (
+            "an i64 of 16 values far apart",
+            build(i64_col, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int((pick(16) as u128) << 40);
+            }),
+        ),
+        (
+            "two i64, one of 1000 values and one ascending",
+            build(pk_u64_two_i64_schema(), N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int((i % 1000) as u128);
+                b.put_int(3 * i as u128);
+            }),
+        ),
+        (
+            "a nullable i64, one row in five NULL, weights of two values",
+            build(nullable_i64, N, |b, i| {
+                b.begin_row(i as u128, if i % 3 == 0 { -1 } else { 1 });
+                b.put_opt_int((i % 5 != 0).then_some(i as u128));
+            }),
+        ),
+        (
+            "a nullable i64, one row in five NULL, weights of seven values",
+            build(nullable_i64, N, |b, i| {
+                b.begin_row(i as u128, (i % 7) as i64 + 1);
+                b.put_opt_int((i % 5 != 0).then_some(i as u128));
+            }),
+        ),
     ];
 
     let instructions = Counter::instructions();
@@ -297,46 +205,55 @@ fn shard_string_footprint_bench() {
         let schema = *batch.schema();
         let name = format!("{si}.db");
         let (path, write_i) = instructions.measure(|| write(dir.path(), &name, batch));
-        let image = std::fs::read(&path).unwrap();
-        let regions: Vec<String> = (0..=num_regions(schema.num_payload_cols()))
-            .map(|r| {
-                let Span { size, encoding, .. } = spans_of(&image)[r];
-                format!("{size}/{encoding:?}")
-            })
+        let regions: Vec<String> = ShardDirectory::read(&path)
+            .unwrap()
+            .regions
+            .iter()
+            .map(|(role, encoding, size)| format!("{role}:{size}/{encoding}"))
             .collect();
         let shard = MappedShard::open(&path, &schema).unwrap();
         let (_, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
         let (_, window_i) = instructions.measure(|| {
-            for start in (0..N).step_by(1024) {
-                black_box(shard.slice_to_owned_batch(start, 1024.min(N - start)));
+            for start in (0..N).step_by(WINDOW) {
+                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
             }
         });
-        let (content, cell_i) = instructions.measure(|| {
-            let mut content = 0usize;
+        let cells = || {
+            let mut sink = 0usize;
             for row in 0..N {
                 for (pi, col) in schema.payload_columns() {
-                    if col.type_code.is_german_string() {
-                        content += gnitz_expr::payload_bytes(&shard, row, pi).len();
-                    }
+                    sink += match col.type_code.is_german_string() {
+                        true => gnitz_expr::payload_bytes(&shard, black_box(row), pi).len(),
+                        false => shard.get_col_ptr(black_box(row), pi, col.size() as usize)[0] as usize,
+                    };
                 }
             }
-            content
+            black_box(sink)
+        };
+        let [fresh_i, decoded_i] = [(); 2].map(|()| instructions.measure(cells).1);
+        let (_, word_i) = instructions.measure(|| {
+            let mut sink = 0u64;
+            for row in 0..N {
+                sink = sink.wrapping_add(shard.get_weight(black_box(row)) as u64 ^ shard.get_null_word(row));
+            }
+            black_box(sink)
         });
         let rows: Vec<(u32, u32, i64)> = (0..N as u32).map(|r| (0, r, 1)).collect();
         let (_, merge_i) = instructions.measure(|| {
             let set = UnifiedSet::whole(std::slice::from_ref(&shard), &schema);
             black_box(set.materialize(&rows, N))
         });
-        let per_row = |i: u64| i / N as u64;
+        let per_row = |i: u64| i as f64 / N as f64;
         println!(
-            "{label}: {N} rows of {content} string bytes\n  {} bytes, {:.1} per row; instructions per row: \
-             write {}, slice {}, windows {}, cells {}, materialize {}\n  regions {}",
-            image.len(),
-            image.len() as f64 / N as f64,
+            "{label}\n  {:.1} bytes per row; instructions per row: write {:.1}, slice {:.1}, windows {:.1}, \
+             cells {:.1} then {:.1}, weight and null word {:.1}, materialize {:.1}\n  regions {}",
+            per_row(shard.file_len()),
             per_row(write_i),
             per_row(slice_i),
             per_row(window_i),
-            per_row(cell_i),
+            per_row(fresh_i),
+            per_row(decoded_i),
+            per_row(word_i),
             per_row(merge_i),
             regions.join(" "),
         );

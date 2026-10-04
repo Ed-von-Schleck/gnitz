@@ -1,5 +1,5 @@
 //! Delta-ingest microbenchmark: the cost a subscriber pays to apply a received
-//! delta, split into its two halves — `Batch::decode_from_wal_block` (the
+//! delta, split into its two halves — `Batch::decode_foreign_wal_block` (the
 //! validating decode every frame off a socket lands in) and
 //! `Table::ingest_owned_batch`.
 //!
@@ -59,7 +59,7 @@ fn delta_ingest_bench() {
         let t0 = Instant::now();
         let mut batches: Vec<Batch> = Vec::with_capacity(k);
         for blk in &blocks {
-            let b = Batch::decode_from_wal_block(blk, &schema).unwrap();
+            let b = Batch::decode_foreign_wal_block(blk, &schema).unwrap();
             batches.push(b);
         }
         let decode_ns = t0.elapsed().as_nanos() as f64;
