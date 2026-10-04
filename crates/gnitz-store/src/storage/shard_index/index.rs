@@ -369,7 +369,7 @@ impl ShardIndex {
     /// Bytes L1 is drained to. Capped at two sweep steps for a budgeted store:
     /// `enforce_capacity` cannot evict from L1, so bytes parked there come out of
     /// what the user asked for.
-    pub(super) fn l1_target_bytes(&self) -> u64 {
+    fn l1_target_bytes(&self) -> u64 {
         let target = Self::balanced_l1_target(self.levels[TERMINAL].bytes(), self.l0_run_bytes);
         match self.budget.cap() {
             Some(cap) => target.min(2 * (cap / SWEEP_STEPS)),

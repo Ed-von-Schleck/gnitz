@@ -51,7 +51,7 @@ fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
 
 /// A payload for row `i` that spans the whole I64 range across a batch, so the
 /// writer cannot pack the column and a fixture's bytes follow from its rows.
-fn spread(i: u64) -> i64 {
+pub(super) fn spread(i: u64) -> i64 {
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64
 }
 

@@ -148,18 +148,6 @@ mod flush;
 
 pub(crate) use flush::flush_barrier;
 
-#[cfg(test)]
-#[path = "benches/flush.rs"]
-mod bench_flush;
-
-#[cfg(test)]
-#[path = "benches/gather.rs"]
-mod bench_gather;
-
-#[cfg(test)]
-#[path = "benches/ingest.rs"]
-mod bench_ingest;
-
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
     /// whatever is already on disk; `budgets` binds for the store's whole life.
@@ -591,3 +579,7 @@ impl Table {
 #[cfg(test)]
 #[path = "tests/table.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/table.rs"]
+mod bench;

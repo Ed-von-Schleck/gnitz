@@ -11,7 +11,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a
 /// cursor merges and a PK probe walks.
-pub(super) const FOLD_THRESHOLD: usize = 16;
+const FOLD_THRESHOLD: usize = 16;
 
 /// Rough bytes per row, used to size the bloom from a byte budget.
 const EST_BYTES_PER_ROW: usize = 40;

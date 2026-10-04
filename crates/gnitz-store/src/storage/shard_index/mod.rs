@@ -17,8 +17,8 @@ mod index;
 /// Which trigger a compaction is serving. Only [`Dehydrate`](Self::Dehydrate)
 /// changes what is written. The index learns its run size from an
 /// [`L0Fold`](Self::L0Fold) and its cancel yield from a
-/// [`GuardSplit`](Self::GuardSplit); the rest label the byte accounting the
-/// amplification benchmark reads.
+/// [`GuardSplit`](Self::GuardSplit); the rest label the byte accounting of
+/// [`cstats`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum CompactionKind {
     L0Fold,
@@ -30,8 +30,7 @@ pub(crate) enum CompactionKind {
     Dehydrate,
 }
 
-/// Per-trigger byte accounting over [`ShardIndex::compact`], for the
-/// amplification benchmark.
+/// Per-trigger byte accounting over [`ShardIndex::compact`].
 #[cfg(test)]
 pub(crate) mod cstats {
     use super::CompactionKind;
@@ -75,26 +74,8 @@ pub(crate) mod cstats {
 
 #[cfg(test)]
 impl ShardIndex {
-    /// One line of tree shape for the amplification bench: the observed `R`, the
-    /// target it derives, and each level's bytes, guards and shards.
-    pub(super) fn tree_report(&self) -> String {
-        let levels: Vec<String> = self
-            .levels
-            .iter()
-            .enumerate()
-            .map(|(li, l)| format!("L{li}={}B/{}g/{}f", l.bytes(), l.guards.len(), l.entries().count()))
-            .collect();
-        format!(
-            "R={} l1_target={} {}",
-            self.l0_run_bytes,
-            self.l1_target_bytes(),
-            levels.join(" ")
-        )
-    }
-
     /// The tree's shape as counts: L0 shards, then L1's and the terminal level's
-    /// guards. What a test asserts a placement against, where `tree_report` is
-    /// for reading.
+    /// guards.
     pub(crate) fn level_shape(&self) -> (usize, [usize; 2]) {
         (
             self.levels[L0].entries().count(),

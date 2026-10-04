@@ -1,5 +1,6 @@
 use super::super::batch::Batch;
 use super::super::scatter::UnifiedSet;
+use super::super::shard_file::ShardWriteOpts;
 use super::super::string_heap::should_relocate_blob;
 use super::tests::{build, wide_string, write};
 use super::*;
@@ -256,6 +257,45 @@ fn shard_read_bench() {
             per_row(word_i),
             per_row(merge_i),
             regions.join(" "),
+        );
+    }
+}
+
+/// What the PK filter adds to a shard write: instructions and cycles per row
+/// with it and without, at key counts inside and outside the cache. Cycles
+/// beside instructions because the filter's construction trades one for the
+/// other.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn pk_filter_write_bench() {
+    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    for rows in [1usize << 12, 1 << 16, 1 << 20] {
+        let batch = build(schema, rows, |b, i| {
+            b.begin_row(i as u128, 1);
+            b.put_int(i as u128);
+        });
+        let [with, without] = [false, true].map(|skip_pk_filter| {
+            let opts = ShardWriteOpts { skip_pk_filter, ..Default::default() };
+            let write = |pass: &str| {
+                let path = dir.path().join(format!("{rows}_{skip_pk_filter}_{pass}.db"));
+                batch.write_as_shard(path.to_str().unwrap(), opts).unwrap();
+                MappedShard::open(path.to_str().unwrap(), &schema)
+                    .unwrap()
+                    .has_shard_filter()
+            };
+            let (filtered, i) = instructions.measure(|| write("instructions"));
+            assert_eq!(filtered, !skip_pk_filter);
+            (
+                i as f64 / rows as f64,
+                cycles.measure(|| write("cycles")).1 as f64 / rows as f64,
+            )
+        });
+        println!(
+            "pk_filter_write_bench {rows:>7} rows: {:.1} instr/row and {:.1} cycles/row with the filter, \
+             {:.1} and {:.1} without",
+            with.0, with.1, without.0, without.1
         );
     }
 }
