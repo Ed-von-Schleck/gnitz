@@ -234,7 +234,6 @@ impl TrainFrame {
 impl TrainLease {
     /// The request id, for a test to answer on.
     #[cfg(test)]
-    #[cfg(test)]
     pub(crate) fn id(&self) -> u32 {
         self.id
     }
@@ -353,7 +352,3 @@ impl Drop for TimerFuture {
 #[cfg(test)]
 #[path = "tests/futures.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "benches/futures.rs"]
-mod bench;

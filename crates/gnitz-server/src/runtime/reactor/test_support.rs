@@ -30,19 +30,12 @@ pub(crate) fn make_reactor_over(w2m: W2mReceiver) -> Reactor {
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
 /// `runloop`/`mod`, so the production files carry no test-only method.
 impl Reactor {
-    /// Bounded: the tests that use this are the ones guarding against lost
-    /// wakes and lock deadlocks, and an unbounded loop would turn each of those
-    /// regressions into a wedged test run rather than a failure. Ticks
-    /// non-blocking, so a task waiting only on another task still progresses.
+    /// Tick until no task is left. Bounded as [`poll_until`] is: the tests that
+    /// use this guard against lost wakes and lock deadlocks, which an unbounded
+    /// loop would turn into a wedged test run rather than a failure.
     pub(super) fn block_until_idle(&self) {
-        const MAX_TICKS: usize = 10_000;
-        for _ in 0..MAX_TICKS {
-            if self.tasks.borrow().is_empty() {
-                return;
-            }
-            self.tick(false);
-        }
-        panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
+        let idle = poll_until(self, || self.tasks.borrow().is_empty());
+        assert!(idle, "reactor never reached idle: lost wake or deadlock");
     }
 
     /// One pass of the loop `block_on` runs; with `block`, it sleeps whenever

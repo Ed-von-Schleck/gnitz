@@ -138,9 +138,8 @@ impl Reactor {
             }
             KIND_OP => {
                 let op = self.ops.borrow_mut().remove(&id);
-                if let Some(PendingOp { done, carry }) = op {
-                    done.send((res, carry));
-                }
+                let PendingOp { done, carry } = op.expect("an op's entry lives until its CQE");
+                done.send((res, carry));
             }
             KIND_RECV => self.handle_recv_cqe(id as i32, res),
             kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
@@ -246,3 +245,7 @@ fn make_waker(key: usize) -> Waker {
 #[cfg(test)]
 #[path = "tests/runloop.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/runloop.rs"]
+mod bench;

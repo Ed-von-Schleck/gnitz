@@ -25,7 +25,7 @@ fn a_zero_sleep_resolves_immediately() {
 fn a_dropped_timer_leaves_no_deadline() {
     let r = make_reactor();
     let mut tf = Box::pin(r.sleep(Duration::from_secs(3600)));
-    assert!(tf.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    assert!(try_poll_once(tf.as_mut()).is_none());
     assert_eq!(r.deadlines.borrow().len(), 1, "the poll registers the deadline");
     drop(tf);
     assert!(r.deadlines.borrow().is_empty(), "the drop removes it");
@@ -44,7 +44,7 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
         let deadline = Instant::now() + Duration::from_secs(10);
         let got = loop {
             r.drain_cqes_into_wakers();
-            if let Poll::Ready(rc) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            if let Some(rc) = try_poll_once(fut.as_mut()) {
                 break rc;
             }
             assert!(
