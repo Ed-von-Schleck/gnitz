@@ -11,20 +11,18 @@ use std::time::Duration;
 
 /// A rustls server on a loopback thread with a freshly minted `127.0.0.1` cert,
 /// reached through the public `tls://…?ca=` target.
-pub(super) struct Loopback {
+struct Loopback<T> {
     target: String,
-    thread: std::thread::JoinHandle<()>,
-    /// Releases a [`Self::start`] script once [`Self::connect`] has returned.
-    connected: Option<mpsc::Sender<()>>,
+    thread: std::thread::JoinHandle<T>,
     /// Holds the minted cert's PEM for as long as the target names it.
     _ca_dir: tempfile::TempDir,
 }
 
-/// The far end as the script sees it: a blocking rustls stream.
-type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+/// The far end of a connection: a blocking rustls stream.
+pub(in crate::protocol::transport) type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
 /// Complete the server side of the TLS handshake. `StreamOwned` handshakes
-/// lazily on first I/O, which a script that only waits never does.
+/// lazily on first I/O, which a peer that only waits never does.
 fn handshake(sock: TcpStream, cfg: Arc<rustls::ServerConfig>) -> ServerEnd {
     let mut end = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
     while end.conn.is_handshaking() {
@@ -45,27 +43,13 @@ fn drain(mut r: impl std::io::Read) {
     let _ = std::io::copy(&mut r, &mut std::io::sink());
 }
 
-impl Loopback {
-    /// A peer that completes the handshake and the HELLO exchange, then runs
-    /// `script` once the client has connected.
-    pub(super) fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        let (connected, go) = mpsc::channel();
-        let mut lb = Self::serve(None, move |sock, cfg| {
-            let end = hello(handshake(sock, cfg));
-            if go.recv().is_ok() {
-                script(end)
-            }
-        });
-        lb.connected = Some(connected);
-        lb
-    }
-
+impl<T: Send + 'static> Loopback<T> {
     /// `serve` gets the accepted socket (`TCP_NODELAY`, as the server sets it)
     /// and the server config. `rcvbuf` pins the socket's `SO_RCVBUF`, set on the
     /// listener so the window the handshake advertises honours it.
     fn serve(
         rcvbuf: Option<libc::c_int>,
-        serve: impl FnOnce(TcpStream, Arc<rustls::ServerConfig>) + Send + 'static,
+        serve: impl FnOnce(TcpStream, Arc<rustls::ServerConfig>) -> T + Send + 'static,
     ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let ca_dir = tempfile::tempdir().unwrap();
@@ -86,28 +70,26 @@ impl Loopback {
         let thread = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             sock.set_nodelay(true).unwrap();
-            serve(sock, cfg);
+            serve(sock, cfg)
         });
         Loopback {
             target: format!("tls://127.0.0.1:{port}?ca={}", pem.display()),
             thread,
-            connected: None,
             _ca_dir: ca_dir,
         }
     }
 
-    pub(super) fn connect(&self) -> ClientTransport {
-        let t = ClientTransport::connect(&self.target, Instant::now() + CONNECT_TIMEOUT).unwrap();
-        if let Some(connected) = &self.connected {
-            connected.send(()).unwrap();
-        }
-        t
+    fn join(self) -> T {
+        self.thread.join().unwrap()
     }
+}
 
-    pub(super) fn join(self) {
-        drop(self.connected);
-        self.thread.join().unwrap();
-    }
+/// A connected transport and its far end, the HELLOs exchanged. `rcvbuf` as
+/// [`Loopback::serve`] takes it.
+pub(in crate::protocol::transport) fn pair(rcvbuf: Option<libc::c_int>) -> (ClientTransport, ServerEnd) {
+    let lb = Loopback::serve(rcvbuf, |sock, cfg| hello(handshake(sock, cfg)));
+    let t = ClientTransport::connect(&lb.target, Instant::now() + CONNECT_TIMEOUT).unwrap();
+    (t, lb.join())
 }
 
 /// The client profile: TLS 1.3 alone, and early data off, so that once a
@@ -145,22 +127,17 @@ fn ca_file_with_an_unparsable_certificate_is_refused() {
 fn one_wakeup_drains_every_frame_rustls_holds() {
     // Two frames in one record and a third in the next: one readable wakeup
     // and one reading pass bring out all three.
-    let (tx, rx) = mpsc::channel::<()>();
-    let lb = Loopback::start(move |mut end| {
-        let mut both = framed(b"one");
-        both.extend(framed(b"two"));
-        end.write_all(&both).unwrap();
-        end.flush().unwrap();
-        write_frame(&mut end, b"three");
-        tx.send(()).unwrap();
-    });
-    let mut t = lb.connect();
-    rx.recv().unwrap();
+    let (mut t, mut peer) = pair(None);
+    let mut both = framed(b"one");
+    both.extend(framed(b"two"));
+    peer.write_all(&both).unwrap();
+    peer.flush().unwrap();
+    write_frame(&mut peer, b"three");
     poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
     let (got, end) = pass(&mut t);
     end.unwrap();
     assert_eq!(got, [b"one".as_slice(), b"two", b"three"]);
-    lb.join();
+    drop(peer);
     let (got, end) = pass(&mut t);
     assert!(got.is_empty());
     assert_eq!(io_kind(&end), Some(ErrorKind::UnexpectedEof));
@@ -171,11 +148,11 @@ fn large_reply_spanning_many_records_is_intact() {
     // Many 16 KiB records: the window is refilled repeatedly and records
     // straddle the refills.
     let payload: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(1024);
+    let (mut t, mut end) = pair(None);
     let p = payload.clone();
-    let lb = Loopback::start(move |mut end| write_frame(&mut end, &p));
-    let mut t = lb.connect();
+    let writer = std::thread::spawn(move || write_frame(&mut end, &p));
     assert_eq!(recv_frames(&mut t, 1), [payload]);
-    lb.join();
+    writer.join().unwrap();
 }
 
 #[test]
@@ -183,22 +160,15 @@ fn flush_can_empty_the_queue_with_ciphertext_still_pending() {
     // 60 KiB fits rustls's send buffer but not the pinned socket buffers: the
     // queue empties into rustls while its ciphertext still waits on the socket.
     let frame: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(240);
-    let expect = frame.clone();
-    let (tx, rx) = mpsc::channel::<()>();
-    let lb = Loopback::serve(Some(8 * 1024), move |sock, cfg| {
-        let mut end = hello(handshake(sock, cfg));
-        rx.recv().unwrap();
-        assert_eq!(read_frame(&mut end), expect);
-    });
-    let mut t = lb.connect();
+    let (mut t, mut end) = pair(Some(8 * 1024));
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024).unwrap();
-    t.enqueue(frame);
+    t.enqueue(frame.clone());
     t.flush().unwrap();
     assert_eq!(t.queued_bytes(), 0, "rustls took the whole frame");
     assert!(t.wants_write(), "the queue alone is not the predicate");
-    tx.send(()).unwrap();
+    let reader = std::thread::spawn(move || assert_eq!(read_frame(&mut end), frame));
     flush_all(&mut t);
-    lb.join();
+    reader.join().unwrap();
 }
 
 #[test]
@@ -208,22 +178,18 @@ fn a_frame_larger_than_the_send_buffer_leaves_its_tail_queued() {
     let big: Vec<u8> = (0u8..=255)
         .collect::<Vec<_>>()
         .repeat((SEND_BUFFER_BYTES + 256 * 1024) / 256);
-    let expect = big.clone();
-    let (tx, rx) = mpsc::channel::<()>();
-    let lb = Loopback::start(move |mut end| {
-        rx.recv().unwrap();
-        assert_eq!(read_frame(&mut end), expect);
-        assert_eq!(read_frame(&mut end), b"after");
-    });
-    let mut t = lb.connect();
+    let (mut t, mut end) = pair(None);
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024).unwrap();
-    t.enqueue(big);
+    t.enqueue(big.clone());
     t.flush().unwrap();
     assert!(t.queued_bytes() > 0, "the tail is queue state, not rustls's");
-    tx.send(()).unwrap();
+    let reader = std::thread::spawn(move || {
+        assert_eq!(read_frame(&mut end), big);
+        assert_eq!(read_frame(&mut end), b"after");
+    });
     t.enqueue(b"after".to_vec());
     flush_all(&mut t);
-    lb.join();
+    reader.join().unwrap();
 }
 
 #[test]
@@ -272,16 +238,12 @@ fn close_notify_with_bytes_behind_it_surfaces_eof() {
     // The last frame, the close_notify and bytes past it, all in one socket
     // read: the frame comes out, then EOF — never a spin on bytes past the
     // close that rustls refuses.
-    let (tx, rx) = mpsc::channel::<()>();
-    let lb = Loopback::start(move |mut end| {
-        write_frame(&mut end, b"last");
-        end.conn.send_close_notify();
-        end.flush().unwrap();
-        end.sock.write_all(&[0u8; 16 * 1024]).unwrap();
-        tx.send(()).unwrap();
-    });
-    let t = lb.connect();
-    rx.recv().unwrap();
+    let (t, mut end) = pair(None);
+    write_frame(&mut end, b"last");
+    end.conn.send_close_notify();
+    end.flush().unwrap();
+    end.sock.write_all(&[0u8; 16 * 1024]).unwrap();
+    drop(end);
     let (done_tx, done_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut t = t;
@@ -294,7 +256,6 @@ fn close_notify_with_bytes_behind_it_surfaces_eof() {
     assert_eq!(frames, [b"last".to_vec()]);
     assert_eq!(end, Some(ErrorKind::UnexpectedEof));
     reader.join().unwrap();
-    lb.join();
 }
 
 #[test]

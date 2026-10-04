@@ -1,54 +1,50 @@
 use super::*;
 use crate::test_support::{framed, transport_pair};
+use gnitz_foundation::posix_io::set_sockopt_int;
 
-/// `frames` as the bytes a peer writes.
-pub(super) fn bench_wire(frames: &[usize]) -> Vec<u8> {
-    frames.iter().flat_map(|&len| framed(&vec![0x5Au8; len])).collect()
-}
-
-/// One reading pass, counting the frames it hands out.
-pub(super) fn bench_pass(t: &mut ClientTransport) -> usize {
-    let mut frames = 0;
-    let mut more = true;
-    while more {
-        more = t
-            .read(|f| {
-                std::hint::black_box(&f);
-                frames += 1;
-                Ok(())
-            })
-            .unwrap();
-    }
-    frames
-}
-
-/// The bursts the read benches run, each as its frames' lengths.
-pub(super) fn bench_bursts() -> [(&'static str, Vec<usize>); 4] {
-    [
-        ("1 x 40 B", vec![40]),
-        ("3000 x 40 B", vec![40; 3000]),
-        ("16 x 8 KiB", vec![8 << 10; 16]),
-        ("1 x 100 KiB + 40 B", vec![100 << 10, 40]),
-    ]
-}
-
-/// Instructions per burst for the one reading pass that takes it, each burst
-/// written whole before the pass.
+/// Instructions per burst over the reading passes that take it, by transport
+/// and burst shape, each burst written whole before the first pass.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn read_burst_bench() {
     const ROUNDS: u64 = 200;
     let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
-    let (mut t, peer) = transport_pair();
-    for (name, frames) in bench_bursts() {
-        let wire = bench_wire(&frames);
-        let mut total = 0;
-        for _ in 0..ROUNDS {
-            peer.send_bytes(&wire);
-            let (got, instr) = counter.measure(|| bench_pass(&mut t));
-            assert_eq!(got, frames.len(), "{name}: one pass takes the burst");
-            total += instr;
+    let (unix, peer) = transport_pair();
+    // The largest burst is written with nobody reading.
+    set_sockopt_int(peer.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 1 << 20).unwrap();
+    let (tls, end) = tls::tests::pair(None);
+    let mut ends: [(&str, ClientTransport, Box<dyn Write>); 2] =
+        [("unix", unix, Box::new(peer.0)), ("tls", tls, Box::new(end))];
+    // Frame lengths: one small frame, many in one read, and a payload wide
+    // enough to be read in place.
+    for (name, frames) in [
+        ("1 x 40 B", &[40][..]),
+        ("3000 x 40 B", &[40; 3000]),
+        ("1 x 200 KiB + 40 B", &[200 << 10, 40]),
+    ] {
+        let wire: Vec<u8> = frames.iter().flat_map(|&len| framed(&vec![0x5A; len])).collect();
+        for (kind, t, peer) in &mut ends {
+            let mut total = 0;
+            for _ in 0..ROUNDS {
+                peer.write_all(&wire).unwrap();
+                peer.flush().unwrap();
+                let mut left = frames.len();
+                while left > 0 {
+                    poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+                    let ((), instr) = counter.measure(|| {
+                        while t
+                            .read(|f| {
+                                std::hint::black_box(&f);
+                                left -= 1;
+                                Ok(())
+                            })
+                            .unwrap()
+                        {}
+                    });
+                    total += instr;
+                }
+            }
+            println!("{kind} read {name}: {} instr/burst", total / ROUNDS);
         }
-        println!("read {name}: {} instr/burst", total / ROUNDS);
     }
 }

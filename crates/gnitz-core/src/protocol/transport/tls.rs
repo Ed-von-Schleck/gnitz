@@ -248,8 +248,4 @@ impl TlsInner {
 
 #[cfg(test)]
 #[path = "tests/tls.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "benches/tls.rs"]
-mod bench;
+pub(super) mod tests;

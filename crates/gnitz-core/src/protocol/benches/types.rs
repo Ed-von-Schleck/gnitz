@@ -1,6 +1,7 @@
 use super::*;
 
-/// Instructions per pushed key row, by key shape.
+/// Instructions per pushed key row: one key column and three through
+/// `push_natives`, whose cost is per column, and one through `from_natives`.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_column_push_bench() {
@@ -10,11 +11,7 @@ fn pk_column_push_bench() {
         columns: types.iter().map(|&tc| ColumnDef::new("k", tc, false)).collect(),
         pk_cols: (0..types.len() as u32).collect(),
     };
-    for types in [
-        &[TypeCode::I64][..],
-        &[TypeCode::U64, TypeCode::U64],
-        &[TypeCode::I32, TypeCode::U128, TypeCode::I16],
-    ] {
+    for types in [&[TypeCode::I64][..], &[TypeCode::I32, TypeCode::U128, TypeCode::I16]] {
         let schema = std::hint::black_box(key_schema(types));
         let mut col = PkColumn::empty_for_schema(&schema);
         col.reserve(ROWS);

@@ -167,9 +167,9 @@ pub struct PkColumn {
 }
 
 impl PkColumn {
-    /// Empty `PkColumn` holding `schema`'s key column types — the only
-    /// constructor, so the stride is never independent data to keep in sync,
-    /// and never zero or wider than a key.
+    /// Empty `PkColumn` holding `schema`'s key column types. The stride is
+    /// derived from them here and only copied from a column after, so it is
+    /// never zero or wider than a key.
     pub fn empty_for_schema(schema: &Schema) -> Self {
         let n = schema.pk_cols.len();
         assert!(
@@ -639,10 +639,8 @@ impl ZSetBatch {
         let whole = n == self.len();
         let mut blob = Vec::new();
         let mut pks = PkColumn {
-            types: self.pks.types,
-            n: self.pks.n,
-            stride: self.pks.stride,
             buf: Vec::with_capacity(n * self.pks.stride()),
+            ..self.pks
         };
         for &(r, _) in rows {
             pks.push_from(&self.pks, r);
