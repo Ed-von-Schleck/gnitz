@@ -1,317 +1,148 @@
-//! Microbenchmarks for the reduce: `op_reduce` itself, and the population of
-//! the value index (AVI) its MIN/MAX aggregates read. Ignored by default; run
-//! one with:
-//!
-//! ```text
-//! cargo test -p gnitz-zset --release <name>_bench -- --ignored --nocapture --test-threads=1
-//! ```
-//!
-//! The population benches time every layer directly and print their sum beside
-//! the independently timed full path, never substituted for it. Keeping the
-//! folded batch as a trace run is not a layer: it does no per-row work at all.
-//!
-//! Their numbers describe one shape — a single 500k-row batch, one MIN over an
-//! I64 payload grouped by a U32 payload (AVI stride 13, inside the `u128`
-//! sort-key arm), into a fresh trace. Production
-//! `GROUP BY <BIGINT>` is stride 17, one byte past that arm, and a view backfill
-//! chunks at ~16k rows per worker, where the sort's share is lower. A second
-//! shape runs the same decomposition over a wide MAX, whose key slot and BLOB
-//! image payload the scalar one does not pay.
-
-use std::time::{Duration, Instant};
-
-use super::avi::{avi_batch, AviBake};
 use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{bench_time, bench_time_each, pk_payload_schema, pk_u64_two_i64_schema, TestTrace};
-use gnitz_wire::AggDescriptor;
-use gnitz_wire::AggFunc;
+use crate::test_support::pk_payload_schema;
+use gnitz_foundation::perf::Counter;
+use gnitz_wire::{AggDescriptor, AggFunc};
 
-const N_ROWS: usize = 500_000;
-const N_GROUPS: u64 = 10_000;
-const ITERS: usize = 40;
+fn mix(i: u64) -> u64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
 
-/// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).
-/// AVI groups by col 1 and aggregates MIN over col 2.
-fn src_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U32, false),
+/// A U64 PK, the `group` columns, then one `value` column.
+fn grouped_schema(group: &[SchemaColumn], value: SchemaColumn) -> SchemaDescriptor {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend_from_slice(group);
+    cols.push(value);
+    SchemaDescriptor::new(&cols, &[0])
+}
+
+/// The reduce of `aggs` over `schema`'s last column, with the COUNT(*) a
+/// circuit reduce carries.
+fn plan(schema: &SchemaDescriptor, group: &[u32], aggs: &[AggFunc]) -> ReducePlan {
+    let col_idx = schema.num_columns() as u32 - 1;
+    let aggs: Vec<AggDescriptor> = aggs
+        .iter()
+        .map(|&agg_op| AggDescriptor { col_idx, agg_op })
+        .chain([AggDescriptor::COUNT_STAR])
+        .collect();
+    ReducePlan::from_wire(schema, group, &aggs, false).unwrap()
+}
+
+/// Instructions per delta row of the value-index entries a MIN/MAX reduce
+/// derives from its delta, per image kind: a scalar, a fixed wide value, a
+/// string, a column holding NULLs, and two extremes at once.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn reduce_index_batch_bench() {
+    use AggFunc::{Max, Min};
+    const N: u64 = 65_536;
+    let counter = Counter::instructions();
+    type Put = fn(&mut BatchBuilder, u64);
+    let cases: [(&str, SchemaColumn, &[AggFunc], Put); 5] = [
+        ("I64 MIN", SchemaColumn::new(TypeCode::I64, false), &[Min], |b, i| {
+            b.put_u64(mix(i))
+        }),
+        ("U128 MAX", SchemaColumn::new(TypeCode::U128, false), &[Max], |b, i| {
+            b.put_int((mix(i) as u128) << 64 | i as u128)
+        }),
+        (
+            "STRING MIN",
+            SchemaColumn::new(TypeCode::String, false),
+            &[Min],
+            |b, i| b.put_string(&format!("{:040}", mix(i))),
+        ),
+        (
+            "nullable I64 MIN",
+            SchemaColumn::new(TypeCode::I64, true),
+            &[Min],
+            |b, i| b.put_opt_int((i % 4 != 0).then_some(mix(i) as u128)),
+        ),
+        (
+            "I64 MIN and MAX",
             SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    )
-}
-
-fn build_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for row in 0..N_ROWS as u64 {
-        b.begin_row(row as u128, 1i64);
-        b.put_int(((row % N_GROUPS) as u32) as u128);
-        b.put_int(((row.wrapping_mul(2654435761)) as i64) as u128);
-        b.end_row();
-    }
-    b.finish()
-}
-
-/// Source schema for the wide shape: U64 pk | U32 grp | U128 val.
-fn wide_src_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U32, false),
-            SchemaColumn::new(TypeCode::U128, false),
-        ],
-        &[0],
-    )
-}
-
-/// [`build_input`] over [`wide_src_schema`], the value scrambled across the
-/// whole 128-bit range.
-fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for row in 0..N_ROWS as u64 {
-        let v = (row.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128) << 64 | row as u128;
-        b.begin_row(row as u128, 1);
-        b.put_int((row % N_GROUPS) as u128);
-        b.put_int(v);
-        b.end_row();
-    }
-    b.finish()
-}
-
-/// The production bake for one extreme over `col` grouped by `group`, reached
-/// the way the compiler reaches it — through the plan that owns the
-/// accumulators the bake reads.
-fn extreme_bake(schema: &SchemaDescriptor, group: &[u32], col: u32, agg_op: AggFunc) -> AviBake {
-    let aggs = [AggDescriptor { col_idx: col, agg_op }, AggDescriptor::COUNT_STAR];
-    ReducePlan::from_wire(schema, group, &aggs, false)
-        .unwrap()
-        .avi
-        .expect("a MIN/MAX reduce is value-indexed")
-}
-
-fn ns_per_row(elapsed: Duration) -> f64 {
-    elapsed.as_nanos() as f64 / (N_ROWS * ITERS) as f64
-}
-
-fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
-    let (p, s, f) = (ns_per_row(population), ns_per_row(sort), ns_per_row(full));
-    println!("\n{index} population — per-row cost decomposition ({ITERS}x{N_ROWS} rows):");
-    println!("  population (avi_batch)   {p:7.2} ns/row   {:5.1}%", 100.0 * p / f);
-    println!("  sort (into_consolidated) {s:7.2} ns/row   {:5.1}%", 100.0 * s / f);
-    println!("  -----");
-    // Both layers are timed independently of `full`, so their sum is a check on
-    // the decomposition rather than a restatement of it.
-    println!("  layer sum                {:7.2} ns/row", p + s);
-    println!(
-        "  avi_batch + ingest (full)   {f:7.2} ns/row   ({:.2} Mrows/s)",
-        1000.0 / f
-    );
-}
-
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn secondary_index_avi_decomposition_bench() {
-    let schema = src_schema();
-    decompose(
-        "AVI (U32 grp, I64 val)",
-        extreme_bake(&schema, &[1], 2, AggFunc::Min),
-        build_input(&schema),
-    );
-}
-
-/// The wide shape, under the scalar one's group key.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn secondary_index_avi_wide_decomposition_bench() {
-    let schema = wide_src_schema();
-    decompose(
-        "AVI (U32 grp, U128 val)",
-        extreme_bake(&schema, &[1], 2, AggFunc::Max),
-        build_wide_input(&schema),
-    );
-}
-
-/// One MIN over an I64 across packed group-key shapes.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn secondary_index_avi_group_shape_bench() {
-    for (label, group) in [
-        ("I32 NOT NULL", &[(TypeCode::I32, false)][..]),
-        ("I32 nullable", &[(TypeCode::I32, true)][..]),
-        ("I64 nullable", &[(TypeCode::I64, true)][..]),
-        ("2xI32 NOT NULL", &[(TypeCode::I32, false); 2][..]),
-        ("2xI64 nullable", &[(TypeCode::I64, true); 2][..]),
-    ] {
-        let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-        cols.extend(group.iter().map(|&(tc, nullable)| SchemaColumn::new(tc, nullable)));
-        cols.push(SchemaColumn::new(TypeCode::I64, false));
-        let schema = SchemaDescriptor::new(&cols, &[0]);
+            &[Min, Max],
+            |b, i| b.put_u64(mix(i)),
+        ),
+    ];
+    for (label, value, aggs, put) in cases {
+        let schema = grouped_schema(&[SchemaColumn::new(TypeCode::U32, false)], value);
         let mut b = BatchBuilder::new(&schema);
-        for row in 0..N_ROWS as u64 {
-            b.begin_row(row as u128, 1);
-            for (i, &(tc, nullable)) in group.iter().enumerate() {
-                let g = (row + i as u64 * 7) % N_GROUPS;
-                match nullable && row % 16 == i as u64 {
-                    true => b.put_null(),
-                    false if tc == TypeCode::I32 => b.put_int((g as i32 - 5_000) as u32 as u128),
-                    false => b.put_int((g as i64 - 5_000) as u64 as u128),
-                }
-            }
-            b.put_int(((row.wrapping_mul(2654435761)) as i64) as u128);
+        for i in 0..N {
+            b.begin_row(i as u128, 1);
+            b.put_int((i % 4096) as u128);
+            put(&mut b, i);
             b.end_row();
         }
-        let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
-        let val = group.len() as u32 + 1;
-        decompose(
-            &format!("AVI ({label} grp, I64 val)"),
-            extreme_bake(&schema, &group_cols, val, AggFunc::Min),
-            b.finish(),
+        let mut delta = b.finish();
+        delta.certify_consolidated();
+        let plan = plan(&schema, &[1], aggs);
+        // The first pass takes the pool's first allocations.
+        let [_, (entries, instructions)] = [(); 2].map(|()| counter.measure(|| plan.index_batch(&delta).unwrap()));
+        println!(
+            "reduce_index_batch_bench {label:<17} {:6.1} instr/row ({} entries)",
+            instructions as f64 / N as f64,
+            entries.count
         );
     }
 }
 
-/// The per-layer decomposition of one bake's population, timed and reported.
-fn decompose(label: &str, bake: AviBake, input: Batch) {
-    let avi_schema = bake.schema;
-    let bake = &bake;
-    let input = &input;
-
-    let population = bench_time(ITERS, || {
-        std::hint::black_box(avi_batch(input, bake));
-    });
-    let sort = bench_time_each(
-        ITERS,
-        || avi_batch(input, bake),
-        |b| {
-            std::hint::black_box(b.into_consolidated());
-        },
-    );
-    // A fresh trace per iteration, built outside the clock.
-    let full = bench_time_each(
-        ITERS,
-        || TestTrace::new(avi_schema),
-        |mut t| {
-            t.ingest(avi_batch(input, bake));
-            std::hint::black_box(&t);
-        },
-    );
-
-    report(label, population, sort, full);
-}
-
-/// Time the `into_consolidated` sort layer for a single-column PK schema
-/// (`[pk, I64 val]`). `pk_bytes_for(row)` is the stored 8-byte key; the payload
-/// is a scrambled I64 so the payload tiebreak is exercised. Hashed PKs keep the
-/// input unsorted (real sort work) with occasional folds.
-fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: impl Fn(usize) -> [u8; 8]) {
-    let build = || {
-        let mut out = Batch::with_capacity(&pk_schema, N_ROWS);
-        for row in 0..N_ROWS {
-            out.begin_row(&pk_bytes_for(row), 1);
-            out.extend_col(0, &((row as i64).wrapping_mul(2654435761)).to_le_bytes());
-            out.commit_row();
-        }
-        out
-    };
-    let sort = bench_time(ITERS, || {
-        std::hint::black_box(build().into_consolidated());
-    });
-    let s = ns_per_row(sort);
-    println!(
-        "\n{label} — sort (into_consolidated): {s:7.2} ns/row   ({:.2} Mrows/s)",
-        1000.0 / s,
-    );
-}
-
-/// The sort of a batch keyed on one 8-byte column.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn secondary_index_single_u64_pk_sort_bench() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    bench_single_pk_sort("single 8-byte PK", schema, |row| {
-        (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes()
-    });
-}
-
-/// `op_reduce` over `delta` against `h`'s state, alone on the clock: the index
-/// population the VM runs ahead of it is not.
-fn time_op_reduce(h: &mut Harness, delta: &Batch) -> (Batch, Duration) {
+/// One epoch over `delta`: the instructions per delta row of `op_reduce` alone,
+/// the index entries the VM adds ahead of it left out.
+fn epoch(counter: &Counter, h: &mut Harness, delta: &Batch) -> f64 {
     h.index(delta);
-    let start = Instant::now();
-    let out = h.reduce(delta);
-    (out, start.elapsed())
-}
-
-/// `op_reduce` over `d2`, against the state `d1` left behind: its wall time and
-/// the instructions it retired.
-fn time_second_epoch(plan: ReducePlan, d1: &Batch, d2: &Batch) -> (Duration, u64) {
-    let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut h = Harness::new(plan);
-    let (out, _) = time_op_reduce(&mut h, d1);
+    let (out, instructions) = counter.measure(|| h.reduce(delta));
     h.trace_out.ingest(out);
-    h.index(d2);
-    let start = Instant::now();
-    let (out, instructions) = counter.measure(|| h.reduce(d2));
-    let warm = start.elapsed();
-    std::hint::black_box(out);
-    (warm, instructions)
+    instructions as f64 / delta.count as f64
 }
 
-/// `delta` as the VM hands it to `plan`'s reduce: folded unless every aggregate
-/// is exact linear.
-fn as_read(plan: &ReducePlan, delta: Batch) -> Batch {
-    match plan.is_exact_linear() {
-        true => delta,
-        false => delta.into_consolidated(),
-    }
-}
-
-/// Times `op_reduce` over a 1M-row delta per shape, against an empty and a
-/// populated trace. `OP_REDUCE_BENCH_SHAPE=<label>` runs one shape alone, for
-/// `perf stat`.
+/// Instructions per delta row of `op_reduce` per shape, over three epochs: an
+/// insert against an empty trace, a second insert into the same groups, and the
+/// retraction of the first.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_bench() {
-    const N: u64 = 1 << 20;
-    let only = std::env::var("OP_REDUCE_BENCH_SHAPE").ok();
-    let mix = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let grp_val = pk_u64_two_i64_schema();
-    let single_pk = pk_payload_schema(&[TypeCode::U64]);
-    let compound_pk = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
-    let agg = |col_idx: u32, agg_op: AggFunc| [AggDescriptor { col_idx, agg_op }, AggDescriptor::COUNT_STAR];
+    use AggFunc::{Min, Sum};
+    const N: u64 = 1 << 18;
+    let counter = Counter::instructions();
+    let run = |label: &str, schema: &SchemaDescriptor, group: &[u32], agg: AggFunc, make: &dyn Fn(u64) -> Batch| {
+        let mut h = Harness::new(plan(schema, group, &[agg]));
+        let (d1, d2) = (h.fold(make(1)), h.fold(make(2)));
+        let retraction = h.fold(d1.clone().negated());
+        let [empty, populated, retract] = [&d1, &d2, &retraction].map(|d| epoch(&counter, &mut h, d));
+        println!(
+            "op_reduce_bench {label:<24} empty trace {empty:7.1}, populated {populated:7.1}, \
+             retraction {retract:7.1} instr/row"
+        );
+    };
 
-    // `[U64 pk, I64 grp, I64 val]` rows, raw.
-    let grp_rows = |salt: u64, grp: &dyn Fn(u64) -> u64| {
-        let mut bb = BatchBuilder::new(&grp_val);
+    // Unsorted rows over a `grouped_schema`: every group column holds `grp` of
+    // the row, a nullable one NULL on every 16th row.
+    let scattered = |schema: &SchemaDescriptor, salt: u64, grp: &dyn Fn(u64) -> u64| {
+        let group = &schema.columns[1..schema.num_columns() - 1];
+        let mut bb = BatchBuilder::new(schema);
         for i in 0..N {
             bb.begin_row(mix(i + salt * N) as u128, 1);
-            bb.put_int(grp(i) as u128);
-            bb.put_int(mix(i ^ salt) as i64 as u128);
+            for (c, col) in group.iter().enumerate() {
+                let g = grp(i) & (u64::MAX >> (64 - 8 * col.size()));
+                bb.put_opt_int((!col.nullable || i % 16 != c as u64).then_some(g as u128));
+            }
+            bb.put_u64(mix(i ^ salt));
             bb.end_row();
         }
         bb.finish()
     };
-    // PK-sorted rows over `schema` (one or two U64 PK columns, one I64 value),
-    // certified consolidated.
-    let sorted_rows = |schema: SchemaDescriptor, salt: u64| {
-        let mut bb = BatchBuilder::new(&schema);
+    // PK-sorted rows over one or two U64 PK columns and one I64 value, certified
+    // consolidated: 16 rows per leading PK column value.
+    let sorted = |schema: &SchemaDescriptor, salt: u64| {
+        let mut bb = BatchBuilder::new(schema);
         for i in 0..N {
             match schema.pk_cols().len() {
                 1 => bb.begin_row(i as u128, 1),
                 _ => bb.begin_row_natives(&[(i / 16) as u128, (i % 16) as u128], 1),
             }
-            bb.put_int((i + salt) as u128);
+            bb.put_u64(i + salt);
             bb.end_row();
         }
         let mut b = bb.finish();
@@ -319,210 +150,78 @@ fn op_reduce_bench() {
         b
     };
 
-    type Shape<'a> = (
-        &'a str,
-        SchemaDescriptor,
-        Vec<u32>,
-        [AggDescriptor; 2],
-        Box<dyn Fn(u64) -> Batch + 'a>,
-    );
-    let shapes: Vec<Shape> = vec![
-        (
-            "keyed_u64_sum",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|i| i % 65_536)),
-        ),
-        // Unsorted groups at the row counts per group the hashed and the sorted
-        // group numbering trade places at.
-        (
-            "keyed_distinct_sum",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|i| mix(i ^ 0x55))),
-        ),
-        (
-            "keyed_2_per_group_sum",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|i| mix((i / 2) ^ 0x55))),
-        ),
-        (
-            "keyed_4_scattered_sum",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|i| mix(i % (N / 4)))),
-        ),
-        (
-            "keyed_256_sum",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|i| mix(i) % 256)),
-        ),
-        (
-            "source_pk",
-            single_pk,
-            vec![0],
-            agg(1, AggFunc::Sum),
-            Box::new(|s| sorted_rows(single_pk, s)),
-        ),
-        (
-            "leading_pk_col",
-            compound_pk,
-            vec![0],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| sorted_rows(compound_pk, s)),
-        ),
-        (
-            "leading_pk_min",
-            compound_pk,
-            vec![0],
-            agg(2, AggFunc::Min),
-            Box::new(|s| sorted_rows(compound_pk, s)),
-        ),
-        (
-            "ungrouped_sum",
-            grp_val,
-            vec![],
-            agg(2, AggFunc::Sum),
-            Box::new(|s| grp_rows(s, &|_| 0)),
-        ),
-        (
-            "ungrouped_min",
-            grp_val,
-            vec![],
-            agg(2, AggFunc::Min),
-            Box::new(|s| grp_rows(s, &|_| 0)),
-        ),
-        (
-            "keyed_min_8",
-            grp_val,
-            vec![1],
-            agg(2, AggFunc::Min),
-            Box::new(|s| grp_rows(s, &|i| i / 8)),
-        ),
-    ];
-    let shapes: Vec<Shape> = shapes
-        .into_iter()
-        .filter(|s| only.as_deref().is_none_or(|o| o == s.0))
-        .collect();
-    assert!(!shapes.is_empty(), "OP_REDUCE_BENCH_SHAPE names no shape");
-    for (label, schema, group, aggs, make) in &shapes {
-        let plan = || ReducePlan::from_wire(schema, group, aggs, false).unwrap();
-        let (d1, d2) = (as_read(&plan(), make(1)), as_read(&plan(), make(2)));
-        let (out, cold) = time_op_reduce(&mut Harness::new(plan()), &d2);
-        std::hint::black_box(out);
-        let (warm, instructions) = time_second_epoch(plan(), &d1, &d2);
-        let per_row = instructions as f64 / d2.count as f64;
-        println!("op_reduce {label}: empty trace {cold:?}, populated trace {warm:?}, {per_row:.1} instr/row");
-    }
+    let value = SchemaColumn::new(TypeCode::I64, false);
+    let one = grouped_schema(&[SchemaColumn::new(TypeCode::I64, false)], value);
+    let narrow_nullable = grouped_schema(&[SchemaColumn::new(TypeCode::I32, true)], value);
+    let two_nullable = grouped_schema(&[SchemaColumn::new(TypeCode::I64, true); 2], value);
+    let single_pk = pk_payload_schema(&[TypeCode::U64]);
+    let compound_pk = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+
+    // The delta's group runs, long enough to fold as ranges: linear, and with an
+    // extreme to step.
+    run("leading_pk_col_sum", &compound_pk, &[0], Sum, &|s| {
+        sorted(&compound_pk, s)
+    });
+    run("leading_pk_col_min", &compound_pk, &[0], Min, &|s| {
+        sorted(&compound_pk, s)
+    });
+    // One run of every row.
+    run("ungrouped_sum", &one, &[], Sum, &|s| scattered(&one, s, &|_| 0));
+    // Runs of one row: numbered off the delta's own order.
+    run("source_pk_sum", &single_pk, &[0], Sum, &|s| sorted(&single_pk, s));
+    // Unsorted groups, numbered by sorting below four rows a group and by
+    // hashing from there.
+    run("keyed_distinct_sum", &one, &[1], Sum, &|s| {
+        scattered(&one, s, &|i| mix(i ^ 0x55))
+    });
+    run("keyed_4_per_group_sum", &one, &[1], Sum, &|s| {
+        scattered(&one, s, &|i| mix(i % (N / 4)))
+    });
+    run("keyed_256_groups_sum", &one, &[1], Sum, &|s| {
+        scattered(&one, s, &|i| mix(i) % 256)
+    });
+    run("keyed_8_per_group_min", &one, &[1], Min, &|s| {
+        scattered(&one, s, &|i| i / 8)
+    });
+    // The 256 groups under the other group-key forms.
+    run("i32_nullable_256_sum", &narrow_nullable, &[1], Sum, &|s| {
+        scattered(&narrow_nullable, s, &|i| mix(i) % 256)
+    });
+    run("2xi64_nullable_256_sum", &two_nullable, &[1, 2], Sum, &|s| {
+        scattered(&two_nullable, s, &|i| mix(i) % 256)
+    });
 }
 
-/// Times `op_reduce` over a 1M-row delta against a populated trace, for SUM and
-/// MIN across packed group-key shapes. `REDUCE_SWEEP=<label>` runs one alone,
-/// for `perf stat`.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn op_reduce_group_sweep_bench() {
-    const N: u64 = 1 << 20;
-    let only = std::env::var("REDUCE_SWEEP").ok();
-    let mix = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let shapes: [(&str, &[(TypeCode, bool)]); 6] = [
-        ("i32_notnull", &[(TypeCode::I32, false)]),
-        ("i32_nullable", &[(TypeCode::I32, true)]),
-        ("i64_nullable", &[(TypeCode::I64, true)]),
-        ("2xi32_notnull", &[(TypeCode::I32, false); 2]),
-        ("2xi64_nullable", &[(TypeCode::I64, true); 2]),
-        ("3xi64_nullable", &[(TypeCode::I64, true); 3]),
-    ];
-    let mut ran = 0;
-    for (shape, group) in shapes {
-        let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-        cols.extend(group.iter().map(|&(tc, nullable)| SchemaColumn::new(tc, nullable)));
-        cols.push(SchemaColumn::new(TypeCode::I64, false));
-        let schema = SchemaDescriptor::new(&cols, &[0]);
-        let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
-        let val = group.len() as u32 + 1;
-        let rows = |salt: u64| {
-            let mut bb = BatchBuilder::new(&schema);
-            for i in 0..N {
-                bb.begin_row(mix(i + salt * N) as u128, 1);
-                for (c, &(tc, nullable)) in group.iter().enumerate() {
-                    let g = (i >> (4 * c)) % 256;
-                    match nullable && i % 16 == c as u64 {
-                        true => bb.put_null(),
-                        false if tc == TypeCode::I32 => bb.put_int((g as i32 - 128) as u32 as u128),
-                        false => bb.put_int((g as i64 - 128) as u64 as u128),
-                    }
-                }
-                bb.put_int(mix(i ^ salt) as i64 as u128);
-                bb.end_row();
-            }
-            bb.finish()
-        };
-        for agg_op in [AggFunc::Sum, AggFunc::Min] {
-            let label = format!("{shape}_{agg_op:?}").to_lowercase();
-            if only.as_deref().is_some_and(|o| o != label) {
-                continue;
-            }
-            ran += 1;
-            let aggs = [AggDescriptor { col_idx: val, agg_op }, AggDescriptor::COUNT_STAR];
-            let plan = ReducePlan::from_wire(&schema, &group_cols, &aggs, false).unwrap();
-            let (d1, d2) = (as_read(&plan, rows(1)), as_read(&plan, rows(2)));
-            let (warm, instructions) = time_second_epoch(plan, &d1, &d2);
-            let per_row = instructions as f64 / d2.count as f64;
-            println!("op_reduce_group_sweep {label}: populated trace {warm:?}, {per_row:.1} instr/row");
-        }
-    }
-    assert!(ran > 0, "REDUCE_SWEEP names no shape");
-}
-
-/// `op_reduce` over a three-run trace_out whose two older runs lie wholly below the
-/// delta's first output key: the delta touches every group of the newest run and
-/// adds a new group between each pair.
+/// Instructions per delta row of `op_reduce` over a three-run output trace whose
+/// two older runs lie wholly below the delta's first group: the delta touches
+/// every group of the newest run and adds a new group between each pair.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_multi_run_bench() {
     const G: u64 = 1 << 14;
-    const RUNS: usize = 200;
+    let counter = Counter::instructions();
     let schema = pk_payload_schema(&[TypeCode::U64]);
-    let aggs = [
-        AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum },
-        AggDescriptor::COUNT_STAR,
-    ];
-    let rows = |keys: &[u64]| {
+    let rows = |keys: &mut dyn Iterator<Item = u64>| {
         let mut bb = BatchBuilder::new(&schema);
-        for &k in keys {
+        for k in keys {
             bb.begin_row(k as u128, 1);
-            bb.put_int(k as u128);
+            bb.put_u64(k);
             bb.end_row();
         }
         let mut b = bb.finish();
         b.certify_consolidated();
         b
     };
-    let mut h = Harness::new(ReducePlan::from_wire(&schema, &[0], &aggs, false).unwrap());
-    let runs: [Vec<u64>; 3] = [
-        (0..2 * G).step_by(2).collect(),
-        (1..2 * G).step_by(2).collect(),
-        (2 * G..4 * G).step_by(2).collect(),
-    ];
-    for keys in &runs {
-        let (out, _) = time_op_reduce(&mut h, &rows(keys));
-        h.trace_out.ingest(out);
-    }
-    let delta = rows(&(2 * G..4 * G).collect::<Vec<_>>());
-    let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut instructions = 0;
-    for _ in 0..RUNS {
-        let (out, n) = counter.measure(|| h.reduce(&delta));
-        std::hint::black_box(out);
-        instructions += n;
-    }
-    println!("op_reduce multi-run: {} instr/iter", instructions / RUNS as u64);
+    let mut h = Harness::new(plan(&schema, &[0], &[AggFunc::Sum]));
+    epoch(&counter, &mut h, &rows(&mut (0..2 * G).step_by(2)));
+    epoch(&counter, &mut h, &rows(&mut (1..2 * G).step_by(2)));
+    epoch(&counter, &mut h, &rows(&mut (2 * G..4 * G).step_by(2)));
+    let delta = rows(&mut (2 * G..4 * G));
+    // The first pass takes the pool's first allocations.
+    let [_, (out, instructions)] = [(); 2].map(|()| counter.measure(|| h.reduce(&delta)));
+    println!(
+        "op_reduce_multi_run_bench {:.1} instr/row (out {})",
+        instructions as f64 / delta.count as f64,
+        out.count
+    );
 }

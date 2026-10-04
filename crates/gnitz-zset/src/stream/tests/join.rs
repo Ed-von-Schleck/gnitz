@@ -4,8 +4,8 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
-    dealt_cursor, join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64,
-    make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema, rekey_plan, trace_cursor, zset_of,
+    join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64,
+    opk_pk, pk_only_schema, pk_payload_schema, rekey_plan, trace_cursor, zset_of, TestTrace,
 };
 use gnitz_wire::read_i64_le;
 
@@ -503,7 +503,7 @@ fn assert_matches_reference(
 
     let cursors = [
         ("one run", trace_cursor(folded)),
-        ("three runs", dealt_cursor(trace, 3)),
+        ("three runs", TestTrace::dealt(trace, 3).cursor()),
     ];
     for (runs, mut ch) in cursors {
         let out = op_join_delta_trace(delta, &mut ch, &p.out_schema, &p.probe);
@@ -718,7 +718,12 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
             assert!(over.out_schema.same_layout(&stored.out_schema));
             assert!(!want.is_empty(), "premise: key {key:?} matches something");
             for runs in [1, 3] {
-                let got = op_join_delta_trace(&delta, &mut dealt_cursor(&source, runs), &over.out_schema, &over.probe);
+                let got = op_join_delta_trace(
+                    &delta,
+                    &mut TestTrace::dealt(&source, runs).cursor(),
+                    &over.out_schema,
+                    &over.probe,
+                );
                 assert_eq!(
                     zset_of(&got, &over.out_schema),
                     zset_of(&want, &stored.out_schema),

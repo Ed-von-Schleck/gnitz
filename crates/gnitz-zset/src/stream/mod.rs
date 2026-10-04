@@ -20,10 +20,6 @@ mod join;
 mod reduce;
 mod topn;
 
-#[cfg(test)]
-#[path = "benches/join.rs"]
-mod bench_join;
-
 use crate::repr::ReadCursor;
 
 /// Opens a cursor over one store of an operator's history, for probing at the

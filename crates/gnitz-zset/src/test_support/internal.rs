@@ -36,18 +36,6 @@ pub(crate) fn create_read_cursor(
     )
 }
 
-/// `rows` dealt round-robin into `runs` runs, each consolidated alone, under one
-/// cursor: an element can cancel across runs.
-pub(crate) fn dealt_cursor(rows: &Batch, runs: usize) -> ReadCursor {
-    let dealt: Vec<Rc<Batch>> = (0..runs)
-        .map(|k| {
-            let rows_k: Vec<(usize, usize)> = (k..rows.count).step_by(runs).map(|r| (r, r + 1)).collect();
-            Rc::new(Batch::from_ranges(rows, &rows_k, 0).into_consolidated())
-        })
-        .collect();
-    create_read_cursor(&dealt, &[], *rows.schema())
-}
-
 /// The reindex of `source` onto its columns `key`, each at its own type,
 /// keeping `keep`: the map a join's trace integrates behind.
 pub(crate) fn rekey_plan(source: &SchemaDescriptor, key: &[u32], keep: &[u32]) -> crate::algebra::MapPlan {
@@ -77,6 +65,17 @@ pub(crate) struct TestTrace {
 impl TestTrace {
     pub(crate) fn new(schema: SchemaDescriptor) -> Self {
         TestTrace { schema, runs: Vec::new() }
+    }
+
+    /// `rows` dealt round-robin into `runs` runs: an element can cancel across
+    /// runs.
+    pub(crate) fn dealt(rows: &Batch, runs: usize) -> Self {
+        let mut trace = TestTrace::new(*rows.schema());
+        for k in 0..runs {
+            let rows_k: Vec<(usize, usize)> = (k..rows.count).step_by(runs).map(|r| (r, r + 1)).collect();
+            trace.ingest(Batch::from_ranges(rows, &rows_k, 0));
+        }
+        trace
     }
 
     /// Add `batch` as one more run.
@@ -194,36 +193,6 @@ pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::I64])
-}
-
-/// Run `f` once as warmup, then `iters` times, returning the total elapsed.
-pub(crate) fn bench_time(iters: usize, mut f: impl FnMut()) -> std::time::Duration {
-    f();
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        f();
-    }
-    start.elapsed()
-}
-
-/// [`bench_time`] for a body that consumes per-iteration state the clock must
-/// not see — a batch to fold, a fresh table to write into. `setup` runs outside
-/// the timed region of every iteration, the warmup included.
-pub(crate) fn bench_time_each<S>(
-    iters: usize,
-    mut setup: impl FnMut() -> S,
-    mut body: impl FnMut(S),
-) -> std::time::Duration {
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..=iters {
-        let state = setup();
-        let start = std::time::Instant::now();
-        body(state);
-        if i > 0 {
-            total += start.elapsed();
-        }
-    }
-    total
 }
 
 /// `batch` written to `path` and mapped back, as a store maps the shards it

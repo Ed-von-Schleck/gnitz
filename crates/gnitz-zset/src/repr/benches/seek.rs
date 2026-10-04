@@ -1,6 +1,51 @@
 use super::*;
+use crate::test_support::Rng;
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
+
+/// Row number `r` as a key of `stride` bytes, in its leading `stride`.
+fn key(stride: usize, r: usize) -> [u8; 40] {
+    let mut k = [0u8; 40];
+    k[stride - 8..stride].copy_from_slice(&(r as u64).to_be_bytes());
+    k
+}
+
+/// `rows` ascending keys of `stride` bytes, row `r` holding key `r`.
+fn region(rows: usize, stride: usize) -> Vec<u8> {
+    (0..rows)
+        .flat_map(|r| key(stride, r).into_iter().take(stride))
+        .collect()
+}
+
+/// Instructions per [`seek_lower_bound`] probe at a random key of a region of
+/// ascending keys, at a stride in each width arm and each key-packing band.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn seek_lower_bound_bench() {
+    const ROWS: usize = 1 << 19;
+    const PROBES: usize = 100_000;
+    let counter = Counter::instructions();
+    for stride in [8usize, 12, 16, 24, 32, 40] {
+        let region = region(ROWS, stride);
+        let pk = ColPtr { base: region.as_ptr(), stride };
+        let mut rng = Rng::new(0xC0FFEE + stride as u64);
+        let probes: Vec<usize> = (0..PROBES).map(|_| rng.gen_range(ROWS as u64) as usize).collect();
+        let (landed, instructions) = counter.measure(|| {
+            let mut landed = 0;
+            for &r in &probes {
+                let k = key(stride, r);
+                // SAFETY: `region` holds `ROWS` rows of `stride` bytes.
+                landed += unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride])) };
+            }
+            landed
+        });
+        assert_eq!(landed, probes.iter().sum::<usize>(), "row r holds key r");
+        println!(
+            "seek_lower_bound_bench stride={stride:>2} {:6.1} instr/probe",
+            instructions as f64 / PROBES as f64
+        );
+    }
+}
 
 /// Instructions and cycles per [`seek_advance_to`] probe over a region of
 /// ascending keys, row `r` holding key `r`: at a stride in each width arm and
@@ -21,12 +66,8 @@ fn seek_advance_to_bench() {
         ("hint at the boundary", false, |_, r| r),
     ];
     for stride in [8usize, 12, 16, 24, 32, 40] {
-        let key = |r: usize| {
-            let mut k = [0u8; 40];
-            k[stride - 8..stride].copy_from_slice(&(r as u64).to_be_bytes());
-            k
-        };
-        let region: Vec<u8> = (0..ROWS).flat_map(|r| key(r).into_iter().take(stride)).collect();
+        let key = |r| key(stride, r);
+        let region = region(ROWS, stride);
         let pk = ColPtr { base: region.as_ptr(), stride };
         for gap in [1usize, 128, 4096] {
             for (label, descending, hint) in drivers {

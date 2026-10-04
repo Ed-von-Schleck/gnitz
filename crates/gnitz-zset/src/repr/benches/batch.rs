@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -9,7 +9,8 @@ use std::hint::black_box;
 /// in and by how many of them share a PK. "Ascending but the last" is the input
 /// a check for "ascending" costs the most on; the last two shapes are the only
 /// ones whose sort breaks PK ties on the payload, and the last the only one that
-/// folds rows.
+/// folds rows. The scattered shape runs again at a PK in each wider arm of the
+/// sort key.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn consolidate_bench() {
@@ -45,6 +46,25 @@ fn consolidate_bench() {
         assert_eq!(out.count as u64, survivors);
         println!(
             "into_consolidated, {label:<28} {:>6.1} instr/row",
+            instructions as f64 / N as f64
+        );
+    }
+    for pk_cols in [2usize, 3, 5] {
+        let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
+        let [_, (out, instructions)] = [(); 2].map(|()| {
+            let mut b = BatchBuilder::new(&schema);
+            for i in 0..N {
+                b.begin_row_natives(&vec![i.wrapping_mul(SCATTER) as u128; pk_cols], 1);
+                b.put_u64(i);
+                b.end_row();
+            }
+            let batch = b.finish();
+            counter.measure(|| black_box(batch).into_consolidated())
+        });
+        assert_eq!(out.count as u64, N);
+        println!(
+            "into_consolidated, {:<28} {:>6.1} instr/row",
+            format!("scattered, {}-byte PK", 8 * pk_cols),
             instructions as f64 / N as f64
         );
     }

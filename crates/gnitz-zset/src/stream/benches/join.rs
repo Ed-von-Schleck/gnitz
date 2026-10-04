@@ -1,75 +1,31 @@
-//! Microbenchmarks for the three delta-trace join kinds. Ignored by default;
-//! wall-clock on a contended box is not decisive, so take every A/B from
-//! instructions retired:
-//!
-//! ```text
-//! perf stat -e instructions:u -- cargo test -p gnitz-zset --release join_ \
-//!     -- --ignored --nocapture --test-threads=1
-//! ```
-//!
-//! Three fixture axes are swept because without them the benches cannot see what
-//! they exist to measure: **source count** (a single-source cursor never reaches
-//! the `with_payload_cmp!` dispatch that only `Multi` re-runs per row), **a
-//! German-string payload** (no blob cache exists without one), and **a
-//! `PayloadCmpKind::Generic` schema**, so both comparator monomorphizations are
-//! compiled and timed.
-//!
-//! The delta is certified consolidated, so the timed region is the probe and
-//! the emit, not a sort.
+use super::*;
+use crate::repr::BatchBuilder;
+use crate::schema::{SchemaColumn, TypeCode};
+use crate::test_support::{rekey_plan, TestTrace};
+use gnitz_foundation::perf::Counter;
+use gnitz_wire::RangeRel;
 
-use std::rc::Rc;
-use std::time::Duration;
-
-use super::{op_join_delta_trace, JoinPlan};
-use crate::repr::{Batch, BatchBuilder, ReadCursor};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::bench_time_each;
-use gnitz_wire::{JoinKind, RangeRel};
-
-/// Rows on the larger side of every fixture. Big enough that the per-call
-/// preamble (one `Batch::with_capacity`, one blob-cache acquire) is noise
-/// against the per-row walk, small enough that a full sweep stays interactive.
+/// Rows on the larger side of an equi or a range fixture.
 const N: usize = 4096;
 
-const ITERS: usize = 20;
+/// Runs the trace is dealt into: one, where the cursor reads its only source
+/// directly, and several, where it merges them and breaks a PK tie on the payload.
+const RUNS: [usize; 2] = [1, 4];
 
-/// Source counts swept per shape: a `Single`-mode cursor and a `Multi`-mode one.
-const SOURCE_COUNTS: [usize; 2] = [1, 4];
-
-/// Both delta sides: the emit loop writes the two payload halves at whichever
-/// output slot range the side flag puts them.
-const SIDES: [bool; 2] = [false, true];
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-/// The payload shape a fixture carries. Each selects a different kernel path:
-/// the comparator monomorphization, and whether a blob cache exists at all.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The payload columns a fixture carries behind the I64 its rows are ordered by.
+#[derive(Clone, Copy, Debug)]
 enum Payload {
-    /// One non-nullable I64 — `PayloadCmpKind::FixedIntNonnull`, no blob heap.
+    /// None: the payload compares as one non-nullable integer, and no blob heap.
     Int,
-    /// I64 + a nullable I64 — `Generic`, still no blob heap.
+    /// A nullable I64: the generic payload comparator, still no blob heap.
     Nullable,
-    /// I64 + a STRING — `Generic`, and the only shape whose emit relocates
-    /// German strings through the dedup cache.
+    /// A STRING: the generic comparator, and an emit that relocates strings.
     Str,
 }
 
-impl Payload {
-    fn tag(self) -> &'static str {
-        match self {
-            Payload::Int => "int",
-            Payload::Nullable => "nullable",
-            Payload::Str => "string",
-        }
-    }
-}
+const PAYLOADS: [Payload; 3] = [Payload::Int, Payload::Nullable, Payload::Str];
 
-/// `pk_types` PK columns followed by `p`'s payload columns. Column 0 of the
-/// payload is always the non-nullable I64 the fixtures order rows by, so
-/// `(PK, payload)` order is decided by it alone in every payload shape.
+/// `pk_types` PK columns, a non-nullable I64, then `p`'s column.
 fn schema_for(pk_types: &[TypeCode], p: Payload) -> SchemaDescriptor {
     let mut cols: Vec<SchemaColumn> = pk_types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
     cols.push(SchemaColumn::new(TypeCode::I64, false));
@@ -82,16 +38,13 @@ fn schema_for(pk_types: &[TypeCode], p: Payload) -> SchemaDescriptor {
     SchemaDescriptor::new(&cols, &pk)
 }
 
-/// One fixture row: its PK column values (in pk-list order) and the I64 that
-/// both orders it within its PK group and seeds the extra payload column.
+/// One fixture row: its PK column values and the I64 that orders it within its
+/// PK.
 type Row = (Vec<u128>, i64);
 
-/// Build a batch over `schema_for(_, p)` and certify it consolidated. `rows`
-/// must arrive sorted by `(PK, ord)`; every weight is `+1`.
-///
-/// The long strings are 24 bytes — past `SHORT_STRING_THRESHOLD`, so they land
-/// in the blob heap and the emit path must relocate rather than copy them
-/// inline. Every fourth nullable cell is NULL.
+/// `rows`, sorted by `(PK, ord)`, each at weight 1 over `schema_for(_, p)`.
+/// Every fourth nullable cell is NULL; the strings are heap-backed and take
+/// eight distinct values.
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for (i, (pk, ord)) in rows.iter().enumerate() {
@@ -101,9 +54,6 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
             Payload::Int => {}
             Payload::Nullable if i % 4 == 0 => b.put_null(),
             Payload::Nullable => b.put_int((ord * 7) as u128),
-            // Only a handful of distinct long strings, so the dedup cache has
-            // repeated spans to collapse — the shape a fan-out join actually
-            // presents it.
             Payload::Str => b.put_string(&format!("join-bench-payload-{:05}", ord % 8)),
         }
         b.end_row();
@@ -113,70 +63,24 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
     b
 }
 
-/// Split `rows` round-robin into `n` batches, each of which stays sorted, and
-/// open one cursor over all of them. `n == 1` yields a `Single`-mode cursor;
-/// `n > 1` a `Multi`-mode one, where a bare `advance()` per row would re-run the
-/// payload-comparator dispatch that both group walks hoist out.
-fn cursor_over(schema: &SchemaDescriptor, p: Payload, rows: &[Row], n: usize) -> ReadCursor {
-    let batches: Vec<Rc<Batch>> = (0..n)
-        .map(|s| {
-            let part: Vec<Row> = rows.iter().skip(s).step_by(n).cloned().collect();
-            Rc::new(build(schema, p, &part))
-        })
-        .collect();
-    crate::test_support::create_read_cursor(&batches, &[], *schema)
-}
-
-// ---------------------------------------------------------------------------
-// Timing
-// ---------------------------------------------------------------------------
-
-/// Time `ITERS` calls of one join kind and print the row. The plan and each
-/// call's fresh `cursor()` are built outside the timed region, as an epoch gets them.
-fn time_join(
-    name: String,
-    kind: JoinKind,
-    delta_is_right: bool,
-    schema: &SchemaDescriptor,
-    delta: &Batch,
-    cursor: impl FnMut() -> ReadCursor,
-) {
-    let plan = JoinPlan::from_wire(kind, delta_is_right, schema, schema).expect("bench join plan is well-formed");
-    let mut out_rows = 0;
-    let elapsed = bench_time_each(ITERS, cursor, |mut cursor| {
-        let out = op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe);
-        out_rows = out.count;
-        std::hint::black_box(&out);
+/// One probe of `delta` against `trace` dealt into `runs` runs: its instructions
+/// per delta row and its output rows.
+fn probe(counter: &Counter, plan: &JoinPlan, delta: &Batch, trace: &Batch, runs: usize) -> (f64, usize) {
+    let trace = TestTrace::dealt(trace, runs);
+    // The first pass takes the pool's first allocations.
+    let [_, (out, instructions)] = [(); 2].map(|()| {
+        let mut cursor = trace.cursor();
+        counter.measure(|| op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe))
     });
-    report(&name, elapsed, delta.count, out_rows);
+    (instructions as f64 / delta.count as f64, out.count)
 }
 
-/// Print one row of the result table. `rows` is the output row count of a
-/// single call — the emit-side work the timing has to be read against, since a
-/// fan-out shape emits far more rows than either input holds.
-fn report(name: &str, elapsed: Duration, delta_rows: usize, out_rows: usize) {
-    let per_out = match out_rows {
-        0 => f64::NAN,
-        n => elapsed.as_nanos() as f64 / (n * ITERS) as f64,
-    };
-    let per_delta = elapsed.as_nanos() as f64 / (delta_rows * ITERS) as f64;
-    println!(
-        "{name:<46} {:>9.3} ms/iter  {per_delta:>8.2} ns/delta-row  {per_out:>8.2} ns/out-row  (out {out_rows})",
-        elapsed.as_secs_f64() * 1000.0 / ITERS as f64,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Equi delta-trace join
-// ---------------------------------------------------------------------------
-
-/// Delta/trace fan-out shape: `d` delta rows and `t` trace rows per key, over a
-/// key space where only every `1 / hit` th delta key is present in the trace.
+/// `d` delta rows and `t` trace rows per key, the trace holding every
+/// `miss_stride`-th of the delta's keys.
 struct EquiShape {
     name: &'static str,
     d: usize,
     t: usize,
-    /// Keep every `miss_stride`-th delta key in the trace; `1` = every key hits.
     miss_stride: usize,
 }
 
@@ -208,173 +112,94 @@ const EQUI_SHAPES: [EquiShape; 5] = [
     },
 ];
 
-/// `(delta rows, trace rows)` for one equi shape. Both sides key on a single
-/// U64; the larger side carries ~`N` rows.
-fn equi_rows(shape: &EquiShape) -> (Vec<Row>, Vec<Row>) {
-    let keys = N / shape.d.max(shape.t);
-    let mut delta = Vec::with_capacity(keys * shape.d);
-    let mut trace = Vec::with_capacity(keys * shape.t);
-    for k in 0..keys as u128 {
-        for i in 0..shape.d {
-            delta.push((vec![k], i as i64));
-        }
-        if (k as usize).is_multiple_of(shape.miss_stride) {
-            for i in 0..shape.t {
-                trace.push((vec![k], i as i64));
-            }
-        }
-    }
-    (delta, trace)
-}
-
+/// The equi join, in instructions per delta row: over a stored trace keyed as
+/// the delta, then over a trace that is its source re-keyed onto the leading
+/// column of a two-column PK — stored, and read out of the source, where the
+/// walk matches a key prefix and the kept key column comes out of the PK.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn join_equi_dt_bench() {
-    println!("\n=== equi delta-trace join ({ITERS} iters) ===");
-    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
-        let schema = schema_for(&[TypeCode::U64], p);
-        for shape in &EQUI_SHAPES {
-            let (delta_rows, trace_rows) = equi_rows(shape);
-            let delta = build(&schema, p, &delta_rows);
-            for srcs in SOURCE_COUNTS {
-                for right in SIDES {
-                    time_join(
-                        format!("equi {:<24} {:<8} src={srcs} right={right}", shape.name, p.tag()),
-                        JoinKind::Equi,
-                        right,
-                        &schema,
-                        &delta,
-                        || cursor_over(&schema, p, &trace_rows, srcs),
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// What the probe costs over a trace's source instead of over the stored trace,
-/// in instructions per output row, over one run and over several: once with the
-/// source keyed exactly as the trace, where the two walk the same rows, and once
-/// keyed one column wider, where the walk matches a prefix and the kept key
-/// column is read out of the PK.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn join_over_source_bench() {
-    use crate::test_support::rekey_plan;
-    use gnitz_foundation::perf::Counter;
-    let instructions = Counter::instructions();
-    // `runs` round-robin slices of `rows`, each mapped by `run`, under one cursor.
-    let cursor_of = |rows: &Batch, runs: usize, run: &mut dyn FnMut(Batch) -> Batch| {
-        let parts: Vec<Rc<Batch>> = (0..runs)
-            .map(|s| {
-                let picks: Vec<u32> = (s..rows.count).step_by(runs).map(|i| i as u32).collect();
-                Rc::new(run(rows.ascending_subset(&picks)))
-            })
-            .collect();
-        let schema = *parts[0].schema();
-        crate::test_support::create_read_cursor(&parts, &[], schema)
-    };
-    let per_out = |plan: &JoinPlan, delta: &Batch, mut cursor: ReadCursor| {
-        let (out, n) = instructions.measure(|| op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe));
-        (n / out.count.max(1) as u64, out.count)
-    };
-    println!("\n=== equi join over the trace's source, instructions per output row ===");
-    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
+fn join_equi_bench() {
+    let counter = Counter::instructions();
+    for p in PAYLOADS {
         let narrow = schema_for(&[TypeCode::U64], p);
         let wide = schema_for(&[TypeCode::U64, TypeCode::U64], p);
-        let keep_narrow: Vec<u32> = (1..narrow.num_columns() as u32).collect();
-        let keep_wide: Vec<u32> = (1..wide.num_columns() as u32).collect();
+        let keep: Vec<u32> = (1..wide.num_columns() as u32).collect();
+        let mut map = rekey_plan(&wide, &[0], &keep);
+        let rekeyed = *map.out_schema();
+        let plans = [
+            JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &narrow).unwrap(),
+            JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &rekeyed).unwrap(),
+            JoinPlan::over_source(false, &narrow, &wide, &map).unwrap(),
+        ];
         for shape in &EQUI_SHAPES {
-            let (delta_rows, trace_rows) = equi_rows(shape);
-            let delta = build(&narrow, p, &delta_rows);
-            let trace = build(&narrow, p, &trace_rows);
+            let keys = N / shape.d.max(shape.t);
+            let rows = |per_key: usize, stride: usize| -> Vec<Row> {
+                (0..keys as u128)
+                    .step_by(stride)
+                    .flat_map(|k| (0..per_key).map(move |i| (vec![k], i as i64)))
+                    .collect()
+            };
+            let delta = build(&narrow, p, &rows(shape.d, 1));
+            let trace_rows = rows(shape.t, shape.miss_stride);
             // The source keyed `(k, i)`; its stored trace is that re-keyed on `k`.
-            let wide_rows: Vec<Row> = trace_rows.iter().map(|(k, i)| (vec![k[0], *i as u128], *i)).collect();
-            let source = build(&wide, p, &wide_rows);
-            let same = rekey_plan(&narrow, &[0], &keep_narrow);
-            let mut map = rekey_plan(&wide, &[0], &keep_wide);
-            let trace_schema = *map.out_schema();
-            for runs in SOURCE_COUNTS {
-                let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &narrow).unwrap();
-                let over = JoinPlan::over_source(false, &narrow, &narrow, &same).unwrap();
-                let (same_stored, out) = per_out(&stored, &delta, cursor_of(&trace, runs, &mut |b| b));
-                let (same_over, _) = per_out(&over, &delta, cursor_of(&trace, runs, &mut |b| b));
-
-                let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &trace_schema).unwrap();
-                let over = JoinPlan::over_source(false, &narrow, &wide, &map).unwrap();
-                let rekeyed = cursor_of(&source, runs, &mut |b| map.evaluate_map_batch(&b).into_consolidated());
-                let (prefix_stored, _) = per_out(&stored, &delta, rekeyed);
-                let (prefix_over, _) = per_out(&over, &delta, cursor_of(&source, runs, &mut |b| b));
+            let source_rows: Vec<Row> = trace_rows.iter().map(|(k, i)| (vec![k[0], *i as u128], *i)).collect();
+            let source = build(&wide, p, &source_rows);
+            let traces = [
+                build(&narrow, p, &trace_rows),
+                map.evaluate_map_batch(&source).into_consolidated(),
+                source,
+            ];
+            for runs in RUNS {
+                let [(stored, out), (prefix_stored, _), (prefix_source, _)] =
+                    [0, 1, 2].map(|i| probe(&counter, &plans[i], &delta, &traces[i], runs));
                 println!(
-                    "{:<24} {:<8} src={runs} out {out:>5}: same key {same_stored:>4} stored, {same_over:>4} over \
-                     source; key prefix {prefix_stored:>4} stored, {prefix_over:>4} over source",
+                    "join_equi_bench {:<24} {:<8} runs={runs} out {out:>5}: {stored:>8.1} instr/delta-row; \
+                     key prefix {prefix_stored:>8.1} stored, {prefix_source:>8.1} over source",
                     shape.name,
-                    p.tag(),
+                    format!("{p:?}"),
                 );
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cross (keyless) delta-trace join
-// ---------------------------------------------------------------------------
-
-/// `(delta rows, trace rows)` per keyless shape. The product is what the walk
-/// emits, so both sides stay small next to `N`.
-const CROSS_SHAPES: [(&str, usize, usize); 3] = [("64x64", 64, 64), ("512x8", 512, 8), ("8x512", 8, 512)];
-
+/// The keyless join, in instructions per delta row, with the product's long side
+/// in the delta and in the trace.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn join_cross_dt_bench() {
-    println!("\n=== cross delta-trace join ({ITERS} iters) ===");
-    let rows = |n: usize| -> Vec<Row> { (0..n as u128).map(|k| (vec![k], k as i64)).collect() };
-    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
-        let schema = schema_for(&[TypeCode::U64], p);
-        for (name, d, t) in CROSS_SHAPES {
-            let delta = build(&schema, p, &rows(d));
-            for srcs in SOURCE_COUNTS {
-                for right in SIDES {
-                    time_join(
-                        format!("cross {name:<23} {:<8} src={srcs} right={right}", p.tag()),
-                        JoinKind::Cross,
-                        right,
-                        &schema,
-                        &delta,
-                        || cursor_over(&schema, p, &rows(t), srcs),
-                    );
-                }
-            }
-        }
+fn join_cross_bench() {
+    let counter = Counter::instructions();
+    let schema = schema_for(&[TypeCode::U64], Payload::Int);
+    let plan = JoinPlan::from_wire(JoinKind::Cross, false, &schema, &schema).unwrap();
+    let side = |n: usize| {
+        let rows: Vec<Row> = (0..n as u128).map(|k| (vec![k], k as i64)).collect();
+        build(&schema, Payload::Int, &rows)
+    };
+    for (d, t) in [(512, 8), (8, 512)] {
+        let (per_row, out) = probe(&counter, &plan, &side(d), &side(t), 1);
+        println!("join_cross_bench {d:>3}x{t:<3} out {out}: {per_row:>9.1} instr/delta-row");
     }
 }
 
-// ---------------------------------------------------------------------------
-// Range (non-equi / band) delta-trace join
-// ---------------------------------------------------------------------------
-
-/// A range-join fixture: the reindexed key shape (`n_eq` equality slots plus
-/// one range slot) and how wide a slice of each trace eq-group the delta covers.
+/// A range-join fixture: a key of equality slots and one range slot.
 struct RangeShape {
     name: &'static str,
-    /// PK column type codes; the last is the range slot, the rest the eq prefix.
+    /// The PK column types: the last is the range slot, the rest the equality
+    /// prefix.
     pk_types: &'static [TypeCode],
-    /// Delta slot values are drawn from the low `span_num / span_den` of the
-    /// slot space for the upward rels — so `Gt`/`Ge` cover a wide span and
-    /// `Lt`/`Le` a narrow one, and the pair of entries below covers both.
+    /// The delta's first probe sits `span_num / span_den` of the way up a
+    /// group's slots.
     span_num: u64,
     span_den: u64,
-    /// Keep every `miss_stride`-th delta eq-group in the trace; `1` = every one
-    /// matches. `> 1` is what the walk's trailing group skip targets.
+    /// The trace holds every `miss_stride`-th of the delta's groups.
     miss_stride: usize,
-    /// Trace slots per eq group, which with `N` fixes the group count. Ignored
-    /// at `n_eq = 0`, one group holding all of `N`.
+    /// Trace slots per group; without an equality prefix, one group holds `N`.
     slots_per_group: u64,
 }
 
 const RANGE_SHAPES: [RangeShape; 6] = [
     RangeShape {
-        name: "n_eq=0 stride=8 wide-span",
+        name: "n_eq=0 stride=8 low probes",
         pk_types: &[TypeCode::U64],
         span_num: 1,
         span_den: 16,
@@ -382,7 +207,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
         slots_per_group: 64,
     },
     RangeShape {
-        name: "n_eq=0 stride=8 narrow-span",
+        name: "n_eq=0 stride=8 high probes",
         pk_types: &[TypeCode::U64],
         span_num: 15,
         span_den: 16,
@@ -390,7 +215,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
         slots_per_group: 64,
     },
     RangeShape {
-        name: "n_eq=1 stride=8 wide-span",
+        name: "n_eq=1 stride=8",
         pk_types: &[TypeCode::U32, TypeCode::U32],
         span_num: 1,
         span_den: 16,
@@ -398,7 +223,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
         slots_per_group: 64,
     },
     RangeShape {
-        name: "n_eq=1 stride=12 wide-span",
+        name: "n_eq=1 stride=12",
         pk_types: &[TypeCode::U32, TypeCode::U64],
         span_num: 1,
         span_den: 16,
@@ -413,81 +238,55 @@ const RANGE_SHAPES: [RangeShape; 6] = [
         miss_stride: 16,
         slots_per_group: 64,
     },
-    // 512 delta groups against a trace holding four — a ~128-group skip between
-    // sweeps, where the shapes above skip at most 15 rows.
+    // 512 delta groups against a trace holding four of them.
     RangeShape {
         name: "n_eq=1 stride=12 sparse-groups",
         pk_types: &[TypeCode::U32, TypeCode::U64],
         span_num: 1,
-        span_den: 16,
+        span_den: 2,
         miss_stride: 128,
         slots_per_group: 8,
     },
 ];
 
-/// Delta probes per group at `n_eq = 0`, spread across the shape's span. A band
-/// shape probes once per group instead, so its delta row count is its group
-/// count.
-const N_EQ0_PROBES: u64 = 8;
-
-/// `(delta rows, trace rows)` for one range shape. The trace holds every slot
-/// of every group it has; the delta probes at slots the shape's span picks.
-fn range_rows(shape: &RangeShape) -> (Vec<Row>, Vec<Row>) {
-    let n_eq = shape.pk_types.len() - 1;
-    let (groups, slots) = match n_eq {
-        0 => (1usize, N as u64),
-        _ => ((N / shape.slots_per_group as usize).max(1), shape.slots_per_group),
-    };
-    let base = shape.span_num * slots / shape.span_den;
-    let mut delta = Vec::new();
-    let mut trace = Vec::new();
-    for g in 0..groups as u128 {
-        let eq: Vec<u128> = (0..n_eq).map(|_| g).collect();
-        let probes = if n_eq == 0 { N_EQ0_PROBES } else { 1 };
-        let step = ((slots - base) / probes).max(1);
-        for i in 0..probes {
-            let mut pk = eq.clone();
-            pk.push((base + i * step) as u128);
-            delta.push((pk, i as i64));
-        }
-        if !(g as usize).is_multiple_of(shape.miss_stride) {
-            continue;
-        }
-        for s in 0..slots {
-            let mut pk = eq.clone();
-            pk.push(s as u128);
-            trace.push((pk, 0));
-        }
-    }
-    (delta, trace)
-}
-
+/// The range join, in instructions per delta row, per relation: the walk reads
+/// no payload, so the fixtures carry the one integer.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn join_range_dt_bench() {
-    println!("\n=== range delta-trace join ({ITERS} iters) ===");
-    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
-        for shape in &RANGE_SHAPES {
-            let schema = schema_for(shape.pk_types, p);
-            let (delta_rows, trace_rows) = range_rows(shape);
-            let delta = build(&schema, p, &delta_rows);
-            for &rel in RangeRel::ALL {
-                for srcs in SOURCE_COUNTS {
-                    for right in SIDES {
-                        time_join(
-                            format!(
-                                "range {:<32} {:<8} {rel:?} src={srcs} right={right}",
-                                shape.name,
-                                p.tag()
-                            ),
-                            JoinKind::Range { rel },
-                            right,
-                            &schema,
-                            &delta,
-                            || cursor_over(&schema, p, &trace_rows, srcs),
-                        );
-                    }
-                }
+fn join_range_bench() {
+    /// Delta probes of the one group a key without an equality prefix has; a
+    /// keyed shape probes each of its groups once.
+    const N_EQ0_PROBES: u64 = 8;
+    let counter = Counter::instructions();
+    for shape in &RANGE_SHAPES {
+        let schema = schema_for(shape.pk_types, Payload::Int);
+        let n_eq = shape.pk_types.len() - 1;
+        let (groups, slots, probes) = match n_eq {
+            0 => (1, N as u64, N_EQ0_PROBES),
+            _ => (N / shape.slots_per_group as usize, shape.slots_per_group, 1),
+        };
+        let base = shape.span_num * slots / shape.span_den;
+        let step = ((slots - base) / probes).max(1);
+        let key = |g: usize, slot: u64| -> Vec<u128> { (0..n_eq).map(|_| g as u128).chain([slot as u128]).collect() };
+        let delta_rows: Vec<Row> = (0..groups)
+            .flat_map(|g| (0..probes).map(move |i| (g, i)))
+            .map(|(g, i)| (key(g, base + i * step), i as i64))
+            .collect();
+        let trace_rows: Vec<Row> = (0..groups)
+            .step_by(shape.miss_stride)
+            .flat_map(|g| (0..slots).map(move |s| (g, s)))
+            .map(|(g, s)| (key(g, s), 0))
+            .collect();
+        let delta = build(&schema, Payload::Int, &delta_rows);
+        let trace = build(&schema, Payload::Int, &trace_rows);
+        for &rel in RangeRel::ALL {
+            let plan = JoinPlan::from_wire(JoinKind::Range { rel }, true, &schema, &schema).unwrap();
+            for runs in RUNS {
+                let (per_row, out) = probe(&counter, &plan, &delta, &trace, runs);
+                println!(
+                    "join_range_bench {:<34} {rel:?} runs={runs} out {out:>5}: {per_row:>9.1} instr/delta-row",
+                    shape.name
+                );
             }
         }
     }

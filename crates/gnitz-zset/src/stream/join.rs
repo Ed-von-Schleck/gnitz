@@ -651,3 +651,7 @@ fn range_merge_walk(
 #[cfg(test)]
 #[path = "tests/join.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/join.rs"]
+mod bench;

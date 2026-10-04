@@ -13,7 +13,6 @@ use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, SchemaFacts, Ty
 use crate::test_support::{assert_folds, cell, le_cell, TestTrace};
 use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind};
 
-use super::avi::avi_batch;
 use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;
 use crate::algebra::SinkPlan;
@@ -92,14 +91,14 @@ fn batch(rows: &[(Row, i64)]) -> Batch {
 
 /// The operator with its two traces, driven the way the VM drives it.
 pub(super) struct Harness {
-    pub(super) plan: ReducePlan,
+    plan: ReducePlan,
     index: Option<TestTrace>,
     pub(super) trace_out: TestTrace,
 }
 
 impl Harness {
     pub(super) fn new(plan: ReducePlan) -> Self {
-        let index = plan.avi.as_ref().map(|bake| TestTrace::new(bake.schema));
+        let index = plan.index_schema().map(|schema| TestTrace::new(*schema));
         let trace_out = TestTrace::new(*plan.output_schema());
         Harness { plan, index, trace_out }
     }
@@ -107,10 +106,8 @@ impl Harness {
     /// Add `delta`'s entries to the value index, as the VM does ahead of
     /// `op_reduce`.
     pub(super) fn index(&mut self, delta: &Batch) {
-        if let (Some(index), Some(bake)) = (&mut self.index, &self.plan.avi) {
-            if delta.count > 0 {
-                index.ingest(avi_batch(delta, bake));
-            }
+        if let (Some(index), Some(entries)) = (&mut self.index, self.plan.index_batch(delta)) {
+            index.ingest(entries);
         }
     }
 
@@ -125,13 +122,18 @@ impl Harness {
         op_reduce(delta, &mut trace_out, Some(&mut index), &self.plan)
     }
 
-    /// One epoch: fold the delta unless every aggregate is exact linear, index
-    /// it, run, integrate the output.
-    fn tick(&mut self, delta: Batch) -> Batch {
-        let delta = match self.plan.is_exact_linear() {
+    /// `delta` as the VM hands it to the reduce: folded unless every aggregate
+    /// is exact linear.
+    pub(super) fn fold(&self, delta: Batch) -> Batch {
+        match self.plan.is_exact_linear() {
             true => delta,
             false => delta.into_consolidated(),
-        };
+        }
+    }
+
+    /// One epoch: fold the delta, index it, run, integrate the output.
+    fn tick(&mut self, delta: Batch) -> Batch {
+        let delta = self.fold(delta);
         self.index(&delta);
         let out = self.reduce(&delta);
         assert_folds(std::slice::from_ref(&out), &out, "op_reduce's delta");
