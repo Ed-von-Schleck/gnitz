@@ -50,15 +50,14 @@ pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     h.digest()
 }
 
-/// The digest of a physical row layout — its PK list and every column's type
-/// code — that a read's reply layout is checked by.
-pub fn layout_digest(pk_indices: &[u32], type_codes: impl IntoIterator<Item = crate::TypeCode>) -> u64 {
+/// The digest of a row layout's regions — how many PK columns, then the type
+/// codes of the PK columns in PK-list order and of the payload columns in
+/// payload order — that a read's reply layout is checked by. Column numbering
+/// is no part of it.
+pub fn layout_digest(pk_columns: usize, region_types: impl IntoIterator<Item = crate::TypeCode>) -> u64 {
     let mut h = Xxh3Default::default();
-    h.update(&[pk_indices.len() as u8]);
-    for &i in pk_indices {
-        h.update(&i.to_le_bytes());
-    }
-    for tc in type_codes {
+    h.update(&[pk_columns as u8]);
+    for tc in region_types {
         h.update(&[tc.as_wire()]);
     }
     h.digest()

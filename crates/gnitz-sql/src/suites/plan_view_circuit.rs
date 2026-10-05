@@ -230,10 +230,11 @@ const SHAPES: &[Row] = &[
     ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v + 1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     // A QUALIFY bounding an unprojected ROW_NUMBER is a top-N per partition,
     // with no band join — cutting the outer side of whatever else the body
-    // joins in; a projected one is the ranking desugar.
-    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 2, &[&[1]], &[(TopN, 1)]),
-    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 2, &[&[1]], &[(TopN, 1)]),
-    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 2, &[&[1]], &[(TopN, 1), (Filter, 1)]),
+    // joins in; a projected one is the ranking desugar. The body's projection
+    // and filter run in the top-N's own circuit.
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 1, &[&[1]], &[(TopN, 1)]),
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 1, &[&[1]], &[(TopN, 1)]),
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 1, &[&[1]], &[(TopN, 1), (Filter, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[&[1], &[2]], &[(TopN, 1), (EquiJoin, 2), (Reduce, 1)]),
     ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[&[0, 1], &[1, 2, 0], &[2, 3, 4]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2), (Filter, 2)]),
 ];

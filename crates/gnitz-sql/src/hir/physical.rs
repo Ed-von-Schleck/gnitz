@@ -9,6 +9,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::project::{leading_schema, ProjItem};
 use gnitz_core::{RelDescriptor, Schema};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::ColumnDef;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -87,6 +88,48 @@ impl Frame {
     /// [`Self::resolve`] for each conjunct.
     pub(crate) fn resolve_preds(&self, preds: &[HirExpr]) -> Result<Vec<BoundExpr>, GnitzSqlError> {
         preds.iter().map(|p| self.resolve(p)).collect()
+    }
+
+    /// This frame's schema under `root`'s numbering: its unnamed key slots, then
+    /// `root`'s columns in `root` order, each unnamed payload slot staying where
+    /// the payload order puts it. The regions are this frame's own, so the engine
+    /// relabels a batch rather than moving a column. Refused for a `root` that
+    /// would move a payload column.
+    pub(crate) fn schema_in_order(&self, root: impl IntoIterator<Item = ColId>) -> Result<Schema, GnitzSqlError> {
+        let internal = |m: &str| GnitzSqlError::Internal(format!("output order: {m}"));
+        let is_pk = |s: usize| self.schema.is_pk_col(s);
+        let mut rooted = vec![false; self.layout.len()];
+        let mut named = Vec::new();
+        for id in root {
+            let slot = self.slot(id)?;
+            if std::mem::replace(&mut rooted[slot], true) {
+                return Err(internal("a column is named twice"));
+            }
+            named.push(slot);
+        }
+        let rooted = &rooted;
+        let unnamed = |pk: bool| (0..rooted.len()).filter(move |&s| !rooted[s] && is_pk(s) == pk);
+        let mut order: Vec<usize> = unnamed(true).collect();
+        let mut hidden_payload = unnamed(false).peekable();
+        for slot in named {
+            if !is_pk(slot) {
+                order.extend(std::iter::from_fn(|| hidden_payload.next_if(|&h| h < slot)));
+            }
+            order.push(slot);
+        }
+        order.extend(hidden_payload);
+        if !order.iter().filter(|&&s| !is_pk(s)).is_sorted() {
+            return Err(internal("the root would move a payload column"));
+        }
+        let mut moved_to = vec![0u32; order.len()];
+        for (to, &from) in order.iter().enumerate() {
+            moved_to[from] = to as u32;
+        }
+        Schema::from_parts(
+            order.iter().map(|&s| self.schema.columns[s].clone()).collect(),
+            self.schema.pk_cols.iter().map(|&s| moved_to[s as usize]).collect(),
+        )
+        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
     }
 
     /// This frame under `rename`'s identities. A slot it does not name loses its
@@ -181,3 +224,7 @@ fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source:
         slots.insert(target, slot);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/physical.rs"]
+mod tests;

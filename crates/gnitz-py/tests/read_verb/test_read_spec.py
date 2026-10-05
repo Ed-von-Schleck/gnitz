@@ -48,9 +48,10 @@ def kv(module_client):
 
 
 def test_the_projection_is_the_clients_to_shape(kv):
-    """The read path hidden-prepends the physical PK and keeps the SELECT list
-    as written — so a column may follow the PK, repeat under two names, or be
-    computed, and the presented shape is the SELECT list alone."""
+    """The reply keeps the SELECT list as written, carrying the physical PK at
+    its SELECT slot or hidden in front when unselected — so a column may precede
+    the PK, repeat under two names, or be computed, and the presented shape is
+    the SELECT list alone."""
     assert bag(rows(kv, "SELECT v, id FROM t WHERE id = 5")) == {(50, 5): 1}
     assert bag(rows(kv, "SELECT id AS x, id AS y FROM t WHERE id = 5")) == {(5, 5): 1}
     assert bag(rows(kv, "SELECT v + 1 AS vp1 FROM t WHERE id = 5")) == {(51,): 1}
@@ -192,9 +193,8 @@ def test_a_nonselective_index_walk_returns_only_its_range(kv):
 
 
 def test_an_empty_indexed_read_keeps_the_column_metadata(kv):
-    """An indexed read matching on no worker still presents the column metadata,
-    and the unprojected source PK riding along as a hidden column is not part of
-    the presented shape."""
+    """An indexed read matching on no worker still presents the column metadata
+    in SELECT order, and no hidden column is part of the presented shape."""
     res = kv.execute_sql("SELECT id, v FROM t WHERE v = 7")[0]
     assert res["type"] == "Rows", res
     miss = res["rows"]

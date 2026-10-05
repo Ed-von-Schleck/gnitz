@@ -22,6 +22,28 @@ def test_full_scan(client, bench_timer, scale):
         )
 
 
+def test_full_scan_projected(client, bench_timer, scale):
+    """The relation's payload in order with the PK unselected: the reply keeps
+    the relation's regions, so it ships no map, as `SELECT *` does."""
+    n = _setup_table(client, scale["rows"])
+    for _ in range(scale["read_iters"]):
+        bench_timer.measure(
+            client.execute_sql, "SELECT val, cat FROM t",
+            rows_per_call=n,
+        )
+
+
+def test_pk_projected(client, bench_timer, scale):
+    """A selected PK rides the key region once; the dropped `cat` still needs
+    the map."""
+    n = _setup_table(client, scale["rows"])
+    for _ in range(scale["read_iters"]):
+        bench_timer.measure(
+            client.execute_sql, "SELECT pk, val FROM t",
+            rows_per_call=n,
+        )
+
+
 def test_pk_seek(client, bench_timer, scale):
     _setup_table(client, scale["rows"])
     for i in range(scale["read_iters"]):

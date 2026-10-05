@@ -129,6 +129,25 @@ def test_bounded_view_matches_its_unbounded_twin(sweeping, body, capacity, sweep
     assert not _any_skeleton(data_dir, pid[0]), "the twin must never dehydrate"
 
 
+def test_a_bounded_view_keyed_mid_row_hydrates_in_its_select_order(sweeping):
+    """A bounded view whose key sits between payload columns: a key the sweep
+    dehydrated is recomputed from the source and read back in the view's
+    declared order, agreeing with the unbounded twin."""
+    c = gnitz.connect(sweeping.target)
+    base_tables(c)
+    bid, pid = _twin(c, "mid", "SELECT body, id, v FROM t WHERE v > 10")
+    churn(c, 1, 1200, chunk=100)
+
+    assert _any_skeleton(sweeping.data_dir, bid[0]), "the bounded store must have dehydrated"
+    assert bag(c.scan(*bid)) == bag(c.scan(*pid)), "full scan"
+    for tmpl in ["SELECT * FROM {v}", "SELECT * FROM {v} WHERE id < 40", "SELECT v, id FROM {v} ORDER BY id LIMIT 7"]:
+        got, want = rows(c, tmpl.format(v="b_mid")), rows(c, tmpl.format(v="p_mid"))
+        assert want, tmpl
+        assert tuple(got[0]._asdict()) == tuple(want[0]._asdict()), tmpl
+        assert bag(got) == bag(want), tmpl
+    assert tuple(rows(c, "SELECT * FROM b_mid")[0]._asdict()) == ("body", "id", "v")
+
+
 def test_a_pk_group_with_several_payloads_folds_to_one_skeleton_weight(sweeping):
     """The output PK of a join is the left input's, so several right-side matches
     put several payload rows under one key — and a projection that drops the

@@ -108,10 +108,15 @@ fn scan_spec_bench() {
         )
     };
     let rows = |map| rows_spec(map, None).sink;
+    // `c2` behind the key region, and `id, c2` as two payload columns.
+    let one = map_of(LogicalProgram::copy_cols(&[3]), &schema(&[I64; 1]));
+    let key_copied = map_of(LogicalProgram::copy_cols(&[0, 3]), &schema(&[TypeCode::U64, I64]));
     // Each sink over half the rows, a group per `c0` where it folds.
     let sinks = [
         ("rows", ReadSink::all_rows(), ROWS / 2),
         ("copied columns", rows(copy.clone()), ROWS / 2),
+        ("one copied column", rows(one), ROWS / 2),
+        ("one copied column and the key again", rows(key_copied), ROWS / 2),
         ("computed columns", rows(computed.clone()), ROWS / 2),
         ("fold", fold(None, vec![1], 3), 256),
         ("fold of computed columns", fold(computed, vec![2], 1), 256),

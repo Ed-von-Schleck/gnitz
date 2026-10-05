@@ -1,6 +1,7 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::test_support::{bind_where, col, ix, pk_schema, schema, two_col};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::TypeCode;
 
 /// The first candidate whose residual compiles serves the WHERE and ships exactly
@@ -88,24 +89,89 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
     rows_reply(rows, &keys, desc).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 
-/// A projection reproducing the relation replies in its layout with no program, its
-/// ORDER BY keys re-pointed at the source columns; any other projection carries a
-/// program.
+/// A projection whose payload is the relation's own, each column copied in
+/// place, replies in the relation's regions with no program — wherever the key
+/// stands in the SELECT list and whatever the columns are called — its ORDER BY
+/// keys numbered by the reply for the client and by the relation for the worker.
+/// Any other projection carries a program, whose output the worker numbers key
+/// first.
 #[test]
-fn only_a_reproducing_projection_ships_no_map() {
+fn a_projection_keeping_the_relations_payload_ships_no_map() {
     let rel3 = |cols: [&str; 3], pk: u32| {
         crate::test_support::table(1, cols.iter().map(|n| col(n, TypeCode::U64)).collect(), vec![pk])
     };
     let (t, mid) = (rel3(["id", "v", "w"], 0), rel3(["v", "id", "w"], 1));
-    for (desc, sql, keys) in [
-        (&t, "SELECT * FROM t ORDER BY w", [2u16]),
-        (&mid, "SELECT * FROM t ORDER BY id", [1]),
+    let cols = |keys: &[gnitz_wire::OrderKey]| keys.iter().map(|k| k.col).collect::<Vec<_>>();
+    let names = |s: &gnitz_core::Schema| s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    // `(relation, statement, reply columns, the key's column, ORDER BY in the
+    // reply, ORDER BY in the relation)`.
+    for (desc, sql, reply_cols, key, in_reply, in_relation) in [
+        (&t, "SELECT * FROM t ORDER BY w", ["id", "v", "w"], 0, 2u16, 2u16),
+        (&mid, "SELECT * FROM t ORDER BY id", ["v", "id", "w"], 1, 1, 1),
+        (&t, "SELECT v, id, w FROM t ORDER BY w", ["v", "id", "w"], 1, 2, 2),
+        (&t, "SELECT v, w, id AS k FROM t ORDER BY k", ["v", "w", "k"], 2, 2, 0),
+        (
+            &mid,
+            "SELECT id, v AS a, w FROM t ORDER BY a",
+            ["id", "a", "w"],
+            0,
+            1,
+            0,
+        ),
+        // The key no item names rides hidden in front.
+        (&t, "SELECT v, w FROM t ORDER BY v", ["id", "v", "w"], 0, 1, 1),
     ] {
-        let RowsReply { schema: reply, program, order, .. } = rows_reply_of(sql, desc);
-        assert!(reply == desc.schema && program.is_none(), "`{sql}`");
-        assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), keys, "`{sql}`");
+        let RowsReply {
+            schema: reply,
+            program,
+            order,
+            sink_order,
+            ..
+        } = rows_reply_of(sql, desc);
+        assert!(program.is_none(), "`{sql}`");
+        assert!(reply.same_region_types(desc.schema.as_ref()), "`{sql}`");
+        assert_eq!(
+            (names(&reply), &reply.pk_cols[..]),
+            (reply_cols.map(String::from).to_vec(), &[key][..]),
+            "`{sql}`"
+        );
+        assert_eq!(
+            (cols(&order), cols(&sink_order)),
+            (vec![in_reply], vec![in_relation]),
+            "`{sql}`"
+        );
     }
-    for sql in ["SELECT v, id, w FROM t", "SELECT * FROM t ORDER BY v + 1"] {
-        assert!(rows_reply_of(sql, &t).program.is_some(), "`{sql}`");
+    // `(statement, visible reply columns, the key's column, ORDER BY in the
+    // reply, ORDER BY in the program's output)`.
+    for (sql, visible, key, in_reply, in_output) in [
+        // A column dropped, two exchanged, a second copy of the key.
+        ("SELECT v, id FROM t ORDER BY v", vec!["v", "id"], 1, 0u16, 1u16),
+        ("SELECT w, v, id FROM t ORDER BY id", vec!["w", "v", "id"], 2, 2, 0),
+        (
+            "SELECT id, id AS again, v, w FROM t ORDER BY again",
+            vec!["id", "again", "v", "w"],
+            0,
+            1,
+            1,
+        ),
+        // A hidden key the ORDER BY computes, behind the SELECT list.
+        ("SELECT * FROM t ORDER BY v + 1", vec!["id", "v", "w"], 0, 3, 3),
+    ] {
+        let RowsReply {
+            schema: reply,
+            program,
+            order,
+            sink_order,
+            ..
+        } = rows_reply_of(sql, &t);
+        assert!(program.is_some(), "`{sql}`");
+        assert_eq!(reply.pk_cols, [key], "`{sql}`");
+        let shown: Vec<&str> = reply.visible_columns().map(|(_, c)| c.name.as_str()).collect();
+        assert_eq!(shown, visible, "`{sql}`");
+        assert_eq!(
+            (cols(&order), cols(&sink_order)),
+            (vec![in_reply], vec![in_output]),
+            "`{sql}`"
+        );
     }
 }

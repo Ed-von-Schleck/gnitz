@@ -331,7 +331,7 @@ pub(super) fn compile_view(
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
-    if !post.vm.out_schema().same_layout(view_schema) {
+    if !post.vm.out_schema().same_region_types(view_schema) {
         return Err("sink schema does not match view output schema".into());
     }
     let sides = side_plans

@@ -260,6 +260,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 schema: reply_schema,
                 program,
                 order,
+                sink_order,
                 pk_ordered,
             } = rows_reply(rows, &keys, &desc)?;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
@@ -272,7 +273,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                     // first, so it stops at the window instead of ranking every row.
                     order: match pk_ordered && in_pk_order {
                         true => Vec::new(),
-                        false => order.clone(),
+                        false => sink_order,
                     },
                 });
             let sink = ReadSink {

@@ -204,10 +204,17 @@ pub(crate) fn project_front(
     Ok((node, out))
 }
 
-/// Lower a bound view body to its bundle, each output column carrying the name
-/// its column of `names` gives it.
+/// Lower a bound view body to its bundle. The view lists its visible columns in
+/// `names` order, each under the name its column of `names` gives it: the final
+/// frame's regions under the SELECT list's numbering.
 pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result<ViewBundle, GnitzSqlError> {
     let mut chain = ViewChain::default();
+    // A top-N carries its input's columns key first: the SELECT list is a
+    // projection over it.
+    let rel = match rel.as_ref() {
+        RelExpr::TopN { .. } => RelExpr::project(Rc::clone(&rel), RelExpr::passthrough_items(rel.cols())),
+        _ => rel,
+    };
     let mut top = lower_body(&mut chain, &rel)?;
     let schema = Arc::make_mut(&mut top.out.schema);
     for (slot, id) in top.out.layout.iter().enumerate() {
@@ -215,6 +222,8 @@ pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result
             schema.columns[slot].name = c.def.name.clone();
         }
     }
+    let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
+    top.out.schema = Arc::new(top.out.schema_in_order(visible)?);
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
         return Err(GnitzSqlError::Rejected(
@@ -232,19 +241,31 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
             match source.as_ref() {
                 RelExpr::Join { .. } => join::lower_join_view(chain, items, fpreds, source),
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, items, fpreds, source),
+                RelExpr::TopN { .. } => {
+                    let above = topn::Above { alias: None, preds: fpreds, items };
+                    topn::lower_topn(chain, source, Some(above))
+                }
+                // An alias nothing else reads: a window's cut under its outer read.
+                RelExpr::Alias { input: cut, cols }
+                    if matches!(cut.as_ref(), RelExpr::TopN { .. }) && Rc::strong_count(cut) == 1 =>
+                {
+                    let above = topn::Above { alias: Some(cols), preds: fpreds, items };
+                    topn::lower_topn(chain, cut, Some(above))
+                }
                 _ => spine::lower_linear(chain, rel, items),
             }
         }
         RelExpr::Distinct { input } => setop::lower_distinct(chain, input),
         RelExpr::SetOp { out, .. } => setop::lower_setop(chain, rel, out),
-        RelExpr::TopN { .. } => topn::lower_topn(chain, rel),
+        RelExpr::TopN { .. } => topn::lower_topn(chain, rel, None),
         _ => Err(GnitzSqlError::Internal(
             "HIR lowering has no body arm for this node".into(),
         )),
     }
 }
 
-/// `Project?(Filter?(Join | Reduce))`: what a join or reduce shell lowers as one body.
+/// `Project?(Filter?(Join | Reduce | TopN))`: what a join, reduce or top-N shell
+/// lowers as one body.
 fn lowered_whole(rel: &RelExpr) -> bool {
     let rel = match rel {
         RelExpr::Project { input, .. } => input.as_ref(),
@@ -254,7 +275,10 @@ fn lowered_whole(rel: &RelExpr) -> bool {
         RelExpr::Filter { input, .. } => input.as_ref(),
         rel => rel,
     };
-    matches!(rel, RelExpr::Join { .. } | RelExpr::Reduce { .. })
+    matches!(
+        rel,
+        RelExpr::Join { .. } | RelExpr::Reduce { .. } | RelExpr::TopN { .. }
+    )
 }
 
 /// `input` read in place: a catalog `Get`, or a rename of what is read in place.

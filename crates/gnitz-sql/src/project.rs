@@ -60,7 +60,7 @@ pub(crate) fn payload_program(
         (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols[i] as usize)),
         "a physicalized projection copies its input's PK in front"
     );
-    compile_projection_map(&items[k..], &out.columns[k..], input)
+    projection_program(&items[k..], &out.columns[k..], input)
 }
 
 /// A compiled payload program paired with the `(type_code, nullable)` declaration of `out`'s
@@ -68,9 +68,9 @@ pub(crate) fn payload_program(
 pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
     ComputeMap {
         program: program.to_blob_bytes(),
-        out_cols: out.columns[out.pk_cols.len()..]
-            .iter()
-            .map(|c| (c.ty.tc, c.is_nullable))
+        out_cols: out
+            .payload_columns()
+            .map(|(_, _, c)| (c.ty.tc, c.is_nullable))
             .collect(),
     }
 }
@@ -81,7 +81,7 @@ pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
 /// class-agnostic here — the engine splits it by the source register's class,
 /// storing the raw 8-byte image for a scalar and a German-string cell for a
 /// string.
-fn compile_projection_map(
+pub(crate) fn projection_program(
     items: &[ProjItem],
     out_cols: &[ColumnDef],
     schema: &Schema,
@@ -120,7 +120,7 @@ pub(crate) fn reply_program(
         .into_iter()
         .map(|(e, def)| (ProjItem::from_bound(e), def))
         .unzip();
-    let program = compile_projection_map(&items, &cols, source)?;
+    let program = projection_program(&items, &cols, source)?;
     let columns = source.hidden_key_columns().chain(cols).collect();
     Ok((leading_schema(columns, source.pk_cols.len())?, program))
 }

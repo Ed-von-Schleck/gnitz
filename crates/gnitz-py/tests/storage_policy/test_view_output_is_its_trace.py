@@ -93,8 +93,9 @@ def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(own_server
 
     assert kinds(ids["by_g"]) == {"rows"}, report
     assert kinds(ids["ext"]) == {"rows", "scratch_reduce", "scratch_avidx"}, report
-    # The top-N runs in a relation the planner put under `top`: its index of
-    # every input row is the one store either of them keeps beside its rows.
+    # The top-N's index of every input row is the one store it keeps beside
+    # the view's rows.
+    assert kinds(ids["top"]) == {"rows", "scratch_topnidx"}, report
     assert kinds() == {"rows", "scratch_reduce", "scratch_avidx", "scratch_topnidx"}, report
     with gnitz.connect(own_server.target) as conn:
         _assert_views(conn, live, "after a graceful restart")

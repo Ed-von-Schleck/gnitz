@@ -1,16 +1,30 @@
 //! The top-N shell. Its input opens through the spine, so a projection over a
 //! relation read in place is not stored a second time beside the operator's index.
 
-use super::super::{ColId, RelExpr};
+use super::super::physical::Rename;
+use super::super::{ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::spine::{open, Top};
-use super::{keyed_frame, EmitPieces, ViewChain};
+use super::{emit_filter, keyed_frame, project_front, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
 
-/// Lower a `TopN` body to circuit pieces.
-pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPieces, GnitzSqlError> {
+/// What a body reads its top-N through: the names an `Alias` gives the top-N's
+/// columns, if one does, then a filter and the projection over it.
+pub(super) struct Above<'a> {
+    pub(super) alias: Option<&'a [HirCol]>,
+    pub(super) preds: &'a [HirExpr],
+    pub(super) items: &'a [ProjEntry],
+}
+
+/// Lower a `TopN` body to circuit pieces, with the `Project(Filter?(Alias?(…)))`
+/// `above` it, if any, in the same circuit.
+pub(super) fn lower_topn(
+    chain: &mut ViewChain,
+    rel: &RelExpr,
+    above: Option<Above<'_>>,
+) -> Result<EmitPieces, GnitzSqlError> {
     let RelExpr::TopN { input, partition, order, limit, offset } = rel else {
         unreachable!("lower_topn receives a TopN");
     };
@@ -49,6 +63,17 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
 
     let out = keyed_frame(&frame, &group, 0..frame.schema.columns.len() as u32, Vec::new())?;
     let node = cb.top_n(node, &group, &keys, *limit, *offset);
+    let (node, out) = match above {
+        None => (node, out),
+        Some(Above { alias, preds, items }) => {
+            let out = match alias {
+                Some(cols) => out.renamed(&Rename::alias(&rel.cols(), cols))?,
+                None => out,
+            };
+            let filtered = emit_filter(&mut cb, node, preds, &out)?;
+            project_front(&mut cb, filtered, items, &out)?
+        }
+    };
     // Keyed by the partition, which holds `limit` slots.
     Ok(EmitPieces {
         circuit: cb,

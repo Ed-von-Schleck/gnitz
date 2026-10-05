@@ -90,14 +90,14 @@ fn explain_names_every_decision() {
                 "order/limit: client sort",
             ],
         ),
-        // Renaming a column is not reproducing it.
+        // A new name is a label over the relation's own regions.
         (
             "SELECT id AS x, v, w FROM t",
             [
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "projection: 3 columns",
+                "projection: 3 columns (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -207,7 +207,7 @@ fn explain_names_every_decision() {
                 "read table c",
                 "access: pk range walk",
                 "predicate: none",
-                "projection: 1 column",
+                "projection: 1 column (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -217,7 +217,7 @@ fn explain_names_every_decision() {
                 "read table c",
                 "access: pk point lookup",
                 "predicate: none",
-                "projection: 1 column",
+                "projection: 1 column (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -250,7 +250,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "projection: 2 columns (+1 for ordering)",
+                "projection: 2 columns (+1 for ordering) (unprojected)",
                 "order/limit: client sort",
             ],
         ),
@@ -594,22 +594,27 @@ fn visible(s: &gnitz_core::Schema) -> Vec<String> {
     s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
 }
 
-/// The reply schema a projection produces: the source PK rides hidden in front
-/// of whatever the SELECT list names, so `* EXCEPT (id)` keeps its key.
+/// The reply schema a projection produces: the SELECT list in order over the
+/// source PK, which the first item copying it names and which rides hidden in
+/// front when none does, so `* EXCEPT (id)` keeps its key.
 #[test]
-fn a_reads_reply_schema_hides_the_source_pk_behind_the_select_list() {
+fn a_reads_reply_schema_is_the_select_list_over_the_source_pk() {
     let cat = base();
-    for (sql, want) in [
-        ("SELECT * EXCEPT (g) FROM t", vec!["id", "v"]),
-        ("SELECT * EXCEPT (id) FROM t", vec!["g", "v"]),
-        ("SELECT * RENAME (g AS x) FROM t", vec!["id", "x", "v"]),
-        ("SELECT t.id, t.g AS x FROM t", vec!["id", "x"]),
-        ("SELECT id, g AS g1, g AS g2 FROM t", vec!["id", "g1", "g2"]),
+    // `(statement, visible columns, the key's column, whether it is hidden)`.
+    for (sql, want, key, hidden) in [
+        ("SELECT * EXCEPT (g) FROM t", vec!["id", "v"], 0, false),
+        ("SELECT * EXCEPT (id) FROM t", vec!["g", "v"], 0, true),
+        ("SELECT * RENAME (g AS x) FROM t", vec!["id", "x", "v"], 0, false),
+        ("SELECT t.g AS x, t.id FROM t", vec!["x", "id"], 1, false),
+        ("SELECT g, id AS k, id FROM t", vec!["g", "k", "id"], 1, false),
+        ("SELECT id + 0 AS k, g FROM t", vec!["k", "g"], 0, true),
     ] {
         let s = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let schema = s.reply_schema();
         assert_eq!(visible(schema), want, "`{sql}`");
-        assert!(schema.columns[0].is_hidden && schema.columns[0].name == "id", "`{sql}`");
+        assert_eq!(schema.pk_cols, [key], "`{sql}`");
+        assert_eq!(schema.columns[key as usize].is_hidden, hidden, "`{sql}`");
+        assert_eq!(schema.columns.len(), want.len() + usize::from(hidden), "`{sql}`");
     }
 }
 

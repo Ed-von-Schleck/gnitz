@@ -25,12 +25,12 @@ fn types(chain: &PlannedChain) -> Vec<TypeCode> {
 
 // ── linear projection ────────────────────────────────────────────────────────
 
-/// The full source PK is pinned to the leading slots in PK order; a projected
-/// PK column moves there (shifting, not swapping, what it passes), an omitted
-/// one rides hidden, a duplicate reference is a payload copy, and a computed
-/// item is nullable and named by its raw projection index.
+/// A view lists its columns in SELECT order over the full source PK: a
+/// projected PK column sits at its SELECT slot, an omitted one rides hidden in
+/// front, a duplicate reference is a payload copy, and a computed item is
+/// nullable and named by its raw projection index.
 #[test]
-fn a_projection_places_the_source_pk_first() {
+fn a_view_lists_its_select_order_over_the_source_pk() {
     let i = TypeCode::I64;
     let s = TypeCode::String;
     let cat = catalog(vec![
@@ -56,18 +56,18 @@ fn a_projection_places_the_source_pk_first() {
     let rows: &[(&str, Shape, &[u32])] = &[
         (
             "SELECT name, age, id FROM late",
-            sh(&[("id", false, false), ("name", false, true), ("age", false, true)]),
-            &[0],
+            sh(&[("name", false, true), ("age", false, true), ("id", false, false)]),
+            &[2],
         ),
         (
             "SELECT * FROM late",
-            sh(&[("id", false, false), ("name", false, true), ("age", false, true)]),
-            &[0],
+            sh(&[("name", false, true), ("age", false, true), ("id", false, false)]),
+            &[2],
         ),
         (
             "SELECT name, age, id FROM mid",
-            sh(&[("id", false, false), ("name", false, true), ("age", false, true)]),
-            &[0],
+            sh(&[("name", false, true), ("age", false, true), ("id", false, false)]),
+            &[2],
         ),
         (
             "SELECT id AS employee_id, name FROM tn",
@@ -101,8 +101,8 @@ fn a_projection_places_the_source_pk_first() {
         ),
         (
             "SELECT b, c, a FROM cab",
-            sh(&[("a", false, false), ("b", false, false), ("c", false, true)]),
-            &[0, 1],
+            sh(&[("b", false, false), ("c", false, true), ("a", false, false)]),
+            &[2, 0],
         ),
         (
             "SELECT a, b, c + 1 FROM cabn",
@@ -116,8 +116,8 @@ fn a_projection_places_the_source_pk_first() {
         ),
         (
             "SELECT (a), c FROM cab",
-            sh(&[("a", false, false), ("b", true, false), ("c", false, true)]),
-            &[0, 1],
+            sh(&[("b", true, false), ("a", false, false), ("c", false, true)]),
+            &[1, 0],
         ),
         (
             "SELECT a + 1 AS x FROM tab",
@@ -160,7 +160,7 @@ fn a_view_over_a_compound_pk_view_keeps_its_pk() {
         ),
     )]);
     let v1 = view(&cat, "SELECT b, c, a FROM base");
-    assert_eq!(pk(&v1), [0, 1]);
+    assert_eq!(pk(&v1), [2, 0]);
     register(&cat, "v1", 40, v1.props.into(), final_view(&v1));
     let v2 = view(&cat, "SELECT a, b FROM v1");
     assert_eq!(output_shape(&v2), sh(&[("a", false, false), ("b", false, false)]));
@@ -312,7 +312,7 @@ fn a_cte_body_reads_in_place_only_when_it_renames() {
         (
             "WITH cte AS (SELECT b AS x, a FROM ab) SELECT x, a FROM cte",
             1,
-            sh(&[("a", false, false), ("x", false, false)]),
+            sh(&[("x", false, false), ("a", false, false)]),
         ),
         (
             "WITH c AS (SELECT a, b FROM ab WHERE a > 0), cte AS (SELECT a + 1 AS s FROM c) SELECT s FROM cte",
@@ -339,8 +339,8 @@ fn a_cte_body_reads_in_place_only_when_it_renames() {
     }
 }
 
-/// A view's column list names the SELECT list in order, wherever the PK-front
-/// convention places each column.
+/// A view's column list names the SELECT list in order, the key's column
+/// included.
 #[test]
 fn view_column_aliases_name_the_select_list() {
     let i = TypeCode::I64;
@@ -354,15 +354,15 @@ fn view_column_aliases_name_the_select_list() {
     let rows: &[(&str, Shape)] = &[
         (
             "CREATE VIEW v (x, y) AS SELECT name, id FROM tn",
-            sh(&[("y", false, false), ("x", false, true)]),
+            sh(&[("x", false, true), ("y", false, false)]),
         ),
         (
             "CREATE VIEW v (x, y) AS SELECT COUNT(*) AS n, g FROM t GROUP BY g",
-            sh(&[("y", false, false), ("x", false, false)]),
+            sh(&[("x", false, false), ("y", false, false)]),
         ),
         (
             "CREATE VIEW v (x, y) AS SELECT name, id FROM tn ORDER BY name LIMIT 2",
-            sh(&[("_group_pk", true, false), ("y", false, false), ("x", false, true)]),
+            sh(&[("_group_pk", true, false), ("x", false, true), ("y", false, false)]),
         ),
     ];
     for (sql, shape) in rows {
@@ -427,14 +427,13 @@ fn a_cte_is_a_shared_subtree_read_through_aliases() {
         3
     );
 
-    // Column aliases name the reference, and a later CTE sees an earlier one
-    // (the source key `x` leads: the linear view's PK-front convention).
+    // Column aliases name the reference, and a later CTE sees an earlier one.
     let chain = view(
         &cat,
         "WITH c(x, y) AS (SELECT id, g FROM t WHERE g > 0), e AS (SELECT * FROM c) SELECT y, x FROM e",
     );
     assert_eq!(view_count(&chain), 2);
-    assert_eq!(&output_shape(&chain), &sh(&[("x", false, false), ("y", false, false)]));
+    assert_eq!(&output_shape(&chain), &sh(&[("y", false, false), ("x", false, false)]));
 
     // A CTE is visible to a subquery's inner relation.
     assert_eq!(
@@ -636,8 +635,8 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
         ),
         (
             "SELECT k2 AS kb, k1 AS ka, COUNT(*) AS n FROM ck GROUP BY k2, k1",
-            sh(&[("ka", false, false), ("kb", false, false), ("n", false, false)]),
-            &[0, 1],
+            sh(&[("kb", false, false), ("ka", false, false), ("n", false, false)]),
+            &[1, 0],
             &[i, i, i],
         ),
         (

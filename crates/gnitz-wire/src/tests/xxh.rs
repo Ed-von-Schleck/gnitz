@@ -36,14 +36,15 @@ fn digest_with_hole_equals_checksum_over_the_spliced_bytes() {
     }
 }
 
-/// A layout digest moves with the column count, the PK list and any type code.
+/// A layout digest moves with the column count, how many columns the PK holds,
+/// a type code and the order of two regions.
 #[test]
-fn layout_digest_separates_every_layout_axis() {
+fn layout_digest_separates_every_region_axis() {
     use crate::TypeCode::{String as Str, I64, U64};
-    let base = layout_digest(&[0], [U64, I64]);
-    assert_ne!(base, layout_digest(&[0], [U64, I64, I64]), "column count");
-    assert_ne!(base, layout_digest(&[0], [U64]), "column count");
-    assert_ne!(base, layout_digest(&[1], [U64, I64]), "PK index");
-    assert_ne!(base, layout_digest(&[0, 1], [U64, I64]), "PK arity");
-    assert_ne!(base, layout_digest(&[0], [U64, Str]), "type code");
+    let base = layout_digest(1, [U64, I64]);
+    assert_ne!(base, layout_digest(1, [U64, I64, I64]), "column count");
+    assert_ne!(base, layout_digest(1, [U64]), "column count");
+    assert_ne!(base, layout_digest(2, [U64, I64]), "PK arity");
+    assert_ne!(base, layout_digest(1, [U64, Str]), "type code");
+    assert_ne!(base, layout_digest(1, [I64, U64]), "region order");
 }

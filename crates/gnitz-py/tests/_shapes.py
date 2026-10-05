@@ -105,6 +105,7 @@ _SA = [(i, i % 20) for i in range(40)]
 _SB_SET = [(i, (i % 20) + 10) for i in range(40) if i not in (5, 25)]
 _VA, _VB = Counter((v,) for _, v in _SA), Counter((v,) for _, v in _SB_SET)
 _DT = [(i, i % 7) for i in range(42)]
+_SO = [(pk, pk % 4, pk * 3) for pk in range(24)]
 _CB = [(a, b, a * 100 + b) for a in range(1, 9) for b in range(1, 5)]
 _FT = [(i, i % 4, (100 if i <= 18 else 5000)) for i in range(1, 25)]
 _GT = "CREATE TABLE gt (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)"
@@ -297,6 +298,18 @@ SHAPES = {
         {"dv": ("SELECT DISTINCT g FROM dt", ("g",), {(g,): 1 for g in range(7)})}),
     "distinct_over_join": _ab({"v": ("SELECT DISTINCT b.bv AS bv FROM a JOIN b ON a.k = b.id",
                                      ("bv",), {(bv,): 1 for _, bv in _B})}),
+
+    # Views whose key is not their first column: the store holds the circuit's
+    # regions under the SELECT list's numbering.
+    "select_order": (
+        "CREATE TABLE so (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        f"INSERT INTO so VALUES {values(_SO)}",
+        {"sol": ("SELECT b, id, a FROM so", ("b", "id", "a"), {(b, i, a): 1 for i, a, b in _SO}),
+         "sog": ("SELECT COUNT(*) AS n, a FROM so GROUP BY a", ("n", "a"), {(6, a): 1 for a in range(4)}),
+         "sot": ("SELECT b, id FROM so ORDER BY b DESC LIMIT 3", ("b", "id"),
+                 {(69, 23): 1, (66, 22): 1, (63, 21): 1}),
+         "soq": ("SELECT a, id FROM so QUALIFY ROW_NUMBER() OVER (PARTITION BY a ORDER BY id) = 1",
+                 ("a", "id"), {(a, a): 1 for a in range(4)})}),
 
     # A linear view over a CLUSTER BY proper prefix sits on the worker owning the
     # source's distribution prefix. That placement is folded at registration and

@@ -87,17 +87,23 @@ pub trait SchemaFacts: ColumnTable {
             _ => None,
         }
     }
-    /// The digest a read request names its reply layout by: the PK list and every
-    /// column's type code. Nullability is not part of it.
+    /// The digest a read request names its reply layout by: its regions' types.
+    /// Column numbering and nullability are not part of it.
     fn layout_digest(&self) -> u64 {
-        gnitz_wire::layout_digest(self.pk_cols(), (0..self.num_columns()).map(|c| self.col_type_code(c)))
+        gnitz_wire::layout_digest(self.pk_cols().len(), region_types(self))
     }
-    /// Same PK list and per-column type codes — what [`Self::layout_digest`]
-    /// digests. Nullability is not compared.
+    /// Same PK list and per-column type codes: the same regions under the same
+    /// column numbering. Nullability is not compared.
     fn same_layout(&self, other: &dyn SchemaFacts) -> bool {
         self.pk_cols() == other.pk_cols()
             && self.num_columns() == other.num_columns()
             && (0..self.num_columns()).all(|c| self.col_type_code(c) == other.col_type_code(c))
+    }
+    /// Whether a batch of `self` and one of `other` have the same regions — what
+    /// [`Self::layout_digest`] digests. Column numbering and nullability are
+    /// labels over those bytes.
+    fn same_region_types(&self, other: &dyn SchemaFacts) -> bool {
+        self.pk_cols().len() == other.pk_cols().len() && region_types(self).eq(region_types(other))
     }
     /// Total encoded PK width — the PK region's per-row stride.
     fn pk_stride(&self) -> usize {
@@ -163,6 +169,16 @@ pub trait SchemaFacts: ColumnTable {
 }
 
 impl<T: ColumnTable + ?Sized> SchemaFacts for T {}
+
+/// The types of a batch's regions under `s`: the PK columns in PK-list order,
+/// then the payload columns in payload order.
+fn region_types<S: SchemaFacts + ?Sized>(s: &S) -> impl Iterator<Item = gnitz_wire::TypeCode> + '_ {
+    let pk = s.pk_cols().iter().map(|&p| s.col_type_code(p as usize));
+    let payload = (0..s.num_columns())
+        .filter(|&c| s.payload_slot(c).is_some())
+        .map(|c| s.col_type_code(c));
+    pk.chain(payload)
+}
 
 #[cfg(test)]
 #[path = "tests/schema_facts.rs"]

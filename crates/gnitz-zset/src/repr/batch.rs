@@ -185,14 +185,15 @@ impl Batch {
         &self.schema
     }
 
-    /// Relabel this batch under `s`, a schema of its own layout: the same PK
-    /// list and column types, so its regions and its (PK, payload) order are
-    /// unchanged, and only nullability may differ. A debug build asserts that.
+    /// Relabel this batch under `s`, a schema of its own regions: the same PK
+    /// types in PK-list order and payload types in payload order, so its bytes
+    /// and its (PK, payload) order are unchanged, and only the column numbering
+    /// and nullability may differ. A debug build asserts that.
     #[inline]
     pub fn set_schema(&mut self, s: &SchemaDescriptor) {
         debug_assert!(
-            self.schema.same_layout(s),
-            "Batch::set_schema: a schema of another layout",
+            self.schema.same_region_types(s),
+            "Batch::set_schema: a schema of other regions",
         );
         self.schema = *s;
     }

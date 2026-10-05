@@ -89,6 +89,23 @@ def test_a_mirrored_read_equals_the_server_read(client, mirror):
     assert local == ordered(rows(client, q))
 
 
+def test_a_mirrored_view_keeps_its_select_order(client, mirror):
+    """A view whose key is not its first column is mirrored in its declared
+    order: the copy answers `SELECT *` with the server's names, order and
+    Z-set."""
+    _fed_view(client, "SELECT body, id, v FROM t WHERE v > 10")
+    vid = mirror.mirror_view("f").view_id
+    churn(client, 1, 120)
+    _quiesce(client, mirror)
+
+    q = "SELECT * FROM f"
+    local, remote = _local(mirror, vid, q), rows(client, q)
+    assert tuple(local[0]._asdict()) == tuple(remote[0]._asdict()) == ("body", "id", "v")
+    _samebag(q, local, remote)
+    q = "SELECT id, body FROM f WHERE id < 50"
+    _samebag(q, _local(mirror, vid, q), rows(client, q))
+
+
 def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     """Locality's falsifiable other half: a relation the handle does not hold,
     and a view it has forgotten, issue requests and stay correct."""

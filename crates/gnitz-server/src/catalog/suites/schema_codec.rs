@@ -61,11 +61,11 @@ proptest! {
 }
 
 proptest! {
-    /// Two layouts share a digest iff `same_layout` holds — probed against an
-    /// unrelated schema and against `a` with every payload column's nullability
-    /// flipped.
+    /// Two layouts share a digest iff their regions have the same types — probed
+    /// against an unrelated schema and against `a` with every payload column's
+    /// nullability flipped.
     #[test]
-    fn layout_digest_agrees_with_same_layout(
+    fn layout_digest_agrees_with_the_region_types(
         a in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
         b in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
     ) {
@@ -76,7 +76,7 @@ proptest! {
             .collect();
         let twin = SchemaDescriptor::new(&flipped, a.pk_cols());
         for other in [&b, &twin] {
-            prop_assert_eq!(a.same_layout(other), a.layout_digest() == other.layout_digest());
+            prop_assert_eq!(a.same_region_types(other), a.layout_digest() == other.layout_digest());
         }
     }
 }
