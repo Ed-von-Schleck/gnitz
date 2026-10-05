@@ -169,13 +169,14 @@ fn fold_family_separates_every_stored_axis() {
     const A: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::U64)];
     const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64), col("w", TypeCode::U64)];
     const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::I64)];
-    let base = fold_family(0, &fam(1, "_t", A, &[0]));
+    let shape = |cols, key_len| SysShape { cols, key_len };
+    let base = fold_family(0, &fam(1, "_t", shape(A, 1)));
     let others = [
-        fam(2, "_t", A, &[0]),
-        fam(1, "_u", A, &[0]),
-        fam(1, "_t", RENAMED, &[0]),
-        fam(1, "_t", RETYPED, &[0]),
-        fam(1, "_t", A, &[0, 1]),
+        fam(2, "_t", shape(A, 1)),
+        fam(1, "_u", shape(A, 1)),
+        fam(1, "_t", shape(RENAMED, 1)),
+        fam(1, "_t", shape(RETYPED, 1)),
+        fam(1, "_t", shape(A, 2)),
     ];
     for (i, other) in others.iter().enumerate() {
         assert_ne!(fold_family(0, other), base, "variant {i}");

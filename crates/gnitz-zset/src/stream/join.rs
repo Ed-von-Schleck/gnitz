@@ -20,7 +20,8 @@ use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 
 use crate::algebra::MapPlan;
-use gnitz_expr::{ColCopy, ColumnLocator, NullPerm, RowSource};
+use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
+use gnitz_wire::RowSource;
 use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
 
 // ---------------------------------------------------------------------------

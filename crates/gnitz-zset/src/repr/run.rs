@@ -17,7 +17,7 @@ use crate::repr::scatter::DecodedColumns;
 use crate::repr::shard_reader::MappedShard;
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 
 #[derive(Clone)]
 pub enum Run {
@@ -90,7 +90,7 @@ impl StoredRow {
     /// and every comparator takes. An `impl Trait` return, so which run kind
     /// backs it stays this crate's business.
     #[inline]
-    pub fn source(&self) -> (&impl gnitz_expr::RowSource, usize) {
+    pub fn source(&self) -> (&impl gnitz_wire::RowSource, usize) {
         (&self.run, self.row)
     }
 }

@@ -98,7 +98,7 @@ fn rows_of(src: &impl ColumnarSource, schema: &SchemaDescriptor) -> Vec<RowImage
                 .payload_columns()
                 .map(|(pi, col)| {
                     if col.type_code.is_german_string() {
-                        gnitz_expr::payload_bytes(src, r, pi).to_vec()
+                        gnitz_wire::payload_bytes(src, r, pi).to_vec()
                     } else {
                         src.get_col_ptr(r, pi, col.size() as usize).to_vec()
                     }
@@ -819,7 +819,7 @@ fn slice_relocates_only_its_own_strings() {
     });
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
     assert_eq!(shard.blob().len(), N * W);
-    let string = |b: &Batch, i: usize| gnitz_expr::payload_string(b, i, 0);
+    let string = |b: &Batch, i: usize| gnitz_wire::payload_str(b, i, 0).unwrap().to_owned();
 
     let one = shard.slice_to_owned_batch(37, 1);
     assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
@@ -859,7 +859,7 @@ fn a_relocating_slice_copies_a_shared_span_once() {
     assert_eq!(slice.blob.len(), 2 * 40);
     for i in 0..3 {
         assert_eq!(
-            gnitz_expr::payload_bytes(&slice, i, 0),
+            gnitz_wire::payload_bytes(&slice, i, 0),
             wide_string(i % 2, 40).as_bytes(),
             "row {i}"
         );

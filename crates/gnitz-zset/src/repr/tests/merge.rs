@@ -1,44 +1,10 @@
 use super::*;
 use crate::repr::shard_reader::MappedShard;
-use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch_u128_raw, make_schema_pk_u64_payload_string,
     make_schema_u128_i64, make_schema_u64_i64, make_string_batch, map_shard, payload0_i64,
 };
-
-/// `MemBatch`'s per-row accessors address the cells its region accessors hold:
-/// the [`BatchView`] contract.
-#[test]
-fn batchview_row_matches_region() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),  // PK
-            SchemaColumn::new(TypeCode::I32, false),  // payload slot 0, 4 bytes
-            SchemaColumn::new(TypeCode::U128, false), // payload slot 1, 16 bytes
-            SchemaColumn::new(TypeCode::I64, true),   // payload slot 2, 8 bytes, nullable
-        ],
-        &[0],
-    );
-    const ROWS: usize = 5;
-    let mut bb = BatchBuilder::new(&schema);
-    for row in 0..ROWS {
-        bb.begin_row(row as u128, 1);
-        bb.put_int(-(row as i32) as u128);
-        bb.put_int((row as u128) << 100);
-        // NULL slot 2 on the odd rows, so the bitmap is not uniformly zero.
-        bb.put_opt_int((row % 2 == 0).then_some(row as u128));
-        bb.end_row();
-    }
-    let b = bb.finish();
-    let pk_vals: Vec<u128> = (0..ROWS as u128).collect();
-    gnitz_expr::assert_batchview_consistent(
-        &b.as_mem_batch(),
-        ROWS,
-        &[(0, 4), (1, 16), (2, 8)],
-        &[(TypeCode::U64, 0, &pk_vals)],
-    );
-}
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
 

@@ -9,8 +9,8 @@
 
 use super::super::*;
 use crate::test_support::{col_tab_batch, idx_tab_batch, schema_tab_batch};
-use gnitz_expr::payload_u64;
-use gnitz_wire::sys_rows::{SysRow, TableTabRow};
+use gnitz_wire::payload_u64;
+use gnitz_wire::sys_rows::{IdxTabSlot, SysRow, TableTabRow};
 use gnitz_wire::validate_user_identifier;
 use gnitz_zset::repr::BatchBuilder;
 
@@ -50,7 +50,7 @@ impl CatalogEngine {
     /// The id of the live index named `name`.
     fn index_id_by_name(&self, name: &str) -> Option<u64> {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
-            gnitz_expr::payload_str(s, i, gnitz_wire::IDXTAB_PAY_NAME) == name
+            gnitz_wire::payload_bytes(s, i, IdxTabSlot::name as usize) == name.as_bytes()
         });
         (!rows.is_empty()).then(|| rows.get_pk(0) as u64)
     }
@@ -62,7 +62,7 @@ impl CatalogEngine {
     /// The ids of the live `sys_indices` rows `owner` owns.
     pub(super) fn index_ids_of(&self, owner: u64) -> Vec<u64> {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
-            payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) == owner
+            payload_u64(s, i, IdxTabSlot::owner_id as usize) == owner
         });
         (0..rows.len()).map(|i| rows.get_pk(i) as u64).collect()
     }
@@ -166,8 +166,8 @@ impl CatalogEngine {
             table_id: tid,
             schema_id: sid,
             name: table_name,
-            pk: gnitz_wire::PkColList::from_slice(pk_cols),
-            props,
+            pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols).pack(),
+            flags: props.pack(),
         };
         row.write(&mut bb, 1);
         self.submit(SysFamily::Table, bb.finish())?;
@@ -290,8 +290,8 @@ impl CatalogEngine {
             table_id: tid,
             schema_id,
             name,
-            pk: gnitz_wire::PkColList::from_slice(pk),
-            props: gnitz_wire::TableProps::default(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(pk).pack(),
+            flags: gnitz_wire::TableProps::default().pack(),
         };
         row.write(&mut bb, 1);
         self.ddl_sync(SysFamily::Table.id(), bb.finish())

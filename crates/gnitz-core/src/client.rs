@@ -11,14 +11,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_expr::{payload_str, payload_u64, LogicalProgram, RowFilter};
-use gnitz_wire::sys_rows::{CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow};
+use gnitz_expr::{LogicalProgram, RowFilter};
+use gnitz_wire::sys_rows::{
+    CircuitRow, ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SchemaTabSlot, SysRow, TableTabRow, ViewTabRow,
+};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND, DELTA_POLL_MAX_VIEWS};
+use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    PkColList, PkListRole, TableProps, ViewProps, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
-    COL_TAB, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB,
-    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    PkColList, PkListRole, TableProps, ViewProps, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
+    TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -507,9 +509,9 @@ impl GnitzClient {
             &IdxTabRow {
                 index_id,
                 owner_id,
-                cols,
+                source_col_idx: cols.pack(),
                 name: &index_name,
-                is_unique,
+                is_unique: is_unique as u64,
             },
             1,
         );
@@ -736,7 +738,9 @@ impl GnitzClient {
             match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
                 (Some(view), Some(j)) => renamed.push((
                     view.schema_name.clone(),
-                    payload_str(b, j, RELTAB_PAY_NAME).to_owned(),
+                    payload_str(b, j, RELTAB_PAY_NAME)
+                        .expect("a bundle this client built names its views in UTF-8")
+                        .to_owned(),
                     Arc::clone(&view.desc),
                 )),
                 _ => dropped.push(v),
@@ -840,8 +844,8 @@ impl GnitzClient {
                 table_id: new_tid,
                 schema_id,
                 name: &table_name,
-                pk,
-                props,
+                pk_col_idx: pk.pack(),
+                flags: props.pack(),
             },
             1,
         );
@@ -850,9 +854,9 @@ impl GnitzClient {
                 &IdxTabRow {
                     index_id: new_tid + 1 + k as u64,
                     owner_id: new_tid,
-                    cols: spec.cols,
+                    source_col_idx: spec.cols.pack(),
                     name: &index_names[k],
-                    is_unique: true,
+                    is_unique: 1,
                 },
                 1,
             );
@@ -971,17 +975,20 @@ impl GnitzClient {
 
             // A foreign key constrains a base table, not a view.
             append_col_rows(&mut b, vid, &pv.schema.columns, &[]);
-            b.put(&CircuitRow { view_id: vid, circuit: &pv.circuit }, 1);
+            let circuit = pv.circuit.encode();
+            b.put(&CircuitRow { view_id: vid, circuit: &circuit }, 1);
+            let (capacity_bytes, delta_bytes) = row_props.row_words();
             // The VIEW_TAB register hook triggers server-side compilation.
             b.put(
                 &ViewTabRow {
                     view_id: vid,
                     schema_id,
                     name: &name,
-                    pk: PkColList::from_slice(&pv.schema.pk_cols),
-                    props: row_props,
+                    pk_col_idx: PkColList::from_slice(&pv.schema.pk_cols).pack(),
+                    capacity_bytes,
+                    delta_bytes,
                     owner_view_id,
-                    pk_repeats: pv.pk_repeats,
+                    pk_repeats: pv.pk_repeats as u64,
                 },
                 1,
             );
@@ -1047,7 +1054,7 @@ impl GnitzClient {
         };
         let (scanned, i) = self.seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))?;
         // Renamed since the resolve: the name no longer denotes this relation.
-        if payload_str(&scanned, i, RELTAB_PAY_NAME) != name {
+        if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.as_bytes() {
             return Ok(None);
         }
         Ok(Some((scanned, i)))
@@ -1067,20 +1074,26 @@ impl GnitzClient {
     }
 
     pub fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, col_idx, |b, row| b.set_string_cell(row, COLTAB_PAY_NAME, new_col))
+        self.alter_col_pair(tid, col_idx, |b, row| {
+            b.set_string_cell(row, ColTabSlot::name as usize, new_col)
+        })
     }
 
     /// `ALTER TABLE … DROP COLUMN`: the column stays physically present, so the
     /// table keeps its layout and comparator.
     pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_HIDDEN, 1))
+        self.alter_col_pair(tid, col_idx, |b, row| {
+            b.set_u64_cell(row, ColTabSlot::is_hidden as usize, 1)
+        })
     }
 
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
     /// pair, only `is_nullable` flipped to true at `+1`. Once the catalog reports
     /// the column nullable, `ZSetBatch::validate` permits a null bit there.
     pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_NULLABLE, 1))
+        self.alter_col_pair(tid, col_idx, |b, row| {
+            b.set_u64_cell(row, ColTabSlot::is_nullable as usize, 1)
+        })
     }
 
     /// `ALTER TABLE … ADD COLUMN`: `def` appended to `rel` after every physical
@@ -1089,15 +1102,7 @@ impl GnitzClient {
         let (tid, col_idx) = (rel.tid, rel.schema.num_columns());
 
         let mut b = DdlBundle::default();
-        b.put(
-            &ColTabRow {
-                owner_id: tid,
-                col_idx: col_idx as u64,
-                col: def,
-                fk: None,
-            },
-            1,
-        );
+        b.put(&ColTabRow::of(tid, col_idx as u64, def, None), 1);
         self.commit_ddl(b)
     }
 
@@ -1165,7 +1170,7 @@ impl GnitzClient {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None)?;
         let i = batch
             .live_rows()
-            .find(|&i| payload_str(&batch, i, SCHEMATAB_PAY_NAME) == schema_name)
+            .find(|&i| payload_bytes(&batch, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
             .ok_or_else(|| absent(format!("schema '{schema_name}' not found")))?;
         Ok((batch, i))
     }
@@ -1516,13 +1521,14 @@ fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
     batch
         .live_rows()
         .map(|i| {
-            let name = payload_str(batch, i, IDXTAB_PAY_NAME).to_string();
-            let cols = PkColList::unpack(payload_u64(batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
+            let r = IdxTabRow::read(batch, i).map_err(|e| ProtocolError::DecodeError(format!("index row {i}: {e}")))?;
+            let name = r.name.to_owned();
+            let cols = PkColList::unpack(r.source_col_idx).map_err(|rule| {
                 ProtocolError::DecodeError(format!("index '{name}': {}", rule.for_role(PkListRole::ColumnList)))
             })?;
-            let is_unique = gnitz_wire::bool_word(payload_u64(batch, i, IDXTAB_PAY_IS_UNIQUE))
+            let is_unique = gnitz_wire::bool_word(r.is_unique)
                 .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
-            let owner = payload_u64(batch, i, IDXTAB_PAY_OWNER_ID);
+            let owner = r.owner_id;
             Ok((i, IndexRow { owner, name, cols, is_unique }))
         })
         .collect()
@@ -1533,7 +1539,7 @@ fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
 fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &[Option<FkTarget>]) {
     for (i, cd) in columns.iter().enumerate() {
         let fk = fks.get(i).copied().flatten().map(|t| t.resolve(owner_id));
-        b.put(&ColTabRow { owner_id, col_idx: i as u64, col: cd, fk }, 1);
+        b.put(&ColTabRow::of(owner_id, i as u64, cd, fk), 1);
     }
 }
 

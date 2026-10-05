@@ -8,8 +8,9 @@
 
 use std::cell::Cell;
 
-use gnitz_expr::{BatchView, RowSource};
+use gnitz_expr::BatchView;
 use gnitz_wire::PkBuf;
+use gnitz_wire::RowSource;
 
 use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
 
@@ -50,7 +51,7 @@ fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word:
     buf.push(1);
     match loc {
         ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
-            let content = gnitz_expr::payload_bytes(src, row, slot as usize);
+            let content = gnitz_wire::payload_bytes(src, row, slot as usize);
             buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
             buf.extend_from_slice(content);
         }
@@ -402,7 +403,7 @@ impl ReindexPacker {
                     cell.fill(0);
                 }
                 ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
-                    let h = gnitz_wire::checksum_128(gnitz_expr::payload_bytes(batch, row, slot as usize));
+                    let h = gnitz_wire::checksum_128(gnitz_wire::payload_bytes(batch, row, slot as usize));
                     cell.copy_from_slice(&h.to_be_bytes());
                 }
                 _ => {

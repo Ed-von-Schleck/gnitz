@@ -12,7 +12,7 @@ use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
 
 // ── Region indices ──────────────────────────────────────────────────────────

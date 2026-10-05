@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use super::{SchemaColumn, SchemaDescriptor};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 
 /// Which comparator orders a schema's payload columns.

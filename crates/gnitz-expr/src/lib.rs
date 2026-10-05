@@ -19,7 +19,7 @@
 //! (the wire-mirroring form, which both encodes to a blob and decodes back from
 //! one), its resolution against a schema, and
 //! the morsel-oriented vectorized kernels that evaluate the resolved form — plus
-//! the two contracts they read through, [`ColumnLocator`] / [`RowSource`] /
+//! the two contracts they read through, [`ColumnLocator`] / [`gnitz_wire::RowSource`] /
 //! [`BatchView`] for *where a value physically sits* and [`ColumnTable`] /
 //! [`SchemaFacts`] for *what the schema says about it* — the column table an
 //! implementor writes, and everything derived from it.

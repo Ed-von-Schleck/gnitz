@@ -3,9 +3,9 @@ use crate::protocol::wal_block::decode_wal_block_into;
 use crate::retraction_batch;
 use crate::test_support::{encode_wal_block, kv_schema};
 use gnitz_expr::{
-    payload_str, payload_u64, BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval,
-    SchemaFacts, Sink,
+    BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, SchemaFacts, Sink,
 };
+use gnitz_wire::{payload_str, payload_u64};
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
@@ -240,7 +240,7 @@ fn extend_from_owned_concatenates() {
     let pks: Vec<u128> = (0..acc.len()).map(|r| acc.pks.get(r)).collect();
     assert_eq!(pks, [1, 2, 10, 11]);
     assert_eq!(acc.weights, [1, -1, 1, -1]);
-    let strs: Vec<&str> = (0..acc.len()).map(|r| payload_str(&acc, r, 0)).collect();
+    let strs: Vec<&str> = (0..acc.len()).map(|r| payload_str(&acc, r, 0).unwrap()).collect();
     assert_eq!(strs, [long(1).as_str(), "short", long(10).as_str(), "short"]);
     acc.validate(&schema).unwrap();
 }
@@ -433,7 +433,7 @@ fn rows(b: &ZSetBatch) -> Vec<Row> {
             (
                 b.pks.get(r),
                 b.weights[r],
-                payload_str(b, r, 0).to_owned(),
+                payload_str(b, r, 0).unwrap().to_owned(),
                 payload_u64(b, r, 1),
             )
         })
@@ -592,9 +592,6 @@ fn fixture_a_batch() -> ZSetBatch {
     }
 }
 
-/// Every payload slot of fixture A as `(slot, width)`.
-const A_SLOTS: [(usize, usize); 5] = [(0, 4), (1, 8), (2, 16), (3, 16), (4, 16)];
-
 // ── Fixture B: a single narrow PK — the shape real traffic has ───────────
 
 fn fixture_b_schema() -> Schema {
@@ -620,41 +617,32 @@ fn fixture_b_batch() -> ZSetBatch {
     b
 }
 
-// ── The region/per-row contract ──────────────────────────────────────────
+// ── PK columns read through `ColumnLocator` ─────────────────────────────
 
 #[test]
 fn locate_addresses_the_pk_region_the_builder_hands_out() {
-    let check =
-        |schema: &Schema, batch: &ZSetBatch, rows: usize, cols: &[(usize, usize)], want: &[(usize, &[u128])]| {
-            let pk: Vec<gnitz_expr::PkColExpect<'_>> = want
-                .iter()
-                .map(|&(ci, vals)| match SchemaFacts::locate(schema, ci) {
-                    gnitz_expr::ColumnLocator::Pk { byte_off, type_code, .. } => (type_code, byte_off as usize, vals),
-                    other => panic!("column {ci} must locate to the PK region, got {other:?}"),
-                })
-                .collect();
-            gnitz_expr::assert_batchview_consistent(batch, rows, cols, &pk);
-        };
+    let check = |schema: &Schema, batch: &ZSetBatch, want: &[(usize, &[u128])]| {
+        for &(ci, vals) in want {
+            let loc = SchemaFacts::locate(schema, ci);
+            assert!(
+                matches!(loc, gnitz_expr::ColumnLocator::Pk { .. }),
+                "column {ci} is a PK column"
+            );
+            assert_eq!(batch.len(), vals.len());
+            for (row, &v) in vals.iter().enumerate() {
+                let mut scratch = [0u8; 16];
+                let got = loc.native_le_bytes(batch, row, &mut scratch);
+                assert_eq!(got, &v.to_le_bytes()[..got.len()], "col {ci} row {row}");
+            }
+        }
+    };
 
     let a_k0: Vec<u128> = PK3.iter().map(|&v| v as u128).collect();
     let a_k1: Vec<u128> = PK0.iter().map(|&v| v as u128).collect();
-    check(
-        &fixture_a_schema(),
-        &fixture_a_batch(),
-        3,
-        &A_SLOTS,
-        &[(3, &a_k0), (0, &a_k1)],
-    );
-    check(
-        &fixture_a_schema(),
-        &ZSetBatch::new(&fixture_a_schema()),
-        0,
-        &A_SLOTS,
-        &[],
-    );
+    check(&fixture_a_schema(), &fixture_a_batch(), &[(3, &a_k0), (0, &a_k1)]);
 
     let b_k: Vec<u128> = B_PK.iter().map(|&v| v as u128).collect();
-    check(&fixture_b_schema(), &fixture_b_batch(), 3, &[(0, 8)], &[(0, &b_k)]);
+    check(&fixture_b_schema(), &fixture_b_batch(), &[(0, &b_k)]);
 }
 
 // ── The shared evaluator over a client batch ─────────────────────────────

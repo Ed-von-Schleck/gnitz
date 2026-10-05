@@ -19,9 +19,10 @@
 use crate::algebra::ReindexPacker;
 use crate::repr::Batch;
 use crate::schema::{oob_col, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use gnitz_expr::{OrderLocator, RowSource};
+use gnitz_expr::OrderLocator;
 use gnitz_wire::OrderKey;
 use gnitz_wire::PkBuf;
+use gnitz_wire::RowSource;
 
 use crate::algebra::{
     append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,

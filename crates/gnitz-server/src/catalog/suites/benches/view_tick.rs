@@ -152,7 +152,7 @@ fn left_join_view_tick_bench() {
         let out = scan_all(&mut engine, v);
         let b_w = out.schema().num_payload_cols() - 1;
         let null_filled = (0..out.len())
-            .filter(|&i| gnitz_expr::payload_is_null(&*out, i, b_w))
+            .filter(|&i| gnitz_wire::payload_is_null(&*out, i, b_w))
             .count() as u64;
         assert_eq!(
             (net_weight(&engine, v) as u64, null_filled),

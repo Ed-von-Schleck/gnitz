@@ -1,11 +1,12 @@
 //! Every read over the system stores: live rows by id or name, an owner's band of
 //! rows and the retraction of one, column records, schema and relation names.
 
-use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::Relation;
+use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, SchemaTabSlot};
+use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
-use super::sys_tables::{read_col_tab_row, CatalogColumn, SysFamily};
+use super::sys_tables::{CatalogColumn, SysFamily};
 use super::CatalogEngine;
 
 /// A set of catalog ids, sorted once so every probe is a binary search: the
@@ -98,19 +99,20 @@ impl CatalogEngine {
             if err.is_some() {
                 return;
             }
-            let col_idx = gnitz_wire::unpack_pair_pk(c.current_key_narrow()).1;
-            if col_idx != defs.len() as u64 {
-                err = Some(format!(
-                    "entity (owner_id={owner_id}): column records are non-contiguous; \
-                     expected index {}, got {col_idx}",
-                    defs.len()
-                ));
-                return;
-            }
             let (src, row) = c.current_row_source();
-            match read_col_tab_row(src, row) {
+            let expected = defs.len() as u64;
+            let def = ColTabRow::read(src, row).and_then(|r| {
+                if r.col_idx != expected {
+                    return Err(format!(
+                        "column records are non-contiguous; expected index {expected}, got {}",
+                        r.col_idx
+                    ));
+                }
+                CatalogColumn::from_row(&r).map_err(|e| format!("column {}: {e}", r.col_idx))
+            });
+            match def {
                 Ok(d) => defs.push(d),
-                Err(e) => err = Some(format!("entity (owner_id={owner_id}) column {col_idx}: {e}")),
+                Err(e) => err = Some(format!("entity (owner_id={owner_id}): {e}")),
             }
         });
         err.map_or(Ok(defs), Err)
@@ -122,7 +124,7 @@ impl CatalogEngine {
     pub(crate) fn schema_id(&self, name: &str) -> Option<u64> {
         let scan = self.sys_relation(SysFamily::Schema).full_scan();
         (0..scan.len())
-            .find(|&i| payload_str(&*scan, i, gnitz_wire::SCHEMATAB_PAY_NAME) == name)
+            .find(|&i| payload_bytes(&*scan, i, SchemaTabSlot::name as usize) == name.as_bytes())
             .map(|i| scan.get_pk(i) as u64)
     }
 
@@ -135,7 +137,8 @@ impl CatalogEngine {
     pub(in crate::catalog) fn schema_name(&self, sid: u64) -> Option<String> {
         let row = self.live_sys_row(SysFamily::Schema, sid)?;
         let (src, ri) = row.source();
-        Some(payload_string(src, ri, gnitz_wire::SCHEMATAB_PAY_NAME))
+        let stored = SchemaTabRow::read(src, ri).expect("a stored schema name passed the precheck");
+        Some(stored.name.to_owned())
     }
 
     /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
@@ -150,7 +153,9 @@ impl CatalogEngine {
         let (src, ri) = row.source();
         let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID);
         let schema = self.schema_name(sid).unwrap_or_else(|| "?".into());
-        (schema, payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
+        let name =
+            payload_str(src, ri, gnitz_wire::RELTAB_PAY_NAME).expect("a stored relation name passed the precheck");
+        (schema, name.to_owned())
     }
 
     /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.

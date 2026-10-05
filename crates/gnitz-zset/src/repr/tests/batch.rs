@@ -325,7 +325,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
     );
     let shared = Batch::from_ranges(&small, &[(0, 1)], 0);
     assert_eq!(shared.count, 1);
-    assert_eq!(gnitz_expr::payload_bytes(&shared, 0, 0), long);
+    assert_eq!(gnitz_wire::payload_bytes(&shared, 0, 0), long);
     assert_eq!(
         shared.blob.len(),
         small.blob.len(),
@@ -343,7 +343,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
     );
     let relocated = Batch::from_ranges(&wide, &[(7, 8)], 0);
     assert_eq!(relocated.count, 1);
-    assert_eq!(gnitz_expr::payload_bytes(&relocated, 0, 0), vals[7]);
+    assert_eq!(gnitz_wire::payload_bytes(&relocated, 0, 0), vals[7]);
     assert!(
         relocated.blob.len() < wide.blob.len(),
         "the relocating arm carries only the survivor's span",
@@ -381,7 +381,7 @@ fn widened_with_nulls_places_the_fill_on_either_side() {
         assert_eq!(out.get_pk(0), 1);
         assert!(!out.blob.is_empty(), "output blob must be propagated ({nulls_first})");
         assert_eq!(
-            gnitz_expr::payload_bytes(&out, 0, str_slot),
+            gnitz_wire::payload_bytes(&out, 0, str_slot),
             long,
             "long string must resolve to the original ({nulls_first})"
         );
@@ -494,7 +494,7 @@ fn a_key_prefix_round_trips() {
         assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
         assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
         assert_eq!(out.get_null_word(i), b.get_null_word(i), "row {i}: null word");
-        assert_eq!(gnitz_expr::payload_bytes(&out, i, 0), row.3, "row {i}: string");
+        assert_eq!(gnitz_wire::payload_bytes(&out, i, 0), row.3, "row {i}: string");
         assert_eq!(
             out.get_col_ptr(i, 1, 8),
             b.get_col_ptr(i, 1, 8),

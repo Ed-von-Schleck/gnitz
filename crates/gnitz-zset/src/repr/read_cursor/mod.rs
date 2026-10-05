@@ -21,7 +21,7 @@ mod source;
 
 use super::run::Run;
 pub use gather::PkSetGather;
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 pub use source::{BoundedIndexCursor, SourceCursor};
 
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat

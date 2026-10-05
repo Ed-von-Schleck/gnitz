@@ -2,7 +2,8 @@
 //! ingest → `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
 //! orphan-directory sweep.
 
-use gnitz_expr::payload_u64;
+use gnitz_wire::payload_u64;
+use gnitz_wire::sys_rows::{IdxTabSlot, ViewTabSlot};
 use gnitz_zset::repr::Batch;
 
 use super::sys_reads::IdSet;
@@ -38,7 +39,7 @@ impl CatalogEngine {
         // A view's segments drop in its own batch, unless the bundle already names them.
         if family == SysFamily::View {
             let segs = self.sys_rows_where(SysFamily::View, |s, i| {
-                owners.contains(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID))
+                owners.contains(payload_u64(s, i, ViewTabSlot::owner_view_id as usize))
                     && !owners.contains(s.get_pk(i) as u64)
             });
             if !segs.is_empty() {
@@ -50,7 +51,7 @@ impl CatalogEngine {
         }
         let indices = self
             .sys_rows_where(SysFamily::Index, |s, i| {
-                owners.contains(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID))
+                owners.contains(payload_u64(s, i, IdxTabSlot::owner_id as usize))
             })
             .negated();
         // A SERIAL row's key is its table id.

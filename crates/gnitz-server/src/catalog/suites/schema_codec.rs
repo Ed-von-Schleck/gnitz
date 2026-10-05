@@ -105,13 +105,7 @@ fn ddl_txn_roundtrip_client_to_server() {
         let mut a = BatchAppender::new(&mut b);
         for i in 0..n {
             let col = ColumnDef::new(format!("c{i}"), TypeCode::U64, false);
-            let row = ColTabRow {
-                owner_id: oid,
-                col_idx: i as u64,
-                col: &col,
-                fk: None,
-            };
-            row.write(&mut a, 1);
+            ColTabRow::of(oid, i as u64, &col, None).write(&mut a, 1);
         }
         b
     };
@@ -122,8 +116,8 @@ fn ddl_txn_roundtrip_client_to_server() {
             table_id: tid,
             schema_id: 3,
             name: "t",
-            pk: gnitz_wire::PkColList::from_slice(&[0]),
-            props: gnitz_wire::TableProps::default(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+            flags: gnitz_wire::TableProps::default().pack(),
         };
         row.write(&mut BatchAppender::new(&mut b), weight);
         b
@@ -134,9 +128,9 @@ fn ddl_txn_roundtrip_client_to_server() {
         let row = IdxTabRow {
             index_id: idx_id,
             owner_id: owner,
-            cols: gnitz_wire::PkColList::from_slice(&[1]),
+            source_col_idx: gnitz_wire::PkColList::from_slice(&[1]).pack(),
             name: "idx_t_b",
-            is_unique: true,
+            is_unique: 1,
         };
         row.write(&mut BatchAppender::new(&mut b), 1);
         b
@@ -193,7 +187,8 @@ fn ddl_txn_roundtrip_client_to_server() {
         let s = sys_schema(CIRCUIT_TAB);
         let mut b = ZSetBatch::new(s);
         let identity = crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None);
-        CircuitRow { view_id: vid, circuit: &identity }.write(&mut BatchAppender::new(&mut b), 1);
+        let circuit = identity.encode();
+        CircuitRow { view_id: vid, circuit: &circuit }.write(&mut BatchAppender::new(&mut b), 1);
         b
     };
     let view = {
@@ -203,10 +198,11 @@ fn ddl_txn_roundtrip_client_to_server() {
             view_id: vid,
             schema_id: 3,
             name: "v",
-            pk: gnitz_wire::PkColList::from_slice(&[0]),
-            props: gnitz_wire::ViewProps::default(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+            capacity_bytes: 0,
+            delta_bytes: 0,
             owner_view_id: 0,
-            pk_repeats: false,
+            pk_repeats: 0,
         };
         row.write(&mut BatchAppender::new(&mut b), 1);
         b

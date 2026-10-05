@@ -5,7 +5,7 @@
 
 use super::merge::ColPtr;
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 
 /// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
 /// probe, where `lt(i)` reports row `i < probe`.

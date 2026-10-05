@@ -17,195 +17,52 @@ pub struct WireSysCol {
 
 /// Terse `WireSysCol` constructor so the column tables read as one line per
 /// column.
-const fn col(name: &'static str, type_code: TypeCode) -> WireSysCol {
+pub(crate) const fn col(name: &'static str, type_code: TypeCode) -> WireSysCol {
     WireSysCol { name, type_code }
 }
 
-/// Index of the column named `name` in `cols`, resolved at compile time.
-/// Panics (const-eval failure) if absent, so a renamed/removed column fails the
-/// build rather than silently mis-indexing. `==` on `&str` is not const-stable,
-/// hence the manual byte compare.
-const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
-    let mut i = 0;
-    while i < cols.len() {
-        let a = cols[i].name.as_bytes();
-        let b = name.as_bytes();
-        if a.len() == b.len() {
-            let mut j = 0;
-            let mut matched = true;
-            while j < a.len() {
-                if a[j] != b[j] {
-                    matched = false;
-                    break;
-                }
-                j += 1;
-            }
-            if matched {
-                return i;
-            }
-        }
-        i += 1;
-    }
-    panic!("column not found")
-}
-
-/// Payload slot of column `name` in system family `id`, whose column list and
-/// key are paired in one place. A PK column or an unknown name is a const-eval
-/// panic.
-const fn pay_index_in_fam(id: u64, name: &str) -> usize {
-    let f = &SYS_FAMILIES[match sys_family_index(id) {
-        Some(i) => i,
-        None => panic!("not a system family"),
-    }];
-    match payload_slot(f.pk_cols, col_index_in(f.cols, name)) {
-        Some(pi) => pi,
-        None => panic!("a PK column has no payload slot"),
-    }
-}
-
-// Every system table's column shape is defined once, here, and reached through
-// `SYS_FAMILIES` (by `sys_family_index(id)`), which pairs each shape with the
-// key that goes with it: the engine builds its `SchemaDescriptor`s and the COL_TAB
-// self-description rows from a family, the client builds its `Schema`s. The two
-// must agree on both halves, and a disagreement on the key is a `pk_stride`
-// mismatch the wire decode rejects — so neither half is offered separately for a
-// consumer to pair up itself.
+// Every system table's column shape is declared once, by its `sys_row!` in
+// `sys_rows`, and reached through `SYS_FAMILIES` (by `sys_family_index(id)`),
+// which pairs each shape with the key that goes with it: the engine builds its
+// `SchemaDescriptor`s and the COL_TAB self-description rows from a family, the
+// client builds its `Schema`s. The two must agree on both halves, and a
+// disagreement on the key is a `pk_stride` mismatch the wire decode rejects — so
+// neither half is offered separately for a consumer to pair up itself.
 
 /// The two halves of a two-column key (COL_TAB's `(owner_id, col_idx)`), off the
-/// widened `u128` a PK region reads back to. Both columns are `U64` — asserted
-/// over [`SYS_FAMILIES`] below — so the split is exact.
+/// widened `u128` a PK region reads back to. Every system key column is `U64`,
+/// so the split is exact.
 #[inline]
 pub const fn unpack_pair_pk(pk: u128) -> (u64, u64) {
     ((pk >> 64) as u64, pk as u64)
 }
 
-const SCHEMA_TAB_COLS: &[WireSysCol] = &[col("schema_id", TypeCode::U64), col("name", TypeCode::String)];
-
-const TABLE_TAB_COLS: &[WireSysCol] = &[
-    col("table_id", TypeCode::U64),
-    col("schema_id", TypeCode::U64),
-    col("name", TypeCode::String),
-    // Packed PK column list (`PkColList::pack`).
-    col("pk_col_idx", TypeCode::U64),
-    // See `TableProps::pack` for the bit layout.
-    col("flags", TypeCode::U64),
-];
-
-const VIEW_TAB_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64),
-    col("schema_id", TypeCode::U64),
-    col("name", TypeCode::String),
-    // Packed view-PK column list (`PkColList::pack`).
-    col("pk_col_idx", TypeCode::U64),
-    // `ViewProps::row_words`: `WITH (capacity = …)` in bytes, `0` absent.
-    col("capacity_bytes", TypeCode::U64),
-    // `ViewProps::row_words`: `WITH (delta = …)` in bytes, `0` absent.
-    col("delta_bytes", TypeCode::U64),
-    // The user view this row is an internal chain segment of; `0` is a user
-    // view. A column rather than a name prefix, because the precheck can
-    // validate it against a forger. Appended, not inserted: the `RELTAB_*`
-    // constants below pin `name` to the same slot in TABLE_TAB and VIEW_TAB.
-    col("owner_view_id", TypeCode::U64),
-    // A boolean ([`bool_word`]): two of the view's rows may carry the same PK, or
-    // one may stand at weight above 1, so its PK region identifies no single row —
-    // a view over a stream, one keyed on a join key or a source-PK pair, a top-N
-    // holding more than one slot per partition, or an ALL set operation. The
-    // planner that compiled the view states it; the engine stores it verbatim.
-    col("pk_repeats", TypeCode::U64),
-];
-
-// Keyed by the compound `(owner_id, col_idx)` — the pair *is* a column record's
-// identity.
-const COL_TAB_COLS: &[WireSysCol] = &[
-    col("owner_id", TypeCode::U64),
-    col("col_idx", TypeCode::U64),
-    col("name", TypeCode::String),
-    col("type_code", TypeCode::U64),
-    col("is_nullable", TypeCode::U64),
-    col("fk_table_id", TypeCode::U64),
-    col("fk_col_idx", TypeCode::U64),
-    // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
-    // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
-    // the record's `hidden` flag.
-    col("is_hidden", TypeCode::U64),
-    // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
-    // column type.
-    col("scale", TypeCode::U64),
-];
-
-const IDX_TAB_COLS: &[WireSysCol] = &[
-    col("index_id", TypeCode::U64),
-    col("owner_id", TypeCode::U64),
-    // The indexed columns' packed list (`PkColList::pack`), single- and
-    // multi-column indexes alike.
-    col("source_col_idx", TypeCode::U64),
-    col("name", TypeCode::String),
-    // A boolean ([`bool_word`]): the index enforces uniqueness.
-    col("is_unique", TypeCode::U64),
-];
-
-const SEQ_TAB_COLS: &[WireSysCol] = &[col("seq_id", TypeCode::U64), col("next_val", TypeCode::U64)];
-
-// One row per view: its whole circuit, as `Circuit::encode` lays it out.
-const CIRCUIT_TAB_COLS: &[WireSysCol] = &[col("view_id", TypeCode::U64), col("circuit", TypeCode::Blob)];
-
 // ---------------------------------------------------------------------------
-// Catalog column positions
+// Payload slots TABLE_TAB and VIEW_TAB share
 // ---------------------------------------------------------------------------
 //
-// Resolved by name from the lists above, so a dropped or renamed column fails
-// the build instead of shifting a literal. Both the engine and the client read
-// catalog batches and must agree on every position, so they are stated once,
-// here, rather than derived again in each crate.
-//
-// The indices address the payload region — the space every catalog read, engine
-// and client alike, uses.
+// An address valid in both families, for the readers that take either through
+// one code path.
 
-pub const SCHEMATAB_PAY_NAME: usize = pay_index_in_fam(SCHEMA_TAB, "name");
-
-pub const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(TABLE_TAB, "pk_col_idx");
-pub const TABTAB_PAY_FLAGS: usize = pay_index_in_fam(TABLE_TAB, "flags");
-
-pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(VIEW_TAB, "pk_col_idx");
-pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in_fam(VIEW_TAB, "capacity_bytes");
-pub const VIEWTAB_PAY_DELTA: usize = pay_index_in_fam(VIEW_TAB, "delta_bytes");
-pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in_fam(VIEW_TAB, "owner_view_id");
-pub const VIEWTAB_PAY_PK_REPEATS: usize = pay_index_in_fam(VIEW_TAB, "pk_repeats");
-
-// `RELTAB_*`: an address valid in TABLE_TAB and VIEW_TAB alike, for the readers
-// that take either family through one code path. A column at the same slot in
-// both but read through neither stays two constants.
-
-/// `name`'s payload index in two families that must agree on it — each half
-/// carries its own key.
-const fn shared_pay_index(a: u64, b: u64, name: &str) -> usize {
-    let i = pay_index_in_fam(a, name);
+/// `schema_id`'s payload slot in TABLE_TAB and VIEW_TAB alike.
+pub const RELTAB_PAY_SCHEMA_ID: usize = {
+    let i = crate::sys_rows::TableTabSlot::schema_id as usize;
     assert!(
-        i == pay_index_in_fam(b, name),
-        "the two families disagree on this column"
+        i == crate::sys_rows::ViewTabSlot::schema_id as usize,
+        "TABLE_TAB and VIEW_TAB disagree on schema_id"
     );
     i
-}
+};
 
-pub const RELTAB_PAY_SCHEMA_ID: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "schema_id");
-pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "name");
-
-pub const COLTAB_PAY_NAME: usize = pay_index_in_fam(COL_TAB, "name");
-pub const COLTAB_PAY_TYPE_CODE: usize = pay_index_in_fam(COL_TAB, "type_code");
-pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in_fam(COL_TAB, "fk_table_id");
-pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in_fam(COL_TAB, "fk_col_idx");
-pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in_fam(COL_TAB, "is_nullable");
-pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in_fam(COL_TAB, "is_hidden");
-pub const COLTAB_PAY_SCALE: usize = pay_index_in_fam(COL_TAB, "scale");
-
-pub const CIRCTAB_PAY_CIRCUIT: usize = pay_index_in_fam(CIRCUIT_TAB, "circuit");
-
-pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
-pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
-pub const IDXTAB_PAY_NAME: usize = pay_index_in_fam(IDX_TAB, "name");
-pub const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in_fam(IDX_TAB, "is_unique");
-
-pub const SEQTAB_PAY_VALUE: usize = pay_index_in_fam(SEQ_TAB, "next_val");
+/// `name`'s payload slot in TABLE_TAB and VIEW_TAB alike.
+pub const RELTAB_PAY_NAME: usize = {
+    let i = crate::sys_rows::TableTabSlot::name as usize;
+    assert!(
+        i == crate::sys_rows::ViewTabSlot::name as usize,
+        "TABLE_TAB and VIEW_TAB disagree on name"
+    );
+    i
+};
 
 // ---------------------------------------------------------------------------
 // Stored-shape digest
@@ -294,38 +151,34 @@ pub struct WireSysFamily {
     pub pk_cols: &'static [u32],
 }
 
-const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: &'static [u32]) -> WireSysFamily {
-    WireSysFamily { id, name, cols, pk_cols }
+/// What a `sys_row!` declaration fixes about a family: its columns, of which the
+/// first `key_len` are its key, each a `U64`.
+pub(crate) struct SysShape {
+    pub(crate) cols: &'static [WireSysCol],
+    pub(crate) key_len: usize,
+}
+
+const fn fam(id: u64, name: &'static str, shape: SysShape) -> WireSysFamily {
+    const LEADING: &[u32] = &[0, 1];
+    WireSysFamily {
+        id,
+        name,
+        cols: shape.cols,
+        pk_cols: LEADING.split_at(shape.key_len).0,
+    }
 }
 
 /// Every system family, in the order both sides index them by. The engine
 /// applies a bundle's families in this order.
 pub const SYS_FAMILIES: &[WireSysFamily] = &[
-    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, &[0]),
-    fam(COL_TAB, "_columns", COL_TAB_COLS, &[0, 1]),
-    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, &[0]),
-    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, &[0]),
-    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, &[0]),
-    fam(IDX_TAB, "_indices", IDX_TAB_COLS, &[0]),
-    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, &[0]),
+    fam(SCHEMA_TAB, "_schemas", crate::sys_rows::SCHEMA_TAB_SHAPE),
+    fam(COL_TAB, "_columns", crate::sys_rows::COL_TAB_SHAPE),
+    fam(CIRCUIT_TAB, "_circuits", crate::sys_rows::CIRCUIT_TAB_SHAPE),
+    fam(TABLE_TAB, "_tables", crate::sys_rows::TABLE_TAB_SHAPE),
+    fam(VIEW_TAB, "_views", crate::sys_rows::VIEW_TAB_SHAPE),
+    fam(IDX_TAB, "_indices", crate::sys_rows::IDX_TAB_SHAPE),
+    fam(SEQ_TAB, "_sequences", crate::sys_rows::SEQ_TAB_SHAPE),
 ];
-
-// What `unpack_pair_pk`'s `>> 64` split is written against.
-const _: () = {
-    let mut f = 0;
-    while f < SYS_FAMILIES.len() {
-        let (cols, pk) = (SYS_FAMILIES[f].cols, SYS_FAMILIES[f].pk_cols);
-        let mut i = 0;
-        while i < pk.len() {
-            assert!(
-                matches!(cols[pk[i] as usize].type_code, TypeCode::U64),
-                "a system family's key column is not U64"
-            );
-            i += 1;
-        }
-        f += 1;
-    }
-};
 
 /// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
 pub const fn sys_family_index(id: u64) -> Option<usize> {
@@ -783,7 +636,7 @@ impl ViewProps {
     }
 
     /// The `(capacity, delta)` `VIEW_TAB` words.
-    pub(crate) fn row_words(self) -> (u64, u64) {
+    pub fn row_words(self) -> (u64, u64) {
         (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
     }
 

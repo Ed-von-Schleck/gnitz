@@ -7,6 +7,31 @@ fn id_v() -> Vec<CatalogColumn> {
     vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
 }
 
+/// A name whose bytes are not UTF-8 is refused as such in every family that
+/// stores one, not read as some other name.
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    let dir = temp_dir("bundle_non_utf8_names");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let id = engine.allocate_ids(1).unwrap();
+    for family in [SysFamily::Schema, SysFamily::Table, SysFamily::View, SysFamily::Index] {
+        let schema = family.schema();
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(id as u128, 1);
+        for (_, col) in schema.payload_columns() {
+            match col.type_code {
+                TypeCode::U64 => bb.put_u64(0),
+                _ => bb.put_blob(b"\xff\xfe"),
+            }
+        }
+        bb.end_row();
+        let err = engine.precheck_family(family, &bb.finish()).unwrap_err();
+        assert!(err.contains("name is not UTF-8"), "{}: {err}", family.name());
+    }
+    engine.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Nothing synthesizes a schema name, so it takes the full identifier rule,
 /// leading `_` included, and one batch may not claim it twice: the name would
 /// resolve to the second row, leaving the first id live and unreachable. Nor may

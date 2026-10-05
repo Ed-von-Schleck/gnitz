@@ -106,17 +106,17 @@ fn test_map_blob_passthrough_and_fallback() {
     // blob keeps every long string's heap offset valid through the verbatim copy.
     let out = project(&in_schema, &[2, 1]).evaluate_map_batch(&batch);
     assert_eq!(out.count, 2);
-    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
-    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 1), b"ab"); // s1 → out payload 1
-    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 0), b"long-string-two-abcdef");
-    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 1), b"cd");
+    assert_eq!(gnitz_wire::payload_bytes(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
+    assert_eq!(gnitz_wire::payload_bytes(&out, 0, 1), b"ab"); // s1 → out payload 1
+    assert_eq!(gnitz_wire::payload_bytes(&out, 1, 0), b"long-string-two-abcdef");
+    assert_eq!(gnitz_wire::payload_bytes(&out, 1, 1), b"cd");
 
     // (B) Drop the long string s2 → passthrough gated OFF, so the relocate path runs and the
     // output blob carries only the referenced (here empty, short-inline) spans.
     let out = project(&in_schema, &[1]).evaluate_map_batch(&batch);
     assert_eq!(out.count, 2);
-    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 0), b"ab");
-    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 0), b"cd");
+    assert_eq!(gnitz_wire::payload_bytes(&out, 0, 0), b"ab");
+    assert_eq!(gnitz_wire::payload_bytes(&out, 1, 0), b"cd");
     assert!(
         out.blob().len() < batch.blob().len(),
         "dropped-string relocate must not copy the dead heap ({} vs {})",

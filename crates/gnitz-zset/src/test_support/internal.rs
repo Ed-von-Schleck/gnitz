@@ -116,7 +116,7 @@ impl TestTrace {
 pub(crate) fn cell(mb: &MemBatch, loc: ColumnLocator, row: usize) -> Option<Vec<u8>> {
     let mut scratch = [0u8; 16];
     (!loc.is_null(mb, row)).then(|| match loc.type_code().is_german_string() {
-        true => gnitz_wire::german_string_content(loc.bytes(mb, row), mb.blob).to_vec(),
+        true => loc.content(mb, row).to_vec(),
         false => loc.native_le_bytes(mb, row, &mut scratch).to_vec(),
     })
 }
@@ -182,7 +182,7 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
 /// Payload column 0's string on every row, in order.
 pub(crate) fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
     (0..batch.len())
-        .map(|row| gnitz_expr::payload_bytes(batch, row, 0).to_vec())
+        .map(|row| gnitz_wire::payload_bytes(batch, row, 0).to_vec())
         .collect()
 }
 

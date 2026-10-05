@@ -76,7 +76,7 @@ fn materialize_carrying_charges_each_sources_dropped_rows() {
     assert_eq!(out.dead_heap, 30 + 50);
     assert_eq!(out.blob().len(), a.blob().len() + b.blob().len());
     let got: Vec<Vec<u8>> = (0..out.count)
-        .map(|row| gnitz_expr::payload_bytes(&out, row, 0).to_vec())
+        .map(|row| gnitz_wire::payload_bytes(&out, row, 0).to_vec())
         .collect();
     let want: Vec<Vec<u8>> = (0..14).map(|i| vec![[b'a', b'b'][i % 2]; 40]).collect();
     assert_eq!(got, want);

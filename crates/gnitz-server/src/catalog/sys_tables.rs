@@ -8,17 +8,11 @@
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
 
-use gnitz_expr::RowSource;
-use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::sys_rows::{ColTabRow, FkRef, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
-use gnitz_wire::{ColType, ColumnDef, TableDistribution, ViewProps};
-use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
-    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
-    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
-    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_PK_REPEATS,
+use gnitz_wire::sys_rows::{
+    ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SeqTabSlot, SysRow, SysRowSink, TableTabRow, ViewTabRow,
 };
+use gnitz_wire::{ColumnDef, TableDistribution, ViewProps};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -46,9 +40,8 @@ use gnitz_wire::{bool_word, PkListRole};
 
 // ---------------------------------------------------------------------------
 // Per-family row-view decoders — the one reading of each family's *full row
-// shape*, run by the precheck arms and again by the register hooks. A caller
-// after one named field reads it through that field's `*_PAY_*` constant
-// instead.
+// shape*, run by the precheck arms and again by the register hooks, each over
+// the row `gnitz_wire::sys_rows` reads back.
 //
 // `read_rel_row` decodes both relation families off a wire `Batch`, which is
 // what every caller holds; the rest are generic over `RowSource`, so a stored
@@ -101,73 +94,82 @@ impl std::fmt::Display for RelRow<'_> {
 /// Decode row `row` of relation family `family` (Table or View). The raw `flags`
 /// word does not escape, so the rejections below hold for every caller.
 pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
-    let id = batch.get_pk(row) as u64;
-    let name = payload_str(batch, row, RELTAB_PAY_NAME);
-    let violated = |noun: &str, e: String| format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}");
-    let pk_list = |noun: &str, pi: usize| {
-        PkColList::unpack(payload_u64(batch, row, pi))
-            .map_err(|rule| violated(noun, rule.for_role(PkListRole::PrimaryKey)))
+    let unreadable = |e: String| {
+        let (noun, id) = (family.row_noun(), batch.get_pk(row) as u64);
+        format!("catalog invariant violated: {noun} (id={id}) {e}")
     };
-    let (pk, kind, detail) = match family {
-        SysFamily::Table => {
-            let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS))
-                .map_err(|e| violated(family.row_noun(), e))?;
-            let kind = if props.stream {
-                RelationKind::Stream
-            } else {
-                RelationKind::BaseTable
-            };
-            let pk = pk_list(kind.noun(), TABTAB_PAY_PK_COL_IDX)?;
-            props
-                .validate(pk.as_slice().len())
-                .map_err(|e| violated(kind.noun(), e))?;
-            let detail = RelDetail::Table {
-                distribution: props.distribution,
-                serial: props.serial,
-            };
-            (pk, kind, detail)
-        }
-        SysFamily::View => {
-            let noun = family.row_noun();
-            let pk = pk_list(noun, VIEWTAB_PAY_PK_COL_IDX)?;
-            let props = ViewProps::from_row(
-                payload_u64(batch, row, VIEWTAB_PAY_CAPACITY),
-                payload_u64(batch, row, VIEWTAB_PAY_DELTA),
-            )
-            .map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
-            let pk_repeats = bool_word(payload_u64(batch, row, VIEWTAB_PAY_PK_REPEATS))
-                .map_err(|e| violated(noun, format!("pk_repeats: {e}")))?;
-            let owner_view_id = payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID);
-            // A chain segment is a relation the planner mints, never one an option
-            // clause may name.
-            if props != ViewProps::Plain && owner_view_id != 0 {
-                return Err(format!(
-                    "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
-                ));
-            }
-            let detail = RelDetail::View { owner_view_id, pk_repeats };
-            (pk, RelationKind::View(props), detail)
-        }
+    match family {
+        SysFamily::Table => rel_from_table_row(TableTabRow::read(batch, row).map_err(unreadable)?),
+        SysFamily::View => rel_from_view_row(ViewTabRow::read(batch, row).map_err(unreadable)?),
         _ => unreachable!("{} is not a relation family", family.name()),
+    }
+}
+
+fn rel_violated(noun: &str, name: &str, id: u64, e: String) -> String {
+    format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}")
+}
+
+fn rel_from_table_row(r: TableTabRow<'_>) -> Result<RelRow<'_>, String> {
+    let (id, name) = (r.table_id, r.name);
+    let props = gnitz_wire::TableProps::from_flags(r.flags)
+        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), name, id, e))?;
+    let kind = if props.stream {
+        RelationKind::Stream
+    } else {
+        RelationKind::BaseTable
     };
+    let pk = PkColList::unpack(r.pk_col_idx)
+        .map_err(|rule| rel_violated(kind.noun(), name, id, rule.for_role(PkListRole::PrimaryKey)))?;
+    props
+        .validate(pk.as_slice().len())
+        .map_err(|e| rel_violated(kind.noun(), name, id, e))?;
     Ok(RelRow {
         id,
-        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
+        schema_id: r.schema_id,
         name,
         pk,
         kind,
-        detail,
+        detail: RelDetail::Table {
+            distribution: props.distribution,
+            serial: props.serial,
+        },
     })
 }
 
-/// Decode IDX_TAB `row`: `(owner_id, col_indices, is_unique)` — the one decoding
-/// of `source_col_idx`, so no consumer holds its undecoded word.
-pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> Result<(u64, PkColList, bool), String> {
+fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
+    let (id, name, noun) = (r.view_id, r.name, SysFamily::View.row_noun());
+    let pk = PkColList::unpack(r.pk_col_idx)
+        .map_err(|rule| rel_violated(noun, name, id, rule.for_role(PkListRole::PrimaryKey)))?;
+    let props =
+        ViewProps::from_row(r.capacity_bytes, r.delta_bytes).map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
+    let pk_repeats = bool_word(r.pk_repeats).map_err(|e| rel_violated(noun, name, id, format!("pk_repeats: {e}")))?;
+    // A chain segment is a relation the planner mints, never one an option
+    // clause may name.
+    if props != ViewProps::Plain && r.owner_view_id != 0 {
+        return Err(format!(
+            "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
+        ));
+    }
+    Ok(RelRow {
+        id,
+        schema_id: r.schema_id,
+        name,
+        pk,
+        kind: RelationKind::View(props),
+        detail: RelDetail::View {
+            owner_view_id: r.owner_view_id,
+            pk_repeats,
+        },
+    })
+}
+
+/// An IDX_TAB row's `(owner_id, col_indices, is_unique)` — the one decoding of
+/// `source_col_idx`, so no consumer holds its undecoded word.
+pub(super) fn index_parts(r: &IdxTabRow<'_>) -> Result<(u64, PkColList, bool), String> {
     Ok((
-        payload_u64(src, row, IDXTAB_PAY_OWNER_ID),
-        PkColList::unpack(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS))
-            .map_err(|rule| rule.for_role(PkListRole::ColumnList))?,
-        bool_word(payload_u64(src, row, IDXTAB_PAY_IS_UNIQUE)).map_err(|e| format!("is_unique: {e}"))?,
+        r.owner_id,
+        PkColList::unpack(r.source_col_idx).map_err(|rule| rule.for_role(PkListRole::ColumnList))?,
+        bool_word(r.is_unique).map_err(|e| format!("is_unique: {e}"))?,
     ))
 }
 
@@ -178,53 +180,16 @@ pub(crate) struct CatalogColumn {
     pub(crate) fk: Option<FkRef>,
 }
 
-/// Decode COL_TAB `row` into the `CatalogColumn` the schema builder consumes. Every
-/// word must fit the width it is stored at and decode to a value
-/// `write_col_tab_row` could emit: an overflowing one would leave a stored row no
-/// client can reproduce, and so no later `-1` can retract.
-pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<CatalogColumn, String> {
-    let word = |field: &str, pi: usize, max: u64| {
-        let w = payload_u64(src, row, pi);
-        if w > max {
-            return Err(format!(
-                "column record carries {field} = {w}, past the {max} its stored width holds"
-            ));
-        }
-        Ok(w)
-    };
-    let flag = |field: &str, pi: usize| word(field, pi, 1).map(|w| w == 1);
-    let code = word("type_code", COLTAB_PAY_TYPE_CODE, u8::MAX as u64)? as u8;
-    let scale = word("scale", COLTAB_PAY_SCALE, u8::MAX as u64)? as u8;
-    let ty = ColType::from_wire(code, scale)
-        .ok_or_else(|| format!("column record carries an invalid column type {code}/{scale}"))?;
-    let fk_col = word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32;
-    let fk = match (payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID), fk_col) {
-        (0, 0) => None,
-        (0, col) => return Err(format!("column record carries FK column {col} with no FK table")),
-        (table_id, col) => Some(FkRef { table_id, col }),
-    };
-    Ok(CatalogColumn {
-        def: ColumnDef {
-            name: payload_string(src, row, COLTAB_PAY_NAME),
-            ty,
-            is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
-            is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
-        },
-        fk,
-    })
-}
-
 impl CatalogColumn {
-    /// Write this column as COL_TAB row `(owner_id, col_idx)` — the inverse of
-    /// [`read_col_tab_row`].
+    /// The column COL_TAB row `r` describes — [`Self::write_col_tab_row`]'s inverse.
+    pub(super) fn from_row(r: &ColTabRow<'_>) -> Result<Self, String> {
+        let (def, fk) = r.column()?;
+        Ok(CatalogColumn { def, fk })
+    }
+
+    /// Write this column as COL_TAB row `(owner_id, col_idx)`.
     pub(crate) fn write_col_tab_row(&self, sink: &mut impl SysRowSink, owner_id: u64, col_idx: usize, weight: i64) {
-        let row = ColTabRow {
-            owner_id,
-            col_idx: col_idx as u64,
-            col: &self.def,
-            fk: self.fk,
-        };
-        row.write(sink, weight);
+        ColTabRow::of(owner_id, col_idx as u64, &self.def, self.fk).write(sink, weight);
     }
 }
 
@@ -342,7 +307,7 @@ pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
             continue;
         }
         let row = sig.pos.or(sig.neg).expect("pk_signatures skips a zero-weight row");
-        let Ok((owner_id, cols, is_unique)) = read_idx_tab_row(batch, row) else {
+        let Ok((owner_id, cols, is_unique)) = IdxTabRow::read(batch, row).and_then(|r| index_parts(&r)) else {
             continue;
         };
         if sig.pos.is_some() {
@@ -471,8 +436,8 @@ impl SysFamily {
                         table_id: family.id(),
                         schema_id: SYSTEM_SCHEMA_ID,
                         name: family.name(),
-                        pk: PkColList::from_slice(family.wire().pk_cols),
-                        props: gnitz_wire::TableProps::default(),
+                        pk_col_idx: PkColList::from_slice(family.wire().pk_cols).pack(),
+                        flags: gnitz_wire::TableProps::default().pack(),
                     };
                     row.write(bb, 1);
                 }
@@ -541,11 +506,13 @@ impl SysFamily {
     /// there is no schema-rename or index-rename surface.
     pub(super) fn pair_change_mask(self) -> Option<u64> {
         match self {
-            SysFamily::Table | SysFamily::View => Some(1 << RELTAB_PAY_NAME),
-            SysFamily::Column => {
-                Some((1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE))
-            }
-            SysFamily::Sequence => Some(1 << gnitz_wire::SEQTAB_PAY_VALUE),
+            SysFamily::Table | SysFamily::View => Some(1 << gnitz_wire::RELTAB_PAY_NAME),
+            SysFamily::Column => Some(
+                (1 << ColTabSlot::name as usize)
+                    | (1 << ColTabSlot::is_hidden as usize)
+                    | (1 << ColTabSlot::is_nullable as usize),
+            ),
+            SysFamily::Sequence => Some(1 << SeqTabSlot::next_val as usize),
             SysFamily::Schema | SysFamily::Index | SysFamily::Circuit => None,
         }
     }

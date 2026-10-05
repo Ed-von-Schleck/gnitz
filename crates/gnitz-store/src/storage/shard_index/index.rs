@@ -13,8 +13,8 @@ use super::{
     fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardBudget, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL,
 };
-use gnitz_expr::RowSource;
 use gnitz_wire::PkBuf;
+use gnitz_wire::RowSource;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ShardWriteOpts;
 use gnitz_zset::repr::StorageError;

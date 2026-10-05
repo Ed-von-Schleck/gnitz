@@ -311,7 +311,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
     let batch = c.drain_chunk(usize::MAX).expect("shard 1 window");
     assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
     let strings: Vec<Vec<u8>> = (0..batch.count)
-        .map(|i| gnitz_expr::payload_bytes(&batch, i, 0).to_vec())
+        .map(|i| gnitz_wire::payload_bytes(&batch, i, 0).to_vec())
         .collect();
     let want: Vec<Vec<u8>> = (10_001..10_004u64)
         .map(|pk| format!("{pk:0>40}").into_bytes())

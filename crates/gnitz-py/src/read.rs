@@ -286,12 +286,8 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
             .call1((format_decimal(gnitz_wire::read_signed_exact(b).into(), ty.scale),))?
             .unbind(),
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
-        TypeCode::String => PyString::from_bytes(py, gnitz_wire::german_string_content(b, &batch.blob))?
-            .into_any()
-            .unbind(),
-        TypeCode::Blob => PyBytes::new(py, gnitz_wire::german_string_content(b, &batch.blob))
-            .into_any()
-            .unbind(),
+        TypeCode::String => PyString::from_bytes(py, loc.content(batch, row))?.into_any().unbind(),
+        TypeCode::Blob => PyBytes::new(py, loc.content(batch, row)).into_any().unbind(),
     })
 }
 

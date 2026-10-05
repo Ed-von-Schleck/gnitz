@@ -2,7 +2,7 @@
 //! checkpoint generation, topology word), user SERIAL ranges and the checkpoint
 //! records.
 
-use gnitz_expr::payload_u64;
+use gnitz_wire::sys_rows::SeqTabRow;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::sys_tables::{SysFamily, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_NEXT_ID, SEQ_ID_TOPOLOGY};
@@ -58,7 +58,8 @@ impl CatalogEngine {
     pub(crate) fn sequence_value(&self, seq_id: u64) -> Option<u64> {
         let row = self.live_sys_row(SysFamily::Sequence, seq_id)?;
         let (src, ri) = row.source();
-        Some(payload_u64(src, ri, gnitz_wire::SEQTAB_PAY_VALUE))
+        let Ok(stored) = SeqTabRow::read(src, ri);
+        Some(stored.next_val)
     }
 
     /// The delta moving `_sequences` row `seq_id` from its live value to `new`;

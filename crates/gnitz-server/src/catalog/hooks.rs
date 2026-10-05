@@ -10,8 +10,9 @@ use super::cache::{encode_record, RelationEntry};
 use super::constraints::FkEdge;
 use super::precheck::build_schema_from_col_defs;
 use super::sys_reads::IdSet;
-use super::sys_tables::{pk_signatures, read_idx_tab_row, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily};
+use super::sys_tables::{index_parts, pk_signatures, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily};
 use super::CatalogEngine;
+use gnitz_wire::sys_rows::IdxTabRow;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
@@ -207,7 +208,9 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as u64;
-            let (owner_id, cols, unique) = read_idx_tab_row(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
+            let (owner_id, cols, unique) = IdxTabRow::read(batch, i)
+                .and_then(|r| index_parts(&r))
+                .map_err(|e| format!("index {idx_id}: {e}"))?;
             if batch.get_weight(i) > 0 {
                 self.registry
                     .add_index(owner_id, IndexClaim::Index { id: idx_id, unique }, cols)?;

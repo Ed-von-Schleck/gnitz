@@ -5,7 +5,6 @@
 
 use super::*;
 use gnitz_wire::sys_rows::{SysRow, TableTabRow};
-use gnitz_wire::{RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};
 use std::path::Path;
 
 /// A rename of `tid` to `new_name` as its two TABLE_TAB rows, `[-1, +1]`: the
@@ -14,11 +13,8 @@ fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch
     let minus = engine.retract_under(SysFamily::Table, &[tid]);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     let row = TableTabRow {
-        table_id: tid,
-        schema_id: payload_u64(&minus, 0, RELTAB_PAY_SCHEMA_ID),
         name: new_name,
-        pk: gnitz_wire::PkColList::unpack(payload_u64(&minus, 0, TABTAB_PAY_PK_COL_IDX)).unwrap(),
-        props: gnitz_wire::TableProps::from_flags(payload_u64(&minus, 0, TABTAB_PAY_FLAGS)).unwrap(),
+        ..TableTabRow::read(&minus, 0).unwrap()
     };
     row.write(&mut bb, 1);
     [minus, bb.finish()]

@@ -4,10 +4,9 @@ use crate::test_support::{
     cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
     RelationFixture, TID,
 };
-use gnitz_expr::{
-    payload_is_null, payload_string, payload_u64, CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink,
-};
+use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::TypeCode;
+use gnitz_wire::{payload_is_null, payload_str, payload_u64};
 use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
@@ -486,7 +485,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
     let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let nv = (!payload_is_null(&*got, row, 2)).then(|| payload_u64(&*got, row, 2) as i64);
-            let s = payload_string(&*got, row, 0);
+            let s = payload_str(&*got, row, 0).unwrap().to_owned();
             (got.get_pk(row) as u64, s, payload_u64(&*got, row, 1), nv)
         })
         .collect();

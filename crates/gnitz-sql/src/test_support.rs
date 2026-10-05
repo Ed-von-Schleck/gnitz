@@ -5,7 +5,8 @@ use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, Schema, ZSetBatch};
-use gnitz_expr::{payload_str, payload_u64, ColumnLocator, SchemaFacts};
+use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_wire::{payload_str, payload_u64};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
 use std::sync::Arc;
@@ -173,7 +174,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
         if loc.is_null(b, r) {
             Cell::Null
         } else if tc.is_german_string() {
-            Cell::Str(payload_str(b, r, pi))
+            Cell::Str(payload_str(b, r, pi).unwrap())
         } else if tc == TypeCode::F64 {
             Cell::F64(f64::from_bits(payload_u64(b, r, pi)))
         } else {

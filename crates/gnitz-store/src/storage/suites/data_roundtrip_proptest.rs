@@ -13,8 +13,8 @@ use gnitz_wire::MAX_PK_COLUMNS;
 
 use crate::storage::{RecoverySource, StoreBudgets, Table};
 use crate::test_support::{arb_schema, row_key, zset_of};
-use gnitz_expr::RowSource;
 use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_wire::RowSource;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 

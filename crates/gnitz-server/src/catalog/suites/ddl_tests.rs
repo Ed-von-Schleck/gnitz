@@ -1,6 +1,7 @@
 use super::*;
 use gnitz_expr::ColumnTable;
-use gnitz_wire::{ColumnDef, COLTAB_PAY_NAME};
+use gnitz_wire::sys_rows::ColTabRow;
+use gnitz_wire::ColumnDef;
 use std::collections::HashMap;
 
 // ── test_bootstrap ───────────────────────────────────────────────────
@@ -60,7 +61,7 @@ fn assert_self_description(engine: &CatalogEngine) {
             let (src, row) = c.current_row_source();
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner, col_idx) = gnitz_wire::unpack_pair_pk(c.current_key_narrow());
-            let entry = (col_idx, payload_string(src, row, COLTAB_PAY_NAME));
+            let entry = (col_idx, ColTabRow::read(src, row).unwrap().name.to_owned());
             described.entry(owner).or_default().push(entry);
         }
         c.advance();

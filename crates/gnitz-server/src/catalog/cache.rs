@@ -2,10 +2,10 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
-use gnitz_expr::{payload_str, payload_u64};
 use gnitz_store::relation::Relation;
 use gnitz_wire::control::Target;
 use gnitz_wire::schema_block::check_same_types;
+use gnitz_wire::{payload_str, payload_u64};
 use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -144,7 +144,7 @@ impl CatalogEngine {
         let key = |i| {
             (
                 payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID),
-                payload_str(batch, i, RELTAB_PAY_NAME),
+                payload_str(batch, i, RELTAB_PAY_NAME).expect("a relation name passed the precheck"),
             )
         };
         let by_schema = &mut self.caches.relation_by_name;

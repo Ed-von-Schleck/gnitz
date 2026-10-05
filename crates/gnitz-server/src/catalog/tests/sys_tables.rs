@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{idx_tab_batch, push_sys_row, push_view_tab_row, table_tab_batch};
+use gnitz_wire::sys_rows::IdxTabSlot;
 use gnitz_zset::repr::BatchBuilder;
 
 /// The pair-keyed family's at-rest PK is `owner_BE ‖ member_BE`, so one owner's
@@ -57,49 +58,21 @@ fn idx_tab_partition_carries_each_rows_column_list() {
     assert_eq!(drops, [(21, &[3][..])]);
 }
 
-/// Every COL_TAB word must fit the width it is stored at and decode to a value
-/// `write_col_tab_row` could emit.
-#[test]
-fn read_col_tab_row_refuses_forged_words() {
-    let read = |forged: Option<(usize, u64)>| {
-        let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-        push_sys_row(&mut bb, SysFamily::Column, [16, 0], 1, |pi| match forged {
-            Some((slot, word)) if slot == pi => word,
-            _ if pi == COLTAB_PAY_TYPE_CODE => gnitz_wire::TypeCode::I64.as_wire() as u64,
-            _ => 0,
-        });
-        read_col_tab_row(&bb.finish(), 0)
-    };
-    read(None).unwrap();
-    for (slot, word, names) in [
-        (COLTAB_PAY_TYPE_CODE, 0x104, "type_code"),
-        (COLTAB_PAY_TYPE_CODE, 99, "invalid column type 99"),
-        (COLTAB_PAY_IS_NULLABLE, 2, "is_nullable"),
-        (COLTAB_PAY_IS_HIDDEN, 2, "is_hidden"),
-        (COLTAB_PAY_FK_COL_IDX, 1 << 32, "fk_col_idx"),
-        (COLTAB_PAY_FK_COL_IDX, 3, "FK column 3 with no FK table"),
-        (COLTAB_PAY_SCALE, 256, "scale"),
-        // A scale on a type that carries none.
-        (COLTAB_PAY_SCALE, 3, "invalid column type"),
-    ] {
-        let err = read(Some((slot, word))).unwrap_err();
-        assert!(err.contains(names), "{names} = {word}: {err}");
-    }
-}
-
 /// An IDX_TAB word that is not a packed list is refused as a column list.
 #[test]
-fn read_idx_tab_row_refuses_an_unpacked_column_list() {
+fn an_index_row_refuses_an_unpacked_column_list() {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     push_sys_row(&mut bb, SysFamily::Index, [53, 0], 1, |pi| {
-        if pi == IDXTAB_PAY_SOURCE_COLS {
+        if pi == IdxTabSlot::source_col_idx as usize {
             PkColList::from_slice(&[1]).pack() & !gnitz_wire::PK_LIST_PACKED_FLAG
         } else {
             0
         }
     });
     assert_eq!(
-        read_idx_tab_row(&bb.finish(), 0).unwrap_err(),
+        IdxTabRow::read(&bb.finish(), 0)
+            .and_then(|r| index_parts(&r))
+            .unwrap_err(),
         "column list word carries no packed-list flag"
     );
 }
@@ -133,8 +106,8 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
             table_id: 40,
             schema_id: PUBLIC_SCHEMA_ID,
             name: "events",
-            pk: PkColList::from_slice(&[0]),
-            props: gnitz_wire::TableProps { stream, ..Default::default() },
+            pk_col_idx: PkColList::from_slice(&[0]).pack(),
+            flags: gnitz_wire::TableProps { stream, ..Default::default() }.pack(),
         };
         row.write(&mut bb, 1);
         bb.finish()
@@ -146,4 +119,110 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
         assert_eq!(rel.pk_repeats(), stream);
         assert!(!rel.serial());
     }
+}
+
+// ── The system-row readers invert the writers ────────────────────────────
+
+fn sys_batch(family: SysFamily, write: impl FnOnce(&mut BatchBuilder)) -> Batch {
+    let mut bb = BatchBuilder::new(family.schema());
+    write(&mut bb);
+    bb.finish()
+}
+
+#[test]
+fn every_system_family_reads_back_the_row_it_wrote() {
+    use gnitz_wire::sys_rows::*;
+
+    let r = SchemaTabRow {
+        schema_id: 7,
+        name: "a_long_schema_name_past_twelve",
+    };
+    assert_eq!(
+        SchemaTabRow::read(&sys_batch(SysFamily::Schema, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    let r = TableTabRow {
+        table_id: 9,
+        schema_id: 2,
+        name: "t",
+        pk_col_idx: 0x31,
+        flags: 5,
+    };
+    assert_eq!(
+        TableTabRow::read(&sys_batch(SysFamily::Table, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    let r = ViewTabRow {
+        view_id: 11,
+        schema_id: 2,
+        name: "v",
+        pk_col_idx: 1,
+        capacity_bytes: 4 << 20,
+        delta_bytes: 32 << 20,
+        owner_view_id: 10,
+        pk_repeats: 1,
+    };
+    assert_eq!(
+        ViewTabRow::read(&sys_batch(SysFamily::View, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    // Both key words distinct.
+    let r = ColTabRow {
+        owner_id: 16,
+        col_idx: 3,
+        name: "c",
+        type_code: 8,
+        is_nullable: 1,
+        fk_table_id: 12,
+        fk_col_idx: 2,
+        is_hidden: 1,
+        scale: 4,
+    };
+    assert_eq!(
+        ColTabRow::read(&sys_batch(SysFamily::Column, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    let r = IdxTabRow {
+        index_id: 70,
+        owner_id: 16,
+        source_col_idx: 0x21,
+        name: "i",
+        is_unique: 1,
+    };
+    assert_eq!(
+        IdxTabRow::read(&sys_batch(SysFamily::Index, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    let r = SeqTabRow { seq_id: 3, next_val: u64::MAX };
+    assert_eq!(
+        SeqTabRow::read(&sys_batch(SysFamily::Sequence, |bb| r.write(bb, 1)), 0),
+        Ok(r)
+    );
+
+    // A circuit past the inline 12 bytes, and an empty one.
+    for circuit in [&b"a circuit cell past twelve bytes"[..], b""] {
+        let r = CircuitRow { view_id: 0x1122, circuit };
+        assert_eq!(
+            CircuitRow::read(&sys_batch(SysFamily::Circuit, |bb| r.write(bb, 1)), 0),
+            Ok(r)
+        );
+    }
+}
+
+#[test]
+fn a_system_name_that_is_not_utf8_does_not_read() {
+    let b = sys_batch(SysFamily::Schema, |bb| {
+        bb.begin_row(1, 1);
+        bb.put_blob(b"\xff");
+        bb.end_row();
+    });
+    assert_eq!(
+        gnitz_wire::sys_rows::SchemaTabRow::read(&b, 0),
+        Err("name is not UTF-8".to_string())
+    );
 }

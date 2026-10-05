@@ -10,7 +10,8 @@ use crate::test_support::{
     filter_prog, is_not_null_op, is_null_op, make_n_col_view, map_prog, passing_ranges, passing_rows, row_values, runs,
     scalar_prog, schema_pk_ints, TestSchema, TestView,
 };
-use crate::{payload_bytes, payload_u64, CmpOp, IntArithOp, LogicalInstr, RowSource, SchemaFacts};
+use crate::{CmpOp, IntArithOp, LogicalInstr, SchemaFacts};
+use gnitz_wire::{payload_bytes, payload_u64, RowSource};
 
 /// A map writes each computed slot from `dst_start` on — zeroing a NULL result's
 /// cell — and moves each copied column's null bit into its slot.

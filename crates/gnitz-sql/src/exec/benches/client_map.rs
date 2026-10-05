@@ -2,7 +2,7 @@ use super::tests::map_of;
 use super::*;
 use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
-use gnitz_expr::payload_u64;
+use gnitz_wire::payload_u64;
 use gnitz_wire::TypeCode;
 
 /// Instructions of a client map's `apply` over a large reply and over one row, which is all

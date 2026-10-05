@@ -23,9 +23,10 @@ use crate::test_support::{
     schema_pk_strings, simd_levels, TestSchema, TestView,
 };
 use crate::{
-    payload_u64, BatchView, CalendarOp, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr,
-    LogicalProgram, MapEval, Reg, RowFilter, ScalarEval, Sink,
+    BatchView, CalendarOp, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram,
+    MapEval, Reg, RowFilter, ScalarEval, Sink,
 };
+use gnitz_wire::payload_u64;
 
 /// The one case a `GNITZ_BENCH_*` variable drives, every case when unset; every
 /// case is still built and checked. A value that names no case fails the bench,

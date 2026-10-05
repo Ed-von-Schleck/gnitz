@@ -10,8 +10,9 @@ use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::{
     BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg,
-    RowFilter, RowSource, ScalarEval, SchemaFacts, Sink,
+    RowFilter, ScalarEval, SchemaFacts, Sink,
 };
+use gnitz_wire::RowSource;
 
 /// A [`BatchView`] and [`MapTarget`] over owned buffers, laid out region-wise
 /// like the physical batch.

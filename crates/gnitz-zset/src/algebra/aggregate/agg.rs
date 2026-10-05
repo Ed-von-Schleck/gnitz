@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::repr::{Batch, MemBatch};
 use crate::schema::{ColumnLocator, TypeCode};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::{for_each_fixed_int, AggFunc, FixedInt, ScalarKind};
 
 use crate::algebra::order_image::{

@@ -22,8 +22,9 @@ use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::{BatchView, RowSource};
+use gnitz_expr::BatchView;
 use gnitz_wire::read_u64_le;
+use gnitz_wire::RowSource;
 use gnitz_wire::NARROW_PK_MAX_BYTES;
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@ use std::cmp::Ordering;
 
 use gnitz_wire::TypeCode;
 
-use crate::{RowSource, SchemaFacts};
+use crate::SchemaFacts;
+use gnitz_wire::RowSource;
 
 /// Where a logical column's value physically lives in a row, resolved once from
 /// the schema.
@@ -79,6 +80,13 @@ impl ColumnLocator {
             }
             ColumnLocator::Payload { slot, size, .. } => mb.get_col_ptr(row, slot as usize, size as usize),
         }
+    }
+
+    /// A STRING/BLOB column's content in `row`, resolved through the source's
+    /// heap.
+    #[inline(always)]
+    pub fn content<'b>(&self, mb: &'b impl RowSource, row: usize) -> &'b [u8] {
+        gnitz_wire::german_string_content(self.bytes(mb, row), mb.blob())
     }
 
     /// Native little-endian value bytes of the column in `row`; a PK column is

@@ -2,7 +2,7 @@ use super::*;
 use crate::project::reply_program;
 use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
-use gnitz_expr::{payload_is_null, payload_string, payload_u64};
+use gnitz_wire::{payload_is_null, payload_str, payload_u64};
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// A spilled body, and one the map computes.
@@ -76,10 +76,13 @@ fn a_computed_string_spills_beside_a_copied_one() {
     )
     .apply(b);
 
-    assert_eq!(payload_string(&out, 0, 0), LONG);
+    assert_eq!(payload_str(&out, 0, 0).unwrap().to_owned(), LONG);
     assert!(payload_is_null(&out, 1, 0));
     assert_eq!(
-        [payload_string(&out, 0, 1), payload_string(&out, 1, 1)],
+        [
+            payload_str(&out, 0, 1).unwrap().to_owned(),
+            payload_str(&out, 1, 1).unwrap().to_owned()
+        ],
         [FALLBACK, FALLBACK]
     );
 }

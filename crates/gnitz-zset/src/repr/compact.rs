@@ -14,8 +14,8 @@ use super::scatter::UnifiedSet;
 use super::shard_reader::MappedShard;
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::RowSource;
 use gnitz_wire::PkBuf;
+use gnitz_wire::RowSource;
 
 /// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
 /// to slot 0 for keys below the first guard.

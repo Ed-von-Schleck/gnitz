@@ -89,7 +89,7 @@ fn write_refuses_an_existing_path_and_leaves_it_intact() {
 #[test]
 fn a_shard_drops_its_runs_dead_heap() {
     use crate::test_support::{make_schema_pk_u64_payload_string, make_string_batch, map_shard, read_strings};
-    use gnitz_expr::RowSource;
+    use gnitz_wire::RowSource;
     let (x, y) = ([b'x'; 20], [b'y'; 20]);
     let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
     let run = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &make_schema_pk_u64_payload_string());
@@ -103,7 +103,7 @@ fn a_shard_drops_its_runs_dead_heap() {
 
 /// The heap of the shard `rows` are written as, and its string region's encoding.
 fn written_strings(rows: &[(u64, i64, &[u8])]) -> (usize, Encoding) {
-    use gnitz_expr::RowSource;
+    use gnitz_wire::RowSource;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
     let batch = make_string_batch(rows);
@@ -113,7 +113,7 @@ fn written_strings(rows: &[(u64, i64, &[u8])]) -> (usize, Encoding) {
     let image = std::fs::read(&path).unwrap();
     let shard = MappedShard::open(path.to_str().unwrap(), batch.schema()).unwrap();
     for (row, &(_, _, want)) in rows.iter().enumerate() {
-        assert_eq!(gnitz_expr::payload_bytes(&shard, row, 0), want, "row {row}");
+        assert_eq!(gnitz_wire::payload_bytes(&shard, row, 0), want, "row {row}");
     }
     (shard.blob().len(), spans_of(&image)[REG_PAYLOAD_START].encoding)
 }
@@ -139,7 +139,7 @@ fn a_repeated_long_string_reaches_the_heap_once() {
 #[test]
 fn a_packed_shard_drops_its_runs_dead_heap() {
     use crate::test_support::map_shard;
-    use gnitz_expr::RowSource;
+    use gnitz_wire::RowSource;
     let (x, y) = ([b'x'; 20], [b'y'; 20]);
     let a = make_string_batch(&[(1, 1, &x), (2, 1, &y), (3, 1, &y), (4, 1, &y)]);
     let run = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &make_schema_pk_u64_payload_string());

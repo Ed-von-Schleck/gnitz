@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use super::batch_pool::{is_tight, tls_pool};
 use super::merge::MemBatch;
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::TypeCode;
 use rustc_hash::FxHashMap;
 

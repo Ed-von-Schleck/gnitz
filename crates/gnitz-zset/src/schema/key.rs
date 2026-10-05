@@ -9,7 +9,7 @@
 use crate::schema::ColumnTable;
 use std::cmp::Ordering;
 
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 
 use gnitz_wire::{PkBuf, PkListRole};

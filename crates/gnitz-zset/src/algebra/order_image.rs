@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::{cmp_col_window, ScalarKind};
 
 /// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
@@ -136,7 +136,7 @@ pub(crate) fn wide_native<'a>(
     scratch: &'a mut [u8; 16],
 ) -> &'a [u8] {
     match kind {
-        WideKind::Bytes => gnitz_wire::german_string_content(loc.bytes(mb, row), mb.blob()),
+        WideKind::Bytes => loc.content(mb, row),
         WideKind::Fixed(_) => loc.native_le_bytes(mb, row, scratch),
     }
 }
@@ -247,11 +247,7 @@ pub(crate) fn append_image(
     match kind {
         ImageKind::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, invert, src, row).to_be_bytes()),
         ImageKind::Wide(WideKind::Fixed(_)) => out.extend_from_slice(&int16_image(loc, invert, src, row)),
-        ImageKind::Wide(WideKind::Bytes) => append_bytes_image(
-            invert,
-            gnitz_wire::german_string_content(loc.bytes(src, row), src.blob()),
-            out,
-        ),
+        ImageKind::Wide(WideKind::Bytes) => append_bytes_image(invert, loc.content(src, row), out),
     }
 }
 

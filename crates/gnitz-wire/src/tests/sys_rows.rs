@@ -1,14 +1,7 @@
 use super::*;
-use crate::{
-    CIRCTAB_PAY_CIRCUIT, CIRCUIT_TAB, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB, IDXTAB_PAY_IS_UNIQUE,
-    IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
-    SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
-    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_PK_REPEATS, VIEW_TAB,
-};
 
-/// A sink that records what a writer emitted, so the tests below read the
-/// row back as a sequence rather than through either side's batch type.
+/// A sink that records what a writer emitted, so the tests below read the row
+/// back as a sequence rather than through either side's batch type.
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Recorder {
     pk: Vec<u128>,
@@ -43,134 +36,114 @@ impl SysRowSink for Recorder {
     }
 }
 
-impl Recorder {
-    /// The recorded payload slots, after what every writer owes its consumer:
-    /// one key value per PK column and one value per payload column of
-    /// `family`, and a closed row. An under-filled row desyncs a columnar
-    /// builder and only surfaces later as an un-attributed length error, so
-    /// every family below reads its slots through here.
-    fn row(&self, family: u64) -> &[Val] {
-        let f = &crate::SYS_FAMILIES[crate::sys_family_index(family).unwrap()];
-        assert_eq!(self.pk.len(), f.pk_cols.len(), "one key value per PK column");
-        assert_eq!(
-            self.vals.len(),
-            f.cols.len() - f.pk_cols.len(),
-            "one value per payload column"
-        );
-        assert!(self.closed, "the writer must close the row");
-        &self.vals
-    }
-}
-
-/// Every `ColTabRow` field landed in its named payload slot. The expectation
-/// is read off the struct, so the check cannot itself transpose a pair.
-fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
+fn written<R: SysRow>(row: &R, weight: i64) -> Recorder {
     let mut rec = Recorder::default();
-    r.write(&mut rec, weight);
-    assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
-    assert_eq!(rec.weight, weight);
-    let v = rec.row(COL_TAB);
-    assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.col.name.clone()));
-    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.col.ty.tc.as_wire() as u64));
-    assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.col.is_nullable as u64));
-    let (fk_table_id, fk_col_idx) = r.fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
-    assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(fk_table_id));
-    assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(fk_col_idx));
-    assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.col.is_hidden as u64));
-    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.col.ty.scale as u64));
+    row.write(&mut rec, weight);
+    rec
 }
 
-/// Each value must land in the payload slot the readers look for it in.
+/// A writer emits its family's key, then one value per payload column in the
+/// column's own type, and closes the row.
 #[test]
-fn values_land_in_their_named_payload_slots() {
-    // Distinct values per u64 field.
-    let score = crate::ColumnDef::typed("score", crate::ColType::decimal(5), true);
-    let witness = ColTabRow {
+fn a_row_writes_one_value_of_its_columns_type_per_payload_column() {
+    fn check<R: SysRow>(row: &R) {
+        let rec = written(row, -1);
+        let f = &crate::SYS_FAMILIES[crate::sys_family_index(R::FAMILY).unwrap()];
+        assert_eq!(rec.pk.len(), f.pk_cols.len(), "{}: one key value per PK column", f.name);
+        assert_eq!(rec.weight, -1);
+        assert!(rec.closed, "{}: the writer closes the row", f.name);
+        let payload = &f.cols[f.pk_cols.len()..];
+        assert_eq!(
+            rec.vals.len(),
+            payload.len(),
+            "{}: one value per payload column",
+            f.name
+        );
+        for (val, col) in rec.vals.iter().zip(payload) {
+            let fits = match val {
+                Val::U64(_) => col.type_code == crate::TypeCode::U64,
+                Val::Str(_) => col.type_code == crate::TypeCode::String,
+                Val::Bytes(_) => col.type_code == crate::TypeCode::Blob,
+            };
+            assert!(fits, "{}.{}: {val:?}", f.name, col.name);
+        }
+    }
+    check(&SchemaTabRow { schema_id: 3, name: "public" });
+    check(&TableTabRow {
+        table_id: 16,
+        schema_id: 3,
+        name: "t",
+        pk_col_idx: 1,
+        flags: 0,
+    });
+    check(&ViewTabRow {
+        view_id: 20,
+        schema_id: 4,
+        name: "v",
+        pk_col_idx: 1,
+        capacity_bytes: 0,
+        delta_bytes: 1 << 20,
+        owner_view_id: 21,
+        pk_repeats: 1,
+    });
+    let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
+    check(&ColTabRow::of(16, 2, &col, None));
+    check(&IdxTabRow {
+        index_id: 100,
         owner_id: 16,
-        col_idx: 2,
-        col: &score,
-        fk: Some(FkRef { table_id: 17, col: 3 }),
-    };
-    assert_col_tab_slots(&witness, -1);
-    assert_col_tab_slots(&ColTabRow { fk: None, ..witness }, 1);
-    // Both booleans flipped, so a transposed pair fails one of the two rows.
+        source_col_idx: 1,
+        name: "idx_t_b",
+        is_unique: 1,
+    });
+    check(&SeqTabRow { seq_id: 1, next_val: 17 });
+    check(&CircuitRow { view_id: 7, circuit: b"\x01" });
+}
+
+/// The first key column is the family's leading id, in key order.
+#[test]
+fn a_column_row_is_keyed_by_its_owner_then_its_index() {
+    let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
+    assert_eq!(written(&ColTabRow::of(16, 2, &col, None), 1).pk, [16, 2]);
+}
+
+/// A column and its foreign key read back out of the row they were laid into,
+/// with both booleans flipped across the cases so a transposed pair fails one.
+#[test]
+fn a_column_reads_back_out_of_its_row() {
+    let score = crate::ColumnDef::typed("score", crate::ColType::decimal(5), true);
     let flipped = crate::ColumnDef {
         is_nullable: false,
         ..score.clone().hidden()
     };
-    assert_col_tab_slots(&ColTabRow { col: &flipped, ..witness }, 1);
-
-    let idx_cols = crate::PkColList::from_slice(&[2, 1]);
-    let mut r = Recorder::default();
-    IdxTabRow {
-        index_id: 100,
-        owner_id: 16,
-        cols: idx_cols,
-        name: "idx_t_b",
-        is_unique: true,
+    for (col, fk) in [
+        (&score, Some(FkRef { table_id: 17, col: 3 })),
+        (&score, None),
+        (&flipped, Some(FkRef { table_id: 17, col: 0 })),
+    ] {
+        let row = ColTabRow::of(16, 2, col, fk);
+        assert_eq!((row.owner_id, row.col_idx), (16, 2));
+        assert_eq!(row.column(), Ok((col.clone(), fk)));
     }
-    .write(&mut r, 1);
-    assert_eq!(r.pk, [100]);
-    let v = r.row(IDX_TAB);
-    assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
-    assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(idx_cols.pack()));
-    assert_eq!(v[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
-    assert_eq!(v[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
+}
 
-    // Distinct values per field, so a transposed pair in the writer body
-    // fails here rather than round-tripping unnoticed.
-    let pk = crate::PkColList::from_slice(&[1, 0]);
-    let props = crate::TableProps { stream: true, ..Default::default() };
-    let mut r = Recorder::default();
-    TableTabRow {
-        table_id: 16,
-        schema_id: 3,
-        name: "t",
-        pk,
-        props,
+/// Every COL_TAB word must fit the width it is stored at and decode to a value
+/// `ColTabRow::of` could emit.
+#[test]
+fn a_column_row_refuses_forged_words() {
+    let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
+    let sound = ColTabRow::of(16, 0, &col, None);
+    assert!(sound.column().is_ok());
+    for (r, expect) in [
+        (ColTabRow { type_code: 0x104, ..sound }, "type_code"),
+        (ColTabRow { type_code: 99, ..sound }, "invalid column type 99"),
+        (ColTabRow { is_nullable: 2, ..sound }, "is_nullable"),
+        (ColTabRow { is_hidden: 2, ..sound }, "is_hidden"),
+        (ColTabRow { fk_col_idx: 1 << 32, ..sound }, "fk_col_idx"),
+        (ColTabRow { fk_col_idx: 3, ..sound }, "FK column 3 with no FK table"),
+        (ColTabRow { scale: 256, ..sound }, "scale"),
+        (ColTabRow { scale: 3, ..sound }, "invalid column type"),
+    ] {
+        let err = r.column().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
     }
-    .write(&mut r, 1);
-    assert_eq!(r.pk, [16]);
-    let v = r.row(TABLE_TAB);
-    assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(3));
-    assert_eq!(v[RELTAB_PAY_NAME], Val::Str("t".into()));
-    assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(pk.pack()));
-    assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(props.pack()));
-
-    let mut r = Recorder::default();
-    ViewTabRow {
-        view_id: 20,
-        schema_id: 4,
-        name: "v",
-        pk,
-        props: crate::ViewProps::Fed {
-            delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
-        },
-        owner_view_id: 21,
-        pk_repeats: true,
-    }
-    .write(&mut r, 1);
-    assert_eq!(r.pk, [20]);
-    let v = r.row(VIEW_TAB);
-    assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
-    assert_eq!(v[RELTAB_PAY_NAME], Val::Str("v".into()));
-    assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(pk.pack()));
-    assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(0));
-    assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
-    assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
-    assert_eq!(v[VIEWTAB_PAY_PK_REPEATS], Val::U64(1));
-
-    let mut r = Recorder::default();
-    SchemaTabRow { schema_id: 3, name: "public" }.write(&mut r, 1);
-    assert_eq!(r.pk, [3]);
-    assert_eq!(r.row(SCHEMA_TAB)[SCHEMATAB_PAY_NAME], Val::Str("public".into()));
-
-    // The circuit family: one row per view, its whole circuit in one cell.
-    let mut circuit = crate::Circuit::default();
-    let scan = circuit.input_delta(31, crate::ReadBound::None);
-    circuit.sink(scan);
-    let mut r = Recorder::default();
-    CircuitRow { view_id: 7, circuit: &circuit }.write(&mut r, 1);
-    assert_eq!((r.pk.as_slice(), r.weight), (&[7][..], 1));
-    assert_eq!(r.row(CIRCUIT_TAB)[CIRCTAB_PAY_CIRCUIT], Val::Bytes(circuit.encode()));
 }

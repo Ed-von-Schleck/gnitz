@@ -17,9 +17,9 @@ use crate::algebra::{
 use crate::algebra::{Accumulator, ExtremeSpec};
 use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
-use gnitz_expr::payload_bytes;
-use gnitz_expr::RowSource;
+use gnitz_wire::payload_bytes;
 use gnitz_wire::PkBuf;
+use gnitz_wire::RowSource;
 
 // ---------------------------------------------------------------------------
 // Key layout

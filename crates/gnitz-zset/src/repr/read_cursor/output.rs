@@ -8,7 +8,7 @@ use crate::repr::batch::Batch;
 use crate::repr::merge::ColumnarSource;
 use crate::repr::scatter::UnifiedSet;
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 
 impl ReadCursor {
     /// Copy the current row into `batch` at `weight`, clearing its consolidated claim.

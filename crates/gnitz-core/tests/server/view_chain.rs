@@ -9,7 +9,8 @@
 
 use super::*;
 use gnitz_core::{PlannedView, ViewBundle};
-use gnitz_wire::{Circuit, ViewProps, VIEWTAB_PAY_OWNER_VIEW_ID, VIEW_TAB};
+use gnitz_wire::sys_rows::ViewTabSlot;
+use gnitz_wire::{Circuit, ViewProps, VIEW_TAB};
 
 /// Base table `t(pk BIGINT PK, v BIGINT)` in a fresh schema, holding pks 1..=3:
 /// `(schema name, tid, schema)`.
@@ -53,7 +54,7 @@ fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
         .scan_spec(VIEW_TAB, &ReadSpec::all_rows(ReadBound::None), view_tab)
         .unwrap()
         .batch;
-    let owners = &b.payload[VIEWTAB_PAY_OWNER_VIEW_ID].bytes;
+    let owners = &b.payload[ViewTabSlot::owner_view_id as usize].bytes;
     let mut out: Vec<_> = (0..b.len())
         .filter(|&i| b.weights[i] > 0)
         .map(|i| (b.pks.get(i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))

@@ -1,6 +1,7 @@
 //! The region convention: the order a batch's column buffers are listed in, the
-//! list type that holds them, and the null word one of those regions carries.
-//! `wal` frames a list into a block; nothing here knows what a block looks like.
+//! list type that holds them, the null word one of those regions carries, and
+//! the per-row reader over them. `wal` frames a list into a block; nothing here
+//! knows what a block looks like.
 
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -118,6 +119,88 @@ pub fn null_word_at(word: u64, at: usize) -> u64 {
     } else {
         0
     }
+}
+
+/// Read one row's columns. The **one** per-row access shape in the system: the
+/// resolved-addressing types (`ColumnLocator`) bind to it, the engine's
+/// `ColumnarSource` extends it with the Z-set weight, and `BatchView` extends
+/// it with the region accessors the vectorized kernels need. A source that can
+/// address cells but has no contiguous `rows * col_size` region to hand out — a
+/// shard mapping whose column is a scalar constant — implements this and
+/// nothing more. Every source is a whole multi-row batch, which is why
+/// [`Self::row_count`] sits here and not one level up.
+///
+/// Static dispatch only wherever a *cell* is read per row: a `&dyn RowSource`
+/// there would put an indirect call on every `ColumnLocator` read.
+/// A whole-batch consumer that resolves the regions once per morsel is not one
+/// of those, and the evaluator's kernels take `&dyn BatchView`.
+/// (Convention: the trait is dyn-compatible, nothing enforces this.)
+///
+/// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
+/// buffers it materializes and can only lend them for `&self`.
+pub trait RowSource {
+    /// The row's packed PK-region bytes (`pk_stride` wide), **order-preserving
+    /// at-rest (OPK)** at every source, a client `ZSetBatch` included. That is
+    /// what the OPK-inverting readers on `ColumnLocator` assume.
+    fn get_pk_bytes(&self, row: usize) -> &[u8];
+    /// The row's null-bitmap word (bit N = payload slot N is NULL).
+    fn get_null_word(&self, row: usize) -> u64;
+    /// `col_size` bytes of payload column `payload_col` (native LE) in `row`.
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
+    /// The variable-length string/blob heap the German-string cells point into.
+    fn blob(&self) -> &[u8];
+    /// Rows in this source. The bound every whole-source walk reads — the
+    /// evaluator's `RowFilter::ranges`, the engine's N-way merge
+    /// — so that a caller can never drive a view past its own end with a count it
+    /// carried alongside. `#[inline(always)]` on every implementor: the per-row
+    /// and per-morsel callers live in gnitz-zset, at opt-level 0.
+    fn row_count(&self) -> usize;
+}
+
+/// A borrowed source reads as the source it borrows.
+impl<T: RowSource + ?Sized> RowSource for &T {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        (**self).get_pk_bytes(row)
+    }
+    #[inline(always)]
+    fn get_null_word(&self, row: usize) -> u64 {
+        (**self).get_null_word(row)
+    }
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        (**self).get_col_ptr(row, payload_col, col_size)
+    }
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        (**self).blob()
+    }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        (**self).row_count()
+    }
+}
+
+/// One row's fixed 8-byte payload slot `pi`, little-endian.
+pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
+    crate::read_u64_le(src.get_col_ptr(row, pi, 8), 0)
+}
+
+/// One row's STRING or BLOB payload slot `pi`, resolved through the source's
+/// heap.
+#[inline(always)]
+pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
+    crate::german_string_content(src.get_col_ptr(row, pi, 16), src.blob())
+}
+
+/// [`payload_bytes`] as a `&str`; an error when the cell is not UTF-8.
+pub fn payload_str<S: RowSource>(src: &S, row: usize, pi: usize) -> Result<&str, std::str::Utf8Error> {
+    std::str::from_utf8(payload_bytes(src, row, pi))
+}
+
+/// Whether one row's payload slot `pi` is NULL.
+pub fn payload_is_null<S: RowSource>(src: &S, row: usize, pi: usize) -> bool {
+    null_word_get(src.get_null_word(row), pi)
 }
 
 #[cfg(test)]

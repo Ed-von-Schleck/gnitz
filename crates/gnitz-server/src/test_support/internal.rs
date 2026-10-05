@@ -116,7 +116,8 @@ pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColu
 /// commits with.
 pub fn circuit_batch(vid: u64, circuit: &Circuit) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
-    CircuitRow { view_id: vid, circuit }.write(&mut bb, 1);
+    let circuit = circuit.encode();
+    CircuitRow { view_id: vid, circuit: &circuit }.write(&mut bb, 1);
     bb.finish()
 }
 
@@ -314,8 +315,8 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
             table_id,
             schema_id: PUBLIC_SCHEMA_ID,
             name,
-            pk: gnitz_wire::PkColList::from_slice(&[0]),
-            props: gnitz_wire::TableProps::default(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+            flags: gnitz_wire::TableProps::default().pack(),
         };
         row.write(&mut bb, weight);
     }
@@ -344,9 +345,9 @@ pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_
     IdxTabRow {
         index_id,
         owner_id,
-        cols: gnitz_wire::PkColList::from_slice(cols),
+        source_col_idx: gnitz_wire::PkColList::from_slice(cols).pack(),
         name,
-        is_unique,
+        is_unique: is_unique as u64,
     }
     .write(&mut bb, weight);
     bb.finish()

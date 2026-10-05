@@ -146,7 +146,7 @@ fn hydrate_seek_bench() {
         let (rows, _) = cell(label, engine, view, &spec);
         assert_eq!(rows.len(), 1, "one row at the sought key");
         assert_eq!(
-            gnitz_expr::payload_u64(&*rows, 0, 0),
+            gnitz_wire::payload_u64(&*rows, 0, 0),
             payload(key)[0],
             "the payload the view last ticked over"
         );

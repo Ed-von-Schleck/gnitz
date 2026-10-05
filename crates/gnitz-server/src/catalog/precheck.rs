@@ -1,18 +1,19 @@
 //! Catalog precheck — the master's trust boundary against client-pushed
 //! system-table deltas.
 
-use gnitz_expr::{payload_str, RowSource, SchemaFacts};
+use gnitz_expr::SchemaFacts;
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, IDXTAB_PAY_NAME, MAX_COLUMNS, SCHEMATAB_PAY_NAME};
+use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow};
+use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, MAX_COLUMNS};
+use gnitz_wire::{payload_bytes, RowSource};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{KeySpec, SchemaColumn, SchemaDescriptor};
 use rustc_hash::FxHashSet;
 
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    family_pk_partition, pk_signatures, read_col_tab_row, read_idx_tab_row, read_rel_row, CatalogColumn, PkSignature,
-    RelDetail, SysFamily,
+    family_pk_partition, index_parts, pk_signatures, read_rel_row, CatalogColumn, PkSignature, RelDetail, SysFamily,
 };
 use super::CatalogEngine;
 
@@ -382,8 +383,9 @@ impl CatalogEngine {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
-            let old = sig.neg.map(|r| read_col_tab_row(batch, r)).transpose()?;
-            let new = sig.pos.map(|r| read_col_tab_row(batch, r)).transpose()?;
+            let decode = |r| ColTabRow::read(batch, r).and_then(|r| CatalogColumn::from_row(&r));
+            let old = sig.neg.map(decode).transpose()?;
+            let new = sig.pos.map(decode).transpose()?;
 
             let Some((is_base, owner_schema)) = self
                 .registry
@@ -626,7 +628,7 @@ impl CatalogEngine {
         // unreachable.
         let mut claimed: FxHashSet<&str> = FxHashSet::default();
         for i in batch.live_rows() {
-            let name = payload_str(batch, i, SCHEMATAB_PAY_NAME);
+            let name = SchemaTabRow::read(batch, i).map_err(|e| format!("Schema: {e}"))?.name;
             // The full identifier rule, leading-`_` included. Nothing synthesizes
             // a schema name, so the reserved `_` prefix applies with no carve-out.
             validate_user_identifier(name)?;
@@ -783,16 +785,17 @@ impl CatalogEngine {
         // indexes are scanned, and a `+1` on one already failed the net bound, so
         // any hit is a different index.
         let live = self.sys_relation(SysFamily::Index).full_scan();
-        let mut taken: FxHashSet<&str> = (0..live.len())
-            .map(|i| payload_str(&*live, i, IDXTAB_PAY_NAME))
+        let mut taken: FxHashSet<&[u8]> = (0..live.len())
+            .map(|i| payload_bytes(&*live, i, IdxTabSlot::name as usize))
             .collect();
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
-            let (owner_id, cols, unique) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
-            let index_name = payload_str(batch, i, IDXTAB_PAY_NAME);
+            let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
+            let (owner_id, cols, unique) = index_parts(&r).map_err(|e| format!("Index: {e}"))?;
+            let index_name = r.name;
             reject_unstorable_name(index_name, noun)?;
             self.validate_index_create(owner_id, cols.as_slice(), unique)?;
-            if !taken.insert(index_name) {
+            if !taken.insert(index_name.as_bytes()) {
                 return Err(format!("Index already exists: {index_name}"));
             }
         }
@@ -800,7 +803,9 @@ impl CatalogEngine {
         for i in batch.retracted_rows() {
             // The row, not `net_dead`: this needs `cols`, which a list of ids
             // does not carry.
-            let (owner_id, cols, _) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
+            let (owner_id, cols, _) = IdxTabRow::read(batch, i)
+                .and_then(|r| index_parts(&r))
+                .map_err(|e| format!("Index: {e}"))?;
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.

@@ -136,9 +136,8 @@ impl DagEngine {
     ) -> Result<Vec<u64>, String> {
         let mut reached = FxHashSet::default();
         for i in circuits.live_rows() {
-            let cell = gnitz_expr::payload_bytes(circuits, i, gnitz_wire::CIRCTAB_PAY_CIRCUIT);
-            let circuit =
-                gnitz_wire::Circuit::decode(cell).map_err(|e| format!("view {}: {e}", circuits.get_pk(i) as u64))?;
+            let Ok(row) = gnitz_wire::sys_rows::CircuitRow::read(circuits, i);
+            let circuit = gnitz_wire::Circuit::decode(row.circuit).map_err(|e| format!("view {}: {e}", row.view_id))?;
             reached.extend(circuit.sources());
         }
         let through_views = self.source_closure(reached.iter().copied());

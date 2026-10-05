@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use gnitz_expr::RowSource;
+use gnitz_wire::RowSource;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
@@ -432,8 +432,8 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64,
 }
 
 /// Payload column 0 of row `row`, an 8-byte integer.
-pub fn payload0_i64<S: gnitz_expr::RowSource>(src: &S, row: usize) -> i64 {
-    gnitz_expr::payload_u64(src, row, 0) as i64
+pub fn payload0_i64<S: gnitz_wire::RowSource>(src: &S, row: usize) -> i64 {
+    gnitz_wire::payload_u64(src, row, 0) as i64
 }
 
 /// The Z-set sum of `inputs`, net-zero elements dropped.

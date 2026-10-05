@@ -18,8 +18,8 @@ use super::shard_filter;
 use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::RowSource;
 use gnitz_wire::read_u64_le;
+use gnitz_wire::RowSource;
 
 use StorageError::Corrupt;
 

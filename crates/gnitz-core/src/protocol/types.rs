@@ -240,9 +240,10 @@ impl PkColumn {
     }
 
     /// Borrow row `i`'s `stride` OPK bytes.
+    #[inline(always)]
     pub fn get_bytes(&self, i: usize) -> &[u8] {
-        let s = self.stride();
-        &self.buf[i * s..(i + 1) * s]
+        let (s, buf): (usize, &[u8]) = (self.stride as usize, &self.buf);
+        &buf[i * s..i * s + s]
     }
 
     /// Room for `n` more rows.
@@ -875,11 +876,10 @@ impl<'a> BatchAppender<'a> {
 /// Every method is `#[inline(always)]`; see [`gnitz_expr::BatchView`] for why
 /// the plain hint is not enough. The bodies slice `&[u8]`, not `Vec<u8>`, whose
 /// indexing stays an out-of-line call at opt-level 0.
-impl gnitz_expr::RowSource for ZSetBatch {
+impl gnitz_wire::RowSource for ZSetBatch {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        let (s, buf): (usize, &[u8]) = (self.pks.stride as usize, &self.pks.buf);
-        &buf[row * s..row * s + s]
+        self.pks.get_bytes(row)
     }
 
     #[inline(always)]
