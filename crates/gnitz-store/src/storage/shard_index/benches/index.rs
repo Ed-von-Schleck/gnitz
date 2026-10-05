@@ -99,8 +99,10 @@ fn shard_probe_bench() {
 }
 
 /// What the FLSM compactions read and write per spilled byte, by trigger, and
-/// the largest single input of each in units of `R`; beside them the
-/// instructions a spilled row costs to write and to keep up.
+/// the largest single input of each in units of `R`; beside them the user-space
+/// instructions a spilled row costs to write and to keep up, the costliest
+/// single upkeep, and the kernel's share as requests: the shard files written,
+/// and the shards a barrier syncs at each cadence in `BARRIERS`.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn compaction_amplification_bench() {
@@ -110,6 +112,8 @@ fn compaction_amplification_bench() {
     const KEYSPACE: u64 = 200_000_000;
     const HOT: u64 = 8 * RUN_ROWS;
     const UPDATED: u64 = 1_000_000;
+    /// Spills between two barriers.
+    const BARRIERS: [u64; 3] = [1, 8, 64];
     type Rows = Vec<(u64, i64, i64)>;
     // Fresh ascending keys: an INSERT stream, and every delta store.
     let ascending = |run: u64, _: &mut Rng| -> Rows {
@@ -144,21 +148,24 @@ fn compaction_amplification_bench() {
             .collect()
     };
     // Label, the rows of a run, the budget, whether the store ends within it,
-    // the runs spilled, the triggers that must run.
+    // whether its shards carry a PK filter, the runs spilled, the triggers that
+    // must run.
     type Arm = (
         &'static str,
         fn(u64, &mut Rng) -> Rows,
         ShardBudget,
         bool,
+        bool,
         u64,
         &'static [CompactionKind],
     );
-    let arms: [Arm; 9] = [
+    let arms: [Arm; 10] = [
         (
             "scattered, under the L1 floor",
             scattered,
             ShardBudget::Unbounded,
             true,
+            false,
             60,
             &[L0Fold, GuardSplit],
         ),
@@ -167,14 +174,34 @@ fn compaction_amplification_bench() {
             updates,
             ShardBudget::Unbounded,
             true,
+            false,
             400,
             &[L0Fold, GuardSplit, TierFold],
         ),
-        ("ascending", ascending, ShardBudget::Unbounded, true, 400, &[L0Fold]),
+        (
+            "ascending",
+            ascending,
+            ShardBudget::Unbounded,
+            true,
+            false,
+            400,
+            &[L0Fold],
+        ),
         (
             "scattered",
             scattered,
             ShardBudget::Unbounded,
+            true,
+            false,
+            400,
+            &[L0Fold, GuardSplit, TierFold, Vertical],
+        ),
+        // A store something probes by PK.
+        (
+            "scattered, PK filters",
+            scattered,
+            ShardBudget::Unbounded,
+            true,
             true,
             400,
             &[L0Fold, GuardSplit, TierFold, Vertical],
@@ -184,6 +211,7 @@ fn compaction_amplification_bench() {
             scattered,
             ShardBudget::Unbounded,
             true,
+            false,
             1600,
             &[L0Fold, GuardSplit, TierFold, Vertical],
         ),
@@ -192,6 +220,7 @@ fn compaction_amplification_bench() {
             churn,
             ShardBudget::Unbounded,
             true,
+            false,
             400,
             &[L0Fold, GuardSplit, GuardMerge],
         ),
@@ -200,6 +229,7 @@ fn compaction_amplification_bench() {
             scattered,
             ShardBudget::Dehydrate(40 << 20),
             true,
+            false,
             400,
             &[BandCut, Dehydrate],
         ),
@@ -209,6 +239,7 @@ fn compaction_amplification_bench() {
             scattered,
             ShardBudget::Dehydrate(16 << 20),
             false,
+            false,
             400,
             &[BandCut, Dehydrate],
         ),
@@ -217,6 +248,7 @@ fn compaction_amplification_bench() {
             ascending,
             ShardBudget::Drop(16 << 20),
             true,
+            false,
             400,
             &[L0Fold],
         ),
@@ -225,20 +257,34 @@ fn compaction_amplification_bench() {
     let schema = make_schema_u64_i64();
     let tmp = tempfile::tempdir().unwrap();
     let counter = Counter::instructions();
-    for (label, rows, budget, fits, runs, reaches) in arms {
+    for (label, rows, budget, fits, filters, runs, reaches) in arms {
         let dir = tmp.path().join(label);
         std::fs::create_dir(&dir).unwrap();
-        let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, budget, true, &ShardSet::default()).unwrap();
+        let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, budget, !filters, &ShardSet::default()).unwrap();
         let mut rng = Rng::new(0x5EED_1234);
         let (mut spilled, mut spilled_rows) = (0, 0);
-        let (mut spill, mut upkeep) = (0, 0);
+        let (mut spill, mut upkeep, mut costliest) = (0, 0, 0);
+        // A cadence, the seq its last barrier published through and the bytes
+        // spilled by then, the shards and the bytes its barriers synced.
+        let mut barriers = BARRIERS.map(|every| (every, 0, 0, 0usize, 0u64));
         cstats::reset();
-        for run in 0..runs {
-            let run = make_batch_raw(&schema, &rows(run, &mut rng)).into_consolidated();
+        for n in 0..runs {
+            let run = make_batch_raw(&schema, &rows(n, &mut rng)).into_consolidated();
             spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
             spilled += idx.levels[L0].entries().last().unwrap().shard.file_len();
             spilled_rows += run.len();
-            upkeep += counter.measure(|| idx.maintain().unwrap()).1;
+            let ((), kept_up) = counter.measure(|| idx.maintain().unwrap());
+            upkeep += kept_up;
+            costliest = costliest.max(kept_up);
+            for (every, through, covered, shards, bytes) in &mut barriers {
+                if (n + 1) % *every == 0 {
+                    for e in idx.all_entries().filter(|e| e.seq > *through) {
+                        *shards += 1;
+                        *bytes += e.shard.file_len();
+                    }
+                    (*through, *covered) = (idx.shard_seq, spilled);
+                }
+            }
         }
 
         let phases = cstats::dump();
@@ -283,10 +329,33 @@ fn compaction_amplification_bench() {
             .values()
             .fold((0, 0), |(i, o), p| (i + p.in_bytes, o + p.out_bytes));
         println!(
-            "  every trigger: read {:6.2} and wrote {:6.2} per spilled byte",
-            read as f64 / spilled as f64,
-            wrote as f64 / spilled as f64
+            "  the costliest upkeep: {:.1} M instr, {:.1} times the mean",
+            costliest as f64 / 1e6,
+            costliest as f64 * runs as f64 / upkeep as f64
         );
+        println!(
+            "  every trigger: read {:6.2} and wrote {:6.2} per spilled byte, {:.1} instr per byte read",
+            read as f64 / spilled as f64,
+            wrote as f64 / spilled as f64,
+            upkeep as f64 / read as f64
+        );
+        let written = idx.shard_seq;
+        println!(
+            "  {:.2} shards written per spill, {} B each, {} of {written} registered",
+            written as f64 / runs as f64,
+            (spilled + wrote) / written,
+            idx.shard_count()
+        );
+        for (every, _, covered, shards, bytes) in barriers {
+            let passed = runs / every;
+            if passed > 0 {
+                println!(
+                    "  a barrier every {every:>2} spills syncs {:5.1} shards, {:.2} bytes per spilled byte",
+                    shards as f64 / passed as f64,
+                    bytes as f64 / covered as f64
+                );
+            }
+        }
         for (kind, p) in &phases {
             assert!(p.max_in <= 2 * r, "{label}: a {kind:?} read {} B, past 2 R", p.max_in);
             println!(
