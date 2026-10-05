@@ -1,4 +1,5 @@
 use super::*;
+use crate::repr::merge::run_merge;
 use crate::test_support::map_shard;
 use gnitz_wire::PkBuf;
 use std::rc::Rc;

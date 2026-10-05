@@ -321,7 +321,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 // PosCursor: one source's position within the N-way merge
 // ---------------------------------------------------------------------------
 
-/// One source's merge position: `position` walks `[0, count)`. Sources are
+/// One source's merge position: `position` walks up to `count`. Sources are
 /// ghost-free by construction (a shard is *written* consolidated, a RAM-tier run
 /// folded on the way in) and [`drive`]'s fold drops a stray ghost anyway, so
 /// advancing is a bare `position + 1`.
@@ -338,11 +338,17 @@ impl PosCursor {
     /// A cursor over `[0, count)`, from row 0.
     #[inline]
     pub(crate) fn new(count: usize) -> Self {
+        Self::over(0..count)
+    }
+
+    /// A cursor over `rows`, from its first.
+    #[inline]
+    pub(crate) fn over(rows: Range<usize>) -> Self {
         debug_assert!(
-            count < u32::MAX as usize,
+            rows.end < u32::MAX as usize,
             "merge source exceeds the heap node's u32 row"
         );
-        PosCursor { position: 0, count }
+        PosCursor { position: rows.start, count: rows.end }
     }
 
     #[inline]
@@ -375,24 +381,35 @@ impl PosCursor {
 ///
 /// Selects the payload order once via `with_payload_cmp!`, seats one
 /// [`PosCursor`] per source, and drives [`drive`]; the PK axis is settled by
-/// each row's key under a [`MergeOrder`], and past it by [`merge_less`]. Each source's walk
-/// bound is its own [`RowSource::row_count`].
+/// each row's key under a [`MergeOrder`], and past it by [`merge_less`]. Source
+/// `i` is walked over the `i`-th of `windows`.
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
 /// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
 /// flush, a guard-routed shard append for compaction).
-pub(crate) fn run_merge<S: ColumnarSource>(
+pub(crate) fn run_merge_in<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
+    windows: impl IntoIterator<Item = Range<usize>>,
     emit: impl FnMut(usize, usize, i64),
 ) {
     if sources.is_empty() {
         return;
     }
-    let mut cursors: Vec<PosCursor> = sources.iter().map(|s| PosCursor::new(s.row_count())).collect();
+    let mut cursors: Vec<PosCursor> = windows.into_iter().map(PosCursor::over).collect();
+    debug_assert_eq!(cursors.len(), sources.len(), "run_merge_in: one window per source");
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop.
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
+}
+
+/// [`run_merge_in`] over every row of every source.
+pub(crate) fn run_merge<S: ColumnarSource>(
+    sources: &[S],
+    schema: &SchemaDescriptor,
+    emit: impl FnMut(usize, usize, i64),
+) {
+    run_merge_in(sources, schema, sources.iter().map(|s| 0..s.row_count()), emit)
 }
 
 /// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
