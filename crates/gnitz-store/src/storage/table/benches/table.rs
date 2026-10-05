@@ -70,6 +70,59 @@ fn table_ingest_bench() {
     }
 }
 
+/// Updates of a store whose net rows fill `fill` of its RAM tier, in cycles and
+/// instructions per update, and the shards it ends with. A tier folded to under
+/// its ceiling stays in RAM, and the fuller it is the sooner it is over the
+/// ceiling again; each crossing folds the whole tier, in bulk copies that retire
+/// next to no instructions.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn ram_tier_ceiling_bench() {
+    const TIER: usize = 16 << 20;
+    const UPDATES: u64 = 1_500_000;
+    const PER_TICK: u64 = 16;
+    let schema = make_schema_u64_i64();
+    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let dir = tempfile::tempdir().unwrap();
+    for fill in [50u64, 85, 92, 96, 99] {
+        let hot = (TIER as u64 / 32) * fill / 100;
+        let rederive = RecoverySource::Rederive { resume_at: None };
+        let mut table = new_table(dir.path().join(fill.to_string()), schema, rederive, TIER);
+        let load: Vec<_> = (0..hot).map(|k| (k, 1, 0)).collect();
+        for chunk in load.chunks(1000) {
+            table.ingest_owned_batch(make_batch_raw(&schema, chunk)).unwrap();
+        }
+        // Each update retracts the row its key holds and inserts the next.
+        let mut version = vec![0i64; hot as usize];
+        let ticks: Vec<Batch> = (0..UPDATES / PER_TICK)
+            .map(|t| {
+                let mut rows = Vec::new();
+                for u in t * PER_TICK..(t + 1) * PER_TICK {
+                    let key = (u.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) % hot;
+                    let v = &mut version[key as usize];
+                    rows.extend([(key, -1, *v), (key, 1, *v + 1)]);
+                    *v += 1;
+                }
+                make_batch_raw(&schema, &rows)
+            })
+            .collect();
+        let (((), instr), cyc) = cycles.measure(|| {
+            instructions.measure(|| {
+                for tick in ticks {
+                    table.ingest_owned_batch(tick).unwrap();
+                }
+            })
+        });
+        assert_eq!(table.full_scan().len() as u64, hot, "{fill}%: the held rows");
+        println!(
+            "ram_tier_ceiling_bench {fill:>2}% full {:>7.0} cycles/update {:>7.0} instr/update, {} shards",
+            cyc as f64 / UPDATES as f64,
+            instr as f64 / UPDATES as f64,
+            table.all_shard_arcs().len()
+        );
+    }
+}
+
 /// Instructions per `Table::gather` of 1, 64 and 4096 keys spread over the key
 /// span of a table whose rows sit in shards and in the memtable, the open
 /// counted.

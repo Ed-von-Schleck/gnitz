@@ -378,6 +378,33 @@ fn pk_filter_follows_whether_the_store_is_probed() {
     }
 }
 
+/// A RAM tier past its ceiling folds, and stays in RAM when the fold leaves it
+/// room; folded to within a sixteenth of the ceiling it spills, since every
+/// later crossing would fold it whole again.
+#[test]
+fn a_tier_folded_to_just_under_its_ceiling_spills() {
+    const CEILING_ROWS: u64 = 1 << 15;
+    let dir = tempfile::tempdir().unwrap();
+    for (held, spills) in [(CEILING_ROWS * 7 / 8, false), (CEILING_ROWS * 31 / 32, true)] {
+        let mut t = new_table(
+            dir.path().join(held.to_string()),
+            make_schema_u64_i64(),
+            RecoverySource::Rederive { resume_at: None },
+            CEILING_ROWS as usize * 32,
+        );
+        t.ingest_owned_batch(rows(&(0..held).map(|k| (k, 1, 0)).collect::<Vec<_>>()))
+            .unwrap();
+        t.fold_to_ram().unwrap();
+        assert_eq!(t.all_shard_arcs().len(), 0, "{held}: under the ceiling");
+        // Updates of a quarter of the ceiling's rows: each a retraction and an insert.
+        let updates = (0..CEILING_ROWS / 4).flat_map(|k| [(k, -1, 0), (k, 1, 1)]);
+        t.ingest_owned_batch(rows(&updates.collect::<Vec<_>>())).unwrap();
+        t.fold_to_ram().unwrap();
+        assert_eq!(!t.all_shard_arcs().is_empty(), spills, "{held} rows held");
+        assert_eq!(t.full_scan().len() as u64, held);
+    }
+}
+
 /// A store held as a read replica of another process's directory never writes
 /// into it, however far past its RAM-tier ceiling it grows.
 #[test]

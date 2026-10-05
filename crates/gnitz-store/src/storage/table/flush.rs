@@ -81,15 +81,17 @@ impl Table {
     }
 
     /// Fold the memtable into the RAM tier, spilling the tier to an unsynced
-    /// shard only if its net state is still over the ceiling.
+    /// shard unless its net state leaves it room.
     pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_ram_tier();
         if self.held_in_ram || !self.ram_tier.is_full() {
             return Ok(());
         }
-        // The fold's cancellation can bring the tier back under its ceiling.
+        // The fold's cancellation can bring the tier back under its ceiling. A
+        // tier it leaves crowded is over the ceiling again within the little
+        // room it has left, and every such crossing folds the whole tier.
         self.ram_tier.fold(&self.shard_index.schema);
-        if !self.ram_tier.is_full() {
+        if !self.ram_tier.is_crowded() {
             return Ok(());
         }
         self.spill_ram_tier()

@@ -13,8 +13,9 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// cursor merges and a PK probe walks.
 const FOLD_THRESHOLD: usize = 16;
 
-/// Rough bytes per row, used to size the bloom from a byte budget.
-const EST_BYTES_PER_ROW: usize = 40;
+/// The share of its budget a set must have free not to be
+/// [crowded](RunSet::is_crowded): one part in this many.
+const ROOM_SHARE: usize = 16;
 
 fn pk_min(run: &Batch) -> &[u8] {
     run.get_pk_bytes(0)
@@ -101,6 +102,11 @@ impl RunSet {
     /// The set has outgrown its heap budget and must be drained by its owner.
     pub(super) fn is_full(&self) -> bool {
         self.bytes > self.budget
+    }
+
+    /// The set has less than a [`ROOM_SHARE`]th of its budget free.
+    pub(super) fn is_crowded(&self) -> bool {
+        self.bytes > self.budget - self.budget / ROOM_SHARE
     }
 
     pub(super) fn row_count(&self) -> usize {
@@ -209,8 +215,10 @@ impl RunSet {
             return false;
         }
         let bloom = self.bloom.get_or_init(|| {
-            // Sized to the budget, not the current rows: later pushes add to it.
-            let mut bloom = BloomFilter::new((self.budget / EST_BYTES_PER_ROW).max(16));
+            // Sized to the rows the budget holds, not the current ones: later
+            // pushes add to it.
+            let row_width = self.runs[0].schema().row_width();
+            let mut bloom = BloomFilter::new((self.budget / row_width).max(16));
             for run in &self.runs {
                 bloom_add_batch(&mut bloom, run);
             }
