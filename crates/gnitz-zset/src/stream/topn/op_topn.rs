@@ -1,6 +1,8 @@
 //! Incremental TOP-N: δ_out = TopN(history + δ_in) − TopN(history), per group
 //! the delta touched.
 
+use std::ops::ControlFlow;
+
 use crate::repr::Batch;
 use crate::schema::MAX_PK_BYTES;
 use crate::stream::OpenAt;
@@ -63,28 +65,29 @@ pub fn op_topn(delta: &Batch, trace_out: OpenAt<'_>, history: OpenAt<'_>, plan: 
         // −TopN(history): the stored rows, at minus their stored weight.
         trace_out.for_each_positive_with_prefix(out_pk_bytes, |c| c.copy_current_row_into(&mut out, -c.current_weight));
 
-        // +TopN(history + δ): the window of the post-delta index. The seek's
-        // verdict is redundant — it is false exactly when the walk's guard fails.
+        // +TopN(history + δ): the window of the post-delta index. Only a
+        // positive entry fills a slot: the input is a relation, bag-positive by
+        // the contract every reduce reads.
         let prefix = plan.index.group_prefix(&mut key, &mb, exemplar);
         let mut skip = plan.offset;
         let mut budget = plan.limit;
-        history.seek_first_positive_with_prefix(prefix);
-        while history.valid && budget > 0 && history.current_pk_bytes().starts_with(prefix) {
-            // A non-positive entry fills no slot: the input is a relation,
-            // bag-positive by the contract every reduce reads.
-            let slots = history.current_weight.max(0) as u64;
+        history.for_each_positive_with_prefix_until(prefix, |c| {
+            let slots = c.current_weight as u64;
             let skipped = slots.min(skip);
             skip -= skipped;
             let take = (slots - skipped).min(budget);
             if take > 0 {
                 budget -= take;
-                let (src, row) = history.current_row_source();
+                let (src, row) = c.current_row_source();
                 out.begin_row(out_pk_bytes, take as i64);
                 out.append_cells_from(0, &plan.index.carried_in_index, src, row);
                 out.commit_row();
             }
-            history.advance();
-        }
+            match budget {
+                0 => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        });
     }
 
     let out = out.into_consolidated();

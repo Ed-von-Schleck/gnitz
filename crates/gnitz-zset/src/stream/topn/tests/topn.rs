@@ -269,6 +269,53 @@ proptest! {
     }
 }
 
+/// Over a nullable key the rank byte places NULLs where `nulls_first` says, and
+/// DESC reverses the values but not the rank — per group.
+#[test]
+fn a_nullable_key_places_nulls_by_nulls_first_in_either_direction() {
+    let rows: [(Row, i64); 5] = [
+        ((1, 0, None, None, 0), 1),
+        ((2, 0, Some(-3), None, 0), 1),
+        ((3, 0, Some(4), None, 0), 1),
+        ((4, 1, Some(9), None, 0), 1),
+        ((5, 1, None, None, 0), 1),
+    ];
+    for (desc, nulls_first, want) in [
+        (false, false, [2, 4]),
+        (false, true, [1, 5]),
+        (true, false, [3, 4]),
+        (true, true, [1, 5]),
+    ] {
+        let key = OrderKey { col: 2, desc, nulls_first };
+        let mut h = Harness::new(TopNPlan::from_wire(&schema(), &[1], &[key], 1, 0).unwrap(), &[1]);
+        h.tick(&batch(&rows));
+        let ids: Vec<Vec<u8>> = h.state().into_keys().map(|row| row[0].clone().unwrap()).collect();
+        let want: Vec<Vec<u8>> = want.iter().map(|id: &u64| id.to_le_bytes().to_vec()).collect();
+        assert_eq!(ids, want, "desc={desc} nulls_first={nulls_first}");
+    }
+}
+
+/// A non-null fixed-width key sits whole in the index PK, with no rank byte and
+/// no image payload repeating it: values differing only in the low byte get
+/// distinct PKs.
+#[test]
+fn a_fixed_width_key_sits_whole_in_the_index_pk() {
+    let key = OrderKey { col: 1, desc: false, nulls_first: false };
+    let plan = TopNPlan::from_wire(&schema(), &[], &[key], 1, 0).unwrap();
+    assert_eq!(plan.index.schema.pk_stride(), 8, "no group, no rank, the whole image");
+    assert_eq!(
+        plan.index.schema.num_payload_cols(),
+        plan.output_schema.num_payload_cols(),
+        "the carried columns alone"
+    );
+    let idx = plan.index_batch(&batch(&[
+        ((1, 0x100, None, None, 0), 1),
+        ((2, 0x101, None, None, 0), 1),
+    ]));
+    let mb = idx.as_mem_batch();
+    assert_ne!(mb.get_pk_bytes(0), mb.get_pk_bytes(1));
+}
+
 #[test]
 fn from_wire_rejects_what_it_cannot_run() {
     let s = schema();

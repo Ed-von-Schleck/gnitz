@@ -66,18 +66,30 @@ fn reduce_index_batch_bench() {
             |b, i| b.put_u64(mix(i)),
         ),
     ];
-    for (label, value, aggs, put) in cases {
-        let schema = grouped_schema(&[SchemaColumn::new(TypeCode::U32, false)], value);
+    let u32_group: &[SchemaColumn] = &[SchemaColumn::new(TypeCode::U32, false)];
+    let nullable_pair: &[SchemaColumn] = &[SchemaColumn::new(TypeCode::I64, true); 2];
+    let grouped = cases
+        .iter()
+        .map(|&(label, value, aggs, put)| (label.to_string(), u32_group, value, aggs, put));
+    // The first case again under a group set too wide for a packed key.
+    let folded = cases[..1]
+        .iter()
+        .map(|&(label, value, aggs, put)| (format!("{label}, 2 groups"), nullable_pair, value, aggs, put));
+    for (label, group, value, aggs, put) in grouped.chain(folded) {
+        let schema = grouped_schema(group, value);
         let mut b = BatchBuilder::new(&schema);
         for i in 0..N {
             b.begin_row(i as u128, 1);
-            b.put_int((i % 4096) as u128);
+            for _ in group {
+                b.put_int((i % 4096) as u128);
+            }
             put(&mut b, i);
             b.end_row();
         }
         let mut delta = b.finish();
         delta.certify_consolidated();
-        let plan = plan(&schema, &[1], aggs);
+        let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
+        let plan = plan(&schema, &group_cols, aggs);
         // The first pass takes the pool's first allocations.
         let [_, (entries, instructions)] = [(); 2].map(|()| counter.measure(|| plan.index_batch(&delta).unwrap()));
         println!(
@@ -182,6 +194,12 @@ fn op_reduce_bench() {
     });
     run("keyed_8_per_group_min", &one, &[1], Min, &|s| {
         scattered(&one, s, &|i| i / 8)
+    });
+    run("i32_nullable_8_per_min", &narrow_nullable, &[1], Min, &|s| {
+        scattered(&narrow_nullable, s, &|i| i / 8)
+    });
+    run("2xi64_nullable_8_per_min", &two_nullable, &[1, 2], Min, &|s| {
+        scattered(&two_nullable, s, &|i| i / 8)
     });
     // The 256 groups under the other group-key forms.
     run("i32_nullable_256_sum", &narrow_nullable, &[1], Sum, &|s| {

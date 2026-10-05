@@ -7,6 +7,7 @@
 //! every row whose PK it prefixes.
 
 use gnitz_wire::PkKeys;
+use std::ops::ControlFlow;
 
 use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
@@ -90,17 +91,18 @@ impl PkSetGather {
     /// group, in key order.
     pub fn for_each_positive_capped(&mut self, cap: usize, mut f: impl FnMut(&ReadCursor)) {
         for key in self.keys.iter().skip(self.next) {
-            if !self.cursor.seek_pk_group_ascending(key) {
+            if cap == 0 || !self.cursor.seek_pk_group_ascending(key) {
                 continue;
             }
-            let taken = std::cell::Cell::new(0);
-            self.cursor.for_each_positive_while(
-                |pk| taken.get() < cap && pk.starts_with(key),
-                |c| {
-                    f(c);
-                    taken.set(taken.get() + 1);
-                },
-            );
+            let mut left = cap;
+            self.cursor.walk_positive_with_prefix_until(key, |c| {
+                f(c);
+                left -= 1;
+                match left {
+                    0 => ControlFlow::Break(()),
+                    _ => ControlFlow::Continue(()),
+                }
+            });
         }
         self.next = self.keys.len();
     }

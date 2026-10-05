@@ -13,6 +13,10 @@ mod op_topn;
 mod plan;
 
 #[cfg(test)]
+#[path = "benches/topn.rs"]
+mod bench;
+
+#[cfg(test)]
 #[path = "tests/topn.rs"]
 mod tests;
 

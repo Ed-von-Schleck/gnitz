@@ -4,7 +4,7 @@
 //! (net weight=0 rows are skipped).
 
 use std::cmp::Ordering;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::MemBatch;
@@ -561,12 +561,6 @@ impl ReadCursor {
     /// whose weight is `> 0`. Returns `true` on a hit (cursor stays positioned;
     /// `current_pk_bytes`, `current_weight` etc. are valid). Returns `false` on
     /// miss (cursor may be past the prefix range or fully invalid).
-    ///
-    /// `prefix` is the OPK image of the leading PK column(s), zero-padded to
-    /// `pk_stride`: 0x00 is the OPK minimum for every PK type (signed MIN maps to
-    /// all-zeros after the sign flip), so the padded key is the correct lower bound
-    /// for the suffix columns. The post-seek walk steps rather than re-seeks — a
-    /// re-seek would re-find the row already consumed and spin forever.
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride();
         self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
@@ -584,11 +578,60 @@ impl ReadCursor {
 
     /// Visit every positive-weight row whose PK begins with `prefix`, invoking
     /// `f(&*self)` at each.
-    pub(crate) fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], f: F) {
-        if !self.seek_first_positive_with_prefix(prefix) {
-            return;
+    pub(crate) fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
+        self.for_each_positive_with_prefix_until(prefix, |c| {
+            f(c);
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// [`Self::for_each_positive_with_prefix`] until `f` breaks, which leaves the
+    /// cursor on that row. `true` iff `f` broke.
+    ///
+    /// `prefix` is the OPK image of the leading PK column(s). Zero-padded to
+    /// `pk_stride` it is the least key beginning with it: 0x00 is the OPK minimum
+    /// for every PK type (signed MIN maps to all-zeros after the sign flip).
+    pub(crate) fn for_each_positive_with_prefix_until<F: FnMut(&ReadCursor) -> ControlFlow<()>>(
+        &mut self,
+        prefix: &[u8],
+        f: F,
+    ) -> bool {
+        let stride = self.schema.pk_stride();
+        self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
+        self.walk_positive_with_prefix_until(prefix, f)
+    }
+
+    /// [`Self::for_each_positive_with_prefix_until`] from where the cursor
+    /// stands. Selects the payload comparator once, as [`Self::for_each_row_while`]
+    /// does.
+    pub(crate) fn walk_positive_with_prefix_until<F: FnMut(&ReadCursor) -> ControlFlow<()>>(
+        &mut self,
+        prefix: &[u8],
+        f: F,
+    ) -> bool {
+        with_payload_cmp!(
+            self.schema,
+            Self::walk_positive_with_prefix_with::<_, _>,
+            self,
+            prefix,
+            f
+        )
+    }
+
+    #[inline]
+    fn walk_positive_with_prefix_with<F: FnMut(&ReadCursor) -> ControlFlow<()>, P: PayloadOrder>(
+        &mut self,
+        prefix: &[u8],
+        mut f: F,
+        payload: P,
+    ) -> bool {
+        while self.valid && self.current_pk_bytes().starts_with(prefix) {
+            if self.current_weight > 0 && f(&*self).is_break() {
+                return true;
+            }
+            self.advance_with(payload);
         }
-        self.for_each_positive_while(|pk| pk.starts_with(prefix), f);
+        false
     }
 
     /// [`Self::for_each_row_while`] with the weight gate applied — the one place
