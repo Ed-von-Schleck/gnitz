@@ -229,9 +229,10 @@ impl Batch {
         let regions = self.wire_regions();
         let npc = schema.num_payload_cols();
         self.debug_verify_consolidated();
+        // A skeleton weight sums a per-key time prefix of a positive integral.
         debug_assert!(
-            !opts.skeleton || npc == 0,
-            "a skeleton shard must be written under the PK-only projection of its relation's schema",
+            !opts.skeleton || (npc == 0 && (0..n).all(|row| self.get_weight(row) > 0)),
+            "a skeleton shard is the PK-only projection of its relation's schema at positive coarse weights",
         );
         // A store nothing point-probes writes no filter.
         let filter = (!opts.skip_pk_filter)

@@ -727,14 +727,24 @@ fn shard_wider_than_reader_schema_opens() {
     let wide = build(schema_with_appended(TypeCode::I64), 3, |b, i| {
         b.begin_row(i as u128 + 1, 1);
         b.put_int((i as u128 + 1) * 10);
-        b.put_int((i as u128 + 1) * 11);
+        b.put_null();
     });
     let shard_path = write(dir.path(), "wide.db", &wide);
 
     let shard = MappedShard::open(&shard_path, &make_schema_u64_i64()).unwrap();
+    // The surplus column is NULL in every row; its bit names no column of the
+    // reader's schema.
     for row in 0..3 {
         assert_eq!(read_i64_le(shard.get_col_ptr(row, 0, 8), 0), (row as i64 + 1) * 10);
+        assert_eq!(shard.get_null_word(row), 0, "row {row}");
     }
+    let sliced = shard.slice_to_owned_batch(0, 3);
+    assert!((0..3).all(|row| sliced.get_null_word(row) == 0));
+    let rebound = MappedShard::open(&shard_path, &schema_with_appended(TypeCode::I64))
+        .unwrap()
+        .rebind(&make_schema_u64_i64())
+        .unwrap();
+    assert!((0..3).all(|row| rebound.get_null_word(row) == 0));
     // The blob region came from the *file's* index, not the reader's.
     assert!(shard.blob().is_empty());
 }

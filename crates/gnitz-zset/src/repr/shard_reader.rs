@@ -150,6 +150,9 @@ pub struct MappedShard {
     blob: &'static [u8],
     /// The PK filter region, or `None` when the file carries none.
     shard_filter: Option<&'static [u8]>,
+    /// The words `null_bmp` points into when the file is wider than `schema`:
+    /// the file's null words without the bits of the columns `schema` lacks.
+    _narrowed_nulls: Option<Box<[u8]>>,
 }
 
 /// A shard's header and directory, read under no schema.
@@ -266,7 +269,20 @@ impl MappedShard {
 
         let pk = direct_region(data, &spans[REG_PK], count, schema.pk_stride())?;
         let weight = WordRegion::bind(data, &spans[REG_WEIGHT], count)?;
-        let null_bmp = WordRegion::bind(data, &spans[REG_NULL_BMP], count)?;
+        let mut null_bmp = WordRegion::bind(data, &spans[REG_NULL_BMP], count)?;
+        let narrowed_nulls = (file_npc > schema.num_payload_cols()).then(|| {
+            let keep = gnitz_wire::low_bits_mask(schema.num_payload_cols());
+            let mut words = vec![0u8; count * FIXED_REGION_BYTES].into_boxed_slice();
+            null_bmp.decode(0, &mut words);
+            for word in words.as_chunks_mut::<8>().0 {
+                *word = (u64::from_le_bytes(*word) & keep).to_le_bytes();
+            }
+            null_bmp = WordRegion::Mapped(ColPtr {
+                base: words.as_ptr(),
+                stride: FIXED_REGION_BYTES,
+            });
+            words
+        });
 
         let col_regions = schema
             .payload_columns()
@@ -330,6 +346,7 @@ impl MappedShard {
             pk,
             weight,
             null_bmp,
+            _narrowed_nulls: narrowed_nulls,
             col_regions,
             null_pad_mask,
             blob: blob.bytes(data),

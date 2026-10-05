@@ -151,8 +151,12 @@ impl Batch {
 
     /// Room for `bytes` more blob heap bytes, taken from the buffer pool —
     /// a bare [`Vec::reserve`] would take them from the global allocator. A heap
-    /// already holding bytes has to grow in place.
+    /// already holding bytes has to grow in place. A schema with no string
+    /// column has no heap to reserve.
     pub(crate) fn reserve_blob(&mut self, bytes: usize) {
+        if !self.schema.has_german_string() {
+            return;
+        }
         match self.blob.capacity() {
             0 => self.blob = PooledBuf::with_capacity(bytes),
             _ => self.blob.reserve(bytes),

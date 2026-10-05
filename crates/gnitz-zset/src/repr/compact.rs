@@ -76,11 +76,6 @@ pub fn merge_and_route(
     for (g, &key) in guards.iter().enumerate() {
         let bucket = &survivors[bounds[g]..bounds[g + 1]];
         if !bucket.is_empty() {
-            // Every fold takes a per-key time prefix of a positive integral.
-            debug_assert!(
-                !skeleton || bucket.iter().all(|&(_, _, w)| w > 0),
-                "negative coarse weight"
-            );
             emit(key, skeleton, set.materialize(bucket, nsurv))?;
         }
     }

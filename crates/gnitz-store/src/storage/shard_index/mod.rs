@@ -167,10 +167,9 @@ struct LevelGuard {
 
 impl LevelGuard {
     /// Whether this guard holds skeleton shards — the state a capacity sweep
-    /// leaves behind, read off the shard headers. Only a terminal guard is ever
-    /// dehydrated, and it holds one shard.
+    /// leaves behind, read off the shard headers.
     fn dehydrated(&self) -> bool {
-        self.entries.iter().all(|e| e.shard.is_skeleton())
+        self.entries.iter().any(|e| e.shard.is_skeleton())
     }
 
     /// When this guard was last written, as the newest stamp over its entries.

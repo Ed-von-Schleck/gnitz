@@ -372,7 +372,7 @@ impl MapPlan {
         };
         let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
         // For relocated copies and string emits alike.
-        if out.schema().has_german_string() && heap_at.is_none() {
+        if heap_at.is_none() {
             out.reserve_blob(crate::repr::prorated_blob_cap(src.blob().len(), src.count, total));
         }
         out.append_session(total).write(total, |out| {
