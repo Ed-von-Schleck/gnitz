@@ -124,6 +124,20 @@ impl<'a> DirectWriter<'a> {
         )
     }
 
+    /// Every region in order, each bounded to this writer's rows, with the heap
+    /// a relocation appends to and the dedup cache it runs under.
+    pub(crate) fn split_mut(&mut self) -> (impl Iterator<Item = &mut [u8]>, &mut Vec<u8>, Option<&mut BlobCache>) {
+        let (schema, cap, at, rows) = (self.schema, self.cap, self.at, self.rows);
+        let mut rest = &mut *self.data;
+        let regions = (0..schema.num_regions()).map(move |r| {
+            let stride = schema.region_stride(r);
+            let (region, tail) = std::mem::take(&mut rest).split_at_mut(cap * stride);
+            rest = tail;
+            &mut region[at * stride..(at + rows) * stride]
+        });
+        (regions, &mut *self.blob, self.blob_cache.as_deref_mut())
+    }
+
     /// Payload column `pi`'s region, bounded to this writer's rows.
     #[inline(always)]
     pub(crate) fn col_mut(&mut self, pi: usize) -> &mut [u8] {

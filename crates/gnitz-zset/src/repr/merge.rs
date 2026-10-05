@@ -11,13 +11,15 @@
 //! the same comparator family — Z-Set `+`, fold included.
 
 use std::cmp::Ordering;
+use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_WEIGHT};
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
-use super::seek::pk_group_end;
-use crate::schema::key::{compare_pk_ordering, pack_pk_be, pk_width_dispatch, PkSortKey};
+use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
+use super::writer::DirectWriter;
+use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
@@ -695,123 +697,287 @@ impl Batch {
     /// order, equal elements' weights summed into one row, net-zero elements
     /// dropped.
     ///
-    /// Only the shared-PK arm folds: a galloped run stops at the other side's
-    /// head PK, so nothing in it can share a (PK, payload) across sides, and a
-    /// consolidated input repeats none internally.
+    /// Only the shared-PK arm folds: a galloped stretch stops at the other
+    /// side's head PK, so nothing in it can share a (PK, payload) across sides,
+    /// and a consolidated input repeats none internally.
     pub fn merged_consolidated(&self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
         debug_assert!(
             self.stands_consolidated() && other.stands_consolidated(),
             "merged_consolidated: both inputs must be consolidated",
         );
-        let mut out = with_payload_cmp!(schema, merged_consolidated_body, self, other, schema);
+        let mut out = pk_width_dispatch!(schema.pk_stride(), |K| {
+            with_payload_cmp!(schema, merged_consolidated_body::<K, _>, self, other, schema)
+        });
         out.certify_consolidated();
         out
     }
 }
 
-#[inline]
-fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &SchemaDescriptor, payload: P) -> Batch {
-    let (n_a, n_b) = (a.count, b.count);
-    let (mb_a, mb_b) = (a.as_mem_batch(), b.as_mem_batch());
+/// One batch's PK region, read as keys of the type `K` matching its stride.
+struct Keys<'a, K> {
+    pk: &'a [u8],
+    stride: usize,
+    count: usize,
+    key: PhantomData<K>,
+}
 
+impl<'a, K: PkSortKey<'a>> Keys<'a, K> {
+    fn of(batch: &'a Batch) -> Self {
+        Keys {
+            pk: batch.pk_data(),
+            stride: batch.schema().pk_stride(),
+            count: batch.count,
+            key: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn at(&self, row: usize) -> K {
+        assert!(row < self.count);
+        // SAFETY: `row` is one of the `count` rows `pk` holds.
+        unsafe { self.at_unchecked(row) }
+    }
+
+    /// # Safety
+    /// `row < self.count`.
+    #[inline(always)]
+    unsafe fn at_unchecked(&self, row: usize) -> K {
+        debug_assert!(row < self.count);
+        K::from_opk(unsafe { self.pk.get_unchecked(row * self.stride..(row + 1) * self.stride) })
+    }
+
+    /// The first row past `row` whose key is not `key`, which `row`'s is. A
+    /// linear step: an equal-PK group is short.
+    #[inline(always)]
+    fn group_end(&self, row: usize, key: K) -> usize {
+        let mut end = row + 1;
+        // SAFETY: `end < count`.
+        while end < self.count && unsafe { self.at_unchecked(end) } == key {
+            end += 1;
+        }
+        end
+    }
+
+    /// The first row past `row` whose key is not below `key`, which `row`'s
+    /// is: a gallop, so the next row costs one probe and a far one `O(log gap)`.
+    #[inline(always)]
+    fn skip_below(&self, row: usize, key: K) -> usize {
+        let (mut lo, mut step) = (row, 1);
+        // SAFETY (both loops): the probed row is below `count`.
+        while lo + step < self.count && unsafe { self.at_unchecked(lo + step) } < key {
+            lo += step;
+            step *= 2;
+        }
+        let (mut lo, mut hi) = (lo + 1, (lo + step).min(self.count));
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match unsafe { self.at_unchecked(mid) } < key {
+                true => lo = mid + 1,
+                false => hi = mid,
+            }
+        }
+        lo
+    }
+}
+
+/// One region of a two-way merge: each side's cells and the output's.
+struct MergeRegion<'w> {
+    src: [&'w [u8]; 2],
+    dst: &'w mut [u8],
+    stride: usize,
+}
+
+/// A two-way merge's output, written a stretch of one side's rows at a time.
+///
+/// It holds every region's bounds for the merge's life: where the sides
+/// interleave a stretch is a row or two, and looking its regions up would cost
+/// more than copying it.
+struct MergeSink<'w> {
+    srcs: &'w [MemBatch<'w>; 2],
+    /// Where each side's heap lies in the output's, if it was carried.
+    heap_at: [Option<usize>; 2],
+    regions: Vec<MergeRegion<'w>>,
+    blob: &'w mut Vec<u8>,
+    cache: Option<&'w mut BlobCache>,
+    string_slots: u64,
+    /// Rows written, of the `room` the output has.
+    rows: usize,
+    room: usize,
+    /// Carried heap bytes that only rows left out name.
+    dead: usize,
+}
+
+impl<'w> MergeSink<'w> {
+    fn new(srcs: &'w [MemBatch<'w>; 2], heap_at: [Option<usize>; 2], writer: &'w mut DirectWriter<'_>) -> Self {
+        let (schema, room) = (writer.schema, writer.rows());
+        let (regions, blob, cache) = writer.split_mut();
+        let regions = regions.enumerate().map(|(r, dst)| MergeRegion {
+            src: [srcs[0].region(r), srcs[1].region(r)],
+            dst,
+            stride: schema.region_stride(r),
+        });
+        MergeSink {
+            srcs,
+            heap_at,
+            regions: regions.collect(),
+            blob,
+            cache,
+            string_slots: schema.string_payload_slots(),
+            rows: 0,
+            room,
+            dead: 0,
+        }
+    }
+
+    /// Rows `[start, end)` of `side` follow; possibly none.
+    #[inline(always)]
+    fn push(&mut self, side: usize, start: usize, end: usize) {
+        if start == end {
+            return;
+        }
+        let at = self.rows;
+        assert!(start < end && end <= self.srcs[side].count && at + (end - start) <= self.room);
+        let n = end - start;
+        // SAFETY (both arms): the stretch lies inside its side's rows and the
+        // rows the output has room for, and every region holds that many cells.
+        if n == 1 {
+            for region in &mut self.regions {
+                let w = region.stride;
+                unsafe {
+                    copy_cell(
+                        region.src[side].as_ptr().add(start * w),
+                        region.dst.as_mut_ptr().add(at * w),
+                        w,
+                    )
+                };
+            }
+        } else {
+            for region in &mut self.regions {
+                let w = region.stride;
+                let src = unsafe { region.src[side].as_ptr().add(start * w) };
+                unsafe { std::ptr::copy_nonoverlapping(src, region.dst.as_mut_ptr().add(at * w), n * w) };
+            }
+        }
+        for pi in gnitz_wire::BitIter(self.string_slots) {
+            let cells = &mut self.regions[REG_PAYLOAD_START + pi].dst[at * 16..(at + n) * 16];
+            let (blob, heap_at) = (self.srcs[side].blob, self.heap_at[side]);
+            rebase_string_cells(cells, blob, self.blob, heap_at, self.cache.as_deref_mut());
+        }
+        self.rows += n;
+    }
+
+    /// Row `ia` of side 0 and row `jb` of side 1 are one element of weight
+    /// `weight`: side 0's row follows at that weight, unless it is zero.
+    #[inline(always)]
+    fn push_folded(&mut self, ia: usize, jb: usize, weight: i64) {
+        self.leave_out(1, jb);
+        if weight == 0 {
+            return self.leave_out(0, ia);
+        }
+        self.push(0, ia, ia + 1);
+        let weights = self.regions[REG_WEIGHT].dst.as_chunks_mut::<8>().0;
+        weights[self.rows - 1] = weight.to_le_bytes();
+    }
+
+    /// `row` of `side` is not copied: a carried heap holds its long bytes dead.
+    #[inline(always)]
+    fn leave_out(&mut self, side: usize, row: usize) {
+        if self.heap_at[side].is_some() {
+            self.dead += row_long_bytes(&self.srcs[side], self.string_slots, row);
+        }
+    }
+}
+
+/// Copy one `width`-byte cell. At a width columns commonly have it is a load
+/// and a store, where a copy of a runtime length is a `memcpy` call.
+///
+/// # Safety
+/// `src` and `dst` each address `width` bytes, and do not overlap.
+#[inline(always)]
+unsafe fn copy_cell(src: *const u8, dst: *mut u8, width: usize) {
+    use std::ptr::copy_nonoverlapping as copy;
+    unsafe {
+        match width {
+            8 => copy(src, dst, 8),
+            16 => copy(src, dst, 16),
+            4 => copy(src, dst, 4),
+            _ => copy(src, dst, width),
+        }
+    }
+}
+
+/// Out of line, so each (key, payload order) pair compiles as its own function.
+#[inline(never)]
+fn merged_consolidated_body<'a, K, P>(a: &'a Batch, b: &'a Batch, schema: &SchemaDescriptor, payload: P) -> Batch
+where
+    K: PkSortKey<'a>,
+    P: PayloadOrder,
+{
+    let (n_a, n_b) = (a.count, b.count);
+    let srcs = [a.as_mem_batch(), b.as_mem_batch()];
+    let (keys_a, keys_b) = (Keys::<K>::of(a), Keys::<K>::of(b));
     let mut out = Batch::with_capacity(schema, n_a + n_b);
-    {
-        // One session for the whole merge: expected run length is 2 for a set
-        // operation's uniform 128-bit PKs, so per-run setup would dominate.
-        let mut sink = out.append_session(n_a + n_b);
-        let carry_a = sink.carry(&mb_a, &[(0, n_a)]);
-        let carry_b = sink.carry(&mb_b, &[(0, n_b)]);
+    let mut session = out.append_session(n_a + n_b);
+    let heap_at = [
+        session.carry(&srcs[0], &[(0, n_a)]),
+        session.carry(&srcs[1], &[(0, n_b)]),
+    ];
+    let dead = session.write_at_most(n_a + n_b, |writer| {
+        let mut sink = MergeSink::new(&srcs, heap_at, writer);
         let (mut ia, mut jb) = (0usize, 0usize);
         while ia < n_a && jb < n_b {
-            match compare_pk_ordering(a.get_pk_bytes(ia), b.get_pk_bytes(jb)) {
-                // A single-source run: one galloping skip, one bulk append.
+            let (ka, kb) = (keys_a.at(ia), keys_b.at(jb));
+            match ka.cmp(&kb) {
+                // A single-source stretch: one galloping skip, one copy.
                 Ordering::Less => {
-                    let s = ia;
-                    ia = a.advance_to(b.get_pk_bytes(jb), ia);
-                    sink.push_ranges(&mb_a, carry_a, &[(s, ia)]);
+                    let start = ia;
+                    ia = keys_a.skip_below(ia, kb);
+                    sink.push(0, start, ia);
                 }
                 Ordering::Greater => {
-                    let s = jb;
-                    jb = b.advance_to(a.get_pk_bytes(ia), jb);
-                    sink.push_ranges(&mb_b, carry_b, &[(s, jb)]);
+                    let start = jb;
+                    jb = keys_b.skip_below(jb, ka);
+                    sink.push(1, start, jb);
                 }
-                // A shared PK: bracket both equal-PK groups and interleave them
-                // by payload. The only arm that folds, and the only one that
-                // reads row by row.
+                // A shared PK: both equal-PK groups, interleaved by payload.
+                // The only arm that folds, and the only one that reads row by
+                // row.
                 Ordering::Equal => {
-                    let (ga, gb) = (pk_group_end(a, ia), pk_group_end(b, jb));
-                    // The single-source stretch still open, ending at its own
-                    // side's live cursor. `flush!` closes it into one push.
-                    enum Open {
-                        None,
-                        A(usize),
-                        B(usize),
-                    }
-                    let mut open = Open::None;
-                    macro_rules! flush {
-                        () => {
-                            match std::mem::replace(&mut open, Open::None) {
-                                Open::A(s) => sink.push_ranges(&mb_a, carry_a, &[(s, ia)]),
-                                Open::B(s) => sink.push_ranges(&mb_b, carry_b, &[(s, jb)]),
-                                Open::None => {}
-                            }
-                        };
-                    }
+                    let (ga, gb) = (keys_a.group_end(ia, ka), keys_b.group_end(jb, ka));
                     while ia < ga && jb < gb {
-                        match payload.compare(schema, &mb_a, ia, &mb_b, jb) {
+                        match payload.compare(schema, &srcs[0], ia, &srcs[1], jb) {
                             Ordering::Less => {
-                                if !matches!(open, Open::A(_)) {
-                                    flush!();
-                                    open = Open::A(ia);
-                                }
+                                sink.push(0, ia, ia + 1);
                                 ia += 1;
                             }
                             Ordering::Greater => {
-                                if !matches!(open, Open::B(_)) {
-                                    flush!();
-                                    open = Open::B(jb);
-                                }
+                                sink.push(1, jb, jb + 1);
                                 jb += 1;
                             }
-                            // One element carried by both sides: `+` sums its two
-                            // weights into one row, and a zero sum drops it (§2),
-                            // which is why this merge can emit fewer rows than it read.
+                            // One element carried by both sides: `+` sums its
+                            // two weights into one row, and a zero sum drops it
+                            // (§2), which is why this merge can emit fewer rows
+                            // than it read.
                             Ordering::Equal => {
-                                flush!();
-                                let w = a.get_weight(ia) + b.get_weight(jb);
-                                sink.push_row_at(&mb_a, carry_a, ia, w);
-                                sink.leave_out(&mb_b, carry_b, jb);
+                                sink.push_folded(ia, jb, a.get_weight(ia) + b.get_weight(jb));
                                 ia += 1;
                                 jb += 1;
                             }
                         }
                     }
-                    // One group ended, so the open stretch runs on into its own
-                    // side's unpicked tail, and the other side's remainder — which
-                    // nothing left can fold against — follows.
-                    match open {
-                        Open::A(s) => {
-                            sink.push_ranges(&mb_a, carry_a, &[(s, ga)]);
-                            sink.push_ranges(&mb_b, carry_b, &[(jb, gb)]);
-                        }
-                        Open::B(s) => {
-                            sink.push_ranges(&mb_b, carry_b, &[(s, gb)]);
-                            sink.push_ranges(&mb_a, carry_a, &[(ia, ga)]);
-                        }
-                        Open::None => {
-                            sink.push_ranges(&mb_a, carry_a, &[(ia, ga)]);
-                            sink.push_ranges(&mb_b, carry_b, &[(jb, gb)]);
-                        }
-                    }
-                    // The only advance that is not an `advance_to`.
-                    ia = ga;
-                    jb = gb;
+                    // One group ended, and nothing left folds against the
+                    // other's remainder.
+                    sink.push(0, ia, ga);
+                    sink.push(1, jb, gb);
+                    (ia, jb) = (ga, gb);
                 }
             }
         }
-        sink.push_ranges(&mb_a, carry_a, &[(ia, n_a)]);
-        sink.push_ranges(&mb_b, carry_b, &[(jb, n_b)]);
-    }
+        sink.push(0, ia, n_a);
+        sink.push(1, jb, n_b);
+        (sink.rows, sink.dead)
+    });
+    out.charge_dead(dead);
     out
 }
 

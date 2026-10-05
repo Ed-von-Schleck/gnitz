@@ -29,6 +29,7 @@ const _: () = assert!(std::mem::size_of::<PerfEventAttr>() == 64);
 const PERF_TYPE_HARDWARE: u32 = 0;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
 const FLAG_DISABLED: u64 = 1 << 0;
 const FLAG_EXCLUDE_KERNEL: u64 = 1 << 5;
 const FLAG_EXCLUDE_HV: u64 = 1 << 6;
@@ -52,6 +53,11 @@ impl Counter {
     /// Core cycles. Panics where the kernel refuses the counter.
     pub fn cycles() -> Self {
         Self::open(PERF_COUNT_HW_CPU_CYCLES)
+    }
+
+    /// Mispredicted branches. Panics where the kernel refuses the counter.
+    pub fn branch_misses() -> Self {
+        Self::open(PERF_COUNT_HW_BRANCH_MISSES)
     }
 
     fn open(config: u64) -> Self {

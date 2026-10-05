@@ -528,7 +528,7 @@ impl Batch {
 }
 
 /// An open append into one destination batch: the blob dedup cache every push
-/// reuses, so appending runs of a row or two stays cheap.
+/// reuses.
 pub(crate) struct AppendSession<'d> {
     dst: &'d mut Batch,
     cache: BlobCache,
@@ -575,10 +575,21 @@ impl AppendSession<'_> {
     /// so no reader reaches a row before its regions are written.
     #[inline(always)]
     pub(crate) fn write<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
+        self.write_at_most(rows, |w| (rows, fill(w)))
+    }
+
+    /// [`Self::write`] for a `fill` that writes only the first of the `rows` it
+    /// has room for, and answers how many ahead of its own result.
+    #[inline(always)]
+    pub(crate) fn write_at_most<R>(
+        &mut self,
+        rows: usize,
+        fill: impl FnOnce(&mut DirectWriter<'_>) -> (usize, R),
+    ) -> R {
         let dst = &mut *self.dst;
         dst.reserve_rows(rows);
         dst.consolidated = false;
-        let out = fill(&mut DirectWriter::over(
+        let (written, out) = fill(&mut DirectWriter::over(
             &mut dst.data,
             dst.capacity,
             dst.count,
@@ -587,7 +598,8 @@ impl AppendSession<'_> {
             &mut dst.blob,
             Some(&mut self.cache),
         ));
-        dst.count += rows;
+        assert!(written <= rows, "write_at_most: more rows written than it had room for");
+        dst.count += written;
         out
     }
 
@@ -595,28 +607,6 @@ impl AppendSession<'_> {
     /// blob dedup cache. A zero weight appends nothing.
     pub(crate) fn push_row<S: RowSource>(&mut self, src: &S, row: usize, weight: i64) {
         self.dst.append_row_from_source(weight, src, row, Some(&mut self.cache));
-    }
-
-    /// [`Self::push_row`] for a `src` whose heap may be carried at `heap_at`. A
-    /// zero weight appends nothing and [leaves the row out](Self::leave_out).
-    pub(crate) fn push_row_at(&mut self, src: &MemBatch<'_>, heap_at: Option<usize>, row: usize, weight: i64) {
-        match heap_at {
-            _ if weight == 0 => self.leave_out(src, heap_at, row),
-            None => self.push_row(src, row, weight),
-            Some(_) => self.write(1, |w| {
-                copy_ranges(src, heap_at, &[(row, row + 1)], w);
-                w.weight_mut().copy_from_slice(&weight.to_le_bytes());
-            }),
-        }
-    }
-
-    /// Charge `src[row]`'s long bytes dead when its heap is carried at
-    /// `heap_at` but the row is not copied.
-    pub(crate) fn leave_out(&mut self, src: &MemBatch<'_>, heap_at: Option<usize>, row: usize) {
-        if heap_at.is_some() {
-            let slots = self.dst.schema.string_payload_slots();
-            self.dst.charge_dead(string_heap::row_long_bytes(src, slots, row));
-        }
     }
 }
 
