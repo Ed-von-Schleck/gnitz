@@ -67,6 +67,27 @@ def test_index_seek_takes_a_negative_key(client):
     assert bag(client.seek_by_index(tid, schema, [1], [5]), "pk", "delta") == {(2, 5): 1}
 
 
+def test_a_select_reports_the_lsn_it_was_read_at(client):
+    """A `SELECT` answered by one server read carries that read's watermark, the
+    one a scan and an index seek of the same table report, whichever access path
+    serves it; a constant `SELECT` reads nothing and carries none."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL); "
+        "CREATE INDEX ON t(cust_id)")
+    tid, schema = client.resolve_table("t")
+    insert(client, "t", [(i, i * 100) for i in range(1, 9)])
+
+    scanned = client.scan(tid, schema).lsn
+    assert scanned is not None
+    assert client.seek_by_index(tid, schema, [1], [300]).lsn == scanned
+    for q in ["SELECT * FROM t WHERE cust_id = 300",
+              "SELECT * FROM t WHERE pk = 3",
+              "SELECT * FROM t",
+              "SELECT COUNT(*) AS n FROM t"]:
+        assert client.execute_sql(q)[0]["rows"].lsn == scanned, q
+    assert client.execute_sql("SELECT 1 AS one")[0]["rows"].lsn is None
+
+
 @pytest.mark.parametrize("keys", [[], [5, 5]], ids=["none", "surplus"])
 def test_index_seek_refuses_a_key_count_the_index_cannot_take(client, keys):
     client.execute_sql(

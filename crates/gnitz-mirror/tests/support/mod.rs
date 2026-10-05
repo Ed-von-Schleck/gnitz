@@ -20,7 +20,7 @@ pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> Reply {
     let mut results = gnitz_sql::execute(client, schema, s).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
-        SqlResult::Rows { schema, batch } => (schema, batch),
+        SqlResult::Rows { schema, batch, .. } => (schema, batch),
         other => panic!("{s} did not return rows: {other:?}"),
     }
 }

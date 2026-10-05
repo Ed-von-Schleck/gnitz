@@ -47,6 +47,10 @@ pub enum SqlResult {
     Rows {
         schema: Arc<Schema>,
         batch: ZSetBatch,
+        /// The server LSN the rows were read at, or `None` for rows no server
+        /// read produced: an answer off a mirrored copy, a constant, `EXPLAIN`
+        /// or `RETURNING`.
+        lsn: Option<u64>,
     },
     /// `BEGIN` / `START TRANSACTION`: a client-side transaction buffer opened.
     TransactionStarted,

@@ -102,7 +102,7 @@ impl Db {
 
     pub fn read(&mut self, sql: &str) -> (Arc<Schema>, ZSetBatch) {
         match self.exec(sql) {
-            SqlResult::Rows { schema, batch } => (schema, batch),
+            SqlResult::Rows { schema, batch, .. } => (schema, batch),
             other => panic!("expected Rows from `{sql}`, got {other:?}"),
         }
     }

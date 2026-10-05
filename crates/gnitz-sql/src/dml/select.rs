@@ -338,26 +338,30 @@ fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<
 pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
     if plan.answers_from_schema() {
         let schema = Arc::clone(plan.out_schema());
-        return Ok(SqlResult::Rows { batch: ZSetBatch::new(&schema), schema });
+        return Ok(SqlResult::Rows {
+            batch: ZSetBatch::new(&schema),
+            schema,
+            lsn: None,
+        });
     }
     let ReadPlan { case, order, window } = plan;
-    let (schema, batch) = match case {
-        ReadCase::Constant { schema, row } => (schema, row),
+    let (schema, batch, lsn) = match case {
+        ReadCase::Constant { schema, row } => (schema, row, None),
         ReadCase::Rows { read, reply_schema } => {
-            let batch = client
-                .scan_spec_local_first(&*read.desc, read.spec, &reply_schema)?
-                .batch;
-            (reply_schema, batch)
+            let reply = client.scan_spec_local_first(&*read.desc, read.spec, &reply_schema)?;
+            (reply_schema, reply.batch, reply.lsn)
         }
         ReadCase::Fold { read, mut finish, .. } => {
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
-            let partial = client
-                .scan_spec_local_first(&*read.desc, read.spec, &finish.partial_schema)?
-                .batch;
-            (Arc::clone(finish.out_schema()), finish.finish(partial))
+            let partial = client.scan_spec_local_first(&*read.desc, read.spec, &finish.partial_schema)?;
+            (
+                Arc::clone(finish.out_schema()),
+                finish.finish(partial.batch),
+                partial.lsn,
+            )
         }
     };
     let batch = order_and_window(&schema, batch, &order, window);
-    Ok(SqlResult::Rows { schema, batch })
+    Ok(SqlResult::Rows { schema, batch, lsn })
 }

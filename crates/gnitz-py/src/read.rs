@@ -335,8 +335,8 @@ pub struct PyScanResult {
     cols: Vec<(ColumnLocator, ColType)>,
     row_type: RowType,
     /// The server-side LSN this result was read at, or `None` where there is
-    /// none — a local answer, SQL rows, delta rows. Reporting 0 would collide
-    /// with a real LSN 0.
+    /// none — a local answer, delta rows, SQL rows no server read produced.
+    /// Reporting 0 would collide with a real LSN 0.
     #[pyo3(get)]
     lsn: Option<u64>,
 }

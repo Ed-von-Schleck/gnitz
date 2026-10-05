@@ -406,6 +406,7 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
                             Some(mut m) => m.apply(rows),
                             None => rows,
                         },
+                        lsn: None,
                     })
                 }
                 None => {

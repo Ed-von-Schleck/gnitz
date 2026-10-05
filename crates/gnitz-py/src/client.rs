@@ -490,11 +490,11 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Vec<Bo
                 d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;
                 d.set_item(pyo3::intern!(py, "count"), count)?;
             }
-            SqlResult::Rows { schema, batch } => {
+            SqlResult::Rows { schema, batch, lsn } => {
                 d.set_item(k_type, pyo3::intern!(py, "Rows"))?;
                 d.set_item(
                     pyo3::intern!(py, "rows"),
-                    scan_result(py, ScanReply { schema, batch, lsn: None })?,
+                    scan_result(py, ScanReply { schema, batch, lsn })?,
                 )?;
             }
             SqlResult::TransactionStarted => {
