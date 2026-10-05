@@ -329,8 +329,7 @@ fn uncompiled_view_traces_invalidate_the_view() {
     engine.flush_ephemeral_round(g2).unwrap();
     engine.close();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    engine.compute_invalid_views();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
         engine.dag.awaits_rebuild(vid),
         "an output store ahead of its traces must be rebuilt, not resumed"
@@ -405,7 +404,6 @@ fn a_chain_resumes_or_rebuilds_as_one() {
 
     // Kept: the segment reopens holding nothing, and takes nothing.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    engine.compute_invalid_views();
     assert!(!engine.dag.awaits_rebuild(seg) && !engine.dag.awaits_rebuild(top));
     // A checkpoint the owner goes through uncompiled leaves its trace a generation
     // behind; the segment has none to leave.
@@ -415,8 +413,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     assert_eq!(net_weight(&engine, seg), 0, "a kept chain's segment stays empty");
     engine.close();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    engine.compute_invalid_views();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
         engine.dag.awaits_rebuild(top),
         "the owner's trace is a generation behind"
@@ -441,6 +438,33 @@ fn only_its_own_unbounded_chain_scans_a_segment() {
     assert!(foreign.contains("a segment of view"), "got: {foreign}");
     let bounded = register_chain(&mut engine, tid, &cols, 4 << 20).unwrap_err();
     assert!(bounded.contains("a segment of view"), "got: {bounded}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── a_rejected_view_opens_empty_and_loses_its_stale_traces ──────────────
+// A view the verdict rejects is opened under that verdict: its output store
+// empty, and no trace of an earlier compile left beside it.
+#[test]
+fn a_rejected_view_opens_empty_and_loses_its_stale_traces() {
+    let dir = temp_dir("view_rejected_erased_at_open");
+    let (_, vid) = checkpointed_traced_view(&dir);
+
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let stale = engine
+        .registry
+        .child_dir(vid, gnitz_store::relation::ChildKind::Scratch("stale"));
+    fs::create_dir_all(&stale).unwrap();
+    // The plan cache is empty, so this stamps the output store but not the traces.
+    let g2 = engine.advance_durable_generation().unwrap();
+    engine.flush_ephemeral_round(g2).unwrap();
+    engine.close();
+
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert!(engine.dag.awaits_rebuild(vid));
+    assert!(!std::path::Path::new(&stale).exists(), "a stale trace is erased");
+    assert_eq!(net_weight(&engine, vid), 0, "the output store opens empty");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

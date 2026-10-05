@@ -432,8 +432,6 @@ pub struct RelationRegistry {
     pub(crate) config: StoreConfig,
     /// What this process is to the stores it registered.
     pub(crate) residency: Residency,
-    /// Set by [`Self::reconcile_child_dirs`]; [`Self::open_stores`] requires it.
-    pub(crate) children_reconciled: bool,
 }
 
 impl RelationRegistry {
@@ -448,7 +446,6 @@ impl RelationRegistry {
                 ..config
             },
             residency: Residency::Origin,
-            children_reconciled: false,
         }
     }
 

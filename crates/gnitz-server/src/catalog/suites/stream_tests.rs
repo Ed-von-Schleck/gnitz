@@ -135,8 +135,7 @@ fn stream_fed_views_are_invalid_at_boot() {
     engine.registry.checkpoint_ephemeral([], g).unwrap();
     engine.close();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    engine.compute_invalid_views();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(engine.dag.awaits_rebuild(direct), "a direct stream source invalidates");
     assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
     assert!(

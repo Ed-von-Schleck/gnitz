@@ -21,11 +21,14 @@ impl UnreplayedCatalog {
         Ok(())
     }
 
-    /// Load the sequence scalars and fire every family's hooks over its rows.
+    /// Load the sequence scalars and fire every family's hooks over its rows, then
+    /// lay every relation's children out for the launched worker count and decide
+    /// which views rebuild — what a store open reads.
     pub(crate) fn replay(self) -> Result<CatalogEngine, String> {
         let mut engine = self.0;
         engine.load_sequence_scalars();
         engine.replay_catalog()?;
+        engine.settle_derived_state()?;
         Ok(engine)
     }
 }
@@ -90,7 +93,6 @@ impl CatalogEngine {
     #[cfg(test)]
     pub(crate) fn open_with(base_dir: &str, num_workers: u32, config: StoreConfig) -> Result<Self, String> {
         let mut engine = Self::open_master(base_dir, num_workers, config)?.replay()?;
-        engine.registry.reconcile_child_dirs()?;
         engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)
     }

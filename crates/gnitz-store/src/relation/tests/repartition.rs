@@ -88,3 +88,39 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
         "the source set still reads whole"
     );
 }
+
+/// A crash after a relay's target set is durable and before its source set is
+/// removed: the next boot keeps the target as it stands and removes the source.
+#[test]
+fn a_complete_launched_set_is_kept_and_a_leftover_source_set_removed() {
+    use crate::relation::{relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_str().unwrap();
+    let schema = make_schema_u64_i64();
+    let rel = relation_dir(base, 7);
+    let boot = || {
+        let mut master = RelationRegistry::master(base, 2, StoreConfig::default());
+        let spec = RelationSpec {
+            id: 7,
+            kind: RelationKind::BaseTable,
+            schema,
+            placement: Placement::full_pk(&schema),
+        };
+        master.register(spec).unwrap();
+        master.reconcile_child_dirs().unwrap();
+    };
+    seed_set(&rel, 40);
+    boot();
+    // One row the target does not hold: relaying the set again would add it.
+    seed_set(&rel, 41);
+    boot();
+
+    let rows: usize = (0..2).map(|k| open_child(&rel, k, 2).full_scan().len()).sum();
+    assert_eq!(rows, 40, "the launched set is not relayed onto again");
+    let source = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(&rel);
+    assert!(
+        !std::path::Path::new(&source).exists(),
+        "the leftover source set is removed"
+    );
+}

@@ -337,16 +337,6 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<Vec<u64>, Str
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
     inject_recovery_panic("genbump");
-
-    catalog
-        .registry
-        .reconcile_child_dirs()
-        .map_err(|e| format!("child-dir sweep failed: {e}"))?;
-
-    // Pre-fork because it reads every launched rank's manifest on behalf of
-    // workers that do not exist yet.
-    catalog.compute_invalid_views();
-
     Ok(swept_base_tables(catalog))
 }
 

@@ -26,7 +26,6 @@ impl RelationRegistry {
             Residency::Master,
             "open_stores runs once, on a master registry"
         );
-        assert!(self.children_reconciled, "open_stores before reconcile_child_dirs");
         assert!(residency.owns_stores());
         self.slot = Slot::new(rank, self.slot.of);
         self.residency = residency;
@@ -80,7 +79,7 @@ impl RelationRegistry {
 
     /// Relay each base table's children onto this boot's worker count, then
     /// [`Self::reclaim_orphan_relation_dirs`]. Idempotent.
-    pub fn reconcile_child_dirs(&mut self) -> Result<(), String> {
+    pub fn reconcile_child_dirs(&self) -> Result<(), String> {
         // A relay removes the set it read, and the reclaim deletes directories.
         assert_eq!(
             self.residency,
@@ -98,9 +97,7 @@ impl RelationRegistry {
                 self.config.scan_chunk_rows,
             )?;
         }
-        self.reclaim_orphan_relation_dirs()?;
-        self.children_reconciled = true;
-        Ok(())
+        self.reclaim_orphan_relation_dirs()
     }
 
     /// The bytes `id`'s next published manifest carries beside its rows.

@@ -39,7 +39,7 @@ impl CatalogEngine {
     /// phase 2 propagates invalidity to any view scanning an invalid source,
     /// following scan edges forward from every locally invalid view, and to the
     /// whole chain of any invalid view.
-    pub(crate) fn compute_invalid_views(&mut self) {
+    fn compute_invalid_views(&mut self) {
         let topo_valid = self.topology_matches();
 
         let view_ids = self.registry.view_ids();
@@ -80,6 +80,17 @@ impl CatalogEngine {
         let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.dag.chain_of(v)).collect();
         let whole_chains = view_ids.into_iter().filter(|&v| chains.contains(&self.dag.chain_of(v)));
         self.dag.set_rebuild(whole_chains.collect());
+    }
+
+    /// Relay each base table onto the launched worker count and drop the children
+    /// no relation owns any more, then reach the resume verdict — which reads every
+    /// launched rank's manifests, so it runs where no worker exists yet.
+    pub(in crate::catalog) fn settle_derived_state(&mut self) -> Result<(), String> {
+        self.registry
+            .reconcile_child_dirs()
+            .map_err(|e| format!("child-dir sweep failed: {e}"))?;
+        self.compute_invalid_views();
+        Ok(())
     }
 
     /// Open this process's stores under the boot's resume verdict: a relation's
