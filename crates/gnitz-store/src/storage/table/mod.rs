@@ -37,6 +37,12 @@ pub(super) const MEMTABLE_BYTES: usize = 192 << 10;
 /// does not touch.
 const SEAL_FOLD_RATIO: usize = 64;
 
+/// Fold input bytes an ingest pays for per byte it ingests. A chosen factor, not
+/// a derived one: it has to exceed what a store's folds read per ingested byte,
+/// or what the store owes grows with it, and that ratio is a property of the
+/// workload.
+const UPKEEP_LEVY: u64 = 64;
+
 /// The RAM-tier ceiling every store opens with: it bounds that one tier, not the
 /// table's heap. The ceiling trades spill writes against RSS; shrinking it is how
 /// a test reaches the disk regime on small data.
@@ -138,6 +144,9 @@ pub(crate) struct Table {
     /// Set by [`Self::hold_in_ram`]: the RAM tier grows past its budget and never
     /// persists.
     held_in_ram: bool,
+    /// Fold input bytes [`Self::upkeep`] merged past what its calls so far paid
+    /// for: a fold stops at a destination, not at a byte.
+    upkeep_overdraft: u64,
 
     /// `live_row_at`'s candidate pool, kept between calls for its capacity.
     live_row_scratch: Cell<Vec<StoredRow>>,
@@ -205,6 +214,7 @@ impl Table {
             loaded_mark,
             caller_record,
             held_in_ram: false,
+            upkeep_overdraft: 0,
             live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
             durable_manifest: None,
@@ -300,11 +310,12 @@ impl Table {
             return Ok(());
         }
         self.cached_full_scan.set(None);
+        let ingested = batch.total_bytes();
         self.memtable.push(batch, &self.shard_index.schema);
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
-        Ok(())
+        self.upkeep(ingested)
     }
 
     /// Drop every row this store holds, in RAM and on disk. The next barrier
@@ -359,22 +370,48 @@ impl Table {
                 Some(from_runs(mem.chain(shards), schema, cap).materialize())
             }
         };
-        let entered = self.shard_index.seal_pending();
+        self.shard_index.seal_pending();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
-        if entered {
-            self.upkeep()?;
-        }
+        self.upkeep(delta.as_ref().map_or(0, |delta| delta.total_bytes()))?;
         // Copied only while the memtable still holds the run.
         Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
     }
 
-    /// The disk tier's upkeep once a shard entered L0.
-    fn upkeep(&mut self) -> Result<(), StorageError> {
-        // The sweep in `maintain` can dehydrate or drop live rows.
-        self.cached_full_scan.set(None);
-        self.shard_index.maintain()
+    /// Pay the disk tier's upkeep for `ingested` bytes: [`UPKEEP_LEVY`] bytes of
+    /// fold input for each, less what earlier calls overdrew. A store nothing
+    /// is ingested into keeps what it owes.
+    fn upkeep(&mut self, ingested: usize) -> Result<(), StorageError> {
+        // A read replica of another process's directory must not write into it.
+        if self.held_in_ram || !self.shard_index.owed() {
+            return Ok(());
+        }
+        let levy = ingested as u64 * UPKEEP_LEVY;
+        let budget = levy.saturating_sub(self.upkeep_overdraft);
+        self.upkeep_overdraft = self.upkeep_overdraft.saturating_sub(levy);
+        let done = self.shard_index.maintain(budget)?;
+        self.upkeep_overdraft += done.read.saturating_sub(budget);
+        self.evicted(done.evicted);
+        Ok(())
+    }
+
+    /// Every fold the disk tier owes, in one call: for a caller with no ingest
+    /// to pay for them out of.
+    pub(crate) fn settle(&mut self) -> Result<(), StorageError> {
+        if self.held_in_ram {
+            return Ok(());
+        }
+        let done = self.shard_index.maintain(u64::MAX)?;
+        self.evicted(done.evicted);
+        Ok(())
+    }
+
+    /// A sweep that dehydrated or dropped rows moved the row set.
+    fn evicted(&mut self, evicted: bool) {
+        if evicted {
+            self.cached_full_scan.set(None);
+        }
     }
 
     /// The checkpoint mark of the manifest this open loaded; 0 without one.

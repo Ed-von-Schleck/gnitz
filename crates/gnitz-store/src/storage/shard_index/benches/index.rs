@@ -36,7 +36,7 @@ fn shard_probe_bench() {
             held.extend(keys.iter().step_by(16));
             idx.append_l0_run(&trailing_key_batch(pk_cols, keys).into_consolidated())
                 .unwrap();
-            idx.maintain().unwrap();
+            idx.maintain(u64::MAX).unwrap();
         }
         let (l0, [l1, terminal]) = idx.level_shape();
         assert!(
@@ -273,7 +273,7 @@ fn compaction_amplification_bench() {
             spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
             spilled += idx.levels[L0].entries().last().unwrap().shard.file_len();
             spilled_rows += run.len();
-            let ((), kept_up) = counter.measure(|| idx.maintain().unwrap());
+            let (_, kept_up) = counter.measure(|| idx.maintain(u64::MAX).unwrap());
             upkeep += kept_up;
             costliest = costliest.max(kept_up);
             for (every, through, covered, shards, bytes) in &mut barriers {

@@ -1,5 +1,6 @@
 use super::super::manifest;
 use super::super::*;
+use super::Fold;
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
@@ -8,6 +9,84 @@ use gnitz_zset::repr::{pk_group_end, Batch, BatchBuilder};
 use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::path::Path;
+
+/// The upkeep's parts, each run to its end, for the tests that drive one alone.
+impl ShardIndex {
+    fn run(&mut self, fold: Fold) -> Result<(), StorageError> {
+        debug_assert!(self.running.is_none(), "one fold at a time");
+        self.begin(fold)?;
+        self.finish_fold().map(drop)
+    }
+
+    /// Every fold the tree owes.
+    fn drain(&mut self) -> Result<(), StorageError> {
+        self.maintain(u64::MAX).map(drop)
+    }
+
+    /// One pass: each guard the level held is folded once at most.
+    fn split_overfull_guards(&mut self, level: usize) -> Result<(), StorageError> {
+        let keys: Vec<PkBuf> = self.levels[level].guards.iter().rev().map(|g| g.guard_key).collect();
+        for key in keys {
+            let guards = &self.levels[level].guards;
+            let fold = guards
+                .binary_search_by(|g| g.guard_key.cmp(&key))
+                .ok()
+                .and_then(|gi| self.split_of(level, &guards[gi]));
+            if let Some(fold) = fold {
+                self.run(fold)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_underfull_guards(&mut self, level: usize) -> Result<(), StorageError> {
+        while let Some(fold) = self.plan_merge(level) {
+            self.run(fold)?;
+        }
+        Ok(())
+    }
+
+    fn rebalance_guards(&mut self, level: usize) -> Result<(), StorageError> {
+        self.split_overfull_guards(level)?;
+        self.merge_underfull_guards(level)
+    }
+
+    fn vertical_fold(&mut self, src: usize) -> Result<(), StorageError> {
+        if let Some(cut) = self.plan_drain(src) {
+            self.run(cut)?;
+        }
+        while let Some(band) = self.bands.pop() {
+            if let Some(fold) = self.plan_band(band) {
+                self.run(fold)?;
+            }
+        }
+        self.rebalance_guards(TERMINAL)
+    }
+
+    fn run_compact(&mut self) -> Result<(), StorageError> {
+        let fold = self.plan_l0_fold();
+        self.run(fold)?;
+        for level in [L1, TERMINAL] {
+            self.rebalance_guards(level)?;
+        }
+        while self.levels[L1].bytes() > self.l1_target_bytes() {
+            let Some(gi) = self.cheapest_l1_guard_to_drain() else {
+                break;
+            };
+            self.vertical_fold(gi)?;
+        }
+        Ok(())
+    }
+
+    fn dehydrate_guard(&mut self, guard_idx: usize) -> Result<(), StorageError> {
+        let fold = self.plan_dehydration(guard_idx);
+        self.run(fold)
+    }
+
+    fn enforce_capacity(&mut self) -> Result<(), StorageError> {
+        self.drain()
+    }
+}
 
 fn open(dir: &Path, schema: SchemaDescriptor, budget: ShardBudget) -> ShardIndex {
     let dir = dir.to_str().unwrap();
@@ -241,11 +320,11 @@ fn a_spill_of_retractions_folds_into_the_rows_it_cancels() {
 
     // Too few to be worth a rewrite of the thousand.
     idx.append_l0_run(&dense_batch(0, 50).negated()).unwrap();
-    idx.maintain().unwrap();
+    idx.drain().unwrap();
     assert_eq!(idx.level_shape(), (1, [1, 0]));
 
     idx.append_l0_run(&dense_batch(50, 250).negated()).unwrap();
-    idx.maintain().unwrap();
+    idx.drain().unwrap();
     assert_eq!(idx.level_shape(), (0, [1, 0]));
     let guard = &idx.levels[L1].guards[0];
     assert_eq!((guard.entries.len(), guard.rows()), (1, 700));
@@ -265,7 +344,7 @@ fn retractions_that_cancel_nothing_stop_folding_for_them() {
             let run = dense_batch(spill * 100, 100);
             let run = if weight < 0 { run.negated() } else { run };
             idx.append_l0_run(&run).unwrap();
-            idx.maintain().unwrap();
+            idx.drain().unwrap();
         }
         assert_weighs(&idx, weight, (0..4000).map(gk));
         cstats::dump().values().map(|p| p.n).sum::<usize>()
@@ -1167,7 +1246,7 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
     for round in 0..60u64 {
         // Ascending keys, as a `_tick`-led delta store's always are.
         idx.append_l0_run(&dense_batch(round * 1000 + 1, 40)).unwrap();
-        idx.maintain().unwrap();
+        idx.drain().unwrap();
         if round == 9 {
             early = idx.resident_bytes();
         }
@@ -1210,7 +1289,7 @@ fn a_drop_removes_nothing_above_the_floor_it_raises() {
 
     for round in 6..24u64 {
         add(&mut idx, &mut written, round);
-        idx.maintain().unwrap();
+        idx.drain().unwrap();
     }
 
     let floor = idx.dropped_max();
@@ -1303,10 +1382,10 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     assert_weighs(&idx, 3, (1..=20).map(gk));
 }
 
-/// One merge pass rewrites about one L0 fold's worth however many guards a jump
-/// in `R` leaves underfull, and later passes finish the job.
+/// A budget of `R` merges about one L0 fold's worth however many guards a jump
+/// in `R` leaves underfull, and later calls finish the job.
 #[test]
-fn a_jump_in_r_merges_one_folds_worth_per_pass() {
+fn a_jump_in_r_is_merged_within_each_calls_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
     const GUARDS: u64 = 40;
@@ -1318,21 +1397,66 @@ fn a_jump_in_r_merges_one_folds_worth_per_pass() {
     for i in 0..5u64 {
         append_stable(&mut idx, 1_000_000 + i * 10_000);
     }
-    cstats::reset();
-    idx.maintain().unwrap();
+    let fold = idx.plan_l0_fold();
+    idx.run(fold).unwrap();
     let r = idx.l0_run_bytes;
     assert!(r > 2 * MIN_GUARD_BYTES, "premise: R jumped past the seeded guards");
+
+    cstats::reset();
+    let done = idx.maintain(r).unwrap();
+    assert!(idx.owed(), "premise: one budget does not finish the job");
     let merged = cstats::dump()[&CompactionKind::GuardMerge].in_bytes;
-    // One pass per guarded level, each stopping once it has read `R`.
-    assert!(merged < 2 * (r + r / 2), "{merged} B merged against R = {r} B");
+    // The call stops at the first destination past its budget.
+    assert!(
+        done.read < 2 * r && merged < 2 * r,
+        "{merged} B merged against R = {r} B"
+    );
     let after_one = idx.levels[TERMINAL].guards.len();
     assert!(after_one > GUARDS as usize / 2, "the level was not rewritten whole");
 
-    for _ in 0..GUARDS {
-        idx.merge_underfull_guards(TERMINAL).unwrap();
-    }
-    assert!(idx.levels[TERMINAL].guards.len() < after_one, "later passes converge");
+    idx.drain().unwrap();
+    assert!(!idx.owed());
+    assert!(idx.levels[TERMINAL].guards.len() < after_one, "later calls converge");
     assert_all_found(&idx, (0..GUARDS).map(|i| i * 10_000 + 1));
+}
+
+/// However much a store owes, one call reads its budget and then at most the
+/// destination it was on: never the folds a spill set off.
+#[test]
+fn a_call_stops_at_the_destination_past_its_budget() {
+    use crate::test_support::Rng;
+    const KEYS: u64 = 400_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut idx = fresh(tmp.path(), schema);
+    let mut rng = Rng::new(11);
+    let (mut calls, mut part_way, mut deferred) = (0, 0, 0);
+    for _ in 0..120 {
+        let mut keys: Vec<u64> = (0..2048).map(|_| rng.gen_range(KEYS)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        idx.append_l0_run(&test_batch(&keys, &keys.iter().map(|&k| k as i64).collect::<Vec<_>>()))
+            .unwrap();
+        // A budget of one byte: the call does one destination and stops.
+        let before = idx.shard_seq;
+        let done = idx.maintain(1).unwrap();
+        // One destination reads no more than the fold it belongs to, and no
+        // fold reads more than two guards' worth.
+        assert!(done.read <= 2 * idx.l0_run_bytes + 1, "one call read {} B", done.read);
+        assert!(idx.shard_seq - before <= 1, "one call wrote more than one shard");
+        calls += 1;
+        part_way += usize::from(idx.running.is_some());
+        deferred += usize::from(idx.owed());
+    }
+    assert!(part_way > 0, "premise: no call left a fold part-way through");
+    assert!(deferred > calls / 2, "premise: the store rarely owed past one call");
+
+    idx.drain().unwrap();
+    assert!(!idx.owed() && idx.running.is_none());
+    assert!(idx.levels[L0].entries().count() <= L0_COMPACT_THRESHOLD);
+    for level in &idx.levels[L1..] {
+        assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
+    }
 }
 
 /// A source guard holding keys below its own key is cut at the low end of its
@@ -1371,7 +1495,7 @@ fn an_ascending_stream_is_written_once() {
     for i in 0..30u64 {
         append_stable(&mut idx, 1 + i * 10_000);
         keys.extend(1 + i * 10_000..1 + i * 10_000 + STABLE_ROWS);
-        idx.maintain().unwrap();
+        idx.drain().unwrap();
     }
     let folded: Vec<u64> = idx.levels[L1].entries().map(|e| e.seq).collect();
     assert!(folded.len() > 1, "premise: several L0 folds reached L1");
@@ -1652,6 +1776,7 @@ fn shard_index_model() {
         (ShardBudget::Dehydrate(1), true),
         (ShardBudget::Drop(150_000), true),
     ];
+    let mut interrupted = 0;
     for seed in 1..=gnitz_foundation::env::env_num("GNITZ_MODEL_SEEDS", 1u64) {
         for pk_cols in [1usize, 3] {
             for (ci, &(budget, monotone)) in configs.iter().enumerate() {
@@ -1684,20 +1809,33 @@ fn shard_index_model() {
                             let batch = next.spill(&mut rng, pk_cols, monotone);
                             if !batch.is_empty() && idx.append_l0_run(&batch).is_ok() {
                                 m = next;
-                                let _ = idx.maintain();
+                                // Half the spills leave a fold part-way through.
+                                let _ = match rng.gen_range(2) {
+                                    0 => idx.drain(),
+                                    _ => idx.maintain(1).map(drop),
+                                };
+                                interrupted += usize::from(idx.running.is_some());
                             }
                         }
                         3 if !idx.levels[L0].guards.is_empty() => {
+                            let _ = idx.finish_fold();
+                            idx.bands.clear();
                             let _ = idx.run_compact();
                         }
                         4 if !idx.levels[L1].guards.is_empty() => {
-                            let gi = rng.gen_range(idx.levels[L1].guards.len() as u64) as usize;
-                            let _ = idx.vertical_fold(gi);
+                            let _ = idx.finish_fold();
+                            idx.bands.clear();
+                            if !idx.levels[L1].guards.is_empty() {
+                                let gi = rng.gen_range(idx.levels[L1].guards.len() as u64) as usize;
+                                let _ = idx.vertical_fold(gi);
+                            }
                         }
                         5 => {
                             let _ = idx.enforce_capacity();
                         }
                         6 => {
+                            let _ = idx.finish_fold();
+                            idx.bands.clear();
                             let _ = idx.rebalance_guards([L1, TERMINAL][rng.gen_range(2) as usize]);
                         }
                         7 => {
@@ -1705,6 +1843,7 @@ fn shard_index_model() {
                             if let Some(p) = &blocker {
                                 std::fs::remove_dir(p).unwrap();
                             }
+                            let _ = idx.finish_fold();
                             floor = floor.max(idx.dropped_max());
                             idx = reopened_under(idx, budget);
                             (published, published_floor) = (m.clone(), floor);
@@ -1721,7 +1860,7 @@ fn shard_index_model() {
                         }
                         _ => {}
                     }
-                    if let Some(p) = blocker.filter(|p| p.exists()) {
+                    if let Some(p) = blocker.filter(|p| p.is_dir()) {
                         std::fs::remove_dir(&p).unwrap();
                     }
                     floor = floor.max(idx.dropped_max());
@@ -1730,6 +1869,7 @@ fn shard_index_model() {
             }
         }
     }
+    assert!(interrupted > 0, "premise: no fold was ever left part-way through");
 }
 
 /// Scattered updates through every trigger, tier folds included, also over a
@@ -1770,7 +1910,7 @@ fn tier_folds_keep_the_zset() {
             }
             idx.append_l0_run(&make_batch_raw(&schema, &rows).into_consolidated())
                 .unwrap();
-            idx.maintain().unwrap();
+            idx.drain().unwrap();
             for level in &idx.levels[L1..] {
                 assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
             }

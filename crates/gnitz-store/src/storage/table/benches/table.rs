@@ -123,6 +123,53 @@ fn ram_tier_ceiling_bench() {
     }
 }
 
+/// What one `Table::ingest_owned_batch` costs its caller once the store has a
+/// disk tier to keep up: the mean call, the costliest one, and how many calls
+/// found upkeep owed, over fresh ascending keys and over keys scattered
+/// across the key space. A call pays for the upkeep its own bytes owe and
+/// stops at a fold's destination, so the costliest is one destination, not the
+/// folds a spill sets off.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn ingest_call_bench() {
+    const UPDATES: u64 = 8_000_000;
+    const PER_TICK: u64 = 100;
+    const TIER: usize = 1 << 20;
+    let ascending = |u: u64| u;
+    let scattered = |u: u64| u.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 1;
+    type Case = (&'static str, fn(u64) -> u64);
+    let cases: [Case; 2] = [("ascending", ascending), ("scattered", scattered)];
+
+    let schema = make_schema_u64_i64();
+    let counter = Counter::instructions();
+    let dir = tempfile::tempdir().unwrap();
+    for (label, key) in cases {
+        let rederive = RecoverySource::Rederive { resume_at: None };
+        let mut table = new_table(dir.path().join(label), schema, rederive, TIER);
+        let (mut total, mut costliest, mut kept_up) = (0, 0, 0u64);
+        for t in 0..UPDATES / PER_TICK {
+            let rows: Vec<_> = (t * PER_TICK..(t + 1) * PER_TICK)
+                .map(|u| (key(u), 1, u as i64))
+                .collect();
+            let tick = make_batch_raw(&schema, &rows);
+            kept_up += u64::from(table.shard_index.owed());
+            let ((), instructions) = counter.measure(|| table.ingest_owned_batch(tick).unwrap());
+            total += instructions;
+            costliest = costliest.max(instructions);
+        }
+        let ticks = UPDATES / PER_TICK;
+        let (l0, deeper) = table.level_shape();
+        assert!(deeper.iter().all(|&guards| guards > 1), "{label}: a level never filled");
+        println!(
+            "ingest_call_bench {label:<10} {:7.1} K instr/call, the costliest {:6.1} M, {:.2}% of calls found upkeep owed; \
+             {l0} L0 shards, {deeper:?} guards",
+            total as f64 / ticks as f64 / 1e3,
+            costliest as f64 / 1e6,
+            kept_up as f64 * 100.0 / ticks as f64,
+        );
+    }
+}
+
 /// Instructions per `Table::gather` of 1, 64 and 4096 keys spread over the key
 /// span of a table whose rows sit in shards and in the memtable, the open
 /// counted.

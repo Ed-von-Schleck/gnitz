@@ -223,8 +223,9 @@ proptest! {
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();
         }
-        // Registering the WAVES'th shard crosses `l0.len() > 4`, so the flush
-        // loop itself compacted into guards below L0.
+        // Registering the WAVES'th shard crosses `l0.len() > 4`, so the store
+        // owes the fold into guards below L0.
+        table.settle().unwrap();
         prop_assert!(
             table.level_shape().1.iter().sum::<usize>() > 0,
             "WAVES flushes must have driven an L0->L1 compaction"

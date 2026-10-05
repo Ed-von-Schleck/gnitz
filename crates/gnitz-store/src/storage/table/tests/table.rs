@@ -135,7 +135,6 @@ proptest! {
         let mut stream = stream.into_iter().cycle();
         // A reopen finds the pending shards its last barrier published in L0,
         // however many they are, until the next upkeep.
-        let mut reopened_over = false;
         for op in ops {
             match op {
                 Op::Ingest(n) | Op::IngestPending(n) => {
@@ -183,14 +182,14 @@ proptest! {
                     t = open();
                     live = durable.clone();
                     sealed = durable.clone();
-                    reopened_over = true;
                     prop_assert_eq!(shard_files(dir.path()), t.shard_index.shard_count());
                 }
             }
             assert_serves(&t, &live, &sealed, &keys);
-            reopened_over &= t.level_shape().0 > L0_COMPACT_THRESHOLD;
-            prop_assert!(reopened_over || t.level_shape().0 <= L0_COMPACT_THRESHOLD, "L0 over its trigger");
         }
+        t.settle().unwrap();
+        assert_serves(&t, &live, &sealed, &keys);
+        prop_assert!(t.level_shape().0 <= L0_COMPACT_THRESHOLD, "L0 over its trigger");
     }
 }
 
@@ -340,6 +339,7 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
         t.ingest_owned_batch(round(r, -1)).unwrap();
     }
     t.fold_to_ram().unwrap();
+    t.settle().unwrap();
     assert_eq!(t.shard_index.shard_count(), 0, "the compaction cancelled everything");
     assert!(publishes(&mut t), "an emptied index publishes");
     drop(t);

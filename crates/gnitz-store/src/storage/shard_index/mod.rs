@@ -354,6 +354,14 @@ pub(super) struct ShardIndex {
     skip_pk_filter: bool,
     /// What the in-place guard folds so far cancelled per retraction they read.
     cancel_yield: CancelYield,
+    /// Whether the tree may owe a fold; see [`Self::owed`].
+    owed: bool,
+    /// The fold under way, between two calls of [`Self::maintain`].
+    running: Option<index::Running>,
+    /// The L1 guards a band cut left to fold down, by guard key, the lowest
+    /// last. While any is left nothing else reshapes L1 or the terminal level:
+    /// the bands were cut against the terminal partition as it stood.
+    bands: Vec<PkBuf>,
 }
 
 /// How many rows a retraction is expected to cancel when a fold brings it
@@ -411,6 +419,10 @@ impl ShardIndex {
             dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,
             cancel_yield: CancelYield::FRESH,
+            // A reopened tree is asked once whether it owes anything.
+            owed: !shards.entries.is_empty(),
+            running: None,
+            bands: Vec::new(),
         };
         for e in &shards.entries {
             let entry = ShardEntry::open(output_dir, e.seq, &idx.schema, e.newest)?;
@@ -461,6 +473,7 @@ impl ShardIndex {
     /// shard leaves the index on the old schema.
     pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         if schema != self.schema {
+            self.abandon_fold();
             let rebound: Vec<Rc<MappedShard>> = self
                 .all_entries()
                 .map(|e| e.shard.rebind(&schema).map(Rc::new))

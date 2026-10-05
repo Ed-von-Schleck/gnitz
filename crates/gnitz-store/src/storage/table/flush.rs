@@ -112,6 +112,9 @@ impl Table {
         let schema = self.shard_index.schema;
         self.pending
             .spill(&schema, |run| self.shard_index.append_pending_run(run))?;
+        // A manifest names a tree; a fold under way has outputs in none.
+        let done = self.shard_index.finish_fold()?;
+        self.evicted(done.evicted);
         let bytes = manifest::encode(&Manifest {
             checkpoint_mark,
             caller_record: self.caller_record.clone(),
@@ -139,16 +142,11 @@ impl Table {
         Ok(Some(FlushWork { bytes, dirs }))
     }
 
-    /// Move the RAM tier's rows to an unsynced L0 shard, then run the disk
-    /// tier's upkeep.
+    /// Move the RAM tier's rows to an unsynced L0 shard.
     fn spill_ram_tier(&mut self) -> Result<(), StorageError> {
         let schema = self.shard_index.schema;
-        if self
-            .ram_tier
-            .spill(&schema, |run| self.shard_index.append_l0_run(run))?
-        {
-            self.upkeep()?;
-        }
+        self.ram_tier
+            .spill(&schema, |run| self.shard_index.append_l0_run(run))?;
         Ok(())
     }
 }
