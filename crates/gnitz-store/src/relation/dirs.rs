@@ -127,11 +127,11 @@ pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
         .all(|d| matches!(read_at(&d, generation), Ok(Some(_))))
 }
 
-/// The caller record of `slot`'s rows child under `rel_dir`; `Ok(None)` without
-/// an intact manifest.
-fn caller_record_at(rel_dir: &str, slot: Slot) -> Result<Option<Vec<u8>>, StorageError> {
+/// The generation and caller record of `slot`'s rows child under `rel_dir`;
+/// `Ok(None)` without an intact manifest.
+fn caller_record_at(rel_dir: &str, slot: Slot) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
     let dir = ChildAddr { kind: ChildKind::Rows, slot }.dir(rel_dir);
-    Ok(read_intact(&dir)?.map(|m| m.caller_record))
+    Ok(read_intact(&dir)?.map(|m| (m.checkpoint_mark, m.caller_record)))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected
@@ -231,13 +231,14 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
     Ok(DirLock { _file: file })
 }
 
-/// One relation directory's caller record, or the I/O error reading it failed with.
-type PersistedRecord = (u64, Result<Vec<u8>, String>);
+/// One relation directory's id, with the generation and caller record its
+/// manifest carries or the I/O error reading it failed with.
+type PersistedRecord = (u64, Result<(u64, Vec<u8>), String>);
 
 impl RelationRegistry {
-    /// Each relation directory's caller record for this slot, by id. A directory
-    /// whose manifest is absent or damaged holds none; a failed read is that
-    /// relation's `Err`.
+    /// Each relation directory's generation and caller record for this slot, by
+    /// id. A directory whose manifest is absent or damaged holds none; a failed
+    /// read is that relation's `Err`.
     pub fn persisted_records(&self) -> Result<Vec<PersistedRecord>, String> {
         let root = relations_dir(&self.base_dir);
         let names = subdir_names(&root).map_err(|e| format!("list '{root}': {e}"))?;

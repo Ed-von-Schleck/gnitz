@@ -242,7 +242,7 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     registry.register(view(damaged)).unwrap();
     registry.set_caller_record(good, b"good".to_vec()).unwrap();
     registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
-    registry.checkpoint_ephemeral([], 0).unwrap();
+    registry.checkpoint_ephemeral([], 3).unwrap();
 
     flip_last_byte_in_place(manifest_path(&registry.child_dir(damaged, ChildKind::Rows)));
     // A name that parses to `good`'s id but is not the name its directory has.
@@ -255,13 +255,52 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     )
     .unwrap();
 
-    let records: Vec<(u64, Vec<u8>)> = registry
+    let records: Vec<(u64, (u64, Vec<u8>))> = registry
         .persisted_records()
         .unwrap()
         .into_iter()
         .map(|(id, r)| (id, r.unwrap()))
         .collect();
-    assert_eq!(records, vec![(good, b"good".to_vec())]);
+    assert_eq!(records, vec![(good, (3, b"good".to_vec()))]);
+}
+
+/// An index reopened beside its owner resumes from the manifest the owner's
+/// checkpoint published it with, and is filled from the owner when its own
+/// manifest is of another generation or gone. Either way it holds the owner's
+/// entries.
+#[test]
+fn a_reopened_index_resumes_only_at_its_owners_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let spec = RelationSpec {
+        kind: RelationKind::View(ViewProps::Plain),
+        ..table(9, schema)
+    };
+    let cols = PkColList::from_slice(&[1]);
+    let rows = make_batch_raw(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
+    {
+        let mut origin = solo(tmp.path());
+        origin.register(spec).unwrap();
+        origin.add_index(9, index(1, false), cols).unwrap();
+        origin.ingest(9, rows.clone()).unwrap();
+        origin.checkpoint_ephemeral([], 5).unwrap();
+    }
+    let reopen = |index_generation: u64| {
+        let mut r = solo(tmp.path());
+        r.reopen_view(spec, 5).unwrap();
+        r.reopen_index(9, index(1, false), cols, index_generation).unwrap();
+        let ix = r.relation(9).unwrap().index_on(&[1]).unwrap();
+        let want = gnitz_zset::algebra::index_entries(&rows, &ix.key_spec(), &ix.schema());
+        assert_eq!(
+            zset_of(&ix.cursor().materialize(), &ix.schema()),
+            zset_of(&want, &ix.schema()),
+            "generation {index_generation}"
+        );
+        ix.resumed()
+    };
+    assert!(reopen(5), "published with its owner");
+    assert!(!reopen(4), "of another generation, so filled from the owner");
+    assert!(!reopen(5), "the refused manifest is gone");
 }
 
 /// A view told to resume opens only from its manifests: its store from the

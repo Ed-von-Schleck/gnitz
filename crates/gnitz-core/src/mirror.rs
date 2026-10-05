@@ -25,7 +25,8 @@
 //! **Cost.** A copy trades W workers' parallelism for a local read: it wins
 //! outright on point and small bounded reads, where the round trip dominates,
 //! and the margin narrows as the walk grows until a full scan of a large view at
-//! high W is a loss. Narrowing the bound is the lever.
+//! high W is a loss. Narrowing the bound is the lever. Each index the view had at
+//! its last resolve is a further local store, maintained on every applied delta.
 
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
@@ -59,22 +60,17 @@ pub trait MirrorStore: Send {
     /// when it refuses.
     fn base_dir(&self) -> &str;
 
-    /// Register `tid` under `schema`, retracting whatever the store held at that
-    /// id with another layout, or under that qualified name at another id.
-    /// Returns the id whose registration that retracted, if any — the store's
-    /// verdict, which is what keeps a client's own name→id bindings free of two
-    /// live entries under one name.
+    /// Register `desc.tid` as `schema_name.name`, with `desc`'s schema and
+    /// indexes, retracting whatever the store held at that id as another
+    /// relation, or under that qualified name at another id. Returns the id
+    /// whose registration that retracted, if any — the store's verdict, which is
+    /// what keeps a client's own name→id bindings free of two live entries under
+    /// one name.
     ///
-    /// The qualified name is what the store records the copy under, and the only
-    /// thing it needs beyond the id: the store mints no ids of its own, so there
-    /// is no schema id for a schema to be entered under.
-    fn register(
-        &mut self,
-        tid: u64,
-        schema_name: &str,
-        name: &str,
-        schema: &Schema,
-    ) -> Result<Option<u64>, MirrorError>;
+    /// The qualified name is what the store records the copy under: the store
+    /// mints no ids of its own, so there is no schema id for a schema to be
+    /// entered under.
+    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError>;
 
     /// Tear `tid` down to `level`. See [`Invalidate`]. Idempotent, and a `tid`
     /// the store does not hold is `Ok(())`.
@@ -374,13 +370,12 @@ impl GnitzClient {
     /// with no second round trip.
     pub(crate) fn bind(&mut self, schema_name: &str, name: &str, desc: Arc<RelDescriptor>) -> Result<u64, ClientError> {
         let tid = desc.tid;
-        let schema = Arc::clone(&desc.schema);
+        let retracted = self.mirror_state()?.store.register(schema_name, name, &desc)?;
         let entry = MirroredView {
             schema_name: schema_name.to_string(),
             name: name.to_string(),
             desc,
         };
-        let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
         let m = self.mirror_state()?;
         // The store's verdict, not a second scan: this map and the store's
         // records must name the same displaced id, or `held`

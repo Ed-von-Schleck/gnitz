@@ -487,6 +487,29 @@ impl RelationRegistry {
     /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
     /// straddle two workers' slices, so only the caller can check it.
     pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
+        self.enter_index(owner, claim, cols, None)
+    }
+
+    /// [`Self::add_index`] beside an owner [reopened](Self::reopen_view) at
+    /// `generation`: the index's store resumes from its manifest at that
+    /// generation, and is filled from the owner when it carries none.
+    pub fn reopen_index(
+        &mut self,
+        owner: u64,
+        claim: IndexClaim,
+        cols: PkColList,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.enter_index(owner, claim, cols, Some(generation))
+    }
+
+    fn enter_index(
+        &mut self,
+        owner: u64,
+        claim: IndexClaim,
+        cols: PkColList,
+        resume_at: Option<u64>,
+    ) -> Result<(), String> {
         let unique = matches!(claim, IndexClaim::Index { unique: true, .. });
         let owner_schema = self.index_owner(owner, unique)?.schema();
         let entry = self.tables.get_mut(&owner).expect("resolved above");
@@ -508,11 +531,13 @@ impl RelationRegistry {
                 owner,
                 ChildKind::Index(ix.cols),
                 index_schema,
-                RecoverySource::Rederive { resume_at: None },
+                RecoverySource::Rederive { resume_at },
                 self.store_budgets(),
             )?));
-            let owner_store = &self.tables[&owner].store;
-            ingest::fill_indexes(owner_store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
+            if !ix.resumed() {
+                let owner_store = &self.tables[&owner].store;
+                ingest::fill_indexes(owner_store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
+            }
         }
         self.tables.get_mut(&owner).expect("resolved above").indexes.push(ix);
         Ok(())

@@ -107,8 +107,9 @@ def test_a_mirrored_view_keeps_its_select_order(client, mirror):
 
 
 def test_a_mirrored_view_with_an_index_reads_every_row_locally(client, mirror):
-    """The copy's descriptor names the server's index, which the copy does not
-    hold; a read planned through it still answers exactly the server's rows."""
+    """The copy carries the server's index, filled at the bootstrap and
+    maintained on every round; a read planned through it answers exactly the
+    server's rows."""
     _fed_view(client)
     client.execute_sql("CREATE INDEX ON f(v)")
     vid = mirror.mirror_view("f").view_id
@@ -120,6 +121,32 @@ def test_a_mirrored_view_with_an_index_reads_every_row_locally(client, mirror):
         "SELECT id, v FROM f WHERE v >= 900 AND v < 960",
         "SELECT id, v FROM f WHERE v > 4700",
     ]:
+        _samebag(q, _local(mirror, vid, q), rows(client, q))
+
+
+def test_an_index_changed_upstream_reaches_the_copy_at_the_next_mirror_view(client, mirror):
+    """An index created after the copy is gained at the next `mirror_view`, and
+    one dropped upstream is lost at the one after; either way the copy answers
+    exactly the server's rows, weight-exact."""
+    _fed_view(client)
+    vid = mirror.mirror_view("f").view_id
+    queries = [
+        "SELECT id, v FROM f WHERE v = 301",
+        "SELECT id, v FROM f WHERE v >= 900 AND v < 960",
+        "SELECT id, v FROM f WHERE v > 4700",
+    ]
+
+    client.execute_sql("CREATE INDEX by_v ON f(v)")
+    assert mirror.mirror_view("f").view_id == vid
+    churn(client, 1, 2000)
+    _quiesce(client, mirror)
+    for q in queries:
+        _samebag(q, _local(mirror, vid, q), rows(client, q))
+
+    client.execute_sql("DROP INDEX by_v")
+    assert mirror.mirror_view("f").view_id == vid
+    _quiesce(client, mirror)
+    for q in queries:
         _samebag(q, _local(mirror, vid, q), rows(client, q))
 
 

@@ -26,6 +26,13 @@ pub fn manifest_path(base_dir: &str, tid: u64) -> String {
     ROWS.manifest(&relation_dir(&root(base_dir), tid))
 }
 
+/// The manifest of `tid`'s copy's index on `cols`.
+#[allow(dead_code)]
+pub fn index_manifest_path(base_dir: &str, tid: u64, cols: &[u32]) -> String {
+    let kind = ChildKind::Index(gnitz_wire::PkColList::from_slice(cols));
+    ChildAddr { kind, slot: Slot::SOLO }.manifest(&relation_dir(&root(base_dir), tid))
+}
+
 pub fn has_manifest(base_dir: &str, tid: u64) -> bool {
     std::path::Path::new(&manifest_path(base_dir, tid)).exists()
 }

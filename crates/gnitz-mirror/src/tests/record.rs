@@ -10,6 +10,8 @@ fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
         schema_name: "public".to_string(),
         name: "recent".to_string(),
         block: encode_schema_block(&make_schema_u64_i64()),
+        pk_repeats: false,
+        indexes: vec![PkColList::from_slice(&[1]), PkColList::from_slice(&[1, 0])],
         cursor,
     }
 }

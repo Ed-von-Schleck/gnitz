@@ -76,7 +76,8 @@ impl MirrorStore for StubStore {
         "stub"
     }
 
-    fn register(&mut self, tid: u64, schema_name: &str, name: &str, _s: &Schema) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+        let tid = desc.tid;
         let qname = format!("{schema_name}.{name}");
         // The live store's name rule; its layout rule is not modelled.
         let renamed = self

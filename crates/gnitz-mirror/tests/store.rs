@@ -10,20 +10,22 @@
 
 use std::collections::BTreeMap;
 
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
-use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_wire::{Cut, KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
 use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
 use gnitz_zset_testkit::{make_batch, make_schema_u128_i64, make_schema_u64_i64};
 use tempfile::TempDir;
 
 #[path = "support/common.rs"]
 mod common;
-use common::{block_copy, has_copy, has_manifest, manifest_path, root, unblock_copy};
+use common::{block_copy, has_copy, has_manifest, index_manifest_path, manifest_path, root, unblock_copy};
 
 const SCHEMA: &str = "s";
 const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 const OTHER_TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID + 1;
+/// The generation a store's first checkpoint publishes at.
+const FIRST_GENERATION: u64 = 1;
 
 /// The client-side schema whose record denotes `layout`.
 fn schema_of(layout: &SchemaDescriptor) -> Schema {
@@ -34,6 +36,31 @@ fn schema_of(layout: &SchemaDescriptor) -> Schema {
 /// a batch built on the engine side decodes against a copy registered from here.
 fn view_schema() -> Schema {
     schema_of(&make_schema_u64_i64())
+}
+
+/// The descriptor a resolve of fed view `tid` answers: `schema`, with an index
+/// on each of `indexes`.
+fn desc_of(tid: u64, schema: &Schema, indexes: &[&[u32]]) -> RelDescriptor {
+    RelDescriptor {
+        tid,
+        class: RelClass::FedView,
+        pk_repeats: false,
+        serial: false,
+        schema: std::sync::Arc::new(schema.clone()),
+        indexes: indexes
+            .iter()
+            .map(|cols| RelIndex {
+                cols: PkColList::from_slice(cols),
+                is_unique: false,
+            })
+            .collect(),
+        token: 1,
+    }
+}
+
+/// [`desc_of`] an unindexed view of [`view_schema`]'s shape.
+fn desc(tid: u64) -> RelDescriptor {
+    desc_of(tid, &view_schema(), &[])
 }
 
 fn cursor(tick: u64) -> DeltaCursor {
@@ -67,9 +94,7 @@ fn open(dir: &TempDir) -> Mirror {
 fn registered() -> (Mirror, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = open(&dir);
-    store
-        .register(TID, SCHEMA, "v", &view_schema())
-        .expect("a first registration");
+    store.register(SCHEMA, "v", &desc(TID)).expect("a first registration");
     (store, dir)
 }
 
@@ -77,7 +102,7 @@ fn registered() -> (Mirror, TempDir) {
 /// one row each at round 4.
 fn two_copies() -> (Mirror, TempDir) {
     let (mut store, dir) = registered();
-    store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
+    store.register(SCHEMA, "w", &desc(OTHER_TID)).unwrap();
     seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     seed(&mut store, OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     (store, dir)
@@ -101,7 +126,11 @@ fn two_checkpointed_copies() -> TempDir {
 /// only in payload onto one entry, and would let a payload the round-stamp strip
 /// mangled pass unnoticed — the keys and their weights would still line up.
 fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
-    let batch = whole_copy(store, tid).expect("a scan of a held copy");
+    rows_of(&whole_copy(store, tid).expect("a scan of a held copy"))
+}
+
+/// [`held`]'s fold over one reply batch.
+fn rows_of(batch: &ZSetBatch) -> BTreeMap<(u64, i64), i64> {
     let vals = &batch.payload[0].bytes;
     let mut out = BTreeMap::new();
     for row in 0..batch.weights.len() {
@@ -126,10 +155,10 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     let (mut store, dir) = registered();
     seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
 
-    assert_eq!(store.register(TID, SCHEMA, "moved", &view_schema()).unwrap(), None);
+    assert_eq!(store.register(SCHEMA, "moved", &desc(TID)).unwrap(), None);
     assert_eq!(store.cursor_of(TID), Some(cursor(4)), "a renamed copy keeps its cursor");
     assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1)]), "and its rows");
-    assert_eq!(store.register(OTHER_TID, SCHEMA, "v", &view_schema()).unwrap(), None);
+    assert_eq!(store.register(SCHEMA, "v", &desc(OTHER_TID)).unwrap(), None);
     assert_eq!(
         store.cursor_of(TID),
         Some(cursor(4)),
@@ -137,7 +166,7 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     );
 
     assert_eq!(
-        store.register(OTHER_TID + 1, SCHEMA, "moved", &view_schema()).unwrap(),
+        store.register(SCHEMA, "moved", &desc(OTHER_TID + 1)).unwrap(),
         Some(TID),
         "a held name at another id names the incumbent it retracted",
     );
@@ -151,7 +180,10 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
 
     seed(&mut store, OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     let wide = schema_of(&make_schema_u128_i64());
-    assert_eq!(store.register(OTHER_TID, SCHEMA, "v", &wide).unwrap(), None);
+    assert_eq!(
+        store.register(SCHEMA, "v", &desc_of(OTHER_TID, &wide, &[])).unwrap(),
+        None
+    );
     assert_eq!(store.cursor_of(OTHER_TID), None, "another layout is another copy");
     let rows = store.scan_spec(OTHER_TID, ReadSpec::all_rows(ReadBound::None), &wide);
     assert_eq!(rows.unwrap().weights.len(), 0, "which starts empty");
@@ -197,7 +229,7 @@ fn a_teardown_stops_where_it_is_asked() {
                 let mut store = open(&dir);
                 assert_eq!(store.cursor_of(TID), None, "a forgotten copy never comes back");
                 store
-                    .register(TID, SCHEMA, "v", &view_schema())
+                    .register(SCHEMA, "v", &desc(TID))
                     .expect("the id can be registered again");
             }
         }
@@ -353,6 +385,138 @@ fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
     );
 }
 
+/// The rows of `tid`'s copy whose `v` lies in `[lo, hi]`, read by a range on
+/// `v`: an index walk where the copy holds that index.
+fn v_range(store: &mut Mirror, tid: u64, lo: i64, hi: i64) -> BTreeMap<(u64, i64), i64> {
+    let image = |v: i64| gnitz_wire::key_image(gnitz_wire::TypeCode::I64, v as u64 as u128);
+    let range = KeyRange::new(
+        PkColList::from_slice(&[1]),
+        &[],
+        Cut::before(image(lo)),
+        Cut::after(image(hi)),
+    );
+    let batch = store
+        .scan_spec(tid, ReadSpec::all_rows(ReadBound::Range(range)), &view_schema())
+        .expect("a range read of a held copy");
+    rows_of(&batch)
+}
+
+/// [`held`], narrowed to the rows [`v_range`] selects.
+fn held_in(store: &mut Mirror, tid: u64, lo: i64, hi: i64) -> BTreeMap<(u64, i64), i64> {
+    let mut rows = held(store, tid);
+    rows.retain(|&(_, v), _| (lo..=hi).contains(&v));
+    rows
+}
+
+/// 128 rows at `v = 10 * id`, so a range of a few values stays an index walk.
+fn spread_rows() -> Vec<u8> {
+    plain(&(0..128).map(|i| (i, 1, i as i64 * 10)).collect::<Vec<_>>())
+}
+
+/// A walk through a copy's index answers exactly the rows a scan selects,
+/// weight-exact, after a bootstrap and applied rounds and across a checkpoint
+/// and reopen, where the index comes back from its own manifest.
+#[test]
+fn a_copys_index_is_maintained_and_resumes_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lo, hi) = (100, 130);
+    let indexed = desc_of(TID, &view_schema(), &[&[1]]);
+    let want = {
+        let mut store = open(&dir);
+        store.register(SCHEMA, "v", &indexed).unwrap();
+        seed(&mut store, TID, &[&spread_rows()], cursor(4)).unwrap();
+        // 11 leaves the range, 12 doubles and 200 enters it.
+        let round = plain(&[(11, -1, 110), (12, 1, 120), (200, 1, 125)]);
+        store.advance(TID, &[&round], cursor(5)).unwrap();
+        let want = held_in(&mut store, TID, lo, hi);
+        assert_eq!(
+            want,
+            BTreeMap::from([((10, 100), 1), ((12, 120), 2), ((13, 130), 1), ((200, 125), 1)]),
+        );
+        assert_eq!(
+            v_range(&mut store, TID, lo, hi),
+            want,
+            "the walk answers what a scan selects"
+        );
+        store.checkpoint().unwrap();
+        want
+    };
+    let index_manifest = index_manifest_path(path(&dir), TID, &[1]);
+    let published = std::fs::read(&index_manifest).expect("the checkpoint published the index");
+
+    let mut store = open(&dir);
+    assert_eq!(store.cursor_of(TID), Some(cursor(5)), "the copy resumed");
+    assert_eq!(v_range(&mut store, TID, lo, hi), want, "and answers the same rows");
+    assert_eq!(
+        std::fs::read(&index_manifest).unwrap(),
+        published,
+        "the index resumed from its manifest rather than being erased"
+    );
+}
+
+/// A crash between a checkpoint's two renames leaves a copy published and its
+/// index a checkpoint behind. The reopened index is refilled from the copy, so
+/// a walk never answers from entries the copy has moved past.
+#[test]
+fn an_index_a_checkpoint_behind_its_copy_is_refilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lo, hi) = (100, 130);
+    let index_manifest = index_manifest_path(path(&dir), TID, &[1]);
+    let want = {
+        let mut store = open(&dir);
+        store
+            .register(SCHEMA, "v", &desc_of(TID, &view_schema(), &[&[1]]))
+            .unwrap();
+        seed(&mut store, TID, &[&spread_rows()], cursor(4)).unwrap();
+        store.checkpoint().unwrap();
+        let behind = std::fs::read(&index_manifest).unwrap();
+        let round = plain(&[(11, -1, 110), (11, 1, 5000), (90, 1, 115), (90, -1, 900)]);
+        store.advance(TID, &[&round], cursor(5)).unwrap();
+        store.checkpoint().unwrap();
+        let want = held_in(&mut store, TID, lo, hi);
+        drop(store);
+        std::fs::write(&index_manifest, behind).unwrap();
+        want
+    };
+    assert_eq!(
+        want,
+        BTreeMap::from([((10, 100), 1), ((12, 120), 1), ((13, 130), 1), ((90, 115), 1)]),
+    );
+
+    let mut store = open(&dir);
+    assert_eq!(store.cursor_of(TID), Some(cursor(5)), "the copy resumed");
+    assert_eq!(v_range(&mut store, TID, lo, hi), want);
+}
+
+/// An index created or dropped upstream reaches a copy that holds a cursor in
+/// place, at the next registration: the copy keeps its rows and its position,
+/// and a range read answers the same rows either way.
+#[test]
+fn a_registration_brings_a_live_copys_indexes_to_the_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lo, hi) = (100, 130);
+    let index_manifest = index_manifest_path(path(&dir), TID, &[1]);
+    let mut store = open(&dir);
+    store.register(SCHEMA, "v", &desc(TID)).unwrap();
+    seed(&mut store, TID, &[&spread_rows()], cursor(4)).unwrap();
+    let want = held_in(&mut store, TID, lo, hi);
+    assert_eq!(want.len(), 4);
+    assert_eq!(v_range(&mut store, TID, lo, hi), want, "narrowed from a scan");
+
+    for (indexes, indexed) in [(&[&[1u32][..]][..], true), (&[][..], false)] {
+        store
+            .register(SCHEMA, "v", &desc_of(TID, &view_schema(), indexes))
+            .unwrap();
+        assert_eq!(store.cursor_of(TID), Some(cursor(4)), "the copy stands");
+        assert_eq!(v_range(&mut store, TID, lo, hi), want, "indexed: {indexed}");
+        store.checkpoint().unwrap();
+        drop(store);
+        store = open(&dir);
+        assert_eq!(std::path::Path::new(&index_manifest).exists(), indexed);
+        assert_eq!(v_range(&mut store, TID, lo, hi), want, "reopened, indexed: {indexed}");
+    }
+}
+
 /// What a copy on disk can suffer between two opens.
 #[derive(Debug, Clone, Copy)]
 enum Damage {
@@ -392,11 +556,11 @@ fn a_damaged_copy_costs_that_copy_alone() {
                         placement: gnitz_zset::schema::Placement::Local,
                         pk_repeats: false,
                     },
-                    0,
+                    FIRST_GENERATION,
                 )
                 .unwrap();
                 raw.set_caller_record(TID, b"not a mirror record".to_vec()).unwrap();
-                raw.checkpoint_ephemeral([], 0).unwrap();
+                raw.checkpoint_ephemeral([], FIRST_GENERATION).unwrap();
             }
         }
 
@@ -422,7 +586,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
         if matches!(damage, Damage::Unopenable) {
             unblock_copy(path(&dir), TID);
         }
-        store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+        store.register(SCHEMA, "v", &desc(TID)).unwrap();
         assert_eq!(
             store.cursor_of(TID),
             None,
@@ -454,7 +618,7 @@ fn a_store_leaves_whatever_else_its_directory_holds() {
     }
 
     let mut store = open(&dir);
-    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    store.register(SCHEMA, "v", &desc(TID)).unwrap();
     seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     let _server = lock_data_dir(path(&dir)).expect("the directory's own lock is free");
@@ -503,10 +667,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
 
     let block = plain(&[(1, 1, 10)]);
     let refused: [(&str, Result<(), MirrorError>); 6] = [
-        (
-            "register",
-            store.register(OTHER_TID, SCHEMA, "w", &view_schema()).map(drop),
-        ),
+        ("register", store.register(SCHEMA, "w", &desc(OTHER_TID)).map(drop)),
         ("invalidate", store.invalidate(OTHER_TID, Invalidate::Cursor)),
         ("refill", seed(&mut store, TID, &[&block], cursor(5))),
         ("advance", store.advance(OTHER_TID, &[&block], cursor(5))),
@@ -592,7 +753,7 @@ fn a_failed_auto_checkpoint_costs_nothing_but_durability() {
         ..MirrorConfig::default()
     };
     let mut store = Mirror::open(path(&dir), config).unwrap();
-    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    store.register(SCHEMA, "v", &desc(TID)).unwrap();
     let mut refill = store.refill(TID).unwrap();
     block_copy(path(&dir), TID);
     refill.block(&big(0)).unwrap();

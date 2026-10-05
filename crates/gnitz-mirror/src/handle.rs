@@ -5,19 +5,19 @@ use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::append_own_regions;
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Refill, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Refill, RelDescriptor, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
-    lock_data_dir, DirLock, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
+    lock_data_dir, DirLock, IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
-use gnitz_wire::ViewProps;
+use gnitz_wire::{PkColList, ViewProps};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
 use crate::guard::Guarded;
-use crate::record::{descriptor_of_block, MirrorRecord};
+use crate::record::{descriptor_of_block, index_lists, MirrorRecord};
 
 /// What a store is sized by. `Default` is the production value of every field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,9 +52,6 @@ impl MirrorConfig {
 /// The store's directory under the one a host names.
 const ROOT: &str = "_mirror";
 
-/// The one generation a mirror's manifests carry.
-const GENERATION: u64 = 0;
-
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
 /// included. A panic rather than an `Err`: nothing else reaches
 /// [`Guarded::touching`]'s panic arm.
@@ -66,9 +63,9 @@ static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 /// checkpoint; each carries its own cursor and is advanced independently.
 ///
 /// Each copy lives under the **server's** relation id; the store mints none of
-/// its own. Every copy is registered as a plain view — no capacity budget, no
-/// index — so no copy holds a skeleton row, and a `Range` bound over non-PK
-/// columns is served by the full scan narrowed to the walk's rows.
+/// its own. Every copy is registered as a plain view with no capacity budget,
+/// so no copy holds a skeleton row, and owns an index on each column list its
+/// view's descriptor named when it was last registered.
 pub struct Mirror {
     /// The directory the host named; the copies' is [`ROOT`] under it.
     base_dir: String,
@@ -92,21 +89,21 @@ impl Mirror {
         let mut copies = Copies {
             registry,
             records: HashMap::new(),
+            generation: 0,
+            unpublished: false,
             applied_bytes: 0,
             checkpoint_bytes: config.checkpoint_bytes,
         };
         let mut all_reopened = true;
         for (tid, record) in persisted {
-            let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
-                // Reopened from the manifest `rec` was read from.
-                Ok(Some((rec, schema))) => copies
-                    .registry
-                    .reopen_view(copy_spec(tid, schema), GENERATION)
-                    .map(|()| {
-                        copies.records.insert(tid, rec);
-                    }),
+            let reopened = match record.map(|(generation, bytes)| (generation, MirrorRecord::decode(&bytes))) {
+                // Reopened from the manifest `rec` was read from, at its generation.
+                Ok((generation, Some((rec, schema)))) => {
+                    copies.generation = copies.generation.max(generation);
+                    copies.enter(tid, rec, schema, Some(generation))
+                }
                 // Not a record this store wrote; the directory is the orphan sweep's.
-                Ok(None) => continue,
+                Ok((_, None)) => continue,
                 Err(e) => Err(e),
             };
             if let Err(e) = reopened {
@@ -131,8 +128,14 @@ impl Mirror {
 /// The copies and their records.
 struct Copies {
     registry: RelationRegistry,
-    /// One per relation in `registry`.
+    /// One per relation in `registry`, whose indexes are the record's.
     records: HashMap<u64, MirrorRecord>,
+    /// The generation the last checkpoint published every copy and index at. A
+    /// reopened index resumes only at its copy's, so one a crash left a
+    /// checkpoint behind its copy is refilled.
+    generation: u64,
+    /// Whether a copy or a record moved since the last checkpoint.
+    unpublished: bool,
     applied_bytes: usize,
     checkpoint_bytes: usize,
 }
@@ -149,14 +152,49 @@ impl Copies {
         self.records.get(&tid).and_then(|r| r.cursor)
     }
 
-    fn register(
+    /// Open `tid`'s copy and the indexes `rec` lists, and record it: from the
+    /// manifests at `resume`, or empty. On `Err` the copy is not entered.
+    fn enter(
         &mut self,
         tid: u64,
-        schema_name: &str,
-        name: &str,
-        schema: &Schema,
-    ) -> Result<Option<u64>, MirrorError> {
-        let block = schema.to_block();
+        rec: MirrorRecord,
+        schema: SchemaDescriptor,
+        resume: Option<u64>,
+    ) -> Result<(), String> {
+        let spec = RelationSpec {
+            id: tid,
+            kind: RelationKind::View(ViewProps::Plain),
+            schema,
+            placement: Placement::Local,
+            pk_repeats: rec.pk_repeats,
+        };
+        match resume {
+            Some(generation) => self.registry.reopen_view(spec, generation)?,
+            None => self.registry.register(spec)?,
+        }
+        for &cols in &rec.indexes {
+            let entered = match resume {
+                Some(generation) => self.registry.reopen_index(tid, index_claim(cols), cols, generation),
+                None => self.registry.add_index(tid, index_claim(cols), cols),
+            };
+            if let Err(e) = entered {
+                // Not erased: the fault may be transient, and the stores resumable.
+                self.registry.unregister(tid);
+                return Err(e);
+            }
+        }
+        self.records.insert(tid, rec);
+        Ok(())
+    }
+
+    /// Bring `desc.tid`'s copy to `desc`: kept in place, cursor and all, while
+    /// it is the same relation, its indexes brought to the ones `desc` names;
+    /// entered empty otherwise.
+    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+        let tid = desc.tid;
+        let block = desc.schema.to_block();
+        let indexes = index_lists(desc);
+        self.unpublished = true;
         // This name at another id was renamed or recreated upstream.
         let renamed = self
             .records
@@ -166,28 +204,53 @@ impl Copies {
         if let Some(old) = renamed {
             self.invalidate(old, Invalidate::Registration)?;
         }
-        match self.records.get_mut(&tid).filter(|r| r.block == block) {
+        let same = |r: &&mut MirrorRecord| r.block == block && r.pk_repeats == desc.pk_repeats;
+        match self.records.get_mut(&tid).filter(same) {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
             Some(r) => {
                 r.schema_name = schema_name.to_string();
                 r.name = name.to_string();
+                if r.indexes != indexes {
+                    self.sync_indexes(tid, indexes)?;
+                }
             }
             None => {
                 self.invalidate(tid, Invalidate::Registration)?;
-                self.registry
-                    .register(copy_spec(tid, descriptor_of_block(&block)?))
-                    .map_err(MirrorError::Engine)?;
                 let rec = MirrorRecord {
                     schema_name: schema_name.to_string(),
                     name: name.to_string(),
-                    block,
+                    pk_repeats: desc.pk_repeats,
+                    indexes,
                     cursor: None,
+                    block,
                 };
-                self.records.insert(tid, rec);
+                let schema = descriptor_of_block(&rec.block)?;
+                self.enter(tid, rec, schema, None).map_err(MirrorError::Engine)?;
             }
         }
         Ok(renamed)
+    }
+
+    /// Bring `tid`'s copy's indexes to `listed`. A copy with a cursor keeps its
+    /// rows, a new index filled from them; one without is entered empty, since
+    /// its bootstrap erases it, as is one an index could not be added to.
+    fn sync_indexes(&mut self, tid: u64, listed: Vec<PkColList>) -> Result<(), MirrorError> {
+        let rec = self.records.get_mut(&tid).expect("checked by the caller");
+        let held = std::mem::replace(&mut rec.indexes, listed.clone());
+        if rec.cursor.is_none() {
+            return self.erase(tid);
+        }
+        for cols in held.iter().filter(|c| !listed.contains(c)) {
+            self.registry.release_index(tid, cols.pack());
+        }
+        for &cols in listed.iter().filter(|c| !held.contains(c)) {
+            if let Err(e) = self.registry.add_index(tid, index_claim(cols), cols) {
+                gnitz_debug!("mirror: indexing the copy of {} failed, so it reseeds: {}", tid, e);
+                return self.erase(tid);
+            }
+        }
+        Ok(())
     }
 
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
@@ -195,6 +258,7 @@ impl Copies {
             return Ok(());
         };
         rec.cursor = None;
+        self.unpublished = true;
         if level == Invalidate::Registration {
             self.records.remove(&tid);
             self.registry
@@ -206,19 +270,21 @@ impl Copies {
 
     /// Drop `tid`'s rows and cursor, keeping its registration.
     fn erase(&mut self, tid: u64) -> Result<(), MirrorError> {
-        let Some(rec) = self.records.get_mut(&tid) else {
+        let Some(mut rec) = self.records.remove(&tid) else {
             return Err(MirrorError::Engine(format!("relation {tid} is not mirrored")));
         };
         rec.cursor = None;
-        // A rederived open with no resume point erases the copy.
-        let spec = copy_spec(tid, self.copy(tid).schema());
+        self.unpublished = true;
+        // A rederived open with no resume point erases the copy and its indexes.
+        let schema = self.copy(tid).schema();
         self.registry.unregister(tid);
-        self.registry.register(spec).map_err(|e| erase_failed(tid, e))
+        self.enter(tid, rec, schema, None).map_err(|e| erase_failed(tid, e))
     }
 
     /// Apply one block to `tid`'s copy. A failed apply erases the copy.
     fn ingest(&mut self, tid: u64, block: &[u8]) -> Result<(), MirrorError> {
         self.applied_bytes += block.len();
+        self.unpublished = true;
         let schema = self.copy(tid).schema();
         let applied = Batch::decode_foreign_wal_block(block, &schema)
             .map_err(|e| format!("decoding a block for {tid}: {e}"))
@@ -238,6 +304,7 @@ impl Copies {
     /// auto-checkpoint is logged, and the next one retries.
     fn settle(&mut self, tid: u64, at: DeltaCursor) {
         self.records.get_mut(&tid).expect("checked by the caller").cursor = Some(at);
+        self.unpublished = true;
         if self.applied_bytes >= self.checkpoint_bytes {
             if let Err(e) = self.checkpoint() {
                 gnitz_error!(
@@ -278,18 +345,26 @@ impl Copies {
         Ok(rows)
     }
 
-    /// Publish every copy with its record. A failure is not a poisoning: a
-    /// flush leaves every store holding what it held.
+    /// Publish every copy with its record, and its indexes, at one new
+    /// generation; nothing when no copy or record moved since the last one. A
+    /// failure is not a poisoning: a flush leaves every store holding what it
+    /// held.
     fn checkpoint(&mut self) -> Result<(), MirrorError> {
         self.applied_bytes = 0;
+        if !self.unpublished {
+            return Ok(());
+        }
         for (&tid, rec) in &self.records {
             self.registry
                 .set_caller_record(tid, rec.encode())
                 .map_err(MirrorError::Engine)?;
         }
+        self.generation += 1;
         self.registry
-            .checkpoint_ephemeral([], GENERATION)
-            .map_err(MirrorError::Engine)
+            .checkpoint_ephemeral([], self.generation)
+            .map_err(MirrorError::Engine)?;
+        self.unpublished = false;
+        Ok(())
     }
 }
 
@@ -303,15 +378,9 @@ impl MirrorStore for Mirror {
         &self.base_dir
     }
 
-    fn register(
-        &mut self,
-        tid: u64,
-        schema_name: &str,
-        name: &str,
-        schema: &Schema,
-    ) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
         self.copies
-            .touching("registering a view", |c| c.register(tid, schema_name, name, schema))
+            .touching("registering a view", |c| c.register(schema_name, name, desc))
     }
 
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
@@ -348,7 +417,9 @@ impl MirrorStore for Mirror {
     }
 
     fn clear_cursors(&mut self) {
-        for r in self.copies.even_if_poisoned_mut().records.values_mut() {
+        let copies = self.copies.even_if_poisoned_mut();
+        copies.unpublished = true;
+        for r in copies.records.values_mut() {
             r.cursor = None;
         }
     }
@@ -401,14 +472,12 @@ impl Refill for Filling<'_> {
     }
 }
 
-/// The registration of `tid`'s copy: a plain view in `schema`'s layout.
-fn copy_spec(tid: u64, schema: SchemaDescriptor) -> RelationSpec {
-    RelationSpec {
-        id: tid,
-        kind: RelationKind::View(ViewProps::Plain),
-        schema,
-        placement: Placement::Local,
-        // The copy owns no index, so it vouches for nothing.
-        pk_repeats: true,
-    }
+/// How a copy claims its index on `cols`: a copy's index is identified by its
+/// column list, so the list's packing is its id.
+fn index_claim(cols: PkColList) -> IndexClaim {
+    IndexClaim::Index { id: cols.pack(), unique: false }
 }
+
+#[cfg(test)]
+#[path = "benches/handle.rs"]
+mod bench;
