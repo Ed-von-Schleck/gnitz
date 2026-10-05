@@ -370,7 +370,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     // Ad-hoc: the fold sink, over no group columns and no aggregate.
     assert_eq!(
         crate::dml::explain_lines(&read(&cat, &format!("EXPLAIN {BODY}")).unwrap(), false)[3],
-        "fold: global aggregate: ; HAVING applied client-side"
+        "fold: global aggregate; HAVING applied client-side"
     );
 
     // View: every reduce groups on nothing, one seeds the ground row, and none

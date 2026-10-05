@@ -27,7 +27,7 @@ use crate::ast_util::{
     select_is_distinct, FromShape,
 };
 use crate::bind::Catalog;
-use crate::dml::plan::{bound_and_predicate, rows_reply, RowsReply};
+use crate::dml::plan::{bound_and_predicate, rows_reply, walks_in_pk_order, RowsReply};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
@@ -41,8 +41,9 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{ReadSink, ReadSpec, RowsCut, SinkKind};
 use sqlparser::ast::{Query, SetExpr, Statement};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -237,6 +238,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         }
     };
     let (bound, predicate) = bound_and_predicate(&desc.schema, &conjuncts, &desc.indexes)?;
+    let in_pk_order = walks_in_pk_order(&bound, &desc.schema.pk_cols);
     let read = |sink| SpecRead {
         name,
         desc: Arc::clone(&desc),
@@ -254,15 +256,28 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
             (case, order)
         }
         AdhocShape::Rows(rows) => {
-            let RowsReply { schema: reply_schema, program, order } = rows_reply(rows, &keys, &desc)?;
-            // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
-            let limit_k = window.end().map_or(0, |e| e as u64);
+            let RowsReply {
+                schema: reply_schema,
+                program,
+                order,
+                pk_ordered,
+            } = rows_reply(rows, &keys, &desc)?;
+            // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
+            let cut = window
+                .end()
+                .and_then(|end| NonZeroU64::new(end as u64))
+                .map(|k| RowsCut {
+                    k,
+                    // A worker walking in the order asked for meets its smallest rows
+                    // first, so it stops at the window instead of ranking every row.
+                    order: match pk_ordered && in_pk_order {
+                        true => Vec::new(),
+                        false => order.clone(),
+                    },
+                });
             let sink = ReadSink {
                 map: program.map(|p| compute_map(p, &reply_schema)),
-                kind: SinkKind::Rows {
-                    order: if limit_k > 0 { order.clone() } else { Vec::new() },
-                    limit_k,
-                },
+                kind: SinkKind::Rows { cut },
             };
             (ReadCase::Rows { read: read(sink), reply_schema }, order)
         }

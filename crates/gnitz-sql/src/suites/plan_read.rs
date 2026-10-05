@@ -107,7 +107,7 @@ fn explain_names_every_decision() {
                 "read nothing (constant row)",
                 "access: none",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: no request (LIMIT 0)",
             ],
         ),
@@ -117,7 +117,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk point lookup",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -127,7 +127,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk range walk",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -138,7 +138,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk set gather (2 keys)",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -149,7 +149,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk point lookup",
                 "predicate: server-side",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -160,7 +160,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 INDEX_V,
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -171,7 +171,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 INDEX_V,
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -182,7 +182,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 INDEX_V,
                 "predicate: server-side",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -195,7 +195,7 @@ fn explain_names_every_decision() {
                 "read table wide",
                 "access: index range on (big)",
                 "predicate: server-side",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -207,7 +207,7 @@ fn explain_names_every_decision() {
                 "read table c",
                 "access: pk range walk",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -217,7 +217,7 @@ fn explain_names_every_decision() {
                 "read table c",
                 "access: pk point lookup",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -228,7 +228,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk range walk",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -239,7 +239,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: server-side",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -261,7 +261,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: server top-12, client sort, client window",
             ],
         ),
@@ -271,7 +271,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: server early-stop 10, client window",
             ],
         ),
@@ -283,7 +283,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: pk point lookup",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: no request (LIMIT 0)",
             ],
         ),
@@ -377,7 +377,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "projection: 1 columns",
+                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -449,6 +449,44 @@ fn explain_rejected_clause_matrix() {
         ("EXPLAIN (FORMAT JSON) SELECT v FROM t", "the parenthesized option list"),
     ] {
         assert_rejects(sql, read(&cat, sql), clause);
+    }
+}
+
+/// A cut ordered ascending by a leading run of the key, over a walk in key
+/// order, ships no ORDER BY: each worker stops at its first rows, and the client
+/// still sorts their union. Any other order ranks every surviving row.
+#[test]
+fn a_cut_ordered_by_the_key_stops_each_worker_early() {
+    let cat = cat();
+    for (sql, cut) in [
+        ("SELECT * FROM t ORDER BY id LIMIT 5", "early-stop 5"),
+        ("SELECT v FROM t ORDER BY id LIMIT 5 OFFSET 2", "early-stop 7"),
+        ("SELECT * FROM t WHERE w + 1 > 3 ORDER BY id LIMIT 5", "early-stop 5"),
+        ("SELECT * FROM t WHERE id > 3 ORDER BY id LIMIT 5", "early-stop 5"),
+        (
+            "SELECT * FROM t WHERE id IN (1, 2, 3) ORDER BY id LIMIT 2",
+            "early-stop 2",
+        ),
+        ("SELECT * FROM c ORDER BY a LIMIT 5", "early-stop 5"),
+        ("SELECT * FROM c ORDER BY a, b LIMIT 5", "early-stop 5"),
+        ("SELECT * FROM c WHERE a = 1 ORDER BY a, b LIMIT 5", "early-stop 5"),
+        ("SELECT * FROM tv ORDER BY id LIMIT 5", "early-stop 5"),
+        // Not a leading run of the key, not ascending, or not the column itself.
+        ("SELECT * FROM c ORDER BY b LIMIT 5", "top-5"),
+        ("SELECT * FROM c ORDER BY b, a LIMIT 5", "top-5"),
+        ("SELECT * FROM c ORDER BY a, b DESC LIMIT 5", "top-5"),
+        ("SELECT * FROM t ORDER BY id DESC LIMIT 5", "top-5"),
+        ("SELECT * FROM t ORDER BY id + 0 LIMIT 5", "top-5"),
+        ("SELECT * FROM t ORDER BY id, v LIMIT 5", "top-5"),
+        // An index walk yields its rows in the index's order.
+        ("SELECT * FROM t WHERE v = 3 ORDER BY id LIMIT 5", "top-5"),
+    ] {
+        let lines = explain(&cat, sql);
+        assert_eq!(
+            lines[4],
+            format!("order/limit: server {cut}, client sort, client window"),
+            "`{sql}`"
+        );
     }
 }
 
@@ -852,22 +890,22 @@ fn an_order_by_key_binds_where_the_select_list_does() {
     for (sql, line) in [
         (
             "SELECT id FROM t ORDER BY v + 1",
-            "projection: 1 columns (+1 for ordering)",
+            "projection: 1 column (+1 for ordering)",
         ),
         (
             "SELECT id FROM t ORDER BY v, g + v DESC",
-            "projection: 1 columns (+2 for ordering)",
+            "projection: 1 column (+2 for ordering)",
         ),
         // One appended column per *distinct* key program — a duplicate would be
         // evaluated by the worker and shipped per row.
         (
             "SELECT id FROM t ORDER BY v + 1, v + 1",
-            "projection: 1 columns (+1 for ordering)",
+            "projection: 1 column (+1 for ordering)",
         ),
         ("SELECT id, v + 1 AS w FROM t ORDER BY v + 1", "projection: 2 columns"),
         ("SELECT id, v + 1 AS w FROM t ORDER BY w", "projection: 2 columns"),
-        ("SELECT id FROM t ORDER BY t.id", "projection: 1 columns"),
-        ("SELECT v FROM t ORDER BY id", "projection: 1 columns"),
+        ("SELECT id FROM t ORDER BY t.id", "projection: 1 column"),
+        ("SELECT v FROM t ORDER BY id", "projection: 1 column"),
     ] {
         assert!(
             explain(&cat, sql).contains(&line.to_string()),
@@ -947,7 +985,7 @@ fn a_from_less_select_plans_a_constant_row() {
             "read nothing (constant row)",
             "access: none",
             "predicate: none",
-            "projection: 1 columns",
+            "projection: 1 column",
             "order/limit: client window",
         ]
     );

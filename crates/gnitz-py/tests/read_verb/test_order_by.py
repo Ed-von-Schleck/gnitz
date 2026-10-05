@@ -138,3 +138,39 @@ def test_a_grouped_views_hidden_key_is_not_a_positional_column(client):
     assert [(r.cat, r.cnt) for r in rows(client, "SELECT * FROM v ORDER BY cnt DESC LIMIT 2")] \
         == [(10, 3), (30, 2)]
     assert [r.cat for r in rows(client, "SELECT * FROM v ORDER BY 1")] == [10, 20, 30]
+
+
+# ---------------------------------------------------------------------------
+# A cut in key order: each worker stops at its first rows
+# ---------------------------------------------------------------------------
+
+
+def test_a_cut_in_key_order_matches_a_full_sort(client):
+    """Ordered ascending by a leading run of the key, each worker ships only the
+    first rows of its own slice; their union must still hold the global window.
+    Negative keys cross the sign-flipped key order, and `g` is a view."""
+    client.execute_sql(
+        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY); "
+        "CREATE TABLE c (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b)); "
+        "CREATE VIEW g AS SELECT a, COUNT(*) AS n FROM c GROUP BY a")
+    p_keys = [(i,) for i in range(-200, 201)]
+    c_keys = [(a, b) for a in range(-10, 10) for b in range(-10, 10)]
+    g_rows = [(a, 20) for a in range(-10, 10)]
+    insert(client, "p", p_keys)
+    insert(client, "c", c_keys)
+    for q, want in [
+        ("SELECT id FROM p ORDER BY id LIMIT 7", p_keys[:7]),
+        ("SELECT id FROM p ORDER BY id LIMIT 5 OFFSET 11", p_keys[11:16]),
+        ("SELECT id FROM p WHERE id > 50 ORDER BY id LIMIT 4", [(i,) for i in range(51, 55)]),
+        ("SELECT id FROM p WHERE id % 7 = 0 ORDER BY id LIMIT 3", [(-196,), (-189,), (-182,)]),
+        ("SELECT id FROM p WHERE id IN (-150, 3, 99, 7) ORDER BY id LIMIT 2", [(-150,), (3,)]),
+        ("SELECT * FROM c ORDER BY a, b LIMIT 9 OFFSET 30", c_keys[30:39]),
+        ("SELECT * FROM c WHERE a = 3 ORDER BY a, b LIMIT 4", [(3, b) for b in range(-10, -6)]),
+        ("SELECT * FROM g ORDER BY a LIMIT 3 OFFSET 2", g_rows[2:5]),
+    ]:
+        assert "early-stop" in rows(client, "EXPLAIN " + q)[-1][0], q
+        assert [tuple(r) for r in rows(client, q)] == want, q
+    # Only the leading key column orders the cut, so its ties land anywhere.
+    got = rows(client, "SELECT * FROM c ORDER BY a LIMIT 25")
+    assert [r.a for r in got] == [-10] * 20 + [-9] * 5
+    assert len({tuple(r) for r in got}) == 25

@@ -1,4 +1,4 @@
-"""SELECT throughput benchmarks: full scan, PK seek, index seek, LIMIT."""
+"""SELECT throughput benchmarks: full scan, PK seek, index seek, LIMIT, and a cut in key order."""
 
 
 from helpers.datagen import PROBE_BASE, bulk_load, probe_val, seed_index_probes
@@ -54,5 +54,26 @@ def test_limit(client, bench_timer, scale):
         bench_timer.measure(
             client.execute_sql,
             "SELECT * FROM t LIMIT 100",
+            rows_per_call=100,
+        )
+
+
+def test_order_by_pk_limit(client, bench_timer, scale):
+    _setup_table(client, scale["rows"])
+    for _ in range(scale["read_iters"]):
+        bench_timer.measure(
+            client.execute_sql,
+            "SELECT * FROM t ORDER BY pk LIMIT 100",
+            rows_per_call=100,
+        )
+
+
+def test_keyset_page(client, bench_timer, scale):
+    n = _setup_table(client, scale["rows"])
+    for i in range(scale["read_iters"]):
+        after = (i * 7919) % max(n - 100, 1)
+        bench_timer.measure(
+            client.execute_sql,
+            f"SELECT * FROM t WHERE pk > {after} ORDER BY pk LIMIT 100",
             rows_per_call=100,
         )

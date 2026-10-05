@@ -173,7 +173,12 @@ fn hydrate_filtered_limit_bench() {
         predicate: cmp_const(gnitz_expr::CmpOp::Eq, 1, payload(M)[0] as i64).to_blob_bytes(),
         sink: gnitz_wire::ReadSink {
             map: None,
-            kind: gnitz_wire::SinkKind::Rows { order: Vec::new(), limit_k: 1 },
+            kind: gnitz_wire::SinkKind::Rows {
+                cut: Some(gnitz_wire::RowsCut {
+                    k: std::num::NonZeroU64::MIN,
+                    order: Vec::new(),
+                }),
+            },
         },
     };
     let (rows, hydrated) = cell("filtered LIMIT 1", &mut engine, view, &spec);

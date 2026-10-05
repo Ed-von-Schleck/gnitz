@@ -1,12 +1,13 @@
 //! The test helpers only this crate uses: they name `Table`, the registry and the
 //! store's own files.
 
+use std::num::NonZeroU64;
 use std::path::Path;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use crate::storage::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
@@ -109,15 +110,17 @@ pub(crate) fn img(v: i64) -> u128 {
     gnitz_wire::key_image(gnitz_wire::TypeCode::I64, v as u64 as u128)
 }
 
+/// A rows sink's cut at `k > 0`.
+pub(crate) fn cut(k: u64, order: Vec<OrderKey>) -> Option<RowsCut> {
+    Some(RowsCut { k: NonZeroU64::new(k).unwrap(), order })
+}
+
 /// A rows spec with no bound and no predicate.
-pub(crate) fn rows_spec(map: Option<ComputeMap>, order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
+pub(crate) fn rows_spec(map: Option<ComputeMap>, cut: Option<RowsCut>) -> ReadSpec {
     ReadSpec {
         bound: ReadBound::None,
         predicate: Vec::new(),
-        sink: ReadSink {
-            map,
-            kind: SinkKind::Rows { order, limit_k },
-        },
+        sink: ReadSink { map, kind: SinkKind::Rows { cut } },
     }
 }
 

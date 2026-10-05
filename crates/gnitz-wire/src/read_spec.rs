@@ -3,6 +3,7 @@
 //! is the trust boundary.
 
 use crate::circuit::{AggDescriptor, ComputeMap};
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use crate::codec::{decode_all, Reader, Wire, Writer};
@@ -74,21 +75,24 @@ pub struct ReadSink {
     pub kind: SinkKind,
 }
 
-/// The two sinks. A fold carries no ORDER BY / LIMIT because all SQL-level
-/// finishing on an aggregate result is client-side; the enum makes that
-/// unrepresentable rather than decode-checked.
+/// A rows sink's cut: stop once the forwarded rows' summed weight reaches `k`,
+/// taking the `order`-smallest rows when `order` is non-empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowsCut {
+    /// OFFSET + LIMIT in logical rows (summed weight).
+    pub k: NonZeroU64,
+    /// ORDER BY keys applied in sequence; `col` indexes the sink input (= the
+    /// reply layout). `len ≤ MAX_ORDER_KEYS`; empty = the first rows the walk
+    /// yields.
+    pub order: Vec<OrderKey>,
+}
+
+/// The two sinks. A fold carries no cut: all SQL-level finishing on an
+/// aggregate result is client-side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkKind {
-    /// Forward rows, ORDER BY / LIMIT top-k.
-    Rows {
-        /// ORDER BY keys applied in sequence; `col` indexes the sink input (=
-        /// the reply layout). `len ≤ MAX_ORDER_KEYS`; empty unless `limit_k > 0`.
-        order: Vec<OrderKey>,
-        /// OFFSET + LIMIT in logical rows (summed weight). 0 = unbounded.
-        /// (`LIMIT 0` never reaches the wire — the SQL layer short-circuits an
-        /// empty window.)
-        limit_k: u64,
-    },
+    /// Forward rows, every one or the ones `cut` keeps.
+    Rows { cut: Option<RowsCut> },
     /// Fold rows into per-group accumulators (GROUP BY / global aggregate /
     /// DISTINCT) and emit partial reduce-output rows. `group_cols` /
     /// `aggs[].col_idx` index the sink input.
@@ -101,7 +105,7 @@ impl ReadSink {
     pub fn all_rows() -> Self {
         ReadSink {
             map: None,
-            kind: SinkKind::Rows { order: Vec::new(), limit_k: 0 },
+            kind: SinkKind::Rows { cut: None },
         }
     }
 }
@@ -231,7 +235,9 @@ impl ReadSpec {
         };
 
         match &self.sink.kind {
-            SinkKind::Rows { order, limit_k } => w.u8(SINK_ROWS).u64(*limit_k).list(order),
+            // `k`, or `0` for no cut; only a cut carries an order list.
+            SinkKind::Rows { cut: None } => w.u8(SINK_ROWS).u64(0),
+            SinkKind::Rows { cut: Some(cut) } => w.u8(SINK_ROWS).u64(cut.k.get()).list(&cut.order),
             SinkKind::Fold(agg) => w.u8(SINK_FOLD).list(&agg.group_cols).list(&agg.aggs),
         };
         w.into_vec()
@@ -248,12 +254,14 @@ impl ReadSpec {
 
             let kind = match r.u8()? {
                 SINK_ROWS => {
-                    let limit_k = r.u64()?;
-                    let order = r.list("order keys", MAX_ORDER_KEYS)?;
-                    if limit_k == 0 && !order.is_empty() {
-                        return Err("an order key without a cut".into());
-                    }
-                    SinkKind::Rows { order, limit_k }
+                    let cut = match NonZeroU64::new(r.u64()?) {
+                        None => None,
+                        Some(k) => Some(RowsCut {
+                            k,
+                            order: r.list("order keys", MAX_ORDER_KEYS)?,
+                        }),
+                    };
+                    SinkKind::Rows { cut }
                 }
                 SINK_FOLD => {
                     let group_cols = r.list("column list", MAX_COLUMNS)?;

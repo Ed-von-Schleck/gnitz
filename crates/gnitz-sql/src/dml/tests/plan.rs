@@ -101,7 +101,7 @@ fn only_a_reproducing_projection_ships_no_map() {
         (&t, "SELECT * FROM t ORDER BY w", [2u16]),
         (&mid, "SELECT * FROM t ORDER BY id", [1]),
     ] {
-        let RowsReply { schema: reply, program, order } = rows_reply_of(sql, desc);
+        let RowsReply { schema: reply, program, order, .. } = rows_reply_of(sql, desc);
         assert!(reply == desc.schema && program.is_none(), "`{sql}`");
         assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), keys, "`{sql}`");
     }

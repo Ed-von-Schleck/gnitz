@@ -10,7 +10,7 @@ use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::SysRowSink;
-use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, SinkKind};
+use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
@@ -63,22 +63,20 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens.
 fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
-    if plan.window.limit == Some(0) {
+    if plan.answers_from_schema() {
         return "order/limit: no request (LIMIT 0)".to_string();
     }
     let mut facts = Vec::new();
-    // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
-    // ORDER BY keys the same wire field just stops the worker early.
+    // The per-worker cut is OFFSET+LIMIT deep, because the client windows. A cut
+    // shipping no ORDER BY keys stops the worker at its first rows.
     if let ReadCase::Rows { read, .. } = &plan.case {
-        if let SinkKind::Rows { limit_k, .. } = &read.spec.sink.kind {
-            if *limit_k > 0 {
-                let at = if local { "local" } else { "server" };
-                facts.push(if plan.order.is_empty() {
-                    format!("{at} early-stop {limit_k}")
-                } else {
-                    format!("{at} top-{limit_k}")
-                });
-            }
+        if let SinkKind::Rows { cut: Some(RowsCut { k, order }) } = &read.spec.sink.kind {
+            let at = if local { "local" } else { "server" };
+            facts.push(if order.is_empty() {
+                format!("{at} early-stop {k}")
+            } else {
+                format!("{at} top-{k}")
+            });
         }
     }
     if !plan.order.is_empty() {
@@ -147,10 +145,11 @@ fn projection_line(schema: &Schema, unprojected: bool) -> String {
     let extra = (0..schema.columns.len())
         .filter(|&i| is_hidden_payload(schema, i))
         .count();
+    let noun = if visible == 1 { "column" } else { "columns" };
     let mut line = if extra > 0 {
-        format!("projection: {visible} columns (+{extra} for ordering)")
+        format!("projection: {visible} {noun} (+{extra} for ordering)")
     } else {
-        format!("projection: {visible} columns")
+        format!("projection: {visible} {noun}")
     };
     if unprojected {
         line.push_str(" (unprojected)");
@@ -190,6 +189,8 @@ fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_dis
 
     let mut line = if is_distinct {
         format!("fold: distinct on ({cols})")
+    } else if agg.group_cols.is_empty() && ops.is_empty() {
+        "fold: global aggregate".to_string()
     } else if agg.group_cols.is_empty() {
         format!("fold: global aggregate: {ops}")
     } else if ops.is_empty() {

@@ -2,7 +2,9 @@
 //! the map, then a forward, a top-k or a fold.
 
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator};
-use gnitz_wire::{ReadSink, SinkKind};
+use std::num::NonZeroI64;
+
+use gnitz_wire::{ReadSink, RowsCut, SinkKind};
 
 use super::aggregate::AdhocFold;
 use super::map::MapPlan;
@@ -16,23 +18,24 @@ pub struct SinkPlan {
 }
 
 enum Kind {
-    /// Forward rows under a weight `window`, `0` = unbounded. With no `order`,
-    /// survivors until their summed weight reaches the window; with one — legal
-    /// only under a `window > 0` — every survivor, trimmed back down with
-    /// [`topk_keep`] at two thresholds. `summed` is the survivor weight `keeper`
-    /// currently holds.
-    Rows {
-        keeper: Batch,
-        order: Vec<OrderLocator>,
-        window: i64,
-        summed: i64,
-    },
+    /// Forward rows: every survivor, or the ones `cut` keeps.
+    Rows { keeper: Batch, cut: Option<Cut> },
     /// Partial reduce-output rows. `mapped` is the one mapped batch of the whole
     /// scan: `clear` keeps its buffers.
     Fold {
         fold: Box<AdhocFold>,
         mapped: Option<Batch>,
     },
+}
+
+/// A rows sink's weight `window`. With no `order`, survivors until their summed
+/// weight reaches the window; with one, every survivor, trimmed back down with
+/// [`topk_keep`] at two thresholds.
+struct Cut {
+    order: Vec<OrderLocator>,
+    window: NonZeroI64,
+    /// The survivor weight the keeper currently holds.
+    summed: i64,
 }
 
 impl SinkPlan {
@@ -52,20 +55,23 @@ impl SinkPlan {
                 fold: Box::new(AdhocFold::new(&sink_in, agg, group_cap)?),
                 mapped: map.as_ref().map(|m| Batch::empty_with_schema(m.out_schema())),
             },
-            SinkKind::Rows { order, limit_k } => {
-                // `0` = unbounded. Saturated: a wrapped negative window would
-                // truncate the answer.
-                let window = (*limit_k).min(i64::MAX as u64) as i64;
-                debug_assert!(
-                    order.is_empty() || window > 0,
-                    "decode admits an order only under a cut"
-                );
-                sink_in.check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))?;
+            SinkKind::Rows { cut } => {
+                let cut = match cut {
+                    None => None,
+                    Some(RowsCut { k, order }) => {
+                        sink_in.check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))?;
+                        Some(Cut {
+                            order: order_locators(order, &sink_in),
+                            // Saturated: a wrapped negative window would truncate
+                            // the answer.
+                            window: NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX),
+                            summed: 0,
+                        })
+                    }
+                };
                 Kind::Rows {
                     keeper: Batch::empty_with_schema(&sink_in),
-                    order: order_locators(order, &sink_in),
-                    window,
-                    summed: 0,
+                    cut,
                 }
             }
         };
@@ -84,9 +90,7 @@ impl SinkPlan {
     /// `chunk_rows`: an unordered cut needs no more than its window.
     pub fn first_drain(&self, chunk_rows: usize) -> usize {
         match &self.kind {
-            Kind::Rows { order, window, .. } if order.is_empty() && *window > 0 => {
-                (*window as usize).clamp(1, chunk_rows)
-            }
+            Kind::Rows { cut: Some(cut), .. } if cut.order.is_empty() => (cut.window.get() as usize).min(chunk_rows),
             _ => chunk_rows,
         }
     }
@@ -97,45 +101,46 @@ impl SinkPlan {
     pub fn push(&mut self, chunk: &Batch, ranges: &mut Vec<(usize, usize)>) -> Result<bool, String> {
         let mb = chunk.as_mem_batch();
         match &mut self.kind {
-            Kind::Rows { keeper, order, window, summed } if order.is_empty() => {
-                let window = *window;
-                if window > 0 {
-                    // Cut at the row whose weight reaches the window: a range, or
-                    // a hydrated group, can run far past it.
-                    for i in 0..ranges.len() {
-                        let (s, e) = ranges[i];
-                        let range_sum = mb.sum_weights(s, e);
-                        if *summed + range_sum < window {
-                            *summed += range_sum;
-                            continue;
-                        }
-                        let mut end = s;
-                        while *summed < window && end < e {
-                            *summed += mb.get_weight(end);
-                            end += 1;
-                        }
-                        ranges[i].1 = end;
-                        ranges.truncate(i + 1);
-                        break;
+            Kind::Rows { keeper, cut: None } => {
+                append_survivors(self.map.as_mut(), chunk, keeper, ranges);
+                Ok(false)
+            }
+            Kind::Rows { keeper, cut: Some(cut) } if cut.order.is_empty() => {
+                let window = cut.window.get();
+                // Cut at the row whose weight reaches the window: a range, or a
+                // hydrated group, can run far past it.
+                for i in 0..ranges.len() {
+                    let (s, e) = ranges[i];
+                    let range_sum = mb.sum_weights(s, e);
+                    if cut.summed + range_sum < window {
+                        cut.summed += range_sum;
+                        continue;
                     }
+                    let mut end = s;
+                    while cut.summed < window && end < e {
+                        cut.summed += mb.get_weight(end);
+                        end += 1;
+                    }
+                    ranges[i].1 = end;
+                    ranges.truncate(i + 1);
+                    break;
                 }
                 append_survivors(self.map.as_mut(), chunk, keeper, ranges);
-                Ok(window > 0 && *summed >= window)
+                Ok(cut.summed >= window)
             }
-            Kind::Rows { keeper, order, window, summed } => {
+            Kind::Rows { keeper, cut: Some(cut) } => {
                 // Weighed off the source — the same weights that land in the
                 // keeper, read from a contiguous region rather than row-by-row
                 // off the destination.
-                *summed = ranges
+                cut.summed = ranges
                     .iter()
-                    .fold(*summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
+                    .fold(cut.summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
                 append_survivors(self.map.as_mut(), chunk, keeper, ranges);
                 // Mid-scan the keeper is still growing, so a trim at `window`
                 // would re-sort after every chunk to shed rows the next chunk
-                // replaces. Saturating: an unbounded window leaves this
-                // unfireable rather than overflowing.
-                if *summed > window.saturating_mul(2) {
-                    *summed = topk_keep(keeper, order, *window);
+                // replaces.
+                if cut.summed > cut.window.get().saturating_mul(2) {
+                    cut.summed = topk_keep(keeper, &cut.order, cut.window);
                 }
                 Ok(false)
             }
@@ -158,13 +163,13 @@ impl SinkPlan {
     /// The reply: the kept rows, or one partial row per group.
     pub fn finish(self) -> Batch {
         match self.kind {
-            Kind::Rows { mut keeper, order, window, summed } => {
+            Kind::Rows { mut keeper, cut } => {
                 // The keeper IS the reply now, and a rows reply carrying a
                 // STRING/BLOB column goes out as one frame — so shed an ordered
                 // keeper down to the smallest superset the client can still cut
                 // exactly. At or below the window it provably cuts nothing.
-                if !order.is_empty() && summed > window {
-                    topk_keep(&mut keeper, &order, window);
+                if let Some(cut) = cut.filter(|c| !c.order.is_empty() && c.summed > c.window.get()) {
+                    topk_keep(&mut keeper, &cut.order, cut.window);
                 }
                 keeper
             }
@@ -185,10 +190,11 @@ fn append_survivors(map: Option<&mut MapPlan>, chunk: &Batch, keeper: &mut Batch
 /// Trim `keeper` to its comparator-smallest rows whose summed weight covers
 /// `window`, in no particular order, and return that weight. The boundary row
 /// stays whole: only the client, which sees every worker's rows, may clip it.
-fn topk_keep(keeper: &mut Batch, order: &[OrderLocator], window: i64) -> i64 {
+fn topk_keep(keeper: &mut Batch, order: &[OrderLocator], window: NonZeroI64) -> i64 {
     if keeper.is_empty() {
         return 0;
     }
+    let window = window.get();
     let mut perm: Vec<u32> = (0..keeper.len() as u32).collect();
     let cmp = |a: &u32, b: &u32| {
         let (ra, rb) = (*a as usize, *b as usize);

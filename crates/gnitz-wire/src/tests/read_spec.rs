@@ -3,6 +3,7 @@ use crate::range::Cut;
 use crate::PkColList;
 use crate::TypeCode;
 use crate::{AggFunc, MAX_COLUMNS};
+use std::num::NonZeroU64;
 
 fn sample_order() -> Vec<OrderKey> {
     vec![
@@ -13,6 +14,11 @@ fn sample_order() -> Vec<OrderKey> {
 
 fn empty_spec() -> ReadSpec {
     ReadSpec::all_rows(ReadBound::None)
+}
+
+/// A rows sink's cut at `k > 0`.
+fn cut(k: u64, order: Vec<OrderKey>) -> Option<RowsCut> {
+    Some(RowsCut { k: NonZeroU64::new(k).unwrap(), order })
 }
 
 /// Three OPK keys of `stride`, deliberately handed over out of order.
@@ -47,8 +53,9 @@ fn roundtrips_every_bound_against_every_sink() {
         Some(ComputeMap { program: vec![7], out_cols: vec![] }),
     ];
     let kinds = [
-        SinkKind::Rows { order: vec![], limit_k: 0 },
-        SinkKind::Rows { order: sample_order(), limit_k: 100 },
+        SinkKind::Rows { cut: None },
+        SinkKind::Rows { cut: cut(100, vec![]) },
+        SinkKind::Rows { cut: cut(100, sample_order()) },
         // Every aggregate the enum names, at a distinct source column.
         SinkKind::Fold(AggReadSpec {
             group_cols: vec![0, 3],
@@ -93,8 +100,7 @@ fn the_encoded_bytes_are_pinned() {
         sink: ReadSink {
             map: None,
             kind: SinkKind::Rows {
-                order: vec![OrderKey { col: 3, desc: true, nulls_first: true }],
-                limit_k: 5,
+                cut: cut(5, vec![OrderKey { col: 3, desc: true, nulls_first: true }]),
             },
         },
     };
@@ -104,7 +110,7 @@ fn the_encoded_bytes_are_pinned() {
         2, 0, 0, 0, 1, 2,       // predicate
         0,                      // no map
         0,                      // sink: rows
-        5, 0, 0, 0, 0, 0, 0, 0, // limit_k
+        5, 0, 0, 0, 0, 0, 0, 0, // cut k
         1, 0,                   // order keys
         3, 0, 0b11,             // column, desc | nulls first
     ];
@@ -181,7 +187,7 @@ fn pk_set_blob(stride: u8, count: u32, keys: &[u8]) -> Vec<u8> {
 #[test]
 fn each_decode_guard_rejects_its_own_forgery() {
     // Layout of the empty Rows spec: bound tag 0 | predicate len 1..5 | map
-    // presence 5 | sink tag 6 | limit_k 7..15 | order key count 15..17.
+    // presence 5 | sink tag 6 | cut k 7..15.
     let poke = |off: usize, val: u8| {
         let mut bytes = empty_spec().encode();
         bytes[off] = val;
@@ -207,13 +213,9 @@ fn each_decode_guard_rejects_its_own_forgery() {
         bytes[at] = bad_agg;
         bytes
     };
-    let order_without_cut = ReadSpec {
-        sink: ReadSink {
-            map: None,
-            kind: SinkKind::Rows { order: sample_order(), limit_k: 0 },
-        },
-        ..empty_spec()
-    };
+    // No cut, then the order list only a cut carries.
+    let mut order_without_cut = empty_spec().encode();
+    order_without_cut.extend([1, 0, 3, 0, 0]);
     let mut trailing = empty_spec().encode();
     trailing.push(0);
 
@@ -231,11 +233,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ("duplicate keys", pk_set_blob(1, 2, &[5, 5]), "strictly ascending"),
         ("count past the cell", pk_set_blob(1, 3, &[1, 2]), "truncated"),
         ("trailing bytes", trailing, "trailing"),
-        (
-            "order key without a cut",
-            order_without_cut.encode(),
-            "an order key without a cut",
-        ),
+        ("order key without a cut", order_without_cut, "trailing"),
         ("unknown aggregate", bad_agg_op, "unknown AggFunc"),
         (
             "aggregate cap",
@@ -318,7 +316,7 @@ fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
                     program: vec![4, 1, 5],
                     out_cols: vec![(TypeCode::I64, true)],
                 }),
-                kind: SinkKind::Rows { order: sample_order(), limit_k: 7 },
+                kind: SinkKind::Rows { cut: cut(7, sample_order()) },
             },
         };
         let blob = spec.encode();

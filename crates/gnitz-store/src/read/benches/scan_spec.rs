@@ -9,7 +9,7 @@ use std::hint::black_box;
 
 use super::tests::layout_of;
 use crate::relation::RelationKind;
-use crate::test_support::{cmp_const, img, map_of, relation_fixture, rows_spec, RelationFixture, TID};
+use crate::test_support::{cmp_const, cut, img, map_of, relation_fixture, rows_spec, RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
     AggDescriptor, AggFunc, AggReadSpec, ComputeMap, Cut, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec,
@@ -107,7 +107,7 @@ fn scan_spec_bench() {
             &schema(&[I64; 2]),
         )
     };
-    let rows = |map| rows_spec(map, vec![], 0).sink;
+    let rows = |map| rows_spec(map, None).sink;
     // Each sink over half the rows, a group per `c0` where it folds.
     let sinks = [
         ("rows", ReadSink::all_rows(), ROWS / 2),
@@ -135,14 +135,25 @@ fn scan_spec_bench() {
     let order = vec![OrderKey { col: 3, desc: false, nulls_first: false }];
     let top = ReadSpec {
         predicate: lt(1, 256),
-        ..rows_spec(copy.clone(), order, 100)
+        ..rows_spec(copy.clone(), cut(100, order))
     };
     cell("ORDER BY .. LIMIT 100", &r, top, 100, ROWS);
     let first = ReadSpec {
         predicate: lt(1, 256),
-        ..rows_spec(copy, vec![], 100)
+        ..rows_spec(copy, cut(100, vec![]))
     };
     cell("LIMIT 100", &r, first, 100, 100);
+    // A cut by the key over every row. Descending ranks them all; ascending is the
+    // walk's own order, which the planner ships as the cut alone.
+    let key_desc = vec![OrderKey { col: 0, desc: true, nulls_first: false }];
+    cell(
+        "ORDER BY id DESC LIMIT 100",
+        &r,
+        rows_spec(None, cut(100, key_desc)),
+        100,
+        ROWS,
+    );
+    cell("ORDER BY id LIMIT 100", &r, rows_spec(None, cut(100, vec![])), 100, 100);
 
     // The widest range of `c2` the index is walked for, and one row wider,
     // which scans the table under the range.
@@ -174,7 +185,7 @@ fn scan_spec_bench() {
     });
     let spec = ReadSpec {
         predicate: lt(2, 1),
-        ..rows_spec(map_of(LogicalProgram::copy_cols(&[1, 2]), &schema(&strings)), vec![], 0)
+        ..rows_spec(map_of(LogicalProgram::copy_cols(&[1, 2]), &schema(&strings)), None)
     };
     cell("copied STRING column, 1-row ranges", &r, spec, ROWS / 2, ROWS);
 }

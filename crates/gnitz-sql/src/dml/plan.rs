@@ -75,6 +75,9 @@ pub(crate) struct RowsReply {
     pub(crate) program: Option<LogicalProgram>,
     /// The ORDER BY keys over the reply.
     pub(crate) order: Vec<OrderKey>,
+    /// Whether `order` ascends a leading run of the relation's PK columns, so
+    /// rows in store order are already in it.
+    pub(crate) pk_ordered: bool,
 }
 
 /// The rows reply `rows` produces over `desc`, ordered by `keys`.
@@ -86,6 +89,7 @@ pub(crate) fn rows_reply(
     let AdhocRows { items, cols: out_cols, placed } = rows;
     let schema = &desc.schema;
     let mut order = wire_keys(keys, &out_cols, placed)?;
+    let pk_ordered = leads_with_pk(&order, &items, &schema.pk_cols);
     let k = schema.pk_cols.len();
     if reproduces(schema, &items[k..], &out_cols[k..]) {
         for key in &mut order {
@@ -97,6 +101,7 @@ pub(crate) fn rows_reply(
             schema: Arc::clone(schema),
             program: None,
             order,
+            pk_ordered,
         });
     }
     let out = leading_schema(out_cols, k)?;
@@ -104,7 +109,28 @@ pub(crate) fn rows_reply(
         program: Some(payload_program(&items, &out, schema)?),
         schema: Arc::new(out),
         order,
+        pk_ordered,
     })
+}
+
+/// Whether `order`, over `items`, ascends a leading run of `pk_cols`, each key a
+/// verbatim copy of its column. The stored key's byte order is the typed order of
+/// those columns.
+fn leads_with_pk(order: &[OrderKey], items: &[ProjItem], pk_cols: &[u32]) -> bool {
+    order.len() <= pk_cols.len()
+        && order
+            .iter()
+            .zip(pk_cols)
+            .all(|(key, &pk)| !key.desc && items[key.col as usize].passthrough_src() == Some(pk as usize))
+}
+
+/// Whether a worker reading under `bound` yields its rows in ascending PK order:
+/// every walk but a secondary index's.
+pub(super) fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
+    match bound {
+        ReadBound::None | ReadBound::PkSet(_) => true,
+        ReadBound::Range(r) => r.walks_pk(pk_cols),
+    }
 }
 
 /// Whether a reply payload is the relation's visible columns, each copied in place,

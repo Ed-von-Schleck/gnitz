@@ -31,7 +31,7 @@ impl RelationRegistry {
         let src_schema = entry.schema();
         // Nothing bounded, filtered, mapped or cut, and nothing to hydrate: the
         // relation whole, off the store's cached snapshot.
-        if let (ReadBound::None, true, None, SinkKind::Rows { limit_k: 0, .. }) =
+        if let (ReadBound::None, true, None, SinkKind::Rows { cut: None }) =
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
             if !entry.table().has_skeleton_rows() {

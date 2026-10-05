@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec};
 use crate::test_support::{
-    img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
+    cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
     RelationFixture, TID,
 };
 use gnitz_expr::{
@@ -84,7 +84,7 @@ fn pk_range(start: Cut, end: Cut) -> ReadBound {
 fn every_sink_answers_only_in_its_own_layout() {
     let r = view(&[(1, 1, 10), (2, 1, 20)]);
     let schema = make_schema_u64_i64();
-    let whole = rows_spec(None, vec![], 0);
+    let whole = rows_spec(None, None);
     let snapshot = r.relation(TID).unwrap().full_scan();
     assert!(Rc::ptr_eq(&run(&r, whole.clone()).unwrap(), &snapshot));
 
@@ -100,8 +100,8 @@ fn every_sink_answers_only_in_its_own_layout() {
     let own = schema.layout_digest();
     let sinks = [
         (whole, own),
-        (rows_spec(None, vec![], 1), own),
-        (rows_spec(None, order_by(1, false), 1), own),
+        (rows_spec(None, cut(1, vec![])), own),
+        (rows_spec(None, cut(1, order_by(1, false))), own),
         (fold, fold_layout),
     ];
     for (spec, layout) in sinks {
@@ -116,7 +116,7 @@ fn every_sink_answers_only_in_its_own_layout() {
 #[test]
 fn top_k_keeps_the_smallest_rows_covering_the_window() {
     let ids = |n: u64, w: i64| (0..n).map(|id| (id, w, id as i64)).collect::<Vec<_>>();
-    // (rows, descending, limit_k, reply).
+    // (rows, descending, cut, reply).
     let cases = [
         // Under the mid-scan residency cap: only the terminal trim sheds.
         (ids(5, 1), true, 3, vec![(2, 1, 2), (3, 1, 3), (4, 1, 4)]),
@@ -131,12 +131,12 @@ fn top_k_keeps_the_smallest_rows_covering_the_window() {
         (ids(40, 3), false, 2, vec![(0, 3, 0)]),
     ];
     let schema = make_schema_u64_i64();
-    for (i, (rows, desc, limit_k, want)) in cases.into_iter().enumerate() {
+    for (i, (rows, desc, k, want)) in cases.into_iter().enumerate() {
         let mut r = view(&rows);
         r.set_scan_chunk_rows(8);
         for map in [None, map_of(LogicalProgram::copy_cols(&[1]), &schema)] {
             let mapped = map.is_some();
-            let got = run(&r, rows_spec(map, order_by(1, desc), limit_k)).unwrap();
+            let got = run(&r, rows_spec(map, cut(k, order_by(1, desc)))).unwrap();
             assert_eq!(rows_of(&got), want, "case {i}, mapped {mapped}");
         }
     }
@@ -144,12 +144,12 @@ fn top_k_keeps_the_smallest_rows_covering_the_window() {
 
 /// With no ORDER BY, a LIMIT stops at the row whose weight reaches the window —
 /// never short of it, never a row past it, even where each survivor is a range of
-/// its own — and a `limit_k` past `i64::MAX` saturates rather than wrapping to a
+/// its own — and a cut past `i64::MAX` saturates rather than wrapping to a
 /// window the first chunk covers.
 #[test]
 fn a_limit_without_order_stops_at_the_row_covering_the_window() {
-    // (row weight, limit_k) → (rows shipped, summed weight), over 40 rows.
-    for (w, limit_k, want) in [
+    // (row weight, cut) → (rows shipped, summed weight), over 40 rows.
+    for (w, k, want) in [
         (1, 5, (5, 5)),
         (3, 5, (2, 6)),
         (1, 1 << 63, (40, 40)),
@@ -158,9 +158,9 @@ fn a_limit_without_order_stops_at_the_row_covering_the_window() {
         let rows: Vec<_> = (0..40).map(|id| (id, w, id as i64)).collect();
         let mut r = view(&rows);
         r.set_scan_chunk_rows(8);
-        let got = run(&r, rows_spec(None, vec![], limit_k)).unwrap();
+        let got = run(&r, rows_spec(None, cut(k, vec![]))).unwrap();
         let summed: i64 = (0..got.len()).map(|i| got.get_weight(i)).sum();
-        assert_eq!((got.len(), summed), want, "weight {w}, limit_k {limit_k}");
+        assert_eq!((got.len(), summed), want, "weight {w}, cut {k}");
     }
 
     // `val = id % 2`, and `val < 1` keeps every other row: one range per survivor.
@@ -170,8 +170,7 @@ fn a_limit_without_order_stops_at_the_row_covering_the_window() {
         predicate: between(1, 0, Some(1)),
         ..rows_spec(
             map_of(LogicalProgram::copy_cols(&[1]), &make_schema_u64_i64()),
-            vec![],
-            5,
+            cut(5, vec![]),
         )
     };
     let got = rows_of(&run(&r, spec).unwrap());
@@ -229,7 +228,7 @@ fn a_malformed_request_is_refused() {
     let own = schema.layout_digest();
     let two_slots = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::I64)], &[0]);
     let cases = [
-        (rows_spec(None, order_by(99, false), 1), own),
+        (rows_spec(None, cut(1, order_by(99, false))), own),
         (walk(64), own),
         (walk(2), own),
         (
@@ -237,7 +236,7 @@ fn a_malformed_request_is_refused() {
             own,
         ),
         (
-            rows_spec(map_of(LogicalProgram::copy_cols(&[1]), &two_slots), vec![], 0),
+            rows_spec(map_of(LogicalProgram::copy_cols(&[1]), &two_slots), None),
             two_slots.layout_digest(),
         ),
     ];
@@ -358,18 +357,18 @@ fn an_index_walk_returns_exactly_its_range() {
         let bound = ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
         let (cursor, _) = r.open_bound(TID, bound.clone()).unwrap();
         assert_eq!(matches!(cursor, SourceCursor::Bounded(_)), walks, "{bound:?}");
-        let spec = |order, limit_k| ReadSpec {
+        let spec = |cut| ReadSpec {
             bound: bound.clone(),
-            ..rows_spec(None, order, limit_k)
+            ..rows_spec(None, cut)
         };
-        assert_eq!(ids(spec(vec![], 0)), want, "{bound:?}");
-        let some = ids(spec(vec![], 2));
+        assert_eq!(ids(spec(None)), want, "{bound:?}");
+        let some = ids(spec(cut(2, vec![])));
         assert!(
             some.len() == want.len().min(2) && some.iter().all(|id| want.contains(id)),
             "{bound:?}: {some:?}"
         );
         // Both columns rise with the id, so the two largest are the last two ids.
-        let top = ids(spec(order_by(col as u16, true), 2));
+        let top = ids(spec(cut(2, order_by(col as u16, true))));
         assert_eq!(top, want[want.len().saturating_sub(2)..], "{bound:?}");
     }
 }
@@ -425,7 +424,7 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
     });
     let reply = SchemaDescriptor::new(&cols, &[0]);
     let copies: Vec<u32> = (1..=P as u32).collect();
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&copies), &reply), vec![], 0);
+    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&copies), &reply), None);
     let got = run(&r, spec).unwrap();
     assert_eq!(got.len(), 40);
     for row in 0..got.len() {
@@ -443,7 +442,7 @@ fn a_pk_sourced_map_zeroes_every_null_word() {
     let mut r = view(&(0..300).map(|id| (id, 1, id as i64 * 7)).collect::<Vec<_>>());
     r.set_scan_chunk_rows(32);
     let reply = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), vec![], 0);
+    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), None);
     let got = run(&r, spec).unwrap();
     assert_eq!(got.len(), 300);
     for row in 0..got.len() {
@@ -482,7 +481,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
         ],
         &[0],
     );
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[2, 0, 1]), &reply), vec![], 0);
+    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[2, 0, 1]), &reply), None);
     let got = run(&r, spec).unwrap();
     let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
@@ -529,7 +528,7 @@ fn a_computed_map_writes_at_the_keepers_tail() {
     // `keep = id * 10 < 1000` keeps ids 0..100, across several chunks.
     let spec = ReadSpec {
         predicate: between(2, 0, Some(1000)),
-        ..rows_spec(map_of(program, &reply), vec![], 0)
+        ..rows_spec(map_of(program, &reply), None)
     };
     let got = run(&r, spec).unwrap();
     let mut decoded: Vec<_> = (0..got.len())
@@ -686,7 +685,7 @@ fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
     let r = skeleton_fixture();
     let spec = ReadSpec {
         bound: pk_set(&[2]),
-        ..rows_spec(None, vec![], 1)
+        ..rows_spec(None, cut(1, vec![]))
     };
     let layout = make_schema_u64_i64().layout_digest();
     let got = rows_of(&r.scan_spec(TID, spec, layout, Some(&mut Recompute::default())).unwrap());
