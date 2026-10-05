@@ -1,22 +1,28 @@
-use super::cache::{encode_record, RelationEntry};
-use super::*;
-use gnitz_expr::ColumnTable;
-use gnitz_wire::TableDistribution;
 use std::collections::hash_map::Entry;
+
+use gnitz_expr::ColumnTable;
+use gnitz_store::relation::{IndexClaim, RelationSpec};
+use gnitz_wire::TableDistribution;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::Placement;
+
+use super::cache::{encode_record, RelationEntry};
+use super::constraints::FkEdge;
+use super::precheck::build_schema_from_col_defs;
+use super::sys_reads::IdSet;
+use super::sys_tables::{pk_signatures, read_idx_tab_row, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily};
+use super::CatalogEngine;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
-    /// Run `family`'s name index and its register hook over `batch`. A registration
-    /// reads the relation's COL_TAB rows, and a view's its CIRCUIT_TAB row, from the
-    /// store, so the caller applies those families first.
+    /// Run `family`'s register hook over `batch`, and a relation family's name
+    /// index. A registration reads the relation's COL_TAB rows, and a view's its
+    /// CIRCUIT_TAB row, from the store, so the caller applies those families first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        self.raise_next_id(family, batch);
         let hooked = match family {
-            SysFamily::Schema => {
-                self.apply_schema_names(batch);
-                Ok(())
-            }
+            // A schema's name is read from its row.
+            SysFamily::Schema => Ok(()),
             SysFamily::Table | SysFamily::View => {
                 self.apply_relation_names(batch);
                 self.hook_relation_register(family, batch)

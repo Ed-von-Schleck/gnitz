@@ -6,10 +6,11 @@
 //!
 //! Every system-table write flows through
 //! [`fire_hooks`](CatalogEngine::fire_hooks), which runs, per family, that family's
-//! name index and its register hook. A registration reads the relation's COL_TAB
-//! rows, and a view's its CIRCUIT_TAB row, from the store, so those families are
-//! applied first — by `apply_bundle` for a live bundle, `replay_catalog` at boot,
-//! `with_owned_retractions` for a drop's owned rows.
+//! register hook. A registration reads the relation's COL_TAB rows, and a view's
+//! its CIRCUIT_TAB row, from the store, so those families are applied first:
+//! [`SysFamily::ALL`] is the apply order, which `apply_bundle` walks for a live
+//! bundle and `replay_catalog` at boot, and `with_owned_retractions` in reverse
+//! for a drop's owned rows.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -24,7 +25,8 @@ mod cache;
 mod constraints;
 mod hooks;
 mod precheck;
-mod registry;
+mod sequences;
+mod sys_reads;
 mod sys_tables;
 mod view_state;
 mod write_path;
@@ -32,43 +34,21 @@ mod write_path;
 #[cfg(test)]
 mod suites;
 
-use std::rc::Rc;
+use gnitz_store::relation::{DirLock, RelationRegistry};
+use gnitz_zset::repr::Batch;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
-use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
+use cache::CatalogCacheSet;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-// The DDL_TXN driver's bundle decoders: it resolves each family once, carries
-// the value, and reads back what the bundle created or dropped.
 pub(crate) use bootstrap::UnreplayedCatalog;
-pub(crate) use constraints::FkEdge;
-pub(crate) use constraints::RowConstraints;
-#[cfg(test)]
-pub(crate) use sys_tables::write_col_tab_rows;
-pub(crate) use sys_tables::CatalogColumn;
+pub(crate) use constraints::{FkEdge, RowConstraints};
 pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
-pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
+pub(crate) use sys_tables::{write_col_tab_rows, CatalogColumn, PUBLIC_SCHEMA_ID};
+// The DDL_TXN driver's bundle decoders: it resolves each family once, carries
+// the value, and reads back what the bundle created or dropped.
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-
-// Import everything from sys_tables for internal use.
-use precheck::{build_schema_from_col_defs, IdSet};
-use sys_tables::*;
-
-// ── Catalog-internal re-exports — no out-of-catalog consumer. These reach
-//    the submodules through their `use super::*` glob, so they stay re-exported
-//    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use cache::CatalogCacheSet;
-pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
-// Directory primitives the catalog consumes rather than owns.
-pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DirLock};
-// `BatchBuilder` holds no catalog state; re-exported for the catalog's row
-// builders.
-pub(in crate::catalog) use gnitz_zset::repr::BatchBuilder;
-// The generic payload-cell readers, for the submodules' `use super::*`.
-pub(in crate::catalog) use gnitz_expr::{payload_string, payload_u64};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
@@ -90,7 +70,8 @@ pub(crate) struct CatalogEngine {
     pub(in crate::catalog) caches: CatalogCacheSet,
 
     /// The next catalog object id (schema, relation or index) `allocate_ids`
-    /// hands out. Every applied id-bearing row raises it past its own id.
+    /// hands out. Boot raises it past every stored id; the precheck admits no id
+    /// at or above it.
     pub(in crate::catalog) next_id: u64,
     /// The master's applied families in apply order, each queued before its ingest:
     /// the zone's broadcast and the undo log `compensate_stage_a` replays.

@@ -1,9 +1,11 @@
 //! The constraints a user write is validated against: FK edges in both
 //! directions, and the unique secondary indexes a write must check.
 
-use super::*;
+use gnitz_store::relation::Relation;
 use gnitz_wire::PkColList;
-use gnitz_zset::schema::KeySpec;
+use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
+
+use super::CatalogEngine;
 
 /// One FK constraint as a directed edge, identical whichever end it was reached
 /// from: the child's relation entry holds the edges it declares, `fk_by_parent`

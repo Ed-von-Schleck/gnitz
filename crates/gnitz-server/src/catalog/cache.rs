@@ -1,12 +1,19 @@
-use super::*;
-use gnitz_expr::payload_str;
-use gnitz_wire::control::Target;
-use gnitz_wire::schema_block::check_same_types;
-use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus};
-use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
+use std::rc::Rc;
+
+use gnitz_expr::{payload_str, payload_u64};
+use gnitz_store::relation::Relation;
+use gnitz_wire::control::Target;
+use gnitz_wire::schema_block::check_same_types;
+use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
+use rustc_hash::FxHashMap;
+
+use super::constraints::FkEdge;
+use super::sys_tables::CatalogColumn;
+use super::CatalogEngine;
 
 // ---------------------------------------------------------------------------
 // CatalogCacheSet — all typed caches for one CatalogEngine
@@ -115,8 +122,6 @@ impl CatalogEngine {
 
 #[derive(Default)]
 pub(in crate::catalog) struct CatalogCacheSet {
-    /// SCHEMA_TAB by name.
-    pub(in crate::catalog) schema_by_name: FxHashMap<String, u64>,
     /// TABLE_TAB and VIEW_TAB by `(schema_id, name)`. A schema's entry exists only
     /// while it holds a relation.
     pub(in crate::catalog) relation_by_name: FxHashMap<u64, FxHashMap<String, u64>>,
@@ -129,23 +134,12 @@ pub(in crate::catalog) struct CatalogCacheSet {
 }
 
 // ---------------------------------------------------------------------------
-// Name-index delta appliers on CatalogEngine
+// The relation name index's delta applier
 // ---------------------------------------------------------------------------
 
 impl CatalogEngine {
-    // Both appliers retract first: one delta may hand a name from one row to another.
-
-    pub(in crate::catalog) fn apply_schema_names(&mut self, batch: &Batch) {
-        let names = &mut self.caches.schema_by_name;
-        for i in batch.retracted_rows() {
-            names.remove(payload_str(batch, i, SCHEMATAB_PAY_NAME));
-        }
-        for i in batch.live_rows() {
-            names.insert(payload_string(batch, i, SCHEMATAB_PAY_NAME), batch.get_pk(i) as u64);
-        }
-    }
-
     /// TABLE_TAB and VIEW_TAB share the leading `(schema_id, name)` payload prefix.
+    /// Retracted first: one delta may hand a name from one row to another.
     pub(in crate::catalog) fn apply_relation_names(&mut self, batch: &Batch) {
         let key = |i| {
             (

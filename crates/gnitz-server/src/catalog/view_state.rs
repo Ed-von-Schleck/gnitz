@@ -2,12 +2,14 @@
 //! boot resume verdict, the source cursor a circuit backfill drives, and the read
 //! wrappers that add what a caller cannot — the hydrator.
 
-use super::*;
-use gnitz_store::relation::Residency;
-use gnitz_wire::ReadSpec;
-use gnitz_zset::repr::SourceCursor;
-use rustc_hash::FxHashSet;
 use std::rc::Rc;
+
+use gnitz_store::relation::{Relation, RelationKind, Residency};
+use gnitz_wire::ReadSpec;
+use gnitz_zset::repr::{Batch, SourceCursor};
+use rustc_hash::FxHashSet;
+
+use super::CatalogEngine;
 
 impl CatalogEngine {
     /// [`RelationRegistry::scan_spec`], hydrating.

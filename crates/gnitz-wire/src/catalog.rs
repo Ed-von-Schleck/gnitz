@@ -298,15 +298,16 @@ const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: 
     WireSysFamily { id, name, cols, pk_cols }
 }
 
-/// Every system family, in the order both sides index them by.
+/// Every system family, in the order both sides index them by. The engine
+/// applies a bundle's families in this order.
 pub const SYS_FAMILIES: &[WireSysFamily] = &[
     fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, &[0]),
+    fam(COL_TAB, "_columns", COL_TAB_COLS, &[0, 1]),
+    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, &[0]),
     fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, &[0]),
     fam(VIEW_TAB, "_views", VIEW_TAB_COLS, &[0]),
-    fam(COL_TAB, "_columns", COL_TAB_COLS, &[0, 1]),
     fam(IDX_TAB, "_indices", IDX_TAB_COLS, &[0]),
     fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, &[0]),
-    fam(CIRCUIT_TAB, "_circuits", CIRCUIT_TAB_COLS, &[0]),
 ];
 
 // What `unpack_pair_pk`'s `>> 64` split is written against.

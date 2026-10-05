@@ -2,7 +2,12 @@
 //! ingest → `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
 //! orphan-directory sweep.
 
-use super::*;
+use gnitz_expr::payload_u64;
+use gnitz_zset::repr::Batch;
+
+use super::sys_reads::IdSet;
+use super::sys_tables::{family_pk_partition, SysFamily};
+use super::CatalogEngine;
 
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
@@ -22,9 +27,9 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// `batch` with the retraction of its dropped relations' rows: index rows first,
-    /// since their hook reads the owner; circuit and column rows last, since undoing
-    /// the drop re-registers the owner from them.
+    /// `batch` with the retraction of every row its dropped relations own, in
+    /// reversed apply order: an index's hook reads its owner, and undoing the drop
+    /// re-registers the owner from its circuit and column rows.
     fn with_owned_retractions(&self, family: SysFamily, mut batch: Batch, net_dead: IdSet) -> Vec<(SysFamily, Batch)> {
         if !matches!(family, SysFamily::Table | SysFamily::View) || net_dead.is_empty() {
             return vec![(family, batch)];
@@ -52,47 +57,36 @@ impl CatalogEngine {
         let sequences = self.retract_under(SysFamily::Sequence, owners.ids());
         let circuits = self.retract_under(SysFamily::Circuit, owners.ids());
         let columns = self.retract_under(SysFamily::Column, owners.ids());
-        vec![
+        let mut parts = vec![
             (SysFamily::Index, indices),
             (SysFamily::Sequence, sequences),
             (family, batch),
             (SysFamily::Circuit, circuits),
             (SysFamily::Column, columns),
-        ]
-    }
-
-    /// The negation of every live row of `family` whose leading key column is one of
-    /// `ids` (strictly ascending): each row for a single-column key, each owner's band
-    /// for a pair.
-    pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[u64]) -> Batch {
-        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
-        let mut batch = Batch::empty_with_schema(family.schema());
-        for &id in ids {
-            self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight));
-        }
-        batch
+        ];
+        parts.sort_by_key(|(f, _)| std::cmp::Reverse(f.index()));
+        parts
     }
 
     /// Apply one `DDL_TXN` bundle: the cross-family guards, each family through
-    /// [`Self::submit`] in dependency order, then a compile of every view it creates.
-    /// Ascending `topo_priority` for a bundle that creates, so every register hook finds
-    /// its dependencies applied; descending for one that only drops, so a dependent is
-    /// retired first. On `Err` what was applied stays queued for
+    /// [`Self::submit`], then a compile of every view it creates. A bundle that
+    /// creates is applied in [`SysFamily::ALL`] order, so every register hook finds
+    /// the families it reads applied; one that only drops in the reverse, so a
+    /// dependent is retired first. On `Err` what was applied stays queued for
     /// [`Self::compensate_stage_a`].
-    pub(crate) fn apply_bundle(&mut self, mut families: [Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
+    pub(crate) fn apply_bundle(&mut self, families: [Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
         self.precheck_bundle(&families)?;
         let new_views = families[SysFamily::View.index()]
             .as_ref()
             .map(|b| family_pk_partition(SysFamily::View, b).creates)
             .unwrap_or_default();
         let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
-            .iter()
-            .filter_map(|&f| families[f.index()].take().map(|b| (f, b)))
+            .into_iter()
+            .zip(families)
+            .filter_map(|(f, b)| Some((f, b?)))
             .collect();
         if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
-            ordered.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
-        } else {
-            ordered.sort_by_key(|(f, _)| f.topo_priority());
+            ordered.reverse();
         }
         for (family, batch) in ordered {
             self.submit(family, batch)?;

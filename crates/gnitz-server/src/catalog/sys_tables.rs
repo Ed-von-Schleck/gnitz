@@ -394,16 +394,17 @@ pub(crate) enum SysFamily {
 impl SysFamily {
     pub(crate) const COUNT: usize = gnitz_wire::SYS_FAMILIES.len();
 
-    /// Every family in `gnitz_wire::SYS_FAMILIES` order — the index the
-    /// per-family arrays share — for the open/bootstrap/flush walks.
+    /// Every family in `gnitz_wire::SYS_FAMILIES` order: the index the
+    /// per-family arrays share, and the order a bundle's families and a boot's
+    /// replay are applied in.
     pub(crate) const ALL: [SysFamily; Self::COUNT] = [
         SysFamily::Schema,
+        SysFamily::Column,
+        SysFamily::Circuit,
         SysFamily::Table,
         SysFamily::View,
-        SysFamily::Column,
         SysFamily::Index,
         SysFamily::Sequence,
-        SysFamily::Circuit,
     ];
 
     /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
@@ -485,18 +486,13 @@ impl SysFamily {
         }
     }
 
-    /// Topological creation priority: lower = created first, destroyed last.
-    /// `apply_bundle` and `replay_catalog` walk it.
-    #[inline]
-    pub(crate) fn topo_priority(self) -> u8 {
+    /// The families this family's hook reads, which are applied before it.
+    const fn applies_after(self) -> &'static [SysFamily] {
         match self {
-            SysFamily::Schema => 0,
-            SysFamily::Column => 1,
-            SysFamily::Circuit => 2,
-            SysFamily::Table => 5,
-            SysFamily::View => 6,
-            SysFamily::Index => 7,
-            SysFamily::Sequence => 99,
+            SysFamily::Schema | SysFamily::Column | SysFamily::Circuit | SysFamily::Sequence => &[],
+            SysFamily::Table => &[SysFamily::Schema, SysFamily::Column],
+            SysFamily::View => &[SysFamily::Schema, SysFamily::Column, SysFamily::Circuit],
+            SysFamily::Index => &[SysFamily::Table, SysFamily::View],
         }
     }
 
@@ -530,12 +526,6 @@ impl SysFamily {
             | SysFamily::Index => Some(gnitz_wire::FIRST_USER_TABLE_ID),
             SysFamily::Circuit => None,
         }
-    }
-
-    /// The exclusive upper bound on an id a client may write: the ceiling
-    /// `allocate_ids` allocates under.
-    pub(super) fn id_ceiling(self) -> Option<u64> {
-        self.allocates_ids().then_some(gnitz_wire::CATALOG_ID_CEILING)
     }
 
     /// Does this family's PK draw from the catalog object-id counter?
@@ -623,10 +613,20 @@ impl SysFamily {
 const _: () = {
     let mut i = 0;
     while i < SysFamily::COUNT {
+        let family = SysFamily::ALL[i];
         assert!(
-            SysFamily::ALL[i].index() == i,
+            family.index() == i,
             "SysFamily::ALL must be in gnitz_wire::SYS_FAMILIES order"
         );
+        let deps = family.applies_after();
+        let mut d = 0;
+        while d < deps.len() {
+            assert!(
+                deps[d].index() < i,
+                "gnitz_wire::SYS_FAMILIES must order a family after every family its hook reads"
+            );
+            d += 1;
+        }
         i += 1;
     }
 };

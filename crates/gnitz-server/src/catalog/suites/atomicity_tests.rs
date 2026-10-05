@@ -38,7 +38,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
         col_def("c", TypeCode::U64).write_col_tab_row(&mut bb, gapped, col_idx, 1);
     }
     engine.submit(SysFamily::Column, bb.finish()).unwrap();
-    let unregistered = engine.allocate_ids(1).unwrap();
+    let unregistered = engine.allocate_ids(2).unwrap();
     let index_on = |owner: u64, cols: &[u32], name: &str| idx_tab_batch(unregistered + 1, owner, cols, name, false, 1);
 
     for (family, batch, why) in [
@@ -102,49 +102,26 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── next_id follows applied ids ──────────────────────────────────────────────
+// ── the id counter at boot ───────────────────────────────────────────────────
 
+/// A row recovered at boot raises the id counter past its id, so no allocation
+/// hands that id out again.
 #[test]
-fn test_next_id_advances_on_index_register() {
-    let dir = temp_dir("atomicity_idx_seq");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+fn a_recovered_row_raises_the_id_counter_past_its_id() {
+    let dir = temp_dir("atomicity_recovered_ids");
+    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
+    let (sid, tail) = (FIRST_ALLOCATED_ID + 500, FIRST_ALLOCATED_ID + 900);
+    unreplayed
+        .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(sid, "recovered", 1)]))
+        .unwrap();
+    let mut engine = unreplayed.replay().unwrap();
+    assert_eq!(engine.allocate_ids(1).unwrap(), sid + 1);
+    drop(engine);
 
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
-
-    // An index id far ahead of the local counter.
-    let large_idx_id = engine.next_id + 500;
-    let batch = idx_tab_batch(large_idx_id, tid, &[1], "public__seqsync__idx_val_sync", false, 1);
-    engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch).unwrap();
-
-    assert!(
-        engine.next_id > large_idx_id,
-        "next_id ({}) must exceed the registered idx_id ({}) after \
-         the IDX_TAB row is applied",
-        engine.next_id,
-        large_idx_id
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_next_id_advances_on_schema_register() {
-    let dir = temp_dir("atomicity_schema_seq");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let large_sid = engine.next_id + 500;
-    let batch = schema_tab_batch(&[(large_sid, "recovered_schema", 1)]);
-    engine.ingest_to_family(gnitz_wire::SCHEMA_TAB, &batch).unwrap();
-
-    assert!(
-        engine.next_id > large_sid,
-        "next_id ({}) must exceed the registered sid ({}) so \
-         allocate_ids never re-issues it",
-        engine.next_id,
-        large_sid,
-    );
-
+    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
+    let schema = schema_tab_batch(&[(tail, "recovered_too", 1)]);
+    unreplayed.stage(gnitz_wire::SCHEMA_TAB, 501, schema).unwrap();
+    assert_eq!(unreplayed.replay().unwrap().allocate_ids(1).unwrap(), tail + 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -182,7 +159,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // succeed despite its id colliding with a table that has a dependent view.
     engine.drop_schema("victim").unwrap();
     assert!(
-        !engine.caches.schema_by_name.contains_key("victim"),
+        engine.schema_id("victim").is_none(),
         "victim schema must be gone after a successful DROP SCHEMA"
     );
 

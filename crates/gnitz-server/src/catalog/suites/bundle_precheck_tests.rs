@@ -278,7 +278,7 @@ fn a_refused_view_bundle_compensates_to_the_prior_catalog() {
     ];
     for (want, blocks) in cases {
         let _ = engine.drain_pending_broadcasts();
-        let vid = engine.next_id;
+        let vid = engine.allocate_ids(1).unwrap();
         let err = engine
             .apply_bundle(bundle(blocks(&engine, vid)))
             .expect_err("the bundle is refused");

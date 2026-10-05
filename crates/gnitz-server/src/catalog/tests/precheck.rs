@@ -5,6 +5,7 @@
 use super::*;
 use crate::test_support::push_sys_row;
 use gnitz_wire::{CATALOG_ID_CEILING, FIRST_USER_TABLE_ID};
+use gnitz_zset::repr::BatchBuilder;
 
 #[test]
 fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
@@ -27,6 +28,9 @@ fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
 /// An id every family's range admits.
 const ID: u64 = 20;
 
+/// The id counter the shape rules run under.
+const NEXT_ID: u64 = 4096;
+
 /// What the shape rules say of `family` rows `(leading id, weight, differing
 /// column)`, `""` when they pass: every row carries the same payload, except
 /// that a row's named column holds another value.
@@ -39,7 +43,9 @@ fn shape(family: SysFamily, rows: &[(u64, i64, &str)]) -> String {
             (payload[pi].name == differing) as u64
         });
     }
-    check_batch_shape(family, &bb.finish()).err().unwrap_or_default()
+    check_batch_shape(family, &bb.finish(), NEXT_ID)
+        .err()
+        .unwrap_or_default()
 }
 
 /// Rows a drop cascade retracts with their owner, and so no client delta may.
@@ -118,10 +124,16 @@ fn an_id_outside_a_familys_range_is_rejected_whatever_its_sign() {
             family,
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index
         );
-        assert_eq!(shape(family, &[(CATALOG_ID_CEILING - 1, 1, "")]), "", "{family:?}");
-        let err = shape(family, &[(CATALOG_ID_CEILING, 1, "")]);
-        assert_eq!(err.contains("id ceiling"), capped, "{family:?}: {err}");
-        assert_eq!(err.is_empty(), !capped, "{family:?}: {err}");
+        assert_eq!(shape(family, &[(NEXT_ID - 1, 1, "")]), "", "{family:?}");
+        for id in [NEXT_ID, CATALOG_ID_CEILING - 1, CATALOG_ID_CEILING] {
+            let err = shape(family, &[(id, 1, "")]);
+            assert_eq!(err.contains("never allocated"), capped, "{family:?} {id}: {err}");
+            assert_eq!(err.is_empty(), !capped, "{family:?} {id}: {err}");
+            if capped {
+                let err = shape(family, &[(id, -1, "")]);
+                assert!(err.contains("never allocated"), "{family:?} {id}: {err}");
+            }
+        }
     }
 }
 

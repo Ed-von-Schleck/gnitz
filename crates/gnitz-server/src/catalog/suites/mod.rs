@@ -24,13 +24,20 @@ mod view_preflight_tests;
 mod view_tick_bench;
 mod wide_pk_validation;
 
+use std::fs;
+use std::rc::Rc;
+
+use gnitz_expr::{payload_string, payload_u64};
+use gnitz_store::relation::{
+    relation_dir, relations_dir, ChildAddr, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec,
+    SecondaryIndex, StoreConfig,
+};
+use gnitz_wire::{PkColList, TypeCode, PK_LIST_PACKED_FLAG};
+use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
+use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
+
 use super::sys_tables::*;
 use super::*;
-use gnitz_store::relation::{relation_dir, relations_dir, ChildAddr, ChildKind, SecondaryIndex};
-use gnitz_wire::{PkColList, TypeCode, PK_LIST_PACKED_FLAG};
-use gnitz_zset::schema::Slot;
-
-use std::fs;
 
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
 fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_zset::repr::Batch> {

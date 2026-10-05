@@ -26,7 +26,7 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, p
 /// `apply_bundle` does: circuit and columns first, then the VIEW_TAB row
 /// (the hook invariant).
 fn register_filtered_view(engine: &mut CatalogEngine, base_tid: u64, name: &str, pred: &[u8]) -> u64 {
-    let vid = engine.next_id;
+    let vid = engine.allocate_ids(1).unwrap();
     write_filtered_circuit(engine, vid, base_tid, pred);
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(vid, &cols).unwrap();
@@ -131,7 +131,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
     for (rows, want) in cases {
         // The setup is not part of the bundle being compensated.
         let _ = engine.drain_pending_broadcasts();
-        let vid = engine.next_id;
+        let vid = engine.allocate_ids(1).unwrap();
         engine.write_column_records(vid, &cols).unwrap();
         engine.submit(SysFamily::Circuit, rows(vid)).unwrap();
         let err = engine
@@ -223,7 +223,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     );
 
     // The replacement's own rows must exist before its VIEW_TAB row is checked.
-    let new_vid = engine.next_id;
+    let new_vid = engine.allocate_ids(1).unwrap();
     write_filtered_circuit(
         &mut engine,
         new_vid,
@@ -278,7 +278,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 
     // The replacing bundle: the new chain's own rows, then one VIEW_TAB batch
     // carrying the incumbent's `-1` and the replacement's `+1`.
-    let new_vid = engine.next_id;
+    let new_vid = engine.allocate_ids(1).unwrap();
     write_filtered_circuit(
         &mut engine,
         new_vid,

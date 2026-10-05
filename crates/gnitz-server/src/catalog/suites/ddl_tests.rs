@@ -599,7 +599,7 @@ fn test_drop_view_removes_directory() {
 
     // Register a view via the raw system-table path.
     // Column records and the circuit must precede the VIEW_TAB row (hook invariant).
-    let vid = engine.next_id;
+    let vid = engine.allocate_ids(1).unwrap();
     let view_cols = vec![col_def("id", TypeCode::U64)];
     engine.write_column_records(vid, &view_cols).unwrap();
     write_identity_circuit(&mut engine, vid, base, gnitz_wire::ReadBound::None);
@@ -650,7 +650,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     let base_circuits = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
-    let vid = engine.next_id;
+    let vid = engine.allocate_ids(1).unwrap();
     let view_cols = vec![col_def("id", TypeCode::U64)];
     write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(vid, &view_cols).unwrap();
@@ -1022,7 +1022,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
         .unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
     let register = |engine: &mut CatalogEngine, name: &str, owner: u64| {
-        let vid = engine.next_id;
+        let vid = engine.allocate_ids(1).unwrap();
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, &cols).unwrap();
         let mut bb = BatchBuilder::new(SysFamily::View.schema());

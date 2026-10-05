@@ -9,7 +9,10 @@
 
 use super::super::*;
 use crate::test_support::{col_tab_batch, idx_tab_batch, schema_tab_batch};
+use gnitz_expr::payload_u64;
 use gnitz_wire::sys_rows::{SysRow, TableTabRow};
+use gnitz_wire::validate_user_identifier;
+use gnitz_zset::repr::BatchBuilder;
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
 /// points take qualified-name strings; the wire path ships schema and entity ids

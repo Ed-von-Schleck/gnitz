@@ -102,6 +102,28 @@ fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// An id enters the catalog only through `allocate_ids`. A `+1` row at one the
+/// counter has not reached is refused before anything applies, so it cannot
+/// raise the counter to the ceiling and exhaust every later allocation.
+#[test]
+fn a_row_at_an_unallocated_id_is_refused_and_leaves_allocation_working() {
+    let dir = temp_dir("unallocated_id");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let next = engine.allocate_ids(1).unwrap() + 1;
+    for id in [next, next + 4096, gnitz_wire::CATALOG_ID_CEILING - 1] {
+        let err = engine
+            .submit(SysFamily::Schema, schema_tab_batch(&[(id, "forged", 1)]))
+            .unwrap_err();
+        assert!(err.contains("never allocated"), "schema {id}: {err}");
+    }
+    assert_eq!(engine.allocate_ids(1).unwrap(), next);
+    engine
+        .submit(SysFamily::Schema, schema_tab_batch(&[(next, "granted", 1)]))
+        .unwrap();
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_user_sequence_durable_roundtrip() {
     let dir = temp_dir("user_seq_roundtrip");
@@ -127,7 +149,7 @@ fn test_user_sequence_durable_roundtrip() {
 #[test]
 fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
-    let expected_topology = crate::catalog::registry::topology_word(4);
+    let expected_topology = crate::catalog::sequences::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation(), 0);
@@ -170,28 +192,23 @@ fn test_boot_generation_advance_monotonic() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A drop, a system flush and a reopen must not hand out again an id that was
-/// registered without being allocated.
+/// A drop, a system flush and a reopen must not hand out again an id a dropped
+/// relation held.
 #[test]
-fn test_raised_counter_survives_drop_and_flush() {
-    let dir = temp_dir("raised_counter_survives_drop");
+fn a_dropped_relations_id_is_not_handed_out_again() {
+    let dir = temp_dir("dropped_id_not_reissued");
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        tid = engine.next_id + 500;
-        engine.write_column_records(tid, &cols).unwrap();
-        engine
-            .submit(SysFamily::Table, table_tab_batch(&[(tid, "unallocated", 1)]))
-            .unwrap();
-        assert!(engine.next_id > tid);
+        tid = engine.create_table("public.dropped", &cols, &[0]).unwrap();
         engine.submit_retraction(SysFamily::Table, tid).unwrap();
         engine.flush_all_system_tables().unwrap();
         engine.close();
     }
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine.registry.has_id(tid));
-    assert!(engine.next_id > tid, "next_id {} must stay past {tid}", engine.next_id);
+    assert!(engine.allocate_ids(1).unwrap() > tid);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }

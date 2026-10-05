@@ -1,46 +1,20 @@
 //! Catalog precheck — the master's trust boundary against client-pushed
 //! system-table deltas.
 
+use gnitz_expr::{payload_str, RowSource, SchemaFacts};
+use gnitz_store::relation::{IndexClaim, RelationKind};
+use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, IDXTAB_PAY_NAME, MAX_COLUMNS, SCHEMATAB_PAY_NAME};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{KeySpec, SchemaColumn, SchemaDescriptor};
 use rustc_hash::FxHashSet;
 
-use super::*;
-use gnitz_expr::{payload_str, RowSource, SchemaFacts};
-use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::MAX_COLUMNS;
-use gnitz_wire::{low_bits_mask, BitIter, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
-use gnitz_zset::schema::KeySpec;
-
-/// A set of catalog ids, sorted once so every probe is a binary search: the
-/// probes run per row of a client-supplied block bounded only by the frame.
-#[derive(Debug, Default)]
-pub(in crate::catalog) struct IdSet(Vec<u64>);
-
-impl IdSet {
-    pub(in crate::catalog) fn new(ids: impl IntoIterator<Item = u64>) -> Self {
-        let mut ids: Vec<u64> = ids.into_iter().collect();
-        ids.sort_unstable();
-        ids.dedup();
-        IdSet(ids)
-    }
-
-    pub(in crate::catalog) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub(in crate::catalog) fn contains(&self, id: u64) -> bool {
-        self.0.binary_search(&id).is_ok()
-    }
-
-    /// The ids, strictly ascending.
-    pub(in crate::catalog) fn ids(&self) -> &[u64] {
-        &self.0
-    }
-
-    /// These ids and `more`.
-    pub(in crate::catalog) fn with(self, more: impl IntoIterator<Item = u64>) -> Self {
-        IdSet::new(self.0.into_iter().chain(more))
-    }
-}
+use super::sys_reads::IdSet;
+use super::sys_tables::{
+    family_pk_partition, pk_signatures, read_col_tab_row, read_idx_tab_row, read_rel_row, CatalogColumn, PkSignature,
+    RelDetail, SysFamily,
+};
+use super::CatalogEngine;
 
 /// The name rules a catalog row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical, since every name-index key is compared
@@ -137,11 +111,12 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
     Ok(())
 }
 
-/// Bootstrap-owned ids sit below the floor, unreachable ones at or above the
-/// ceiling. Both are properties of the id space rather than of the mutation's
-/// shape, so they cover every sign: a `-1` drops a bootstrap row, a bare `+1`
-/// aliases a bootstrap id into the name indexes, and a pair renames one.
-fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
+/// Bootstrap-owned ids sit below the floor, and one at or above `next_id`, the
+/// id counter, was never allocated. Both are properties of the id space rather
+/// than of the mutation's shape, so they cover every sign: a `-1` drops a
+/// bootstrap row, a bare `+1` aliases a bootstrap id into the name indexes, and
+/// a pair renames one.
+fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<(), String> {
     let id = sig.leading;
     if family.first_user_id().is_some_and(|floor| id < floor) {
         return Err(format!(
@@ -151,13 +126,11 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
             family.pk_label(sig.pk)
         ));
     }
-    if let Some(ceiling) = family.id_ceiling() {
-        if id >= ceiling {
-            return Err(format!(
-                "{} is at or above the id ceiling ({ceiling})",
-                family.pk_label(sig.pk)
-            ));
-        }
+    if family.allocates_ids() && id >= next_id {
+        return Err(format!(
+            "{} was never allocated (next id {next_id})",
+            family.pk_label(sig.pk)
+        ));
     }
     Ok(())
 }
@@ -204,8 +177,9 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     Ok(())
 }
 
-/// The rules a system batch must satisfy on its own, before any store is read.
-fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
+/// The rules a system batch must satisfy on its own, before any store is read,
+/// with the id counter at `next_id`.
+fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<Vec<PkSignature>, String> {
     check_row_weights(family, batch)?;
     let sigs = pk_signatures(family, batch);
     for sig in &sigs {
@@ -217,7 +191,7 @@ fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature
                 family.pk_label(sig.pk)
             ));
         }
-        check_id_range(family, sig)?;
+        check_id_range(family, sig, next_id)?;
         check_pair_fields(family, batch, sig)?;
     }
     Ok(sigs)
@@ -389,7 +363,7 @@ impl CatalogEngine {
     /// store. Returns the per-PK signatures and the PKs whose net is dead: the
     /// genuine drops, which a rename pair's net-live `-1` is not.
     fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, IdSet), String> {
-        let sigs = check_batch_shape(family, batch)?;
+        let sigs = check_batch_shape(family, batch, self.next_id)?;
         let mut net_dead: Vec<u64> = Vec::new();
         for sig in &sigs {
             if self.check_cas_and_net(family, batch, sig)? <= 0 {

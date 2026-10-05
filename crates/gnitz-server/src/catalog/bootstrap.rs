@@ -1,5 +1,12 @@
-use super::*;
 use gnitz_expr::ColumnTable;
+use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::Placement;
+
+use super::cache::CatalogCacheSet;
+use super::sys_tables::{SysFamily, FIRST_ALLOCATED_ID};
+use super::CatalogEngine;
+use crate::query::DagEngine;
 
 /// A master catalog with only its system families registered, their stores open.
 /// [`Self::replay`] registers the rest.
@@ -115,13 +122,14 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        let mut families = SysFamily::ALL;
-        families.sort_by_key(|f| f.topo_priority());
-        // Each registration reads its own column records; the system families'
-        // entries are compile-time data.
-        for family in families.into_iter().filter(|&f| f != SysFamily::Column) {
+        for family in SysFamily::ALL {
             let rows = self.sys_relation(family).full_scan();
-            self.fire_hooks(family, &rows)?;
+            self.raise_next_id(family, &rows);
+            // Each registration reads its own column records; the system families'
+            // entries are compile-time data.
+            if family != SysFamily::Column {
+                self.fire_hooks(family, &rows)?;
+            }
         }
         Ok(())
     }
