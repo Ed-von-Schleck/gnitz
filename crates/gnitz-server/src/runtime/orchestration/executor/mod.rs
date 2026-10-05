@@ -367,6 +367,9 @@ impl ServerExecutor {
         // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
         // before exiting.
         install_shutdown_signal_handlers();
+        // Past the last env knob the boot reads, so one it refuses stops the
+        // server before it reports ready.
+        gnitz_note!("GnitzDB ready");
 
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
         for listener in listeners {

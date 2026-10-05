@@ -495,7 +495,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     })?;
 
     let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
-    gnitz_note!("GnitzDB ready");
     Ok(ServerExecutor::run(dispatcher, data_dir, listeners))
 }
 
