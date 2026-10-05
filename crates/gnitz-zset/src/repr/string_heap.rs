@@ -8,17 +8,17 @@ use std::collections::VecDeque;
 use super::batch_pool::{is_tight, tls_pool};
 use super::merge::MemBatch;
 use gnitz_expr::RowSource;
-use gnitz_wire::{write_u64_le, TypeCode};
+use gnitz_wire::TypeCode;
 use rustc_hash::FxHashMap;
 
-type SpanKey = (usize, usize, usize);
+type SpanKey = (usize, usize);
 type SpanMap = FxHashMap<SpanKey, usize>;
 
-/// One source span, identified by the heap it lives in. Shared so a sizing pass
-/// charges exactly the spans a relocation copies.
+/// One source span, identified by its address and length. Shared so a sizing
+/// pass charges exactly the spans a relocation copies.
 #[inline]
-pub(super) fn blob_span_key(src_blob: &[u8], start: usize, length: usize) -> SpanKey {
-    (src_blob.as_ptr() as usize, start, length)
+pub(super) fn blob_span_key(content: &[u8]) -> SpanKey {
+    (content.as_ptr() as usize, content.len())
 }
 
 /// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
@@ -113,24 +113,45 @@ pub(super) fn rebase_string_cells(
     heap_at: Option<usize>,
     cache: Option<&mut BlobCache>,
 ) {
-    let Some(base) = heap_at else {
-        let (cells, _) = cells.as_chunks_mut::<16>();
-        // The cache is matched once, so neither loop tests for it per cell.
-        match cache {
-            Some(cache) => {
-                for cell in cells {
-                    relocate_german_string(cell, src_blob, dst_blob, Some(&mut *cache));
-                }
-            }
-            None => {
-                for cell in cells {
-                    relocate_german_string(cell, src_blob, dst_blob, None);
-                }
+    match heap_at {
+        Some(base) => gnitz_wire::shift_german_string_heaps(cells, base),
+        None => relocate_cells(cells.as_chunks_mut::<16>().0, src_blob, dst_blob, cache),
+    }
+}
+
+/// [`rebase_string_cells`] for one cell, inlined into a loop that picks a
+/// source per cell.
+#[inline]
+pub(super) fn rebase_string_cell(
+    cell: &mut [u8; 16],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    heap_at: Option<usize>,
+    cache: Option<&mut BlobCache>,
+) {
+    match heap_at {
+        Some(base) => gnitz_wire::shift_german_string_heaps(cell, base),
+        None => relocate_german_string(cell, src_blob, dst_blob, cache),
+    }
+}
+
+/// Relocate each of `cells`. Out of line: a caller's loop over fixed-width
+/// regions is compiled without it.
+#[inline(never)]
+fn relocate_cells(cells: &mut [[u8; 16]], src_blob: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
+    // The cache is matched once, so neither loop tests for it per cell.
+    match cache {
+        Some(cache) => {
+            for cell in cells {
+                relocate_german_string(cell, src_blob, dst_blob, Some(&mut *cache));
             }
         }
-        return;
-    };
-    gnitz_wire::shift_german_string_heaps(cells, base);
+        None => {
+            for cell in cells {
+                relocate_german_string(cell, src_blob, dst_blob, None);
+            }
+        }
+    }
 }
 
 /// `src_cell` rebased onto `dst_blob`; see [`relocate_german_string`].
@@ -148,45 +169,28 @@ pub(crate) fn relocate_german_string_vec(
     cell
 }
 
-/// Rebase `cell`, read against `src_blob`, onto `dst_blob`: a short cell's pad
-/// is zeroed, a long one's content is appended to `dst_blob` — once per source
-/// span when `cache` is `Some`. A long cell overrunning `src_blob` becomes the
-/// empty string.
+/// [`gnitz_wire::relocate_german_string`] in place, copying each source span
+/// once when `cache` is `Some`.
 #[inline]
 fn relocate_german_string(cell: &mut [u8; 16], src_blob: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
-    match gnitz_wire::canonical_short_cell(cell) {
-        Some(short) => *cell = short,
-        None => relocate_long_german_string(cell, src_blob, dst_blob, cache),
-    }
+    *cell = gnitz_wire::relocate_german_string_with(cell, src_blob, |content| place_span(content, dst_blob, cache));
 }
 
-/// The long arm of [`relocate_german_string`], out of line so the short arm
-/// inlines alone. A long cell's length and prefix stay; only its offset moves.
-fn relocate_long_german_string(
-    cell: &mut [u8; 16],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    cache: Option<&mut BlobCache>,
-) {
-    let Some(span) = gnitz_wire::german_string_heap(cell, src_blob.len()) else {
-        *cell = [0; 16];
-        return;
-    };
-    let new_offset = dst_blob.len();
-    let off = match cache {
-        Some(cache) => {
-            let key = blob_span_key(src_blob, span.start, span.len());
-            *cache.map().entry(key).or_insert_with(|| {
-                dst_blob.extend_from_slice(&src_blob[span]);
-                new_offset
-            })
-        }
+/// Where `content`, a span of a source heap, sits in `dst_blob`: appended, or
+/// where `cache` already put it. Out of line so a short cell's relocation
+/// inlines without it.
+fn place_span(content: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) -> usize {
+    let at = dst_blob.len();
+    match cache {
+        Some(cache) => *cache.map().entry(blob_span_key(content)).or_insert_with(|| {
+            dst_blob.extend_from_slice(content);
+            at
+        }),
         None => {
-            dst_blob.extend_from_slice(&src_blob[span]);
-            new_offset
+            dst_blob.extend_from_slice(content);
+            at
         }
-    };
-    write_u64_le(cell, 8, off as u64);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -730,29 +730,19 @@ impl StrView {
     fn arena(off: usize, len: usize) -> Self {
         Self::at(SRC_ARENA, off, len)
     }
-}
 
-/// `v`'s byte range in its buffer, degrading to an empty range when it runs past
-/// the end — `gnitz_wire::german_string_content`'s corrupt-cell convention,
-/// never a panic.
-fn view_span(v: StrView, buf_len: usize) -> (usize, usize) {
-    match gnitz_wire::blob_extent(buf_len, v.off, v.len as usize) {
-        Some(r) => (r.start, r.len()),
-        None => (0, 0),
+    /// `(offset, length)` in `src`'s buffer. A view is cut from a buffer that
+    /// held it, and no buffer shrinks under a live view.
+    fn span(self) -> (usize, usize) {
+        (self.off as usize, self.len as usize)
     }
 }
 
-/// `v`'s bytes together with the offset they sit at, a view running past its
-/// buffer reading as the empty string at offset 0 — [`view_span`]'s convention
-/// in one range check. The sub-view producers need both, and must read the
-/// offset from here rather than from `v.off`.
+/// `v`'s bytes together with the offset they sit at; the sub-view producers
+/// need both.
 fn view_bytes_at<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> (&'x [u8], usize) {
-    let buf = bufs.region(v.src).unwrap_or(arena);
-    let o = v.off as usize;
-    match buf.get(o..o.wrapping_add(v.len as usize)) {
-        Some(bytes) => (bytes, o),
-        None => (&[], 0),
-    }
+    let (o, l) = v.span();
+    (&bufs.region(v.src).unwrap_or(arena)[o..o + l], o)
 }
 
 fn view_bytes<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> &'x [u8] {
@@ -767,14 +757,13 @@ fn view_bytes<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> &'x [u8] {
 #[inline]
 fn arena_push_view(arena: &mut Vec<u8>, bufs: StrBufs<'_>, v: StrView) -> (usize, usize) {
     let start = arena.len();
-    let (o, l) = view_span(v, bufs.region(v.src).map_or(arena.len(), <[u8]>::len));
+    let (o, l) = v.span();
     arena_push_span(arena, bufs, v.src, o, l);
     (start, arena.len() - start)
 }
 
 /// Append an already-resolved span to the arena. Callers that need the extent
-/// for their own arithmetic resolve it once and come here, instead of paying
-/// [`view_span`] a second time inside [`arena_push_view`].
+/// for their own arithmetic resolve it once and come here.
 ///
 /// `#[inline]` because it is called per row from the concatenation kernels and
 /// is smaller than its own call.
@@ -1273,8 +1262,8 @@ fn eval_str_concat(
             // operands wrap in u32 space, and an oversized length would trip
             // `encode_german_string`'s release assert — a worker abort, which the
             // totality rule forbids.
-            let (oa, la) = view_span(va, bufs.region(va.src).map_or(str_arena.len(), <[u8]>::len));
-            let (ob, lb) = view_span(vb, bufs.region(vb.src).map_or(str_arena.len(), <[u8]>::len));
+            let (oa, la) = va.span();
+            let (ob, lb) = vb.span();
             let total = la as u64 + lb as u64;
             if total > u32::MAX as u64 {
                 bad[i] = 1;
@@ -1632,7 +1621,10 @@ fn minmax2<P: LanePred>(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u
 /// Dispatch a German-string compare on its operator, hoisting the six-way
 /// branch out of the row loop: the two equalities read the cells through
 /// [`eval_str_eq`], and each ordering arm instantiates [`eval_str_cmp`] with
-/// its own `Ordering` predicate.
+/// its own `Ordering` predicate. Out of line, so the row loops are compiled
+/// apart from the instruction dispatch that calls them;
+/// `str_const_filter_bench` measures it.
+#[inline(never)]
 fn str_cmp<A: Cells, B: Cells>(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,

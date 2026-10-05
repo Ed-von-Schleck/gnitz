@@ -18,7 +18,7 @@ use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
 
-use super::shared::{arb_type_code, pk_payload_schema, read_german_string, u64_pk_schema, zset_of, zset_sum};
+use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema, zset_of, zset_sum};
 
 /// A cursor over `batches` and `shards`, one run each.
 pub(crate) fn create_read_cursor(
@@ -181,7 +181,9 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
 
 /// Payload column 0's string on every row, in order.
 pub(crate) fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
-    (0..batch.len()).map(|row| read_german_string(batch, 0, row)).collect()
+    (0..batch.len())
+        .map(|row| gnitz_expr::payload_bytes(batch, row, 0).to_vec())
+        .collect()
 }
 
 /// U64 pk + a single BLOB payload column.

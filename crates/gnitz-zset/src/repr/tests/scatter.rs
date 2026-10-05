@@ -56,7 +56,7 @@ fn both_kernels_gather_rows_at_every_pk_width() {
 /// survivors interleaved across both — and every kept string reads back.
 #[test]
 fn materialize_carrying_charges_each_sources_dropped_rows() {
-    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string, read_german_string};
+    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
     let schema = make_schema_pk_u64_payload_string();
     // Eight rows a side, one dropped from each: too little to make either
     // carried heap wasteful.
@@ -75,7 +75,9 @@ fn materialize_carrying_charges_each_sources_dropped_rows() {
     let out = materialize_carrying(&sources, &schema, &rows);
     assert_eq!(out.dead_heap, 30 + 50);
     assert_eq!(out.blob().len(), a.blob().len() + b.blob().len());
-    let got: Vec<Vec<u8>> = (0..out.count).map(|row| read_german_string(&out, 0, row)).collect();
+    let got: Vec<Vec<u8>> = (0..out.count)
+        .map(|row| gnitz_expr::payload_bytes(&out, row, 0).to_vec())
+        .collect();
     let want: Vec<Vec<u8>> = (0..14).map(|i| vec![[b'a', b'b'][i % 2]; 40]).collect();
     assert_eq!(got, want);
 }

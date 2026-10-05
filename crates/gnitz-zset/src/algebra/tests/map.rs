@@ -4,9 +4,7 @@ use gnitz_wire::{MapKind, NullKeys};
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
-use crate::test_support::{
-    make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, read_german_string, weighted_rows,
-};
+use crate::test_support::{make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, weighted_rows};
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 pub(super) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
@@ -108,17 +106,17 @@ fn test_map_blob_passthrough_and_fallback() {
     // blob keeps every long string's heap offset valid through the verbatim copy.
     let out = project(&in_schema, &[2, 1]).evaluate_map_batch(&batch);
     assert_eq!(out.count, 2);
-    assert_eq!(read_german_string(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
-    assert_eq!(read_german_string(&out, 1, 0), b"ab"); // s1 → out payload 1
-    assert_eq!(read_german_string(&out, 0, 1), b"long-string-two-abcdef");
-    assert_eq!(read_german_string(&out, 1, 1), b"cd");
+    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
+    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 1), b"ab"); // s1 → out payload 1
+    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 0), b"long-string-two-abcdef");
+    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 1), b"cd");
 
     // (B) Drop the long string s2 → passthrough gated OFF, so the relocate path runs and the
     // output blob carries only the referenced (here empty, short-inline) spans.
     let out = project(&in_schema, &[1]).evaluate_map_batch(&batch);
     assert_eq!(out.count, 2);
-    assert_eq!(read_german_string(&out, 0, 0), b"ab");
-    assert_eq!(read_german_string(&out, 0, 1), b"cd");
+    assert_eq!(gnitz_expr::payload_bytes(&out, 0, 0), b"ab");
+    assert_eq!(gnitz_expr::payload_bytes(&out, 1, 0), b"cd");
     assert!(
         out.blob().len() < batch.blob().len(),
         "dropped-string relocate must not copy the dead heap ({} vs {})",

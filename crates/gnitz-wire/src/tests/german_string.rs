@@ -3,23 +3,16 @@ use std::cmp::Ordering;
 
 /// Encode → decode at one length, out of an arena that already holds `prefix`
 /// bytes: a heap payload must be found at its own non-zero offset, not at 0.
-/// The two readers — the fallible `try_decode_german_string` and the infallible
-/// `german_string_content` — must agree on every class; the encoded cell is
-/// canonical; the short-cell accessors classify it; and shifting it by the
-/// bytes an appender put in front of its arena keeps its content.
+/// The encoded cell is canonical; the short-cell accessors classify it; and
+/// shifting it by the bytes an appender put in front of its arena keeps its
+/// content.
 fn roundtrip(s: &[u8], prefix: usize) {
     let mut blob = vec![0xEEu8; prefix];
     let st = encode_german_string(s, &mut blob);
     assert_eq!(
-        try_decode_german_string(&st, &blob).as_deref(),
-        Some(s),
-        "try_decode roundtrip failed for len {} at prefix {prefix}",
-        s.len(),
-    );
-    assert_eq!(
         german_string_content(&st, &blob),
         s,
-        "the two readers disagree at len {} prefix {prefix}",
+        "roundtrip failed for len {} at prefix {prefix}",
         s.len(),
     );
     if s.len() > SHORT_STRING_THRESHOLD {
@@ -57,6 +50,71 @@ fn roundtrip_across_length_boundaries() {
         roundtrip(b"abcdefghijklmnopqrstuvwxyz", prefix); // 26
         roundtrip(&vec![0xABu8; 1000], prefix); // long blob string
     }
+}
+
+/// A long cell overrunning its heap relocates to the canonical empty string,
+/// its prefix zeroed with its length: one left holding the corrupt cell's bytes
+/// would order apart from an empty string that reads the same.
+#[test]
+fn relocate_overrunning_long_cell_becomes_clean_empty() {
+    let mut src_cell = [0u8; 16];
+    write_u32_le(&mut src_cell, 0, 20);
+    src_cell[4..8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+    write_u64_le(&mut src_cell, 8, 999);
+
+    let mut dst_blob: Vec<u8> = Vec::new();
+    let result = relocate_german_string(&src_cell, &[0u8; 4], &mut dst_blob);
+    assert_eq!(result, [0u8; 16]);
+    assert!(dst_blob.is_empty());
+    assert!(german_string_cell_ok(&result, &dst_blob));
+}
+
+/// A relocated short cell is rebuilt, so a skewed pad — which orders the cell
+/// apart from an equal-content one — does not survive.
+#[test]
+fn relocate_canonicalizes_pad_bytes() {
+    let mut dst_blob: Vec<u8> = Vec::new();
+    for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
+        let clean = encode_german_string(content, &mut Vec::new());
+        let mut dirty = clean;
+        dirty[4 + content.len()..].fill(0xFF);
+        assert_eq!(relocate_german_string(&dirty, &[], &mut dst_blob), clean, "{content:?}");
+    }
+    assert!(dst_blob.is_empty(), "inline cells must not touch the blob");
+}
+
+/// A long cell's content lands wherever `place` puts it, its length and prefix
+/// carried over; the appending form puts it at the destination's end.
+#[test]
+fn relocate_moves_only_a_long_cells_offset() {
+    let content = b"abcdefghijklmnopqrst";
+    let mut src_blob = vec![0x11u8; 9];
+    let src = encode_german_string(content, &mut src_blob);
+    let mut dst_blob = vec![0x22u8; 5];
+    let out = relocate_german_string(&src, &src_blob, &mut dst_blob);
+    assert_eq!(out[..8], src[..8], "length and prefix carry over");
+    assert_eq!(read_u64_le(&out, 8), 5);
+    assert_eq!(german_string_content(&out, &dst_blob), content);
+    assert!(german_string_cell_ok(&out, &dst_blob));
+
+    let placed = relocate_german_string_with(&src, &src_blob, |c| {
+        assert_eq!(c, content);
+        77
+    });
+    assert_eq!((&placed[..8], read_u64_le(&placed, 8)), (&src[..8], 77));
+}
+
+/// The region check is the cell check over every cell.
+#[test]
+fn region_ok_refuses_one_bad_cell() {
+    let mut blob = Vec::new();
+    let mut region = [
+        encode_german_string(b"abc", &mut blob),
+        encode_german_string(b"abcdefghijklmnopqrst", &mut blob),
+    ];
+    assert!(german_string_region_ok(region.as_flattened(), &blob));
+    region[0][15] = 1;
+    assert!(!german_string_region_ok(region.as_flattened(), &blob));
 }
 
 #[test]
@@ -117,9 +175,16 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     assert!(!german_string_cell_ok(&dirty, &blob));
 
     // Short cell with a dirty suffix pad past the content — same story.
-    let mut dirty_suffix = encode_german_string(b"abcde", &mut blob);
+    let clean_suffix = encode_german_string(b"abcde", &mut blob);
+    let mut dirty_suffix = clean_suffix;
     dirty_suffix[15] = 0x01;
     assert!(!german_string_cell_ok(&dirty_suffix, &blob));
+    // The tail word is compared under the content's mask, so this pad is not
+    // compare-visible: the cells order as their contents do.
+    assert_eq!(
+        compare_german_strings(&clean_suffix, &blob, &dirty_suffix, &blob),
+        Ordering::Equal
+    );
 
     // Long cell whose inline prefix disagrees with its heap payload.
     let mut skewed = encode_german_string(b"abcdefghijklmnopqrstuvwxyz", &mut blob);
@@ -146,8 +211,10 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
         b"ab\0", // NUL past min_len aliases "ab"'s prefix pad
         b"abc",
         b"abcd",
+        b"abcd\0", // 5, a zero tail byte against the other side's pad
         b"abcde",
         b"abce",                       // 4, prefix differs in the last byte
+        b"abcdefghijk",                // 11, the 12 below differing only in length
         b"abcdefghijkl",               // 12 — last inline length
         b"abcdefghijklm",              // 13 — first heap length
         b"abcdefghijklmnopqrst",       // 20, shares the 12-byte prefix above

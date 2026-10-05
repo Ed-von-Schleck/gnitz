@@ -204,8 +204,7 @@ pub fn row_key<S: RowSource>(src: &S, schema: &(impl SchemaFacts + ?Sized), row:
             let tc = schema.col_type_code(schema.payload_col_idx(pi));
             let raw = src.get_col_ptr(row, pi, tc.wire_stride());
             Some(if tc.is_german_string() {
-                let st: [u8; 16] = raw.try_into().unwrap();
-                gnitz_wire::try_decode_german_string(&st, src.blob()).unwrap()
+                gnitz_wire::german_string_content(raw, src.blob()).to_vec()
             } else {
                 raw.to_vec()
             })
@@ -260,13 +259,6 @@ pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> 
 /// [`make_schema_u64_i64`].
 pub fn make_schema_u128_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::U128])
-}
-
-/// Payload column `col`'s string on row `row`.
-pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
-    let off = row * 16;
-    let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();
-    gnitz_wire::try_decode_german_string(gs, batch.blob()).unwrap()
 }
 
 /// U64 pk + a single STRING payload column.

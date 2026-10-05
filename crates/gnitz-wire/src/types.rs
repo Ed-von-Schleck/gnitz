@@ -391,7 +391,7 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
         T::I128 => i128::from_le_bytes(arr(a)).cmp(&i128::from_le_bytes(arr(b))),
         T::F32 => f32::from_le_bytes(arr(a)).total_cmp(&f32::from_le_bytes(arr(b))),
         T::F64 => f64::from_le_bytes(arr(a)).total_cmp(&f64::from_le_bytes(arr(b))),
-        T::String | T::Blob => crate::compare_german_strings(a, a_blob, b, b_blob),
+        T::String | T::Blob => crate::compare_german_strings(&arr(a), a_blob, &arr(b), b_blob),
     }
 }
 

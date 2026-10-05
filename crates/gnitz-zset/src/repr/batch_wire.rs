@@ -188,13 +188,9 @@ impl Batch {
     fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
         let mut cost = 0;
         for span in self.long_spans(row, slots) {
-            let len = span.len();
-            if seen
-                .map()
-                .insert(blob_span_key(&self.blob, span.start, len), 0)
-                .is_none()
-            {
-                cost += len;
+            let content = &self.blob[span];
+            if seen.map().insert(blob_span_key(content), 0).is_none() {
+                cost += content.len();
             }
         }
         cost

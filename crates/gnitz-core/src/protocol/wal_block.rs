@@ -85,14 +85,12 @@ fn append_regions(
         let at = dst.len();
         dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
         if col.ty.tc.is_german_string() {
-            for cell in dst[at..].as_chunks_mut::<16>().0 {
-                if foreign && !gnitz_wire::german_string_cell_ok(cell, block_blob) {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "column {ci}: German string cell is not in canonical form"
-                    )));
-                }
-                gnitz_wire::shift_german_string_heaps(cell, blob_base);
+            if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
+                return Err(ProtocolError::DecodeError(format!(
+                    "column {ci}: German string cell is not in canonical form"
+                )));
             }
+            gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);
         }
     }
     Ok(())

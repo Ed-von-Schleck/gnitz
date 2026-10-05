@@ -5,8 +5,8 @@ use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{
     arb_fold_case, assert_folds, create_read_cursor, fold_batch, fold_schemas, make_batch_u128,
-    make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64,
-    read_german_string, row_key, u64_pk_schema, weighted_rows, zset_of, RowKey,
+    make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key,
+    u64_pk_schema, weighted_rows, zset_of, RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -310,7 +310,9 @@ fn bounded_string_read_carries_only_its_own_rows() {
     assert_eq!(c.mode, Some(1));
     let batch = c.drain_chunk(usize::MAX).expect("shard 1 window");
     assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
-    let strings: Vec<Vec<u8>> = (0..batch.count).map(|i| read_german_string(&batch, 0, i)).collect();
+    let strings: Vec<Vec<u8>> = (0..batch.count)
+        .map(|i| gnitz_expr::payload_bytes(&batch, i, 0).to_vec())
+        .collect();
     let want: Vec<Vec<u8>> = (10_001..10_004u64)
         .map(|pk| format!("{pk:0>40}").into_bytes())
         .collect();

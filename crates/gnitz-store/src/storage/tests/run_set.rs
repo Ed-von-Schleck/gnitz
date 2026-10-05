@@ -192,7 +192,7 @@ fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
     let folded = &**set.runs.first().expect("every key survives");
     let got: Vec<(u128, i64, Vec<u8>)> = (0..folded.len())
         .map(|row| {
-            let s = crate::test_support::read_german_string(folded, 0, row);
+            let s = gnitz_expr::payload_bytes(folded, row, 0).to_vec();
             (folded.get_pk(row), folded.get_weight(row), s)
         })
         .collect();

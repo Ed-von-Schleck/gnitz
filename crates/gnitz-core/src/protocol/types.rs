@@ -390,20 +390,21 @@ impl ZSetBatch {
     }
 
     /// Append the cell at row `i` of `src.payload[src_pi]` onto
-    /// `self.payload[dst_pi]`. A German cell is re-encoded against this batch's
+    /// `self.payload[dst_pi]`. A German cell is relocated onto this batch's
     /// arena — its heap offset is relative to `src`'s and means nothing here.
     pub fn push_cell_from(&mut self, dst_pi: usize, src: &ZSetBatch, src_pi: usize, i: usize) {
         let col = &src.payload[src_pi];
         let tc = col.tc();
         debug_assert_eq!(self.payload[dst_pi].tc(), tc, "push_cell_from: slot type mismatch");
-        let w = tc.wire_stride();
-        let cell = &col.bytes[i * w..(i + 1) * w];
         if tc.is_german_string() {
-            let content = gnitz_wire::german_string_content(cell, &src.blob);
-            let moved = gnitz_wire::encode_german_string(content, &mut self.blob);
+            let cell = &col.bytes.as_chunks::<16>().0[i];
+            let moved = gnitz_wire::relocate_german_string(cell, &src.blob, &mut self.blob);
             self.payload[dst_pi].bytes.extend_from_slice(&moved);
         } else {
-            self.payload[dst_pi].bytes.extend_from_slice(cell);
+            let w = tc.wire_stride();
+            self.payload[dst_pi]
+                .bytes
+                .extend_from_slice(&col.bytes[i * w..(i + 1) * w]);
         }
     }
 
@@ -652,9 +653,9 @@ impl ZSetBatch {
                 let s = src.stride();
                 let mut bytes = Vec::with_capacity(n * s);
                 if !whole && src.tc.is_german_string() {
+                    let cells = src.bytes.as_chunks::<16>().0;
                     for &(r, _) in rows {
-                        let content = gnitz_wire::german_string_content(&src.bytes[r * s..(r + 1) * s], &self.blob);
-                        bytes.extend_from_slice(&gnitz_wire::encode_german_string(content, &mut blob));
+                        bytes.extend_from_slice(&gnitz_wire::relocate_german_string(&cells[r], &self.blob, &mut blob));
                     }
                 } else {
                     for &(r, _) in rows {

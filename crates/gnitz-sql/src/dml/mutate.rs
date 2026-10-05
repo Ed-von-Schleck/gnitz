@@ -21,7 +21,7 @@ use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
-use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set};
+use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, TypeCode};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 use std::sync::Arc;
@@ -375,7 +375,7 @@ pub(super) fn apply_set(
                 let ZSetBatch { payload, blob, .. } = &mut new;
                 // One spill for every row's cell.
                 let cell = if tc.is_german_string() {
-                    encode_german_string(german_string_content(cell, spill), blob).to_vec()
+                    relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, blob).to_vec()
                 } else {
                     cell.clone()
                 };

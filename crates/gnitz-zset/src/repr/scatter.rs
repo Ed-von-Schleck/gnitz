@@ -13,7 +13,7 @@ use super::batch::{range_rows, write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
 use super::merge::{ColPtr, ColumnarSource, MemBatch, UnifiedSource};
 use super::string_heap::{
-    carried_dead, prorated_blob_cap, rebase_string_cells, relocate_german_string_vec, row_long_bytes,
+    carried_dead, prorated_blob_cap, rebase_string_cell, relocate_german_string_vec, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
@@ -232,7 +232,7 @@ pub(crate) fn scatter_unified_sources(
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
                 cell.copy_from_slice(&src_struct[..16]);
-                rebase_string_cells(cell, src.blob, blob, src.heap_at, cache.as_deref_mut());
+                rebase_string_cell(cell, src.blob, blob, src.heap_at, cache.as_deref_mut());
             }
         } else {
             width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));

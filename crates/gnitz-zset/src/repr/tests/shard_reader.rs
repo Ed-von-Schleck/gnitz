@@ -8,7 +8,7 @@ use crate::repr::error::StorageError;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema,
-    read_german_string, sweep_bit_flips, u64_pk_schema,
+    sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, write_u64_le};
@@ -809,7 +809,7 @@ fn slice_relocates_only_its_own_strings() {
     });
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
     assert_eq!(shard.blob().len(), N * W);
-    let string = |b: &Batch, i: usize| String::from_utf8(read_german_string(b, 0, i)).unwrap();
+    let string = |b: &Batch, i: usize| gnitz_expr::payload_string(b, i, 0);
 
     let one = shard.slice_to_owned_batch(37, 1);
     assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
@@ -849,7 +849,7 @@ fn a_relocating_slice_copies_a_shared_span_once() {
     assert_eq!(slice.blob.len(), 2 * 40);
     for i in 0..3 {
         assert_eq!(
-            read_german_string(&slice, 0, i),
+            gnitz_expr::payload_bytes(&slice, i, 0),
             wide_string(i % 2, 40).as_bytes(),
             "row {i}"
         );
