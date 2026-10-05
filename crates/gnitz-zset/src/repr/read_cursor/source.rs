@@ -37,10 +37,10 @@ impl SourceCursor {
     }
 }
 
-/// A walk of one secondary-index key range, gathering each entry's row from the base
-/// table it indexes, over one snapshot of each. The indexed rows are unique on
-/// their PK, so a source PK has one live row and at most one live index entry, at
-/// weight 1.
+/// A walk of one secondary-index key range, gathering each entry's row from the
+/// relation it indexes, over one snapshot of each. The gather returns every row
+/// under an entry's source PK, so the walk is exact only over rows unique on
+/// their PK: a source PK then has one live row and at most one live index entry.
 pub struct BoundedIndexCursor {
     /// Positioned on the index range and clamped at its end.
     idx: ReadCursor,
@@ -53,7 +53,7 @@ pub struct BoundedIndexCursor {
 
 impl BoundedIndexCursor {
     /// A walk of `idx`, positioned on the index range and clamped at its end,
-    /// gathering from `src`, a cursor over the table `spec` indexes.
+    /// gathering from `src`, a cursor over the relation `spec` indexes.
     pub fn new(idx: ReadCursor, src: ReadCursor, spec: KeySpec) -> Self {
         let none = PkKeys::from_sorted(src.schema.pk_stride(), Vec::new());
         BoundedIndexCursor {
@@ -72,6 +72,10 @@ impl BoundedIndexCursor {
         );
         loop {
             if let Some(chunk) = self.src.drain_live_chunk(max_rows, skeletons) {
+                debug_assert!(
+                    (1..chunk.len()).all(|i| chunk.get_pk_bytes(i - 1) != chunk.get_pk_bytes(i)),
+                    "index owner holds two rows under one PK"
+                );
                 return Some(chunk);
             }
             if !self.refill(max_rows) {

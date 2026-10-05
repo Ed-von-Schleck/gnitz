@@ -25,12 +25,7 @@ impl CatalogEngine {
     /// `batch` with the retraction of its dropped relations' rows: index rows first,
     /// since their hook reads the owner; circuit and column rows last, since undoing
     /// the drop re-registers the owner from them.
-    fn with_owned_retractions(
-        &self,
-        family: SysFamily,
-        mut batch: Batch,
-        net_dead: Vec<u64>,
-    ) -> Vec<(SysFamily, Batch)> {
+    fn with_owned_retractions(&self, family: SysFamily, mut batch: Batch, net_dead: IdSet) -> Vec<(SysFamily, Batch)> {
         if !matches!(family, SysFamily::Table | SysFamily::View) || net_dead.is_empty() {
             return vec![(family, batch)];
         }
@@ -38,14 +33,11 @@ impl CatalogEngine {
         // A view's segments drop in its own batch, unless the bundle already names them.
         if family == SysFamily::View {
             let segs = self.sys_rows_where(SysFamily::View, |s, i| {
-                owners
-                    .binary_search(&(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID)))
-                    .is_ok()
-                    && owners.binary_search(&(s.get_pk(i) as u64)).is_err()
+                owners.contains(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID))
+                    && !owners.contains(s.get_pk(i) as u64)
             });
             if !segs.is_empty() {
-                owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as u64));
-                owners.sort_unstable();
+                owners = owners.with((0..segs.len()).map(|i| segs.get_pk(i) as u64));
                 let mut merged = segs.negated();
                 merged.append_batch(&batch);
                 batch = merged;
@@ -53,15 +45,13 @@ impl CatalogEngine {
         }
         let indices = self
             .sys_rows_where(SysFamily::Index, |s, i| {
-                owners
-                    .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID)))
-                    .is_ok()
+                owners.contains(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID))
             })
             .negated();
         // A SERIAL row's key is its table id.
-        let sequences = self.retract_under(SysFamily::Sequence, &owners);
-        let circuits = self.retract_under(SysFamily::Circuit, &owners);
-        let columns = self.retract_under(SysFamily::Column, &owners);
+        let sequences = self.retract_under(SysFamily::Sequence, owners.ids());
+        let circuits = self.retract_under(SysFamily::Circuit, owners.ids());
+        let columns = self.retract_under(SysFamily::Column, owners.ids());
         vec![
             (SysFamily::Index, indices),
             (SysFamily::Sequence, sequences),

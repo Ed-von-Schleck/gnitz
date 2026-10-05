@@ -390,6 +390,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
                         kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
                         schema: make_schema_u64_i64(),
                         placement: gnitz_zset::schema::Placement::Local,
+                        pk_repeats: false,
                     },
                     0,
                 )

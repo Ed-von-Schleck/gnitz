@@ -64,6 +64,7 @@ impl TestPlan {
                 kind: RelationKind::View(ViewProps::Plain),
                 schema,
                 placement: gnitz_zset::schema::Placement::full_pk(&schema),
+                pk_repeats: false,
             })
             .unwrap();
         TestVm {

@@ -189,6 +189,15 @@ impl RelationKind {
         matches!(self, RelationKind::View(_))
     }
 
+    /// Whether this kind of relation may carry a secondary index.
+    fn admits_index(self) -> bool {
+        match self {
+            RelationKind::BaseTable | RelationKind::View(ViewProps::Plain | ViewProps::Fed { .. }) => true,
+            // A bounded view's sweep drops the payload an entry is projected from.
+            RelationKind::View(ViewProps::Bounded { .. }) | RelationKind::Stream | RelationKind::SystemCatalog => false,
+        }
+    }
+
     /// Whether this relation keeps a delta feed, whether or not this process holds
     /// its store.
     #[inline]
@@ -248,6 +257,7 @@ pub struct Relation {
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
     placement: Placement,
+    pk_repeats: bool,
 }
 
 impl Relation {
@@ -274,6 +284,11 @@ impl Relation {
     /// Where this relation's rows live.
     pub fn placement(&self) -> Placement {
         self.placement
+    }
+
+    /// Whether two of its rows may share a PK.
+    pub fn pk_repeats(&self) -> bool {
+        self.pk_repeats
     }
 
     /// The unique secondary indexes a write must still check: one covering the
@@ -363,6 +378,9 @@ pub struct RelationSpec {
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
     pub placement: Placement,
+    /// Whether two of its rows may share a PK. `false` is a promise the index
+    /// gather relies on, so a host that cannot vouch for it passes `true`.
+    pub pk_repeats: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +487,8 @@ impl RelationRegistry {
     /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
     /// straddle two workers' slices, so only the caller can check it.
     pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
-        let owner_schema = self.index_owner(owner)?.schema();
+        let unique = matches!(claim, IndexClaim::Index { unique: true, .. });
+        let owner_schema = self.index_owner(owner, unique)?.schema();
         let entry = self.tables.get_mut(&owner).expect("resolved above");
         if let Some(ix) = entry.indexes.iter_mut().find(|ix| ix.cols == cols) {
             debug_assert!(!ix.claims.contains(&claim), "{claim:?} claimed twice");
@@ -573,13 +592,26 @@ impl RelationRegistry {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
     }
 
-    /// `owner`, if it may carry a secondary index: only a base table can.
-    pub fn index_owner(&self, owner: u64) -> Result<&Relation, String> {
+    /// `owner`, if it may carry a secondary index, `unique` or not. Every path
+    /// that enters an index asks here.
+    pub fn index_owner(&self, owner: u64, unique: bool) -> Result<&Relation, String> {
         let e = self.relation_or_err(owner)?;
-        if !e.kind().is_base_table() {
+        if !e.kind.admits_index() {
             return Err(format!(
-                "Index: owner {owner} is a {}; only a base table can be indexed",
-                e.kind().noun()
+                "Index: owner {owner} is a {}; only a base table or a view without a capacity can be indexed",
+                e.kind.noun()
+            ));
+        }
+        if unique && e.kind.is_view() {
+            return Err(format!(
+                "Index: view {owner} cannot carry a UNIQUE index: its circuit cannot refuse a duplicate"
+            ));
+        }
+        // An index walk gathers every row under an in-range entry's source PK, so
+        // a second row under that PK would come back whatever its own key.
+        if e.pk_repeats {
+            return Err(format!(
+                "Index: owner {owner} repeats its primary key, so an index entry does not name one row"
             ));
         }
         Ok(e)

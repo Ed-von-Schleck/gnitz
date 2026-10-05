@@ -45,6 +45,7 @@ impl RelationRegistry {
                 kind: e.kind(),
                 schema: e.schema(),
                 placement: e.placement(),
+                pk_repeats: e.pk_repeats(),
             };
             let (store, delta) = self.build_relation_store(spec, resume_at)?;
             let index_stores = e

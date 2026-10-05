@@ -741,6 +741,7 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
         kind: RelationKind::View(ViewProps::Plain),
         schema,
         placement: Placement::full_pk(&schema),
+        pk_repeats: false,
     })
     .unwrap();
     for (id, after_tick, layout) in [(TID, 0, own ^ 1), (TID, 3, own ^ 1), (TID + 1, 0, own)] {

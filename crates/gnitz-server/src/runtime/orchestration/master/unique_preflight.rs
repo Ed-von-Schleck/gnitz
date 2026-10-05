@@ -111,7 +111,7 @@ impl MasterDispatcher {
                 return Ok(Some(UniqueFilter::new()));
             };
             // What the IDX_TAB precheck refuses is refused before any scan.
-            let spec = cat.validate_index_create(owner_id, cols.as_slice())?;
+            let spec = cat.validate_index_create(owner_id, cols.as_slice(), true)?;
             // A PK-covering index skips the scan, and every check it would ever plan.
             if owner_schema.covers_pk(cols.as_slice()) {
                 return Ok(None);

@@ -134,6 +134,46 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     scanned(&r, point);
 }
 
+/// A view's index is fed its output deltas: a retraction and an insert under one
+/// key move the entry, and a row keeps its own weight through the walk.
+#[test]
+fn a_views_index_walk_follows_its_deltas() {
+    let schema = make_schema_u64_i64();
+    let rows: Vec<_> = (0..NBASE).map(|id| (id, 1, id as i64 * 10)).collect();
+    let view = RelationKind::View(gnitz_wire::ViewProps::Plain);
+    let mut r = relation_fixture(view, schema, &[1], [make_batch_raw(&schema, &rows)]);
+    // 51 leaves the range, 90 enters it at weight 2.
+    let delta = [(51, -1, 510), (51, 1, 9000), (90, -1, 900), (90, 2, 555)];
+    r.ingest(TID, make_batch_raw(&schema, &delta)).unwrap();
+
+    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 560)).unwrap();
+    assert!(matches!(cur, SourceCursor::Bounded(_)));
+    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(
+        drain_all(&mut cur, 4),
+        [(50, 1), (52, 1), (53, 1), (54, 1), (55, 1), (90, 2)]
+    );
+}
+
+/// The walk gathers every row under an in-range entry's source PK, so an owner
+/// holding two rows under one PK trips it.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "two rows under one PK")]
+fn an_index_walk_over_a_repeating_key_trips_the_gather() {
+    let schema = make_schema_u64_i64();
+    // PK 1 twice, one of its values in range; the rest keep the walk under the gate.
+    let rows: Vec<_> = [(1, 1, 5), (1, 1, 500)]
+        .into_iter()
+        .chain((2..64).map(|pk| (pk, 1, 1000)))
+        .collect();
+    let view = RelationKind::View(gnitz_wire::ViewProps::Plain);
+    let r = relation_fixture(view, schema, &[1], [make_batch_raw(&schema, &rows)]);
+    let (mut cur, _) = r.open_bound(TID, val_range(5, 6)).unwrap();
+    assert!(matches!(cur, SourceCursor::Bounded(_)));
+    cur.drain_chunk(1024);
+}
+
 /// A range over a PK prefix walks the table's own store even when an index names the
 /// same columns: `INDEX(a)` under `PRIMARY KEY (a, b)` is never walked for `a`.
 #[test]

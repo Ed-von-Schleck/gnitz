@@ -275,6 +275,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
                 kind: gnitz_store::relation::RelationKind::BaseTable,
                 schema,
                 placement: gnitz_zset::schema::Placement::full_pk(&schema),
+                pk_repeats: false,
             })
             .unwrap();
         engine

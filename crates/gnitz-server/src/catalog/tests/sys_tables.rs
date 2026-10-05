@@ -143,7 +143,7 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
         let batch = row(stream);
         let rel = read_rel_row(SysFamily::Table, &batch, 0).map_err(drop).unwrap();
         assert_eq!(rel.kind == RelationKind::Stream, stream);
-        assert_eq!(rel.facts().pk_repeats, stream);
-        assert!(!rel.facts().serial);
+        assert_eq!(rel.pk_repeats(), stream);
+        assert!(!rel.serial());
     }
 }

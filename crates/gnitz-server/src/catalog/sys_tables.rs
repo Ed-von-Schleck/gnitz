@@ -8,7 +8,6 @@
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
 
-use super::RelFacts;
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
@@ -77,15 +76,18 @@ pub(super) enum RelDetail {
 }
 
 impl RelRow<'_> {
-    pub(super) fn facts(&self) -> RelFacts {
+    /// Whether two of the relation's rows may share a PK.
+    pub(super) fn pk_repeats(&self) -> bool {
         match self.detail {
             // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-            RelDetail::Table { serial, .. } => RelFacts {
-                pk_repeats: self.kind == RelationKind::Stream,
-                serial,
-            },
-            RelDetail::View { pk_repeats, .. } => RelFacts { pk_repeats, serial: false },
+            RelDetail::Table { .. } => self.kind == RelationKind::Stream,
+            RelDetail::View { pk_repeats, .. } => pk_repeats,
         }
+    }
+
+    /// [`gnitz_wire::TableProps::serial`].
+    pub(super) fn serial(&self) -> bool {
+        matches!(self.detail, RelDetail::Table { serial: true, .. })
     }
 }
 

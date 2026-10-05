@@ -18,13 +18,17 @@ import os
 import pytest
 import gnitz
 from _paths import relation_dir
-from _read import bag, scanned
+from _read import access, bag, rows, scanned
 from _sql import insert
 
 
 @pytest.mark.parametrize("wrote,launched,rebuilt", [(None, None, 0), (4, 2, 1)],
                          ids=["same-count", "relayout"])
-def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt):
+@pytest.mark.parametrize("owner,ddl", [
+    ("t", "CREATE INDEX ON t(g)"),
+    ("v", "CREATE VIEW v AS SELECT id, g FROM t; CREATE INDEX ON v(g)"),
+], ids=["table", "view"])
+def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, owner, ddl):
     """A graceful stop's shutdown barrier runs a full checkpoint sequence, whose
     ephemeral round publishes every worker's index at the committed generation.
     A restart at the same count must reload it: the seeks alone would pass on a
@@ -37,19 +41,42 @@ def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt):
         conn.execute_sql(
             "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)")
         insert(conn, "t", [(i, i * 10) for i in range(64)])
-        conn.execute_sql("CREATE INDEX ON t(g)")
+        conn.execute_sql(ddl)
 
     own_server.restart(graceful=True, workers=launched)
 
     with gnitz.connect(own_server.target) as conn:
-        tid, schema = conn.resolve_table("t")
+        rid, schema = conn.resolve_table(owner)
         for i in (0, 63):
-            assert bag(conn.seek_by_index(tid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
+            assert bag(conn.seek_by_index(rid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the restart"
 
     assert own_server.rebuilt_index_counts() == [rebuilt] * own_server.workers
-    children = [d for d in os.listdir(relation_dir(own_server.data_dir, tid)) if d.startswith("idx_")]
+    children = [d for d in os.listdir(relation_dir(own_server.data_dir, rid)) if d.startswith("idx_")]
     assert len(children) == own_server.workers, children
+
+
+def test_a_reset_view_takes_its_index_with_it(own_server):
+    """A view over a stream is reset at boot, and its index with it: an entry
+    surviving the reset would name a sum the view no longer holds, so the walk
+    would answer a pre-restart value."""
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(
+            "CREATE TABLE st (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL) "
+            "WITH (stream = true); "
+            "CREATE VIEW agg AS SELECT k, SUM(x) AS s FROM st GROUP BY k; "
+            "CREATE INDEX ON agg(s)")
+        insert(conn, "st", [(k, k, k) for k in range(1000)])
+
+    own_server.restart()
+
+    with gnitz.connect(own_server.target) as conn:
+        insert(conn, "st", [(k, k, k + 5000) for k in range(1000)])
+        for q, want in (("SELECT k FROM agg WHERE s = 7", {}),
+                        ("SELECT k FROM agg WHERE s = 5007", {(7,): 1})):
+            assert access(conn, q) == "index range on (s)"
+            assert bag(rows(conn, q)) == want
 
 
 def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):

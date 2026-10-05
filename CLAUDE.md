@@ -473,7 +473,7 @@ or its source tables' stores, which stay full-fidelity.
 
 Capacity bounds one store's shard bytes on one worker — not the traces, not
 the cluster, and not read peak. Bounded views are **leaf** views: nothing may be
-created over one.
+created over one, and none can be indexed.
 
 Read paths branch on whether a store *holds* a skeleton row, never on whether it
 has a capacity.

@@ -339,6 +339,7 @@ fn child_registry(
             kind: RelationKind::BaseTable,
             schema,
             placement,
+            pk_repeats: false,
         })
         .unwrap();
     registry

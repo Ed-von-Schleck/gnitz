@@ -12,14 +12,6 @@ use std::collections::hash_map::Entry;
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// What a RESOLVE reports of a relation beyond its schema and indexes.
-#[derive(Clone, Copy, Default)]
-pub(in crate::catalog) struct RelFacts {
-    pub(in crate::catalog) pk_repeats: bool,
-    /// [`gnitz_wire::TableProps::serial`].
-    pub(in crate::catalog) serial: bool,
-}
-
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
@@ -28,7 +20,8 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) record: Rc<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
-    pub(in crate::catalog) facts: RelFacts,
+    /// [`gnitz_wire::TableProps::serial`].
+    pub(in crate::catalog) serial: bool,
 }
 
 /// The named record of a relation keyed `pk` over `defs`.
@@ -78,8 +71,8 @@ impl CatalogEngine {
         let entry = self.relation_entry(tid);
         let desc = RelDescriptorBlob {
             class: rel.kind().class(),
-            pk_repeats: entry.facts.pk_repeats,
-            serial: entry.facts.serial,
+            pk_repeats: rel.pk_repeats(),
+            serial: entry.serial,
             indexes: rel
                 .indexes()
                 .iter()

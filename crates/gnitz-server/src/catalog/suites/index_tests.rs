@@ -1853,6 +1853,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             kind: RelationKind::BaseTable,
             schema,
             placement: Placement::full_pk(&schema),
+            pk_repeats: false,
         })
         .unwrap();
     engine

@@ -332,6 +332,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
             kind: RelationKind::BaseTable,
             schema,
             placement: gnitz_zset::schema::Placement::full_pk(&schema),
+            pk_repeats: false,
         })
         .unwrap();
 

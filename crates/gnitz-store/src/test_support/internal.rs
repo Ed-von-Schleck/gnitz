@@ -88,6 +88,7 @@ pub(crate) fn relation_fixture(
             kind,
             schema,
             placement: Placement::full_pk(&schema),
+            pk_repeats: false,
         })
         .unwrap();
     for (id, &col) in (TID + 1..).zip(indexed) {

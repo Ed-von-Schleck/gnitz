@@ -397,10 +397,14 @@ def bounded(client):
     # and dropped by the Filter under 3VL, so neither walk returns it.
     ("ind >= 48", lambda ind: ind >= 48),
 ])
-def test_an_index_changes_the_walk_never_the_answer(client, bounded, where, keep):
+@pytest.mark.parametrize("owner", ["t", "w"], ids=["table", "view"])
+def test_an_index_changes_the_walk_never_the_answer(client, bounded, where, keep, owner):
     """The same grouped read before an index exists, through it, and after it is
-    dropped: the plan's access line moves, the rows do not."""
-    q = f"SELECT g, COUNT(*) AS c, SUM(v) AS s FROM t WHERE {where} GROUP BY g"
+    dropped: the plan's access line moves, the rows do not. The view projects
+    the table's PK away, so its key is a hidden column the index entry names."""
+    if owner == "w":
+        client.execute_sql("CREATE VIEW w AS SELECT g, v, ind FROM t")
+    q = f"SELECT g, COUNT(*) AS c, SUM(v) AS s FROM {owner} WHERE {where} GROUP BY g"
     groups = {}
     for _, g, v, ind in _BOUNDED:
         if ind is not None and keep(ind):
@@ -410,12 +414,39 @@ def test_an_index_changes_the_walk_never_the_answer(client, bounded, where, keep
 
     assert access(client, q) == "full scan"
     assert bag(rows(client, q)) == want
-    client.execute_sql("CREATE INDEX by_ind ON t(ind)")
+    client.execute_sql(f"CREATE INDEX by_ind ON {owner}(ind)")
     assert access(client, q) == "index range on (ind)"
     assert bag(rows(client, q)) == want
     client.execute_sql("DROP INDEX by_ind")
     assert access(client, q) == "full scan"
     assert bag(rows(client, q)) == want
+
+
+@pytest.mark.parametrize("index_first", [False, True], ids=["backfill", "maintained"])
+def test_a_view_index_follows_its_aggregate(client, index_first):
+    """An index on an aggregate view's output column walks the view's current
+    rows: an UPDATE that moves one group's sum retracts the old entry and adds
+    the new one, whether the index was built over the backfill or before it."""
+    n = 2000
+    view = "CREATE VIEW agg AS SELECT k, SUM(x) AS s FROM t GROUP BY k; CREATE INDEX ON agg(s)"
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL)")
+    if index_first:
+        client.execute_sql(view)
+    # Two rows per group, summing to the distinct 3k + 1.
+    insert(client, "t", [(2 * k, k, k) for k in range(n)] + [(2 * k + 1, k, 2 * k + 1) for k in range(n)])
+    if not index_first:
+        client.execute_sql(view)
+
+    k = 700
+    old, new = 3 * k + 1, 10 * n
+    q = f"SELECT k FROM agg WHERE s = {old}"
+    assert access(client, q) == "index range on (s)"
+    assert bag(rows(client, q)) == {(k,): 1}
+
+    client.execute_sql(f"UPDATE t SET x = {new - k} WHERE pk = {2 * k + 1}")
+    assert rows(client, q) == []
+    assert bag(rows(client, f"SELECT k FROM agg WHERE s = {new}")) == {(k,): 1}
 
 
 def test_a_bounded_view_backfill_matches_and_then_maintains(client, bounded):

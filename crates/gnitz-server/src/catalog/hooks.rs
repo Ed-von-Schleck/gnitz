@@ -88,8 +88,9 @@ impl CatalogEngine {
             kind: rel.kind,
             schema,
             placement,
+            pk_repeats: rel.pk_repeats(),
         })?;
-        self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.facts());
+        self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.serial());
         // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included — a
         // parent's RESTRICT probe reads the child through it.
@@ -107,7 +108,7 @@ impl CatalogEngine {
 
     /// Enter registered relation `id`'s [`RelationEntry`], and index the FK edges it
     /// declares by parent.
-    pub(in crate::catalog) fn enter_relation(&mut self, id: u64, pk: &[u32], defs: &[CatalogColumn], facts: RelFacts) {
+    pub(in crate::catalog) fn enter_relation(&mut self, id: u64, pk: &[u32], defs: &[CatalogColumn], serial: bool) {
         let fks: Vec<FkEdge> = defs
             .iter()
             .enumerate()
@@ -124,7 +125,7 @@ impl CatalogEngine {
             self.caches.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
         }
         let record = encode_record(pk, defs);
-        self.caches.relations.insert(id, RelationEntry { record, fks, facts });
+        self.caches.relations.insert(id, RelationEntry { record, fks, serial });
     }
 
     /// Tear relation `id` out of the registry and the DAG. Its owned system rows are
@@ -175,12 +176,8 @@ impl CatalogEngine {
 
     /// Apply a column ALTER (or its compensation) to every registered owner.
     fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
-        let mut owners: Vec<u64> = (0..batch.len())
-            .map(|i| SysFamily::Column.leading_id(batch.get_pk(i)))
-            .collect();
-        owners.sort_unstable();
-        owners.dedup();
-        for owner in owners {
+        let owners = IdSet::new((0..batch.len()).map(|i| SysFamily::Column.leading_id(batch.get_pk(i))));
+        for &owner in owners.ids() {
             let Some((kind, cur)) = self.registry.relation(owner).map(|e| (e.kind(), e.schema())) else {
                 continue;
             };

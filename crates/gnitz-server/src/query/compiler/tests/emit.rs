@@ -79,7 +79,15 @@ fn two_tables(slot: gnitz_zset::schema::Slot, wide: Wide) -> (RelationRegistry, 
         (10, kind_of_10, wide, placement(&wide)),
         (11, RelationKind::BaseTable, narrow, Placement::full_pk(&narrow)),
     ] {
-        registry.register(RelationSpec { id, kind, schema, placement }).unwrap();
+        registry
+            .register(RelationSpec {
+                id,
+                kind,
+                schema,
+                placement,
+                pk_repeats: false,
+            })
+            .unwrap();
     }
     (registry, dir)
 }

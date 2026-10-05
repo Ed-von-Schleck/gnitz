@@ -106,6 +106,23 @@ def test_a_mirrored_view_keeps_its_select_order(client, mirror):
     _samebag(q, _local(mirror, vid, q), rows(client, q))
 
 
+def test_a_mirrored_view_with_an_index_reads_every_row_locally(client, mirror):
+    """The copy's descriptor names the server's index, which the copy does not
+    hold; a read planned through it still answers exactly the server's rows."""
+    _fed_view(client)
+    client.execute_sql("CREATE INDEX ON f(v)")
+    vid = mirror.mirror_view("f").view_id
+    churn(client, 1, 2000)
+    _quiesce(client, mirror)
+
+    for q in [
+        "SELECT id, v FROM f WHERE v = 301",
+        "SELECT id, v FROM f WHERE v >= 900 AND v < 960",
+        "SELECT id, v FROM f WHERE v > 4700",
+    ]:
+        _samebag(q, _local(mirror, vid, q), rows(client, q))
+
+
 def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     """Locality's falsifiable other half: a relation the handle does not hold,
     and a view it has forgotten, issue requests and stay correct."""

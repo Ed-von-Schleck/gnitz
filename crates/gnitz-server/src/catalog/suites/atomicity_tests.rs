@@ -15,6 +15,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let taken = engine.create_table("public.taken", &cols, &[0]).unwrap();
     engine.create_index("public.taken", &["val"], false).unwrap();
     let view = register_identity_view(&mut engine, taken, "a_view", &cols);
+    let bounded = try_register_identity_view(&mut engine, taken, "a_bounded_view", &cols, 1 << 20, 0).unwrap();
 
     // A fresh relation id carrying `cols` as its column records.
     let mut with_cols = |cols: &[CatalogColumn]| {
@@ -75,12 +76,17 @@ fn a_malformed_create_is_refused_at_the_precheck() {
             index_on(unregistered, &[0], "ix"),
             "is not registered",
         ),
-        // Index projection runs on the base-table DML paths alone, so an index
-        // on a view would backfill once and then serve stale rows.
+        // A bounded view's sweep drops the payload an entry is projected from.
         (
             SysFamily::Index,
-            index_on(view, &[0], "ix"),
-            "only a base table can be indexed",
+            index_on(bounded, &[1], "ix"),
+            "only a base table or a view without a capacity can be indexed",
+        ),
+        // A view's circuit cannot refuse a duplicate.
+        (
+            SysFamily::Index,
+            idx_tab_batch(unregistered + 1, view, &[1], "ix", true, 1),
+            "cannot carry a UNIQUE index",
         ),
         (
             SysFamily::Index,

@@ -16,6 +16,7 @@ fn table(id: u64, schema: SchemaDescriptor) -> RelationSpec {
         kind: RelationKind::BaseTable,
         schema,
         placement: Placement::full_pk(&schema),
+        pk_repeats: false,
     }
 }
 
@@ -26,6 +27,7 @@ fn view(id: u64) -> RelationSpec {
         kind: RelationKind::View(ViewProps::Plain),
         schema,
         placement: Placement::full_pk(&schema),
+        pk_repeats: false,
     }
 }
 
@@ -72,6 +74,43 @@ fn a_circuit_lives_while_one_claim_remains() {
 
 /// A master creates each relation's directory, so it exists once the DDL is
 /// acknowledged, and opens no child store under it.
+/// A store holding each of its keys once, in full, takes a non-unique index, and
+/// only a base table a unique one.
+#[test]
+fn only_a_store_naming_one_row_per_key_admits_an_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    let schema = make_schema_u64_i64();
+    let plain = RelationKind::View(ViewProps::Plain);
+    let mb = std::num::NonZeroU64::new(1 << 20).unwrap();
+    let fed = RelationKind::View(ViewProps::Fed { delta_bytes: mb });
+    let bounded = RelationKind::View(ViewProps::Bounded { capacity_bytes: mb });
+    let owners = [
+        (RelationKind::BaseTable, false, Ok(true)),
+        (plain, false, Ok(false)),
+        (fed, false, Ok(false)),
+        (plain, true, Err("repeats its primary key")),
+        (bounded, false, Err("without a capacity")),
+        (RelationKind::Stream, true, Err("without a capacity")),
+    ];
+    for (id, (kind, pk_repeats, want)) in (70..).zip(owners) {
+        let spec = RelationSpec { kind, pk_repeats, ..table(id, schema) };
+        registry.register(spec).unwrap();
+        let verdict = |unique| registry.index_owner(id, unique).map(drop);
+        match want {
+            Ok(unique_too) => {
+                assert!(verdict(false).is_ok(), "{kind:?}");
+                assert_eq!(verdict(true).is_ok(), unique_too, "{kind:?}");
+            }
+            Err(needle) => {
+                let err = verdict(false).unwrap_err();
+                assert!(err.contains(needle), "{kind:?}: {err}");
+                assert!(verdict(true).is_err(), "{kind:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_master_creates_the_relation_directory_and_no_child() {
     let tmp = tempfile::tempdir().unwrap();
@@ -154,6 +193,24 @@ fn an_upsert_moves_the_index_entry() {
         zset_of(&ix.cursor().materialize(), &ix.schema()),
         zset_of(&want, &ix.schema())
     );
+}
+
+/// An upsert of the row a key already holds retracts and re-inserts one entry;
+/// the pair cancels before the index store takes it.
+#[test]
+fn an_identical_upsert_writes_no_index_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    let schema = make_schema_u64_i64();
+    registry.register(table(50, schema)).unwrap();
+    registry
+        .add_index(50, index(51, false), PkColList::from_slice(&[1]))
+        .unwrap();
+    for _ in 0..3 {
+        registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 10)])).unwrap();
+    }
+    let ix = registry.relation(50).unwrap().index_on(&[1]).unwrap();
+    assert_eq!(ix.store.held().estimated_rows(), 1);
 }
 
 /// An index store is rederived: the base round leaves it, the ephemeral round

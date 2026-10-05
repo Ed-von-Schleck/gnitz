@@ -10,6 +10,38 @@ use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{low_bits_mask, BitIter, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 use gnitz_zset::schema::KeySpec;
 
+/// A set of catalog ids, sorted once so every probe is a binary search: the
+/// probes run per row of a client-supplied block bounded only by the frame.
+#[derive(Debug, Default)]
+pub(in crate::catalog) struct IdSet(Vec<u64>);
+
+impl IdSet {
+    pub(in crate::catalog) fn new(ids: impl IntoIterator<Item = u64>) -> Self {
+        let mut ids: Vec<u64> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        IdSet(ids)
+    }
+
+    pub(in crate::catalog) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(in crate::catalog) fn contains(&self, id: u64) -> bool {
+        self.0.binary_search(&id).is_ok()
+    }
+
+    /// The ids, strictly ascending.
+    pub(in crate::catalog) fn ids(&self) -> &[u64] {
+        &self.0
+    }
+
+    /// These ids and `more`.
+    pub(in crate::catalog) fn with(self, more: impl IntoIterator<Item = u64>) -> Self {
+        IdSet::new(self.0.into_iter().chain(more))
+    }
+}
+
 /// The name rules a catalog row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical, since every name-index key is compared
 /// byte-wise against the client's folded form. Unlike `validate_user_identifier`
@@ -194,13 +226,10 @@ fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature
 /// A circuit `+1` may only name a view this same transaction creates — one under
 /// a foreign `view_id` would pin its source table's drop or rewrite a running
 /// circuit.
-fn check_circuit_rows(batch: &Batch, mut created: Vec<u64>) -> Result<(), String> {
-    // Sorted once: this runs per row of a client-supplied block bounded only by
-    // the 64 MB frame.
-    created.sort_unstable();
+fn check_circuit_rows(batch: &Batch, created: &IdSet) -> Result<(), String> {
     for i in batch.live_rows() {
         let view_id = SysFamily::Circuit.leading_id(batch.get_pk(i));
-        if created.binary_search(&view_id).is_err() {
+        if !created.contains(view_id) {
             return Err(format!(
                 "a circuit names view {view_id}, which this transaction does not create"
             ));
@@ -218,7 +247,7 @@ impl CatalogEngine {
         tid: u64,
         col_defs: &[CatalogColumn],
         schema: &SchemaDescriptor,
-        net_dead: &[u64],
+        net_dead: &IdSet,
     ) -> Result<(), String> {
         for cd in col_defs {
             if let Some(fk) = cd.fk {
@@ -235,7 +264,7 @@ impl CatalogEngine {
         self_table_id: u64,
         self_cols: &[CatalogColumn],
         self_schema: &SchemaDescriptor,
-        net_dead: &[u64],
+        net_dead: &IdSet,
     ) -> Result<(), String> {
         // The target is a legal reference iff it is the parent's lone PK column,
         // or it carries its own UNIQUE index. Mirrors the production planner gate.
@@ -249,7 +278,7 @@ impl CatalogEngine {
             }
             self_cols[fk.col as usize].def.ty
         } else {
-            if net_dead.contains(&fk.table_id) {
+            if net_dead.contains(fk.table_id) {
                 return Err(format!(
                     "FK references table {}, which this transaction drops",
                     fk.table_id
@@ -295,36 +324,35 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Reject a CREATE whose `(schema, name)` collides with an existing relation.
-    /// A rewrite pair that leaves the name unchanged re-registers the incumbent, so
-    /// `existing == self_id` is not one.
+    /// Claim `(schema, name)` for `self_id`, refused when an existing relation
+    /// holds it. A rewrite pair that leaves the name unchanged re-registers the
+    /// incumbent, so `existing == self_id` is not one.
     ///
     /// `net_dead` is this same bundle's net-dead PKs in this same family. An
     /// incumbent among them is not a collision either: one bundle may retire an
     /// id and register a different one under the same name — an ALTER VIEW is
-    /// exactly that. Precheck reads the name index *before* apply, so it still maps
-    /// the name to the outgoing id.
-    fn precheck_qname_unique<'a>(
+    /// exactly that — and that retired id is returned. Precheck reads the name
+    /// index *before* apply, so it still maps the name to the outgoing id.
+    fn claim_qname<'a>(
         &self,
         sid: u64,
         name: &'a str,
         self_id: u64,
-        net_dead: &[u64],
+        net_dead: &IdSet,
         claimed: &mut FxHashSet<(u64, &'a str)>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u64>, String> {
         let schema_name = self
             .schema_name(sid)
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
-        let incumbent = self
-            .relation_id(sid, name)
-            .is_some_and(|existing| existing != self_id && !net_dead.contains(&existing));
-        if incumbent || !claimed.insert((sid, name)) {
+        let incumbent = self.relation_id(sid, name).filter(|&existing| existing != self_id);
+        let displaced = incumbent.filter(|&e| net_dead.contains(e));
+        if incumbent != displaced || !claimed.insert((sid, name)) {
             return Err(format!(
                 "Table or view already exists: {}",
                 gnitz_wire::qualified_key(&schema_name, name)
             ));
         }
-        Ok(())
+        Ok(displaced)
     }
 
     /// The `-1` must content-equal the live row — you may only retract the
@@ -358,9 +386,9 @@ impl CatalogEngine {
     }
 
     /// [`check_batch_shape`], then the CAS and net bound per PK against the live
-    /// store. Returns the per-PK signatures and the sorted PKs whose net is dead:
-    /// the genuine drops, which a rename pair's net-live `-1` is not.
-    fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, Vec<u64>), String> {
+    /// store. Returns the per-PK signatures and the PKs whose net is dead: the
+    /// genuine drops, which a rename pair's net-live `-1` is not.
+    fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, IdSet), String> {
         let sigs = check_batch_shape(family, batch)?;
         let mut net_dead: Vec<u64> = Vec::new();
         for sig in &sigs {
@@ -368,8 +396,7 @@ impl CatalogEngine {
                 net_dead.push(sig.leading);
             }
         }
-        net_dead.sort_unstable();
-        Ok((sigs, net_dead))
+        Ok((sigs, IdSet::new(net_dead)))
     }
 
     /// What a COL_TAB write means once [`Self::check_family_contract`] has settled
@@ -534,20 +561,14 @@ impl CatalogEngine {
     /// the paths that skip it replay rows this already accepted.
     /// A rewrite pair is absent from `sorted_creates` and needs no entry: it
     /// renames a view that already exists, so it falls through to the registry.
-    fn validate_view_owner(
-        &self,
-        vid: u64,
-        name: &str,
-        owner_view_id: u64,
-        sorted_creates: &[u64],
-    ) -> Result<(), String> {
+    fn validate_view_owner(&self, vid: u64, name: &str, owner_view_id: u64, creates: &IdSet) -> Result<(), String> {
         if owner_view_id == 0 {
             return Ok(());
         }
         if owner_view_id == vid {
             return Err(format!("view '{name}' (vid={vid}) declares itself its own owner"));
         }
-        if sorted_creates.binary_search(&owner_view_id).is_ok() || self.registry.has_id(owner_view_id) {
+        if creates.contains(owner_view_id) || self.registry.has_id(owner_view_id) {
             return Ok(());
         }
         Err(format!(
@@ -556,12 +577,12 @@ impl CatalogEngine {
     }
 
     /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
-    /// earlier families left it. Returns the sorted ids the delta drops.
+    /// earlier families left it. Returns the ids the delta drops.
     ///
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
-    pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<Vec<u64>, String> {
+    pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
         let (sigs, net_dead) = self.check_family_contract(family, batch)?;
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
@@ -587,7 +608,7 @@ impl CatalogEngine {
         if let Some(b) = families[SysFamily::Circuit.index()].as_ref() {
             let views = families[SysFamily::View.index()].as_ref();
             let created = views.map(|v| family_pk_partition(SysFamily::View, v).creates);
-            check_circuit_rows(b, created.unwrap_or_default())?;
+            check_circuit_rows(b, &IdSet::new(created.unwrap_or_default()))?;
         }
         Ok(())
     }
@@ -595,12 +616,12 @@ impl CatalogEngine {
     /// Every column record must name an owner this bundle creates or the registry
     /// holds: a phantom owner is never dropped, so nothing would ever retract the row.
     fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
-        let mut created: FxHashSet<u64> = FxHashSet::default();
-        for family in [SysFamily::Table, SysFamily::View] {
-            if let Some(b) = families[family.index()].as_ref() {
-                created.extend(b.live_rows().map(|i| b.get_pk(i) as u64));
-            }
-        }
+        let created = IdSet::new(
+            [SysFamily::Table, SysFamily::View]
+                .into_iter()
+                .filter_map(|family| families[family.index()].as_ref())
+                .flat_map(|b| b.live_rows().map(|i| b.get_pk(i) as u64)),
+        );
         let mut altered: Option<u64> = None;
         for i in cols.live_rows() {
             let owner_id = SysFamily::Column.leading_id(cols.get_pk(i));
@@ -611,7 +632,7 @@ impl CatalogEngine {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());
                 }
                 altered = Some(owner_id);
-            } else if !created.contains(&owner_id) {
+            } else if !created.contains(owner_id) {
                 return Err(format!(
                     "column record names owner {owner_id}, which this transaction \
                      does not create and the catalog does not hold"
@@ -625,7 +646,7 @@ impl CatalogEngine {
     /// this batch already claims — and a DROP must find the schema empty. Schema ids
     /// share one id space with relation ids, so the member count, not the
     /// relation-keyed dep map, is the whole drop guard.
-    fn precheck_schema_family(&self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
+    fn precheck_schema_family(&self, batch: &Batch, net_dead: &IdSet) -> Result<(), String> {
         // Two `+1` rows under one name both miss the live schemas and both apply:
         // the name would resolve to the second, leaving the first id live and
         // unreachable.
@@ -640,7 +661,7 @@ impl CatalogEngine {
                 return Err(format!("Schema already exists: {name}"));
             }
         }
-        for &sid in net_dead {
+        for &sid in net_dead.ids() {
             let n = self.caches.relation_by_name.get(&sid).map_or(0, |names| names.len());
             if n > 0 {
                 return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
@@ -661,17 +682,15 @@ impl CatalogEngine {
         family: SysFamily,
         batch: &Batch,
         sigs: &[PkSignature],
-        net_dead: &[u64],
+        net_dead: &IdSet,
     ) -> Result<(), String> {
         let mut claimed: FxHashSet<(u64, &str)> = FxHashSet::default();
-        // Sorted for `validate_view_owner`'s probe, which runs per `+1` row.
-        let mut creates: Vec<u64> = sigs
-            .iter()
-            .filter(|s| s.pos.is_some() && s.neg.is_none())
-            .map(|s| s.leading)
-            .collect();
-        creates.sort_unstable();
-        if let Some(id) = creates.iter().find(|&&id| self.registry.has_id(id)) {
+        let creates = IdSet::new(
+            sigs.iter()
+                .filter(|s| s.pos.is_some() && s.neg.is_none())
+                .map(|s| s.leading),
+        );
+        if let Some(id) = creates.ids().iter().find(|&&id| self.registry.has_id(id)) {
             return Err(format!("relation id {id} already exists"));
         }
 
@@ -704,18 +723,30 @@ impl CatalogEngine {
                     self.validate_view_owner(rel.id, rel.name, owner_view_id, &creates)?
                 }
             }
-            self.precheck_qname_unique(rel.schema_id, rel.name, rel.id, net_dead, &mut claimed)?;
+            let displaced = self.claim_qname(rel.schema_id, rel.name, rel.id, net_dead, &mut claimed)?;
+            // The drop cascade would take the outgoing relation's indexes with it.
+            let owns_index = |old: u64| {
+                let named = |c: &IndexClaim| matches!(c, IndexClaim::Index { .. });
+                self.registry
+                    .relation(old)
+                    .is_some_and(|e| e.indexes().iter().any(|ix| ix.claims().iter().any(named)))
+            };
+            if displaced.is_some_and(owns_index) {
+                return Err(format!(
+                    "{rel} owns an index, which replacing it would drop; DROP INDEX first"
+                ));
+            }
         }
 
         if family == SysFamily::Table {
-            for &tid in net_dead {
+            for &tid in net_dead.ids() {
                 // A FK child being co-dropped in this same batch is
                 // self-resolving — only a child *outside* the batch blocks the
                 // drop. Mirrors the view-dependency filter below.
                 let blocking = self
                     .fk_children_of(tid)
                     .iter()
-                    .find(|r| net_dead.binary_search(&r.child_tid).is_err());
+                    .find(|r| !net_dead.contains(r.child_tid));
                 if let Some(r) = blocking {
                     let child = self.qualified_name(r.child_tid);
                     return Err(format!("Integrity violation: table referenced by '{child}'"));
@@ -723,15 +754,10 @@ impl CatalogEngine {
             }
         }
 
-        for &id in net_dead {
+        for &id in net_dead.ids() {
             // A dependent that is itself being dropped in this same batch is
             // self-resolving — only an *outside* dependent blocks the drop.
-            // net_dead is sorted, so binary_search.
-            let still_active = self
-                .dag
-                .dependents_of(id)
-                .iter()
-                .any(|&dep_id| net_dead.binary_search(&dep_id).is_err());
+            let still_active = self.dag.dependents_of(id).iter().any(|&dep| !net_dead.contains(dep));
             if still_active {
                 return Err(format!("View dependency: entity '{}'", self.qualified_name(id)));
             }
@@ -739,13 +765,18 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The owner and column rules of a CREATE INDEX on `owner_id`, and the
-    /// key span they admit.
-    pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32]) -> Result<KeySpec, String> {
-        let entry = self.registry.index_owner(owner_id)?;
+    /// The owner and column rules of a CREATE INDEX on `owner_id`, `unique` or
+    /// not, and the key span they admit.
+    pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32], unique: bool) -> Result<KeySpec, String> {
+        let entry = self.registry.index_owner(owner_id, unique)?;
+        // A segment drops its rows once its chain is built, and its index would
+        // keep their entries.
+        if self.dag.chain_of(owner_id) != owner_id {
+            return Err(format!("Index: owner {owner_id} is a segment of a view's chain"));
+        }
         let spec = KeySpec::new(cols, &entry.schema()).map_err(|e| {
             format!(
-                "{e} for table '{}' (tid={owner_id})",
+                "{e} for '{}' (tid={owner_id})",
                 self.qualified_name_or_unknown(owner_id).1
             )
         })?;
@@ -754,17 +785,26 @@ impl CatalogEngine {
             .iter()
             .find(|&&c| defs.get(c as usize).is_some_and(|d| d.def.is_hidden))
         {
-            return Err(format!("Index: column {c} of table {owner_id} is dropped"));
+            // A table hides the columns it dropped, a view the key slots it minted.
+            let why = if entry.kind().is_base_table() {
+                "dropped"
+            } else {
+                "hidden"
+            };
+            return Err(format!(
+                "Index: column {c} of {} {owner_id} is {why}",
+                entry.kind().noun()
+            ));
         }
         Ok(spec)
     }
 
-    /// IDX_TAB: a CREATE must name a base-table owner with an admissible column
-    /// list and a free index name; a DROP must not strip the uniqueness an FK
+    /// IDX_TAB: a CREATE must name an owner that admits the index, an admissible
+    /// column list and a free index name; a DROP must not strip the uniqueness an FK
     /// depends on. The drop guards read the batch row rather than probing: the
     /// contract's CAS proved every `-1` content-equals the live one, `name` and
     /// `source_cols` included.
-    fn precheck_index_family(&self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
+    fn precheck_index_family(&self, batch: &Batch, net_dead: &IdSet) -> Result<(), String> {
         // Every live index name, then the ones this batch claims: only live
         // indexes are scanned, and a `+1` on one already failed the net bound, so
         // any hit is a different index.
@@ -774,10 +814,10 @@ impl CatalogEngine {
             .collect();
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
-            let (owner_id, cols, _) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
+            let (owner_id, cols, unique) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
             let index_name = payload_str(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(index_name, noun)?;
-            self.validate_index_create(owner_id, cols.as_slice())?;
+            self.validate_index_create(owner_id, cols.as_slice(), unique)?;
             if !taken.insert(index_name) {
                 return Err(format!("Index already exists: {index_name}"));
             }
@@ -816,7 +856,7 @@ impl CatalogEngine {
                 .is_some_and(|ix| {
                     ix.claims()
                         .iter()
-                        .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if net_dead.binary_search(&id).is_err()))
+                        .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if !net_dead.contains(id)))
                 });
             if !unique_remains {
                 return Err(format!(

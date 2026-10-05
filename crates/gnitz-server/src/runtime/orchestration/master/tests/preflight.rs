@@ -35,6 +35,7 @@ fn an_own_pk_probe_follows_a_keyed_placement_and_spreads_a_replicated_one() {
             kind: RelationKind::Stream,
             schema,
             placement,
+            pk_repeats: false,
         };
         registry.register(spec).unwrap();
         assert_eq!(probe_placement(registry.relation(16).unwrap()), want, "{placement:?}");

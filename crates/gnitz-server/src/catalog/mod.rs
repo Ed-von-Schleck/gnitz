@@ -54,13 +54,13 @@ pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
 
 // Import everything from sys_tables for internal use.
-use precheck::build_schema_from_col_defs;
+use precheck::{build_schema_from_col_defs, IdSet};
 use sys_tables::*;
 
 // ── Catalog-internal re-exports — no out-of-catalog consumer. These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};
+pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // Directory primitives the catalog consumes rather than owns.
 pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DirLock};

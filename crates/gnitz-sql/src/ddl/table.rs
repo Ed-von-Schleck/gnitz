@@ -848,7 +848,7 @@ impl IndexSite {
 
 /// One index the statement asks for, as its own text describes it.
 pub(crate) struct IndexRequest<'a> {
-    pub(crate) table_name: &'a str,
+    pub(crate) owner_name: &'a str,
     pub(crate) columns: &'a [sqlparser::ast::IndexColumn],
     /// The written index or constraint name, canonical.
     pub(crate) explicit_name: Option<String>,
@@ -893,21 +893,21 @@ pub(crate) fn execute_create_index(
     ci: &sqlparser::ast::CreateIndex,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_create_index_clauses(ci)?;
-    let table_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;
+    let owner_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;
     let explicit_name = ci
         .name
         .as_ref()
         .map(|n| extract_index_name(n, "CREATE INDEX"))
         .transpose()?;
     // The one resolve on this path: `create_index_core` takes the descriptor.
-    let target = client.resolve_relation(schema_name, &table_name)?;
-    require_class(&target, &table_name, ClassWant::BaseTable, "CREATE INDEX")?;
+    let target = client.resolve_relation(schema_name, &owner_name)?;
+    require_class(&target, &owner_name, ClassWant::Indexable, "CREATE INDEX")?;
     create_index_core(
         client,
         schema_name,
         &target,
         &IndexRequest {
-            table_name: &table_name,
+            owner_name: &owner_name,
             columns: &ci.columns,
             explicit_name,
             site: IndexSite::CreateIndex {
@@ -919,8 +919,8 @@ pub(crate) fn execute_create_index(
 }
 
 /// The shared CREATE INDEX / `ALTER TABLE … ADD CONSTRAINT UNIQUE` core. `target`
-/// is the caller's already-resolved base table, so a statement resolves its name
-/// and asserts the base-table rule exactly once.
+/// is the caller's already-resolved owner, so a statement resolves its name and
+/// asserts the owner class exactly once.
 pub(crate) fn create_index_core(
     client: &mut GnitzClient,
     schema_name: &str,
@@ -932,7 +932,7 @@ pub(crate) fn create_index_core(
         return Err(GnitzSqlError::Rejected(format!("{ctx}: at least one column required")));
     }
 
-    let (table_id, schema) = (target.tid, &target.schema);
+    let (owner_id, schema) = (target.tid, &target.schema);
     let (col_names, col_indices) = resolve_index_columns(req.columns, &schema.columns, ctx)?;
 
     let cols = index_key(&schema.columns, &col_indices, schema.pk_cols.len(), ctx)?;
@@ -940,7 +940,7 @@ pub(crate) fn create_index_core(
     let index_name = match req.explicit_name.clone() {
         Some(name) => {
             // Index names are globally unique, so a name already standing — on
-            // this table or any other — means this CREATE would fail; the clause
+            // this relation or any other — means this CREATE would fail; the clause
             // says skip it. Without it the collision errors in `create_index`.
             if req.site.if_not_exists() && client.index_rows()?.iter().any(|r| r.name == name) {
                 return Ok(SqlResult::Ddl);
@@ -948,10 +948,10 @@ pub(crate) fn create_index_core(
             name
         }
         None => {
-            let base = default_index_name(schema_name, req.table_name, &col_names);
+            let base = default_index_name(schema_name, req.owner_name, &col_names);
             let existing = client.index_rows()?;
             let serves_request = |r: &gnitz_core::IndexRow| {
-                r.owner == table_id && r.cols == cols && (r.is_unique || !req.site.is_unique())
+                r.owner == owner_id && r.cols == cols && (r.is_unique || !req.site.is_unique())
             };
             if let Some(same) = existing
                 .iter()
@@ -967,7 +967,7 @@ pub(crate) fn create_index_core(
         }
     };
 
-    client.create_index(table_id, cols, &index_name, req.site.is_unique())?;
+    client.create_index(owner_id, cols, &index_name, req.site.is_unique())?;
     Ok(SqlResult::Ddl)
 }
 

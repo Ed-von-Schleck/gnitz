@@ -408,5 +408,7 @@ fn copy_spec(tid: u64, schema: SchemaDescriptor) -> RelationSpec {
         kind: RelationKind::View(ViewProps::Plain),
         schema,
         placement: Placement::Local,
+        // The copy owns no index, so it vouches for nothing.
+        pk_repeats: true,
     }
 }

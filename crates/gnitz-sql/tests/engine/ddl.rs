@@ -177,10 +177,9 @@ fn create_index_naming_and_rejections() {
         ("CREATE INDEX ON t(ghost)", "ghost"),
         ("CREATE INDEX ON t(a, a)", "duplicate column"),
         ("CREATE INDEX ix ON t (a) WHERE a > 0", "partial index"),
-        // A stream holds no rows to index, a view is not a table, and a reserved
-        // name is refused before the catalog is probed.
+        // A stream holds no rows to index, and a reserved name is refused before
+        // the catalog is probed.
         ("CREATE INDEX ON st(v)", "is a stream"),
-        ("CREATE INDEX ON vw(a)", "is a view"),
         ("CREATE INDEX ON _seg999999 (v)", "cannot start with '_'"),
     ] {
         db.refuses(sql, Rejected, needle);
@@ -188,6 +187,50 @@ fn create_index_naming_and_rejections() {
     // BTREE is the one index method, so naming it is accepted.
     db.exec("CREATE INDEX ixb ON t USING BTREE (c)");
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
+}
+
+/// A view whose store holds each of its keys once, in full, takes an index; one
+/// whose store cannot is refused, as is a replacement that would drop an index.
+#[test]
+fn create_index_owner_rules() {
+    let mut db = Db::boot(4);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT);
+         CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT);
+         CREATE VIEW pv AS SELECT id, v FROM t;
+         CREATE VIEW fv WITH (delta = '1 MB') AS SELECT id, v FROM t;
+         CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, v FROM t;
+         CREATE VIEW jv AS SELECT t.id, u.v FROM t JOIN u ON t.v = u.v;
+         CREATE VIEW tv AS SELECT id, v FROM t ORDER BY v LIMIT 3;
+         CREATE INDEX pv_v ON pv(v);
+         CREATE INDEX ON fv(v)",
+    );
+    db.refuses("CREATE INDEX ON bv(v)", Rejected, "without a capacity");
+    // A view that projects its source's key away is keyed on a hidden slot, and
+    // an index entry names its row by that slot.
+    db.exec("CREATE VIEW hv AS SELECT v, w FROM t; CREATE INDEX ON hv(w)");
+    for (sql, needle) in [
+        ("CREATE UNIQUE INDEX ON pv(v)", "cannot carry a UNIQUE index"),
+        ("CREATE INDEX ON jv(v)", "repeats its primary key"),
+        ("CREATE INDEX ON tv(v)", "repeats its primary key"),
+        ("CREATE OR REPLACE VIEW pv AS SELECT id, w AS v FROM t", "owns an index"),
+        ("ALTER VIEW pv AS SELECT id, w AS v FROM t", "owns an index"),
+    ] {
+        db.refuses(sql, Refused(Error), needle);
+    }
+
+    db.exec(
+        "DROP INDEX pv_v;
+         CREATE OR REPLACE VIEW pv AS SELECT id, w AS v FROM t;
+         ALTER VIEW pv AS SELECT id, v FROM t",
+    );
+    // The drop cascades the index, so its name is free again.
+    db.exec(
+        "CREATE INDEX pv_v ON pv(v);
+         DROP VIEW pv;
+         CREATE VIEW pv AS SELECT id, v FROM t;
+         CREATE INDEX pv_v ON pv(v)",
+    );
 }
 
 // ── ALTER ────────────────────────────────────────────────────────────────────

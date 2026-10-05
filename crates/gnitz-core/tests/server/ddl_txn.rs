@@ -74,7 +74,7 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     let source = client.resolve_relation(&sn, "t").unwrap();
     let vid = client.create_view(&sn, "v", &source, ViewProps::default()).unwrap();
     let err = unique_on_v(&mut client, vid);
-    assert!(err.contains("only a base table can be indexed"), "{err}");
+    assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 
     client.drop_view(&sn, &["v"], false).unwrap();
     client.alter_drop_column(tid, 1).unwrap();

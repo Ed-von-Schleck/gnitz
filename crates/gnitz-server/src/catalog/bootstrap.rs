@@ -67,14 +67,10 @@ impl CatalogEngine {
                     schema: *family.schema(),
                     // DDL is master-broadcast, so each worker holds a full copy.
                     placement: Placement::Replicated,
+                    pk_repeats: false,
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
-            engine.enter_relation(
-                family.id(),
-                family.schema().pk_cols(),
-                &family.column_defs(),
-                RelFacts::default(),
-            );
+            engine.enter_relation(family.id(), family.schema().pk_cols(), &family.column_defs(), false);
         }
 
         engine.system_zone = engine.registry.system_replay_floors().into_values().max().unwrap_or(0);

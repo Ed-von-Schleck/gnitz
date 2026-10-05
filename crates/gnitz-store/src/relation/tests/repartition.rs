@@ -106,6 +106,7 @@ fn a_complete_launched_set_is_kept_and_a_leftover_source_set_removed() {
             kind: RelationKind::BaseTable,
             schema,
             placement: Placement::full_pk(&schema),
+            pk_repeats: false,
         };
         master.register(spec).unwrap();
         master.reconcile_child_dirs().unwrap();

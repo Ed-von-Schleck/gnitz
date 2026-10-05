@@ -189,7 +189,7 @@ impl CatalogEngine {
     /// The base of the next `count` SERIAL ids of table `seq_id`, and the
     /// `_sequences` delta recording them.
     pub(crate) fn reserve_user_sequence(&self, seq_id: u64, count: u64) -> Result<(i64, Batch), String> {
-        if !self.caches.relations.get(&seq_id).is_some_and(|e| e.facts.serial) {
+        if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
             return Err(format!("relation {seq_id} is not a SERIAL table"));
         }
         let invalid = || format!("SERIAL range of {count} on sequence {seq_id} is invalid or exhausted");

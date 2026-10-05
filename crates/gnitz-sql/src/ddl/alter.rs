@@ -117,7 +117,7 @@ pub(crate) fn execute_alter_table(
                 schema_name,
                 &rel,
                 &super::table::IndexRequest {
-                    table_name: &source_name,
+                    owner_name: &source_name,
                     columns,
                     explicit_name,
                     site: super::table::IndexSite::AddConstraint,

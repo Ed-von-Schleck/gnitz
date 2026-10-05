@@ -66,6 +66,7 @@ pub(super) fn sources_at<S: Into<Source>>(slot: Slot, rows: impl IntoIterator<It
             kind: RelationKind::Stream,
             schema,
             placement,
+            pk_repeats: false,
         };
         registry.register(spec).expect("a stream registers without a store");
     }

@@ -78,6 +78,8 @@ pub(crate) enum ClassWant {
     /// What a view body may read: anything but a capacity-bounded view, whose
     /// skeleton rows hydrate from its own sources, which a view over it cannot reach.
     ViewSource,
+    /// What may carry a secondary index.
+    Indexable,
 }
 
 impl ClassWant {
@@ -88,14 +90,25 @@ impl ClassWant {
         match class {
             RelClass::Table => matches!(
                 self,
-                ClassWant::BaseTable | ClassWant::BaseTableOrStream | ClassWant::Readable | ClassWant::ViewSource
+                ClassWant::BaseTable
+                    | ClassWant::BaseTableOrStream
+                    | ClassWant::Readable
+                    | ClassWant::ViewSource
+                    | ClassWant::Indexable
             ),
             RelClass::Stream => matches!(self, ClassWant::BaseTableOrStream | ClassWant::ViewSource),
             RelClass::View => matches!(
                 self,
-                ClassWant::View | ClassWant::PlainView | ClassWant::Readable | ClassWant::ViewSource
+                ClassWant::View
+                    | ClassWant::PlainView
+                    | ClassWant::Readable
+                    | ClassWant::ViewSource
+                    | ClassWant::Indexable
             ),
-            RelClass::FedView => matches!(self, ClassWant::View | ClassWant::Readable | ClassWant::ViewSource),
+            RelClass::FedView => matches!(
+                self,
+                ClassWant::View | ClassWant::Readable | ClassWant::ViewSource | ClassWant::Indexable
+            ),
             RelClass::BoundedView => matches!(self, ClassWant::View | ClassWant::Readable),
         }
     }
@@ -109,6 +122,7 @@ impl ClassWant {
             ClassWant::PlainView => "a view created without WITH options (DROP and CREATE the view instead)",
             ClassWant::Readable => "a table or a view (a stream is read only inside a view body)",
             ClassWant::ViewSource => "a relation a view can be created over (a capacity-bounded view is a leaf)",
+            ClassWant::Indexable => "a base table or a view without a capacity",
         }
     }
 }

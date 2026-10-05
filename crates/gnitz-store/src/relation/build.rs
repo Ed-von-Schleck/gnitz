@@ -25,7 +25,7 @@ impl RelationRegistry {
     }
 
     fn enter(&mut self, spec: RelationSpec, (store, delta): (Store, Option<Box<Table>>)) {
-        let RelationSpec { id, kind, placement, .. } = spec;
+        let RelationSpec { id, kind, placement, pk_repeats, .. } = spec;
         let prev = self.tables.insert(
             id,
             Relation {
@@ -36,6 +36,7 @@ impl RelationRegistry {
                 indexes: Vec::new(),
                 kind,
                 placement,
+                pk_repeats,
             },
         );
         debug_assert!(prev.is_none(), "relation {id} registered twice");
@@ -48,7 +49,7 @@ impl RelationRegistry {
         spec: RelationSpec,
         resume_at: Option<u64>,
     ) -> Result<(Store, Option<Box<Table>>), String> {
-        let RelationSpec { id, kind, schema, placement } = spec;
+        let RelationSpec { id, kind, schema, placement, .. } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
         let (recovery, budgets, feed) = match kind {
             RelationKind::Stream => return absent(),

@@ -491,11 +491,11 @@ impl GnitzClient {
         self.round_trip(Request::ScanMulti(relations)).map(Reply::into_multi)
     }
 
-    /// Index `cols` of table `table_id`, in that order, under the catalog name
+    /// Index `cols` of relation `owner_id`, in that order, under the catalog name
     /// `index_name`.
     pub fn create_index(
         &mut self,
-        table_id: u64,
+        owner_id: u64,
         cols: PkColList,
         index_name: &str,
         is_unique: bool,
@@ -506,7 +506,7 @@ impl GnitzClient {
         b.put(
             &IdxTabRow {
                 index_id,
-                owner_id: table_id,
+                owner_id,
                 cols,
                 name: &index_name,
                 is_unique,
