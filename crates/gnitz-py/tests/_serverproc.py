@@ -24,6 +24,7 @@ is loaded at import time, before the fork).
 import ctypes
 import os
 import re
+import resource
 import signal
 import subprocess
 import threading
@@ -106,6 +107,14 @@ def server_preexec():
     # we were already reparented, so the death signal would never arrive.
     if os.getppid() != parent:
         os._exit(1)
+
+
+def server_preexec_no_core():
+    """`server_preexec` for a server expected to die: a build that aborts on a
+    panic would hand its image to the host's core handler, which can outlast
+    the wait for its exit."""
+    server_preexec()
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
 def kill_group(proc):
@@ -254,7 +263,7 @@ class ServerProc:
 
     # ── spawning ─────────────────────────────────────────────────────────────
 
-    def _popen(self, spawn_env, extra_args=()):
+    def _popen(self, spawn_env, extra_args=(), preexec=server_preexec):
         env = server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
@@ -277,7 +286,7 @@ class ServerProc:
                 [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}",
                  "--tls-listen=127.0.0.1:0", *extra_args],
                 stdout=log, stderr=log, env=env,
-                start_new_session=True, preexec_fn=server_preexec,
+                start_new_session=True, preexec_fn=preexec,
             )
         finally:
             log.close()
@@ -308,7 +317,7 @@ class ServerProc:
         arguments every boot gets, so a flag given there replaces its default."""
         if workers is not None:
             self.workers = workers
-        self.proc = self._popen(extra_env, extra_args)
+        self.proc = self._popen(extra_env, extra_args, server_preexec_no_core)
         deadline = time.time() + timeout
         while time.time() < deadline:
             rc = self.proc.poll()
