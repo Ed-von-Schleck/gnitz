@@ -57,7 +57,7 @@ impl DepMap {
         if let Some(steps) = self.tick_steps.get(&source) {
             return Rc::clone(steps);
         }
-        let producers = std::iter::once(source).chain(Self::closure(&self.forward, vec![source]));
+        let producers = std::iter::once(source).chain(Self::closure(&self.forward, [source]));
         let mut steps: Vec<Step> = producers
             .flat_map(|producer| {
                 let views = self.forward.get(&producer).into_iter().flatten();
@@ -72,9 +72,9 @@ impl DepMap {
 
     /// Every id one or more edges from some seed over one half of the map — a
     /// seed only when another seed reaches it.
-    fn closure(edges: &FxHashMap<u64, Vec<u64>>, seeds: Vec<u64>) -> FxHashSet<u64> {
+    fn closure(edges: &FxHashMap<u64, Vec<u64>>, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
         let mut reachable: FxHashSet<u64> = FxHashSet::default();
-        let mut stack = seeds;
+        let mut stack: Vec<u64> = seeds.into_iter().collect();
         while let Some(id) = stack.pop() {
             for &next in edges.get(&id).into_iter().flatten() {
                 if reachable.insert(next) {
@@ -106,20 +106,24 @@ impl DagEngine {
 
     /// Every relation one or more `view → sources` edges from some seed —
     /// through view sources, down to the bases.
-    pub(crate) fn source_closure(&self, seeds: Vec<u64>) -> FxHashSet<u64> {
+    pub(crate) fn source_closure(&self, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
         DepMap::closure(&self.dep.reverse, seeds)
     }
 
     /// The other direction over the same edges: every view one or more
     /// `source → dependents` edges from some seed — which views a tick of these
     /// sources reaches.
-    pub(crate) fn dependent_closure(&self, seeds: Vec<u64>) -> FxHashSet<u64> {
+    pub(crate) fn dependent_closure(&self, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
         DepMap::closure(&self.dep.forward, seeds)
     }
 
     /// The base tables — not streams — that `seeds`' source chains reach through
     /// view sources, sorted.
-    pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<u64>) -> Vec<u64> {
+    pub(crate) fn base_tables_reachable_from(
+        &self,
+        registry: &RelationRegistry,
+        seeds: impl IntoIterator<Item = u64>,
+    ) -> Vec<u64> {
         base_tables_among(registry, self.source_closure(seeds))
     }
 
@@ -137,7 +141,7 @@ impl DagEngine {
                 gnitz_wire::Circuit::decode(cell).map_err(|e| format!("view {}: {e}", circuits.get_pk(i) as u64))?;
             reached.extend(circuit.sources());
         }
-        let through_views = self.source_closure(reached.iter().copied().collect());
+        let through_views = self.source_closure(reached.iter().copied());
         reached.extend(through_views);
         Ok(base_tables_among(registry, reached))
     }

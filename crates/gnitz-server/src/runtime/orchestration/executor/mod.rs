@@ -965,7 +965,7 @@ fn read_is_fresh(shared: &Rc<Shared>, target: u64) -> bool {
     shared
         .cat()
         .dag
-        .source_closure(vec![target])
+        .source_closure([target])
         .into_iter()
         .all(|s| shared.commit_lsn_of(s) <= ticked)
 }

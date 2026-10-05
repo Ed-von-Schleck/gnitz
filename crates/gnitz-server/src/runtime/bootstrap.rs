@@ -89,12 +89,10 @@ fn inject_recovery_panic(stage: &str) {
 /// tail contained, because the sweep is also what compiles a view at boot, and
 /// the boot checkpoint publishes traces only for compiled views.
 fn swept_base_tables(catalog: &CatalogEngine) -> Vec<u64> {
-    let keeps_state: Vec<u64> = catalog
+    let keeps_state = catalog
         .registry
         .view_ids()
-        .into_iter()
-        .filter(|&vid| !catalog.dag.awaits_rebuild(vid))
-        .collect();
+        .filter(|&vid| !catalog.dag.awaits_rebuild(vid));
     catalog.dag.base_tables_reachable_from(&catalog.registry, keeps_state)
 }
 

@@ -208,6 +208,16 @@ impl<S: Into<String>> From<S> for WireFault {
     }
 }
 
+impl WireFault {
+    /// Prefix the text with what the caller was doing; the status is kept.
+    pub fn in_context(self, what: impl std::fmt::Display) -> Self {
+        WireFault {
+            text: format!("{what}: {}", self.text),
+            status: self.status,
+        }
+    }
+}
+
 impl std::fmt::Display for WireFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.text)

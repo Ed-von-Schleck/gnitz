@@ -657,12 +657,8 @@ impl RelationRegistry {
     }
 
     /// Every registered view id.
-    pub fn view_ids(&self) -> Vec<u64> {
-        self.tables
-            .iter()
-            .filter(|(_, e)| e.kind.is_view())
-            .map(|(&id, _)| id)
-            .collect()
+    pub fn view_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.tables.iter().filter(|(_, e)| e.kind.is_view()).map(|(&id, _)| id)
     }
 
     /// What every store this registry opens starts from; the two bounded kinds

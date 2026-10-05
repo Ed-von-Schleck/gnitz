@@ -44,7 +44,7 @@ impl CatalogEngine {
     fn compute_invalid_views(&mut self) {
         let topo_valid = self.topology_matches();
 
-        let view_ids = self.registry.view_ids();
+        let view_ids: Vec<u64> = self.registry.view_ids().collect();
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
         // view resumes and nothing below need be read.
         if !topo_valid {
@@ -77,8 +77,8 @@ impl CatalogEngine {
 
         // Phase 2: every view downstream of an invalid one, then every view of a
         // chain holding one.
-        let seeds = invalid.iter().copied().collect();
-        invalid.extend(self.dag.dependent_closure(seeds));
+        let downstream = self.dag.dependent_closure(invalid.iter().copied());
+        invalid.extend(downstream);
         let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.dag.chain_of(v)).collect();
         let whole_chains = view_ids.into_iter().filter(|&v| chains.contains(&self.dag.chain_of(v)));
         self.dag.set_rebuild(whole_chains.collect());

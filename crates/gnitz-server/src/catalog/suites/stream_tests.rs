@@ -99,7 +99,7 @@ fn the_drive_set_excludes_a_stream() {
 
     let driven = engine
         .dag
-        .base_tables_reachable_from(&engine.registry, vec![over_stream, over_table]);
+        .base_tables_reachable_from(&engine.registry, [over_stream, over_table]);
     assert!(driven.contains(&tid), "a base table feeding a view is driven");
     assert!(!driven.contains(&sid), "a stream must never be driven");
 

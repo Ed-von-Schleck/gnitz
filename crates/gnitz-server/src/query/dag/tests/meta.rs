@@ -26,18 +26,18 @@ fn the_closures_walk_both_directions_transitively() {
         dag.dep.link(view, sources.iter().copied());
     }
 
-    assert!(dag.source_closure(vec![]).is_empty());
-    assert_eq!(dag.source_closure(vec![3]), set(&[1, 2]));
-    assert_eq!(dag.source_closure(vec![13]), set(&[10, 11, 12]));
-    assert_eq!(dag.source_closure(vec![21]), set(&[20]));
-    assert!(dag.source_closure(vec![1]).is_empty());
-    assert!(dag.source_closure(vec![99]).is_empty());
-    assert_eq!(dag.source_closure(vec![3, 2]), set(&[1, 2]));
+    assert!(dag.source_closure([]).is_empty());
+    assert_eq!(dag.source_closure([3]), set(&[1, 2]));
+    assert_eq!(dag.source_closure([13]), set(&[10, 11, 12]));
+    assert_eq!(dag.source_closure([21]), set(&[20]));
+    assert!(dag.source_closure([1]).is_empty());
+    assert!(dag.source_closure([99]).is_empty());
+    assert_eq!(dag.source_closure([3, 2]), set(&[1, 2]));
     // The other direction, so a walk that read the wrong half of `DepMap`
     // cannot pass both.
-    assert_eq!(dag.dependent_closure(vec![1]), set(&[2, 3]));
-    assert_eq!(dag.dependent_closure(vec![10]), set(&[11, 12, 13]));
-    assert!(dag.dependent_closure(vec![21]).is_empty());
+    assert_eq!(dag.dependent_closure([1]), set(&[2, 3]));
+    assert_eq!(dag.dependent_closure([10]), set(&[11, 12, 13]));
+    assert!(dag.dependent_closure([21]).is_empty());
 }
 
 /// A view links to each source once however many scans name it. Forgetting it
@@ -114,9 +114,7 @@ fn an_unapplied_circuit_delta_reaches_the_bases_its_views_will() {
     engine.dag.dep.link(first, [existing].into_iter());
     engine.dag.dep.link(second, [first].into_iter());
     assert_eq!(
-        engine
-            .dag
-            .base_tables_reachable_from(&engine.registry, vec![first, second]),
+        engine.dag.base_tables_reachable_from(&engine.registry, [first, second]),
         scanned
     );
 
