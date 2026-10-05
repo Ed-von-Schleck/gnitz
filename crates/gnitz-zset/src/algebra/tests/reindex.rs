@@ -132,12 +132,13 @@ fn every_accepted_join_key_pair_copartitions() {
 }
 
 // -----------------------------------------------------------------------
-// FoldCols::key_row — the one-shot and the streaming form are one digest
+// FoldCols::key_row — its two byte layouts
 // -----------------------------------------------------------------------
 
-/// The fold's stack and scratch arms hash the same bytes.
+/// Under either layout two rows fold to one key exactly when they agree on
+/// every folded column, a NULL told from a zero; the fold of no columns is V₀.
 #[test]
-fn hash_fold_stack_arm_matches_the_scratch_arm() {
+fn each_fold_layout_keys_a_row_by_its_columns() {
     /// The same columns folded the other way — the arm `FoldCols::new` did not pick.
     fn flipped(f: &FoldCols) -> FoldCols {
         FoldCols { locs: f.locs.clone(), inline: !f.inline }
@@ -153,39 +154,49 @@ fn hash_fold_stack_arm_matches_the_scratch_arm() {
         ],
         &[0],
     );
+    // One PK, and every combination of the payload values: a NULL beside a zero
+    // in each nullable column.
+    let mut rows: Vec<[Option<u128>; 4]> = Vec::new();
+    for a in [0, (-9i32) as u32 as u128] {
+        for b in [None, Some(0), Some(42)] {
+            for c in [0, u128::MAX - 3] {
+                for d in [None, Some(0), Some(5)] {
+                    rows.push([Some(a), b, Some(c), d]);
+                }
+            }
+        }
+    }
     let mut b = BatchBuilder::new(&schema);
-    // Row 0: nothing NULL. Row 1: the two nullable columns NULL, so both the
-    // marker-only arm and the marker+route-key arm run in one row.
-    for (pk, nulls) in [(7u128, false), (8u128, true)] {
-        b.begin_row(pk, 1);
-        b.put_int((-9i32) as u128);
-        match nulls {
-            true => b.put_null(),
-            false => b.put_int(42),
-        }
-        b.put_int(u128::MAX - 3);
-        match nulls {
-            true => b.put_null(),
-            false => b.put_int(5),
-        }
+    for row in &rows {
+        b.begin_row(7, 1);
+        row.iter().for_each(|&cell| b.put_opt_int(cell));
         b.end_row();
     }
     let b = b.finish();
     let mb = b.as_mem_batch();
 
     let all: Vec<ColumnLocator> = (0..5).map(|c| schema.locate(c)).collect();
-    // Every arity from the global aggregate's empty fold up to the full set.
-    for k in 0..=all.len() {
-        let f = FoldCols::new(all[..k].to_vec());
-        assert!(f.inline, "arity {k} is fixed-width and fits the stack buffer");
-        let g = flipped(&f);
-        for row in 0..2 {
-            let null_word = mb.get_null_word(row);
-            assert_eq!(
-                f.key_row(&mb, row, null_word),
-                g.key_row(&mb, row, null_word),
-                "arity {k}, row {row}"
-            );
+    let empty = FoldCols::new(Vec::new());
+    assert_eq!(
+        empty.key_row(&mb, 0, mb.get_null_word(0)),
+        gnitz_wire::global_group_key()
+    );
+    for k in 1..all.len() {
+        let stack = FoldCols::new(all[1..=k].to_vec());
+        assert!(stack.inline, "arity {k} is fixed-width and fits the stack buffer");
+        for (arm, f) in [("stack", &stack), ("scratch", &flipped(&stack))] {
+            let key = |row: usize| f.key_row(&mb, row, mb.get_null_word(row));
+            for x in 0..rows.len() {
+                for y in 0..rows.len() {
+                    assert_eq!(
+                        key(x) == key(y),
+                        rows[x][..k] == rows[y][..k],
+                        "{arm}, arity {k}: {:?} against {:?}",
+                        rows[x],
+                        rows[y]
+                    );
+                }
+            }
         }
     }
 

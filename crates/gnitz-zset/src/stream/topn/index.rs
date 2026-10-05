@@ -4,17 +4,17 @@
 //! same "populate before the operator reads" contract.
 //!
 //! ```text
-//! PK      = group key (the AVI packer) ‖ lead: image_0, a string's cut to the slot
-//! payload = image_0 when a string's ‖ image_1 … image_{k-1}   (BLOB each)
+//! PK      = group key (the AVI packer) ‖ rank_0 ‖ image_0, a string's cut to its slot
+//! payload = image_0 when a string's ‖ rank_i ‖ image_i for i ≥ 1   (BLOB each)
 //!         ‖ the output row's payload columns, in output order
 //! ```
 //!
-//! An image is the column's order image, byte-complemented for DESC, behind one
-//! rank byte placing NULLs where the column is nullable. Images are prefix-free,
-//! and a BLOB payload compares by content, so the trace's own `(PK, payload)`
-//! order *is* the ORDER BY order. A fixed-width `image_0` sits whole in the PK,
-//! so only rows equal on the first key share a PK and fall to the merge's
-//! row-by-row equal-PK arm; a string's does past its slot.
+//! An image is the column's order image, byte-complemented for DESC. A rank
+//! byte, over a nullable key only, places NULLs; a NULL has no image. Images are
+//! prefix-free, and a BLOB payload compares by content, so the trace's own `(PK,
+//! payload)` order *is* the ORDER BY order. A fixed-width `image_0` sits whole in
+//! the PK, so only rows equal on the first key share a PK and fall to the
+//! merge's row-by-row equal-PK arm; a string's does past its slot.
 
 use crate::algebra::ReindexPacker;
 use crate::repr::Batch;
@@ -23,7 +23,10 @@ use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
 use gnitz_wire::PkBuf;
 
-use crate::algebra::{append_image, has_fixed_image, image_slot_col, write_image_slot, ImageKind, IMAGE_COL};
+use crate::algebra::{
+    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,
+    IMAGE_COL,
+};
 
 /// The rank byte leading a nullable key's image.
 const RANK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
@@ -54,6 +57,35 @@ impl OrderSpec {
             }
         }
         append_image(&self.key.loc, self.kind, self.key.desc, src, row, out);
+    }
+
+    /// Write the key's lead for `row` into `lead`, [`Self::lead_cols`] wide: the
+    /// rank byte of a nullable key, then the image, zero-padded or cut to its
+    /// slot. A string's whole image is appended to `image`.
+    #[inline]
+    fn write_lead(&self, src: &impl RowSource, row: usize, lead: &mut [u8], image: &mut Vec<u8>) {
+        let slot = match self.nullable {
+            false => lead,
+            true => {
+                let is_null = self.key.loc.is_null(src, row);
+                let (rank, slot) = lead.split_at_mut(1);
+                rank[0] = (is_null != self.key.nulls_first) as u8;
+                if is_null {
+                    slot.fill(0);
+                    return;
+                }
+                slot
+            }
+        };
+        let (loc, desc) = (&self.key.loc, self.key.desc);
+        match self.kind {
+            ImageKind::Scalar(kind) => slot.copy_from_slice(&scalar_image(loc, kind, desc, src, row).to_be_bytes()),
+            ImageKind::Wide(WideKind::Fixed(_)) => slot.copy_from_slice(&int16_image(loc, desc, src, row)),
+            ImageKind::Wide(WideKind::Bytes) => {
+                append_image(loc, self.kind, desc, src, row, image);
+                write_image_slot(slot, image);
+            }
+        }
     }
 
     /// The PK columns holding the image's lead: the rank byte of a nullable
@@ -155,8 +187,8 @@ impl TopNIndex {
                 return;
             }
             image.clear();
-            self.lead.append_image(&mb, row, &mut image);
-            write_image_slot(&mut key[stride..stride + self.lead_bytes], &image);
+            self.lead
+                .write_lead(&mb, row, &mut key[stride..stride + self.lead_bytes], &mut image);
             out.begin_row(key, weight);
             let mut col = 0;
             if !self.lead.fits_lead() {

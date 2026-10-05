@@ -272,6 +272,45 @@ fn ascending_sources_merge_to_their_rows_in_order() {
     assert_eq!(merge(&[]), vec![]);
 }
 
+/// `into_consolidated` folds an unsorted batch to its Z-set at the PK widths on
+/// either side of each argsort key form: keys that differ in their last byte
+/// alone, rows that share a PK and differ in payload, and rows that cancel.
+#[test]
+fn consolidation_folds_at_every_sort_key_boundary() {
+    use crate::test_support::{make_batch_opk, pk_payload_schema, Rng};
+    use std::collections::BTreeMap;
+    use TypeCode::{U128, U32, U64, U8};
+    let mut rng = Rng::new(7);
+    for pk in [
+        &[U128][..],
+        &[U128, U8],
+        &[U128, U64, U32],
+        &[U128, U64, U32, U8],
+        &[U128, U128],
+    ] {
+        let schema = pk_payload_schema(pk);
+        let stride = schema.pk_stride();
+        let mut model: BTreeMap<(Vec<u8>, i64), i64> = BTreeMap::new();
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..400)
+            .map(|_| {
+                let mut key = vec![0xA5u8; stride];
+                key[stride - 1] = rng.gen_range(4) as u8;
+                key[0] = rng.gen_range(2) as u8;
+                (key, [-1, 1, 2][rng.gen_range(3) as usize], rng.gen_range(3) as i64)
+            })
+            .collect();
+        for (key, w, val) in &rows {
+            *model.entry((key.clone(), *val)).or_default() += w;
+        }
+        model.retain(|_, w| *w != 0);
+        let out = make_batch_opk(&schema, &rows).into_consolidated();
+        let got: Vec<((Vec<u8>, i64), i64)> = (0..out.len())
+            .map(|r| ((out.get_pk_bytes(r).to_vec(), payload0_i64(&out, r)), out.get_weight(r)))
+            .collect();
+        assert_eq!(got, model.into_iter().collect::<Vec<_>>(), "a {stride}-byte PK");
+    }
+}
+
 /// A merge over wide PKs folds to the Z-set its sources sum to, in (PK,
 /// payload) order, wherever the keys differ: in the bytes every row shares
 /// (none do, then), in the span the tournament is keyed by, and behind it.

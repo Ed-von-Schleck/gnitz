@@ -1021,6 +1021,12 @@ pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
     ascending && !batch.has_ghost()
 }
 
+/// One argsort element: a row's PK sort key and its index.
+trait ArgEntry: Copy {
+    fn idx(self) -> usize;
+    fn same_pk(self, other: Self) -> bool;
+}
+
 /// A `(sort key, row-index)` pair. Keeps the key co-located with its index so the
 /// comparator reads from the element being positioned rather than chasing a
 /// separate key array.
@@ -1030,7 +1036,46 @@ struct SortEntry<K> {
     idx: u32,
 }
 
-/// The argsort half of [`consolidate_groups`]: [`PkSortKey`] carries the whole
+impl<K: Copy + Eq> ArgEntry for SortEntry<K> {
+    #[inline(always)]
+    fn idx(self) -> usize {
+        self.idx as usize
+    }
+    #[inline(always)]
+    fn same_pk(self, other: Self) -> bool {
+        self.key == other.key
+    }
+}
+
+/// A 17..=[`PACKED_MAX_STRIDE`]-byte PK's `[u128; 2]` key with the row index in
+/// its low four bytes, which the left-aligned key leaves zero: ordered by one
+/// plain compare.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PackedEntry([u128; 2]);
+
+const PACKED_MAX_STRIDE: usize = size_of::<PackedEntry>() - size_of::<u32>();
+
+impl PackedEntry {
+    #[inline(always)]
+    fn new(opk: &[u8], idx: u32) -> Self {
+        debug_assert!((17..=PACKED_MAX_STRIDE).contains(&opk.len()));
+        let [hi, lo] = <[u128; 2]>::from_opk(opk);
+        PackedEntry([hi, lo | idx as u128])
+    }
+}
+
+impl ArgEntry for PackedEntry {
+    #[inline(always)]
+    fn idx(self) -> usize {
+        self.0[1] as u32 as usize
+    }
+    #[inline(always)]
+    fn same_pk(self, other: Self) -> bool {
+        self.0[0] == other.0[0] && (self.0[1] ^ other.0[1]) >> 32 == 0
+    }
+}
+
+/// The argsort half of [`consolidate_groups`]: the sort key carries the whole
 /// OPK image, so a key tie goes straight to the payload order.
 #[inline]
 fn consolidate_groups_inner<P: PayloadOrder>(
@@ -1040,7 +1085,21 @@ fn consolidate_groups_inner<P: PayloadOrder>(
     out: &mut Vec<(u32, u32, i64)>,
     payload: P,
 ) {
-    pk_width_dispatch!(batch.pk_stride(), |K| {
+    let stride = batch.pk_stride();
+    if (17..=PACKED_MAX_STRIDE).contains(&stride) {
+        let mut entries: Vec<PackedEntry> = (0..n as u32)
+            .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
+            .collect();
+        // By PK, then row index; the payload order then applies within each PK.
+        entries.sort_unstable();
+        if schema.num_payload_cols() > 0 {
+            for run in entries.chunk_by_mut(|a, b| a.same_pk(*b)).filter(|r| r.len() > 1) {
+                run.sort_unstable_by(|a, b| payload.compare(schema, batch, a.idx(), batch, b.idx()));
+            }
+        }
+        return drain_groups(&entries, batch, schema, payload, out);
+    }
+    pk_width_dispatch!(stride, |K| {
         let mut entries: Vec<SortEntry<K>> = (0..n as u32)
             .map(|i| SortEntry {
                 key: K::from_opk(batch.get_pk_bytes(i as usize)),
@@ -1058,30 +1117,30 @@ fn consolidate_groups_inner<P: PayloadOrder>(
 /// The fold half of [`consolidate_groups`]: walk the sorted entries and push one
 /// survivor per (PK, payload) group whose weights do not cancel.
 #[inline]
-fn drain_groups<K: Copy + Eq, P: PayloadOrder>(
-    entries: &[SortEntry<K>],
+fn drain_groups<E: ArgEntry, P: PayloadOrder>(
+    entries: &[E],
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     payload: P,
     out: &mut Vec<(u32, u32, i64)>,
 ) {
     let mut pending = entries[0];
-    let mut pending_weight = batch.get_weight(pending.idx as usize);
+    let mut pending_weight = batch.get_weight(pending.idx());
 
-    for cur in &entries[1..] {
-        let (pi, ci) = (pending.idx as usize, cur.idx as usize);
-        if pending.key == cur.key && payload.compare(schema, batch, pi, batch, ci).is_eq() {
+    for &cur in &entries[1..] {
+        let (pi, ci) = (pending.idx(), cur.idx());
+        if pending.same_pk(cur) && payload.compare(schema, batch, pi, batch, ci).is_eq() {
             pending_weight += batch.get_weight(ci);
         } else {
             if pending_weight != 0 {
-                out.push((0, pending.idx, pending_weight));
+                out.push((0, pi as u32, pending_weight));
             }
-            pending = *cur;
+            pending = cur;
             pending_weight = batch.get_weight(ci);
         }
     }
     if pending_weight != 0 {
-        out.push((0, pending.idx, pending_weight));
+        out.push((0, pending.idx() as u32, pending_weight));
     }
 }
 

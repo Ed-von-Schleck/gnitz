@@ -66,17 +66,19 @@ thread_local! {
 /// Columns a fold assembles on the stack; a wider fold takes the scratch buffer.
 const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 
-/// The columns one 128-bit row digest folds, and whether their key bytes fit
-/// the stack buffer.
+/// The columns one 128-bit row digest folds, and which of its two byte layouts
+/// the digest is taken over. Over no columns it is the digest of no bytes.
 pub(crate) struct FoldCols {
     locs: Vec<ColumnLocator>,
-    /// Every column is fixed-width, and there are at most `FOLD_INLINE_COLS`.
+    /// One to `FOLD_INLINE_COLS` columns, each fixed-width: the key bytes are
+    /// assembled on the stack.
     inline: bool,
 }
 
 impl FoldCols {
     pub(crate) fn new(locs: Vec<ColumnLocator>) -> Self {
-        let inline = locs.len() <= FOLD_INLINE_COLS && !locs.iter().any(|l| l.type_code().is_german_string());
+        let inline =
+            (1..=FOLD_INLINE_COLS).contains(&locs.len()) && !locs.iter().any(|l| l.type_code().is_german_string());
         FoldCols { locs, inline }
     }
 
@@ -89,19 +91,18 @@ impl FoldCols {
     #[inline]
     pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
         if self.inline {
-            // `push_col_key`'s bytes, written to the stack.
-            let mut buf = [0u8; 17 * FOLD_INLINE_COLS];
-            let mut n = 0usize;
-            for &loc in &self.locs {
-                if loc.is_null_word(null_word) {
-                    buf[n] = 0;
-                    n += 1;
-                    continue;
+            // One word of presence bits, then each present column's image: every
+            // 8-byte read XXH3 makes lies inside one store.
+            let mut buf = [0u8; 8 + 16 * FOLD_INLINE_COLS];
+            let (mut n, mut present) = (8usize, 0u64);
+            for (i, &loc) in self.locs.iter().enumerate() {
+                if !loc.is_null_word(null_word) {
+                    present |= 1 << i;
+                    buf[n..n + 16].copy_from_slice(&loc.opk_image(src, row).to_le_bytes());
+                    n += 16;
                 }
-                buf[n] = 1;
-                buf[n + 1..n + 17].copy_from_slice(&loc.opk_image(src, row).to_le_bytes());
-                n += 17;
             }
+            buf[..8].copy_from_slice(&present.to_le_bytes());
             return gnitz_wire::checksum_128(&buf[..n]);
         }
         self.key_row_scratch(src, row, null_word)
