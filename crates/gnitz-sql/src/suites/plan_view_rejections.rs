@@ -573,6 +573,8 @@ fn scalar_expression_rules() {
         // An integer literal past `u64::MAX` has no register slot at all.
         ("CAST(18446744073709551616 AS BIGINT UNSIGNED)", "18446744073709551616"),
         ("CAST('abc' AS DECIMAL(5, 2))", "invalid DECIMAL("),
+        // A literal past the scaled integer is refused, not wrapped at run time.
+        ("CAST(1e30 AS DECIMAL(10, 2))", "value out of range"),
         // Each product adds its operands' scales, so a chain of them runs past
         // what the scaled integer can hold.
         ("qty * qty * qty * qty * qty * qty * qty", "DECIMAL scale"),

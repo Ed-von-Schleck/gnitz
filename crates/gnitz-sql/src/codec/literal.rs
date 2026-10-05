@@ -26,19 +26,21 @@ pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
 }
 
 /// The value an assignment of `lit` into `ty` stores, as its native image. A
-/// float column takes every numeric spelling as its binary64 value.
+/// float column takes every numeric spelling as its binary64 value, an F32 one
+/// that value narrowed.
 pub(crate) fn assign<R>(lit: &BExpr<R>, ty: ColType) -> Result<u128, String> {
-    let v = match ty.tc {
-        TypeCode::F64 => float_value(lit).map(|v| u128::from(v.to_bits())),
-        // F32 rounds through binary64.
-        TypeCode::F32 => float_value(lit).map(|v| u128::from((v as f32).to_bits())),
-        _ => place(lit, ty)
-            .map(|p| {
-                p.stored()
-                    .ok_or_else(|| format!("{ty} value out of range: {}", lit.literal_text()))
-            })
-            .transpose()?,
+    let stored = match ty.tc {
+        // SQL spells no infinity, so an infinite value is a literal past `f64`.
+        TypeCode::F64 => float_value(lit).map(|v| v.is_finite().then(|| u128::from(v.to_bits()))),
+        TypeCode::F32 => float_value(lit).map(|v| {
+            let f = gnitz_wire::narrow_f32(v).filter(|f| f.is_finite());
+            f.map(|f| u128::from(f.to_bits()))
+        }),
+        _ => place(lit, ty).map(Placed::stored),
     };
+    let v = stored
+        .map(|v| v.ok_or_else(|| format!("{ty} value out of range: {}", lit.literal_text())))
+        .transpose()?;
     v.ok_or_else(|| match lit {
         BExpr::LitStr(s) => invalid_literal(ty, s),
         _ => format!("{} is not a {ty} value", lit.literal_text()),
@@ -47,7 +49,7 @@ pub(crate) fn assign<R>(lit: &BExpr<R>, ty: ColType) -> Result<u128, String> {
 
 /// A numeric literal as a float column's value. A magnitude past `i128` is
 /// included, which a DOUBLE holds and no integer parse would.
-fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
+pub(crate) fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
     match lit {
         BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v as f64),
         BExpr::LitFloat { v, .. } => Some(*v),

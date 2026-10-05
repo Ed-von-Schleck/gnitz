@@ -662,6 +662,14 @@ impl FixedInt {
     }
 }
 
+/// `v` rounded to F32; `None` when a finite `v` rounds past F32's range. The
+/// rounded value is what is tested, so a double just above `f32::MAX` that
+/// rounds down onto it is that value.
+pub fn narrow_f32(v: f64) -> Option<f32> {
+    let f = v as f32;
+    (f.is_finite() || !v.is_finite()).then_some(f)
+}
+
 /// The ≤8-byte scalar register image of a column type: the domain on which
 /// "read these native-LE bytes as a number" is total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -169,6 +169,21 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         (TypeCode::I8, "127.4", Ok(i8(127))),
         (TypeCode::I8, "-128.4", Ok(i8(-128))),
         (TypeCode::F64, "-0.0", Ok((-0.0f64).to_bits().into())),
+        (TypeCode::F32, "0.1", Ok((0.1f64 as f32).to_bits().into())),
+        (TypeCode::F32, "3.4028234e38", Ok(f32::MAX.to_bits().into())),
+        // A float literal past the column's range is refused, as an integer
+        // column refuses one, where it was stored as an infinity.
+        (
+            TypeCode::F32,
+            "1e39",
+            Err("F32 value out of range: 1000000000000000000000000000000000000000"),
+        ),
+        (
+            TypeCode::F32,
+            U128_MAX,
+            Err("F32 value out of range: 340282366920938463463374607431768211455"),
+        ),
+        (TypeCode::F64, "1e400", Err("F64 value out of range: inf")),
         (TypeCode::I8, "127.5", Err("I8 value out of range: 127.5")),
         (TypeCode::Date, "1.5", Err("1.5 is not a DATE value")),
         (TypeCode::U32, "'5'", Err("invalid U32 literal: '5'")),

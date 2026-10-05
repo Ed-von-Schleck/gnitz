@@ -440,6 +440,20 @@ class TestValueCoercion:
         with pytest.raises(OverflowError):
             ZSetBatch(schema).append(id=9, v=10**16)
 
+    def test_an_f32_column_refuses_a_finite_value_past_its_range(self):
+        """A Python float is an f64, narrowed to the column's width. A finite
+        value past F32's range has no F32 image, so it is refused as the SQL
+        literal is rather than stored as an infinity; an explicit infinity is a
+        value the column holds."""
+        schema = Schema([ColumnDef("id", TypeCode.I64),
+                         ColumnDef("f", TypeCode.F32)], [0])
+        batch = ZSetBatch(schema)
+        with pytest.raises(OverflowError):
+            batch.append(id=1, f=1e39)
+        assert len(batch) == 0
+        batch.append(id=2, f=float("inf"))
+        assert _col(batch, "f") == [float("inf")]
+
     @pytest.mark.parametrize("scale,value,want", [
         (0, "1.25" + "0" * 36, "1"),
         (0, "-1.25" + "0" * 36, "-1"),

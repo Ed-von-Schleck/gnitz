@@ -1800,13 +1800,9 @@ pub(crate) fn eval_batch(
                     encode_f64(decode_f64(x).partial_cmp(&0.0).map_or(f64::NAN, |o| o as i32 as f64))
                 }),
             },
-            // A finite source whose rounded result is not finite overflowed f32's
-            // range. Testing the ROUNDED value (not `|x| > f32::MAX`) keeps the
-            // 2^28-1 doubles just above f32::MAX that round down to it.
             Instr::FloatToF32 { a } => unary_null_like(scratch, mo, dst, a, |x| {
-                let f = decode_f64(x);
-                let v32 = f as f32;
-                (encode_f64(v32 as f64), f.is_finite() && v32.is_infinite())
+                let f = gnitz_wire::narrow_f32(decode_f64(x));
+                (encode_f64(f.map_or(0.0, f64::from)), f.is_none())
             }),
             Instr::IntCast { a, fi, src_signed } => {
                 let (lo, hi, hi_u) = int_cast_bounds(fi);

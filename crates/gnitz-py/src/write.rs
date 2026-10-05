@@ -694,7 +694,13 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexac
         TypeCode::I16 => buf.extend_from_slice(&item.extract::<i16>()?.to_le_bytes()),
         TypeCode::U32 => buf.extend_from_slice(&item.extract::<u32>()?.to_le_bytes()),
         TypeCode::I32 => buf.extend_from_slice(&item.extract::<i32>()?.to_le_bytes()),
-        TypeCode::F32 => buf.extend_from_slice(&item.extract::<f32>()?.to_le_bytes()),
+        TypeCode::F32 => {
+            let v = item.extract::<f64>()?;
+            let f = gnitz_wire::narrow_f32(v).ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(format!("{v} is out of range for an F32 column"))
+            })?;
+            buf.extend_from_slice(&f.to_le_bytes())
+        }
         TypeCode::U64 => buf.extend_from_slice(&item.extract::<u64>()?.to_le_bytes()),
         TypeCode::I64 => buf.extend_from_slice(&item.extract::<i64>()?.to_le_bytes()),
         TypeCode::F64 => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),

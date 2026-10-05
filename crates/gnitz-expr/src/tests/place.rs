@@ -44,3 +44,17 @@ fn an_assignment_stores_the_nearest_value_inside_the_type() {
         assert_eq!(p.stored(), stored, "{n}/10");
     }
 }
+
+/// A scale gap whose power of ten is past `i128` still places: every `i128`
+/// over it is under a half, on its own side of zero.
+#[test]
+fn a_scale_gap_past_i128_places_strictly_inside_a_half() {
+    let i64_of = |v: i128| FixedInt::I64.pack(v);
+    for (v, lo) in [(i128::MAX, 0), (1, 0), (i128::MIN + 1, -1), (-1, -1)] {
+        let p = place_scaled(FixedInt::I64, v, 60, 0);
+        assert_eq!(p, Between { lo: i64_of(lo), nearest: i64_of(0) }, "{v}");
+    }
+    assert_eq!(place_scaled(FixedInt::I64, 0, 60, 2), At(0));
+    // An unsigned type holds nothing below zero, and rounding still reaches it.
+    assert_eq!(place_scaled(FixedInt::U8, -1, 60, 0), Below { nearest: Some(0) });
+}

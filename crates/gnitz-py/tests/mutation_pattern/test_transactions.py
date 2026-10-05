@@ -77,6 +77,30 @@ def test_a_refused_write_commits_nothing_and_leaves_no_transaction_open(client, 
         client.execute_sql("ROLLBACK")
 
 
+def test_a_null_under_not_null_is_refused_at_the_statement(client):
+    """A NULL an UPDATE writes into a NOT NULL column is refused at the statement
+    that writes it — in autocommit and inside a transaction alike, so no later
+    statement of the transaction reads it back as a real value. An autocommit
+    refusal leaves no transaction open; one inside a transaction leaves the
+    transaction's other writes to commit."""
+    q = client.execute_sql
+    q(f"{_TU}; INSERT INTO t VALUES (1, 10)")
+    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
+        q("UPDATE t SET val = NULL WHERE pk = 1")
+    assert bag(scanned(client, "t")) == {(1, 10): 1}
+    with pytest.raises(gnitz.GnitzError, match="no transaction open"):
+        q("ROLLBACK")
+    # Nothing matched, so nothing was written.
+    assert q("UPDATE t SET val = NULL WHERE pk = 999")[0]["count"] == 0
+
+    q("BEGIN")
+    q("INSERT INTO t VALUES (2, 20)")
+    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
+        q("UPDATE t SET val = NULL WHERE pk = 1")
+    q("COMMIT")
+    assert bag(scanned(client, "t")) == {(1, 10): 1, (2, 20): 1}
+
+
 def test_a_bundle_over_two_tables_reaches_a_join_as_one_delta_each(client):
     """Both sides of a join written, interleaved, in one bundle. Rolled back it
     leaves every relation empty; committed, each table holds its net rows and

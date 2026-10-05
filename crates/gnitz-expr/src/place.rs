@@ -81,12 +81,11 @@ pub fn place_scaled(fi: FixedInt, v: i128, s: u8, scale: u8) -> Placed {
             None if v < 0 => Placed::Below { nearest: None },
             None => Placed::Above { nearest: None },
         },
-        None => {
-            let den = 10i128
-                .checked_pow(u32::from(s - scale))
-                .expect("a decimal literal has at most 38 fractional digits");
-            place_ratio(fi, v, den, Round::HalfAwayFromZero)
-        }
+        None => match 10i128.checked_pow(u32::from(s - scale)) {
+            Some(den) => place_ratio(fi, v, den, Round::HalfAwayFromZero),
+            // `|v| < 10^39 <= den`: strictly inside (-0.5, 0.5), as ±0.1 is.
+            None => place_ratio(fi, v.signum(), 10, Round::HalfAwayFromZero),
+        },
     }
 }
 

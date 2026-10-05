@@ -5,7 +5,7 @@
 //! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
 //! projection expression it emits.
 
-use crate::codec::literal::{assign, invalid_literal, place, Compared, Placed};
+use crate::codec::literal::{assign, float_value, invalid_literal, place, Compared, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
     bin_types, blend_type, check_decimal_scale, operand_ty_pair, operand_tys, range_step, reads_unsigned, BExpr, BinOp,
@@ -171,17 +171,15 @@ impl Lowering<'_> {
             (BoundExpr::LitNull, _) => return Ok(self.eb.emit(L::LoadNull)),
             (BoundExpr::LitStr(_), RegClass::Dec(_)) => Some(to),
             (_, RegClass::Dec(_)) if e.decimal_literal().is_some() => Some(to),
-            (
-                BoundExpr::LitInt(_)
-                | BoundExpr::LitWide(_)
-                | BoundExpr::LitFloat { .. }
-                | BoundExpr::LitTemporal { .. },
-                RegClass::Float,
-            ) => Some(ColType::of(TypeCode::F64)),
+            // A computed float is whatever binary64 makes of the literal, an
+            // infinity included: only a stored cell refuses one.
+            (_, RegClass::Float) => match float_value(e) {
+                Some(v) => return Ok(self.eb.const_f64(v)),
+                None => None,
+            },
             _ => None,
         };
         if let Some(ty) = constant {
-            // Either image is 8 bytes: a DECIMAL's `i64`, an f64's bits.
             let val = FixedInt::I64.unpack(assign(e, ty).map_err(GnitzSqlError::Rejected)?);
             return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
         }

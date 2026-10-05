@@ -517,9 +517,8 @@ pub enum LogicalInstr {
         a: Reg,
         fi: FixedInt,
     },
-    /// Round through f32 precision. NULL iff the source is finite and the
-    /// rounded result is not; NaN and ±∞ pass through (both representable), as
-    /// does underflow to ±0.
+    /// [`gnitz_wire::narrow_f32`], NULL where that has no value: NaN and ±∞ pass
+    /// through, as does underflow to ±0.
     FloatToF32 {
         a: Reg,
     },

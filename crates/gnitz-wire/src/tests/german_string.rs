@@ -241,3 +241,10 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
         }
     }
 }
+
+#[test]
+fn the_empty_string_is_the_zero_cell() {
+    let mut blob = Vec::new();
+    assert_eq!(encode_german_string(&[], &mut blob), [0u8; 16]);
+    assert!(blob.is_empty());
+}
