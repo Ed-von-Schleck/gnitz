@@ -394,6 +394,31 @@ fn a_store_held_in_ram_never_spills() {
     assert_eq!(t.full_scan().len(), 200, "every row held in RAM");
 }
 
+/// A seal folds its delta into the memtable unless the delta is a small
+/// fraction of it; either way the delta it answers and the rows it holds are
+/// the pushes'.
+#[test]
+fn a_seal_folds_the_memtable_only_for_a_sizable_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
+    let mut pushed = Vec::new();
+    let mut seal = |t: &mut Table, keys: std::ops::Range<u64>| {
+        let batch = rows(&keys.map(|k| (k, 1, 0)).collect::<Vec<_>>());
+        t.ingest_pending(batch.clone());
+        let delta = t.seal().unwrap().expect("rows were pending");
+        assert_eq!(zset_of(&delta, &schema), zset_of(&batch, &schema), "the delta");
+        pushed.push(batch);
+        assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
+    };
+    let held = 4 * SEAL_FOLD_RATIO as u64;
+    seal(&mut t, 0..held);
+    seal(&mut t, held..held + 1);
+    assert_eq!(t.memtable.len(), 2, "a one-row delta stays a run of its own");
+    seal(&mut t, held + 1..2 * held);
+    assert_eq!(t.memtable.len(), 1, "a delta as long as the memtable folds it");
+}
+
 /// A seal that moves pending shards into L0 runs the disk tier's upkeep,
 /// whether or not its delta also overflows the memtable.
 #[test]
