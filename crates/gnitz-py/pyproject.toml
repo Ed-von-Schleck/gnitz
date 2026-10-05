@@ -5,11 +5,24 @@ build-backend = "maturin"
 [project]
 name             = "gnitz"
 version          = "0.1.0"
+description      = "Client for Gnitz, a SQL database whose views are all materialized and incrementally updated"
+readme           = "README.md"
 requires-python  = ">=3.14"
+license          = "MIT OR Apache-2.0"
+license-files    = ["LICENSE-APACHE", "LICENSE-MIT"]
+authors          = [{ name = "Christian Schramm" }]
+keywords         = ["database", "sql", "dbsp", "incremental", "materialized-views"]
 classifiers      = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
 ]
+
+[project.urls]
+Repository = "https://github.com/Ed-von-Schleck/gnitz"
 
 [project.optional-dependencies]
 dev = [
@@ -32,3 +45,4 @@ tmp_path_retention_policy = "failed"
 features       = ["pyo3/extension-module"]
 module-name    = "gnitz._native"
 python-source  = "python"
+exclude        = ["**/__pycache__/**"]
