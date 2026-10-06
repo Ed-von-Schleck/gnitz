@@ -22,10 +22,10 @@ use gnitz_wire::sys_rows::{
 };
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
-use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{Circuit, ComputeMap, Cut, KeyRange, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    PkColList, PkListRole, TableProps, ViewProps, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
-    TABLE_TAB, VIEW_TAB,
+    PkColList, PkListRole, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -135,6 +135,28 @@ impl DdlBundle {
     fn put<R: SysRow>(&mut self, row: &R, weight: i64) {
         row.write(&mut BatchAppender::new(self.batch(R::FAMILY)), weight);
     }
+
+    /// Whether `other` holds the same live rows, family for family.
+    fn same_rows(&self, other: &DdlBundle) -> bool {
+        // A German cell's offset is relative to the arena of the batch it sits
+        // in, so each side is copied onto an arena laid out in key order.
+        fn in_key_order(family: u64, rows: &ZSetBatch) -> ZSetBatch {
+            let mut live: Vec<usize> = rows.live_rows().collect();
+            live.sort_unstable_by_key(|&i| rows.pks.get_bytes(i));
+            let mut out = ZSetBatch::new(sys_schema(family));
+            for i in live {
+                out.copy_row_at(rows, i, rows.weights[i]);
+            }
+            out
+        }
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(family, rows)| {
+                other
+                    .0
+                    .iter()
+                    .any(|(f, theirs)| f == family && in_key_order(*family, rows) == in_key_order(*family, theirs))
+            })
+    }
 }
 
 /// Upper bound on the segments in one atomic view chain — a bound on the DDL
@@ -152,12 +174,20 @@ fn segment_name(vid: u64) -> String {
 }
 
 /// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
-/// `segments[j]`. Symbolic ids start at [`gnitz_wire::CATALOG_ID_CEILING`], which
-/// no durable relation id reaches, so `create_view_chain` tells them apart from
-/// real relation ids and substitutes the id it allocated — a bundle reaches no
-/// server while it is built.
+/// `segments[j]`. No durable relation id reaches
+/// [`gnitz_wire::CATALOG_ID_CEILING`], so it is no relation's own.
 pub fn segment_id(j: u64) -> u64 {
     gnitz_wire::CATALOG_ID_CEILING + j
+}
+
+/// The relation `source` names in a chain whose first member stands at `base`.
+/// A [`segment_id`] past the chain's end becomes an id no lower than the user-named
+/// view's own, which the engine refuses.
+fn source_at(source: u64, base: u64) -> u64 {
+    match source.checked_sub(gnitz_wire::CATALOG_ID_CEILING) {
+        Some(j) => base + j,
+        None => source,
+    }
 }
 
 /// One view in a [`ViewBundle`].
@@ -174,6 +204,47 @@ pub struct PlannedView {
 pub struct ViewBundle {
     pub segments: Vec<PlannedView>,
     pub view: PlannedView,
+}
+
+impl ViewBundle {
+    /// The chain's catalog rows at `+1`, its first member standing at `base`:
+    /// each segment named by [`segment_name`] and owned by the user-named view,
+    /// which stands last under `view_name` and `props`. Every schema has passed
+    /// [`Schema::validate`].
+    fn put_rows(&self, b: &mut DdlBundle, view_name: &str, props: ViewProps, schema_id: u64, base: u64) {
+        let owner_vid = base + self.segments.len() as u64;
+        for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
+            let mut circuit = pv.circuit.clone();
+            for src in circuit.sources_mut() {
+                *src = source_at(*src, base);
+            }
+            let (name, owner_view_id, props) = if vid == owner_vid {
+                (view_name.to_string(), 0, props)
+            } else {
+                (segment_name(vid), owner_vid, ViewProps::default())
+            };
+
+            // A foreign key constrains a base table, not a view.
+            append_col_rows(b, vid, &pv.schema.columns, &[]);
+            let circuit = circuit.encode();
+            b.put(&CircuitRow { view_id: vid, circuit: &circuit }, 1);
+            let (capacity_bytes, delta_bytes) = props.row_words();
+            // The VIEW_TAB register hook triggers server-side compilation.
+            b.put(
+                &ViewTabRow {
+                    view_id: vid,
+                    schema_id,
+                    name: &name,
+                    pk_col_idx: PkColList::from_slice(&pv.schema.pk_cols).pack(),
+                    capacity_bytes,
+                    delta_bytes,
+                    owner_view_id,
+                    pk_repeats: pv.pk_repeats as u64,
+                },
+                1,
+            );
+        }
+    }
 }
 
 impl From<PlannedView> for ViewBundle {
@@ -1136,11 +1207,9 @@ impl GnitzClient {
         self.create_view_chain(view, planned.into(), props, None).await
     }
 
-    /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.
-    /// `bundle.view` takes `view`'s name and `props`; each segment is named by
-    /// [`segment_name`] and owned by it.
-    ///
-    /// `replace` is the id of the view this one supersedes in the same zone.
+    /// Create `bundle` as `view` in one atomic `DDL_TXN` and return its id.
+    /// `replace` is the id of the view it supersedes in the same zone. One that
+    /// already is `bundle` stays under its id, and nothing is written.
     pub async fn create_view_chain(
         &mut self,
         view: &RelName,
@@ -1149,14 +1218,12 @@ impl GnitzClient {
         replace: Option<u64>,
     ) -> Result<u64, ClientError> {
         let view_name = view.name();
-        // Reject a malformed chain before any allocation.
         let n_views = bundle.segments.len() + 1;
         if n_views > MAX_CHAIN_SEGMENTS {
             return Err(ClientError::from(format!(
                 "view chain has {n_views} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
             )));
         }
-
         // Before any allocation, so a bad schema leaves no residue and never
         // reaches `PkColList::from_slice`, which panics on one.
         for (k, pv) in bundle.segments.iter().chain([&bundle.view]).enumerate() {
@@ -1164,77 +1231,54 @@ impl GnitzClient {
                 .validate()
                 .map_err(|e| ClientError::from(format!("View '{view_name}' segment {k}: {e}")))?;
         }
+        let n_segments = bundle.segments.len() as u64;
 
-        // Only the user-named view: the engine cascades its segments.
-        let replaced = match replace {
-            Some(vid) => Some(
-                self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", view))
-                    .await?,
-            ),
-            None => None,
-        };
-        let schema_id = match &replaced {
-            Some((row, i)) => payload_u64(row, *i, RELTAB_PAY_SCHEMA_ID),
+        let mut b = DdlBundle::default();
+        let schema_id = match replace {
+            Some(vid) => {
+                // Where `bundle` stands if it is the chain under `vid`: one
+                // allocation holds a chain, the user-named view last.
+                let base = vid.saturating_sub(n_segments);
+                let members = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
+                    PkColList::from_slice(&[0]),
+                    &[],
+                    Cut::before(base as u128),
+                    Cut::after(vid as u128),
+                )));
+                // One round trip: every family's read is sent before the first is awaited.
+                let reads = [VIEW_TAB, COL_TAB, CIRCUIT_TAB]
+                    .map(|family| (family, self.scan_spec(family, &members, sys_schema(family)).detach()));
+                let mut standing = DdlBundle::default();
+                for (family, read) in reads {
+                    standing.0.push((family, self.wait(read).await?.batch));
+                }
+                let views = &standing.0[0].1;
+                let i = views
+                    .live_rows()
+                    .find(|&i| views.pks.get(i) as u64 == vid)
+                    .ok_or_else(|| not_found("view", view))?;
+                let schema_id = payload_u64(views, i, RELTAB_PAY_SCHEMA_ID);
+
+                let mut want = DdlBundle::default();
+                bundle.put_rows(&mut want, view_name, props, schema_id, base);
+                if want.same_rows(&standing) {
+                    return Ok(vid);
+                }
+                // Only the user-named view, ahead of the new chain's `+1`s: the
+                // engine cascades its segments.
+                b.batch(VIEW_TAB).copy_row_at(views, i, -1);
+                schema_id
+            }
             None => {
                 let (schemas, at) = self.lookup_schema(view.schema()).await?;
                 schemas.pks.get(at) as u64
             }
         };
 
-        // The whole bundle is assigned in one allocation before any substitution
-        // runs, because a downstream segment's `ScanDelta` names an upstream
-        // segment by its position.
         let base = self.alloc_ids(n_views as u64).await?;
-        // The user-named view takes the id after every segment's, and every
-        // segment names it as owner.
-        let owner_vid = base + bundle.segments.len() as u64;
-
-        let mut b = DdlBundle::default();
-        // The replaced view's retraction, ahead of the new chain's `+1`s.
-        if let Some((scanned, i)) = &replaced {
-            b.batch(VIEW_TAB).copy_row_at(scanned, *i, -1);
-        }
-
-        let ViewBundle { segments, view } = bundle;
-        let views = segments.into_iter().map(|pv| (pv, false)).chain([(view, true)]);
-        for ((mut pv, is_view), vid) in views.zip(base..) {
-            // Substitute the bundle's symbolic ids. `base` is below the ceiling,
-            // so this cannot overflow; a forward or out-of-range tag becomes an
-            // id no lower than the view's own, which the engine refuses.
-            for src in pv.circuit.sources_mut() {
-                if *src >= gnitz_wire::CATALOG_ID_CEILING {
-                    *src = base + (*src - gnitz_wire::CATALOG_ID_CEILING);
-                }
-            }
-            let (name, owner_view_id, row_props) = if is_view {
-                (view_name.to_string(), 0, props)
-            } else {
-                (segment_name(vid), owner_vid, ViewProps::default())
-            };
-
-            // A foreign key constrains a base table, not a view.
-            append_col_rows(&mut b, vid, &pv.schema.columns, &[]);
-            let circuit = pv.circuit.encode();
-            b.put(&CircuitRow { view_id: vid, circuit: &circuit }, 1);
-            let (capacity_bytes, delta_bytes) = row_props.row_words();
-            // The VIEW_TAB register hook triggers server-side compilation.
-            b.put(
-                &ViewTabRow {
-                    view_id: vid,
-                    schema_id,
-                    name: &name,
-                    pk_col_idx: PkColList::from_slice(&pv.schema.pk_cols).pack(),
-                    capacity_bytes,
-                    delta_bytes,
-                    owner_view_id,
-                    pk_repeats: pv.pk_repeats as u64,
-                },
-                1,
-            );
-        }
-
+        bundle.put_rows(&mut b, view_name, props, schema_id, base);
         self.commit_ddl(b).await?;
-        Ok(owner_vid)
+        Ok(base + n_segments)
     }
 
     /// Drop views as one DDL zone; the engine cascades each one's hidden segments

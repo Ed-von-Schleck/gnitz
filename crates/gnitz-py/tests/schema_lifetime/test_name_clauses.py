@@ -2,10 +2,9 @@
 taken: `IF NOT EXISTS` and `IF EXISTS` across tables, views and indexes, and
 `CREATE OR REPLACE VIEW` over a free name.
 
-Every one of these is a NAME test — a view's catalog rows are its compiled
-circuit, never its text — so a *different* body under a taken name is skipped
-rather than compiled, and a name held by the wrong kind of relation still ends
-the statement.
+`IF NOT EXISTS` and `IF EXISTS` test the NAME: a *different* body under a taken
+name is skipped rather than compiled, and a name held by the wrong kind of
+relation still ends the statement.
 """
 
 import gnitz
@@ -64,3 +63,4 @@ def test_if_exists_answers_only_no_such_object(client, base):
     for name in ("v1", "v2", "t"):
         with pytest.raises(gnitz.GnitzNotFoundError):
             client.resolve_table(name)
+

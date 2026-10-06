@@ -259,8 +259,9 @@ def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
         client.execute_sql("DROP VIEW f")
         mk_feed(client, "f", LINEAR)
     else:
+        # A changed body: a replace by the standing definition keeps the view.
         client.execute_sql(
-            f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR}"
+            f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR} AND v > 0"
         )
     client.execute_sql("INSERT INTO t VALUES (2, 200, 'b')")
 

@@ -124,7 +124,7 @@ pub(crate) struct PlannedChain {
     pub(crate) name: RelName,
     pub(crate) bundle: ViewBundle,
     pub(crate) props: ViewProps,
-    /// The id of the view this chain replaces, retracted in the same bundle.
+    /// The id of the view this chain supersedes.
     pub(crate) replacing: Option<u64>,
 }
 
@@ -134,7 +134,7 @@ pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Opt
     let named = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
     let view_name = &named.rel;
 
-    // Each clause tests the name alone: a view's catalog rows hold its circuit, not its text.
+    // Each clause tests the name alone.
     let replacing = if cv.if_not_exists {
         // Any relation under the name ends the statement, whatever its kind.
         if cat.probe(view_name)?.is_some() {
@@ -166,8 +166,8 @@ pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Opt
     }))
 }
 
-/// Plan an `ALTER VIEW <name> [(columns)] AS <query>`: the chain that replaces the
-/// view under a fresh id.
+/// Plan an `ALTER VIEW <name> [(columns)] AS <query>`: the chain that supersedes
+/// the view.
 pub(crate) fn plan_alter_view(
     name: &ObjectName,
     columns: &[Ident],

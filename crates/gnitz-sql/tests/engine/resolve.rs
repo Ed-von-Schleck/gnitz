@@ -192,14 +192,28 @@ fn a_statement_resolves_each_relation_once() {
             "resolve, two reads",
         ),
         ("ALTER TABLE t RENAME TO u", 3, "resolve, seek, push"),
-        ("ALTER VIEW v AS SELECT id FROM u", 5, "two resolves, seek, alloc, push"),
+        (
+            "ALTER VIEW v AS SELECT id FROM u",
+            7,
+            "two resolves, one read per catalog family, alloc, push",
+        ),
         (
             "CREATE OR REPLACE VIEW v AS SELECT id, x FROM u",
-            5,
-            "two resolves, seek, alloc, push",
+            7,
+            "two resolves, one read per catalog family, alloc, push",
         ),
         ("SELECT * FROM u", 2, "resolve, read"),
         ("SELECT * FROM u", 1, "read"),
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT id, x FROM u",
+            5,
+            "two resolves, one read per catalog family: the definition stands",
+        ),
+        (
+            "SELECT * FROM u",
+            1,
+            "read: a replace that wrote nothing drops no descriptor",
+        ),
     ] {
         assert_eq!(cost(&mut db, sql), want, "`{sql}`: {what}");
     }
