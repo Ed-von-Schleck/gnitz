@@ -75,7 +75,7 @@ fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::AlterTable) -> R
     Ok(())
 }
 
-pub(crate) fn execute_alter_table(
+pub(crate) async fn execute_alter_table(
     client: &mut GnitzClient,
     schema_name: &str,
     alter: &AlterTable,
@@ -90,7 +90,7 @@ pub(crate) fn execute_alter_table(
     let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
     let (ctx, action) = parse(operation, schema_name)?;
 
-    let Some(rel) = client.resolve(schema_name, &source_name)? else {
+    let Some(rel) = client.resolve(schema_name, &source_name).await? else {
         return if alter.if_exists {
             Ok(SqlResult::Ddl)
         } else {
@@ -105,12 +105,16 @@ pub(crate) fn execute_alter_table(
 
     let cols = &rel.schema.columns;
     match action {
-        Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name)?,
-        Action::RenameColumn { old, new } => client.alter_rename_column(rel.tid, require_column(cols, old)?, new)?,
-        Action::AddColumn(def) => client.alter_add_column(&rel, &def)?,
+        Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name).await?,
+        Action::RenameColumn { old, new } => {
+            client
+                .alter_rename_column(rel.tid, require_column(cols, old)?, new)
+                .await?
+        }
+        Action::AddColumn(def) => client.alter_add_column(&rel, &def).await?,
         Action::DropColumn { name, if_exists: true } if find_unique_column(cols, name)?.is_none() => {}
-        Action::DropColumn { name, .. } => client.alter_drop_column(rel.tid, require_column(cols, name)?)?,
-        Action::DropNotNull { name } => client.alter_drop_not_null(rel.tid, require_column(cols, name)?)?,
+        Action::DropColumn { name, .. } => client.alter_drop_column(rel.tid, require_column(cols, name)?).await?,
+        Action::DropNotNull { name } => client.alter_drop_not_null(rel.tid, require_column(cols, name)?).await?,
         Action::AddUnique { columns, explicit_name } => {
             return super::table::create_index_core(
                 client,
@@ -122,9 +126,10 @@ pub(crate) fn execute_alter_table(
                     explicit_name,
                     site: super::table::IndexSite::AddConstraint,
                 },
-            );
+            )
+            .await;
         }
-        Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, name, if_exists)?,
+        Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, name, if_exists).await?,
     }
     Ok(SqlResult::Ddl)
 }

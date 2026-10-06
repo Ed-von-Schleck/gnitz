@@ -1,5 +1,6 @@
 //! Fixtures shared by the mirror's integration tests.
 
+use gnitz_core::block_on;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -11,13 +12,13 @@ pub mod common;
 
 /// Run `sql` for effect, panicking with the statement on failure.
 pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
-    gnitz_sql::execute(client, schema, statements).unwrap_or_else(|e| panic!("{statements}: {e}"));
+    block_on(gnitz_sql::execute(client, schema, statements)).unwrap_or_else(|e| panic!("{statements}: {e}"));
 }
 
 /// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
 /// valid copy of the relation answers off it.
 pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> Reply {
-    let mut results = gnitz_sql::execute(client, schema, s).unwrap_or_else(|e| panic!("{s}: {e}"));
+    let mut results = block_on(gnitz_sql::execute(client, schema, s)).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
         SqlResult::Rows { schema, batch, .. } => (schema, batch),

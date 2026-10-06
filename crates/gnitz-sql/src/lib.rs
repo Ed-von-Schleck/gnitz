@@ -66,13 +66,13 @@ pub enum SqlResult {
 /// Parse `sql` and run each statement, one `SqlResult` per statement. A `SELECT`
 /// (and its `EXPLAIN`) over a relation the client's local copy holds is answered
 /// off that copy; everything else runs on the connection.
-pub fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
+pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
     let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let mut results = Vec::with_capacity(stmts.len());
     // One begun by an earlier call is the caller's to end.
     let mut began_here = false;
     for stmt in &stmts {
-        match dispatch::execute_statement(client, schema_name, stmt) {
+        match dispatch::execute_statement(client, schema_name, stmt).await {
             Ok(r) => {
                 began_here |= matches!(r, SqlResult::TransactionStarted);
                 results.push(r);
@@ -87,3 +87,10 @@ pub fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result
     }
     Ok(results)
 }
+
+// A host spawns a statement onto a multi-thread runtime, or runs it with the
+// GIL released; both need its future `Send`.
+const _: fn() = || {
+    fn assert_send_value<T: Send>(_: T) {}
+    let _ = |client: &mut GnitzClient| assert_send_value(execute(client, "", ""));
+};

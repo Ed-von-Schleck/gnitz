@@ -59,22 +59,20 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
     assert!(rejected(rename(&["x", "X"])).contains("duplicate column name 'X'"));
 }
 
-/// A name is asked once per statement, whatever its case and whether or not
-/// it exists.
+/// An attempt stops at a name without a verdict and names it; with the
+/// verdict supplied — absence is one — the name is settled, whatever its case.
 #[test]
-fn the_catalog_asks_the_resolver_once_per_name() {
-    let asked = RefCell::new(Vec::new());
-    let resolve = |name: &str| {
-        asked.borrow_mut().push(name.to_string());
-        Ok(None)
+fn an_attempt_names_the_relation_it_misses() {
+    let cat = Catalog::new("s");
+    let plan = |cat: &Catalog<'_>| cat.probe("T");
+    assert!(matches!(cat.attempt(plan), Attempt::Missing(name) if name == "T"));
+    cat.insert("T", None);
+    assert!(matches!(cat.attempt(plan), Attempt::Planned(Ok(None))));
+    let Attempt::Planned(Err(err)) = cat.attempt(|cat| cat.probe_relation("t")) else {
+        panic!("the lower-case spelling is the same name");
     };
-    let cat = Catalog::new("s", &resolve);
-    assert!(cat.probe("T").unwrap().is_none());
-    assert!(cat.probe("t").unwrap().is_none());
-    let err = cat.probe_relation("t").unwrap_err();
     assert_eq!(
         format!("{err:?}"),
         format!("{:?}", crate::error::missing_relation("s", "t"))
     );
-    assert_eq!(*asked.borrow(), ["T"]);
 }

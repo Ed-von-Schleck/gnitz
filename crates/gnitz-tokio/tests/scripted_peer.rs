@@ -41,9 +41,14 @@ const ROW_BYTES: usize = 24;
 /// Rows whose push no socket buffer holds.
 const BIG: usize = 200_000;
 
-/// A read of every row of `tid`.
+/// A read of every row of `tid`, submitted when called.
 fn scan(c: &AsyncClient, tid: u64) -> impl Future<Output = Result<ScanReply, ClientError>> {
-    c.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema())
+    c.send(move |c| c.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema()))
+}
+
+/// A push of `batch` to `tid`, submitted when called.
+fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> impl Future<Output = Result<u64, ClientError>> {
+    c.send(move |c| c.push(tid, &schema(), batch, WireConflictMode::Update))
 }
 
 /// A client connected to a peer that has answered its HELLO, and the peer's end.
@@ -152,8 +157,8 @@ fn a_submit_flushes_while_a_reply_is_outstanding() {
     assert_eq!(settled(&rt, second).unwrap().lsn, Some(22));
 }
 
-/// Past either cap a verb waits; the spine's own refusal at the cap never
-/// reaches one.
+/// Past either cap a verb waits for room; the client's own refusal at the cap
+/// never reaches one.
 #[test]
 fn past_a_cap_a_verb_waits() {
     // Every push is submitted before the peer reads a byte: one-row pushes past
@@ -164,12 +169,9 @@ fn past_a_cap_a_verb_waits() {
         let (client, conn, mut peer) = connect_to_peer(&rt);
         rt.spawn(conn);
 
-        let schema = schema();
-        let batch = batch(&schema, rows);
+        let batch = batch(&schema(), rows);
         let pushes = pushes as u64;
-        let verbs: Vec<_> = (1..=pushes)
-            .map(|tid| client.push(tid, &schema, &batch, WireConflictMode::Update))
-            .collect();
+        let verbs: Vec<_> = (1..=pushes).map(|tid| push(&client, tid, batch.clone())).collect();
         // As many as may be in flight arrive and go unanswered, which is what
         // holds the rest back; they follow as the answers free slots.
         let held = pushes.min(MAX_IN_FLIGHT as u64);
@@ -188,7 +190,7 @@ fn past_a_cap_a_verb_waits() {
     }
 }
 
-/// A request the spine refuses fails that verb alone: it reaches no wire, and
+/// A request the client refuses fails that verb alone: it reaches no wire, and
 /// the verb behind it still gets its own reply.
 #[test]
 fn a_refused_verb_reaches_no_wire() {
@@ -196,10 +198,9 @@ fn a_refused_verb_reaches_no_wire() {
     let (client, conn, mut peer) = connect_to_peer(&rt);
     rt.spawn(conn);
 
-    let schema = schema();
-    let mut keyless = ZSetBatch::new(&schema);
+    let mut keyless = ZSetBatch::new(&schema());
     keyless.weights.push(1);
-    let refused = settled(&rt, client.push(1, &schema, &keyless, WireConflictMode::Update));
+    let refused = settled(&rt, push(&client, 1, keyless));
     assert!(matches!(refused, Err(ClientError::Refused(_))), "{refused:?}");
 
     let next = scan(&client, 2);
@@ -312,8 +313,7 @@ fn a_waiting_driver_is_not_polled() {
 
     // To a peer that reads no further than the length prefix: the socket takes
     // what it buffers and refuses the rest.
-    let schema = schema();
-    let stuck = client.push(3, &schema, &batch(&schema, BIG), WireConflictMode::Update);
+    let stuck = push(&client, 3, batch(&schema(), BIG));
     let len = read_len(&mut peer);
     assert_waiting("bytes the socket refused");
     assert!(unread(&peer, len) < len, "the socket took the whole push");

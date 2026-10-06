@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_core::block_on;
 
 use std::hint::black_box;
 
@@ -37,15 +38,15 @@ fn mirror_call_cost_bench() {
     churn(&mut fx.direct, 1, 2_000);
     fx.tick("s", &["v_keyed"]);
     cell("bootstrap", 1, fx.mirror(), |m| {
-        m.mirror_view("s", "v_keyed").expect("mirror");
+        block_on(m.mirror_view("s", "v_keyed")).expect("mirror");
     });
     churn(&mut fx.direct, 2_001, 4_000);
     fx.tick("s", &["v_keyed"]);
     cell("poll carrying a round", 1, fx.mirror(), |m| {
-        m.poll_mirror().expect("poll");
+        block_on(m.poll_mirror()).expect("poll");
     });
 
-    let rel = fx.mirror().resolve_relation("s", "v_keyed").expect("resolve");
+    let rel = block_on(fx.mirror().resolve_relation("s", "v_keyed")).expect("resolve");
     let image = |v: i64| key_image(TypeCode::I64, v as u128);
     let point: Vec<u8> = [977, 977 % 7]
         .iter()
@@ -65,23 +66,23 @@ fn mirror_call_cost_bench() {
     .map(|(label, bound, rows)| (label, ReadSpec::all_rows(bound), rows));
 
     for (label, spec, rows) in &reads {
-        let served = fx.direct.scan_spec(&*rel, spec, &rel.schema).expect("served read");
+        let served = block_on(fx.direct.scan_spec(&*rel, spec, &rel.schema)).expect("served read");
         assert_eq!(
             served.batch.weights.len(),
             *rows,
             "{label}: the bound walks what its label says"
         );
         cell(&format!("served {label}, {rows} rows"), CALLS, &mut fx.direct, |c| {
-            black_box(c.scan_spec(&*rel, spec, &rel.schema).expect("served read"));
+            black_box(block_on(c.scan_spec(&*rel, spec, &rel.schema)).expect("served read"));
         });
     }
     for tier in ["RAM tier", "shards"] {
         if tier == "shards" {
-            fx.mirror().checkpoint_mirror().expect("checkpoint");
+            block_on(fx.mirror().checkpoint_mirror()).expect("checkpoint");
         }
         for (label, spec, rows) in &reads {
             cell(&format!("local {label}, {tier}"), CALLS, fx.mirror(), |m| {
-                let local = m.scan_spec_local_first(&*rel, spec.clone(), &rel.schema);
+                let local = block_on(m.scan_spec_local_first(&*rel, spec.clone(), &rel.schema));
                 assert_eq!(black_box(local.expect("local read")).batch.weights.len(), *rows);
             });
         }
@@ -93,7 +94,7 @@ fn mirror_call_cost_bench() {
         fx.many_views(prefix, more, "a, b, v");
         let views = fx.mirror().mirrored_ids().len();
         cell(&format!("idle poll, {views} views"), CALLS, fx.mirror(), |m| {
-            m.poll_mirror().expect("poll");
+            block_on(m.poll_mirror()).expect("poll");
         });
     }
 }
@@ -116,7 +117,7 @@ fn resident_footprint_bench() {
         "s",
         "CREATE TABLE big (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
     );
-    let big = fx.direct.resolve_relation("s", "big").expect("resolve");
+    let big = block_on(fx.direct.resolve_relation("s", "big")).expect("resolve");
     for lo in (0..ROWS).step_by(SLICE as usize) {
         let mut batch = gnitz_core::ZSetBatch::new(&big.schema);
         let mut rows = gnitz_core::BatchAppender::new(&mut batch);
@@ -124,9 +125,11 @@ fn resident_footprint_bench() {
             // Distinct per row, or a shard stores the column as one value.
             rows.add_row(id, 1).str_val(&format!("{id:0>200}"));
         }
-        fx.direct
-            .push(big.tid, &big.schema, &batch, gnitz_wire::WireConflictMode::Update)
-            .expect("push");
+        block_on(
+            fx.direct
+                .push(big.tid, &big.schema, &batch, gnitz_wire::WireConflictMode::Update),
+        )
+        .expect("push");
     }
     fed_view(&mut fx.direct, "s", "v_big", "SELECT id, body FROM big WHERE id >= 0");
 
@@ -142,9 +145,9 @@ fn resident_footprint_bench() {
 
     let base = perf::rss_bytes();
     perf::reset_peak_rss();
-    mirror.mirror_view("s", "v_big").expect("mirror");
+    block_on(mirror.mirror_view("s", "v_big")).expect("mirror");
     let peak = perf::peak_rss_bytes();
-    mirror.checkpoint_mirror().expect("checkpoint");
+    block_on(mirror.checkpoint_mirror()).expect("checkpoint");
     let held = perf::rss_bytes();
 
     print!(

@@ -10,7 +10,9 @@
 mod resolve;
 pub(crate) mod structural;
 
-pub(crate) use resolve::{apply_positional_aliases, find_unique_column, output_column, require_column, Catalog};
+pub(crate) use resolve::{
+    apply_positional_aliases, find_unique_column, output_column, require_column, Attempt, Catalog,
+};
 pub(crate) use structural::{
     bind_conjuncts, bind_single_table, bind_structural, reject_foreign_qualifier, single_relation_col_idx, LeafBinder,
     SingleTable,

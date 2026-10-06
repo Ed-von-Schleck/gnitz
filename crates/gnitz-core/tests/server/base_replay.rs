@@ -2,6 +2,7 @@
 //! shards carry.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_core::PkColumn;
 
 const WORKERS: usize = 2;
@@ -22,9 +23,7 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
         .collect();
     let push_each = |client: &mut GnitzClient, keys: &[u64]| {
         for &k in keys {
-            client
-                .push(tid, &schema, rows(&schema, [k]), WireConflictMode::Update)
-                .unwrap();
+            block_on(client.push(tid, &schema, rows(&schema, [k]), WireConflictMode::Update)).unwrap();
         }
     };
 

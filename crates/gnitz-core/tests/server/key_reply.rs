@@ -9,6 +9,7 @@
 //! non-adjacent compound PK whose OPK sign flip must survive.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_core::key_reply;
 use gnitz_expr::SchemaFacts;
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
@@ -32,8 +33,7 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
     assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
     let spec = ReadSpec { bound: ReadBound::None, predicate, sink };
-    let reply = client
-        .scan_spec(tid, &spec, &reply_schema)
+    let reply = block_on(client.scan_spec(tid, &spec, &reply_schema))
         .expect("a PK-only reply must not be rejected")
         .batch;
     assert!(reply.payload.is_empty() && reply.blob.is_empty());
@@ -61,7 +61,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     for i in 1u64..=200 {
         app.add_row(i as u128, 1).i64_val(i as i64).str_val(&"x".repeat(300));
     }
-    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
+    block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
     let (_, reply) = read_keys(&mut client, tid, &schema, gt_predicate(1, 150));
     let mut got: Vec<u64> = (0..reply.len()).map(|i| reply.pks.get(i) as u64).collect();
@@ -96,7 +96,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
             .str_val("payload")
             .i64_val(c2);
     }
-    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
+    block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
     // c2 > 15 → every row but the first
     let (_, reply) = read_keys(&mut client, tid, &schema, gt_predicate(2, 15));

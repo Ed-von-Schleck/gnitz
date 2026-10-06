@@ -14,15 +14,16 @@ mod protocol;
 mod test_support;
 
 pub use client::{
-    key_reply, not_found, qualified_name, retraction_batch, segment_id, FkTarget, GnitzClient, Held, IndexRow,
-    InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
+    block_on, key_reply, not_found, qualified_name, retraction_batch, segment_id, serve, BlockingHost, FkTarget,
+    GnitzClient, Held, Host, IndexRow, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, ViewBundle,
+    MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
-    Completions, DeltaCursor, Encoded, Interest, RelDescriptor, Reply, Request, ScanReply, Session, SlotId, Target,
-    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    DeltaCursor, Interest, RelDescriptor, Reply, Request, ScanReply, Sent, Session, Target, MAX_IN_FLIGHT,
+    MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
-pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Refill};
+pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::error::ProtocolError;
 pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};

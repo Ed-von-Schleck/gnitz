@@ -12,9 +12,7 @@ mod plan_view_rejections;
 mod plan_view_schema;
 mod plan_view_window;
 
-use std::cell::RefCell;
-
-use crate::bind::Catalog;
+use crate::bind::{Attempt, Catalog};
 use crate::ddl::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
@@ -136,17 +134,23 @@ fn count(circuit: &Circuit, pred: impl Fn(&OpNode) -> bool) -> usize {
     circuit.nodes().iter().filter(|n| pred(&n.op)).count()
 }
 
-/// Plan against a catalog that resolves each name out of `known`, recording the
-/// names the planner asked for, in order.
+/// Plan against a catalog supplied each name out of `known` as the plan asks
+/// for it, recording the names asked for, in order.
 fn resolving<T>(
     known: &Catalog<'_>,
-    plan: impl FnOnce(&Catalog<'_>) -> Result<T, GnitzSqlError>,
+    plan: impl Fn(&Catalog<'_>) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, Vec<String>) {
-    let asked = RefCell::new(Vec::new());
-    let ask = |n: &str| {
-        asked.borrow_mut().push(n.to_string());
-        known.probe(n)
-    };
-    let r = plan(&Catalog::new(SN, &ask));
-    (r, asked.into_inner())
+    let cat = Catalog::new(SN);
+    let mut asked = Vec::new();
+    loop {
+        let name = match cat.attempt(&plan) {
+            Attempt::Planned(r) => return (r, asked),
+            Attempt::Missing(name) => name,
+        };
+        cat.insert(
+            &name,
+            known.probe(&name).expect("a complete catalog answers every name"),
+        );
+        asked.push(name);
+    }
 }

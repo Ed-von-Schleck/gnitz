@@ -75,11 +75,9 @@ fn plain(rows: &[(u64, i64, i64)]) -> Vec<u8> {
 
 /// Replace `tid`'s copy with `blocks`, the view's whole value at `cursor`.
 fn seed(store: &mut Mirror, tid: u64, blocks: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError> {
-    let mut refill = store.refill(tid)?;
-    for block in blocks {
-        refill.block(block)?;
-    }
-    refill.seal(cursor)
+    store.refill(tid)?;
+    store.fill(tid, blocks)?;
+    store.seal(tid, cursor)
 }
 
 fn path(dir: &TempDir) -> &str {
@@ -244,10 +242,9 @@ fn a_refill_replaces_the_copy_once_sealed() {
     seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
 
-    let mut refill = store.refill(TID).unwrap();
-    refill.block(&plain(&[(7, 1, 70)])).unwrap();
-    refill.block(&plain(&[(8, 1, 80)])).unwrap();
-    drop(refill);
+    store.refill(TID).unwrap();
+    store.fill(TID, &[&plain(&[(7, 1, 70)])]).unwrap();
+    store.fill(TID, &[&plain(&[(8, 1, 80)])]).unwrap();
     assert_eq!(store.cursor_of(TID), None, "an unsealed refill answers no read");
 
     seed(
@@ -275,13 +272,13 @@ fn a_refill_replaces_the_copy_once_sealed() {
 #[test]
 fn a_failed_block_ends_its_refill() {
     let (mut store, _dir) = registered();
-    let mut refill = store.refill(TID).unwrap();
-    refill.block(&plain(&[(5, 1, 50)])).unwrap();
-    let torn = refill.block(&[0xFF; 64]);
+    store.refill(TID).unwrap();
+    store.fill(TID, &[&plain(&[(5, 1, 50)])]).unwrap();
+    let torn = store.fill(TID, &[&[0xFF; 64]]);
     assert!(matches!(torn, Err(MirrorError::Engine(_))), "{torn:?}");
-    let next = refill.block(&plain(&[(6, 1, 60)]));
+    let next = store.fill(TID, &[&plain(&[(6, 1, 60)])]);
     assert!(matches!(next, Err(MirrorError::Engine(_))), "{next:?}");
-    let sealed = refill.seal(cursor(5));
+    let sealed = store.seal(TID, cursor(5));
     assert!(matches!(sealed, Err(MirrorError::Engine(_))), "{sealed:?}");
     assert_eq!(store.cursor_of(TID), None);
     assert!(store.poisoned().is_none());
@@ -656,7 +653,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
     store.checkpoint().unwrap();
 
     block_copy(path(&dir), TID);
-    let err = store.refill(TID).err().expect("an erase over a blocked copy must fail");
+    let err = store.refill(TID).expect_err("an erase over a blocked copy must fail");
     assert!(matches!(err, MirrorError::Poisoned(_)), "{err}");
     assert!(store.poisoned().is_some());
     assert_eq!(
@@ -754,11 +751,11 @@ fn a_failed_auto_checkpoint_costs_nothing_but_durability() {
     };
     let mut store = Mirror::open(path(&dir), config).unwrap();
     store.register(SCHEMA, "v", &desc(TID)).unwrap();
-    let mut refill = store.refill(TID).unwrap();
+    store.refill(TID).unwrap();
     block_copy(path(&dir), TID);
-    refill.block(&big(0)).unwrap();
-    refill
-        .seal(cursor(4))
+    store.fill(TID, &[&big(0)]).unwrap();
+    store
+        .seal(TID, cursor(4))
         .expect("the threshold drives a checkpoint, and its failure is not the apply's");
     assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
     assert_eq!(

@@ -772,17 +772,19 @@ pub(crate) fn plan_create_table(
 }
 /// Commit a planned `CREATE TABLE`: one bundle carrying the table, its columns
 /// and its inline unique indexes.
-pub(crate) fn execute_create_table(
+pub(crate) async fn execute_create_table(
     client: &mut GnitzClient,
     schema_name: &str,
     plan: TablePlan,
 ) -> Result<SqlResult, GnitzSqlError> {
     let TablePlan { name, schema, fks, props, unique_indexes } = plan;
-    client.create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)?;
+    client
+        .create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)
+        .await?;
     Ok(SqlResult::Ddl)
 }
 
-pub(crate) fn execute_drop(
+pub(crate) async fn execute_drop(
     client: &mut GnitzClient,
     schema_name: &str,
     object_type: &ObjectType,
@@ -807,9 +809,9 @@ pub(crate) fn execute_drop(
     // `IF EXISTS` rides the verb, which resolves its own targets. It softens
     // nothing else: one refusal still fails the whole statement.
     match object_type {
-        ObjectType::View => client.drop_view(schema_name, &targets, if_exists)?,
-        ObjectType::Index => client.drop_indexes_by_name(&targets, if_exists)?,
-        _ => client.drop_table(schema_name, &targets, if_exists)?,
+        ObjectType::View => client.drop_view(schema_name, &targets, if_exists).await?,
+        ObjectType::Index => client.drop_indexes_by_name(&targets, if_exists).await?,
+        _ => client.drop_table(schema_name, &targets, if_exists).await?,
     }
     Ok(SqlResult::Ddl)
 }
@@ -887,7 +889,7 @@ fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Re
     Ok(())
 }
 
-pub(crate) fn execute_create_index(
+pub(crate) async fn execute_create_index(
     client: &mut GnitzClient,
     schema_name: &str,
     ci: &sqlparser::ast::CreateIndex,
@@ -900,7 +902,7 @@ pub(crate) fn execute_create_index(
         .map(|n| extract_index_name(n, "CREATE INDEX"))
         .transpose()?;
     // The one resolve on this path: `create_index_core` takes the descriptor.
-    let target = client.resolve_relation(schema_name, &owner_name)?;
+    let target = client.resolve_relation(schema_name, &owner_name).await?;
     require_class(&target, &owner_name, ClassWant::Indexable, "CREATE INDEX")?;
     create_index_core(
         client,
@@ -916,12 +918,13 @@ pub(crate) fn execute_create_index(
             },
         },
     )
+    .await
 }
 
 /// The shared CREATE INDEX / `ALTER TABLE … ADD CONSTRAINT UNIQUE` core. `target`
 /// is the caller's already-resolved owner, so a statement resolves its name and
 /// asserts the owner class exactly once.
-pub(crate) fn create_index_core(
+pub(crate) async fn create_index_core(
     client: &mut GnitzClient,
     schema_name: &str,
     target: &gnitz_core::RelDescriptor,
@@ -942,14 +945,14 @@ pub(crate) fn create_index_core(
             // Index names are globally unique, so a name already standing — on
             // this relation or any other — means this CREATE would fail; the clause
             // says skip it. Without it the collision errors in `create_index`.
-            if req.site.if_not_exists() && client.index_rows()?.iter().any(|r| r.name == name) {
+            if req.site.if_not_exists() && client.index_rows().await?.iter().any(|r| r.name == name) {
                 return Ok(SqlResult::Ddl);
             }
             name
         }
         None => {
             let base = default_index_name(schema_name, req.owner_name, &col_names);
-            let existing = client.index_rows()?;
+            let existing = client.index_rows().await?;
             let serves_request = |r: &gnitz_core::IndexRow| {
                 r.owner == owner_id && r.cols == cols && (r.is_unique || !req.site.is_unique())
             };
@@ -967,7 +970,9 @@ pub(crate) fn create_index_core(
         }
     };
 
-    client.create_index(owner_id, cols, &index_name, req.site.is_unique())?;
+    client
+        .create_index(owner_id, cols, &index_name, req.site.is_unique())
+        .await?;
     Ok(SqlResult::Ddl)
 }
 

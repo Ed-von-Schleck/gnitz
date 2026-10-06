@@ -134,9 +134,11 @@ fn a_text_table_past_one_frame_reads_back_whole() {
     for id in 0..ROWS {
         app.add_row(id as u128, 1).u64_val(id % GROUPS).str_val(&text);
     }
-    db.client
-        .push(rel.tid, &rel.schema, &batch, gnitz_wire::WireConflictMode::Update)
-        .unwrap();
+    block_on(
+        db.client
+            .push(rel.tid, &rel.schema, &batch, gnitz_wire::WireConflictMode::Update),
+    )
+    .unwrap();
 
     // Checked by content, not by count: each frame's rows are appended into one
     // batch, and the null words and German cells of a frame are indexed by its

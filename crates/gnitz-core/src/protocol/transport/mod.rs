@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -152,11 +152,10 @@ impl ClientTransport {
         }
     }
 
-    /// A `dup` of the underlying stream socket — the AF_UNIX socket, or the
-    /// `TcpStream` under TLS. The copy shares the open file description, so it
-    /// reports the same readiness, and closing it leaves this transport open.
-    pub fn try_clone_fd(&self) -> Result<OwnedFd, ProtocolError> {
-        Ok(self.inner.as_fd().try_clone_to_owned()?)
+    /// The underlying stream socket — the AF_UNIX socket, or the `TcpStream`
+    /// under TLS — for a host to register.
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 
     /// Connect to a `tls://` target, or else to an AF_UNIX socket path, and

@@ -9,8 +9,8 @@ use gnitz_expr::SchemaFacts;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
-use std::os::fd::{OwnedFd, RawFd};
-use std::sync::Arc;
+use std::os::fd::{BorrowedFd, RawFd};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Instant;
 
 use crate::error::ClientError;
@@ -158,11 +158,6 @@ impl Interest {
     }
 }
 
-/// A pending request. Monotonic, never an index into a recycled table: a
-/// driver holding one across an abandonment cannot match a later slot.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SlotId(u64);
-
 /// One request, cut where the encoding or the decoding differs rather than
 /// where the verb names do. It borrows its inputs; the borrow ends at
 /// [`Request::encode`].
@@ -203,10 +198,8 @@ pub enum Request<'a> {
     ScanMulti(Vec<(u64, Arc<Schema>)>),
 }
 
-/// A [`Request`] validated and encoded, with how its reply decodes. Built
-/// without a session, so a driver whose session lives on another task encodes
-/// where the request's borrows do.
-pub struct Encoded {
+/// A request validated and encoded, with how its reply decodes.
+pub(crate) struct Encoded {
     frame: Vec<u8>,
     kind: SlotKind,
 }
@@ -226,24 +219,26 @@ impl Encoded {
         Ok(Encoded { frame, kind })
     }
 
-    /// DELTA_POLL: one train per view, in order, delivered to the [`PollSink`]
-    /// of a [`Session::step_polling`] drain. Not a [`Request`], because a driver
-    /// stepping without a sink drops them.
-    pub(crate) fn delta_poll(views: &[txn_frame::DeltaPollItem]) -> Result<Self, ClientError> {
+    /// DELTA_POLL: one train per view, in order, queued on `feed` under the
+    /// view's index in its poll — `first` for the first of `views`. Not a
+    /// [`Request`], because its results are a stream and not one reply.
+    fn delta_poll(views: &[txn_frame::DeltaPollItem], first: usize, feed: &Arc<PollFeed>) -> Result<Self, ClientError> {
         if views.is_empty() {
             return Err(ClientError::from("a delta poll names no view".to_string()));
         }
         let kind = SlotKind::DeltaPoll {
             views: views.iter().map(|v| v.view_id).collect(),
             at: 0,
+            first,
+            feed: Arc::downgrade(feed),
         };
         Encoded::new(txn_frame::encode_delta_poll(views), kind)
     }
 }
 
 impl Request<'_> {
-    /// Validate and encode, for [`Session::enqueue`].
-    pub fn encode(self) -> Result<Encoded, ClientError> {
+    /// Validate and encode.
+    fn encode(self) -> Result<Encoded, ClientError> {
         let (frame, kind) = match self {
             Request::AllocIds(n) => {
                 let hdr = ControlHeader {
@@ -347,7 +342,7 @@ pub enum Reply {
     /// A RESOLVE: the descriptor, or `None` when no such relation exists.
     Resolve(Option<Arc<RelDescriptor>>),
     /// A delta poll: the slot is done, and every view's blocks and end went to
-    /// the poll's own listener.
+    /// the poll's own feed.
     Polled,
 }
 
@@ -415,8 +410,6 @@ fn wrong_shape(got: &'static str, want: &'static str) -> ! {
     )
 }
 
-pub type Completions = Vec<(SlotId, Result<Reply, ClientError>)>;
-
 /// How a slot decodes its reply, what that reply becomes, and the reply read so
 /// far. A slot is answered only while it heads the queue, so its state is the
 /// one train in progress, and it goes when the slot does.
@@ -446,19 +439,112 @@ enum SlotKind {
     DeltaPoll {
         views: Vec<u64>,
         at: usize,
+        /// The index of `views[0]` in the poll this request is a chunk of.
+        first: usize,
+        /// Dead once the poll's reader is gone, which drops what is left of
+        /// its trains.
+        feed: Weak<PollFeed>,
     },
 }
 
 struct Slot {
-    id: SlotId,
     kind: SlotKind,
+    /// Where the reply goes. A delta poll has none: its results go to its feed.
+    cell: Option<Arc<SentCell>>,
+}
+
+/// Where a request's reply is, between its request and its reader.
+#[derive(Default)]
+enum Awaited {
+    #[default]
+    Outstanding,
+    Arrived(Result<Reply, ClientError>),
+    /// Handed on as it arrives.
+    Routed(Box<dyn FnOnce(Result<Reply, ClientError>) + Send>),
+}
+
+#[derive(Default)]
+struct SentCell(Mutex<Awaited>);
+
+impl SentCell {
+    /// A panic under this lock leaves what it guards whole.
+    fn lock(&self) -> MutexGuard<'_, Awaited> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn arrive(&self, reply: Result<Reply, ClientError>) {
+        let mut state = self.lock();
+        match std::mem::take(&mut *state) {
+            Awaited::Routed(route) => {
+                drop(state);
+                route(reply)
+            }
+            _ => *state = Awaited::Arrived(reply),
+        }
+    }
+
+    fn take(&self) -> Option<Result<Reply, ClientError>> {
+        let mut state = self.lock();
+        match std::mem::take(&mut *state) {
+            Awaited::Arrived(reply) => Some(reply),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    }
+}
+
+/// The reply to a request already submitted, borrowing nothing. Stepping the
+/// session is what makes it arrive:
+/// [`GnitzClient::wait`](crate::GnitzClient::wait) steps until it has.
+pub struct Sent<T>(SentState<T>);
+
+enum SentState<T> {
+    /// Answered without a request.
+    Ready(Option<Result<T, ClientError>>),
+    Waiting(Arc<SentCell>, fn(Reply) -> T),
+}
+
+impl<T> Sent<T> {
+    pub fn ready(value: Result<T, ClientError>) -> Self {
+        Sent(SentState::Ready(Some(value)))
+    }
+
+    /// The reply, if it has arrived. It is handed out once.
+    pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
+        match &mut self.0 {
+            SentState::Ready(value) => value.take(),
+            SentState::Waiting(cell, narrow) => cell.take().map(|r| r.map(*narrow)),
+        }
+    }
+
+    /// Hand the reply to `route` — now if it has arrived, else from inside the
+    /// step that reads it.
+    pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static)
+    where
+        T: 'static,
+    {
+        let (cell, narrow) = match self.0 {
+            SentState::Ready(value) => return route(value.expect("a reply is handed out once")),
+            SentState::Waiting(cell, narrow) => (cell, narrow),
+        };
+        let mut state = cell.lock();
+        match std::mem::take(&mut *state) {
+            Awaited::Arrived(reply) => {
+                drop(state);
+                route(reply.map(narrow))
+            }
+            _ => *state = Awaited::Routed(Box::new(move |reply| route(reply.map(narrow)))),
+        }
+    }
 }
 
 /// How one view's train ends: the cursor its terminal carries, or the fault
 /// that ended its position.
 pub(crate) type PollEnd = Result<DeltaCursor, ClientError>;
 
-/// What a delta poll hands its listener as each frame arrives.
+/// What a delta poll hands its reader as each frame arrives.
 pub(crate) enum Polled {
     /// One data block of the view's train.
     Block(RawBlock),
@@ -466,37 +552,42 @@ pub(crate) enum Polled {
     End(PollEnd),
 }
 
-/// The listener a delta poll's results go to, addressed by the slot that asked
-/// — so a train left behind by an abandoned poll is recognised rather than
-/// matched onto a live view of the same id. Each view of a poll gets exactly
-/// one [`Polled::End`], in request order, however the poll ends.
-pub(crate) type PollSink<'a> = dyn FnMut(SlotId, Polled) + 'a;
+/// Where a delta poll's results queue for its reader, each under its view's
+/// index in the poll. Each view gets exactly one [`Polled::End`], in request
+/// order, however the poll ends.
+pub(crate) type PollFeed = Mutex<VecDeque<(usize, Polled)>>;
 
-/// What one read owes a sink, held until the read returns: a sink that panics
-/// then finds every frame of that read fed.
-type Owed = Vec<(SlotId, Polled)>;
-
-/// Hand `owed` to `sink`; with none, the poll was abandoned and nobody is left
-/// to take it.
-fn deliver(sink: Option<&mut PollSink<'_>>, owed: &mut Owed) {
-    match sink {
-        Some(sink) => owed.drain(..).for_each(|(slot, p)| sink(slot, p)),
-        None => owed.clear(),
+/// Queue `polled` for the reader of `feed`, if it still has one.
+fn hand(feed: &Weak<PollFeed>, item: usize, polled: Polled) {
+    if let Some(feed) = feed.upgrade() {
+        feed.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back((item, polled));
     }
 }
 
 /// A protocol session: the transport plus all per-connection protocol state
 /// (the pending queue, and the continuation reassembly and status→error policy
-/// that read/write it). Exactly one owner of that
-/// state — the sync [`crate::GnitzClient`] holds one, and so does each async
-/// executor.
+/// that read/write it). Exactly one owner of that state: a
+/// [`crate::GnitzClient`], whose host decides how it waits.
 pub struct Session {
     transport: ClientTransport,
     pending: VecDeque<Slot>,
-    next_slot: u64,
+    submitted: u64,
     /// The error every request gets once the session has ended — `Closed` or
     /// `ConnectionLost`; `None` while it is open.
     ended: Option<ClientError>,
+    /// The last read stopped with more waiting, to hand a delta poll's blocks
+    /// over before reading on.
+    unread: bool,
+}
+
+/// Every reply still owed resolves `Closed`, so nothing waits on a session
+/// that is gone.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl Session {
@@ -514,41 +605,50 @@ impl Session {
         Session {
             transport,
             pending: VecDeque::new(),
-            next_slot: 1,
+            submitted: 0,
             ended: None,
+            unread: false,
         }
     }
 
     /// Requests submitted since this session connected — one per `submit`,
     /// however the bytes were batched. HELLO predates the session, uncounted.
     pub fn requests_sent(&self) -> u64 {
-        self.next_slot - 1
+        self.submitted
     }
 
-    /// The fd a driver polls. Borrowed: it lives exactly as long as the
-    /// session, so a reactor that outlives one call wants
-    /// [`Self::try_clone_fd`] instead.
+    /// The connection's socket, as a number: valid while this session lives.
     pub fn as_raw_fd(&self) -> RawFd {
         self.transport.as_raw_fd()
     }
 
-    /// An owned `dup` of the connection's socket, for a reactor to register and
-    /// drop on its own schedule. It shares the open file description, so it
-    /// reports the same readiness, and closing it leaves the connection open.
-    pub fn try_clone_fd(&self) -> Result<OwnedFd, ClientError> {
-        Ok(self.transport.try_clone_fd()?)
+    /// The connection's socket, for a [`Host`](crate::Host) to register.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.transport.as_fd()
     }
 
     // ── The spine ──────────────────────────────────────────────────────────
 
-    /// Encode, enqueue, register a slot. `Request` borrows its inputs; the
-    /// borrow ends here.
-    pub fn submit(&mut self, req: Request<'_>) -> Result<SlotId, ClientError> {
-        self.enqueue(req.encode()?)
+    /// Encode and queue `req`; its reply arrives as `narrow` makes of it.
+    /// `Request` borrows its inputs; the borrow ends here. Raises at either cap.
+    pub fn submit<T>(&mut self, req: Request<'_>, narrow: fn(Reply) -> T) -> Result<Sent<T>, ClientError> {
+        let cell = Arc::new(SentCell::default());
+        self.enqueue(req.encode()?, Some(Arc::clone(&cell)))?;
+        Ok(Sent(SentState::Waiting(cell, narrow)))
     }
 
-    /// Queue an encoded request and open its slot. Raises at either cap.
-    pub fn enqueue(&mut self, Encoded { frame, kind }: Encoded) -> Result<SlotId, ClientError> {
+    /// Queue a delta poll of `views`, the items of a poll from its `first` on.
+    /// Their results queue on `feed` as the steps that read them run.
+    pub(crate) fn submit_delta_poll(
+        &mut self,
+        views: &[txn_frame::DeltaPollItem],
+        first: usize,
+        feed: &Arc<PollFeed>,
+    ) -> Result<(), ClientError> {
+        self.enqueue(Encoded::delta_poll(views, first, feed)?, None)
+    }
+
+    fn enqueue(&mut self, Encoded { frame, kind }: Encoded, cell: Option<Arc<SentCell>>) -> Result<(), ClientError> {
         if let Some(why) = &self.ended {
             return Err(why.clone());
         }
@@ -563,60 +663,62 @@ impl Session {
             }));
         }
         self.transport.enqueue(frame);
-        let id = SlotId(self.next_slot);
-        self.next_slot += 1;
-        self.pending.push_back(Slot { id, kind });
-        Ok(id)
+        self.submitted += 1;
+        self.pending.push_back(Slot { kind, cell });
+        Ok(())
     }
 
-    /// Do the I/O `ready` allows and return every slot that completed. Afterwards
+    /// Do the I/O `ready` allows; every reply it completes arrives. Afterwards
     /// a driver may park on `interest()`: nothing buffered can advance, and
     /// bytes still queued are ones the fd refused.
     ///
-    /// A failure ends the session: every slot still pending comes back
+    /// A failure ends the session: every reply still owed arrives as
     /// [`ClientError::ConnectionLost`], after those that completed.
-    pub fn step(&mut self, ready: Interest) -> Completions {
-        self.step_polling(ready, None)
-    }
-
-    /// [`Self::step`] for a drain that takes a delta poll's per-view results.
-    pub(crate) fn step_polling(&mut self, ready: Interest, mut sink: Option<&mut PollSink<'_>>) -> Completions {
-        let mut done: Completions = Vec::new();
+    pub fn step(&mut self, ready: Interest) {
         if ready.read {
-            self.read_frames(sink.as_deref_mut(), &mut done);
+            self.read_frames();
         }
         // Last, so the ciphertext a read queues goes out with this flush.
         if ready.write && self.ended.is_none() {
             if let Err(e) = self.transport.flush() {
                 // A peer gone after answering is still readable.
-                self.read_frames(sink.as_deref_mut(), &mut done);
-                let mut owed = Owed::new();
-                self.end(ClientError::ConnectionLost(e), &mut done, &mut owed);
-                deliver(sink, &mut owed);
+                self.read_frames();
+                self.end(ClientError::ConnectionLost(e));
             }
         }
-        done
     }
 
     /// Feed the frames of every read the fd allows, until one proves it drained
     /// or fails — which ends the session.
-    fn read_frames(&mut self, mut sink: Option<&mut PollSink<'_>>, done: &mut Completions) {
-        let mut owed = Owed::new();
+    ///
+    /// Stops at the first read that queued a delta poll's blocks for its
+    /// reader, so the blocks held at once are one read's.
+    fn read_frames(&mut self) {
+        self.unread = false;
         while self.ended.is_none() {
             let Session { transport, pending, .. } = self;
-            let read = transport.read(|buf| feed(pending, buf, done, &mut owed));
-            let more = match read {
+            let mut handed = false;
+            let more = match transport.read(|buf| feed(pending, buf, &mut handed)) {
                 Ok(more) => more,
                 Err(e) => {
-                    self.end(ClientError::ConnectionLost(e), done, &mut owed);
+                    self.end(ClientError::ConnectionLost(e));
                     false
                 }
             };
-            deliver(sink.as_deref_mut(), &mut owed);
             if !more {
                 return;
             }
+            if handed {
+                self.unread = true;
+                return;
+            }
         }
+    }
+
+    /// The last step left a read unfinished: step `READ` again without waiting
+    /// for the socket, which has no new edge to report.
+    pub(crate) fn unread(&self) -> bool {
+        self.unread
     }
 
     /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
@@ -651,41 +753,32 @@ impl Session {
 
     /// Fail every pending slot with `why` and refuse further work. The shutdown
     /// shows the server EOF now rather than when the session drops.
-    fn end(&mut self, why: ClientError, done: &mut Completions, owed: &mut Owed) {
+    fn end(&mut self, why: ClientError) {
         if self.ended.is_some() {
             return;
         }
         self.transport.close();
         for slot in self.pending.drain(..) {
-            slot.complete(Err(why.clone()), done, owed);
+            slot.complete(Err(why.clone()));
         }
         self.ended = Some(why);
     }
 
-    /// Close the session; returns every slot it abandoned, failed `Closed`.
-    #[must_use]
-    pub fn close(&mut self) -> Completions {
-        let mut done = Vec::new();
-        // No drain is running, so no sink is there to take a poll's ends.
-        self.end(ClientError::Closed, &mut done, &mut Owed::new());
-        done
+    /// Close the session: every reply still owed arrives as `Closed`.
+    pub fn close(&mut self) {
+        self.end(ClientError::Closed);
     }
 }
 
-/// Feed one reply frame to the head slot: the slot it completes goes onto
-/// `done`, what it owes a delta poll's listener onto `owed`.
-fn feed(
-    pending: &mut VecDeque<Slot>,
-    buf: Cow<'_, [u8]>,
-    done: &mut Completions,
-    owed: &mut Owed,
-) -> Result<(), ProtocolError> {
+/// Feed one reply frame to the head slot, whose reply arrives if that completes
+/// it. `handed` is set by a block queued for a delta poll's reader.
+fn feed(pending: &mut VecDeque<Slot>, buf: Cow<'_, [u8]>, handed: &mut bool) -> Result<(), ProtocolError> {
     let Some(head) = pending.front_mut() else {
         return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
     };
-    if let Some(result) = head.feed(buf, owed)? {
+    if let Some(result) = head.feed(buf, handed)? {
         let slot = pending.pop_front().expect("the head was just fed");
-        slot.complete(result, done, owed);
+        slot.complete(result);
     }
     Ok(())
 }
@@ -697,7 +790,7 @@ impl Slot {
     fn feed(
         &mut self,
         mut buf: Cow<'_, [u8]>,
-        owed: &mut Owed,
+        handed: &mut bool,
     ) -> Result<Option<Result<Reply, ClientError>>, ProtocolError> {
         let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let named = ctrl.hdr.target_id;
@@ -707,7 +800,7 @@ impl Slot {
         let want = match &self.kind {
             SlotKind::Ack { tid } | SlotKind::Scan { tid, .. } => Some(*tid),
             SlotKind::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
-            SlotKind::DeltaPoll { views, at } => Some(views[*at]),
+            SlotKind::DeltaPoll { views, at, .. } => Some(views[*at]),
             SlotKind::Resolve => None,
         };
         if let Some(fault) = ctrl.fault(&buf) {
@@ -715,11 +808,13 @@ impl Slot {
             // A DELTA_POLL fault naming a view ends that view's position alone;
             // every other fault ends the request.
             return match (&mut self.kind, want) {
-                (SlotKind::DeltaPoll { views, at }, Some(view)) if named != 0 => {
+                (SlotKind::DeltaPoll { views, at, first, feed }, Some(view)) if named != 0 => {
                     if named != view {
                         return Err(out_of_order(view, named));
                     }
-                    Ok(end_poll_position(self.id, views, at, Err(refused), owed))
+                    hand(feed, *first + *at, Polled::End(Err(refused)));
+                    *at += 1;
+                    Ok((*at == views.len()).then_some(Ok(Reply::Polled)))
                 }
                 _ => Ok(Some(Err(refused))),
             };
@@ -748,10 +843,13 @@ impl Slot {
         };
         match (&mut self.kind, ctrl.data.clone()) {
             (_, None) => {}
-            (SlotKind::DeltaPoll { .. }, Some(block)) => {
+            // An abandoned poll's block is dropped uncopied.
+            (SlotKind::DeltaPoll { at, first, feed, .. }, Some(block)) if feed.strong_count() > 0 => {
                 let frame = std::mem::take(&mut buf).into_owned();
-                owed.push((self.id, Polled::Block(RawBlock { frame, block })));
+                hand(feed, *first + *at, Polled::Block(RawBlock { frame, block }));
+                *handed = true;
             }
+            (SlotKind::DeltaPoll { .. }, Some(_)) => {}
             (SlotKind::Scan { reply_schema, data, .. }, Some(r)) => decode(data, reply_schema, &buf[r])?,
             (SlotKind::Multi { rels, replies, data }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
             (SlotKind::Ack { .. } | SlotKind::Resolve, Some(_)) => {
@@ -780,40 +878,33 @@ impl Slot {
                 replies.push(reply);
                 (replies.len() == rels.len()).then(|| Ok(Reply::Multi(std::mem::take(replies))))
             }
-            SlotKind::DeltaPoll { views, at } => {
+            SlotKind::DeltaPoll { views, at, first, feed } => {
                 let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                     .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-                end_poll_position(self.id, views, at, Ok(cursor), owed)
+                hand(feed, *first + *at, Polled::End(Ok(cursor)));
+                *at += 1;
+                (*at == views.len()).then_some(Ok(Reply::Polled))
             }
         })
     }
 
-    /// The slot is answered: report it. A delta poll that failed whole ends
-    /// each view it had yet to answer with that failure.
-    fn complete(self, result: Result<Reply, ClientError>, done: &mut Completions, owed: &mut Owed) {
-        if let (SlotKind::DeltaPoll { views, at }, Err(why)) = (&self.kind, &result) {
-            owed.extend(views[*at..].iter().map(|_| (self.id, Polled::End(Err(why.clone())))));
+    /// The slot is answered: its reply arrives. A delta poll that failed whole
+    /// ends each view it had yet to answer with that failure.
+    fn complete(self, result: Result<Reply, ClientError>) {
+        if let (SlotKind::DeltaPoll { views, at, first, feed }, Err(why)) = (&self.kind, &result) {
+            for item in first + at..first + views.len() {
+                hand(feed, item, Polled::End(Err(why.clone())));
+            }
         }
-        done.push((self.id, result));
+        if let Some(cell) = self.cell {
+            cell.arrive(result);
+        }
     }
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.
 fn out_of_order(want: u64, got: u64) -> ProtocolError {
     ProtocolError::DecodeError(format!("reply out of order: expected target {want}, got {got}"))
-}
-
-/// End the view a delta poll is on; the poll's reply once that was its last.
-fn end_poll_position(
-    slot: SlotId,
-    views: &[u64],
-    at: &mut usize,
-    end: PollEnd,
-    owed: &mut Owed,
-) -> Option<Result<Reply, ClientError>> {
-    owed.push((slot, Polled::End(end)));
-    *at += 1;
-    (*at == views.len()).then_some(Ok(Reply::Polled))
 }
 
 /// A RESOLVE train as its descriptor; `None` when the reply names no relation.

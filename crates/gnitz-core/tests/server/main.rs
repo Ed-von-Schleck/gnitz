@@ -11,12 +11,10 @@ mod spine;
 mod transport;
 mod view_chain;
 
-use std::collections::HashMap;
+use gnitz_core::block_on;
 use std::sync::Arc;
 
-use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, Interest, Reply, Request, Schema, Session, SlotId, ZSetBatch,
-};
+use gnitz_core::{BatchAppender, ClientError, GnitzClient, Interest, Reply, Request, Schema, Sent, Session, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
 
@@ -34,10 +32,8 @@ fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
 /// `schema` created as table `t` in a fresh schema: `(schema name, tid, schema)`.
 fn create_table(client: &mut GnitzClient, schema: Schema) -> (String, u64, Arc<Schema>) {
     let sn = unique_schema("t");
-    client.create_schema(&sn).unwrap();
-    let tid = client
-        .create_table(&sn, "t", &schema, &[], TableProps::default(), &[])
-        .unwrap();
+    block_on(client.create_schema(&sn)).unwrap();
+    let tid = block_on(client.create_table(&sn, "t", &schema, &[], TableProps::default(), &[])).unwrap();
     (sn, tid, Arc::new(schema))
 }
 
@@ -57,8 +53,7 @@ fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
 
 /// Every row of `tid`, decoded under `schema`.
 fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBatch {
-    client
-        .scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), schema)
+    block_on(client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), schema))
         .unwrap()
         .batch
 }
@@ -110,17 +105,20 @@ fn park(s: &Session, want: Interest) -> Interest {
 }
 
 /// The driver: step with what `poll` reported, parking on `interest()`, until
-/// `want` slots completed. Also reports whether both interests were ever armed
-/// at once.
-fn drive_all(s: &mut Session, want: usize) -> (HashMap<SlotId, Result<Reply, ClientError>>, bool) {
-    let mut done = HashMap::new();
+/// every reply of `sent` has arrived; they come back in that order. Also
+/// reports whether both interests were ever armed at once.
+fn drive_all(s: &mut Session, sent: Vec<Sent<Reply>>) -> (Vec<Result<Reply, ClientError>>, bool) {
+    let mut done = Vec::with_capacity(sent.len());
+    let mut sent = sent.into_iter().peekable();
     let mut ready = Interest::WRITE;
     let mut both_armed = false;
     loop {
-        for (id, r) in s.step(ready) {
-            assert!(done.insert(id, r).is_none(), "a slot completes exactly once");
+        s.step(ready);
+        while let Some(reply) = sent.peek_mut().and_then(Sent::try_take) {
+            done.push(reply);
+            sent.next();
         }
-        if done.len() == want {
+        if sent.peek().is_none() {
             return (done, both_armed);
         }
         let interest = s.interest();
@@ -133,7 +131,7 @@ fn drive_all(s: &mut Session, want: usize) -> (HashMap<SlotId, Result<Reply, Cli
 /// read; false once the session has ended.
 fn write_out(s: &mut Session) -> bool {
     loop {
-        let _ = s.step(Interest::WRITE);
+        s.step(Interest::WRITE);
         if s.is_closed() {
             return false;
         }

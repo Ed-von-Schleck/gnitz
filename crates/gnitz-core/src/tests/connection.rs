@@ -2,20 +2,32 @@
 //! end of a socketpair feeds reply frames one `step` at a time.
 
 use super::*;
-use crate::client::await_slot;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{framed, kv_rows, kv_schema, reply_ctrl, reply_status, session_pair as pair};
 use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
-fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<SlotId, ClientError> {
+fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<Reply>, ClientError> {
     let spec = ReadSpec::all_rows(ReadBound::None);
-    s.submit(Request::ScanSpec {
+    let req = Request::ScanSpec {
         target: tid.into(),
         spec: &spec,
         reply_schema: schema,
-    })
+    };
+    s.submit(req, |reply| reply)
+}
+
+/// Step and park until `sent` is answered.
+fn await_reply(s: &mut Session, mut sent: Sent<Reply>) -> Result<Reply, ClientError> {
+    let mut ready = Interest::WRITE;
+    loop {
+        s.step(ready);
+        if let Some(reply) = sent.try_take() {
+            return reply;
+        }
+        ready = Interest::from_revents(poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap());
+    }
 }
 
 /// A request ACKed at target 0, whose reply is [`Reply::Ack`].
@@ -72,26 +84,27 @@ fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
 fn train_split_across_continuation_frames_completes_once() {
     let (mut s, peer) = pair();
     let schema = schema_a();
-    let slot = submit_scan(&mut s, 7, &schema).unwrap();
+    let mut sent = submit_scan(&mut s, 7, &schema).unwrap();
     assert_eq!(s.interest(), Interest::BOTH);
-    assert!(s.step(Interest::WRITE).is_empty());
+    s.step(Interest::WRITE);
+    assert!(sent.try_take().is_none());
     assert_eq!(s.interest(), Interest::READ);
     peer.recv();
 
     // Three frames, one per step: nothing completes until the terminal.
     peer.send(&reply_rows(7, &batch_a(&[1, 2]), 0, true));
-    assert!(s.step(Interest::READ).is_empty());
+    s.step(Interest::READ);
+    assert!(sent.try_take().is_none());
     peer.send(&reply_rows(7, &batch_a(&[3]), 0, true));
-    assert!(s.step(Interest::READ).is_empty());
+    s.step(Interest::READ);
+    assert!(sent.try_take().is_none());
     peer.send(&reply_rows(7, &batch_a(&[4, 5]), 0, false));
-    let mut done = s.step(Interest::READ);
-    assert_eq!(done.len(), 1);
-    let (id, reply) = done.pop().unwrap();
-    assert_eq!(id, slot);
-    let Reply::Scan(r) = reply.unwrap() else { panic!("scan") };
+    s.step(Interest::READ);
+    let Reply::Scan(r) = sent.try_take().unwrap().unwrap() else {
+        panic!("scan")
+    };
     assert_eq!(r.batch, batch_a(&[1, 2, 3, 4, 5]));
     assert!(Arc::ptr_eq(&r.schema, &schema), "the schema the request named");
-    assert!(s.step(Interest::READ).is_empty());
     assert_eq!(s.interest(), Interest::NONE);
 }
 
@@ -101,8 +114,11 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     let (sa, sb) = (schema_a(), schema_b());
     // Each train must decode under the schema paired with its relation — a
     // two-frame train for relation 2 included.
-    let slot = s
-        .submit(Request::ScanMulti(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]))
+    let mut sent = s
+        .submit(
+            Request::ScanMulti(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]),
+            |r| r,
+        )
         .unwrap();
     s.step(Interest::WRITE);
     let req = peer.recv();
@@ -115,10 +131,11 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
         "each item names its reply layout"
     );
     peer.send(&reply_rows(1, &batch_a(&[10, 11]), 0, false));
-    assert!(s.step(Interest::READ).is_empty(), "one of two trains");
+    s.step(Interest::READ);
+    assert!(sent.try_take().is_none(), "one of two trains");
     peer.send(&reply_rows(2, &batch_b(&[20]), 0, true));
     peer.send(&reply_rows(2, &batch_b(&[21]), 0, false));
-    let Reply::Multi(replies) = await_slot(&mut s, &mut None, slot).unwrap() else {
+    let Reply::Multi(replies) = await_reply(&mut s, sent).unwrap() else {
         panic!("multi")
     };
     assert_eq!(replies.len(), 2);
@@ -135,7 +152,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
 fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
     let (mut s, peer) = pair();
     let sa = schema_a();
-    let slot = submit_scan(&mut s, 7, &sa).unwrap();
+    let sent = submit_scan(&mut s, 7, &sa).unwrap();
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&encode_frame(
@@ -144,7 +161,7 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
         Some(&sa.to_block()),
         Some(&batch_a(&[5])),
     ));
-    let e = await_slot(&mut s, &mut None, slot).expect_err("a schema block on a read is a decode error");
+    let e = await_reply(&mut s, sent).expect_err("a schema block on a read is a decode error");
     assert!(
         matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
         "{e:?}"
@@ -168,14 +185,14 @@ fn a_status_frame_fails_its_slot_alone() {
         ("a commit", COMMIT, 0, WireStatus::TxnConflict),
     ] {
         let (mut s, peer) = pair();
-        let slot = s.submit(req).unwrap();
+        let sent = s.submit(req, |r| r).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         for tid in 1..=trains_before {
             peer.send(&reply_rows(tid, &batch_a(&[tid]), 0, false));
         }
         peer.send(&reply_status(0, status, "refused"));
-        let r = await_slot(&mut s, &mut None, slot);
+        let r = await_reply(&mut s, sent);
         assert!(
             matches!(&r, Err(ClientError::Refused(f)) if f.status == status && f.text == "refused"),
             "{what}: {r:?}"
@@ -183,11 +200,11 @@ fn a_status_frame_fails_its_slot_alone() {
         assert!(!s.is_closed(), "{what}");
         assert_eq!(s.interest(), Interest::NONE, "{what}: nothing left pending");
 
-        let slot = submit_scan(&mut s, 3, &sa).unwrap();
+        let sent = submit_scan(&mut s, 3, &sa).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
-        let Reply::Scan(r) = await_slot(&mut s, &mut None, slot).unwrap() else {
+        let Reply::Scan(r) = await_reply(&mut s, sent).unwrap() else {
             panic!("scan")
         };
         assert_eq!(r.lsn, Some(42), "{what}: the next request completes normally");
@@ -231,7 +248,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
             },
         ),
     ] {
-        assert!(s.submit(req).is_err(), "{what}");
+        assert!(s.submit(req, |r| r).is_err(), "{what}");
         assert_eq!(s.requests_sent(), 0, "{what}");
         assert_eq!(s.interest(), Interest::NONE, "{what}");
         assert!(!s.is_closed(), "{what}");
@@ -242,8 +259,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
 fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
     let (mut s, peer) = pair();
     let sa = schema_a();
-    let s1 = submit_scan(&mut s, 1, &sa).unwrap();
-    let s2 = submit_scan(&mut s, 2, &sa).unwrap();
+    let mut sent = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa).unwrap());
     s.step(Interest::WRITE);
     peer.recv();
     peer.recv();
@@ -251,12 +267,12 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
     let mut both = framed(&reply_rows(1, &empty, 11, false));
     both.extend(framed(&reply_rows(2, &empty, 22, false)));
     peer.send_bytes(&both);
-    let done = s.step(Interest::READ);
-    let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids, vec![s1, s2], "in request order");
-    for (id, r) in done {
-        let Reply::Scan(r) = r.unwrap() else { panic!("scan") };
-        assert_eq!(r.lsn, Some(if id == s1 { 11 } else { 22 }));
+    s.step(Interest::READ);
+    for (sent, lsn) in sent.iter_mut().zip([11, 22]) {
+        let Reply::Scan(r) = sent.try_take().unwrap().unwrap() else {
+            panic!("scan")
+        };
+        assert_eq!(r.lsn, Some(lsn), "in request order");
     }
     assert_eq!(s.interest(), Interest::NONE);
 }
@@ -268,34 +284,27 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
 fn replies_completed_before_a_fatal_frame_are_delivered() {
     let (mut s, peer) = pair();
     let (sa, rows) = (schema_a(), batch_a(&[1]));
-    let a = s.submit(COMMIT).unwrap();
-    let b = s
-        .submit(Request::Push {
-            target: 5.into(),
-            schema: &sa,
-            batch: &rows,
-            mode: WireConflictMode::Update,
-        })
-        .unwrap();
-    assert!(s.step(Interest::WRITE).is_empty());
+    let mut a = s.submit(COMMIT, |r| r).unwrap();
+    let push = Request::Push {
+        target: 5.into(),
+        schema: &sa,
+        batch: &rows,
+        mode: WireConflictMode::Update,
+    };
+    let mut b = s.submit(push, |r| r).unwrap();
+    s.step(Interest::WRITE);
     peer.recv();
     peer.recv();
     // The push to 5 is answered by a frame naming 6.
     let mut both = framed(&reply_ctrl(0, 11));
     both.extend(framed(&reply_ctrl(6, 1)));
     peer.send_bytes(&both);
-    let done = s.step(Interest::READ);
-    assert_eq!(done.len(), 2);
-    assert_eq!(done[0].0, a);
-    assert!(matches!(done[0].1, Ok(Reply::Ack(11))), "{:?}", done[0].1);
-    assert_eq!(done[1].0, b);
+    s.step(Interest::READ);
+    let (a, b) = (a.try_take().unwrap(), b.try_take().unwrap());
+    assert!(matches!(a, Ok(Reply::Ack(11))), "{a:?}");
     assert!(
-        matches!(
-            &done[1].1,
-            Err(ClientError::ConnectionLost(ProtocolError::DecodeError(_)))
-        ),
-        "{:?}",
-        done[1].1
+        matches!(&b, Err(ClientError::ConnectionLost(ProtocolError::DecodeError(_)))),
+        "{b:?}"
     );
     assert!(s.is_closed());
     assert_eq!(s.interest(), Interest::NONE);
@@ -303,7 +312,6 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
         submit_scan(&mut s, 1, &sa),
         Err(ClientError::ConnectionLost(_))
     ));
-    assert!(s.step(Interest::READ).is_empty());
 }
 
 /// A peer that answered and then went is still readable after the write
@@ -311,28 +319,25 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
 #[test]
 fn a_reply_readable_behind_a_failed_flush_is_delivered() {
     let (mut s, peer) = pair();
-    let a = s.submit(COMMIT).unwrap();
-    assert!(s.step(Interest::WRITE).is_empty());
+    let mut a = s.submit(COMMIT, |r| r).unwrap();
+    s.step(Interest::WRITE);
     peer.recv();
     peer.send(&reply_ctrl(0, 11));
     drop(peer);
-    let b = submit_scan(&mut s, 5, &schema_a()).unwrap();
-    let done = s.step(Interest::WRITE);
-    assert_eq!(done.len(), 2, "{done:?}");
-    assert_eq!(done[0].0, a);
-    assert!(matches!(done[0].1, Ok(Reply::Ack(11))), "{:?}", done[0].1);
-    assert_eq!(done[1].0, b);
+    let mut b = submit_scan(&mut s, 5, &schema_a()).unwrap();
+    s.step(Interest::WRITE);
+    let (a, b) = (a.try_take().unwrap(), b.try_take().unwrap());
+    assert!(matches!(a, Ok(Reply::Ack(11))), "{a:?}");
     assert!(
-        matches!(&done[1].1, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
-        "{:?}",
-        done[1].1
+        matches!(&b, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
+        "{b:?}"
     );
 }
 
 #[test]
 fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
     let (mut s, peer) = pair();
-    let slot = submit_scan(&mut s, 5, &schema_a()).unwrap();
+    let mut sent = submit_scan(&mut s, 5, &schema_a()).unwrap();
     s.step(Interest::WRITE);
     // The request is on the wire and unread, so dropping the peer draws a
     // reset. A hangup folds into read readiness, so the waiting driver wakes.
@@ -344,13 +349,11 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
     )
     .expect("poll");
     assert!(Interest::from_revents(rev).read, "a hangup wakes a read park");
-    let done = s.step(Interest::READ);
-    assert_eq!(done.len(), 1, "{done:?}");
-    assert_eq!(done[0].0, slot);
+    s.step(Interest::READ);
+    let lost = sent.try_take().unwrap();
     assert!(
-        matches!(&done[0].1, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
-        "{:?}",
-        done[0].1
+        matches!(&lost, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
+        "{lost:?}"
     );
 }
 
@@ -358,16 +361,14 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
 fn close_abandons_every_pending_slot_and_refuses_further_work() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
-    let a = submit_scan(&mut s, 1, &sa).unwrap();
-    let b = submit_scan(&mut s, 2, &sa).unwrap();
+    let mut owed = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa).unwrap());
     assert_eq!(s.interest(), Interest::BOTH);
-    let done = s.close();
-    let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids, vec![a, b], "in submit order");
-    assert!(done.iter().all(|(_, r)| matches!(r, Err(ClientError::Closed))));
+    s.close();
+    for sent in &mut owed {
+        assert!(matches!(sent.try_take(), Some(Err(ClientError::Closed))));
+    }
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(submit_scan(&mut s, 3, &sa), Err(ClientError::Closed)));
-    assert!(s.step(Interest::BOTH).is_empty());
 }
 
 /// The in-flight count bounds no memory on its own, so the byte cap is what
@@ -379,12 +380,13 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     // About 1 MiB encoded, so the cap is some sixty pushes away.
     let b = batch_a(&(0..32_768).collect::<Vec<_>>());
     let push = |s: &mut Session| {
-        s.submit(Request::Push {
+        let push = Request::Push {
             target: 4.into(),
             schema: &sa,
             batch: &b,
             mode: WireConflictMode::Update,
-        })
+        };
+        s.submit(push, |r| r).map(drop)
     };
     // An encoded push is a full copy of its batch, so the counter grows with
     // what was pushed, not with how many times.
@@ -423,78 +425,12 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
 fn in_flight_cap_raises_rather_than_hanging() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
-    let mut last = SlotId(0);
     for _ in 0..MAX_IN_FLIGHT {
         assert!(!s.at_capacity());
-        let id = submit_scan(&mut s, 1, &sa).unwrap();
-        assert!(id > last, "monotonic");
-        last = id;
+        submit_scan(&mut s, 1, &sa).unwrap();
     }
     assert!(s.at_capacity());
     assert!(matches!(submit_scan(&mut s, 1, &sa), Err(ClientError::Refused(_))));
-}
-
-/// A one-view delta poll answered by a block and then `behind`, all in one
-/// read, stepped with a sink that panics on the block. Returns the session the
-/// unwind left.
-fn poll_whose_sink_panics(behind: &[Vec<u8>]) -> (Session, crate::test_support::Peer) {
-    let (mut s, peer) = pair();
-    let poll = Encoded::delta_poll(&[txn_frame::DeltaPollItem {
-        view_id: 7,
-        after_tick: 4,
-        reply_layout: schema_a().layout_digest(),
-    }]);
-    s.enqueue(poll.unwrap()).unwrap();
-    s.step(Interest::WRITE);
-    peer.recv();
-    let mut wire = framed(&reply_rows(7, &batch_a(&[1]), 0, true));
-    for frame in behind {
-        wire.extend(framed(frame));
-    }
-    peer.send_bytes(&wire);
-    let mut sink = |_: SlotId, p: Polled| {
-        if matches!(p, Polled::Block(_)) {
-            panic!("the sink's own failure")
-        }
-    };
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        s.step_polling(Interest::READ, Some(&mut sink))
-    }));
-    assert!(unwound.is_err(), "the sink's panic unwinds out of the step");
-    (s, peer)
-}
-
-/// A sink that panics on a block finds every frame of that read already fed:
-/// the terminal behind the block ended the poll, and the session answers the
-/// next request.
-#[test]
-fn a_panicking_sink_leaves_the_frames_behind_its_block_fed() {
-    let (mut s, peer) = poll_whose_sink_panics(&[encode_frame(reply_header(7, 9, false), &[], None, None)]);
-    assert!(!s.is_closed());
-    assert_eq!(
-        s.interest(),
-        Interest::NONE,
-        "the terminal behind the block ended the poll"
-    );
-    let slot = s.submit(COMMIT).unwrap();
-    s.step(Interest::WRITE);
-    peer.recv();
-    peer.send(&reply_ctrl(0, 11));
-    let done = s.step(Interest::READ);
-    assert!(
-        matches!(&done[..], [(id, Ok(Reply::Ack(11)))] if *id == slot),
-        "{done:?}"
-    );
-}
-
-/// A frame that fails behind the block ends the session before the sink runs,
-/// so the unwind leaves it closed rather than half-fed.
-#[test]
-fn a_panicking_sink_finds_a_failure_behind_its_block_already_recorded() {
-    // The poll's position is on view 7; the frame behind the block names 8.
-    let (mut s, _peer) = poll_whose_sink_panics(&[reply_ctrl(8, 1)]);
-    assert!(s.is_closed());
-    assert!(matches!(s.submit(COMMIT), Err(ClientError::ConnectionLost(_))));
 }
 
 /// A delta poll that fails whole — refused at target 0, or cut off by the
@@ -508,9 +444,8 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     };
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        let slot = s
-            .enqueue(Encoded::delta_poll(&[item(7), item(8), item(9)]).unwrap())
-            .unwrap();
+        let feed = Arc::new(PollFeed::default());
+        s.submit_delta_poll(&[item(7), item(8), item(9)], 0, &feed).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -532,20 +467,18 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
         if !refused {
             drop(peer);
         }
-        let mut ends = Vec::new();
-        let mut sink = |id: SlotId, p: Polled| {
-            assert_eq!(id, slot);
-            match p {
-                Polled::End(end) => ends.push(end),
-                Polled::Block(_) => panic!("no view sent a block"),
-            }
-        };
-        let mut done = Vec::new();
-        while done.is_empty() {
-            done = s.step_polling(Interest::READ, Some(&mut sink));
+        while !s.interest().is_empty() {
+            s.step(Interest::READ);
         }
-        assert!(matches!(&done[..], [(id, Err(_))] if *id == slot), "{done:?}");
         assert_eq!(s.is_closed(), !refused);
+        let ends: Vec<PollEnd> = std::mem::take(&mut *feed.lock().unwrap())
+            .into_iter()
+            .enumerate()
+            .map(|(view, polled)| match polled {
+                (item, Polled::End(end)) if item == view => end,
+                _ => panic!("view {view} ends once, and no view sent a block"),
+            })
+            .collect();
         assert_eq!(ends.len(), 3, "one end per view: {ends:?}");
         assert!(ends[0].is_ok(), "{ends:?}");
         for end in &ends[1..] {
@@ -573,11 +506,11 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
         ),
     ] {
         let (mut s, peer) = pair();
-        let slot = s.submit(Request::Resolve("s.t")).unwrap();
+        let sent = s.submit(Request::Resolve("s.t"), |r| r).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&frame);
-        let e = await_slot(&mut s, &mut None, slot).expect_err(what);
+        let e = await_reply(&mut s, sent).expect_err(what);
         assert!(
             matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
             "{what}: {e:?}"

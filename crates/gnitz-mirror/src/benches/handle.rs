@@ -55,12 +55,12 @@ fn copy_index_bench() {
             token: 1,
         };
         store.register("s", "v", &desc).unwrap();
-        let mut refill = store.refill(TID).unwrap();
+        store.refill(TID).unwrap();
         let held: Vec<_> = (0..ROWS).map(|id| (id, 1, id as i64)).collect();
         for chunk in held.chunks(10_000) {
-            refill.block(&block(chunk)).unwrap();
+            store.fill(TID, &[&block(chunk)]).unwrap();
         }
-        refill.seal(cursor(1)).unwrap();
+        store.seal(TID, cursor(1)).unwrap();
 
         // Each round moves `ROUND` rows of the upper half to a `v` past every
         // held one.

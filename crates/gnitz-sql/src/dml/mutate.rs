@@ -141,12 +141,14 @@ fn plan_mutation(
 }
 
 /// Read the rows the WHERE matches, then write [`delta`] of them.
-pub(crate) fn execute_mutation(client: &mut GnitzClient, plan: MutationPlan) -> Result<SqlResult, GnitzSqlError> {
+pub(crate) async fn execute_mutation(client: &mut GnitzClient, plan: MutationPlan) -> Result<SqlResult, GnitzSqlError> {
     let MutationPlan { target, bound, predicate, mut set } = plan;
     let keys_only = set.is_none();
-    let count = client.read_modify_write(&target, bound, predicate, keys_only, |rows| {
-        delta(set.as_deref_mut(), rows, &target.schema)
-    })?;
+    let count = client
+        .read_modify_write(&target, bound, predicate, keys_only, |rows| {
+            delta(set.as_deref_mut(), rows, &target.schema)
+        })
+        .await?;
     Ok(SqlResult::RowsAffected { count })
 }
 

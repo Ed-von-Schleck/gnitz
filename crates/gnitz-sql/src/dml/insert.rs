@@ -377,13 +377,13 @@ fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, 
     Ok(rows)
 }
 
-pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Result<SqlResult, GnitzSqlError> {
+pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Result<SqlResult, GnitzSqlError> {
     let InsertPlan { target, mut rows, conflict, returning } = plan;
     let schema = &target.schema;
     if serial_col(&target).is_some() {
         // One durable advance for the whole statement.
         let n = rows.len();
-        rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64)?, n, schema)?;
+        rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64).await?, n, schema)?;
     }
     match conflict {
         ConflictPlan::Error => {
@@ -399,7 +399,7 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
             // project it, saving a deep clone inside a transaction.
             match returning {
                 Some((schema_out, map)) => {
-                    client.push(&*target, schema, &rows, mode)?;
+                    client.push(&*target, schema, &rows, mode).await?;
                     Ok(SqlResult::Rows {
                         schema: schema_out,
                         batch: match map {
@@ -411,7 +411,7 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
                 }
                 None => {
                     let count = rows.len();
-                    client.push(&*target, schema, rows, mode)?;
+                    client.push(&*target, schema, rows, mode).await?;
                     Ok(SqlResult::RowsAffected { count })
                 }
             }
@@ -419,9 +419,11 @@ pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Resu
         ConflictPlan::Resolve { mut set } => {
             let bound = ReadBound::PkSet(rows.pks.keys());
             let keys_only = set.is_none();
-            let count = client.read_modify_write(&target, bound, Vec::new(), keys_only, |held| {
-                resolve_conflicts(&rows, held, set.as_deref_mut(), schema)
-            })?;
+            let count = client
+                .read_modify_write(&target, bound, Vec::new(), keys_only, |held| {
+                    resolve_conflicts(&rows, held, set.as_deref_mut(), schema)
+                })
+                .await?;
             Ok(SqlResult::RowsAffected { count })
         }
     }

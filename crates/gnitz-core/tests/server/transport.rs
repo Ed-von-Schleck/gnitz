@@ -2,6 +2,7 @@
 //! (self-signed dev cert, ephemeral port) beside the AF_UNIX socket, and what
 //! the server does to a connection that stalls, floods or never says HELLO.
 
+use gnitz_core::block_on;
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -42,7 +43,7 @@ fn evicted_within(s: &mut Session, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if s.submit(Request::AllocIds(1)).is_err() || !write_out(s) {
+        if s.submit(Request::AllocIds(1), |r| r).is_err() || !write_out(s) {
             return true;
         }
     }
@@ -69,7 +70,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
 
     // ?ca=dev cert: full verification against the minted self-signed cert.
     let mut pinned = GnitzClient::connect(&srv.tls_target()).expect("ca-pinned connect");
-    pinned.alloc_id().unwrap();
+    block_on(pinned.alloc_id()).unwrap();
 
     // Default webpki roots must REJECT the self-signed dev cert.
     let err = GnitzClient::connect(&format!("tls://{}", srv.tls_endpoint()))
@@ -125,7 +126,7 @@ fn ipv6_loopback_connect_and_ca_verify() {
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
     // Full verification against the dev cert's ::1 IP SAN.
     let mut client = GnitzClient::connect(&target).expect("ca-pinned tls over [::1]");
-    client.alloc_id().unwrap();
+    block_on(client.alloc_id()).unwrap();
 }
 
 /// A required-mTLS server admits the leaf its own client CA signed, and neither
@@ -135,7 +136,7 @@ fn an_mtls_server_admits_only_a_leaf_its_client_ca_signed() {
     let srv = ServerHandle::start_mtls(1);
     let (mut client, _, tid, schema) = client_with_table(&srv.mtls_target());
     let pushed = rows(&schema, 0..500);
-    client.push(tid, &schema, &pushed, WireConflictMode::Update).unwrap();
+    block_on(client.push(tid, &schema, &pushed, WireConflictMode::Update)).unwrap();
     assert_eq!(
         weighted_rows(&scan_all(&mut client, tid, &schema)),
         weighted_rows(&pushed)
@@ -206,7 +207,7 @@ fn first_frame_deadline_reaps_silent_connections() {
 
     // A client that sends its HELLO at once is unaffected.
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
-    client.alloc_id().unwrap();
+    block_on(client.alloc_id()).unwrap();
 }
 
 #[test]
@@ -253,11 +254,10 @@ fn both_transports_carry_every_cell_at_its_net_weight() {
     let (mut tls, _, tid, schema) = client_with_table(&srv.tls_target());
     let mut unix = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    tls.push(tid, &schema, rows(&schema, 0..700_000), WireConflictMode::Update)
-        .unwrap();
+    block_on(tls.push(tid, &schema, rows(&schema, 0..700_000), WireConflictMode::Update)).unwrap();
     let mut retract = rows(&schema, [500]);
     retract.weights[0] = -1;
-    unix.push(tid, &schema, &retract, WireConflictMode::Update).unwrap();
+    block_on(unix.push(tid, &schema, &retract, WireConflictMode::Update)).unwrap();
 
     let want = weighted_rows(&rows(&schema, (0..700_000).filter(|&pk| pk != 500)));
     for client in [&mut tls, &mut unix] {
@@ -278,13 +278,11 @@ fn a_restart_fails_the_old_connection_fast_and_admits_a_new_one() {
     for ((client, _, tid, schema), target) in clients.iter_mut().zip(&targets) {
         let t0 = Instant::now();
         for _ in 0..2 {
-            let err = client
-                .scan_spec(*tid, &ReadSpec::all_rows(ReadBound::None), schema)
-                .unwrap_err();
+            let err = block_on(client.scan_spec(*tid, &ReadSpec::all_rows(ReadBound::None), schema)).unwrap_err();
             assert!(matches!(err, ClientError::ConnectionLost(_)), "{target}: {err:?}");
         }
         assert!(t0.elapsed() < Duration::from_secs(5), "{target}: {:?}", t0.elapsed());
-        GnitzClient::connect(target).unwrap().alloc_id().unwrap();
+        block_on(GnitzClient::connect(target).unwrap().alloc_id()).unwrap();
     }
 }
 
@@ -304,22 +302,23 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         set_small_bufs(s.as_raw_fd());
 
         let (n_pushes, per) = (30u64, 25_000u64);
-        let pushes: Vec<SlotId> = (0..n_pushes)
+        let mut sent: Vec<_> = (0..n_pushes)
             .map(|i| {
                 let batch = rows(&schema, i * per..(i + 1) * per);
-                s.submit(push_req(tid, &schema, &batch)).unwrap()
+                s.submit(push_req(tid, &schema, &batch), |r| r).unwrap()
             })
             .collect();
         let all = ReadSpec::all_rows(ReadBound::None);
-        let scan = s.submit(scan_req(tid, &all, &schema)).unwrap();
+        sent.push(s.submit(scan_req(tid, &all, &schema), |r| r).unwrap());
         assert!(write_out(&mut s), "the server keeps reading");
 
-        let (done, _) = drive_all(&mut s, pushes.len() + 1);
-        for id in pushes {
-            assert!(matches!(done[&id], Ok(Reply::Ack(_))), "{:?}", done[&id]);
+        let (mut done, _) = drive_all(&mut s, sent);
+        let scan = done.pop().unwrap();
+        for push in done {
+            assert!(matches!(push, Ok(Reply::Ack(_))), "{push:?}");
         }
-        let Ok(Reply::Scan(data)) = &done[&scan] else {
-            panic!("{:?}", done[&scan])
+        let Ok(Reply::Scan(data)) = &scan else {
+            panic!("{scan:?}")
         };
         assert_eq!(
             data.batch.len() as u64,
@@ -338,22 +337,18 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
     for target in [srv.sock_path().to_string(), srv.tls_target()] {
         with_watchdog(120, move || {
             let (mut setup, _, tid, schema) = client_with_table(&target);
-            setup
-                .push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)
-                .unwrap();
+            block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
             let mut s = Session::connect(&target).unwrap();
             set_small_bufs(s.as_raw_fd());
             let all = ReadSpec::all_rows(ReadBound::None);
-            s.submit(scan_req(tid, &all, &schema)).unwrap();
+            let _unread = s.submit(scan_req(tid, &all, &schema), |r| r).unwrap();
             assert!(write_out(&mut s));
             // Never read. Allow a few deadlines of slack.
             assert!(evicted_within(&mut s, 8_000), "{target}: not evicted");
 
             // Everyone else kept going.
-            setup
-                .push(tid, &schema, rows(&schema, [200_000]), WireConflictMode::Update)
-                .unwrap();
+            block_on(setup.push(tid, &schema, rows(&schema, [200_000]), WireConflictMode::Update)).unwrap();
             assert_eq!(scan_all(&mut setup, tid, &schema).len(), 200_001);
         });
     }
@@ -368,19 +363,17 @@ fn inbound_cap_breach_closes_stalled_connection() {
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (mut setup, _, tid, schema) = client_with_table(&target);
-        setup
-            .push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)
-            .unwrap();
+        block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
         let mut s = Session::connect(&target).unwrap();
         set_small_bufs(s.as_raw_fd());
         let all = ReadSpec::all_rows(ReadBound::None);
-        s.submit(scan_req(tid, &all, &schema)).unwrap();
+        let _unread = s.submit(scan_req(tid, &all, &schema), |r| r).unwrap();
 
         // ~140 MB of rows the table does not hold, ~1 MB a frame.
         let flood = rows(&schema, 200_000..225_000);
         let mut sent = 0;
-        while sent < 140 && s.submit(push_req(tid, &schema, &flood)).is_ok() && write_out(&mut s) {
+        while sent < 140 && s.submit(push_req(tid, &schema, &flood), |r| r).is_ok() && write_out(&mut s) {
             sent += 1;
         }
         assert!(

@@ -3,6 +3,7 @@
 //! a kept descriptor out once another client's DDL has made it stale.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_wire::{RelClass, WireStatus::NotFound};
 
 const T_ID_V: &str = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)";
@@ -19,7 +20,7 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert!(rel.tid >= gnitz_wire::FIRST_USER_TABLE_ID);
     assert_eq!(visible_names(&rel.schema), ["id", "v"]);
     assert!(!db.exists("nope"));
-    let err = db.client.resolve("no_such_schema", "t").unwrap_err();
+    let err = block_on(db.client.resolve("no_such_schema", "t")).unwrap_err();
     assert!(
         matches!(&err, ClientError::Refused(WireFault { status: NotFound, .. })),
         "got: {err:?}"
@@ -216,9 +217,9 @@ fn drop_schema_is_four_requests_whatever_the_member_count() {
         ));
     }
     let before = db.client.requests_sent();
-    db.client.drop_schema(&db.sn).unwrap();
+    block_on(db.client.drop_schema(&db.sn)).unwrap();
     assert_eq!(db.client.requests_sent() - before, 4);
-    db.client.create_schema(&db.sn).unwrap();
+    block_on(db.client.create_schema(&db.sn)).unwrap();
     assert!(!db.exists("m0") && !db.exists("vw0"));
 }
 
@@ -261,7 +262,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     let rel = b.rel("t");
     let mut batch = ZSetBatch::new(&rel.schema);
     BatchAppender::new(&mut batch).add_row(1, 1).i64_val(10);
-    b.client.push(rel.tid, &rel.schema, &batch, Update).unwrap();
+    block_on(b.client.push(rel.tid, &rel.schema, &batch, Update)).unwrap();
 
     a.exec("ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
 
@@ -270,7 +271,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     assert!(rel2.schema.columns[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&rel2.schema);
     BatchAppender::new(&mut batch).add_row(2, 1).null();
-    b.client.push(rel2.tid, &rel2.schema, &batch, Update).unwrap();
+    block_on(b.client.push(rel2.tid, &rel2.schema, &batch, Update)).unwrap();
 
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1], [2, NULL, 1]]);
 }
@@ -285,8 +286,8 @@ fn a_recreated_schema_resolves_its_new_members() {
     db.exec("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
     let old_tid = db.rel("t").tid;
 
-    db.client.drop_schema(&db.sn).unwrap();
-    db.client.create_schema(&db.sn).unwrap();
+    block_on(db.client.drop_schema(&db.sn)).unwrap();
+    block_on(db.client.create_schema(&db.sn)).unwrap();
     assert!(
         !db.exists("t"),
         "the old member must not resurrect under the recreated schema"

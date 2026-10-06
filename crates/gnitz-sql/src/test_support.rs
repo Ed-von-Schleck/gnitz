@@ -66,14 +66,9 @@ pub(crate) fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc
     rel(tid, RelClass::Table, columns, pk_cols, Vec::new())
 }
 
-/// A resolver that knows no relation.
-fn absent(_: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-    Ok(None)
-}
-
 /// A catalog holding `rels` under [`SN`]; any other name is absent.
 pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> Catalog<'static> {
-    let cat = Catalog::new(SN, &absent);
+    let cat = Catalog::complete(SN);
     for (name, desc) in rels {
         cat.insert(name, Some(desc));
     }

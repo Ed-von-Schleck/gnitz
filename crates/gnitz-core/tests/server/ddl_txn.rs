@@ -3,6 +3,7 @@
 //! checks.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_core::sys_schema;
 use gnitz_wire::sys_rows::{SchemaTabRow, SysRow};
 use gnitz_wire::{PkColList, ViewProps, SCHEMA_TAB, SEQ_TAB};
@@ -17,9 +18,9 @@ fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
 
 /// The refusal of `families` sent as one DDL bundle.
 fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
-    let slot = s.submit(Request::DdlTxn(families)).unwrap();
-    let (mut done, _) = drive_all(s, 1);
-    done.remove(&slot).unwrap().unwrap_err().to_string()
+    let sent = s.submit(Request::DdlTxn(families), |r| r).unwrap();
+    let (mut done, _) = drive_all(s, vec![sent]);
+    done.remove(0).unwrap_err().to_string()
 }
 
 /// Refused whole, before the catalog reads it: a bundle with two blocks for one
@@ -32,7 +33,10 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let mut s = Session::connect(srv.sock_path()).unwrap();
-    let (a, b) = (client.alloc_id().unwrap(), client.alloc_id().unwrap());
+    let (a, b) = (
+        block_on(client.alloc_id()).unwrap(),
+        block_on(client.alloc_id()).unwrap(),
+    );
     let err = refusal(
         &mut s,
         &[(SCHEMA_TAB, schema_row(a, "one")), (SCHEMA_TAB, schema_row(b, "two"))],
@@ -46,8 +50,8 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     assert!(err.contains("not writable from the wire"), "{err}");
 
     // Neither wrote anything: both names are still free.
-    client.create_schema("one").unwrap();
-    client.create_schema("two").unwrap();
+    block_on(client.create_schema("one")).unwrap();
+    block_on(client.create_schema("two")).unwrap();
 }
 
 /// A unique index the catalog's owner or dropped-column rule refuses is refused
@@ -61,23 +65,22 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     let mut app = BatchAppender::new(&mut dup);
     app.add_row(1, 1).i64_val(5);
     app.add_row(2, 1).i64_val(5);
-    client.push(tid, &schema, &dup, WireConflictMode::Update).unwrap();
+    block_on(client.push(tid, &schema, &dup, WireConflictMode::Update)).unwrap();
 
     let unique_on_v = |client: &mut GnitzClient, owner_id: u64| {
-        client
-            .create_index(owner_id, PkColList::from_slice(&[1]), "ix", true)
+        block_on(client.create_index(owner_id, PkColList::from_slice(&[1]), "ix", true))
             .unwrap_err()
             .to_string()
     };
 
     // The backfill copies both rows into the view.
-    let source = client.resolve_relation(&sn, "t").unwrap();
-    let vid = client.create_view(&sn, "v", &source, ViewProps::default()).unwrap();
+    let source = block_on(client.resolve_relation(&sn, "t")).unwrap();
+    let vid = block_on(client.create_view(&sn, "v", &source, ViewProps::default())).unwrap();
     let err = unique_on_v(&mut client, vid);
     assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 
-    client.drop_view(&sn, &["v"], false).unwrap();
-    client.alter_drop_column(tid, 1).unwrap();
+    block_on(client.drop_view(&sn, &["v"], false)).unwrap();
+    block_on(client.alter_drop_column(tid, 1)).unwrap();
     let err = unique_on_v(&mut client, tid);
     assert!(err.contains("is dropped"), "{err}");
 }

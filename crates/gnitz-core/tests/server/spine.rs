@@ -1,13 +1,14 @@
 //! A second driver over the connection spine: many operations in flight on
 //! one connection against a real server, on both transports. Carries no
 //! futures, no waker and no executor — submit N, then `step` / drain / park
-//! until every slot is done. It lives out of crate on purpose: it proves the
-//! spine's public surface is complete for a driver with nothing private in
+//! until every reply has arrived. It lives out of crate on purpose: it proves
+//! the spine's public surface is complete for a driver with nothing private in
 //! reach, and it exercises what the one-slot blocking client cannot — a deep
-//! outbound queue, the head accumulator handing off across slots, a
-//! driver-side slot map, both interests armed at once, and the cap.
+//! outbound queue, the head accumulator handing off across slots, both
+//! interests armed at once, and the cap.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_core::MAX_IN_FLIGHT;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::strace_test;
@@ -38,36 +39,32 @@ fn concurrent_pushes_and_scans(target: &str) {
     let all = ReadSpec::all_rows(ReadBound::None);
     let sent_before = s.requests_sent();
     let (n, per) = (40u64, 5_000u64);
-    let mut slots: Vec<(SlotId, bool)> = Vec::new();
+    let mut sent = Vec::new();
     for i in 0..n {
         let batch = rows(&schema, i * per..(i + 1) * per);
-        slots.push((s.submit(push_req(tid, &schema, &batch)).unwrap(), true));
-        slots.push((s.submit(scan_req(tid, &all, &schema)).unwrap(), false));
+        sent.push(s.submit(push_req(tid, &schema, &batch), |r| r).unwrap());
+        sent.push(s.submit(scan_req(tid, &all, &schema), |r| r).unwrap());
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n, "counted on enqueue");
-    let (mut done, both_armed) = drive_all(&mut s, slots.len());
+    let (done, both_armed) = drive_all(&mut s, sent);
     assert!(
         both_armed,
         "a pending write and a pending read arm both interests at once"
     );
+    // A push, then a scan, `n` times over.
     let mut pushed = 0;
-    for (id, is_push) in slots {
-        let r = done
-            .remove(&id)
-            .expect("every slot completes")
-            .expect("no server error");
-        if is_push {
-            pushed += per;
-            assert!(matches!(r, Reply::Ack(_)), "a push completes as its ingest LSN");
-        } else {
-            let Reply::Scan(data) = r else { panic!("scan") };
-            assert_eq!(
+    for r in done {
+        match r.expect("no server error") {
+            Reply::Ack(_) => pushed += per,
+            Reply::Scan(data) => assert_eq!(
                 data.batch.len() as u64,
                 pushed,
                 "a scan sees every push submitted ahead of it"
-            );
+            ),
+            other => panic!("{other:?}"),
         }
     }
+    assert_eq!(pushed, n * per, "every push completes as its ingest LSN");
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
     assert_eq!(
@@ -89,16 +86,13 @@ fn every_slot_up_to_the_cap_completes() {
     let (_blocking, tid, schema) = table(srv.sock_path());
     let all = ReadSpec::all_rows(ReadBound::None);
     let mut s = Session::connect(srv.sock_path()).unwrap();
-    let ids: Vec<SlotId> = (0..MAX_IN_FLIGHT)
-        .map(|_| s.submit(scan_req(tid, &all, &schema)).unwrap())
-        .collect();
-    assert!(s.submit(scan_req(tid, &all, &schema)).is_err(), "at the cap");
-    let (done, _) = drive_all(&mut s, MAX_IN_FLIGHT);
-    for id in ids {
-        assert!(done[&id].is_ok());
-    }
-    assert!(s.submit(scan_req(tid, &all, &schema)).is_ok(), "below the cap again");
-    let _ = drive_all(&mut s, 1);
+    let scan = |s: &mut Session| s.submit(scan_req(tid, &all, &schema), |r| r);
+    let sent: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| scan(&mut s).unwrap()).collect();
+    assert!(scan(&mut s).is_err(), "at the cap");
+    let (done, _) = drive_all(&mut s, sent);
+    assert!(done.iter().all(Result::is_ok));
+    let below = scan(&mut s).expect("below the cap again");
+    let _ = drive_all(&mut s, vec![below]);
 }
 
 // ── Syscalls per operation ────────────────────────────────────────────────
@@ -120,9 +114,7 @@ fn syscall_count_child() {
     let mut client = GnitzClient::connect(&target).unwrap();
     let schema = Arc::new(pk_a());
     for i in 0..n {
-        client
-            .push(tid, &schema, rows(&schema, [i]), WireConflictMode::Update)
-            .unwrap();
+        block_on(client.push(tid, &schema, rows(&schema, [i]), WireConflictMode::Update)).unwrap();
     }
 }
 

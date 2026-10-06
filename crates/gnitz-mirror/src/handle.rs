@@ -5,7 +5,7 @@ use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::append_own_regions;
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Refill, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
@@ -70,6 +70,9 @@ pub struct Mirror {
     /// The directory the host named; the copies' is [`ROOT`] under it.
     base_dir: String,
     copies: Guarded<Copies>,
+    /// The copy between its erase and its seal, every block of its value so
+    /// far landed.
+    filling: Option<u64>,
     _dir_lock: DirLock,
 }
 
@@ -120,6 +123,7 @@ impl Mirror {
         Ok(Mirror {
             base_dir: base_dir.to_string(),
             copies: Guarded::new(copies),
+            filling: None,
             _dir_lock: dir_lock,
         })
     }
@@ -388,13 +392,32 @@ impl MirrorStore for Mirror {
             .touching("invalidating a copy", |c| c.invalidate(tid, level))
     }
 
-    fn refill(&mut self, tid: u64) -> Result<Box<dyn Refill + '_>, MirrorError> {
+    fn refill(&mut self, tid: u64) -> Result<(), MirrorError> {
+        self.filling = None;
         self.copies.touching("erasing a copy", |c| c.erase(tid))?;
-        Ok(Box::new(Filling {
-            copies: &mut self.copies,
-            tid,
-            torn: false,
-        }))
+        self.filling = Some(tid);
+        Ok(())
+    }
+
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]]) -> Result<(), MirrorError> {
+        self.being_filled(tid)?;
+        let taken = self.copies.touching("filling a copy", |c| {
+            blocks.iter().try_for_each(|block| c.ingest(tid, block))
+        });
+        // A block that failed took the blocks before it along.
+        if taken.is_err() {
+            self.filling = None;
+        }
+        taken
+    }
+
+    fn seal(&mut self, tid: u64, cursor: DeltaCursor) -> Result<(), MirrorError> {
+        self.being_filled(tid)?;
+        self.filling = None;
+        self.copies.touching("sealing a copy", |c| {
+            c.settle(tid, cursor);
+            Ok(())
+        })
     }
 
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
@@ -433,42 +456,15 @@ impl MirrorStore for Mirror {
     }
 }
 
-/// One copy between its erase and its seal.
-struct Filling<'a> {
-    copies: &'a mut Guarded<Copies>,
-    tid: u64,
-    /// A block failed and took the blocks before it along.
-    torn: bool,
-}
-
-impl Filling<'_> {
-    fn intact(&self) -> Result<(), MirrorError> {
-        if self.torn {
-            return Err(MirrorError::Engine(format!(
-                "a block of relation {}'s whole value failed, so the copy holds none of it",
-                self.tid
-            )));
+impl Mirror {
+    /// `tid` is the copy being filled.
+    fn being_filled(&self, tid: u64) -> Result<(), MirrorError> {
+        match self.filling == Some(tid) {
+            true => Ok(()),
+            false => Err(MirrorError::Engine(format!(
+                "relation {tid}'s copy is not being refilled"
+            ))),
         }
-        Ok(())
-    }
-}
-
-impl Refill for Filling<'_> {
-    fn block(&mut self, block: &[u8]) -> Result<(), MirrorError> {
-        self.intact()?;
-        let tid = self.tid;
-        let taken = self.copies.touching("filling a copy", |c| c.ingest(tid, block));
-        self.torn = taken.is_err();
-        taken
-    }
-
-    fn seal(self: Box<Self>, cursor: DeltaCursor) -> Result<(), MirrorError> {
-        self.intact()?;
-        let tid = self.tid;
-        self.copies.touching("sealing a copy", |c| {
-            c.settle(tid, cursor);
-            Ok(())
-        })
     }
 }
 

@@ -61,24 +61,41 @@ pub(crate) fn output_column<'a>(
     }
 }
 
-/// What a statement's resolver answers for one relation name.
-pub(crate) type Resolve<'r> = &'r dyn Fn(&str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError>;
+/// One run of a plan against a [`Catalog`].
+pub(crate) enum Attempt<T> {
+    Planned(Result<T, GnitzSqlError>),
+    /// The plan asked for this name, which the catalog has no verdict for:
+    /// [`Catalog::insert`] one and attempt again.
+    Missing(String),
+}
 
-/// The relations one statement's plan reads under `schema_name`: each name is
-/// resolved on its first probe and remembered, absence included.
+/// The relations one statement's plan reads under `schema_name`, as far as
+/// they are known.
 pub(crate) struct Catalog<'r> {
     schema_name: &'r str,
-    resolve: Resolve<'r>,
+    /// Each name's verdict, absence included.
     known: RefCell<HashMap<String, Option<Arc<RelDescriptor>>>>,
+    /// The name the running attempt asked for and found no verdict on.
+    missed: RefCell<Option<String>>,
+    /// Whether a name without a verdict may yet be supplied; otherwise it is
+    /// absent.
+    open: bool,
 }
 
 impl<'r> Catalog<'r> {
-    pub(crate) fn new(schema_name: &'r str, resolve: Resolve<'r>) -> Self {
+    pub(crate) fn new(schema_name: &'r str) -> Self {
         Catalog {
             schema_name,
-            resolve,
             known: RefCell::new(HashMap::new()),
+            missed: RefCell::new(None),
+            open: true,
         }
+    }
+
+    /// A catalog that already holds every relation there is.
+    #[cfg(test)]
+    pub(crate) fn complete(schema_name: &'r str) -> Self {
+        Catalog { open: false, ..Catalog::new(schema_name) }
     }
 
     /// The schema every name of the statement resolves under.
@@ -89,13 +106,16 @@ impl<'r> Catalog<'r> {
     /// The relation `name` resolves to, `None` for a free name.
     pub(crate) fn probe(&self, name: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
         let key = qualified_name(self.schema_name, name);
-        let hit = self.known.borrow().get(&key).cloned();
-        if let Some(hit) = hit {
-            return Ok(hit);
+        if let Some(hit) = self.known.borrow().get(&key) {
+            return Ok(hit.clone());
         }
-        let found = (self.resolve)(name)?;
-        self.known.borrow_mut().insert(key, found.clone());
-        Ok(found)
+        if !self.open {
+            return Ok(None);
+        }
+        *self.missed.borrow_mut() = Some(name.to_string());
+        Err(GnitzSqlError::Internal(format!(
+            "relation '{name}' was planned before it was resolved"
+        )))
     }
 
     /// The relation `name` a statement reads: [`Self::probe`], with absence an
@@ -105,8 +125,16 @@ impl<'r> Catalog<'r> {
             .ok_or_else(|| crate::error::missing_relation(self.schema_name, name))
     }
 
-    /// Record `name`'s verdict without asking the resolver.
-    #[cfg(test)]
+    /// Run `plan` against what this catalog holds.
+    pub(crate) fn attempt<T>(&self, plan: impl FnOnce(&Self) -> Result<T, GnitzSqlError>) -> Attempt<T> {
+        let planned = plan(self);
+        match self.missed.borrow_mut().take() {
+            Some(name) => Attempt::Missing(name),
+            None => Attempt::Planned(planned),
+        }
+    }
+
+    /// Record `name`'s verdict.
     pub(crate) fn insert(&self, name: &str, desc: Option<Arc<RelDescriptor>>) {
         self.known
             .borrow_mut()

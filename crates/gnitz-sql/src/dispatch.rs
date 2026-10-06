@@ -1,7 +1,7 @@
 //! Statement dispatch: routes a `Statement` to its handler in `ddl` or `dml`,
 //! each planned against the statement's catalog and then run on the client.
 
-use crate::bind::Catalog;
+use crate::bind::{Attempt, Catalog};
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
@@ -9,35 +9,39 @@ use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, Held};
 use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
-use std::cell::{Cell, RefCell};
 
-/// Plan against a catalog that asks `client` for each name on first use: what
-/// it holds — the copy's descriptor for a `read`, a kept one when `use_kept` —
-/// else the server. Also answers whether a kept descriptor went into the plan.
-fn planned<T>(
+/// Plan against the descriptors `client` supplies for the names the plan asks
+/// for: one it holds — the copy's for a `read`, a kept one when `use_kept` —
+/// else the server's. Also answers whether a kept one went into the plan.
+async fn planned<T>(
     client: &mut GnitzClient,
     schema_name: &str,
     read: bool,
     use_kept: bool,
-    plan: impl FnOnce(&Catalog<'_>) -> Result<T, GnitzSqlError>,
+    plan: impl Fn(&Catalog<'_>) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, bool) {
-    let client = RefCell::new(client);
-    let from_kept = Cell::new(false);
-    let ask = |name: &str| {
-        let mut client = client.borrow_mut();
+    let cat = Catalog::new(schema_name);
+    let mut from_kept = false;
+    loop {
+        let name = match cat.attempt(&plan) {
+            Attempt::Planned(planned) => return (planned, from_kept),
+            Attempt::Missing(name) => name,
+        };
         let held = client
-            .held(schema_name, name, read)
+            .held(schema_name, &name, read)
             .filter(|&(_, held)| use_kept || held == Held::Copy);
-        Ok(match held {
+        let desc = match held {
             Some((desc, held)) => {
-                from_kept.set(from_kept.get() || held == Held::Kept);
+                from_kept |= held == Held::Kept;
                 Some(desc)
             }
-            None => client.resolve(schema_name, name)?,
-        })
-    };
-    let planned = plan(&Catalog::new(schema_name, &ask));
-    (planned, from_kept.get())
+            None => match client.resolve(schema_name, &name).await {
+                Ok(desc) => desc,
+                Err(e) => return (Err(e.into()), from_kept),
+            },
+        };
+        cat.insert(&name, desc);
+    }
 }
 
 /// Times [`planned_kept`] plans a statement before its `StaleCatalog` refusal
@@ -53,19 +57,19 @@ const STALE_MAX_ATTEMPTS: usize = 4;
 /// - a plan that fails, or one `checked` denies sends such a request, stands
 ///   only when no kept descriptor went into it; otherwise the statement is
 ///   planned again.
-fn planned_kept<P>(
+async fn planned_kept<P>(
     client: &mut GnitzClient,
     schema_name: &str,
     read: bool,
     plan: impl Fn(&Catalog<'_>) -> Result<P, GnitzSqlError>,
     checked: impl Fn(&P) -> bool,
-    run: impl Fn(&mut GnitzClient, P) -> Result<SqlResult, GnitzSqlError>,
+    run: impl AsyncFn(&mut GnitzClient, P) -> Result<SqlResult, GnitzSqlError>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let mut use_kept = true;
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let plan = match planned(client, schema_name, read, use_kept, &plan) {
+        let plan = match planned(client, schema_name, read, use_kept, &plan).await {
             (Ok(plan), from_kept) if !from_kept || checked(&plan) => plan,
             (Err(e), false) => return Err(e),
             _ => {
@@ -73,7 +77,7 @@ fn planned_kept<P>(
                 continue;
             }
         };
-        match run(client, plan) {
+        match run(client, plan).await {
             Err(GnitzSqlError::Client(ClientError::Refused(WireFault {
                 status: WireStatus::StaleCatalog, ..
             }))) if attempt < STALE_MAX_ATTEMPTS => use_kept = false,
@@ -85,7 +89,7 @@ fn planned_kept<P>(
 /// Route one statement. Only a read is planned from a mirrored copy's
 /// descriptor, and only DML and a `SELECT` from kept ones: an EXPLAIN sends no
 /// request to check one.
-pub(crate) fn execute_statement(
+pub(crate) async fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
@@ -94,17 +98,22 @@ pub(crate) fn execute_statement(
         // Bare `DESC t` is `Statement::ExplainTable`, table introspection, and falls to
         // the catch-all below; `plan_read` rejects the EXPLAIN of a non-SELECT.
         Statement::Explain { .. } => {
-            let plan = planned(client, schema_name, true, false, |cat| dml::plan_read(stmt, cat)).0?;
+            let plan = planned(client, schema_name, true, false, |cat| dml::plan_read(stmt, cat))
+                .await
+                .0?;
             Ok(dml::execute_explain(client, &plan))
         }
-        Statement::Query(_) => planned_kept(
-            client,
-            schema_name,
-            true,
-            |cat| dml::plan_read(stmt, cat),
-            |plan| !plan.answers_from_schema(),
-            dml::execute_select,
-        ),
+        Statement::Query(_) => {
+            planned_kept(
+                client,
+                schema_name,
+                true,
+                |cat| dml::plan_read(stmt, cat),
+                |plan| !plan.answers_from_schema(),
+                dml::execute_select,
+            )
+            .await
+        }
         // Transaction control is a pure client-state-machine transition, so the
         // arm is the whole consumer: `transaction already open` and `no
         // transaction open` come from the `client.txn_*` calls below.
@@ -139,7 +148,7 @@ pub(crate) fn execute_statement(
             reject_if(modifier.is_some(), CTX, "a COMMIT modifier (TRY / CATCH)")?;
             // A conflict is surfaced, not retried: the transaction is already
             // closed.
-            Ok(SqlResult::TransactionCommitted { lsn: client.txn_commit()? })
+            Ok(SqlResult::TransactionCommitted { lsn: client.txn_commit().await? })
         }
         Statement::Rollback { chain, savepoint } => {
             const CTX: &str = "ROLLBACK";
@@ -150,30 +159,39 @@ pub(crate) fn execute_statement(
         }
         // A write is checked wherever it lands: sent, by its own request;
         // buffered in a transaction, by the COMMIT that ships it.
-        Statement::Insert(insert) => planned_kept(
-            client,
-            schema_name,
-            false,
-            |cat| dml::plan_insert(insert, cat),
-            |_| true,
-            dml::execute_insert,
-        ),
-        Statement::Update(update) => planned_kept(
-            client,
-            schema_name,
-            false,
-            |cat| dml::plan_update(update, cat),
-            |_| true,
-            dml::execute_mutation,
-        ),
-        Statement::Delete(del) => planned_kept(
-            client,
-            schema_name,
-            false,
-            |cat| dml::plan_delete(del, cat),
-            |_| true,
-            dml::execute_mutation,
-        ),
+        Statement::Insert(insert) => {
+            planned_kept(
+                client,
+                schema_name,
+                false,
+                |cat| dml::plan_insert(insert, cat),
+                |_| true,
+                dml::execute_insert,
+            )
+            .await
+        }
+        Statement::Update(update) => {
+            planned_kept(
+                client,
+                schema_name,
+                false,
+                |cat| dml::plan_update(update, cat),
+                |_| true,
+                dml::execute_mutation,
+            )
+            .await
+        }
+        Statement::Delete(del) => {
+            planned_kept(
+                client,
+                schema_name,
+                false,
+                |cat| dml::plan_delete(del, cat),
+                |_| true,
+                dml::execute_mutation,
+            )
+            .await
+        }
         // Refused, not failed: the transaction stays open.
         Statement::CreateTable(_)
         | Statement::Drop { .. }
@@ -191,9 +209,10 @@ pub(crate) fn execute_statement(
             match planned(client, schema_name, false, false, |cat| {
                 ddl::plan_create_table(create, cat)
             })
+            .await
             .0?
             {
-                Some(plan) => ddl::execute_create_table(client, schema_name, plan),
+                Some(plan) => ddl::execute_create_table(client, schema_name, plan).await,
                 None => Ok(SqlResult::Ddl),
             }
         }
@@ -216,22 +235,26 @@ pub(crate) fn execute_statement(
             reject_if(*purge, CTX, "PURGE")?;
             reject_if(*temporary, CTX, "TEMPORARY")?;
             reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
-            ddl::execute_drop(client, schema_name, object_type, names, *if_exists)
+            ddl::execute_drop(client, schema_name, object_type, names, *if_exists).await
         }
         Statement::CreateView(cv) => {
-            match planned(client, schema_name, false, false, |cat| ddl::plan_create_view(cv, cat)).0? {
-                Some(chain) => ddl::execute_view_chain(client, schema_name, chain),
+            match planned(client, schema_name, false, false, |cat| ddl::plan_create_view(cv, cat))
+                .await
+                .0?
+            {
+                Some(chain) => ddl::execute_view_chain(client, schema_name, chain).await,
                 None => Ok(SqlResult::Ddl),
             }
         }
-        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci),
-        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
+        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci).await,
+        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a).await,
         Statement::AlterView { name, query, columns, with_options } => {
             let chain = planned(client, schema_name, false, false, |cat| {
                 ddl::plan_alter_view(name, columns, query, with_options, cat)
             })
+            .await
             .0?;
-            ddl::execute_view_chain(client, schema_name, chain)
+            ddl::execute_view_chain(client, schema_name, chain).await
         }
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }

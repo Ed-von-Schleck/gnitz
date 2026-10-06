@@ -12,6 +12,7 @@ mod placement;
 mod resolve;
 mod views;
 
+use gnitz_core::block_on;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -52,7 +53,7 @@ impl Db {
     fn on(srv: ServerHandle) -> Db {
         let sn = unique_schema("s");
         let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-        client.create_schema(&sn).unwrap();
+        block_on(client.create_schema(&sn)).unwrap();
         Db { client, sn, srv: Rc::new(srv) }
     }
 
@@ -66,7 +67,7 @@ impl Db {
     }
 
     pub fn try_exec(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-        gnitz_sql::execute(&mut self.client, &self.sn, sql)
+        block_on(gnitz_sql::execute(&mut self.client, &self.sn, sql))
     }
 
     /// Execute `sql`, returning its last statement's result.
@@ -146,12 +147,12 @@ impl Db {
     }
 
     pub fn rel(&mut self, name: &str) -> Arc<RelDescriptor> {
-        self.client.resolve_relation(&self.sn, name).unwrap()
+        block_on(self.client.resolve_relation(&self.sn, name)).unwrap()
     }
 
     /// Whether `name` resolves.
     pub fn exists(&mut self, name: &str) -> bool {
-        self.client.resolve(&self.sn, name).unwrap().is_some()
+        block_on(self.client.resolve(&self.sn, name)).unwrap().is_some()
     }
 
     /// `name`'s secondary indexes as `(column names, is_unique)`, sorted.

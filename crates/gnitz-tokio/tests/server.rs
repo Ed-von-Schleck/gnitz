@@ -1,18 +1,22 @@
 #![cfg(feature = "integration")]
 
 //! The tokio client against a real server: what needs real replies — verbs
-//! pipelined over both transports, the syscalls a burst costs, and the blocking
-//! client its clones share.
+//! pipelined over both transports, the syscalls a burst costs, and the mirror
+//! a shared client keeps.
 
 mod support;
 
 use std::ops::Range;
 use std::sync::Arc;
 
-use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
+use std::future::Future;
+
+use gnitz_core::{
+    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, ScanReply, Schema, ZSetBatch,
+};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
-use gnitz_tokio::BlockingClient;
+use gnitz_tokio::AsyncClient;
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
 use support::settled;
 use tokio::runtime::Runtime;
@@ -33,11 +37,9 @@ fn schema() -> Schema {
 fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     let mut client = GnitzClient::connect(target).expect("connect");
     let sn = unique_schema("tokio");
-    client.create_schema(&sn).unwrap();
+    block_on(client.create_schema(&sn)).unwrap();
     let schema = schema();
-    let tid = client
-        .create_table(&sn, "t", &schema, &[], TableProps::default(), &[])
-        .unwrap();
+    let tid = block_on(client.create_table(&sn, "t", &schema, &[], TableProps::default(), &[])).unwrap();
     (client, tid, Arc::new(schema), sn)
 }
 
@@ -62,6 +64,28 @@ fn all_rows() -> ReadSpec {
     ReadSpec::all_rows(ReadBound::None)
 }
 
+/// Push `batch`, submitted when called.
+fn push(
+    c: &AsyncClient,
+    tid: u64,
+    schema: &Arc<Schema>,
+    batch: ZSetBatch,
+) -> impl Future<Output = Result<u64, ClientError>> {
+    let schema = Arc::clone(schema);
+    c.send(move |c| c.push(tid, &schema, batch, WireConflictMode::Update))
+}
+
+/// Read `tid` under `spec`, submitted when called.
+fn scan(
+    c: &AsyncClient,
+    tid: u64,
+    spec: ReadSpec,
+    schema: &Arc<Schema>,
+) -> impl Future<Output = Result<ScanReply, ClientError>> {
+    let schema = Arc::clone(schema);
+    c.send(move |c| c.scan_spec(tid, &spec, &schema))
+}
+
 // ── Pipelining ────────────────────────────────────────────────────────────
 
 /// Many verbs in flight on one connection, over each transport: each resolves
@@ -84,13 +108,8 @@ fn pipelined_verbs() {
             let rounds: Vec<_> = (0..n)
                 .map(|i| {
                     (
-                        client.push(
-                            tid,
-                            &schema,
-                            &rows(&schema, i * per..(i + 1) * per),
-                            WireConflictMode::Update,
-                        ),
-                        client.scan_spec(tid, &all_rows(), &schema),
+                        push(&client, tid, &schema, rows(&schema, i * per..(i + 1) * per)),
+                        scan(&client, tid, all_rows(), &schema),
                     )
                 })
                 .collect();
@@ -108,13 +127,19 @@ fn pipelined_verbs() {
             let mut replaced = ZSetBatch::new(&schema);
             BatchAppender::new(&mut replaced).add_row(7, 1).i64_val(-1);
             let key = PkColumn::from_natives(&schema, [7]);
+            let relations = vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))];
+            let resolve = |name: &'static str| {
+                let sn = sn.clone();
+                client.run(move |c| Box::pin(async move { c.resolve(&sn, name).await }))
+            };
             let (_, one, many, found, missing) = tokio::join!(
-                client.push(tid, &schema, &replaced, WireConflictMode::Update),
-                client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
-                client.scan_many(vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))]),
-                client.resolve(&sn, "t"),
-                client.resolve(&sn, "nope"),
+                push(&client, tid, &schema, replaced),
+                scan(&client, tid, ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
+                client.send(move |c| c.scan_many(relations)),
+                resolve("t"),
+                resolve("nope"),
             );
+            let (found, missing) = (found.unwrap(), missing.unwrap());
             let one = one.unwrap().batch;
             assert_eq!(unit_rows(&one), 1);
             assert_eq!((one.pks.get(0), read_i64_le(&one.payload[0].bytes, 0)), (7, -1));
@@ -148,7 +173,7 @@ fn syscall_count_child() {
         return;
     };
     let tid: u64 = tid.parse().unwrap();
-    let schema = schema();
+    let schema = Arc::new(schema());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -156,7 +181,7 @@ fn syscall_count_child() {
     settled(&rt, async {
         let (client, conn) = gnitz_tokio::connect(&target).await.unwrap();
         let pushes: Vec<_> = (0..BURST)
-            .map(|pk| client.push(tid, &schema, &rows(&schema, pk..pk + 1), WireConflictMode::Update))
+            .map(|pk| push(&client, tid, &schema, rows(&schema, pk..pk + 1)))
             .collect();
         // The last handle goes, which is what lets the driver finish.
         drop(client);
@@ -168,7 +193,7 @@ fn syscall_count_child() {
 }
 
 /// A burst of pushes called together leaves in one `writev`, not one each: the
-/// driver drains the whole channel before it steps.
+/// driver runs every call queued before it steps.
 #[test]
 fn one_writev_per_burst() {
     let srv = ServerHandle::start();
@@ -183,7 +208,7 @@ fn one_writev_per_burst() {
         eprintln!("strace not installed; skipping the syscall count");
         return;
     };
-    let pushed = blocking.scan_spec(tid, &all_rows(), &schema).unwrap().batch;
+    let pushed = block_on(blocking.scan_spec(tid, &all_rows(), &schema)).unwrap().batch;
     assert_eq!(unit_rows(&pushed), BURST as usize, "the traced child pushed its burst");
     // The transport writes the socket through `write_vectored`; plain `write`
     // is the harness's own stdout. One for the HELLO, one for the burst.
@@ -195,95 +220,91 @@ fn one_writev_per_burst() {
     );
 }
 
-// ── The shared blocking client ────────────────────────────────────────────
+// ── The shared client's mirror ────────────────────────────────────────────
 
-/// Every clone drives one blocking client, one call at a time, which outlives
-/// a call that panics; and a local-first read routes on what that client
-/// mirrors.
+/// A shared client mirrors a view: calls from its clones run one at a time on
+/// the one client, the copy's disk work leaves the runtime's threads, and a
+/// local-first read routes on what the client mirrors.
 #[test]
-fn clones_share_one_blocking_client() {
+fn a_shared_client_mirrors() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
-    let source = blocking.resolve_relation(&sn, "t").unwrap();
-    let vid = blocking
-        .create_view(
-            &sn,
-            "v",
-            &source,
-            ViewProps::Fed {
-                delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
-            },
-        )
-        .unwrap();
+    let source = block_on(blocking.resolve_relation(&sn, "t")).unwrap();
+    let vid = block_on(blocking.create_view(
+        &sn,
+        "v",
+        &source,
+        ViewProps::Fed {
+            delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
+        },
+    ))
+    .unwrap();
     // A push, then a read against the server: the read drains the pending
     // ticks, so the rounds a mirror reads already exist.
     let mut push_and_tick = |pks| {
-        blocking
-            .push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)
-            .unwrap();
-        blocking.scan_spec(vid, &all_rows(), &schema).unwrap();
+        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+        block_on(blocking.scan_spec(vid, &all_rows(), &schema)).unwrap();
     };
     push_and_tick(0..50);
 
     settled(&Runtime::new().unwrap(), async {
         let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
         let driver = tokio::spawn(conn);
-        let shared = BlockingClient::connect(srv.sock_path()).await.expect("connect");
         {
-            let read = |tid| shared.scan_spec_local_first(&client, tid, all_rows(), Arc::clone(&schema));
+            let read = |tid| {
+                let schema = Arc::clone(&schema);
+                client.send(move |c| c.scan_spec_local_first(tid, all_rows(), &schema))
+            };
+            let sent = || client.run(|c| Box::pin(async move { c.requests_sent() }));
 
             // Nothing is mirrored yet: the server answers.
             let served = read(vid).await.unwrap();
             assert!(served.lsn.is_some(), "a served read carries the server's LSN");
             assert_eq!(unit_rows(&served.batch), 50);
 
-            // One clone mirrors the view; every other reads off that copy.
             let dir = tempfile::tempdir().unwrap();
             let store = Mirror::open(dir.path().to_str().unwrap(), MirrorConfig::default()).unwrap();
             let name = sn.clone();
-            let mirrored = shared
-                .clone()
+            let mirrored = client
                 .run(move |c| {
-                    c.attach_mirror(store)?;
-                    c.mirror_view(&name, "v")
+                    Box::pin(async move {
+                        c.attach_mirror(store)?;
+                        c.mirror_view(&name, "v").await
+                    })
                 })
                 .await
+                .unwrap()
                 .expect("mirror the view");
             assert_eq!(mirrored.view_id, vid);
 
-            // Two clones polling at once: the second waits for the first's lock.
+            // Two clones polling at once: the second runs after the first.
             push_and_tick(50..100);
-            let (a, b) = (shared.clone(), shared.clone());
-            let (polled_a, polled_b) = tokio::join!(a.run(GnitzClient::poll_mirror), b.run(GnitzClient::poll_mirror));
-            for outcome in polled_a.unwrap().into_iter().chain(polled_b.unwrap()) {
+            let (a, b) = (client.clone(), client.clone());
+            let (polled_a, polled_b) = tokio::join!(
+                a.run(|c| Box::pin(c.poll_mirror())),
+                b.run(|c| Box::pin(c.poll_mirror()))
+            );
+            for outcome in polled_a.unwrap().unwrap().into_iter().chain(polled_b.unwrap().unwrap()) {
                 assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");
             }
 
-            // A panic in a call resumes on its caller and takes neither the lock
-            // nor the client with it: the reads below still find the copy.
-            let panicking = shared.clone();
-            let panicked = tokio::spawn(async move {
-                let boom = |_: &mut GnitzClient| -> Result<(), ClientError> { panic!("inside the blocking call") };
-                panicking.run(boom).await
-            });
-            assert!(panicked.await.unwrap_err().is_panic());
-
-            let sent = || shared.run(|c| Ok(c.requests_sent()));
             let before = sent().await.unwrap();
             let local = read(vid).await.unwrap();
             assert!(local.lsn.is_none(), "a local answer carries no served LSN");
             assert_eq!(unit_rows(&local.batch), 100);
+            assert_eq!(sent().await.unwrap(), before, "the copy answered, not the server");
 
-            // A relation the copy does not hold still reads, over the driver's
-            // connection rather than the blocking client's.
+            // A relation the copy does not hold still reads, upstream.
             let unheld = read(tid).await.unwrap();
             assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
             assert_eq!(unit_rows(&unheld.batch), 100);
-            assert_eq!(
-                sent().await.unwrap(),
-                before,
-                "neither read went through the blocking client"
-            );
+            assert_eq!(sent().await.unwrap(), before + 1);
+
+            client
+                .run(|c| Box::pin(c.close_mirror()))
+                .await
+                .unwrap()
+                .expect("the exit checkpoint");
         }
         drop(client);
         driver.await.unwrap();

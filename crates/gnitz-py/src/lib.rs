@@ -1,20 +1,19 @@
 //! The Python extension module: the exception hierarchy every surface raises
-//! through, the connection factory that installs the Ctrl-C park hook, and the
-//! `_native` registration.
+//! through, and the `_native` registration.
 
 use pyo3::prelude::*;
 
-use gnitz_core::{ClientError, GnitzClient, MirrorError};
+use gnitz_core::{ClientError, MirrorError};
 use gnitz_wire::{TypeCode, WireStatus};
 
-mod async_transport;
 mod client;
+mod drive;
 mod read;
 mod schema;
 mod write;
 
-use async_transport::PyAsyncTransport;
-use client::{PyGnitzClient, PyPollResult, PyTxn};
+use client::{PyAsyncClient, PyClient, PyGnitzClient, PyPollResult, PyTxn};
+use drive::{LoopCore, PyPending, PyPipeline};
 use read::{PyRow, PyRowIterator, PyScanResult};
 use schema::{PyColumnDef, PySchema};
 use write::{install_append_method, PyZSetBatch};
@@ -90,16 +89,6 @@ pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     }
 }
 
-/// How `GnitzClient` obtains its connection, with the park hook installed — what
-/// makes a blocking call Ctrl-C-interruptible.
-pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClient> {
-    let mut client = py.detach(|| GnitzClient::connect(target)).map_err(client_err)?;
-    client.set_park_hook(Some(Box::new(|| {
-        Python::attach(|py| py.check_signals()).map_err(Into::into)
-    })));
-    Ok(client)
-}
-
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`, which
 /// `_types.py` builds its `TypeCode` IntEnum from.
 #[pyfunction]
@@ -131,9 +120,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     install_append_method(m.py())?;
     m.add_class::<PyScanResult>()?;
     m.add_class::<PyRowIterator>()?;
+    m.add_class::<PyClient>()?;
     m.add_class::<PyGnitzClient>()?;
+    m.add_class::<PyAsyncClient>()?;
+    m.add_class::<LoopCore>()?;
     m.add_class::<PyTxn>()?;
-    m.add_class::<PyAsyncTransport>()?;
+    m.add_class::<PyPipeline>()?;
+    m.add_class::<PyPending>()?;
     m.add_class::<PyPollResult>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzRefusedError", m.py().get_type::<GnitzRefusedError>())?;

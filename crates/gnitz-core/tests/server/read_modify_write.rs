@@ -3,6 +3,7 @@
 //! autocommit while `b` writes around it.
 
 use super::*;
+use gnitz_core::block_on;
 use gnitz_core::{PkColumn, RelDescriptor, RMW_MAX_ATTEMPTS};
 use gnitz_wire::{WireFault, WireStatus};
 
@@ -19,7 +20,7 @@ fn boot() -> Fixture {
     let mut a = GnitzClient::connect(srv.sock_path()).unwrap();
     let b = GnitzClient::connect(srv.sock_path()).unwrap();
     let (schema_name, ..) = create_table(&mut a, schema_of(&[("pk", TypeCode::I64), ("val", TypeCode::I64)]));
-    let target = a.resolve_relation(&schema_name, "t").unwrap();
+    let target = block_on(a.resolve_relation(&schema_name, "t")).unwrap();
     commit(&mut a, &target, 1, 0);
     Fixture { _srv: srv, schema_name, a, b, target }
 }
@@ -29,7 +30,7 @@ fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) 
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
     BatchAppender::new(&mut batch).add_row(pk, 1).i64_val(val);
-    client.push(target.tid, s, &batch, WireConflictMode::Update).unwrap();
+    block_on(client.push(target.tid, s, &batch, WireConflictMode::Update)).unwrap();
 }
 
 /// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first on every
@@ -42,15 +43,17 @@ fn run_increment(
     let keys = PkColumn::from_natives(&s, [1]).keys();
     let mut attempts = 0;
     let Fixture { a, b, target, .. } = f;
-    let result = a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
-        side(&mut *b, target, attempts);
-        attempts += 1;
-        for r in 0..rows.len() {
-            let v = read_i64_le(&rows.payload[0].bytes, r * 8);
-            rows.set_u64_cell(r, 0, (v + 1) as u64);
-        }
-        Ok::<_, ClientError>(rows)
-    });
+    let result = block_on(
+        a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
+            side(&mut *b, target, attempts);
+            attempts += 1;
+            for r in 0..rows.len() {
+                let v = read_i64_le(&rows.payload[0].bytes, r * 8);
+                rows.set_u64_cell(r, 0, (v + 1) as u64);
+            }
+            Ok::<_, ClientError>(rows)
+        }),
+    );
     (result, attempts)
 }
 

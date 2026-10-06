@@ -209,12 +209,14 @@ fn plan_segments<'a>(
 }
 
 /// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.
-pub(crate) fn execute_view_chain(
+pub(crate) async fn execute_view_chain(
     client: &mut GnitzClient,
     schema_name: &str,
     chain: PlannedChain,
 ) -> Result<SqlResult, GnitzSqlError> {
-    client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, chain.replacing)?;
+    client
+        .create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, chain.replacing)
+        .await?;
     Ok(SqlResult::Ddl)
 }
 

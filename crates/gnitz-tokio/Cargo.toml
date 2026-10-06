@@ -18,7 +18,7 @@ gnitz-core.workspace = true
 gnitz-wire.workspace = true
 # `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
 # `spawn_blocking`, and `sync` the mpsc and the oneshot the handle and
-# driver share, and the mutex over the blocking client.
+# driver share.
 tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]

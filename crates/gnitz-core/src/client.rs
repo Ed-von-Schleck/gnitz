@@ -1,5 +1,5 @@
 use crate::connection::{
-    DeltaCursor, Encoded, Interest, Polled, RawBlock, RelDescriptor, Reply, Request, ScanReply, Session, SlotId, Target,
+    DeltaCursor, Interest, PollFeed, Polled, RelDescriptor, Reply, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -7,9 +7,14 @@ use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Sche
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::{poll_fn, Future};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{ready, Context, Poll, Waker};
 
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{
@@ -200,13 +205,263 @@ pub enum Held {
     Kept,
 }
 
-/// Run when a signal interrupts a blocking call's wait; an `Err` aborts the call.
+/// Run when a signal interrupts a blocking wait; an `Err` aborts the call.
 /// The Python binding checks for Ctrl-C here.
 pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
 
+/// Work a [`Host`] runs where blocking is allowed.
+pub type Job = Box<dyn FnOnce() + Send>;
+
+/// How a client waits: for its socket, and for work that blocks.
+pub trait Host: Send {
+    /// The client's socket is `fd` from here on, until the next `attach` or
+    /// this host's drop — either of which comes before the socket closes.
+    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()>;
+
+    /// Once the socket is ready for any of `want`, run `io` on what is ready.
+    /// `io` reads until the socket has no more, and answers what the client
+    /// still waits for: write, if the socket refused bytes.
+    fn poll_io(
+        &mut self,
+        want: Interest,
+        cx: &mut Context<'_>,
+        io: &mut dyn FnMut(Interest) -> Interest,
+    ) -> Poll<Result<(), ClientError>>;
+
+    /// Run `job` where it may block. A host that cannot run it drops it.
+    fn spawn(&mut self, job: Job);
+}
+
+/// Waits in `poll(2)` and runs jobs in place, so a future over it never pends:
+/// [`block_on`] drives one to completion.
+#[derive(Default)]
+pub struct BlockingHost {
+    fd: Option<RawFd>,
+    hook: Option<ParkHook>,
+    /// The socket refused bytes, so the next write waits for it.
+    refused: bool,
+}
+
+impl BlockingHost {
+    /// A host that runs `hook` whenever a signal interrupts its wait.
+    pub fn with_hook(hook: ParkHook) -> Self {
+        BlockingHost { hook: Some(hook), ..Default::default() }
+    }
+}
+
+impl Host for BlockingHost {
+    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+        self.fd = Some(fd.as_raw_fd());
+        self.refused = false;
+        Ok(())
+    }
+
+    fn poll_io(
+        &mut self,
+        want: Interest,
+        _cx: &mut Context<'_>,
+        io: &mut dyn FnMut(Interest) -> Interest,
+    ) -> Poll<Result<(), ClientError>> {
+        let fd = self.fd.expect("a client attaches its host before it waits");
+        // A socket takes bytes until it says otherwise, so asking first would
+        // be a syscall per request.
+        if want.write && !self.refused {
+            self.refused = io(Interest::WRITE).write;
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            match poll_fd(fd, want.poll_events(), None) {
+                Ok(revents) => {
+                    self.refused = io(Interest::from_revents(revents)).write;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    if let Some(hook) = self.hook.as_mut() {
+                        if let Err(e) = hook() {
+                            return Poll::Ready(Err(ClientError::Interrupted(e.into())));
+                        }
+                    }
+                }
+                Err(e) => return Poll::Ready(Err(e.into())),
+            }
+        }
+    }
+
+    fn spawn(&mut self, job: Job) {
+        job()
+    }
+}
+
+/// Drive a future of a client whose host never pends — a [`BlockingHost`]'s.
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("block_on drove a client whose host pends; that client belongs to an event loop"),
+    }
+}
+
+/// Wait for the session's socket and step it on what is ready.
+fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
+    if session.unread() {
+        session.step(Interest::READ);
+        return Poll::Ready(Ok(()));
+    }
+    let want = session.interest();
+    if want.is_empty() {
+        // Nothing this session will ever answer: it ended, or the reply
+        // awaited belongs to a session since replaced.
+        return Poll::Ready(Err(ClientError::Closed));
+    }
+    host.poll_io(want, cx, &mut |ready| {
+        session.step(ready);
+        session.interest()
+    })
+}
+
+/// A job's outcome on its way back to [`offload`].
+struct Offloaded<R> {
+    /// How the job ended: its value, the payload of its panic, or `Err(None)`
+    /// for a job its host dropped unrun.
+    ended: Option<Result<R, Option<Box<dyn Any + Send>>>>,
+    waiter: Option<Waker>,
+}
+
+/// The job's end of an [`Offloaded`]: dropped, it wakes the waiter, whether
+/// the job ran or not.
+struct Finish<R>(Arc<Mutex<Offloaded<R>>>);
+
+impl<R> Drop for Finish<R> {
+    fn drop(&mut self) {
+        let waiter = {
+            let mut job = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            job.ended.get_or_insert(Err(None));
+            job.waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+}
+
+/// Run `job` on `host`, where it may block, and wait for what it returns. A
+/// panic in it resumes here; a job the host dropped is `Closed`.
+pub(crate) async fn offload<R: Send + 'static>(
+    host: &mut dyn Host,
+    job: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, ClientError> {
+    let cell = Arc::new(Mutex::new(Offloaded { ended: None, waiter: None }));
+    let finish = Finish(Arc::clone(&cell));
+    host.spawn(Box::new(move || {
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        finish.0.lock().unwrap_or_else(PoisonError::into_inner).ended = Some(ended.map_err(Some));
+    }));
+    let ended = poll_fn(|cx| {
+        let mut job = cell.lock().unwrap_or_else(PoisonError::into_inner);
+        match job.ended.take() {
+            Some(ended) => Poll::Ready(ended),
+            None => {
+                job.waiter = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    })
+    .await;
+    match ended {
+        Ok(value) => Ok(value),
+        Err(Some(panic)) => std::panic::resume_unwind(panic),
+        Err(None) => Err(ClientError::Closed),
+    }
+}
+
+/// A verb that is one request: awaited, it is that round trip;
+/// [detached](Self::detach), the request is on its way and the client is free
+/// for the next, which is what lets several share a round trip.
+#[must_use = "a verb does nothing until awaited or detached"]
+pub struct Pending<'a, T> {
+    client: &'a mut GnitzClient,
+    sent: Sent<T>,
+}
+
+impl<T> Unpin for Pending<'_, T> {}
+
+impl<'a, T> Pending<'a, T> {
+    /// A refusal that sent nothing is the reply.
+    fn submitted(client: &'a mut GnitzClient, req: Request<'_>, narrow: fn(Reply) -> T) -> Self {
+        let sent = client
+            .session
+            .submit(req, narrow)
+            .unwrap_or_else(|e| Sent::ready(Err(e)));
+        Pending { client, sent }
+    }
+
+    /// Let go of the client, keeping the reply.
+    pub fn detach(self) -> Sent<T> {
+        self.sent
+    }
+}
+
+impl<T> Future for Pending<'_, T> {
+    type Output = Result<T, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            if let Some(reply) = this.sent.try_take() {
+                return Poll::Ready(reply);
+            }
+            let GnitzClient { session, host, .. } = &mut *this.client;
+            ready!(poll_turn(session, &mut **host, cx))?;
+        }
+    }
+}
+
+/// One queued call of a [`serve`] loop: it has the client to itself until its
+/// future completes.
+pub type Op = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
+
+/// Run the ops `next` yields on `client`, in order and one at a time. Steps
+/// the session while none is ready, and after `next` yields `None` until
+/// nothing is outstanding; then returns the client.
+pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) -> GnitzClient {
+    let mut more = true;
+    loop {
+        let op = poll_fn(|cx| loop {
+            if more {
+                match next(cx) {
+                    Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
+                    Poll::Ready(None) => more = false,
+                    Poll::Pending => {}
+                }
+            }
+            let GnitzClient { session, host, .. } = &mut client;
+            if session.interest().is_empty() && !session.unread() {
+                return match more {
+                    true => Poll::Pending,
+                    false => Poll::Ready(None),
+                };
+            }
+            match poll_turn(session, &mut **host, cx) {
+                Poll::Ready(Ok(())) => {}
+                // The replies outstanding resolve as the session's end.
+                Poll::Ready(Err(_)) => session.close(),
+                Poll::Pending => return Poll::Pending,
+            }
+        })
+        .await;
+        let Some(op) = op else {
+            return client;
+        };
+        // A connection that is gone refuses the op's own requests.
+        let _ = client.make_room().await;
+        op(&mut client).await;
+    }
+}
+
 pub struct GnitzClient {
+    /// Before the session, so it lets go of the socket before that closes.
+    pub(crate) host: Box<dyn Host>,
     pub(crate) session: Session,
-    pub(crate) park_hook: Option<ParkHook>,
     /// Per table, the SERIAL ids a reservation drew and no INSERT has taken. A
     /// disconnect discards them (an intentional, PostgreSQL-style gap).
     serial_cache: HashMap<u64, std::ops::Range<u64>>,
@@ -221,44 +476,58 @@ pub struct GnitzClient {
     kept: HashMap<String, Arc<RelDescriptor>>,
 }
 
-// The client-facing types must stay `Send`: `gnitz-py` drops the GIL inside
-// `Python::detach`, whose `Ungil` bound is `Send`, and `gnitz-tokio` spawns a
-// `Session`-owning future onto a multi-thread runtime. An `Rc` anywhere in
-// their reachable set otherwise breaks the build a crate away, naming a pyo3
-// trait rather than the field.
-//
-// A `GnitzClient` is deliberately *not* `Sync`: an attached store is a live
-// engine. `Session` is, because `gnitz-py` exposes a bare one as a `#[pyclass]`
-// and pyo3 demands `Sync` of every pyclass it holds by value; `ClientTransport`
-// follows, because a `Session` holds one.
+// `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
+// and both need `Send`. Asserted here, a breach names the field that caused it.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
-    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send_value<T: Send>(_: T) {}
     assert_send::<GnitzClient>();
-    assert_send_sync::<Session>();
-    assert_send_sync::<crate::ClientTransport>();
+    assert_send::<Sent<ScanReply>>();
+    let _ = |mut c: GnitzClient, schema: &Arc<Schema>, batch: &ZSetBatch| {
+        assert_send_value(c.poll_mirror());
+        assert_send_value(c.create_schema(""));
+        assert_send_value(c.push(0, schema, batch, WireConflictMode::Update));
+        assert_send_value(serve(c, |_| Poll::Ready(None)));
+    };
     assert_send::<ZSetBatch>();
     assert_send::<ClientError>();
     // Handed back as `Arc<Schema>` by the scan path, and `Arc<T>: Send` requires
     // `T: Send + Sync`, so this one is the stricter bound.
+    fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Schema>();
 };
 
 impl GnitzClient {
+    /// A blocking client: its verbs' futures complete under [`block_on`].
     pub fn connect(target: &str) -> Result<Self, ClientError> {
-        Session::connect(target).map(Self::from_session)
+        block_on(Self::connect_with(target, Box::new(BlockingHost::default())))
+    }
+
+    /// A client that waits the way `host` does, connected where `host` lets
+    /// work block.
+    pub async fn connect_with(target: &str, mut host: Box<dyn Host>) -> Result<Self, ClientError> {
+        let target = target.to_owned();
+        let session = offload(&mut *host, move || Session::connect(&target)).await??;
+        Self::over(session, host)
+    }
+
+    /// A blocking client over an already-connected session.
+    #[cfg(test)]
+    pub(crate) fn from_session(session: Session) -> GnitzClient {
+        Self::over(session, Box::new(BlockingHost::default())).expect("a blocking host attaches to any socket")
     }
 
     /// A client over an already-connected session.
-    pub(crate) fn from_session(session: Session) -> GnitzClient {
-        GnitzClient {
+    pub fn over(session: Session, mut host: Box<dyn Host>) -> Result<GnitzClient, ClientError> {
+        host.attach(session.as_fd())?;
+        Ok(GnitzClient {
+            host,
             session,
-            park_hook: None,
             serial_cache: HashMap::new(),
             txn: None,
             mirror: None,
             kept: HashMap::new(),
-        }
+        })
     }
 
     /// Requests this connection has submitted. Exposed for the
@@ -267,22 +536,46 @@ impl GnitzClient {
         self.session.requests_sent()
     }
 
-    pub fn set_park_hook(&mut self, hook: Option<ParkHook>) {
-        self.park_hook = hook;
+    // ── Waiting ────────────────────────────────────────────────────────────
+
+    fn round_trip(&mut self, req: Request<'_>) -> Pending<'_, Reply> {
+        Pending::submitted(self, req, |reply| reply)
     }
 
-    // ── The blocking driver ────────────────────────────────────────────────
+    /// Step this client's session until `sent` is answered. Replies arrive in
+    /// request order, so every reply detached before it is answered by then.
+    pub fn wait<T>(&mut self, sent: Sent<T>) -> Pending<'_, T> {
+        Pending { client: self, sent }
+    }
 
-    pub(crate) fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
-        let slot = self.session.submit(req)?;
-        await_slot(&mut self.session, &mut self.park_hook, slot)
+    /// Wait for the socket and step once. `Closed` when nothing is outstanding.
+    pub async fn turn(&mut self) -> Result<(), ClientError> {
+        let GnitzClient { session, host, .. } = self;
+        poll_fn(|cx| poll_turn(session, &mut **host, cx)).await
+    }
+
+    /// Step until the connection is under its in-flight caps, at which a
+    /// request is refused.
+    pub async fn make_room(&mut self) -> Result<(), ClientError> {
+        while self.session.at_capacity() {
+            self.turn().await?;
+        }
+        Ok(())
+    }
+
+    /// Run `job` where this client's host lets work block.
+    pub async fn offload<R: Send + 'static>(
+        &mut self,
+        job: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<R, ClientError> {
+        offload(&mut *self.host, job).await
     }
 
     /// Reserve `count` contiguous SERIAL ids for `table` and return the first,
     /// so an INSERT that knows its row count pays one fsynced durable advance
     /// rather than `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
     /// range's, or this reservation's — is the intentional PostgreSQL-style gap.
-    pub fn reserve_serial_ids(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
+    pub async fn reserve_serial_ids(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
         match self.serial_cache.get_mut(&table.tid) {
             Some(r) if r.end - r.start >= count => {
                 let base = r.start;
@@ -293,7 +586,8 @@ impl GnitzClient {
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
                 let base = self
-                    .round_trip(Request::AllocSerial { table: table.into(), count: want })?
+                    .round_trip(Request::AllocSerial { table: table.into(), count: want })
+                    .await?
                     .into_ack();
                 self.serial_cache.insert(table.tid, base + count..base + want);
                 Ok(base)
@@ -304,13 +598,13 @@ impl GnitzClient {
     // --- Raw ops ---
 
     /// Allocate a run of `n` catalog object ids, returning its first.
-    fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
-        self.round_trip(Request::AllocIds(n)).map(Reply::into_ack)
+    async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
+        self.round_trip(Request::AllocIds(n)).await.map(Reply::into_ack)
     }
 
     /// Allocate one catalog object id (schema, relation or index).
-    pub fn alloc_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc_ids(1)
+    pub async fn alloc_id(&mut self) -> Result<u64, ClientError> {
+        self.alloc_ids(1).await
     }
 
     /// Push `batch` into `target` under `mode`. SQL `INSERT` uses `Error` to get
@@ -326,16 +620,15 @@ impl GnitzClient {
         schema: &Arc<Schema>,
         batch: impl Into<Cow<'a, ZSetBatch>>,
         mode: WireConflictMode,
-    ) -> Result<u64, ClientError> {
+    ) -> Pending<'_, u64> {
         let (target, batch) = (target.into(), batch.into());
         if let Some(txn) = &mut self.txn {
-            txn.push(target, schema, batch.into_owned(), mode, BLIND)?;
-            return Ok(0);
+            let buffered = txn.push(target, schema, batch.into_owned(), mode, BLIND);
+            let sent = Sent::ready(buffered.map(|()| 0));
+            return Pending { client: self, sent };
         }
         let batch = &*batch;
-        Ok(self
-            .round_trip(Request::Push { target, schema, batch, mode })?
-            .into_ack())
+        Pending::submitted(self, Request::Push { target, schema, batch, mode }, Reply::into_ack)
     }
 
     /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
@@ -344,10 +637,9 @@ impl GnitzClient {
         target: impl Into<Target>,
         spec: &ReadSpec,
         reply_schema: &Arc<Schema>,
-    ) -> Result<ScanReply, ClientError> {
+    ) -> Pending<'_, ScanReply> {
         let target = target.into();
-        self.round_trip(Request::ScanSpec { target, spec, reply_schema })
-            .map(Reply::into_scan)
+        Pending::submitted(self, Request::ScanSpec { target, spec, reply_schema }, Reply::into_scan)
     }
 
     // ── The read seam ──────────────────────────────────────────────────────
@@ -371,7 +663,7 @@ impl GnitzClient {
                 .find(|(&t, v)| {
                     v.schema_name.eq_ignore_ascii_case(schema_name)
                         && v.name.eq_ignore_ascii_case(name)
-                        && m.store.cursor_of(t).is_some()
+                        && m.store.get().cursor_of(t).is_some()
                 })
                 .map(|(_, v)| (Arc::clone(&v.desc), Held::Copy))
         });
@@ -385,57 +677,73 @@ impl GnitzClient {
         target: impl Into<Target>,
         spec: ReadSpec,
         reply_schema: &Arc<Schema>,
-    ) -> Result<ScanReply, ClientError> {
+    ) -> Pending<'_, ScanReply> {
         let target = target.into();
-        match self.mirror.as_deref_mut() {
-            Some(m) if m.cursor_of(target.tid).is_some() => Ok(ScanReply {
-                batch: m.store.scan_spec(target.tid, spec, reply_schema)?,
+        let Some(store) = self
+            .mirror
+            .as_deref()
+            .filter(|m| m.cursor_of(target.tid).is_some())
+            .map(|m| &m.store)
+        else {
+            return self.scan_spec(target, &spec, reply_schema);
+        };
+        let reply = store
+            .get()
+            .scan_spec(target.tid, spec, reply_schema)
+            .map(|batch| ScanReply {
+                batch,
                 schema: Arc::clone(reply_schema),
                 lsn: None,
-            }),
-            _ => self.scan_spec(target, &spec, reply_schema),
-        }
+            });
+        let sent = Sent::ready(reply.map_err(ClientError::from));
+        Pending { client: self, sent }
     }
 
     /// Replace the connection and keep the copies — what a host does after a
     /// server restart, which kills the socket while the copies survive it.
     ///
-    /// Refused while a transaction is open. Otherwise the client is rebuilt
-    /// through [`Self::connect`] rather than reset field by field, which keeps
-    /// the transaction slot and the SERIAL cache from being enumerated here and
-    /// drifting. Nothing is taken out of
-    /// `self` until the new session exists, so a failed connect leaves this
-    /// client exactly as it was.
+    /// Refused while a transaction is open. A failed connect, or a host that
+    /// refuses the new socket, leaves this client exactly as it was.
     ///
     /// A copy rides along with every cursor dropped: the new connection may be a
     /// different server, where the same name is a different id, so the next
     /// poll re-resolves every view by name. A poisoned store crosses unchanged.
-    pub fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
+    pub async fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
             return Err(ClientError::from(
                 "reconnect inside a transaction; commit or roll back first".to_string(),
             ));
         }
-        let mut fresh = GnitzClient::connect(target)?;
-        // The hook is what keeps a blocking call Ctrl-C-interruptible.
-        fresh.park_hook = self.park_hook.take();
-        fresh.mirror = self.mirror.take();
-        if let Some(m) = fresh.mirror.as_deref_mut() {
-            m.store.clear_cursors();
+        let target = target.to_owned();
+        let fresh = self.offload(move || Session::connect(&target)).await??;
+        // Every field, so one added later is decided here too.
+        let GnitzClient {
+            host,
+            session,
+            serial_cache,
+            txn: _,
+            mirror,
+            kept,
+        } = self;
+        host.attach(fresh.as_fd())?;
+        *session = fresh;
+        serial_cache.clear();
+        kept.clear();
+        if let Some(m) = mirror.as_deref() {
+            m.store.get().clear_cursors();
         }
-        *self = fresh;
         Ok(())
     }
 
     /// Bootstrap a view's delta feed: the view's whole current value at its true
     /// net weights, in the view's own schema, and the cursor to poll from. It
     /// replaces a copy's state; it does not add to it.
-    pub fn delta_bootstrap(
+    pub async fn delta_bootstrap(
         &mut self,
         view_id: u64,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, view_schema)
+        self.delta_read(view_id, 0, view_schema).await
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -450,19 +758,19 @@ impl GnitzClient {
     /// A poll does **not** drive a tick: a delta read answers "what has
     /// happened", not "what is current", so a push the tick loop has not run yet
     /// is a round the next poll will carry.
-    pub fn delta_poll(
+    pub async fn delta_poll(
         &mut self,
         view_id: u64,
         cursor: DeltaCursor,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (data, next) = self.delta_read(view_id, cursor.tick.get(), view_schema)?;
+        let (data, next) = self.delta_read(view_id, cursor.tick.get(), view_schema).await?;
         Ok((data, cursor.advanced_to(next)?))
     }
 
     /// One view's delta read, decoded under `reply_schema`, with the terminal
     /// frame's `(tag, T)` pair as a cursor.
-    fn delta_read(
+    async fn delta_read(
         &mut self,
         view_id: u64,
         after_tick: u64,
@@ -475,13 +783,22 @@ impl GnitzClient {
         };
         let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
-        let cursor = delta_read_blocks(&mut self.session, &mut self.park_hook, item, |b| {
-            Ok(crate::protocol::wal_block::decode_wal_block_into(
-                &mut batch,
-                b.block(),
-                &schema,
-            )?)
-        })?;
+        let GnitzClient { session, host, .. } = self;
+        let mut poll = DeltaPoll::start(session, &[item]);
+        let (mut end, mut undecoded) = (None, None);
+        while let Some((_, polled)) = poll.next(session, &mut **host).await? {
+            match polled {
+                Polled::Block(b) if undecoded.is_none() => {
+                    undecoded = crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema).err();
+                }
+                Polled::Block(_) => {}
+                Polled::End(e) => end = Some(e),
+            }
+        }
+        if let Some(e) = undecoded {
+            return Err(e.into());
+        }
+        let cursor = end.expect("one item ends once")?;
         Ok((ScanReply { schema, batch, lsn: None }, cursor))
     }
 
@@ -489,13 +806,13 @@ impl GnitzClient {
     /// in request order. An atomic multi-table `txn_commit` is never observed torn
     /// across the result set.
     /// Each relation is replied in the layout of the schema paired with it.
-    pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Result<Vec<ScanReply>, ClientError> {
-        self.round_trip(Request::ScanMulti(relations)).map(Reply::into_multi)
+    pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Pending<'_, Vec<ScanReply>> {
+        Pending::submitted(self, Request::ScanMulti(relations), Reply::into_multi)
     }
 
     /// Index `cols` of relation `owner_id`, in that order, under the catalog name
     /// `index_name`.
-    pub fn create_index(
+    pub async fn create_index(
         &mut self,
         owner_id: u64,
         cols: PkColList,
@@ -503,7 +820,7 @@ impl GnitzClient {
         is_unique: bool,
     ) -> Result<u64, ClientError> {
         let index_name = gnitz_wire::canonical_identifier(index_name)?;
-        let index_id = self.alloc_id()?;
+        let index_id = self.alloc_id().await?;
         let mut b = DdlBundle::default();
         b.put(
             &IdxTabRow {
@@ -515,32 +832,33 @@ impl GnitzClient {
             },
             1,
         );
-        self.commit_ddl(b)?;
+        self.commit_ddl(b).await?;
         Ok(index_id)
     }
 
     /// Drop indexes by name as **one** DDL zone: the whole set retires or none of
     /// it does, and a name repeated in `index_names` retires once.
-    pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
-        self.drop_index_rows(index_names, "index", if_exists, |_| true)
+    pub async fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_index_rows(index_names, "index", if_exists, |_| true).await
     }
 
     /// `ALTER TABLE … DROP CONSTRAINT`: the UNIQUE index `name` of table `tid`.
     /// The `-1` is the stored row, so the engine's CAS re-proves owner and
     /// uniqueness against the live row.
-    pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
+    pub async fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
         self.drop_index_rows(&[name], "constraint", if_exists, |r| r.owner == tid && r.is_unique)
+            .await
     }
 
     /// Retract the live IDX_TAB rows named in `names` that pass `matches`.
-    fn drop_index_rows(
+    async fn drop_index_rows(
         &mut self,
         names: &[&str],
         noun: &'static str,
         if_exists: bool,
         matches: impl Fn(&IndexRow) -> bool,
     ) -> Result<(), ClientError> {
-        let scanned = self.sys_rows(IDX_TAB, ReadBound::None)?;
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
         let mut retired: Vec<usize> = Vec::with_capacity(names.len());
@@ -558,13 +876,13 @@ impl GnitzClient {
                 None => return Err(absent(format!("{noun} '{name}' not found"))),
             }
         }
-        self.commit_ddl(b)
+        self.commit_ddl(b).await
     }
 
     /// Every live secondary index. Names come back canonical (lowercase): every
     /// writer folds them at store time.
-    pub fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
-        let scanned = self.sys_rows(IDX_TAB, ReadBound::None)?;
+    pub async fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
         Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
     }
 
@@ -606,9 +924,9 @@ impl GnitzClient {
     /// sending no request of its own. The recovery is a conflict's: nothing was
     /// written, and the transaction run again resolves the relations it wrote
     /// afresh.
-    pub fn txn_commit(&mut self) -> Result<u64, ClientError> {
+    pub async fn txn_commit(&mut self) -> Result<u64, ClientError> {
         let buf = self.txn.take().ok_or_else(no_transaction)?;
-        self.push_txn(&buf).map_err(|e| match e {
+        self.push_txn(&buf).await.map_err(|e| match e {
             ClientError::Refused(WireFault { status: WireStatus::StaleCatalog, text }) => {
                 self.kept.retain(|_, rel| !buf.families_of.contains_key(&rel.tid));
                 ClientError::Refused(WireFault {
@@ -622,7 +940,7 @@ impl GnitzClient {
 
     /// Ship `buf` as one `PUSH_TXN` frame, whose families land together under one
     /// zone LSN or not at all; an empty buffer sends nothing.
-    fn push_txn(&mut self, buf: &TxnBuffer) -> Result<u64, ClientError> {
+    async fn push_txn(&mut self, buf: &TxnBuffer) -> Result<u64, ClientError> {
         if buf.families.is_empty() {
             return Ok(0);
         }
@@ -638,6 +956,7 @@ impl GnitzClient {
             })
             .collect();
         self.round_trip(Request::PushTxn { families: &families })
+            .await
             .map(Reply::into_ack)
     }
 
@@ -649,7 +968,7 @@ impl GnitzClient {
     /// Inside a transaction COMMIT checks the condition. In autocommit the statement
     /// is a transaction of its own, and a conflict re-reads and rebuilds, up to
     /// [`RMW_MAX_ATTEMPTS`] times.
-    pub fn read_modify_write<E: From<ClientError>>(
+    pub async fn read_modify_write<E: From<ClientError>>(
         &mut self,
         target: &RelDescriptor,
         bound: ReadBound,
@@ -680,8 +999,9 @@ impl GnitzClient {
                         predicate: spec.predicate.clone(),
                         sink: spec.sink.clone(),
                     });
-                    let ScanReply { batch, lsn, .. } =
-                        self.scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)?;
+                    let ScanReply { batch, lsn, .. } = self
+                        .scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)
+                        .await?;
                     (batch, lsn.expect("a server read carries its watermark"))
                 }
             };
@@ -692,7 +1012,7 @@ impl GnitzClient {
             txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
             let pushed = match self.txn {
                 Some(_) => Ok(0),
-                None => self.push_txn(&own),
+                None => self.push_txn(&own).await,
             };
             match pushed {
                 Err(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
@@ -708,23 +1028,23 @@ impl GnitzClient {
     // --- DDL ---
 
     /// Commit `bundle` as one DDL zone. One that holds no row opens no zone.
-    fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
+    async fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
         if bundle.0.is_empty() {
             return Ok(());
         }
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
-        self.round_trip(Request::DdlTxn(&bundle.0))?;
+        self.round_trip(Request::DdlTxn(&bundle.0)).await?;
         self.kept.clear();
-        self.after_ddl_commit(&bundle.0);
+        self.after_ddl_commit(&bundle.0).await;
         Ok(())
     }
 
     /// Drop the copy of every view the bundle retracted, except a mirrored view
     /// the bundle also wrote back — a rename — which is rebound under its new
     /// name.
-    fn after_ddl_commit(&mut self, families: &[(u64, ZSetBatch)]) {
+    async fn after_ddl_commit(&mut self, families: &[(u64, ZSetBatch)]) {
         let Some(m) = self.mirror.as_deref() else {
             return;
         };
@@ -747,24 +1067,24 @@ impl GnitzClient {
             }
         }
         for v in dropped {
-            let _ = self.forget_view(v);
+            let _ = self.forget_view(v).await;
         }
         for (schema_name, name, desc) in renamed {
             let tid = desc.tid;
-            if self.bind(&schema_name, &name, desc).is_err() {
-                let _ = self.forget_view(tid);
+            if self.bind(&schema_name, &name, desc).await.is_err() {
+                let _ = self.forget_view(tid).await;
             }
         }
     }
 
-    pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
+    pub async fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
         // Refuses the empty string, a leading `_` (the reserved system prefix)
         // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
-        let schema_id = self.alloc_id()?;
+        let schema_id = self.alloc_id().await?;
         let mut b = DdlBundle::default();
         b.put(&SchemaTabRow { schema_id, name: &name }, 1);
-        self.commit_ddl(b)?;
+        self.commit_ddl(b).await?;
         Ok(schema_id)
     }
 
@@ -779,9 +1099,9 @@ impl GnitzClient {
     /// Atomic in both directions: an external dependent (a cross-schema FK child
     /// or view-on-view) or a rename landing between the scans and the push fails
     /// the whole bundle and drops nothing.
-    pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
+    pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = gnitz_wire::canonical_identifier(name)?;
-        let (schemas, at) = self.lookup_schema(&name)?;
+        let (schemas, at) = self.lookup_schema(&name).await?;
         let schema_id = schemas.pks.get(at) as u64;
 
         // Hidden segments need no separate pass: each is an ordinary VIEW_TAB row
@@ -790,7 +1110,7 @@ impl GnitzClient {
         // the same drop set.
         let mut b = DdlBundle::default();
         for family in [VIEW_TAB, TABLE_TAB] {
-            let scanned = self.sys_rows(family, ReadBound::None)?;
+            let scanned = self.sys_rows(family, ReadBound::None).await?;
             for i in scanned.live_rows() {
                 if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
                     b.batch(family).copy_row_at(&scanned, i, -1);
@@ -798,13 +1118,13 @@ impl GnitzClient {
             }
         }
         b.batch(SCHEMA_TAB).copy_row_at(&schemas, at, -1);
-        self.commit_ddl(b)
+        self.commit_ddl(b).await
     }
 
     /// Register a table, its FOREIGN KEY columns and its inline UNIQUE indexes as
     /// one DDL bundle. `fks[i]` is column `i`'s target; an empty `fks` gives no
     /// column one.
-    pub fn create_table(
+    pub async fn create_table(
         &mut self,
         schema_name: &str,
         table_name: &str,
@@ -832,10 +1152,10 @@ impl GnitzClient {
             )));
         }
 
-        let (schemas, at) = self.lookup_schema(&schema_name)?;
+        let (schemas, at) = self.lookup_schema(&schema_name).await?;
         let schema_id = schemas.pks.get(at) as u64;
         // The table's id, then one per inline UNIQUE index.
-        let new_tid = self.alloc_ids(1 + unique_indexes.len() as u64)?;
+        let new_tid = self.alloc_ids(1 + unique_indexes.len() as u64).await?;
 
         let mut b = DdlBundle::default();
         append_col_rows(&mut b, new_tid, &schema.columns, fks);
@@ -861,19 +1181,25 @@ impl GnitzClient {
                 1,
             );
         }
-        self.commit_ddl(b)?;
+        self.commit_ddl(b).await?;
 
         Ok(new_tid)
     }
 
     /// Drop tables as one DDL zone; the engine cascades each one's indexes off
     /// their owner. See [`Self::drop_relations`] for the batch rules.
-    pub fn drop_table(&mut self, schema_name: &str, table_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+    pub async fn drop_table(
+        &mut self,
+        schema_name: &str,
+        table_names: &[&str],
+        if_exists: bool,
+    ) -> Result<(), ClientError> {
         self.drop_relations(TABLE_TAB, "table", schema_name, table_names, if_exists)
+            .await
     }
 
     /// Create a passthrough view over `source` and return its id.
-    pub fn create_view(
+    pub async fn create_view(
         &mut self,
         schema_name: &str,
         view_name: &str,
@@ -894,6 +1220,7 @@ impl GnitzClient {
             pk_repeats: source.pk_repeats,
         };
         self.create_view_chain(schema_name, view_name, view.into(), props, None)
+            .await
     }
 
     /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.
@@ -901,7 +1228,7 @@ impl GnitzClient {
     /// [`segment_name`] and owned by it.
     ///
     /// `replace` is the id of the view this one supersedes in the same zone.
-    pub fn create_view_chain(
+    pub async fn create_view_chain(
         &mut self,
         schema_name: &str,
         view_name: &str,
@@ -929,15 +1256,16 @@ impl GnitzClient {
 
         // Only the user-named view: the engine cascades its segments.
         let replaced = match replace {
-            Some(vid) => {
-                Some(self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", &schema_name, &view_name))?)
-            }
+            Some(vid) => Some(
+                self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", &schema_name, &view_name))
+                    .await?,
+            ),
             None => None,
         };
         let schema_id = match &replaced {
             Some((row, i)) => payload_u64(row, *i, RELTAB_PAY_SCHEMA_ID),
             None => {
-                let (schemas, at) = self.lookup_schema(&schema_name)?;
+                let (schemas, at) = self.lookup_schema(&schema_name).await?;
                 schemas.pks.get(at) as u64
             }
         };
@@ -945,7 +1273,7 @@ impl GnitzClient {
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
         // segment by its position.
-        let base = self.alloc_ids(n_views as u64)?;
+        let base = self.alloc_ids(n_views as u64).await?;
         // The user-named view takes the id after every segment's, and every
         // segment names it as owner.
         let owner_vid = base + bundle.segments.len() as u64;
@@ -994,15 +1322,21 @@ impl GnitzClient {
             );
         }
 
-        self.commit_ddl(b)?;
+        self.commit_ddl(b).await?;
         Ok(owner_vid)
     }
 
     /// Drop views as one DDL zone; the engine cascades each one's hidden segments
     /// off `owner_view_id`, so the client never names a segment. See
     /// [`Self::drop_relations`] for the batch rules.
-    pub fn drop_view(&mut self, schema_name: &str, view_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+    pub async fn drop_view(
+        &mut self,
+        schema_name: &str,
+        view_names: &[&str],
+        if_exists: bool,
+    ) -> Result<(), ClientError> {
         self.drop_relations(VIEW_TAB, "view", schema_name, view_names, if_exists)
+            .await
     }
 
     /// Retire every named relation of `family` in **one** DDL zone: the whole set
@@ -1011,7 +1345,7 @@ impl GnitzClient {
     /// `if_exists` answers a name that does not resolve, and nothing else: a name
     /// that resolves to another family, a dependent view and an FK child outside
     /// the batch all still fail the statement.
-    fn drop_relations(
+    async fn drop_relations(
         &mut self,
         family: u64,
         noun: &'static str,
@@ -1024,7 +1358,7 @@ impl GnitzClient {
         let mut retired: Vec<u64> = Vec::with_capacity(names.len());
         for &raw in names {
             let name = gnitz_wire::canonical_identifier(raw)?;
-            let Some((scanned, i)) = self.relation_retraction(family, noun, &schema_name, &name)? else {
+            let Some((scanned, i)) = self.relation_retraction(family, noun, &schema_name, &name).await? else {
                 if if_exists {
                     continue;
                 }
@@ -1036,23 +1370,25 @@ impl GnitzClient {
                 b.batch(family).copy_row_at(&scanned, i, -1);
             }
         }
-        self.commit_ddl(b)
+        self.commit_ddl(b).await
     }
 
     /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
     /// *resolve* miss alone; a name that resolves but holds no row in `family` —
     /// `DROP TABLE <view>` — is the hard `not_found`.
-    fn relation_retraction(
+    async fn relation_retraction(
         &mut self,
         family: u64,
         noun: &'static str,
         schema_name: &str,
         name: &str,
     ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
-        let Some(desc) = self.resolve(schema_name, name)? else {
+        let Some(desc) = self.resolve(schema_name, name).await? else {
             return Ok(None);
         };
-        let (scanned, i) = self.seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))?;
+        let (scanned, i) = self
+            .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))
+            .await?;
         // Renamed since the resolve: the name no longer denotes this relation.
         if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.as_bytes() {
             return Ok(None);
@@ -1061,7 +1397,7 @@ impl GnitzClient {
     }
 
     /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.
-    pub fn alter_rename_relation(&mut self, rel: &RelDescriptor, new_name: &str) -> Result<(), ClientError> {
+    pub async fn alter_rename_relation(&mut self, rel: &RelDescriptor, new_name: &str) -> Result<(), ClientError> {
         let new_name = gnitz_wire::canonical_identifier(new_name)?;
         let tid = rel.tid;
         let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
@@ -1071,43 +1407,47 @@ impl GnitzClient {
             || absent(format!("relation {tid} not found")),
             |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
         )
+        .await
     }
 
-    pub fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
+    pub async fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |b, row| {
             b.set_string_cell(row, ColTabSlot::name as usize, new_col)
         })
+        .await
     }
 
     /// `ALTER TABLE … DROP COLUMN`: the column stays physically present, so the
     /// table keeps its layout and comparator.
-    pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
+    pub async fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |b, row| {
             b.set_u64_cell(row, ColTabSlot::is_hidden as usize, 1)
         })
+        .await
     }
 
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
     /// pair, only `is_nullable` flipped to true at `+1`. Once the catalog reports
     /// the column nullable, `ZSetBatch::validate` permits a null bit there.
-    pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
+    pub async fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |b, row| {
             b.set_u64_cell(row, ColTabSlot::is_nullable as usize, 1)
         })
+        .await
     }
 
     /// `ALTER TABLE … ADD COLUMN`: `def` appended to `rel` after every physical
     /// column, dropped ones included.
-    pub fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
+    pub async fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
         let (tid, col_idx) = (rel.tid, rel.schema.num_columns());
 
         let mut b = DdlBundle::default();
         b.put(&ColTabRow::of(tid, col_idx as u64, def, None), 1);
-        self.commit_ddl(b)
+        self.commit_ddl(b).await
     }
 
     /// [`Self::rewrite_sys_row`] on column `col_idx` of relation `tid`.
-    fn alter_col_pair(
+    async fn alter_col_pair(
         &mut self,
         tid: u64,
         col_idx: usize,
@@ -1119,31 +1459,33 @@ impl GnitzClient {
             || absent(format!("column index {col_idx} not found on table {tid}")),
             patch,
         )
+        .await
     }
 
     /// Push a `(-1, +1)` rewrite pair on the live `family` row keyed `key`: the
     /// stored row at `-1`, and a copy of it at `+1` that `patch` edits in place.
-    fn rewrite_sys_row(
+    async fn rewrite_sys_row(
         &mut self,
         family: u64,
         key: &[u128],
         missing: impl FnOnce() -> ClientError,
         patch: impl FnOnce(&mut ZSetBatch, usize),
     ) -> Result<(), ClientError> {
-        let (scanned, i) = self.seek_sys_row(family, key, missing)?;
+        let (scanned, i) = self.seek_sys_row(family, key, missing).await?;
         let mut b = DdlBundle::default();
         let rows = b.batch(family);
         rows.copy_row_at(&scanned, i, -1);
         rows.copy_row_at(&scanned, i, 1);
         patch(rows, 1);
-        self.commit_ddl(b)
+        self.commit_ddl(b).await
     }
 
     /// Resolve `name` under `schema_name`, rejecting a missing relation. The
     /// erroring form of [`Self::resolve`], for the callers whose next step needs
     /// the relation to exist.
-    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<Arc<RelDescriptor>, ClientError> {
-        self.resolve(schema_name, name)?
+    pub async fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<Arc<RelDescriptor>, ClientError> {
+        self.resolve(schema_name, name)
+            .await?
             .ok_or_else(|| not_found("relation", schema_name, name))
     }
 
@@ -1152,9 +1494,12 @@ impl GnitzClient {
     /// The descriptor for `schema_name.name` as the server answers it now, or
     /// `None` when no such relation exists; `Err` is a missing schema or a decode
     /// error.
-    pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+    pub async fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         let qname = qualified_name(schema_name, name);
-        let found = self.round_trip(Request::Resolve(&qname)).map(Reply::into_resolve)?;
+        let found = self
+            .round_trip(Request::Resolve(&qname))
+            .await
+            .map(Reply::into_resolve)?;
         match &found {
             Some(desc) => self.kept.insert(qname, Arc::clone(desc)),
             None => self.kept.remove(&qname),
@@ -1166,8 +1511,8 @@ impl GnitzClient {
 
     /// The live SCHEMA_TAB row named `schema_name` (already canonical): the scanned
     /// batch and the row's index in it.
-    fn lookup_schema(&mut self, schema_name: &str) -> Result<(ZSetBatch, usize), ClientError> {
-        let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None)?;
+    async fn lookup_schema(&mut self, schema_name: &str) -> Result<(ZSetBatch, usize), ClientError> {
+        let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
         let i = batch
             .live_rows()
             .find(|&i| payload_bytes(&batch, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
@@ -1177,9 +1522,10 @@ impl GnitzClient {
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;
     /// the server checks the reply against that schema's layout.
-    fn sys_rows(&mut self, family: u64, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
+    async fn sys_rows(&mut self, family: u64, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
         Ok(self
-            .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))?
+            .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))
+            .await?
             .batch)
     }
 
@@ -1188,7 +1534,7 @@ impl GnitzClient {
     /// reply batch and the row's index in it, for a caller to copy the stored row
     /// out of. `PkSet` is exact, so a live row in the reply is that key's; none is
     /// `missing()`.
-    fn seek_sys_row(
+    async fn seek_sys_row(
         &mut self,
         family: u64,
         key: &[u128],
@@ -1196,108 +1542,80 @@ impl GnitzClient {
     ) -> Result<(ZSetBatch, usize), ClientError> {
         let mut keys = PkColumn::empty_for_schema(sys_schema(family));
         keys.push_natives(key);
-        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys()))?;
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }
 }
 
-/// Step and park until `slot` completes.
-pub(crate) fn await_slot(
-    session: &mut Session,
-    hook: &mut Option<ParkHook>,
-    slot: SlotId,
-) -> Result<Reply, ClientError> {
-    let mut ready = Interest::WRITE;
-    loop {
-        let mut done = session.step(ready);
-        if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
-            return done.swap_remove(i).1;
-        }
-        ready = park(session, hook)?;
-    }
+/// A delta poll in flight: `items`, one request per `DELTA_POLL_MAX_VIEWS`,
+/// handed out as each item's blocks and then its one end, the items in order.
+/// Dropped unfinished, the session drops what is left of its trains.
+pub(crate) struct DeltaPoll {
+    feed: Arc<PollFeed>,
+    /// Items a request went out for, and items in all.
+    sent: usize,
+    total: usize,
+    /// Ends handed out so far.
+    answered: usize,
+    /// Why the items past `sent` were never asked for.
+    unsent: Option<ClientError>,
 }
 
-/// Poll `items`, one request per `DELTA_POLL_MAX_VIEWS`, handing `on` each
-/// item's blocks and then its one end, the items in order. `Err` is an
-/// interrupt alone.
-pub(crate) fn poll_deltas(
-    session: &mut Session,
-    hook: &mut Option<ParkHook>,
-    items: &[DeltaPollItem],
-    mut on: impl FnMut(usize, Polled),
-) -> Result<(), ClientError> {
-    let mut slots = Vec::new();
-    let mut unsent = None;
-    for chunk in items.chunks(DELTA_POLL_MAX_VIEWS) {
-        match Encoded::delta_poll(chunk).and_then(|poll| session.enqueue(poll)) {
-            Ok(slot) => slots.push(slot),
-            // Neither of `enqueue`'s refusals clears without a step, so no
-            // later chunk is tried.
-            Err(e) => {
-                unsent = Some(e);
-                break;
-            }
-        }
-    }
-    let sent = items.len().min(slots.len() * DELTA_POLL_MAX_VIEWS);
-    // The session answers slots in submit order and a slot's views in request
-    // order, each exactly once: the ends counted so far name the item.
-    let mut answered = 0;
-    let mut ready = Interest::WRITE;
-    while answered < sent {
-        let mut sink = |slot: SlotId, polled: Polled| {
-            // By slot, so a train an abandoned call left behind is not taken
-            // for one of this call's.
-            if slots.contains(&slot) {
-                let item = answered;
-                answered += usize::from(matches!(polled, Polled::End(_)));
-                on(item, polled);
-            }
-        };
-        session.step_polling(ready, Some(&mut sink));
-        if answered < sent {
-            ready = park(session, hook)?;
-        }
-    }
-    if let Some(e) = unsent {
-        (sent..items.len()).for_each(|item| on(item, Polled::End(Err(e.clone()))));
-    }
-    Ok(())
-}
-
-/// One view's delta read, handing `on_block` each block as its frame arrives.
-/// Returns the terminal's `(tag, T)` as a cursor, unchecked against a previous
-/// one, or the first error `on_block` returned.
-pub(crate) fn delta_read_blocks(
-    session: &mut Session,
-    hook: &mut Option<ParkHook>,
-    item: DeltaPollItem,
-    mut on_block: impl FnMut(RawBlock) -> Result<(), ClientError>,
-) -> Result<DeltaCursor, ClientError> {
-    let mut refused = None;
-    let mut end = None;
-    poll_deltas(session, hook, &[item], |_, polled| match polled {
-        Polled::Block(b) if refused.is_none() => refused = on_block(b).err(),
-        Polled::Block(_) => {}
-        Polled::End(e) => end = Some(e),
-    })?;
-    refused.map_or(end.expect("one item ends once"), Err)
-}
-
-/// Wait for the session's interest, running `hook` on every `EINTR`.
-pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Interest, ClientError> {
-    let interest = session.interest();
-    assert!(!interest.is_empty(), "park with nothing outstanding");
-    loop {
-        match poll_fd(session.as_raw_fd(), interest.poll_events(), None) {
-            Ok(revents) => return Ok(Interest::from_revents(revents)),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                if let Some(hook) = hook.as_mut() {
-                    hook().map_err(|e| ClientError::Interrupted(e.into()))?;
+impl DeltaPoll {
+    pub(crate) fn start(session: &mut Session, items: &[DeltaPollItem]) -> Self {
+        let feed = Arc::new(PollFeed::default());
+        let (mut sent, mut unsent) = (0, None);
+        for chunk in items.chunks(DELTA_POLL_MAX_VIEWS) {
+            match session.submit_delta_poll(chunk, sent, &feed) {
+                Ok(()) => sent += chunk.len(),
+                // Neither of a submit's refusals clears without a step, so no
+                // later chunk is tried.
+                Err(e) => {
+                    unsent = Some(e);
+                    break;
                 }
             }
-            Err(e) => return Err(e.into()),
+        }
+        DeltaPoll {
+            feed,
+            sent,
+            total: items.len(),
+            answered: 0,
+            unsent,
+        }
+    }
+
+    fn pop(&self) -> Option<(usize, Polled)> {
+        self.feed.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+    }
+
+    /// Everything the last step queued has been handed out.
+    pub(crate) fn drained(&self) -> bool {
+        self.feed.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
+    }
+
+    /// The next block or end, with its item's index; `None` once every item
+    /// has ended. `Err` is the host's alone — an interrupt.
+    pub(crate) async fn next(
+        &mut self,
+        session: &mut Session,
+        host: &mut dyn Host,
+    ) -> Result<Option<(usize, Polled)>, ClientError> {
+        loop {
+            if let Some(next) = self.pop() {
+                self.answered += usize::from(matches!(next.1, Polled::End(_)));
+                return Ok(Some(next));
+            }
+            if self.answered == self.sent {
+                let Some(e) = self.unsent.as_ref().filter(|_| self.sent < self.total) else {
+                    return Ok(None);
+                };
+                self.sent += 1;
+                self.answered += 1;
+                return Ok(Some((self.sent - 1, Polled::End(Err(e.clone())))));
+            }
+            poll_fn(|cx| poll_turn(session, host, cx)).await?;
         }
     }
 }

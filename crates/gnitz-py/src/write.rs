@@ -74,7 +74,9 @@ pub(crate) fn pk_point_spec(schema: &Schema, pk: &Bound<'_, PyAny>) -> PyResult<
 #[pyclass(name = "ZSetBatch")]
 pub struct PyZSetBatch {
     pub(crate) schema: Arc<Schema>,
-    pub(crate) batch: ZSetBatch,
+    /// Shared with a push still on its way, which sends the rows as they were
+    /// at its call: a later append copies them first.
+    pub(crate) batch: Arc<ZSetBatch>,
     /// Is [`WEIGHT_KW`] the name of a visible column? Then it means that column,
     /// not the row weight: the schema is the authority on what a name means, and
     /// `extend`'s own `_weight` parameter still sets the weight for such a batch.
@@ -98,7 +100,7 @@ impl PyZSetBatch {
         match body(self) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.batch.rollback_to(mark);
+                Arc::make_mut(&mut self.batch).rollback_to(mark);
                 Err(e)
             }
         }
@@ -304,6 +306,7 @@ impl PyZSetBatch {
             kw_plan,
             key_scratch,
         } = &mut *self;
+        let batch = Arc::make_mut(batch);
         let schema: &Schema = schema;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
@@ -495,7 +498,7 @@ impl PyZSetBatch {
     pub fn new(schema: PySchema) -> Self {
         let schema = schema.rust;
         let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
-        let batch = ZSetBatch::new(&schema);
+        let batch = Arc::new(ZSetBatch::new(&schema));
         PyZSetBatch {
             batch,
             weight_is_column,
@@ -526,7 +529,7 @@ impl PyZSetBatch {
             // A sized sequence lets every growth stream skip its climb from
             // zero; a generator has no `__len__`, so the probe is discarded.
             if let Ok(n) = rows.len() {
-                s.batch.reserve(n);
+                Arc::make_mut(&mut s.batch).reserve(n);
             }
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
@@ -545,7 +548,7 @@ impl PyZSetBatch {
             py,
             ScanReply {
                 schema: Arc::clone(&self.schema),
-                batch: self.batch.clone(),
+                batch: ZSetBatch::clone(&self.batch),
                 lsn: None,
             },
         )
