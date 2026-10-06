@@ -467,8 +467,8 @@ unsafe fn append_fastcall(
 }
 
 /// CPython text signature (`name(…)\n--\n\n`). Without it the descriptor has no
-/// `__doc__` and no `__text_signature__`, and `inspect.signature` fails. There
-/// are no `.pyi` stubs, so this is where the argument names are documented.
+/// `__doc__` and no `__text_signature__`, and `inspect.signature` fails — and
+/// that signature is what the `.pyi` stub's is checked against.
 const APPEND_DOC: &CStr = c"append($self, /, *, _weight=1, **columns)\n--\n\n\
 Append one row, one keyword per column: batch.append(pk=1, name='x').\n\
 An omitted or None column is NULL; _weight is the row's Z-set weight\n\

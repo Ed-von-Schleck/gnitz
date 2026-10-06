@@ -120,7 +120,7 @@ enum PendingState {
 
 /// The result of a verb called inside `client.pipeline()`: its request is on
 /// its way, and `result()` waits for the reply.
-#[pyclass(name = "Pending", frozen)]
+#[pyclass(name = "Pending", frozen, generic)]
 pub(crate) struct PyPending {
     client: Py<crate::client::PyClient>,
     state: Mutex<PendingState>,

@@ -632,11 +632,12 @@ impl PyGnitzClient {
 
     /// A context manager inside which every verb returns a `Pending`, and one
     /// that is a single request returns it with the request queued — so the
-    /// block's requests share round trips:
+    /// block's requests share round trips. The block's name is the client
+    /// itself, typed as what it returns there:
     ///
     /// ```python
-    /// with client.pipeline():
-    ///     lsns = [client.push(tid, b) for b in batches]
+    /// with client.pipeline() as piped:
+    ///     lsns = [piped.push(tid, b) for b in batches]
     /// print([lsn.result() for lsn in lsns])
     /// ```
     fn pipeline(slf: &Bound<'_, Self>) -> PyPipeline {
@@ -711,7 +712,7 @@ impl PyAsyncClient {
 
 /// The context manager `transaction()` returns: entering it opens the client's
 /// transaction and hands back the client.
-#[pyclass(name = "Txn", frozen)]
+#[pyclass(name = "Txn", frozen, generic)]
 pub struct PyTxn {
     client: Py<PyClient>,
 }

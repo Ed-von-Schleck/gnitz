@@ -1,0 +1,6 @@
+# A column read as `row.col` is a descriptor on a `Row` subclass built per
+# result; the stub's `__getattr__` is how a type checker is told so.
+gnitz\._native\.Row\.__getattr__
+# The verbs are `_Client`'s at runtime and each client class's in the stub,
+# which is what gives them a return type. `test_typing` holds the two together.
+gnitz\._native\._Client\.\w+

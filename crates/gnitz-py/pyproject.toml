@@ -19,6 +19,7 @@ classifiers      = [
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Database",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -28,6 +29,7 @@ Repository = "https://github.com/Ed-von-Schleck/gnitz"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "mypy>=1.18",
     "maturin>=1.0,<2.0",
     "jupyterlab>=4.0",
 ]

@@ -26,8 +26,10 @@ future is not cancellation: the request is still written and committed.
 
 from gnitz._native import AsyncGnitzClient
 
+__all__ = ["AsyncGnitzClient", "connect"]
 
-def connect(target, schema="public"):
+
+def connect(target: str, schema: str = "public") -> AsyncGnitzClient:
     """Connect to a gnitz server, with unqualified relation names resolving
     in `schema`; `other.name` names a relation of another schema. The
     connection is made when this returns, so awaiting it yields itself, and
