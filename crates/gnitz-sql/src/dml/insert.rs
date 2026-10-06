@@ -22,7 +22,7 @@ use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
 use sqlparser::ast::{
@@ -400,14 +400,14 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
             match returning {
                 Some((schema_out, map)) => {
                     client.push(&*target, schema, &rows, mode).await?;
-                    Ok(SqlResult::Rows {
+                    Ok(SqlResult::Rows(ScanReply {
                         schema: schema_out,
                         batch: match map {
                             Some(mut m) => m.apply(rows),
                             None => rows,
                         },
                         lsn: None,
-                    })
+                    }))
                 }
                 None => {
                     let count = rows.len();

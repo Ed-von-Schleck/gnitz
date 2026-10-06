@@ -3,8 +3,11 @@
 //! a kept descriptor out once another client's DDL has made it stale.
 
 use super::*;
-use gnitz_core::block_on;
+use gnitz_core::{block_on, BlockingHost, Host, Interest, Job};
 use gnitz_wire::{RelClass, WireStatus::NotFound};
+use std::os::fd::BorrowedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 const T_ID_V: &str = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)";
 
@@ -248,6 +251,61 @@ fn a_second_client_sees_a_rename_then_recreate() {
     b.exec("INSERT INTO t (id, v) VALUES (4, 400)");
     assert_eq!(a.scan("t", &["id", "v"]), [[2, 200, 1], [3, 300, 1], [4, 400, 1]]);
     assert_eq!(a.scan("u", &["id", "v"]), [[1, 100, 1]]);
+}
+
+/// A blocking host whose next wait, once armed, is interrupted.
+struct Interruptible {
+    host: BlockingHost,
+    armed: Arc<AtomicBool>,
+}
+
+impl Host for Interruptible {
+    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+        self.host.attach(fd)
+    }
+
+    fn poll_io(
+        &mut self,
+        want: Interest,
+        cx: &mut Context<'_>,
+        io: &mut dyn FnMut(Interest) -> Interest,
+    ) -> Poll<Result<(), ClientError>> {
+        if self.armed.swap(false, Ordering::Relaxed) {
+            let why: Box<dyn std::error::Error + Send + Sync> = "interrupted".into();
+            return Poll::Ready(Err(ClientError::Interrupted(why.into())));
+        }
+        self.host.poll_io(want, cx, io)
+    }
+
+    fn spawn(&mut self, job: Job) {
+        self.host.spawn(job)
+    }
+}
+
+/// An interrupt during a RESOLVE ends the statement, a kept descriptor in the
+/// plan or not: the statement asks for `t1`, which is kept, before `t2`, whose
+/// RESOLVE is the one request it sends.
+#[test]
+fn an_interrupted_resolve_ends_the_statement() {
+    let mut db = Db::boot(1);
+    db.exec("CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY); CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY)");
+    let armed = Arc::new(AtomicBool::new(false));
+    let host = Interruptible {
+        host: BlockingHost::default(),
+        armed: Arc::clone(&armed),
+    };
+    let mut client = block_on(GnitzClient::connect_with(db.srv.sock_path(), Box::new(host))).unwrap();
+    block_on(gnitz_sql::execute(&mut client, &db.sn, "SELECT * FROM t1")).unwrap();
+
+    let before = client.requests_sent();
+    armed.store(true, Ordering::Relaxed);
+    let two = "WITH a AS (SELECT * FROM t1), b AS (SELECT * FROM t2) SELECT * FROM a";
+    let e = block_on(gnitz_sql::execute(&mut client, &db.sn, two)).unwrap_err();
+    assert!(
+        matches!(e, GnitzSqlError::Client(ClientError::Interrupted(_))),
+        "got: {e:?}"
+    );
+    assert_eq!(client.requests_sent() - before, 1, "the RESOLVE of `t2`, and no replan");
 }
 
 /// `ALTER COLUMN … DROP NOT NULL` on A, then a raw binary `push` on B through

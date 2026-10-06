@@ -12,7 +12,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -25,7 +25,7 @@ use crate::{
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
 use gnitz_wire::CONNECT_TIMEOUT;
-use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags};
+use gnitz_wire::{ClientVerb, WireConflictMode};
 use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex, WireFault, WireStatus};
 
 /// Requests one connection may hold in flight; `submit` raises past it. A bound
@@ -39,12 +39,14 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
-/// One relation's read result. `lsn` is the server LSN the read was served
-/// at; a read answered off a mirrored copy has none.
+/// One relation's read result.
 #[derive(Debug)]
 pub struct ScanReply {
     pub schema: Arc<Schema>,
     pub batch: ZSetBatch,
+    /// The server LSN the read was served at. `None` for rows no server read
+    /// produced: an answer off a mirrored copy, a constant, `EXPLAIN` or
+    /// `RETURNING`.
     pub lsn: Option<u64>,
 }
 
@@ -124,10 +126,10 @@ fn delta_expired(text: &str) -> ClientError {
     })
 }
 
-// ── The spine's vocabulary ───────────────────────────────────────────────────
+// ── The request vocabulary ───────────────────────────────────────────────────
 
 /// What a driver should wait for before its next `step`, and what it hands
-/// back: two booleans on the connection, never a per-slot union.
+/// back: two booleans on the connection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Interest {
     pub read: bool,
@@ -173,7 +175,7 @@ pub enum Request<'a> {
     DdlTxn(&'a [(u64, ZSetBatch)]),
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
-    PushTxn { families: &'a [PushFamily<'a>] },
+    PushTxn { families: &'a [PushFamily] },
     /// PUSH. The frame always carries `schema`'s record.
     Push {
         target: Target,
@@ -188,14 +190,7 @@ impl Request<'_> {
     fn encode(self) -> Result<(Vec<u8>, u64), ClientError> {
         Ok(match self {
             Request::AllocIds(n) => {
-                let hdr = ControlHeader {
-                    flags: WireFlags {
-                        verb: ClientVerb::AllocIds,
-                        ..Default::default()
-                    },
-                    arg0: n,
-                    ..Default::default()
-                };
+                let hdr = ControlHeader::naming(ClientVerb::AllocIds, Target::from(0), n);
                 (encode_frame(hdr, &[], None, None), 0)
             }
             Request::AllocSerial { table, count } => {
@@ -213,7 +208,7 @@ impl Request<'_> {
             }
             Request::PushTxn { families } => {
                 for f in families {
-                    f.batch.validate(f.schema)?;
+                    f.batch.validate(&f.schema)?;
                 }
                 (encode_push_txn(families), 0)
             }
@@ -267,11 +262,8 @@ enum Slot {
     DeltaPoll {
         views: Vec<u64>,
         at: usize,
-        /// The index of `views[0]` in the poll this request is a chunk of.
-        first: usize,
-        /// Dead once the poll's reader is gone, which drops what is left of
-        /// its trains.
-        feed: Weak<PollFeed>,
+        /// The poll this request is a chunk of; see [`Polls::live`].
+        poll: u64,
     },
 }
 
@@ -302,17 +294,17 @@ impl<T> Cell<T> {
 pub struct Sent<T>(Arc<Cell<T>>);
 
 /// The writer of a [`Sent`]. Dropped unfulfilled, the reply is `Closed`.
-pub(crate) struct Promise<T>(Option<Arc<Cell<T>>>);
+pub struct Promise<T>(Option<Arc<Cell<T>>>);
 
 /// A reply yet to arrive, and its writer.
-pub(crate) fn promise<T>() -> (Promise<T>, Sent<T>) {
+pub fn promise<T>() -> (Promise<T>, Sent<T>) {
     let cell = Arc::new(Cell(Mutex::new(Awaited::Outstanding)));
     (Promise(Some(Arc::clone(&cell))), Sent(cell))
 }
 
 impl<T> Promise<T> {
     /// The reply arrives; a second one goes nowhere.
-    pub(crate) fn fulfil(&mut self, reply: Result<T, ClientError>) {
+    pub fn fulfil(&mut self, reply: Result<T, ClientError>) {
         let Some(cell) = self.0.take() else {
             return;
         };
@@ -397,17 +389,20 @@ pub(crate) enum Polled {
     End(PollEnd),
 }
 
-/// Where a delta poll's results queue for its reader, each under its view's
-/// index in the poll. Each view gets exactly one [`Polled::End`], in request
-/// order, however the poll ends.
-pub(crate) type PollFeed = Mutex<VecDeque<(usize, Polled)>>;
+/// A delta poll's results, queued for its reader in item order: each view's
+/// blocks, then its one [`Polled::End`], however the poll ends.
+#[derive(Default)]
+struct Polls {
+    /// The poll whose reader is live. A slot of any other drops what it is fed.
+    live: u64,
+    queue: VecDeque<Polled>,
+}
 
-/// Queue `polled` for the reader of `feed`, if it still has one.
-fn hand(feed: &Weak<PollFeed>, item: usize, polled: Polled) {
-    if let Some(feed) = feed.upgrade() {
-        feed.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back((item, polled));
+impl Polls {
+    fn hand(&mut self, poll: u64, polled: Polled) {
+        if poll == self.live {
+            self.queue.push_back(polled);
+        }
     }
 }
 
@@ -422,9 +417,9 @@ pub struct Session {
     /// The error every request gets once the session has ended — `Closed` or
     /// `ConnectionLost`; `None` while it is open.
     ended: Option<ClientError>,
-    /// The last read stopped with more waiting, to hand a delta poll's blocks
-    /// over before reading on.
+    /// The last read filled its window, so more may be waiting.
     unread: bool,
+    polls: Polls,
 }
 
 impl Session {
@@ -445,6 +440,7 @@ impl Session {
             submitted: 0,
             ended: None,
             unread: false,
+            polls: Polls::default(),
         }
     }
 
@@ -464,7 +460,7 @@ impl Session {
         self.transport.as_fd()
     }
 
-    // ── The spine ──────────────────────────────────────────────────────────
+    // ── Submitting and stepping ────────────────────────────────────────────
 
     /// Encode and queue `req`. Raises at either cap, as every submit does.
     pub fn submit(&mut self, req: Request<'_>) -> Result<Sent<u64>, ClientError> {
@@ -477,13 +473,7 @@ impl Session {
     /// RESOLVE — describe the relation named by the canonical
     /// `"schema_name.relation_name"`; `None` when there is none.
     pub fn submit_resolve(&mut self, qname: &str) -> Result<Sent<Option<Arc<RelDescriptor>>>, ClientError> {
-        let hdr = ControlHeader {
-            flags: WireFlags {
-                verb: ClientVerb::Resolve,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let hdr = ControlHeader::naming(ClientVerb::Resolve, Target::from(0), 0);
         let (to, sent) = promise();
         self.enqueue(encode_frame(hdr, qname.as_bytes(), None, None), Slot::Resolve { to })?;
         Ok(sent)
@@ -532,23 +522,17 @@ impl Session {
         Ok(sent)
     }
 
-    /// DELTA_POLL: one train per view of `views`, the items of a poll from its
-    /// `first` on, in order. Their results queue on `feed`, each under its
-    /// view's index in the poll, as the steps that read them run.
-    pub(crate) fn submit_delta_poll(
-        &mut self,
-        views: &[txn_frame::DeltaPollItem],
-        first: usize,
-        feed: &Arc<PollFeed>,
-    ) -> Result<(), ClientError> {
+    /// DELTA_POLL: one train per view of `views`, in order — the next items of
+    /// the live poll. Their results queue for [`Self::next_polled`] as the
+    /// steps that read them run.
+    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) -> Result<(), ClientError> {
         if views.is_empty() {
             return Err(ClientError::from("a delta poll names no view".to_string()));
         }
         let slot = Slot::DeltaPoll {
             views: views.iter().map(|v| v.view_id).collect(),
             at: 0,
-            first,
-            feed: Arc::downgrade(feed),
+            poll: self.polls.live,
         };
         self.enqueue(txn_frame::encode_delta_poll(views), slot)
     }
@@ -582,51 +566,59 @@ impl Session {
         Ok(())
     }
 
-    /// Do the I/O `ready` allows; every reply it completes arrives. Afterwards
-    /// a driver may park on `interest()`: nothing buffered can advance, and
-    /// bytes still queued are ones the fd refused.
+    /// Do the I/O `ready` allows — one read, then one flush; every reply it
+    /// completes arrives. Afterwards a driver may park on `interest()` unless
+    /// [`Self::unread`]: nothing buffered can advance, and bytes still queued
+    /// are ones the fd refused.
     ///
     /// A failure ends the session: every reply still owed arrives as
     /// [`ClientError::ConnectionLost`], after those that completed.
     pub fn step(&mut self, ready: Interest) {
         if ready.read {
-            self.read_frames();
+            self.read();
         }
         // Last, so the ciphertext a read queues goes out with this flush.
         if ready.write && self.ended.is_none() {
             if let Err(e) = self.transport.flush() {
                 // A peer gone after answering is still readable.
-                self.read_frames();
+                self.read();
+                while self.unread {
+                    self.read();
+                }
                 self.end(ClientError::ConnectionLost(e));
             }
         }
     }
 
-    /// Feed the frames of every read the fd allows, until one proves it drained
-    /// or fails — which ends the session.
-    ///
-    /// Stops at the first read that queued a delta poll's blocks for its
-    /// reader, so the blocks held at once are one read's.
-    fn read_frames(&mut self) {
+    /// One read of the socket, each frame it completes fed to the head slot. A
+    /// failure ends the session.
+    fn read(&mut self) {
         self.unread = false;
-        while self.ended.is_none() {
-            let Session { transport, pending, .. } = self;
-            let mut handed = false;
-            let more = match transport.read(|buf| feed(pending, buf, &mut handed)) {
-                Ok(more) => more,
-                Err(e) => {
-                    self.end(ClientError::ConnectionLost(e));
-                    false
-                }
-            };
-            if !more {
-                return;
-            }
-            if handed {
-                self.unread = true;
-                return;
-            }
+        if self.ended.is_some() {
+            return;
         }
+        let Session { transport, pending, polls, .. } = self;
+        match transport.read(|buf| feed(pending, buf, polls)) {
+            Ok(more) => self.unread = more,
+            Err(e) => self.end(ClientError::ConnectionLost(e)),
+        }
+    }
+
+    /// The live delta poll's next result.
+    pub(crate) fn next_polled(&mut self) -> Option<Polled> {
+        self.polls.queue.pop_front()
+    }
+
+    /// Everything the last step queued has been handed out.
+    pub(crate) fn polled_out(&self) -> bool {
+        self.polls.queue.is_empty()
+    }
+
+    /// The live poll's reader is gone: drop what it was handed, and what its
+    /// slots are still to be fed.
+    pub(crate) fn abandon_poll(&mut self) {
+        self.polls.live += 1;
+        self.polls.queue.clear();
     }
 
     /// The last step left a read unfinished: step `READ` again without waiting
@@ -672,8 +664,9 @@ impl Session {
             return;
         }
         self.transport.close();
-        for slot in self.pending.drain(..) {
-            slot.fail(why.clone());
+        let Session { pending, polls, .. } = self;
+        for slot in pending.drain(..) {
+            slot.fail(why.clone(), polls);
         }
         self.ended = Some(why);
     }
@@ -686,15 +679,15 @@ impl Session {
 }
 
 /// Feed one reply frame to the head slot, whose reply arrives if that completes
-/// it. `handed` is set by a block queued for a delta poll's reader.
-fn feed(pending: &mut VecDeque<Slot>, buf: Cow<'_, [u8]>, handed: &mut bool) -> Result<(), ProtocolError> {
+/// it.
+fn feed(pending: &mut VecDeque<Slot>, buf: Cow<'_, [u8]>, polls: &mut Polls) -> Result<(), ProtocolError> {
     let Some(head) = pending.front_mut() else {
         return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
     };
-    if let Some(answered) = head.feed(buf, handed)? {
+    if let Some(answered) = head.feed(buf, polls)? {
         let slot = pending.pop_front().expect("the head was just fed");
         if let Err(why) = answered {
-            slot.fail(why);
+            slot.fail(why, polls);
         }
     }
     Ok(())
@@ -707,7 +700,7 @@ impl Slot {
     fn feed(
         &mut self,
         mut buf: Cow<'_, [u8]>,
-        handed: &mut bool,
+        polls: &mut Polls,
     ) -> Result<Option<Result<(), ClientError>>, ProtocolError> {
         let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let named = ctrl.hdr.target_id;
@@ -725,11 +718,11 @@ impl Slot {
             // A DELTA_POLL fault naming a view ends that view's position alone;
             // every other fault ends the request.
             return match (&mut *self, want) {
-                (Slot::DeltaPoll { views, at, first, feed }, Some(view)) if named != 0 => {
+                (Slot::DeltaPoll { views, at, poll }, Some(view)) if named != 0 => {
                     if named != view {
                         return Err(out_of_order(view, named));
                     }
-                    hand(feed, *first + *at, Polled::End(Err(refused)));
+                    polls.hand(*poll, Polled::End(Err(refused)));
                     *at += 1;
                     Ok((*at == views.len()).then_some(Ok(())))
                 }
@@ -761,10 +754,9 @@ impl Slot {
         match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
             // An abandoned poll's block is dropped uncopied.
-            (Slot::DeltaPoll { at, first, feed, .. }, Some(block)) if feed.strong_count() > 0 => {
+            (Slot::DeltaPoll { poll, .. }, Some(block)) if *poll == polls.live => {
                 let frame = std::mem::take(&mut buf).into_owned();
-                hand(feed, *first + *at, Polled::Block(RawBlock { frame, block }));
-                *handed = true;
+                polls.hand(*poll, Polled::Block(RawBlock { frame, block }));
             }
             (Slot::DeltaPoll { .. }, Some(_)) => {}
             (Slot::Scan { reply_schema, data, .. }, Some(r)) => decode(data, reply_schema, &buf[r])?,
@@ -798,10 +790,10 @@ impl Slot {
                 }
                 to.fulfil(Ok(std::mem::take(replies)))
             }
-            Slot::DeltaPoll { views, at, first, feed } => {
+            Slot::DeltaPoll { views, at, poll } => {
                 let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                     .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-                hand(feed, *first + *at, Polled::End(Ok(cursor)));
+                polls.hand(*poll, Polled::End(Ok(cursor)));
                 *at += 1;
                 if *at < views.len() {
                     return Ok(None);
@@ -813,15 +805,15 @@ impl Slot {
 
     /// The request ended unanswered: `why` is its reply, and the end of each
     /// view a delta poll had yet to answer.
-    fn fail(self, why: ClientError) {
+    fn fail(self, why: ClientError, polls: &mut Polls) {
         match self {
             Slot::Ack { mut to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { mut to } => to.fulfil(Err(why)),
             Slot::Scan { mut to, .. } => to.fulfil(Err(why)),
             Slot::Multi { mut to, .. } => to.fulfil(Err(why)),
-            Slot::DeltaPoll { views, at, first, feed } => {
-                for item in first + at..first + views.len() {
-                    hand(&feed, item, Polled::End(Err(why.clone())));
+            Slot::DeltaPoll { views, at, poll } => {
+                for _ in at..views.len() {
+                    polls.hand(poll, Polled::End(Err(why.clone())));
                 }
             }
         }

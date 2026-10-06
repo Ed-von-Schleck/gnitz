@@ -25,23 +25,23 @@ fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSet
 /// from *that* family's schema, batch, tid and basis, in that order.
 #[test]
 fn push_txn_families_carry_their_own_schema_and_batch() {
-    let schema = kv_schema(TypeCode::I64);
+    let schema = Arc::new(kv_schema(TypeCode::I64));
     let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let b1 = kv_rows(&[(3, 30, 1)]);
     let b2 = retraction_batch(&schema, PkColumn::from_natives(&schema, [4]));
 
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),
-        schema: &schema,
+        schema: Arc::clone(&schema),
         batch,
         mode,
         basis,
     };
     let blind = gnitz_wire::txn_frame::BLIND;
     let families = [
-        family(16, &b0, WireConflictMode::Update, 42),
-        family(17, &b1, WireConflictMode::Error, blind),
-        family(16, &b2, WireConflictMode::Update, blind),
+        family(16, b0, WireConflictMode::Update, 42),
+        family(17, b1, WireConflictMode::Error, blind),
+        family(16, b2, WireConflictMode::Update, blind),
     ];
     let payload = encode_push_txn(&families);
 
@@ -52,8 +52,8 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
         let block_schema = frame_schema(frame, fam).unwrap();
-        assert_eq!(block_schema, schema);
-        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(want.batch));
+        assert_eq!(block_schema, *schema);
+        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(&want.batch));
     }
 }
 

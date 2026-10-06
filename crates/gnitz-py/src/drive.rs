@@ -242,8 +242,6 @@ struct State {
     owed: usize,
     /// No further call is taken, and the loop ends once the queue is empty.
     closing: bool,
-    /// The Python handle is gone.
-    released: bool,
 
     fd: RawFd,
     /// The loop reported the socket ready, and no step has used that up.
@@ -252,11 +250,10 @@ struct State {
     /// Whether the loop is watching the socket for each direction.
     reader_on: bool,
     writer_on: bool,
-    /// A write may be tried before the loop reports the socket writable. Off
-    /// while a burst of calls is being made, so it leaves in one `writev`.
-    write_now: bool,
+    /// The core's bound methods; `None` before it exists and once it closed.
     on_readable: Option<Py<PyAny>>,
     on_writable: Option<Py<PyAny>>,
+    on_flush: Option<Py<PyAny>>,
 }
 
 /// The loop future one call owes, resolved exactly once: with the call's
@@ -344,7 +341,7 @@ impl Host for LoopHost {
             let mut st = self.shared.state();
             Interest {
                 read: want.read && std::mem::take(&mut st.readable),
-                write: want.write && (std::mem::take(&mut st.writable) || (st.write_now && !st.writer_on)),
+                write: want.write && (std::mem::take(&mut st.writable) || !st.writer_on),
             }
         };
         if ready.is_empty() {
@@ -383,18 +380,17 @@ impl Drop for LoopHost {
 }
 
 /// Wakes the `serve` loop from the thread a job ran on.
-struct LoopWaker {
-    event_loop: Py<PyAny>,
-    pump: Py<PyAny>,
-}
-
-impl Wake for LoopWaker {
+impl Wake for Shared {
     fn wake(self: Arc<Self>) {
-        Python::attach(|py| {
+        // `move`: the last handle may be this one, and its `Py`s drop under the GIL.
+        Python::attach(move |py| {
+            let Some(pump) = self.state().on_flush.as_ref().map(|f| f.clone_ref(py)) else {
+                return;
+            };
             // A loop that is closed has nobody left to wake.
             let _ = self
                 .event_loop
-                .call_method1(py, intern!(py, "call_soon_threadsafe"), (&self.pump,));
+                .call_method1(py, intern!(py, "call_soon_threadsafe"), (pump,));
         });
     }
 }
@@ -403,19 +399,11 @@ impl Wake for LoopWaker {
 /// from the loop's own callbacks.
 #[pyclass]
 pub(crate) struct LoopCore {
-    /// A `Sync` shim; never locked.
-    inner: Mutex<Inner>,
-}
-
-struct Inner {
-    /// The `serve` loop; `None` once the client is closed.
-    actor: Option<BoxFut<'static, GnitzClient>>,
+    /// The `serve` loop; `None` once the client is closed. The `Mutex` is a
+    /// `Sync` shim for the future, never locked.
+    actor: Mutex<Option<BoxFut<'static, ()>>>,
     shared: Arc<Shared>,
     waker: Waker,
-    /// `None` once the client is closed.
-    on_flush: Option<Py<PyAny>>,
-    /// A `call_soon(on_flush)` is queued and has not run.
-    flush_scheduled: bool,
 }
 
 /// What a client class holds of its [`LoopCore`].
@@ -433,7 +421,7 @@ impl LoopHandle {
             .unbind();
         let session = py.detach(|| Session::connect(target)).map_err(client_err)?;
         let shared = Arc::new(Shared {
-            event_loop: event_loop.clone_ref(py),
+            event_loop,
             state: Mutex::new(State::default()),
         });
         let host = LoopHost { shared: Arc::clone(&shared), jobs: None };
@@ -450,27 +438,21 @@ impl LoopHandle {
         let core = Bound::new(
             py,
             LoopCore {
-                inner: Mutex::new(Inner {
-                    actor: Some(Box::pin(serve(client, next))),
-                    shared: Arc::clone(&shared),
-                    waker: Waker::noop().clone(),
-                    on_flush: None,
-                    flush_scheduled: false,
-                }),
+                actor: Mutex::new(Some(Box::pin(serve(client, next)))),
+                shared: Arc::clone(&shared),
+                waker: Waker::from(Arc::clone(&shared)),
             },
         )?;
         // The callbacks are the core's own methods, so they exist only now.
-        let on_flush = core.getattr(intern!(py, "on_flush"))?.unbind();
+        let callback = |name| core.getattr(name).map(Bound::unbind);
+        let on_readable = callback(intern!(py, "on_readable"))?;
+        let on_writable = callback(intern!(py, "on_writable"))?;
+        let on_flush = callback(intern!(py, "on_flush"))?;
         {
             let mut st = shared.state();
-            st.on_readable = Some(core.getattr(intern!(py, "on_readable"))?.unbind());
-            st.on_writable = Some(core.getattr(intern!(py, "on_writable"))?.unbind());
-        }
-        {
-            let mut this = core.borrow_mut();
-            let inner = this.inner();
-            inner.waker = Waker::from(Arc::new(LoopWaker { event_loop, pump: on_flush.clone_ref(py) }));
-            inner.on_flush = Some(on_flush);
+            st.on_readable = Some(on_readable);
+            st.on_writable = Some(on_writable);
+            st.on_flush = Some(on_flush);
         }
         Ok(LoopHandle { core: core.unbind(), shared })
     }
@@ -483,6 +465,12 @@ impl LoopHandle {
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
     {
         let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;
+        let mut core = self.core.bind(py).try_borrow_mut()?;
+        // At the cap, start what is queued before refusing: the session takes
+        // what it has room for.
+        if self.shared.state().queue.len() >= MAX_IN_FLIGHT {
+            core.pump(py);
+        }
         let refused = {
             let st = self.shared.state();
             if st.closing {
@@ -499,6 +487,21 @@ impl LoopHandle {
             settle(py, &future, Err(why));
             return Ok(future);
         }
+        let (idle, flush) = {
+            let st = self.shared.state();
+            let idle = st.owed == 0;
+            // A call queued behind none, while another is unresolved, is the
+            // first of a burst: nothing is on its way to start it.
+            let first = !idle && st.queue.is_empty();
+            (
+                idle,
+                first.then(|| st.on_flush.as_ref().map(|f| f.clone_ref(py))).flatten(),
+            )
+        };
+        if let Some(on_flush) = flush {
+            let event_loop = self.shared.event_loop.bind(py);
+            event_loop.call_method1(intern!(py, "call_soon"), (on_flush,))?;
+        }
         let owed = Owed {
             future: Some(future.clone_ref(py)),
             shared: Arc::clone(&self.shared),
@@ -511,22 +514,16 @@ impl LoopHandle {
                 }
             })
         });
-        let idle = {
+        {
             let mut st = self.shared.state();
             st.queue.push_back(call);
             st.owed += 1;
-            st.owed == 1
-        };
-        let mut core = self.core.bind(py).try_borrow_mut()?;
-        let inner = core.inner();
-        // A call made while others are unresolved is one of a burst: its bytes
-        // wait for the loop's next turn, where the burst leaves together.
-        if let (false, Some(on_flush)) = (idle || inner.flush_scheduled, &inner.on_flush) {
-            let event_loop = self.shared.event_loop.bind(py);
-            event_loop.call_method1(intern!(py, "call_soon"), (on_flush,))?;
-            inner.flush_scheduled = true;
         }
-        inner.pump(py, idle);
+        // A call made while others are unresolved is one of a burst: it starts
+        // on the loop's next turn, where the burst leaves together.
+        if idle {
+            core.pump(py);
+        }
         Ok(future)
     }
 
@@ -541,7 +538,7 @@ impl LoopHandle {
         }
         let closed = self.submit(py, last, |py, ()| Ok(py.None()))?;
         self.shared.state().closing = true;
-        self.core.bind(py).try_borrow_mut()?.inner().pump(py, true);
+        self.core.bind(py).try_borrow_mut()?.pump(py);
         Ok(closed)
     }
 
@@ -554,27 +551,21 @@ impl LoopHandle {
 
     /// The Python handle is gone: close once nothing is in flight.
     pub(crate) fn release(&self, py: Python<'_>) {
-        self.shared.state().released = true;
+        self.shared.state().closing = true;
         // Borrowed means a pump is running, which reads the flag as it ends.
         if let Ok(mut core) = self.core.bind(py).try_borrow_mut() {
-            core.inner().pump(py, true);
+            core.pump(py);
         }
     }
 }
 
 impl LoopCore {
-    fn inner(&mut self) -> &mut Inner {
-        self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl Inner {
     /// Poll the `serve` loop once, which runs every queued call as far as it
     /// goes without waiting, and resolve what that completed.
-    fn pump(&mut self, py: Python<'_>, write_now: bool) {
-        self.shared.state().write_now = write_now;
-        if let Some(actor) = self.actor.as_mut() {
-            if actor.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready() {
+    fn pump(&mut self, py: Python<'_>) {
+        let actor = self.actor.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(serving) = actor.as_mut() {
+            if serving.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready() {
                 self.close();
             }
         }
@@ -590,13 +581,17 @@ impl Inner {
         if writable {
             self.shared.watch(py, true, false);
         }
-        // Resolving runs Python, which can drop the handle: `released` is read
-        // after it, and closing lands what is left to resolve.
+        // Resolving runs Python, which can drop the handle: `closing` is read
+        // after it, and closing lands what is left to resolve. A handle
+        // released on a closed loop has no callback left to finish the
+        // `serve` loop's drain, and with nothing owed dropping it loses nothing.
         loop {
             let resolved = self.resolve(py);
-            let st = self.shared.state();
-            let abandoned = self.actor.is_some() && st.released && st.owed == 0;
-            drop(st);
+            let live = self.actor.get_mut().unwrap_or_else(PoisonError::into_inner).is_some();
+            let abandoned = {
+                let st = self.shared.state();
+                live && st.closing && st.owed == 0
+            };
             match (abandoned, resolved) {
                 (true, _) => self.close(),
                 (false, true) => {}
@@ -623,37 +618,32 @@ impl Inner {
     /// Drop the client, which closes its connection; every call still owed a
     /// result lands as `Closed`.
     fn close(&mut self) {
-        self.actor = None;
-        let unstarted = {
+        *self.actor.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
+        let (unstarted, callbacks) = {
             let mut st = self.shared.state();
             st.closing = true;
             // The callbacks hold this object, which holds them.
-            (st.on_readable, st.on_writable) = (None, None);
-            std::mem::take(&mut st.queue)
+            let callbacks = (st.on_readable.take(), st.on_writable.take(), st.on_flush.take());
+            (std::mem::take(&mut st.queue), callbacks)
         };
-        drop(unstarted);
-        (self.on_flush, self.waker) = (None, Waker::noop().clone());
+        drop((unstarted, callbacks));
     }
 }
 
 #[pymethods]
 impl LoopCore {
     fn on_readable(&mut self, py: Python<'_>) {
-        let inner = self.inner();
-        inner.shared.state().readable = true;
-        inner.pump(py, true);
+        self.shared.state().readable = true;
+        self.pump(py);
     }
 
     fn on_writable(&mut self, py: Python<'_>) {
-        let inner = self.inner();
-        inner.shared.state().writable = true;
-        inner.pump(py, true);
+        self.shared.state().writable = true;
+        self.pump(py);
     }
 
-    /// A burst's deferred flush, and a finished job's wake-up.
+    /// A burst's deferred start, and a finished job's wake-up.
     fn on_flush(&mut self, py: Python<'_>) {
-        let inner = self.inner();
-        inner.flush_scheduled = false;
-        inner.pump(py, true);
+        self.pump(py);
     }
 }

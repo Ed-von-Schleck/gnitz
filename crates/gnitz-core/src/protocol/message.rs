@@ -3,6 +3,7 @@ use gnitz_wire::control::{append_frame, ControlHeader};
 use gnitz_wire::txn_frame::{encode_items, FrameItem};
 use gnitz_wire::WireConflictMode;
 use gnitz_wire::{ClientVerb, WireFlags};
+use std::sync::Arc;
 
 /// One frame payload, without the 4-byte length prefix. An empty batch ships no
 /// data block, and still ships the schema record.
@@ -18,22 +19,25 @@ pub fn encode_frame(hdr: ControlHeader, blob: &[u8], schema: Option<&[u8]>, data
     out
 }
 
-/// One family of a user-table push transaction: a batch into `target` under
-/// `mode`.
-pub struct PushFamily<'a> {
+/// One family of a user-table push transaction: a maximal run of same-mode
+/// writes into `target`.
+pub struct PushFamily {
+    /// The relation, under the descriptor token of the first of the family's
+    /// batches built from a descriptor; `0` while none was.
     pub target: crate::Target,
-    pub schema: &'a Schema,
-    pub batch: &'a ZSetBatch,
+    pub schema: Arc<Schema>,
+    pub batch: ZSetBatch,
     pub mode: WireConflictMode,
-    /// The commit fails if `target` was written after `basis`, the watermark of the
-    /// read this family was built from; `BLIND` for a family built from no read.
+    /// The commit fails if `target` was written after `basis`, the oldest
+    /// watermark among the reads this family's writes were built from; `BLIND`
+    /// when none was.
     pub basis: u64,
 }
 
 /// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
 /// wire bytes (without the 4-byte frame header). Every family carries its schema
 /// record, which the master validates it against.
-pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
+pub fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
     let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
     let items: Vec<FrameItem> = families
         .iter()

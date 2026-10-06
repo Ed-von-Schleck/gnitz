@@ -40,7 +40,7 @@ use crate::validate::{
     as_plain_select, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{ReadSink, ReadSpec, RowsCut, SinkKind};
 use sqlparser::ast::{Query, SetExpr, Statement};
 use std::num::NonZeroU64;
@@ -354,11 +354,11 @@ fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<
 pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
     if plan.answers_from_schema() {
         let schema = Arc::clone(plan.out_schema());
-        return Ok(SqlResult::Rows {
+        return Ok(SqlResult::Rows(ScanReply {
             batch: ZSetBatch::new(&schema),
             schema,
             lsn: None,
-        });
+        }));
     }
     let ReadPlan { case, order, window } = plan;
     let (schema, batch, lsn) = match case {
@@ -383,5 +383,5 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
         }
     };
     let batch = order_and_window(&schema, batch, &order, window);
-    Ok(SqlResult::Rows { schema, batch, lsn })
+    Ok(SqlResult::Rows(ScanReply { schema, batch, lsn }))
 }

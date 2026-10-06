@@ -15,11 +15,12 @@ mod test_support;
 
 pub use client::{
     block_on, key_reply, not_found, qualified_name, retraction_batch, segment_id, serve, BlockingHost, BoxFut,
-    FkTarget, GnitzClient, Held, Host, IndexRow, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView,
-    ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
+    FkTarget, GnitzClient, Host, IndexRow, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, ViewBundle,
+    MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
-    DeltaCursor, Interest, RelDescriptor, Request, ScanReply, Sent, Session, Target, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, Target, MAX_IN_FLIGHT,
+    MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};

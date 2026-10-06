@@ -24,9 +24,8 @@
 //! `ReadSpec` executor — and links neither the circuit compiler, the DBSP VM,
 //! epoch execution nor the system-table catalog.
 //!
-//! The store is `Send` and `!Sync`, so a [`gnitz_core::GnitzClient`] holding one
-//! is `Send` and is not `Sync`; the argument is beside the `unsafe impl` in
-//! `handle.rs`.
+//! The store is `Send` and `!Sync`, and a [`gnitz_core::GnitzClient`] holds it
+//! behind a lock; the argument is beside the `unsafe impl` in `handle.rs`.
 //!
 //! There is **one store per data directory**. The engine's own `flock` refuses a
 //! second one, in this process or any other: a second [`Mirror::open`] takes a

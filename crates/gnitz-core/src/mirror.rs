@@ -22,11 +22,8 @@
 //! read spanning both is no consistent cut. A relation the copy does not hold is
 //! delegated upstream and keeps every guarantee a server read has.
 //!
-//! **Cost.** A copy trades W workers' parallelism for a local read: it wins
-//! outright on point and small bounded reads, where the round trip dominates,
-//! and the margin narrows as the walk grows until a full scan of a large view at
-//! high W is a loss. Narrowing the bound is the lever. Each index the view had at
-//! its last resolve is a further local store, maintained on every applied delta.
+//! **Cost.** Each index the view had at its last resolve is a further local
+//! store, maintained on every applied delta.
 
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
@@ -134,10 +131,6 @@ pub enum Invalidate {
 }
 
 /// Why a mirror operation did not happen.
-///
-/// It lives here rather than beside [`ClientError`] because it is the
-/// [`MirrorStore`] seam's error channel and nothing else raises it;
-/// [`ClientError::Mirror`] is how it reaches a caller of the client.
 #[derive(Debug, Clone)]
 pub enum MirrorError {
     /// The local engine refused or failed: a storage fault, a registration the
@@ -306,12 +299,6 @@ fn advance_from(store: &mut dyn MirrorStore, (tid, prev, blocks, at): Train) -> 
 // ---------------------------------------------------------------------------
 // The reconciliation state machine
 // ---------------------------------------------------------------------------
-//
-// It lands on the client and not in a crate of its own because what it is made
-// of is connection work: it resolves names upstream, drives the raw delta verb,
-// and classifies what comes back. The only non-connection steps in it are
-// calls through `MirrorStore` — which is also what makes it exist once for the
-// blocking, async and Python clients alike.
 
 /// Where [`GnitzClient::settle`] is with a view.
 enum Settle {
@@ -410,8 +397,8 @@ impl GnitzClient {
         };
         let m = self.mirror_state()?;
         // The store's verdict, not a second scan: this map and the store's
-        // records must name the same displaced id, or `held`
-        // picks one of two live entries out of a `HashMap`.
+        // records must name the same displaced id, or `mirrored_desc` picks
+        // one of two live entries out of a `HashMap`.
         if let Some(old) = retracted {
             m.views.remove(&old);
         }
@@ -501,7 +488,7 @@ impl GnitzClient {
         store.clone().run(host, move |s| s.refill(tid)).await??;
         let mut poll = DeltaPoll::start(session, &[item]);
         let (mut blocks, mut end, mut refused) = (Vec::new(), None, None);
-        while let Some((_, polled)) = poll.next(session, host).await? {
+        while let Some((_, polled)) = poll.next(host).await? {
             match polled {
                 Polled::Block(b) => blocks.push(b),
                 Polled::End(e) => end = Some(e),
@@ -519,6 +506,7 @@ impl GnitzClient {
                 }
             }
         }
+        drop(poll);
         if let Some(e) = refused {
             return Err(e.into());
         }
@@ -637,7 +625,7 @@ impl GnitzClient {
     /// The host's word for [`Invalidate::Registration`].
     pub async fn forget_view(&mut self, table_id: u64) -> Result<(), ClientError> {
         // The client-side entry goes first: it is the read gate
-        // `held` consults. The store is asked whether or not
+        // `mirrored_desc` consults. The store is asked whether or not
         // there was one, because a reopened store holds copies this client has
         // not registered — and forgetting one is exactly the call that erases it.
         let m = self.mirror_state()?;
@@ -671,7 +659,7 @@ impl GnitzClient {
         // views one step ended, applied together before the session reads on.
         let mut blocks = Vec::new();
         let mut due: Vec<Train> = Vec::new();
-        while let Some((i, polled)) = poll.next(session, host).await? {
+        while let Some((i, polled)) = poll.next(host).await? {
             match polled {
                 Polled::Block(b) => blocks.push(b),
                 Polled::End(end) => {

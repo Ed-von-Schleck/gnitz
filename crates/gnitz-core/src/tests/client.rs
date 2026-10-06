@@ -192,7 +192,7 @@ fn overlay_is_the_committed_read_without_a_live_op() {
 #[test]
 fn the_read_index_is_built_on_read() {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    let indexed = |buf: &TxnBuffer| buf.families.iter().map(|f| f.indexed).sum::<usize>();
+    let indexed = |buf: &TxnBuffer| buf.indexed.iter().sum::<usize>();
     let mut buf = TxnBuffer::default();
     buf.push(17, &s, kv_rows(&[(9, 90, 1)]), Error, BLIND).unwrap();
     for pk in 1..=4 {
@@ -506,12 +506,10 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
             }
         }
     };
-    let (c, polls) = drive(fd, serve(c, next));
+    let ((), polls) = drive(fd, serve(c, next));
     assert_eq!(whole.lock().unwrap().take().unwrap(), [0, 1, 2]);
     assert_eq!(answered, [3, 4]);
-    assert_eq!(c.requests_sent(), 5);
     assert!(polls > 1, "the host pended");
-    drop(c);
     peer.join().unwrap();
 }
 

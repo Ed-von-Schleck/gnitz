@@ -5,7 +5,7 @@ use super::*;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{framed, kv_rows, kv_schema, reply_ctrl, reply_status, session_pair as pair};
 use crate::BatchAppender;
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<ScanReply>, ClientError> {
@@ -438,8 +438,7 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     };
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        let feed = Arc::new(PollFeed::default());
-        s.submit_delta_poll(&[item(7), item(8), item(9)], 0, &feed).unwrap();
+        s.submit_delta_poll(&[item(7), item(8), item(9)]).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -465,12 +464,11 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
             s.step(Interest::READ);
         }
         assert_eq!(s.is_closed(), !refused);
-        let ends: Vec<PollEnd> = std::mem::take(&mut *feed.lock().unwrap())
+        let ends: Vec<PollEnd> = std::mem::take(&mut s.polls.queue)
             .into_iter()
-            .enumerate()
-            .map(|(view, polled)| match polled {
-                (item, Polled::End(end)) if item == view => end,
-                _ => panic!("view {view} ends once, and no view sent a block"),
+            .map(|polled| match polled {
+                Polled::End(end) => end,
+                Polled::Block(_) => panic!("no view sent a block"),
             })
             .collect();
         assert_eq!(ends.len(), 3, "one end per view: {ends:?}");
@@ -483,6 +481,47 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
             }
         }
     }
+}
+
+/// A poll whose reader is gone hands nothing on: its trains are read off the
+/// socket and dropped, and the next poll's results are the queue's alone.
+#[test]
+fn an_abandoned_poll_queues_nothing() {
+    let item = |view_id| txn_frame::DeltaPollItem {
+        view_id,
+        after_tick: 4,
+        reply_layout: schema_a().layout_digest(),
+    };
+    let terminal = |tid| ControlHeader {
+        target_id: tid,
+        arg0: 9,
+        arg1: 1,
+        ..Default::default()
+    };
+    let (mut s, peer) = pair();
+    s.submit_delta_poll(&[item(7)]).unwrap();
+    s.abandon_poll();
+    s.submit_delta_poll(&[item(8)]).unwrap();
+    s.step(Interest::WRITE);
+    let mut wire = Vec::new();
+    for tid in [7, 8] {
+        wire.extend(framed(&reply_rows(tid, &batch_a(&[tid]), 0, true)));
+        wire.extend(framed(&encode_frame(terminal(tid), &[], None, None)));
+    }
+    peer.send_bytes(&wire);
+    while !s.interest().is_empty() {
+        s.step(Interest::from_revents(
+            poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap(),
+        ));
+    }
+    let Some(Polled::Block(block)) = s.next_polled() else {
+        panic!("the live poll's block comes first");
+    };
+    let mut rows = ZSetBatch::new(&schema_a());
+    decode_wal_block_into(&mut rows, block.block(), &schema_a()).unwrap();
+    assert_eq!(rows, batch_a(&[8]));
+    assert!(matches!(s.next_polled(), Some(Polled::End(Ok(_)))));
+    assert!(s.polled_out());
 }
 
 /// A RESOLVE reply that does not decode ends the session, whichever of its

@@ -1,5 +1,5 @@
 use crate::connection::{
-    promise, DeltaCursor, Interest, PollFeed, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
+    promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::future::{poll_fn, Future};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use std::task::{ready, Context, Poll, Waker};
 
 use gnitz_expr::{LogicalProgram, RowFilter};
@@ -192,18 +192,6 @@ impl From<PlannedView> for ViewBundle {
     }
 }
 
-/// Where [`GnitzClient::held`] found a descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Held {
-    /// A mirrored registration's, while its copy answers reads: as stale as the
-    /// copy, and checked by nothing.
-    Copy,
-    /// What the last RESOLVE answered. Only a request carrying its token finds
-    /// out whether it is stale; a planning error or an answer that needs no
-    /// request is the caller's to repeat from [`GnitzClient::resolve`].
-    Kept,
-}
-
 /// Run when a signal interrupts a blocking wait; an `Err` aborts the call.
 /// The Python binding checks for Ctrl-C here.
 pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
@@ -379,8 +367,8 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Run the ops `next` yields on `client`, in order and one at a time. Steps
 /// the session while none is ready, and after `next` yields `None` until
-/// nothing is outstanding; then returns the client.
-pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) -> GnitzClient {
+/// nothing is outstanding; then drops the client.
+pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) {
     let mut more = true;
     loop {
         let op = poll_fn(|cx| loop {
@@ -406,9 +394,7 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
             }
         })
         .await;
-        let Some(op) = op else {
-            return client;
-        };
+        let Some(op) = op else { return };
         // A connection that is gone refuses the op's own requests.
         let _ = client.make_room().await;
         op(&mut client).await;
@@ -429,7 +415,7 @@ pub struct GnitzClient {
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
-    /// [`Self::held`]. This client's own DDL empties it.
+    /// [`Self::kept_desc`]. This client's own DDL empties it.
     kept: HashMap<String, Arc<RelDescriptor>>,
 }
 
@@ -602,30 +588,36 @@ impl GnitzClient {
 
     // ── The read seam ──────────────────────────────────────────────────────
     //
-    // `resolve` and `scan_spec` are the connection; `held` and
-    // `scan_spec_local_first` below consult the copy first, so every call site
+    // `resolve` and `scan_spec` are the connection; `mirrored_desc` and
+    // `scan_spec_local_first` below consult the copy first, and `kept_desc`
+    // the last RESOLVE's answer, so every call site
     // declares which freshness it is asking for. **The gate is what the copy
     // holds, never whether a store is attached**, so a client with one reads
     // exactly like a client without for every relation the copy does not hold.
 
-    /// The descriptor this client holds for `schema_name.name`. A `read` is
-    /// answered off a mirrored registration while its copy answers reads — the
-    /// cursor is the one gate, for names and reads alike — and anything else off
-    /// what the last RESOLVE answered.
-    pub fn held(&self, schema_name: &str, name: &str, read: bool) -> Option<(Arc<RelDescriptor>, Held)> {
-        let copy = self.mirror.as_deref().filter(|_| read).and_then(|m| {
-            m.views
-                .iter()
-                // The stored names are canonical, so comparing the parts is the
-                // fold of the joined name without its allocation.
-                .find(|(&t, v)| {
-                    v.schema_name.eq_ignore_ascii_case(schema_name)
-                        && v.name.eq_ignore_ascii_case(name)
-                        && m.store.get().cursor_of(t).is_some()
-                })
-                .map(|(_, v)| (Arc::clone(&v.desc), Held::Copy))
-        });
-        copy.or_else(|| Some((self.kept.get(&qualified_name(schema_name, name))?.clone(), Held::Kept)))
+    /// The descriptor of the mirrored view `schema_name.name`, while its copy
+    /// answers reads — the cursor is the one gate, for names and reads alike. As
+    /// stale as the copy, and checked by nothing.
+    pub fn mirrored_desc(&self, schema_name: &str, name: &str) -> Option<Arc<RelDescriptor>> {
+        let m = self.mirror.as_deref()?;
+        m.views
+            .iter()
+            // The stored names are canonical, so comparing the parts is the
+            // fold of the joined name without its allocation.
+            .find(|(&t, v)| {
+                v.schema_name.eq_ignore_ascii_case(schema_name)
+                    && v.name.eq_ignore_ascii_case(name)
+                    && m.store.get().cursor_of(t).is_some()
+            })
+            .map(|(_, v)| Arc::clone(&v.desc))
+    }
+
+    /// What the last RESOLVE answered for `schema_name.name`. Only a request
+    /// carrying its token finds out whether it is stale; a planning error or an
+    /// answer that needs no request is the caller's to repeat from
+    /// [`Self::resolve`].
+    pub fn kept_desc(&self, schema_name: &str, name: &str) -> Option<Arc<RelDescriptor>> {
+        self.kept.get(&qualified_name(schema_name, name)).cloned()
     }
 
     /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
@@ -744,7 +736,7 @@ impl GnitzClient {
         let GnitzClient { session, host, .. } = self;
         let mut poll = DeltaPoll::start(session, &[item]);
         let (mut end, mut undecoded) = (None, None);
-        while let Some((_, polled)) = poll.next(session, &mut **host).await? {
+        while let Some((_, polled)) = poll.next(&mut **host).await? {
             match polled {
                 Polled::Block(b) if undecoded.is_none() => {
                     undecoded = crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema).err();
@@ -903,18 +895,7 @@ impl GnitzClient {
         if buf.families.is_empty() {
             return Ok(0);
         }
-        let families: Vec<PushFamily<'_>> = buf
-            .families
-            .iter()
-            .map(|f| PushFamily {
-                target: f.target,
-                schema: &f.schema,
-                batch: &f.batch,
-                mode: f.mode,
-                basis: f.basis,
-            })
-            .collect();
-        self.ack(Request::PushTxn { families: &families }).await
+        self.ack(Request::PushTxn { families: &buf.families }).await
     }
 
     /// Read `target`'s rows under `bound` and `predicate` — only their keys when
@@ -1506,23 +1487,28 @@ impl GnitzClient {
 /// A delta poll in flight: `items`, one request per `DELTA_POLL_MAX_VIEWS`,
 /// handed out as each item's blocks and then its one end, the items in order.
 /// Dropped unfinished, the session drops what is left of its trains.
-pub(crate) struct DeltaPoll {
-    feed: Arc<PollFeed>,
+pub(crate) struct DeltaPoll<'s> {
+    session: &'s mut Session,
     /// Items a request went out for, and items in all.
     sent: usize,
     total: usize,
-    /// Ends handed out so far.
+    /// Ends handed out so far: the index of the item being answered.
     answered: usize,
     /// Why the items past `sent` were never asked for.
     unsent: Option<ClientError>,
 }
 
-impl DeltaPoll {
-    pub(crate) fn start(session: &mut Session, items: &[DeltaPollItem]) -> Self {
-        let feed = Arc::new(PollFeed::default());
+impl Drop for DeltaPoll<'_> {
+    fn drop(&mut self) {
+        self.session.abandon_poll();
+    }
+}
+
+impl<'s> DeltaPoll<'s> {
+    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem]) -> Self {
         let (mut sent, mut unsent) = (0, None);
         for chunk in items.chunks(DELTA_POLL_MAX_VIEWS) {
-            match session.submit_delta_poll(chunk, sent, &feed) {
+            match session.submit_delta_poll(chunk) {
                 Ok(()) => sent += chunk.len(),
                 // Neither of a submit's refusals clears without a step, so no
                 // later chunk is tried.
@@ -1533,7 +1519,7 @@ impl DeltaPoll {
             }
         }
         DeltaPoll {
-            feed,
+            session,
             sent,
             total: items.len(),
             answered: 0,
@@ -1541,26 +1527,19 @@ impl DeltaPoll {
         }
     }
 
-    fn pop(&self) -> Option<(usize, Polled)> {
-        self.feed.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
-    }
-
     /// Everything the last step queued has been handed out.
     pub(crate) fn drained(&self) -> bool {
-        self.feed.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
+        self.session.polled_out()
     }
 
     /// The next block or end, with its item's index; `None` once every item
     /// has ended. `Err` is the host's alone — an interrupt.
-    pub(crate) async fn next(
-        &mut self,
-        session: &mut Session,
-        host: &mut dyn Host,
-    ) -> Result<Option<(usize, Polled)>, ClientError> {
+    pub(crate) async fn next(&mut self, host: &mut dyn Host) -> Result<Option<(usize, Polled)>, ClientError> {
         loop {
-            if let Some(next) = self.pop() {
-                self.answered += usize::from(matches!(next.1, Polled::End(_)));
-                return Ok(Some(next));
+            if let Some(next) = self.session.next_polled() {
+                let item = self.answered;
+                self.answered += usize::from(matches!(next, Polled::End(_)));
+                return Ok(Some((item, next)));
             }
             if self.answered == self.sent {
                 let Some(e) = self.unsent.as_ref().filter(|_| self.sent < self.total) else {
@@ -1570,28 +1549,12 @@ impl DeltaPoll {
                 self.answered += 1;
                 return Ok(Some((self.sent - 1, Polled::End(Err(e.clone())))));
             }
-            poll_fn(|cx| poll_turn(session, host, cx)).await?;
+            poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
         }
     }
 }
 
 // --- TxnBuffer: the locally-buffered atomic write-batch transaction ---
-
-/// One buffered family: a maximal run of same-mode ops on one relation.
-struct BufferedFamily {
-    /// The relation, under the descriptor token of the first of the family's
-    /// batches built from a descriptor; `0` while none was.
-    target: Target,
-    schema: Arc<Schema>,
-    batch: ZSetBatch,
-    mode: WireConflictMode,
-    /// The oldest watermark among the reads this family's writes were built
-    /// from; `BLIND` when none was.
-    basis: u64,
-    /// How many of `batch`'s rows are already folded into `last_op_of`. A batch
-    /// only ever extends, so this is a watermark, not a dirty flag.
-    indexed: usize,
-}
 
 fn no_transaction() -> ClientError {
     ClientError::from("no transaction open".to_string())
@@ -1605,7 +1568,10 @@ fn no_transaction() -> ClientError {
 struct TxnBuffer {
     /// Creation order; per tid, maximal same-mode runs of the caller's op
     /// sequence.
-    families: Vec<BufferedFamily>,
+    families: Vec<PushFamily>,
+    /// Per family, how many of its batch's rows are already folded into
+    /// `last_op_of`. A batch only ever extends, so this is a watermark.
+    indexed: Vec<usize>,
 
     /// tid → its family indices in creation order. Only the last one can still
     /// grow (a matching-mode append extends it), which is what makes indexing a
@@ -1666,14 +1632,14 @@ impl TxnBuffer {
             }
             None => {
                 self.families_of.entry(tid).or_default().push(self.families.len());
-                self.families.push(BufferedFamily {
+                self.families.push(PushFamily {
                     target,
                     schema: Arc::clone(schema),
                     batch,
                     mode,
                     basis,
-                    indexed: 0,
                 });
+                self.indexed.push(0);
             }
         }
         Ok(())
@@ -1683,7 +1649,7 @@ impl TxnBuffer {
     fn check_layout(
         &self,
         tid: u64,
-        matches: impl FnOnce(&BufferedFamily) -> Result<(), String>,
+        matches: impl FnOnce(&PushFamily) -> Result<(), String>,
     ) -> Result<(), ClientError> {
         let Some(&first) = self.families_of.get(&tid).and_then(|v| v.first()) else {
             return Ok(());
@@ -1702,13 +1668,12 @@ impl TxnBuffer {
         };
         let index = self.last_op_of.entry(tid).or_default();
         for &fam in own {
-            let f = &mut self.families[fam];
-            for row in f.indexed..f.batch.len() {
-                if f.batch.weights[row] != 0 {
-                    index.insert(PkBuf::from_bytes(f.batch.pks.get_bytes(row)), (fam, row));
+            let batch = &self.families[fam].batch;
+            for row in std::mem::replace(&mut self.indexed[fam], batch.len())..batch.len() {
+                if batch.weights[row] != 0 {
+                    index.insert(PkBuf::from_bytes(batch.pks.get_bytes(row)), (fam, row));
                 }
             }
-            f.indexed = f.batch.len();
         }
     }
 

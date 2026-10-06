@@ -4,7 +4,7 @@ use gnitz_core::block_on;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gnitz_core::{GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
 use gnitz_zset_testkit::{row_key, RowKey};
 
@@ -21,7 +21,7 @@ pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> Reply {
     let mut results = block_on(gnitz_sql::execute(client, schema, s)).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
-        SqlResult::Rows { schema, batch, .. } => (schema, batch),
+        SqlResult::Rows(ScanReply { schema, batch, .. }) => (schema, batch),
         other => panic!("{s} did not return rows: {other:?}"),
     }
 }

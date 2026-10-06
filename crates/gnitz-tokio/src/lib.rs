@@ -8,9 +8,9 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending};
+use gnitz_core::{promise, serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Waits on tokio's reactor, and runs jobs on its blocking pool.
 #[derive(Default)]
@@ -91,7 +91,7 @@ pub async fn client(target: &str) -> Result<GnitzClient, ClientError> {
 pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
     let client = client(target).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Op>();
-    let driver = async move { drop(serve(client, |cx| rx.poll_recv(cx)).await) };
+    let driver = serve(client, move |cx| rx.poll_recv(cx));
     Ok((AsyncClient { tx }, Connection(Box::pin(driver))))
 }
 
@@ -115,20 +115,17 @@ impl AsyncClient {
     /// ```ignore
     /// client.run(|c| Box::pin(c.create_schema("s"))).await??;
     /// ```
-    pub fn run<T, F>(&self, f: F) -> impl Future<Output = Result<T, ClientError>>
+    pub fn run<T, F>(&self, f: F) -> Sent<T>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, T> + Send + 'static,
     {
-        let (reply, rx) = oneshot::channel();
-        // A driver that is gone drops the op, and with it `reply`.
+        let (mut to, sent) = promise();
+        // A driver that is gone drops the op, and with it `to`.
         let _ = self.tx.send(Box::new(move |client| {
-            Box::pin(async move {
-                // A dropped caller's result goes nowhere.
-                let _ = reply.send(f(client).await);
-            })
+            Box::pin(async move { to.fulfil(Ok(f(client).await)) })
         }));
-        async move { rx.await.map_err(|_| ClientError::Closed) }
+        sent
     }
 
     /// Submit the one request `f` makes, queued when called, and resolve to
@@ -138,18 +135,16 @@ impl AsyncClient {
     /// ```ignore
     /// let lsn = client.send(move |c| c.push(tid, &schema, batch, mode)).await?;
     /// ```
-    pub fn send<T, F>(&self, f: F) -> impl Future<Output = Result<T, ClientError>>
+    pub fn send<T, F>(&self, f: F) -> Sent<T>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut GnitzClient) -> Pending<'a, T> + Send + 'static,
     {
-        let (reply, rx) = oneshot::channel();
+        let (mut to, sent) = promise();
         let _ = self.tx.send(Box::new(move |client| {
-            Box::pin(async move {
-                f(client).detach().then(move |r| drop(reply.send(r)));
-            })
+            Box::pin(async move { f(client).detach().then(move |reply| to.fulfil(reply)) })
         }));
-        async move { rx.await.map_err(|_| ClientError::Closed)? }
+        sent
     }
 }
 

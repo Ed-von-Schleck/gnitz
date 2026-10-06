@@ -31,10 +31,9 @@ mod validate;
 
 pub use error::GnitzSqlError;
 
-use gnitz_core::{GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, ScanReply};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::sync::Arc;
 
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
@@ -44,14 +43,7 @@ pub enum SqlResult {
     RowsAffected {
         count: usize,
     },
-    Rows {
-        schema: Arc<Schema>,
-        batch: ZSetBatch,
-        /// The server LSN the rows were read at, or `None` for rows no server
-        /// read produced: an answer off a mirrored copy, a constant, `EXPLAIN`
-        /// or `RETURNING`.
-        lsn: Option<u64>,
-    },
+    Rows(ScanReply),
     /// `BEGIN` / `START TRANSACTION`: a client-side transaction buffer opened.
     TransactionStarted,
     /// `COMMIT`: the buffer shipped as one atomic frame. `lsn` is the zone LSN

@@ -87,8 +87,8 @@ pub(crate) enum Mode {
 /// inside `GnitzClient.pipeline()`.
 #[pyclass(name = "_Client", subclass)]
 pub struct PyClient {
-    /// A `Sync` shim: `#[pyclass]` demands `Sync` and a mirroring client is
-    /// `Send` only. Never locked — [`Self::mode`] is the only way in.
+    /// A `Sync` shim: `#[pyclass]` demands `Sync` and a client is `Send` only,
+    /// as its host is. Never locked — [`Self::mode`] is the only way in.
     mode: Mutex<Mode>,
     /// The schema this connection's names resolve in: every SQL statement, and
     /// every verb that takes a relation name.
@@ -569,12 +569,9 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyA
                 d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;
                 d.set_item(pyo3::intern!(py, "count"), count)?;
             }
-            SqlResult::Rows { schema, batch, lsn } => {
+            SqlResult::Rows(reply) => {
                 d.set_item(k_type, pyo3::intern!(py, "Rows"))?;
-                d.set_item(
-                    pyo3::intern!(py, "rows"),
-                    scan_result(py, ScanReply { schema, batch, lsn })?,
-                )?;
+                d.set_item(pyo3::intern!(py, "rows"), scan_result(py, reply)?)?;
             }
             SqlResult::TransactionStarted => {
                 d.set_item(k_type, pyo3::intern!(py, "TransactionStarted"))?;

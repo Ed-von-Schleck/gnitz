@@ -297,7 +297,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
 
 /// The visible columns of `schema` over `batch`, or every column when
 /// `include_hidden`.
-fn present(
+pub(crate) fn present(
     py: Python<'_>,
     schema: Arc<Schema>,
     batch: Arc<ZSetBatch>,

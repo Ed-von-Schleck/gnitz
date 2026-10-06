@@ -16,7 +16,7 @@ use gnitz_core::block_on;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_core::{ClientError, GnitzClient, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_test_harness::{unique_schema, ServerHandle};
@@ -103,7 +103,7 @@ impl Db {
 
     pub fn read(&mut self, sql: &str) -> (Arc<Schema>, ZSetBatch) {
         match self.exec(sql) {
-            SqlResult::Rows { schema, batch, .. } => (schema, batch),
+            SqlResult::Rows(ScanReply { schema, batch, .. }) => (schema, batch),
             other => panic!("expected Rows from `{sql}`, got {other:?}"),
         }
     }

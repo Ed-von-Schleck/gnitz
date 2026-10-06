@@ -6,7 +6,7 @@ use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
 use crate::{ddl, dml};
-use gnitz_core::{ClientError, GnitzClient, Held, RelDescriptor};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
 use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
 use std::cell::Cell;
@@ -30,10 +30,11 @@ async fn planned<T>(
         let missing = {
             let kept = Cell::new(false);
             let held = |name: &str| {
-                let (desc, held) = client
-                    .held(schema_name, name, read)
-                    .filter(|&(_, held)| use_kept || held == Held::Copy)?;
-                kept.set(kept.get() || held == Held::Kept);
+                if let Some(desc) = read.then(|| client.mirrored_desc(schema_name, name)).flatten() {
+                    return Some(desc);
+                }
+                let desc = use_kept.then(|| client.kept_desc(schema_name, name)).flatten()?;
+                kept.set(true);
                 Some(desc)
             };
             let cat = Catalog::holding(schema_name, &held);
@@ -49,7 +50,9 @@ async fn planned<T>(
         };
         match client.resolve(schema_name, &missing).await {
             Ok(desc) => resolved.push((missing, desc)),
-            Err(e) => return (Err(e.into()), from_kept),
+            // The server's answer for a name the client did not hold: no kept
+            // descriptor decided it, so it stands.
+            Err(e) => return (Err(e.into()), false),
         }
     }
 }

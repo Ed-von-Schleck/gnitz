@@ -7,7 +7,7 @@
 
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::SysRowSink;
 use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, RowsCut, SinkKind};
@@ -231,9 +231,9 @@ fn plan_rows(lines: &[String]) -> SqlResult {
             a.end_row();
         }
     }
-    SqlResult::Rows {
+    SqlResult::Rows(ScanReply {
         schema: std::sync::Arc::new(schema),
         batch,
         lsn: None,
-    }
+    })
 }

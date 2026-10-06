@@ -15,13 +15,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
-use gnitz_core::{PkColumn, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::place::{place_scaled, Placed};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::decimal::parse_decimal_text;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
 
-use crate::read::{scan_result, PyScanResult};
+use crate::read::{present, PyScanResult};
 use crate::schema::PySchema;
 
 /// The lookup keys `pks` as a `PkColumn` for `schema`: a single-column key is
@@ -552,15 +552,12 @@ impl PyZSetBatch {
         Ok(slf)
     }
 
-    /// The rows appended so far, as a `ScanResult` over a copy of the batch.
+    /// The rows appended so far, as a `ScanResult`: a snapshot, since a later
+    /// append copies the batch it shares.
     pub fn rows(&self, py: Python<'_>) -> PyResult<Py<PyScanResult>> {
-        scan_result(
+        Py::new(
             py,
-            ScanReply {
-                schema: Arc::clone(&self.schema),
-                batch: ZSetBatch::clone(&self.batch),
-                lsn: None,
-            },
+            present(py, Arc::clone(&self.schema), Arc::clone(&self.batch), false, None)?,
         )
     }
 
