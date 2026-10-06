@@ -4,9 +4,9 @@ use super::resolve::require_column;
 use crate::ast_util::{
     bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_fn_name, CallSurface, PlainCall,
 };
-use crate::codec::literal::{invalid_literal, parse_temporal};
+use crate::codec::literal::{invalid_literal, parse_bool, parse_temporal};
 use crate::error::{reject_if, GnitzSqlError};
-use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
+use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode, BOOL};
 use crate::types::sql_col_type;
 use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
@@ -110,10 +110,15 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
     })
 }
 
-/// `CAST(e AS dt)`; a string literal cast to DATE/TIMESTAMP folds to its value.
+/// `CAST(e AS dt)`; a string literal cast to DATE/TIMESTAMP folds to its value,
+/// and a string or integer literal cast to BOOLEAN to its.
 fn bind_cast<R>(e: BExpr<R>, dt: &DataType) -> Result<BExpr<R>, GnitzSqlError> {
     let to = sql_col_type(dt)?;
     Ok(match e {
+        BExpr::LitStr(s) if to == BOOL => {
+            BExpr::LitBool(parse_bool(&s).ok_or_else(|| GnitzSqlError::Rejected(invalid_literal(to, &s)))?)
+        }
+        BExpr::LitInt(v) if to == BOOL => BExpr::LitBool(v != 0),
         BExpr::LitStr(s) if to.tc.is_temporal() => BExpr::LitTemporal {
             tc: to.tc,
             v: parse_temporal(to.tc, &s).ok_or_else(|| GnitzSqlError::Rejected(invalid_literal(to, &s)))?,
@@ -266,6 +271,31 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         Expr::IsNull(i) => Ok(null_test(bind_structural(i, leaf)?, true, leaf)),
         Expr::IsNotNull(i) => Ok(null_test(bind_structural(i, leaf)?, false, leaf)),
+        // `b IS [NOT] TRUE/FALSE` is definite where `b` is NULL: a CASE whose
+        // one test is `b` or `NOT b`, neither of which a NULL takes.
+        Expr::IsTrue(i) | Expr::IsNotTrue(i) | Expr::IsFalse(i) | Expr::IsNotFalse(i) => {
+            let b = bind_structural(i, leaf)?;
+            let test = match expr {
+                Expr::IsTrue(_) | Expr::IsNotTrue(_) => b,
+                _ => BExpr::Not(Box::new(b)),
+            };
+            let holds = matches!(expr, Expr::IsTrue(_) | Expr::IsFalse(_));
+            Ok(BExpr::Case {
+                branches: vec![(test, BExpr::LitBool(holds))],
+                else_: Box::new(BExpr::LitBool(!holds)),
+            })
+        }
+        // `b IS [NOT] UNKNOWN` is `IS [NOT] NULL` over a BOOLEAN.
+        Expr::IsUnknown(i) | Expr::IsNotUnknown(i) => {
+            let b = bind_structural(i, leaf)?;
+            let ty = b.infer_ty_with(&|r| leaf.type_of(r));
+            if ty != BOOL && !matches!(b, BExpr::LitNull) {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "IS UNKNOWN takes a BOOLEAN, not {ty}; use IS NULL"
+                )));
+            }
+            Ok(null_test(b, matches!(expr, Expr::IsUnknown(_)), leaf))
+        }
         Expr::Nested(i) => bind_structural(i, leaf),
         Expr::Value(vws) => bind_literal(&vws.value),
         // `DATE '…'` (and the ODBC `{d '…'}`) is `CAST('…' AS DATE)`.
@@ -800,8 +830,8 @@ fn nullness<R, L: LeafBinder<R>>(value: &BExpr<R>, leaf: &L) -> Nullness {
 /// one can be elided whole. Anything else is a `NullTest` over the value.
 fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) -> BExpr<R> {
     match nullness(&value, leaf) {
-        Nullness::Never => BExpr::LitInt(i64::from(!want_null)),
-        Nullness::Always => BExpr::LitInt(i64::from(want_null)),
+        Nullness::Never => BExpr::LitBool(!want_null),
+        Nullness::Always => BExpr::LitBool(want_null),
         Nullness::Unknown => BExpr::NullTest { inner: Box::new(value), want_null },
     }
 }

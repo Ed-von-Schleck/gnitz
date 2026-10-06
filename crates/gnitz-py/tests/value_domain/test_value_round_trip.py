@@ -51,6 +51,7 @@ _TYPES = [
     ("BIGINT UNSIGNED", TC.U64, [0, 1, U64_MAX], U64_MAX + 1),
     ("FLOAT", TC.F32, [0.0, -1.5, 1.5], None),
     ("DOUBLE", TC.F64, [0.0, -1.5, 1.5], None),
+    ("BOOLEAN", TC.BOOLEAN, [False, True], None),
 ]
 
 _COLS = [f"v{i}" for i in range(len(_TYPES))]
@@ -227,6 +228,7 @@ _FAMILIES = [
      "00000000-0000-0000-0000-000000000000"),
     ("DATE", "'1970-01-01'", date(1970, 1, 1)),
     ("TIMESTAMP", "'1970-01-01 00:00:00'", datetime(1970, 1, 1)),
+    ("BOOLEAN", "FALSE", False),
 ]
 
 

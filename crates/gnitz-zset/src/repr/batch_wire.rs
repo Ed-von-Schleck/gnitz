@@ -9,7 +9,7 @@ use super::merge::MemBatch;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, TypeCode};
 
@@ -290,7 +290,8 @@ impl Batch {
     }
 
     /// [`Self::decode_from_wal_block`] for a block a peer wrote, validated
-    /// first. The header's dead-heap bound is not trusted: the heap is measured.
+    /// first: its string cells, null bits and BOOLEAN cells. The header's
+    /// dead-heap bound is not trusted: the heap is measured.
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut mb = MemBatch::of_wal_block(data, schema)?;
         mb.dead_heap = validate_string_cells(&mb)?;
@@ -299,6 +300,9 @@ impl Batch {
         }
         if first_valued_null_cell(&mb).is_some() {
             return Err("a non-zero cell under a NULL");
+        }
+        if !boolean_cells_ok(&mb) {
+            return Err("a BOOLEAN cell is neither 0 nor 1");
         }
         Ok(Batch::from_mem_batch(&mb))
     }
@@ -314,6 +318,22 @@ pub(super) fn first_valued_null_cell(mb: &MemBatch<'_>) -> Option<(usize, usize)
         (mb.col_data(pi, width), width)
     };
     gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)
+}
+
+/// Every BOOLEAN cell of `mb`, key or payload, is 0 or 1: a third byte would
+/// be a second encoding of true, which keys and compares apart from the first.
+fn boolean_cells_ok(mb: &MemBatch<'_>) -> bool {
+    // Branch-free over a column: a conforming batch is the one worth being fast on.
+    fn le1<'a>(cells: impl Iterator<Item = &'a u8>) -> bool {
+        cells.fold(0, |a, &b| a | b) <= 1
+    }
+    (0..mb.schema.num_columns()).all(|ci| match mb.schema.locate(ci) {
+        ColumnLocator::Payload { slot, type_code: TypeCode::Bool, .. } => le1(mb.col_data(slot as usize, 1).iter()),
+        ColumnLocator::Pk { byte_off, type_code: TypeCode::Bool, .. } => {
+            le1(mb.pk().iter().skip(byte_off as usize).step_by(mb.pk_stride()))
+        }
+        _ => true,
+    })
 }
 
 /// Every German-string cell of `mb` is in canonical form against its own heap,

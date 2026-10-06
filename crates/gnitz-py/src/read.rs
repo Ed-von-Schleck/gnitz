@@ -256,6 +256,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
             gnitz_wire::read_signed_exact(b).into_py_any(py)?
         }
+        TypeCode::Bool => (b[0] != 0).into_py_any(py)?,
         TypeCode::F32 => f32::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::F64 => f64::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::U128 => u128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,

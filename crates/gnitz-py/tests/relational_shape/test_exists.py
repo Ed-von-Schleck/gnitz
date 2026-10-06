@@ -10,7 +10,7 @@ weighted bag, against existence recomputed from the rows the test wrote.
 Two lowerings share the file. A subquery that is a top-level `AND` conjunct of
 the WHERE becomes the semi/anti shape directly; one in any other boolean
 position — under OR, under NOT, inside CASE, or projected as a column — is
-rewritten to a 0/1 **mark** that ordinary expression evaluation consumes.
+rewritten to a BOOLEAN **mark** that ordinary expression evaluation consumes.
 
 Run with GNITZ_WORKERS=4: the correlation key is an exchange key.
 """
@@ -113,7 +113,7 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client):
         f"CREATE VIEW mark_range AS SELECT id FROM a WHERE v = 100 OR EXISTS ({ex} {_MARK['range'][0]}); "
         f"CREATE VIEW flag AS SELECT id, EXISTS ({ex} {_MARK['eq'][0]}) AS f FROM a; "
         f"CREATE VIEW searched AS SELECT id, CASE WHEN EXISTS ({ex} {_MARK['eq'][0]}) THEN v ELSE 0 END AS f FROM a; "
-        f"CREATE VIEW simple AS SELECT id, CASE EXISTS ({ex} {_MARK['eq'][0]}) WHEN 1 THEN 10 WHEN 0 THEN 20 END AS f FROM a; "
+        f"CREATE VIEW simple AS SELECT id, CASE EXISTS ({ex} {_MARK['eq'][0]}) WHEN TRUE THEN 10 WHEN FALSE THEN 20 END AS f FROM a; "
         f"CREATE VIEW mark_two AS SELECT k1 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]}) OR EXISTS ({ex} {_MARK['band'][0]}); "
         f"CREATE VIEW derived_exists AS SELECT id FROM (SELECT id, k2 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]})) d "
         f"WHERE EXISTS ({ex} b.k2 = d.k2)")

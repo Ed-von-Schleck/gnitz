@@ -11,7 +11,7 @@ use crate::ir::BoundExpr;
 use gnitz_core::Schema;
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::ComputeMap;
-use gnitz_wire::{ColumnDef, FixedInt};
+use gnitz_wire::{ColumnDef, FixedInt, TypeCode};
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).
@@ -97,8 +97,10 @@ pub(crate) fn projection_program(
                 ProjItem::Computed { bound_expr } => {
                     let mut reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
                     // A slot narrower than the register takes a value range-checked
-                    // into the slot's declared type.
-                    if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(|fi| fi.width() < 8) {
+                    // into the slot's declared type; a BOOLEAN slot stores the
+                    // register's truth, which needs no check.
+                    let checked = |fi: &FixedInt| fi.width() < 8 && col.ty.tc != TypeCode::Bool;
+                    if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(checked) {
                         reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
                     }
                     Ok(Sink::Reg(reg))

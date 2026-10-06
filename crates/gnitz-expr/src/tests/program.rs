@@ -500,8 +500,9 @@ fn an_out_of_range_column_is_refused() {
 fn each_column_opcode_admits_exactly_its_column_kinds() {
     use LogicalInstr as L;
     use TypeCode as T;
-    // The calendar types and DECIMAL are fixed-width integers under other names.
+    // The calendar types, DECIMAL and BOOLEAN are fixed-width integers under other names.
     const SCALARS: &[TypeCode] = &[
+        T::Bool,
         T::U8,
         T::I8,
         T::U16,
@@ -657,7 +658,8 @@ fn copy_col_admits_only_a_widening_destination() {
 }
 
 /// A register sink's slot holds the register's class and whole value: fewer
-/// bytes only where the producer range-checked the value to that width.
+/// bytes only where the producer range-checked the value to that width. A
+/// BOOLEAN slot stores any scalar register's truth.
 #[test]
 fn a_register_sinks_slot_holds_its_whole_value() {
     use TypeCode as T;
@@ -674,6 +676,14 @@ fn a_register_sinks_slot_holds_its_whole_value() {
         LogicalInstr::LoadColStr { col: 2 },
         LogicalInstr::StrReverse { a: Reg(0) },
     ];
+    let truth = [
+        LogicalInstr::LoadCol { col: 1 },
+        LogicalInstr::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(0) },
+    ];
+    let to_u8 = [
+        LogicalInstr::LoadCol { col: 1 },
+        LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::U8 },
+    ];
     let width = |type_code| Err(ExprValidateErr::EmitSlotWidth { out: 0, type_code });
     let class = |type_code| Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code });
     for (tc, instrs, want) in [
@@ -682,6 +692,11 @@ fn a_register_sinks_slot_holds_its_whole_value() {
         (T::F64, int, Ok(())),
         (T::I16, to_i16, Ok(())),
         (T::I16, int, width(T::I16)),
+        (T::Bool, truth, Ok(())),
+        (T::Bool, int, Ok(())),
+        (T::Bool, text, class(T::Bool)),
+        (T::U8, to_u8, Ok(())),
+        (T::U8, truth, width(T::U8)),
         (T::I32, to_i16, width(T::I32)),
         (T::U128, int, width(T::U128)),
         (T::F32, int, width(T::F32)),

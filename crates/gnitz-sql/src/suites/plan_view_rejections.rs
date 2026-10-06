@@ -569,7 +569,6 @@ fn scalar_expression_rules() {
         ("DATE_TRUNC('fortnight', d)", "fortnight"),
         ("DATE '2024-02-30'", "invalid DATE literal"),
         ("CAST(i AS UUID)", "UUID"),
-        ("CAST(i AS BOOLEAN)", "BOOLEAN"),
         // An integer literal past `u64::MAX` has no register slot at all.
         ("CAST(18446744073709551616 AS BIGINT UNSIGNED)", "18446744073709551616"),
         ("CAST('abc' AS DECIMAL(5, 2))", "invalid DECIMAL("),
@@ -582,7 +581,7 @@ fn scalar_expression_rules() {
         ("GREATEST(s, s)", "column \"s\" is a string"),
         ("-s", "column \"s\" is a string"),
         ("s + 1", "string operand"),
-        ("s AND i", "is a string"),
+        ("s AND i", "a condition must be BOOLEAN"),
         ("s || 1", "expected a string value"),
         ("STRPOS(s, f)", "expected a string value"),
         ("LEFT(s, f)", "must be an integer"),

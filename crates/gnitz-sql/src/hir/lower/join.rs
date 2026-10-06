@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 /// One branch an emitter hands the shell: its node over the join frame, and a mark
-/// branch's `0/1` constant.
-pub(super) type Branch = (NodeId, Option<i64>);
+/// branch's BOOLEAN constant.
+pub(super) type Branch = (NodeId, Option<bool>);
 
 /// Lower a `Project(Filter?(Join))` tree's join to circuit pieces, whose output
 /// leads with the join step's [`OutKey`] slots, then the projected payload in item
@@ -230,7 +230,7 @@ fn join_keep(
 ) -> Result<[(Vec<u32>, usize); 2], GnitzSqlError> {
     let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
     // Rules 1 + 2: the projection and the WHERE over the join. The mark column is
-    // in neither layout: the shell substitutes it per branch by its `0/1` constant.
+    // in neither layout: the shell substitutes it per branch by its BOOLEAN constant.
     let mut referenced: HashSet<ColId> = HashSet::new();
     down.refs(&mut referenced);
     if let JoinType::Mark(mark) = kind {
@@ -278,12 +278,12 @@ fn join_keep(
     }))
 }
 
-/// Substitute `ColRef(mark_id)` with `LitInt(val)` throughout an expression —
+/// Substitute `ColRef(mark_id)` with `LitBool(val)` throughout an expression —
 /// the mark column's per-branch constant; every other leaf passes through.
-fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: i64) -> HirExpr {
+fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: bool) -> HirExpr {
     let Ok(out) = e.try_rebuild::<ColId, std::convert::Infallible>(&mut |id| {
         Ok(match *id == mark_id {
-            true => BExpr::LitInt(val),
+            true => BExpr::LitBool(val),
             false => BExpr::ColRef(*id),
         })
     });
@@ -305,8 +305,10 @@ fn exists_branches(cb: &mut Circuit, kind: JoinType, split: Split, all: NodeId) 
     match (kind, split) {
         (JoinType::Semi, Split::Matched(half)) | (JoinType::Anti, Split::Unmatched(half)) => vec![(half, None)],
         (JoinType::Semi | JoinType::Anti, _) => vec![(complement(cb), None)],
-        (JoinType::Mark(_), Split::Matched(matched)) => vec![(matched, Some(1)), (complement(cb), Some(0))],
-        (JoinType::Mark(_), Split::Unmatched(unmatched)) => vec![(complement(cb), Some(1)), (unmatched, Some(0))],
+        (JoinType::Mark(_), Split::Matched(matched)) => vec![(matched, Some(true)), (complement(cb), Some(false))],
+        (JoinType::Mark(_), Split::Unmatched(unmatched)) => {
+            vec![(complement(cb), Some(true)), (unmatched, Some(false))]
+        }
         _ => unreachable!("exists_branches receives a decorrelated kind"),
     }
 }

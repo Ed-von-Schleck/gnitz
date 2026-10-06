@@ -9,7 +9,7 @@ use crate::codec::literal::{assign, float_value, invalid_literal, place, Compare
 use crate::error::GnitzSqlError;
 use crate::ir::{
     bin_types, blend_type, check_decimal_scale, operand_ty_pair, operand_tys, range_step, reads_unsigned, BExpr, BinOp,
-    BoundExpr, NumFunc, RangeStep, RegClass, StrArg, StrFunc,
+    BoundExpr, NumFunc, RangeStep, RegClass, StrArg, StrFunc, BOOL, STRING,
 };
 use gnitz_core::Schema;
 use gnitz_expr::{
@@ -24,9 +24,9 @@ use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 /// the node's inferred type.
 ///
 /// An operand is read through the position it stands in: [`Self::lower_to`]
-/// brings it to the type its node combines it at, [`Self::lower_num`] reads a
-/// scalar, and each turns a wrong-class operand into a SQL error instead of an
-/// engine-side `RegClassMismatch`.
+/// brings it to the type its node combines it at, [`Self::lower_bool`] reads a
+/// condition, and each turns a wrong-class operand into a SQL error instead of
+/// an engine-side `RegClassMismatch`.
 struct Lowering<'a> {
     cols: &'a [ColumnDef],
     eb: &'a mut ExprBuilder,
@@ -39,6 +39,7 @@ impl Lowering<'_> {
             BoundExpr::LitInt(v) | BoundExpr::LitTemporal { v, .. } => {
                 self.eb.emit(L::LoadConst { val: *v, unsigned: false })
             }
+            BoundExpr::LitBool(b) => self.eb.emit(L::LoadConst { val: i64::from(*b), unsigned: false }),
             BoundExpr::LitFloat { v, .. } => self.eb.const_f64(*v),
             BoundExpr::LitStr(s) => {
                 let const_idx = self.eb.add_const_bytes(s.as_bytes());
@@ -56,7 +57,7 @@ impl Lowering<'_> {
             BoundExpr::LitNull => self.eb.emit(L::LoadNull),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r)?,
             BoundExpr::Not(inner) => {
-                let a = self.lower_num(inner)?;
+                let a = self.lower_bool(inner)?;
                 self.eb.emit(L::BoolNot { a })
             }
             BoundExpr::NullTest { inner, want_null } => self.null_test(inner, *want_null)?,
@@ -129,13 +130,20 @@ impl Lowering<'_> {
         })
     }
 
-    /// Lower `expr` into a scalar register.
-    fn lower_num(&mut self, expr: &BoundExpr) -> Result<Reg, GnitzSqlError> {
+    /// Lower `expr` as a condition: a BOOLEAN, or the NULL literal, which is
+    /// one that holds for no row.
+    fn lower_bool(&mut self, expr: &BoundExpr) -> Result<Reg, GnitzSqlError> {
+        // Lowered first: an operand refused in itself types as a fallback, and
+        // its own refusal is the one to report.
         let r = self.lower(expr)?;
-        match self.ty(expr).tc {
-            TypeCode::String => Err(self.not_scalar(expr)),
-            _ => Ok(r),
+        let ty = self.ty(expr);
+        if ty != BOOL && !matches!(expr, BoundExpr::LitNull) {
+            return Err(GnitzSqlError::Rejected(format!(
+                "{} is {ty}; a condition must be BOOLEAN — compare it, or CAST it AS BOOLEAN",
+                self.describe(expr)
+            )));
         }
+        Ok(r)
     }
 
     fn not_scalar(&self, e: &BoundExpr) -> GnitzSqlError {
@@ -195,7 +203,18 @@ impl Lowering<'_> {
             RangeStep::Cast(fi) => self.eb.emit(L::IntCast { a: r, fi }),
         };
         Ok(match (RegClass::of(from), class) {
-            (RegClass::Str, RegClass::Str) | (RegClass::Int, RegClass::Int) | (RegClass::Float, RegClass::Float) => r,
+            (RegClass::Str, RegClass::Str)
+            | (RegClass::Int, RegClass::Int)
+            | (RegClass::Bool, RegClass::Bool)
+            | (RegClass::Float, RegClass::Float) => r,
+            // A BOOLEAN is combined with nothing but a BOOLEAN, and no node
+            // combines a fraction at an integer type; only CAST narrows one.
+            (RegClass::Bool, _) | (_, RegClass::Bool) | (RegClass::Float | RegClass::Dec(_), RegClass::Int) => {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "{} is {from}; CAST it to use it as {to}",
+                    self.describe(e)
+                )))
+            }
             (RegClass::Str, _) => return Err(self.not_scalar(e)),
             (_, RegClass::Str) => return Err(GnitzSqlError::Rejected("expected a string value here".to_string())),
             (RegClass::Int | RegClass::Dec(0), RegClass::Float) => self.eb.emit(L::IntToFloat { a: r }),
@@ -215,13 +234,6 @@ impl Lowering<'_> {
                 let v = self.eb.emit(L::FloatArith { op: FloatArithOp::Mul, a: r, b: scale });
                 let v = self.eb.emit(L::FloatUnary { op: FloatUnaryOp::Round, a: v });
                 self.eb.emit(L::FloatToInt { a: v, fi: FixedInt::I64 })
-            }
-            // No node combines a fraction at an integer type; only CAST narrows one.
-            (RegClass::Float | RegClass::Dec(_), RegClass::Int) => {
-                return Err(GnitzSqlError::Rejected(format!(
-                    "{} is {from}; CAST it to use it as {to}",
-                    self.describe(e)
-                )))
             }
         })
     }
@@ -247,6 +259,12 @@ impl Lowering<'_> {
         }
         Ok(match RegClass::of(self.ty(e)) {
             RegClass::Str => self.lower(e)?,
+            // `true` / `false`, and NULL for a NULL: neither test takes one.
+            RegClass::Bool => {
+                let text = |s: &str| BoundExpr::LitStr(s.to_string());
+                let not = BoundExpr::Not(Box::new(e.clone()));
+                self.case(&[(e.clone(), text("true")), (not, text("false"))], &BoundExpr::LitNull)?
+            }
             RegClass::Int => {
                 let a = self.lower(e)?;
                 self.eb.emit(L::IntToStr { a })
@@ -305,6 +323,16 @@ impl Lowering<'_> {
     fn func(&mut self, f: NumFunc, arg: &BoundExpr) -> Result<Reg, GnitzSqlError> {
         use FloatUnaryOp as F;
         let arg_ty = self.ty(arg);
+        match RegClass::of(arg_ty) {
+            RegClass::Str => return Err(self.not_scalar(arg)),
+            RegClass::Bool => {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "{} is BOOLEAN; a numeric function takes a number",
+                    self.describe(arg)
+                )))
+            }
+            _ => {}
+        }
         let out = f.result_type(arg_ty);
         if out.tc == TypeCode::F64 {
             let a = self.lower_to(arg, out)?;
@@ -313,7 +341,7 @@ impl Lowering<'_> {
                 NumFunc::Round(n) => self.scaled_round(a, n),
             });
         }
-        let r = self.lower_num(arg)?;
+        let r = self.lower(arg)?;
         let int_op = match f {
             NumFunc::Unary(F::Neg) => Some(IntUnaryOp::Neg),
             NumFunc::Unary(F::Abs) if arg_ty.tc.is_signed_int() => Some(IntUnaryOp::Abs),
@@ -377,7 +405,6 @@ impl Lowering<'_> {
                 // The opcode reads the register as an integer, so a fraction is
                 // an error rather than a silent truncation.
                 StrArg::Int | StrArg::IntOpt => {
-                    let r = self.lower_num(a)?;
                     if RegClass::of(self.ty(a)) != RegClass::Int {
                         return Err(GnitzSqlError::Rejected(format!(
                             "{}: argument {} must be an integer expression",
@@ -385,7 +412,7 @@ impl Lowering<'_> {
                             k + 1
                         )));
                     }
-                    r
+                    self.lower(a)?
                 }
             });
         }
@@ -442,15 +469,31 @@ impl Lowering<'_> {
         Ok(acc)
     }
 
-    /// CAST, dispatched on the target class, then the source's. A superset of
+    /// CAST, dispatched on the source and target classes. A superset of
     /// [`Self::lower_to`]: it also parses a string, renders text and narrows.
     fn cast(&mut self, expr: &BoundExpr, to: ColType) -> Result<Reg, GnitzSqlError> {
         let from = self.ty(expr);
         let from_class = RegClass::of(from);
-        match RegClass::of(to) {
-            RegClass::Str => return self.as_text(expr),
-            RegClass::Dec(_) => return self.lower_to(expr, to),
-            RegClass::Float => {
+        if from_class == RegClass::Str && (to.tc.is_temporal() || to == BOOL) {
+            return Err(GnitzSqlError::Rejected(format!(
+                "CAST of a string to {to} is supported for a literal only"
+            )));
+        }
+        let plain_int = |t: ColType| FixedInt::exact(t.tc).is_some();
+        match (from_class, RegClass::of(to)) {
+            (_, RegClass::Str) => return self.as_text(expr),
+            // A BOOLEAN is the integer 0 or 1, and an integer is true where it
+            // is not zero; a fraction and a calendar value are neither.
+            (RegClass::Bool, RegClass::Bool) => return self.lower(expr),
+            (_, RegClass::Bool) if plain_int(from) => return self.binop(expr, BinOp::Ne, &BoundExpr::LitInt(0)),
+            (RegClass::Bool, _) if plain_int(to) => {}
+            (RegClass::Bool, _) | (_, RegClass::Bool) => {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "CAST of {from} to {to} is not supported"
+                )))
+            }
+            (_, RegClass::Dec(_)) => return self.lower_to(expr, to),
+            (_, RegClass::Float) => {
                 let f = match from_class {
                     RegClass::Str => {
                         let a = self.lower(expr)?;
@@ -463,17 +506,12 @@ impl Lowering<'_> {
                     _ => f,
                 });
             }
-            RegClass::Int => {}
+            (_, RegClass::Int) => {}
         }
         if (from.tc, to.tc) == (TypeCode::Date, TypeCode::Timestamp) {
             return self.lower_to(expr, to);
         }
         let a = self.lower(expr)?;
-        if to.tc.is_temporal() && from_class == RegClass::Str {
-            return Err(GnitzSqlError::Rejected(format!(
-                "CAST of a string to {to} is supported for a literal only"
-            )));
-        }
         if (from.tc, to.tc) == (TypeCode::Timestamp, TypeCode::Date) {
             return Ok(self.eb.emit(L::Calendar { op: CalendarOp::ToDays, a, micros: true }));
         }
@@ -498,12 +536,16 @@ impl Lowering<'_> {
             // Elided where the register already holds only values of `to`, read
             // with `to`'s signedness: the engine tracks a register as U64 iff
             // its type is U64, so an elided cast must not change that.
-            RegClass::Int if self.within(expr, fi) && (fi == FixedInt::U64) == reads_unsigned(from) => a,
-            RegClass::Int => self.eb.emit(L::IntCast { a, fi }),
+            RegClass::Int | RegClass::Bool
+                if self.within(expr, fi) && (fi == FixedInt::U64) == reads_unsigned(from) =>
+            {
+                a
+            }
+            RegClass::Int | RegClass::Bool => self.eb.emit(L::IntCast { a, fi }),
         })
     }
 
-    /// Searched CASE as a right-to-left fold of selects, so the first truthy
+    /// Searched CASE as a right-to-left fold of selects, so the first true
     /// WHEN wins. `Select` blends raw bit patterns, so every result is lowered
     /// at the type they blend to.
     fn case(&mut self, branches: &[(BoundExpr, BoundExpr)], else_: &BoundExpr) -> Result<Reg, GnitzSqlError> {
@@ -511,7 +553,7 @@ impl Lowering<'_> {
         let ty = blend_type(&operand_tys(&results, &|idx: &usize| self.cols[*idx].ty));
         let mut arms = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
-            arms.push((self.lower_num(cond)?, self.lower_blended(result, ty)?));
+            arms.push((self.lower_bool(cond)?, self.lower_blended(result, ty)?));
         }
         let mut acc = self.lower_blended(else_, ty)?;
         for (cond, a) in arms.into_iter().rev() {
@@ -545,7 +587,7 @@ impl Lowering<'_> {
                         _ => None,
                     })
                     .collect();
-                let c = self.lower_num(inner)?;
+                let c = self.lower(inner)?;
                 if values.is_empty() {
                     return Ok(self.eb.emit(L::Cmp { op: CmpOp::Ne, a: c, b: c }));
                 }
@@ -594,7 +636,7 @@ impl Lowering<'_> {
         if p.is_outside() && !self.within(other, fi) {
             return Ok(None);
         }
-        let a = self.lower_num(other)?;
+        let a = self.lower(other)?;
         let (op, b) = match p.compare(cmp) {
             Compared::Cmp(op, v) => {
                 let unsigned = fi == FixedInt::U64;
@@ -636,8 +678,8 @@ impl Lowering<'_> {
     /// opcode of the class they share.
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Reg, GnitzSqlError> {
         if let BinOp::And | BinOp::Or = op {
-            let a = self.lower_num(left)?;
-            let b = self.lower_num(right)?;
+            let a = self.lower_bool(left)?;
+            let b = self.lower_bool(right)?;
             return Ok(self.eb.emit(L::BoolBinary { a, b, is_or: op == BinOp::Or }));
         }
         if let Some(reg) = self.cmp_placed(left, op, right)? {
@@ -656,14 +698,14 @@ impl Lowering<'_> {
         Ok(self.eb.emit(match (op.as_cmp(), RegClass::of(t.l)) {
             (Some(op), RegClass::Str) => L::StrCmp { op, a, b },
             (Some(op), RegClass::Float) => L::FCmp { op, a, b },
-            (Some(op), RegClass::Int | RegClass::Dec(_)) => L::Cmp { op, a, b },
+            (Some(op), RegClass::Int | RegClass::Bool | RegClass::Dec(_)) => L::Cmp { op, a, b },
             // `||` propagates a NULL, and casts no number, unlike CONCAT.
             (None, RegClass::Str) => L::StrConcat { a, b, skip_null: false },
             (None, RegClass::Float) => {
                 let op = op.as_float_arith().expect("`bin_types` takes no float modulo");
                 L::FloatArith { op, a, b }
             }
-            (None, RegClass::Int | RegClass::Dec(_)) => {
+            (None, RegClass::Int | RegClass::Bool | RegClass::Dec(_)) => {
                 let op = op
                     .as_int_arith()
                     .expect("an operator over integers that is no comparison is arithmetic");
@@ -672,8 +714,6 @@ impl Lowering<'_> {
         }))
     }
 }
-
-const STRING: ColType = ColType::of(TypeCode::String);
 
 /// Compile a BoundExpr into `eb`, returning the result register — the form for
 /// a caller threading several expressions into one program.
@@ -696,7 +736,7 @@ pub(crate) fn compile_bound_expr_to_program(
 }
 
 /// An expression's truth when its `NOT` / `AND` / `OR` connectives settle it over
-/// integer literals: exact wherever it is read, since `true OR NULL` is true and
+/// boolean literals: exact wherever it is read, since `true OR NULL` is true and
 /// `false AND NULL` is false.
 fn constant_truth(e: &BoundExpr) -> Option<bool> {
     let settle = |l: &BoundExpr, r: &BoundExpr, absorbing: bool| match (constant_truth(l), constant_truth(r)) {
@@ -705,7 +745,7 @@ fn constant_truth(e: &BoundExpr) -> Option<bool> {
         _ => None,
     };
     match e {
-        BoundExpr::LitInt(v) => Some(*v != 0),
+        BoundExpr::LitBool(b) => Some(*b),
         BoundExpr::Not(inner) => constant_truth(inner).map(|t| !t),
         BoundExpr::BinOp(l, BinOp::Or, r) => settle(l, r, true),
         BoundExpr::BinOp(l, BinOp::And, r) => settle(l, r, false),
@@ -723,10 +763,13 @@ pub(crate) fn compile_filter_program<'a>(
     let mut backend = Lowering { cols, eb: &mut eb };
     let mut acc: Option<Reg> = None;
     for e in conjuncts {
+        // A conjunct settled true filters nothing, and is still a condition:
+        // it is lowered apart for its refusals alone.
         if constant_truth(e) == Some(true) {
+            Lowering { cols, eb: &mut ExprBuilder::new() }.lower_bool(e)?;
             continue;
         }
-        let r = backend.lower_num(e)?;
+        let r = backend.lower_bool(e)?;
         acc = Some(match acc {
             Some(a) => backend.eb.emit(L::BoolBinary { a, b: r, is_or: false }),
             None => r,

@@ -10,7 +10,8 @@ variable-length string has no fixed stride to compare at.
 
 DATE, TIMESTAMP and DECIMAL are PK-eligible because each stores as a *signed*
 integer — I32, I64 and a scaled I64 — which is why their keys sign-flip like any
-other signed column rather than being a category of their own.
+other signed column rather than being a category of their own. BOOLEAN stores as
+an unsigned byte and keys as one.
 
 What is asserted here is the catalog round trip: `CREATE TABLE` → catalog →
 `resolve_table` hands the declared type back unchanged. The spelling-to-TypeCode
@@ -52,6 +53,8 @@ _SPELLINGS = [
     ("UUID", TC.UUID, True),
     ("DATE", TC.DATE, True),
     ("TIMESTAMP", TC.TIMESTAMP, True),
+    ("BOOLEAN", TC.BOOLEAN, True),
+    ("BOOL", TC.BOOLEAN, True),
 ]
 
 

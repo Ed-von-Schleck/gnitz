@@ -16,7 +16,7 @@ use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::BoundExpr;
+use crate::ir::{BoundExpr, RegClass};
 use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
@@ -306,6 +306,26 @@ fn classify_set_rhs(expr: &BoundExpr, scope: Scope, target: usize, schema: &Sche
             return Ok(SetRhs::Copy { scope, src: slot });
         }
     }
+    // An f64 register has no computed destination but a DECIMAL's cast: nothing
+    // downstream can tell its bit pattern from an integer's.
+    let (from, to) = (RegClass::of(src), RegClass::of(ty));
+    if from == RegClass::Float && !ty.is_decimal() {
+        return Err(GnitzSqlError::Rejected(
+            "SET from a floating-point expression is not supported".to_string(),
+        ));
+    }
+    // A string and a BOOLEAN are assigned only to a column of their own class,
+    // and a number to any column stored as an integer.
+    let admits = match (from, to) {
+        (RegClass::Str | RegClass::Bool, _) | (_, RegClass::Str | RegClass::Bool) => from == to,
+        _ => FixedInt::from_type_code(ty.tc).is_some(),
+    };
+    if !admits {
+        return Err(GnitzSqlError::Rejected(format!(
+            "cannot assign a value of type {src} to column '{}' ({ty})",
+            col.name
+        )));
+    }
     // A DECIMAL source into a non-DECIMAL target casts to I64, not the target, so
     // a narrow target's range is checked per row rather than NULLed by the cast.
     let cast_to = if ty.is_decimal() {
@@ -319,30 +339,9 @@ fn classify_set_rhs(expr: &BoundExpr, scope: Scope, target: usize, schema: &Sche
     };
     let expr = match cast_to {
         Some(to) => BoundExpr::Cast { expr: Box::new(expr.clone()), to },
-        // An f64 register has no computed destination: nothing downstream can
-        // tell its bit pattern from an integer's.
-        None if src.tc.is_float() => {
-            return Err(GnitzSqlError::Rejected(
-                "SET from a floating-point expression is not supported".to_string(),
-            ))
-        }
         None => expr.clone(),
     };
     let ev = compile_scalar_evaluator(&expr, schema)?;
-    let str_valued = ev.result_is_str();
-    let admits = if str_valued {
-        col.ty.tc == TypeCode::String
-    } else {
-        FixedInt::from_type_code(col.ty.tc).is_some()
-    };
-    if !admits {
-        return Err(GnitzSqlError::Rejected(format!(
-            "cannot assign {} value to column '{}' ({})",
-            if str_valued { "a string" } else { "an integer" },
-            col.name,
-            col.ty,
-        )));
-    }
     Ok(SetRhs::Expr { scope, ev: Box::new(ev) })
 }
 

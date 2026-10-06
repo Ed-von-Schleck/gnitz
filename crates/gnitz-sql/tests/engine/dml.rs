@@ -17,7 +17,7 @@ fn a_refused_write_writes_nothing() {
     );
     for (sql, needle) in [
         ("INSERT INTO t VALUES (2, 20, 'b'), (3, NULL, 'c')", "NOT NULL"),
-        ("UPDATE t SET v = UPPER(s)", "cannot assign a string value"),
+        ("UPDATE t SET v = UPPER(s)", "cannot assign a value of type STRING"),
         ("DELETE FROM t LIMIT 1", "LIMIT"),
         ("INSERT INTO sr VALUES (1), (NULL)", "NOT NULL"),
     ] {

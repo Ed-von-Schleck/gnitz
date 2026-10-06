@@ -89,6 +89,43 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     }
 }
 
+/// The foreign decode refuses a BOOLEAN byte past 1, in the key and in the
+/// payload: a second encoding of true, which the engine's own decode admits.
+#[test]
+fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
+    // `(BOOLEAN, U64)` keyed, then a BOOLEAN payload: the key's flag is the
+    // first of its 9 bytes.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::Bool, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::Bool, true),
+        ],
+        &[0, 1],
+    );
+    let mut b = BatchBuilder::new(&schema);
+    for (flag, id) in [(0u128, 7u128), (1, 8)] {
+        b.begin_row_natives(&[flag, id], 1);
+        b.put_int(1 - flag);
+        b.end_row();
+    }
+    let clean = encode_to_wire_vec(&b.finish());
+    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+
+    let second_key = wal::WAL_HEADER_SIZE + schema.pk_stride();
+    let first_cell = region_offset(&schema, 2, REG_PAYLOAD_START);
+    for at in [second_key, first_cell] {
+        let mut forged = clean.clone();
+        forged[at] = 2;
+        assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok(), "byte {at}");
+        assert_eq!(
+            Batch::decode_foreign_wal_block(&forged, &schema).err(),
+            Some("a BOOLEAN cell is neither 0 nor 1"),
+            "byte {at}"
+        );
+    }
+}
+
 /// Every encoder round-trips through the validated decode at narrow and odd PK
 /// and payload strides, where a block's regions start unaligned.
 #[test]

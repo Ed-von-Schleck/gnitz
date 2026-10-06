@@ -231,6 +231,11 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCod
              column '{}' ({}); a string content hash never matches a native key",
                 left.name, left.ty, right.name, right.ty
             )),
+            JoinKeyRule::BoolWithNumber => GnitzSqlError::Rejected(format!(
+                "JOIN ON: cannot equijoin BOOLEAN column with a non-BOOLEAN one: '{}' ({}) and '{}' ({}); \
+             CAST one side",
+                left.name, left.ty, right.name, right.ty
+            )),
             JoinKeyRule::NoSigned256 => GnitzSqlError::Rejected(format!(
                 "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
              a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \

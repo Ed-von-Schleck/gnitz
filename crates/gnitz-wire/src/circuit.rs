@@ -149,9 +149,12 @@ impl Wire for ComputeMap {
 pub const fn agg_output_type(func: AggFunc, src_tc: TypeCode) -> Option<TypeCode> {
     match func {
         AggFunc::Count | AggFunc::CountNonNull => Some(TypeCode::I64),
-        // Adding two calendar values is meaningless.
+        // Adding two calendar values, or two truth values, is meaningless.
         AggFunc::Sum => {
-            if crate::ScalarKind::from_type_code(src_tc).is_some() && !src_tc.is_temporal() {
+            if crate::ScalarKind::from_type_code(src_tc).is_some()
+                && !src_tc.is_temporal()
+                && !matches!(src_tc, TypeCode::Bool)
+            {
                 Some(src_tc.register_image())
             } else {
                 None

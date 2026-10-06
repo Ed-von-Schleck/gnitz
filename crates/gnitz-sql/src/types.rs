@@ -30,11 +30,7 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
             ))
         }
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => return decimal_type(info),
-        DataType::Boolean | DataType::Bool => {
-            return Err(GnitzSqlError::Rejected(
-                "BOOLEAN has no gnitz type; use TINYINT(1)".to_string(),
-            ))
-        }
+        DataType::Boolean | DataType::Bool => TypeCode::Bool,
         _ => return Err(GnitzSqlError::Rejected(format!("unsupported SQL type: {dt}"))),
     };
     Ok(ColType::of(tc))

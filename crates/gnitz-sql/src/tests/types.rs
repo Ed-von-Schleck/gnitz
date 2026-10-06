@@ -43,6 +43,8 @@ fn each_accepted_spelling_declares_its_type() {
         ("TEXT", t(String)),
         ("CHAR", t(String)),
         ("UUID", t(UUID)),
+        ("BOOLEAN", t(Bool)),
+        ("BOOL", t(Bool)),
         ("DATE", t(Date)),
         ("TIMESTAMP", t(Timestamp)),
         ("TIMESTAMP WITHOUT TIME ZONE", t(Timestamp)),
@@ -84,8 +86,6 @@ fn each_accepted_spelling_declares_its_type() {
 #[test]
 fn each_refused_spelling_names_its_reason() {
     for (decl, needle) in [
-        ("BOOLEAN", "TINYINT(1)"),
-        ("BOOL", "TINYINT(1)"),
         ("TIMESTAMP WITH TIME ZONE", "time zone"),
         ("TIMESTAMPTZ", "time zone"),
         ("DECIMAL", "precision and scale"),

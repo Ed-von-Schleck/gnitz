@@ -428,6 +428,8 @@ mod pack_proptest {
             | TypeCode::Timestamp
             | TypeCode::Decimal => T::I64,
             TypeCode::I128 => T::I128,
+            // Packs at no slot but its own.
+            TypeCode::Bool => T::Bool,
             _ => T::U128, // U128, UUID
         }
     }

@@ -63,7 +63,7 @@ _PK_TYPES = [TypeCode.U8, TypeCode.I8, TypeCode.U16, TypeCode.I16,
              TypeCode.U32, TypeCode.I32, TypeCode.U64, TypeCode.I64,
              TypeCode.U128, TypeCode.UUID, TypeCode.I128]
 _PAYLOAD_ONLY_TYPES = [TypeCode.F32, TypeCode.F64, TypeCode.STRING, TypeCode.BLOB,
-                       TypeCode.DATE, TypeCode.TIMESTAMP, TypeCode.DECIMAL]
+                       TypeCode.DATE, TypeCode.TIMESTAMP, TypeCode.DECIMAL, TypeCode.BOOLEAN]
 _ALL_TYPES = _PK_TYPES + _PAYLOAD_ONLY_TYPES
 
 _RANGES = {
@@ -93,6 +93,8 @@ def _rand_value(rng, tc):
         return datetime(1970, 1, 1) + timedelta(microseconds=rng.randint(-10**15, 10**15))
     if tc is TypeCode.DECIMAL:
         return Decimal(rng.randint(-10**9, 10**9)).scaleb(-3)
+    if tc is TypeCode.BOOLEAN:
+        return rng.random() < 0.5
     raise AssertionError("unhandled type code %r" % (tc,))
 
 

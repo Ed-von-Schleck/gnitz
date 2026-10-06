@@ -154,6 +154,17 @@ fn a_literal_is_placed_among_the_values_of_the_type() {
         (TypeCode::Date.into(), "'2020-02-30'", None),
         // A temporal literal into a numeric column is its storage integer.
         (TypeCode::I64.into(), "DATE '2020-01-02'", Some(At(i64(D)))),
+        // A BOOLEAN is its keyword or one of its text spellings, never a
+        // number, and is a value of no other type.
+        (TypeCode::Bool.into(), "TRUE", Some(At(1))),
+        (TypeCode::Bool.into(), "FALSE", Some(At(0))),
+        (TypeCode::Bool.into(), "'yes'", Some(At(1))),
+        (TypeCode::Bool.into(), "' OFF '", Some(At(0))),
+        (TypeCode::Bool.into(), "'maybe'", None),
+        (TypeCode::Bool.into(), "1", None),
+        (TypeCode::Bool.into(), "0.0", None),
+        (TypeCode::I64.into(), "TRUE", None),
+        (TypeCode::U8.into(), "FALSE", None),
         // A type not stored as an integer places nothing.
         (TypeCode::F64.into(), "1", None),
         (TypeCode::String.into(), "'a'", None),

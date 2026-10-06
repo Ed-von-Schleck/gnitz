@@ -10,6 +10,16 @@ use gnitz_wire::{ColType, FixedInt, TypeCode};
 
 pub(crate) use gnitz_expr::place::{Compared, Placed};
 
+/// The text spellings of a BOOLEAN, PostgreSQL's: case and surrounding
+/// whitespace are ignored.
+pub(crate) fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Some(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// A DATE/TIMESTAMP spelling as the integer a column of type `tc` stores; `None`
 /// for text that spells no such value, and for any other type.
 pub(crate) fn parse_temporal(tc: TypeCode, s: &str) -> Option<i64> {
@@ -61,8 +71,8 @@ pub(crate) fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
 
 /// `lit` among the values of `ty`; `None` when it spells no value of the type:
 /// NULL, a string that is not one of the type's spellings, a fraction for a
-/// DATE/TIMESTAMP or a 16-byte type, and anything for a type not stored as an
-/// integer.
+/// DATE/TIMESTAMP or a 16-byte type, a number for a BOOLEAN or a BOOLEAN for
+/// anything else, and anything for a type not stored as an integer.
 pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
     let tc = ty.tc;
     if !tc.is_pk_eligible() {
@@ -70,6 +80,9 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
     }
     let day = i128::from(MICROS_PER_DAY);
     let (v, s) = match (lit, tc) {
+        (BExpr::LitBool(b), TypeCode::Bool) => return Some(Placed::At(u128::from(*b))),
+        (BExpr::LitStr(s), TypeCode::Bool) => return parse_bool(s).map(|b| Placed::At(u128::from(b))),
+        (_, TypeCode::Bool) => return None,
         (BExpr::LitStr(s), TypeCode::UUID) => return gnitz_wire::parse_uuid(s).map(Placed::At),
         (BExpr::LitStr(s), TypeCode::Date | TypeCode::Timestamp) => (parse_temporal(tc, s)?.into(), 0),
         (BExpr::LitStr(s), TypeCode::Decimal) => parse_decimal_text(s)?,

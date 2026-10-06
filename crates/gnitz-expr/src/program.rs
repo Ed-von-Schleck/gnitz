@@ -983,7 +983,7 @@ pub(crate) struct IntReg {
 impl LogicalInstr {
     /// The type this instruction range-checks its result into, for the casts
     /// that do — a value they produce is whole in that type's low bytes, which is
-    /// what lets [`EmitWidth::for_slot`] admit a slot narrower than the register.
+    /// what lets [`EmitStore::for_slot`] admit a slot narrower than the register.
     /// `None` for every other instruction: a register is otherwise the full
     /// 8-byte image and narrowing it would truncate.
     pub(crate) fn range_check(&self) -> Option<FixedInt> {
@@ -2242,29 +2242,36 @@ pub struct ColCopy {
 pub(crate) struct ScalarEmit {
     pub(crate) reg: usize,
     pub(crate) slot: usize,
-    pub(crate) width: EmitWidth,
+    pub(crate) store: EmitStore,
 }
 
-/// The byte width of a scalar emit's output slot.
+/// How a scalar emit stores its register: the value's low bytes at the slot's
+/// width, or for a BOOLEAN slot the one byte saying whether it is non-zero.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum EmitWidth {
+pub(crate) enum EmitStore {
     W1,
     W2,
     W4,
     W8,
+    Truth,
 }
 
-impl EmitWidth {
-    /// The width a scalar register stores into a slot of `type_code`: its whole
-    /// 8-byte image, or the low bytes for a fixed-int slot whose source
-    /// range-checked the value to exactly that width.
+impl EmitStore {
+    /// How a scalar register is stored into a slot of `type_code`. A BOOLEAN
+    /// slot takes any scalar register, read as every condition reads one: true
+    /// where non-zero. Any other takes the whole 8-byte image, or the low bytes
+    /// for a fixed-int slot whose source range-checked the value to exactly
+    /// that width.
     fn for_slot(type_code: TypeCode, src: &LogicalInstr) -> Option<Self> {
+        if type_code == TypeCode::Bool {
+            return Some(EmitStore::Truth);
+        }
         match type_code.wire_stride() {
-            8 => Some(EmitWidth::W8),
+            8 => Some(EmitStore::W8),
             w if type_code.is_fixed_int() && src.range_check().map(FixedInt::width) == Some(w) => match w {
-                1 => Some(EmitWidth::W1),
-                2 => Some(EmitWidth::W2),
-                4 => Some(EmitWidth::W4),
+                1 => Some(EmitStore::W1),
+                2 => Some(EmitStore::W2),
+                4 => Some(EmitStore::W4),
                 _ => None,
             },
             _ => None,
@@ -2273,10 +2280,10 @@ impl EmitWidth {
 
     pub(crate) fn bytes(self) -> usize {
         match self {
-            EmitWidth::W1 => 1,
-            EmitWidth::W2 => 2,
-            EmitWidth::W4 => 4,
-            EmitWidth::W8 => 8,
+            EmitStore::W1 | EmitStore::Truth => 1,
+            EmitStore::W2 => 2,
+            EmitStore::W4 => 4,
+            EmitStore::W8 => 8,
         }
     }
 }
@@ -2332,9 +2339,9 @@ impl LogicalProgram {
                 }
                 Sink::Reg(r) if self.is_str(r) => str_emits.push(StrEmit { reg: r.0 as usize, slot }),
                 Sink::Reg(r) => {
-                    let width = EmitWidth::for_slot(type_code, &self.instrs[r.0 as usize])
+                    let store = EmitStore::for_slot(type_code, &self.instrs[r.0 as usize])
                         .ok_or(E::EmitSlotWidth { out, type_code })?;
-                    scalar_emits.push(ScalarEmit { reg: r.0 as usize, slot, width });
+                    scalar_emits.push(ScalarEmit { reg: r.0 as usize, slot, store });
                 }
             }
         }

@@ -264,11 +264,6 @@ impl ScalarEval {
     pub(crate) fn result_reg(&self) -> usize {
         self.result_reg
     }
-
-    /// Whether [`Self::eval_all`] hands back [`ExprResults::Str`].
-    pub fn result_is_str(&self) -> bool {
-        matches!(self.class, ResultClass::Str)
-    }
 }
 
 // ---------------------------------------------------------------------------

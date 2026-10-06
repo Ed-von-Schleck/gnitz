@@ -14,7 +14,8 @@ use crate::{CmpOp, IntArithOp, LogicalInstr, SchemaFacts};
 use gnitz_wire::{payload_bytes, payload_u64, RowSource};
 
 /// A map writes each computed slot from `dst_start` on — zeroing a NULL result's
-/// cell — and moves each copied column's null bit into its slot.
+/// cell — and moves each copied column's null bit into its slot. A BOOLEAN slot
+/// stores 1 for any non-zero register value.
 #[test]
 fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     let in_schema = TestSchema::new(
@@ -28,6 +29,7 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
             (TypeCode::I16, true),
             (TypeCode::String, true),
             (TypeCode::I64, true),
+            (TypeCode::Bool, true),
         ],
         &[0],
     );
@@ -60,7 +62,13 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
         is_not_null_op(2),
         LogicalInstr::BoolBinary { is_or: false, a: Reg(7), b: Reg(8) },
     ];
-    let sinks = vec![Sink::Col(1), Sink::Reg(Reg(3)), Sink::Reg(Reg(5)), Sink::Reg(Reg(9))];
+    let sinks = vec![
+        Sink::Col(1),
+        Sink::Reg(Reg(3)),
+        Sink::Reg(Reg(5)),
+        Sink::Reg(Reg(9)),
+        Sink::Reg(Reg(2)),
+    ];
     let mut ev = map_prog(&in_schema, &out_schema, instrs, sinks, vec![]);
     assert!(ev.emits_anything());
     assert_eq!(
@@ -107,6 +115,12 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
             (payload_u64(&out, dst, 3) as i64, bit(3)),
             (and.map_or(0, i64::from), and.is_none()),
             "row {row}: AND"
+        );
+
+        assert_eq!(
+            (out.get_col_ptr(dst, 4, 1), bit(4)),
+            (&[u8::from(!int_null(row) && int(row) != 0)][..], int_null(row)),
+            "row {row}: BOOLEAN slot"
         );
     }
 

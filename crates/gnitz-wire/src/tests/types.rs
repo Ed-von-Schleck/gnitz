@@ -8,7 +8,8 @@ fn type_predicates_partition_the_type_table() {
     /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
     /// pk_eligible, serial_eligible)` — one row per `TypeCode`, one column per
     /// predicate. A SERIAL key is exactly the plain integers of at most 8 bytes:
-    /// not a DATE's days, a DECIMAL's scaled units, nor a 16-byte type.
+    /// not a DATE's days, a DECIMAL's scaled units, nor a 16-byte type. A
+    /// BOOLEAN is stored as a fixed int and keys as one, and is no integer.
     type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool);
     let table: &[Row] = &[
         (TypeCode::U8, true, false, true, false, false, false, true, true),
@@ -29,6 +30,7 @@ fn type_predicates_partition_the_type_table() {
         (TypeCode::Date, true, true, true, false, false, false, true, false),
         (TypeCode::Timestamp, true, true, true, false, false, false, true, false),
         (TypeCode::Decimal, true, true, true, false, false, false, true, false),
+        (TypeCode::Bool, true, false, false, false, false, false, true, false),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
@@ -55,8 +57,11 @@ fn type_code_wire_names_are_distinct() {
 }
 
 /// `[min, max]` of an integer type's values, read through its storage type;
-/// `None` for UUID and every non-integer.
+/// `None` for UUID, BOOLEAN and every non-integer.
 fn int_bounds(tc: TypeCode) -> Option<(i128, u128)> {
+    if tc == TypeCode::Bool {
+        return None;
+    }
     match tc.storage_type() {
         TypeCode::U128 => Some((0, u128::MAX)),
         TypeCode::I128 => Some((i128::MIN, i128::MAX as u128)),
@@ -120,6 +125,7 @@ fn reindex_output_type_policy() {
         (TypeCode::Date, TypeCode::Date),
         (TypeCode::Timestamp, TypeCode::Timestamp),
         (TypeCode::Decimal, TypeCode::Decimal),
+        (TypeCode::Bool, TypeCode::Bool),
     ];
     assert_eq!(
         policy.len(),
@@ -151,6 +157,9 @@ fn join_key_common_type_is_the_narrowest_faithful_slot() {
         }
         if l.is_german_string() {
             return Ok(U128);
+        }
+        if l == Bool || r == Bool {
+            return Err(JoinKeyRule::BoolWithNumber);
         }
         if l.is_temporal() && r.is_temporal() {
             return Err(JoinKeyRule::UnitMismatch);

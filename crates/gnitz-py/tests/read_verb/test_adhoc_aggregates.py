@@ -384,12 +384,10 @@ def test_a_grouped_guard_fires_on_both_paths(gg, query):
      "HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1", "cat", [1, 2, 3]),
     # A scalar function wrapping the aggregate.
     ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING ABS(SUM(nn)) > 0", "cat", [1, 2, 3]),
-    # Constant predicates: NULL is UNKNOWN and never truthy, a statically-false
-    # one drops everything, and a bare float evaluating to -0.0 is KEPT because
-    # the engine filter bit-tests rather than comparing to 0.0.
+    # Constant predicates: NULL is UNKNOWN and never true, and a statically-false
+    # one drops everything.
     ("SELECT cat FROM hg GROUP BY cat HAVING NULL", "cat", []),
     ("SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'", "cat", []),
-    ("SELECT cat FROM hg GROUP BY cat HAVING -(SUM(cat) * 0.0)", "cat", [1, 2, 3]),
     # An aggregate appearing only in HAVING: all groups dropped, all kept, and
     # several filter ranges rather than one.
     ("SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 99", "cat", []),
@@ -406,11 +404,15 @@ def test_having_parity_and_value(hg, query, col, want):
 
 
 def test_a_constant_having_that_never_reaches_the_engine(hg):
-    """`HAVING 1` folds away at plan time and `HAVING 0` compiles to a constant
-    that drops every group."""
-    assert bag(rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING 1")) == \
+    """`HAVING TRUE` folds away at plan time and `HAVING FALSE` compiles to a
+    constant that drops every group. A number is no condition: `HAVING 1` is
+    refused, and so is an aggregate that is not a BOOLEAN."""
+    assert bag(rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING TRUE")) == \
         {(1,): 1, (2,): 1, (3,): 1}
-    assert rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING 0") == []
+    assert rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING FALSE") == []
+    for cond in ("1", "0", "SUM(cat)", "-(SUM(cat) * 0.0)"):
+        with pytest.raises(gnitz.GnitzError, match="a condition must be BOOLEAN"):
+            rows(hg, f"SELECT cat FROM hg GROUP BY cat HAVING {cond}")
 
 
 def test_the_register_cap_is_located_not_pinned(hg):

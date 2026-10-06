@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
 
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
-use crate::program::{EmitWidth, FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, ScalarEmit, StrEmit};
+use crate::program::{EmitStore, FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, ScalarEmit, StrEmit};
 use crate::search::{fields, find};
 use crate::simd::{self, LanePred, Level};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
@@ -257,16 +257,18 @@ impl MorselOut<'_> {
     }
 
     /// Write scalar emit `e` for this morsel's rows into its slot from `row0`:
-    /// each value's low bytes, NULL rows zeroed with their bit set in `nb`.
+    /// each value's low bytes or its truth, NULL rows zeroed with their bit set
+    /// in `nb`.
     pub(crate) fn emit_scalar(&self, e: &ScalarEmit, (col, nb, _): (&mut [u8], &mut [u8], &mut Vec<u8>), row0: usize) {
-        let w = e.width.bytes();
+        let w = e.store.bytes();
         let win = &mut col[row0 * w..(row0 + self.m) * w];
         let vals = self.reg_values(e.reg);
-        match e.width {
-            EmitWidth::W8 => win.copy_from_slice(self.reg_bytes(e.reg)),
-            EmitWidth::W4 => Self::narrow_cells(win, vals, |v| (v as u32).to_le_bytes()),
-            EmitWidth::W2 => Self::narrow_cells(win, vals, |v| (v as u16).to_le_bytes()),
-            EmitWidth::W1 => Self::narrow_cells(win, vals, |v| (v as u8).to_le_bytes()),
+        match e.store {
+            EmitStore::W8 => win.copy_from_slice(self.reg_bytes(e.reg)),
+            EmitStore::W4 => Self::narrow_cells(win, vals, |v| (v as u32).to_le_bytes()),
+            EmitStore::W2 => Self::narrow_cells(win, vals, |v| (v as u16).to_le_bytes()),
+            EmitStore::W1 => Self::narrow_cells(win, vals, |v| (v as u8).to_le_bytes()),
+            EmitStore::Truth => Self::narrow_cells(win, vals, |v| [u8::from(v != 0)]),
         }
         self.write_null_rows(e.reg, win, w, nb, row0, e.slot);
     }

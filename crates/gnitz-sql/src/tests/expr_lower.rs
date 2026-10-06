@@ -77,6 +77,42 @@ fn check<Ty: Into<ColType> + Copy>(tys: &[Ty], rows: &[(&str, &[Cell], Cell)]) {
 // What each form computes
 // ------------------------------------------------------------------
 
+/// A BOOLEAN is a condition as it stands and a number only through a CAST; the
+/// IS tests answer a NULL definitely, and its text is `true` / `false`.
+#[test]
+fn the_boolean_forms_compute_their_values() {
+    check(
+        &[T::Bool, T::I64],
+        &[
+            ("c1 AND c2 > 1", &[Int(1), Int(5)], Int(1)),
+            ("c1 AND c2 > 1", &[Null, Int(0)], Int(0)),
+            ("NOT c1", &[Int(1), Int(0)], Int(0)),
+            ("c1 = TRUE", &[Int(0), Int(0)], Int(0)),
+            ("c1 = 'yes'", &[Int(1), Int(0)], Int(1)),
+            ("c1 < TRUE", &[Int(0), Int(0)], Int(1)),
+            ("c1 = (c2 > 1)", &[Int(0), Int(1)], Int(1)),
+            ("c1 IS TRUE", &[Null, Int(0)], Int(0)),
+            ("c1 IS NOT TRUE", &[Null, Int(0)], Int(1)),
+            ("c1 IS FALSE", &[Int(0), Int(0)], Int(1)),
+            ("c1 IS NOT FALSE", &[Null, Int(0)], Int(1)),
+            ("c1 IS UNKNOWN", &[Null, Int(0)], Int(1)),
+            ("c1 = NULL", &[Int(1), Int(0)], Null),
+            ("COALESCE(c1, c2 = 0)", &[Null, Int(0)], Int(1)),
+            ("CASE WHEN c1 THEN c2 ELSE -c2 END", &[Null, Int(3)], Int(-3)),
+            // An integer is true where it is not zero; a BOOLEAN is 0 or 1.
+            ("CAST(c2 AS BOOLEAN)", &[Null, Int(-7)], Int(1)),
+            ("CAST(c2 AS BOOLEAN)", &[Null, Int(0)], Int(0)),
+            ("CAST(c2 AS BOOLEAN)", &[Null, Null], Null),
+            ("CAST(c1 AS INT) + c2", &[Int(1), Int(4)], Int(5)),
+            ("CAST(c1 AS TEXT)", &[Int(1), Int(0)], Str("true")),
+            ("CAST(c1 AS TEXT)", &[Int(0), Int(0)], Str("false")),
+            ("CAST(c1 AS TEXT)", &[Null, Int(0)], Null),
+            ("CONCAT('b=', c1)", &[Null, Int(0)], Str("b=")),
+            ("CONCAT('b=', c1)", &[Int(0), Int(0)], Str("b=false")),
+        ],
+    );
+}
+
 /// The string functions, each argument in the position its signature names, and
 /// the string channel's NULL rules: `||` propagates a NULL where CONCAT reads it
 /// as the empty string and casts a number to text.
@@ -175,7 +211,7 @@ fn the_numeric_forms_compute_their_values() {
             ("POWER(c1, 2)", &[Int(3)], F64(9.0)),
             ("c1 % 3", &[Int(7)], Int(1)),
             ("c1 / 0", &[Int(7)], Null),
-            // CASE takes its first truthy branch, in the class its results blend to.
+            // CASE takes its first true branch, in the class its results blend to.
             (
                 "CASE WHEN c1 > 0 THEN 1 WHEN c1 > 5 THEN 2 ELSE 3 END",
                 &[Int(9)],
@@ -829,14 +865,86 @@ fn each_refused_form_names_its_rule() {
     let cases: Vec<(String, Vec<ColType>, &str)> = [
         // A string in a numeric position.
         ("c1 + 1", vec![t(T::String)], "is not supported on a string operand"),
-        ("c1 AND 'x'", vec![t(T::String)], "column \"c1\" is a string"),
-        ("c1 OR 'x'", vec![t(T::String)], "column \"c1\" is a string"),
-        ("NOT c1", vec![t(T::String)], "column \"c1\" is a string"),
+        // A BOOLEAN where a number is wanted, and a number where a BOOLEAN is.
+        (
+            "c1 + 1",
+            vec![t(T::Bool)],
+            "operator Add is not supported on a BOOLEAN operand",
+        ),
+        ("c1 = 1", vec![t(T::Bool)], "comparison Eq between BOOLEAN and I64"),
+        (
+            "c1 IN (1, 0)",
+            vec![t(T::Bool)],
+            "comparison Eq between BOOLEAN and I64",
+        ),
+        ("c1 = TRUE", vec![t(T::I64)], "comparison Eq between I64 and BOOLEAN"),
+        (
+            "c1 AND TRUE",
+            vec![t(T::I64)],
+            "column \"c1\" is I64; a condition must be BOOLEAN",
+        ),
+        (
+            "CASE WHEN c1 THEN 1 END",
+            vec![t(T::I64)],
+            "a condition must be BOOLEAN",
+        ),
+        (
+            "CASE WHEN c1 THEN 1 ELSE TRUE END",
+            vec![t(T::Bool)],
+            "CAST it to use it as BOOLEAN",
+        ),
+        (
+            "GREATEST(c1, 1)",
+            vec![t(T::Bool)],
+            "is I64; CAST it to use it as BOOLEAN",
+        ),
+        ("ABS(c1)", vec![t(T::Bool)], "a numeric function takes a number"),
+        ("LEFT('abc', c1)", vec![t(T::Bool)], "must be an integer expression"),
+        ("c1 || 'x'", vec![t(T::Bool)], "is BOOLEAN; CAST it to use it as STRING"),
+        (
+            "CAST(c1 AS DOUBLE)",
+            vec![t(T::Bool)],
+            "CAST of BOOLEAN to F64 is not supported",
+        ),
+        (
+            "CAST(c1 AS DATE)",
+            vec![t(T::Bool)],
+            "CAST of BOOLEAN to DATE is not supported",
+        ),
+        (
+            "CAST(c1 AS BOOLEAN)",
+            vec![t(T::F64)],
+            "CAST of F64 to BOOLEAN is not supported",
+        ),
+        (
+            "CAST(c1 AS BOOLEAN)",
+            vec![t(T::String)],
+            "CAST of a string to BOOLEAN is supported for a literal only",
+        ),
+        (
+            "c1 AND 'x'",
+            vec![t(T::String)],
+            "column \"c1\" is STRING; a condition must be BOOLEAN",
+        ),
+        (
+            "c1 OR 'x'",
+            vec![t(T::String)],
+            "column \"c1\" is STRING; a condition must be BOOLEAN",
+        ),
+        (
+            "NOT c1",
+            vec![t(T::String)],
+            "column \"c1\" is STRING; a condition must be BOOLEAN",
+        ),
         ("-c1", vec![t(T::String)], "column \"c1\" is a string"),
         ("ABS(c1)", vec![t(T::String)], "column \"c1\" is a string"),
         ("ROUND(c1, 2)", vec![t(T::String)], "column \"c1\" is a string"),
         ("GREATEST(c1, 'x')", vec![t(T::String)], "column \"c1\" is a string"),
-        ("SUBSTR(c1, c1)", vec![t(T::String)], "column \"c1\" is a string"),
+        (
+            "SUBSTR(c1, c1)",
+            vec![t(T::String)],
+            "argument 2 must be an integer expression",
+        ),
         // A comparison carries no implicit cast.
         ("c1 = 1", vec![t(T::String)], "needs both operands to be strings"),
         (
@@ -853,7 +961,7 @@ fn each_refused_form_names_its_rule() {
         ),
         ("c1 LIKE 'a'", vec![t(T::I32)], "expected a string value here"),
         (
-            "CASE WHEN 1 THEN 'x' ELSE 0 END",
+            "CASE WHEN TRUE THEN 'x' ELSE 0 END",
             vec![t(T::I64)],
             "expected a string value here",
         ),
@@ -913,7 +1021,7 @@ fn each_refused_form_names_its_rule() {
         ("5 - c1", vec![t(T::Date)], "not supported on a DATE/TIMESTAMP operand"),
         ("c1 + c1", vec![t(T::Date)], "not supported on a DATE/TIMESTAMP operand"),
         (
-            "CASE WHEN 1 THEN c1 ELSE 1.5 END",
+            "CASE WHEN TRUE THEN c1 ELSE 1.5 END",
             vec![t(T::Date)],
             "cannot mix DATE with F64",
         ),
@@ -950,7 +1058,7 @@ fn each_refused_form_names_its_rule() {
             "DECIMAL scale 21 exceeds 18",
         ),
         (
-            &format!("CASE WHEN 1 THEN c1 ELSE {q7} END"),
+            &format!("CASE WHEN TRUE THEN c1 ELSE {q7} END"),
             vec![dec(2), dec(3)],
             "DECIMAL scale 21 exceeds 18",
         ),
@@ -975,7 +1083,7 @@ fn each_refused_form_names_its_rule() {
 fn a_filter_program_drops_the_conjuncts_settled_true() {
     let s = typed_schema(&[T::I64]);
     let p = bind_sql("c1 > 1", &s).unwrap();
-    let (t, f) = (BoundExpr::LitInt(1), BoundExpr::LitInt(0));
+    let (t, f) = (BoundExpr::LitBool(true), BoundExpr::LitBool(false));
     let or = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::Or, b.clone());
     let and = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::And, b.clone());
     let not = |a: &BoundExpr| BoundExpr::Not(Box::new(a.clone()));
@@ -998,12 +1106,27 @@ fn a_filter_program_drops_the_conjuncts_settled_true() {
 }
 
 /// Every conjunct is a boolean, a lone one included: a string column on its own
-/// draws the lowering's message rather than reaching the resolver.
+/// draws the lowering's message rather than reaching the resolver, and so does
+/// an integer one.
 #[test]
-fn a_lone_string_conjunct_is_rejected_by_lowering() {
+fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
     let s = typed_schema(&[T::String]);
     let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], &s.columns));
-    assert!(m.contains("column \"c1\" is a string"), "{m}");
+    assert!(
+        m.contains("column \"c1\" is STRING; a condition must be BOOLEAN"),
+        "{m}"
+    );
+    let s = typed_schema(&[T::I64]);
+    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], &s.columns));
+    assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
+    // A conjunct its connectives settle true is dropped from the program and
+    // refused all the same.
+    let settled = BoundExpr::bin(BoundExpr::LitBool(true), BinOp::Or, BoundExpr::ColRef(1));
+    let m = rejected(compile_filter_program([&settled], &s.columns));
+    assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
+    // An operand refused in itself reports that refusal, not the type it fell back to.
+    let m = rejected(compile_filter_program([&bind_sql("c1 + 'x'", &s).unwrap()], &s.columns));
+    assert!(m.contains("is not supported on a string operand"), "{m}");
 }
 
 /// The rows of `batch` that pass every conjunct, through the wire blob a read ships.
@@ -1022,8 +1145,13 @@ fn a_null_residual_conjunct_excludes_the_row() {
     let schema = two_col(T::I64);
     let batch = batch_of(&schema, &[&[Null]]); // pk = 1
     let bind = |sql| bind_sql(sql, &schema).unwrap();
+    let flags = two_col(T::Bool);
+    let bare = BoundExpr::ColRef(1);
+    assert_eq!(
+        residual_rows(&[&bare], &batch_of(&flags, &[&[Null]]), &flags),
+        [0usize; 0]
+    );
     for conjuncts in [
-        vec![BoundExpr::ColRef(1)],
         vec![bind("val = 0")],
         vec![bind("pk = 1"), bind("val = 0")],
         vec![bind("pk = 2"), bind("val = 0")],
@@ -1040,7 +1168,7 @@ fn a_null_residual_conjunct_excludes_the_row() {
 fn the_residual_keep_every_row_exits() {
     let schema = two_col(T::I64);
     let batch = batch_of(&schema, &[&[Int(7)]]);
-    let (t, f) = (BoundExpr::LitInt(1), BoundExpr::LitInt(0));
+    let (t, f) = (BoundExpr::LitBool(true), BoundExpr::LitBool(false));
     assert!(compile_wire_conjuncts([&t], &schema.columns).unwrap().is_empty());
     assert_eq!(residual_rows(&[], &batch, &schema), [0]);
     assert_eq!(residual_rows(&[&t], &batch, &schema), [0]);

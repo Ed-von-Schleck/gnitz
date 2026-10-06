@@ -33,7 +33,7 @@ use crate::validate::{
     cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses,
 };
 use gnitz_core::RelDescriptor;
-use gnitz_wire::{ColType, ColumnDef, TypeCode};
+use gnitz_wire::{ColType, ColumnDef};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
@@ -678,7 +678,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
     }
     fn type_of(&self, id: &ColId) -> ColType {
         match self.recorded(*id) {
-            Some(SubqueryKind::Exists { .. }) => ColType::of(TypeCode::I64),
+            Some(SubqueryKind::Exists { .. }) => crate::ir::BOOL,
             Some(SubqueryKind::Scalar { ty, .. }) => ty,
             None => hircol_of(self.env(), *id).def.ty,
         }

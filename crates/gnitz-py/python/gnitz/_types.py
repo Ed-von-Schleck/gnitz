@@ -25,6 +25,7 @@ class TypeCode(IntEnum):
     DATE = 16
     TIMESTAMP = 17
     DECIMAL = 18
+    BOOLEAN = 19
 
 
 # The members are written out because a type checker reads them from this file;

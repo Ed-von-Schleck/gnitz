@@ -116,6 +116,7 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
                 .map_err(|_| GnitzSqlError::Rejected(format!("invalid number literal: {n}")))
         }
         Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
+        Value::Boolean(b) => Ok(BExpr::LitBool(*b)),
         _ => Err(GnitzSqlError::Rejected(format!(
             "value type not supported in expressions: {v:?}"
         ))),

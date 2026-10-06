@@ -186,7 +186,7 @@ pub(crate) fn cross_comparison<'a>(
 /// through, and what joins that column in when the body's projection is built.
 #[derive(Clone)]
 pub(crate) struct SubqueryRef {
-    /// The column this subquery is read through: its Mark join's `0/1` column,
+    /// The column this subquery is read through: its Mark join's BOOLEAN column,
     /// or its finalized aggregate.
     pub id: ColId,
     pub kind: SubqueryKind,
@@ -458,7 +458,7 @@ pub(crate) enum JoinType {
     Semi,
     /// NOT EXISTS / NOT IN: drop each left row by match existence.
     Anti,
-    /// EXISTS/IN in a mark position, carrying the `ColId` of the synthetic `0/1`
+    /// EXISTS/IN in a mark position, carrying the `ColId` of the synthetic BOOLEAN
     /// column tagging each left row — the column the subquery is read through.
     Mark(ColId),
 }
@@ -468,7 +468,7 @@ impl JoinType {
     /// Hidden: nothing but the expressions reading the subquery reach it, and it
     /// is addressed by id, never by name.
     pub(crate) fn mark_col(id: ColId) -> HirCol {
-        HirCol::new(id, ColumnDef::new("_mark", TypeCode::I64, false).hidden())
+        HirCol::new(id, ColumnDef::new("_mark", TypeCode::Bool, false).hidden())
     }
 
     /// A left row survives unmatched ⇒ the right columns can be NULL, and

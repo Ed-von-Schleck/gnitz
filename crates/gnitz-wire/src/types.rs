@@ -30,6 +30,10 @@ crate::wire_enum! {
         /// ([`ColType`], the schema record's scale byte, `COL_TAB.scale`); storage, ordering,
         /// routing and the VM see the integer alone.
         Decimal = 18,
+        /// A truth value, physically a `U8` holding 0 for false and 1 for true.
+        /// No other byte is a value of the type: a block a peer wrote is refused
+        /// for one.
+        Bool = 19,
     }
 }
 
@@ -56,6 +60,7 @@ impl TypeCode {
             TypeCode::Date => "DATE",
             TypeCode::Timestamp => "TIMESTAMP",
             TypeCode::Decimal => "DECIMAL",
+            TypeCode::Bool => "BOOLEAN",
         }
     }
 
@@ -68,13 +73,14 @@ impl TypeCode {
     }
 
     /// The integer type a value of this type is stored, ordered and computed as:
-    /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, and the type
-    /// itself otherwise.
+    /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, `U8` for `Bool`,
+    /// and the type itself otherwise.
     #[inline(always)]
     pub const fn storage_type(self) -> TypeCode {
         match self {
             TypeCode::Date => TypeCode::I32,
             TypeCode::Timestamp | TypeCode::Decimal => TypeCode::I64,
+            TypeCode::Bool => TypeCode::U8,
             t => t,
         }
     }
@@ -98,15 +104,21 @@ impl TypeCode {
     /// typing to read it unconditionally; `BLOB` has a register of neither class
     /// and falls in with the rest.
     ///
-    /// A temporal or decimal type also maps to itself: the register holds the
-    /// 8-byte integer while the declared column keeps its name. A `DATE` slot is
-    /// narrower than that register, so a sink into one is admitted only behind a
-    /// cast that range-checks the value into that width.
+    /// A temporal, decimal or boolean type also maps to itself: the register
+    /// holds the 8-byte integer while the declared column keeps its name. A
+    /// `DATE` slot is narrower than that register, so a sink into one is
+    /// admitted only behind a cast that range-checks the value into that width;
+    /// a `BOOLEAN` slot stores whether the register is non-zero.
     #[inline]
     pub const fn register_image(self) -> TypeCode {
         match self {
             TypeCode::F32 | TypeCode::F64 => TypeCode::F64,
-            TypeCode::U64 | TypeCode::String | TypeCode::Date | TypeCode::Timestamp | TypeCode::Decimal => self,
+            TypeCode::U64
+            | TypeCode::String
+            | TypeCode::Date
+            | TypeCode::Timestamp
+            | TypeCode::Decimal
+            | TypeCode::Bool => self,
             _ => TypeCode::I64,
         }
     }
@@ -151,16 +163,16 @@ impl TypeCode {
 
     /// Whether this type is an **integer** of any width or sign —
     /// [`Self::is_fixed_int`]'s domain plus the 128-bit pair. UUID shares U128's
-    /// width and is not one. The domain [`Self::int_domain_fits`] is defined on,
-    /// where `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit
-    /// column.
+    /// width and is not one, and BOOLEAN is stored as an integer without being
+    /// one. The domain [`Self::int_domain_fits`] is defined on, where
+    /// `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit column.
     #[inline(always)]
     const fn is_int(self) -> bool {
-        self.is_fixed_int() || matches!(self, TypeCode::U128 | TypeCode::I128)
+        (self.is_fixed_int() && !matches!(self, TypeCode::Bool)) || matches!(self, TypeCode::U128 | TypeCode::I128)
     }
 
-    /// Whether this type may be a PRIMARY KEY column: the integer scalars of
-    /// every width, and nothing else. A PK region is compared as raw bytes, which
+    /// Whether this type may be a PRIMARY KEY column: the scalars stored as an
+    /// integer of any width, and nothing else. A PK region is compared as raw bytes, which
     /// String/Blob heap offsets and IEEE-754 floats (±0.0 differ byte-wise but
     /// compare equal) do not survive.
     #[inline(always)]
@@ -172,7 +184,7 @@ impl TypeCode {
     #[inline(always)]
     pub const fn wire_stride(self) -> usize {
         match self {
-            TypeCode::U8 | TypeCode::I8 => 1,
+            TypeCode::U8 | TypeCode::I8 | TypeCode::Bool => 1,
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::F32 | TypeCode::U32 | TypeCode::I32 | TypeCode::Date => 4,
             TypeCode::F64 | TypeCode::U64 | TypeCode::I64 | TypeCode::Timestamp | TypeCode::Decimal => 8,
@@ -235,6 +247,9 @@ impl TypeCode {
         if l.is_german_string() {
             return Ok(TypeCode::U128);
         }
+        if matches!(l, TypeCode::Bool) || matches!(r, TypeCode::Bool) {
+            return Err(JoinKeyRule::BoolWithNumber);
+        }
         if l.is_temporal() && r.is_temporal() {
             return Err(JoinKeyRule::UnitMismatch);
         }
@@ -275,6 +290,8 @@ pub enum JoinKeyRule {
     UnitMismatch,
     /// A content hash never equals a native key.
     StringWithNative,
+    /// A truth value equals no number.
+    BoolWithNumber,
     /// A cross-sign pair whose unsigned side is 128-bit needs a signed-256 type.
     NoSigned256,
 }
@@ -379,7 +396,7 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
     }
     use TypeCode as T;
     match tc {
-        T::U8 => a[0].cmp(&b[0]),
+        T::U8 | T::Bool => a[0].cmp(&b[0]),
         T::I8 => (a[0] as i8).cmp(&(b[0] as i8)),
         T::U16 => u16::from_le_bytes(arr(a)).cmp(&u16::from_le_bytes(arr(b))),
         T::I16 => i16::from_le_bytes(arr(a)).cmp(&i16::from_le_bytes(arr(b))),
@@ -543,7 +560,7 @@ impl FixedInt {
     #[inline(always)]
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
         match tc {
-            TypeCode::U8 => Some(Self::U8),
+            TypeCode::U8 | TypeCode::Bool => Some(Self::U8),
             TypeCode::I8 => Some(Self::I8),
             TypeCode::U16 => Some(Self::U16),
             TypeCode::I16 => Some(Self::I16),
@@ -703,7 +720,7 @@ const _: () = {
             kind.is_some() != (tc.is_wide_int() || tc.is_german_string()),
             "a type is wide iff it has no scalar image"
         );
-        // A temporal or decimal type is its storage integer under another name,
+        // A temporal, decimal or boolean type is its storage integer under another name,
         // so the two must lay out identically — `wire_stride` spells the width
         // table separately from `storage_type`'s map.
         assert!(

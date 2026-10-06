@@ -285,9 +285,10 @@ fn a_refused_mutation_names_its_rule() {
         ("UPDATE ty SET u8c = 300", "out of range"),
         ("UPDATE ty SET n = f", "floating-point"),
         ("UPDATE ty SET f = f + 1.0", "floating-point"),
-        ("UPDATE ty SET f = n", "cannot assign an integer value"),
-        ("UPDATE ty SET n = UPPER(s)", "cannot assign a string value"),
-        ("UPDATE ty SET s = n + 1", "cannot assign an integer value"),
+        ("UPDATE ty SET f = n", "cannot assign a value of type I64"),
+        ("UPDATE ty SET n = UPPER(s)", "cannot assign a value of type STRING"),
+        ("UPDATE ty SET s = n + 1", "cannot assign a value of type I64"),
+        ("UPDATE ty SET n = f > 1.5", "cannot assign a value of type BOOLEAN"),
         // A view is read-only, and a stream holds no row.
         ("UPDATE vw SET v = 1 WHERE id = 1", "is a view"),
         ("DELETE FROM vw", "is a view"),
@@ -296,11 +297,9 @@ fn a_refused_mutation_names_its_rule() {
     ] {
         assert_rejects(sql, plan(&cat, sql), needle);
     }
-    // A float comparison is integer-valued, and the written alias is the one
-    // qualifier that answers.
-    for sql in ["UPDATE ty SET n = f > 1.5", "UPDATE t AS x SET v = 11 WHERE x.v = 10"] {
-        plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-    }
+    // The written alias is the one qualifier that answers.
+    let sql = "UPDATE t AS x SET v = 11 WHERE x.v = 10";
+    plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 }
 
 /// A DELETE writes the retraction of the keys it read.

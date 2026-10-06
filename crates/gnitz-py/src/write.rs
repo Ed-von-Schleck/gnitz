@@ -699,6 +699,8 @@ enum Inexact {
 fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
     match ty.tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),
+        // A `bool` only: `1` is an integer, as it is in SQL.
+        TypeCode::Bool => buf.push(u8::from(item.extract::<bool>()?)),
         TypeCode::I8 => buf.push(item.extract::<i8>()? as u8),
         TypeCode::U16 => buf.extend_from_slice(&item.extract::<u16>()?.to_le_bytes()),
         TypeCode::I16 => buf.extend_from_slice(&item.extract::<i16>()?.to_le_bytes()),

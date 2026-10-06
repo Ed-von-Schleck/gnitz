@@ -47,6 +47,18 @@ fn each_sugar_binds_to_the_tree_its_plain_spelling_binds_to() {
             "CASE WHEN c = 1 THEN 10 WHEN c = 2 THEN 20 END",
         ),
         ("NULLIF(c, 0)", "CASE WHEN c = 0 THEN NULL ELSE c END"),
+        // The IS tests take a NULL to a definite answer: neither `x` nor
+        // `NOT x` is taken over one.
+        ("(c > 1) IS TRUE", "CASE WHEN c > 1 THEN TRUE ELSE FALSE END"),
+        ("(c > 1) IS NOT TRUE", "CASE WHEN c > 1 THEN FALSE ELSE TRUE END"),
+        ("(c > 1) IS FALSE", "CASE WHEN NOT (c > 1) THEN TRUE ELSE FALSE END"),
+        ("(c > 1) IS NOT FALSE", "CASE WHEN NOT (c > 1) THEN FALSE ELSE TRUE END"),
+        ("(c > 1) IS UNKNOWN", "(c > 1) IS NULL"),
+        ("(n > 1) IS NOT UNKNOWN", "TRUE"),
+        // A literal cast to BOOLEAN is the literal.
+        ("CAST('yes' AS BOOLEAN)", "TRUE"),
+        ("CAST(0 AS BOOLEAN)", "FALSE"),
+        ("CAST(-3 AS BOOLEAN)", "TRUE"),
         ("IF(c > 1, 10, 20)", "CASE WHEN c > 1 THEN 10 ELSE 20 END"),
         // COALESCE stops at the first operand provably never NULL and skips a NULL one.
         ("COALESCE(c)", "c"),
@@ -70,12 +82,12 @@ fn each_sugar_binds_to_the_tree_its_plain_spelling_binds_to() {
         ),
         ("pk IS DISTINCT FROM 1", "pk <> 1"),
         // A null test whose answer is settled at bind time is that literal.
-        ("pk IS NULL", "0"),
-        ("t.n IS NOT NULL", "1"),
-        ("n + 1 IS NULL", "0"),
-        ("NULL IS NULL", "1"),
-        ("NULL IS NOT NULL", "0"),
-        ("1 IS NULL", "0"),
+        ("pk IS NULL", "FALSE"),
+        ("t.n IS NOT NULL", "TRUE"),
+        ("n + 1 IS NULL", "FALSE"),
+        ("NULL IS NULL", "TRUE"),
+        ("NULL IS NOT NULL", "FALSE"),
+        ("1 IS NULL", "FALSE"),
         ("T.c IS NULL", "c IS NULL"),
         ("MOD(c, 2)", "c % 2"),
         ("pow(c, 2)", "POWER(c, 2)"),
@@ -415,7 +427,8 @@ fn each_unsupported_form_is_rejected_by_name() {
         ("+c", "unary operator + not supported"),
         ("+(c > 1)", "unary operator + not supported"),
         ("c & 1", "binary operator & not supported"),
-        ("c IS TRUE", "expression not supported: c IS TRUE"),
+        ("c IS UNKNOWN", "IS UNKNOWN takes a BOOLEAN"),
+        ("CAST('maybe' AS BOOLEAN)", "invalid BOOLEAN literal: 'maybe'"),
         // Arity. A call reads its arguments by position, so an extra one would
         // be dropped silently.
         ("COALESCE()", "at least one argument"),

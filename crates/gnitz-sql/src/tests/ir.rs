@@ -43,12 +43,16 @@ fn each_node_types_as_the_value_it_computes() {
         ("18446744073709551616", t(I64)),
         ("-18446744073709551616", t(I64)),
         // Booleans.
-        ("u > u32", t(I64)),
-        ("NOT u", t(I64)),
-        ("u IS NULL", t(I64)),
-        ("u IS NOT NULL", t(I64)),
-        ("u IN (1, 2)", t(I64)),
-        ("s LIKE 'a%'", t(I64)),
+        ("u > u32", t(Bool)),
+        ("TRUE", t(Bool)),
+        ("u > 1 AND i < 2", t(Bool)),
+        ("CASE WHEN TRUE THEN u > 1 END", t(Bool)),
+        ("CAST(i AS BOOLEAN)", t(Bool)),
+        ("NOT (u > 1)", t(Bool)),
+        ("u IS NULL", t(Bool)),
+        ("u IS NOT NULL", t(Bool)),
+        ("u IN (1, 2)", t(Bool)),
+        ("s LIKE 'a%'", t(Bool)),
         // Arithmetic keeps U64, so a materialized column re-seeds a downstream
         // unsigned compare; a narrow integer computes in I64.
         ("u + u", t(U64)),
@@ -75,13 +79,13 @@ fn each_node_types_as_the_value_it_computes() {
         ("CONCAT(s, 1)", t(String)),
         ("TRIM(s)", t(String)),
         // CASE and GREATEST blend their results; a NULL one is neutral.
-        ("CASE WHEN 1 THEN u ELSE i END", t(U64)),
-        ("CASE WHEN 1 THEN f ELSE u END", t(F64)),
-        ("CASE WHEN 1 THEN NULL END", t(I64)),
-        ("CASE WHEN 1 THEN NULL WHEN 1 THEN u END", t(U64)),
-        ("CASE WHEN 1 THEN d ELSE ts END", t(Timestamp)),
-        ("CASE WHEN 1 THEN s ELSE 'x' END", t(String)),
-        ("CASE WHEN 1 THEN p ELSE 0.5 END", dec(2)),
+        ("CASE WHEN TRUE THEN u ELSE i END", t(U64)),
+        ("CASE WHEN TRUE THEN f ELSE u END", t(F64)),
+        ("CASE WHEN TRUE THEN NULL END", t(I64)),
+        ("CASE WHEN TRUE THEN NULL WHEN TRUE THEN u END", t(U64)),
+        ("CASE WHEN TRUE THEN d ELSE ts END", t(Timestamp)),
+        ("CASE WHEN TRUE THEN s ELSE 'x' END", t(String)),
+        ("CASE WHEN TRUE THEN p ELSE 0.5 END", dec(2)),
         ("GREATEST(p, q, i)", dec(3)),
         // CAST: a float target is an f64 register, anything else its target, which
         // the cast range-checks into.
@@ -99,7 +103,7 @@ fn each_node_types_as_the_value_it_computes() {
         ("p / q", t(F64)),
         ("p / 3", t(F64)),
         ("p + f", t(F64)),
-        ("p > q", t(I64)),
+        ("p > q", t(Bool)),
         ("p * 1.1", dec(3)),
         ("p + 1.255", dec(3)),
         ("i * 1.1", t(F64)),
@@ -133,6 +137,8 @@ fn unify_blend_type_rule() {
         // A narrow unsigned value stays below 2^63.
         (t(U32), t(U16), t(I64)),
         (t(Date), t(I64), t(Date)),
+        (t(Bool), t(I64), t(Bool)),
+        (t(Bool), t(Bool), t(Bool)),
         (t(Date), t(Date), t(Date)),
         (t(Date), t(Timestamp), t(Timestamp)),
     ] {
@@ -242,13 +248,13 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         // Text renders any scalar; every other target can refuse a value.
         ("CAST({x} AS VARCHAR)", true),
         ("CAST({x} AS SMALLINT)", false),
-        ("CASE WHEN 1 THEN {x} ELSE {x} END", true),
-        ("CASE WHEN 1 THEN c ELSE {x} END", false),
-        ("CASE WHEN 1 THEN {x} END", false),
+        ("CASE WHEN TRUE THEN {x} ELSE {x} END", true),
+        ("CASE WHEN TRUE THEN c ELSE {x} END", false),
+        ("CASE WHEN TRUE THEN {x} END", false),
         // A signed operand of an unsigned result is range-cast, and an unsigned
         // operand of temporal arithmetic is: either cast can refuse a value.
         ("GREATEST({x}, nu)", false),
-        ("CASE WHEN 1 THEN {x} ELSE pk END", false),
+        ("CASE WHEN TRUE THEN {x} ELSE pk END", false),
         ("pk / -2 + 0 * {x}", false),
         ("d + pk < d OR {x} = 1", false),
     ] {

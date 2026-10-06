@@ -740,7 +740,7 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
         (
             "SELECT o.id, EXISTS (SELECT 1 FROM d WHERE d.k = o.k) AS e FROM o",
             "e",
-            I64,
+            TypeCode::Bool,
             false,
         ),
         (
@@ -761,6 +761,9 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
         ("SELECT id, k, CAST(k AS SMALLINT) FROM d", "_expr2", I64, true),
         ("SELECT id, CAST(k AS FLOAT) AS x FROM d", "x", F64, true),
         ("SELECT id, w + 1 AS x FROM d", "x", I64, true),
+        // A test is a BOOLEAN, stored as one.
+        ("SELECT id, w > 1 AS x FROM d", "x", TypeCode::Bool, true),
+        ("SELECT id, w > 1 AND k IS NULL AS x FROM d", "x", TypeCode::Bool, true),
     ];
     for &(body, name, tc, nullable) in rows {
         let chain = view(&cat, body);
