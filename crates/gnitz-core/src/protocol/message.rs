@@ -50,6 +50,7 @@ pub fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
                 },
                 ..ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis)
             },
+            blob: &[],
             schema: Some(schema),
             data: Some(f.batch.wire_regions()),
         })
@@ -66,6 +67,7 @@ pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
         .iter()
         .map(|(tid, b)| FrameItem {
             hdr: ControlHeader { target_id: *tid, ..Default::default() },
+            blob: &[],
             schema: None,
             data: Some(b.wire_regions()),
         })

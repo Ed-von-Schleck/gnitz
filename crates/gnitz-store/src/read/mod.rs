@@ -17,6 +17,7 @@
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover.
 
+mod delta_read;
 mod key_spans;
 mod scan_spec;
 mod store_io;

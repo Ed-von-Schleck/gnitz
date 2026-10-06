@@ -242,15 +242,17 @@ impl MasterDispatcher {
         self.tick_round.get()
     }
 
-    /// The cursor tag a delta reply carries: distinct for every (boot, view), so a
-    /// cursor from another boot or from a dropped view is recognizably foreign.
-    pub(crate) fn delta_cursor_tag(&self, view_id: u64) -> u64 {
+    /// The cursor tag a delta reply carries: distinct for every (boot, view) and,
+    /// with fair odds, every spec the view is read under — so a cursor from
+    /// another boot, from a dropped view, or polled under another spec is
+    /// recognizably foreign. `spec` is the request's encoded bytes.
+    pub(crate) fn delta_cursor_tag(&self, view_id: u64, spec: &[u8]) -> u64 {
         // splitmix64's finalizer, a bijection on u64: two views of one boot
         // never share a tag.
         let mut z = view_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        self.boot_nonce ^ (z ^ (z >> 31))
+        self.boot_nonce ^ (z ^ (z >> 31)) ^ gnitz_wire::checksum(spec)
     }
 
     /// The last round that reached `view_id`, or `1` for a view no round has

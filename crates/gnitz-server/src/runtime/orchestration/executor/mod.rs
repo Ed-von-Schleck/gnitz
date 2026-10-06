@@ -1195,6 +1195,12 @@ fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> 
 /// DELTA_POLL: advance N mirrored views in one request, holding the reply up to
 /// its wait while none of them has anything to report.
 ///
+/// A view the rounds since its cursor left no rows for has nothing to report,
+/// whether no round reached it or its spec kept none of them. Where no view has
+/// anything and wait is left, the poll parks again behind the rounds it read.
+/// The cursor that moves across a park is this handler's own: the client's is
+/// the one the terminal finally carries.
+///
 /// An `Err` rejects the frame, at `target_id = 0`; a per-view failure is not an
 /// `Err` — it goes out as that view's own fault frame, and the rest of the poll
 /// continues.
@@ -1204,15 +1210,48 @@ async fn handle_delta_poll(
     prologue: &ControlHeader,
     body: &[u8],
 ) -> Result<(), WireFault> {
-    let (wait_ms, views) =
+    let (wait_ms, mut views) =
         gnitz_wire::txn_frame::decode_delta_poll(prologue, body).map_err(|e| format!("decode error: {e}"))?;
-    let wait = Duration::from_millis(wait_ms).min(DELTA_POLL_MAX_WAIT);
-    // The poll drains once, here; a later slice takes the lock alone.
-    let mut first_lock = Some(delta_poll_lock(shared, peer, &views, wait).await?);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms).min(DELTA_POLL_MAX_WAIT);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (lock, may_hold) = delta_poll_lock(shared, peer, &views, left).await?;
+        let Some(rounds) = delta_poll_pass(shared, peer, &views, lock, may_hold).await? else {
+            return Ok(());
+        };
+        // No row of a view lies between its cursor and the round it was read
+        // through, so that round is where the next pass reads it from.
+        for (view, round) in views.iter_mut().zip(rounds) {
+            view.after_tick = round;
+        }
+    }
+}
+
+/// Answer `views` once, the first slice under `lock`. With `may_hold`, a view
+/// with nothing to report has its terminal kept back until one that has
+/// something releases it; where none has, no terminal goes out and the round
+/// each view was read through is returned. `None` once the poll is answered, or
+/// the client is gone.
+async fn delta_poll_pass(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    views: &[DeltaPollItem<'_>],
+    lock: ReadGuard,
+    may_hold: bool,
+) -> Result<Option<Vec<u64>>, WireFault> {
+    let disp = shared.disp();
+    let terminal = |item: &DeltaPollItem, result: Result<u64, WireFault>| {
+        let tag = disp.delta_cursor_tag(item.view_id, item.spec);
+        finish_scan_fanout(peer, item.view_id, tag, result);
+    };
+    // The poll drained once, for `lock`; a later slice takes the lock alone.
+    let mut first_lock = Some(lock);
+    // The round each view so far was read through, while every one of them had
+    // nothing to report. `None` once a terminal has gone out.
+    let mut held: Option<Vec<u64>> = may_hold.then(Vec::new);
 
     // One slice at a time: one catalog lock and — for however many of its views
     // moved — one broadcast.
-    let disp = shared.disp();
     for slice in views.chunks(DELTA_POLL_CUT_VIEWS) {
         // ── Phase 1: classify under the catalog lock, dispatch one cut ─────
         // No await between a view's position and the round an up-to-date one
@@ -1234,12 +1273,13 @@ async fn handle_delta_poll(
             disp.scan_cut(|cut| {
                 dispatch_round = disp.last_tick_round();
                 for item in moved() {
-                    cut.read(DirectGroup::new(Read::Delta {
-                        view: item.view_id,
-                        after_tick: item.after_tick,
-                        cut_round: dispatch_round,
-                        reply_layout: item.reply_layout,
-                    }))?;
+                    cut.read(DirectGroup::new(Read::delta(
+                        item.view_id,
+                        item.after_tick,
+                        dispatch_round,
+                        item.spec,
+                        item.reply_layout,
+                    )))?;
                 }
                 Ok(())
             })
@@ -1250,47 +1290,66 @@ async fn handle_delta_poll(
         drop(catalog);
 
         // ── Phase 2: one terminal per view, in request order ───────────────
+        // Taken in step with the `Moved`s that were pushed. A dispatch left
+        // undrained — an earlier return dropped it — discards the rest of its
+        // train at the ring boundary.
         let mut dispatches = dispatches.into_iter();
         for (item, position) in slice.iter().zip(positions) {
-            let (round, result) = match position {
-                PollPosition::Fault(fault) => (0, Err(fault)),
-                PollPosition::UpToDate => (up_to_date_round, Ok(())),
-                // Taken in step with the `Moved`s that were pushed. A dispatch
-                // left undrained — an earlier return dropped it — discards the
-                // rest of its train at the ring boundary.
+            let mut lease = None;
+            // The round the view's terminal carries, and the first frame of
+            // its rows.
+            let report = match position {
+                PollPosition::Fault(fault) => Err(fault),
+                PollPosition::UpToDate => Ok((up_to_date_round, None)),
                 PollPosition::Moved => {
-                    let lease = dispatches.next().expect("one dispatch per moved view");
-                    (dispatch_round, forward_scan(peer, &lease).await)
+                    let lease = lease.insert(dispatches.next().expect("one dispatch per moved view"));
+                    // A train with no rows is read to its end here, so it pins
+                    // nothing of the ring while a later view's is read.
+                    lease.next().await.map(|first| (dispatch_round, first))
                 }
             };
-            let tid = item.view_id;
-            finish_scan_fanout(peer, tid, disp.delta_cursor_tag(tid), result.map(|()| round));
+            if let (Some(held), Ok((round, None))) = (&mut held, &report) {
+                held.push(*round);
+                continue;
+            }
+            for (view, round) in views.iter().zip(held.take().into_iter().flatten()) {
+                terminal(view, Ok(round));
+            }
+            let result = match (report, &lease) {
+                (Ok((round, Some(first))), Some(lease)) => match peer.send(first.slot).await {
+                    Ok(()) => forward_scan(peer, lease).await.map(|()| round),
+                    Err(_) => return Ok(None),
+                },
+                (report, _) => report.map(|(round, _)| round),
+            };
+            terminal(item, result);
             // Carry no more than the budget into the next view, and learn here
             // rather than at the end if the client is gone.
             if peer.flush_if_full().await.is_err() {
-                return Ok(());
+                return Ok(None);
             }
         }
     }
-    Ok(())
+    Ok(held)
 }
 
-/// The catalog read lock a poll of `views` is first answered under: behind a
-/// drain when a commit reaching one of them has not been ticked, and, with a
-/// `wait`, after holding the poll while none of them has anything to report —
-/// until a relation one of them reads changes, `wait` passes, or the client
-/// sends its next request or goes.
+/// The catalog read lock a poll of `views` is answered under, and whether a
+/// view with nothing to report may still be held: behind a drain when a commit
+/// reaching one of them has not been ticked, and, with a `wait`, after holding
+/// the poll while none of them has anything to report — until a relation one
+/// of them reads changes, `wait` passes, or the client sends its next request
+/// or goes. Only the first of those leaves the poll one that may be held on.
 async fn delta_poll_lock(
     shared: &Rc<Shared>,
     peer: &Peer,
-    views: &[DeltaPollItem],
+    views: &[DeltaPollItem<'_>],
     wait: Duration,
-) -> Result<ReadGuard, WireFault> {
+) -> Result<(ReadGuard, bool), WireFault> {
     let ids = || views.iter().map(|v| v.view_id);
     let waiting = !wait.is_zero();
     let g = fresh_read_lock(shared, ids(), waiting).await?;
     if !waiting {
-        return Ok(g);
+        return Ok((g, false));
     }
     // No await from the test to the park, so no commit is acknowledged between
     // them. The drain above was one: a commit it did not take is un-ticked here.
@@ -1300,16 +1359,16 @@ async fn delta_poll_lock(
             .iter()
             .all(|&v| matches!(poll_position(shared, &g, v), PollPosition::UpToDate));
     if !quiet {
-        return Ok(g);
+        return Ok((g, true));
     }
     // A commit or a drop reaches a view through the view or anything it reads.
     watched.extend(ids());
     let mut parked = shared.poll_waiters.park(watched);
     drop(g);
     let released = select2(shared.disp().reactor().sleep(wait), peer.next_request_ready());
-    select2(&mut parked.woken, released).await;
+    let woken = matches!(select2(&mut parked.woken, released).await, Either::A(_));
     drop(parked);
-    fresh_read_lock(shared, ids(), true).await
+    Ok((fresh_read_lock(shared, ids(), true).await?, woken))
 }
 
 /// Whether a delta read after `after_tick` already sits at the view's last round,

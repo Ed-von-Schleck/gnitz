@@ -551,6 +551,14 @@ on the client, and nothing retained survives a restart.
 A delta read carries every push acknowledged before it, and may ask to be held
 while it has nothing to report.
 
+**A delta read may carry a subscription**: a `SELECT` over the view with no
+aggregate, order or cut, answered with only the rows and columns it keeps. A
+filter and a projection are linear, so those are the subscription's own deltas
+and a copy built from them is the `SELECT` over the view, weight for weight. A
+cursor belongs to the subscription it was handed out under; polled under
+another it is refused as a foreign one. "Nothing to report" is judged after the
+subscription: a round that leaves the view rows it keeps none of ends no wait.
+
 **A cursor can expire, and every subscriber must handle it.** The budget is a
 byte bound, and the oldest rounds are dropped whether or not anyone is still
 reading them. An expired cursor is refused, and so is one from a different boot
@@ -564,6 +572,15 @@ delegated upstream. The copy lives in a store (`gnitz-mirror`) the host opens an
 attaches to a client. An ingest error costs the one copy it hit, which bootstraps
 again; a store whose copy may be torn refuses the reads it would have answered
 until it is closed.
+
+A mirror may hold a subscription instead of a whole view, under an **alias**: a
+relation of `_local`, the one schema no server holds. An alias is read only off
+its copy, never upstream, and several may read one view, whose own name stays an
+upstream relation. Its indexes are the view's whose columns it keeps, each a
+local store over the alias's own rows. The alias's plan is the SQL layer's:
+`gnitz-core` links no planner, so an alias is mirrored with one, and a poll
+calls it to plan the alias again once its view was dropped and recreated, its
+feed no longer continues, or the connection was replaced.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no

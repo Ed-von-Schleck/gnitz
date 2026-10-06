@@ -806,37 +806,36 @@ fn a_waiting_poll_is_held_until_a_commit_reaches_a_view() {
     assert!(fx.differential("s", "SELECT * FROM v_keyed") > 30);
 }
 
-/// A commit to a relation a view reads ends the wait even when the view lets
-/// none of it through: the reply is empty and moves the cursor alone.
+/// A commit to a relation a view reads ends no wait when the view lets none of
+/// it through: the poll is held on behind the round that left it nothing, and
+/// answered by the next commit a row of which reaches the view.
 #[test]
-fn a_commit_the_view_filters_out_ends_the_wait_with_an_empty_delta() {
+fn a_commit_the_view_filters_out_does_not_end_the_wait() {
+    const GAP: Duration = Duration::from_millis(1200);
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     let (keyed, _) = fx.mirror_both();
     fx.drain();
-    let before = canonical(&fx.local("SELECT * FROM v_keyed"));
     let settled = fx.mirror().cursor_of(keyed).expect("a settled copy");
 
     // `v_keyed` keeps `v >= 0`.
-    let writer = later(
-        &fx,
-        Duration::from_millis(200),
-        "INSERT INTO t VALUES (2000, 1, -5, 0.5, 'filtered')",
-    );
+    let target = fx.server.sock_path().to_string();
+    let writer = std::thread::spawn(move || {
+        let mut client = GnitzClient::connect(&target).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        sql(&mut client, "s", "INSERT INTO t VALUES (2000, 1, -5, 0.5, 'filtered')");
+        std::thread::sleep(GAP);
+        sql(&mut client, "s", "INSERT INTO t VALUES (2001, 1, 5, 0.5, 'kept')");
+    });
     let t0 = std::time::Instant::now();
-    block_on(fx.mirror().poll_mirror(HELD)).expect("a poll the commit ends");
-    assert!(t0.elapsed() < RELEASED, "the commit released it");
+    block_on(fx.mirror().poll_mirror(HELD)).expect("a poll the second commit ends");
+    let took = t0.elapsed();
     writer.join().unwrap();
-    assert_eq!(
-        canonical(&fx.local("SELECT * FROM v_keyed")),
-        before,
-        "no row reached the view"
-    );
+    assert!(took >= GAP, "the commit the view kept nothing of ended the wait");
+    assert!(took < RELEASED, "the commit the view kept a row of released it");
+    assert!(fx.differential("s", "SELECT * FROM v_keyed WHERE a >= 2000") > 0);
     let now = fx.mirror().cursor_of(keyed).expect("still a copy");
-    assert!(
-        now.tick > settled.tick,
-        "and the round it did not change is behind the cursor"
-    );
+    assert!(now.tick > settled.tick);
 }
 
 /// A subscriber looping on a waiting poll under back-to-back commits is
@@ -949,6 +948,7 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
     churn(&mut fx.direct, 1, 40);
     let (keyed, _) = fx.mirror_both();
     fx.drain();
+    let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
     let item = DeltaPollItem {
         view_id: keyed,
         after_tick: fx.mirror().cursor_of(keyed).expect("a settled copy").tick.get(),
@@ -956,6 +956,7 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
             .expect("resolve")
             .schema
             .layout_digest(),
+        spec: &whole,
     };
 
     let mut raw = std::os::unix::net::UnixStream::connect(fx.server.sock_path()).unwrap();

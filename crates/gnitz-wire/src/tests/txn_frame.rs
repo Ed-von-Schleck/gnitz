@@ -6,8 +6,13 @@ fn rel(tid: u64, reply_layout: u64) -> ScanMultiItem {
     ScanMultiItem { tid, reply_layout }
 }
 
-fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem {
-    DeltaPollItem { view_id, after_tick, reply_layout }
+fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem<'static> {
+    DeltaPollItem {
+        view_id,
+        after_tick,
+        reply_layout,
+        spec: b"spec",
+    }
 }
 
 /// The PK region every stand-in block below carries: one 24-byte key.
@@ -37,6 +42,7 @@ fn block() -> Vec<u8> {
 fn ddl_item(tid: u64) -> FrameItem<'static> {
     FrameItem {
         hdr: ControlHeader { target_id: tid, ..Default::default() },
+        blob: &[],
         schema: None,
         data: Some(regions()),
     }
@@ -50,13 +56,14 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
             arg0: basis,
             ..Default::default()
         },
+        blob: &[],
         schema: Some(schema),
         data: Some(regions()),
     }
 }
 
 /// The views of a `DELTA_POLL` body sent with no wait.
-fn delta_poll_views(body: &[u8]) -> Result<Vec<DeltaPollItem>, String> {
+fn delta_poll_views(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
     decode_delta_poll(&ControlHeader::default(), body).map(|(_, views)| views)
 }
 
@@ -139,6 +146,8 @@ fn delta_poll_roundtrips_every_view_in_order() {
         item(1, 0, 1),
         item(2, 42, u64::MAX),
         item(3, u64::MAX, 7),
+        // One view twice is two items, each under its own spec.
+        DeltaPollItem { spec: b"another spec", ..item(1, 0, 1) },
         item(1, 0, 1),
     ];
     let frame = encode_delta_poll(&views, 0);
@@ -193,7 +202,7 @@ fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8
 /// short list (a cut on an item boundary is a shorter well-formed body, since
 /// items run to the end); and an item is refused whose sections differ from the
 /// verb's shape, that names another verb, that carries a non-`Ok` status, or
-/// that carries a blob.
+/// that carries a blob its verb's items do not.
 #[test]
 fn decode_items_enforces_each_verbs_item_rules() {
     let multi: Vec<ClientVerb> = ClientVerb::ALL
@@ -203,7 +212,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
         .collect();
     assert_eq!(multi.len(), 4);
     for verb in multi {
-        let (schema, data, cap) = item_shape(verb).unwrap();
+        let ItemShape { blob, schema, data, cap } = item_shape(verb).unwrap();
         let hdr = ControlHeader {
             target_id: 7,
             flags: WireFlags { verb, ..Default::default() },
@@ -253,7 +262,13 @@ fn decode_items_enforces_each_verbs_item_rules() {
             ),
             "status",
         );
-        refused(&one_item(hdr, b"blob", schema, data), "blob");
+        match blob {
+            true => assert_eq!(
+                decode_items(&one_item(hdr, b"blob", schema, data), verb).unwrap().len(),
+                1
+            ),
+            false => refused(&one_item(hdr, b"blob", schema, data), "blob"),
+        }
     }
     let err = decode_items(
         &one_item(ControlHeader::default(), b"", false, false),

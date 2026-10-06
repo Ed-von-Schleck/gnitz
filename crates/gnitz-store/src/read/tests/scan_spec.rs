@@ -1,16 +1,16 @@
 use super::*;
-use crate::relation::{RelationKind, RelationSpec};
+use crate::relation::RelationKind;
 use crate::test_support::{
-    cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
+    between, cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
     RelationFixture, TID,
 };
-use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink};
+use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{payload_is_null, payload_str, payload_u64};
 use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
-use gnitz_wire::{PkKeys, ViewProps};
+use gnitz_wire::{PkKeys, ReadBound, SinkKind, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{Placement, SchemaColumn};
+use gnitz_zset::schema::SchemaColumn;
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
@@ -47,20 +47,6 @@ pub(super) fn layout_of(schema: &SchemaDescriptor, sink: &ReadSink) -> u64 {
 
 fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
     vec![OrderKey { col, desc, nulls_first: false }]
-}
-
-/// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
-fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
-    let mut eb = ExprBuilder::new();
-    let v = eb.emit(LogicalInstr::LoadCol { col });
-    let lo_c = eb.emit(LogicalInstr::LoadConst { val: lo, unsigned: false });
-    let mut keep = eb.emit(LogicalInstr::Cmp { op: CmpOp::Ge, a: v, b: lo_c });
-    if let Some(hi) = hi {
-        let hi_c = eb.emit(LogicalInstr::LoadConst { val: hi, unsigned: false });
-        let lt = eb.emit(LogicalInstr::Cmp { op: CmpOp::Lt, a: v, b: hi_c });
-        keep = eb.emit(LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
-    }
-    eb.build(vec![Sink::Reg(keep)]).unwrap().to_blob_bytes()
 }
 
 /// A `pk IN (…)` bound over a U64 PK.
@@ -710,46 +696,6 @@ fn a_hydration_off_the_skeleton_weight_panics() {
     let mut h = Recompute { short: true, ..Recompute::default() };
     let layout = make_schema_u64_i64().layout_digest();
     let _ = r.scan_spec(TID, ReadSpec::all_rows(pk_set(&[2])), layout, Some(&mut h));
-}
-
-// ── Delta reads ──────────────────────────────────────────────────────
-
-/// A fed view's delta read answers the rounds `(after_tick, cut_tick]` at each
-/// round's own weights — both sides of a pair the output store folded away — in the
-/// view's layout; `after_tick = 0` reads the view whole. Any other layout, or a view
-/// with no feed, is refused.
-#[test]
-fn a_delta_read_answers_the_rounds_past_its_cursor() {
-    let schema = make_schema_u64_i64();
-    let kind = RelationKind::View(ViewProps::Fed {
-        delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
-    });
-    let mut r = relation_fixture(kind, schema, &[], []);
-    r.ingest_at(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
-        .unwrap();
-    r.ingest_at(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
-        .unwrap();
-    let own = schema.layout_digest();
-    let read = |after_tick| rows_of(&r.delta_read(TID, after_tick, 5, own).unwrap());
-    assert_eq!(read(3), [(7, -1, 70), (7, 1, 70), (8, 1, 80)]);
-    assert_eq!(read(4), [(7, -1, 70), (8, 1, 80)]);
-    assert_eq!(read(5), []);
-    assert_eq!(read(0), [(8, 1, 80)], "the output store folded the pair away");
-
-    r.register(RelationSpec {
-        id: TID + 1,
-        kind: RelationKind::View(ViewProps::Plain),
-        schema,
-        placement: Placement::full_pk(&schema),
-        pk_repeats: false,
-    })
-    .unwrap();
-    for (id, after_tick, layout) in [(TID, 0, own ^ 1), (TID, 3, own ^ 1), (TID + 1, 0, own)] {
-        let Err(err) = r.delta_read(id, after_tick, 5, layout) else {
-            panic!("relation {id} at {after_tick} must be refused");
-        };
-        assert!(matches!(err.status, WireStatus::Error), "{err:?}");
-    }
 }
 
 // ── The drain ramp ───────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 //! and `DELTA_POLL` — in both directions.
 //!
 //! A frame is a prologue header naming the verb (`target_id = 0`), then items to
-//! the end of the frame, each a control frame of that verb with no blob. A
+//! the end of the frame, each a control frame of that verb. A
 //! `DELTA_POLL` prologue's `arg0` is the poll's wait in milliseconds; every other
 //! prologue field is zero.
 //!
@@ -11,7 +11,7 @@
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
 //! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | schema record, data block |
 //! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest                | none                      |
-//! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | none   |
+//! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | blob = `ReadSpec` |
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
 //! ends that position alone; every other fault ends the request.
@@ -32,6 +32,8 @@ pub const BLIND: u64 = u64::MAX;
 /// One item to encode: its header (the verb is the frame's) and its sections.
 pub struct FrameItem<'a> {
     pub hdr: ControlHeader,
+    /// Empty for none; only a verb whose items may carry one decodes with it.
+    pub blob: &'a [u8],
     pub schema: Option<&'a [u8]>,
     pub data: Option<Regions<'a>>,
 }
@@ -46,7 +48,7 @@ fn encode_items_under(verb: ClientVerb, arg0: u64, items: &[FrameItem<'_>]) -> V
     let size = CTRL_HEADER_SIZE
         + items
             .iter()
-            .map(|it| frame_size(&[], it.schema, it.data.as_deref()))
+            .map(|it| frame_size(it.blob, it.schema, it.data.as_deref()))
             .sum::<usize>();
     let mut out = Vec::with_capacity(size);
     let prologue = ControlHeader {
@@ -58,29 +60,40 @@ fn encode_items_under(verb: ClientVerb, arg0: u64, items: &[FrameItem<'_>]) -> V
     for it in items {
         let mut hdr = it.hdr;
         hdr.flags.verb = verb;
-        append_frame(&mut out, &hdr, &[], it.schema, it.data.as_deref());
+        append_frame(&mut out, &hdr, it.blob, it.schema, it.data.as_deref());
     }
     debug_assert_eq!(out.len(), size);
     out
 }
 
-/// A multi-item verb's item shape — whether each item carries a schema record
-/// and a data block — and its item cap; `None` for a single-item verb.
-pub(crate) const fn item_shape(verb: ClientVerb) -> Option<(bool, bool, usize)> {
-    match verb {
-        ClientVerb::DdlTxn => Some((false, true, usize::MAX)),
-        ClientVerb::PushTxn => Some((true, true, usize::MAX)),
-        ClientVerb::ScanMulti => Some((false, false, SCAN_MULTI_MAX_RELATIONS)),
-        ClientVerb::DeltaPoll => Some((false, false, usize::MAX)),
-        _ => None,
-    }
+/// The sections an item of a multi-item verb carries, and how many items one
+/// frame may hold.
+#[derive(Clone, Copy)]
+pub(crate) struct ItemShape {
+    /// Whether an item may carry a blob.
+    pub(crate) blob: bool,
+    pub(crate) schema: bool,
+    pub(crate) data: bool,
+    pub(crate) cap: usize,
+}
+
+/// A multi-item verb's item shape; `None` for a single-item verb.
+pub(crate) const fn item_shape(verb: ClientVerb) -> Option<ItemShape> {
+    let (blob, schema, data, cap) = match verb {
+        ClientVerb::DdlTxn => (false, false, true, usize::MAX),
+        ClientVerb::PushTxn => (false, true, true, usize::MAX),
+        ClientVerb::ScanMulti => (false, false, false, SCAN_MULTI_MAX_RELATIONS),
+        ClientVerb::DeltaPoll => (true, false, false, usize::MAX),
+        _ => return None,
+    };
+    Some(ItemShape { blob, schema, data, cap })
 }
 
 /// Split a multi-item `verb` frame's body into its items, in send order: each
 /// item's own frame bytes and its peeked control. An item's `body` is the empty
 /// range at its end.
 pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], DecodedControl)>, String> {
-    let Some((schema, data, cap)) = item_shape(verb) else {
+    let Some(ItemShape { blob, schema, data, cap }) = item_shape(verb) else {
         return Err(format!("{verb:?} is not a multi-item verb"));
     };
     let item = |rest: &[u8]| -> Result<DecodedControl, String> {
@@ -91,7 +104,7 @@ pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], Decoded
         if ctrl.hdr.flags.verb != verb {
             return Err(format!("an item names verb {:?}", ctrl.hdr.flags.verb));
         }
-        if !ctrl.blob.is_empty() {
+        if !ctrl.blob.is_empty() && !blob {
             return Err("an item carries a blob".into());
         }
         if ctrl.schema.is_some() != schema {
@@ -144,6 +157,7 @@ pub fn encode_scan_multi(relations: &[ScanMultiItem]) -> Vec<u8> {
                 arg0: r.reply_layout,
                 ..Default::default()
             },
+            blob: &[],
             schema: None,
             data: None,
         })
@@ -162,18 +176,23 @@ pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanMultiItem>, String> {
         .collect())
 }
 
-/// One DELTA_POLL item: every delta `view_id` recorded after round `after_tick`
-/// (`0` = the whole view), replied in the layout whose digest is `reply_layout`.
+/// One DELTA_POLL item: `spec` applied to every delta `view_id` recorded after
+/// round `after_tick` (`0` = the whole view), replied in the layout whose digest
+/// is `reply_layout`, which is the spec's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeltaPollItem {
+pub struct DeltaPollItem<'a> {
     pub view_id: u64,
     pub after_tick: u64,
     pub reply_layout: u64,
+    /// An encoded `ReadSpec` forwarding rows with no cut; `ReadSpec::all_rows`
+    /// of no bound for the view's own rows. The worker's decode is the trust
+    /// boundary.
+    pub spec: &'a [u8],
 }
 
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. The
 /// server may hold its reply `wait_ms` while no view has anything new.
-pub fn encode_delta_poll(views: &[DeltaPollItem], wait_ms: u64) -> Vec<u8> {
+pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], wait_ms: u64) -> Vec<u8> {
     let items: Vec<FrameItem> = views
         .iter()
         .map(|v| FrameItem {
@@ -183,6 +202,7 @@ pub fn encode_delta_poll(views: &[DeltaPollItem], wait_ms: u64) -> Vec<u8> {
                 arg1: v.after_tick,
                 ..Default::default()
             },
+            blob: v.spec,
             schema: None,
             data: None,
         })
@@ -192,15 +212,19 @@ pub fn encode_delta_poll(views: &[DeltaPollItem], wait_ms: u64) -> Vec<u8> {
 
 /// Decode a `DELTA_POLL` frame into its wait in milliseconds and its items.
 /// View id `0` is refused: it is the id of a fault ending the request.
-pub fn decode_delta_poll(prologue: &ControlHeader, body: &[u8]) -> Result<(u64, Vec<DeltaPollItem>), String> {
+pub fn decode_delta_poll<'a>(
+    prologue: &ControlHeader,
+    body: &'a [u8],
+) -> Result<(u64, Vec<DeltaPollItem<'a>>), String> {
     let views: Result<Vec<DeltaPollItem>, String> = decode_items(body, ClientVerb::DeltaPoll)?
         .into_iter()
-        .map(|(_, c)| match c.hdr.target_id {
+        .map(|(item, c)| match c.hdr.target_id {
             0 => Err("DeltaPoll: view id 0 names no view".to_string()),
             view_id => Ok(DeltaPollItem {
                 view_id,
                 after_tick: c.hdr.arg1,
                 reply_layout: c.hdr.arg0,
+                spec: &item[c.blob.clone()],
             }),
         })
         .collect();

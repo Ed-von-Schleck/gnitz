@@ -210,6 +210,10 @@ pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
+/// The schema a client's own aliases live in. No server holds it: it starts
+/// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
+pub const LOCAL_SCHEMA: &str = "_local";
+
 /// Reject empty names, names starting with `_` (reserved for the engine's own
 /// internal relation and index names) and names outside `[A-Za-z0-9_]`.
 pub fn validate_user_identifier(name: &str) -> Result<(), String> {

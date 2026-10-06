@@ -36,7 +36,9 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
                 order_limit,
             ]
         }
-        ReadCase::Rows { read, reply_schema } => (read, projection_line(reply_schema, read.spec.sink.map.is_none())),
+        ReadCase::Rows { read, reply_schema, .. } => {
+            (read, projection_line(reply_schema, read.spec.sink.map.is_none()))
+        }
         ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
             let SinkKind::Fold(agg) = &read.spec.sink.kind else {
                 unreachable!("a fold read ships a fold sink")

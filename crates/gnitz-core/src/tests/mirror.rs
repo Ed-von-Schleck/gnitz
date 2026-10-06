@@ -257,7 +257,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             indexes: Vec::new(),
             token: 0,
         };
-        block_on(client.bind(rel("s", name), Arc::new(desc))).unwrap();
+        block_on(client.bind(MirroredView::of_view(rel("s", name), Arc::new(desc)))).unwrap();
     }
     assert!(log.take().is_empty(), "registration tears nothing down");
     (client, peer, log)
@@ -401,6 +401,7 @@ fn a_leftover_poll_does_not_shift_the_replies() {
         view_id: 7,
         after_tick: 4,
         reply_layout: kv_schema(TypeCode::I64).layout_digest(),
+        spec: &[],
     };
     drop(DeltaPoll::start(&mut client.session, &[abandoned], Duration::ZERO));
 

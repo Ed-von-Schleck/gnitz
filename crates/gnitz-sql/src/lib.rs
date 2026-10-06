@@ -31,9 +31,10 @@ mod validate;
 
 pub use error::GnitzSqlError;
 
-use gnitz_core::{GnitzClient, ScanReply};
+use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
@@ -78,6 +79,47 @@ pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> 
         }
     }
     Ok(results)
+}
+
+/// Plan `sql`, one `SELECT` over one view with a delta feed, as a subscription:
+/// what a delta read of the view carries to be answered with only the rows and
+/// columns the `SELECT` keeps. The view's key rides along, hidden where the
+/// `SELECT` does not name it.
+pub async fn plan_subscription(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    sql: &str,
+) -> Result<Subscription, GnitzSqlError> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let [stmt] = &stmts[..] else {
+        return Err(error::unsupported_clause("a subscription", "more than one statement"));
+    };
+    dispatch::plan_subscription(client, schema_name, stmt).await
+}
+
+/// Mirror `sql` as the local relation `alias`; see
+/// [`GnitzClient::mirror_subscription`]. A poll plans `sql` again, in
+/// `schema_name`, whenever what it was planned against may be gone.
+pub async fn mirror_subscription(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    alias: &str,
+    sql: &str,
+) -> Result<PollOutcome, GnitzSqlError> {
+    let sub = plan_subscription(client, schema_name, sql).await?;
+    let (schema_name, sql) = (schema_name.to_string(), sql.to_string());
+    let plan: Planner = Arc::new(move |client| {
+        let (schema_name, sql) = (schema_name.clone(), sql.clone());
+        Box::pin(async move {
+            plan_subscription(client, &schema_name, &sql)
+                .await
+                .map_err(|e| match e {
+                    GnitzSqlError::Client(e) => e,
+                    e => ClientError::from(e.to_string()),
+                })
+        })
+    });
+    Ok(client.mirror_subscription(alias, sub, plan).await?)
 }
 
 // A host spawns a statement onto a multi-thread runtime, or runs it with the

@@ -558,14 +558,17 @@ pub fn project_schema(schema: &SchemaDescriptor, project: &[u32]) -> Result<Sche
 }
 
 /// `schema` keyed by `prefix` followed by its own key, over its payload space —
-/// the layout `Batch::with_key_prefix` copies into. `None` when the key has no
-/// column to spare.
+/// the layout `Batch::with_key_prefix` copies into. `schema`'s columns keep
+/// their numbers and `prefix` is numbered one past them, so a program compiled
+/// over `schema` resolves against the result unchanged. `None` when the key has
+/// no column to spare.
 pub fn key_prefixed_schema(prefix: SchemaColumn, schema: &SchemaDescriptor) -> Option<SchemaDescriptor> {
-    let mut b = DerivedSchema::new();
-    b.push_pk(prefix);
-    b.push_pk_of(schema);
-    b.push_payload_of(schema);
-    b.finish().ok()
+    let n = schema.num_columns();
+    let mut cols = schema.columns[..n].to_vec();
+    cols.push(prefix);
+    let mut pk = vec![n as u32];
+    pk.extend_from_slice(schema.pk_cols());
+    SchemaDescriptor::try_new(&cols, &pk).ok()
 }
 
 #[cfg(test)]

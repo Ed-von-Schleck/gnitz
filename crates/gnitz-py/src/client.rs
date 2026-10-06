@@ -177,6 +177,11 @@ impl Drop for PyClient {
     }
 }
 
+/// The spec of a delta read that names none: the view whole.
+fn whole_view() -> Vec<u8> {
+    gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode()
+}
+
 /// A poll's `wait`, given in seconds.
 fn poll_wait(seconds: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(seconds)
@@ -328,41 +333,74 @@ impl PyClient {
         )
     }
 
-    /// delta_bootstrap(view_id, view_schema) -> (rows, cursor)
+    /// subscription(sql) -> (view_id, schema, spec)
     ///
-    /// The view's whole current value, and the cursor `delta_poll` continues
-    /// from.
-    fn delta_bootstrap(slf: &Bound<'_, Self>, view_id: u64, view_schema: PySchema) -> PyResult<Py<PyAny>> {
+    /// Plan `sql`, one `SELECT` over one view with a delta feed, as what
+    /// `delta_bootstrap` and `delta_poll` take to answer with only the rows and
+    /// columns it keeps: the view's id, the schema the replies come in, and the
+    /// spec to pass. The view's key rides along, hidden where the `SELECT` does
+    /// not name it. An aggregate, `DISTINCT`, `ORDER BY` and `LIMIT` are refused.
+    fn subscription(slf: &Bound<'_, Self>, sql: String) -> PyResult<Py<PyAny>> {
+        let sn = Self::schema_name(slf)?;
         Self::run(
             slf,
-            whole!(|c| c.delta_bootstrap(view_id, &view_schema.rust).await?),
+            whole!(|c| gnitz_sql::plan_subscription(c, &sn, &sql).await?),
+            |py, s| {
+                (
+                    s.upstream.tid,
+                    PySchema { rust: s.schema },
+                    pyo3::types::PyBytes::new(py, &s.spec),
+                )
+                    .into_py_any(py)
+            },
+        )
+    }
+
+    /// delta_bootstrap(view_id, schema, spec=None) -> (rows, cursor)
+    ///
+    /// The view's whole current value, and the cursor `delta_poll` continues
+    /// from. Under a `subscription`'s `spec` and `schema` it is what the
+    /// subscription keeps of the view; every later `delta_poll` of that copy
+    /// takes the same two.
+    #[pyo3(signature = (view_id, schema, spec = None))]
+    fn delta_bootstrap(
+        slf: &Bound<'_, Self>,
+        view_id: u64,
+        schema: PySchema,
+        spec: Option<Vec<u8>>,
+    ) -> PyResult<Py<PyAny>> {
+        let spec = spec.unwrap_or_else(whole_view);
+        Self::run(
+            slf,
+            whole!(|c| c.delta_bootstrap(view_id, &schema.rust, &spec).await?),
             delta,
         )
     }
 
-    /// delta_poll(view_id, view_schema, cursor, wait=0.0) -> (rows, cursor)
+    /// delta_poll(view_id, schema, cursor, wait=0.0, spec=None) -> (rows, cursor)
     ///
     /// The view's deltas since `cursor`, and the cursor past them: every push
     /// acknowledged before the call is in them. Raises
     /// `GnitzDeltaExpiredError` for a cursor whose rounds are gone, or that is
-    /// another boot's or relation's: bootstrap again.
+    /// another boot's, another relation's or another `spec`'s: bootstrap again.
     ///
-    /// With nothing new, the server holds the reply until a commit reaches a
-    /// relation the view reads, or `wait` seconds pass.
-    #[pyo3(signature = (view_id, view_schema, cursor, wait = 0.0))]
+    /// With nothing to report, the server holds the reply until a round leaves
+    /// the view a row `spec` keeps, or `wait` seconds pass.
+    #[pyo3(signature = (view_id, schema, cursor, wait = 0.0, spec = None))]
     fn delta_poll(
         slf: &Bound<'_, Self>,
         view_id: u64,
-        view_schema: PySchema,
+        schema: PySchema,
         cursor: (u64, u64),
         wait: f64,
+        spec: Option<Vec<u8>>,
     ) -> PyResult<Py<PyAny>> {
         let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
             .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
-        let wait = poll_wait(wait)?;
+        let (wait, spec) = (poll_wait(wait)?, spec.unwrap_or_else(whole_view));
         Self::run(
             slf,
-            whole!(|c| c.delta_poll(view_id, cursor, &view_schema.rust, wait).await?),
+            whole!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec, wait).await?),
             delta,
         )
     }
@@ -489,6 +527,28 @@ impl PyClient {
         })
     }
 
+    /// mirror_subscription(alias, sql) -> PollResult
+    ///
+    /// Mirror what `sql` keeps of one view — a `SELECT` as `subscription` takes
+    /// it — as the local relation `_local.<alias>`, and bring its copy up to
+    /// date; idempotent as `mirror_view` is. The server sends only those rows
+    /// and columns, and the copy carries each of the view's indexes whose
+    /// columns the `SELECT` keeps.
+    ///
+    /// A read of `_local.<alias>` is answered off the copy and never upstream;
+    /// the view itself is still read upstream, whole. Several aliases may read
+    /// one view. `poll` advances an alias with the mirrored views, and plans
+    /// `sql` again when its view was dropped and recreated, its feed expired or
+    /// the connection replaced.
+    fn mirror_subscription(slf: &Bound<'_, Self>, alias: String, sql: String) -> PyResult<Py<PyAny>> {
+        let sn = Self::schema_name(slf)?;
+        Self::run(
+            slf,
+            whole!(|c| gnitz_sql::mirror_subscription(c, &sn, &alias, &sql).await?),
+            |py, outcome| PyPollResult::new(py, outcome).into_py_any(py),
+        )
+    }
+
     /// forget_view(view_id) — stop mirroring the relation. The copy goes, and a
     /// later read of it is delegated upstream.
     fn forget_view(slf: &Bound<'_, Self>, view_id: u64) -> PyResult<Py<PyAny>> {
@@ -497,8 +557,8 @@ impl PyClient {
 
     /// poll(wait=0.0) -> list[PollResult]
     ///
-    /// Advance every registered view by one poll each — one entry per view,
-    /// whatever happened to it. A view that failed carries its exception in
+    /// Advance every registered view and alias by one poll each — one entry per
+    /// copy, whatever happened to it. A view that failed carries its exception in
     /// `error`; the others went on. It raises only for a failure of the call
     /// itself: no store attached, a poisoned one, or a `KeyboardInterrupt`.
     ///

@@ -3,8 +3,9 @@
 use std::hash::{Hash, Hasher};
 
 /// A relation's schema and its name there, each a name a user may give: the
-/// engine's own relations have none. Two spellings of one catalog name are
-/// equal.
+/// engine's own relations have none. The one schema it may spell that no user
+/// can create is [`gnitz_wire::LOCAL_SCHEMA`], whose relations are the client's
+/// own. Two spellings of one catalog name are equal.
 #[derive(Clone, Debug)]
 pub struct RelName {
     /// `schema.name`, folded to its catalog form.
@@ -17,10 +18,12 @@ pub struct RelName {
 
 impl RelName {
     pub fn new(schema: &str, name: &str) -> Result<Self, String> {
-        let key = gnitz_wire::qualified_key(
-            &gnitz_wire::canonical_identifier(schema)?,
-            &gnitz_wire::canonical_identifier(name)?,
-        );
+        // The one reserved schema a name may spell: a client's own.
+        let schema_key = match schema.eq_ignore_ascii_case(gnitz_wire::LOCAL_SCHEMA) {
+            true => gnitz_wire::LOCAL_SCHEMA.to_string(),
+            false => gnitz_wire::canonical_identifier(schema)?,
+        };
+        let key = gnitz_wire::qualified_key(&schema_key, &gnitz_wire::canonical_identifier(name)?);
         Ok(RelName {
             key,
             spelled: gnitz_wire::qualified_key(schema, name),

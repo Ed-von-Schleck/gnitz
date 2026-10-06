@@ -712,7 +712,7 @@ impl GnitzClient {
     ///
     /// A copy rides along with every cursor dropped: the new connection may be a
     /// different server, where the same name is a different id, so the next
-    /// poll re-resolves every view by name. A poisoned store crosses unchanged.
+    /// poll resolves every view by name again, and plans every alias. A poisoned store crosses unchanged.
     pub async fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
             return Err(ClientError::from(
@@ -741,36 +741,46 @@ impl GnitzClient {
     }
 
     /// Bootstrap a view's delta feed: the view's whole current value at its true
-    /// net weights, in the view's own schema, and the cursor to poll from. It
-    /// replaces a copy's state; it does not add to it.
+    /// net weights, and the cursor to poll from. It replaces a copy's state; it
+    /// does not add to it.
+    ///
+    /// `spec` is an encoded `ReadSpec` forwarding rows with no cut: the reply is
+    /// that spec applied to the view, in `reply_schema`, which is the view's own
+    /// under `ReadSpec::all_rows` of no bound. Every later poll of the copy
+    /// carries the same `spec`.
     pub async fn delta_bootstrap(
         &mut self,
         view_id: u64,
-        view_schema: &Arc<Schema>,
+        reply_schema: &Arc<Schema>,
+        spec: &[u8],
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, Duration::ZERO, view_schema).await
+        self.delta_read(view_id, 0, Duration::ZERO, reply_schema, spec).await
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
-    /// with the cursor to poll from next. The reply comes back in the view's
-    /// schema, weights and all. Apply what comes back and store the new cursor;
-    /// there is nothing to filter and nothing to reconcile.
+    /// under `spec`, with the cursor to poll from next. The reply comes back in
+    /// `reply_schema`, weights and all. Apply what comes back and store the new
+    /// cursor; there is nothing to reconcile.
     ///
     /// A reply whose tag does not continue the cursor is refused as
     /// `DeltaExpired`: discard the copy and
-    /// [`delta_bootstrap`](Self::delta_bootstrap) again.
+    /// [`delta_bootstrap`](Self::delta_bootstrap) again. A cursor handed out
+    /// under another `spec` is refused the same way.
     ///
-    /// It carries every push acknowledged before it. With nothing new, the
-    /// server holds the reply until a commit reaches a relation the view reads,
+    /// It carries every push acknowledged before it. With nothing to report, the
+    /// server holds the reply until a round leaves the view a row `spec` keeps,
     /// or `wait` passes.
     pub async fn delta_poll(
         &mut self,
         view_id: u64,
         cursor: DeltaCursor,
-        view_schema: &Arc<Schema>,
+        reply_schema: &Arc<Schema>,
+        spec: &[u8],
         wait: Duration,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (data, next) = self.delta_read(view_id, cursor.tick.get(), wait, view_schema).await?;
+        let (data, next) = self
+            .delta_read(view_id, cursor.tick.get(), wait, reply_schema, spec)
+            .await?;
         Ok((data, cursor.advanced_to(next)?))
     }
 
@@ -782,11 +792,13 @@ impl GnitzClient {
         after_tick: u64,
         wait: Duration,
         reply_schema: &Arc<Schema>,
+        spec: &[u8],
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
         let item = DeltaPollItem {
             view_id,
             after_tick,
             reply_layout: reply_schema.layout_digest(),
+            spec,
         };
         let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
@@ -1066,7 +1078,11 @@ impl GnitzClient {
         }
         for (name, desc) in renamed {
             let tid = desc.tid;
-            if self.bind(name, desc).await.is_err() {
+            if self
+                .bind(crate::mirror::MirroredView::of_view(name, desc))
+                .await
+                .is_err()
+            {
                 let _ = self.forget_view(tid).await;
             }
         }

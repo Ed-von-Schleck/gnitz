@@ -137,7 +137,7 @@ impl<'d> ScanCut<'d> {
             unreachable!("a cut routes reads; {:?} is none", group.request)
         };
         let bound = match read {
-            Read::ScanSpec { spec, .. } => Some(&spec[..]),
+            Read::ScanSpec { spec, .. } | Read::Delta { read: spec, .. } => Some(&spec[..]),
             _ => None,
         };
         let tid = read.target();

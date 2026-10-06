@@ -272,3 +272,16 @@ pub(crate) async fn execute_statement(
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }
 }
+
+/// Plan `stmt`, a `SELECT` over one fed view, as a subscription, against the
+/// server's own descriptors: what a copy holds is no source to subscribe to.
+pub(crate) async fn plan_subscription(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    stmt: &Statement,
+) -> Result<gnitz_core::Subscription, GnitzSqlError> {
+    planned(client, schema_name, false, false, |cat| dml::plan_read(stmt, cat))
+        .await
+        .0?
+        .into_subscription()
+}

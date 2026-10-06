@@ -84,6 +84,9 @@ pub(crate) struct RowsReply {
     /// Whether `order` ascends a leading run of the relation's PK columns, so
     /// rows in store order are already in it.
     pub(crate) pk_ordered: bool,
+    /// `(relation column, reply column)` for each relation column an item copies
+    /// verbatim, at the first item that does.
+    pub(crate) copied: Vec<(u32, u32)>,
 }
 
 /// The rows reply `rows` produces over `desc`, ordered by `keys`.
@@ -164,6 +167,12 @@ pub(crate) fn rows_reply(
             renumbered(&|i| sink_at[i]),
         ),
     };
+    let mut copied: Vec<(u32, u32)> = Vec::new();
+    for (i, src) in sources.iter().enumerate() {
+        if let Some(src) = src.map(|s| s as u32).filter(|s| copied.iter().all(|(c, _)| c != s)) {
+            copied.push((src, reply_at[i] as u32));
+        }
+    }
     let reply =
         Schema::from_parts(columns, pk_cols).map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
     Ok(RowsReply {
@@ -172,6 +181,7 @@ pub(crate) fn rows_reply(
         order: renumbered(&|i| reply_at[i]),
         sink_order,
         pk_ordered,
+        copied,
     })
 }
 

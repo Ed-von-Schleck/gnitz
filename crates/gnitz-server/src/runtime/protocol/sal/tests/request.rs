@@ -37,13 +37,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
             spec: vec![27u8, 28, 29].into(),
         }
         .into(),
-        Read::Delta {
-            view: 30,
-            after_tick: 31,
-            cut_round: 32,
-            reply_layout: 33,
-        }
-        .into(),
+        Read::delta(30, 31, 32, &[33, 34, 35], 36).into(),
     ]
 }
 
@@ -102,7 +96,7 @@ fn a_blob_of_the_wrong_width_is_refused() {
     let hdr = ControlHeader::default();
     for (kind, blob) in [
         (SalMessageKind::Tick, &[0u8; 12][..]),
-        (SalMessageKind::DeltaRead, &[0u8; 12][..]),
+        (SalMessageKind::DeltaRead, &[0u8; 7][..]),
         (SalMessageKind::DeltaRead, &[][..]),
     ] {
         assert!(

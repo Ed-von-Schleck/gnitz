@@ -23,8 +23,9 @@ pub(crate) fn delta_round(delta_key: &[u8]) -> u64 {
     u64::from_be_bytes(tick.try_into().expect("a delta key leads with its round"))
 }
 
-/// The delta store's schema for a fed view: a `_tick` U64 key column, then the
-/// view's PK, then its payload, so the view's payload space is the delta's.
+/// The delta store's schema for a fed view: its key is a `_tick` U64 column, then
+/// the view's PK, and its payload space is the view's. The view's columns keep
+/// their numbers, so a program compiled over the view runs on the store's rows.
 /// Derived rather than persisted, as an index schema is. `None` for a view with
 /// no column to spare for the stamp.
 pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {

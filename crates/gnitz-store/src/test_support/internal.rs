@@ -125,6 +125,20 @@ pub(crate) fn rows_spec(map: Option<ComputeMap>, cut: Option<RowsCut>) -> ReadSp
     }
 }
 
+/// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
+pub(crate) fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
+    let mut eb = gnitz_expr::ExprBuilder::new();
+    let v = eb.emit(gnitz_expr::LogicalInstr::LoadCol { col });
+    let lo_c = eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lo, unsigned: false });
+    let mut keep = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Ge, a: v, b: lo_c });
+    if let Some(hi) = hi {
+        let hi_c = eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: hi, unsigned: false });
+        let lt = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Lt, a: v, b: hi_c });
+        keep = eb.emit(gnitz_expr::LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
+    }
+    eb.build(vec![gnitz_expr::Sink::Reg(keep)]).unwrap().to_blob_bytes()
+}
+
 /// `program` as a sink map declaring `reply`'s payload columns.
 pub(crate) fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Option<ComputeMap> {
     let out_cols = reply

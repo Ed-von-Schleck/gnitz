@@ -3,17 +3,15 @@
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
 use gnitz_expr::SchemaFacts;
-use gnitz_wire::{PkKeys, ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
+use gnitz_wire::{PkKeys, ReadSpec};
 
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::relation::RelationRegistry;
-use crate::relation::{delta_round, delta_round_prefix};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::{Batch, SkeletonKeys, SourceCursor};
-use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 use gnitz_zset::schema::SchemaDescriptor;
 
 impl RelationRegistry {
@@ -26,19 +24,15 @@ impl RelationRegistry {
         reply_layout: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, String> {
-        let ReadSpec { bound, predicate, sink } = spec;
         let entry = self.relation_or_err(target_id)?;
         let src_schema = entry.schema();
-        // Nothing bounded, filtered, mapped or cut, and nothing to hydrate: the
-        // relation whole, off the store's cached snapshot.
-        if let (ReadBound::None, true, None, SinkKind::Rows { cut: None }) =
-            (&bound, predicate.is_empty(), &sink.map, &sink.kind)
-        {
-            if !entry.table().has_skeleton_rows() {
-                check_layout(reply_layout, &src_schema)?;
-                return Ok(entry.full_scan());
-            }
+        // Nothing to hydrate either: the relation whole, off the store's cached
+        // snapshot.
+        if spec.is_whole() && !entry.table().has_skeleton_rows() {
+            check_layout(reply_layout, &src_schema)?;
+            return Ok(entry.full_scan());
         }
+        let ReadSpec { bound, predicate, sink } = spec;
         let (source, unapplied) = self.open_bound(target_id, bound)?;
         // A bad predicate and a bad walk are both a corrupt request: the client
         // pre-compiled the identical program at plan time.
@@ -64,58 +58,11 @@ impl RelationRegistry {
         }
         Ok(Rc::new(sink.finish()))
     }
-
-    /// Every delta `id`'s feed recorded in rounds `(after_tick, cut_tick]`, in the
-    /// view's schema whatever `after_tick`; `0` walks the view's own output store.
-    /// A cursor below the retained floor is refused as [`WireStatus::DeltaExpired`];
-    /// every other refusal is `Error`.
-    pub fn delta_read(
-        &self,
-        id: u64,
-        after_tick: u64,
-        cut_tick: u64,
-        reply_layout: u64,
-    ) -> Result<Rc<Batch>, WireFault> {
-        let entry = self.relation_or_err(id)?;
-        if !entry.kind().has_delta_feed() {
-            return Err(format!(
-                "delta_read: relation {id} carries no delta feed; \
-                 create the view WITH (delta = '<size>') to subscribe to it"
-            )
-            .into());
-        }
-        let view = entry.schema();
-        check_layout(reply_layout, &view)?;
-        if after_tick == 0 {
-            return Ok(entry.full_scan());
-        }
-        let feed = entry
-            .delta()
-            .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
-        let dropped_through = delta_round(feed.dropped_max().pk_bytes());
-        // A cursor at the floor has lost nothing.
-        if after_tick < dropped_through {
-            return Err(WireFault {
-                status: WireStatus::DeltaExpired,
-                text: format!(
-                    "delta cursor {after_tick} of relation {id} is below the \
-                     retained floor {dropped_through}; re-read at 0"
-                ),
-            });
-        }
-        let band = key_range_between_cuts(
-            KeyCut::above(&delta_round_prefix(after_tick)),
-            KeyCut::above(&delta_round_prefix(cut_tick)),
-            feed.schema().pk_stride(),
-        );
-        let rows = feed.range_cursor(band).materialize();
-        Ok(Rc::new(rows.without_key_prefix(&view)))
-    }
 }
 
 /// The reply guard's refusal: a keeper built in any other layout would ship its
 /// regions under the client's strides.
-fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), String> {
+pub(super) fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), String> {
     if reply_layout != produced.layout_digest() {
         return Err("reply schema does not match the output layout".to_string());
     }

@@ -63,6 +63,8 @@ pub(super) enum ReadCase {
     Rows {
         read: SpecRead,
         reply_schema: Arc<Schema>,
+        /// [`RowsReply::copied`].
+        copied: Vec<(u32, u32)>,
     },
     Fold {
         read: SpecRead,
@@ -73,10 +75,7 @@ pub(super) enum ReadCase {
         is_distinct: bool,
     },
     /// A FROM-less SELECT: its one row, finished at plan time.
-    Constant {
-        schema: Arc<Schema>,
-        row: ZSetBatch,
-    },
+    Constant { schema: Arc<Schema>, row: ZSetBatch },
 }
 
 /// The relation a `ReadSpec` names, and what ships.
@@ -103,6 +102,38 @@ impl ReadPlan {
     #[cfg(test)]
     pub(crate) fn spec(&self) -> Option<&ReadSpec> {
         self.spec_read().map(|read| &read.spec)
+    }
+
+    /// This read as the subscription a delta read carries: a rows read with
+    /// nothing ordered, cut or folded, since a delta of any of those is not
+    /// that read of a delta.
+    pub(crate) fn into_subscription(self) -> Result<gnitz_core::Subscription, GnitzSqlError> {
+        // Only a LIMIT cuts the sink, so no window is no cut.
+        let plain = self.order.is_empty() && self.window.offset == 0 && self.window.limit.is_none();
+        match self.case {
+            ReadCase::Rows { read, reply_schema, copied } if plain => {
+                // An index survives where every column it lists does, under the
+                // reply's numbering.
+                let at = |c: &u32| copied.iter().find(|(src, _)| src == c).map(|&(_, to)| to);
+                let indexes = read.desc.indexes.iter().filter_map(|ix| {
+                    let cols: Option<Vec<u32>> = ix.cols.as_slice().iter().map(at).collect();
+                    Some(gnitz_wire::RelIndex {
+                        cols: gnitz_wire::PkColList::from_slice(&cols?),
+                        is_unique: ix.is_unique,
+                    })
+                });
+                Ok(gnitz_core::Subscription {
+                    indexes: indexes.collect(),
+                    spec: read.spec.encode(),
+                    schema: reply_schema,
+                    upstream: read.desc,
+                })
+            }
+            _ => Err(crate::error::unsupported_clause(
+                "a subscription",
+                "an aggregate, DISTINCT, ORDER BY, LIMIT or OFFSET",
+            )),
+        }
     }
 
     /// The relation read and what ships; `None` for a constant row.
@@ -262,6 +293,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 order,
                 sink_order,
                 pk_ordered,
+                copied,
             } = rows_reply(rows, &keys, &desc)?;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
             let cut = window
@@ -280,7 +312,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 map: program.map(|p| compute_map(p, &reply_schema)),
                 kind: SinkKind::Rows { cut },
             };
-            (ReadCase::Rows { read: read(sink), reply_schema }, order)
+            (ReadCase::Rows { read: read(sink), reply_schema, copied }, order)
         }
     };
     Ok(ReadPlan { case, order, window })
@@ -363,7 +395,7 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
     let ReadPlan { case, order, window } = plan;
     let (schema, batch, lsn) = match case {
         ReadCase::Constant { schema, row } => (schema, row, None),
-        ReadCase::Rows { read, reply_schema } => {
+        ReadCase::Rows { read, reply_schema, .. } => {
             let reply = client
                 .scan_spec_local_first(&*read.desc, read.spec, &reply_schema)
                 .await?;

@@ -172,6 +172,21 @@ impl PkKeys {
         self.bytes.chunks_exact(self.stride())
     }
 
+    /// Whether `key`, of this list's stride, is one of its keys.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        debug_assert_eq!(key.len(), self.stride());
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.bytes[mid * self.stride()..][..self.stride()].cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
     /// The first and last key, or `None` for an empty list.
     pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
         let first = self.iter().next()?;
@@ -216,6 +231,20 @@ impl ReadSpec {
             predicate: Vec::new(),
             sink: ReadSink::all_rows(),
         }
+    }
+
+    /// Whether this is the relation whole: nothing bounded, filtered, mapped,
+    /// cut or folded.
+    pub fn is_whole(&self) -> bool {
+        matches!(self.bound, ReadBound::None)
+            && self.predicate.is_empty()
+            && matches!(
+                self.sink,
+                ReadSink {
+                    map: None,
+                    kind: SinkKind::Rows { cut: None }
+                }
+            )
     }
 
     /// The SCAN_SPEC request blob.

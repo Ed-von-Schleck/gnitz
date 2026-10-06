@@ -435,6 +435,7 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
         view_id,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
+        spec: &[],
     };
     for refused in [true, false] {
         let (mut s, peer) = pair();
@@ -491,6 +492,7 @@ fn an_abandoned_poll_queues_nothing() {
         view_id,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
+        spec: &[],
     };
     let terminal = |tid| ControlHeader {
         target_id: tid,

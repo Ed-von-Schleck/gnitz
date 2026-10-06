@@ -26,14 +26,15 @@ fn the_delta_schema_stamps_the_view_key_and_keeps_its_payload_space() {
     assert_eq!(
         types(&delta),
         [
+            (TypeCode::I64, true),
             (TypeCode::U64, false),
+            (TypeCode::String, false),
             (TypeCode::I32, false),
             (TypeCode::U64, false),
-            (TypeCode::I64, true),
-            (TypeCode::String, false),
         ],
+        "the view's columns under their own numbers, then the stamp",
     );
-    assert_eq!(delta.pk_cols(), [0, 1, 2]);
+    assert_eq!(delta.pk_cols(), [4, 3, 1]);
     assert_eq!(delta.pk_stride(), 8 + view.pk_stride());
     let payload = |s: &SchemaDescriptor| -> Vec<TypeCode> { s.payload_columns().map(|(_, c)| c.type_code).collect() };
     assert_eq!(payload(&delta), payload(&view));
