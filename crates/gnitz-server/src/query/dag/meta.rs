@@ -71,10 +71,11 @@ impl DepMap {
     }
 
     /// Every id one or more edges from some seed over one half of the map — a
-    /// seed only when another seed reaches it.
+    /// seed only when another seed reaches it. Seeds with no edge allocate
+    /// nothing.
     fn closure(edges: &FxHashMap<u64, Vec<u64>>, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
         let mut reachable: FxHashSet<u64> = FxHashSet::default();
-        let mut stack: Vec<u64> = seeds.into_iter().collect();
+        let mut stack: Vec<u64> = seeds.into_iter().filter(|id| edges.contains_key(id)).collect();
         while let Some(id) = stack.pop() {
             for &next in edges.get(&id).into_iter().flatten() {
                 if reachable.insert(next) {

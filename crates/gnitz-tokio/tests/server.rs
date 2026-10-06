@@ -8,6 +8,7 @@ mod support;
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::future::Future;
 
@@ -243,13 +244,10 @@ fn a_shared_client_mirrors() {
         },
     ))
     .unwrap();
-    // A push, then a read against the server: the read drains the pending
-    // ticks, so the rounds a mirror reads already exist.
-    let mut push_and_tick = |pks| {
+    let mut push = |pks| {
         block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
-        block_on(blocking.scan_spec(vid, &all_rows(), &schema)).unwrap();
     };
-    push_and_tick(0..50);
+    push(0..50);
 
     settled(&Runtime::new().unwrap(), async {
         let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
@@ -282,11 +280,11 @@ fn a_shared_client_mirrors() {
             assert_eq!(mirrored.view_id, vid);
 
             // Two clones polling at once: the second runs after the first.
-            push_and_tick(50..100);
+            push(50..100);
             let (a, b) = (client.clone(), client.clone());
             let (polled_a, polled_b) = tokio::join!(
-                a.run(|c| Box::pin(c.poll_mirror())),
-                b.run(|c| Box::pin(c.poll_mirror()))
+                a.run(|c| Box::pin(c.poll_mirror(Duration::ZERO))),
+                b.run(|c| Box::pin(c.poll_mirror(Duration::ZERO)))
             );
             for outcome in polled_a.unwrap().unwrap().into_iter().chain(polled_b.unwrap().unwrap()) {
                 assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");

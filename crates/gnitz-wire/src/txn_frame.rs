@@ -2,7 +2,9 @@
 //! and `DELTA_POLL` — in both directions.
 //!
 //! A frame is a prologue header naming the verb (`target_id = 0`), then items to
-//! the end of the frame, each a control frame of that verb with no blob:
+//! the end of the frame, each a control frame of that verb with no blob. A
+//! `DELTA_POLL` prologue's `arg0` is the poll's wait in milliseconds; every other
+//! prologue field is zero.
 //!
 //! | Verb         | Item header                                              | Sections                  |
 //! |--------------|----------------------------------------------------------|---------------------------|
@@ -23,11 +25,6 @@ use crate::{ClientVerb, WireFlags, WireStatus};
 /// covers a realistic consistent snapshot.
 pub(crate) const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 
-/// Maximum views in one `DELTA_POLL`: the ceiling on the leases and reply
-/// trains one poll puts on the master. A mirroring host holds tens of views, and
-/// a host past this chunks into a second request.
-pub const DELTA_POLL_MAX_VIEWS: usize = 64;
-
 /// The basis of a `PUSH_TXN` family built from no read. No read reports it, and
 /// no commit exceeds it.
 pub const BLIND: u64 = u64::MAX;
@@ -41,6 +38,11 @@ pub struct FrameItem<'a> {
 
 /// Encode a multi-item `verb` frame, without the 4-byte frame length prefix.
 pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
+    encode_items_under(verb, 0, items)
+}
+
+/// [`encode_items`] with the prologue's `arg0`.
+fn encode_items_under(verb: ClientVerb, arg0: u64, items: &[FrameItem<'_>]) -> Vec<u8> {
     let size = CTRL_HEADER_SIZE
         + items
             .iter()
@@ -49,6 +51,7 @@ pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(size);
     let prologue = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
+        arg0,
         ..Default::default()
     };
     append_frame(&mut out, &prologue, &[], None, None);
@@ -68,7 +71,7 @@ pub(crate) const fn item_shape(verb: ClientVerb) -> Option<(bool, bool, usize)> 
         ClientVerb::DdlTxn => Some((false, true, usize::MAX)),
         ClientVerb::PushTxn => Some((true, true, usize::MAX)),
         ClientVerb::ScanMulti => Some((false, false, SCAN_MULTI_MAX_RELATIONS)),
-        ClientVerb::DeltaPoll => Some((false, false, DELTA_POLL_MAX_VIEWS)),
+        ClientVerb::DeltaPoll => Some((false, false, usize::MAX)),
         _ => None,
     }
 }
@@ -168,8 +171,9 @@ pub struct DeltaPollItem {
     pub reply_layout: u64,
 }
 
-/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix.
-pub fn encode_delta_poll(views: &[DeltaPollItem]) -> Vec<u8> {
+/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. The
+/// server may hold its reply `wait_ms` while no view has anything new.
+pub fn encode_delta_poll(views: &[DeltaPollItem], wait_ms: u64) -> Vec<u8> {
     let items: Vec<FrameItem> = views
         .iter()
         .map(|v| FrameItem {
@@ -183,13 +187,13 @@ pub fn encode_delta_poll(views: &[DeltaPollItem]) -> Vec<u8> {
             data: None,
         })
         .collect();
-    encode_items(ClientVerb::DeltaPoll, &items)
+    encode_items_under(ClientVerb::DeltaPoll, wait_ms, &items)
 }
 
-/// Decode a `DELTA_POLL` frame body into its items. View id `0` is refused: it
-/// is the id of a fault ending the request.
-pub fn decode_delta_poll(body: &[u8]) -> Result<Vec<DeltaPollItem>, String> {
-    decode_items(body, ClientVerb::DeltaPoll)?
+/// Decode a `DELTA_POLL` frame into its wait in milliseconds and its items.
+/// View id `0` is refused: it is the id of a fault ending the request.
+pub fn decode_delta_poll(prologue: &ControlHeader, body: &[u8]) -> Result<(u64, Vec<DeltaPollItem>), String> {
+    let views: Result<Vec<DeltaPollItem>, String> = decode_items(body, ClientVerb::DeltaPoll)?
         .into_iter()
         .map(|(_, c)| match c.hdr.target_id {
             0 => Err("DeltaPoll: view id 0 names no view".to_string()),
@@ -199,7 +203,8 @@ pub fn decode_delta_poll(body: &[u8]) -> Result<Vec<DeltaPollItem>, String> {
                 reply_layout: c.hdr.arg0,
             }),
         })
-        .collect()
+        .collect();
+    Ok((prologue.arg0, views?))
 }
 
 #[cfg(test)]

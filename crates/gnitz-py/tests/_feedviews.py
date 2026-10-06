@@ -11,6 +11,10 @@ feed" a comparison of two mechanisms rather than of two setups.
 "capacity is invisible" is a claim about the shapes the other two already cover.
 """
 
+import threading
+import time
+
+import gnitz
 from _read import bag
 
 # Big enough that nothing built on these helpers falls off the window; a test
@@ -47,10 +51,10 @@ class Subscriber:
         # A bootstrap replaces state; it does not add to it.
         self.copy = bag(rows.including_hidden())
 
-    def poll(self):
+    def poll(self, wait=0.0):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor)
+        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor, wait)
         for k, w in bag(rows.including_hidden()).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
@@ -58,8 +62,9 @@ class Subscriber:
         return rows
 
     def drain(self):
-        """Collect every round that exists: one poll, since a poll covers
-        everything past its cursor — so the next one must come back empty."""
+        """Collect every push acknowledged so far: one poll, since a poll ticks
+        what is pending and covers everything past its cursor — so the next
+        one must come back empty."""
         self.poll()
         assert len(self.poll()) == 0, "one poll left a round behind"
 
@@ -67,17 +72,23 @@ class Subscriber:
         return bag(self.client.scan(self.vid, self.schema).including_hidden())
 
     def assert_converged(self, what=""):
-        """Quiesce, then require the copy to equal the view as a multiset.
-
-        The order matters: a poll does **not** drive a tick and a scan does, so
-        a push ACKed but not yet ticked is in the scan and not in the copy — a
-        real and intended divergence that the next poll heals. Scanning first
-        drains, so the rounds exist before the polls that collect them.
-        """
-        live = self.scan()
+        """Poll, then require the copy to equal the view as a multiset."""
         self.drain()
+        live = self.scan()
         assert live or self.copy, f"{what}: both sides are empty, so they agree about nothing"
         assert self.copy == live, what
+
+
+def later(target, schema, after, statement):
+    """Run `statement` from a connection of its own, `after` seconds from now."""
+    def run():
+        with gnitz.connect(target, schema=schema) as other:
+            time.sleep(after)
+            other.execute_sql(statement)
+
+    t = threading.Thread(target=run)
+    t.start()
+    return t
 
 
 def mk_feed(client, name, body, feed=FEED):

@@ -17,12 +17,13 @@ the raw `delta_bootstrap` / `delta_poll` verbs, whose refusals a mirror hides.
 """
 import hashlib
 import os
+import time
 
 import pytest
 import gnitz
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP, SWEEP_ENV,
-    Subscriber, base_tables, churn, flood, mk_feed,
+    Subscriber, base_tables, churn, flood, later, mk_feed,
 )
 from _paths import relation_dir
 from _serverproc import NEEDS_MULTI
@@ -139,17 +140,10 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
         assert sal_digest() == before, "an up-to-date poll must write no SAL bytes"
 
 
-def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
-    """Every other read of a stream-fed view drains the tick a push leaves
-    pending. A delta poll answers "what has
-    happened", so it drains nothing — else every poll would tick the whole server.
-
-    Observable because a drain is synchronous: a poll issued right after a push
-    ACK either already carries that push (it drained) or does not. These rounds
-    are far below any row count that triggers a tick on its own, so every poll
-    comes back empty — and each round must still arrive on a later poll, as its
-    own round rather than folded into its neighbour.
-    """
+def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
+    """A poll issued right after a push ACK carries that push. Over a stream and
+    far below the row count that ticks on its own, so only the poll can have
+    ticked it."""
     client.execute_sql(
         "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, amount BIGINT NOT NULL) "
         "WITH (stream = true)",
@@ -163,9 +157,37 @@ def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
         client.execute_sql(
             "INSERT INTO ev VALUES " + ",".join(f"({r * 50 + i}, {i % 4}, {i + 1})" for i in range(50)),
         )
-        assert len(sub.poll()) == 0, f"poll {r} carried the push it raced — it drove a tick"
+        assert len(sub.poll()) > 0, f"poll {r} did not carry the push it followed"
+        assert len(sub.poll()) == 0, f"poll {r} left part of its round behind"
+        assert sub.copy == sub.scan(), f"after poll {r}"
 
-    sub.assert_converged("after the undrained polls")
+    sub.assert_converged("after the polls")
+
+
+def test_a_waiting_poll_is_held_until_a_commit_reaches_the_view(client, server):
+    """With `wait`, a poll that has nothing to report is held for the wait, and a
+    commit ends it at once with the commit's rows."""
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    sub = Subscriber(client, "f")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+    sub.bootstrap()
+    sub.drain()
+
+    t0 = time.monotonic()
+    assert len(sub.poll(wait=0.3)) == 0
+    assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
+
+    writer = later(server, client.schema, 0.2, "INSERT INTO t VALUES (2, 200, 'late')")
+    t0 = time.monotonic()
+    got = sub.poll(wait=60)
+    assert time.monotonic() - t0 < 20, "the commit released it, not the wait"
+    writer.join()
+    assert len(got) == 1, "the reply is the commit's delta"
+    sub.assert_converged("after the waiting poll")
+
+    with pytest.raises(ValueError, match="non-negative"):
+        sub.poll(wait=-1)
 
 
 # ── refused cursors ──────────────────────────────────────────────────────────

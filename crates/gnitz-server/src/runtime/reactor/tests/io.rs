@@ -126,3 +126,34 @@ fn inbound_cap_accounting_balances_on_consume() {
         "counter must return to 0 once every frame is consumed"
     );
 }
+
+/// `readable` resolves on a queued frame and on the end of the recv side, and
+/// takes nothing: the frame is still there for `recv`.
+#[test]
+fn readable_reports_a_frame_or_the_end_and_takes_neither() {
+    let r = capped_reactor(1 << 20);
+    let (conn, partner) = registered(&r);
+    assert!(try_poll_once(conn.readable()).is_none(), "nothing sent yet");
+
+    let payload = [7u8; 16];
+    (&partner)
+        .write_all(&gnitz_wire::frame_len_prefix(payload.len()))
+        .expect("write");
+    (&partner).write_all(&payload).expect("write");
+    assert!(
+        poll_until(&r, || try_poll_once(conn.readable()).is_some()),
+        "a frame is queued"
+    );
+    let frame = try_poll_once(conn.recv())
+        .flatten()
+        .expect("the frame readable reported");
+    assert_eq!(frame.as_slice(), payload);
+    drop(frame);
+    assert!(try_poll_once(conn.readable()).is_none(), "and nothing behind it");
+
+    drop(partner);
+    assert!(
+        poll_until(&r, || try_poll_once(conn.readable()).is_some()),
+        "the peer is gone"
+    );
+}

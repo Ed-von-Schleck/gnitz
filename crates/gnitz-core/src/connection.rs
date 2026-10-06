@@ -14,7 +14,7 @@ use std::os::fd::{BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::ClientError;
 use crate::protocol::wal_block::decode_wal_block_into;
@@ -262,7 +262,7 @@ enum Slot {
     DeltaPoll {
         views: Vec<u64>,
         at: usize,
-        /// The poll this request is a chunk of; see [`Polls::live`].
+        /// The poll this request is; see [`Polls::live`].
         poll: u64,
     },
 }
@@ -522,19 +522,26 @@ impl Session {
         Ok(sent)
     }
 
-    /// DELTA_POLL: one train per view of `views`, in order — the next items of
-    /// the live poll. Their results queue for [`Self::next_polled`] as the
-    /// steps that read them run.
-    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) -> Result<(), ClientError> {
+    /// DELTA_POLL: one train per view of `views`, in order — the items of the
+    /// live poll, held by the server up to `wait` while none has anything new.
+    /// Their results queue for [`Self::next_polled`] as the steps that read
+    /// them run; a request the session refuses ends each view with the refusal.
+    /// No view is no request.
+    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem], wait: Duration) {
         if views.is_empty() {
-            return Err(ClientError::from("a delta poll names no view".to_string()));
+            return;
         }
         let slot = Slot::DeltaPoll {
             views: views.iter().map(|v| v.view_id).collect(),
             at: 0,
             poll: self.polls.live,
         };
-        self.enqueue(txn_frame::encode_delta_poll(views), slot)
+        // Rounded up: a wait shorter than the wire's unit is still a wait.
+        let wait_ms = u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+        if let Err(why) = self.enqueue(txn_frame::encode_delta_poll(views, wait_ms), slot) {
+            let ends = views.iter().map(|_| Polled::End(Err(why.clone())));
+            self.polls.queue.extend(ends);
+        }
     }
 
     fn enqueue(&mut self, frame: Vec<u8>, slot: Slot) -> Result<(), ClientError> {

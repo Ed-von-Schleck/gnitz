@@ -13,9 +13,9 @@ mod ddl;
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::guard_panic;
 use gnitz_foundation::fault::Seam;
@@ -31,12 +31,25 @@ use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadG
 use crate::runtime::sal::{DirectGroup, Read};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_wire::control::{DecodedControl, Target};
+use gnitz_wire::control::{ControlHeader, DecodedControl, Target};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::{ReadBound, ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
+
+/// Views one DELTA_POLL reads at one SAL cut: the ceiling on the leases and
+/// reply trains a poll puts on the master at a time. A poll naming more is
+/// answered a slice at a time.
+const DELTA_POLL_CUT_VIEWS: usize = 64;
+
+/// The longest a DELTA_POLL is held, whatever wait it asks for.
+const DELTA_POLL_MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// The least time between a tick and one only waiting polls ask for: such a
+/// poll is re-issued the moment it is answered, so unpaced it would tick per
+/// commit.
+const PATIENT_TICK_GAP: Duration = Duration::from_millis(10);
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
 /// would.
@@ -92,13 +105,16 @@ enum TickTrigger {
     /// success would serve stale rows under `WireStatus::Ok`.
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
+        /// Asked for by a waiting poll: held to [`PATIENT_TICK_GAP`] unless a
+        /// trigger that is not joins the batch.
+        patient: bool,
     },
 }
 
 /// Ask the tick loop to tick everything pending and report the tick's verdict.
-pub(super) fn request_drain(shared: &Shared) -> oneshot::Receiver<Result<(), WireFault>> {
+pub(super) fn request_drain(shared: &Shared, patient: bool) -> oneshot::Receiver<Result<(), WireFault>> {
     let (done, rx) = oneshot::channel();
-    shared.tick_tx.send(TickTrigger::Drain { done });
+    shared.tick_tx.send(TickTrigger::Drain { done, patient });
     rx
 }
 
@@ -108,6 +124,51 @@ fn request_barrier(shared: &Shared, kind: BarrierKind) -> oneshot::Receiver<()> 
     let (done, rx) = oneshot::channel();
     shared.committer_tx.send(CommitRequest::Barrier { kind, done });
     rx
+}
+
+/// The DELTA_POLLs held back with nothing to report, each with the relations
+/// whose change ends its wait.
+#[derive(Default)]
+struct PollWaiters {
+    next_id: Cell<u64>,
+    parked: RefCell<Vec<ParkedPoll>>,
+}
+
+struct ParkedPoll {
+    id: u64,
+    watched: FxHashSet<u64>,
+    wake: oneshot::Sender<()>,
+}
+
+/// One poll's place among the [`PollWaiters`], given up on drop.
+struct Parked<'a> {
+    waiters: &'a PollWaiters,
+    id: u64,
+    woken: oneshot::Receiver<()>,
+}
+
+impl PollWaiters {
+    fn park(&self, watched: FxHashSet<u64>) -> Parked<'_> {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let (wake, woken) = oneshot::channel();
+        self.parked.borrow_mut().push(ParkedPoll { id, watched, wake });
+        Parked { waiters: self, id, woken }
+    }
+
+    /// Wake every poll watching `relation`.
+    fn wake(&self, relation: u64) {
+        let mut parked = self.parked.borrow_mut();
+        for poll in parked.extract_if(.., |p| p.watched.contains(&relation)) {
+            poll.wake.send(());
+        }
+    }
+}
+
+impl Drop for Parked<'_> {
+    fn drop(&mut self) {
+        self.waiters.parked.borrow_mut().retain(|p| p.id != self.id);
+    }
 }
 
 /// Shared executor state held by every task.
@@ -128,6 +189,7 @@ pub struct Shared {
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
     tick_rows: RefCell<FxHashMap<u64, usize>>,
+    poll_waiters: PollWaiters,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
@@ -246,6 +308,8 @@ impl Shared {
             // Pushes sharing a read guard resume from the await in any order.
             let e = map.entry(tid).or_default();
             *e = (*e).max(lsn);
+            // After the raise, which is what a woken poll reads as staleness.
+            self.poll_waiters.wake(tid);
         }
         Ok(lsn)
     }
@@ -277,6 +341,7 @@ impl Shared {
     /// Every per-relation master state a drop must reclaim is cleared here: ids
     /// are never reused, so nothing else would ever reclaim it.
     fn forget_relation(&self, _catalog_write: &WriteGuard, id: u64) {
+        self.poll_waiters.wake(id);
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
         self.disp().forget_delta_round(id);
@@ -285,7 +350,8 @@ impl Shared {
 
     /// Credit `rows` against each tid's pending-tick count and fire the auto-tick
     /// if any tid now stands at or above the coalesce threshold. Below it a push
-    /// only accumulates, and nothing ticks until a read asks for a drain.
+    /// only accumulates, and nothing ticks until a read or a delta poll asks for
+    /// a drain.
     pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (u64, usize)>) {
         let crossed = {
             let mut pending = self.tick_rows.borrow_mut();
@@ -353,6 +419,7 @@ impl ServerExecutor {
             tick_tx,
             last_tick_lsn: Cell::new(boot_seed),
             tick_rows: RefCell::new(FxHashMap::default()),
+            poll_waiters: PollWaiters::default(),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Cell::new(false),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
@@ -504,7 +571,8 @@ async fn serve_until_signalled(shared: &Shared) {
 ///
 /// Coalescing is the *sender's* job — the committer sends `Auto` only once a tid
 /// crosses `TICK_COALESCE_ROWS`, and `Drain` senders are parked on the answer —
-/// so this loop never delays a tick to gather more.
+/// so this loop delays no tick to gather more. The one tick it holds back is
+/// one only patient drains ask for, to [`PATIENT_TICK_GAP`] after the last.
 ///
 /// A failure in one trigger fails only that trigger; SAL emission is further
 /// guarded by `guard_panic` inside `run_tick`.
@@ -514,12 +582,31 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<u64> = Vec::new();
+    let mut patient_from = Instant::now();
     loop {
-        let first = rx.recv().await;
-        for t in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
-            if let TickTrigger::Drain { done } = t {
-                dones.push(done);
+        let mut all_patient = true;
+        let mut trigger = rx.recv().await;
+        loop {
+            match trigger {
+                TickTrigger::Auto => all_patient = false,
+                TickTrigger::Drain { done, patient } => {
+                    all_patient &= patient;
+                    dones.push(done);
+                }
             }
+            trigger = match rx.try_recv() {
+                Some(t) => t,
+                None => {
+                    let hold = patient_from.saturating_duration_since(Instant::now());
+                    if !all_patient || hold.is_zero() {
+                        break;
+                    }
+                    match select2(rx.recv(), shared.disp().reactor().sleep(hold)).await {
+                        Either::A(t) => t,
+                        Either::B(()) => break,
+                    }
+                }
+            };
         }
 
         let _ticking = shared.tick_gate.read().await;
@@ -535,6 +622,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         for done in dones.drain(..) {
             done.send(tick_result.clone());
         }
+        patient_from = Instant::now() + PATIENT_TICK_GAP;
     }
 }
 
@@ -616,7 +704,7 @@ async fn dispatch_request(
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
         ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &data[ctrl.body]).await,
-        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &data[ctrl.body]).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl.hdr, &data[ctrl.body]).await,
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {
@@ -940,66 +1028,55 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Re
     Ok(())
 }
 
-/// True when no un-ticked commit can reach `target`: every source feeding it —
-/// transitively, through view sources — committed at or below the last completed
-/// tick's watermark.
+/// True when every relation of `sources` committed at or below the last
+/// completed tick's watermark, so no un-ticked commit reaches a view whose
+/// source closure they are.
 ///
 /// Sound because the committer queues a commit's tids in `tick_rows` in the
 /// step that lays the commit out (see `run_tick`'s snapshot); a *missing* map
 /// entry is the `boot_seed` argument. Erring towards false is harmless (one
 /// extra drain).
-///
-/// A non-view target is vacuously fresh and answers before the closure walk.
-/// Caller holds the catalog read lock.
-fn read_is_fresh(shared: &Rc<Shared>, target: u64) -> bool {
-    if !shared
-        .cat()
-        .registry
-        .relation(target)
-        .map(Relation::kind)
-        .is_some_and(|k| k.is_view())
-    {
-        return true;
-    }
+fn all_ticked(shared: &Shared, sources: &FxHashSet<u64>) -> bool {
     let ticked = shared.last_tick_lsn.get();
-    shared
-        .cat()
-        .dag
-        .source_closure([target])
-        .into_iter()
-        .all(|s| shared.commit_lsn_of(s) <= ticked)
+    sources.iter().all(|&s| shared.commit_lsn_of(s) <= ticked)
 }
 
-/// Drop the caller's read guard, tick everything pending, and hand back a fresh
-/// guard, so a DDL queued on the lock does not wait out the drain.
+/// The catalog read lock for a read of `targets`, behind a drain when an
+/// un-ticked commit reaches one of them. The one read-lock entry of every read
+/// verb.
 ///
-/// The trigger goes out even when nothing looks pending — the tick loop is serial,
-/// so awaiting `done` also serializes behind a concurrent `Auto`, without which a
-/// read could observe a view mid-tick. A failed tick is reported, not swallowed:
-/// its views are stale, and serving them under `WireStatus::Ok` is a silent stale read.
-async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadGuard, WireFault> {
-    drop(guard);
-    request_drain(shared).await?;
+/// Only a view has sources, so any other target — an absent one included — is
+/// fresh. The guard is dropped across the drain, so a DDL queued on the lock
+/// does not wait it out: a caller validates its targets under the guard handed
+/// back.
+///
+/// A failed tick is reported, not swallowed: its views are stale, and serving
+/// them under `WireStatus::Ok` is a silent stale read. The tick loop is serial,
+/// so the drain also puts the read behind a tick already running.
+async fn fresh_read_lock(
+    shared: &Rc<Shared>,
+    targets: impl IntoIterator<Item = u64>,
+    patient: bool,
+) -> Result<ReadGuard, WireFault> {
+    let g = shared.catalog_rwlock.read().await;
+    if all_ticked(shared, &shared.cat().dag.source_closure(targets)) {
+        return Ok(g);
+    }
+    drop(g);
+    request_drain(shared, patient).await?;
     Ok(shared.catalog_rwlock.read().await)
 }
 
-/// Take the catalog read lock and resolve `target`'s kind from the same probe
-/// that validated it, draining first when the target is a stale view.
-///
-/// The one read-lock entry point for every single-target read verb: each passes
-/// the `Access` its realization can serve and routes on the returned kind, rather
-/// than re-deciding the system/user split from the id. The target is validated
-/// under the guard handed back, so after the drain: a DDL may have dropped or
-/// altered it meanwhile, and [`read_is_fresh`] holds an absent one fresh.
+/// [`fresh_read_lock`] for one target, with its kind resolved from the same
+/// probe that validated it: each single-target read verb passes the `Access`
+/// its realization can serve and routes on the returned kind, rather than
+/// re-deciding the system/user split from the id.
 async fn read_lock(
     shared: &Rc<Shared>,
     target: Target,
     access: Access,
 ) -> Result<(ReadGuard, RelationKind), WireFault> {
-    let mut g = shared.catalog_rwlock.read().await;
-    if !read_is_fresh(shared, target.tid) {
-        g = drain_and_relock(shared, g).await?;
-    }
+    let g = fresh_read_lock(shared, [target.tid], false).await?;
     let kind = target_kind(shared, target, access)?;
     Ok((g, kind))
 }
@@ -1106,53 +1183,61 @@ enum PollPosition {
     Moved,
 }
 
-/// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
-/// for however many of them moved — one broadcast.
+/// Where a poll of `item` stands.
+fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
+    match target_kind(shared, item.view_id.into(), Access::UserRead) {
+        Err(f) => PollPosition::Fault(f),
+        Ok(_) if delta_up_to_date(shared, item.view_id, item.after_tick) => PollPosition::UpToDate,
+        Ok(_) => PollPosition::Moved,
+    }
+}
+
+/// DELTA_POLL: advance N mirrored views in one request, holding the reply up to
+/// its wait while none of them has anything to report.
 ///
 /// An `Err` rejects the frame, at `target_id = 0`; a per-view failure is not an
 /// `Err` — it goes out as that view's own fault frame, and the rest of the poll
 /// continues.
-///
-/// Never drains pending ticks: a delta read reports what has happened, and a
-/// round not yet ticked is one the next poll carries.
-async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
-    let views = gnitz_wire::txn_frame::decode_delta_poll(body).map_err(|e| format!("decode error: {e}"))?;
+async fn handle_delta_poll(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    prologue: &ControlHeader,
+    body: &[u8],
+) -> Result<(), WireFault> {
+    let (wait_ms, views) =
+        gnitz_wire::txn_frame::decode_delta_poll(prologue, body).map_err(|e| format!("decode error: {e}"))?;
+    let wait = Duration::from_millis(wait_ms).min(DELTA_POLL_MAX_WAIT);
+    // The poll drains once, here; a later slice takes the lock alone.
+    let mut first_lock = Some(delta_poll_lock(shared, peer, &views, wait).await?);
 
-    // ── Phase 1: classify under the catalog lock, dispatch one cut ─────────
-    // No await between a view's gate test and the round its terminal reports, so
-    // no tick can land in between. The guard is scoped to this phase: phase 2
-    // reads no catalog state, and holding it across the drain would block DDL.
-    // A poll with nothing to fetch takes no SAL hold.
-    let (positions, dispatches, up_to_date_round, dispatch_round) = {
-        let _g = shared.catalog_rwlock.read().await;
-        let disp = shared.disp();
+    // One slice at a time: one catalog lock and — for however many of its views
+    // moved — one broadcast.
+    let disp = shared.disp();
+    for slice in views.chunks(DELTA_POLL_CUT_VIEWS) {
+        // ── Phase 1: classify under the catalog lock, dispatch one cut ─────
+        // No await between a view's position and the round an up-to-date one
+        // reports, so no tick lands in between.
+        let catalog = match first_lock.take() {
+            Some(g) => g,
+            None => shared.catalog_rwlock.read().await,
+        };
+        let positions: Vec<PollPosition> = slice.iter().map(|&v| poll_position(shared, &catalog, v)).collect();
         let up_to_date_round = disp.last_tick_round();
-        let mut positions = Vec::with_capacity(views.len());
-        let mut moved: Vec<DeltaPollItem> = Vec::with_capacity(views.len());
-        for &item in &views {
-            let tid = item.view_id;
-            let position = match target_kind(shared, tid.into(), Access::UserRead) {
-                Err(f) => PollPosition::Fault(f),
-                Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
-                Ok(_) => {
-                    moved.push(item);
-                    PollPosition::Moved
-                }
-            };
-            positions.push((tid, position));
-        }
-
-        let mut round = 0;
-        let dispatches = if moved.is_empty() {
+        let moved = || {
+            let judged = slice.iter().zip(&positions);
+            judged.filter_map(|(v, p)| matches!(p, PollPosition::Moved).then_some(v))
+        };
+        let mut dispatch_round = 0;
+        let dispatches = if moved().next().is_none() {
             Vec::new()
         } else {
             disp.scan_cut(|cut| {
-                round = disp.last_tick_round();
-                for item in &moved {
+                dispatch_round = disp.last_tick_round();
+                for item in moved() {
                     cut.read(DirectGroup::new(Read::Delta {
                         view: item.view_id,
                         after_tick: item.after_tick,
-                        cut_round: round,
+                        cut_round: dispatch_round,
                         reply_layout: item.reply_layout,
                     }))?;
                 }
@@ -1160,32 +1245,71 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
             })
             .await?
         };
-        (positions, dispatches, up_to_date_round, round)
-    };
+        // Phase 2 reads no catalog state, and holding the lock across the
+        // forward would block DDL.
+        drop(catalog);
 
-    // ── Phase 2: one terminal per view, in request order ───────────────────
-    let disp = shared.disp();
-    let mut dispatches = dispatches.into_iter();
-    for (tid, position) in positions {
-        let (round, result) = match position {
-            PollPosition::Fault(fault) => (0, Err(fault)),
-            PollPosition::UpToDate => (up_to_date_round, Ok(())),
-            // Taken in step with the `Moved`s that were pushed. A dispatch left
-            // undrained — an earlier return dropped it — discards the rest of
-            // its train at the ring boundary.
-            PollPosition::Moved => {
-                let lease = dispatches.next().expect("one dispatch per moved view");
-                (dispatch_round, forward_scan(peer, &lease).await)
+        // ── Phase 2: one terminal per view, in request order ───────────────
+        let mut dispatches = dispatches.into_iter();
+        for (item, position) in slice.iter().zip(positions) {
+            let (round, result) = match position {
+                PollPosition::Fault(fault) => (0, Err(fault)),
+                PollPosition::UpToDate => (up_to_date_round, Ok(())),
+                // Taken in step with the `Moved`s that were pushed. A dispatch
+                // left undrained — an earlier return dropped it — discards the
+                // rest of its train at the ring boundary.
+                PollPosition::Moved => {
+                    let lease = dispatches.next().expect("one dispatch per moved view");
+                    (dispatch_round, forward_scan(peer, &lease).await)
+                }
+            };
+            let tid = item.view_id;
+            finish_scan_fanout(peer, tid, disp.delta_cursor_tag(tid), result.map(|()| round));
+            // Carry no more than the budget into the next view, and learn here
+            // rather than at the end if the client is gone.
+            if peer.flush_if_full().await.is_err() {
+                return Ok(());
             }
-        };
-        finish_scan_fanout(peer, tid, disp.delta_cursor_tag(tid), result.map(|()| round));
-        // Carry no more than the budget into the next view, and learn here
-        // rather than at the end if the client is gone.
-        if peer.flush_if_full().await.is_err() {
-            return Ok(());
         }
     }
     Ok(())
+}
+
+/// The catalog read lock a poll of `views` is first answered under: behind a
+/// drain when a commit reaching one of them has not been ticked, and, with a
+/// `wait`, after holding the poll while none of them has anything to report —
+/// until a relation one of them reads changes, `wait` passes, or the client
+/// sends its next request or goes.
+async fn delta_poll_lock(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    views: &[DeltaPollItem],
+    wait: Duration,
+) -> Result<ReadGuard, WireFault> {
+    let ids = || views.iter().map(|v| v.view_id);
+    let waiting = !wait.is_zero();
+    let g = fresh_read_lock(shared, ids(), waiting).await?;
+    if !waiting {
+        return Ok(g);
+    }
+    // No await from the test to the park, so no commit is acknowledged between
+    // them. The drain above was one: a commit it did not take is un-ticked here.
+    let mut watched = shared.cat().dag.source_closure(ids());
+    let quiet = all_ticked(shared, &watched)
+        && views
+            .iter()
+            .all(|&v| matches!(poll_position(shared, &g, v), PollPosition::UpToDate));
+    if !quiet {
+        return Ok(g);
+    }
+    // A commit or a drop reaches a view through the view or anything it reads.
+    watched.extend(ids());
+    let mut parked = shared.poll_waiters.park(watched);
+    drop(g);
+    let released = select2(shared.disp().reactor().sleep(wait), peer.next_request_ready());
+    select2(&mut parked.woken, released).await;
+    drop(parked);
+    fresh_read_lock(shared, ids(), true).await
 }
 
 /// Whether a delta read after `after_tick` already sits at the view's last round,
@@ -1226,14 +1350,9 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
     // ── Phase 0: decode; tid legality is Phase 1's, under the catalog lock ──
     let relations = gnitz_wire::txn_frame::decode_scan_multi(body).map_err(|e| format!("decode error: {e}"))?;
 
-    // Drain once if any target is a stale view — the same test `read_lock` runs
-    // for a single target. Phase 1 resolves every tid's kind under the guard
-    // handed back, so a DDL during the drain is caught there and an unknown tid
-    // is rejected there rather than here.
-    let mut cat = shared.catalog_rwlock.read().await;
-    if relations.iter().any(|r| !read_is_fresh(shared, r.tid)) {
-        cat = drain_and_relock(shared, cat).await?;
-    }
+    // Phase 1 resolves every tid's kind under this guard, so a DDL during the
+    // drain is caught there and an unknown tid is rejected there.
+    let cat = fresh_read_lock(shared, relations.iter().map(|r| r.tid), false).await?;
 
     // ── Phase 1: catalog lock — resolve shapes + schemas, dispatch one cut ──
     // One catalog snapshot for every relation, one SAL cut for every group.

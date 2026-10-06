@@ -548,9 +548,8 @@ so a row-set comparison of a feed tests nothing. No subscription verb and no
 server-side cursor registry: the engine stays request/response, the cursor lives
 on the client, and nothing retained survives a restart.
 
-**A delta read is the one read verb that does not drain pending ticks.** It
-answers "what has happened", not "what is current", so a push the tick loop has
-not run yet is a round the next poll carries.
+A delta read carries every push acknowledged before it, and may ask to be held
+while it has nothing to report.
 
 **A cursor can expire, and every subscriber must handle it.** The budget is a
 byte bound, and the oldest rounds are dropped whether or not anyone is still

@@ -262,6 +262,12 @@ impl ClientConn {
         std::future::poll_fn(|cx| self.q.borrow_mut().frames.poll(cx)).await
     }
 
+    /// Resolves once [`Self::recv`] would: a frame is queued, or the recv side
+    /// has ended. Takes no frame.
+    pub(crate) async fn readable(&self) {
+        std::future::poll_fn(|cx| self.q.borrow_mut().frames.poll_ready(cx)).await
+    }
+
     /// The next already-deframed frame without parking. `None` means nothing is
     /// queued right now, not that the peer is gone.
     pub(crate) fn try_recv(&self) -> Option<RecvBuf> {

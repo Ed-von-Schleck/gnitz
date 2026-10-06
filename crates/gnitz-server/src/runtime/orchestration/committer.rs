@@ -198,7 +198,7 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // Stamping after a failed drain would make the views' missing deltas
     // generation-valid; left behind step 1's generation, they are rebuilt at the
     // next boot. Not an abort: this path also serves the Shutdown barrier.
-    if let Err(e) = request_drain(shared).await {
+    if let Err(e) = request_drain(shared, false).await {
         gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
         return;
     }
@@ -376,7 +376,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         let synced = scope.commit().then(|| excl.sync(disp.reactor(), "committer"));
         // Queued in the block that laid the groups out, so a tick whose snapshot
         // of the SAL watermark covers `zone_lsn` also takes these tids — what
-        // `read_is_fresh` relies on. The tick's group follows these in the log,
+        // `all_ticked` relies on. The tick's group follows these in the log,
         // and the auto-tick it may fire overlaps the ACKs and the fsync.
         shared.note_commit_rows(units.iter().flat_map(|u| u.live()).map(|g| (g.tid, g.merged.len())));
         (zone_lsn, synced)

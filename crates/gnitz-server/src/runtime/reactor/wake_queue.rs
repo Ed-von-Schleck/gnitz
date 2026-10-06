@@ -42,14 +42,17 @@ impl<T> WakeQueue<T> {
     /// Hand the next value to the awaiter, `None` once the stream has ended and
     /// is drained, or park it.
     pub(super) fn poll(&mut self, cx: &Context<'_>) -> Poll<Option<T>> {
-        match self.pop() {
-            Some(v) => Poll::Ready(Some(v)),
-            None if self.closed => Poll::Ready(None),
-            None => {
-                self.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+        self.poll_ready(cx).map(|()| self.pop())
+    }
+
+    /// Park the awaiter until [`Self::poll`] would not: a value is queued or
+    /// the stream has ended. Takes nothing.
+    pub(super) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<()> {
+        if self.closed || !self.queue.is_empty() {
+            return Poll::Ready(());
         }
+        self.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 
     fn wake(&mut self) {

@@ -43,7 +43,7 @@ fn mirror_call_cost_bench() {
     churn(&mut fx.direct, 2_001, 4_000);
     fx.tick("s", &["v_keyed"]);
     cell("poll carrying a round", 1, fx.mirror(), |m| {
-        block_on(m.poll_mirror()).expect("poll");
+        block_on(m.poll_mirror(Duration::ZERO)).expect("poll");
     });
 
     let rel = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
@@ -94,7 +94,7 @@ fn mirror_call_cost_bench() {
         fx.many_views(prefix, more, "a, b, v");
         let views = fx.mirror().mirrored_ids().len();
         cell(&format!("idle poll, {views} views"), CALLS, fx.mirror(), |m| {
-            block_on(m.poll_mirror()).expect("poll");
+            block_on(m.poll_mirror(Duration::ZERO)).expect("poll");
         });
     }
 }

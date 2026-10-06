@@ -55,6 +55,11 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
     }
 }
 
+/// The views of a `DELTA_POLL` body sent with no wait.
+fn delta_poll_views(body: &[u8]) -> Result<Vec<DeltaPollItem>, String> {
+    decode_delta_poll(&ControlHeader::default(), body).map(|(_, views)| views)
+}
+
 /// Peek `frame`'s prologue — it carries only its verb, and its body starts right
 /// after it — check it as a client frame, and decode its body.
 fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>) -> Result<T, String> {
@@ -136,14 +141,35 @@ fn delta_poll_roundtrips_every_view_in_order() {
         item(3, u64::MAX, 7),
         item(1, 0, 1),
     ];
-    let frame = encode_delta_poll(&views);
-    assert_eq!(peeked(&frame, decode_delta_poll).unwrap(), views);
+    let frame = encode_delta_poll(&views, 0);
+    assert_eq!(peeked(&frame, delta_poll_views).unwrap(), views);
+}
+
+/// The wait rides the prologue's `arg0` and nothing else of it moves.
+#[test]
+fn a_delta_poll_carries_its_wait_in_the_prologue() {
+    let views = [item(1, 5, 1)];
+    let frame = encode_delta_poll(&views, 1_500);
+    let ctrl = peek_control_block(&frame).unwrap();
+    let prologue = ControlHeader {
+        flags: WireFlags {
+            verb: ClientVerb::DeltaPoll,
+            ..Default::default()
+        },
+        arg0: 1_500,
+        ..Default::default()
+    };
+    assert_eq!(ctrl.hdr, prologue);
+    assert_eq!(
+        decode_delta_poll(&ctrl.hdr, &frame[ctrl.body.clone()]).unwrap(),
+        (1_500, views.to_vec())
+    );
 }
 
 /// A delta poll names no view `0`: it is the id of a fault ending the request.
 #[test]
 fn a_delta_poll_refuses_view_id_zero() {
-    let err = peeked(&encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)]), decode_delta_poll).expect_err("view id 0");
+    let err = peeked(&encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)], 0), delta_poll_views).expect_err("view id 0");
     assert!(err.contains("view id 0"), "{err:?}");
 }
 

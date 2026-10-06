@@ -14,12 +14,13 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll, Waker};
+use std::time::Duration;
 
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{
     CircuitRow, ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SchemaTabSlot, SysRow, TableTabRow, ViewTabRow,
 };
-use gnitz_wire::txn_frame::{DeltaPollItem, BLIND, DELTA_POLL_MAX_VIEWS};
+use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
@@ -416,7 +417,7 @@ const _: fn() = || {
     assert_send::<GnitzClient>();
     assert_send::<Sent<ScanReply>>();
     let _ = |mut c: GnitzClient, schema: &Arc<Schema>, batch: &ZSetBatch| {
-        assert_send_value(c.poll_mirror());
+        assert_send_value(c.poll_mirror(Duration::ZERO));
         assert_send_value(c.create_schema(""));
         assert_send_value(c.push(0, schema, batch, WireConflictMode::Update));
         assert_send_value(serve(c, |_| Poll::Ready(None)));
@@ -676,7 +677,7 @@ impl GnitzClient {
         view_id: u64,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, view_schema).await
+        self.delta_read(view_id, 0, Duration::ZERO, view_schema).await
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -688,16 +689,17 @@ impl GnitzClient {
     /// `DeltaExpired`: discard the copy and
     /// [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
-    /// A poll does **not** drive a tick: a delta read answers "what has
-    /// happened", not "what is current", so a push the tick loop has not run yet
-    /// is a round the next poll will carry.
+    /// It carries every push acknowledged before it. With nothing new, the
+    /// server holds the reply until a commit reaches a relation the view reads,
+    /// or `wait` passes.
     pub async fn delta_poll(
         &mut self,
         view_id: u64,
         cursor: DeltaCursor,
         view_schema: &Arc<Schema>,
+        wait: Duration,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (data, next) = self.delta_read(view_id, cursor.tick.get(), view_schema).await?;
+        let (data, next) = self.delta_read(view_id, cursor.tick.get(), wait, view_schema).await?;
         Ok((data, cursor.advanced_to(next)?))
     }
 
@@ -707,6 +709,7 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         after_tick: u64,
+        wait: Duration,
         reply_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
         let item = DeltaPollItem {
@@ -717,7 +720,7 @@ impl GnitzClient {
         let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
         let GnitzClient { session, host, .. } = self;
-        let mut poll = DeltaPoll::start(session, &[item]);
+        let mut poll = DeltaPoll::start(session, &[item], wait);
         let (mut end, mut undecoded) = (None, None);
         while let Some((_, polled)) = poll.next(&mut **host).await? {
             match polled {
@@ -1438,18 +1441,14 @@ impl GnitzClient {
     }
 }
 
-/// A delta poll in flight: `items`, one request per `DELTA_POLL_MAX_VIEWS`,
-/// handed out as each item's blocks and then its one end, the items in order.
-/// Dropped unfinished, the session drops what is left of its trains.
+/// A delta poll in flight: `items` in one request, handed out as each item's
+/// blocks and then its one end, the items in order. Dropped unfinished, the
+/// session drops what is left of its trains.
 pub(crate) struct DeltaPoll<'s> {
     session: &'s mut Session,
-    /// Items a request went out for, and items in all.
-    sent: usize,
     total: usize,
     /// Ends handed out so far: the index of the item being answered.
     answered: usize,
-    /// Why the items past `sent` were never asked for.
-    unsent: Option<ClientError>,
 }
 
 impl Drop for DeltaPoll<'_> {
@@ -1459,26 +1458,9 @@ impl Drop for DeltaPoll<'_> {
 }
 
 impl<'s> DeltaPoll<'s> {
-    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem]) -> Self {
-        let (mut sent, mut unsent) = (0, None);
-        for chunk in items.chunks(DELTA_POLL_MAX_VIEWS) {
-            match session.submit_delta_poll(chunk) {
-                Ok(()) => sent += chunk.len(),
-                // Neither of a submit's refusals clears without a step, so no
-                // later chunk is tried.
-                Err(e) => {
-                    unsent = Some(e);
-                    break;
-                }
-            }
-        }
-        DeltaPoll {
-            session,
-            sent,
-            total: items.len(),
-            answered: 0,
-            unsent,
-        }
+    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem], wait: Duration) -> Self {
+        session.submit_delta_poll(items, wait);
+        DeltaPoll { session, total: items.len(), answered: 0 }
     }
 
     /// Everything the last step queued has been handed out.
@@ -1495,13 +1477,8 @@ impl<'s> DeltaPoll<'s> {
                 self.answered += usize::from(matches!(next, Polled::End(_)));
                 return Ok(Some((item, next)));
             }
-            if self.answered == self.sent {
-                let Some(e) = self.unsent.as_ref().filter(|_| self.sent < self.total) else {
-                    return Ok(None);
-                };
-                self.sent += 1;
-                self.answered += 1;
-                return Ok(Some((self.sent - 1, Polled::End(Err(e.clone())))));
+            if self.answered == self.total {
+                return Ok(None);
             }
             poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
         }

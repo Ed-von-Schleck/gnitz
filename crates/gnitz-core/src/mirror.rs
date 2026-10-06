@@ -15,12 +15,11 @@
 //!
 //! # What a mirrored read promises
 //!
-//! **Freshness.** It answers at the copy's cursor round. A read against the
-//! server drains pending ticks first, so it answers "what is current"; a poll
-//! drives no tick and a local read never polls. So a copy is not
-//! read-your-own-writes, and two mirrored views can sit at different rounds — a
-//! read spanning both is no consistent cut. A relation the copy does not hold is
-//! delegated upstream and keeps every guarantee a server read has.
+//! **Freshness.** It answers at the copy's cursor round, and a local read never
+//! polls. So a copy is not read-your-own-writes, and two mirrored views can sit
+//! at different rounds — a read spanning both is no consistent cut. A relation
+//! the copy does not hold is delegated upstream and keeps every guarantee a
+//! server read has.
 //!
 //! **Cost.** Each index the view had at its last resolve is a further local
 //! store, maintained on every applied delta.
@@ -29,6 +28,7 @@ use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use crate::client::{offload, DeltaPoll, GnitzClient, Host};
 use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor};
@@ -400,7 +400,7 @@ impl GnitzClient {
                     };
                     let item = self.mirrored_view(tid)?.poll_item(prev.tick.get());
                     let (_, polled) = self
-                        .delta_poll_many(&[(prev, item)])
+                        .delta_poll_many(&[(prev, item)], Duration::ZERO)
                         .await?
                         .pop()
                         .expect("one view, one result");
@@ -466,7 +466,7 @@ impl GnitzClient {
         let GnitzClient { session, host, .. } = self;
         let host = &mut **host;
         store.clone().run(host, move |s| s.refill(tid)).await??;
-        let mut poll = DeltaPoll::start(session, &[item]);
+        let mut poll = DeltaPoll::start(session, &[item], Duration::ZERO);
         let (mut blocks, mut end, mut refused) = (Vec::new(), None, None);
         while let Some((_, polled)) = poll.next(host).await? {
             match polled {
@@ -619,21 +619,22 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Advance every view in `views`, one request per `DELTA_POLL_MAX_VIEWS`,
-    /// applying the views each step ended before the session reads on — so a
-    /// poll over M views holds one read's trains, not M.
+    /// Advance every view in `views` in one request, applying the views each
+    /// step ended before the session reads on — so a poll over M views holds
+    /// one read's trains, not M.
     ///
     /// A view that fails gets **that view's** own entry. Only an interrupt ends
     /// the call.
     async fn delta_poll_many(
         &mut self,
         views: &[(DeltaCursor, DeltaPollItem)],
+        wait: Duration,
     ) -> Result<ViewPollResults, ClientError> {
         let store = self.mirror_state()?.store.clone();
         let GnitzClient { session, host, .. } = self;
         let host = &mut **host;
         let items: Vec<DeltaPollItem> = views.iter().map(|&(_, item)| item).collect();
-        let mut poll = DeltaPoll::start(session, &items);
+        let mut poll = DeltaPoll::start(session, &items, wait);
         let mut applied = Vec::with_capacity(views.len());
         // The blocks of the view being answered, held until its end; and the
         // views one step ended, applied together before the session reads on.
@@ -685,9 +686,8 @@ impl GnitzClient {
     /// quiet unless the caller reads the vector, which a correct subscriber does
     /// anyway for [`PollResult::Reseeded`].
     ///
-    /// A poll drives no tick server-side, so a drain is "read the view against
-    /// the server, then poll once".
-    pub async fn poll_mirror(&mut self) -> Result<Vec<PollOutcome>, ClientError> {
+    /// `wait` is [`Self::delta_poll`]'s, over every mirrored view at once.
+    pub async fn poll_mirror(&mut self, wait: Duration) -> Result<Vec<PollOutcome>, ClientError> {
         self.refuse_poisoned_mirror()?;
 
         // ── Phase 1: advance, in one round trip ────────────────────────────
@@ -704,7 +704,9 @@ impl GnitzClient {
             }
         }
 
-        let applied = self.delta_poll_many(&requests).await?;
+        // Phase 2 has work in hand, which phase 1 must not wait in front of.
+        let wait = if recoveries.is_empty() { wait } else { Duration::ZERO };
+        let applied = self.delta_poll_many(&requests, wait).await?;
 
         // ── Phase 2: recover, strictly after every phase-1 apply ───────────
         let mut out: Vec<PollOutcome> = Vec::with_capacity(applied.len() + recoveries.len());

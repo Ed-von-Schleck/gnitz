@@ -438,7 +438,7 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     };
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        s.submit_delta_poll(&[item(7), item(8), item(9)]).unwrap();
+        s.submit_delta_poll(&[item(7), item(8), item(9)], Duration::ZERO);
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -499,9 +499,9 @@ fn an_abandoned_poll_queues_nothing() {
         ..Default::default()
     };
     let (mut s, peer) = pair();
-    s.submit_delta_poll(&[item(7)]).unwrap();
+    s.submit_delta_poll(&[item(7)], Duration::ZERO);
     s.abandon_poll();
-    s.submit_delta_poll(&[item(8)]).unwrap();
+    s.submit_delta_poll(&[item(8)], Duration::ZERO);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {

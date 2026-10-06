@@ -63,6 +63,15 @@ impl Peer {
         self.conn.recv().await
     }
 
+    /// Resolves once the client has sent its next request or is gone, taking
+    /// nothing. Ships what is corked first, as [`Self::next_request`] does
+    /// before it parks.
+    pub async fn next_request_ready(&self) {
+        if self.flush_egress().await.is_ok() {
+            self.conn.readable().await
+        }
+    }
+
     /// Append a reply written by `write`, to leave with whatever is corked
     /// beside it. Synchronous, so a caller holding a W2M ring slot can copy out
     /// of it and release it before any await.

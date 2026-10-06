@@ -16,7 +16,6 @@ use crate::test_support::{interrupt_self_until, kv_schema, rel, reply_ctrl, repl
 use crate::BlockingHost;
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
-use gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS;
 use gnitz_wire::RelDescriptorBlob;
 use gnitz_wire::{TypeCode, WireStatus};
 use std::collections::HashMap;
@@ -187,8 +186,9 @@ impl Peer {
     fn expect_poll(&self, what: &str) -> Vec<u64> {
         let frame = self.expect_frame(what);
         let ctrl = peek_control_block(&frame).expect("a control header");
-        gnitz_wire::txn_frame::decode_delta_poll(&frame[ctrl.body])
+        gnitz_wire::txn_frame::decode_delta_poll(&ctrl.hdr, &frame[ctrl.body.clone()])
             .expect("a delta poll")
+            .1
             .into_iter()
             .map(|v| v.view_id)
             .collect()
@@ -267,12 +267,12 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
 // Frame count
 // ---------------------------------------------------------------------------
 
-/// One poll names every view in as few requests as the per-request cap allows —
-/// one up to the cap, a second past it — and every view advances.
+/// One poll names every view in one request, however many there are — a wait
+/// is the request's, so views split across two would wait separately — and
+/// every view advances.
 #[test]
-fn one_poll_writes_one_request_per_chunk_of_views() {
-    for want in [vec![6], vec![DELTA_POLL_MAX_VIEWS, 1]] {
-        let m: usize = want.iter().sum();
+fn one_poll_writes_one_request_for_every_view() {
+    for m in [6usize, 200] {
         let names: Vec<String> = (0..m).map(|i| format!("v{i}")).collect();
         let views: Vec<(u64, &str, u64)> = names
             .iter()
@@ -281,24 +281,18 @@ fn one_poll_writes_one_request_per_chunk_of_views() {
             .collect();
         let (mut client, peer, _log) = fixture(&views);
 
-        let chunks = want.len();
         let h = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for _ in 0..chunks {
-                let ids = peer.expect_poll("a chunk");
-                for &id in &ids {
-                    peer.reply_watermark(id, TAG, 9);
-                }
-                seen.push(ids);
+            let ids = peer.expect_poll("the poll");
+            for &id in &ids {
+                peer.reply_watermark(id, TAG, 9);
             }
-            seen
+            ids
         });
-        let report = block_on(client.poll_mirror()).expect("every view advances");
+        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("every view advances");
         let seen = h.join().unwrap();
 
-        assert_eq!(client.requests_sent(), chunks as u64, "{m} views");
-        assert_eq!(seen.iter().map(Vec::len).collect::<Vec<_>>(), want);
-        let mut ids = seen.concat();
+        assert_eq!(client.requests_sent(), 1, "{m} views");
+        let mut ids = seen;
         ids.sort_unstable();
         assert_eq!(
             ids,
@@ -331,7 +325,7 @@ fn only_a_vanished_relation_pays_a_probe() {
                 peer.send(&reply_ctrl(0, 0));
             }
         });
-        let report = block_on(client.poll_mirror()).expect("a per-view failure is not the call's");
+        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a per-view failure is not the call's");
         h.join().unwrap();
         assert_eq!(client.requests_sent(), requests, "status {status:?}");
         assert!(
@@ -372,7 +366,7 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
         }
         peer.send(&block(&[(2, 20, 1)], 20, false));
     });
-    let report = block_on(client.poll_mirror()).expect("the bootstrap lands");
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the bootstrap lands");
     h.join().unwrap();
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 7 && o.result.reseeded()),
@@ -408,7 +402,7 @@ fn a_leftover_poll_does_not_shift_the_replies() {
         after_tick: 4,
         reply_layout: kv_schema(TypeCode::I64).layout_digest(),
     };
-    drop(DeltaPoll::start(&mut client.session, &[abandoned]));
+    drop(DeltaPoll::start(&mut client.session, &[abandoned], Duration::ZERO));
 
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the abandoned poll"), vec![7]);
@@ -421,7 +415,7 @@ fn a_leftover_poll_does_not_shift_the_replies() {
             peer.reply_watermark(tid, TAG, 100 + tid);
         }
     });
-    block_on(client.poll_mirror()).expect("the leftover train is drained, not applied");
+    block_on(client.poll_mirror(Duration::ZERO)).expect("the leftover train is drained, not applied");
     h.join().unwrap();
 
     let mut applied = log.take();
@@ -461,7 +455,7 @@ fn no_recovery_runs_before_every_ingest_has() {
         peer.reply_watermark(9, TAG, 20);
         (ids[0], ids[1])
     });
-    let report = block_on(client.poll_mirror()).expect("a recovered view is not the call's failure");
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a recovered view is not the call's failure");
     let (gone, alive) = h.join().unwrap();
     assert_eq!(client.requests_sent(), 4, "both views ride one request");
 
@@ -507,7 +501,7 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         assert_eq!(peer.expect_poll("the follow-up poll"), vec![8]);
         peer.reply_watermark(8, TAG, 12);
     });
-    let report = block_on(client.poll_mirror()).expect("the reseed lands on a live copy");
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the reseed lands on a live copy");
     h.join().unwrap();
     assert_eq!(client.requests_sent(), 3, "the live copy is not re-read");
 
@@ -552,7 +546,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
         peer.expect_request("the probe");
         peer
     });
-    let r = block_on(client.poll_mirror());
+    let r = block_on(client.poll_mirror(Duration::ZERO));
     assert!(matches!(r, Err(ClientError::Interrupted(_))), "{r:?}");
     stop.store(true, Ordering::Relaxed);
     sig.join().unwrap();
@@ -570,7 +564,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     });
     let mut results = Vec::new();
     for _ in 0..2 {
-        let mut report: Vec<(u64, bool)> = block_on(client.poll_mirror())
+        let mut report: Vec<(u64, bool)> = block_on(client.poll_mirror(Duration::ZERO))
             .expect("both views advance")
             .iter()
             .map(|o| (o.view_id, o.result.reseeded()))
@@ -611,7 +605,7 @@ fn a_broken_poll_reply_fails_the_views_it_never_answered() {
             script(&peer, &ids);
             ids
         });
-        let report = block_on(client.poll_mirror()).expect("a broken reply is reported per view");
+        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a broken reply is reported per view");
         let ids = h.join().unwrap();
 
         for (i, id) in ids.iter().enumerate() {
@@ -656,7 +650,7 @@ fn each_view_is_ingested_before_the_next_one_is_answered() {
         }
         peer.reply_watermark(ids[1], TAG, 12);
     });
-    let report = block_on(client.poll_mirror()).expect("both views advance");
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("both views advance");
     h.join().unwrap();
 
     assert!(report.iter().all(|o| matches!(o.result, PollResult::Advanced)));
@@ -676,7 +670,7 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
             assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
         }
 
-        let report = block_on(client.poll_mirror()).expect("a dead socket is not the call's own failure");
+        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a dead socket is not the call's own failure");
         let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");

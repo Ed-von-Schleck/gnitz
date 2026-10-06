@@ -7,6 +7,7 @@
 //! dispatches on a column type.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -176,6 +177,12 @@ impl Drop for PyClient {
     }
 }
 
+/// A poll's `wait`, given in seconds.
+fn poll_wait(seconds: f64) -> PyResult<Duration> {
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| PyValueError::new_err(format!("wait must be a non-negative number of seconds, not {seconds}")))
+}
+
 fn none(py: Python<'_>, _: ()) -> PyResult<Py<PyAny>> {
     Ok(py.None())
 }
@@ -333,22 +340,29 @@ impl PyClient {
         )
     }
 
-    /// delta_poll(view_id, view_schema, cursor) -> (rows, cursor)
+    /// delta_poll(view_id, view_schema, cursor, wait=0.0) -> (rows, cursor)
     ///
-    /// The view's deltas since `cursor`, and the cursor past them. Raises
+    /// The view's deltas since `cursor`, and the cursor past them: every push
+    /// acknowledged before the call is in them. Raises
     /// `GnitzDeltaExpiredError` for a cursor whose rounds are gone, or that is
     /// another boot's or relation's: bootstrap again.
+    ///
+    /// With nothing new, the server holds the reply until a commit reaches a
+    /// relation the view reads, or `wait` seconds pass.
+    #[pyo3(signature = (view_id, view_schema, cursor, wait = 0.0))]
     fn delta_poll(
         slf: &Bound<'_, Self>,
         view_id: u64,
         view_schema: PySchema,
         cursor: (u64, u64),
+        wait: f64,
     ) -> PyResult<Py<PyAny>> {
         let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
             .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
+        let wait = poll_wait(wait)?;
         Self::run(
             slf,
-            whole!(|c| c.delta_poll(view_id, cursor, &view_schema.rust).await?),
+            whole!(|c| c.delta_poll(view_id, cursor, &view_schema.rust, wait).await?),
             delta,
         )
     }
@@ -481,16 +495,19 @@ impl PyClient {
         Self::run(slf, whole!(|c| c.forget_view(view_id).await?), none)
     }
 
-    /// poll() -> list[PollResult]
+    /// poll(wait=0.0) -> list[PollResult]
     ///
     /// Advance every registered view by one poll each — one entry per view,
     /// whatever happened to it. A view that failed carries its exception in
     /// `error`; the others went on. It raises only for a failure of the call
     /// itself: no store attached, a poisoned one, or a `KeyboardInterrupt`.
     ///
-    /// A poll drives no tick server-side.
-    fn poll(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.poll_mirror().await?), |py, outcomes| {
+    /// The copies then hold every push acknowledged before the call. `wait` is
+    /// `delta_poll`'s, over every view at once.
+    #[pyo3(signature = (wait = 0.0))]
+    fn poll(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
+        let wait = poll_wait(wait)?;
+        Self::run(slf, whole!(|c| c.poll_mirror(wait).await?), |py, outcomes| {
             let results: Vec<PyPollResult> = outcomes.into_iter().map(|o| PyPollResult::new(py, o)).collect();
             results.into_py_any(py)
         })
