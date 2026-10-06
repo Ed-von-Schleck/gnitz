@@ -8,7 +8,6 @@
 //! interests armed at once, and the cap.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::MAX_IN_FLIGHT;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::strace_test;
@@ -39,32 +38,30 @@ fn concurrent_pushes_and_scans(target: &str) {
     let all = ReadSpec::all_rows(ReadBound::None);
     let sent_before = s.requests_sent();
     let (n, per) = (40u64, 5_000u64);
-    let mut sent = Vec::new();
+    // A push, then a scan, `n` times over.
+    let (mut pushes, mut scans) = (Vec::new(), Vec::new());
     for i in 0..n {
         let batch = rows(&schema, i * per..(i + 1) * per);
-        sent.push(s.submit(push_req(tid, &schema, &batch), |r| r).unwrap());
-        sent.push(s.submit(scan_req(tid, &all, &schema), |r| r).unwrap());
+        pushes.push(s.submit(push_req(tid, &schema, &batch)).unwrap());
+        scans.push(s.submit_scan(tid.into(), &all, &schema).unwrap());
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n, "counted on enqueue");
-    let (done, both_armed) = drive_all(&mut s, sent);
+    let (last, both_armed) = drive(&mut s, scans.pop().unwrap());
     assert!(
         both_armed,
         "a pending write and a pending read arm both interests at once"
     );
-    // A push, then a scan, `n` times over.
-    let mut pushed = 0;
-    for r in done {
-        match r.expect("no server error") {
-            Reply::Ack(_) => pushed += per,
-            Reply::Scan(data) => assert_eq!(
-                data.batch.len() as u64,
-                pushed,
-                "a scan sees every push submitted ahead of it"
-            ),
-            other => panic!("{other:?}"),
-        }
+    for push in pushes {
+        arrived(push).expect("every push completes as its ingest LSN");
     }
-    assert_eq!(pushed, n * per, "every push completes as its ingest LSN");
+    let scans = scans.into_iter().map(arrived).chain([last]);
+    for (data, pushed) in scans.zip((1..=n).map(|i| i * per)) {
+        assert_eq!(
+            data.expect("no server error").batch.len() as u64,
+            pushed,
+            "a scan sees every push submitted ahead of it"
+        );
+    }
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
     assert_eq!(
@@ -86,13 +83,13 @@ fn every_slot_up_to_the_cap_completes() {
     let (_blocking, tid, schema) = table(srv.sock_path());
     let all = ReadSpec::all_rows(ReadBound::None);
     let mut s = Session::connect(srv.sock_path()).unwrap();
-    let scan = |s: &mut Session| s.submit(scan_req(tid, &all, &schema), |r| r);
-    let sent: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| scan(&mut s).unwrap()).collect();
+    let scan = |s: &mut Session| s.submit_scan(tid.into(), &all, &schema);
+    let mut sent: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| scan(&mut s).unwrap()).collect();
     assert!(scan(&mut s).is_err(), "at the cap");
-    let (done, _) = drive_all(&mut s, sent);
-    assert!(done.iter().all(Result::is_ok));
+    let (last, _) = drive(&mut s, sent.pop().unwrap());
+    assert!(sent.into_iter().map(arrived).chain([last]).all(|r| r.is_ok()));
     let below = scan(&mut s).expect("below the cap again");
-    let _ = drive_all(&mut s, vec![below]);
+    drive(&mut s, below).0.unwrap();
 }
 
 // ── Syscalls per operation ────────────────────────────────────────────────

@@ -14,7 +14,7 @@ mod view_chain;
 use gnitz_core::block_on;
 use std::sync::Arc;
 
-use gnitz_core::{BatchAppender, ClientError, GnitzClient, Interest, Reply, Request, Schema, Sent, Session, ZSetBatch};
+use gnitz_core::{BatchAppender, ClientError, GnitzClient, Interest, Request, Schema, Sent, Session, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
 
@@ -71,15 +71,6 @@ fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
     out
 }
 
-/// A read of `tid` under `spec`, replied in `schema`'s layout.
-fn scan_req<'a>(tid: u64, spec: &'a ReadSpec, schema: &'a Arc<Schema>) -> Request<'a> {
-    Request::ScanSpec {
-        target: tid.into(),
-        spec,
-        reply_schema: schema,
-    }
-}
-
 /// `batch` pushed into `tid` as an upsert.
 fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'a> {
     Request::Push {
@@ -105,26 +96,25 @@ fn park(s: &Session, want: Interest) -> Interest {
 }
 
 /// The driver: step with what `poll` reported, parking on `interest()`, until
-/// every reply of `sent` has arrived; they come back in that order. Also
-/// reports whether both interests were ever armed at once.
-fn drive_all(s: &mut Session, sent: Vec<Sent<Reply>>) -> (Vec<Result<Reply, ClientError>>, bool) {
-    let mut done = Vec::with_capacity(sent.len());
-    let mut sent = sent.into_iter().peekable();
+/// `last` is answered. Also reports whether both interests were ever armed at
+/// once.
+fn drive<T>(s: &mut Session, mut last: Sent<T>) -> (Result<T, ClientError>, bool) {
     let mut ready = Interest::WRITE;
     let mut both_armed = false;
     loop {
         s.step(ready);
-        while let Some(reply) = sent.peek_mut().and_then(Sent::try_take) {
-            done.push(reply);
-            sent.next();
-        }
-        if sent.peek().is_none() {
-            return (done, both_armed);
+        if let Some(reply) = last.try_take() {
+            return (reply, both_armed);
         }
         let interest = s.interest();
         both_armed |= interest.read && interest.write;
         ready = park(s, interest);
     }
+}
+
+/// The reply to a request submitted ahead of one already answered.
+fn arrived<T>(mut sent: Sent<T>) -> Result<T, ClientError> {
+    sent.try_take().expect("replies arrive in request order")
 }
 
 /// Write everything `s` has queued, parking on writability alone so no reply is

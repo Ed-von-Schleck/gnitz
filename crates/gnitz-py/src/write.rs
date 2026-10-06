@@ -87,23 +87,34 @@ pub struct PyZSetBatch {
     key_scratch: Vec<u8>,
 }
 
+/// A [`PyZSetBatch`] open for one surface's rows: its batch, unshared, and
+/// what a row is written through.
+struct Rows<'b> {
+    batch: &'b mut ZSetBatch,
+    schema: &'b Schema,
+    weight_is_column: bool,
+    kw_plan: &'b mut Option<KwPlan>,
+    key_scratch: &'b mut Vec<u8>,
+}
+
 impl PyZSetBatch {
-    /// Run `body` against `self`; on error, truncate every per-row vector back
-    /// to the pre-call row count, so a half-written row never leaves the batch
-    /// with mismatched column lengths. Wrap once per surface — `append` its one
-    /// row, `extend` its whole loop — and never nested.
+    /// Run `body` against this batch's rows; on error, truncate every per-row
+    /// vector back to the pre-call row count, so a half-written row never
+    /// leaves the batch with mismatched column lengths. Wrap once per surface —
+    /// `append` its one row, `extend` its whole loop — and never nested.
     fn with_rollback<F>(&mut self, body: F) -> PyResult<()>
     where
-        F: FnOnce(&mut Self) -> PyResult<()>,
+        F: FnOnce(&mut Rows<'_>) -> PyResult<()>,
     {
-        let mark = self.batch.mark();
-        match body(self) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                Arc::make_mut(&mut self.batch).rollback_to(mark);
-                Err(e)
-            }
-        }
+        let mut rows = Rows {
+            batch: Arc::make_mut(&mut self.batch),
+            schema: &self.schema,
+            weight_is_column: self.weight_is_column,
+            kw_plan: &mut self.kw_plan,
+            key_scratch: &mut self.key_scratch,
+        };
+        let mark = rows.batch.mark();
+        body(&mut rows).inspect_err(|_| rows.batch.rollback_to(mark))
     }
 }
 
@@ -281,7 +292,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
     })
 }
 
-impl PyZSetBatch {
+impl Rows<'_> {
     /// Write one row: resolve this call's shape against the cached plan, then
     /// read each column's value through `arg`, which maps a name's position in
     /// `names` to its value. `tuple` is those names as a Python tuple where the
@@ -290,7 +301,8 @@ impl PyZSetBatch {
     /// The key is appended once every PK column has extracted, then each payload
     /// cell into its column, and the weight and null word close the row. Rolls
     /// nothing back on error: each surface wraps its own call in
-    /// [`Self::with_rollback`], which cuts a half-written row off every stream.
+    /// [`PyZSetBatch::with_rollback`], which cuts a half-written row off every
+    /// stream.
     fn write_row<'a, 'py>(
         &mut self,
         py: Python<'py>,
@@ -299,15 +311,13 @@ impl PyZSetBatch {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let PyZSetBatch {
+        let Rows {
             batch,
             schema,
             weight_is_column,
             kw_plan,
             key_scratch,
-        } = &mut *self;
-        let batch = Arc::make_mut(batch);
-        let schema: &Schema = schema;
+        } = self;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
             slot => {
@@ -529,7 +539,7 @@ impl PyZSetBatch {
             // A sized sequence lets every growth stream skip its climb from
             // zero; a generator has no `__len__`, so the probe is discarded.
             if let Ok(n) = rows.len() {
-                Arc::make_mut(&mut s.batch).reserve(n);
+                s.batch.reserve(n);
             }
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;

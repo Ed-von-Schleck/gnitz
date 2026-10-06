@@ -3,7 +3,6 @@
 //! checks.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::sys_schema;
 use gnitz_wire::sys_rows::{SchemaTabRow, SysRow};
 use gnitz_wire::{PkColList, ViewProps, SCHEMA_TAB, SEQ_TAB};
@@ -18,9 +17,8 @@ fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
 
 /// The refusal of `families` sent as one DDL bundle.
 fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
-    let sent = s.submit(Request::DdlTxn(families), |r| r).unwrap();
-    let (mut done, _) = drive_all(s, vec![sent]);
-    done.remove(0).unwrap_err().to_string()
+    let sent = s.submit(Request::DdlTxn(families)).unwrap();
+    drive(s, sent).0.unwrap_err().to_string()
 }
 
 /// Refused whole, before the catalog reads it: a bundle with two blocks for one

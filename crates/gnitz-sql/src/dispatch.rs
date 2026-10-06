@@ -6,9 +6,11 @@ use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
 use crate::{ddl, dml};
-use gnitz_core::{ClientError, GnitzClient, Held};
+use gnitz_core::{ClientError, GnitzClient, Held, RelDescriptor};
 use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
+use std::cell::Cell;
+use std::sync::Arc;
 
 /// Plan against the descriptors `client` supplies for the names the plan asks
 /// for: one it holds — the copy's for a `read`, a kept one when `use_kept` —
@@ -20,27 +22,35 @@ async fn planned<T>(
     use_kept: bool,
     plan: impl Fn(&Catalog<'_>) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, bool) {
-    let cat = Catalog::new(schema_name);
+    // What the server answered, absence included; the client's own holdings
+    // are read as the plan asks, so a plan they cover runs once.
+    let mut resolved: Vec<(String, Option<Arc<RelDescriptor>>)> = Vec::new();
     let mut from_kept = false;
     loop {
-        let name = match cat.attempt(&plan) {
-            Attempt::Planned(planned) => return (planned, from_kept),
-            Attempt::Missing(name) => name,
-        };
-        let held = client
-            .held(schema_name, &name, read)
-            .filter(|&(_, held)| use_kept || held == Held::Copy);
-        let desc = match held {
-            Some((desc, held)) => {
-                from_kept |= held == Held::Kept;
+        let missing = {
+            let kept = Cell::new(false);
+            let held = |name: &str| {
+                let (desc, held) = client
+                    .held(schema_name, name, read)
+                    .filter(|&(_, held)| use_kept || held == Held::Copy)?;
+                kept.set(kept.get() || held == Held::Kept);
                 Some(desc)
+            };
+            let cat = Catalog::holding(schema_name, &held);
+            for (name, desc) in &resolved {
+                cat.insert(name, desc.clone());
             }
-            None => match client.resolve(schema_name, &name).await {
-                Ok(desc) => desc,
-                Err(e) => return (Err(e.into()), from_kept),
-            },
+            let attempt = cat.attempt(&plan);
+            from_kept |= kept.get();
+            match attempt {
+                Attempt::Planned(planned) => return (planned, from_kept),
+                Attempt::Missing(name) => name,
+            }
         };
-        cat.insert(&name, desc);
+        match client.resolve(schema_name, &missing).await {
+            Ok(desc) => resolved.push((missing, desc)),
+            Err(e) => return (Err(e.into()), from_kept),
+        }
     }
 }
 

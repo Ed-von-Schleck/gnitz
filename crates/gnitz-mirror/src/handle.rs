@@ -304,11 +304,15 @@ impl Copies {
         Ok(())
     }
 
-    /// Set `tid`'s cursor to `at`, then checkpoint if due. A failed
-    /// auto-checkpoint is logged, and the next one retries.
+    /// Set `tid`'s cursor to `at`.
     fn settle(&mut self, tid: u64, at: DeltaCursor) {
         self.records.get_mut(&tid).expect("checked by the caller").cursor = Some(at);
         self.unpublished = true;
+    }
+
+    /// Checkpoint once enough bytes were applied since the last. A failed
+    /// auto-checkpoint is logged, and the next one retries.
+    fn checkpoint_if_due(&mut self) {
         if self.applied_bytes >= self.checkpoint_bytes {
             if let Err(e) = self.checkpoint() {
                 gnitz_error!(
@@ -332,6 +336,10 @@ impl Copies {
             self.ingest(tid, block)?;
         }
         self.settle(tid, next);
+        // Not for an advance that carried nothing, which touches no disk.
+        if !blocks.is_empty() {
+            self.checkpoint_if_due();
+        }
         Ok(())
     }
 
@@ -416,6 +424,7 @@ impl MirrorStore for Mirror {
         self.filling = None;
         self.copies.touching("sealing a copy", |c| {
             c.settle(tid, cursor);
+            c.checkpoint_if_due();
             Ok(())
         })
     }

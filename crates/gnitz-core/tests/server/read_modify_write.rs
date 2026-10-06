@@ -3,7 +3,6 @@
 //! autocommit while `b` writes around it.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::{PkColumn, RelDescriptor, RMW_MAX_ATTEMPTS};
 use gnitz_wire::{WireFault, WireStatus};
 

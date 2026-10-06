@@ -8,18 +8,12 @@ use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
-fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<Reply>, ClientError> {
-    let spec = ReadSpec::all_rows(ReadBound::None);
-    let req = Request::ScanSpec {
-        target: tid.into(),
-        spec: &spec,
-        reply_schema: schema,
-    };
-    s.submit(req, |reply| reply)
+fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<ScanReply>, ClientError> {
+    s.submit_scan(tid.into(), &ReadSpec::all_rows(ReadBound::None), schema)
 }
 
 /// Step and park until `sent` is answered.
-fn await_reply(s: &mut Session, mut sent: Sent<Reply>) -> Result<Reply, ClientError> {
+fn await_reply<T>(s: &mut Session, mut sent: Sent<T>) -> Result<T, ClientError> {
     let mut ready = Interest::WRITE;
     loop {
         s.step(ready);
@@ -30,7 +24,7 @@ fn await_reply(s: &mut Session, mut sent: Sent<Reply>) -> Result<Reply, ClientEr
     }
 }
 
-/// A request ACKed at target 0, whose reply is [`Reply::Ack`].
+/// A request ACKed at target 0.
 const COMMIT: Request<'static> = Request::PushTxn { families: &[] };
 
 fn schema_a() -> Arc<Schema> {
@@ -100,9 +94,7 @@ fn train_split_across_continuation_frames_completes_once() {
     assert!(sent.try_take().is_none());
     peer.send(&reply_rows(7, &batch_a(&[4, 5]), 0, false));
     s.step(Interest::READ);
-    let Reply::Scan(r) = sent.try_take().unwrap().unwrap() else {
-        panic!("scan")
-    };
+    let r = sent.try_take().unwrap().unwrap();
     assert_eq!(r.batch, batch_a(&[1, 2, 3, 4, 5]));
     assert!(Arc::ptr_eq(&r.schema, &schema), "the schema the request named");
     assert_eq!(s.interest(), Interest::NONE);
@@ -115,10 +107,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     // Each train must decode under the schema paired with its relation — a
     // two-frame train for relation 2 included.
     let mut sent = s
-        .submit(
-            Request::ScanMulti(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]),
-            |r| r,
-        )
+        .submit_scan_multi(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))])
         .unwrap();
     s.step(Interest::WRITE);
     let req = peer.recv();
@@ -135,9 +124,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert!(sent.try_take().is_none(), "one of two trains");
     peer.send(&reply_rows(2, &batch_b(&[20]), 0, true));
     peer.send(&reply_rows(2, &batch_b(&[21]), 0, false));
-    let Reply::Multi(replies) = await_reply(&mut s, sent).unwrap() else {
-        panic!("multi")
-    };
+    let replies = await_reply(&mut s, sent).unwrap();
     assert_eq!(replies.len(), 2);
     assert_eq!(replies[0].batch, batch_a(&[10, 11]));
     assert_eq!(replies[1].batch, batch_b(&[20, 21]));
@@ -175,17 +162,16 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
 #[test]
 fn a_status_frame_fails_its_slot_alone() {
     let sa = schema_a();
-    for (what, req, trains_before, status) in [
-        (
-            "the second of three trains",
-            Request::ScanMulti((1..=3).map(|tid| (tid, Arc::clone(&sa))).collect()),
-            1,
-            WireStatus::Error,
-        ),
-        ("a commit", COMMIT, 0, WireStatus::TxnConflict),
-    ] {
+    /// `sent`'s request refused `status` after `trains_before` of its trains.
+    fn refused<T: std::fmt::Debug>(
+        what: &str,
+        submit: impl FnOnce(&mut Session) -> Result<Sent<T>, ClientError>,
+        trains_before: u64,
+        status: WireStatus,
+    ) {
+        let sa = schema_a();
         let (mut s, peer) = pair();
-        let sent = s.submit(req, |r| r).unwrap();
+        let sent = submit(&mut s).unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         for tid in 1..=trains_before {
@@ -204,11 +190,17 @@ fn a_status_frame_fails_its_slot_alone() {
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
-        let Reply::Scan(r) = await_reply(&mut s, sent).unwrap() else {
-            panic!("scan")
-        };
+        let r = await_reply(&mut s, sent).unwrap();
         assert_eq!(r.lsn, Some(42), "{what}: the next request completes normally");
     }
+    let three = (1..=3).map(|tid| (tid, Arc::clone(&sa))).collect();
+    refused(
+        "the second of three trains",
+        |s| s.submit_scan_multi(three),
+        1,
+        WireStatus::Error,
+    );
+    refused("a commit", |s| s.submit(COMMIT), 0, WireStatus::TxnConflict);
 }
 
 /// A request `submit` refuses opens no slot and queues nothing: the reply queue
@@ -226,9 +218,15 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         .add_row(1, 1)
         .str_val(&"x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD))
         .f64_val(0.0);
+    let untouched = |s: &Session, what: &str| {
+        assert_eq!(s.requests_sent(), 0, "{what}");
+        assert_eq!(s.interest(), Interest::NONE, "{what}");
+        assert!(!s.is_closed(), "{what}");
+    };
+    assert!(s.submit_scan_multi(Vec::new()).is_err());
+    untouched(&s, "an empty multi-read");
     for (what, req) in [
         ("a DDL family that is no system table", Request::DdlTxn(&ddl)),
-        ("an empty multi-read", Request::ScanMulti(Vec::new())),
         (
             "a push whose batch is not in its schema's layout",
             Request::Push {
@@ -248,10 +246,8 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
             },
         ),
     ] {
-        assert!(s.submit(req, |r| r).is_err(), "{what}");
-        assert_eq!(s.requests_sent(), 0, "{what}");
-        assert_eq!(s.interest(), Interest::NONE, "{what}");
-        assert!(!s.is_closed(), "{what}");
+        assert!(s.submit(req).is_err(), "{what}");
+        untouched(&s, what);
     }
 }
 
@@ -269,9 +265,7 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
     peer.send_bytes(&both);
     s.step(Interest::READ);
     for (sent, lsn) in sent.iter_mut().zip([11, 22]) {
-        let Reply::Scan(r) = sent.try_take().unwrap().unwrap() else {
-            panic!("scan")
-        };
+        let r = sent.try_take().unwrap().unwrap();
         assert_eq!(r.lsn, Some(lsn), "in request order");
     }
     assert_eq!(s.interest(), Interest::NONE);
@@ -284,14 +278,14 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
 fn replies_completed_before_a_fatal_frame_are_delivered() {
     let (mut s, peer) = pair();
     let (sa, rows) = (schema_a(), batch_a(&[1]));
-    let mut a = s.submit(COMMIT, |r| r).unwrap();
+    let mut a = s.submit(COMMIT).unwrap();
     let push = Request::Push {
         target: 5.into(),
         schema: &sa,
         batch: &rows,
         mode: WireConflictMode::Update,
     };
-    let mut b = s.submit(push, |r| r).unwrap();
+    let mut b = s.submit(push).unwrap();
     s.step(Interest::WRITE);
     peer.recv();
     peer.recv();
@@ -301,7 +295,7 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     peer.send_bytes(&both);
     s.step(Interest::READ);
     let (a, b) = (a.try_take().unwrap(), b.try_take().unwrap());
-    assert!(matches!(a, Ok(Reply::Ack(11))), "{a:?}");
+    assert!(matches!(a, Ok(11)), "{a:?}");
     assert!(
         matches!(&b, Err(ClientError::ConnectionLost(ProtocolError::DecodeError(_)))),
         "{b:?}"
@@ -319,7 +313,7 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
 #[test]
 fn a_reply_readable_behind_a_failed_flush_is_delivered() {
     let (mut s, peer) = pair();
-    let mut a = s.submit(COMMIT, |r| r).unwrap();
+    let mut a = s.submit(COMMIT).unwrap();
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&reply_ctrl(0, 11));
@@ -327,7 +321,7 @@ fn a_reply_readable_behind_a_failed_flush_is_delivered() {
     let mut b = submit_scan(&mut s, 5, &schema_a()).unwrap();
     s.step(Interest::WRITE);
     let (a, b) = (a.try_take().unwrap(), b.try_take().unwrap());
-    assert!(matches!(a, Ok(Reply::Ack(11))), "{a:?}");
+    assert!(matches!(a, Ok(11)), "{a:?}");
     assert!(
         matches!(&b, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
         "{b:?}"
@@ -386,7 +380,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
             batch: &b,
             mode: WireConflictMode::Update,
         };
-        s.submit(push, |r| r).map(drop)
+        s.submit(push).map(drop)
     };
     // An encoded push is a full copy of its batch, so the counter grows with
     // what was pushed, not with how many times.
@@ -506,7 +500,7 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
         ),
     ] {
         let (mut s, peer) = pair();
-        let sent = s.submit(Request::Resolve("s.t"), |r| r).unwrap();
+        let sent = s.submit_resolve("s.t").unwrap();
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&frame);

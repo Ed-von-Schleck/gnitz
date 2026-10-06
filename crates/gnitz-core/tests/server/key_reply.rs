@@ -9,7 +9,6 @@
 //! non-adjacent compound PK whose OPK sign flip must survive.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::key_reply;
 use gnitz_expr::SchemaFacts;
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};

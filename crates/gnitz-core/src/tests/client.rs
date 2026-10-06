@@ -4,6 +4,7 @@ use crate::test_support::{interrupt_self_until, kv_rows, kv_schema, reply_ctrl, 
 use gnitz_wire::TypeCode;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use WireConflictMode::{Error, Update};
 
 fn del(pk: u64) -> ZSetBatch {
@@ -423,14 +424,14 @@ fn detached_requests_are_answered_by_one_wait() {
     let (s, peer) = session_pair();
     let peer = numbering_peer(peer);
     let mut c = GnitzClient::from_session(s);
-    let ack = |c: &mut GnitzClient| c.round_trip(Request::AllocIds(1)).detach();
+    let ack = |c: &mut GnitzClient| c.ack(Request::AllocIds(1)).detach();
     let (mut first, mut second, last) = (ack(&mut c), ack(&mut c), ack(&mut c));
     assert_eq!(c.requests_sent(), 3);
     assert!(first.try_take().is_none(), "nothing has stepped the session");
 
-    assert_eq!(block_on(c.wait(last)).unwrap().into_ack(), 2);
-    assert_eq!(first.try_take().unwrap().unwrap().into_ack(), 0);
-    assert_eq!(second.try_take().unwrap().unwrap().into_ack(), 1);
+    assert_eq!(block_on(c.wait(last)).unwrap(), 2);
+    assert_eq!(first.try_take().unwrap().unwrap(), 0);
+    assert_eq!(second.try_take().unwrap().unwrap(), 1);
 
     // A verb awaited whole is the same round trip, undetached.
     assert_eq!(block_on(c.alloc_id()).unwrap(), 3);
@@ -444,14 +445,14 @@ fn detached_requests_are_answered_by_one_wait() {
 fn a_session_that_goes_resolves_what_it_owed() {
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::from_session(s);
-    let mut owed = c.round_trip(Request::AllocIds(1)).detach();
+    let mut owed = c.ack(Request::AllocIds(1)).detach();
     drop(c);
     assert!(matches!(owed.try_take(), Some(Err(ClientError::Closed))));
 
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::from_session(s);
     let (replacement, _peer2) = session_pair();
-    let stale = c.round_trip(Request::AllocIds(1)).detach();
+    let stale = c.ack(Request::AllocIds(1)).detach();
     c.session = replacement;
     assert!(matches!(block_on(c.wait(stale)), Err(ClientError::Closed)));
 }
@@ -467,7 +468,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
     let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
 
     let whole = Arc::new(Mutex::new(None));
-    let detached: Arc<Mutex<Vec<Sent<Reply>>>> = Arc::default();
+    let detached: Arc<Mutex<Vec<Sent<u64>>>> = Arc::default();
     let mut calls: VecDeque<Op> = VecDeque::new();
     let out = Arc::clone(&whole);
     calls.push_back(Box::new(move |c| {
@@ -483,7 +484,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
         let detached = Arc::clone(&detached);
         calls.push_back(Box::new(move |c| {
             Box::pin(async move {
-                let sent = c.round_trip(Request::AllocIds(1)).detach();
+                let sent = c.ack(Request::AllocIds(1)).detach();
                 detached.lock().unwrap().push(sent);
             })
         }));
@@ -496,7 +497,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
         None => {
             let mut owed = owed.lock().unwrap();
             while let Some(reply) = owed.first_mut().and_then(Sent::try_take) {
-                answered.push(reply.unwrap().into_ack());
+                answered.push(reply.unwrap());
                 owed.remove(0);
             }
             match owed.is_empty() {

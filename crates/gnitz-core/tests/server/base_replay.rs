@@ -2,7 +2,6 @@
 //! shards carry.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::PkColumn;
 
 const WORKERS: usize = 2;

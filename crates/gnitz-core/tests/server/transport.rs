@@ -2,7 +2,6 @@
 //! (self-signed dev cert, ephemeral port) beside the AF_UNIX socket, and what
 //! the server does to a connection that stalls, floods or never says HELLO.
 
-use gnitz_core::block_on;
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -43,7 +42,7 @@ fn evicted_within(s: &mut Session, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if s.submit(Request::AllocIds(1), |r| r).is_err() || !write_out(s) {
+        if s.submit(Request::AllocIds(1)).is_err() || !write_out(s) {
             return true;
         }
     }
@@ -302,24 +301,20 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         set_small_bufs(s.as_raw_fd());
 
         let (n_pushes, per) = (30u64, 25_000u64);
-        let mut sent: Vec<_> = (0..n_pushes)
+        let pushes: Vec<_> = (0..n_pushes)
             .map(|i| {
                 let batch = rows(&schema, i * per..(i + 1) * per);
-                s.submit(push_req(tid, &schema, &batch), |r| r).unwrap()
+                s.submit(push_req(tid, &schema, &batch)).unwrap()
             })
             .collect();
         let all = ReadSpec::all_rows(ReadBound::None);
-        sent.push(s.submit(scan_req(tid, &all, &schema), |r| r).unwrap());
+        let scan = s.submit_scan(tid.into(), &all, &schema).unwrap();
         assert!(write_out(&mut s), "the server keeps reading");
 
-        let (mut done, _) = drive_all(&mut s, sent);
-        let scan = done.pop().unwrap();
-        for push in done {
-            assert!(matches!(push, Ok(Reply::Ack(_))), "{push:?}");
+        let data = drive(&mut s, scan).0.expect("the scan behind the pushes");
+        for push in pushes {
+            arrived(push).expect("a pipelined push");
         }
-        let Ok(Reply::Scan(data)) = &scan else {
-            panic!("{scan:?}")
-        };
         assert_eq!(
             data.batch.len() as u64,
             n_pushes * per,
@@ -342,7 +337,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
             let mut s = Session::connect(&target).unwrap();
             set_small_bufs(s.as_raw_fd());
             let all = ReadSpec::all_rows(ReadBound::None);
-            let _unread = s.submit(scan_req(tid, &all, &schema), |r| r).unwrap();
+            let _unread = s.submit_scan(tid.into(), &all, &schema).unwrap();
             assert!(write_out(&mut s));
             // Never read. Allow a few deadlines of slack.
             assert!(evicted_within(&mut s, 8_000), "{target}: not evicted");
@@ -368,12 +363,12 @@ fn inbound_cap_breach_closes_stalled_connection() {
         let mut s = Session::connect(&target).unwrap();
         set_small_bufs(s.as_raw_fd());
         let all = ReadSpec::all_rows(ReadBound::None);
-        let _unread = s.submit(scan_req(tid, &all, &schema), |r| r).unwrap();
+        let _unread = s.submit_scan(tid.into(), &all, &schema).unwrap();
 
         // ~140 MB of rows the table does not hold, ~1 MB a frame.
         let flood = rows(&schema, 200_000..225_000);
         let mut sent = 0;
-        while sent < 140 && s.submit(push_req(tid, &schema, &flood), |r| r).is_ok() && write_out(&mut s) {
+        while sent < 140 && s.submit(push_req(tid, &schema, &flood)).is_ok() && write_out(&mut s) {
             sent += 1;
         }
         assert!(

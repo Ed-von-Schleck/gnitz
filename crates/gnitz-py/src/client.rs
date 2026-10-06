@@ -13,14 +13,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
-use gnitz_core::{retraction_batch, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Sent};
+use gnitz_core::{
+    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Sent,
+};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 use gnitz_wire::{TableProps, ViewProps, WireConflictMode};
 
 use crate::client_err;
-use crate::drive::{Blocking, BoxFut, LoopHandle, PyPipeline};
+use crate::drive::{Blocking, LoopHandle, PyPipeline};
 use crate::read::scan_result;
 use crate::schema::PySchema;
 use crate::write::{pk_point_spec, py_key_image, py_pks_to_column, PyZSetBatch};
@@ -637,8 +639,8 @@ impl PyGnitzClient {
     }
 
     /// A context manager inside which every verb returns a `Pending`, and one
-    /// that is a single request returns it as soon as the request is sent — so
-    /// the block's requests share round trips:
+    /// that is a single request returns it with the request queued — so the
+    /// block's requests share round trips:
     ///
     /// ```python
     /// with client.pipeline():
@@ -655,9 +657,19 @@ impl PyGnitzClient {
 // ---------------------------------------------------------------------------
 
 /// A connection on the running asyncio event loop: every verb submits when
-/// called and returns a future of its result.
-#[pyclass(name = "AsyncGnitzClient", extends = PyClient, subclass)]
+/// called and returns a future of its result. It is connected when built, so
+/// awaiting it yields itself, and `async with` closes it on exit.
+#[pyclass(name = "AsyncGnitzClient", extends = PyClient)]
 pub struct PyAsyncClient;
+
+impl PyAsyncClient {
+    fn on_loop<R>(slf: &Bound<'_, Self>, f: impl FnOnce(&LoopHandle) -> PyResult<R>) -> PyResult<R> {
+        match slf.as_super().try_borrow_mut()?.mode() {
+            Mode::Loop(handle) => f(handle),
+            Mode::Closed | Mode::Blocking(_) => unreachable!("this class is built on an event loop and stays there"),
+        }
+    }
+}
 
 #[pymethods]
 impl PyAsyncClient {
@@ -676,10 +688,28 @@ impl PyAsyncClient {
     /// made, then close the connection, whether or not that checkpoint failed.
     /// Awaits to `None`; idempotent.
     fn aclose(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        match slf.as_super().try_borrow_mut()?.mode() {
-            Mode::Loop(handle) => handle.finish(slf.py(), whole!(|c| c.close_mirror().await?)),
-            Mode::Closed | Mode::Blocking(_) => unreachable!("this class is built on an event loop and stays there"),
-        }
+        Self::on_loop(slf, |handle| {
+            handle.finish(slf.py(), whole!(|c| c.close_mirror().await?))
+        })
+    }
+
+    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::on_loop(slf, |handle| handle.settled(slf.py(), slf.clone().into_any().unbind()))
+    }
+
+    /// `await connect(p)`, beside `async with connect(p)`.
+    fn __await__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::__aenter__(slf)?.call_method0(slf.py(), pyo3::intern!(slf.py(), "__await__"))
+    }
+
+    /// `aclose()`, whose `None` lets the block's exception through.
+    fn __aexit__(
+        slf: &Bound<'_, Self>,
+        _exc_type: Py<PyAny>,
+        _exc_val: Py<PyAny>,
+        _exc_tb: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::aclose(slf)
     }
 }
 
@@ -702,18 +732,15 @@ impl PyTxn {
         Ok(self.client.clone_ref(py))
     }
 
-    /// Commit on a clean exit. If the block raised, discard whatever transaction is
-    /// still open and let the exception through.
+    /// Ends the transaction and lets the block's exception through.
     fn __exit__(&self, py: Python<'_>, exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> PyResult<bool> {
         let mut client = self.client.bind(py).try_borrow_mut()?;
-        if exc_type.is_none(py) {
-            client
-                .blocking()?
-                .call(py, async |c| c.txn_commit().await.map(|_| ()))?;
-        } else if let Mode::Blocking(blocking) = client.mode() {
-            if blocking.client.txn_active() {
-                blocking.client.txn_rollback().map_err(client_err)?;
-            }
+        let clean = exc_type.is_none(py);
+        match client.blocking() {
+            Ok(blocking) => blocking.call(py, async |c| end_txn(c, clean).await)?,
+            // The block's own exception outranks a client it left unusable.
+            Err(_) if !clean => {}
+            Err(e) => return Err(e),
         }
         Ok(false)
     }
@@ -736,18 +763,21 @@ impl PyTxn {
         let client = self.client.bind(py);
         self.on_loop(client)?;
         let clean = exc_type.is_none(py);
-        PyClient::run(
-            client,
-            whole!(|c| {
-                if clean {
-                    c.txn_commit().await?;
-                } else if c.txn_active() {
-                    c.txn_rollback()?;
-                }
-            }),
-            |py, ()| false.into_py_any(py),
-        )
+        PyClient::run(client, whole!(|c| end_txn(c, clean).await?), |py, ()| {
+            false.into_py_any(py)
+        })
     }
+}
+
+/// How a transaction block ends: a clean exit commits, and an exception
+/// discards whatever transaction is still open.
+async fn end_txn(c: &mut GnitzClient, clean: bool) -> Result<(), ClientError> {
+    if clean {
+        c.txn_commit().await?;
+    } else if c.txn_active() {
+        c.txn_rollback()?;
+    }
+    Ok(())
 }
 
 impl PyTxn {

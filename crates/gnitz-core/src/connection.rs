@@ -8,9 +8,12 @@
 use gnitz_expr::SchemaFacts;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use crate::error::ClientError;
@@ -158,88 +161,32 @@ impl Interest {
     }
 }
 
-/// One request, cut where the encoding or the decoding differs rather than
-/// where the verb names do. It borrows its inputs; the borrow ends at
-/// [`Request::encode`].
+/// A request answered by one value — an LSN, or the base id of a run. It
+/// borrows its inputs; the borrow ends at [`Session::submit`].
 pub enum Request<'a> {
-    /// A run of this many catalog object ids. Completes as [`Reply::Ack`], the
-    /// run's base id.
+    /// A run of this many catalog object ids.
     AllocIds(u64),
-    /// A run of `count` ids from the SERIAL sequence of `table`. Completes as
-    /// [`Reply::Ack`], the run's base id.
+    /// A run of `count` ids from the SERIAL sequence of `table`.
     AllocSerial { table: Target, count: u64 },
     /// An atomic DDL transaction: system-table batches, each named by its table
-    /// id, under one durable SAL zone. Completes as [`Reply::Ack`], its LSN.
+    /// id, under one durable SAL zone.
     DdlTxn(&'a [(u64, ZSetBatch)]),
     /// An atomic user-table push transaction: the server refuses it if some
-    /// family's relation was written after that family's `basis`. Completes as
-    /// [`Reply::Ack`], its LSN.
+    /// family's relation was written after that family's `basis`.
     PushTxn { families: &'a [PushFamily<'a>] },
-    /// RESOLVE — describe the relation named by the canonical
-    /// `"schema_name.relation_name"`. Uncorrelated on the wire, because the
-    /// request names no id.
-    Resolve(&'a str),
-    /// PUSH. The frame always carries `schema`'s record. Completes as
-    /// [`Reply::Ack`], its LSN.
+    /// PUSH. The frame always carries `schema`'s record.
     Push {
         target: Target,
         schema: &'a Schema,
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
     },
-    /// SCAN_SPEC, replied in `reply_schema`'s layout.
-    ScanSpec {
-        target: Target,
-        spec: &'a gnitz_wire::ReadSpec,
-        reply_schema: &'a Arc<Schema>,
-    },
-    /// SCAN_MULTI: every row of N relations at one cut, each replied in the
-    /// layout of the schema paired with it.
-    ScanMulti(Vec<(u64, Arc<Schema>)>),
-}
-
-/// A request validated and encoded, with how its reply decodes.
-pub(crate) struct Encoded {
-    frame: Vec<u8>,
-    kind: SlotKind,
-}
-
-impl Encoded {
-    /// A frame past the ceiling is refused here rather than by the server's
-    /// ingress cap, which would drop the connection.
-    fn new(frame: Vec<u8>, kind: SlotKind) -> Result<Self, ClientError> {
-        let total = frame.len();
-        let limit = gnitz_wire::MAX_FRAME_PAYLOAD;
-        if total > limit {
-            return Err(ClientError::from(format!(
-                "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
-                 split the request"
-            )));
-        }
-        Ok(Encoded { frame, kind })
-    }
-
-    /// DELTA_POLL: one train per view, in order, queued on `feed` under the
-    /// view's index in its poll — `first` for the first of `views`. Not a
-    /// [`Request`], because its results are a stream and not one reply.
-    fn delta_poll(views: &[txn_frame::DeltaPollItem], first: usize, feed: &Arc<PollFeed>) -> Result<Self, ClientError> {
-        if views.is_empty() {
-            return Err(ClientError::from("a delta poll names no view".to_string()));
-        }
-        let kind = SlotKind::DeltaPoll {
-            views: views.iter().map(|v| v.view_id).collect(),
-            at: 0,
-            first,
-            feed: Arc::downgrade(feed),
-        };
-        Encoded::new(txn_frame::encode_delta_poll(views), kind)
-    }
 }
 
 impl Request<'_> {
-    /// Validate and encode.
-    fn encode(self) -> Result<Encoded, ClientError> {
-        let (frame, kind) = match self {
+    /// Validate and encode: the frame, and the relation its ACK names.
+    fn encode(self) -> Result<(Vec<u8>, u64), ClientError> {
+        Ok(match self {
             Request::AllocIds(n) => {
                 let hdr = ControlHeader {
                     flags: WireFlags {
@@ -249,11 +196,11 @@ impl Request<'_> {
                     arg0: n,
                     ..Default::default()
                 };
-                (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: 0 })
+                (encode_frame(hdr, &[], None, None), 0)
             }
             Request::AllocSerial { table, count } => {
                 let hdr = ControlHeader::naming(ClientVerb::AllocSerialRange, table, count);
-                (encode_frame(hdr, &[], None, None), SlotKind::Ack { tid: table.tid })
+                (encode_frame(hdr, &[], None, None), table.tid)
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
@@ -262,23 +209,13 @@ impl Request<'_> {
                     }
                     batch.validate(sys_schema(*tid))?;
                 }
-                (encode_ddl_txn(families), SlotKind::Ack { tid: 0 })
+                (encode_ddl_txn(families), 0)
             }
             Request::PushTxn { families } => {
                 for f in families {
                     f.batch.validate(f.schema)?;
                 }
-                (encode_push_txn(families), SlotKind::Ack { tid: 0 })
-            }
-            Request::Resolve(qname) => {
-                let hdr = ControlHeader {
-                    flags: WireFlags {
-                        verb: ClientVerb::Resolve,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
+                (encode_push_txn(families), 0)
             }
             Request::Push { target, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
@@ -292,138 +229,28 @@ impl Request<'_> {
                 hdr.flags.conflict_mode = mode;
                 (
                     encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
-                    SlotKind::Ack { tid: target.tid },
+                    target.tid,
                 )
             }
-            Request::ScanSpec { target, spec, reply_schema } => {
-                let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout_digest());
-                (
-                    encode_frame(hdr, &spec.encode(), None, None),
-                    SlotKind::Scan {
-                        tid: target.tid,
-                        reply_schema: Arc::clone(reply_schema),
-                        data: None,
-                    },
-                )
-            }
-            Request::ScanMulti(rels) => {
-                if rels.is_empty() {
-                    return Err(ClientError::from("a multi-read names no relation".to_string()));
-                }
-                let items: Vec<txn_frame::ScanMultiItem> = rels
-                    .iter()
-                    .map(|(tid, schema)| txn_frame::ScanMultiItem {
-                        tid: *tid,
-                        reply_layout: schema.layout_digest(),
-                    })
-                    .collect();
-                let (replies, data) = (Vec::with_capacity(rels.len()), None);
-                (
-                    txn_frame::encode_scan_multi(&items),
-                    SlotKind::Multi { rels, replies, data },
-                )
-            }
-        };
-        Encoded::new(frame, kind)
+        })
     }
 }
 
-/// What a slot's verb asked for. The spine resolves a reply against the request
-/// that opened its slot, so no driver re-attaches a relation id.
-#[derive(Debug)]
-pub enum Reply {
-    /// SCAN_SPEC.
-    Scan(ScanReply),
-    /// `scan_multi`: N per-relation results in request order.
-    Multi(Vec<ScanReply>),
-    /// A control-only ACK's value: a PUSH's or transaction's LSN, an id
-    /// allocation's base id.
-    Ack(u64),
-    /// A RESOLVE: the descriptor, or `None` when no such relation exists.
-    Resolve(Option<Arc<RelDescriptor>>),
-    /// A delta poll: the slot is done, and every view's blocks and end went to
-    /// the poll's own feed.
-    Polled,
-}
-
-impl Reply {
-    /// The variant's name, for [`wrong_shape`]. Not `Debug`: `Reply::Scan`
-    /// reaches a whole `ZSetBatch`.
-    fn kind(&self) -> &'static str {
-        match self {
-            Reply::Scan(_) => "Scan",
-            Reply::Multi(_) => "Multi",
-            Reply::Ack(_) => "Ack",
-            Reply::Resolve(_) => "Resolve",
-            Reply::Polled => "Polled",
-        }
-    }
-
-    /// A control-only ACK's value.
-    #[inline]
-    #[track_caller]
-    pub fn into_ack(self) -> u64 {
-        match self {
-            Reply::Ack(value) => value,
-            other => wrong_shape(other.kind(), "Ack"),
-        }
-    }
-
-    /// One relation's read result.
-    #[inline]
-    #[track_caller]
-    pub fn into_scan(self) -> ScanReply {
-        match self {
-            Reply::Scan(r) => r,
-            other => wrong_shape(other.kind(), "Scan"),
-        }
-    }
-
-    /// A `scan_multi`'s N per-relation results, in request order.
-    #[inline]
-    #[track_caller]
-    pub fn into_multi(self) -> Vec<ScanReply> {
-        match self {
-            Reply::Multi(r) => r,
-            other => wrong_shape(other.kind(), "Multi"),
-        }
-    }
-
-    /// A RESOLVE's descriptor, or `None` when no such relation exists.
-    #[inline]
-    #[track_caller]
-    pub fn into_resolve(self) -> Option<Arc<RelDescriptor>> {
-        match self {
-            Reply::Resolve(d) => d,
-            other => wrong_shape(other.kind(), "Resolve"),
-        }
-    }
-}
-
-#[cold]
-#[inline(never)]
-#[track_caller]
-fn wrong_shape(got: &'static str, want: &'static str) -> ! {
-    panic!(
-        "the spine resolves a reply against the request that opened its slot; \
-         wanted Reply::{want}, got Reply::{got}"
-    )
-}
-
-/// How a slot decodes its reply, what that reply becomes, and the reply read so
-/// far. A slot is answered only while it heads the queue, so its state is the
-/// one train in progress, and it goes when the slot does.
-enum SlotKind {
+/// One request in flight: how its reply decodes, the reply read so far, and
+/// where it goes. A slot is answered only while it heads the queue, so its
+/// state is the one train in progress, and it goes when the slot does.
+enum Slot {
     /// A control-only ACK naming `tid`, its value in `arg0`.
-    Ack {
-        tid: u64,
-    },
-    Resolve,
+    Ack { tid: u64, to: Promise<u64> },
+    /// RESOLVE: the descriptor, or `None` when no such relation exists.
+    /// Uncorrelated on the wire, because the request names no id.
+    Resolve { to: Promise<Option<Arc<RelDescriptor>>> },
     Scan {
         tid: u64,
         reply_schema: Arc<Schema>,
         /// The train's rows so far.
         data: Option<ZSetBatch>,
+        to: Promise<ScanReply>,
     },
     /// One train per relation, each decoded under the schema paired with it.
     /// The train in progress is `rels[replies.len()]`.
@@ -431,6 +258,7 @@ enum SlotKind {
         rels: Vec<(u64, Arc<Schema>)>,
         replies: Vec<ScanReply>,
         data: Option<ZSetBatch>,
+        to: Promise<Vec<ScanReply>>,
     },
     /// One train per view, its blocks kept raw. The train in progress is
     /// `views[at]`. The ids are what correlates each
@@ -447,44 +275,78 @@ enum SlotKind {
     },
 }
 
-struct Slot {
-    kind: SlotKind,
-    /// Where the reply goes. A delta poll has none: its results go to its feed.
-    cell: Option<Arc<SentCell>>,
-}
-
-/// Where a request's reply is, between its request and its reader.
+/// Where a reply is, between its writer and its reader.
 #[derive(Default)]
-enum Awaited {
+enum Awaited<T> {
     #[default]
     Outstanding,
-    Arrived(Result<Reply, ClientError>),
+    Arrived(Result<T, ClientError>),
     /// Handed on as it arrives.
-    Routed(Box<dyn FnOnce(Result<Reply, ClientError>) + Send>),
+    Routed(Box<dyn FnOnce(Result<T, ClientError>) + Send>),
+    /// Awaited by a task its arrival wakes.
+    Watched(Waker),
 }
 
-#[derive(Default)]
-struct SentCell(Mutex<Awaited>);
+struct Cell<T>(Mutex<Awaited<T>>);
 
-impl SentCell {
+impl<T> Cell<T> {
     /// A panic under this lock leaves what it guards whole.
-    fn lock(&self) -> MutexGuard<'_, Awaited> {
+    fn lock(&self) -> MutexGuard<'_, Awaited<T>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
 
-    fn arrive(&self, reply: Result<Reply, ClientError>) {
-        let mut state = self.lock();
+/// A reply on its way, borrowing nothing. One to a request arrives as the
+/// session is stepped: [`GnitzClient::wait`](crate::GnitzClient::wait) steps
+/// until it has, and awaiting it directly leaves the stepping to someone else.
+pub struct Sent<T>(Arc<Cell<T>>);
+
+/// The writer of a [`Sent`]. Dropped unfulfilled, the reply is `Closed`.
+pub(crate) struct Promise<T>(Option<Arc<Cell<T>>>);
+
+/// A reply yet to arrive, and its writer.
+pub(crate) fn promise<T>() -> (Promise<T>, Sent<T>) {
+    let cell = Arc::new(Cell(Mutex::new(Awaited::Outstanding)));
+    (Promise(Some(Arc::clone(&cell))), Sent(cell))
+}
+
+impl<T> Promise<T> {
+    /// The reply arrives; a second one goes nowhere.
+    pub(crate) fn fulfil(&mut self, reply: Result<T, ClientError>) {
+        let Some(cell) = self.0.take() else {
+            return;
+        };
+        let mut state = cell.lock();
         match std::mem::take(&mut *state) {
             Awaited::Routed(route) => {
                 drop(state);
                 route(reply)
             }
-            _ => *state = Awaited::Arrived(reply),
+            Awaited::Watched(waiter) => {
+                *state = Awaited::Arrived(reply);
+                drop(state);
+                waiter.wake()
+            }
+            Awaited::Outstanding | Awaited::Arrived(_) => *state = Awaited::Arrived(reply),
         }
     }
+}
 
-    fn take(&self) -> Option<Result<Reply, ClientError>> {
-        let mut state = self.lock();
+impl<T> Drop for Promise<T> {
+    fn drop(&mut self) {
+        self.fulfil(Err(ClientError::Closed));
+    }
+}
+
+impl<T> Sent<T> {
+    /// A reply that needed no request.
+    pub fn ready(value: Result<T, ClientError>) -> Self {
+        Sent(Arc::new(Cell(Mutex::new(Awaited::Arrived(value)))))
+    }
+
+    /// The reply, if it has arrived. It is handed out once.
+    pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
+        let mut state = self.0.lock();
         match std::mem::take(&mut *state) {
             Awaited::Arrived(reply) => Some(reply),
             other => {
@@ -493,49 +355,32 @@ impl SentCell {
             }
         }
     }
-}
 
-/// The reply to a request already submitted, borrowing nothing. Stepping the
-/// session is what makes it arrive:
-/// [`GnitzClient::wait`](crate::GnitzClient::wait) steps until it has.
-pub struct Sent<T>(SentState<T>);
-
-enum SentState<T> {
-    /// Answered without a request.
-    Ready(Option<Result<T, ClientError>>),
-    Waiting(Arc<SentCell>, fn(Reply) -> T),
-}
-
-impl<T> Sent<T> {
-    pub fn ready(value: Result<T, ClientError>) -> Self {
-        Sent(SentState::Ready(Some(value)))
-    }
-
-    /// The reply, if it has arrived. It is handed out once.
-    pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
-        match &mut self.0 {
-            SentState::Ready(value) => value.take(),
-            SentState::Waiting(cell, narrow) => cell.take().map(|r| r.map(*narrow)),
-        }
-    }
-
-    /// Hand the reply to `route` — now if it has arrived, else from inside the
-    /// step that reads it.
-    pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static)
-    where
-        T: 'static,
-    {
-        let (cell, narrow) = match self.0 {
-            SentState::Ready(value) => return route(value.expect("a reply is handed out once")),
-            SentState::Waiting(cell, narrow) => (cell, narrow),
-        };
-        let mut state = cell.lock();
+    /// Hand the reply to `route` — now if it has arrived, else from wherever
+    /// it does: for a request's, inside the step that reads it.
+    pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static) {
+        let mut state = self.0.lock();
         match std::mem::take(&mut *state) {
             Awaited::Arrived(reply) => {
                 drop(state);
-                route(reply.map(narrow))
+                route(reply)
             }
-            _ => *state = Awaited::Routed(Box::new(move |reply| route(reply.map(narrow)))),
+            _ => *state = Awaited::Routed(Box::new(route)),
+        }
+    }
+}
+
+impl<T> Future for Sent<T> {
+    type Output = Result<T, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.0.lock();
+        match std::mem::take(&mut *state) {
+            Awaited::Arrived(reply) => Poll::Ready(reply),
+            _ => {
+                *state = Awaited::Watched(cx.waker().clone());
+                Poll::Pending
+            }
         }
     }
 }
@@ -582,14 +427,6 @@ pub struct Session {
     unread: bool,
 }
 
-/// Every reply still owed resolves `Closed`, so nothing waits on a session
-/// that is gone.
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://` target (see
     /// `ClientTransport::connect`).
@@ -629,26 +466,103 @@ impl Session {
 
     // ── The spine ──────────────────────────────────────────────────────────
 
-    /// Encode and queue `req`; its reply arrives as `narrow` makes of it.
-    /// `Request` borrows its inputs; the borrow ends here. Raises at either cap.
-    pub fn submit<T>(&mut self, req: Request<'_>, narrow: fn(Reply) -> T) -> Result<Sent<T>, ClientError> {
-        let cell = Arc::new(SentCell::default());
-        self.enqueue(req.encode()?, Some(Arc::clone(&cell)))?;
-        Ok(Sent(SentState::Waiting(cell, narrow)))
+    /// Encode and queue `req`. Raises at either cap, as every submit does.
+    pub fn submit(&mut self, req: Request<'_>) -> Result<Sent<u64>, ClientError> {
+        let (frame, tid) = req.encode()?;
+        let (to, sent) = promise();
+        self.enqueue(frame, Slot::Ack { tid, to })?;
+        Ok(sent)
     }
 
-    /// Queue a delta poll of `views`, the items of a poll from its `first` on.
-    /// Their results queue on `feed` as the steps that read them run.
+    /// RESOLVE — describe the relation named by the canonical
+    /// `"schema_name.relation_name"`; `None` when there is none.
+    pub fn submit_resolve(&mut self, qname: &str) -> Result<Sent<Option<Arc<RelDescriptor>>>, ClientError> {
+        let hdr = ControlHeader {
+            flags: WireFlags {
+                verb: ClientVerb::Resolve,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (to, sent) = promise();
+        self.enqueue(encode_frame(hdr, qname.as_bytes(), None, None), Slot::Resolve { to })?;
+        Ok(sent)
+    }
+
+    /// SCAN_SPEC, replied in `reply_schema`'s layout.
+    pub fn submit_scan(
+        &mut self,
+        target: Target,
+        spec: &gnitz_wire::ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> Result<Sent<ScanReply>, ClientError> {
+        let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout_digest());
+        let (to, sent) = promise();
+        let slot = Slot::Scan {
+            tid: target.tid,
+            reply_schema: Arc::clone(reply_schema),
+            data: None,
+            to,
+        };
+        self.enqueue(encode_frame(hdr, &spec.encode(), None, None), slot)?;
+        Ok(sent)
+    }
+
+    /// SCAN_MULTI: every row of N relations at one cut, each replied in the
+    /// layout of the schema paired with it, in request order.
+    pub fn submit_scan_multi(&mut self, rels: Vec<(u64, Arc<Schema>)>) -> Result<Sent<Vec<ScanReply>>, ClientError> {
+        if rels.is_empty() {
+            return Err(ClientError::from("a multi-read names no relation".to_string()));
+        }
+        let items: Vec<txn_frame::ScanMultiItem> = rels
+            .iter()
+            .map(|(tid, schema)| txn_frame::ScanMultiItem {
+                tid: *tid,
+                reply_layout: schema.layout_digest(),
+            })
+            .collect();
+        let (to, sent) = promise();
+        let slot = Slot::Multi {
+            replies: Vec::with_capacity(rels.len()),
+            rels,
+            data: None,
+            to,
+        };
+        self.enqueue(txn_frame::encode_scan_multi(&items), slot)?;
+        Ok(sent)
+    }
+
+    /// DELTA_POLL: one train per view of `views`, the items of a poll from its
+    /// `first` on, in order. Their results queue on `feed`, each under its
+    /// view's index in the poll, as the steps that read them run.
     pub(crate) fn submit_delta_poll(
         &mut self,
         views: &[txn_frame::DeltaPollItem],
         first: usize,
         feed: &Arc<PollFeed>,
     ) -> Result<(), ClientError> {
-        self.enqueue(Encoded::delta_poll(views, first, feed)?, None)
+        if views.is_empty() {
+            return Err(ClientError::from("a delta poll names no view".to_string()));
+        }
+        let slot = Slot::DeltaPoll {
+            views: views.iter().map(|v| v.view_id).collect(),
+            at: 0,
+            first,
+            feed: Arc::downgrade(feed),
+        };
+        self.enqueue(txn_frame::encode_delta_poll(views), slot)
     }
 
-    fn enqueue(&mut self, Encoded { frame, kind }: Encoded, cell: Option<Arc<SentCell>>) -> Result<(), ClientError> {
+    fn enqueue(&mut self, frame: Vec<u8>, slot: Slot) -> Result<(), ClientError> {
+        // A frame past the ceiling is refused here rather than by the server's
+        // ingress cap, which would drop the connection.
+        let (total, limit) = (frame.len(), gnitz_wire::MAX_FRAME_PAYLOAD);
+        if total > limit {
+            return Err(ClientError::from(format!(
+                "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
+                 split the request"
+            )));
+        }
         if let Some(why) = &self.ended {
             return Err(why.clone());
         }
@@ -664,7 +578,7 @@ impl Session {
         }
         self.transport.enqueue(frame);
         self.submitted += 1;
-        self.pending.push_back(Slot { kind, cell });
+        self.pending.push_back(slot);
         Ok(())
     }
 
@@ -759,12 +673,13 @@ impl Session {
         }
         self.transport.close();
         for slot in self.pending.drain(..) {
-            slot.complete(Err(why.clone()));
+            slot.fail(why.clone());
         }
         self.ended = Some(why);
     }
 
-    /// Close the session: every reply still owed arrives as `Closed`.
+    /// Close the session: every reply still owed arrives as `Closed`, as it
+    /// does for a session dropped.
     pub fn close(&mut self) {
         self.end(ClientError::Closed);
     }
@@ -776,45 +691,47 @@ fn feed(pending: &mut VecDeque<Slot>, buf: Cow<'_, [u8]>, handed: &mut bool) -> 
     let Some(head) = pending.front_mut() else {
         return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
     };
-    if let Some(result) = head.feed(buf, handed)? {
+    if let Some(answered) = head.feed(buf, handed)? {
         let slot = pending.pop_front().expect("the head was just fed");
-        slot.complete(result);
+        if let Err(why) = answered {
+            slot.fail(why);
+        }
     }
     Ok(())
 }
 
 impl Slot {
-    /// Take one reply frame. `Some` once the slot is answered: its reply, or the
-    /// refusal that ended the request. `Err` is a frame this slot cannot have
-    /// been sent, which ends the session.
+    /// Take one reply frame. `Some` once the slot is answered: its reply has
+    /// arrived, or this refusal ended the request. `Err` is a frame this slot
+    /// cannot have been sent, which ends the session.
     fn feed(
         &mut self,
         mut buf: Cow<'_, [u8]>,
         handed: &mut bool,
-    ) -> Result<Option<Result<Reply, ClientError>>, ProtocolError> {
+    ) -> Result<Option<Result<(), ClientError>>, ProtocolError> {
         let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let named = ctrl.hdr.target_id;
         // The relation this frame must name. Replies arrive in request order,
         // so a frame naming another would decode under the wrong schema
         // silently; make it loud.
-        let want = match &self.kind {
-            SlotKind::Ack { tid } | SlotKind::Scan { tid, .. } => Some(*tid),
-            SlotKind::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
-            SlotKind::DeltaPoll { views, at, .. } => Some(views[*at]),
-            SlotKind::Resolve => None,
+        let want = match &*self {
+            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } => Some(*tid),
+            Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
+            Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
+            Slot::Resolve { .. } => None,
         };
         if let Some(fault) = ctrl.fault(&buf) {
             let refused = ClientError::Refused(fault);
             // A DELTA_POLL fault naming a view ends that view's position alone;
             // every other fault ends the request.
-            return match (&mut self.kind, want) {
-                (SlotKind::DeltaPoll { views, at, first, feed }, Some(view)) if named != 0 => {
+            return match (&mut *self, want) {
+                (Slot::DeltaPoll { views, at, first, feed }, Some(view)) if named != 0 => {
                     if named != view {
                         return Err(out_of_order(view, named));
                     }
                     hand(feed, *first + *at, Polled::End(Err(refused)));
                     *at += 1;
-                    Ok((*at == views.len()).then_some(Ok(Reply::Polled)))
+                    Ok((*at == views.len()).then_some(Ok(())))
                 }
                 _ => Ok(Some(Err(refused))),
             };
@@ -826,7 +743,7 @@ impl Slot {
         // under the schema its request named.
         let frame_schema = match ctrl.schema.clone() {
             None => None,
-            Some(r) if matches!(self.kind, SlotKind::Resolve) => Some(Arc::new(
+            Some(r) if matches!(self, Slot::Resolve { .. }) => Some(Arc::new(
                 Schema::from_block(&buf[r]).map_err(ProtocolError::DecodeError)?,
             )),
             Some(_) => {
@@ -841,18 +758,18 @@ impl Slot {
         let decode = |data: &mut Option<ZSetBatch>, schema: &Arc<Schema>, block: &[u8]| {
             decode_wal_block_into(data.get_or_insert_with(|| ZSetBatch::new(schema)), block, schema)
         };
-        match (&mut self.kind, ctrl.data.clone()) {
+        match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
             // An abandoned poll's block is dropped uncopied.
-            (SlotKind::DeltaPoll { at, first, feed, .. }, Some(block)) if feed.strong_count() > 0 => {
+            (Slot::DeltaPoll { at, first, feed, .. }, Some(block)) if feed.strong_count() > 0 => {
                 let frame = std::mem::take(&mut buf).into_owned();
                 hand(feed, *first + *at, Polled::Block(RawBlock { frame, block }));
                 *handed = true;
             }
-            (SlotKind::DeltaPoll { .. }, Some(_)) => {}
-            (SlotKind::Scan { reply_schema, data, .. }, Some(r)) => decode(data, reply_schema, &buf[r])?,
-            (SlotKind::Multi { rels, replies, data }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
-            (SlotKind::Ack { .. } | SlotKind::Resolve, Some(_)) => {
+            (Slot::DeltaPoll { .. }, Some(_)) => {}
+            (Slot::Scan { reply_schema, data, .. }, Some(r)) => decode(data, reply_schema, &buf[r])?,
+            (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
+            (Slot::Ack { .. } | Slot::Resolve { .. }, Some(_)) => {
                 return Err(ProtocolError::DecodeError(
                     "a data block on a reply that carries no rows".into(),
                 ))
@@ -869,35 +786,44 @@ impl Slot {
             schema: Arc::clone(schema),
             lsn: Some(ctrl.hdr.arg0),
         };
-        Ok(match &mut self.kind {
-            SlotKind::Ack { .. } => Some(Ok(Reply::Ack(ctrl.hdr.arg0))),
-            SlotKind::Resolve => Some(Ok(Reply::Resolve(resolve_descriptor(&ctrl, &buf, frame_schema)?))),
-            SlotKind::Scan { reply_schema, data, .. } => Some(Ok(Reply::Scan(scan_reply(reply_schema, data)))),
-            SlotKind::Multi { rels, replies, data } => {
+        match self {
+            Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
+            Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf, frame_schema)?)),
+            Slot::Scan { reply_schema, data, to, .. } => to.fulfil(Ok(scan_reply(reply_schema, data))),
+            Slot::Multi { rels, replies, data, to } => {
                 let reply = scan_reply(&rels[replies.len()].1, data);
                 replies.push(reply);
-                (replies.len() == rels.len()).then(|| Ok(Reply::Multi(std::mem::take(replies))))
+                if replies.len() < rels.len() {
+                    return Ok(None);
+                }
+                to.fulfil(Ok(std::mem::take(replies)))
             }
-            SlotKind::DeltaPoll { views, at, first, feed } => {
+            Slot::DeltaPoll { views, at, first, feed } => {
                 let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                     .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
                 hand(feed, *first + *at, Polled::End(Ok(cursor)));
                 *at += 1;
-                (*at == views.len()).then_some(Ok(Reply::Polled))
-            }
-        })
-    }
-
-    /// The slot is answered: its reply arrives. A delta poll that failed whole
-    /// ends each view it had yet to answer with that failure.
-    fn complete(self, result: Result<Reply, ClientError>) {
-        if let (SlotKind::DeltaPoll { views, at, first, feed }, Err(why)) = (&self.kind, &result) {
-            for item in first + at..first + views.len() {
-                hand(feed, item, Polled::End(Err(why.clone())));
+                if *at < views.len() {
+                    return Ok(None);
+                }
             }
         }
-        if let Some(cell) = self.cell {
-            cell.arrive(result);
+        Ok(Some(Ok(())))
+    }
+
+    /// The request ended unanswered: `why` is its reply, and the end of each
+    /// view a delta poll had yet to answer.
+    fn fail(self, why: ClientError) {
+        match self {
+            Slot::Ack { mut to, .. } => to.fulfil(Err(why)),
+            Slot::Resolve { mut to } => to.fulfil(Err(why)),
+            Slot::Scan { mut to, .. } => to.fulfil(Err(why)),
+            Slot::Multi { mut to, .. } => to.fulfil(Err(why)),
+            Slot::DeltaPoll { views, at, first, feed } => {
+                for item in first + at..first + views.len() {
+                    hand(&feed, item, Polled::End(Err(why.clone())));
+                }
+            }
         }
     }
 }

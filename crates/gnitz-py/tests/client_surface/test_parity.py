@@ -1,5 +1,5 @@
 """One client, two ways of waiting: `gnitz.GnitzClient` and
-`gnitz.aio.AsyncConnection` run the same verbs, and each has the other's way of
+`gnitz.AsyncGnitzClient` run the same verbs, and each has the other's way of
 sharing a round trip.
 
 What a verb *does* is owned by the coordinate that tests it through the
@@ -51,7 +51,6 @@ def test_the_two_classes_share_every_verb():
     assert base is gnitz.AsyncGnitzClient.__mro__[1]
     assert own(gnitz.GnitzClient) == {"close", "pipeline"}
     assert own(gnitz.AsyncGnitzClient) == {"aclose"}
-    assert own(aio.AsyncConnection) == set()
     assert {"push", "execute_sql", "mirror_view", "transaction", "create_table"} <= own(base)
 
 

@@ -27,28 +27,8 @@ future is not cancellation: the request is still written and committed.
 from gnitz._native import AsyncGnitzClient
 
 
-async def _immediate_return(value):
-    return value
-
-
-class AsyncConnection(AsyncGnitzClient):
-    """A connection on the running event loop. It is connected when built, so
-    awaiting it yields itself, and `async with` closes it on exit."""
-
-    __slots__ = ()
-
-    def __await__(self):
-        # Lets `await connect(p)` and `async with connect(p)` both work.
-        return _immediate_return(self).__await__()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        await self.aclose()
-        return False
-
-
 def connect(target, schema="public"):
-    """Connect to a gnitz server, with names resolving in `schema`."""
-    return AsyncConnection(target, schema)
+    """Connect to a gnitz server, with names resolving in `schema`. The
+    connection is made when this returns, so awaiting it yields itself, and
+    `async with` closes it on exit."""
+    return AsyncGnitzClient(target, schema)

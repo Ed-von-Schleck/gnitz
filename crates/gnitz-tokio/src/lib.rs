@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use gnitz_core::{serve, ClientError, GnitzClient, Host, Interest, Job, Op, Pending};
+use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
 
@@ -118,7 +118,7 @@ impl AsyncClient {
     pub fn run<T, F>(&self, f: F) -> impl Future<Output = Result<T, ClientError>>
     where
         T: Send + 'static,
-        F: for<'a> FnOnce(&'a mut GnitzClient) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, T> + Send + 'static,
     {
         let (reply, rx) = oneshot::channel();
         // A driver that is gone drops the op, and with it `reply`.
@@ -156,7 +156,7 @@ impl AsyncClient {
 /// Owns the client and serves the calls its [`AsyncClient`]s make: poll it to
 /// completion. It completes once every handle is dropped and nothing is
 /// outstanding; a lost connection fails the calls and does not end it.
-pub struct Connection(Pin<Box<dyn Future<Output = ()> + Send>>);
+pub struct Connection(BoxFut<'static, ()>);
 
 impl Future for Connection {
     type Output = ();

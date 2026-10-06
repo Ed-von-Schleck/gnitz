@@ -80,7 +80,13 @@ pub(crate) struct Catalog<'r> {
     /// Whether a name without a verdict may yet be supplied; otherwise it is
     /// absent.
     open: bool,
+    /// Asked for a name without a verdict before the attempt reports it
+    /// missing.
+    held: Option<&'r Held<'r>>,
 }
+
+/// The relation a name denotes, where it is to be had without waiting.
+pub(crate) type Held<'r> = dyn Fn(&str) -> Option<Arc<RelDescriptor>> + 'r;
 
 impl<'r> Catalog<'r> {
     pub(crate) fn new(schema_name: &'r str) -> Self {
@@ -89,6 +95,15 @@ impl<'r> Catalog<'r> {
             known: RefCell::new(HashMap::new()),
             missed: RefCell::new(None),
             open: true,
+            held: None,
+        }
+    }
+
+    /// A catalog that takes what `held` has before it reports a name missing.
+    pub(crate) fn holding(schema_name: &'r str, held: &'r Held<'r>) -> Self {
+        Catalog {
+            held: Some(held),
+            ..Catalog::new(schema_name)
         }
     }
 
@@ -111,6 +126,10 @@ impl<'r> Catalog<'r> {
         }
         if !self.open {
             return Ok(None);
+        }
+        if let Some(desc) = self.held.and_then(|held| held(name)) {
+            self.known.borrow_mut().insert(key, Some(Arc::clone(&desc)));
+            return Ok(Some(desc));
         }
         *self.missed.borrow_mut() = Some(name.to_string());
         Err(GnitzSqlError::Internal(format!(

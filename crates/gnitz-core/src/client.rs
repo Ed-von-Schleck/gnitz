@@ -1,5 +1,5 @@
 use crate::connection::{
-    DeltaCursor, Interest, PollFeed, Polled, RelDescriptor, Reply, Request, ScanReply, Sent, Session, Target,
+    promise, DeltaCursor, Interest, PollFeed, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -7,13 +7,12 @@ use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Sche
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::{poll_fn, Future};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::task::{ready, Context, Poll, Waker};
 
 use gnitz_expr::{LogicalProgram, RowFilter};
@@ -319,59 +318,17 @@ fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -
     })
 }
 
-/// A job's outcome on its way back to [`offload`].
-struct Offloaded<R> {
-    /// How the job ended: its value, the payload of its panic, or `Err(None)`
-    /// for a job its host dropped unrun.
-    ended: Option<Result<R, Option<Box<dyn Any + Send>>>>,
-    waiter: Option<Waker>,
-}
-
-/// The job's end of an [`Offloaded`]: dropped, it wakes the waiter, whether
-/// the job ran or not.
-struct Finish<R>(Arc<Mutex<Offloaded<R>>>);
-
-impl<R> Drop for Finish<R> {
-    fn drop(&mut self) {
-        let waiter = {
-            let mut job = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            job.ended.get_or_insert(Err(None));
-            job.waiter.take()
-        };
-        if let Some(waiter) = waiter {
-            waiter.wake();
-        }
-    }
-}
-
 /// Run `job` on `host`, where it may block, and wait for what it returns. A
 /// panic in it resumes here; a job the host dropped is `Closed`.
 pub(crate) async fn offload<R: Send + 'static>(
     host: &mut dyn Host,
     job: impl FnOnce() -> R + Send + 'static,
 ) -> Result<R, ClientError> {
-    let cell = Arc::new(Mutex::new(Offloaded { ended: None, waiter: None }));
-    let finish = Finish(Arc::clone(&cell));
+    let (mut ended, job_end) = promise();
     host.spawn(Box::new(move || {
-        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-        finish.0.lock().unwrap_or_else(PoisonError::into_inner).ended = Some(ended.map_err(Some));
+        ended.fulfil(Ok(std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))))
     }));
-    let ended = poll_fn(|cx| {
-        let mut job = cell.lock().unwrap_or_else(PoisonError::into_inner);
-        match job.ended.take() {
-            Some(ended) => Poll::Ready(ended),
-            None => {
-                job.waiter = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    })
-    .await;
-    match ended {
-        Ok(value) => Ok(value),
-        Err(Some(panic)) => std::panic::resume_unwind(panic),
-        Err(None) => Err(ClientError::Closed),
-    }
+    job_end.await?.map_err(|panic| std::panic::resume_unwind(panic))
 }
 
 /// A verb that is one request: awaited, it is that round trip;
@@ -387,11 +344,8 @@ impl<T> Unpin for Pending<'_, T> {}
 
 impl<'a, T> Pending<'a, T> {
     /// A refusal that sent nothing is the reply.
-    fn submitted(client: &'a mut GnitzClient, req: Request<'_>, narrow: fn(Reply) -> T) -> Self {
-        let sent = client
-            .session
-            .submit(req, narrow)
-            .unwrap_or_else(|e| Sent::ready(Err(e)));
+    fn submitted(client: &'a mut GnitzClient, sent: Result<Sent<T>, ClientError>) -> Self {
+        let sent = sent.unwrap_or_else(|e| Sent::ready(Err(e)));
         Pending { client, sent }
     }
 
@@ -418,7 +372,10 @@ impl<T> Future for Pending<'_, T> {
 
 /// One queued call of a [`serve`] loop: it has the client to itself until its
 /// future completes.
-pub type Op = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
+pub type Op = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, ()> + Send>;
+
+/// A boxed future a host can move between threads.
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Run the ops `next` yields on `client`, in order and one at a time. Steps
 /// the session while none is ready, and after `next` yields `None` until
@@ -538,8 +495,9 @@ impl GnitzClient {
 
     // ── Waiting ────────────────────────────────────────────────────────────
 
-    fn round_trip(&mut self, req: Request<'_>) -> Pending<'_, Reply> {
-        Pending::submitted(self, req, |reply| reply)
+    fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
+        let sent = self.session.submit(req);
+        Pending::submitted(self, sent)
     }
 
     /// Step this client's session until `sent` is answered. Replies arrive in
@@ -586,9 +544,8 @@ impl GnitzClient {
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
                 let base = self
-                    .round_trip(Request::AllocSerial { table: table.into(), count: want })
-                    .await?
-                    .into_ack();
+                    .ack(Request::AllocSerial { table: table.into(), count: want })
+                    .await?;
                 self.serial_cache.insert(table.tid, base + count..base + want);
                 Ok(base)
             }
@@ -599,7 +556,7 @@ impl GnitzClient {
 
     /// Allocate a run of `n` catalog object ids, returning its first.
     async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
-        self.round_trip(Request::AllocIds(n)).await.map(Reply::into_ack)
+        self.ack(Request::AllocIds(n)).await
     }
 
     /// Allocate one catalog object id (schema, relation or index).
@@ -628,7 +585,7 @@ impl GnitzClient {
             return Pending { client: self, sent };
         }
         let batch = &*batch;
-        Pending::submitted(self, Request::Push { target, schema, batch, mode }, Reply::into_ack)
+        self.ack(Request::Push { target, schema, batch, mode })
     }
 
     /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
@@ -639,7 +596,8 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
     ) -> Pending<'_, ScanReply> {
         let target = target.into();
-        Pending::submitted(self, Request::ScanSpec { target, spec, reply_schema }, Reply::into_scan)
+        let sent = self.session.submit_scan(target, spec, reply_schema);
+        Pending::submitted(self, sent)
     }
 
     // ── The read seam ──────────────────────────────────────────────────────
@@ -807,7 +765,8 @@ impl GnitzClient {
     /// across the result set.
     /// Each relation is replied in the layout of the schema paired with it.
     pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Pending<'_, Vec<ScanReply>> {
-        Pending::submitted(self, Request::ScanMulti(relations), Reply::into_multi)
+        let sent = self.session.submit_scan_multi(relations);
+        Pending::submitted(self, sent)
     }
 
     /// Index `cols` of relation `owner_id`, in that order, under the catalog name
@@ -955,9 +914,7 @@ impl GnitzClient {
                 basis: f.basis,
             })
             .collect();
-        self.round_trip(Request::PushTxn { families: &families })
-            .await
-            .map(Reply::into_ack)
+        self.ack(Request::PushTxn { families: &families }).await
     }
 
     /// Read `target`'s rows under `bound` and `predicate` — only their keys when
@@ -1035,7 +992,7 @@ impl GnitzClient {
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
-        self.round_trip(Request::DdlTxn(&bundle.0)).await?;
+        self.ack(Request::DdlTxn(&bundle.0)).await?;
         self.kept.clear();
         self.after_ddl_commit(&bundle.0).await;
         Ok(())
@@ -1496,10 +1453,8 @@ impl GnitzClient {
     /// error.
     pub async fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         let qname = qualified_name(schema_name, name);
-        let found = self
-            .round_trip(Request::Resolve(&qname))
-            .await
-            .map(Reply::into_resolve)?;
+        let sent = self.session.submit_resolve(&qname);
+        let found = Pending::submitted(self, sent).await?;
         match &found {
             Some(desc) => self.kept.insert(qname, Arc::clone(desc)),
             None => self.kept.remove(&qname),

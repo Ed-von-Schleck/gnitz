@@ -8,7 +8,6 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_core::block_on;
 use gnitz_core::{PlannedView, ViewBundle};
 use gnitz_wire::sys_rows::ViewTabSlot;
 use gnitz_wire::{Circuit, ViewProps, VIEW_TAB};

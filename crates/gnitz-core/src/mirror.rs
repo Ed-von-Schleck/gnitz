@@ -85,7 +85,8 @@ pub trait MirrorStore: Send {
     fn seal(&mut self, tid: u64, cursor: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
-    /// `next`. Refused for a copy holding no cursor.
+    /// `next`. Refused for a copy holding no cursor. With no block it moves the
+    /// cursor alone and touches no disk: the client makes that call in place.
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
@@ -684,11 +685,16 @@ impl GnitzClient {
             }
             if poll.drained() && !due.is_empty() {
                 let trains = std::mem::take(&mut due);
+                let idle = trains.iter().all(|(_, _, blocks, _)| blocks.is_empty());
                 let apply = move |s: &mut dyn MirrorStore| {
                     let apply = |train: Train| (train.0, advance_from(s, train));
                     trains.into_iter().map(apply).collect::<Vec<_>>()
                 };
-                applied.extend(store.clone().run(host, apply).await?);
+                applied.extend(match idle {
+                    // Only cursors move, so there is nothing to block on.
+                    true => apply(&mut *store.get()),
+                    false => store.clone().run(host, apply).await?,
+                });
             }
         }
         Ok(applied)

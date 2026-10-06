@@ -2,9 +2,7 @@
 //! the GIL released, and [`LoopCore`], queued for an asyncio event loop.
 
 use std::collections::VecDeque;
-use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::pin::Pin;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -13,14 +11,13 @@ use pyo3::intern;
 use pyo3::prelude::*;
 
 use gnitz_core::{
-    block_on, serve, BlockingHost, ClientError, GnitzClient, Host, Interest, Job, Op, Sent, Session, MAX_IN_FLIGHT,
+    block_on, serve, BlockingHost, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Sent, Session,
+    MAX_IN_FLIGHT,
 };
 
 use gnitz_sql::GnitzSqlError;
 
 use crate::{client_err, gnitz_err, sql_err};
-
-pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A verb's result, ready to become a Python object once the GIL is held.
 type Landed = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
@@ -99,18 +96,24 @@ impl Blocking {
                 })
             })
             .map_err(sql_err)?;
-        let state = Arc::new(Mutex::new(PendingState::Outstanding));
-        let arrived = Arc::clone(&state);
-        sent.then(move |reply| *lock(&arrived) = PendingState::Arrived(landed(reply.map_err(Into::into), convert)));
+        let (mut sent, mut convert) = (sent, Some(convert));
+        let arrived: Arrived = Box::new(move || {
+            let reply = sent.try_take()?;
+            let convert = convert.take().expect("a reply is handed out once");
+            Some(landed(reply.map_err(Into::into), convert))
+        });
+        let state = Mutex::new(PendingState::Outstanding(arrived));
         let pending = Py::new(py, PyPending { client: slf.clone().unbind(), state })?;
         owed.push(pending.clone_ref(py));
         Ok(pending.into_any())
     }
 }
 
+/// A pipelined verb's reply, once the session has read it.
+type Arrived = Box<dyn FnMut() -> Option<Landed> + Send>;
+
 enum PendingState {
-    Outstanding,
-    Arrived(Landed),
+    Outstanding(Arrived),
     /// The reply, and whether `result()` has handed it to anyone.
     Landed(PyResult<Py<PyAny>>, bool),
 }
@@ -120,8 +123,7 @@ enum PendingState {
 #[pyclass(name = "Pending", frozen)]
 pub(crate) struct PyPending {
     client: Py<crate::client::PyClient>,
-    /// Shared with the step that reads the reply.
-    state: Arc<Mutex<PendingState>>,
+    state: Mutex<PendingState>,
 }
 
 impl PyPending {
@@ -130,16 +132,13 @@ impl PyPending {
         loop {
             {
                 let mut state = lock(&self.state);
-                match std::mem::replace(&mut *state, PendingState::Outstanding) {
-                    PendingState::Outstanding => {}
-                    PendingState::Arrived(landed) => {
-                        *state = PendingState::Landed(landed(py), false);
-                        return Ok(());
-                    }
-                    landed => {
-                        *state = landed;
-                        return Ok(());
-                    }
+                let landed = match &mut *state {
+                    PendingState::Outstanding(arrived) => arrived(),
+                    PendingState::Landed(..) => return Ok(()),
+                };
+                if let Some(landed) = landed {
+                    *state = PendingState::Landed(landed(py), false);
+                    return Ok(());
                 }
             }
             let mut client = self.client.bind(py).try_borrow_mut()?;
@@ -170,7 +169,7 @@ impl PyPending {
                     Err(e) => Err(e.clone_ref(py)),
                 }
             }
-            PendingState::Outstanding | PendingState::Arrived(_) => unreachable!("landed above"),
+            PendingState::Outstanding(_) => unreachable!("landed above"),
         }
     }
 }
@@ -538,14 +537,19 @@ impl LoopHandle {
         O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<()>, GnitzSqlError>> + Send + 'static,
     {
         if self.shared.state().closing {
-            let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;
-            settle(py, &future, Ok(py.None()));
-            return Ok(future);
+            return self.settled(py, py.None());
         }
         let closed = self.submit(py, last, |py, ()| Ok(py.None()))?;
         self.shared.state().closing = true;
         self.core.bind(py).try_borrow_mut()?.inner().pump(py, true);
         Ok(closed)
+    }
+
+    /// A loop future already resolved to `value`.
+    pub(crate) fn settled(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;
+        settle(py, &future, Ok(value));
+        Ok(future)
     }
 
     /// The Python handle is gone: close once nothing is in flight.
