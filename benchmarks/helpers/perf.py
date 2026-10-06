@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import signal
@@ -174,31 +175,45 @@ class PerfRecorder:
 
 
 class PerfStat:
-    """perf stat -p <pid> -e cycles,instructions,cache-references,..."""
+    """`perf stat` over the master and its workers: the user-space instructions
+    and cycles the server spends between `start()` and `stop()`."""
 
-    EVENTS = "cycles,instructions,cache-references,cache-misses,branch-misses"
+    EVENTS = "instructions:u,cycles:u"
 
     def __init__(self, pid: int):
-        self._pid = pid
+        self._pids = [pid] + get_child_pids(pid)
         self._proc: subprocess.Popen | None = None
 
     def start(self) -> None:
+        ctl_r, ctl_w = os.pipe()
+        ack_r, ack_w = os.pipe()
         try:
             self._proc = subprocess.Popen(
-                ["perf", "stat", "-p", str(self._pid),
-                 "-e", self.EVENTS],
+                ["perf", "stat", "-x", ";", "-e", self.EVENTS,
+                 "-p", ",".join(str(p) for p in self._pids),
+                 "--delay", "-1", "--control", f"fd:{ctl_r},{ack_w}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                pass_fds=(ctl_r, ack_w),
             )
         except (FileNotFoundError, PermissionError) as e:
             print(f"[perf] Could not start perf stat: {e}")
             print("[perf] Check that 'perf' is installed and "
                   "kernel.perf_event_paranoid allows profiling.")
-            self._proc = None
+        finally:
+            os.close(ctl_r)
+            os.close(ack_w)
+        if self._proc:
+            os.write(ctl_w, b"enable\n")
+            # perf's acknowledgement that it counts; empty if it exited instead.
+            os.read(ack_r, 16)
+        os.close(ctl_w)
+        os.close(ack_r)
 
     def stop(self) -> dict[str, int]:
-        """Stop perf stat and parse output. Returns {event_name: count}."""
+        """Stop counting. Returns {"instructions": n, "cycles": n}, or {} when
+        perf did not count."""
         if self._proc is None:
             return {}
         self._proc.send_signal(signal.SIGINT)
@@ -210,11 +225,8 @@ class PerfStat:
 
         counters = {}
         for line in stderr.splitlines():
-            line = line.strip()
-            # Format: "1,234,567      cycles"
-            m = re.match(r"^([\d,]+)\s+(\S+)", line)
-            if m:
-                count = int(m.group(1).replace(",", ""))
-                event = m.group(2)
-                counters[event] = count
+            # value;unit;event;...
+            fields = line.split(";")
+            if len(fields) > 2 and fields[0].isdigit():
+                counters[fields[2].split(":")[0]] = int(fields[0])
         return counters

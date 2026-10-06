@@ -98,9 +98,10 @@ def print_summary_table(output_dir: Path) -> None:
         return
 
     # Header
+    counted = any("server_instructions" in b.get("extra", {}) for b in benchmarks)
     print(f"\n{'Name':<45} {'rows/s':>10} {'p50ms':>8} {'p90ms':>8} "
-          f"{'p99ms':>8} {'iters':>6}")
-    print("-" * 95)
+          f"{'p99ms':>8} {'iters':>6}" + (f" {'instr/row':>10} {'cycles/row':>10}" if counted else ""))
+    print("-" * (117 if counted else 95))
     for b in benchmarks:
         w = b.get("workers", "")
         c = b.get("clients", "")
@@ -108,8 +109,14 @@ def print_summary_table(output_dir: Path) -> None:
         name = prefix + b["name"]
         if len(name) > 44:
             name = name[:41] + "..."
-        print(f"{name:<45} {b['rows_per_sec']:>10.0f} {b['p50_ms']:>8.2f} "
-              f"{b['p90_ms']:>8.2f} {b['p99_ms']:>8.2f} {b['iterations']:>6}")
+        line = (f"{name:<45} {b['rows_per_sec']:>10.0f} {b['p50_ms']:>8.2f} "
+                f"{b['p90_ms']:>8.2f} {b['p99_ms']:>8.2f} {b['iterations']:>6}")
+        extra = b.get("extra", {})
+        if "server_instructions" in extra:
+            # What the server spent on the whole test, over its measured rows.
+            rows = max(b["rows"], 1)
+            line += f" {extra['server_instructions'] / rows:>10.0f} {extra['server_cycles'] / rows:>10.0f}"
+        print(line)
 
     print(f"\nResults in: {output_dir}")
 

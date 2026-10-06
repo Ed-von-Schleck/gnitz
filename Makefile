@@ -14,6 +14,7 @@ WORKERS    ?= 1                              # e2e overrides this to 4 (see belo
 CLIENTS    ?= 1
 FULL       ?=
 PERF       ?=
+STAT       ?=                                # bench: count the server's instructions and cycles per benchmark
 PERF_DWARF ?=
 ROWS       ?=                                # bench-disk: rows loaded per scenario
 RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES of its compacted regime
@@ -172,7 +173,7 @@ bench: release-server pyext-release ## Run the SQL benchmark suite
 		$(if $(FULL),--full) \
 		--workers=$(WORKERS) --clients=$(CLIENTS) \
 		$(if $(K),-k '$(K)') \
-		$(if $(PERF),--perf --perf-stat) \
+		$(if $(PERF),--perf) $(if $(PERF)$(STAT),--perf-stat) \
 		$(if $(PERF_DWARF),--perf-dwarf)
 
 # Bytes, not time: a run prints what the data directory holds once the final

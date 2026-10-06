@@ -607,8 +607,12 @@ once the new one is durable, so a crash at any point leaves one complete set.
 ```bash
 make bench                          # quick mode, 1 worker
 make bench-full                     # full mode, 4 workers
-make bench WORKERS=4 PERF=1         # knobs: WORKERS, CLIENTS, FULL=1, PERF=1
+make bench WORKERS=4 STAT=1         # knobs: WORKERS, CLIENTS, FULL=1, PERF=1, STAT=1
 ```
+
+`STAT=1` adds the server's own user-space instructions and cycles per measured
+row. Compare two builds on those: rows per second moves by more than most
+changes do.
 
 `make help` lists the rest. Results land in the gitignored `benchmarks/results/`;
 `benchmarks/report.py` turns them into report tables.

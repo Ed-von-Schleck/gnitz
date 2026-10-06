@@ -3,6 +3,7 @@ use super::*;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::{self, Counter};
 use gnitz_zset::repr::BatchBuilder;
+use std::rc::Rc;
 
 /// A consolidated run of `rows`, `(pk, weight)` each and ascending by PK; a
 /// string payload is spelled out long enough to live on the heap.
@@ -19,6 +20,20 @@ fn run(schema: &SchemaDescriptor, rows: impl Iterator<Item = (u64, i64)>) -> Bat
     let mut run = b.finish();
     run.certify_consolidated();
     run
+}
+
+/// The rows a push made `set` fold.
+fn rows_folded(runs_before: &[Rc<Batch>], rows_with_pushed: usize, set: &RunSet) -> usize {
+    let kept = set
+        .runs
+        .iter()
+        .zip(runs_before)
+        .take_while(|(a, b)| Rc::ptr_eq(a, b))
+        .count();
+    match kept == runs_before.len() {
+        true => 0,
+        false => rows_with_pushed - runs_before[..kept].iter().map(|r| r.len()).sum::<usize>(),
+    }
 }
 
 /// 40 scattered bits, distinct per `seq`.
@@ -71,15 +86,16 @@ fn run_set_fold_bench() {
             .iter()
             .map(|r| (0..r.len()).filter(|&i| r.get_weight(i) < 0).count());
         let rows_out = rows_in - 2 * retracted.sum::<usize>();
-        let before = perf::rss_bytes();
-        perf::reset_peak_rss();
+        let resident = perf::Resident::baseline();
         let ((), instructions) = counter.measure(|| set.fold(&schema));
-        let peak = perf::peak_rss_bytes().saturating_sub(before);
+        let peak = match resident {
+            Some(r) => format!("{:.2}x the output", r.peak_added() as f64 / set.bytes as f64),
+            None => format!("n/a without {}", perf::PIN_MMAP_THRESHOLD),
+        };
         assert_eq!(set.row_count(), rows_out, "{label}");
         println!(
-            "run_set_fold_bench {label:<34} {rows_in} rows in, {rows_out} out, {:5.1} instr/row, peak {:.2}x the output",
-            instructions as f64 / rows_in as f64,
-            peak as f64 / set.bytes as f64
+            "run_set_fold_bench {label:<34} {rows_in} rows in, {rows_out} out, {:5.1} instr/row, peak {peak}",
+            instructions as f64 / rows_in as f64
         );
     }
 }
@@ -107,7 +123,7 @@ fn run_set_push_bench() {
     );
     for (schema_label, schema) in schemas {
         for (order_label, key) in orders {
-            for tick in [1u64, 16, 256] {
+            for tick in [1u64, 16, 128] {
                 let mut cells = [0.0; 2];
                 let (mut rows, mut folded, mut unprobed_cycles) = (0u64, 0u64, 0u64);
                 for (cell, probed) in cells.iter_mut().zip([false, true]) {
@@ -128,14 +144,14 @@ fn run_set_push_bench() {
                                 (!full).then_some(b)
                             })
                             .collect();
-                        // What the set's own folds will merge, by its trigger.
-                        let (mut runs, mut held) = (0, 0);
-                        for _ in &ticks {
-                            (runs, held) = (runs + 1, held + tick);
-                            if runs == FOLD_THRESHOLD {
-                                (runs, folded) = (1, folded + held);
-                            }
+                        // What the set's own folds merge, off a set the same ticks fill.
+                        let mut shadow = RunSet::new(MEMTABLE_BYTES);
+                        for b in &ticks {
+                            let (before, rows) = (shadow.runs.clone(), shadow.row_count() + b.len());
+                            shadow.push(b.clone(), &schema);
+                            folded += rows_folded(&before, rows, &shadow) as u64;
                         }
+                        let (runs, held) = (shadow.len(), shadow.row_count() as u64);
                         let (((), i), c) = cycles.measure(|| {
                             counter.measure(|| {
                                 for (at, b) in ticks.into_iter().enumerate() {
@@ -167,6 +183,98 @@ fn run_set_push_bench() {
                     cells[1]
                 );
             }
+        }
+    }
+}
+
+/// `RunSet::drain_into` at a RAM tier's cadence: each drain moves a memtable's
+/// worth of rows into the tier, which spills once full. The columns are
+/// `run_set_push_bench`'s per moved row, the tier probed after every drain.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn run_set_tier_bench() {
+    /// Drains that fill the tier once.
+    const FILL: u64 = (DEFAULT_RAM_TIER_BYTES / MEMTABLE_BYTES) as u64;
+    const DRAINS: u64 = 4 * FILL;
+    /// The `seq`-th moved row, `hot` being the rows of half a fill.
+    type Rows = fn(seq: u64, hot: u64) -> (u64, i64);
+    let arms: [(&str, bool, Rows); 3] = [
+        ("ascending", true, |seq, _| (seq, 1)),
+        ("scattered", true, |seq, _| (scatter(seq), 1)),
+        // Every pass over the hot keys cancels the one before it.
+        ("churn", false, |seq, hot| {
+            (seq % hot * 1_000_003 % hot, [1, -1][(seq / hot % 2) as usize])
+        }),
+    ];
+    let schemas = [
+        ("ints", make_schema_u64_i64()),
+        ("strings", make_schema_pk_u64_payload_string()),
+    ];
+    let (counter, cycles) = (Counter::instructions(), Counter::cycles());
+    println!(
+        "run_set_tier_bench {:<20} {:>9} {:>6} {:>11} {:>10} {:>10} {:>10}",
+        "", "rows/run", "spills", "folded/row", "instr/row", "cycles/row", "probed"
+    );
+    for (schema_label, schema) in schemas {
+        let row_bytes = run(&schema, (0..1024).map(|pk| (pk, 1))).trimmed().total_bytes() / 1024;
+        let per_run = (MEMTABLE_BYTES / row_bytes) as u64;
+        let hot = per_run * (FILL / 2);
+        for (arm_label, fills, rows) in arms {
+            let label = format!("{schema_label}, {arm_label}");
+            let mut cells = [0.0; 2];
+            let (mut spills, mut folded, mut unprobed_cycles) = (0u64, 0u64, 0u64);
+            for (cell, probed) in cells.iter_mut().zip([false, true]) {
+                (spills, folded) = (0, 0);
+                let mut instructions = 0;
+                let mut memtable = RunSet::new(MEMTABLE_BYTES);
+                let mut tier = RunSet::new(DEFAULT_RAM_TIER_BYTES);
+                for drain in 0..DRAINS {
+                    let mut moved: Vec<(u64, i64)> = (drain * per_run..(drain + 1) * per_run)
+                        .map(|seq| rows(seq, hot))
+                        .collect();
+                    moved.sort_unstable();
+                    memtable.push(run(&schema, moved.into_iter()), &schema);
+                    let (before, rows) = (tier.runs.clone(), tier.row_count() + memtable.row_count());
+                    let (((mut merged, spilled), i), c) = cycles.measure(|| {
+                        counter.measure(|| {
+                            memtable.drain_into(&mut tier, &schema);
+                            if probed {
+                                std::hint::black_box(tier.may_contain(0));
+                            }
+                            let merged = rows_folded(&before, rows, &tier);
+                            let spilled = tier.is_full().then(|| {
+                                let refolded = if tier.len() > 1 { tier.row_count() } else { 0 };
+                                tier.spill(&schema, |_| Ok::<(), ()>(())).unwrap();
+                                refolded
+                            });
+                            (merged, spilled)
+                        })
+                    });
+                    instructions += i;
+                    unprobed_cycles += c * !probed as u64;
+                    assert_eq!(memtable.len(), 0, "{label}: the memtable kept a run");
+                    assert!(
+                        before.len() + 1 < FOLD_THRESHOLD || merged > 0,
+                        "{label}: the tier did not fold"
+                    );
+                    if let Some(refolded) = spilled {
+                        assert_eq!(tier.len(), 0, "{label}: the spill left a run");
+                        merged += refolded;
+                        spills += 1;
+                    }
+                    folded += merged as u64;
+                }
+                assert_eq!(spills > 0, fills, "{label}: {spills} spills");
+                *cell = instructions as f64 / (DRAINS * per_run) as f64;
+            }
+            let moved_rows = (DRAINS * per_run) as f64;
+            println!(
+                "run_set_tier_bench {label:<20} {per_run:>9} {spills:>6} {:>11.1} {:>10.1} {:>10.1} {:>10.1}",
+                folded as f64 / moved_rows,
+                cells[0],
+                unprobed_cycles as f64 / moved_rows,
+                cells[1]
+            );
         }
     }
 }

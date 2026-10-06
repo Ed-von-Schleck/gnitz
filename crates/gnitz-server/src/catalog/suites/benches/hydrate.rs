@@ -93,19 +93,20 @@ fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> 
     black_box(read(&mut Counting { dag: &mut engine.dag, hydrated: 0 }));
 
     let mut hydrator = Counting { dag: &mut engine.dag, hydrated: 0 };
-    let before = perf::rss_bytes();
-    perf::reset_peak_rss();
+    let resident = perf::Resident::baseline();
     let (rows, instructions) = counter.measure(|| read(&mut hydrator));
-    let peak = perf::peak_rss_bytes().saturating_sub(before);
+    let peak = match resident {
+        Some(r) => format!("+{:>7.1} MiB", r.peak_added() as f64 / (1 << 20) as f64),
+        None => format!("n/a without {}", perf::PIN_MMAP_THRESHOLD),
+    };
     let hydrated = hydrator.hydrated;
     assert!(
         hydrated > 0,
         "{label}: the read hydrated nothing, so it measured no hydration"
     );
     println!(
-        "{label:<30} rows {:>8}  hydrated {hydrated:>8}  peak +{:>7.1} MiB  {instructions:>12} instr",
+        "{label:<30} rows {:>8}  hydrated {hydrated:>8}  peak {peak}  {instructions:>12} instr",
         rows.len(),
-        peak as f64 / (1 << 20) as f64,
     );
     (rows, hydrated)
 }

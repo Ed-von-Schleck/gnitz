@@ -143,20 +143,21 @@ fn resident_footprint_bench() {
         .attach_mirror(Mirror::open(&dir, config).expect("a store opens"))
         .expect("a fresh client attaches it");
 
-    let base = perf::rss_bytes();
-    perf::reset_peak_rss();
+    let resident = perf::Resident::baseline();
     block_on(mirror.mirror_view("s", "v_big")).expect("mirror");
-    let peak = perf::peak_rss_bytes();
+    let peak = resident.as_ref().map(perf::Resident::peak_added);
     block_on(mirror.checkpoint_mirror()).expect("checkpoint");
-    let held = perf::rss_bytes();
+    let held = resident.as_ref().map(perf::Resident::added);
 
     print!(
         "{}",
         gnitz_store::relation::disk_usage(&support::common::root(&dir)).expect("the copy's directory")
     );
-    println!(
-        "{ROWS} rows mirrored: host RSS +{} held, +{} at the bootstrap's peak",
-        held.saturating_sub(base),
-        peak.saturating_sub(base),
-    );
+    match held.zip(peak) {
+        Some((held, peak)) => println!("{ROWS} rows mirrored: host RSS +{held} held, +{peak} at the bootstrap's peak"),
+        None => println!(
+            "{ROWS} rows mirrored: host RSS n/a without {}",
+            perf::PIN_MMAP_THRESHOLD
+        ),
+    }
 }

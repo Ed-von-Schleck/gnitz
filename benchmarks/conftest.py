@@ -48,11 +48,18 @@ def client(socket_path, request):
 
 
 @pytest.fixture
-def bench_timer(request, scale_mode):
+def bench_timer(request, scale_mode, server_pid):
     tier = request.path.parent.name
     module = request.node.module.__name__.rsplit(".", 1)[-1]
     timer = BenchTimer(request.node.name, f"{tier}/{module}")
+    perf_stat = None
+    if request.config.getoption("--perf-stat"):
+        from helpers.perf import PerfStat
+        perf_stat = PerfStat(server_pid)
+        perf_stat.start()
     yield timer
+    if perf_stat:
+        timer.extra.update({f"server_{event}": n for event, n in perf_stat.stop().items()})
     record_result(timer.result())
 
 
@@ -73,7 +80,7 @@ def pytest_addoption(parser):
     parser.addoption("--perf-dwarf", action="store_true", default=False,
                      help="Enable perf record with --call-graph=dwarf for full userspace stacks")
     parser.addoption("--perf-stat", action="store_true", default=False,
-                     help="Enable perf stat during benchmarks")
+                     help="Count the server's instructions and cycles per benchmark")
     parser.addoption("--results-dir", type=str, default=None,
                      help="Override results output directory")
 
@@ -142,20 +149,11 @@ def server(request, results_dir):
         perf_recorder = PerfRecorder(proc.pid, results_dir, dwarf=dwarf)
         perf_recorder.start()
 
-    perf_stat = None
-    if request.config.getoption("--perf-stat"):
-        from helpers.perf import PerfStat
-        perf_stat = PerfStat(proc.pid)
-        perf_stat.start()
-
     yield str(sock_path), proc.pid, proc
 
     if perf_recorder:
         perf_recorder.stop()
         perf_recorder.flamegraph()
-    if perf_stat:
-        perf_stat.stop()
-
     kill_group(proc)
     log_f.close()
 

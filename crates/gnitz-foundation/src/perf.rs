@@ -101,39 +101,55 @@ pub fn voluntary_ctx_switches() -> i64 {
     }
 }
 
-/// Bytes of `field` (`VmRSS`, `VmHWM`, …) in `/proc/self/status`. `0` where
-/// `/proc` does not answer.
+/// Bytes of `field` (`VmRSS`, `VmHWM`, …) in `/proc/self/status`.
 fn status_bytes(field: &str) -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
-                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let kb = status
+        .lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok());
+    kb.unwrap_or_else(|| panic!("no {field} in /proc/self/status")) * 1024
+}
+
+/// What to run a benchmark under for [`Resident`] to answer.
+pub const PIN_MMAP_THRESHOLD: &str = "GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072";
+
+/// What, written to `/proc/self/clear_refs`, resets `VmHWM` to the resident set.
+const RESET_PEAK_RSS: &str = "5";
+
+/// This process's resident memory against a baseline, in bytes.
+pub struct Resident {
+    base: u64,
+}
+
+impl Resident {
+    /// The baseline, taken now. `None` unless [`PIN_MMAP_THRESHOLD`] is set:
+    /// glibc otherwise keeps freed memory resident and hands it out again, so
+    /// a reading would count what earlier work left behind.
+    pub fn baseline() -> Option<Self> {
+        let pinned = std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.mmap_threshold="));
+        pinned.then(|| {
+            let base = Self::now();
+            std::fs::write("/proc/self/clear_refs", RESET_PEAK_RSS).expect("reset the peak resident set");
+            Resident { base }
         })
-        .map_or(0, |kb| kb * 1024)
-}
+    }
 
-/// This process's resident set, in bytes, once the allocator has handed its
-/// free memory back — so a delta of two readings counts what is still
-/// referenced. `0` where `/proc` does not answer.
-pub fn rss_bytes() -> u64 {
-    // SAFETY: `malloc_trim` only releases memory the allocator holds free.
-    unsafe { libc::malloc_trim(0) };
-    status_bytes("VmRSS")
-}
+    /// What is resident beyond the baseline, the allocator's free memory handed back.
+    pub fn added(&self) -> u64 {
+        Self::now().saturating_sub(self.base)
+    }
 
-/// This process's peak resident set since it started or since the last
-/// [`reset_peak_rss`], in bytes. `0` where `/proc` does not answer.
-pub fn peak_rss_bytes() -> u64 {
-    status_bytes("VmHWM")
-}
+    /// The most that was resident beyond the baseline since it was taken.
+    pub fn peak_added(&self) -> u64 {
+        status_bytes("VmHWM").saturating_sub(self.base)
+    }
 
-/// Reset [`peak_rss_bytes`] to the current resident set, so a peak measures one
-/// region; take the [`rss_bytes`] baseline first, since that reading lowers the
-/// resident set. A no-op where `/proc/self/clear_refs` is not writable.
-pub fn reset_peak_rss() {
-    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    fn now() -> u64 {
+        // SAFETY: `malloc_trim` only releases memory the allocator holds free.
+        unsafe { libc::malloc_trim(0) };
+        status_bytes("VmRSS")
+    }
 }
 
 /// The pass count a benchmark loops over, from `GNITZ_BENCH_PASSES`; `1` when
