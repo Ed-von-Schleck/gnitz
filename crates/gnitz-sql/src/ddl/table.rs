@@ -6,12 +6,12 @@ use super::guard::{
     reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
 };
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{find_unique_column, Catalog};
+use crate::bind::{find_unique_column, Catalog, NameRef};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
-use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, Schema};
+use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::TableDistribution;
@@ -24,8 +24,8 @@ use std::collections::HashSet;
 
 /// The canonical catalog name of an unnamed index:
 /// `{schema}__{table}__idx_{col1}_{col2}…`.
-fn default_index_name(schema_name: &str, table_name: &str, col_names: &[&str]) -> String {
-    let name = format!("{schema_name}__{table_name}__idx_{}", col_names.join("_"));
+fn default_index_name(table: &RelName, col_names: &[&str]) -> String {
+    let name = format!("{}__{}__idx_{}", table.schema(), table.name(), col_names.join("_"));
     // A quoted column name holds any byte; an index name holds identifier bytes.
     name.bytes()
         .map(|b| {
@@ -133,7 +133,7 @@ fn resolve_index_columns<'c>(
 /// omitted column list defaults to it, and is undefined otherwise.
 fn resolve_referred_column(
     referred_columns: &[sqlparser::ast::Ident],
-    ref_table: &str,
+    ref_table: &NameRef,
     cols: &[ColumnDef],
     pk_single: Option<usize>,
 ) -> Result<usize, GnitzSqlError> {
@@ -163,7 +163,7 @@ fn resolve_referred_column(
 fn resolve_fk_target_inline(
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
-    ref_table: &str,
+    ref_table: &NameRef,
     site: &FkSite<'_>,
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
     let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
@@ -192,18 +192,18 @@ fn resolve_fk_target_inline(
 fn resolve_fk_target(
     cat: &Catalog<'_>,
     site: &FkSite<'_>,
-    ref_table: &str,
-    current_table_name: &str,
+    ref_table: &NameRef,
+    current_table: &RelName,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
-    if ref_table.eq_ignore_ascii_case(current_table_name) {
+    if ref_table.rel == *current_table {
         return resolve_fk_target_inline(current_cols, current_pk_cols, ref_table, site);
     }
 
-    let ref_rel = cat.probe_relation(ref_table)?;
+    let ref_rel = cat.probe_relation(&ref_table.rel)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
@@ -459,8 +459,7 @@ fn name_unique_indexes(
     unique: Vec<UniqueDecl>,
     cols: &[ColumnDef],
     pk_count: usize,
-    schema_name: &str,
-    table_name: &str,
+    table: &RelName,
 ) -> Result<Vec<InlineUniqueIndex>, GnitzSqlError> {
     // Written names first: they are the fixed points auto-names route around.
     let mut taken: HashSet<String> = HashSet::new();
@@ -479,7 +478,7 @@ fn name_unique_indexes(
                 Some(name) => name,
                 None => {
                     let col_names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
-                    let base = default_index_name(schema_name, table_name, &col_names);
+                    let base = default_index_name(table, &col_names);
                     let name = disambiguate_index_name(base, &taken);
                     taken.insert(name.clone());
                     name
@@ -492,7 +491,7 @@ fn name_unique_indexes(
 
 /// A `CREATE TABLE`'s bundle: the table and its inline unique indexes.
 pub(crate) struct TablePlan {
-    pub(crate) name: String,
+    pub(crate) name: RelName,
     pub(crate) schema: Schema,
     /// Per column, the target its FOREIGN KEY names.
     pub(crate) fks: Vec<Option<FkTarget>>,
@@ -648,7 +647,7 @@ pub(crate) fn plan_create_table(
 ) -> Result<Option<TablePlan>, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
     let schema_name = cat.schema_name();
-    let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
+    let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?.rel;
 
     // The `WITH (…)` keys and values are decidable from the statement's own text.
     // A `Keyed` distribution's prefix is the other half of `props`, and needs
@@ -688,7 +687,7 @@ pub(crate) fn plan_create_table(
     // column's type to the parent's — so this runs after collection, not inside it.
     // The self-references go last: one adopts the PK column's type, which a
     // cross-table FK on that column rewrites.
-    let mut sites: Vec<(String, &FkSite<'_>)> = fk_sites
+    let mut sites: Vec<(NameRef, &FkSite<'_>)> = fk_sites
         .iter()
         .map(|site| {
             Ok((
@@ -697,7 +696,7 @@ pub(crate) fn plan_create_table(
             ))
         })
         .collect::<Result<_, GnitzSqlError>>()?;
-    sites.sort_by_key(|(ref_table, _)| ref_table.eq_ignore_ascii_case(&table_name));
+    sites.sort_by_key(|(ref_table, _)| ref_table.rel == table_name);
     let mut fks: Vec<Option<FkTarget>> = vec![None; cols.len()];
     for (ref_table, site) in sites {
         if fks[site.col_idx].is_some() {
@@ -732,7 +731,7 @@ pub(crate) fn plan_create_table(
 
     drop_unique_covered_by_pk(&mut unique, cols, pk_indices)?;
 
-    let unique_indexes = name_unique_indexes(unique, cols, pk_indices.len(), schema_name, &table_name)?;
+    let unique_indexes = name_unique_indexes(unique, cols, pk_indices.len(), &table_name)?;
     // Every FK column carries an index of its own.
     for (i, _) in fks.iter().enumerate().filter(|(_, fk)| fk.is_some()) {
         index_key(cols, &[i as u32], pk_indices.len(), "FOREIGN KEY")?;
@@ -774,12 +773,11 @@ pub(crate) fn plan_create_table(
 /// and its inline unique indexes.
 pub(crate) async fn execute_create_table(
     client: &mut GnitzClient,
-    schema_name: &str,
     plan: TablePlan,
 ) -> Result<SqlResult, GnitzSqlError> {
     let TablePlan { name, schema, fks, props, unique_indexes } = plan;
     client
-        .create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)
+        .create_table(&name, &schema, &fks, props, &unique_indexes)
         .await?;
     Ok(SqlResult::Ddl)
 }
@@ -795,23 +793,25 @@ pub(crate) async fn execute_drop(
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
         return Err(unsupported_clause("DROP", &object_type.to_string()));
     }
-    let mut targets: Vec<String> = Vec::with_capacity(names.len());
-    for obj_name in names {
-        // An index name is global, so a qualifier on one means nothing; a table
-        // or view name is schema-scoped, and the active schema is the session's.
-        targets.push(match object_type {
-            ObjectType::Index => extract_index_name(obj_name, "DROP")?,
-            _ => extract_object_name(obj_name, schema_name, "DROP")?,
-        });
-    }
-    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-
     // `IF EXISTS` rides the verb, which resolves its own targets. It softens
     // nothing else: one refusal still fails the whole statement.
+    if let ObjectType::Index = object_type {
+        // An index name is global, so a qualifier on one means nothing.
+        let targets = names
+            .iter()
+            .map(|n| extract_index_name(n, "DROP"))
+            .collect::<Result<Vec<String>, _>>()?;
+        let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+        client.drop_indexes_by_name(&targets, if_exists).await?;
+        return Ok(SqlResult::Ddl);
+    }
+    let targets = names
+        .iter()
+        .map(|n| Ok(extract_object_name(n, schema_name, "DROP")?.rel))
+        .collect::<Result<Vec<RelName>, GnitzSqlError>>()?;
     match object_type {
-        ObjectType::View => client.drop_view(schema_name, &targets, if_exists).await?,
-        ObjectType::Index => client.drop_indexes_by_name(&targets, if_exists).await?,
-        _ => client.drop_table(schema_name, &targets, if_exists).await?,
+        ObjectType::View => client.drop_view(&targets, if_exists).await?,
+        _ => client.drop_table(&targets, if_exists).await?,
     }
     Ok(SqlResult::Ddl)
 }
@@ -850,7 +850,7 @@ impl IndexSite {
 
 /// One index the statement asks for, as its own text describes it.
 pub(crate) struct IndexRequest<'a> {
-    pub(crate) owner_name: &'a str,
+    pub(crate) owner_name: &'a RelName,
     pub(crate) columns: &'a [sqlparser::ast::IndexColumn],
     /// The written index or constraint name, canonical.
     pub(crate) explicit_name: Option<String>,
@@ -902,14 +902,13 @@ pub(crate) async fn execute_create_index(
         .map(|n| extract_index_name(n, "CREATE INDEX"))
         .transpose()?;
     // The one resolve on this path: `create_index_core` takes the descriptor.
-    let target = client.resolve_relation(schema_name, &owner_name).await?;
+    let target = client.resolve_relation(&owner_name.rel).await?;
     require_class(&target, &owner_name, ClassWant::Indexable, "CREATE INDEX")?;
     create_index_core(
         client,
-        schema_name,
         &target,
         &IndexRequest {
-            owner_name: &owner_name,
+            owner_name: &owner_name.rel,
             columns: &ci.columns,
             explicit_name,
             site: IndexSite::CreateIndex {
@@ -926,7 +925,6 @@ pub(crate) async fn execute_create_index(
 /// asserts the owner class exactly once.
 pub(crate) async fn create_index_core(
     client: &mut GnitzClient,
-    schema_name: &str,
     target: &gnitz_core::RelDescriptor,
     req: &IndexRequest<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -951,7 +949,7 @@ pub(crate) async fn create_index_core(
             name
         }
         None => {
-            let base = default_index_name(schema_name, req.owner_name, &col_names);
+            let base = default_index_name(req.owner_name, &col_names);
             let existing = client.index_rows().await?;
             let serves_request = |r: &gnitz_core::IndexRow| {
                 r.owner == owner_id && r.cols == cols && (r.is_unique || !req.site.is_unique())

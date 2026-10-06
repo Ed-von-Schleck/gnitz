@@ -14,7 +14,7 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{
-    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Sent,
+    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, RelName, ScanReply, Sent,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
@@ -90,8 +90,8 @@ pub struct PyClient {
     /// A `Sync` shim: `#[pyclass]` demands `Sync` and a client is `Send` only,
     /// as its host is. Never locked — [`Self::mode`] is the only way in.
     mode: Mutex<Mode>,
-    /// The schema this connection's names resolve in: every SQL statement, and
-    /// every verb that takes a relation name.
+    /// The schema of a relation named without one, in SQL and in every verb
+    /// that takes a name.
     #[pyo3(get, set)]
     schema: String,
 }
@@ -160,6 +160,11 @@ impl PyClient {
     fn schema_name(slf: &Bound<'_, Self>) -> PyResult<String> {
         Ok(slf.try_borrow()?.schema.clone())
     }
+
+    /// The relation a verb's `name` or `schema.name` argument names.
+    fn relation(slf: &Bound<'_, Self>, text: &str) -> PyResult<RelName> {
+        RelName::parse(&slf.try_borrow()?.schema, text).map_err(|e| client_err(e.into()))
+    }
 }
 
 /// The handle is gone: a client on an event loop closes once it owes nothing.
@@ -207,11 +212,11 @@ impl PyClient {
     /// create_table(table_name, schema). Partitioned, default distribution; no
     /// inline UNIQUE surface.
     fn create_table(slf: &Bound<'_, Self>, table_name: String, schema: PySchema) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
+        let table = Self::relation(slf, &table_name)?;
         Self::run(
             slf,
             whole!(|c| {
-                c.create_table(&sn, &table_name, &schema.rust, &[], TableProps::default(), &[])
+                c.create_table(&table, &schema.rust, &[], TableProps::default(), &[])
                     .await?
             }),
             |py, tid| tid.into_py_any(py),
@@ -219,8 +224,8 @@ impl PyClient {
     }
 
     fn drop_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
-        Self::run(slf, whole!(|c| c.drop_table(&sn, &[&table_name], false).await?), none)
+        let table = Self::relation(slf, &table_name)?;
+        Self::run(slf, whole!(|c| c.drop_table(&[table], false).await?), none)
     }
 
     // ----- DML -----
@@ -274,42 +279,32 @@ impl PyClient {
 
     // ----- Views -----
 
-    /// create_view(view_name, source_name, source_schema=None) — a passthrough
-    /// view, whose schema is its source's. The source is resolved in this
-    /// client's schema unless `source_schema` names another.
-    #[pyo3(signature = (view_name, source_name, source_schema = None))]
-    fn create_view(
-        slf: &Bound<'_, Self>,
-        view_name: String,
-        source_name: String,
-        source_schema: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
+    /// create_view(view_name, source_name) — a passthrough view, whose schema
+    /// is its source's.
+    fn create_view(slf: &Bound<'_, Self>, view_name: String, source_name: String) -> PyResult<Py<PyAny>> {
+        let view = Self::relation(slf, &view_name)?;
+        let source = Self::relation(slf, &source_name)?;
         Self::run(
             slf,
             whole!(|c| {
-                let source = c
-                    .resolve_relation(source_schema.as_deref().unwrap_or(&sn), &source_name)
-                    .await?;
-                c.create_view(&sn, &view_name, &source, ViewProps::default()).await?
+                let source = c.resolve_relation(&source).await?;
+                c.create_view(&view, &source, ViewProps::default()).await?
             }),
             |py, vid| vid.into_py_any(py),
         )
     }
 
     fn drop_view(slf: &Bound<'_, Self>, view_name: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
-        Self::run(slf, whole!(|c| c.drop_view(&sn, &[&view_name], false).await?), none)
+        let view = Self::relation(slf, &view_name)?;
+        Self::run(slf, whole!(|c| c.drop_view(&[view], false).await?), none)
     }
 
     /// resolve_table(table_name) -> (tid: int, schema: Schema)
     fn resolve_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
-        Self::run(
-            slf,
-            whole!(|c| c.resolve_relation(&sn, &table_name).await?),
-            |py, rel| (rel.tid, PySchema { rust: Arc::clone(&rel.schema) }).into_py_any(py),
-        )
+        let table = Self::relation(slf, &table_name)?;
+        Self::run(slf, whole!(|c| c.resolve_relation(&table).await?), |py, rel| {
+            (rel.tid, PySchema { rust: Arc::clone(&rel.schema) }).into_py_any(py)
+        })
     }
 
     /// scan(target_id, schema) -> ScanResult
@@ -474,8 +469,8 @@ impl PyClient {
     /// A mirrored read answers at the last poll, not at what the server holds
     /// now.
     fn mirror_view(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
-        Self::run(slf, whole!(|c| c.mirror_view(&sn, &name).await?), |py, outcome| {
+        let view = Self::relation(slf, &name)?;
+        Self::run(slf, whole!(|c| c.mirror_view(&view).await?), |py, outcome| {
             PyPollResult::new(py, outcome).into_py_any(py)
         })
     }

@@ -151,6 +151,6 @@ fn resolving<T>(
             &name,
             known.probe(&name).expect("a complete catalog answers every name"),
         );
-        asked.push(name);
+        asked.push(name.name().to_string());
     }
 }

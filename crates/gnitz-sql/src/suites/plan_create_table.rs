@@ -39,7 +39,10 @@ fn fk_catalog() -> Catalog<'static> {
     let i = TypeCode::I64;
     let cols = || vec![col("id", i), col("u", i)];
     let cat = catalog(vec![("q", rel(40, RelClass::Table, cols(), vec![0], vec![ix(&[1])]))]);
-    cat.insert("p", Some(rel(41, RelClass::Table, cols(), vec![0], vec![uq(&[1])])));
+    cat.insert(
+        &in_sn("p"),
+        Some(rel(41, RelClass::Table, cols(), vec![0], vec![uq(&[1])])),
+    );
     cat
 }
 
@@ -301,9 +304,9 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         vec![col("a", u), col("b", u), ncol("payload", TypeCode::I64)],
         vec![0, 1],
     );
-    known.insert("cp", Some(cp));
+    known.insert(&in_sn("cp"), Some(cp));
     let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
-    known.insert("st", Some(st));
+    known.insert(&in_sn("st"), Some(st));
     for (sql, needle) in [
         ("CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p", "CTAS"),
         ("CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)", "TEMPORARY"),
@@ -574,19 +577,52 @@ fn a_plan_resolves_only_the_fk_targets_and_the_if_not_exists_name() {
 
 // ── the schema qualifier ─────────────────────────────────────────────────────
 
-/// The active schema is a session parameter, so a qualifier is accepted only
-/// when it names that schema. Dropping it silently planned `REFERENCES other.t`
-/// as a *self*-reference.
+/// A qualifier places the table, and decides which relation a `REFERENCES`
+/// means.
 #[test]
-fn a_cross_schema_qualifier_is_rejected_rather_than_dropped() {
+fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
     let cat = fk_catalog();
-    for sql in [
-        "CREATE TABLE other.t (id BIGINT PRIMARY KEY)",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
-    ] {
-        assert_rejects(sql, plan_table(&cat, sql), "cross-schema");
-    }
-    // The same-schema spelling is the one a Postgres user writes.
+    let i = TypeCode::I64;
+    let other = |name: &str| gnitz_core::RelName::new("other", name).unwrap();
+    cat.insert(&other("t"), Some(table(42, vec![col("id", i)], vec![0])));
+
+    let c = created(&cat, "CREATE TABLE Other.t2 (id BIGINT PRIMARY KEY, u BIGINT UNIQUE)");
+    assert_eq!(c.name, other("t2"));
+    assert_eq!(c.unique_indexes, [unique(&[1], "other__t2__idx_u")]);
+    // The session schema, spelled out, is the session schema.
     let c = created(&cat, &format!("CREATE TABLE {SN}.t (id BIGINT PRIMARY KEY)"));
-    assert_eq!(c.schema.pk_cols, vec![0]);
+    assert_eq!(c.name, in_sn("t"));
+
+    for (sql, want) in [
+        // Two tables named `t`: the session's own and `other`'s.
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
+            FkTarget::Table(FkRef { table_id: 42, col: 0 }),
+        ),
+        (
+            "CREATE TABLE other.t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
+            FkTarget::SelfTable { col: 0 },
+        ),
+        (
+            "CREATE TABLE other.x (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id))",
+            FkTarget::Table(FkRef { table_id: 41, col: 0 }),
+        ),
+    ] {
+        assert_eq!(created(&cat, sql).fks[1], Some(want), "`{sql}`");
+    }
+    for (sql, needle) in [
+        // An unqualified parent is the session's, whatever schema the child is in.
+        (
+            "CREATE TABLE other.t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES t(id))",
+            "not found",
+        ),
+        ("CREATE TABLE db.other.t (id BIGINT PRIMARY KEY)", "too many name parts"),
+        (
+            "CREATE TABLE _system.t (id BIGINT PRIMARY KEY)",
+            "cannot start with '_'",
+        ),
+    ] {
+        let err = plan_table(&cat, sql).err().unwrap_or_else(|| panic!("`{sql}` planned"));
+        assert!(format!("{err:?}").contains(needle), "`{sql}`: {err:?}");
+    }
 }

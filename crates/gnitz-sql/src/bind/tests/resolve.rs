@@ -60,19 +60,23 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
 }
 
 /// An attempt stops at a name without a verdict and names it; with the
-/// verdict supplied — absence is one — the name is settled, whatever its case.
+/// verdict supplied — absence is one — the name is settled, in its schema only.
 #[test]
 fn an_attempt_names_the_relation_it_misses() {
     let cat = Catalog::new("s");
-    let plan = |cat: &Catalog<'_>| cat.probe("T");
-    assert!(matches!(cat.attempt(plan), Attempt::Missing(name) if name == "T"));
-    cat.insert("T", None);
+    let name = |schema, name| RelName::new(schema, name).unwrap();
+    let (t, elsewhere) = (name("s", "T"), name("other", "t"));
+    let plan = |cat: &Catalog<'_>| cat.probe(&t);
+    assert!(matches!(cat.attempt(plan), Attempt::Missing(missed) if missed == t));
+    cat.insert(&t, None);
     assert!(matches!(cat.attempt(plan), Attempt::Planned(Ok(None))));
-    let Attempt::Planned(Err(err)) = cat.attempt(|cat| cat.probe_relation("t")) else {
-        panic!("the lower-case spelling is the same name");
+    assert!(matches!(cat.attempt(|cat| cat.probe(&elsewhere)), Attempt::Missing(missed) if missed == elsewhere));
+    let respelled = name("S", "t");
+    let Attempt::Planned(Err(err)) = cat.attempt(|cat| cat.probe_relation(&respelled)) else {
+        panic!("the other spelling is the same name");
     };
     assert_eq!(
         format!("{err:?}"),
-        format!("{:?}", crate::error::missing_relation("s", "t"))
+        format!("{:?}", crate::error::missing_relation(&respelled))
     );
 }

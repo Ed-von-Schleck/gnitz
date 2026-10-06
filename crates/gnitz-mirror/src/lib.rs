@@ -12,7 +12,7 @@
 //!
 //! ```ignore
 //! client.attach_mirror(gnitz_mirror::Mirror::open(dir, MirrorConfig::from_env())?)?;
-//! client.mirror_view("public", "recent")?;
+//! client.mirror_view(&RelName::new("public", "recent")?)?;
 //! ```
 //!
 //! Everything a *host* contracts for — freshness, what can be mirrored, the read

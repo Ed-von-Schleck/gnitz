@@ -383,7 +383,7 @@ fn every_unsupported_window_names_its_clause() {
 fn row_number_reads_the_row_key_off_the_relation() {
     let cat = cat();
     cat.insert(
-        "jt",
+        &in_sn("jt"),
         Some(table(
             10,
             vec![col("_join_pk", TypeCode::I64), col("a", TypeCode::I64)],

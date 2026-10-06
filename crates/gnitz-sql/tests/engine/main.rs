@@ -16,11 +16,16 @@ use gnitz_core::block_on;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_core::{ClientError, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName, ScanReply, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{FixedInt, TypeCode, WireFault, WireStatus};
+
+/// `schema.name`.
+pub fn rel(schema: &str, name: &str) -> RelName {
+    RelName::new(schema, name).unwrap()
+}
 
 /// Who refused a statement: the planner, or the client or engine under the
 /// status a caller branches on.
@@ -147,12 +152,12 @@ impl Db {
     }
 
     pub fn rel(&mut self, name: &str) -> Arc<RelDescriptor> {
-        block_on(self.client.resolve_relation(&self.sn, name)).unwrap()
+        block_on(self.client.resolve_relation(&rel(&self.sn, name))).unwrap()
     }
 
     /// Whether `name` resolves.
     pub fn exists(&mut self, name: &str) -> bool {
-        block_on(self.client.resolve(&self.sn, name)).unwrap().is_some()
+        block_on(self.client.resolve(&rel(&self.sn, name))).unwrap().is_some()
     }
 
     /// `name`'s secondary indexes as `(column names, is_unique)`, sorted.

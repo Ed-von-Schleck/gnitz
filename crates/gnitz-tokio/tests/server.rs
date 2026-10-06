@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::future::Future;
 
 use gnitz_core::{
-    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, ScanReply, Schema, ZSetBatch,
+    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, RelName, ScanReply, Schema, ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
@@ -20,6 +20,11 @@ use gnitz_tokio::AsyncClient;
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
 use support::settled;
 use tokio::runtime::Runtime;
+
+/// `schema.name`.
+fn rel(schema: &str, name: &str) -> RelName {
+    RelName::new(schema, name).unwrap()
+}
 
 /// `(pk BIGINT, a BIGINT)`.
 fn schema() -> Schema {
@@ -39,7 +44,7 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     let sn = unique_schema("tokio");
     block_on(client.create_schema(&sn)).unwrap();
     let schema = schema();
-    let tid = block_on(client.create_table(&sn, "t", &schema, &[], TableProps::default(), &[])).unwrap();
+    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], TableProps::default(), &[])).unwrap();
     (client, tid, Arc::new(schema), sn)
 }
 
@@ -130,7 +135,7 @@ fn pipelined_verbs() {
             let relations = vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))];
             let resolve = |name: &'static str| {
                 let sn = sn.clone();
-                client.run(move |c| Box::pin(async move { c.resolve(&sn, name).await }))
+                client.run(move |c| Box::pin(async move { c.resolve(&rel(&sn, name)).await }))
             };
             let (_, one, many, found, missing) = tokio::join!(
                 push(&client, tid, &schema, replaced),
@@ -229,10 +234,9 @@ fn one_writev_per_burst() {
 fn a_shared_client_mirrors() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
-    let source = block_on(blocking.resolve_relation(&sn, "t")).unwrap();
+    let source = block_on(blocking.resolve_relation(&rel(&sn, "t"))).unwrap();
     let vid = block_on(blocking.create_view(
-        &sn,
-        "v",
+        &rel(&sn, "v"),
         &source,
         ViewProps::Fed {
             delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
@@ -269,7 +273,7 @@ fn a_shared_client_mirrors() {
                 .run(move |c| {
                     Box::pin(async move {
                         c.attach_mirror(store)?;
-                        c.mirror_view(&name, "v").await
+                        c.mirror_view(&rel(&name, "v")).await
                     })
                 })
                 .await

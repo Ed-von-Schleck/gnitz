@@ -72,10 +72,11 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let (sn, base_tid, schema) = make_base(&mut client);
 
     let owner =
-        block_on(client.create_view_chain(&sn, "f", chain(base_tid, &schema), ViewProps::default(), None)).unwrap();
+        block_on(client.create_view_chain(&rel(&sn, "f"), chain(base_tid, &schema), ViewProps::default(), None))
+            .unwrap();
     assert_eq!(
         owner,
-        block_on(client.resolve_relation(&sn, "f")).unwrap().tid,
+        block_on(client.resolve_relation(&rel(&sn, "f"))).unwrap().tid,
         "the returned id is the user view's"
     );
     // One contiguous id run, the user view last; both segments name it as owner.
@@ -90,11 +91,13 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
         assert_eq!(view_rows(&mut client, segment, &schema), [], "segment {segment}");
     }
 
-    let err = block_on(client.drop_table(&sn, &["t"], false)).unwrap_err().to_string();
+    let err = block_on(client.drop_table(&[rel(&sn, "t")], false))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("View dependency"), "got: {err}");
 
     // A rename is a net-live rewrite of the owner's row: the cascade must not fire.
-    let f = block_on(client.resolve_relation(&sn, "f")).unwrap();
+    let f = block_on(client.resolve_relation(&rel(&sn, "f"))).unwrap();
     block_on(client.alter_rename_relation(&f, "renamed")).unwrap();
     assert_eq!(
         live_views(&mut client),
@@ -103,9 +106,9 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     );
     assert_eq!(view_rows(&mut client, owner, &schema), base);
 
-    block_on(client.drop_view(&sn, &["renamed"], false)).unwrap();
+    block_on(client.drop_view(&[rel(&sn, "renamed")], false)).unwrap();
     assert_eq!(live_views(&mut client), [], "the drop cascades to every segment");
-    block_on(client.drop_table(&sn, &["t"], false)).unwrap();
+    block_on(client.drop_table(&[rel(&sn, "t")], false)).unwrap();
 }
 
 #[test]
@@ -116,17 +119,17 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A committed view whose name the bundle's user-named view reuses.
     let taken = block_on(client.create_view_chain(
-        &sn,
-        "taken",
+        &rel(&sn, "taken"),
         segment(base_tid, &schema).into(),
         ViewProps::default(),
         None,
     ))
     .unwrap();
 
-    let err = block_on(client.create_view_chain(&sn, "taken", chain(base_tid, &schema), ViewProps::default(), None))
-        .unwrap_err()
-        .to_string();
+    let err =
+        block_on(client.create_view_chain(&rel(&sn, "taken"), chain(base_tid, &schema), ViewProps::default(), None))
+            .unwrap_err()
+            .to_string();
     assert!(err.contains("already exists"), "got: {err}");
     // Nothing of the refused bundle committed: the only live view is `taken`.
     let only_taken = [(taken, 0)];
@@ -141,7 +144,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         segments: vec![segment(gnitz_core::segment_id(1), &schema), segment(base_tid, &schema)],
         view: segment(gnitz_core::segment_id(0), &schema),
     };
-    let err = block_on(client.create_view_chain(&sn, "fwd", forward, ViewProps::default(), None))
+    let err = block_on(client.create_view_chain(&rel(&sn, "fwd"), forward, ViewProps::default(), None))
         .unwrap_err()
         .to_string();
     assert!(err.contains("not older"), "got: {err}");
@@ -160,7 +163,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         circuit: wide,
         ..segment(base_tid, &schema)
     };
-    let err = block_on(client.create_view_chain(&sn, "wide", planned.into(), ViewProps::default(), None))
+    let err = block_on(client.create_view_chain(&rel(&sn, "wide"), planned.into(), ViewProps::default(), None))
         .unwrap_err()
         .to_string();
     assert!(
@@ -178,7 +181,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         segments: (1..over).map(|_| segment(base_tid, &schema)).collect(),
         view: segment(base_tid, &schema),
     };
-    let err = block_on(client.create_view_chain(&sn, "x", planned, ViewProps::default(), None))
+    let err = block_on(client.create_view_chain(&rel(&sn, "x"), planned, ViewProps::default(), None))
         .unwrap_err()
         .to_string();
     assert!(

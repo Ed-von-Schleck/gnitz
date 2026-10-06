@@ -23,7 +23,7 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert!(rel.tid >= gnitz_wire::FIRST_USER_TABLE_ID);
     assert_eq!(visible_names(&rel.schema), ["id", "v"]);
     assert!(!db.exists("nope"));
-    let err = block_on(db.client.resolve("no_such_schema", "t")).unwrap_err();
+    let err = block_on(db.client.resolve(&crate::rel("no_such_schema", "t"))).unwrap_err();
     assert!(
         matches!(&err, ClientError::Refused(WireFault { status: NotFound, .. })),
         "got: {err:?}"

@@ -241,7 +241,7 @@ pub fn canonical_identifier(name: &str) -> Result<String, String> {
     Ok(name.to_ascii_lowercase())
 }
 
-/// The canonical `"schema.relation"` key, from names **already canonical**. `.`
+/// `"schema.relation"`: the catalog key when both names are canonical. `.`
 /// is outside [`is_valid_ident_char`], so no pair can produce another pair's key.
 pub fn qualified_key(schema_name: &str, name: &str) -> String {
     let mut q = String::with_capacity(schema_name.len() + 1 + name.len());

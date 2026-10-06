@@ -1,15 +1,14 @@
 //! A copy's registration and feed position, published in the manifest beside
 //! the copy's rows.
 
-use gnitz_core::{DeltaCursor, MirrorError, RelDescriptor};
+use gnitz_core::{DeltaCursor, MirrorError, RelDescriptor, RelName};
 use gnitz_wire::{decode_all, PkColList, Reader, Writer};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// What one copy's registration fixed, and where its feed got to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MirrorRecord {
-    pub(crate) schema_name: String,
-    pub(crate) name: String,
+    pub(crate) name: RelName,
     /// The view's schema record; the copy's layout.
     pub(crate) block: Vec<u8>,
     /// Whether two of the view's rows may share a PK.
@@ -28,8 +27,8 @@ impl MirrorRecord {
         let mut w = Writer::new();
         w.u64(tag)
             .u64(tick)
-            .bytes32(self.schema_name.as_bytes())
-            .bytes32(self.name.as_bytes())
+            .bytes32(self.name.schema().as_bytes())
+            .bytes32(self.name.name().as_bytes())
             .bytes32(&self.block)
             .bool(self.pk_repeats)
             .u32(self.indexes.len() as u32);
@@ -45,8 +44,10 @@ impl MirrorRecord {
         let rec = decode_all(bytes, "mirror record", |r| {
             let (tag, tick) = (r.u64()?, r.u64()?);
             let cursor = DeltaCursor::from_pair(tag, tick);
-            let text = |r: &mut Reader| String::from_utf8(r.bytes32()?.to_vec()).map_err(|e| e.to_string());
-            let (schema_name, name) = (text(r)?, text(r)?);
+            fn text<'a>(r: &mut Reader<'a>) -> Result<&'a str, String> {
+                std::str::from_utf8(r.bytes32()?).map_err(|e| e.to_string())
+            }
+            let name = RelName::new(text(r)?, text(r)?)?;
             let block = r.bytes32()?.to_vec();
             let pk_repeats = r.bool()?;
             let indexes = (0..r.u32()?)
@@ -56,14 +57,7 @@ impl MirrorRecord {
             if !indexes.windows(2).all(|w| w[0].pack() < w[1].pack()) {
                 return Err("index column lists out of order".into());
             }
-            Ok(MirrorRecord {
-                cursor,
-                schema_name,
-                name,
-                block,
-                pk_repeats,
-                indexes,
-            })
+            Ok(MirrorRecord { cursor, name, block, pk_repeats, indexes })
         })
         .ok()?;
         let schema = descriptor_of_block(&rec.block).ok()?;

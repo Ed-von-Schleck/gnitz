@@ -138,7 +138,12 @@ fn class_noun(class: RelClass) -> &'static str {
 }
 
 /// Reject a relation of the wrong class for `op`.
-pub(crate) fn require_class(rel: &RelDescriptor, name: &str, want: ClassWant, op: &str) -> Result<(), GnitzSqlError> {
+pub(crate) fn require_class(
+    rel: &RelDescriptor,
+    name: impl std::fmt::Display,
+    want: ClassWant,
+    op: &str,
+) -> Result<(), GnitzSqlError> {
     if want.accepts(rel.class) {
         return Ok(());
     }

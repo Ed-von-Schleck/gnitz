@@ -12,7 +12,7 @@ use super::*;
 use crate::block_on;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{interrupt_self_until, kv_schema, reply_ctrl, reply_status, session_pair, Peer};
+use crate::test_support::{interrupt_self_until, kv_schema, rel, reply_ctrl, reply_status, session_pair, Peer};
 use crate::BlockingHost;
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
@@ -68,7 +68,7 @@ impl Log {
 /// reconciliation state machine reads back through the seam, and nothing else.
 struct StubStore {
     cursors: HashMap<u64, DeltaCursor>,
-    names: HashMap<u64, String>,
+    names: HashMap<u64, RelName>,
     log: Log,
 }
 
@@ -77,19 +77,18 @@ impl MirrorStore for StubStore {
         "stub"
     }
 
-    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
         let tid = desc.tid;
-        let qname = format!("{schema_name}.{name}");
         // The live store's name rule; its layout rule is not modelled.
         let renamed = self
             .names
             .iter()
-            .find(|(&t, n)| t != tid && **n == qname)
+            .find(|(&t, n)| t != tid && *n == name)
             .map(|(&t, _)| t);
         if let Some(old) = renamed {
             self.invalidate(old, Invalidate::Registration)?;
         }
-        self.names.insert(tid, qname);
+        self.names.insert(tid, name.clone());
         Ok(renamed)
     }
 
@@ -258,7 +257,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             indexes: Vec::new(),
             token: 0,
         };
-        block_on(client.bind("s", name, Arc::new(desc))).unwrap();
+        block_on(client.bind(rel("s", name), Arc::new(desc))).unwrap();
     }
     assert!(log.take().is_empty(), "registration tears nothing down");
     (client, peer, log)

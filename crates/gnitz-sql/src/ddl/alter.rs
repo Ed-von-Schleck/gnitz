@@ -10,7 +10,7 @@ use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlErro
 use crate::rules::{canonical_user_name, require_class, validate_user_name, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
-use gnitz_core::GnitzClient;
+use gnitz_core::{GnitzClient, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
     TableConstraint,
@@ -88,13 +88,13 @@ pub(crate) async fn execute_alter_table(
         ));
     };
     let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
-    let (ctx, action) = parse(operation, schema_name)?;
+    let (ctx, action) = parse(operation, &source_name.rel)?;
 
-    let Some(rel) = client.resolve(schema_name, &source_name).await? else {
+    let Some(rel) = client.resolve(&source_name.rel).await? else {
         return if alter.if_exists {
             Ok(SqlResult::Ddl)
         } else {
-            Err(missing_relation(schema_name, &source_name))
+            Err(missing_relation(&source_name.rel))
         };
     };
     // `RENAME TO` accepts a view too, as Postgres does: views bind sources by id
@@ -118,10 +118,9 @@ pub(crate) async fn execute_alter_table(
         Action::AddUnique { columns, explicit_name } => {
             return super::table::create_index_core(
                 client,
-                schema_name,
                 &rel,
                 &super::table::IndexRequest {
-                    owner_name: &source_name,
+                    owner_name: &source_name.rel,
                     columns,
                     explicit_name,
                     site: super::table::IndexSite::AddConstraint,
@@ -134,18 +133,27 @@ pub(crate) async fn execute_alter_table(
     Ok(SqlResult::Ddl)
 }
 
-/// The operation's context and [`Action`], or the rejection the statement alone
-/// earns.
+/// The operation's context and [`Action`] on `source`, or the rejection the
+/// statement alone earns.
 fn parse<'a>(
     operation: &'a AlterTableOperation,
-    schema_name: &str,
+    source: &RelName,
 ) -> Result<(&'static str, Action<'a>), GnitzSqlError> {
     match operation {
         AlterTableOperation::RenameTable { table_name } => {
             const CTX: &str = "ALTER TABLE RENAME TO";
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
             let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
-            let new_name = extract_object_name(target, schema_name, "ALTER TABLE")?;
+            // A rename keeps the relation in its schema.
+            let new = extract_object_name(target, source.schema(), "ALTER TABLE")?;
+            if new.rel.schema() != source.schema() {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "{CTX}: a cross-schema rename is not supported \
+                     ('{new}' is not in schema '{}')",
+                    source.schema()
+                )));
+            }
+            let new_name = new.rel.name().to_string();
             Ok((CTX, Action::RenameRelation { new_name }))
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => Ok((

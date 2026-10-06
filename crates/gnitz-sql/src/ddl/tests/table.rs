@@ -69,7 +69,7 @@ fn an_fk_child_type_must_fit_the_parent_type() {
 /// base, and no other base's or a written name is.
 #[test]
 fn an_auto_name_is_recognized_from_its_base() {
-    let base = default_index_name("s", "t", &["a", "B c"]);
+    let base = default_index_name(&RelName::new("s", "t").unwrap(), &["a", "B c"]);
     assert_eq!(base, "s__t__idx_a_b_c");
     let mut taken = HashSet::new();
     for want in ["s__t__idx_a_b_c", "s__t__idx_a_b_c_2", "s__t__idx_a_b_c_3"] {

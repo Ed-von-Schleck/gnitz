@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use gnitz_core::{RelDescriptor, Schema};
+use gnitz_core::{RelDescriptor, RelName, Schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{Cut, KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
 use gnitz_zset::schema::encode_schema_block;
@@ -54,7 +54,7 @@ fn copy_index_bench() {
             indexes: indexed.then_some(index).into_iter().collect(),
             token: 1,
         };
-        store.register("s", "v", &desc).unwrap();
+        store.register(&RelName::new("s", "v").unwrap(), &desc).unwrap();
         store.refill(TID).unwrap();
         let held: Vec<_> = (0..ROWS).map(|id| (id, 1, id as i64)).collect();
         for chunk in held.chunks(10_000) {

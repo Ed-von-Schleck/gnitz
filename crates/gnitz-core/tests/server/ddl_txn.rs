@@ -72,12 +72,12 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     };
 
     // The backfill copies both rows into the view.
-    let source = block_on(client.resolve_relation(&sn, "t")).unwrap();
-    let vid = block_on(client.create_view(&sn, "v", &source, ViewProps::default())).unwrap();
+    let source = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
+    let vid = block_on(client.create_view(&rel(&sn, "v"), &source, ViewProps::default())).unwrap();
     let err = unique_on_v(&mut client, vid);
     assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 
-    block_on(client.drop_view(&sn, &["v"], false)).unwrap();
+    block_on(client.drop_view(&[rel(&sn, "v")], false)).unwrap();
     block_on(client.alter_drop_column(tid, 1)).unwrap();
     let err = unique_on_v(&mut client, tid);
     assert!(err.contains("is dropped"), "{err}");

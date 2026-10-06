@@ -50,8 +50,8 @@ pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
 }
 
 /// A relation miss read from the statement's catalog, as the client reports its own.
-pub(crate) fn missing_relation(schema: &str, name: &str) -> GnitzSqlError {
-    GnitzSqlError::Client(gnitz_core::not_found("relation", schema, name))
+pub(crate) fn missing_relation(name: &gnitz_core::RelName) -> GnitzSqlError {
+    GnitzSqlError::Client(gnitz_core::not_found("relation", name))
 }
 
 /// [`unsupported_clause`] when `present`.

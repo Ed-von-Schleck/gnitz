@@ -5,7 +5,7 @@ use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::append_own_regions;
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
@@ -194,7 +194,7 @@ impl Copies {
     /// Bring `desc.tid`'s copy to `desc`: kept in place, cursor and all, while
     /// it is the same relation, its indexes brought to the ones `desc` names;
     /// entered empty otherwise.
-    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
         let tid = desc.tid;
         let block = desc.schema.to_block();
         let indexes = index_lists(desc);
@@ -203,7 +203,7 @@ impl Copies {
         let renamed = self
             .records
             .iter()
-            .find(|(&t, r)| t != tid && r.schema_name == schema_name && r.name == name)
+            .find(|(&t, r)| t != tid && r.name == *name)
             .map(|(&t, _)| t);
         if let Some(old) = renamed {
             self.invalidate(old, Invalidate::Registration)?;
@@ -213,8 +213,7 @@ impl Copies {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
             Some(r) => {
-                r.schema_name = schema_name.to_string();
-                r.name = name.to_string();
+                r.name = name.clone();
                 if r.indexes != indexes {
                     self.sync_indexes(tid, indexes)?;
                 }
@@ -222,8 +221,7 @@ impl Copies {
             None => {
                 self.invalidate(tid, Invalidate::Registration)?;
                 let rec = MirrorRecord {
-                    schema_name: schema_name.to_string(),
-                    name: name.to_string(),
+                    name: name.clone(),
                     pk_repeats: desc.pk_repeats,
                     indexes,
                     cursor: None,
@@ -390,9 +388,8 @@ impl MirrorStore for Mirror {
         &self.base_dir
     }
 
-    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
-        self.copies
-            .touching("registering a view", |c| c.register(schema_name, name, desc))
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+        self.copies.touching("registering a view", |c| c.register(name, desc))
     }
 
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {

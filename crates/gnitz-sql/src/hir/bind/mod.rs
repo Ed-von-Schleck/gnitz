@@ -24,7 +24,7 @@ use crate::ast_util::{
     single_fn_name,
 };
 use crate::bind::apply_positional_aliases;
-use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder};
+use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder, NameRef};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::BExpr;
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
@@ -151,17 +151,18 @@ impl<'c> BindCx<'c> {
 
 /// The subtree a relation name reads: the CTE it names, else the catalog relation.
 /// Every relation a view body names resolves here.
-fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    if let Some(cte) = cx.ctes.get(&name.to_ascii_lowercase()) {
+fn resolve_relation(cx: &mut BindCx<'_>, name: &NameRef) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    // A CTE lives in no schema.
+    let cte = (!name.qualified).then(|| cx.ctes.get(name.rel.name()));
+    if let Some(cte) = cte.flatten() {
         return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
     }
-    let rel = cx.cat.probe_relation(name)?;
+    let rel = cx.cat.probe_relation(&name.rel)?;
     // The replaced view is retracted in the same bundle, taking the body's input with it.
     if cx.view.replacing == Some(rel.tid) {
         return Err(GnitzSqlError::Rejected(format!(
-            "{} '{}.{name}' AS a query referencing the view itself is not supported",
-            cx.view.stmt,
-            cx.cat.schema_name()
+            "{} '{}' AS a query referencing the view itself is not supported",
+            cx.view.stmt, name.rel
         )));
     }
     let (want, op) = match cx.surface {

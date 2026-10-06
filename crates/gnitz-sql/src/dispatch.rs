@@ -6,7 +6,7 @@ use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
 use crate::{ddl, dml};
-use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
 use std::cell::Cell;
@@ -24,16 +24,16 @@ async fn planned<T>(
 ) -> (Result<T, GnitzSqlError>, bool) {
     // What the server answered, absence included; the client's own holdings
     // are read as the plan asks, so a plan they cover runs once.
-    let mut resolved: Vec<(String, Option<Arc<RelDescriptor>>)> = Vec::new();
+    let mut resolved: Vec<(RelName, Option<Arc<RelDescriptor>>)> = Vec::new();
     let mut from_kept = false;
     loop {
         let missing = {
             let kept = Cell::new(false);
-            let held = |name: &str| {
-                if let Some(desc) = read.then(|| client.mirrored_desc(schema_name, name)).flatten() {
+            let held = |name: &RelName| {
+                if let Some(desc) = read.then(|| client.mirrored_desc(name)).flatten() {
                     return Some(desc);
                 }
-                let desc = use_kept.then(|| client.kept_desc(schema_name, name)).flatten()?;
+                let desc = use_kept.then(|| client.kept_desc(name)).flatten()?;
                 kept.set(true);
                 Some(desc)
             };
@@ -48,7 +48,7 @@ async fn planned<T>(
                 Attempt::Missing(name) => name,
             }
         };
-        match client.resolve(schema_name, &missing).await {
+        match client.resolve(&missing).await {
             Ok(desc) => resolved.push((missing, desc)),
             // The server's answer for a name the client did not hold: no kept
             // descriptor decided it, so it stands.
@@ -225,7 +225,7 @@ pub(crate) async fn execute_statement(
             .await
             .0?
             {
-                Some(plan) => ddl::execute_create_table(client, schema_name, plan).await,
+                Some(plan) => ddl::execute_create_table(client, plan).await,
                 None => Ok(SqlResult::Ddl),
             }
         }
@@ -255,7 +255,7 @@ pub(crate) async fn execute_statement(
                 .await
                 .0?
             {
-                Some(chain) => ddl::execute_view_chain(client, schema_name, chain).await,
+                Some(chain) => ddl::execute_view_chain(client, chain).await,
                 None => Ok(SqlResult::Ddl),
             }
         }
@@ -267,7 +267,7 @@ pub(crate) async fn execute_statement(
             })
             .await
             .0?;
-            ddl::execute_view_chain(client, schema_name, chain).await
+            ddl::execute_view_chain(client, chain).await
         }
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }

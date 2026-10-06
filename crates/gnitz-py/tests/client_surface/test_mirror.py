@@ -264,6 +264,24 @@ def test_every_refusal_names_why(client, mirror):
         mirror.mirror_view("f")
 
 
+def test_a_mirror_reads_a_view_of_another_schema_by_its_qualified_name(client, mirror):
+    """The copy is keyed by the view's own schema, so a mirror whose schema is
+    another registers it and reads it locally under its qualified name — and
+    the unqualified name, which now means a different relation, is not it."""
+    _fed_view(client)
+    mirror.schema = "public"
+    qualified = f"{client.schema}.f"
+    vid = mirror.mirror_view(qualified).view_id
+    assert vid == client.resolve_table("f")[0]
+
+    churn(client, 1, 50)
+    _quiesce(client, mirror)
+    _samebag("qualified read", _local(mirror, vid, f"SELECT * FROM {qualified}"),
+             rows(client, "SELECT * FROM f"))
+    with pytest.raises(gnitz.GnitzNotFoundError, match="public.f"):
+        rows(mirror, "SELECT * FROM f")
+
+
 @pytest.mark.parametrize("case,env", [
     ("erase", {"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"}),
     ("panic", {"GNITZ_INJECT_MIRROR_INGEST_PANIC": "1"}),

@@ -46,6 +46,12 @@ pub(super) fn fold_join_step(
     (keys, kind): (&JoinConstraint, JoinType),
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let (right_src, ralias, rcols) = resolve_table_factor(cx, relation)?;
+    // Under one alias twice, `alias.col` would name a column of either relation.
+    if scope.relations.iter().any(|(a, _)| a.eq_ignore_ascii_case(&ralias)) {
+        return Err(GnitzSqlError::Rejected(format!(
+            "relation alias '{ralias}' is used by two relations of one FROM; rename one"
+        )));
+    }
 
     // Before `scope.push` below: a `USING`/`NATURAL` name pairs against the left
     // side alone, where an `ON` (bound after the push) sees both sides.

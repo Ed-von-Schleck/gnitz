@@ -1,6 +1,6 @@
 use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
-use gnitz_core::{qualified_name, RelDescriptor};
+use gnitz_core::{RelDescriptor, RelName};
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{Expr, Ident};
 use std::cell::RefCell;
@@ -61,22 +61,39 @@ pub(crate) fn output_column<'a>(
     }
 }
 
+/// A relation as a statement names it.
+#[derive(Clone, Debug)]
+pub(crate) struct NameRef {
+    pub(crate) rel: RelName,
+    /// Whether the statement wrote the schema.
+    pub(crate) qualified: bool,
+}
+
+/// The name as the statement qualified it.
+impl std::fmt::Display for NameRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.qualified {
+            true => self.rel.fmt(f),
+            false => f.write_str(self.rel.spelled_name()),
+        }
+    }
+}
+
 /// One run of a plan against a [`Catalog`].
 pub(crate) enum Attempt<T> {
     Planned(Result<T, GnitzSqlError>),
     /// The plan asked for this name, which the catalog has no verdict for:
     /// [`Catalog::insert`] one and attempt again.
-    Missing(String),
+    Missing(RelName),
 }
 
-/// The relations one statement's plan reads under `schema_name`, as far as
-/// they are known.
+/// The relations one statement's plan reads, as far as they are known.
 pub(crate) struct Catalog<'r> {
     schema_name: &'r str,
     /// Each name's verdict, absence included.
-    known: RefCell<HashMap<String, Option<Arc<RelDescriptor>>>>,
+    known: RefCell<HashMap<RelName, Option<Arc<RelDescriptor>>>>,
     /// The name the running attempt asked for and found no verdict on.
-    missed: RefCell<Option<String>>,
+    missed: RefCell<Option<RelName>>,
     /// Whether a name without a verdict may yet be supplied; otherwise it is
     /// absent.
     open: bool,
@@ -86,7 +103,7 @@ pub(crate) struct Catalog<'r> {
 }
 
 /// The relation a name denotes, where it is to be had without waiting.
-pub(crate) type Held<'r> = dyn Fn(&str) -> Option<Arc<RelDescriptor>> + 'r;
+pub(crate) type Held<'r> = dyn Fn(&RelName) -> Option<Arc<RelDescriptor>> + 'r;
 
 impl<'r> Catalog<'r> {
     pub(crate) fn new(schema_name: &'r str) -> Self {
@@ -113,25 +130,23 @@ impl<'r> Catalog<'r> {
         Catalog { open: false, ..Catalog::new(schema_name) }
     }
 
-    /// The schema every name of the statement resolves under.
+    /// The session's schema.
     pub(crate) fn schema_name(&self) -> &'r str {
         self.schema_name
     }
 
     /// The relation `name` resolves to, `None` for a free name.
-    pub(crate) fn probe(&self, name: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-        let key = qualified_name(self.schema_name, name);
-        if let Some(hit) = self.known.borrow().get(&key) {
+    pub(crate) fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+        if let Some(hit) = self.known.borrow().get(name) {
             return Ok(hit.clone());
         }
         if !self.open {
             return Ok(None);
         }
         if let Some(desc) = self.held.and_then(|held| held(name)) {
-            self.known.borrow_mut().insert(key, Some(Arc::clone(&desc)));
             return Ok(Some(desc));
         }
-        *self.missed.borrow_mut() = Some(name.to_string());
+        *self.missed.borrow_mut() = Some(name.clone());
         Err(GnitzSqlError::Internal(format!(
             "relation '{name}' was planned before it was resolved"
         )))
@@ -139,9 +154,8 @@ impl<'r> Catalog<'r> {
 
     /// The relation `name` a statement reads: [`Self::probe`], with absence an
     /// error.
-    pub(crate) fn probe_relation(&self, name: &str) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-        self.probe(name)?
-            .ok_or_else(|| crate::error::missing_relation(self.schema_name, name))
+    pub(crate) fn probe_relation(&self, name: &RelName) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
+        self.probe(name)?.ok_or_else(|| crate::error::missing_relation(name))
     }
 
     /// Run `plan` against what this catalog holds.
@@ -154,10 +168,8 @@ impl<'r> Catalog<'r> {
     }
 
     /// Record `name`'s verdict.
-    pub(crate) fn insert(&self, name: &str, desc: Option<Arc<RelDescriptor>>) {
-        self.known
-            .borrow_mut()
-            .insert(qualified_name(self.schema_name, name), desc);
+    pub(crate) fn insert(&self, name: &RelName, desc: Option<Arc<RelDescriptor>>) {
+        self.known.borrow_mut().insert(name.clone(), desc);
     }
 }
 

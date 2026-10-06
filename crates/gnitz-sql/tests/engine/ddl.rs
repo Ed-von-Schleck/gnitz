@@ -445,31 +445,108 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     assert!(!db.exists("keeper") && !db.exists("b"));
 }
 
-/// A qualifier naming the session schema is accepted on every name surface;
-/// any other is a cross-schema reference, and an index name — being global —
-/// takes none at all.
+/// A qualifier is the relation's schema on every name surface, and a name
+/// without one is the session's. An index name — being global — takes none.
 #[test]
-fn a_name_qualifier_is_matched_not_dropped() {
-    let mut db = Db::boot(1);
+fn a_qualified_name_reaches_another_schema() {
+    let mut db = Db::boot(4);
     let sn = db.sn.clone();
-    db.exec(&format!(
-        "CREATE TABLE {sn}.t (id BIGINT PRIMARY KEY, v BIGINT);
-         INSERT INTO {sn}.t VALUES (1, 10);
-         CREATE VIEW {sn}.vw AS SELECT id FROM {sn}.t"
-    ));
-    assert_eq!(db.rows(&format!("SELECT id FROM {sn}.vw"), &["id"]), [[1, 1]]);
-    db.exec(&format!("DROP VIEW {sn}.vw"));
+    let other = unique_schema("o");
+    block_on(db.client.create_schema(&other)).unwrap();
 
-    for (sql, needle) in [
-        ("SELECT id FROM other.t", "cross-schema"),
-        ("INSERT INTO other.t VALUES (2, 20)", "cross-schema"),
-        ("DROP TABLE other.t", "cross-schema"),
-        ("CREATE INDEX ON other.t (v)", "cross-schema"),
+    // Two relations named `t`, one per schema.
+    db.exec(&format!(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT);
+         CREATE TABLE {other}.t (id BIGINT PRIMARY KEY, v BIGINT);
+         INSERT INTO t VALUES (1, 10), (2, 20);
+         INSERT INTO {other}.t VALUES (1, 100), (3, 300)"
+    ));
+    let (id_v, mine) = (["id", "v"], [[1, 10, 1], [2, 20, 1]]);
+    assert_eq!(db.scan("t", &id_v), mine);
+    assert_eq!(db.scan(&format!("{sn}.t"), &id_v), mine);
+    assert_eq!(db.scan(&format!("{other}.t"), &id_v), [[1, 100, 1], [3, 300, 1]]);
+
+    // A view joins across schemas, and one is placed in a schema other than
+    // the session's; an unqualified name in its body is still the session's.
+    db.exec(&format!(
+        "CREATE VIEW j AS SELECT a.id, a.v AS av, b.v AS bv FROM t a JOIN {other}.t b ON a.id = b.id;
+         CREATE VIEW {other}.doubled AS SELECT id, v + v AS d FROM t"
+    ));
+    assert_eq!(db.scan("j", &["id", "av", "bv"]), [[1, 10, 100, 1]]);
+
+    assert_eq!(db.affected(&format!("UPDATE {other}.t SET v = 101 WHERE id = 1")), 1);
+    assert_eq!(db.affected(&format!("DELETE FROM {other}.t WHERE id = 3")), 1);
+    db.exec(&format!("INSERT INTO {other}.t VALUES (2, 200)"));
+    assert_eq!(db.scan("j", &["id", "av", "bv"]), [[1, 10, 101, 1], [2, 20, 200, 1]]);
+    assert_eq!(
+        db.scan(&format!("{other}.doubled"), &["id", "d"]),
+        [[1, 20, 1], [2, 40, 1]]
+    );
+
+    // A CTE lives in no schema: `t` is the CTE, `{sn}.t` the table it shadows.
+    db.exec(&format!(
+        "CREATE VIEW c AS WITH t AS (SELECT id, v FROM {other}.t)
+         SELECT x.id, x.v AS cv, y.v AS tv FROM t x JOIN {sn}.t y ON x.id = y.id"
+    ));
+    assert_eq!(db.scan("c", &["id", "cv", "tv"]), [[1, 101, 10, 1], [2, 200, 20, 1]]);
+
+    // A foreign key reaches a parent in another schema, and an auto-named index
+    // takes its owner's schema.
+    db.exec(&format!(
+        "CREATE TABLE child (id BIGINT PRIMARY KEY, p BIGINT REFERENCES {other}.t(id));
+         INSERT INTO child VALUES (1, 2);
+         CREATE INDEX ON {other}.t (v)"
+    ));
+    db.refuses("INSERT INTO child VALUES (2, 9)", Refused(IntegrityViolation), "");
+    let indexes = block_on(db.client.index_rows()).unwrap();
+    assert!(indexes.iter().any(|r| r.name == format!("{other}__t__idx_v")));
+
+    // A rename keeps the relation where it is.
+    db.exec(&format!("ALTER TABLE {other}.doubled RENAME TO twice"));
+    assert_eq!(
+        db.scan(&format!("{other}.twice"), &["id", "d"]),
+        [[1, 20, 1], [2, 40, 1]]
+    );
+    db.refuses(
+        &format!("ALTER TABLE {other}.twice RENAME TO {sn}.twice"),
+        Rejected,
+        "cross-schema",
+    );
+
+    for (sql, want, needle) in [
+        (
+            "SELECT id FROM nosuch.t",
+            Refused(NotFound),
+            "schema 'nosuch' not found",
+        ),
+        (&*format!("SELECT id FROM {other}.nope"), Refused(NotFound), "not found"),
+        (
+            "INSERT INTO nosuch.t VALUES (2, 20)",
+            Refused(NotFound),
+            "schema 'nosuch'",
+        ),
+        ("SELECT id FROM db.s.t", Rejected, "too many name parts"),
+        ("SELECT id FROM _system.t", Rejected, "cannot start with '_'"),
         // An index name is global, so a qualifier on one scopes nothing.
-        ("CREATE INDEX other.ix ON t (v)", "no qualifier"),
-        ("DROP INDEX other.ix", "no qualifier"),
-        (&format!("DROP INDEX {sn}.ix"), "no qualifier"),
+        ("CREATE INDEX other.ix ON t (v)", Rejected, "no qualifier"),
+        ("DROP INDEX other.ix", Rejected, "no qualifier"),
+        (&*format!("DROP INDEX {sn}.ix"), Rejected, "no qualifier"),
     ] {
-        db.refuses(sql, Rejected, needle);
+        db.refuses(sql, want, needle);
+    }
+
+    // One statement retires relations of both schemas, or none of them: the
+    // parent still has its FK child.
+    db.refuses(&format!("DROP TABLE t, {other}.t"), Refused(Error), "");
+    assert_eq!(db.scan("t", &id_v), mine);
+    db.exec(&format!(
+        "DROP VIEW j, c, {other}.twice;
+         DROP TABLE child, {other}.t, t"
+    ));
+    for (schema, name) in [(&sn, "t"), (&other, "t"), (&other, "twice"), (&sn, "j")] {
+        assert!(
+            block_on(db.client.resolve(&rel(schema, name))).unwrap().is_none(),
+            "{schema}.{name}"
+        );
     }
 }

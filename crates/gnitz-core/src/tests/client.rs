@@ -1,6 +1,6 @@
 use super::*;
 use crate::block_on;
-use crate::test_support::{interrupt_self_until, kv_rows, kv_schema, reply_ctrl, session_pair};
+use crate::test_support::{interrupt_self_until, kv_rows, kv_schema, rel, reply_ctrl, session_pair};
 use gnitz_wire::TypeCode;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,7 +274,7 @@ fn create_table_refuses_an_fk_it_cannot_write() {
     let schema = kv_schema(TypeCode::I64);
     let fk = Some(FkTarget::Table(FkRef { table_id: 16, col: 0 }));
     for fks in [vec![fk], vec![None, fk, None]] {
-        let err = block_on(c.create_table("public", "t", &schema, &fks, TableProps::default(), &[]))
+        let err = block_on(c.create_table(&rel("public", "t"), &schema, &fks, TableProps::default(), &[]))
             .unwrap_err()
             .to_string();
         let want = format!("{} foreign-key slots for 2 columns", fks.len());

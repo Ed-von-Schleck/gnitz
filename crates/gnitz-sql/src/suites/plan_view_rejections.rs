@@ -106,7 +106,7 @@ fn cat() -> Catalog<'static> {
             ),
         ),
     ] {
-        cat.insert(name, Some(desc));
+        cat.insert(&in_sn(name), Some(desc));
     }
     let jv = view(&cat, "SELECT * FROM t JOIN u ON t.v = u.v");
     register(&cat, "jv", 47, jv.props.into(), final_view(&jv));
@@ -721,6 +721,9 @@ fn ambiguous_and_hidden_column_rules() {
             ("SELECT b.id FROM t", "not found"),
             ("SELECT id FROM t WHERE b.id = 1", "not found"),
             ("SELECT id FROM t AS x WHERE t.id = 1", "not found"),
+            ("SELECT t.id FROM t JOIN t ON t.id = t.g", "used by two relations"),
+            ("SELECT x.id FROM t x JOIN u X ON x.id = x.g", "used by two relations"),
+            ("SELECT t.id FROM t, u AS t", "used by two relations"),
             (
                 "SELECT t.id AS x FROM t JOIN u ON t.id = u.id JOIN a USING (v)",
                 "'v' is ambiguous",
@@ -803,7 +806,7 @@ fn capacity_rules() {
 fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
     let cat = cat();
     let chain = plan(&cat, "ALTER VIEW tv AS SELECT id, v FROM t").unwrap();
-    assert_eq!(chain.name, "tv");
+    assert_eq!(chain.name, in_sn("tv"));
     assert_eq!(final_view(&chain).schema.columns.len(), 2);
     for verb in ["ALTER VIEW", "CREATE OR REPLACE VIEW"] {
         for (target, body, needle) in [

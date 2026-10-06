@@ -216,7 +216,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
         .ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
     let values = extract_values_rows(source)?;
 
-    let target = cat.probe_relation(&table_name)?;
+    let target = cat.probe_relation(&table_name.rel)?;
     require_class(&target, &table_name, ClassWant::BaseTableOrStream, "INSERT")?;
     let schema = &target.schema;
 
@@ -248,7 +248,12 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
                 OnConflictAction::DoNothing => ConflictPlan::Resolve { set: None },
                 OnConflictAction::DoUpdate(do_update) => {
                     reject_if(do_update.selection.is_some(), "INSERT … ON CONFLICT DO UPDATE", "WHERE")?;
-                    let set = bind_set_list(&do_update.assignments, schema, &table_name, SetClause::DoUpdate)?;
+                    let set = bind_set_list(
+                        &do_update.assignments,
+                        schema,
+                        table_name.rel.spelled_name(),
+                        SetClause::DoUpdate,
+                    )?;
                     ConflictPlan::Resolve { set: Some(set) }
                 }
             }
@@ -351,8 +356,11 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
         .returning
         .as_deref()
         .map(|items| {
-            let RowsReply { schema: out_schema, program, .. } =
-                rows_reply(crate::hir::bind_returning(items, &target, &table_name)?, &[], &target)?;
+            let RowsReply { schema: out_schema, program, .. } = rows_reply(
+                crate::hir::bind_returning(items, &target, table_name.rel.spelled_name())?,
+                &[],
+                &target,
+            )?;
             let map = program
                 .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                 .transpose()?;

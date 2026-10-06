@@ -130,7 +130,7 @@ fn plan_mutation(
         )));
     };
     let (table_name, alias) = extract_table_name_and_alias(factor, cat.schema_name(), verb)?;
-    let target = cat.probe_relation(&table_name)?;
+    let target = cat.probe_relation(&table_name.rel)?;
     require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
     let schema = &target.schema;
     let set = set

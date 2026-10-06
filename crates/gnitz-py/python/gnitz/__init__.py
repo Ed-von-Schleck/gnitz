@@ -13,5 +13,6 @@ from gnitz._types import TypeCode
 
 
 def connect(target, schema="public"):
-    """A connection whose names resolve in `schema`."""
+    """A connection whose unqualified relation names resolve in `schema`;
+    `other.name` names a relation of another schema."""
     return GnitzClient(target, schema)

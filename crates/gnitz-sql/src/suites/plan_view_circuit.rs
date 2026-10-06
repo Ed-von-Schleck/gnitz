@@ -73,7 +73,7 @@ fn cat() -> Catalog<'static> {
     let cat = base();
     let i = TypeCode::I64;
     cat.insert(
-        "m",
+        &in_sn("m"),
         Some(table(30, vec![col("id", i), ncol("k", i), ncol("v", i)], vec![0])),
     );
     let rv = view(&cat, "SELECT g, COUNT(*) AS n FROM t GROUP BY g");
@@ -422,7 +422,7 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
     let cat = base();
     let i = TypeCode::I64;
     cat.insert(
-        "ck3",
+        &in_sn("ck3"),
         Some(table(
             30,
             vec![col("k1", i), col("k2", i), col("k3", i), col("v", i)],

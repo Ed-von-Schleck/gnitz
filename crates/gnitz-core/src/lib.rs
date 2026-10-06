@@ -10,13 +10,14 @@ mod connection;
 mod error;
 mod mirror;
 mod protocol;
+mod rel_name;
 #[cfg(test)]
 mod test_support;
 
 pub use client::{
-    block_on, key_reply, not_found, qualified_name, retraction_batch, segment_id, serve, BlockingHost, BoxFut,
-    FkTarget, GnitzClient, Host, IndexRow, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, ViewBundle,
-    MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
+    block_on, key_reply, not_found, retraction_batch, segment_id, serve, BlockingHost, BoxFut, FkTarget, GnitzClient,
+    Host, IndexRow, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS,
+    RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
     promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, Target, MAX_IN_FLIGHT,
@@ -32,3 +33,4 @@ pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
 pub use protocol::wal_block::append_own_regions;
+pub use rel_name::RelName;

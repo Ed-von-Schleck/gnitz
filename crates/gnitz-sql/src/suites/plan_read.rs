@@ -538,7 +538,7 @@ fn every_read_shape_plans_to_its_sink() {
 #[test]
 fn a_distinct_reads_as_rows_only_over_a_sets_whole_key() {
     let cat = cat();
-    let tv = cat.probe_relation("tv").unwrap();
+    let tv = cat.probe_relation(&in_sn("tv")).unwrap();
     let bag = gnitz_core::RelDescriptor {
         tid: 22,
         class: RelClass::View,
@@ -548,7 +548,7 @@ fn a_distinct_reads_as_rows_only_over_a_sets_whole_key() {
         indexes: Vec::new(),
         token: 0,
     };
-    cat.insert("bv", Some(std::sync::Arc::new(bag)));
+    cat.insert(&in_sn("bv"), Some(std::sync::Arc::new(bag)));
     for (sql, shape) in [
         ("SELECT DISTINCT a, b FROM c", "projection:"),
         ("SELECT DISTINCT a, x FROM c", "fold: distinct on (a, x)"),
@@ -640,12 +640,12 @@ fn a_read_the_planner_rejects_names_its_rule() {
     // A join view whose two sides both carry `id` and `val`.
     let l = table(30, vec![col("id", TypeCode::I64), col("val", TypeCode::I64)], vec![0]);
     let r = table(31, vec![col("id", TypeCode::I64), col("val", TypeCode::I64)], vec![0]);
-    cat.insert("l", Some(l));
-    cat.insert("r", Some(r));
+    cat.insert(&in_sn("l"), Some(l));
+    cat.insert(&in_sn("r"), Some(r));
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
     register(&cat, "jv", 32, jv.props.into(), final_view(&jv));
     let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
-    cat.insert("st", Some(st));
+    cat.insert(&in_sn("st"), Some(st));
 
     for (sql, msg) in [
         // A query deriving a new relation is refused from the AST alone, naming

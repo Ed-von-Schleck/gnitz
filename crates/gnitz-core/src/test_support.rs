@@ -13,7 +13,12 @@ use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
 
 use crate::protocol::error::ProtocolError;
 use crate::protocol::transport::{poll_fd, ClientTransport};
-use crate::{BatchAppender, Schema, Session, ZSetBatch};
+use crate::{BatchAppender, RelName, Schema, Session, ZSetBatch};
+
+/// `schema.name`.
+pub(crate) fn rel(schema: &str, name: &str) -> RelName {
+    RelName::new(schema, name).unwrap()
+}
 
 /// `(pk U64, v <v>)`.
 pub(crate) fn kv_schema(v: TypeCode) -> Schema {

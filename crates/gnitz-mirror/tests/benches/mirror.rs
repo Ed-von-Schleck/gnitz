@@ -38,7 +38,7 @@ fn mirror_call_cost_bench() {
     churn(&mut fx.direct, 1, 2_000);
     fx.tick("s", &["v_keyed"]);
     cell("bootstrap", 1, fx.mirror(), |m| {
-        block_on(m.mirror_view("s", "v_keyed")).expect("mirror");
+        block_on(m.mirror_view(&rel("s", "v_keyed"))).expect("mirror");
     });
     churn(&mut fx.direct, 2_001, 4_000);
     fx.tick("s", &["v_keyed"]);
@@ -46,7 +46,7 @@ fn mirror_call_cost_bench() {
         block_on(m.poll_mirror()).expect("poll");
     });
 
-    let rel = block_on(fx.mirror().resolve_relation("s", "v_keyed")).expect("resolve");
+    let rel = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
     let image = |v: i64| key_image(TypeCode::I64, v as u128);
     let point: Vec<u8> = [977, 977 % 7]
         .iter()
@@ -117,7 +117,7 @@ fn resident_footprint_bench() {
         "s",
         "CREATE TABLE big (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
     );
-    let big = block_on(fx.direct.resolve_relation("s", "big")).expect("resolve");
+    let big = block_on(fx.direct.resolve_relation(&rel("s", "big"))).expect("resolve");
     for lo in (0..ROWS).step_by(SLICE as usize) {
         let mut batch = gnitz_core::ZSetBatch::new(&big.schema);
         let mut rows = gnitz_core::BatchAppender::new(&mut batch);
@@ -144,7 +144,7 @@ fn resident_footprint_bench() {
         .expect("a fresh client attaches it");
 
     let resident = perf::Resident::baseline();
-    block_on(mirror.mirror_view("s", "v_big")).expect("mirror");
+    block_on(mirror.mirror_view(&rel("s", "v_big"))).expect("mirror");
     let peak = resident.as_ref().map(perf::Resident::peak_added);
     block_on(mirror.checkpoint_mirror()).expect("checkpoint");
     let held = resident.as_ref().map(perf::Resident::added);

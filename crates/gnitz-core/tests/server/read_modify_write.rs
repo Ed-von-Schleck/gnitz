@@ -19,7 +19,7 @@ fn boot() -> Fixture {
     let mut a = GnitzClient::connect(srv.sock_path()).unwrap();
     let b = GnitzClient::connect(srv.sock_path()).unwrap();
     let (schema_name, ..) = create_table(&mut a, schema_of(&[("pk", TypeCode::I64), ("val", TypeCode::I64)]));
-    let target = block_on(a.resolve_relation(&schema_name, "t")).unwrap();
+    let target = block_on(a.resolve_relation(&rel(&schema_name, "t"))).unwrap();
     commit(&mut a, &target, 1, 0);
     Fixture { _srv: srv, schema_name, a, b, target }
 }

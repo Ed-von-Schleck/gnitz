@@ -3,9 +3,11 @@
 //! never who calls it, which rots the moment a caller moves.
 
 use crate::agg::{agg_func_from_name, agg_func_name, AggFunc};
+use crate::bind::NameRef;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
-use crate::rules::{canonical_user_name, first_duplicate, validate_user_name};
+use crate::rules::{canonical_user_name, first_duplicate};
+use gnitz_core::RelName;
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
@@ -41,27 +43,15 @@ fn object_name_parts<'a>(name: &'a sqlparser::ast::ObjectName, context: &str) ->
     Ok(parts)
 }
 
-/// A schema-scoped catalog object (table, view). The active schema is a session
-/// parameter, never part of the statement, so a qualifier is accepted only when
-/// it names `session_schema`; anything else names a relation no gnitz statement
-/// can reach.
-///
-/// The name is checked by [`validate_user_name`]: a leading `_` names a hidden
-/// chain segment, which no statement may read or write.
+/// A table or view: `name` in `session_schema`, or `schema.name`.
 pub(crate) fn extract_object_name(
     name: &sqlparser::ast::ObjectName,
     session_schema: &str,
     context: &str,
-) -> Result<String, GnitzSqlError> {
-    let n = match object_name_parts(name, context)?.as_slice() {
-        [n] => *n,
-        [s, n] if s.eq_ignore_ascii_case(session_schema) => *n,
-        [s, ..] => {
-            return Err(GnitzSqlError::Rejected(format!(
-                "{context}: cross-schema names are not supported \
-             (qualifier '{s}' is not the session schema '{session_schema}')"
-            )))
-        }
+) -> Result<NameRef, GnitzSqlError> {
+    let (schema, relation) = match object_name_parts(name, context)?.as_slice() {
+        [n] => (None, *n),
+        [s, n] => (Some(*s), *n),
         // `object_name_parts` rejects the empty name, so this is 3+ parts.
         _ => {
             return Err(GnitzSqlError::Rejected(format!(
@@ -69,8 +59,10 @@ pub(crate) fn extract_object_name(
             )))
         }
     };
-    validate_user_name(n)?;
-    Ok(n.to_string())
+    Ok(NameRef {
+        rel: RelName::new(schema.unwrap_or(session_schema), relation).map_err(GnitzSqlError::Rejected)?,
+        qualified: schema.is_some(),
+    })
 }
 
 /// An index name, canonical. Index names are global, so it takes no qualifier.
@@ -616,15 +608,13 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
     }
 }
 
-/// Extract `(relation name, effective alias)` from a plain-table FROM factor —
-/// the declared alias when present, else the name itself. The one acceptance
-/// point for a base-relation FROM factor, so its name goes through
-/// [`extract_object_name`] like every other.
+/// `(relation name, effective alias)` of a plain-table FROM factor: the
+/// declared alias when present, else the name without its schema.
 pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     session_schema: &str,
     context: &str,
-) -> Result<(String, String), GnitzSqlError> {
+) -> Result<(NameRef, String), GnitzSqlError> {
     let sqlparser::ast::TableFactor::Table {
         name,
         alias,
@@ -668,7 +658,7 @@ pub(crate) fn extract_table_name_and_alias(
             reject_if(at.is_some(), context, "AT (PartiQL index alias)")?;
             alias_name.value.clone()
         }
-        None => table_name.clone(),
+        None => table_name.rel.spelled_name().to_string(),
     };
     Ok((table_name, alias))
 }

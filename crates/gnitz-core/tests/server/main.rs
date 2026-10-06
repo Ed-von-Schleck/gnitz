@@ -14,9 +14,16 @@ mod view_chain;
 use gnitz_core::block_on;
 use std::sync::Arc;
 
-use gnitz_core::{BatchAppender, ClientError, GnitzClient, Interest, Request, Schema, Sent, Session, ZSetBatch};
+use gnitz_core::{
+    BatchAppender, ClientError, GnitzClient, Interest, RelName, Request, Schema, Sent, Session, ZSetBatch,
+};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
+
+/// `schema.name`.
+fn rel(schema: &str, name: &str) -> RelName {
+    RelName::new(schema, name).unwrap()
+}
 
 /// Non-nullable `columns`, the first one the PK.
 fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
@@ -33,7 +40,7 @@ fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
 fn create_table(client: &mut GnitzClient, schema: Schema) -> (String, u64, Arc<Schema>) {
     let sn = unique_schema("t");
     block_on(client.create_schema(&sn)).unwrap();
-    let tid = block_on(client.create_table(&sn, "t", &schema, &[], TableProps::default(), &[])).unwrap();
+    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], TableProps::default(), &[])).unwrap();
     (sn, tid, Arc::new(schema))
 }
 

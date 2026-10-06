@@ -3,7 +3,7 @@ use crate::connection::{
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Schema, ZSetBatch};
+use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, RelName, Schema, ZSetBatch};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
@@ -29,20 +29,9 @@ use gnitz_wire::{
 
 // --- Module-private helpers ---
 
-/// [`gnitz_wire::qualified_key`] from names that may still be raw user text.
-/// The fold lives on this side only — see that function for why.
-pub fn qualified_name(schema_name: &str, name: &str) -> String {
-    let mut q = gnitz_wire::qualified_key(schema_name, name);
-    q.make_ascii_lowercase();
-    q
-}
-
-/// The classified absence every schema-qualified catalog lookup reports, rather
-/// than a spelling of one message per call site. `name` reaches the message only,
-/// never a key, so it is reported as the caller spelled it: someone who wrote
-/// `MyTab` is told about `MyTab`.
-pub fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
-    absent(format!("{noun} '{schema_name}.{name}' not found"))
+/// The absence a catalog lookup by name reports.
+pub fn not_found(noun: &'static str, name: &RelName) -> ClientError {
+    absent(format!("{noun} '{name}' not found"))
 }
 
 /// A `WireStatus::NotFound` refusal raised on this side, worded by the caller.
@@ -416,7 +405,7 @@ pub struct GnitzClient {
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL empties it.
-    kept: HashMap<String, Arc<RelDescriptor>>,
+    kept: HashMap<RelName, Arc<RelDescriptor>>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -595,29 +584,23 @@ impl GnitzClient {
     // holds, never whether a store is attached**, so a client with one reads
     // exactly like a client without for every relation the copy does not hold.
 
-    /// The descriptor of the mirrored view `schema_name.name`, while its copy
-    /// answers reads — the cursor is the one gate, for names and reads alike. As
-    /// stale as the copy, and checked by nothing.
-    pub fn mirrored_desc(&self, schema_name: &str, name: &str) -> Option<Arc<RelDescriptor>> {
+    /// The descriptor of the mirrored view `name`, while its copy answers
+    /// reads — the cursor is the one gate, for names and reads alike. As stale
+    /// as the copy, and checked by nothing.
+    pub fn mirrored_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
         let m = self.mirror.as_deref()?;
         m.views
             .iter()
-            // The stored names are canonical, so comparing the parts is the
-            // fold of the joined name without its allocation.
-            .find(|(&t, v)| {
-                v.schema_name.eq_ignore_ascii_case(schema_name)
-                    && v.name.eq_ignore_ascii_case(name)
-                    && m.store.get().cursor_of(t).is_some()
-            })
+            .find(|(&t, v)| v.name == *name && m.store.get().cursor_of(t).is_some())
             .map(|(_, v)| Arc::clone(&v.desc))
     }
 
-    /// What the last RESOLVE answered for `schema_name.name`. Only a request
+    /// What the last RESOLVE answered for `name`. Only a request
     /// carrying its token finds out whether it is stale; a planning error or an
     /// answer that needs no request is the caller's to repeat from
     /// [`Self::resolve`].
-    pub fn kept_desc(&self, schema_name: &str, name: &str) -> Option<Arc<RelDescriptor>> {
-        self.kept.get(&qualified_name(schema_name, name)).cloned()
+    pub fn kept_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
+        self.kept.get(name).cloned()
     }
 
     /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
@@ -991,14 +974,14 @@ impl GnitzClient {
         };
         let vid = |i| b.pks.get(i) as u64;
         let mut dropped: Vec<u64> = Vec::new();
-        let mut renamed: Vec<(String, String, Arc<RelDescriptor>)> = Vec::new();
+        let mut renamed: Vec<(RelName, Arc<RelDescriptor>)> = Vec::new();
         for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
             match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
                 (Some(view), Some(j)) => renamed.push((
-                    view.schema_name.clone(),
                     payload_str(b, j, RELTAB_PAY_NAME)
-                        .expect("a bundle this client built names its views in UTF-8")
-                        .to_owned(),
+                        .ok()
+                        .and_then(|new| view.name.sibling(new).ok())
+                        .expect("a bundle this client built names its views"),
                     Arc::clone(&view.desc),
                 )),
                 _ => dropped.push(v),
@@ -1007,9 +990,9 @@ impl GnitzClient {
         for v in dropped {
             let _ = self.forget_view(v).await;
         }
-        for (schema_name, name, desc) in renamed {
+        for (name, desc) in renamed {
             let tid = desc.tid;
-            if self.bind(&schema_name, &name, desc).await.is_err() {
+            if self.bind(name, desc).await.is_err() {
                 let _ = self.forget_view(tid).await;
             }
         }
@@ -1064,19 +1047,16 @@ impl GnitzClient {
     /// column one.
     pub async fn create_table(
         &mut self,
-        schema_name: &str,
-        table_name: &str,
+        table: &RelName,
         schema: &Schema,
         fks: &[Option<FkTarget>],
         props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
-        let table_name = gnitz_wire::canonical_identifier(table_name)?;
         let index_names: Vec<String> = unique_indexes
             .iter()
             .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
             .collect::<Result<Vec<_>, String>>()?;
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // `PkColList::from_slice` panics on a schema this refuses.
         schema
             .validate()
@@ -1090,7 +1070,7 @@ impl GnitzClient {
             )));
         }
 
-        let (schemas, at) = self.lookup_schema(&schema_name).await?;
+        let (schemas, at) = self.lookup_schema(table.schema()).await?;
         let schema_id = schemas.pks.get(at) as u64;
         // The table's id, then one per inline UNIQUE index.
         let new_tid = self.alloc_ids(1 + unique_indexes.len() as u64).await?;
@@ -1101,7 +1081,7 @@ impl GnitzClient {
             &TableTabRow {
                 table_id: new_tid,
                 schema_id,
-                name: &table_name,
+                name: table.name(),
                 pk_col_idx: pk.pack(),
                 flags: props.pack(),
             },
@@ -1126,21 +1106,14 @@ impl GnitzClient {
 
     /// Drop tables as one DDL zone; the engine cascades each one's indexes off
     /// their owner. See [`Self::drop_relations`] for the batch rules.
-    pub async fn drop_table(
-        &mut self,
-        schema_name: &str,
-        table_names: &[&str],
-        if_exists: bool,
-    ) -> Result<(), ClientError> {
-        self.drop_relations(TABLE_TAB, "table", schema_name, table_names, if_exists)
-            .await
+    pub async fn drop_table(&mut self, tables: &[RelName], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(TABLE_TAB, "table", tables, if_exists).await
     }
 
     /// Create a passthrough view over `source` and return its id.
     pub async fn create_view(
         &mut self,
-        schema_name: &str,
-        view_name: &str,
+        view: &RelName,
         source: &RelDescriptor,
         props: ViewProps,
     ) -> Result<u64, ClientError> {
@@ -1152,30 +1125,27 @@ impl GnitzClient {
 
         // A passthrough's layout must equal its source's, so the whole output
         // schema and its PK-repeat flag are the source's own.
-        let view = PlannedView {
+        let planned = PlannedView {
             circuit,
             schema: Arc::clone(&source.schema),
             pk_repeats: source.pk_repeats,
         };
-        self.create_view_chain(schema_name, view_name, view.into(), props, None)
-            .await
+        self.create_view_chain(view, planned.into(), props, None).await
     }
 
     /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.
-    /// `bundle.view` takes `view_name` and `props`; each segment is named by
+    /// `bundle.view` takes `view`'s name and `props`; each segment is named by
     /// [`segment_name`] and owned by it.
     ///
     /// `replace` is the id of the view this one supersedes in the same zone.
     pub async fn create_view_chain(
         &mut self,
-        schema_name: &str,
-        view_name: &str,
+        view: &RelName,
         bundle: ViewBundle,
         props: ViewProps,
         replace: Option<u64>,
     ) -> Result<u64, ClientError> {
-        let view_name = gnitz_wire::canonical_identifier(view_name)?;
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
+        let view_name = view.name();
         // Reject a malformed chain before any allocation.
         let n_views = bundle.segments.len() + 1;
         if n_views > MAX_CHAIN_SEGMENTS {
@@ -1195,7 +1165,7 @@ impl GnitzClient {
         // Only the user-named view: the engine cascades its segments.
         let replaced = match replace {
             Some(vid) => Some(
-                self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", &schema_name, &view_name))
+                self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", view))
                     .await?,
             ),
             None => None,
@@ -1203,7 +1173,7 @@ impl GnitzClient {
         let schema_id = match &replaced {
             Some((row, i)) => payload_u64(row, *i, RELTAB_PAY_SCHEMA_ID),
             None => {
-                let (schemas, at) = self.lookup_schema(&schema_name).await?;
+                let (schemas, at) = self.lookup_schema(view.schema()).await?;
                 schemas.pks.get(at) as u64
             }
         };
@@ -1234,7 +1204,7 @@ impl GnitzClient {
                 }
             }
             let (name, owner_view_id, row_props) = if is_view {
-                (view_name.clone(), 0, props)
+                (view_name.to_string(), 0, props)
             } else {
                 (segment_name(vid), owner_vid, ViewProps::default())
             };
@@ -1267,14 +1237,8 @@ impl GnitzClient {
     /// Drop views as one DDL zone; the engine cascades each one's hidden segments
     /// off `owner_view_id`, so the client never names a segment. See
     /// [`Self::drop_relations`] for the batch rules.
-    pub async fn drop_view(
-        &mut self,
-        schema_name: &str,
-        view_names: &[&str],
-        if_exists: bool,
-    ) -> Result<(), ClientError> {
-        self.drop_relations(VIEW_TAB, "view", schema_name, view_names, if_exists)
-            .await
+    pub async fn drop_view(&mut self, views: &[RelName], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(VIEW_TAB, "view", views, if_exists).await
     }
 
     /// Retire every named relation of `family` in **one** DDL zone: the whole set
@@ -1287,20 +1251,17 @@ impl GnitzClient {
         &mut self,
         family: u64,
         noun: &'static str,
-        schema_name: &str,
-        names: &[&str],
+        names: &[RelName],
         if_exists: bool,
     ) -> Result<(), ClientError> {
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let mut b = DdlBundle::default();
         let mut retired: Vec<u64> = Vec::with_capacity(names.len());
-        for &raw in names {
-            let name = gnitz_wire::canonical_identifier(raw)?;
-            let Some((scanned, i)) = self.relation_retraction(family, noun, &schema_name, &name).await? else {
+        for name in names {
+            let Some((scanned, i)) = self.relation_retraction(family, noun, name).await? else {
                 if if_exists {
                     continue;
                 }
-                return Err(not_found(noun, &schema_name, raw));
+                return Err(not_found(noun, name));
             };
             let id = scanned.pks.get(i) as u64;
             if !retired.contains(&id) {
@@ -1318,17 +1279,16 @@ impl GnitzClient {
         &mut self,
         family: u64,
         noun: &'static str,
-        schema_name: &str,
-        name: &str,
+        name: &RelName,
     ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
-        let Some(desc) = self.resolve(schema_name, name).await? else {
+        let Some(desc) = self.resolve(name).await? else {
             return Ok(None);
         };
         let (scanned, i) = self
-            .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))
+            .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, name))
             .await?;
         // Renamed since the resolve: the name no longer denotes this relation.
-        if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.as_bytes() {
+        if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.name().as_bytes() {
             return Ok(None);
         }
         Ok(Some((scanned, i)))
@@ -1418,27 +1378,21 @@ impl GnitzClient {
         self.commit_ddl(b).await
     }
 
-    /// Resolve `name` under `schema_name`, rejecting a missing relation. The
-    /// erroring form of [`Self::resolve`], for the callers whose next step needs
-    /// the relation to exist.
-    pub async fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<Arc<RelDescriptor>, ClientError> {
-        self.resolve(schema_name, name)
-            .await?
-            .ok_or_else(|| not_found("relation", schema_name, name))
+    /// [`Self::resolve`], with a missing relation an error.
+    pub async fn resolve_relation(&mut self, name: &RelName) -> Result<Arc<RelDescriptor>, ClientError> {
+        self.resolve(name).await?.ok_or_else(|| not_found("relation", name))
     }
 
     // --- Relation resolution ---
 
-    /// The descriptor for `schema_name.name` as the server answers it now, or
-    /// `None` when no such relation exists; `Err` is a missing schema or a decode
-    /// error.
-    pub async fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-        let qname = qualified_name(schema_name, name);
-        let sent = self.session.submit_resolve(&qname);
+    /// The descriptor for `name` as the server answers it now, or `None` when
+    /// no such relation exists; `Err` is a missing schema or a decode error.
+    pub async fn resolve(&mut self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        let sent = self.session.submit_resolve(name.key());
         let found = Pending::submitted(self, sent).await?;
         match &found {
-            Some(desc) => self.kept.insert(qname, Arc::clone(desc)),
-            None => self.kept.remove(&qname),
+            Some(desc) => self.kept.insert(name.clone(), Arc::clone(desc)),
+            None => self.kept.remove(name),
         };
         Ok(found)
     }

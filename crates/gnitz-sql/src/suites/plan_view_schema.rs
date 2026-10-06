@@ -1027,5 +1027,5 @@ fn a_registered_bounded_view_carries_its_class() {
     let cat = base();
     let bounded = plan(&cat, "CREATE VIEW v WITH (capacity = '1 MB') AS SELECT id, v FROM t").unwrap();
     register(&cat, "bnd", 60, bounded.props.into(), final_view(&bounded));
-    assert_eq!(cat.probe("bnd").unwrap().unwrap().class, RelClass::BoundedView);
+    assert_eq!(cat.probe(&in_sn("bnd")).unwrap().unwrap().class, RelClass::BoundedView);
 }

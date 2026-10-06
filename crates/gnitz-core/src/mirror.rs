@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::client::{offload, DeltaPoll, GnitzClient, Host};
 use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor};
 use crate::error::ClientError;
-use crate::{Schema, ZSetBatch};
+use crate::{RelName, Schema, ZSetBatch};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::RelClass;
 
@@ -55,9 +55,9 @@ pub trait MirrorStore: Send {
     /// when it refuses.
     fn base_dir(&self) -> &str;
 
-    /// Register `desc.tid` as `schema_name.name`, with `desc`'s schema and
-    /// indexes, retracting whatever the store held at that id as another
-    /// relation, or under that qualified name at another id. Returns the id
+    /// Register `desc.tid` as `name`, with `desc`'s schema and indexes,
+    /// retracting whatever the store held at that id as another relation, or
+    /// under that name at another id. Returns the id
     /// whose registration that retracted, if any — the store's verdict, which is
     /// what keeps a client's own name→id bindings free of two live entries under
     /// one name.
@@ -65,7 +65,7 @@ pub trait MirrorStore: Send {
     /// The qualified name is what the store records the copy under: the store
     /// mints no ids of its own, so there is no schema id for a schema to be
     /// entered under.
-    fn register(&mut self, schema_name: &str, name: &str, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError>;
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError>;
 
     /// Tear `tid` down to `level`. See [`Invalidate`]. Idempotent, and a `tid`
     /// the store does not hold is `Ok(())`.
@@ -215,10 +215,7 @@ impl PollResult {
 /// One mirrored view, as the client tracks it: what to re-resolve it by, and the
 /// descriptor its reads and polls are answered under.
 pub(crate) struct MirroredView {
-    /// Kept split rather than joined: the state machine re-resolves by
-    /// `(schema, name)`.
-    pub(crate) schema_name: String,
-    pub(crate) name: String,
+    pub(crate) name: RelName,
     /// The upstream descriptor registration resolved, handed back verbatim to
     /// every local resolve. Its schema is the client-side one, hidden columns
     /// included, which keeps `pk_stride` right for a view whose physical PK is a
@@ -265,7 +262,7 @@ pub(crate) struct MirrorState {
     pub(crate) store: Store,
     /// The client's registrations — the poll's work list, and what
     /// [`GnitzClient::cursor_of`] reports a round for. Survives a
-    /// [`GnitzClient::reconnect`]: it carries the `(schema_name, name)` the
+    /// [`GnitzClient::reconnect`]: it carries the name the
     /// re-resolve runs on.
     pub(crate) views: HashMap<u64, MirroredView>,
     /// Views owed a [`PollResult::Reseeded`]: a bootstrap ran and no caller has
@@ -325,10 +322,9 @@ impl GnitzClient {
         self.mirror.as_deref_mut().ok_or_else(no_mirror_store)
     }
 
-    /// The `(schema, name)` `tid` is registered under, for a re-resolve.
-    fn mirrored_qname(&mut self, tid: u64) -> Result<(String, String), ClientError> {
-        let v = self.mirrored_view(tid)?;
-        Ok((v.schema_name.clone(), v.name.clone()))
+    /// The name `tid` is registered under, for a re-resolve.
+    fn mirrored_name(&mut self, tid: u64) -> Result<RelName, ClientError> {
+        Ok(self.mirrored_view(tid)?.name.clone())
     }
 
     fn mirrored_view(&mut self, tid: u64) -> Result<&MirroredView, ClientError> {
@@ -338,7 +334,7 @@ impl GnitzClient {
             .ok_or_else(|| ClientError::from(format!("relation {tid} is not mirrored")))
     }
 
-    /// Resolve `schema_name.name` upstream, check it can be mirrored, and bind
+    /// Resolve `name` upstream, check it can be mirrored, and bind
     /// the result. Returns the relation's server id.
     ///
     /// Reconciliation is keyed by **id**, not by name: the id is what the copy is
@@ -347,54 +343,38 @@ impl GnitzClient {
     /// — a relation dropped and recreated, or altered — whose local copy is
     /// worthless anyway, since the bootstrap that follows is the only correct
     /// answer.
-    ///
-    /// The one entry that takes **host-supplied** names, so the canonical fold
-    /// every catalog gateway applies happens here: a record spelled differently
-    /// from the server's row would never match a later local resolve.
-    async fn reconcile_registration(&mut self, schema_name: &str, name: &str) -> Result<u64, ClientError> {
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        let name = gnitz_wire::canonical_identifier(name)?;
-        let rel = self.resolve_relation(&schema_name, &name).await?;
+    async fn reconcile_registration(&mut self, name: &RelName) -> Result<u64, ClientError> {
+        let rel = self.resolve_relation(name).await?;
         match rel.class {
-            RelClass::FedView => self.bind(&schema_name, &name, rel).await,
+            RelClass::FedView => self.bind(name.clone(), rel).await,
             RelClass::Table | RelClass::Stream => Err(ClientError::from(format!(
-                "'{schema_name}.{name}' is a {}; only a view can be mirrored",
+                "'{name}' is a {}; only a view can be mirrored",
                 rel.class.noun()
             ))),
             RelClass::BoundedView => Err(ClientError::from(format!(
-                "view '{schema_name}.{name}' is capacity-bounded, and a capacity and a feed \
+                "view '{name}' is capacity-bounded, and a capacity and a feed \
                  are refused together, so it carries no feed to subscribe to"
             ))),
             RelClass::View => Err(ClientError::from(format!(
-                "view '{schema_name}.{name}' keeps no delta feed; \
+                "view '{name}' keeps no delta feed; \
                  create it WITH (delta = '<size>') to mirror it"
             ))),
         }
     }
 
-    /// Record `desc.tid` as mirrored under `schema_name.name` — **already
-    /// canonical** — with `desc` the descriptor local resolves are answered from.
-    /// Returns that id.
+    /// Record `desc.tid` as mirrored under `name`, with `desc` the descriptor
+    /// local resolves are answered from. Returns that id.
     ///
     /// Class, capacity and feed are **not** re-checked, so a caller holding a
     /// descriptor for a relation whose identity did not change — a rename — binds
     /// with no second round trip.
-    pub(crate) async fn bind(
-        &mut self,
-        schema_name: &str,
-        name: &str,
-        desc: Arc<RelDescriptor>,
-    ) -> Result<u64, ClientError> {
+    pub(crate) async fn bind(&mut self, name: RelName, desc: Arc<RelDescriptor>) -> Result<u64, ClientError> {
         let tid = desc.tid;
         let store = self.mirror_state()?.store.clone();
-        let (schema, rel, registered) = (schema_name.to_owned(), name.to_owned(), Arc::clone(&desc));
-        let register = move |s: &mut dyn MirrorStore| s.register(&schema, &rel, &registered);
+        let (rel, registered) = (name.clone(), Arc::clone(&desc));
+        let register = move |s: &mut dyn MirrorStore| s.register(&rel, &registered);
         let retracted = store.run(&mut *self.host, register).await??;
-        let entry = MirroredView {
-            schema_name: schema_name.to_string(),
-            name: name.to_string(),
-            desc,
-        };
+        let entry = MirroredView { name, desc };
         let m = self.mirror_state()?;
         // The store's verdict, not a second scan: this map and the store's
         // records must name the same displaced id, or `mirrored_desc` picks
@@ -457,11 +437,11 @@ impl GnitzClient {
                     // would leave the read gate open on a copy whose feed is known
                     // not to continue, with no reseed ever reported.
                     self.mirror_state()?.store.get().invalidate(tid, Invalidate::Cursor)?;
-                    let (schema_name, name) = self.mirrored_qname(tid)?;
+                    let name = self.mirrored_name(tid)?;
                     // Within one server the re-resolved id names the same relation
                     // or a newer one, never an older one's rows: relation ids are
                     // monotone and durably high-watermarked, so they are not recycled.
-                    tid = self.reconcile_registration(&schema_name, &name).await?;
+                    tid = self.reconcile_registration(&name).await?;
                     // Not a bootstrap: the name may now denote a view this client
                     // already mirrors, whose copy is live and correct.
                     Settle::Sync
@@ -472,8 +452,8 @@ impl GnitzClient {
 
     /// Whether `tid`'s name now resolves to a different id upstream.
     async fn relation_id_moved(&mut self, tid: u64) -> Result<bool, ClientError> {
-        let (schema_name, name) = self.mirrored_qname(tid)?;
-        Ok(self.resolve_relation(&schema_name, &name).await?.tid != tid)
+        let name = self.mirrored_name(tid)?;
+        Ok(self.resolve_relation(&name).await?.tid != tid)
     }
 
     /// Replace `tid`'s copy with the view's whole current value.
@@ -599,7 +579,7 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Mirror `schema_name.name`, and bring its copy up to date.
+    /// Mirror `name`, and bring its copy up to date.
     ///
     /// Idempotent, and the same call whether this is a first registration or a
     /// reopen: it resolves the relation upstream, reconciles that against
@@ -609,10 +589,10 @@ impl GnitzClient {
     /// Only a view with a delta feed can be mirrored — create it
     /// `WITH (delta = '<size>')`. A single-view call reports its own failure as
     /// `Err`, so the outcome never carries [`PollResult::Failed`].
-    pub async fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<PollOutcome, ClientError> {
+    pub async fn mirror_view(&mut self, name: &RelName) -> Result<PollOutcome, ClientError> {
         self.refuse_poisoned_mirror()?;
         // The resolve inside it is what makes a bootstrap legal here.
-        let tid = self.reconcile_registration(schema_name, name).await?;
+        let tid = self.reconcile_registration(name).await?;
         let (id, result) = self.settle(tid, Settle::Sync).await?;
         let out = self.outcome(id, result);
         self.reported(std::slice::from_ref(&out));

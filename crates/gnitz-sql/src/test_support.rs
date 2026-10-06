@@ -4,7 +4,7 @@
 use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{payload_str, payload_u64};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
@@ -66,11 +66,16 @@ pub(crate) fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc
     rel(tid, RelClass::Table, columns, pk_cols, Vec::new())
 }
 
+/// `name` in [`SN`].
+pub(crate) fn in_sn(name: &str) -> RelName {
+    RelName::new(SN, name).unwrap()
+}
+
 /// A catalog holding `rels` under [`SN`]; any other name is absent.
 pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> Catalog<'static> {
     let cat = Catalog::complete(SN);
     for (name, desc) in rels {
-        cat.insert(name, Some(desc));
+        cat.insert(&in_sn(name), Some(desc));
     }
     cat
 }
@@ -79,7 +84,7 @@ pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> Catalog<'static>
 /// `CREATE VIEW`.
 pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass, view: &PlannedView) {
     cat.insert(
-        name,
+        &in_sn(name),
         Some(Arc::new(RelDescriptor {
             tid,
             class,
