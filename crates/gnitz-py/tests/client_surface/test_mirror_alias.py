@@ -153,7 +153,8 @@ def test_an_alias_gains_an_index_at_its_next_plan(client, mirror):
     q = "SELECT id FROM _local.even WHERE v = 304"
     assert access(mirror, q) == "full scan"
     client.execute_sql("CREATE INDEX by_v ON f(v)")
-    again = mirror.mirror_subscription("even", sql)
+    (again,) = mirror.poll()
+    assert again.error is None, again.error
     assert again.view_id == first.view_id and not again.reseeded, "the rows stay; the index is filled from them"
     assert access(mirror, q) == "index range on (v)"
     _same(client, mirror, q, "SELECT id FROM f WHERE v = 304", "through the new index")
@@ -222,10 +223,9 @@ def test_an_alias_follows_its_view_through_a_drop_and_a_recreate(client, mirror)
     assert r.error is not None and "v" in str(r.error), r.error
 
 
-def test_an_alias_is_planned_again_after_a_reconnect(own_server, mirror_on, mirror_dir):
-    """A new connection may be another server, where the id an alias holds is
-    some other relation: nothing is read under it until the SELECT is planned
-    against what that server holds."""
+def test_an_alias_reseeds_after_a_restart(own_server, mirror_on, mirror_dir):
+    """A restarted server continues no cursor an earlier boot handed out: the
+    first poll on the new connection reads the alias whole."""
     own_server.start()
     sql = "SELECT id, v FROM f WHERE v % 2 = 0"
     with gnitz.connect(own_server.target) as client:

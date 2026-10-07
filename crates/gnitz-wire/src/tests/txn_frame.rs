@@ -8,7 +8,8 @@ fn rel(tid: u64, reply_layout: u64) -> ScanMultiItem {
 
 fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem<'static> {
     DeltaPollItem {
-        view_id,
+        view: Target { tid: view_id, token: view_id ^ 0xA5A5 },
+        tag: !after_tick,
         after_tick,
         reply_layout,
         spec: b"spec",
@@ -180,6 +181,28 @@ fn a_delta_poll_carries_its_wait_in_the_prologue() {
 fn a_delta_poll_refuses_view_id_zero() {
     let err = peeked(&encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)], 0), delta_poll_views).expect_err("view id 0");
     assert!(err.contains("view id 0"), "{err:?}");
+}
+
+/// An item's blob opens with its cursor, so one too short to hold a cursor is
+/// refused rather than read as a spec.
+#[test]
+fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
+    let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, Target { tid: 7, token: 3 }, 9);
+    for len in [0, 1, 15] {
+        let err = delta_poll_views(&one_item(hdr, &[0u8; 15][..len], false, false)).expect_err("a short blob");
+        assert!(err.contains("carries no cursor"), "{len}: {err:?}");
+    }
+    let body = one_item(hdr, &[0u8; 16], false, false);
+    assert_eq!(
+        delta_poll_views(&body).unwrap(),
+        [DeltaPollItem {
+            view: Target { tid: 7, token: 3 },
+            tag: 0,
+            after_tick: 0,
+            reply_layout: 9,
+            spec: b"",
+        }]
+    );
 }
 
 /// A body of one hand-built item: `hdr` (status and verb as given), `blob`,

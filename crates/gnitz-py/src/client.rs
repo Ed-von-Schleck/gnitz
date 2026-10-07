@@ -537,9 +537,8 @@ impl PyClient {
     ///
     /// A read of `_local.<alias>` is answered off the copy and never upstream;
     /// the view itself is still read upstream, whole. Several aliases may read
-    /// one view. `poll` advances an alias with the mirrored views, and plans
-    /// `sql` again when its view was dropped and recreated, its feed expired or
-    /// the connection replaced.
+    /// one view. `poll` advances an alias with the mirrored views, and may
+    /// plan `sql` again.
     fn mirror_subscription(slf: &Bound<'_, Self>, alias: String, sql: String) -> PyResult<Py<PyAny>> {
         let sn = Self::schema_name(slf)?;
         Self::run(
@@ -619,9 +618,8 @@ impl PyClient {
     /// reconnect(target)
     ///
     /// Replace the connection, keeping every mirrored copy — what a host does
-    /// after a server restart. Refused inside a transaction. Every cursor is
-    /// dropped, so a read before the next poll goes upstream and that poll
-    /// reports a reseed for every view.
+    /// after a server restart. Refused inside a transaction. Every copy stops
+    /// answering reads until the next poll, so a read before it goes upstream.
     fn reconnect(slf: &Bound<'_, Self>, target: String) -> PyResult<Py<PyAny>> {
         Self::run(slf, whole!(|c| c.reconnect(&target).await?), none)
     }

@@ -579,8 +579,8 @@ its copy, never upstream, and several may read one view, whose own name stays an
 upstream relation. Its indexes are the view's whose columns it keeps, each a
 local store over the alias's own rows. The alias's plan is the SQL layer's:
 `gnitz-core` links no planner, so an alias is mirrored with one, and a poll
-calls it to plan the alias again once its view was dropped and recreated, its
-feed no longer continues, or the connection was replaced.
+calls it to plan the alias again once its view no longer resolves as it did when
+the alias was planned.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no

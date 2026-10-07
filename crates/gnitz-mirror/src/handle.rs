@@ -5,7 +5,7 @@ use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::append_own_regions;
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
@@ -188,17 +188,20 @@ impl Copies {
             }
         }
         self.records.insert(tid, rec);
+        // An index that did not resume holds rows no manifest does.
+        if resume.is_some() {
+            self.unpublished |= self.copy(tid).indexes().iter().any(|ix| !ix.resumed());
+        }
         Ok(())
     }
 
     /// Bring `desc.tid`'s copy to `desc`: kept in place, cursor and all, while
     /// it is the same relation, its indexes brought to the ones `desc` names;
     /// entered empty otherwise.
-    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
         let tid = desc.tid;
         let block = desc.schema.to_block();
         let indexes = index_lists(desc);
-        self.unpublished = true;
         // This name at another id was renamed or recreated upstream.
         let renamed = self
             .records
@@ -206,20 +209,25 @@ impl Copies {
             .find(|(&t, r)| t != tid && r.name == *name)
             .map(|(&t, _)| t);
         if let Some(old) = renamed {
-            self.invalidate(old, Invalidate::Registration)?;
+            self.forget(old)?;
         }
         let same = |r: &&mut MirrorRecord| r.block == block && r.pk_repeats == desc.pk_repeats;
         match self.records.get_mut(&tid).filter(same) {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
             Some(r) => {
-                r.name = name.clone();
+                if r.name != *name {
+                    r.name = name.clone();
+                    self.unpublished = true;
+                }
                 if r.indexes != indexes {
+                    self.unpublished = true;
                     self.sync_indexes(tid, indexes)?;
                 }
             }
             None => {
-                self.invalidate(tid, Invalidate::Registration)?;
+                self.forget(tid)?;
+                self.unpublished = true;
                 let rec = MirrorRecord {
                     name: name.clone(),
                     pk_repeats: desc.pk_repeats,
@@ -231,7 +239,7 @@ impl Copies {
                 self.enter(tid, rec, schema, None).map_err(MirrorError::Engine)?;
             }
         }
-        Ok(renamed)
+        Ok(())
     }
 
     /// Bring `tid`'s copy's indexes to `listed`. A copy with a cursor keeps its
@@ -255,19 +263,22 @@ impl Copies {
         Ok(())
     }
 
-    fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
-        let Some(rec) = self.records.get_mut(&tid) else {
-            return Ok(());
-        };
-        rec.cursor = None;
-        self.unpublished = true;
-        if level == Invalidate::Registration {
-            self.records.remove(&tid);
-            self.registry
-                .unregister_and_erase(tid)
-                .map_err(|e| erase_failed(tid, e))?;
+    /// Drop `tid`'s cursor, keeping its rows and its registration.
+    fn drop_cursor(&mut self, tid: u64) {
+        if self.records.get_mut(&tid).and_then(|r| r.cursor.take()).is_some() {
+            self.unpublished = true;
         }
-        Ok(())
+    }
+
+    /// Drop `tid`'s record, and erase its copy with its directory.
+    fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
+        if self.records.remove(&tid).is_none() {
+            return Ok(());
+        }
+        self.unpublished = true;
+        self.registry
+            .unregister_and_erase(tid)
+            .map_err(|e| erase_failed(tid, e))
     }
 
     /// Drop `tid`'s rows and cursor, keeping its registration.
@@ -304,8 +315,11 @@ impl Copies {
 
     /// Set `tid`'s cursor to `at`.
     fn settle(&mut self, tid: u64, at: DeltaCursor) {
-        self.records.get_mut(&tid).expect("checked by the caller").cursor = Some(at);
-        self.unpublished = true;
+        let rec = self.records.get_mut(&tid).expect("checked by the caller");
+        if rec.cursor != Some(at) {
+            rec.cursor = Some(at);
+            self.unpublished = true;
+        }
     }
 
     /// Checkpoint once enough bytes were applied since the last. A failed
@@ -388,13 +402,16 @@ impl MirrorStore for Mirror {
         &self.base_dir
     }
 
-    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
         self.copies.touching("registering a view", |c| c.register(name, desc))
     }
 
-    fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
-        self.copies
-            .touching("invalidating a copy", |c| c.invalidate(tid, level))
+    fn drop_cursor(&mut self, tid: u64) {
+        self.copies.even_if_poisoned_mut().drop_cursor(tid);
+    }
+
+    fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
+        self.copies.touching("forgetting a copy", |c| c.forget(tid))
     }
 
     fn refill(&mut self, tid: u64) -> Result<(), MirrorError> {
@@ -443,14 +460,6 @@ impl MirrorStore for Mirror {
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
         self.copies.even_if_poisoned().cursor_of(tid)
-    }
-
-    fn clear_cursors(&mut self) {
-        let copies = self.copies.even_if_poisoned_mut();
-        copies.unpublished = true;
-        for r in copies.records.values_mut() {
-            r.cursor = None;
-        }
     }
 
     fn checkpoint(&mut self) -> Result<(), MirrorError> {

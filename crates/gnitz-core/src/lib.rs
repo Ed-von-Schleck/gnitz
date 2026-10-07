@@ -24,7 +24,7 @@ pub use connection::{
     MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
-pub use mirror::{Invalidate, MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
+pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
 pub use protocol::error::ProtocolError;
 pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};

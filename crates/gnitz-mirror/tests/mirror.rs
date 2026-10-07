@@ -443,10 +443,7 @@ fn each_mirror_call_costs_what_it_must() {
 
     let (plan, sent) = cost(m, |m| query(m, "s", "EXPLAIN SELECT a, b, v FROM v_keyed WHERE a = 7"));
     assert_eq!(sent, 0, "nor does its EXPLAIN");
-    let lines: Vec<String> = canonical_rows(&plan)
-        .into_iter()
-        .filter_map(|((_, cells), _)| Some(String::from_utf8_lossy(cells.first()?.as_ref()?).into_owned()))
-        .collect();
+    let lines = plan_lines(&plan);
     assert!(
         lines.iter().any(|l| l == "read view v_keyed (local copy)"),
         "the plan names the local copy: {lines:?}",
@@ -603,8 +600,9 @@ fn storage_fault_child() {
 
 /// A reopen resumes each copy from its checkpoint rather than reseeding; two
 /// stores on two directories in one process each keep their own; and a close
-/// that changes nothing writes nothing — a publish renames a fresh inode in, so
-/// an unchanged inode is a skipped publish.
+/// that changes nothing writes nothing, nor does one behind a re-mirror and a
+/// poll that moved nothing — a publish renames a fresh inode in, so an
+/// unchanged inode is a skipped publish.
 #[test]
 fn a_reopen_resumes_every_copy_and_a_quiet_close_writes_nothing() {
     let mut fx = Fixture::start();
@@ -649,6 +647,29 @@ fn a_reopen_resumes_every_copy_and_a_quiet_close_writes_nothing() {
     }
     fx.differential("s", "SELECT * FROM v_keyed");
     differential(&mut second, &mut fx.direct, "s", "SELECT * FROM v_repl", Answer::Local);
+
+    // The re-mirror moved each cursor to the round it read through. With no
+    // write to the server since, a registration that already stands and a poll
+    // that carries nothing leave the stores as that checkpoint published them.
+    block_on(fx.mirror().checkpoint_mirror()).expect("checkpoint");
+    block_on(second.checkpoint_mirror()).expect("checkpoint the second store");
+    let published = inodes(&fx.base_dir());
+    for (client, view) in [(fx.mirror(), "v_keyed"), (&mut second, "v_repl")] {
+        let out = block_on(client.mirror_view(&rel("s", view))).expect("mirror it again");
+        assert!(matches!(out.result, PollResult::Advanced), "{view}: {:?}", out.result);
+        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("an idle poll");
+        assert!(
+            matches!(&report[..], [o] if matches!(o.result, PollResult::Advanced)),
+            "{view}: {report:?}"
+        );
+    }
+    fx.close();
+    block_on(second.close_mirror()).expect("close the second store");
+    assert_eq!(
+        inodes(&fx.base_dir()),
+        published,
+        "a registration that stands and a poll that carries nothing must write nothing",
+    );
 }
 
 /// The inode of the mirrored copy of `view_id`'s manifest.
@@ -949,13 +970,13 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
     let (keyed, _) = fx.mirror_both();
     fx.drain();
     let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
+    let (tag, after_tick) = fx.mirror().cursor_of(keyed).expect("a settled copy").pair();
+    let desc = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
     let item = DeltaPollItem {
-        view_id: keyed,
-        after_tick: fx.mirror().cursor_of(keyed).expect("a settled copy").tick.get(),
-        reply_layout: block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed")))
-            .expect("resolve")
-            .schema
-            .layout_digest(),
+        view: gnitz_core::Target::from(&*desc),
+        tag,
+        after_tick,
+        reply_layout: desc.schema.layout_digest(),
         spec: &whole,
     };
 
@@ -1005,6 +1026,65 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
     recv(&mut raw);
 }
 
+/// A whole read that waits, over a view its spec keeps nothing of, is parked
+/// with nothing to report and then answered with a cursor: the position the
+/// server carries across the park is one it would hand out.
+#[test]
+fn a_whole_read_held_over_nothing_is_answered_with_a_cursor() {
+    use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
+    use gnitz_zset::schema::SchemaFacts;
+    use std::io::{Read, Write};
+
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let sub = block_on(gnitz_sql::plan_subscription(
+        &mut fx.direct,
+        "s",
+        "SELECT a, v FROM v_keyed WHERE v < -1000000",
+    ))
+    .expect("a subscription that keeps no row");
+    let item = DeltaPollItem {
+        view: gnitz_core::Target::from(&*sub.upstream),
+        tag: 0,
+        after_tick: 0,
+        reply_layout: sub.schema.layout_digest(),
+        spec: &sub.spec,
+    };
+
+    let mut raw = std::os::unix::net::UnixStream::connect(fx.server.sock_path()).unwrap();
+    let mut exchange = |payload: &[u8]| {
+        raw.write_all(&gnitz_wire::frame_len_prefix(payload.len())).unwrap();
+        raw.write_all(payload).unwrap();
+        let mut len = [0u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES];
+        raw.read_exact(&mut len).unwrap();
+        let mut reply = vec![0u8; u32::from_le_bytes(len) as usize];
+        raw.read_exact(&mut reply).unwrap();
+        reply
+    };
+    assert_eq!(exchange(&gnitz_wire::HELLO), gnitz_wire::HELLO);
+
+    let wait = Duration::from_millis(150);
+    let t0 = std::time::Instant::now();
+    let reply = exchange(&encode_delta_poll(&[item], wait.as_millis() as u64));
+    assert!(t0.elapsed() >= wait, "the read was held, having nothing to report");
+    let ctrl = gnitz_wire::control::peek_control_block(&reply).expect("a control header");
+    assert!(
+        ctrl.fault(&reply).is_none(),
+        "answered, not refused: {:?}",
+        ctrl.fault(&reply)
+    );
+    assert_eq!(ctrl.hdr.target_id, sub.upstream.tid);
+    let cursor = gnitz_core::DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0).expect("a round to poll after");
+
+    // And the cursor it was answered with continues.
+    let (rows, next) = block_on(
+        fx.direct
+            .delta_poll(&*sub.upstream, cursor, &sub.schema, &sub.spec, Duration::ZERO),
+    )
+    .expect("the cursor is the feed's own");
+    assert_eq!((rows.batch.len(), next.tag), (0, cursor.tag));
+}
+
 /// A server restart ends every feed, so a cursor checkpointed before it carries a
 /// tag the new boot does not continue: re-mirroring reseeds each copy under its
 /// id, inside the call.
@@ -1012,9 +1092,6 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
 /// A view over a stream comes back at the value it would have if the stream had
 /// never received a row, and the copy must follow it *there*: one that resumed
 /// across the restart would hold rows the server no longer has.
-///
-/// The store is closed and reopened, not reconnected: a reconnect drops every
-/// cursor, and the cursor-less poll that follows never meets the foreign tag.
 #[test]
 fn a_cursor_from_before_a_server_restart_reseeds() {
     let mut fx = Fixture::start();
@@ -1452,8 +1529,8 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
 /// and reseeding the new one — without the host re-registering. A recovery that
 /// bootstrapped in place would read a relation that no longer exists.
 ///
-/// Both arms that reach it: a poll whose cursor names an id the server no longer
-/// knows, and a cursor-less poll after a reconnect. Each recreation changes the
+/// Both arms that reach it: a poll on the connection the copy was synced on,
+/// and the first poll after a reconnect. Each recreation changes the
 /// column set too — the reachable form of a schema change under a live mirror,
 /// since `ALTER TABLE` is refused while a dependent view exists.
 #[test]
@@ -1501,8 +1578,9 @@ fn a_recreated_view_is_followed_to_its_new_id() {
     }
 }
 
-/// A reconnect keeps every registration, is refused inside a transaction, and
-/// **closes the read gate** until the next poll, which reseeds every view.
+/// A reconnect is refused inside a transaction, keeps every registration, and
+/// closes the read gate until the next poll: one request, re-reading nothing
+/// on the server the cursors came from.
 #[test]
 fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     let mut fx = Fixture::start();
@@ -1522,18 +1600,22 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     for tid in [keyed, repl] {
         assert!(
             !fx.mirror().mirrors(tid),
-            "every cursor is dropped, so the gate is shut"
+            "no copy is confirmed on this connection, so the gate is shut"
         );
     }
     fx.delegated("s", "SELECT * FROM v_keyed");
 
-    let report = block_on(fx.mirror().poll_mirror(Duration::ZERO)).expect("the poll after a reconnect");
+    churn(&mut fx.direct, 61, 90);
+    let (report, sent) = cost(fx.mirror(), |m| {
+        block_on(m.poll_mirror(Duration::ZERO)).expect("the poll after a reconnect")
+    });
+    assert_eq!(sent, 1, "every stored cursor rides one request");
     assert_eq!(report.len(), 2);
     assert!(
-        report.iter().all(|o| o.result.reseeded()),
-        "every view reseeds, and the report says so",
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "the server continues every cursor, so nothing is re-read: {report:?}",
     );
-    fx.drain();
+    assert!(fx.mirror().mirrors(keyed) && fx.mirror().mirrors(repl));
     fx.differential("s", "SELECT * FROM v_keyed");
     fx.differential("s", "SELECT * FROM v_repl");
 }
@@ -1726,14 +1808,10 @@ fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
-/// `DROP VIEW v_0; ALTER VIEW v_1 RENAME TO v_0` upstream, with both mirrored.
-///
-/// Phase one holds `B`'s reply for `(prev_B, T]` while `A`'s poll is refused.
-/// Recovering `A` inside that loop would re-point its registration at `B` —
-/// whose copy and cursor are live — and re-fetch an interval `B`'s reply already
-/// carries; applying both leaves the **row set identical** and every weight in
-/// the overlap doubled, which is why the check here is a weight-exact
-/// differential rather than a shape assertion.
+/// `DROP VIEW v_0; ALTER VIEW v_1 RENAME TO v_0` upstream, with both mirrored:
+/// `A`'s registration moves onto `B`, whose copy is live, and `B`'s rounds are
+/// applied once — a second application leaves the row set identical and every
+/// weight in the overlap doubled.
 #[test]
 fn a_drop_and_a_rename_into_the_freed_name_report_once_each() {
     let mut fx = Fixture::start();
@@ -1742,8 +1820,7 @@ fn a_drop_and_a_rename_into_the_freed_name_report_once_each() {
         unreachable!()
     };
 
-    // Rounds both copies are behind on, so phase one really does hold `B`'s
-    // reply when `A`'s poll comes back refused.
+    // Rounds both copies are behind on, so `B`'s reply carries rows.
     churn(&mut fx.direct, 61, 120);
     sql(&mut fx.direct, "s", "DROP VIEW v_0");
     sql(&mut fx.direct, "s", "ALTER TABLE v_1 RENAME TO v_0");
@@ -1795,6 +1872,111 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
     fx.drain();
     fx.differential("s", "SELECT * FROM v_moved");
     fx.differential("s", "SELECT * FROM v_keyed");
+}
+
+/// A view another client renamed fails its poll as not found — nothing resolves
+/// under the name it was mirrored as — with its copy still answering at its last
+/// round, and mirroring the new name takes that copy up where it stood.
+#[test]
+fn a_view_renamed_by_another_client_fails_until_its_new_name_is_mirrored() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let tid = block_on(fx.mirror().mirror_view(&rel("s", "v_keyed")))
+        .expect("mirror v_keyed")
+        .view_id;
+    fx.drain();
+    let before = fx.mirror().cursor_of(tid).expect("a round to answer at");
+    let held = fx.local("SELECT * FROM v_keyed");
+
+    sql(&mut fx.direct, "s", "ALTER TABLE v_keyed RENAME TO v_moved");
+    churn(&mut fx.direct, 61, 120);
+    for _ in 0..2 {
+        let report = fx.drain();
+        assert!(
+            matches!(
+                &report[..],
+                [o] if o.view_id == tid
+                    && o.cursor == Some(before)
+                    && matches!(&o.result, PollResult::Failed(ClientError::Refused(f)) if f.status == WireStatus::NotFound)
+            ),
+            "the old name resolves to nothing: {report:?}",
+        );
+    }
+    assert_eq!(
+        canonical(&fx.local("SELECT * FROM v_keyed")),
+        canonical(&held),
+        "the copy answers its last round under the name it was mirrored as",
+    );
+
+    let out = block_on(fx.mirror().mirror_view(&rel("s", "v_moved"))).expect("mirror the new name");
+    assert_eq!(out.view_id, tid, "a rename keeps the id");
+    assert!(
+        matches!(out.result, PollResult::Advanced) && out.cursor.is_some_and(|c| c.tick > before.tick),
+        "the copy resumes from its cursor rather than reseeding: {out:?}",
+    );
+    assert_eq!(
+        fx.mirror().mirrored_ids(),
+        [tid],
+        "one registration, under the new name"
+    );
+    fx.differential("s", "SELECT * FROM v_moved");
+}
+
+/// The lines of an `EXPLAIN` reply.
+fn plan_lines(plan: &Reply) -> Vec<String> {
+    canonical_rows(plan)
+        .into_iter()
+        .filter_map(|((_, cells), _)| Some(String::from_utf8_lossy(cells.first()?.as_ref()?).into_owned()))
+        .collect()
+}
+
+/// What EXPLAIN's `access:` line says of `q`, read through the mirroring client.
+fn access(fx: &mut Fixture, q: &str) -> String {
+    let lines = plan_lines(&query(fx.mirror(), "s", &format!("EXPLAIN {q}")));
+    let [access] = &lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("access: "))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one access line: {lines:?}");
+    };
+    access.to_string()
+}
+
+/// An index created on a mirrored view upstream reaches the copy at the next
+/// poll, filled from the rows the copy holds, and one dropped leaves it there.
+#[test]
+fn an_index_created_upstream_is_used_after_one_poll() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let tid = block_on(fx.mirror().mirror_view(&rel("s", "v_keyed")))
+        .expect("mirror v_keyed")
+        .view_id;
+    fx.drain();
+    let q = "SELECT a, v FROM v_keyed WHERE v = 7";
+    let unindexed = access(&mut fx, q);
+
+    sql(&mut fx.direct, "s", "CREATE INDEX by_v ON v_keyed(v)");
+    let report = fx.drain();
+    assert!(
+        matches!(&report[..], [o] if o.view_id == tid && matches!(o.result, PollResult::Advanced)),
+        "the rows stay; the index is filled from them: {report:?}",
+    );
+    let indexed = access(&mut fx, q);
+    assert!(
+        indexed.contains("index") && indexed != unindexed,
+        "{unindexed} -> {indexed}"
+    );
+    fx.differential("s", q);
+
+    sql(&mut fx.direct, "s", "DROP INDEX by_v");
+    let report = fx.drain();
+    assert!(
+        matches!(&report[..], [o] if o.view_id == tid && matches!(o.result, PollResult::Advanced)),
+        "{report:?}",
+    );
+    assert_eq!(access(&mut fx, q), unindexed);
+    fx.differential("s", q);
 }
 
 /// Two views cross-renamed upstream: `v_0 → v_c`, then `v_1 → v_0`. Mirroring

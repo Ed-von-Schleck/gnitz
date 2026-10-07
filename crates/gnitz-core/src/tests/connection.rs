@@ -5,7 +5,7 @@ use super::*;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{framed, kv_rows, kv_schema, reply_ctrl, reply_status, session_pair as pair};
 use crate::BatchAppender;
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<ScanReply>, ClientError> {
@@ -431,8 +431,9 @@ fn in_flight_cap_raises_rather_than_hanging() {
 /// connection — still ends every view it had yet to answer, once each.
 #[test]
 fn a_poll_that_fails_whole_ends_each_unanswered_view() {
-    let item = |view_id| txn_frame::DeltaPollItem {
-        view_id,
+    let item = |view_id: u64| txn_frame::DeltaPollItem {
+        view: view_id.into(),
+        tag: 1,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
         spec: &[],
@@ -488,8 +489,9 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
 /// socket and dropped, and the next poll's results are the queue's alone.
 #[test]
 fn an_abandoned_poll_queues_nothing() {
-    let item = |view_id| txn_frame::DeltaPollItem {
-        view_id,
+    let item = |view_id: u64| txn_frame::DeltaPollItem {
+        view: view_id.into(),
+        tag: 1,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
         spec: &[],

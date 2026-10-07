@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_wire::{Cut, KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
 use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
@@ -149,28 +149,24 @@ fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
 
 /// What a registration keeps and what it retracts. The same id at the same
 /// layout stands, rows and cursor, and takes the upstream name; another id under
-/// a held name retracts the incumbent and names it; the same id at another
-/// layout is registered afresh.
+/// a held name retracts the incumbent; the same id at another layout is
+/// registered afresh.
 #[test]
 fn a_registration_stands_while_the_id_and_the_layout_do() {
     let (mut store, dir) = registered();
     seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
 
-    assert_eq!(store.register(&rel("moved"), &desc(TID)).unwrap(), None);
+    store.register(&rel("moved"), &desc(TID)).unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(4)), "a renamed copy keeps its cursor");
     assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1)]), "and its rows");
-    assert_eq!(store.register(&rel("v"), &desc(OTHER_TID)).unwrap(), None);
+    store.register(&rel("v"), &desc(OTHER_TID)).unwrap();
     assert_eq!(
         store.cursor_of(TID),
         Some(cursor(4)),
         "the name it left retracts nothing"
     );
 
-    assert_eq!(
-        store.register(&rel("moved"), &desc(OTHER_TID + 1)).unwrap(),
-        Some(TID),
-        "a held name at another id names the incumbent it retracted",
-    );
+    store.register(&rel("moved"), &desc(OTHER_TID + 1)).unwrap();
     assert_eq!(
         store.cursor_of(TID),
         None,
@@ -181,42 +177,45 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
 
     seed(&mut store, OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     let wide = schema_of(&make_schema_u128_i64());
-    assert_eq!(
-        store.register(&rel("v"), &desc_of(OTHER_TID, &wide, &[])).unwrap(),
-        None
-    );
+    store.register(&rel("v"), &desc_of(OTHER_TID, &wide, &[])).unwrap();
     assert_eq!(store.cursor_of(OTHER_TID), None, "another layout is another copy");
     let rows = store.scan_spec(OTHER_TID, ReadSpec::all_rows(ReadBound::None), &wide);
     assert_eq!(rows.unwrap().weights.len(), 0, "which starts empty");
 }
 
 /// Either teardown drops the cursor, so no delta continues it, and is
-/// idempotent. `Cursor` keeps the rows; `Registration` takes them, the record and
+/// idempotent. `drop_cursor` keeps the rows; `forget` takes them, the record and
 /// the directory.
 #[test]
 fn a_teardown_stops_where_it_is_asked() {
-    for level in [Invalidate::Cursor, Invalidate::Registration] {
+    for forget in [false, true] {
+        let level = if forget { "forget" } else { "drop_cursor" };
         let (mut store, dir) = registered();
         seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
         store.checkpoint().unwrap();
-        store.invalidate(TID, level).unwrap();
-        store.invalidate(TID, level).expect("a second teardown is a no-op");
+        // A second teardown is a no-op.
+        for _ in 0..2 {
+            match forget {
+                true => store.forget(TID).unwrap(),
+                false => store.drop_cursor(TID),
+            }
+        }
 
-        assert_eq!(store.cursor_of(TID), None, "{level:?} drops the cursor");
+        assert_eq!(store.cursor_of(TID), None, "{level} drops the cursor");
         assert!(
             matches!(
                 store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)),
                 Err(MirrorError::Engine(_))
             ),
-            "{level:?}: no cursor, so no delta continues it",
+            "{level}: no cursor, so no delta continues it",
         );
-        match level {
-            Invalidate::Cursor => assert_eq!(
+        match forget {
+            false => assert_eq!(
                 held(&mut store, TID),
                 BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
-                "Cursor keeps the rows, and the refused delta touched none",
+                "drop_cursor keeps the rows, and the refused delta touched none",
             ),
-            Invalidate::Registration => {
+            true => {
                 let refilled = seed(&mut store, TID, &[&plain(&[(7, 1, 70)])], cursor(4));
                 assert!(
                     matches!(refilled, Err(MirrorError::Engine(_))),
@@ -624,7 +623,7 @@ fn a_store_leaves_whatever_else_its_directory_holds() {
     let _server = lock_data_dir(path(&dir)).expect("the directory's own lock is free");
     drop(store);
     let mut store = open(&dir);
-    store.invalidate(TID, Invalidate::Registration).unwrap();
+    store.forget(TID).unwrap();
 
     for file in &theirs {
         assert_eq!(std::fs::read(file).ok().as_deref(), Some(&b"theirs"[..]), "{file}");
@@ -668,7 +667,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
     let block = plain(&[(1, 1, 10)]);
     let refused: [(&str, Result<(), MirrorError>); 6] = [
         ("register", store.register(&rel("w"), &desc(OTHER_TID)).map(drop)),
-        ("invalidate", store.invalidate(OTHER_TID, Invalidate::Cursor)),
+        ("forget", store.forget(OTHER_TID)),
         ("refill", seed(&mut store, TID, &[&block], cursor(5))),
         ("advance", store.advance(OTHER_TID, &[&block], cursor(5))),
         ("scan_spec", whole_copy(&mut store, OTHER_TID).map(drop)),
@@ -682,7 +681,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
         Some(cursor(4)),
         "no refused verb moved the sibling"
     );
-    store.clear_cursors();
+    store.drop_cursor(OTHER_TID);
     assert_eq!(
         store.cursor_of(OTHER_TID),
         None,

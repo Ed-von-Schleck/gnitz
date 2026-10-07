@@ -3,7 +3,7 @@
 //!
 //! What these pin is otherwise unassertable: the *shape* of a poll — how many
 //! requests it writes before it reads a reply, which failure classes pay a
-//! probe, and the order the two phases run in — none of which shows up in the
+//! resolve, and the order its rounds run in — none of which shows up in the
 //! rows an acceptance test compares. The store here holds no rows at all; it
 //! records the calls the state machine makes, which no live store would let a
 //! test see.
@@ -17,15 +17,14 @@ use crate::BlockingHost;
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
 use gnitz_wire::RelDescriptorBlob;
-use gnitz_wire::{TypeCode, WireStatus};
+use gnitz_wire::TypeCode;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The feed tag every cursor here carries; a reply must echo it or the cursor
-/// stops continuing.
+/// The feed tag every cursor here carries.
 const TAG: u64 = 0xFEED;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +34,9 @@ const TAG: u64 = 0xFEED;
 /// One call the state machine made through the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ev {
-    Invalidate(u64, Invalidate),
+    Register(u64),
+    DropCursor(u64),
+    Forget(u64),
     /// `tid`'s copy erased for a refill.
     Erase(u64),
     /// One block of a refill of `tid`.
@@ -47,7 +48,7 @@ enum Ev {
 }
 
 #[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<Ev>>>);
+struct Log(Arc<Mutex<Vec<Ev>>>, Arc<Mutex<Option<u64>>>);
 
 impl Log {
     fn push(&self, e: Ev) {
@@ -56,6 +57,10 @@ impl Log {
     fn take(&self) -> Vec<Ev> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
+    /// Fail the store's next `register`, once, after it retracted `old`.
+    fn fail_next_register_retracting(&self, old: u64) {
+        *self.1.lock().unwrap() = Some(old);
+    }
     /// Whether any event so far matches, without draining — for a test that
     /// watches the log while the call under test is still running.
     fn saw(&self, f: impl Fn(&Ev) -> bool) -> bool {
@@ -63,11 +68,10 @@ impl Log {
     }
 }
 
-/// A store that holds names, feed positions and a call log — everything the
-/// reconciliation state machine reads back through the seam, and nothing else.
+/// A store that holds feed positions and a call log — everything the
+/// reconciliation reads back through the seam, and nothing else.
 struct StubStore {
     cursors: HashMap<u64, DeltaCursor>,
-    names: HashMap<u64, RelName>,
     log: Log,
 }
 
@@ -76,27 +80,23 @@ impl MirrorStore for StubStore {
         "stub"
     }
 
-    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<Option<u64>, MirrorError> {
-        let tid = desc.tid;
-        // The live store's name rule; its layout rule is not modelled.
-        let renamed = self
-            .names
-            .iter()
-            .find(|(&t, n)| t != tid && *n == name)
-            .map(|(&t, _)| t);
-        if let Some(old) = renamed {
-            self.invalidate(old, Invalidate::Registration)?;
+    fn register(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+        self.log.push(Ev::Register(desc.tid));
+        if let Some(old) = self.log.1.lock().unwrap().take() {
+            self.cursors.remove(&old);
+            return Err(MirrorError::Engine("stub: the copy could not be entered".into()));
         }
-        self.names.insert(tid, name.clone());
-        Ok(renamed)
+        Ok(())
     }
 
-    fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
-        self.log.push(Ev::Invalidate(tid, level));
+    fn drop_cursor(&mut self, tid: u64) {
+        self.log.push(Ev::DropCursor(tid));
         self.cursors.remove(&tid);
-        if level == Invalidate::Registration {
-            self.names.remove(&tid);
-        }
+    }
+
+    fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
+        self.log.push(Ev::Forget(tid));
+        self.cursors.remove(&tid);
         Ok(())
     }
 
@@ -139,10 +139,6 @@ impl MirrorStore for StubStore {
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
         self.cursors.get(&tid).copied()
-    }
-
-    fn clear_cursors(&mut self) {
-        self.cursors.clear();
     }
 
     fn checkpoint(&mut self) -> Result<(), MirrorError> {
@@ -190,7 +186,7 @@ impl Peer {
             .expect("a delta poll")
             .1
             .into_iter()
-            .map(|v| v.view_id)
+            .map(|v| v.view.tid)
             .collect()
     }
 
@@ -229,8 +225,8 @@ impl Peer {
 // ---------------------------------------------------------------------------
 
 /// A client on a scripted peer with `views` mirrored through `bind`: each
-/// `(tid, name, tick)` is registered under `s.name` and, at a non-zero tick,
-/// holds a feed position. Nothing goes over the wire.
+/// `(tid, name, tick)` is registered under `s.name`, confirmed, and, at a
+/// non-zero tick, holds a feed position. Nothing goes over the wire.
 fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
     let (session, peer) = session_pair();
     let mut client = GnitzClient::from_session(session);
@@ -239,13 +235,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
         .iter()
         .filter_map(|&(tid, _, tick)| Some((tid, DeltaCursor::from_pair(TAG, tick)?)))
         .collect();
-    client
-        .attach_mirror(StubStore {
-            cursors,
-            names: HashMap::new(),
-            log: log.clone(),
-        })
-        .unwrap();
+    client.attach_mirror(StubStore { cursors, log: log.clone() }).unwrap();
     let schema = Arc::new(kv_schema(TypeCode::I64));
     for &(tid, name, _) in views {
         let desc = RelDescriptor {
@@ -257,9 +247,14 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             indexes: Vec::new(),
             token: 0,
         };
-        block_on(client.bind(MirroredView::of_view(rel("s", name), Arc::new(desc)))).unwrap();
+        let entry = MirroredView::new(rel("s", name), Subscription::whole(Arc::new(desc)), None).unwrap();
+        block_on(client.bind(entry)).unwrap();
+        client.mirror.as_mut().unwrap().views.get_mut(&tid).unwrap().confirmed = true;
     }
-    assert!(log.take().is_empty(), "registration tears nothing down");
+    assert!(
+        log.take().iter().all(|e| matches!(e, Ev::Register(_))),
+        "registration tears nothing down"
+    );
     (client, peer, log)
 }
 
@@ -309,28 +304,46 @@ fn one_poll_writes_one_request_for_every_view() {
     }
 }
 
-/// A refusal naming a vanished relation pays exactly one probe; every other
-/// refusal pays none — a dead socket or a poisoned reply stops buying a second
-/// doomed round trip.
+/// A refused registration pays exactly one RESOLVE, a refused cursor a whole
+/// read and no RESOLVE, and every other refusal nothing — a dead socket or a
+/// poisoned reply stops buying a second doomed round trip.
 #[test]
-fn only_a_vanished_relation_pays_a_probe() {
-    for (status, requests) in [(WireStatus::NotFound, 2), (WireStatus::Error, 1)] {
+fn only_a_stale_registration_pays_a_resolve() {
+    for status in [WireStatus::StaleCatalog, WireStatus::DeltaExpired, WireStatus::Error] {
         let (mut client, peer, _log) = fixture(&[(7, "v", 4)]);
         let h = std::thread::spawn(move || {
             assert_eq!(peer.expect_poll("the poll"), vec![7]);
-            peer.send(&reply_status(7, status, "gone"));
-            if status == WireStatus::NotFound {
-                // "No such relation", so the recovery is a `Failed` either way.
-                peer.expect_request("the probe");
-                peer.send(&reply_ctrl(0, 0));
+            peer.send(&reply_status(7, status, "refused"));
+            match status {
+                WireStatus::StaleCatalog => {
+                    // "No such relation", so the view fails as not found.
+                    assert_eq!(peer.expect_request("the re-resolve"), 0);
+                    peer.send(&reply_ctrl(0, 0));
+                }
+                WireStatus::DeltaExpired => {
+                    assert_eq!(peer.expect_poll("the whole read"), vec![7]);
+                    peer.reply_watermark(7, TAG, 20);
+                }
+                _ => {}
             }
         });
         let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a per-view failure is not the call's");
         h.join().unwrap();
+        let (requests, reseeded) = match status {
+            WireStatus::StaleCatalog => (2, false),
+            WireStatus::DeltaExpired => (2, true),
+            _ => (1, false),
+        };
         assert_eq!(client.requests_sent(), requests, "status {status:?}");
-        assert!(
-            matches!(report.as_slice(), [o] if o.view_id == 7 && matches!(o.result, PollResult::Failed(_))),
-            "status {status:?}: got {report:?}",
+        let [o] = report.as_slice() else {
+            panic!("status {status:?}: got {report:?}");
+        };
+        assert_eq!(o.view_id, 7);
+        assert_eq!(o.result.reseeded(), reseeded, "status {status:?}: got {report:?}");
+        assert_eq!(
+            matches!(o.result, PollResult::Failed(_)),
+            !reseeded,
+            "status {status:?}: got {report:?}"
         );
         assert!(
             client.mirrors(7),
@@ -355,8 +368,6 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
         encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows)))
     };
     let h = std::thread::spawn(move || {
-        peer.expect_request("the re-resolve");
-        peer.reply_resolved(7);
         assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
         peer.send(&block(&[(1, 10, 1)], 0, true));
         let until = Instant::now() + PATIENCE;
@@ -375,7 +386,7 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
     assert_eq!(
         log.take(),
         [
-            Ev::Invalidate(7, Invalidate::Cursor),
+            Ev::Register(7),
             Ev::Erase(7),
             Ev::Fill(7),
             Ev::Fill(7),
@@ -398,7 +409,8 @@ fn a_leftover_poll_does_not_shift_the_replies() {
     let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
     // A poll submitted and its reader gone: what an aborting park leaves behind.
     let abandoned = DeltaPollItem {
-        view_id: 7,
+        view: 7.into(),
+        tag: TAG,
         after_tick: 4,
         reply_layout: kv_schema(TypeCode::I64).layout_digest(),
         spec: &[],
@@ -429,61 +441,54 @@ fn a_leftover_poll_does_not_shift_the_replies() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase ordering
+// Round ordering
 // ---------------------------------------------------------------------------
 
-/// No teardown reaches the store until every phase-1 ingest has run.
-///
-/// One view is refused as gone and the other advances. Recovering inside the
-/// ingest loop would re-resolve and re-fetch while a reply for the second view
-/// was still in hand, and applying that reply after the recovery's own fetch
-/// doubles every weight in the overlap.
+/// No recovery reaches the store until every train of its round is applied: a
+/// recovery can re-point a registration at a view whose reply is still in hand,
+/// and that reply applied after the recovery's own fetch doubles its weights.
 #[test]
 fn no_recovery_runs_before_every_ingest_has() {
     let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
 
     let h = std::thread::spawn(move || {
         let ids = peer.expect_poll("the poll");
-        // The first position's view is the one that vanished.
-        peer.send(&reply_status(ids[0], WireStatus::NotFound, "gone"));
+        // The first position's view is the one that no longer resolves.
+        peer.send(&reply_status(ids[0], WireStatus::StaleCatalog, "stale"));
         peer.reply_watermark(ids[1], TAG, 11);
-        // Phase 2: the probe, the re-resolve it feeds, and the bootstrap.
-        peer.expect_request("the probe");
+        // The recovery, and the round it leaves a view to sync in.
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
         peer.reply_resolved(9);
-        peer.expect_request("the re-resolve");
-        peer.reply_resolved(9);
-        assert_eq!(peer.expect_poll("the bootstrap"), vec![9]);
+        assert_eq!(peer.expect_poll("the next round"), vec![9]);
         peer.reply_watermark(9, TAG, 20);
         (ids[0], ids[1])
     });
     let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a recovered view is not the call's failure");
     let (gone, alive) = h.join().unwrap();
-    assert_eq!(client.requests_sent(), 4, "both views ride one request");
+    assert_eq!(client.requests_sent(), 3, "both views ride one request");
 
     let events = log.take();
     let first_ingest = events
         .iter()
         .position(|e| matches!(e, Ev::Advance(t, 11) if *t == alive))
-        .expect("phase 1 ingested the reply it had");
-    let first_teardown = events.iter().position(|e| matches!(e, Ev::Invalidate(..)));
+        .expect("the round ingested the reply it had");
+    let first_recovery = events.iter().position(|e| !matches!(e, Ev::Advance(..)));
     assert!(
-        first_teardown.is_none_or(|t| t > first_ingest),
-        "a recovery ran before phase 1 finished ingesting: {events:?}",
+        first_recovery.is_some_and(|t| t > first_ingest),
+        "a recovery ran before its round finished ingesting: {events:?}",
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Ev::Invalidate(t, Invalidate::Cursor) if *t == gone)),
-        "the vanished view is reseeded by name: {events:?}",
+        events.contains(&Ev::Reseed(9, 20)) && !events.iter().any(|e| matches!(e, Ev::Erase(t) if *t == gone)),
+        "the moved view is read whole at its new id: {events:?}",
     );
     let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![alive, 9], "one entry per view, the moved one at its new id");
 }
 
-/// A reseed onto an id that already holds a cursor advances it instead
-/// of erasing a good copy: the cursor-less registration's name now resolves to
-/// a view this same poll already advanced.
+/// A recovery onto an id that already holds a cursor advances it instead of
+/// erasing a good copy: the refused registration's name now resolves to a view
+/// this same poll already advanced.
 #[test]
 fn a_reseed_onto_a_live_copy_does_not_erase_it() {
     let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
@@ -495,16 +500,18 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
             "only the view with a round to poll after"
         );
         peer.reply_watermark(8, TAG, 11);
-        // Phase 2 re-resolves the cursor-less registration; it lands on 8, whose
-        // copy is advanced from where phase 1 left it rather than re-read.
-        peer.expect_request("the re-resolve");
+        assert_eq!(peer.expect_poll("the whole read"), vec![7]);
+        peer.send(&reply_status(7, WireStatus::StaleCatalog, "stale"));
+        // The registration lands on 8, whose copy is advanced from where the
+        // first round left it rather than re-read.
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
         peer.reply_resolved(8);
-        assert_eq!(peer.expect_poll("the follow-up poll"), vec![8]);
+        assert_eq!(peer.expect_poll("the next round"), vec![8]);
         peer.reply_watermark(8, TAG, 12);
     });
-    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the reseed lands on a live copy");
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the recovery lands on a live copy");
     h.join().unwrap();
-    assert_eq!(client.requests_sent(), 3, "the live copy is not re-read");
+    assert_eq!(client.requests_sent(), 4, "the live copy is not re-read");
 
     let events = log.take();
     assert!(
@@ -516,6 +523,105 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         "one entry, at the id the view ended up under: {report:?}",
     );
     assert_eq!(client.mirrored_ids(), [8], "the retired registration is gone");
+}
+
+/// A recovery that lands on a view whose own poll was refused as expired reads
+/// it whole once, whichever of the two refusals is taken first.
+#[test]
+fn a_recovery_onto_an_expired_view_reads_it_whole_once() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+
+    let h = std::thread::spawn(move || {
+        for id in peer.expect_poll("the poll") {
+            let status = if id == 7 {
+                WireStatus::StaleCatalog
+            } else {
+                WireStatus::DeltaExpired
+            };
+            peer.send(&reply_status(id, status, "refused"));
+        }
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
+        peer.reply_resolved(8);
+        assert_eq!(peer.expect_poll("the whole read"), vec![8]);
+        peer.reply_watermark(8, TAG, 20);
+    });
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("both recoveries land");
+    h.join().unwrap();
+    assert_eq!(client.requests_sent(), 3);
+
+    let events = log.take();
+    let whole: Vec<&Ev> = events
+        .iter()
+        .filter(|e| matches!(e, Ev::Erase(_) | Ev::Reseed(..)))
+        .collect();
+    assert_eq!(whole, [&Ev::Erase(8), &Ev::Reseed(8, 20)], "{events:?}");
+    assert!(
+        matches!(report.as_slice(), [o] if o.view_id == 8 && o.result.reseeded()),
+        "{report:?}"
+    );
+}
+
+/// A recovery that moves a registration and then fails is reported at the id
+/// the view is mirrored under, which is the one `forget_view` takes.
+#[test]
+fn a_recovery_that_moves_and_then_fails_is_reported_at_the_new_id() {
+    let (mut client, peer, _log) = fixture(&[(7, "a", 4)]);
+
+    let h = std::thread::spawn(move || {
+        assert_eq!(peer.expect_poll("the poll"), vec![7]);
+        peer.send(&reply_status(7, WireStatus::StaleCatalog, "stale"));
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
+        peer.reply_resolved(9);
+        // The connection goes with the whole read unanswered.
+        assert_eq!(peer.expect_poll("the whole read"), vec![9]);
+    });
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a lost connection is each view's failure");
+    h.join().unwrap();
+
+    assert!(
+        matches!(
+            report.as_slice(),
+            [o] if o.view_id == 9 && o.cursor.is_none() && matches!(o.result, PollResult::Failed(ClientError::ConnectionLost(_)))
+        ),
+        "{report:?}"
+    );
+    assert_eq!(client.mirrored_ids(), [9]);
+    assert!(!client.mirrors(9), "a copy never synced answers no read");
+}
+
+/// A registration whose store record went with a `register` that failed after
+/// its retraction is entered again by the next poll's whole read.
+#[test]
+fn a_registration_the_store_lost_is_entered_again_by_the_next_poll() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 4)]);
+    log.fail_next_register_retracting(7);
+
+    let h = std::thread::spawn(move || {
+        assert_eq!(peer.expect_poll("the poll"), vec![7]);
+        peer.send(&reply_status(7, WireStatus::StaleCatalog, "stale"));
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
+        peer.reply_resolved(9);
+        peer
+    });
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a store refusal is the view's failure");
+    let peer = h.join().unwrap();
+    assert!(
+        matches!(report.as_slice(), [o] if o.view_id == 7 && matches!(o.result, PollResult::Failed(ClientError::Mirror(_)))),
+        "{report:?}"
+    );
+    assert_eq!(log.take(), [Ev::Register(9)]);
+
+    let h = std::thread::spawn(move || {
+        assert_eq!(peer.expect_poll("the whole read"), vec![7]);
+        peer.reply_watermark(7, TAG, 20);
+    });
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the view is read whole");
+    h.join().unwrap();
+    assert!(
+        matches!(report.as_slice(), [o] if o.view_id == 7 && o.result.reseeded()),
+        "{report:?}"
+    );
+    assert_eq!(log.take(), [Ev::Register(7), Ev::Erase(7), Ev::Reseed(7, 20)]);
 }
 
 /// An interrupted poll discards its report, so a reseed it ran is still owed:
@@ -537,14 +643,12 @@ fn an_interrupted_poll_reannounces_its_reseed() {
 
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the poll"), vec![8]);
-        peer.send(&reply_status(8, WireStatus::NotFound, "gone"));
-        // Phase 2 recovers the cursor-less view first: re-resolve, bootstrap.
-        peer.expect_request("the re-resolve");
-        peer.reply_resolved(7);
+        peer.send(&reply_status(8, WireStatus::StaleCatalog, "stale"));
+        // The round reads the cursor-less view whole before any recovery.
         assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
         peer.reply_watermark(7, TAG, 20);
-        // 8's probe is never answered, so the call parks and is interrupted.
-        peer.expect_request("the probe");
+        // 8's re-resolve is never answered, so the call parks and is interrupted.
+        peer.expect_request("the re-resolve");
         peer
     });
     let r = block_on(client.poll_mirror(Duration::ZERO));
@@ -556,7 +660,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     let peer = h.join().unwrap();
 
     let h = std::thread::spawn(move || {
-        peer.send(&reply_ctrl(0, 0)); // the abandoned probe
+        peer.send(&reply_ctrl(0, 0)); // the abandoned re-resolve
         for tick in [21, 22] {
             for id in peer.expect_poll("a poll") {
                 peer.reply_watermark(id, TAG, tick);

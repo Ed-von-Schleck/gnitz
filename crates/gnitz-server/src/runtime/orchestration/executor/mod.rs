@@ -1185,9 +1185,21 @@ enum PollPosition {
 
 /// Where a poll of `item` stands.
 fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
-    match target_kind(shared, item.view_id.into(), Access::UserRead) {
+    let tid = item.view.tid;
+    match target_kind(shared, item.view, Access::UserRead) {
         Err(f) => PollPosition::Fault(f),
-        Ok(_) if delta_up_to_date(shared, item.view_id, item.after_tick) => PollPosition::UpToDate,
+        // A relation with no feed handed out no cursor to compare.
+        Ok(kind)
+            if kind.has_delta_feed()
+                && item.after_tick > 0
+                && item.tag != shared.disp().delta_cursor_tag(tid, item.spec) =>
+        {
+            PollPosition::Fault(WireFault {
+                status: WireStatus::DeltaExpired,
+                text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
+            })
+        }
+        Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
         Ok(_) => PollPosition::Moved,
     }
 }
@@ -1222,6 +1234,7 @@ async fn handle_delta_poll(
         // No row of a view lies between its cursor and the round it was read
         // through, so that round is where the next pass reads it from.
         for (view, round) in views.iter_mut().zip(rounds) {
+            view.tag = shared.disp().delta_cursor_tag(view.view.tid, view.spec);
             view.after_tick = round;
         }
     }
@@ -1241,8 +1254,8 @@ async fn delta_poll_pass(
 ) -> Result<Option<Vec<u64>>, WireFault> {
     let disp = shared.disp();
     let terminal = |item: &DeltaPollItem, result: Result<u64, WireFault>| {
-        let tag = disp.delta_cursor_tag(item.view_id, item.spec);
-        finish_scan_fanout(peer, item.view_id, tag, result);
+        let tag = disp.delta_cursor_tag(item.view.tid, item.spec);
+        finish_scan_fanout(peer, item.view.tid, tag, result);
     };
     // The poll drained once, for `lock`; a later slice takes the lock alone.
     let mut first_lock = Some(lock);
@@ -1274,7 +1287,7 @@ async fn delta_poll_pass(
                 dispatch_round = disp.last_tick_round();
                 for item in moved() {
                     cut.read(DirectGroup::new(Read::delta(
-                        item.view_id,
+                        item.view.tid,
                         item.after_tick,
                         dispatch_round,
                         item.spec,
@@ -1345,7 +1358,7 @@ async fn delta_poll_lock(
     views: &[DeltaPollItem<'_>],
     wait: Duration,
 ) -> Result<(ReadGuard, bool), WireFault> {
-    let ids = || views.iter().map(|v| v.view_id);
+    let ids = || views.iter().map(|v| v.view.tid);
     let waiting = !wait.is_zero();
     let g = fresh_read_lock(shared, ids(), waiting).await?;
     if !waiting {

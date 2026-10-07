@@ -657,14 +657,10 @@ impl GnitzClient {
     // exactly like a client without for every relation the copy does not hold.
 
     /// The descriptor of the mirrored view `name`, while its copy answers
-    /// reads — the cursor is the one gate, for names and reads alike. As stale
-    /// as the copy, and checked by nothing.
+    /// reads. As stale as the copy.
     pub fn mirrored_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
-        let m = self.mirror.as_deref()?;
-        m.views
-            .iter()
-            .find(|(&t, v)| v.name == *name && m.store.get().cursor_of(t).is_some())
-            .map(|(_, v)| Arc::clone(&v.desc))
+        let view = self.mirror.as_deref()?.answering(name)?;
+        Some(Arc::clone(&view.desc))
     }
 
     /// What the last RESOLVE answered for `name`. Only a request
@@ -710,9 +706,9 @@ impl GnitzClient {
     /// Refused while a transaction is open. A failed connect, or a host that
     /// refuses the new socket, leaves this client exactly as it was.
     ///
-    /// A copy rides along with every cursor dropped: the new connection may be a
-    /// different server, where the same name is a different id, so the next
-    /// poll resolves every view by name again, and plans every alias. A poisoned store crosses unchanged.
+    /// Every copy keeps its cursor and answers no read until the next poll: the
+    /// new connection may be a different server. A poisoned store crosses
+    /// unchanged.
     pub async fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
             return Err(ClientError::from(
@@ -734,8 +730,8 @@ impl GnitzClient {
         *session = fresh;
         serial_cache.clear();
         kept.clear();
-        if let Some(m) = mirror.as_deref() {
-            m.store.get().clear_cursors();
+        if let Some(m) = mirror.as_deref_mut() {
+            m.connection_replaced();
         }
         Ok(())
     }
@@ -750,11 +746,12 @@ impl GnitzClient {
     /// carries the same `spec`.
     pub async fn delta_bootstrap(
         &mut self,
-        view_id: u64,
+        view: impl Into<Target>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, Duration::ZERO, reply_schema, spec).await
+        self.delta_read(view.into(), None, Duration::ZERO, reply_schema, spec)
+            .await
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -762,40 +759,40 @@ impl GnitzClient {
     /// `reply_schema`, weights and all. Apply what comes back and store the new
     /// cursor; there is nothing to reconcile.
     ///
-    /// A reply whose tag does not continue the cursor is refused as
-    /// `DeltaExpired`: discard the copy and
-    /// [`delta_bootstrap`](Self::delta_bootstrap) again. A cursor handed out
-    /// under another `spec` is refused the same way.
+    /// A cursor the feed does not continue — its rounds dropped, or handed out
+    /// by another boot, relation or `spec` — is refused as `DeltaExpired`:
+    /// discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
     /// It carries every push acknowledged before it. With nothing to report, the
     /// server holds the reply until a round leaves the view a row `spec` keeps,
     /// or `wait` passes.
     pub async fn delta_poll(
         &mut self,
-        view_id: u64,
+        view: impl Into<Target>,
         cursor: DeltaCursor,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
         wait: Duration,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (data, next) = self
-            .delta_read(view_id, cursor.tick.get(), wait, reply_schema, spec)
-            .await?;
-        Ok((data, cursor.advanced_to(next)?))
+        self.delta_read(view.into(), Some(cursor), wait, reply_schema, spec)
+            .await
     }
 
-    /// One view's delta read, decoded under `reply_schema`, with the terminal
-    /// frame's `(tag, T)` pair as a cursor.
+    /// One view's delta read after `from` — the view whole with none —
+    /// decoded under `reply_schema`, with the terminal frame's `(tag, T)` pair
+    /// as a cursor.
     async fn delta_read(
         &mut self,
-        view_id: u64,
-        after_tick: u64,
+        view: Target,
+        from: Option<DeltaCursor>,
         wait: Duration,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
+        let (tag, after_tick) = DeltaCursor::flat(from);
         let item = DeltaPollItem {
-            view_id,
+            view,
+            tag,
             after_tick,
             reply_layout: reply_schema.layout_digest(),
             spec,
@@ -804,18 +801,12 @@ impl GnitzClient {
         let mut batch = ZSetBatch::new(&schema);
         let GnitzClient { session, host, .. } = self;
         let mut poll = DeltaPoll::start(session, &[item], wait);
-        let (mut end, mut undecoded) = (None, None);
+        let mut end = None;
         while let Some((_, polled)) = poll.next(&mut **host).await? {
             match polled {
-                Polled::Block(b) if undecoded.is_none() => {
-                    undecoded = crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema).err();
-                }
-                Polled::Block(_) => {}
+                Polled::Block(b) => crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?,
                 Polled::End(e) => end = Some(e),
             }
-        }
-        if let Some(e) = undecoded {
-            return Err(e.into());
         }
         let cursor = end.expect("one item ends once")?;
         Ok((ScanReply { schema, batch, lsn: None }, cursor))
@@ -1060,29 +1051,26 @@ impl GnitzClient {
         };
         let vid = |i| b.pks.get(i) as u64;
         let mut dropped: Vec<u64> = Vec::new();
-        let mut renamed: Vec<(RelName, Arc<RelDescriptor>)> = Vec::new();
+        let mut renamed = Vec::new();
         for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
             match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
-                (Some(view), Some(j)) => renamed.push((
-                    payload_str(b, j, RELTAB_PAY_NAME)
-                        .ok()
-                        .and_then(|new| view.name.sibling(new).ok())
-                        .expect("a bundle this client built names its views"),
-                    Arc::clone(&view.desc),
-                )),
+                (Some(view), Some(j)) => renamed.push(
+                    view.renamed(
+                        payload_str(b, j, RELTAB_PAY_NAME)
+                            .ok()
+                            .and_then(|new| view.name.sibling(new).ok())
+                            .expect("a bundle this client built names its views"),
+                    ),
+                ),
                 _ => dropped.push(v),
             }
         }
         for v in dropped {
             let _ = self.forget_view(v).await;
         }
-        for (name, desc) in renamed {
-            let tid = desc.tid;
-            if self
-                .bind(crate::mirror::MirroredView::of_view(name, desc))
-                .await
-                .is_err()
-            {
+        for entry in renamed {
+            let tid = entry.desc.tid;
+            if self.bind(entry).await.is_err() {
                 let _ = self.forget_view(tid).await;
             }
         }

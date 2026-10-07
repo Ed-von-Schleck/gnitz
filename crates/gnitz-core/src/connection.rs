@@ -26,7 +26,7 @@ use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
 use gnitz_wire::CONNECT_TIMEOUT;
 use gnitz_wire::{ClientVerb, WireConflictMode};
-use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex, WireFault, WireStatus};
+use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
 
 /// Requests one connection may hold in flight; `submit` raises past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
@@ -109,21 +109,10 @@ impl DeltaCursor {
         (self.tag, self.tick.get())
     }
 
-    /// `next` as this cursor's successor, or a `DeltaExpired` refusal when it
-    /// names another boot or relation.
-    pub(crate) fn advanced_to(self, next: DeltaCursor) -> Result<DeltaCursor, ClientError> {
-        (self.tag == next.tag)
-            .then_some(next)
-            .ok_or_else(|| delta_expired("delta cursor's tag names a different boot or relation; bootstrap"))
+    /// The flat pair [`Self::from_pair`] reads `cursor` back from.
+    pub fn flat(cursor: Option<DeltaCursor>) -> (u64, u64) {
+        cursor.map_or((0, 0), DeltaCursor::pair)
     }
-}
-
-/// A `WireStatus::DeltaExpired` refusal raised on this side.
-fn delta_expired(text: &str) -> ClientError {
-    ClientError::Refused(WireFault {
-        status: WireStatus::DeltaExpired,
-        text: text.into(),
-    })
 }
 
 // ── The request vocabulary ───────────────────────────────────────────────────
@@ -532,7 +521,7 @@ impl Session {
             return;
         }
         let slot = Slot::DeltaPoll {
-            views: views.iter().map(|v| v.view_id).collect(),
+            views: views.iter().map(|v| v.view.tid).collect(),
             at: 0,
             poll: self.polls.live,
         };

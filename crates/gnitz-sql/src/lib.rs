@@ -98,15 +98,14 @@ pub async fn plan_subscription(
 }
 
 /// Mirror `sql` as the local relation `alias`; see
-/// [`GnitzClient::mirror_subscription`]. A poll plans `sql` again, in
-/// `schema_name`, whenever what it was planned against may be gone.
+/// [`GnitzClient::mirror_subscription`]. A poll may plan `sql` again, in
+/// `schema_name`.
 pub async fn mirror_subscription(
     client: &mut GnitzClient,
     schema_name: &str,
     alias: &str,
     sql: &str,
 ) -> Result<PollOutcome, GnitzSqlError> {
-    let sub = plan_subscription(client, schema_name, sql).await?;
     let (schema_name, sql) = (schema_name.to_string(), sql.to_string());
     let plan: Planner = Arc::new(move |client| {
         let (schema_name, sql) = (schema_name.clone(), sql.clone());
@@ -119,7 +118,7 @@ pub async fn mirror_subscription(
                 })
         })
     });
-    Ok(client.mirror_subscription(alias, sub, plan).await?)
+    Ok(client.mirror_subscription(alias, plan).await?)
 }
 
 // A host spawns a statement onto a multi-thread runtime, or runs it with the

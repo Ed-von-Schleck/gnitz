@@ -11,14 +11,17 @@
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
 //! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | schema record, data block |
 //! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest                | none                      |
-//! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | blob = `ReadSpec` |
+//! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = descriptor token | blob = cursor tag, after_tick, `ReadSpec` |
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
 //! ends that position alone; every other fault ends the request.
 
-use crate::control::{append_frame, frame_size, peek_control_block, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
+use crate::control::{
+    append_frame, frame_size, peek_control_block, ControlHeader, DecodedControl, Target, CTRL_HEADER_SIZE,
+};
 use crate::region::Regions;
 use crate::{ClientVerb, WireFlags, WireStatus};
+use std::ops::Range;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -176,12 +179,16 @@ pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanMultiItem>, String> {
         .collect())
 }
 
-/// One DELTA_POLL item: `spec` applied to every delta `view_id` recorded after
-/// round `after_tick` (`0` = the whole view), replied in the layout whose digest
-/// is `reply_layout`, which is the spec's.
+/// One DELTA_POLL item: `spec` applied to every delta `view` recorded after the
+/// cursor `(tag, after_tick)`, replied in the layout whose digest is
+/// `reply_layout`, which is the spec's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaPollItem<'a> {
-    pub view_id: u64,
+    /// The view, and the token of the RESOLVE answer this read was built from.
+    pub view: Target,
+    /// The cursor read from. `after_tick = 0` reads the view whole and its tag
+    /// is not read.
+    pub tag: u64,
     pub after_tick: u64,
     pub reply_layout: u64,
     /// An encoded `ReadSpec` forwarding rows with no cut; `ReadSpec::all_rows`
@@ -190,19 +197,29 @@ pub struct DeltaPollItem<'a> {
     pub spec: &'a [u8],
 }
 
+/// The bytes an item's blob opens with: the cursor's tag, then its tick.
+const CURSOR_SIZE: usize = 16;
+
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. The
 /// server may hold its reply `wait_ms` while no view has anything new.
 pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], wait_ms: u64) -> Vec<u8> {
+    let mut blobs = Vec::with_capacity(views.iter().map(|v| CURSOR_SIZE + v.spec.len()).sum());
+    let ranges: Vec<Range<usize>> = views
+        .iter()
+        .map(|v| {
+            let start = blobs.len();
+            blobs.extend_from_slice(&v.tag.to_le_bytes());
+            blobs.extend_from_slice(&v.after_tick.to_le_bytes());
+            blobs.extend_from_slice(v.spec);
+            start..blobs.len()
+        })
+        .collect();
     let items: Vec<FrameItem> = views
         .iter()
-        .map(|v| FrameItem {
-            hdr: ControlHeader {
-                target_id: v.view_id,
-                arg0: v.reply_layout,
-                arg1: v.after_tick,
-                ..Default::default()
-            },
-            blob: v.spec,
+        .zip(ranges)
+        .map(|(v, blob)| FrameItem {
+            hdr: ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
+            blob: &blobs[blob],
             schema: None,
             data: None,
         })
@@ -218,14 +235,21 @@ pub fn decode_delta_poll<'a>(
 ) -> Result<(u64, Vec<DeltaPollItem<'a>>), String> {
     let views: Result<Vec<DeltaPollItem>, String> = decode_items(body, ClientVerb::DeltaPoll)?
         .into_iter()
-        .map(|(item, c)| match c.hdr.target_id {
-            0 => Err("DeltaPoll: view id 0 names no view".to_string()),
-            view_id => Ok(DeltaPollItem {
-                view_id,
-                after_tick: c.hdr.arg1,
+        .map(|(item, c)| {
+            if c.hdr.target_id == 0 {
+                return Err("DeltaPoll: view id 0 names no view".to_string());
+            }
+            let Some((cursor, spec)) = item[c.blob.clone()].split_first_chunk::<CURSOR_SIZE>() else {
+                return Err(format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id));
+            };
+            let (tag, tick) = cursor.split_at(8);
+            Ok(DeltaPollItem {
+                view: c.hdr.target(),
+                tag: u64::from_le_bytes(tag.try_into().unwrap()),
+                after_tick: u64::from_le_bytes(tick.try_into().unwrap()),
                 reply_layout: c.hdr.arg0,
-                spec: &item[c.blob.clone()],
-            }),
+                spec,
+            })
         })
         .collect();
     Ok((prologue.arg0, views?))

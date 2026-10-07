@@ -112,9 +112,9 @@ def test_a_mirrored_view_with_an_index_reads_every_row_locally(client, mirror):
         _samebag(q, _local(mirror, vid, q), rows(client, q))
 
 
-def test_an_index_changed_upstream_reaches_the_copy_at_the_next_mirror_view(client, mirror):
-    """An index created after the copy is gained at the next `mirror_view`, and
-    one dropped upstream is lost at the one after; either way the copy answers
+def test_an_index_changed_upstream_reaches_the_copy_at_the_next_poll(client, mirror):
+    """An index created after the copy is gained at the next poll, and one
+    dropped upstream is lost at the one after; either way the copy answers
     exactly the server's rows, weight-exact."""
     _fed_view(client)
     vid = mirror.mirror_view("f").view_id
@@ -125,15 +125,15 @@ def test_an_index_changed_upstream_reaches_the_copy_at_the_next_mirror_view(clie
     ]
 
     client.execute_sql("CREATE INDEX by_v ON f(v)")
-    assert mirror.mirror_view("f").view_id == vid
     churn(client, 1, 2000)
-    mirror.poll()
+    (r,) = mirror.poll()
+    assert (r.view_id, r.reseeded, r.error) == (vid, False, None)
     for q in queries:
         _samebag(q, _local(mirror, vid, q), rows(client, q))
 
     client.execute_sql("DROP INDEX by_v")
-    assert mirror.mirror_view("f").view_id == vid
-    mirror.poll()
+    (r,) = mirror.poll()
+    assert (r.view_id, r.reseeded, r.error) == (vid, False, None)
     for q in queries:
         _samebag(q, _local(mirror, vid, q), rows(client, q))
 

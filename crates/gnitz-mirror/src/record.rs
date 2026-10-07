@@ -23,7 +23,7 @@ impl MirrorRecord {
     /// The bytes a copy's manifest carries for it.
     pub(crate) fn encode(&self) -> Vec<u8> {
         // Round 0 is no cursor here as on the wire, where it asks for a bootstrap.
-        let (tag, tick) = self.cursor.map_or((0, 0), DeltaCursor::pair);
+        let (tag, tick) = DeltaCursor::flat(self.cursor);
         let mut w = Writer::new();
         w.u64(tag)
             .u64(tick)
