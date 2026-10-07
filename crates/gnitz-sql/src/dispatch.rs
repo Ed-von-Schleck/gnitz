@@ -1,7 +1,7 @@
 //! Statement dispatch: routes a `Statement` to its handler in `ddl` or `dml`,
 //! each planned against the statement's catalog and then run on the client.
 
-use crate::bind::{Attempt, Catalog};
+use crate::bind::Catalog;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
@@ -9,8 +9,46 @@ use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::{WireFault, WireStatus};
 use sqlparser::ast::Statement;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+
+/// One run of a plan: the names the server answered in earlier runs, then what
+/// the client holds, else a miss that ends the run.
+struct Run<'a> {
+    client: &'a GnitzClient,
+    schema_name: &'a str,
+    read: bool,
+    use_kept: bool,
+    /// What the server answered, absence included.
+    resolved: &'a [(RelName, Option<Arc<RelDescriptor>>)],
+    /// Whether a kept descriptor went into this run.
+    kept: Cell<bool>,
+    /// The name this run asked for that nothing above answers.
+    missed: RefCell<Option<RelName>>,
+}
+
+impl Catalog for Run<'_> {
+    fn schema_name(&self) -> &str {
+        self.schema_name
+    }
+
+    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+        if let Some((_, desc)) = self.resolved.iter().find(|(n, _)| n == name) {
+            return Ok(desc.clone());
+        }
+        if let Some(desc) = self.read.then(|| self.client.mirrored_desc(name)).flatten() {
+            return Ok(Some(desc));
+        }
+        if let Some(desc) = self.use_kept.then(|| self.client.kept_desc(name)).flatten() {
+            self.kept.set(true);
+            return Ok(Some(desc));
+        }
+        *self.missed.borrow_mut() = Some(name.clone());
+        Err(GnitzSqlError::Internal(format!(
+            "relation '{name}' was planned before it was resolved"
+        )))
+    }
+}
 
 /// Plan against the descriptors `client` supplies for the names the plan asks
 /// for: one it holds — the copy's for a `read`, a kept one when `use_kept` —
@@ -20,32 +58,26 @@ async fn planned<T>(
     schema_name: &str,
     read: bool,
     use_kept: bool,
-    plan: impl Fn(&Catalog<'_>) -> Result<T, GnitzSqlError>,
+    plan: impl Fn(&dyn Catalog) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, bool) {
-    // What the server answered, absence included; the client's own holdings
-    // are read as the plan asks, so a plan they cover runs once.
-    let mut resolved: Vec<(RelName, Option<Arc<RelDescriptor>>)> = Vec::new();
-    let mut from_kept = false;
+    let mut resolved = Vec::new();
     loop {
+        // `run` borrows `client`, so it ends before the resolve below.
         let missing = {
-            let kept = Cell::new(false);
-            let held = |name: &RelName| {
-                if let Some(desc) = read.then(|| client.mirrored_desc(name)).flatten() {
-                    return Some(desc);
-                }
-                let desc = use_kept.then(|| client.kept_desc(name)).flatten()?;
-                kept.set(true);
-                Some(desc)
+            let run = Run {
+                client: &*client,
+                schema_name,
+                read,
+                use_kept,
+                resolved: &resolved,
+                kept: Cell::new(false),
+                missed: RefCell::new(None),
             };
-            let cat = Catalog::holding(schema_name, &held);
-            for (name, desc) in &resolved {
-                cat.insert(name, desc.clone());
-            }
-            let attempt = cat.attempt(&plan);
-            from_kept |= kept.get();
-            match attempt {
-                Attempt::Planned(planned) => return (planned, from_kept),
-                Attempt::Missing(name) => name,
+            let planned = plan(&run);
+            // Read before `planned`: a plan may swallow the miss's error.
+            match run.missed.into_inner() {
+                None => return (planned, run.kept.get()),
+                Some(name) => name,
             }
         };
         match client.resolve(&missing).await {
@@ -74,7 +106,7 @@ async fn planned_kept<P>(
     client: &mut GnitzClient,
     schema_name: &str,
     read: bool,
-    plan: impl Fn(&Catalog<'_>) -> Result<P, GnitzSqlError>,
+    plan: impl Fn(&dyn Catalog) -> Result<P, GnitzSqlError>,
     checked: impl Fn(&P) -> bool,
     run: impl AsyncFn(&mut GnitzClient, P) -> Result<SqlResult, GnitzSqlError>,
 ) -> Result<SqlResult, GnitzSqlError> {

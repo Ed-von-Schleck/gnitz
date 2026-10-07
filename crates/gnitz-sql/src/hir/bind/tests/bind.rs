@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_stmt, table};
+use crate::test_support::{col, ncol, parse_stmt, table, TestCatalog};
 use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
 use std::rc::Rc;
@@ -7,7 +7,7 @@ use std::rc::Rc;
 /// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)` and
 /// `u(uid BIGINT PK, a BIGINT)` — one catalog both a linear and a join body
 /// bind against.
-fn catalog() -> Catalog<'static> {
+fn catalog() -> TestCatalog {
     let i = TypeCode::I64;
     crate::test_support::catalog(vec![
         (

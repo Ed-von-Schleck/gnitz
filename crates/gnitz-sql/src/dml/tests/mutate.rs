@@ -1,13 +1,13 @@
 use super::*;
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{
-    assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema,
+    assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema, TestCatalog,
 };
 use gnitz_core::BatchAppender;
 use gnitz_wire::{RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
-fn plan(cat: &Catalog<'_>, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
+fn plan(cat: &dyn Catalog, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
     match parse_stmt(sql) {
         Statement::Update(u) => plan_update(&u, cat),
         Statement::Delete(d) => plan_delete(&d, cat),
@@ -217,7 +217,7 @@ fn the_arena_holds_only_referenced_spill() {
 /// | `c` | `(a U64, b U64, v)` with `PRIMARY KEY (a, b)` |
 /// | `st` | a stream `(id PK, v)` |
 /// | `vw` | a view `(id PK, v)` |
-fn cat() -> Catalog<'static> {
+fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let idv = || vec![col("id", i), ncol("v", i)];
     catalog(vec![

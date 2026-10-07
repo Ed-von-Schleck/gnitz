@@ -59,7 +59,9 @@ pub(super) fn fold_join_step(
         JoinConstraint::Using(cols) => {
             let mut names = Vec::with_capacity(cols.len());
             for c in cols {
-                names.push(crate::ast_util::extract_ident_name(c, "JOIN USING")?);
+                let name = crate::ast_util::single_part_ident(c)
+                    .ok_or_else(|| GnitzSqlError::Rejected("JOIN USING: column must be a simple identifier".into()))?;
+                names.push(name.to_string());
             }
             crate::rules::reject_duplicate_names(names.iter().map(String::as_str), "JOIN USING")?;
             (merge_pairs(scope, &rcols, &names, "USING")?, "USING")

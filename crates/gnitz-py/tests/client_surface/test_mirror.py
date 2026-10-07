@@ -266,7 +266,7 @@ def test_a_mirror_reads_a_view_of_another_schema_by_its_qualified_name(client, m
     mirror.poll()
     _samebag("qualified read", _local(mirror, vid, f"SELECT * FROM {qualified}"),
              rows(client, "SELECT * FROM f"))
-    with pytest.raises(gnitz.GnitzNotFoundError, match="public.f"):
+    with pytest.raises(gnitz.GnitzNotFoundError, match="relation 'f' not found"):
         rows(mirror, "SELECT * FROM f")
 
 

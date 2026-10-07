@@ -129,22 +129,21 @@ pub(crate) struct PlannedChain {
 }
 
 /// Plan a `CREATE VIEW`; `None` when `IF NOT EXISTS` finds the name taken.
-pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Option<PlannedChain>, GnitzSqlError> {
+pub(crate) fn plan_create_view(cv: &CreateView, cat: &dyn Catalog) -> Result<Option<PlannedChain>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
-    let named = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
-    let view_name = &named.rel;
+    let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
 
     // Each clause tests the name alone.
     let replacing = if cv.if_not_exists {
         // Any relation under the name ends the statement, whatever its kind.
-        if cat.probe(view_name)?.is_some() {
+        if cat.probe(&view_name)?.is_some() {
             return Ok(None);
         }
         None
     } else if cv.or_replace {
-        match cat.probe(view_name)? {
+        match cat.probe(&view_name)? {
             Some(rel) => {
-                require_class(&rel, &named, ClassWant::View, "CREATE OR REPLACE VIEW")?;
+                require_class(&rel, &view_name, ClassWant::View, "CREATE OR REPLACE VIEW")?;
                 Some(rel.tid)
             }
             // A free name: `OR REPLACE` degenerates to a plain create.
@@ -159,7 +158,7 @@ pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Opt
     let aliases = cv.columns.iter().map(|c| &c.name);
     let bundle = plan_segments(cat, view, &cv.query, aliases, props)?;
     Ok(Some(PlannedChain {
-        name: named.rel,
+        name: view_name,
         bundle,
         props,
         replacing,
@@ -173,12 +172,12 @@ pub(crate) fn plan_alter_view(
     columns: &[Ident],
     query: &Query,
     with_options: &[sqlparser::ast::SqlOption],
-    cat: &Catalog<'_>,
+    cat: &dyn Catalog,
 ) -> Result<PlannedChain, GnitzSqlError> {
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
     let named = extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
-    let old = cat.probe_relation(&named.rel)?;
+    let old = cat.probe_relation(&named)?;
     require_class(&old, &named, ClassWant::PlainView, "ALTER VIEW")?;
     let old_vid = old.tid;
     let view = ViewBody {
@@ -188,7 +187,7 @@ pub(crate) fn plan_alter_view(
     let props = ViewProps::Plain;
     let bundle = plan_segments(cat, view, query, columns.iter(), props)?;
     Ok(PlannedChain {
-        name: named.rel,
+        name: named,
         bundle,
         props,
         replacing: Some(old_vid),
@@ -198,7 +197,7 @@ pub(crate) fn plan_alter_view(
 /// Compile a view body to its segment bundle, the user-named view's visible
 /// output columns renamed by `aliases`.
 fn plan_segments<'a>(
-    cat: &Catalog<'_>,
+    cat: &dyn Catalog,
     view: ViewBody,
     query: &Query,
     aliases: impl ExactSizeIterator<Item = &'a Ident>,

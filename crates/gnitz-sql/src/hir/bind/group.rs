@@ -2,7 +2,7 @@
 //! the leaf its HAVING and SELECT list bind through.
 
 use super::super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
-use super::{bind_select_list, clause_error, ItemLeaf, ScopeLeaf, Surface};
+use super::{bind_select_list, ItemLeaf, ScopeLeaf, Surface};
 use crate::agg::AggFunc;
 use crate::ast_util::{
     classify_agg_call, col_ref_parts, for_each_agg_call, group_by_exprs, projection_item_expr, window_spec_keys, AggArg,
@@ -101,7 +101,7 @@ fn resolve_group_cols(
         let target = group_by_target(ge, select)?;
         // The key binds through the FROM leaf, whose rejection names the column but
         // not the clause it was written in.
-        let id = pre.column_for(target, leaf).map_err(|e| clause_error("GROUP BY", e))?;
+        let id = pre.column_for(target, leaf).map_err(|e| e.in_clause("GROUP BY"))?;
         reject_float_keys([&hircol_of(&pre.env, id).def], "GROUP BY")?;
         cols.push(id);
     }
@@ -349,7 +349,7 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
     /// the grouping does not cover was written outside both, and anything the
     /// body itself refuses is that refusal, re-read as this clause's.
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        let bound = bind_structural(e, self.leaf).map_err(|err| clause_error(self.clause, err))?;
+        let bound = bind_structural(e, self.leaf).map_err(|err| err.in_clause(self.clause))?;
         match find_bound(self.extra, &bound).filter(|id| self.group_cols.contains(id)) {
             Some(id) => Ok(BExpr::ColRef(id)),
             None => Err(match col_ref_parts(e).map(|(_, n)| n) {

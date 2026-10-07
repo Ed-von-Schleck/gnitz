@@ -88,13 +88,13 @@ pub(crate) async fn execute_alter_table(
         ));
     };
     let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
-    let (ctx, action) = parse(operation, &source_name.rel)?;
+    let (ctx, action) = parse(operation, &source_name)?;
 
-    let Some(rel) = client.resolve(&source_name.rel).await? else {
+    let Some(rel) = client.resolve(&source_name).await? else {
         return if alter.if_exists {
             Ok(SqlResult::Ddl)
         } else {
-            Err(missing_relation(&source_name.rel))
+            Err(missing_relation(&source_name))
         };
     };
     // `RENAME TO` accepts a view too, as Postgres does: views bind sources by id
@@ -120,7 +120,7 @@ pub(crate) async fn execute_alter_table(
                 client,
                 &rel,
                 &super::table::IndexRequest {
-                    owner_name: &source_name.rel,
+                    owner_name: &source_name,
                     columns,
                     explicit_name,
                     site: super::table::IndexSite::AddConstraint,
@@ -146,14 +146,14 @@ fn parse<'a>(
             let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
             // A rename keeps the relation in its schema.
             let new = extract_object_name(target, source.schema(), "ALTER TABLE")?;
-            if new.rel.schema() != source.schema() {
+            if new.schema() != source.schema() {
                 return Err(GnitzSqlError::Rejected(format!(
                     "{CTX}: a cross-schema rename is not supported \
                      ('{new}' is not in schema '{}')",
                     source.schema()
                 )));
             }
-            let new_name = new.rel.name().to_string();
+            let new_name = new.name().to_string();
             Ok((CTX, Action::RenameRelation { new_name }))
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => Ok((

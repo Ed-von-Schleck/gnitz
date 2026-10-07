@@ -75,7 +75,6 @@ fn relation_names_are_case_insensitive() {
 #[test]
 fn an_absent_relation_is_one_not_found_everywhere() {
     let mut db = Db::boot(1);
-    let sn = db.sn.clone();
     for (sql, name) in [
         ("SELECT * FROM nope", "nope"),
         ("SELECT * FROM NoPe", "NoPe"),
@@ -85,7 +84,7 @@ fn an_absent_relation_is_one_not_found_everywhere() {
         ("DELETE FROM NoPe", "NoPe"),
         ("DROP TABLE NoPe", "NoPe"),
     ] {
-        db.refuses(sql, Refused(NotFound), &format!("{sn}.{name}"));
+        db.refuses(sql, Refused(NotFound), &format!("'{name}' not found"));
     }
 }
 

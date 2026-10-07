@@ -11,7 +11,7 @@
 use crate::ast_util::{
     classify_from, col_ref_parts, expr_any, extract_table_name_and_alias, single_part_ident, FromShape,
 };
-use crate::bind::{bind_single_table, find_unique_column, Catalog};
+use crate::bind::{bind_single_table, require_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
 use crate::error::{reject_if, GnitzSqlError};
@@ -39,7 +39,7 @@ pub(crate) struct MutationPlan {
     set: Option<Vec<SetCol>>,
 }
 
-pub(crate) fn plan_update(update: &Update, cat: &Catalog<'_>) -> Result<MutationPlan, GnitzSqlError> {
+pub(crate) fn plan_update(update: &Update, cat: &dyn Catalog) -> Result<MutationPlan, GnitzSqlError> {
     reject_unhonored_update_clauses(update)?;
     plan_mutation(
         std::slice::from_ref(&update.table),
@@ -49,7 +49,7 @@ pub(crate) fn plan_update(update: &Update, cat: &Catalog<'_>) -> Result<Mutation
     )
 }
 
-pub(crate) fn plan_delete(del: &Delete, cat: &Catalog<'_>) -> Result<MutationPlan, GnitzSqlError> {
+pub(crate) fn plan_delete(del: &Delete, cat: &dyn Catalog) -> Result<MutationPlan, GnitzSqlError> {
     reject_unhonored_delete_clauses(del)?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
     plan_mutation(from, del.selection.as_ref(), None, cat)
@@ -119,7 +119,7 @@ fn plan_mutation(
     from: &[TableWithJoins],
     selection: Option<&Expr>,
     set: Option<&[Assignment]>,
-    cat: &Catalog<'_>,
+    cat: &dyn Catalog,
 ) -> Result<MutationPlan, GnitzSqlError> {
     let verb = if set.is_some() { "UPDATE" } else { "DELETE" };
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
@@ -130,7 +130,7 @@ fn plan_mutation(
         )));
     };
     let (table_name, alias) = extract_table_name_and_alias(factor, cat.schema_name(), verb)?;
-    let target = cat.probe_relation(&table_name.rel)?;
+    let target = cat.probe_relation(&table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
     let schema = &target.schema;
     let set = set
@@ -222,8 +222,7 @@ pub(super) fn bind_set_list(
             _ => None,
         }
         .ok_or_else(|| GnitzSqlError::Rejected(format!("{clause_name}: column must be a simple identifier")))?;
-        let ci = find_unique_column(&schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in {clause_name}")))?;
+        let ci = require_column(&schema.columns, name).map_err(|e| e.in_clause(clause_name))?;
         if schema.is_pk_col(ci) {
             return Err(GnitzSqlError::Rejected(format!(
                 "cannot assign to primary key column in {clause_name}"
@@ -252,8 +251,7 @@ fn bind_set_rhs(
 ) -> Result<SetRhs, GnitzSqlError> {
     if clause == SetClause::DoUpdate {
         if let Some(col_name) = excluded_col(expr) {
-            let col_idx = find_unique_column(&schema.columns, col_name)?
-                .ok_or_else(|| GnitzSqlError::Rejected(format!("EXCLUDED.{col_name}: column not found")))?;
+            let col_idx = require_column(&schema.columns, col_name).map_err(|e| e.in_clause("EXCLUDED"))?;
             // Through the same classifier as a bare RHS, so `SET int_col =
             // EXCLUDED.str_col` is rejected here rather than per row.
             return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);

@@ -12,6 +12,19 @@ fn a_name_is_its_folded_parts() {
 }
 
 #[test]
+fn a_name_prints_as_it_was_written() {
+    let written = RelName::parse("other", "S.T").unwrap();
+    assert!(written.is_qualified());
+    assert_eq!(written.to_string(), "S.T");
+    let alone = RelName::parse("S", "T").unwrap();
+    assert!(!alone.is_qualified());
+    assert_eq!(alone.to_string(), "T");
+    assert_eq!(alone, written);
+    assert_eq!(alone.sibling("U").unwrap().to_string(), "U");
+    assert_eq!(written.sibling("U").unwrap().to_string(), "S.U");
+}
+
+#[test]
 fn each_part_is_a_users_identifier() {
     for (schema, name) in [
         ("s", "a.b"),

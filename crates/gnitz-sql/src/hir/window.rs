@@ -55,11 +55,11 @@ use super::bind::{bind_projection, place_order_keys, ItemLeaf};
 use super::{as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr};
 use super::{TopNKey, Value};
 use crate::agg::{agg_func_from_name, AggFunc};
-use crate::ast_util::{classify_agg_shape, single_fn_name, unknown_function, CallSurface, PlainCall};
+use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, CallSurface, PlainCall};
 use crate::bind::{bind_conjuncts, bind_structural, output_column, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use crate::rules::{first_duplicate, reject_float_key};
+use crate::rules::reject_float_key;
 use crate::tail::parse_order_key;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{
@@ -83,7 +83,7 @@ pub(crate) fn bind_view_select_list<L: ItemLeaf>(
     ctx: &str,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    if let Some(name) = first_duplicate(select.named_window.iter().map(|d| d.0.value.as_str())) {
+    if let Some(name) = gnitz_wire::first_duplicate(select.named_window.iter().map(|d| d.0.value.as_str())) {
         return Err(GnitzSqlError::Rejected(format!("WINDOW clause defines '{name}' twice")));
     }
     let state = RefCell::new(Windows::default());
@@ -406,7 +406,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
 /// Classify a windowed call into its function and its unbound argument.
 fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>), GnitzSqlError> {
     let call = PlainCall::check(f, CallSurface::Window)?;
-    let name = single_fn_name(f).ok_or_else(|| unknown_function(f))?;
+    let name = single_part_ident(&f.name).ok_or_else(|| unknown_function(f))?;
     let ranking = match name.to_ascii_lowercase().as_str() {
         "rank" => Some(WinFunc::Rank),
         "dense_rank" => Some(WinFunc::DenseRank),

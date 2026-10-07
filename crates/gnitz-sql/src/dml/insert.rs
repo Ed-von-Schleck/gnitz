@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::ast_util::{extract_object_name, single_part_ident};
 use crate::bind::structural::bind_constant;
-use crate::bind::{find_unique_column, Catalog};
+use crate::bind::{require_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::dml::plan::{rows_reply, RowsReply};
@@ -51,8 +51,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
         Some(ConflictTarget::Columns(cols)) => {
             let mut named: Vec<u32> = Vec::with_capacity(cols.len());
             for c in cols {
-                let ci = find_unique_column(&schema.columns, c.value.as_str())?
-                    .ok_or_else(|| GnitzSqlError::Rejected(format!("ON CONFLICT ({}): column not found", c.value)))?;
+                let ci = require_column(&schema.columns, c.value.as_str()).map_err(|e| e.in_clause("ON CONFLICT"))?;
                 named.push(ci as u32);
             }
             let mut pk = schema.pk_cols.clone();
@@ -94,8 +93,7 @@ fn value_slots(
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
             .ok_or_else(|| GnitzSqlError::Rejected("INSERT column list: column must be a simple identifier".into()))?;
-        let ci = find_unique_column(&schema.columns, ident)?
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{ident}' not found in the INSERT column list")))?;
+        let ci = require_column(&schema.columns, ident).map_err(|e| e.in_clause("INSERT column list"))?;
         if Some(ci) == serial_ci {
             return Err(GnitzSqlError::Rejected(
                 "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
@@ -204,7 +202,7 @@ fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<()
     Ok(())
 }
 
-pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPlan, GnitzSqlError> {
+pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPlan, GnitzSqlError> {
     reject_unhonored_insert_clauses(insert)?;
     let table_name = match &insert.table {
         TableObject::TableName(obj_name) => extract_object_name(obj_name, cat.schema_name(), "INSERT")?,
@@ -216,7 +214,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
         .ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
     let values = extract_values_rows(source)?;
 
-    let target = cat.probe_relation(&table_name.rel)?;
+    let target = cat.probe_relation(&table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTableOrStream, "INSERT")?;
     let schema = &target.schema;
 
@@ -251,7 +249,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
                     let set = bind_set_list(
                         &do_update.assignments,
                         schema,
-                        table_name.rel.spelled_name(),
+                        table_name.spelled_name(),
                         SetClause::DoUpdate,
                     )?;
                     ConflictPlan::Resolve { set: Some(set) }
@@ -357,7 +355,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
         .as_deref()
         .map(|items| {
             let RowsReply { schema: out_schema, program, .. } = rows_reply(
-                crate::hir::bind_returning(items, &target, table_name.rel.spelled_name())?,
+                crate::hir::bind_returning(items, &target, table_name.spelled_name())?,
                 &[],
                 &target,
             )?;

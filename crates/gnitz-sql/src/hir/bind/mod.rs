@@ -19,12 +19,12 @@ use super::{
     SubqueryKind, SubqueryRef, TopNKey,
 };
 use crate::ast_util::{
-    body_is_grouped, col_ref_parts, expand_wildcard_item, extract_table_name_and_alias, has_exists_in_subquery,
-    has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, scalar_projection_item, select_is_distinct,
-    single_fn_name,
+    alias_column_names, body_is_grouped, col_ref_parts, expand_wildcard_item, extract_table_name_and_alias,
+    has_exists_in_subquery, has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, scalar_projection_item,
+    select_is_distinct, single_part_ident,
 };
 use crate::bind::apply_positional_aliases;
-use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder, NameRef};
+use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::BExpr;
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
@@ -32,7 +32,7 @@ use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_o
 use crate::validate::{
     cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses,
 };
-use gnitz_core::RelDescriptor;
+use gnitz_core::{RelDescriptor, RelName};
 use gnitz_wire::{ColType, ColumnDef};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
@@ -60,7 +60,7 @@ pub(crate) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzS
         let ctx = format!("CTE '{name}'");
         let rel = bind_body(cx, cte_body(cte, &ctx)?)?;
         let (rel, mut defs) = collapse_identity(rel);
-        apply_positional_aliases(cte.alias.columns.iter().map(|a| &a.name), defs.iter_mut(), &ctx)?;
+        apply_positional_aliases(alias_column_names(&cte.alias.columns, &ctx)?, defs.iter_mut(), &ctx)?;
         cx.ctes.insert(canonical, Cte { rel, defs });
     }
     Ok(())
@@ -117,7 +117,7 @@ pub(crate) struct ViewBody {
 
 /// One body's bind state, threaded through the recursion.
 pub(crate) struct BindCx<'c> {
-    pub(crate) cat: &'c Catalog<'c>,
+    pub(crate) cat: &'c dyn Catalog,
     pub(crate) ids: &'c ColIdGen,
     pub(crate) view: ViewBody,
     surface: Surface,
@@ -128,7 +128,7 @@ pub(crate) struct BindCx<'c> {
 }
 
 impl<'c> BindCx<'c> {
-    pub(crate) fn new(cat: &'c Catalog<'c>, ids: &'c ColIdGen, view: ViewBody) -> Self {
+    pub(crate) fn new(cat: &'c dyn Catalog, ids: &'c ColIdGen, view: ViewBody) -> Self {
         BindCx {
             cat,
             ids,
@@ -140,7 +140,7 @@ impl<'c> BindCx<'c> {
     }
 
     /// The context of an ad-hoc read; `op` names it in a class rejection.
-    pub(crate) fn adhoc(cat: &'c Catalog<'c>, ids: &'c ColIdGen, op: &'static str) -> Self {
+    pub(crate) fn adhoc(cat: &'c dyn Catalog, ids: &'c ColIdGen, op: &'static str) -> Self {
         let view = ViewBody { stmt: "SELECT", replacing: None };
         BindCx {
             surface: Surface::AdhocRead { op },
@@ -151,18 +151,18 @@ impl<'c> BindCx<'c> {
 
 /// The subtree a relation name reads: the CTE it names, else the catalog relation.
 /// Every relation a view body names resolves here.
-fn resolve_relation(cx: &mut BindCx<'_>, name: &NameRef) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn resolve_relation(cx: &mut BindCx<'_>, name: &RelName) -> Result<Rc<RelExpr>, GnitzSqlError> {
     // A CTE lives in no schema.
-    let cte = (!name.qualified).then(|| cx.ctes.get(name.rel.name()));
+    let cte = (!name.is_qualified()).then(|| cx.ctes.get(name.name()));
     if let Some(cte) = cte.flatten() {
         return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
     }
-    let rel = cx.cat.probe_relation(&name.rel)?;
+    let rel = cx.cat.probe_relation(name)?;
     // The replaced view is retracted in the same bundle, taking the body's input with it.
     if cx.view.replacing == Some(rel.tid) {
         return Err(GnitzSqlError::Rejected(format!(
             "{} '{}' AS a query referencing the view itself is not supported",
-            cx.view.stmt, name.rel
+            cx.view.stmt, name
         )));
     }
     let (want, op) = match cx.surface {
@@ -312,7 +312,7 @@ fn resolve_table_factor(
         let subtree = bind_body(cx, body)?;
         let mut cols = subtree.cols();
         apply_positional_aliases(
-            alias.columns.iter().map(|a| &a.name),
+            alias_column_names(&alias.columns, &ctx)?,
             cols.iter_mut().map(|c| &mut c.def),
             &ctx,
         )?;
@@ -527,7 +527,7 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         let star = match item {
             SelectItem::Wildcard(o) => Some((None, o)),
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(q), o) => {
-                crate::ast_util::single_part_ident(q).map(|q| (Some(q), o))
+                single_part_ident(q).map(|q| (Some(q), o))
             }
             _ => None,
         };
@@ -566,7 +566,9 @@ fn bind_scalar_item<L: ItemLeaf>(
         .map(|c| c.def.name.clone());
     // An aggregate or window call is named for its function.
     let stem = match peel_nested(expr) {
-        Expr::Function(f) if is_agg_call(f) || f.over.is_some() => single_fn_name(f).map(str::to_ascii_lowercase),
+        Expr::Function(f) if is_agg_call(f) || f.over.is_some() => {
+            single_part_ident(&f.name).map(str::to_ascii_lowercase)
+        }
         _ => None,
     };
     let ty = bound.infer_ty_with(&|r| leaf.type_of(r));
@@ -661,10 +663,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
     }
 
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        Err(clause_error(
-            self.clause,
-            crate::bind::structural::aggregate_not_allowed(f),
-        ))
+        Err(crate::bind::structural::aggregate_not_allowed(f).in_clause(self.clause))
     }
 
     /// A subquery's column by its shape (an EXISTS/IN over NOT NULL operands or
@@ -687,10 +686,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         match self.sub {
             SubPolicy::Bind { bind, .. } => bind(e),
-            SubPolicy::PerKind => Err(clause_error(
-                self.clause,
-                crate::bind::structural::unsupported_subquery(e),
-            )),
+            SubPolicy::PerKind => Err(crate::bind::structural::unsupported_subquery(e).in_clause(self.clause)),
             SubPolicy::Reject(m) => Err(GnitzSqlError::Rejected(m.to_string())),
         }
     }
@@ -793,7 +789,7 @@ impl JoinScope {
         // One relation in scope: the single-relation rule, worded as every other
         // statement words it.
         if let [(only, _)] = self.relations.as_slice() {
-            crate::bind::reject_foreign_qualifier(Some(alias), name, only)?;
+            crate::bind::reject_foreign_qualifier(Some(alias), only)?;
             return self.resolve_unqualified(name);
         }
         let cols = self.relation(alias)?;
@@ -815,15 +811,6 @@ impl JoinScope {
         let scope = if self.relations.len() > 1 { " in any table" } else { "" };
         self.find_unqualified(name)?
             .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found{scope}")))
-    }
-}
-
-/// A rejection raised while binding one clause, named with it. The message already
-/// says what is wrong with the reference; only the clause is added.
-fn clause_error(clause: &str, e: GnitzSqlError) -> GnitzSqlError {
-    match e {
-        GnitzSqlError::Rejected(m) => GnitzSqlError::Rejected(format!("{clause}: {m}")),
-        other => other,
     }
 }
 

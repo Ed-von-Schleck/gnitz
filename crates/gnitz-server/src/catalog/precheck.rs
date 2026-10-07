@@ -59,13 +59,9 @@ fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), 
         return Err(format!("has {} columns (max {max}{why})", col_defs.len()));
     }
     if kind.is_ingestion_point() {
-        let mut seen = FxHashSet::default();
-        if let Some(cd) = col_defs
-            .iter()
-            .filter(|c| !c.def.is_hidden)
-            .find(|c| !seen.insert(c.def.name.to_ascii_lowercase()))
-        {
-            return Err(format!("has duplicate column name '{}'", cd.def.name));
+        let visible = col_defs.iter().filter(|c| !c.def.is_hidden);
+        if let Some(name) = gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
+            return Err(format!("has duplicate column name '{name}'"));
         }
     }
     Ok(())

@@ -495,11 +495,6 @@ fn each_unsupported_form_is_rejected_by_name() {
         negated: false,
     };
     assert!(rejected(bind_single_table(&empty, &schema(), "t")).contains("empty list"));
-    // No relation in scope: there is no alias a qualifier could name.
-    assert_eq!(
-        rejected(bind_single_table(&parse_expr_sql("t.c"), &schema(), "")),
-        "column 't.c' not found (no relation is in scope)"
-    );
 }
 
 /// `scalar_call` matches before the leaf ever sees a call, so a name in two

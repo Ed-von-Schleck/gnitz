@@ -8,7 +8,7 @@ use super::*;
 /// `u(uid BIGINT PK, k BIGINT)`, `st`, a stream with `t`'s columns, `x(id
 /// BIGINT PK, a BIGINT, big UINT128)`, `wk(big UINT128 PK, k BIGINT, a BIGINT)` and
 /// `td(id BIGINT PK, dt DATE, a BIGINT)`.
-fn cat() -> Catalog<'static> {
+fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let t_cols = || {
         vec![
@@ -384,11 +384,11 @@ fn row_number_reads_the_row_key_off_the_relation() {
     let cat = cat();
     cat.insert(
         &in_sn("jt"),
-        Some(table(
+        table(
             10,
             vec![col("_join_pk", TypeCode::I64), col("a", TypeCode::I64)],
             vec![0],
-        )),
+        ),
     );
     for (tid, name, body) in [
         (20, "sv", "SELECT id, a FROM st"),

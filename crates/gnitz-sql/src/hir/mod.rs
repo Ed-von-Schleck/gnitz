@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
 pub(crate) fn bind_and_lower<'a>(
-    cat: &crate::bind::Catalog<'_>,
+    cat: &dyn crate::bind::Catalog,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
     bounded: bool,
@@ -59,7 +59,7 @@ pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape};
 /// relation. One binder, two sinks, so a statement means the same thing as an
 /// ad-hoc read and as a view body.
 pub(crate) fn bind_adhoc_read(
-    cat: &crate::bind::Catalog<'_>,
+    cat: &dyn crate::bind::Catalog,
     query: &sqlparser::ast::Query,
     select: &sqlparser::ast::Select,
     op: &'static str,

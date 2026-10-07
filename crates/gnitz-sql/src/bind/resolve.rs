@@ -3,8 +3,6 @@ use crate::error::GnitzSqlError;
 use gnitz_core::{RelDescriptor, RelName};
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{Expr, Ident};
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The one visible column of `columns` named `col_name`, matched
@@ -61,115 +59,17 @@ pub(crate) fn output_column<'a>(
     }
 }
 
-/// A relation as a statement names it.
-#[derive(Clone, Debug)]
-pub(crate) struct NameRef {
-    pub(crate) rel: RelName,
-    /// Whether the statement wrote the schema.
-    pub(crate) qualified: bool,
-}
-
-/// The name as the statement qualified it.
-impl std::fmt::Display for NameRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.qualified {
-            true => self.rel.fmt(f),
-            false => f.write_str(self.rel.spelled_name()),
-        }
-    }
-}
-
-/// One run of a plan against a [`Catalog`].
-pub(crate) enum Attempt<T> {
-    Planned(Result<T, GnitzSqlError>),
-    /// The plan asked for this name, which the catalog has no verdict for:
-    /// [`Catalog::insert`] one and attempt again.
-    Missing(RelName),
-}
-
-/// The relations one statement's plan reads, as far as they are known.
-pub(crate) struct Catalog<'r> {
-    schema_name: &'r str,
-    /// Each name's verdict, absence included.
-    known: RefCell<HashMap<RelName, Option<Arc<RelDescriptor>>>>,
-    /// The name the running attempt asked for and found no verdict on.
-    missed: RefCell<Option<RelName>>,
-    /// Whether a name without a verdict may yet be supplied; otherwise it is
-    /// absent.
-    open: bool,
-    /// Asked for a name without a verdict before the attempt reports it
-    /// missing.
-    held: Option<&'r Held<'r>>,
-}
-
-/// The relation a name denotes, where it is to be had without waiting.
-pub(crate) type Held<'r> = dyn Fn(&RelName) -> Option<Arc<RelDescriptor>> + 'r;
-
-impl<'r> Catalog<'r> {
-    pub(crate) fn new(schema_name: &'r str) -> Self {
-        Catalog {
-            schema_name,
-            known: RefCell::new(HashMap::new()),
-            missed: RefCell::new(None),
-            open: true,
-            held: None,
-        }
-    }
-
-    /// A catalog that takes what `held` has before it reports a name missing.
-    pub(crate) fn holding(schema_name: &'r str, held: &'r Held<'r>) -> Self {
-        Catalog {
-            held: Some(held),
-            ..Catalog::new(schema_name)
-        }
-    }
-
-    /// A catalog that already holds every relation there is.
-    #[cfg(test)]
-    pub(crate) fn complete(schema_name: &'r str) -> Self {
-        Catalog { open: false, ..Catalog::new(schema_name) }
-    }
-
+/// The relations a statement's plan reads.
+pub(crate) trait Catalog {
     /// The session's schema.
-    pub(crate) fn schema_name(&self) -> &'r str {
-        self.schema_name
-    }
+    fn schema_name(&self) -> &str;
 
     /// The relation `name` resolves to, `None` for a free name.
-    pub(crate) fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-        if let Some(hit) = self.known.borrow().get(name) {
-            return Ok(hit.clone());
-        }
-        if !self.open {
-            return Ok(None);
-        }
-        if let Some(desc) = self.held.and_then(|held| held(name)) {
-            return Ok(Some(desc));
-        }
-        *self.missed.borrow_mut() = Some(name.clone());
-        Err(GnitzSqlError::Internal(format!(
-            "relation '{name}' was planned before it was resolved"
-        )))
-    }
+    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError>;
 
-    /// The relation `name` a statement reads: [`Self::probe`], with absence an
-    /// error.
-    pub(crate) fn probe_relation(&self, name: &RelName) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
+    /// The relation `name` a statement reads: [`Self::probe`], with absence an error.
+    fn probe_relation(&self, name: &RelName) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         self.probe(name)?.ok_or_else(|| crate::error::missing_relation(name))
-    }
-
-    /// Run `plan` against what this catalog holds.
-    pub(crate) fn attempt<T>(&self, plan: impl FnOnce(&Self) -> Result<T, GnitzSqlError>) -> Attempt<T> {
-        let planned = plan(self);
-        match self.missed.borrow_mut().take() {
-            Some(name) => Attempt::Missing(name),
-            None => Attempt::Planned(planned),
-        }
-    }
-
-    /// Record `name`'s verdict.
-    pub(crate) fn insert(&self, name: &RelName, desc: Option<Arc<RelDescriptor>>) {
-        self.known.borrow_mut().insert(name.clone(), desc);
     }
 }
 
@@ -179,8 +79,8 @@ impl<'r> Catalog<'r> {
 /// (a JOIN body's synthetic-PK region) are skipped, so an alias list names exactly
 /// what a downstream query sees.
 ///
-/// A rename can collide where the original names did not, so the duplicate check
-/// belongs here rather than at each caller.
+/// A rename can collide where the original names did not, so the result is checked
+/// for duplicates.
 pub(crate) fn apply_positional_aliases<'a, 'b>(
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
     defs: impl IntoIterator<Item = &'b mut ColumnDef>,

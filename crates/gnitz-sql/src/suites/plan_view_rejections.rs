@@ -12,7 +12,7 @@ use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 /// integer, a float and a string), `tt` (a TIMESTAMP), `xd` (a DECIMAL at `x.qty`'s
 /// scale), and two join views over duplicated names —
 /// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
-fn cat() -> Catalog<'static> {
+fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let cat = base();
     let keys = || (0..=PK_LIST_MAX_COLS).map(|n| col(&format!("c{n}"), i)).collect();
@@ -106,7 +106,7 @@ fn cat() -> Catalog<'static> {
             ),
         ),
     ] {
-        cat.insert(&in_sn(name), Some(desc));
+        cat.insert(&in_sn(name), desc);
     }
     let jv = view(&cat, "SELECT * FROM t JOIN u ON t.v = u.v");
     register(&cat, "jv", 47, jv.props.into(), final_view(&jv));
@@ -116,7 +116,7 @@ fn cat() -> Catalog<'static> {
 }
 
 /// Assert each `(body, substring)` row rejects as `CREATE VIEW v AS body`.
-fn rejects(cat: &Catalog<'static>, rows: &[(&str, &str)]) {
+fn rejects(cat: &TestCatalog, rows: &[(&str, &str)]) {
     for (body, needle) in rows {
         assert_rejects(body, plan(cat, &format!("CREATE VIEW v AS {body}")), needle);
     }
@@ -150,6 +150,18 @@ fn join_key_rules() {
             (
                 "SELECT a.id FROM a JOIN b USING (nope)",
                 "JOIN USING: column 'nope' not found",
+            ),
+            (
+                "SELECT a.id FROM a JOIN b USING (a.k)",
+                "JOIN USING: column must be a simple identifier",
+            ),
+            (
+                "WITH d(x BIGINT) AS (SELECT id FROM a) SELECT x FROM d",
+                "CTE 'd': a type on a column alias is not supported",
+            ),
+            (
+                "SELECT x FROM (SELECT id FROM a) AS d(x BIGINT)",
+                "derived table 'd': a type on a column alias is not supported",
             ),
             ("SELECT * FROM ty JOIN a ON ty.big = a.k", "signed-256"),
             ("SELECT * FROM ty JOIN w ON ty.s = w.big", "content hash never matches"),

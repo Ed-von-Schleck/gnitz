@@ -21,6 +21,16 @@ impl fmt::Display for GnitzSqlError {
 
 impl std::error::Error for GnitzSqlError {}
 
+impl GnitzSqlError {
+    /// This rejection, named with the clause it was raised in.
+    pub(crate) fn in_clause(self, clause: &str) -> Self {
+        match self {
+            GnitzSqlError::Rejected(m) => GnitzSqlError::Rejected(format!("{clause}: {m}")),
+            other => other,
+        }
+    }
+}
+
 impl From<gnitz_core::ClientError> for GnitzSqlError {
     fn from(e: gnitz_core::ClientError) -> Self {
         GnitzSqlError::Client(e)

@@ -10,14 +10,27 @@ use std::hash::{Hash, Hasher};
 pub struct RelName {
     /// `schema.name`, folded to its catalog form.
     key: String,
-    /// `schema.name` as it was spelled; the same length as `key`.
+    /// `schema.name` as it was spelled, the schema being the default's spelling
+    /// where the name was written alone; the same length as `key`.
     spelled: String,
     /// Where the `.` is, in both.
     dot: usize,
+    /// Whether the schema was written, rather than supplied as a default.
+    qualified: bool,
 }
 
 impl RelName {
+    /// `schema.name`, both written.
     pub fn new(schema: &str, name: &str) -> Result<Self, String> {
+        Self::build(schema, name, true)
+    }
+
+    /// `name`, written alone, in `schema`.
+    pub fn unqualified(schema: &str, name: &str) -> Result<Self, String> {
+        Self::build(schema, name, false)
+    }
+
+    fn build(schema: &str, name: &str, qualified: bool) -> Result<Self, String> {
         // The one reserved schema a name may spell: a client's own.
         let schema_key = match schema.eq_ignore_ascii_case(gnitz_wire::LOCAL_SCHEMA) {
             true => gnitz_wire::LOCAL_SCHEMA.to_string(),
@@ -28,13 +41,21 @@ impl RelName {
             key,
             spelled: gnitz_wire::qualified_key(schema, name),
             dot: schema.len(),
+            qualified,
         })
     }
 
     /// `text` as `schema.name`, or as a name in `default_schema`.
     pub fn parse(default_schema: &str, text: &str) -> Result<Self, String> {
-        let (schema, name) = text.split_once('.').unwrap_or((default_schema, text));
-        Self::new(schema, name)
+        match text.split_once('.') {
+            Some((schema, name)) => Self::new(schema, name),
+            None => Self::unqualified(default_schema, text),
+        }
+    }
+
+    /// Whether the schema was written.
+    pub fn is_qualified(&self) -> bool {
+        self.qualified
     }
 
     pub fn schema(&self) -> &str {
@@ -57,7 +78,7 @@ impl RelName {
 
     /// The same schema's relation `name`.
     pub fn sibling(&self, name: &str) -> Result<Self, String> {
-        Self::new(&self.spelled[..self.dot], name)
+        Self::build(&self.spelled[..self.dot], name, self.qualified)
     }
 }
 
@@ -75,10 +96,13 @@ impl Hash for RelName {
     }
 }
 
-/// `schema.name`, as it was spelled.
+/// The name as it was written: with its schema only where that was spelled.
 impl std::fmt::Display for RelName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.spelled)
+        f.write_str(match self.qualified {
+            true => &self.spelled,
+            false => self.spelled_name(),
+        })
     }
 }
 

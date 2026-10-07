@@ -210,6 +210,13 @@ pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
+/// The first name `names` repeats, folded case-insensitively as SQL identifiers
+/// are, and returned as it was spelled at the repeat.
+pub fn first_duplicate<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names.find(|n| !seen.insert(n.to_ascii_lowercase()))
+}
+
 /// The schema a client's own aliases live in. No server holds it: it starts
 /// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
 pub const LOCAL_SCHEMA: &str = "_local";

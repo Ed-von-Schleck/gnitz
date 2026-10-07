@@ -11,7 +11,7 @@ use super::*;
 use crate::ddl::{plan_create_table, TablePlan};
 
 /// Plan `sql` against `cat`. The statement must parse as a `CREATE TABLE`.
-fn plan_table(cat: &Catalog<'_>, sql: &str) -> Result<Option<TablePlan>, GnitzSqlError> {
+fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TablePlan>, GnitzSqlError> {
     match parse_stmt(sql) {
         sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat),
         other => panic!("`{sql}` is not a CREATE TABLE: {other}"),
@@ -19,7 +19,7 @@ fn plan_table(cat: &Catalog<'_>, sql: &str) -> Result<Option<TablePlan>, GnitzSq
 }
 
 /// The bundle of a plan expected to create.
-fn created(cat: &Catalog<'_>, sql: &str) -> TablePlan {
+fn created(cat: &dyn Catalog, sql: &str) -> TablePlan {
     plan_table(cat, sql)
         .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         .unwrap_or_else(|| panic!("`{sql}` planned nothing"))
@@ -35,14 +35,11 @@ fn unique(cols: &[u32], name: &str) -> InlineUniqueIndex {
 
 /// `p (id BIGINT PK, u BIGINT)` with a **unique** index on `u`, and `q` with the
 /// same shape and a non-unique one — so only `p.u` is a legal non-PK FK target.
-fn fk_catalog() -> Catalog<'static> {
+fn fk_catalog() -> TestCatalog {
     let i = TypeCode::I64;
     let cols = || vec![col("id", i), col("u", i)];
     let cat = catalog(vec![("q", rel(40, RelClass::Table, cols(), vec![0], vec![ix(&[1])]))]);
-    cat.insert(
-        &in_sn("p"),
-        Some(rel(41, RelClass::Table, cols(), vec![0], vec![uq(&[1])])),
-    );
+    cat.insert(&in_sn("p"), rel(41, RelClass::Table, cols(), vec![0], vec![uq(&[1])]));
     cat
 }
 
@@ -304,9 +301,9 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         vec![col("a", u), col("b", u), ncol("payload", TypeCode::I64)],
         vec![0, 1],
     );
-    known.insert(&in_sn("cp"), Some(cp));
+    known.insert(&in_sn("cp"), cp);
     let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
-    known.insert(&in_sn("st"), Some(st));
+    known.insert(&in_sn("st"), st);
     for (sql, needle) in [
         ("CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p", "CTAS"),
         ("CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)", "TEMPORARY"),
@@ -584,7 +581,7 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
     let cat = fk_catalog();
     let i = TypeCode::I64;
     let other = |name: &str| gnitz_core::RelName::new("other", name).unwrap();
-    cat.insert(&other("t"), Some(table(42, vec![col("id", i)], vec![0])));
+    cat.insert(&other("t"), table(42, vec![col("id", i)], vec![0]));
 
     let c = created(&cat, "CREATE TABLE Other.t2 (id BIGINT PRIMARY KEY, u BIGINT UNIQUE)");
     assert_eq!(c.name, other("t2"));

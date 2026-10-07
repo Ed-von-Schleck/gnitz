@@ -3,14 +3,15 @@
 //! never who calls it, which rots the moment a caller moves.
 
 use crate::agg::{agg_func_from_name, agg_func_name, AggFunc};
-use crate::bind::NameRef;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
-use crate::rules::{canonical_user_name, first_duplicate};
+use crate::rules::canonical_user_name;
 use gnitz_core::RelName;
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
-use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
+use sqlparser::ast::{
+    ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, TableAliasColumnDef, Value, WildcardAdditionalOptions,
+};
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
 /// not a plain identifier.
@@ -48,21 +49,14 @@ pub(crate) fn extract_object_name(
     name: &sqlparser::ast::ObjectName,
     session_schema: &str,
     context: &str,
-) -> Result<NameRef, GnitzSqlError> {
-    let (schema, relation) = match object_name_parts(name, context)?.as_slice() {
-        [n] => (None, *n),
-        [s, n] => (Some(*s), *n),
+) -> Result<RelName, GnitzSqlError> {
+    match object_name_parts(name, context)?.as_slice() {
+        [n] => RelName::unqualified(session_schema, n),
+        [s, n] => RelName::new(s, n),
         // `object_name_parts` rejects the empty name, so this is 3+ parts.
-        _ => {
-            return Err(GnitzSqlError::Rejected(format!(
-                "{context}: '{name}' has too many name parts"
-            )))
-        }
-    };
-    Ok(NameRef {
-        rel: RelName::new(schema.unwrap_or(session_schema), relation).map_err(GnitzSqlError::Rejected)?,
-        qualified: schema.is_some(),
-    })
+        _ => Err(format!("{context}: '{name}' has too many name parts")),
+    }
+    .map_err(GnitzSqlError::Rejected)
 }
 
 /// An index name, canonical. Index names are global, so it takes no qualifier.
@@ -73,14 +67,6 @@ pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &st
             "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
         ))),
     }
-}
-
-/// A column reference the parser handed over as an `ObjectName`: a qualifier here
-/// is `table.col`, so the column is the last part.
-pub(crate) fn extract_ident_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
-    object_name_ident(name)
-        .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Rejected(format!("empty name in {context}")))
 }
 
 /// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
@@ -120,15 +106,6 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
         _ => Err(GnitzSqlError::Rejected(format!(
             "value type not supported in expressions: {v:?}"
         ))),
-    }
-}
-
-/// The bare name of an unqualified single-part function call, or `None` for a
-/// qualified (`schema.fn`) name.
-pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
-    match f.name.0.as_slice() {
-        [part] => part.as_ident().map(|i| i.value.as_str()),
-        _ => None,
     }
 }
 
@@ -203,7 +180,7 @@ pub(crate) fn classify_agg_shape(
 ) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     let f = call.0;
-    let base = single_fn_name(f)
+    let base = single_part_ident(&f.name)
         .and_then(agg_func_from_name)
         .ok_or_else(|| unknown_function(f))?;
     if base == AggFunc::Count {
@@ -375,7 +352,7 @@ pub(crate) fn unknown_function(f: &sqlparser::ast::Function) -> GnitzSqlError {
 /// one: `SUM(x) OVER (…)` is a window function whose *argument* may hold an
 /// aggregate, and it neither groups its body nor is collected into a reduce.
 pub(crate) fn is_agg_call(f: &sqlparser::ast::Function) -> bool {
-    f.over.is_none() && single_fn_name(f).and_then(agg_func_from_name).is_some()
+    f.over.is_none() && single_part_ident(&f.name).and_then(agg_func_from_name).is_some()
 }
 
 /// The expressions a window specification keys on: its PARTITION BY, then its
@@ -615,7 +592,7 @@ pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     session_schema: &str,
     context: &str,
-) -> Result<(NameRef, String), GnitzSqlError> {
+) -> Result<(RelName, String), GnitzSqlError> {
     let sqlparser::ast::TableFactor::Table {
         name,
         alias,
@@ -659,9 +636,23 @@ pub(crate) fn extract_table_name_and_alias(
             reject_if(at.is_some(), context, "AT (PartiQL index alias)")?;
             alias_name.value.clone()
         }
-        None => table_name.rel.spelled_name().to_string(),
+        None => table_name.spelled_name().to_string(),
     };
     Ok((table_name, alias))
+}
+
+/// The names a table alias gives its columns. A type on one is refused: it
+/// would have to be checked against the body's own or silently ignored.
+pub(crate) fn alias_column_names<'a>(
+    columns: &'a [TableAliasColumnDef],
+    ctx: &str,
+) -> Result<impl ExactSizeIterator<Item = &'a Ident>, GnitzSqlError> {
+    reject_if(
+        columns.iter().any(|c| c.data_type.is_some()),
+        ctx,
+        "a type on a column alias",
+    )?;
+    Ok(columns.iter().map(|c| &c.name))
 }
 
 /// A strictly simple identifier expression's name, or the shared
@@ -812,7 +803,7 @@ where
             "{ctx}: SELECT * RENAME names excluded column '{f}'"
         )));
     }
-    if let Some(f) = first_duplicate(rename.iter().map(|&(f, _)| f)) {
+    if let Some(f) = gnitz_wire::first_duplicate(rename.iter().map(|&(f, _)| f)) {
         return Err(GnitzSqlError::Rejected(format!(
             "{ctx}: SELECT * RENAME names column '{f}' twice"
         )));

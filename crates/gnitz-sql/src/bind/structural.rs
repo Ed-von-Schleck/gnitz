@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use super::resolve::require_column;
 use crate::ast_util::{
-    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_fn_name, CallSurface, PlainCall,
+    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_part_ident, CallSurface, PlainCall,
 };
 use crate::codec::literal::{invalid_literal, parse_bool, parse_temporal};
 use crate::error::{reject_if, GnitzSqlError};
@@ -143,7 +143,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::Function(f) if f.over.is_some() => leaf.bind_window(f),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
-            None => match single_fn_name(f) {
+            None => match single_part_ident(&f.name) {
                 Some(n) if VOLATILE_FNS.iter().any(|v| n.eq_ignore_ascii_case(v)) => {
                     Err(GnitzSqlError::Rejected(format!(
                         "{}: a non-deterministic function is not supported",
@@ -628,7 +628,7 @@ fn calendar_field(name: &str) -> Option<CalendarOp> {
 }
 
 fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
-    let n = single_fn_name(f)?;
+    let n = single_part_ident(&f.name)?;
     SCALAR_CALLS
         .iter()
         .find(|(name, _)| n.eq_ignore_ascii_case(name))
@@ -839,32 +839,21 @@ fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) ->
 /// The position of an `Identifier` / two-part `CompoundIdentifier` within one
 /// relation's columns. A written qualifier must name `alias`, the relation's
 /// effective alias, so `SELECT b.val FROM a` is a rejection rather than a read of
-/// `a.val`; it disambiguates nothing beyond that. An empty `alias` means no
-/// relation is in scope: there is no alias a qualifier could name, so such a
-/// reference is reported whole.
-///
-/// The one home for the single-relation resolve contract — the "expected a column
-/// reference" / "column not found" pair and `find_unique_column`'s ambiguity
-/// error.
+/// `a.val`; it disambiguates nothing beyond that.
 pub(crate) fn single_relation_col_idx<'a>(
     cols: impl IntoIterator<Item = &'a ColumnDef>,
     alias: &str,
     e: &Expr,
 ) -> Result<usize, GnitzSqlError> {
     let (qual, name) = col_ref_parts(e).ok_or_else(|| GnitzSqlError::Rejected("expected a column reference".into()))?;
-    reject_foreign_qualifier(qual, name, alias)?;
+    reject_foreign_qualifier(qual, alias)?;
     require_column(cols, name)
 }
 
 /// The qualifier half of [`single_relation_col_idx`], for a resolver that carries
 /// its own name lookup.
-pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, name: &str, alias: &str) -> Result<(), GnitzSqlError> {
+pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, alias: &str) -> Result<(), GnitzSqlError> {
     let Some(q) = qual else { return Ok(()) };
-    if alias.is_empty() {
-        return Err(GnitzSqlError::Rejected(format!(
-            "column '{q}.{name}' not found (no relation is in scope)"
-        )));
-    }
     if !q.eq_ignore_ascii_case(alias) {
         return Err(GnitzSqlError::Rejected(format!(
             "table alias '{q}' not found (the relation in scope is '{alias}')"

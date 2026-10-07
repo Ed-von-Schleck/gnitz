@@ -86,7 +86,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(99999999, KV)
 
-    with pytest.raises(gnitz.GnitzNotFoundError, match=f"{client.schema}.nope"):
+    with pytest.raises(gnitz.GnitzNotFoundError, match="table 'nope' not found"):
         client.drop_table("nope")
 
     # SQL reports the same class for a read and a write.

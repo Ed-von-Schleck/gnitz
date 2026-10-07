@@ -29,7 +29,7 @@ def test_a_qualified_name_reaches_a_relation_of_another_schema(server, client, i
         assert tid == client.resolve_table("items")[0]
         assert bag(public.scan(tid, schema)) == _ITEMS
         assert bag(rows(public, f"SELECT pk, val FROM {items}")) == _ITEMS
-        with pytest.raises(gnitz.GnitzNotFoundError, match="public.items"):
+        with pytest.raises(gnitz.GnitzNotFoundError, match="relation 'items' not found"):
             public.resolve_table("items")
 
         public.execute_sql(f"INSERT INTO {items} VALUES (3, 30)")

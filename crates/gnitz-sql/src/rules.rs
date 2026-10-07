@@ -5,19 +5,12 @@ use crate::error::GnitzSqlError;
 use gnitz_core::RelDescriptor;
 use gnitz_wire::{ColumnDef, RelClass, TypeCode};
 
-/// The first name `names` repeats, folded case-insensitively as SQL identifiers
-/// are, and returned as the user spelled it at the repeat.
-pub(crate) fn first_duplicate<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    names.find(|n| !seen.insert(n.to_ascii_lowercase()))
-}
-
 /// Reject a list naming one column twice. `context` names the list in the error.
 pub(crate) fn reject_duplicate_names<'a>(
     names: impl Iterator<Item = &'a str>,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    match first_duplicate(names) {
+    match gnitz_wire::first_duplicate(names) {
         Some(name) => Err(GnitzSqlError::Rejected(format!(
             "duplicate column name '{name}' in {context}"
         ))),

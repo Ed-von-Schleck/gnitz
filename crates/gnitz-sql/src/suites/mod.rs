@@ -12,7 +12,7 @@ mod plan_view_rejections;
 mod plan_view_schema;
 mod plan_view_window;
 
-use crate::bind::{Attempt, Catalog};
+use crate::bind::Catalog;
 use crate::ddl::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
@@ -36,7 +36,7 @@ use sqlparser::ast::Statement;
 /// | `tv` | a view with `t`'s columns |
 /// | `bv` | a capacity-bounded view with `t`'s columns |
 /// | `fv` | a view with a delta feed, with `t`'s columns |
-fn base() -> Catalog<'static> {
+fn base() -> TestCatalog {
     let i = TypeCode::I64;
     let tgv = || vec![col("id", i), col("g", i), col("v", i)];
     catalog(vec![
@@ -82,7 +82,7 @@ fn base() -> Catalog<'static> {
 
 /// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
 /// here carry `IF NOT EXISTS`, the one clause that plans nothing.
-fn plan(cat: &Catalog<'_>, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
+fn plan(cat: &dyn Catalog, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
     match parse_stmt(sql) {
         Statement::CreateView(cv) => {
             plan_create_view(&cv, cat).map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing")))
@@ -95,7 +95,7 @@ fn plan(cat: &Catalog<'_>, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
 }
 
 /// Plan a read (`SELECT` / `EXPLAIN`) against `cat`.
-fn read(cat: &Catalog<'_>, sql: &str) -> Result<ReadPlan, GnitzSqlError> {
+fn read(cat: &dyn Catalog, sql: &str) -> Result<ReadPlan, GnitzSqlError> {
     crate::dml::plan_read(&parse_stmt(sql), cat)
 }
 
@@ -115,7 +115,7 @@ fn view_count(chain: &PlannedChain) -> usize {
 }
 
 /// `CREATE VIEW v AS <body>` planned against `cat`, unwrapped.
-fn view(cat: &Catalog<'_>, body: &str) -> PlannedChain {
+fn view(cat: &dyn Catalog, body: &str) -> PlannedChain {
     plan(cat, &format!("CREATE VIEW v AS {body}")).unwrap_or_else(|e| panic!("`{body}`: {e:?}"))
 }
 
@@ -134,23 +134,14 @@ fn count(circuit: &Circuit, pred: impl Fn(&OpNode) -> bool) -> usize {
     circuit.nodes().iter().filter(|n| pred(&n.op)).count()
 }
 
-/// Plan against a catalog supplied each name out of `known` as the plan asks
-/// for it, recording the names asked for, in order.
+/// Plan against `known`, recording the names the plan asks for, each once, in
+/// order.
 fn resolving<T>(
-    known: &Catalog<'_>,
-    plan: impl Fn(&Catalog<'_>) -> Result<T, GnitzSqlError>,
+    known: &TestCatalog,
+    plan: impl Fn(&dyn Catalog) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, Vec<String>) {
-    let cat = Catalog::new(SN);
-    let mut asked = Vec::new();
-    loop {
-        let name = match cat.attempt(&plan) {
-            Attempt::Planned(r) => return (r, asked),
-            Attempt::Missing(name) => name,
-        };
-        cat.insert(
-            &name,
-            known.probe(&name).expect("a complete catalog answers every name"),
-        );
-        asked.push(name.name().to_string());
-    }
+    known.take_asked();
+    let planned = plan(known);
+    let asked = known.take_asked();
+    (planned, asked.iter().map(|n| n.name().to_string()).collect())
 }

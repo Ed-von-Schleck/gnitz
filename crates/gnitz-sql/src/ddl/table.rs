@@ -6,7 +6,7 @@ use super::guard::{
     reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
 };
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{find_unique_column, Catalog, NameRef};
+use crate::bind::{require_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
@@ -116,9 +116,7 @@ fn resolve_index_columns<'c>(
     let mut indices: Vec<u32> = Vec::with_capacity(columns.len());
     for c in columns {
         let name = index_column_ident(c, ctx)?;
-        let idx = find_unique_column(cols, name)?
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("{ctx} column '{name}' not found")))?
-            as u32;
+        let idx = require_column(cols, name).map_err(|e| e.in_clause(ctx))? as u32;
         if indices.contains(&idx) {
             return Err(GnitzSqlError::Rejected(format!("{ctx}: duplicate column '{name}'")));
         }
@@ -133,7 +131,7 @@ fn resolve_index_columns<'c>(
 /// omitted column list defaults to it, and is undefined otherwise.
 fn resolve_referred_column(
     referred_columns: &[sqlparser::ast::Ident],
-    ref_table: &NameRef,
+    ref_table: &RelName,
     cols: &[ColumnDef],
     pk_single: Option<usize>,
 ) -> Result<usize, GnitzSqlError> {
@@ -143,12 +141,9 @@ fn resolve_referred_column(
         ));
     }
     match referred_columns.first() {
-        Some(ident) => find_unique_column(cols, &ident.value)?.ok_or_else(|| {
-            GnitzSqlError::Rejected(format!(
-                "FK references column '{}' not found in table '{}'",
-                ident.value, ref_table,
-            ))
-        }),
+        Some(ident) => {
+            require_column(cols, &ident.value).map_err(|e| e.in_clause(&format!("FOREIGN KEY REFERENCES {ref_table}")))
+        }
         None => pk_single.ok_or_else(|| {
             GnitzSqlError::Rejected(format!(
                 "FK against '{ref_table}' must name the referenced column (its primary key is not a single column)",
@@ -163,7 +158,7 @@ fn resolve_referred_column(
 fn resolve_fk_target_inline(
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
-    ref_table: &NameRef,
+    ref_table: &RelName,
     site: &FkSite<'_>,
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
     let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
@@ -190,20 +185,20 @@ fn resolve_fk_target_inline(
 /// Validates that the child's type is compatible with the referenced column's
 /// and returns that type so the caller can widen the child column.
 fn resolve_fk_target(
-    cat: &Catalog<'_>,
+    cat: &dyn Catalog,
     site: &FkSite<'_>,
-    ref_table: &NameRef,
+    ref_table: &RelName,
     current_table: &RelName,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
-    if ref_table.rel == *current_table {
+    if ref_table == current_table {
         return resolve_fk_target_inline(current_cols, current_pk_cols, ref_table, site);
     }
 
-    let ref_rel = cat.probe_relation(&ref_table.rel)?;
+    let ref_rel = cat.probe_relation(ref_table)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
@@ -369,11 +364,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                     ));
                 }
                 let local_col_name = &columns[0].value;
-                let col_idx = find_unique_column(&cols, local_col_name)?.ok_or_else(|| {
-                    GnitzSqlError::Rejected(format!(
-                        "FOREIGN KEY column '{local_col_name}' not found in table definition"
-                    ))
-                })?;
+                let col_idx = require_column(&cols, local_col_name).map_err(|e| e.in_clause("FOREIGN KEY"))?;
                 fk_sites.push(FkSite { col_idx, foreign_table, referred_columns });
             }
             TableConstraint::Unique(UniqueConstraint { name: name_ident, columns, .. }) => {
@@ -611,9 +602,6 @@ fn reject_unhonored_table_constraints(constraints: &[sqlparser::ast::TableConstr
     Ok(())
 }
 
-/// Plan a `CREATE TABLE` into the bundle its commit writes; `None` when
-/// `IF NOT EXISTS` finds the name taken. [`collect_declarations`] reads the statement; everything below it
-/// resolves, admits and names.
 /// `Err` unless `cluster` is exactly `pk`'s leading prefix, in PK order: the
 /// distribution key is a leading PK prefix so write-side routing is a byte-slice
 /// of the OPK region. `cols` names a column the PK does not hold.
@@ -641,13 +629,16 @@ fn validate_dist_prefix(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Resu
     Ok(())
 }
 
+/// Plan a `CREATE TABLE` into the bundle its commit writes; `None` when
+/// `IF NOT EXISTS` finds the name taken. [`collect_declarations`] reads the statement; everything below it
+/// resolves, admits and names.
 pub(crate) fn plan_create_table(
     create: &sqlparser::ast::CreateTable,
-    cat: &Catalog<'_>,
+    cat: &dyn Catalog,
 ) -> Result<Option<TablePlan>, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
     let schema_name = cat.schema_name();
-    let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?.rel;
+    let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
 
     // The `WITH (…)` keys and values are decidable from the statement's own text.
     // A `Keyed` distribution's prefix is the other half of `props`, and needs
@@ -687,7 +678,7 @@ pub(crate) fn plan_create_table(
     // column's type to the parent's — so this runs after collection, not inside it.
     // The self-references go last: one adopts the PK column's type, which a
     // cross-table FK on that column rewrites.
-    let mut sites: Vec<(NameRef, &FkSite<'_>)> = fk_sites
+    let mut sites: Vec<(RelName, &FkSite<'_>)> = fk_sites
         .iter()
         .map(|site| {
             Ok((
@@ -696,7 +687,7 @@ pub(crate) fn plan_create_table(
             ))
         })
         .collect::<Result<_, GnitzSqlError>>()?;
-    sites.sort_by_key(|(ref_table, _)| ref_table.rel == table_name);
+    sites.sort_by_key(|(ref_table, _)| *ref_table == table_name);
     let mut fks: Vec<Option<FkTarget>> = vec![None; cols.len()];
     for (ref_table, site) in sites {
         if fks[site.col_idx].is_some() {
@@ -746,8 +737,7 @@ pub(crate) fn plan_create_table(
         let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
         for expr in exprs {
             let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
-            let idx = find_unique_column(cols, col_name)?
-                .ok_or_else(|| GnitzSqlError::Rejected(format!("CLUSTER BY column '{col_name}' not found")))?;
+            let idx = require_column(cols, col_name).map_err(|e| e.in_clause("CLUSTER BY"))?;
             cluster_indices.push(idx as u32);
         }
         validate_dist_prefix(cols, pk_indices, &cluster_indices)?;
@@ -807,7 +797,7 @@ pub(crate) async fn execute_drop(
     }
     let targets = names
         .iter()
-        .map(|n| Ok(extract_object_name(n, schema_name, "DROP")?.rel))
+        .map(|n| extract_object_name(n, schema_name, "DROP"))
         .collect::<Result<Vec<RelName>, GnitzSqlError>>()?;
     match object_type {
         ObjectType::View => client.drop_view(&targets, if_exists).await?,
@@ -861,7 +851,7 @@ pub(crate) struct IndexRequest<'a> {
 /// `columns`, `unique`). `using` is accepted only for the BTree default (gnitz's index is ordered /
 /// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`
 /// (no non-blocking-build guarantee), `include`/`nulls_distinct`/`with` (silent default semantics)
-/// are rejected. `if_not_exists` is consumed (the dispatcher's skip route).
+/// are rejected. `if_not_exists` is consumed by `create_index_core`.
 fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE INDEX";
     let sqlparser::ast::CreateIndex {
@@ -869,7 +859,7 @@ fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Re
         table_name: _,
         columns: _,
         unique: _,
-        if_not_exists: _, // consumed: the dispatcher's skip route
+        if_not_exists: _, // consumed by `create_index_core`
         using,
         concurrently,
         include,
@@ -902,13 +892,13 @@ pub(crate) async fn execute_create_index(
         .map(|n| extract_index_name(n, "CREATE INDEX"))
         .transpose()?;
     // The one resolve on this path: `create_index_core` takes the descriptor.
-    let target = client.resolve_relation(&owner_name.rel).await?;
+    let target = client.resolve_relation(&owner_name).await?;
     require_class(&target, &owner_name, ClassWant::Indexable, "CREATE INDEX")?;
     create_index_core(
         client,
         &target,
         &IndexRequest {
-            owner_name: &owner_name.rel,
+            owner_name: &owner_name,
             columns: &ci.columns,
             explicit_name,
             site: IndexSite::CreateIndex {

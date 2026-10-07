@@ -69,12 +69,12 @@ impl Node {
 
 /// [`base`] plus `m`, a second table with nullable join keys, and `rv`, a
 /// registered reduce view `(g, n)` keyed by its one group column.
-fn cat() -> Catalog<'static> {
+fn cat() -> TestCatalog {
     let cat = base();
     let i = TypeCode::I64;
     cat.insert(
         &in_sn("m"),
-        Some(table(30, vec![col("id", i), ncol("k", i), ncol("v", i)], vec![0])),
+        table(30, vec![col("id", i), ncol("k", i), ncol("v", i)], vec![0]),
     );
     let rv = view(&cat, "SELECT g, COUNT(*) AS n FROM t GROUP BY g");
     register(&cat, "rv", 31, gnitz_wire::RelClass::View, final_view(&rv));
@@ -295,7 +295,7 @@ fn a_keyless_step_keys_its_output_by_the_hidden_pair_pk() {
 
 /// `t(pk, g, ind, other)` with `u(pk, val)`; `indexes` lists `t`'s secondary
 /// indexes by column.
-fn indexed(indexes: &[&[u32]]) -> Catalog<'static> {
+fn indexed(indexes: &[&[u32]]) -> TestCatalog {
     let i = TypeCode::I64;
     catalog(vec![
         (
@@ -321,7 +321,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
     let on_ind_other = indexed(&[&[2, 3]]);
     let unindexed = indexed(&[]);
     #[rustfmt::skip]
-    let rows: &[(&Catalog<'static>, &str, &[&str])] = &[
+    let rows: &[(&TestCatalog, &str, &[&str])] = &[
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &["[2]"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &["[2]"]),
         (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &["[2, 3]"]),
@@ -423,11 +423,11 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
     let i = TypeCode::I64;
     cat.insert(
         &in_sn("ck3"),
-        Some(table(
+        table(
             30,
             vec![col("k1", i), col("k2", i), col("k3", i), col("v", i)],
             vec![0, 1, 2],
-        )),
+        ),
     );
     for (body, want) in [
         ("SELECT k2, k1, COUNT(*) AS n FROM ck3 GROUP BY k2, k1", &[0u32, 1][..]),

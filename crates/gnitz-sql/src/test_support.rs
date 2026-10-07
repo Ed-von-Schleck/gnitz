@@ -9,6 +9,8 @@ use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{payload_str, payload_u64};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The schema every test catalog resolves under.
@@ -71,21 +73,55 @@ pub(crate) fn in_sn(name: &str) -> RelName {
     RelName::new(SN, name).unwrap()
 }
 
+/// A catalog of exactly the relations inserted into it, with [`SN`] as the
+/// session's schema; any other name is absent.
+#[derive(Default)]
+pub(crate) struct TestCatalog {
+    rels: RefCell<HashMap<RelName, Arc<RelDescriptor>>>,
+    /// The names probed, each once, in order.
+    asked: RefCell<Vec<RelName>>,
+}
+
+impl TestCatalog {
+    pub(crate) fn insert(&self, name: &RelName, desc: Arc<RelDescriptor>) {
+        self.rels.borrow_mut().insert(name.clone(), desc);
+    }
+
+    /// The names probed since the last call.
+    pub(crate) fn take_asked(&self) -> Vec<RelName> {
+        self.asked.take()
+    }
+}
+
+impl Catalog for TestCatalog {
+    fn schema_name(&self) -> &str {
+        SN
+    }
+
+    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+        let mut asked = self.asked.borrow_mut();
+        if !asked.contains(name) {
+            asked.push(name.clone());
+        }
+        Ok(self.rels.borrow().get(name).cloned())
+    }
+}
+
 /// A catalog holding `rels` under [`SN`]; any other name is absent.
-pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> Catalog<'static> {
-    let cat = Catalog::complete(SN);
+pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> TestCatalog {
+    let cat = TestCatalog::default();
     for (name, desc) in rels {
-        cat.insert(&in_sn(name), Some(desc));
+        cat.insert(&in_sn(name), desc);
     }
     cat
 }
 
 /// Register `view` under `name` as a `class` relation, as the server would after
 /// `CREATE VIEW`.
-pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass, view: &PlannedView) {
+pub(crate) fn register(cat: &TestCatalog, name: &str, tid: u64, class: RelClass, view: &PlannedView) {
     cat.insert(
         &in_sn(name),
-        Some(Arc::new(RelDescriptor {
+        Arc::new(RelDescriptor {
             tid,
             class,
             pk_repeats: view.pk_repeats,
@@ -93,7 +129,7 @@ pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass,
             schema: Arc::clone(&view.schema),
             indexes: Vec::new(),
             token: 0,
-        })),
+        }),
     );
 }
 

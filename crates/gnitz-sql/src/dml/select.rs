@@ -162,7 +162,7 @@ impl ReadPlan {
 
 /// Plan a `SELECT`, or the `EXPLAIN` of one, into the read it runs. Both
 /// statement forms yield the same plan.
-pub(crate) fn plan_read(stmt: &Statement, cat: &Catalog<'_>) -> Result<ReadPlan, GnitzSqlError> {
+pub(crate) fn plan_read(stmt: &Statement, cat: &dyn Catalog) -> Result<ReadPlan, GnitzSqlError> {
     let query = match stmt {
         Statement::Query(q) => q.as_ref(),
         // EXPLAIN describes the plan a query *would* take, so it consumes only
@@ -210,7 +210,7 @@ pub(crate) fn plan_read(stmt: &Statement, cat: &Catalog<'_>) -> Result<ReadPlan,
 
 /// Validate an ad-hoc SELECT's shape, bind it to the one relation it reads, and
 /// decide its access and sink.
-fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlError> {
+fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
     let select = match query.body.as_ref() {

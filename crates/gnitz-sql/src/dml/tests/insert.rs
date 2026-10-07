@@ -3,6 +3,7 @@ use crate::dml::plan::access_path;
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{
     assert_rejects, batch_of, catalog, col, ncol, parse_expr_sql, parse_stmt, pk_schema, rel, rows_of, schema, table,
+    TestCatalog,
 };
 use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
@@ -16,7 +17,7 @@ use sqlparser::ast::Statement;
 /// | `sr` | `(id SMALLINT SERIAL PK, name TEXT)` |
 /// | `st` | a stream `(id PK, v)` |
 /// | `vw` | a view `(id PK, v)` |
-fn cat() -> Catalog<'static> {
+fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let idv = || vec![col("id", i), ncol("v", i)];
     let sr = vec![col("id", TypeCode::I16), ncol("name", TypeCode::String)];
@@ -55,7 +56,7 @@ fn cat() -> Catalog<'static> {
     ])
 }
 
-fn insert(cat: &Catalog<'_>, sql: &str) -> Result<InsertPlan, GnitzSqlError> {
+fn insert(cat: &dyn Catalog, sql: &str) -> Result<InsertPlan, GnitzSqlError> {
     let Statement::Insert(insert) = parse_stmt(sql) else {
         panic!("`{sql}` is not an INSERT");
     };
@@ -203,7 +204,7 @@ fn a_refused_insert_names_its_rule() {
         ),
         (
             "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (nope) DO NOTHING",
-            "column not found",
+            "ON CONFLICT: column 'nope' not found",
         ),
         (
             "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT ON CONSTRAINT pk DO NOTHING",
@@ -237,7 +238,7 @@ fn a_refused_insert_names_its_rule() {
         ),
         (
             "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.nope",
-            "EXCLUDED.nope: column not found",
+            "EXCLUDED: column 'nope' not found",
         ),
         (
             "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.v",
