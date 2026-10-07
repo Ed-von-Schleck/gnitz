@@ -151,12 +151,11 @@ impl DagEngine {
         self.views.get_mut(&view_id).and_then(|v| v.plan.as_mut())
     }
 
-    /// Every compiled view's operator state.
-    pub(crate) fn ephemeral_states(&mut self) -> impl Iterator<Item = &mut CircuitState> {
+    /// Every compiled view's operator state, by view id.
+    pub(crate) fn ephemeral_states(&mut self) -> impl Iterator<Item = (u64, &mut CircuitState)> {
         self.views
-            .values_mut()
-            .filter_map(|v| v.plan.as_mut())
-            .map(|p| &mut p.state)
+            .iter_mut()
+            .filter_map(|(&id, v)| Some((id, &mut v.plan.as_mut()?.state)))
     }
 }
 

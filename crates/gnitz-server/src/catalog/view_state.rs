@@ -25,22 +25,21 @@ impl CatalogEngine {
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
     ///   * every child that carries its state is stamped with the committed
-    ///     checkpoint generation — `resume_generation`, the in-memory recovered
-    ///     `G`, NOT the recovery-start-bumped durable `G+1` — which
-    ///     [`RelationRegistry::view_children_resumable`] answers; and
+    ///     checkpoint generation, which
+    ///     [`RelationRegistry::view_children_resumable`] answers. That is
+    ///     `resume_generation`, the recovered `G`: the durable one is `G+1`
+    ///     before any store opens when the boot replays a push; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
     ///   * every view of its chain is valid — a segment's rows are dropped once
     ///     its chain is built, so a chain member's rebuild needs them rebuilt; and
-    ///   * none of its sources is a STREAM — a stream-fed view's manifests are
-    ///     published normally, so without this it would resume at the committed
-    ///     generation onto state whose stream inputs are gone.
+    ///   * none of its sources is a STREAM — its state integrates stream rows
+    ///     that are gone.
     ///
-    /// The topology word is decided once for the whole set. Then phase 1 decides
-    /// each view's **local** validity (direct sources + child manifests), and
-    /// phase 2 propagates invalidity to any view scanning an invalid source,
-    /// following scan edges forward from every locally invalid view, and to the
-    /// whole chain of any invalid view.
+    /// The topology word is decided once for the whole set. Then each view's
+    /// **local** validity is decided (direct sources + child manifests), and
+    /// [`Self::rebuilt_with`] propagates invalidity to any view scanning an
+    /// invalid source and to the whole chain of any invalid view.
     fn compute_invalid_views(&mut self) {
         let topo_valid = self.topology_matches();
 
@@ -52,36 +51,48 @@ impl CatalogEngine {
             return;
         }
 
-        // Phase 1: local validity (no direct stream source + every output child's
-        // manifest at g). A *transitive* stream source needs no walk here: phase 2
-        // propagates invalidity down every dependency chain. The source test comes
-        // first, so it short-circuits the per-child manifest reads.
+        // Local validity: every output child's manifest at `g`. A stream-fed
+        // view needs no manifest read.
         // An unreadable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still
         // be at `g`.
-        let mut invalid: FxHashSet<u64> = FxHashSet::default();
+        let mut invalid = self.stream_fed_views();
         for &vid in &view_ids {
-            let stream_fed = self
-                .dag
-                .sources_of(vid)
-                .iter()
-                .any(|s| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream));
-            if stream_fed {
-                invalid.insert(vid);
-                continue;
-            }
-            if !self.registry.view_children_resumable(vid, self.resume_generation) {
+            if !invalid.contains(&vid) && !self.registry.view_children_resumable(vid, self.resume_generation) {
                 invalid.insert(vid);
             }
         }
+        let rebuild = self.rebuilt_with(invalid);
+        self.dag.set_rebuild(rebuild);
+    }
 
-        // Phase 2: every view downstream of an invalid one, then every view of a
-        // chain holding one.
+    /// The views with a stream among their direct sources.
+    fn stream_fed_views(&self) -> FxHashSet<u64> {
+        let is_stream = |s: &u64| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream);
+        self.registry
+            .view_ids()
+            .filter(|&vid| self.dag.sources_of(vid).iter().any(is_stream))
+            .collect()
+    }
+
+    /// Every view a rebuild of `invalid` takes with it: each view downstream of
+    /// one, then every view of a chain holding one.
+    fn rebuilt_with(&self, mut invalid: FxHashSet<u64>) -> FxHashSet<u64> {
         let downstream = self.dag.dependent_closure(invalid.iter().copied());
         invalid.extend(downstream);
         let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.dag.chain_of(v)).collect();
-        let whole_chains = view_ids.into_iter().filter(|&v| chains.contains(&self.dag.chain_of(v)));
-        self.dag.set_rebuild(whole_chains.collect());
+        self.registry
+            .view_ids()
+            .filter(|&v| chains.contains(&self.dag.chain_of(v)))
+            .collect()
+    }
+
+    /// The views every boot rebuilds whatever their stores hold: those a stream
+    /// reaches, and their chains. A subset of what
+    /// [`Self::compute_invalid_views`] rejects, so a checkpoint round has no
+    /// reason to publish one.
+    pub(in crate::catalog) fn never_resumed_views(&self) -> FxHashSet<u64> {
+        self.rebuilt_with(self.stream_fed_views())
     }
 
     /// Relay each base table onto the launched worker count and drop the children

@@ -198,7 +198,7 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (u64, u64)
 
     // The index is the only rederived store this table owns, so the ephemeral
     // round publishes exactly it.
-    engine.registry.checkpoint_ephemeral([], g).unwrap();
+    engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
 
     engine.close();
     (tid, g)

@@ -97,8 +97,8 @@ pub(crate) enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
     /// from the manifest at open.
     SalReplay,
-    /// Derived state, persisted at each checkpoint under a generation-stamped
-    /// manifest.
+    /// Derived state, persisted under a generation-stamped manifest by each
+    /// ephemeral round that picks its relation.
     Rederive {
         /// The generation a manifest must carry for the open to resume from it
         /// instead of erasing it; `None` erases it.
@@ -154,8 +154,14 @@ pub(crate) struct Table {
     /// Last `full_scan` result, held until the row set moves.
     cached_full_scan: Cell<Option<Rc<Batch>>>,
 
-    /// The manifest bytes this process's last barrier made durable here.
-    durable_manifest: Option<Vec<u8>>,
+    /// The bytes of the manifest in place: the one this open read, or the one
+    /// this process's last barrier renamed. `None` for a store that has none,
+    /// and from the staging of another until its barrier completes.
+    manifest_in_place: Option<Vec<u8>>,
+    /// Whether a barrier of this process synced the directories behind
+    /// `manifest_in_place`. The rename of a manifest read at open may predate a
+    /// kill that came before them.
+    manifest_synced: bool,
 }
 
 mod flush;
@@ -201,6 +207,7 @@ impl Table {
             super::manifest::unlink(dir)?;
         }
         let loaded_mark = loaded.as_ref().map(|m| m.checkpoint_mark);
+        let manifest_in_place = loaded.as_ref().map(super::manifest::encode);
         let Manifest { caller_record, shards, .. } = loaded.unwrap_or_default();
         // Only a `SalReplay` store is point-probed by PK.
         let skip_pk_filter = rederived;
@@ -217,7 +224,8 @@ impl Table {
             upkeep_overdraft: 0,
             live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
-            durable_manifest: None,
+            manifest_in_place,
+            manifest_synced: false,
         })
     }
 

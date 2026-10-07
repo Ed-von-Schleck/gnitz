@@ -20,7 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::guard_panic;
 use gnitz_foundation::fault::Seam;
 
-use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_tick_for_ddl, TICK_HOLD_FOR_DDL};
+use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
@@ -708,7 +708,7 @@ async fn dispatch_request(
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {
-            let base = commit_serial_range_durable(shared, ctrl.hdr.target(), ctrl.hdr.arg0).await?;
+            let base = reserve_serial_range(shared, ctrl.hdr.target(), ctrl.hdr.arg0).await?;
             send_ack(peer, target_id, base as u64);
             Ok(())
         }

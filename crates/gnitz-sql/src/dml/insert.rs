@@ -387,7 +387,7 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
     let InsertPlan { target, mut rows, conflict, returning } = plan;
     let schema = &target.schema;
     if serial_col(&target).is_some() {
-        // One durable advance for the whole statement.
+        // One reservation for the whole statement.
         let n = rows.len();
         rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64).await?, n, schema)?;
     }

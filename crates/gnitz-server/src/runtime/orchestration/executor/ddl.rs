@@ -1,17 +1,16 @@
 //! The catalog-zone write path: one protocol, two entry points.
 //! [`handle_ddl_txn`] ingests a client bundle of system-table families;
-//! [`commit_serial_range_durable`] advances one sequence. Both mutate the
-//! catalog, then [`emit_zone_to_sal`] and await its fsync.
+//! [`reserve_serial_range`] advances one sequence. Both mutate the catalog,
+//! then [`emit_zone_to_sal`]; only the DDL awaits the zone's fsync.
 //!
-//! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs none of that: a `sys_sequences`
-//! advance has no DAG evaluation and no rollback path, and the row it broadcasts
-//! is one no worker reads.
+//! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs
+//! none of that: a `sys_sequences` advance has no DAG evaluation and no rollback
+//! path, and the row it broadcasts is one no worker reads.
 //!
 //! A child of `executor`, so it reads that module's private items — `Shared` and
 //! its accessors included — with no visibility widened, and the DDL seams sit
 //! beside the code they perturb.
 
-use std::future::Future;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -192,7 +191,11 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // SAL emission window: broadcast each queued family as one zone, then fsync.
     // A failure here is unrecoverable — workers already applied the DdlSync
     // groups in real time — so abort.
-    let (zone_lsn, synced) = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL");
+    let (zone_lsn, synced) = {
+        let mut excl = shared.disp().sal().lock().await;
+        let zone_lsn = emit_zone_to_sal(shared, &mut excl, "DDL");
+        (zone_lsn, excl.sync(shared.disp().reactor(), "DDL"))
+    };
     synced.await;
 
     // Relation ids are never reissued within a boot, so these entries are dead.
@@ -234,14 +237,10 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     Ok(())
 }
 
-/// Emit every queued family broadcast as one zone, mark it applied, and submit
-/// its fdatasync; answers the zone LSN and the fsync. Aborts on failure: the
-/// catalog is already mutated in memory.
-fn emit_zone_to_sal<'w>(
-    shared: &Shared,
-    excl: &mut SalExcl<'w>,
-    op: &'static str,
-) -> (u64, impl Future<Output = ()> + 'w) {
+/// Emit every queued family broadcast as one zone and mark it applied; answers
+/// the zone LSN. Submits no fdatasync. Aborts on failure: the catalog is already
+/// mutated in memory.
+fn emit_zone_to_sal(shared: &Shared, excl: &mut SalExcl<'_>, op: &'static str) -> u64 {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
     // Nothing inside the scope is visible until it commits, so a refused group
@@ -263,46 +262,35 @@ fn emit_zone_to_sal<'w>(
     if scope.commit() {
         shared.cat_mut().mark_zone_applied(zone_lsn);
     }
-    (zone_lsn, excl.sync(disp.reactor(), op))
+    zone_lsn
 }
 
-/// Durably reserve a SERIAL id range for `seq` and return its base. It commits
-/// through a DDL SAL zone because the master holds no user-table rows to re-derive
-/// a lost high-water from.
+/// Reserve a SERIAL id range for `seq` and return its base. The advance is a
+/// DDL SAL zone because the master holds no user-table rows to re-derive a lost
+/// high-water from.
 ///
-/// Both locks are released before the fsync — the whole reserve/mutate/emit span
-/// is synchronous, so catalog readers never block across an `fdatasync`.
-/// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
-/// its post-fsync catalog cleanup and the backfill.
-pub(super) async fn commit_serial_range_durable(
-    shared: &Rc<Shared>,
-    seq: Target,
-    count: u64,
-) -> Result<i64, WireFault> {
-    let (base, synced) = {
-        // Lock order catalog -> SAL, matching INSERT and every read, so acquiring
-        // SAL under catalog.write cannot deadlock. Both guards drop at the end of this block.
-        let _write = shared.catalog_rwlock.write().await;
-        shared.cat().check_token(seq)?;
+/// The ACK waits for no fdatasync. A row holding one of these ids is durable
+/// through a later zone's fdatasync of the same log or through a checkpoint, and
+/// either makes this zone durable first. An advance a crash loses was used by no
+/// durable row, and a client drops its reserved ids with its connection.
+pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count: u64) -> Result<i64, WireFault> {
+    // A read guard holds the token and the sequence's table against a DDL; the
+    // SAL lock orders reservations among themselves, and everything under it is
+    // synchronous. Lock order catalog -> SAL, matching INSERT and every read.
+    let _read = shared.catalog_rwlock.read().await;
+    shared.cat().check_token(seq)?;
 
-        let mut excl = shared.disp().sal().lock().await;
+    let mut excl = shared.disp().sal().lock().await;
 
-        let (base, delta) = shared.cat().reserve_user_sequence(seq.tid, count)?;
+    let (base, delta) = shared.cat().reserve_user_sequence(seq.tid, count)?;
 
-        // A sys_sequences advance is a pure system-table write (no view tick,
-        // no rollback); a hook failure on a well-formed 2-row delta is an
-        // invariant violation — abort rather than compensate.
-        if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
-            gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
-        }
+    // A sys_sequences advance is a pure system-table write (no view tick,
+    // no rollback); a hook failure on a well-formed 2-row delta is an
+    // invariant violation — abort rather than compensate.
+    if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
+        gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
+    }
 
-        // SAL emission under the still-held `SalExcl`; the fdatasync SQE is
-        // submitted synchronously. Both guards drop as this block ends, before
-        // the await below.
-        let (_, synced) = emit_zone_to_sal(shared, &mut excl, "serial-range");
-        (base, synced)
-    };
-
-    synced.await;
+    emit_zone_to_sal(shared, &mut excl, "serial-range");
     Ok(base)
 }

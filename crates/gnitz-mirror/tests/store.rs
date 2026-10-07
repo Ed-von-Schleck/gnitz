@@ -559,7 +559,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
                 )
                 .unwrap();
                 raw.set_caller_record(TID, b"not a mirror record".to_vec()).unwrap();
-                raw.checkpoint_ephemeral([], FIRST_GENERATION).unwrap();
+                raw.checkpoint_ephemeral([], FIRST_GENERATION, |_| true).unwrap();
             }
         }
 

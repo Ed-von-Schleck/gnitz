@@ -219,7 +219,10 @@ def test_a_compound_uuid_pk_with_one_leading_value_reads_like_its_twin(sweeping)
 
 def test_a_bounded_join_over_a_stream_reads_like_its_twin(sweeping):
     """A bounded join recomputes a skeleton row from its own traces, not from its
-    sources' stores, so it may read a stream, whose store holds nothing."""
+    sources' stores, so it may read a stream, whose store holds nothing.
+
+    No checkpoint writes a view a stream reaches, so its rows reach a shard only
+    by outgrowing the store's memtable: hence the kilobyte bodies."""
     c = gnitz.connect(sweeping.target)
     c.execute_sql(
         "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL) "
@@ -234,7 +237,7 @@ def test_a_bounded_join_over_a_stream_reads_like_its_twin(sweeping):
 
     for lo in range(1, n + 1, 100):
         c.execute_sql(
-            "INSERT INTO s VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(lo, lo + 100)),
+            "INSERT INTO s VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>1000}')" for i in range(lo, lo + 100)),
         )
 
     live = bag(c.scan(*pid))

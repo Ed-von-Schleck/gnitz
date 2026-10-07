@@ -91,6 +91,51 @@ def test_every_dml_verb_survives_two_crashes(own_server):
             (1, "a"): 1, (2, "b"): 1, (3, "c"): 1, (d.id, "d"): 1, (e.id, "e"): 1}
 
 
+def test_no_committed_serial_id_is_reissued_after_a_crash(own_server):
+    """A SERIAL reservation is acknowledged without a sync of its own: it is
+    durable once a commit behind it in the log is. So every id a committed row
+    holds must stay taken across a crash, whichever connection reserved it and
+    whichever table's commit followed, while a reservation no commit followed is
+    free to come back.
+
+    `a` and `b` reserve from separate connections, so `b`'s reservation sits
+    behind `a`'s commit. `c`'s is followed by a commit to another table only.
+    The refused insert reserves from `q` and commits nothing."""
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(
+            "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
+            "CREATE TABLE other (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+            "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY); "
+            "CREATE TABLE child (id SERIAL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))")
+    committed = {}
+    for name in ("a", "b"):
+        with gnitz.connect(own_server.target) as conn:
+            for r in rows(conn, f"INSERT INTO q (name) VALUES ('{name}1'), ('{name}2') RETURNING id, name"):
+                committed[r.id] = r.name
+    with gnitz.connect(own_server.target) as conn:
+        [c] = rows(conn, "INSERT INTO q (name) VALUES ('c') RETURNING id")
+        committed[c.id] = "c"
+        conn.execute_sql("INSERT INTO other VALUES (1, 1)")
+    with gnitz.connect(own_server.target) as conn:
+        with pytest.raises(gnitz.GnitzIntegrityError, match="Foreign Key violation"):
+            conn.execute_sql("INSERT INTO child (pid) VALUES (404)")
+    assert len(committed) == 5
+
+    for _ in range(2):
+        own_server.restart()
+        with gnitz.connect(own_server.target) as conn:
+            assert bag(scanned(conn, "q"), "id", "name") == {row: 1 for row in committed.items()}
+            [fresh] = rows(conn, "INSERT INTO q (name) VALUES ('post') RETURNING id")
+            assert fresh.id > max(committed), "a committed SERIAL id was reissued"
+            committed[fresh.id] = "post"
+            conn.execute_sql("INSERT INTO parent VALUES (1)")
+            [child] = rows(conn, "INSERT INTO child (pid) VALUES (1) RETURNING id")
+            assert bag(scanned(conn, "child"), "id", "pid") == {(child.id, 1): 1}
+            conn.execute_sql("DELETE FROM child")
+            conn.execute_sql("DELETE FROM parent")
+
+
 def test_every_ddl_kind_survives_a_crash(own_server):
     """CREATE TABLE and VIEW, a rapid batch of CREATEs whose fdatasync is
     deferred to end-of-cycle, DROP TABLE and DROP VIEW, and DDL interleaved with

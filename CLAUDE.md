@@ -603,10 +603,13 @@ operations — view ticks, scans, seeks, backfills, validation queries — plus 
 push to a **stream**, which upserts nothing that survives a restart. The
 dichotomy is what must be recovered, not what carries rows.
 
+A SERIAL reservation is ACKed unsynced: a crash may reissue ids no committed row
+took, so a client drops its reserved ids with its connection.
+
 The **checkpoint** is the sole shard-durability point: between checkpoints the
 fsynced SAL alone carries durability. A checkpoint persists the base and system
-tables, then, after draining pending view ticks, every view's operator traces
-and output stores.
+tables, then, after draining pending view ticks, every resumable view's operator
+traces and output stores.
 
 At open a view is **resumed from its checkpoint when that checkpoint is valid,
 rebuilt from base otherwise**. Resume is *incremental*: only the un-checkpointed

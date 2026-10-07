@@ -83,8 +83,8 @@ def test_concurrent_connections_never_share_an_id(client, serial_t, server):
     SERIAL column from the catalog alone — draw ids at once in 30-row
     statements, so each refills its cached range several times and abandons a
     tail each time, while a fifth connection seeks the table throughout. No id
-    is issued twice, each connection's ids rise, a seek never waits out a range
-    allocation's sync, and the table holds exactly the returned ids."""
+    is issued twice, each connection's ids rise, a seek never waits behind a range
+    allocation, and the table holds exactly the returned ids."""
     writers, statements, per = 4, 5, 30
     ids = [[] for _ in range(writers)]
     done = threading.Event()

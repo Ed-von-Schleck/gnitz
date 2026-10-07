@@ -10,6 +10,9 @@ reads the boot's own `recovery: rebuilding N invalid view(s)` marker alongside
 the view's Z-set. That marker is the only observable the distinction has.
 """
 
+import glob
+import os
+
 import pytest
 import gnitz
 from _read import bag, scanned
@@ -156,6 +159,95 @@ def test_a_crash_in_the_recovery_window_forces_a_correct_rebuild(stage, own_serv
         "the stale view must be rebuilt, not resumed"
     _assert_doubled(own_server, range(1, 11),
                     "a stale resume would show only the cut")
+
+
+def _manifests(srv):
+    """Every published manifest under the data dir, by path, as the inode it is:
+    a publish renames a new file into place, so a manifest rewritten shows as a
+    changed inode."""
+    paths = glob.glob(os.path.join(srv.data_dir, "_relations", "**", "manifest.bin"), recursive=True)
+    return {os.path.relpath(p, srv.data_dir): os.stat(p).st_ino for p in paths}
+
+
+def test_a_restart_with_nothing_to_replay_rewrites_no_manifest(own_server):
+    """With no committed tail a boot moves no base store, so the checkpoint
+    generation stands and every store's manifest is the one already in place:
+    neither the boot's own checkpoint nor an idle shutdown's rewrites one. A
+    restart that replays a tail must still advance the generation and restamp the
+    view, which is what shows the first half is not a boot that checkpoints
+    nothing at all."""
+    _checkpoint_cut(own_server)
+    cut = _manifests(own_server)
+    assert any("/w0of" in path for path in cut), f"no worker store among {sorted(cut)}"
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 0
+    _assert_doubled(own_server, range(1, 6), "the resumed cut")
+    own_server.stop_graceful()
+    assert _manifests(own_server) == cut, "a clean boot and an idle stop publish nothing"
+
+    own_server.start()
+    _tail(own_server, range(6, 11))
+    own_server.restart()
+    assert own_server.rebuilt_view_count() == 0
+    _assert_doubled(own_server, range(1, 11), "cut + tail, each row once")
+    own_server.stop_graceful()
+    restamped = _manifests(own_server)
+    assert restamped.keys() == cut.keys()
+    moved = {path for path in cut if restamped[path] != cut[path]}
+    with gnitz.connect(own_server.start().target) as conn:
+        view_id = conn.resolve_table("v")[0]
+    assert any(path.startswith(f"_relations/{view_id}/") for path in moved), \
+        f"a replayed tail must restamp the view; rewritten: {sorted(moved)}"
+
+
+@pytest.mark.parametrize("stage", ["genbump", "reset", "sweep", "backfill"])
+def test_a_crash_in_a_boot_with_nothing_to_replay_keeps_the_views_valid(stage, own_server):
+    """The sibling of the recovery-window test below, with no tail: the boot
+    advances no generation, so a crash anywhere in it leaves the checkpoint it
+    started from as valid as it was. The next boot resumes it, and the tail
+    pushed afterwards is replayed onto it exactly once."""
+    _checkpoint_cut(own_server)
+    rc = own_server.start_expecting_exit(
+        extra_env={"GNITZ_INJECT_RECOVERY_PANIC": stage})
+    assert rc != 0, f"the injected panic at {stage} must crash boot"
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 0, "nothing moved, so nothing is stale"
+    _assert_doubled(own_server, range(1, 6), "the resumed cut")
+    _tail(own_server, range(6, 11))
+    own_server.restart()
+    assert own_server.rebuilt_view_count() == 0
+    _assert_doubled(own_server, range(1, 11), "cut + tail, each row once")
+
+
+def test_a_checkpoint_with_no_push_behind_it_publishes_new_derived_state_resumably(own_server):
+    """A checkpoint that follows DDL but no push advances no generation, so the
+    view and the index created since are published at the generation already in
+    force, beside stores published there earlier. Both must resume from it, and a
+    tail replayed onto them must count once: a view resumed onto the wrong cut
+    shows the cut's rows missing or the tail's doubled."""
+    _checkpoint_cut(own_server)
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql("CREATE VIEW late AS SELECT val, COUNT(*) AS n FROM t GROUP BY val")
+        conn.execute_sql("CREATE INDEX late_ix ON t (val)")
+    own_server.stop_graceful()
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 0, "the late view resumes"
+    assert own_server.rebuilt_index_counts() == [0] * len(own_server.rebuilt_index_counts())
+    _tail(own_server, range(6, 11))
+    own_server.restart()
+    assert own_server.rebuilt_view_count() == 0
+    assert own_server.rebuilt_index_counts() == [0] * len(own_server.rebuilt_index_counts())
+    _assert_doubled(own_server, range(1, 11), "cut + tail, each row once")
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "late"), "val", "n") == {(k * 10, 1): 1 for k in range(1, 11)}
+        tid, schema = conn.resolve_table("t")
+        for k in (2, 7):
+            got = bag(conn.seek_by_index(tid, schema, [1], [k * 10]), "pk", "val")
+            assert got == {(k, k * 10): 1}, f"index seek {k}: {got}"
 
 
 def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):

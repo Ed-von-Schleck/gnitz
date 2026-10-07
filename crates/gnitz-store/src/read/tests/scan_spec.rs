@@ -541,7 +541,7 @@ fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64
         capacity_bytes: std::num::NonZeroU64::MIN,
     });
     let mut registry = relation_fixture(kind, schema, &[], [rows(on_disk)]);
-    registry.checkpoint_ephemeral([], 1).unwrap();
+    registry.checkpoint_ephemeral([], 1, |_| true).unwrap();
     registry.fold_to_ram(TID).unwrap();
     assert!(
         registry.relation(TID).unwrap().table().has_skeleton_rows(),

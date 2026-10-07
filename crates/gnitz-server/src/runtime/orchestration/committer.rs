@@ -16,8 +16,8 @@
 //!   a timer would add tail latency to every commit to help only serial
 //!   single-request workloads. See `drain_ready_batch`.
 //! - **Checkpoint.**  When the batch warrants one the committer runs the full
-//!   three-step sequence (`run_checkpoint_sequence`: gen bump → base round →
-//!   drain → tick gate → ephemeral round), then proceeds with the push batch.
+//!   sequence (`run_checkpoint_sequence`: base round → drain → tick gate →
+//!   ephemeral round), then proceeds with the push batch.
 //!   `checkpoint_warranted` is the one statement of when.
 //! - **Barrier.**  A `Barrier` request flushes any in-flight batch and
 //!   signals via a oneshot — used by DDL to drain the committer before
@@ -176,9 +176,10 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     b
 }
 
-/// The full steady-state checkpoint sequence: gen bump → base round → drain →
-/// tick gate → ephemeral round. Requests arriving meanwhile wait in the channel,
-/// so the pushes `batch` holds are the only ones the sequence runs ahead of.
+/// The full steady-state checkpoint sequence: base round → drain → tick gate →
+/// ephemeral round. The base round advances the generation when it has pushes
+/// to flush. Requests arriving meanwhile wait in the channel, so the pushes
+/// `batch` holds are the only ones the sequence runs ahead of.
 ///
 /// A failed round aborts: the workers are re-epoched against an un-reset SAL,
 /// which only a restart's replay repairs.
@@ -196,7 +197,8 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // Step 2 — DRAIN (lock released). One Drain suffices: pushes are held, so the
     // pending-tick counts cannot grow.
     // Stamping after a failed drain would make the views' missing deltas
-    // generation-valid; left behind step 1's generation, they are rebuilt at the
+    // generation-valid. Unstamped, they stay behind the generation the base
+    // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the Shutdown barrier.
     if let Err(e) = request_drain(shared, false).await {
         gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);

@@ -2,7 +2,7 @@
 //! first defect, unless that defect lies below the anchored `synced` offset —
 //! a hole in the durable log, which fails the boot.
 
-use super::{next_epoch, SalLog, SalMessage};
+use super::{next_epoch, SalLog, SalMessage, SalMessageKind};
 
 /// The committed part of the un-checkpointed tail.
 #[derive(Clone, Copy)]
@@ -37,6 +37,12 @@ impl CommittedTail {
             ));
         }
         Ok(CommittedTail { log, epoch, end })
+    }
+
+    /// Whether a push committed since the last base round: this boot's replay
+    /// moves a base store.
+    pub(crate) fn holds_pushes(self) -> bool {
+        self.groups().any(|m| m.kind == SalMessageKind::Push)
     }
 
     /// The epoch this boot writes and drains at: one above the tail's.

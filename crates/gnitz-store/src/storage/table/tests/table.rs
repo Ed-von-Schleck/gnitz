@@ -310,7 +310,7 @@ fn a_barriers_checkpoint_mark_is_what_the_reopen_reports() {
 }
 
 /// A barrier publishes exactly when the manifest would change — rows, shards or
-/// caller record — and on a process's first round.
+/// caller record — and on a fresh store's first round.
 #[test]
 fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     let dir = tempfile::tempdir().unwrap();
@@ -344,10 +344,62 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     assert!(publishes(&mut t), "an emptied index publishes");
     drop(t);
 
-    let mut t = new_table(dir.path(), schema, resume, 100);
+    let t = new_table(dir.path(), schema, resume, 100);
     assert_eq!(t.caller_record, b"first", "the record reloads with its manifest");
     assert_eq!(t.full_scan().len(), 0, "no retracted row comes back");
-    assert!(publishes(&mut t), "a reopened store's first round publishes");
+}
+
+/// A reopened store's first barrier owes the manifest it read only its
+/// directory syncs: the file is rewritten when the manifest changes, and not
+/// otherwise.
+#[test]
+fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let path = manifest_path(dir.path().to_str().unwrap());
+    let inode = || std::fs::metadata(&path).unwrap().ino();
+    let staging = dir.path().join("manifest.bin.tmp");
+    let resume = RecoverySource::Rederive { resume_at: Some(4) };
+    {
+        let mut t = new_table(dir.path(), schema, resume, 100);
+        // Several shards over two levels, so the reloaded order is not trivial.
+        for r in 0..2 * L0_COMPACT_THRESHOLD as u64 {
+            t.ingest_owned_batch(rows(&[(r, 1, 10)])).unwrap();
+            flush_barrier([&mut t], 4).unwrap();
+        }
+        t.set_caller_record(b"rec".to_vec());
+        flush_barrier([&mut t], 4).unwrap();
+    }
+    let published = inode();
+
+    let mut t = new_table(dir.path(), schema, resume, 100);
+    assert!(t.flush_prepare(4).unwrap().is_some(), "the directory syncs are owed");
+    assert!(!staging.exists(), "nothing is staged for the manifest already in place");
+    flush_barrier([&mut t], 4).unwrap();
+    assert_eq!(inode(), published, "the manifest this open read stays in place");
+    assert!(t.flush_prepare(4).unwrap().is_none(), "and is durable from here on");
+    assert_eq!(t.full_scan().len(), 2 * L0_COMPACT_THRESHOLD);
+    drop(t);
+
+    // Another mark is another manifest.
+    let mut t = new_table(dir.path(), schema, resume, 100);
+    flush_barrier([&mut t], 5).unwrap();
+    assert_ne!(inode(), published, "a changed manifest is renamed into place");
+    let published = inode();
+    drop(t);
+
+    // So are new rows, and the manifest read at open stops counting once one is staged.
+    let resume = RecoverySource::Rederive { resume_at: Some(5) };
+    let mut t = new_table(dir.path(), schema, resume, 100);
+    t.ingest_owned_batch(rows(&[(900, 1, 10)])).unwrap();
+    assert!(t.flush_prepare(5).unwrap().is_some());
+    assert!(staging.exists(), "new rows stage a manifest");
+    flush_barrier([&mut t], 5).unwrap();
+    assert_ne!(inode(), published);
+    drop(t);
+    let t = new_table(dir.path(), schema, resume, 100);
+    assert_eq!(t.full_scan().len(), 2 * L0_COMPACT_THRESHOLD + 1);
 }
 
 /// Only base-table paths point-probe a store by PK, and they are the only

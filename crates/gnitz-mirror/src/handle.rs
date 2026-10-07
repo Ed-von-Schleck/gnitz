@@ -385,7 +385,7 @@ impl Copies {
         }
         self.generation += 1;
         self.registry
-            .checkpoint_ephemeral([], self.generation)
+            .checkpoint_ephemeral([], self.generation, |_| true)
             .map_err(MirrorError::Engine)?;
         self.unpublished = false;
         Ok(())

@@ -126,11 +126,13 @@ impl CatalogEngine {
         Ok(g)
     }
 
-    /// The ephemeral checkpoint round: persist every view's operator traces and
-    /// output stores, and every index, at `generation`.
+    /// The ephemeral checkpoint round: persist the operator traces, output store
+    /// and indexes of every view a boot can resume, and every table's indexes, at
+    /// `generation`.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
+        let never = self.never_resumed_views();
         self.registry
-            .checkpoint_ephemeral(self.dag.ephemeral_states(), generation)
+            .checkpoint_ephemeral(self.dag.ephemeral_states(), generation, |id| !never.contains(&id))
     }
 
     /// Record the launched topology. Durable at the next system flush.

@@ -95,18 +95,24 @@ impl MasterDispatcher {
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
-    /// A checkpoint's first half: a generation bump, then the round that flushes
-    /// base and system tables. Every checkpointed view and index is invalid
-    /// until the next ephemeral round restamps it.
+    /// A checkpoint's first half: the round that flushes base and system tables.
+    ///
+    /// When a recoverable push group was written since the last one, the round
+    /// moves the base stores past what the checkpointed views integrate, so a
+    /// generation bump goes ahead of it: every checkpointed view and index is
+    /// invalid until the next ephemeral round restamps it. Otherwise the round
+    /// moves no base store, the generation stands, and the ephemeral round
+    /// republishes only the stores whose manifests changed.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
-        self.cat_mut().advance_durable_generation()?;
         let mut excl = self.sal.lock().await;
-        self.unflushed_pushes.set(false);
+        if self.unflushed_pushes.replace(false) {
+            self.cat_mut().advance_durable_generation()?;
+        }
         self.flush_round(&mut excl, Apply::Flush).await
     }
 
-    /// A checkpoint's second half: the round that flushes every view's traces
-    /// and output stores, stamped with the durable generation.
+    /// A checkpoint's second half: the round that flushes every resumable
+    /// view's traces and output stores, stamped with the durable generation.
     pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
         debug_assert!(
@@ -366,7 +372,7 @@ impl MasterDispatcher {
     /// SAL entries about to be discarded), then advance the epoch.
     ///
     /// Finalizes **both** rounds. The ephemeral one must flush too: a
-    /// `commit_serial_range_durable` advance can land in the `sys_sequences`
+    /// `reserve_serial_range` advance can land in the `sys_sequences`
     /// MemTable during the drain window, after the base round's reset, so this
     /// flush is its only durability event before the ephemeral reset makes the
     /// SAL tail useless for recovery.
@@ -390,9 +396,10 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Boot-end checkpoint: record the launched topology, then restamp every view
-    /// and index at the generation reserved pre-fork. The workers published their
-    /// base stores during recovery, and no push is admitted yet.
+    /// Boot-end checkpoint: record the launched topology, then stamp every
+    /// resumable view and every index at the durable generation, which a boot
+    /// that replayed a push advanced pre-fork. The workers published their base
+    /// stores during recovery, and no push is admitted yet.
     pub(crate) async fn boot_checkpoint(&self) -> Result<(), WireFault> {
         let cat = self.cat_mut();
         cat.record_topology(cat.registry.slot().of)?;

@@ -110,7 +110,7 @@ impl FkTarget {
 }
 
 /// The ids one SERIAL reservation takes when the statement asks for fewer. Each
-/// reservation is a durable advance on the master.
+/// reservation is a round trip to the master.
 const SERIAL_RANGE_SIZE: u64 = 64;
 
 /// The rows of one DDL transaction: one batch per system family it writes.
@@ -467,7 +467,8 @@ pub struct GnitzClient {
     pub(crate) host: Box<dyn Host>,
     pub(crate) session: Session,
     /// Per table, the SERIAL ids a reservation drew and no INSERT has taken. A
-    /// disconnect discards them (an intentional, PostgreSQL-style gap).
+    /// disconnect discards them (an intentional, PostgreSQL-style gap): a server
+    /// that crashed may hand the ids no committed row took to another client.
     serial_cache: HashMap<u64, std::ops::Range<u64>>,
     /// Open transaction, if any; `None` is autocommit. Every user-table write
     /// buffers here while it is open, and dropping it is ROLLBACK.
@@ -577,8 +578,8 @@ impl GnitzClient {
     }
 
     /// Reserve `count` contiguous SERIAL ids for `table` and return the first,
-    /// so an INSERT that knows its row count pays one fsynced durable advance
-    /// rather than `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
+    /// so an INSERT that knows its row count pays one round trip rather than
+    /// `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
     /// range's, or this reservation's — is the intentional PostgreSQL-style gap.
     pub async fn reserve_serial_ids(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
         match self.serial_cache.get_mut(&table.tid) {

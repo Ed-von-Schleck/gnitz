@@ -219,12 +219,13 @@ impl RelationRegistry {
             .map_err(|e| format!("fold relation {id} to RAM: {e}"))
     }
 
-    /// Each user relation's own `Table` plus its index tables. System families
-    /// are excluded, so a forked worker cannot flush its inherited copy.
-    fn collect_user_tables(&mut self) -> impl Iterator<Item = &mut Table> {
+    /// The own `Table` plus the index tables of each user relation `picked`
+    /// keeps. System families are excluded, so a forked worker cannot flush its
+    /// inherited copy.
+    fn collect_user_tables(&mut self, picked: impl Fn(u64) -> bool) -> impl Iterator<Item = &mut Table> {
         self.tables
             .values_mut()
-            .filter(|e| e.kind != RelationKind::SystemCatalog)
+            .filter(move |e| e.kind != RelationKind::SystemCatalog && picked(e.id))
             .flat_map(|e| {
                 e.store
                     .table_mut()
@@ -245,7 +246,7 @@ impl RelationRegistry {
 
     /// The base round: every user store that is not rederived, in one barrier.
     pub fn checkpoint_base(&mut self) -> Result<(), String> {
-        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| !t.is_rederived()), 0)
+        crate::storage::flush_barrier(self.collect_user_tables(|_| true).filter(|t| !t.is_rederived()), 0)
             .map_err(|e| format!("base flush: {e}"))
     }
 
@@ -255,15 +256,22 @@ impl RelationRegistry {
             .map_err(|e| format!("system catalog flush: {e}"))
     }
 
-    /// The ephemeral round at `generation`: `state`'s operator traces and every
-    /// rederived store, in one barrier.
+    /// The ephemeral round at `generation`: the rederived stores of every
+    /// relation `resumes` picks and, of `state`, those relations' operator
+    /// traces, in one barrier. A relation no round ever picks has no manifest,
+    /// so every open rebuilds it.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
-        state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
+        state: impl IntoIterator<Item = (u64, &'s mut crate::relation::CircuitState)>,
         generation: u64,
+        resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
-        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
-        tables.extend(self.collect_user_tables().filter(|t| t.is_rederived()));
+        let mut tables: Vec<&mut Table> = state
+            .into_iter()
+            .filter(|(id, _)| resumes(*id))
+            .flat_map(|(_, s)| s.tables_mut())
+            .collect();
+        tables.extend(self.collect_user_tables(resumes).filter(|t| t.is_rederived()));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }
 }

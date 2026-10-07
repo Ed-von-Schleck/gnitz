@@ -14,7 +14,10 @@ use gnitz_zset::repr::StorageError;
 /// A publish [`Table::flush_prepare`] staged and [`flush_barrier`] completes.
 pub(super) struct FlushWork {
     bytes: Vec<u8>,
-    /// Fsynced once the manifest is renamed.
+    /// Whether a manifest was staged for the rename. Without one the manifest
+    /// in place already holds `bytes`, and only `dirs` are owed.
+    staged: bool,
+    /// Fsynced once the manifest is in place.
     dirs: Vec<PathBuf>,
 }
 
@@ -37,25 +40,28 @@ pub(crate) fn flush_barrier<'a>(
     // Every unsynced shard and every staged manifest, before any rename.
     sync_paths(
         &mut ring,
-        work.iter().flat_map(|(t, _)| {
+        work.iter().flat_map(|(t, w)| {
             t.shard_index
                 .unsynced_paths()
-                .chain([manifest::staging_path(&t.shard_index.output_dir)])
+                .chain(w.staged.then(|| manifest::staging_path(&t.shard_index.output_dir)))
         }),
         FsyncFlags::DATASYNC,
     )?;
     let mut dirs = BTreeSet::new();
     for (t, w) in &mut work {
-        // The rename publishes every shard the manifest names.
-        manifest::commit(&t.shard_index.output_dir)?;
-        t.shard_index.mark_published();
+        if w.staged {
+            // The rename publishes every shard the manifest names.
+            manifest::commit(&t.shard_index.output_dir)?;
+            t.shard_index.mark_published();
+        }
         dirs.extend(std::mem::take(&mut w.dirs));
     }
     // A rename is metadata: a full fsync, not fdatasync.
     sync_paths(&mut ring, &dirs, FsyncFlags::empty())?;
     // No durable manifest names a superseded shard any more.
     for (t, w) in work {
-        t.durable_manifest = Some(w.bytes);
+        t.manifest_in_place = Some(w.bytes);
+        t.manifest_synced = true;
         t.shard_index.unlink_retired();
     }
     Ok(())
@@ -102,7 +108,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Fold memtable and RAM tier into one shard and stage the manifest naming
-    /// it; `None` when that manifest is the one this process last made durable.
+    /// it, unless it is the one in place; `None` when that one is also synced.
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
@@ -120,26 +126,29 @@ impl Table {
             caller_record: self.caller_record.clone(),
             shards: self.shard_index.shard_set(),
         });
-        if self.durable_manifest.as_deref() == Some(&bytes[..]) {
-            debug_assert!(
-                self.shard_index.unsynced_paths().next().is_none(),
-                "a durable manifest names an unsynced shard"
-            );
+        let staged = self.manifest_in_place.as_deref() != Some(&bytes[..]);
+        debug_assert!(
+            staged || self.shard_index.unsynced_paths().next().is_none(),
+            "the manifest in place names an unsynced shard"
+        );
+        if !staged && self.manifest_synced {
             return Ok(None);
         }
-        let first_publish = self.durable_manifest.is_none();
-        // Unknown until the barrier records it: a failed publish may have renamed.
-        self.durable_manifest = None;
-        manifest::prepare(&self.shard_index.output_dir, &bytes)?;
-        // A first publish also makes the directory's own entry and its parent's durable.
-        let entry_dirs = if first_publish { 2 } else { 0 };
+        // Until the barrier records otherwise: a failed publish may have renamed.
+        let first_sync = !std::mem::take(&mut self.manifest_synced);
+        if staged {
+            self.manifest_in_place = None;
+            manifest::prepare(&self.shard_index.output_dir, &bytes)?;
+        }
+        // A first sync also makes the directory's own entry and its parent's durable.
+        let entry_dirs = if first_sync { 2 } else { 0 };
         let dirs = Path::new(&self.shard_index.output_dir)
             .ancestors()
             .take(1 + entry_dirs)
             .filter(|d| !d.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .collect();
-        Ok(Some(FlushWork { bytes, dirs }))
+        Ok(Some(FlushWork { bytes, staged, dirs }))
     }
 
     /// Move the RAM tier's rows to an unsynced L0 shard.

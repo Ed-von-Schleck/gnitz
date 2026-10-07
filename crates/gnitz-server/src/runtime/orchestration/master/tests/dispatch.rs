@@ -128,26 +128,35 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     engine.close();
 }
 
-/// A whole checkpoint is `checkpoint_base` + an ephemeral round: the base round
+/// A whole checkpoint is `checkpoint_base` + an ephemeral round. The base round
 /// owns the one generation bump that invalidates every checkpointed view, and
-/// neither the ephemeral round nor the boot checkpoint's restamp bumps again.
+/// makes it only when a push group was written since the last: without one the
+/// round moves no base store, and the views checkpointed at the generation in
+/// force stay valid. Neither the ephemeral round nor the boot checkpoint's
+/// restamp bumps.
 #[test]
-fn a_checkpoint_bumps_the_generation_once() {
+fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
     let disp = Rc::new(disp);
     let gen = disp.cat().durable_generation();
+    let checkpoint = |disp: &Rc<super::super::MasterDispatcher>| {
+        let d = Rc::clone(disp);
+        disp.reactor()
+            .block_on(async move {
+                d.checkpoint_base().await?;
+                d.checkpoint_ephemeral().await?;
+                d.boot_checkpoint().await
+            })
+            .unwrap();
+        disp.cat().durable_generation()
+    };
 
-    let d = Rc::clone(&disp);
-    disp.reactor()
-        .block_on(async move {
-            d.checkpoint_base().await?;
-            d.checkpoint_ephemeral().await?;
-            d.boot_checkpoint().await
-        })
-        .unwrap();
-    assert_eq!(disp.cat().durable_generation(), gen + 1);
+    assert_eq!(checkpoint(&disp), gen, "no push since the last base round");
+    disp.unflushed_pushes.set(true);
+    assert_eq!(checkpoint(&disp), gen + 1);
+    assert_eq!(checkpoint(&disp), gen + 1, "the base round took the push with it");
 
     drop(disp);
     engine.close();

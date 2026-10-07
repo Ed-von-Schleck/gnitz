@@ -107,14 +107,13 @@ fn the_drive_set_excludes_a_stream() {
 }
 
 /// A stream-fed view's checkpointed state must never be resumed: its stream inputs
-/// are gone at boot. The verdict propagates to a view over it, which phase 2 reaches
-/// only because phase 1 put something in the invalid set.
+/// are gone at boot. The verdict propagates to a view over it.
 ///
 /// Every view here is put in the state that *would* resume — matching topology and an
-/// output manifest at the committed generation — because that is the only state in
-/// which the stream clause decides anything. Without the checkpoint the manifests are
-/// absent, every view is invalid on that term alone, and the test passes with the
-/// clause deleted.
+/// output manifest at the committed generation, published past the engine's own round,
+/// which leaves these views out — because that is the only state in which the stream
+/// clause decides anything. Without those manifests every view is invalid on that term
+/// alone, and the test passes with the clause deleted.
 #[test]
 fn stream_fed_views_are_invalid_at_boot() {
     let dir = temp_dir("stream_fed_views_invalid");
@@ -132,7 +131,7 @@ fn stream_fed_views_are_invalid_at_boot() {
     // generation — a completed checkpoint.
     engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();
-    engine.registry.checkpoint_ephemeral([], g).unwrap();
+    engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
     engine.close();
 
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -142,6 +141,67 @@ fn stream_fed_views_are_invalid_at_boot() {
         !engine.dag.awaits_rebuild(over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the stream"
     );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The child directories of relation `id` holding a manifest.
+fn published_children(dir: &str, id: u64) -> Vec<String> {
+    let rel = relation_dir(dir, id);
+    let mut names: Vec<String> = fs::read_dir(&rel)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| std::path::Path::new(&format!("{rel}/{name}/manifest.bin")).exists())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A backfilled `DISTINCT` view over `source`: an output store and one trace.
+fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
+    let vid = engine.allocate_ids(1).unwrap();
+    write_circuit(engine, vid, distinct_circuit(source));
+    engine.write_column_records(vid, cols).unwrap();
+    engine
+        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, name))
+        .unwrap();
+    backfill(engine, vid, &[source]);
+    vid
+}
+
+/// An ephemeral round publishes nothing of a view a stream reaches — neither its
+/// output store nor a trace — and everything of a view over a table.
+#[test]
+fn an_ephemeral_round_publishes_no_view_a_stream_reaches() {
+    let dir = temp_dir("stream_views_unpublished");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
+    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+
+    let direct = traced_view(&mut engine, sid, "v_direct", &cols);
+    let downstream = traced_view(&mut engine, direct, "v_downstream", &cols);
+    let over_table = traced_view(&mut engine, tid, "v_table", &cols);
+
+    engine.record_topology(1).unwrap();
+    let g = engine.advance_durable_generation().unwrap();
+    engine.flush_ephemeral_round(g).unwrap();
+
+    assert_eq!(published_children(&dir, direct), Vec::<String>::new());
+    assert_eq!(published_children(&dir, downstream), Vec::<String>::new());
+    let table_children = published_children(&dir, over_table);
+    assert!(table_children.contains(&"w0of1".to_string()), "got {table_children:?}");
+    assert!(
+        table_children.iter().any(|c| c.starts_with("scratch_")),
+        "the trace of a view over a table is published: {table_children:?}"
+    );
+    engine.close();
+
+    // What the round left out is what the boot rebuilds, and nothing else.
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert!(engine.dag.awaits_rebuild(direct));
+    assert!(engine.dag.awaits_rebuild(downstream));
+    assert!(!engine.dag.awaits_rebuild(over_table));
 
     fs::remove_dir_all(&dir).ok();
 }

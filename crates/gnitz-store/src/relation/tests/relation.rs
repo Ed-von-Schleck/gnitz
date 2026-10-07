@@ -227,7 +227,7 @@ fn only_the_ephemeral_round_publishes_an_index() {
 
     registry.checkpoint_base().unwrap();
     assert!(read_intact(&dir).unwrap().is_none(), "the base round skips it");
-    registry.checkpoint_ephemeral([], 3).unwrap();
+    registry.checkpoint_ephemeral([], 3, |_| true).unwrap();
     assert!(read_at(&dir, 3).unwrap().is_some());
 }
 
@@ -242,7 +242,7 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     registry.register(view(damaged)).unwrap();
     registry.set_caller_record(good, b"good".to_vec()).unwrap();
     registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
-    registry.checkpoint_ephemeral([], 3).unwrap();
+    registry.checkpoint_ephemeral([], 3, |_| true).unwrap();
 
     flip_last_byte_in_place(manifest_path(&registry.child_dir(damaged, ChildKind::Rows)));
     // A name that parses to `good`'s id but is not the name its directory has.
@@ -283,7 +283,7 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
         origin.register(spec).unwrap();
         origin.add_index(9, index(1, false), cols).unwrap();
         origin.ingest(9, rows.clone()).unwrap();
-        origin.checkpoint_ephemeral([], 5).unwrap();
+        origin.checkpoint_ephemeral([], 5, |_| true).unwrap();
     }
     let reopen = |index_generation: u64| {
         let mut r = solo(tmp.path());
@@ -320,7 +320,7 @@ fn a_resumed_view_refuses_a_missing_manifest() {
         let mut origin = solo(tmp.path());
         origin.register(spec).unwrap();
         let mut state = CircuitState::open(&origin, 7, layout()).unwrap();
-        origin.checkpoint_ephemeral([&mut state], 0).unwrap();
+        origin.checkpoint_ephemeral([(7, &mut state)], 0, |_| true).unwrap();
     }
     let reopen = || {
         let mut r = solo(tmp.path());

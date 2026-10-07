@@ -193,8 +193,8 @@ fn worker_boot_recovery(
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        catalog.durable_generation() > catalog.resume_generation,
-        "boot base flush without the pre-fork generation advance ahead of it",
+        !tail.holds_pushes() || catalog.durable_generation() > catalog.resume_generation,
+        "boot base flush of replayed pushes without the pre-fork generation advance ahead of it",
     );
     catalog
         .registry
@@ -328,12 +328,22 @@ fn run_worker_child(
     WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.park, ipc.mesh).run()
 }
 
-/// The master's half of recovery before any worker exists: the sweep set every
-/// worker inherits.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<Vec<u64>, String> {
-    // G → G+1, the resume generation left at G: until `boot_checkpoint`
-    // restamps at G+1, a crash rebuilds every view instead of resuming it.
-    catalog.advance_durable_generation()?;
+/// The master's half of recovery before any worker exists: the system families
+/// made durable, and the sweep set every worker inherits.
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) -> Result<Vec<u64>, String> {
+    if tail.holds_pushes() {
+        // G → G+1, the resume generation left at G: the workers' boot flush moves
+        // the base stores past what the views at G integrate, so until
+        // `boot_checkpoint` restamps at G+1 a crash rebuilds every view instead
+        // of resuming it.
+        catalog.advance_durable_generation()?;
+    } else {
+        // No push is replayed, so every base store stays what the views at G
+        // integrate, and a view this boot keeps is still valid at G.
+        catalog
+            .flush_all_system_tables()
+            .map_err(|e| format!("boot system flush failed: {e}"))?;
+    }
     inject_recovery_panic("genbump");
     Ok(swept_base_tables(catalog))
 }
@@ -460,7 +470,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    let swept_bases = master_pre_fork_recovery(catalog)?;
+    let swept_bases = master_pre_fork_recovery(catalog, ipc.tail)?;
 
     let SharedIpc { sal, tail, workers, receiver, parks } = ipc;
     let worker_pids = fork_workers(catalog, data_dir, workers, &swept_bases, pinning.as_ref())?;

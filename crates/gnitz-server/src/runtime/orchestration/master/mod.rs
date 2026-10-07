@@ -47,7 +47,7 @@ pub struct MasterDispatcher {
     /// list). Every entry holds all of its index's spans.
     unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
 
-    /// A push group was written since the last base round.
+    /// A recoverable push group was written since the last base round.
     unflushed_pushes: Cell<bool>,
 
     /// The last tick round allocated, one per tid a tick group carries. Starts at 1, which is

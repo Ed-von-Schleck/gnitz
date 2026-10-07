@@ -15,6 +15,9 @@ weight-0 ghost all as correct, in the one file whose subject is multiplicity.
 What a stream *refuses* is in `admissibility/test_stream_rejections.py`.
 """
 
+import glob
+import os
+
 import pytest
 import gnitz
 from _read import bag, rows
@@ -143,6 +146,51 @@ def test_a_stream_fed_view_returns_to_its_never_received_a_row_value(own_server)
         insert(conn, "s", [(1, 1, 42)])
         assert _read(conn, "agg") == {(1, 42): 1}
         assert _read(conn, "grown") == {(2,): 1, (3,): 1}
+
+
+def _published_stores(data_dir, tid):
+    """The store directories of relation `tid` that hold a manifest."""
+    return glob.glob(os.path.join(data_dir, "_relations", str(tid), "*", "manifest.bin"))
+
+
+def test_a_checkpoint_publishes_no_view_a_stream_reaches(own_server):
+    """A boot rebuilds every view a stream reaches whatever its stores hold, so a
+    checkpoint that published them would write state nothing reads. `sv` is fed by
+    the stream, `over_sv` only reaches it through `sv`, and `tv` beside them over a
+    table is published and resumed, so the absence is about the stream."""
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
+        _stream(conn)
+        for name, src in (("tv", "t"), ("sv", "s")):
+            conn.execute_sql(
+                f"CREATE VIEW {name} AS SELECT kind, SUM(amount) AS total FROM {src} GROUP BY kind")
+        conn.execute_sql("CREATE VIEW over_sv AS SELECT kind, total FROM sv WHERE total > 0")
+        insert(conn, "t", [(i, 1, 10) for i in range(1, 11)])
+        insert(conn, "s", [(i, 2, 10) for i in range(1, 11)])
+        assert _read(conn, "sv") == {(2, 100): 1}
+        assert _read(conn, "over_sv") == {(2, 100): 1}
+        ids = {name: conn.resolve_table(name)[0] for name in ("tv", "sv", "over_sv")}
+
+    own_server.stop_graceful()
+    assert _published_stores(own_server.data_dir, ids["tv"]), "a view over a table is published"
+    assert _published_stores(own_server.data_dir, ids["sv"]) == []
+    assert _published_stores(own_server.data_dir, ids["over_sv"]) == []
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 2, "the two views the stream reaches, and not `tv`"
+    with gnitz.connect(own_server.target) as conn:
+        assert _read(conn, "tv") == {(1, 100): 1}
+        assert _read(conn, "sv") == {}
+        assert _read(conn, "over_sv") == {}
+        insert(conn, "s", [(1, 3, 7)])
+        assert _read(conn, "over_sv") == {(3, 7): 1}
+
+    # The boot's own checkpoint and the next stop's publish them no more than the first did.
+    own_server.stop_graceful()
+    assert _published_stores(own_server.data_dir, ids["tv"])
+    assert _published_stores(own_server.data_dir, ids["sv"]) == []
+    assert _published_stores(own_server.data_dir, ids["over_sv"]) == []
 
 
 def test_a_crash_keeps_the_table_tail_and_drops_the_stream_tail(own_server):
