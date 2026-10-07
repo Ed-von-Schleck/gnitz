@@ -1107,3 +1107,28 @@ fn a_grouped_cte_reads_as_its_fold() {
         assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }
 }
+
+/// A system table is a class of its own: an ad-hoc read and a view body admit
+/// it, alone or beside a base table.
+#[test]
+fn a_system_table_is_read_and_scanned_by_a_view() {
+    let cat = base();
+    for sql in [
+        "SELECT id, v FROM sys WHERE v > 1",
+        "SELECT g, COUNT(*) FROM sys GROUP BY g",
+        "SELECT id FROM sys ORDER BY id LIMIT 2",
+    ] {
+        read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    }
+    for body in [
+        "SELECT id, v FROM sys WHERE v > 1",
+        "SELECT sys.id, t.v FROM sys JOIN t ON sys.id = t.id",
+        "SELECT g, COUNT(*) AS n FROM sys GROUP BY g",
+    ] {
+        let chain = view(&cat, body);
+        assert!(
+            all_views(&chain).any(|v| v.circuit.sources().any(|s| s == 27)),
+            "`{body}` scans the system table"
+        );
+    }
+}

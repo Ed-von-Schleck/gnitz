@@ -217,6 +217,7 @@ fn the_arena_holds_only_referenced_spill() {
 /// | `c` | `(a U64, b U64, v)` with `PRIMARY KEY (a, b)` |
 /// | `st` | a stream `(id PK, v)` |
 /// | `vw` | a view `(id PK, v)` |
+/// | `sys` | a system table `(id PK, v)` |
 fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let idv = || vec![col("id", i), ncol("v", i)];
@@ -249,6 +250,7 @@ fn cat() -> TestCatalog {
         ),
         ("st", rel(4, RelClass::Stream, idv(), vec![0], vec![])),
         ("vw", rel(5, RelClass::View, idv(), vec![0], vec![])),
+        ("sys", rel(6, RelClass::Catalog, idv(), vec![0], vec![])),
     ])
 }
 
@@ -260,6 +262,15 @@ fn a_refused_mutation_names_its_rule() {
     let cat = cat();
     for (sql, needle) in [
         ("UPDATE t SET v = 9 WHERE id = 1 RETURNING id", "RETURNING"),
+        // Only a DDL writes the catalog.
+        (
+            "UPDATE sys SET v = 9 WHERE id = 1",
+            "'sys' is a system table; UPDATE requires a base table",
+        ),
+        (
+            "DELETE FROM sys WHERE id = 1",
+            "'sys' is a system table; DELETE requires a base table",
+        ),
         ("DELETE FROM t WHERE id = 1 RETURNING id", "RETURNING"),
         ("DELETE FROM t LIMIT 1", "LIMIT"),
         ("DELETE FROM t ORDER BY id", "ORDER BY"),

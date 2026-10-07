@@ -188,8 +188,8 @@ impl MasterDispatcher {
 
     /// Log a DDL batch of `family` inside `scope`'s zone — one LSN across a DDL's
     /// groups, so recovery groups them atomically — and send it to every worker.
-    /// `_sequences` is master state no worker reads, so its group is logged and
-    /// addresses none. Publishes nothing; that is the scope's commit.
+    /// A family that reaches no worker is logged and addresses none. Publishes
+    /// nothing; that is the scope's commit.
     pub(crate) fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
         let target_id = family.id();
         let record = self
@@ -197,7 +197,7 @@ impl MasterDispatcher {
             .schema_record(target_id)
             .expect("a wire target is registered under the catalog lock");
         let mut group = DirectGroup::ddl_sync(target_id, &record, batch);
-        if family == SysFamily::Sequence {
+        if !family.reaches_workers() {
             group.targets = GroupTargets {
                 set: WorkerSet::EMPTY,
                 ..GroupTargets::UNADDRESSED

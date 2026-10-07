@@ -166,11 +166,8 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         }
     }
 
-    // A new view's base sources tick before it registers: registered, it would be ticked
-    // over rows its backfill also scans. Nothing commits between this drain and the
-    // registration — the DDL holds the catalog write and the tick gate. A stream source
-    // is not drained: the backfill scans its empty store, so a pending stream row reaches
-    // the view through the tick alone.
+    // For speed alone: a backfill walks a source's index only while nothing sits
+    // above the source's cut.
     if let Some(circuits) = families[SysFamily::Circuit.index()].as_ref() {
         let sources = {
             let cat = shared.cat();
@@ -191,6 +188,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // SAL emission window: broadcast each queued family as one zone, then fsync.
     // A failure here is unrecoverable — workers already applied the DdlSync
     // groups in real time — so abort.
+    let held_above = shared.cat().broadcasts_owed_a_tick();
     let (zone_lsn, synced) = {
         let mut excl = shared.disp().sal().lock().await;
         let zone_lsn = emit_zone_to_sal(shared, &mut excl, "DDL");
@@ -228,6 +226,15 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         );
     });
 
+    // After the backfill: a new view has read the sealed families, and these
+    // rows reach the views that already scanned them.
+    guard_panic_async("catalog-tick", shared.disp().drain_tick(&held_above))
+        .await
+        .unwrap_or_else(|e| gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {}", e));
+    for &family in &held_above {
+        shared.poll_waiters.wake(family);
+    }
+
     drop(locks);
     send_ack(peer, 0, zone_lsn);
     let total = t_ddl_start.elapsed();
@@ -249,7 +256,7 @@ fn emit_zone_to_sal(shared: &Shared, excl: &mut SalExcl<'_>, op: &'static str) -
     let scope = excl.begin("ddl");
     let zone_lsn = scope.lsn();
     let emitted = guard_panic(op, || {
-        for (family, bat) in &drained {
+        for (family, bat, _) in &drained {
             disp.broadcast_ddl(&scope, *family, bat)?;
         }
         Ok::<_, WireFault>(())

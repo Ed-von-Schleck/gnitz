@@ -32,7 +32,9 @@ fn each_part_is_a_users_identifier() {
         ("s", ""),
         ("", "t"),
         ("s", "a b"),
-        ("_system", "t"),
+        ("_other", "t"),
+        ("_system", "_x"),
+        ("public", "_x"),
         ("s", "_seg"),
     ] {
         assert!(RelName::new(schema, name).is_err(), "{schema:?} {name:?}");
@@ -40,4 +42,13 @@ fn each_part_is_a_users_identifier() {
     for text in ["a.b.c", ".t", "s.", ""] {
         assert!(RelName::parse("s", text).is_err(), "{text:?}");
     }
+}
+
+#[test]
+fn the_system_schema_is_spelled_in_any_case() {
+    let t = RelName::new("_system", "tables").unwrap();
+    assert_eq!((t.schema(), t.name(), t.key()), ("_system", "tables", "_system.tables"));
+    let shouted = RelName::parse("public", "_SYSTEM.Tables").unwrap();
+    assert_eq!(shouted, t);
+    assert_eq!(shouted.to_string(), "_SYSTEM.Tables");
 }

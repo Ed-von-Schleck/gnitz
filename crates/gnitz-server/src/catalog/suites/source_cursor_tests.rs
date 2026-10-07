@@ -57,3 +57,18 @@ fn a_backfill_opens_the_bound_its_view_recorded() {
     ));
     engine.close();
 }
+
+/// A backfill over a source holding un-ticked rows is exact: it reads below the
+/// cut, and the tick brings the rest once.
+#[test]
+fn a_backfill_leaves_the_rows_above_the_cut_to_their_tick() {
+    let (mut engine, tid, vid) = fixture("srccur_pending", None);
+    let late = rows(&engine, tid, 1, 200..203, |id| [id * 10]);
+    engine.ingest_unticked(tid, late).unwrap();
+
+    backfill(&mut engine, vid, &[tid]);
+    assert_eq!(held(&engine, vid), (200, 200));
+    seal_and_tick(&mut engine, tid);
+    assert_eq!(held(&engine, vid), (203, 203));
+    discard(engine);
+}

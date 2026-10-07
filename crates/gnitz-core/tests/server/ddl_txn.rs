@@ -23,7 +23,7 @@ fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
 
 /// Refused whole, before the catalog reads it: a bundle with two blocks for one
 /// family, which every list the handler derives would read as its first block
-/// alone while both were applied; and `_sequences`, whose durable high-waters
+/// alone while both were applied; and `sequences`, whose durable high-waters
 /// boot feeds into the id counters, where a forged one trips the allocator's
 /// ceiling on every later start.
 #[test]

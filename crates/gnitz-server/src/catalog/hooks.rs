@@ -30,7 +30,7 @@ impl CatalogEngine {
             }
             SysFamily::Column => self.hook_column_change(batch),
             SysFamily::Index => self.hook_index_register(batch),
-            // `_sequences` rows drive no cache; a view's registration reads its `_circuits` row.
+            // `sequences` rows drive no cache; a view's registration reads its `circuits` row.
             SysFamily::Sequence | SysFamily::Circuit => return Ok(()),
         };
         // Every family that reaches here can change what a RESOLVE answers.
@@ -50,6 +50,12 @@ impl CatalogEngine {
             RelDetail::View { owner_view_id, .. } => {
                 let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner_view_id)?;
                 for &src in self.dag.sources_of(rel.id) {
+                    if SysFamily::from_id(src).is_some_and(|f| !f.reaches_workers()) {
+                        return Err(format!(
+                            "reads '{}', which holds no set a view can scan",
+                            self.qualified_name(src)
+                        ));
+                    }
                     // A capacity-bounded view is a leaf: its store holds skeleton rows, so
                     // nothing may scan it.
                     if self.registry.relation(src).is_some_and(|r| r.kind().is_bounded()) {

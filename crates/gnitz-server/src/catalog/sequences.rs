@@ -1,4 +1,4 @@
-//! Catalog object-id allocation and `_sequences`: the master scalars (next id,
+//! Catalog object-id allocation and `sequences`: the master scalars (next id,
 //! checkpoint generation, topology word), user SERIAL ranges and the checkpoint
 //! records.
 
@@ -13,7 +13,7 @@ use super::CatalogEngine;
 /// manifest layout carry their own version words.
 const STATE_FORMAT: u32 = 16;
 
-/// The durable topology word recorded in `_sequences` ([`SEQ_ID_TOPOLOGY`]):
+/// The durable topology word recorded in `sequences` ([`SEQ_ID_TOPOLOGY`]):
 /// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time
 /// recorder and the resume-verdict validator.
 pub(in crate::catalog) fn topology_word(worker_count: u32) -> u64 {
@@ -42,7 +42,7 @@ impl CatalogEngine {
         Ok(base)
     }
 
-    // -- `_sequences` -------------------------------------------------------
+    // -- `sequences` -------------------------------------------------------
 
     /// Whether persisted derived state was written under this boot's topology.
     pub(in crate::catalog) fn topology_matches(&self) -> bool {
@@ -54,7 +54,7 @@ impl CatalogEngine {
         self.sequence_value(SEQ_ID_CHECKPOINT_GEN).unwrap_or(0)
     }
 
-    /// The live value of `_sequences` row `seq_id`, if one is stored.
+    /// The live value of `sequences` row `seq_id`, if one is stored.
     pub(crate) fn sequence_value(&self, seq_id: u64) -> Option<u64> {
         let row = self.live_sys_row(SysFamily::Sequence, seq_id)?;
         let (src, ri) = row.source();
@@ -62,7 +62,7 @@ impl CatalogEngine {
         Some(stored.next_val)
     }
 
-    /// The delta moving `_sequences` row `seq_id` from its live value to `new`;
+    /// The delta moving `sequences` row `seq_id` from its live value to `new`;
     /// empty when it already holds `new`.
     pub(in crate::catalog) fn sequence_delta(&self, seq_id: u64, new: u64) -> Batch {
         let old = self.sequence_value(seq_id);
@@ -78,7 +78,7 @@ impl CatalogEngine {
     }
 
     /// The base of the next `count` SERIAL ids of table `seq_id`, and the
-    /// `_sequences` delta recording them.
+    /// `sequences` delta recording them.
     pub(crate) fn reserve_user_sequence(&self, seq_id: u64, count: u64) -> Result<(i64, Batch), String> {
         if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
             return Err(format!("relation {seq_id} is not a SERIAL table"));
@@ -93,20 +93,20 @@ impl CatalogEngine {
         Ok((base as i64, self.sequence_delta(seq_id, last)))
     }
 
-    /// Move `_sequences` row `seq_id` to `value`.
+    /// Move `sequences` row `seq_id` to `value`.
     fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
         let delta = self.sequence_delta(seq_id, value);
         self.registry.ingest(SysFamily::Sequence.id(), delta)
     }
 
-    /// Write the next catalog id to `_sequences`, then flush every system table
+    /// Write the next catalog id to `sequences`, then flush every system table
     /// in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
         self.set_sequence(SEQ_ID_NEXT_ID, self.next_id)?;
         self.registry.checkpoint_system(self.system_zone)
     }
 
-    /// Load the next catalog id stored in `_sequences`, and latch the resume
+    /// Load the next catalog id stored in `sequences`, and latch the resume
     /// generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {

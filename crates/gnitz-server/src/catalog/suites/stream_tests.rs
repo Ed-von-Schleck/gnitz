@@ -145,30 +145,6 @@ fn stream_fed_views_are_invalid_at_boot() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// The child directories of relation `id` holding a manifest.
-fn published_children(dir: &str, id: u64) -> Vec<String> {
-    let rel = relation_dir(dir, id);
-    let mut names: Vec<String> = fs::read_dir(&rel)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|name| std::path::Path::new(&format!("{rel}/{name}/manifest.bin")).exists())
-        .collect();
-    names.sort();
-    names
-}
-
-/// A backfilled `DISTINCT` view over `source`: an output store and one trace.
-fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
-    let vid = engine.allocate_ids(1).unwrap();
-    write_circuit(engine, vid, distinct_circuit(source));
-    engine.write_column_records(vid, cols).unwrap();
-    engine
-        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, name))
-        .unwrap();
-    backfill(engine, vid, &[source]);
-    vid
-}
-
 /// An ephemeral round publishes nothing of a view a stream reaches — neither its
 /// output store nor a trace — and everything of a view over a table.
 #[test]

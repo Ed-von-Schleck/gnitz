@@ -525,7 +525,36 @@ fn a_qualified_name_reaches_another_schema() {
             "schema 'nosuch'",
         ),
         ("SELECT id FROM db.s.t", Rejected, "too many name parts"),
-        ("SELECT id FROM _system.t", Rejected, "cannot start with '_'"),
+        ("SELECT id FROM _other.t", Rejected, "cannot start with '_'"),
+        // `_system` is spelled, and holds the families alone.
+        ("SELECT id FROM _system.t", Refused(NotFound), "not found"),
+        ("SELECT name FROM _system._tables", Rejected, "cannot start with '_'"),
+        (
+            "CREATE TABLE _system.mine (id BIGINT PRIMARY KEY)",
+            Refused(Error),
+            "the system schema takes no relation",
+        ),
+        // A family is no base table to the statements that need one.
+        (
+            "ALTER TABLE _system.tables ADD COLUMN extra BIGINT",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "CREATE INDEX ON _system.tables (schema_id)",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "CREATE INDEX sysix ON _system.tables (schema_id)",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "INSERT INTO _system.schemas VALUES (99, 'forged')",
+            Rejected,
+            "is a system table",
+        ),
         // An index name is global, so a qualifier on one scopes nothing.
         ("CREATE INDEX other.ix ON t (v)", Rejected, "no qualifier"),
         ("DROP INDEX other.ix", Rejected, "no qualifier"),

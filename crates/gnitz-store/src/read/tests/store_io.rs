@@ -1,4 +1,5 @@
 use super::*;
+use crate::relation::Cut as At;
 use crate::test_support::{
     img, make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_only_schema, relation_fixture, RelationFixture,
     TID,
@@ -58,11 +59,47 @@ fn ids(ids: impl IntoIterator<Item = u128>) -> Vec<(u128, i64)> {
 fn a_selective_range_walks_the_index_at_every_chunk_size() {
     let r = fixture(|id| id as i64 * 10);
     for chunk in [1, 3, 7, 64, usize::MAX] {
-        let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600)).unwrap();
+        let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
         assert_eq!(unapplied, ReadBound::None, "chunk {chunk}");
         assert_eq!(drain_all(&mut cur, chunk), ids(50..60), "chunk {chunk}");
     }
+}
+
+/// A backfill's read: an index holds a pending row's entry from its ingest on,
+/// so at the sealed cut it is walked only while nothing is pending. With rows
+/// above the cut the whole sealed store is read and the range handed back.
+#[test]
+fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
+    let mut r = fixture(|id| id as i64 * 10);
+
+    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
+    assert!(matches!(cur, SourceCursor::Bounded(_)), "nothing pending: the index");
+    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(drain_all(&mut cur, 7), ids(50..60));
+
+    // One pending row inside the range, one outside it.
+    let pending = make_batch_raw(&make_schema_u64_i64(), &[(NBASE, 1, 555), (NBASE + 1, 1, 9_000)]);
+    r.ingest_pending(TID, pending).unwrap();
+
+    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
+    assert!(matches!(cur, SourceCursor::Full(_)), "rows pending: the sealed store");
+    assert_eq!(unapplied, val_range(500, 600), "the range is the caller's to apply");
+    assert_eq!(
+        drain_all(&mut cur, 7),
+        ids(0..NBASE as u128),
+        "the pending rows are left out"
+    );
+
+    let (mut cur, _) = r.open_bound(TID, val_range(500, 600), At::Now).unwrap();
+    assert!(matches!(cur, SourceCursor::Bounded(_)), "a read at now walks the index");
+    assert_eq!(drain_all(&mut cur, 7), ids((50..60).chain([NBASE as u128])));
+
+    r.seal(TID).unwrap().expect("rows were pending");
+    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
+    assert!(matches!(cur, SourceCursor::Bounded(_)), "sealed: the cuts agree again");
+    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(drain_all(&mut cur, 7), ids((50..60).chain([NBASE as u128])));
 }
 
 /// With `val` anti-correlated to the PK, a range at val's minimum makes the first
@@ -72,7 +109,7 @@ fn a_selective_range_walks_the_index_at_every_chunk_size() {
 #[test]
 fn a_walk_reseeks_backward_from_an_exhausted_base_cursor() {
     let r = fixture(|id| (NBASE - id) as i64 * 10);
-    let (mut cur, _) = r.open_bound(TID, val_range(10, 110)).unwrap();
+    let (mut cur, _) = r.open_bound(TID, val_range(10, 110), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 3), ids(190..200));
 }
@@ -93,7 +130,7 @@ fn a_walk_follows_the_bases_updates() {
         (52, 1, 5200),
     ];
     r.ingest(TID, make_batch_raw(&make_schema_u64_i64(), &updates)).unwrap();
-    let (mut cur, _) = r.open_bound(TID, val_range(500, 560)).unwrap();
+    let (mut cur, _) = r.open_bound(TID, val_range(500, 560), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 4), ids([10, 50, 51, 53, 54]));
 }
@@ -116,14 +153,14 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         (point.clone(), ids([73])),
         (inverted, vec![]),
     ] {
-        let (mut cur, unapplied) = r.open_bound(TID, bound.clone()).unwrap();
+        let (mut cur, unapplied) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "{bound:?}");
         assert_eq!(unapplied, ReadBound::None, "{bound:?}");
         assert_eq!(drain_all(&mut cur, 64), want, "{bound:?}");
     }
 
     let scanned = |r: &RelationRegistry, bound: ReadBound| {
-        let (mut cur, unapplied) = r.open_bound(TID, bound.clone()).unwrap();
+        let (mut cur, unapplied) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Full(_)), "{bound:?}");
         assert_eq!(unapplied, bound);
         assert_eq!(drain_all(&mut cur, 64), ids(0..NBASE as u128), "{bound:?}");
@@ -146,7 +183,7 @@ fn a_views_index_walk_follows_its_deltas() {
     let delta = [(51, -1, 510), (51, 1, 9000), (90, -1, 900), (90, 2, 555)];
     r.ingest(TID, make_batch_raw(&schema, &delta)).unwrap();
 
-    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 560)).unwrap();
+    let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 560), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(unapplied, ReadBound::None);
     assert_eq!(
@@ -169,7 +206,7 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
         .collect();
     let view = RelationKind::View(gnitz_wire::ViewProps::Plain);
     let r = relation_fixture(view, schema, &[1], [make_batch_raw(&schema, &rows)]);
-    let (mut cur, _) = r.open_bound(TID, val_range(5, 6)).unwrap();
+    let (mut cur, _) = r.open_bound(TID, val_range(5, 6), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     cur.drain_chunk(1024);
 }
@@ -189,7 +226,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let r = relation_fixture(RelationKind::BaseTable, schema, &[0], [bb.finish()]);
 
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
-    let (mut cur, unapplied) = r.open_bound(TID, ReadBound::Range(range)).unwrap();
+    let (mut cur, unapplied) = r.open_bound(TID, ReadBound::Range(range), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)), "a PK walk, not the index");
     assert_eq!(unapplied, ReadBound::None, "a PK walk applies the whole range");
     assert_eq!(drain_all(&mut cur, 64), ids((0..3).map(|b| 5 << 64 | b)));
@@ -201,8 +238,8 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
 fn open_bound_refuses_a_foreign_key_stride_and_an_unknown_relation() {
     let r = fixture(|id| id as i64);
     let wide = ReadBound::PkSet(PkKeys::from_keys(16, [&[0u8; 16][..]]));
-    assert!(r.open_bound(TID, wide).is_err());
-    assert!(r.open_bound(999_999, ReadBound::None).is_err());
+    assert!(r.open_bound(TID, wide, At::Now).is_err());
+    assert!(r.open_bound(999_999, ReadBound::None, At::Now).is_err());
 }
 
 /// Probe keys over the table's own PK store, one row per id.

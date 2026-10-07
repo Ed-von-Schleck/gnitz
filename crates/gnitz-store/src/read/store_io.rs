@@ -3,7 +3,7 @@
 //! an index over it;
 //! [`RelationRegistry::probe`] answers a HasPk probe.
 
-use crate::relation::{Relation, RelationKind, RelationRegistry};
+use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
 use gnitz_expr::ColumnTable;
 use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
@@ -37,7 +37,7 @@ impl RelationRegistry {
                 let mut live = Vec::with_capacity(keys.pk_data().len());
                 held(keys, relation.table()).for_each(|key| live.extend_from_slice(key));
                 let live = PkKeys::from_sorted(stride, live);
-                return relation.gather(live, crate::relation::Cut::Now).project_live(&[col]);
+                return relation.gather(live, Cut::Now).project_live(&[col]);
             }
             Probe::Index(cols, cap) => (cols, cap),
         };
@@ -60,7 +60,7 @@ impl RelationRegistry {
 
     /// Open `bound`'s source over `id`, without walking it, and the part of `bound`
     /// the source does not apply.
-    pub fn open_bound(&self, id: u64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), String> {
+    pub fn open_bound(&self, id: u64, bound: ReadBound, cut: Cut) -> Result<(SourceCursor, ReadBound), String> {
         let entry = self.relation_or_err(id)?;
         // A stream holds no rows, but a backfill over one still feeds an empty
         // epoch: that is what mints a global aggregate's ground row.
@@ -69,7 +69,7 @@ impl RelationRegistry {
             return Ok((SourceCursor::Full(Box::new(empty)), ReadBound::None));
         }
         let cursor = match bound {
-            ReadBound::None => SourceCursor::Full(Box::new(entry.cursor())),
+            ReadBound::None => SourceCursor::Full(Box::new(entry.table().open_cursor(cut))),
             ReadBound::PkSet(keys) => {
                 let schema = entry.schema();
                 if keys.stride() != schema.pk_stride() {
@@ -80,9 +80,9 @@ impl RelationRegistry {
                     ));
                 }
                 // A key this worker holds no row for copies nothing.
-                SourceCursor::PkSet(Box::new(entry.gather(keys, crate::relation::Cut::Now)))
+                SourceCursor::PkSet(Box::new(entry.gather(keys, cut)))
             }
-            ReadBound::Range(r) => return open_range(entry, r),
+            ReadBound::Range(r) => return open_range(entry, r, cut),
         };
         Ok((cursor, ReadBound::None))
     }
@@ -96,20 +96,29 @@ fn held<'a>(keys: &'a Batch, table: &'a Table) -> impl Iterator<Item = &'a [u8]>
 }
 
 /// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.
-fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), String> {
+fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, ReadBound), String> {
     let schema = entry.schema();
+    let table = entry.table();
     if r.walks_pk(schema.pk_cols()) {
-        let cursor = entry.table().range_cursor(schema.pk_range_keys(&r));
+        let cursor = table.range_cursor(schema.pk_range_keys(&r), cut);
         return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
     }
-    if let Some(ic) = entry.index_on(r.cols().as_slice()) {
+    // An index holds a pending row's entry from its ingest on, so it is walked
+    // only where the store's two cuts read the same rows.
+    let index = entry
+        .index_on(r.cols().as_slice())
+        .filter(|_| cut == Cut::Now || !entry.has_pending());
+    if let Some(ic) = index {
         let idx = ic.cursor_over(&r);
-        if idx.estimated_length() <= entry.table().estimated_rows() / INDEX_SCAN_RATIO {
-            let walk = BoundedIndexCursor::new(idx, entry.cursor(), ic.key_spec());
+        if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {
+            let walk = BoundedIndexCursor::new(idx, table.open_cursor(cut), ic.key_spec());
             return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
         }
     }
-    Ok((SourceCursor::Full(Box::new(entry.cursor())), ReadBound::Range(r)))
+    Ok((
+        SourceCursor::Full(Box::new(table.open_cursor(cut))),
+        ReadBound::Range(r),
+    ))
 }
 
 #[cfg(test)]

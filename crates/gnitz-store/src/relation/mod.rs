@@ -94,7 +94,7 @@ impl SecondaryIndex {
 
     /// Non-compacting cursor over this index's store, in the index schema.
     pub fn cursor(&self) -> ReadCursor {
-        self.store.held().open_cursor()
+        self.store.held().open_cursor(Cut::Now)
     }
 
     /// Every stored entry of `spans`, each this index's leading key bytes.
@@ -105,7 +105,7 @@ impl SecondaryIndex {
     /// A cursor positioned on the key band `r` names under this index's key spec.
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
         let t = self.store.held();
-        t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r))
+        t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r), Cut::Now)
     }
 
     /// Project `source` into this index's layout and ingest the result.
@@ -160,7 +160,8 @@ impl RelationKind {
         match self {
             RelationKind::Stream => gnitz_wire::RelClass::Stream,
             RelationKind::View(props) => props.into(),
-            RelationKind::BaseTable | RelationKind::SystemCatalog => gnitz_wire::RelClass::Table,
+            RelationKind::BaseTable => gnitz_wire::RelClass::Table,
+            RelationKind::SystemCatalog => gnitz_wire::RelClass::Catalog,
         }
     }
 
@@ -299,7 +300,7 @@ impl Relation {
 
     /// Non-compacting cursor over this relation's store.
     pub fn cursor(&self) -> ReadCursor {
-        self.table().open_cursor()
+        self.table().open_cursor(Cut::Now)
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of one,
@@ -329,7 +330,7 @@ impl Relation {
             KeyCut::above(prefix),
             table.schema().pk_stride(),
         );
-        table.range_cursor(band).for_each_positive_while(|_| true, f);
+        table.range_cursor(band, Cut::Now).for_each_positive_while(|_| true, f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.

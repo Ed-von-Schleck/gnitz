@@ -5,7 +5,7 @@
 use std::hint::black_box;
 use std::num::NonZeroU64;
 
-use crate::relation::RelationKind;
+use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, RelationFixture, TID,
 };
@@ -28,7 +28,7 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
     });
     let r = relation_fixture(RelationKind::BaseTable, schema, &[1], rounds);
     let table = r.relation(TID).unwrap().table();
-    assert_eq!((table.all_shard_arcs().len(), table.runs().count()), (0, RUNS));
+    assert_eq!((table.all_shard_arcs().len(), table.runs(At::Now).count()), (0, RUNS));
     r
 }
 

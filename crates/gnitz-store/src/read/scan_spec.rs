@@ -8,7 +8,7 @@ use gnitz_wire::{PkKeys, ReadSpec};
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
-use crate::relation::RelationRegistry;
+use crate::relation::{Cut, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::{Batch, SkeletonKeys, SourceCursor};
@@ -33,7 +33,7 @@ impl RelationRegistry {
             return Ok(entry.full_scan());
         }
         let ReadSpec { bound, predicate, sink } = spec;
-        let (source, unapplied) = self.open_bound(target_id, bound)?;
+        let (source, unapplied) = self.open_bound(target_id, bound, Cut::Now)?;
         // A bad predicate and a bad walk are both a corrupt request: the client
         // pre-compiled the identical program at plan time.
         let filter = RowFilter::for_read(&predicate, &unapplied, &src_schema).map_err(|e| format!("scan_spec: {e}"))?;

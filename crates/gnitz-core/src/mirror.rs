@@ -415,7 +415,9 @@ const SETTLE_ATTEMPTS: usize = 4;
 fn refuse_unfed(what: &str, class: RelClass) -> Result<(), ClientError> {
     Err(ClientError::from(match class {
         RelClass::FedView => return Ok(()),
-        RelClass::Table | RelClass::Stream => format!("{what} is a {}; only a view can be mirrored", class.noun()),
+        RelClass::Table | RelClass::Stream | RelClass::Catalog => {
+            format!("{what} is a {}; only a view can be mirrored", class.noun())
+        }
         RelClass::BoundedView => format!(
             "{what} is capacity-bounded, and a capacity and a feed \
              are refused together, so it carries no feed to subscribe to"

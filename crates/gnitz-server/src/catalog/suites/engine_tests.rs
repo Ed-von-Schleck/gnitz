@@ -374,7 +374,7 @@ fn test_ddl_sync() {
 
 // ── the_newest_applied_zone_is_every_familys_replay_floor ──────────────
 
-/// `close` also writes the next-id `_sequences` row outside any zone, which must
+/// `close` also writes the next-id `sequences` row outside any zone, which must
 /// not move a floor.
 #[test]
 fn the_newest_applied_zone_is_every_familys_replay_floor() {
@@ -597,7 +597,7 @@ fn test_circuit_table_surface_introspectable() {
     circuit.input_delta(100, gnitz_wire::ReadBound::None);
     write_circuit(&mut engine, 107, circuit);
 
-    // The family is SQL-introspectable — `SELECT * FROM _circuits` must return
+    // The family is SQL-introspectable — `SELECT * FROM _system.circuits` must return
     // what we just inserted (full-scan path, used by SQL planner).
     let scan = scan_all(&mut engine, gnitz_wire::CIRCUIT_TAB);
     assert_eq!(scan.len(), 1, "scan must expose the circuit row");

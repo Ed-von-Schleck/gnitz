@@ -36,6 +36,7 @@ use sqlparser::ast::Statement;
 /// | `tv` | a view with `t`'s columns |
 /// | `bv` | a capacity-bounded view with `t`'s columns |
 /// | `fv` | a view with a delta feed, with `t`'s columns |
+/// | `sys` | a system table with `t`'s columns |
 fn base() -> TestCatalog {
     let i = TypeCode::I64;
     let tgv = || vec![col("id", i), col("g", i), col("v", i)];
@@ -77,6 +78,7 @@ fn base() -> TestCatalog {
         ("tv", rel(24, RelClass::View, tgv(), vec![0], vec![])),
         ("bv", rel(25, RelClass::BoundedView, tgv(), vec![0], vec![])),
         ("fv", rel(26, RelClass::FedView, tgv(), vec![0], vec![])),
+        ("sys", rel(27, RelClass::Catalog, tgv(), vec![0], vec![])),
     ])
 }
 

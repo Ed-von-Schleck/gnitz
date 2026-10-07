@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::RelationKind;
+use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{
     between, cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
     RelationFixture, TID,
@@ -340,7 +340,7 @@ fn an_index_walk_returns_exactly_its_range() {
     let ids = |spec: ReadSpec| rows_of_walk(&run(&r, spec).unwrap());
     for (col, start, end, walks, want) in walks {
         let bound = ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
-        let (cursor, _) = r.open_bound(TID, bound.clone()).unwrap();
+        let (cursor, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(cursor, SourceCursor::Bounded(_)), walks, "{bound:?}");
         let spec = |cut| ReadSpec {
             bound: bound.clone(),
@@ -683,7 +683,10 @@ fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
 #[should_panic(expected = "a raw drain met a skeleton row")]
 fn a_raw_drain_over_a_skeleton_run_panics() {
     let r = dehydrated_fixture(0..5, 100..105);
-    r.open_bound(TID, ReadBound::None).unwrap().0.drain_chunk(usize::MAX);
+    r.open_bound(TID, ReadBound::None, At::Now)
+        .unwrap()
+        .0
+        .drain_chunk(usize::MAX);
 }
 
 /// A hydration whose rows under a key do not sum to the skeleton row's weight is a

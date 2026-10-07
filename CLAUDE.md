@@ -531,6 +531,23 @@ null-filled for `table LEFT JOIN stream`, and *grown* for
 A read of a view drains pending ticks when a push it reaches has not been
 ticked yet — a stream push exactly as a table's.
 
+## The catalog as relations
+
+The system families are the relations of `_system`, the one schema besides a
+client's `_local` that no user can create: `schemas`, `tables`, `views`,
+`columns`, `indices`, `circuits`, `sequences`. A `SELECT` reads one like any
+table. A view may scan one, and is then maintained from catalog deltas as it is
+from a table's: **a DDL's catalog rows have reached every view that scans them
+before the DDL is acknowledged.**
+
+`_system` holds nothing else, and no client write reaches a family but a DDL.
+`sequences` is read but never scanned: it holds the master's positions, not a
+set, moves with every SERIAL reservation and checkpoint, and reaches no worker.
+
+A view reaching a family is rebuilt at every boot, as one reaching a stream is:
+the catalog's tail is applied before any view exists, so no checkpoint keeps
+such a view.
+
 ## Window functions
 
 A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) desugars in the planner into

@@ -103,6 +103,7 @@ impl ClassWant {
                 ClassWant::View | ClassWant::Readable | ClassWant::ViewSource | ClassWant::Indexable
             ),
             RelClass::BoundedView => matches!(self, ClassWant::View | ClassWant::Readable),
+            RelClass::Catalog => matches!(self, ClassWant::Readable | ClassWant::ViewSource),
         }
     }
 
@@ -126,7 +127,7 @@ fn class_noun(class: RelClass) -> &'static str {
     match class {
         RelClass::BoundedView => "capacity-bounded view",
         RelClass::FedView => "view with a delta feed",
-        RelClass::Table | RelClass::Stream | RelClass::View => class.noun(),
+        RelClass::Table | RelClass::Stream | RelClass::View | RelClass::Catalog => class.noun(),
     }
 }
 

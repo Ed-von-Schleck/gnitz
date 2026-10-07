@@ -12,8 +12,8 @@ use gnitz_zset::repr::{Batch, StorageError};
 static INGEST_APPLY_ERROR: gnitz_foundation::fault::Seam =
     gnitz_foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
 
-/// Inert for [`RelationKind::SystemCatalog`], whose writes happen at boot: an
-/// armed process must reach the push it is meant to fail.
+/// Inert for [`RelationKind::SystemCatalog`]: an armed process must reach the
+/// push it is meant to fail.
 fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), StorageError>) -> Result<(), StorageError> {
     if kind != RelationKind::SystemCatalog && INGEST_APPLY_ERROR.at(which) {
         return Err(StorageError::Io(libc::EIO));
@@ -39,7 +39,7 @@ pub(super) fn fill_indexes(
             ix.cols.as_slice()
         );
     }
-    let mut source = owner.held().open_cursor();
+    let mut source = owner.held().open_cursor(super::Cut::Now);
     while let Some(chunk) = source.drain_chunk(chunk_rows) {
         for ix in targets.iter_mut() {
             let cols = ix.cols;
@@ -93,13 +93,6 @@ impl RelationRegistry {
         debug_assert!(entry.kind.is_view() && entry.delta.is_none() && entry.indexes.is_empty());
         entry.store.held_mut().clear();
         Ok(())
-    }
-
-    /// [`Self::ingest`], handing back the batch as the store saw it, after PK
-    /// enforcement — what a caller that must forward the applied rows takes.
-    pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, String> {
-        self.ingest_at(id, batch, None, true)
-            .map(|b| b.expect("an echo was asked for"))
     }
 
     /// [`Self::ingest`], captured as round `round` by the delta feed this process

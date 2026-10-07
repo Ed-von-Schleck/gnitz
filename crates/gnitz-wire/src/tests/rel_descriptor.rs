@@ -44,7 +44,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
 
     // (what, blob, the message that must name it)
     let cases: &[(&str, Vec<u8>, &str)] = &[
-        ("unknown class", forge(&|b| b[0] = 5), "unknown RelClass 5"),
+        ("unknown class", forge(&|b| b[0] = 6), "unknown RelClass 6"),
         ("pk_repeats byte 2", forge(&|b| b[1] = 2), "neither 0 nor 1"),
         ("serial byte 2", forge(&|b| b[2] = 2), "neither 0 nor 1"),
         ("trailing byte", forge(&|b| b.push(0)), "trailing"),

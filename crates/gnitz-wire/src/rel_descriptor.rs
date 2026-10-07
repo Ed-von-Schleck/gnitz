@@ -16,6 +16,8 @@ wire_enum! {
         BoundedView = 3,
         /// A view created `WITH (delta = …)`.
         FedView = 4,
+        /// A system family: read, and scanned by a view, and written by a DDL alone.
+        Catalog = 5,
     }
 }
 
@@ -25,6 +27,7 @@ impl RelClass {
         match self {
             RelClass::Table => "table",
             RelClass::Stream => "stream",
+            RelClass::Catalog => "system table",
             RelClass::View | RelClass::BoundedView | RelClass::FedView => "view",
         }
     }

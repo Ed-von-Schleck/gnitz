@@ -268,7 +268,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── `_sequences` never accumulates an unmatched retraction ───────────────────
+// ── `sequences` never accumulates an unmatched retraction ───────────────────
 
 #[test]
 fn sequence_advances_leave_no_negative_ghost() {
@@ -291,7 +291,7 @@ fn sequence_advances_leave_no_negative_ghost() {
     assert_eq!(
         count_negative_records(engine.sys_relation(SysFamily::Sequence).cursor()),
         0,
-        "_sequences must hold no net-negative row"
+        "sequences must hold no net-negative row"
     );
 
     engine.close();

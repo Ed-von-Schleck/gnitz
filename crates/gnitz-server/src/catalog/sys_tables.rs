@@ -426,7 +426,10 @@ impl SysFamily {
     pub(in crate::catalog) fn write_seed_rows(self, bb: &mut BatchBuilder) {
         match self {
             SysFamily::Schema => {
-                for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
+                for (schema_id, name) in [
+                    (SYSTEM_SCHEMA_ID, gnitz_wire::SYSTEM_SCHEMA),
+                    (PUBLIC_SCHEMA_ID, "public"),
+                ] {
                     SchemaTabRow { schema_id, name }.write(bb, 1);
                 }
             }
@@ -531,6 +534,22 @@ impl SysFamily {
     /// counters and the resume verdict, where a forged value aborts every
     /// subsequent start. Every legitimate sequence write is engine-built.
     pub(crate) fn client_writable(self) -> bool {
+        match self {
+            SysFamily::Sequence => false,
+            SysFamily::Schema
+            | SysFamily::Table
+            | SysFamily::View
+            | SysFamily::Column
+            | SysFamily::Index
+            | SysFamily::Circuit => true,
+        }
+    }
+
+    /// Is this family's delta sent to the workers? `false` for Sequence alone:
+    /// its rows are the master's positions, moved by every SERIAL reservation
+    /// and checkpoint, so a worker's copy is the one it forked with and no view
+    /// can be maintained over it.
+    pub(crate) fn reaches_workers(self) -> bool {
         match self {
             SysFamily::Sequence => false,
             SysFamily::Schema

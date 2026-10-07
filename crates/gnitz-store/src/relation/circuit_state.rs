@@ -70,7 +70,7 @@ impl CircuitState {
     }
 
     pub fn cursor(&self, idx: StateIdx) -> ReadCursor {
-        self.at(idx).open_cursor()
+        self.at(idx).open_cursor(super::Cut::Now)
     }
 
     /// Every live row of `keys` in `idx`.

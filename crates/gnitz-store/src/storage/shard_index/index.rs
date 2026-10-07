@@ -231,10 +231,11 @@ impl ShardIndex {
         self.published_through = self.shard_seq;
     }
 
-    /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
-    /// intermediate `Vec` (the per-worker cursor gather).
-    pub(crate) fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.all_entries().map(|e| Rc::clone(&e.shard))
+    /// Every shard; the pending ones iff `pending`.
+    pub(crate) fn shard_arcs(&self, pending: bool) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.settled_entries()
+            .chain(self.pending.iter().filter(move |_| pending))
+            .map(|e| Rc::clone(&e.shard))
     }
 
     /// Every shard whose PK extent meets `[lo, hi]`; the pending ones iff `pending`.

@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use gnitz_store::relation::{Relation, RelationKind, Residency};
+use gnitz_store::relation::{Cut, Relation, Residency};
 use gnitz_wire::ReadSpec;
 use gnitz_zset::repr::{Batch, SourceCursor};
 use rustc_hash::FxHashSet;
@@ -33,8 +33,9 @@ impl CatalogEngine {
     ///     sibling's freshly-emptied output store; and
     ///   * every view of its chain is valid — a segment's rows are dropped once
     ///     its chain is built, so a chain member's rebuild needs them rebuilt; and
-    ///   * none of its sources is a STREAM — its state integrates stream rows
-    ///     that are gone.
+    ///   * none of its sources is a STREAM or a system family — its state
+    ///     integrates stream rows that are gone, or catalog rows no boot replays
+    ///     into it.
     ///
     /// The topology word is decided once for the whole set. Then each view's
     /// **local** validity is decided (direct sources + child manifests), and
@@ -51,12 +52,12 @@ impl CatalogEngine {
             return;
         }
 
-        // Local validity: every output child's manifest at `g`. A stream-fed
-        // view needs no manifest read.
+        // Local validity: every output child's manifest at `g`. A view over a
+        // stream or a system family needs no manifest read.
         // An unreadable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still
         // be at `g`.
-        let mut invalid = self.stream_fed_views();
+        let mut invalid = self.views_over_unreplayed_sources();
         for &vid in &view_ids {
             if !invalid.contains(&vid) && !self.registry.view_children_resumable(vid, self.resume_generation) {
                 invalid.insert(vid);
@@ -66,12 +67,19 @@ impl CatalogEngine {
         self.dag.set_rebuild(rebuild);
     }
 
-    /// The views with a stream among their direct sources.
-    fn stream_fed_views(&self) -> FxHashSet<u64> {
-        let is_stream = |s: &u64| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream);
+    /// The views with a direct source whose deltas no boot replays into a kept
+    /// view. Boot replays a base table's tail alone: a stream's rows are gone,
+    /// and a system family's tail is applied before any view exists.
+    fn views_over_unreplayed_sources(&self) -> FxHashSet<u64> {
+        let unreplayed = |s: &u64| {
+            self.registry
+                .relation(*s)
+                .map(Relation::kind)
+                .is_some_and(|k| !(k.is_view() || k.is_base_table()))
+        };
         self.registry
             .view_ids()
-            .filter(|&vid| self.dag.sources_of(vid).iter().any(is_stream))
+            .filter(|&vid| self.dag.sources_of(vid).iter().any(unreplayed))
             .collect()
     }
 
@@ -88,11 +96,11 @@ impl CatalogEngine {
     }
 
     /// The views every boot rebuilds whatever their stores hold: those a stream
-    /// reaches, and their chains. A subset of what
+    /// or a system family reaches, and their chains. A subset of what
     /// [`Self::compute_invalid_views`] rejects, so a checkpoint round has no
     /// reason to publish one.
     pub(in crate::catalog) fn never_resumed_views(&self) -> FxHashSet<u64> {
-        self.rebuilt_with(self.stream_fed_views())
+        self.rebuilt_with(self.views_over_unreplayed_sources())
     }
 
     /// Relay each base table onto the launched worker count and drop the children
@@ -116,11 +124,12 @@ impl CatalogEngine {
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
-    /// circuit carries for it; the circuit's `Filter` applies the WHERE.
+    /// circuit carries for it; the circuit's `Filter` applies the WHERE. Rows
+    /// above `source`'s cut are left to the tick that seals them.
     pub(crate) fn open_source_cursor(&mut self, view_id: u64, source: u64) -> Result<SourceCursor, String> {
         let bound = self.dag.view_meta(view_id)?.source_bound(source);
         self.registry
-            .open_bound(source, bound)
+            .open_bound(source, bound, Cut::Sealed)
             .map(|(cursor, _unapplied)| cursor)
     }
 }

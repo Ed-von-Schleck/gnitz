@@ -35,7 +35,7 @@ fn test_bootstrap() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// What a client scanning `_columns` on a fresh server sees: every system
+/// What a client scanning `columns` on a fresh server sees: every system
 /// family describes itself with one row per column of its wire list, named and
 /// in `col_idx` order, under its own id — and nothing else is described.
 ///
@@ -137,7 +137,7 @@ fn an_unpublished_tables_family_is_reseeded_alone() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An unpublished `_columns` does not stop the open: the system families'
+/// An unpublished `columns` does not stop the open: the system families'
 /// entries are compile-time data, and the reseed restores the self-description.
 #[test]
 fn an_unpublished_columns_family_is_reseeded() {
@@ -193,8 +193,8 @@ fn test_ddl() {
         init_cols
     );
 
-    // System table drop should fail (identifier starts with '_')
-    assert!(engine.drop_table("_system._columns").is_err());
+    // A family is not dropped by name: `_system` is no schema a user spells here.
+    assert!(engine.drop_table("_system.columns").is_err());
 
     // Drop schema
     engine.create_schema("temp").unwrap();
@@ -724,7 +724,7 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
 
     // Collect the broadcast family-id sequence.
-    let tids: Vec<u64> = engine.drain_pending_broadcasts().iter().map(|(f, _)| f.id()).collect();
+    let tids: Vec<u64> = engine.drain_pending_broadcasts().iter().map(|(f, ..)| f.id()).collect();
 
     let pos = |id: u64| tids.iter().position(|&t| t == id);
     let idx_pos =
@@ -1005,7 +1005,7 @@ fn set_based_table_drop_queues_one_batch_per_family() {
     let drop = engine.retract_under(SysFamily::Table, &tids);
     engine.submit(SysFamily::Table, drop).unwrap();
 
-    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
+    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, ..)| f).collect();
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
     assert!(tids.iter().all(|&t| !engine.registry.has_id(t)));
 
@@ -1045,7 +1045,7 @@ fn view_drop_retracts_its_segments() {
 
     engine.submit_retraction(SysFamily::View, v).unwrap();
 
-    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
+    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, ..)| f).collect();
     assert_eq!(families, [SysFamily::View, SysFamily::Circuit, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry.has_id(id));

@@ -125,7 +125,7 @@ def test_system_relations_survive_a_rejected_drop(client):
 
     client.schema = "_system"
     with pytest.raises(gnitz.GnitzRefusedError):
-        client.drop_table("_tables")
+        client.drop_table("tables")
     assert sys_ids() == before
 
 

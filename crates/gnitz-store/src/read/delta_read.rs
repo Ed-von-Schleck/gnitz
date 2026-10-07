@@ -71,7 +71,7 @@ impl RelationRegistry {
             feed.schema().pk_stride(),
         );
         if whole {
-            let rows = feed.range_cursor(band).materialize();
+            let rows = feed.range_cursor(band, Cut::Now).materialize();
             return Ok(Rc::new(rows.without_key_prefix(&view)));
         }
 
@@ -99,7 +99,7 @@ impl RelationRegistry {
                 SourceCursor::PkSet(Box::new(feed.gather(probes, Cut::Now))),
                 ReadBound::None,
             ),
-            None => (SourceCursor::Full(Box::new(feed.range_cursor(band))), bound),
+            None => (SourceCursor::Full(Box::new(feed.range_cursor(band, Cut::Now))), bound),
         };
         // The feed numbers the view's columns as the view does, so the spec's
         // programs run on its chunks as they are and only survivors are copied.

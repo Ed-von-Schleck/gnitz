@@ -1,6 +1,7 @@
 mod alter_tests;
 mod atomicity_tests;
 mod bundle_precheck_tests;
+mod catalog_view_tests;
 mod compound_pk_smoke;
 mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
@@ -191,6 +192,38 @@ fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
         }
         engine.dag.finish_backfill(&mut engine.registry, view, source).unwrap();
     }
+}
+
+/// The child directories of relation `id` holding a manifest.
+fn published_children(dir: &str, id: u64) -> Vec<String> {
+    let rel = relation_dir(dir, id);
+    let mut names: Vec<String> = fs::read_dir(&rel)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| std::path::Path::new(&format!("{rel}/{name}/manifest.bin")).exists())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A backfilled `DISTINCT` view over `source`: an output store and one trace.
+fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
+    let vid = try_register_view(engine, distinct_circuit(source), name, cols, 0, 0).unwrap();
+    backfill(engine, vid, &[source]);
+    vid
+}
+
+/// `(rows, summed weight)` of relation `id`: equal iff every row stands at weight 1.
+fn held(engine: &CatalogEngine, id: u64) -> (usize, i64) {
+    let rel = engine.registry.relation(id).expect("a registered relation");
+    (count_records(rel.cursor()), sum_weights(rel.cursor()))
+}
+
+/// Seal `source` and tick what the seal answers, as a worker's `Tick` does.
+fn seal_and_tick(engine: &mut CatalogEngine, source: u64) {
+    let delta = engine.registry.seal(source).unwrap();
+    let what = crate::query::Drive::Tick { source, round: 1 };
+    crate::query::drive(&mut LocalDrive(engine), what, delta).unwrap();
 }
 
 /// `ids` as rows of `tid` at `weight`, in the order given; `cells(id)` is one

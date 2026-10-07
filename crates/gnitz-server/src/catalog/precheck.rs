@@ -14,6 +14,7 @@ use rustc_hash::FxHashSet;
 use super::sys_reads::IdSet;
 use super::sys_tables::{
     family_pk_partition, index_parts, pk_signatures, read_rel_row, CatalogColumn, PkSignature, RelDetail, SysFamily,
+    SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
 
@@ -668,6 +669,10 @@ impl CatalogEngine {
 
         for i in batch.live_rows() {
             let rel = read_rel_row(family, batch, i)?;
+            // The system schema holds the catalog's own relations and nothing else.
+            if rel.schema_id == SYSTEM_SCHEMA_ID {
+                return Err(format!("{rel}: the system schema takes no relation"));
+            }
             let col_defs = self.read_column_defs(rel.id)?;
             let schema =
                 build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;

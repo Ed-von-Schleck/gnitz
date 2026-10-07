@@ -17,6 +17,7 @@ use sqlparser::ast::Statement;
 /// | `sr` | `(id SMALLINT SERIAL PK, name TEXT)` |
 /// | `st` | a stream `(id PK, v)` |
 /// | `vw` | a view `(id PK, v)` |
+/// | `sys` | a system table `(id PK, v)` |
 fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let idv = || vec![col("id", i), ncol("v", i)];
@@ -53,6 +54,7 @@ fn cat() -> TestCatalog {
         ),
         ("st", rel(6, RelClass::Stream, idv(), vec![0], vec![])),
         ("vw", rel(7, RelClass::View, idv(), vec![0], vec![])),
+        ("sys", rel(8, RelClass::Catalog, idv(), vec![0], vec![])),
     ])
 }
 
@@ -247,6 +249,10 @@ fn a_refused_insert_names_its_rule() {
         // A view is read-only, a reserved name is refused before the catalog is
         // probed, and a stream holds no row to resolve a conflict against.
         ("INSERT INTO vw VALUES (2, 20)", "is a view"),
+        (
+            "INSERT INTO sys VALUES (2, 20)",
+            "'sys' is a system table; INSERT requires",
+        ),
         ("INSERT INTO _seg999999 VALUES (1, 1)", "cannot start with '_'"),
         (
             "INSERT INTO st VALUES (1, 2) ON CONFLICT (id) DO NOTHING",

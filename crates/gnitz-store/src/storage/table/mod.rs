@@ -457,16 +457,16 @@ impl Table {
         self.ram_tiers(Cut::Now).map(|s| s.len()).sum()
     }
 
-    /// Every run this table reads through.
-    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
-        self.mem_runs(None, Cut::Now)
-            .chain(self.shard_index.all_shard_arcs_iter().map(Run::Shard))
+    /// Every run `cut` reads.
+    pub(crate) fn runs(&self, cut: Cut) -> impl Iterator<Item = Run> + '_ {
+        self.mem_runs(None, cut)
+            .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
     }
 
-    /// Open a read-only cursor over every tier.
-    pub(crate) fn open_cursor(&self) -> ReadCursor {
+    /// Open a read-only cursor over the rows `cut` reads.
+    pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
         let cap = self.mem_run_count() + self.shard_index.shard_count();
-        from_runs(self.runs(), self.shard_index.schema, cap)
+        from_runs(self.runs(cut), self.shard_index.schema, cap)
     }
 
     /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
@@ -517,12 +517,13 @@ impl Table {
         (runs, self.mem_run_count() + self.shard_index.narrow_range_shards())
     }
 
-    /// A cursor positioned on the OPK key band `[start, end)`; `None` opens empty.
-    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>) -> ReadCursor {
+    /// A cursor positioned on the OPK key band `[start, end)` of the rows `cut`
+    /// reads; `None` opens empty.
+    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> ReadCursor {
         let Some((start, end)) = range else {
             return empty_cursor(self.shard_index.schema);
         };
-        let (runs, cap) = self.runs_in_range(start, end, Cut::Now);
+        let (runs, cap) = self.runs_in_range(start, end, cut);
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
     }
@@ -543,7 +544,7 @@ impl Table {
         let rc = self
             .cached_full_scan
             .take()
-            .unwrap_or_else(|| self.open_cursor().materialize());
+            .unwrap_or_else(|| self.open_cursor(Cut::Now).materialize());
         self.cached_full_scan.set(Some(Rc::clone(&rc)));
         rc
     }
@@ -556,7 +557,7 @@ impl Table {
     /// Every registered shard.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.shard_index.all_shard_arcs_iter().collect()
+        self.shard_index.shard_arcs(true).collect()
     }
 
     /// `(L0 shard count, L1 and terminal guard counts)`.

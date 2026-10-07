@@ -66,12 +66,6 @@ fn zset(schema: &SchemaDescriptor, model: &BTreeMap<Elem, i64>) -> HashMap<RowKe
 fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
     let s = *t.schema();
     let want = zset(&s, live);
-    let where_pk = |f: &dyn Fn(&[u8]) -> bool| -> HashMap<RowKey, i64> {
-        want.iter()
-            .filter(|(k, _)| f(&k.0))
-            .map(|(k, &w)| (k.clone(), w))
-            .collect()
-    };
     assert_eq!(zset_of(&t.full_scan(), &s), want, "full_scan");
 
     for k in keys {
@@ -95,12 +89,22 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, 
             gathered.extend(zset_of(&b, &s));
         }
         assert_eq!(gathered, want, "gather at {cut:?}");
-    }
 
-    for w in keys.windows(2) {
-        let (lo, hi) = (PkBuf::from_bytes(&w[0]), PkBuf::from_bytes(&w[1]));
-        let got = zset_of(&t.range_cursor(Some((lo, Some(hi)))).materialize(), &s);
-        assert_eq!(got, where_pk(&|p| &w[0][..] <= p && p < &w[1][..]), "range cursor");
+        assert_eq!(
+            zset_of(&t.open_cursor(cut).materialize(), &s),
+            want,
+            "cursor at {cut:?}"
+        );
+        for w in keys.windows(2) {
+            let (lo, hi) = (PkBuf::from_bytes(&w[0]), PkBuf::from_bytes(&w[1]));
+            let got = zset_of(&t.range_cursor(Some((lo, Some(hi))), cut).materialize(), &s);
+            let band: HashMap<RowKey, i64> = want
+                .iter()
+                .filter(|(k, _)| w[0] <= k.0 && k.0 < w[1])
+                .map(|(k, &w)| (k.clone(), w))
+                .collect();
+            assert_eq!(got, band, "range cursor at {cut:?}");
+        }
     }
 }
 

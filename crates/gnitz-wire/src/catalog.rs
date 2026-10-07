@@ -171,13 +171,13 @@ const fn fam(id: u64, name: &'static str, shape: SysShape) -> WireSysFamily {
 /// Every system family, in the order both sides index them by. The engine
 /// applies a bundle's families in this order.
 pub const SYS_FAMILIES: &[WireSysFamily] = &[
-    fam(SCHEMA_TAB, "_schemas", crate::sys_rows::SCHEMA_TAB_SHAPE),
-    fam(COL_TAB, "_columns", crate::sys_rows::COL_TAB_SHAPE),
-    fam(CIRCUIT_TAB, "_circuits", crate::sys_rows::CIRCUIT_TAB_SHAPE),
-    fam(TABLE_TAB, "_tables", crate::sys_rows::TABLE_TAB_SHAPE),
-    fam(VIEW_TAB, "_views", crate::sys_rows::VIEW_TAB_SHAPE),
-    fam(IDX_TAB, "_indices", crate::sys_rows::IDX_TAB_SHAPE),
-    fam(SEQ_TAB, "_sequences", crate::sys_rows::SEQ_TAB_SHAPE),
+    fam(SCHEMA_TAB, "schemas", crate::sys_rows::SCHEMA_TAB_SHAPE),
+    fam(COL_TAB, "columns", crate::sys_rows::COL_TAB_SHAPE),
+    fam(CIRCUIT_TAB, "circuits", crate::sys_rows::CIRCUIT_TAB_SHAPE),
+    fam(TABLE_TAB, "tables", crate::sys_rows::TABLE_TAB_SHAPE),
+    fam(VIEW_TAB, "views", crate::sys_rows::VIEW_TAB_SHAPE),
+    fam(IDX_TAB, "indices", crate::sys_rows::IDX_TAB_SHAPE),
+    fam(SEQ_TAB, "sequences", crate::sys_rows::SEQ_TAB_SHAPE),
 ];
 
 /// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
@@ -220,6 +220,13 @@ pub fn first_duplicate<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&
 /// The schema a client's own aliases live in. No server holds it: it starts
 /// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
 pub const LOCAL_SCHEMA: &str = "_local";
+
+/// The schema the system families live in. No user can create it: it starts
+/// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
+pub const SYSTEM_SCHEMA: &str = "_system";
+
+/// The schemas a relation's name may spell that no user can create.
+pub const RESERVED_SCHEMAS: [&str; 2] = [LOCAL_SCHEMA, SYSTEM_SCHEMA];
 
 /// Reject empty names, names starting with `_` (reserved for the engine's own
 /// internal relation and index names) and names outside `[A-Za-z0-9_]`.

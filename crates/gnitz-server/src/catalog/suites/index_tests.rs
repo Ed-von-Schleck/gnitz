@@ -148,7 +148,7 @@ fn test_failed_create_index_rolls_back() {
         Vec::<i64>::new(),
         "a failed create must leave no stored weight under its id"
     );
-    for (family, batch) in &engine.drain_pending_broadcasts() {
+    for (family, batch, _) in &engine.drain_pending_broadcasts() {
         if *family == SysFamily::Index {
             assert!(
                 (0..batch.len()).all(|i| batch.get_weight(i) >= 0),

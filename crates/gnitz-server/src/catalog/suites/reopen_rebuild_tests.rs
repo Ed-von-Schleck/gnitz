@@ -278,13 +278,7 @@ fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
 
-    let vid = engine.allocate_ids(1).unwrap();
-    write_circuit(&mut engine, vid, distinct_circuit(tid));
-    engine.write_column_records(vid, &cols).unwrap();
-    engine
-        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, "v_traced"))
-        .unwrap();
-    backfill(&mut engine, vid, &[tid]);
+    let vid = traced_view(&mut engine, tid, "v_traced", &cols);
 
     engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();

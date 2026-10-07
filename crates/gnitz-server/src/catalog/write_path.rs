@@ -22,8 +22,11 @@ impl CatalogEngine {
             if batch.is_empty() {
                 continue;
             }
-            self.pending_broadcasts.push((family, batch.clone()));
-            self.apply_family(family, batch)?;
+            // What a worker's `ddl_sync` of this group will read: it applies the
+            // same groups in the same order.
+            let scanned = self.dag.is_scanned(family.id());
+            self.pending_broadcasts.push((family, batch.clone(), scanned));
+            self.apply_family(family, batch, false)?;
         }
         Ok(())
     }
@@ -100,14 +103,18 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Ingest one delta into its family's store and fire its hooks.
-    fn apply_family(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+    /// Ingest one delta into its family's store — above its cut iff `above` —
+    /// and fire its hooks.
+    fn apply_family(&mut self, family: SysFamily, mut batch: Batch, above: bool) -> Result<(), String> {
         let id = family.id();
-        let mut applied = self.registry.ingest_returning(id, batch)?;
+        match above {
+            true => self.registry.ingest_pending(id, batch.clone()),
+            false => self.registry.ingest(id, batch.clone()),
+        }?;
         // The hooks read the rows through the catalog's descriptor, not the
         // descriptor the delta arrived under.
-        applied.set_schema(family.schema());
-        self.fire_hooks(family, &applied)
+        batch.set_schema(family.schema());
+        self.fire_hooks(family, &batch)
     }
 
     /// Apply a push to ingestion point `tid`'s store, and hold its effect for the
@@ -126,10 +133,11 @@ impl CatalogEngine {
         }
     }
 
-    /// Apply one DdlSync group. Never queues.
+    /// Apply one DdlSync group: above the store's cut when a view scans the
+    /// family, for the tick the master sends behind the zone. Never queues.
     pub(crate) fn ddl_sync(&mut self, table_id: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
-        self.apply_family(family, batch)
+        self.apply_family(family, batch, self.dag.is_scanned(table_id))
     }
 
     // -- Broadcast queue, applied zone, directory sweep -------------------------
@@ -147,8 +155,18 @@ impl CatalogEngine {
 
     /// Drain the pending-broadcast queue. Taken by `emit_zone_to_sal` on success and
     /// by `compensate_stage_a` on failure.
-    pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
+    pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch, bool)> {
         std::mem::take(&mut self.pending_broadcasts)
+    }
+
+    /// The queued families a worker holds above its cut once the zone is
+    /// emitted, each owed the tick that seals it.
+    pub(crate) fn broadcasts_owed_a_tick(&self) -> Vec<u64> {
+        SysFamily::ALL
+            .into_iter()
+            .filter(|f| self.pending_broadcasts.iter().any(|(q, _, scanned)| q == f && *scanned))
+            .map(SysFamily::id)
+            .collect()
     }
 
     /// Remove every relation and index directory no live entity owns. Only sound once
@@ -173,7 +191,7 @@ impl CatalogEngine {
         self.drain_pending_broadcasts()
             .into_iter()
             .rev()
-            .try_for_each(|(family, batch)| self.apply_family(family, batch.negated()))
+            .try_for_each(|(family, batch, _)| self.apply_family(family, batch.negated(), false))
             .map_err(|e| {
                 format!(
                     "Stage-A DDL compensation failed — catalog cannot be restored, \

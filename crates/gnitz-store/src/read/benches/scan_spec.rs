@@ -8,7 +8,7 @@
 use std::hint::black_box;
 
 use super::tests::layout_of;
-use crate::relation::RelationKind;
+use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{cmp_const, cut, img, map_of, relation_fixture, rows_spec, RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
@@ -43,7 +43,7 @@ fn fixture(payload: &[TypeCode], indexed: &[u32], mut put_row: impl FnMut(&mut B
     }
     let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [bb.finish()]);
     let table = r.relation(TID).unwrap().table();
-    assert_eq!((table.all_shard_arcs().len(), table.runs().count()), (0, 1));
+    assert_eq!((table.all_shard_arcs().len(), table.runs(At::Now).count()), (0, 1));
     r
 }
 
@@ -173,7 +173,7 @@ fn scan_spec_bench() {
             Cut::before(img(width as i64)),
         );
         let bound = ReadBound::Range(range);
-        let (source, _) = r.open_bound(TID, bound.clone()).unwrap();
+        let (source, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(source, SourceCursor::Bounded(_)), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);
     }

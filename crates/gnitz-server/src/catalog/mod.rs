@@ -73,10 +73,10 @@ pub(crate) struct CatalogEngine {
     /// hands out. Boot raises it past every stored id; the precheck admits no id
     /// at or above it.
     pub(in crate::catalog) next_id: u64,
-    /// The master's applied families in apply order, each queued before its ingest:
-    /// the zone's broadcast and the undo log `compensate_stage_a` replays.
-    /// `ddl_sync` never enqueues.
-    pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch)>,
+    /// The master's applied families in apply order, each queued before its ingest
+    /// with whether a view scanned the family then: the zone's broadcast and the
+    /// undo log `compensate_stage_a` replays. `ddl_sync` never enqueues.
+    pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch, bool)>,
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) system_zone: u64,

@@ -304,6 +304,8 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
     known.insert(&in_sn("cp"), cp);
     let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
     known.insert(&in_sn("st"), st);
+    let sys = rel(44, RelClass::Catalog, vec![col("id", TypeCode::I64)], vec![0], vec![]);
+    known.insert(&in_sn("sys"), sys);
     for (sql, needle) in [
         ("CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p", "CTAS"),
         ("CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)", "TEMPORARY"),
@@ -329,6 +331,10 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",
             "is a stream",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES sys(id))",
+            "'sys' is a system table; a FOREIGN KEY target requires a base table",
         ),
         // A compound PK has no lone column, so a member qualifies only through a
         // UNIQUE index of its own.
@@ -614,10 +620,7 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
             "not found",
         ),
         ("CREATE TABLE db.other.t (id BIGINT PRIMARY KEY)", "too many name parts"),
-        (
-            "CREATE TABLE _system.t (id BIGINT PRIMARY KEY)",
-            "cannot start with '_'",
-        ),
+        ("CREATE TABLE _other.t (id BIGINT PRIMARY KEY)", "cannot start with '_'"),
     ] {
         let err = plan_table(&cat, sql).err().unwrap_or_else(|| panic!("`{sql}` planned"));
         assert!(format!("{err:?}").contains(needle), "`{sql}`: {err:?}");
