@@ -174,3 +174,110 @@ def test_a_cut_in_key_order_matches_a_full_sort(client):
     got = rows(client, "SELECT * FROM c ORDER BY a LIMIT 25")
     assert [r.a for r in got] == [-10] * 20 + [-9] * 5
     assert len({tuple(r) for r in got}) == 25
+
+
+# ---------------------------------------------------------------------------
+# A cut over many tied rows on every worker
+# ---------------------------------------------------------------------------
+
+
+def _sorted_by(data, keys):
+    """`data` (dict rows) ordered by `keys` — `(column, desc, nulls_first)` each — ties
+    in ascending `id`, the identity a cut breaks them by."""
+    out = sorted(data, key=lambda r: r["id"])
+    for col, desc, nulls_first in reversed(keys):
+        nulls = [r for r in out if r[col] is None]
+        # A reversed sort still keeps equal keys in their order.
+        vals = sorted((r for r in out if r[col] is not None), key=lambda r: r[col], reverse=desc)
+        out = nulls + vals if nulls_first else vals + nulls
+    return out
+
+
+def _window(entries, offset, limit):
+    """`entries` — `(row, weight)` in order — cut to logical rows `[offset, offset + limit)`."""
+    out, at = [], 0
+    for row, w in entries:
+        kept = min(at + w, offset + limit) - max(at, offset)
+        if kept > 0:
+            out.append((row, kept))
+        at += w
+    return out
+
+
+def _entries(got, cols):
+    """The result as `(values of cols, weight)` in order, one entry per run of equal rows."""
+    out = []
+    for r in got:
+        key = tuple(getattr(r, c) for c in cols)
+        if out and out[-1][0] == key:
+            out[-1] = (key, out[-1][1] + r._weight)
+        else:
+            out.append((key, r._weight))
+    return out
+
+
+def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
+    """Each worker trims thousands of rows whose leading key ties heavily — 16 values and
+    NULLs, strings sharing their first 8 bytes — to its own window, and the client cuts
+    their union. The result is the sorted prefix weight for weight, over a table and over
+    a `UNION ALL` view whose rows weigh 1 or 2, with a window that starts inside a row."""
+    client.execute_sql(
+        "CREATE TABLE big (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, s TEXT); "
+        "CREATE TABLE twice (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, s TEXT); "
+        "CREATE VIEW both AS SELECT * FROM big UNION ALL SELECT * FROM twice")
+    data = [{"id": i,
+             "v": None if i % 11 == 0 else (i * 7919) % 16,
+             "s": None if i % 13 == 0 else f"user_000{(i * 104729) % 977:04d}"}
+            for i in range(1, 6001)]
+    as_rows = [(r["id"], r["v"], r["s"]) for r in data]
+    for at in range(0, len(as_rows), 1000):
+        insert(client, "big", as_rows[at:at + 1000])
+        insert(client, "twice", [r for r in as_rows[at:at + 1000] if r[0] % 3 == 0])
+    cols = ("id", "v", "s")
+    values = lambda r: tuple(r[c] for c in cols)
+    weight = lambda r: 2 if r["id"] % 3 == 0 else 1
+
+    # `(ORDER BY, the keys it names, OFFSET, LIMIT)`; a cut breaks ties by ascending id.
+    for order, keys, offset, limit in [
+        ("v", [("v", False, False)], 0, 37),
+        ("v DESC", [("v", True, True)], 500, 37),
+        ("v NULLS FIRST", [("v", False, True)], 0, 700),
+        ("v DESC NULLS LAST", [("v", True, False)], 5400, 300),
+        ("s", [("s", False, False)], 0, 50),
+        ("s DESC NULLS LAST", [("s", True, False)], 20, 50),
+        ("s NULLS FIRST, v DESC", [("s", False, True), ("v", True, True)], 450, 40),
+        ("v, id DESC", [("v", False, False), ("id", True, True)], 300, 100),
+    ]:
+        q = f"SELECT * FROM big ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+        want = [(values(r), 1) for r in _sorted_by(data, keys)[offset:offset + limit]]
+        assert _entries(rows(client, q), cols) == want, q
+
+    # Uncut, ties are open: the written keys must be total for the order to be pinned.
+    for order, keys in [
+        ("v, id", [("v", False, False)]),
+        ("s DESC, id", [("s", True, True)]),
+    ]:
+        q = f"SELECT * FROM big ORDER BY {order}"
+        assert _entries(rows(client, q), cols) == [(values(r), 1) for r in _sorted_by(data, keys)], q
+
+    for order, keys in [
+        ("v, id", [("v", False, False)]),
+        ("s DESC, id", [("s", True, True)]),
+    ]:
+        full = [(r, weight(r)) for r in _sorted_by(data, keys)]
+        # The window opens on the second logical row of the first weight-2 entry past 40.
+        first = next(i for i, (_, w) in enumerate(full) if i >= 40 and w == 2)
+        offset = sum(w for _, w in full[:first]) + 1
+        for limit in (1, 2, 60):
+            q = f"SELECT * FROM both ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+            want = [(values(r), w) for r, w in _window(full, offset, limit)]
+            assert want[0][1] == 1, q
+            assert _entries(rows(client, q), cols) == want, q
+    # Ordered by the leading key alone, the view's ties break by its own identity; the
+    # values the window holds are fixed all the same.
+    full = [(r, weight(r)) for r in _sorted_by(data, [("v", False, False)])]
+    got = rows(client, "SELECT v FROM both ORDER BY v LIMIT 900 OFFSET 333")
+    want = {}
+    for r, w in _window(full, 333, 900):
+        want[(r["v"],)] = want.get((r["v"],), 0) + w
+    assert bag(got) == dict(sorted(want.items(), key=repr))

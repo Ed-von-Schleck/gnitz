@@ -15,9 +15,9 @@ use crate::bind::bind_constant;
 use crate::bind::{require_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
-use crate::dml::plan::{rows_reply, RowsReply};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
+use crate::hir::RowsReply;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
@@ -354,11 +354,8 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
         .returning
         .as_deref()
         .map(|items| {
-            let RowsReply { schema: out_schema, program, .. } = rows_reply(
-                crate::hir::bind_returning(items, &target, table_name.spelled_name())?,
-                &[],
-                &target,
-            )?;
+            let RowsReply { schema: out_schema, program, .. } =
+                crate::hir::bind_returning(items, &target, table_name.spelled_name())?.reply(&[])?;
             let map = program
                 .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                 .transpose()?;

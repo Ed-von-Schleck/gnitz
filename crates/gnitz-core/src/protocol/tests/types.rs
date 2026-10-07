@@ -464,10 +464,10 @@ fn retain_ranges_keeps_the_named_runs_in_order() {
 #[test]
 fn a_cut_gather_matches_a_row_by_row_rebuild() {
     let (schema, b) = string_batch();
-    let picks = [(2usize, 1i64), (0, 1), (3, 4)];
+    let picks = [2u32, 0, 3];
     let mut want = ZSetBatch::new(&schema);
-    for &(r, w) in &picks {
-        want.copy_row_at(&b, r, w);
+    for &r in &picks {
+        want.copy_row_at(&b, r as usize, b.weights[r as usize]);
     }
     let got = b.gather(&picks);
     assert_eq!(rows(&got), rows(&want));
@@ -492,36 +492,24 @@ fn a_copied_row_differs_only_where_it_is_patched() {
     );
 }
 
-/// A gather naming every row in place at its own weight is the batch itself; one
-/// clipped weight is not.
+/// A gather naming every row in place is the batch itself.
 #[test]
 fn an_in_place_gather_is_the_batch() {
     let (schema, b) = string_batch();
-    let in_place: Vec<(usize, i64)> = b.weights.iter().copied().enumerate().collect();
+    let in_place: Vec<u32> = (0..b.len() as u32).collect();
     let weights = b.weights.as_ptr();
     let got = b.gather(&in_place);
     assert_eq!(got.weights.as_ptr(), weights);
-
-    let mut clipped = in_place;
-    let last = clipped.len() - 1;
-    clipped[last].1 += 1;
-    let weights = got.weights.as_ptr();
-    let cut = got.gather(&clipped);
-    assert_ne!(cut.weights.as_ptr(), weights);
-    assert_eq!(cut.weights[last], clipped[last].1);
-    cut.validate(&schema).unwrap();
+    got.validate(&schema).unwrap();
 }
 
 /// A gather keeping every row moves the arena whole: every cell keeps its offset.
 #[test]
 fn a_whole_gather_moves_the_arena() {
     let (schema, b) = string_batch();
-    let perm = [(3usize, 1i64), (1, 1), (0, 2), (2, 1)];
+    let perm = [3u32, 1, 0, 2];
     let all = rows(&b);
-    let want: Vec<Row> = perm
-        .iter()
-        .map(|&(r, w)| (all[r].0, w, all[r].2.clone(), all[r].3))
-        .collect();
+    let want: Vec<Row> = perm.iter().map(|&r| all[r as usize].clone()).collect();
     let arena = b.blob.as_ptr();
     let got = b.gather(&perm);
     assert_eq!(got.blob.as_ptr(), arena);

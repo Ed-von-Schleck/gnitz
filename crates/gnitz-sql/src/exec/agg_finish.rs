@@ -33,13 +33,13 @@ pub(crate) struct FoldFinish {
 impl FoldFinish {
     pub(crate) fn new(
         partial_schema: Arc<Schema>,
-        ops: impl IntoIterator<Item = WireAggFunc>,
+        aggs: &[gnitz_wire::AggDescriptor],
         having: &[BoundExpr],
         finalize: Vec<(BoundExpr, ColumnDef)>,
     ) -> Result<FoldFinish, GnitzSqlError> {
-        let merge = ops
-            .into_iter()
-            .map(|op| match op.merge_op() {
+        let merge = aggs
+            .iter()
+            .map(|d| match d.agg_op {
                 WireAggFunc::Min => Some(Ordering::Less),
                 WireAggFunc::Max => Some(Ordering::Greater),
                 _ => None,

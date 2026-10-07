@@ -1675,9 +1675,9 @@ impl TxnBuffer {
         let Some(index) = self.last_op_of.get(&tid) else {
             return Ok(committed);
         };
-        let keep: Vec<(usize, i64)> = (0..committed.len())
+        let keep: Vec<u32> = (0..committed.len())
             .filter(|&i| !index.contains_key(committed.pks.get_bytes(i)))
-            .map(|i| (i, committed.weights[i]))
+            .map(|i| i as u32)
             .collect();
         // `gather` compacts the string arena the dropped rows carried.
         let mut out = committed.gather(&keep);
@@ -1708,11 +1708,7 @@ impl TxnBuffer {
             live.retain_ranges(&ranges);
             live.nulls.fill(0);
         } else {
-            let kept: Vec<(usize, i64)> = ranges
-                .iter()
-                .flat_map(|&(s, e)| s..e)
-                .map(|r| (r, live.weights[r]))
-                .collect();
+            let kept: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
             live = live.gather(&kept);
         }
         out.extend_from_owned(live);

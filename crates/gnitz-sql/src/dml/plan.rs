@@ -1,20 +1,13 @@
 //! WHERE → access path for every direct-read verb ([`access_path`], over the
-//! candidates [`crate::access`] recognizes), and the rows reply a projection produces
-//! ([`rows_reply`]).
-
-use std::sync::Arc;
+//! candidates [`crate::access`] recognizes).
 
 use crate::access::{candidates, residual, Candidate};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
-use crate::hir::AdhocRows;
 use crate::ir::BoundExpr;
-use crate::project::{projection_program, ProjItem};
-use crate::tail::wire_keys;
-use gnitz_core::{RelDescriptor, Schema};
-use gnitz_expr::LogicalProgram;
+use gnitz_core::Schema;
+use gnitz_wire::ReadBound;
 use gnitz_wire::RelIndex;
-use gnitz_wire::{OrderKey, ReadBound};
 use sqlparser::ast::Expr;
 
 // ---------------------------------------------------------------------------
@@ -61,139 +54,6 @@ pub(super) fn bound_and_predicate(
         return Err(e);
     }
     Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, &schema.columns)?))
-}
-
-// ---------------------------------------------------------------------------
-// The rows reply
-// ---------------------------------------------------------------------------
-
-/// The rows reply a projection over a relation produces.
-pub(crate) struct RowsReply {
-    /// The reply's regions under the SELECT list's numbering: the key columns no
-    /// item names, hidden, then the items — a key column at the first item that
-    /// copies it, every other item a payload column.
-    pub(crate) schema: Arc<Schema>,
-    /// The program filling the reply's payload from a source row; `None` when the
-    /// reply's regions are the relation's own.
-    pub(crate) program: Option<LogicalProgram>,
-    /// The ORDER BY keys over `schema`.
-    pub(crate) order: Vec<OrderKey>,
-    /// `order` as the worker's sink numbers its input: the program's output, key
-    /// region first, or the relation where there is no program.
-    pub(crate) sink_order: Vec<OrderKey>,
-    /// Whether `order` ascends a leading run of the relation's PK columns, so
-    /// rows in store order are already in it.
-    pub(crate) pk_ordered: bool,
-    /// `(relation column, reply column)` for each relation column an item copies
-    /// verbatim, at the first item that does.
-    pub(crate) copied: Vec<(u32, u32)>,
-}
-
-/// The rows reply `rows` produces over `desc`, ordered by `keys`.
-pub(crate) fn rows_reply(
-    rows: AdhocRows,
-    keys: &[crate::tail::OrderKey<'_>],
-    desc: &Arc<RelDescriptor>,
-) -> Result<RowsReply, GnitzSqlError> {
-    let AdhocRows { items, cols, placed } = rows;
-    let schema = &desc.schema;
-    let k = schema.pk_cols.len();
-    // Keyed by item.
-    let item_order = wire_keys(keys, &cols, placed)?;
-    let pk_ordered = leads_with_pk(&item_order, &items, &schema.pk_cols);
-
-    // The first visible item copying a key column is that column of the key
-    // region, which the reply carries once.
-    let mut named: Vec<Option<usize>> = vec![None; k];
-    for (i, (item, col)) in items.iter().zip(&cols).enumerate().skip(k) {
-        let key = schema
-            .pk_cols
-            .iter()
-            .position(|&pk| item.passthrough_src() == Some(pk as usize));
-        if let Some(j) = key.filter(|&j| !col.is_hidden && named[j].is_none()) {
-            named[j] = Some(i);
-        }
-    }
-
-    // Each item's column in the reply, and as the program's output numbers it.
-    let (mut reply_at, mut sink_at) = (vec![0u16; items.len()], vec![0u16; items.len()]);
-    let (mut columns, mut pk_cols) = (Vec::with_capacity(items.len()), vec![0u32; k]);
-    let (mut payload, mut payload_cols) = (Vec::new(), Vec::new());
-    let mut sources = Vec::with_capacity(items.len());
-    for (i, (item, col)) in items.into_iter().zip(cols).enumerate() {
-        sources.push(item.passthrough_src());
-        let key = match i < k {
-            true => named[i].is_none().then_some(i),
-            false => named.iter().position(|&n| n == Some(i)),
-        };
-        match (key, i < k) {
-            // A key column an item names stands at that item.
-            (None, true) => continue,
-            (Some(j), _) => {
-                pk_cols[j] = columns.len() as u32;
-                (reply_at[j], sink_at[j]) = (columns.len() as u16, j as u16);
-                sink_at[i] = j as u16;
-            }
-            (None, false) => {
-                sink_at[i] = (k + payload.len()) as u16;
-                payload.push(item);
-                payload_cols.push(col.clone());
-            }
-        }
-        reply_at[i] = columns.len() as u16;
-        columns.push(col);
-    }
-
-    // The relation's payload columns, each copied in place at its own type: the
-    // reply's regions are the relation's.
-    let copied = payload
-        .iter()
-        .zip(&payload_cols)
-        .map(|(item, col)| (item.passthrough_src(), &col.ty));
-    let unmapped = copied.eq(schema.payload_columns().map(|(_, ci, col)| (Some(ci), &col.ty)));
-    let renumbered = |at: &dyn Fn(usize) -> u16| -> Vec<OrderKey> {
-        item_order
-            .iter()
-            .map(|key| OrderKey { col: at(key.col as usize), ..*key })
-            .collect()
-    };
-    let (program, sink_order) = match unmapped {
-        true => {
-            let source = |i: usize| sources[i].expect("a key or an unmapped payload column is copied") as u16;
-            (None, renumbered(&source))
-        }
-        false => (
-            Some(projection_program(&payload, &payload_cols, schema)?),
-            renumbered(&|i| sink_at[i]),
-        ),
-    };
-    let mut copied: Vec<(u32, u32)> = Vec::new();
-    for (i, src) in sources.iter().enumerate() {
-        if let Some(src) = src.map(|s| s as u32).filter(|s| copied.iter().all(|(c, _)| c != s)) {
-            copied.push((src, reply_at[i] as u32));
-        }
-    }
-    let reply =
-        Schema::from_parts(columns, pk_cols).map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
-    Ok(RowsReply {
-        schema: Arc::new(reply),
-        program,
-        order: renumbered(&|i| reply_at[i]),
-        sink_order,
-        pk_ordered,
-        copied,
-    })
-}
-
-/// Whether `order`, over `items`, ascends a leading run of `pk_cols`, each key a
-/// verbatim copy of its column. The stored key's byte order is the typed order of
-/// those columns.
-fn leads_with_pk(order: &[OrderKey], items: &[ProjItem], pk_cols: &[u32]) -> bool {
-    order.len() <= pk_cols.len()
-        && order
-            .iter()
-            .zip(pk_cols)
-            .all(|(key, &pk)| !key.desc && items[key.col as usize].passthrough_src() == Some(pk as usize))
 }
 
 /// Whether a worker reading under `bound` yields its rows in ascending PK order:

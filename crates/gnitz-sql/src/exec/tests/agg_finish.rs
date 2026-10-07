@@ -37,13 +37,7 @@ pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     let crate::hir::AdhocRead::Relation { shape: AdhocShape::Fold(pieces, _), .. } = read else {
         panic!("{sql}: not a fold");
     };
-    FoldFinish::new(
-        pieces.partial_schema,
-        pieces.agg.aggs.iter().map(|d| d.agg_op),
-        &pieces.having,
-        pieces.finalize,
-    )
-    .unwrap()
+    FoldFinish::new(pieces.partial_schema, &pieces.agg.aggs, &pieces.having, pieces.finalize).unwrap()
 }
 
 /// A concatenated partial reply to `f`: one weight-1 row per `(key, cells)`, the key as

@@ -237,6 +237,12 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
                     di.cmp(dj),
                     "compare mismatch for {di:?} vs {dj:?}",
                 );
+                // The lead decides only what the contents decide the same way.
+                let lead = german_string_lead(&x.0[i], &x.1).cmp(&german_string_lead(&y.0[j], &y.1));
+                assert!(
+                    lead == Ordering::Equal || lead == di.cmp(dj),
+                    "lead of {di:?} vs {dj:?}"
+                );
             }
         }
     }

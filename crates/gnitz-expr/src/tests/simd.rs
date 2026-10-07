@@ -32,12 +32,7 @@ fn operand_lanes() -> (Vec<i64>, Vec<i64>) {
         }
     }
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state as i64
-    };
+    let mut next = move || crate::test_support::xorshift(&mut state) as i64;
     while !a.len().is_multiple_of(64) || a.len() < 512 {
         let (x, y) = (next(), next());
         let small = a.len().is_multiple_of(3);

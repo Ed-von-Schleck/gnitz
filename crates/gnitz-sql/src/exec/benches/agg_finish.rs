@@ -4,8 +4,8 @@ use crate::test_support::{col, ncol, table};
 use gnitz_core::BatchAppender;
 use gnitz_wire::TypeCode;
 
-/// Instructions per partial row of `combine` over four workers' replies, each as long as a
-/// store's default ad-hoc group cap and holding a group at most once.
+/// Instructions per partial row of `combine` over four workers' replies, each holding a
+/// group at most once.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn agg_combine_bench() {

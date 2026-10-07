@@ -21,7 +21,7 @@ mod setop;
 mod spine;
 mod topn;
 
-use super::physical::{self, Frame, Rename};
+use super::physical::{self, Frame, Rename, Slot};
 use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
@@ -45,7 +45,7 @@ pub(crate) struct ReduceSpecs {
     pub(crate) specs: Vec<AggDescriptor>,
     /// Each spec's output column, parallel to `specs`; `None` for one no reference
     /// names.
-    pub(crate) cols: Vec<(Option<ColId>, ColumnDef)>,
+    pub(crate) cols: Vec<Slot>,
 }
 
 impl ReduceSpecs {
@@ -84,7 +84,7 @@ pub(crate) fn keyed_frame(
     input: &Frame,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
-    tail: Vec<(Option<ColId>, ColumnDef)>,
+    tail: Vec<Slot>,
 ) -> Result<Frame, GnitzSqlError> {
     let slots = input.schema.reduce_out_key(group).output_layout(group, row);
     let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
@@ -223,7 +223,7 @@ pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result
         }
     }
     let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
-    top.out.schema = Arc::new(top.out.schema_in_order(visible)?);
+    top.out.schema = Arc::new(top.out.schema_in_order(visible)?.0);
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
         return Err(GnitzSqlError::Rejected(

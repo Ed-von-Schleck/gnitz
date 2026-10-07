@@ -263,6 +263,29 @@ fn a_refused_insert_names_its_rule() {
     }
 }
 
+/// RETURNING a relation's own columns replies in the relation's regions, numbered by the
+/// list, with no program — wherever the key stands in the relation.
+#[test]
+fn returning_a_relations_columns_ships_no_program() {
+    let i = TypeCode::I64;
+    let cat = catalog(vec![("m", table(1, vec![col("v", i), col("id", i)], vec![1]))]);
+    for (list, names, key) in [
+        ("v, id", ["v", "id"], 1u32),
+        ("id, v", ["id", "v"], 0),
+        ("*", ["v", "id"], 1),
+    ] {
+        let plan = insert(&cat, &format!("INSERT INTO m VALUES (10, 1) RETURNING {list}")).unwrap();
+        let (schema, map) = plan.returning.unwrap();
+        assert!(map.is_none(), "RETURNING {list}");
+        let got: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            (got, &schema.pk_cols[..]),
+            (names.to_vec(), &[key][..]),
+            "RETURNING {list}"
+        );
+    }
+}
+
 /// ON CONFLICT pushes each VALUES row whose key nothing holds, and for a held
 /// key nothing (DO NOTHING) or the held row rewritten by the SET list, which
 /// reads `EXCLUDED` off the VALUES row that collided with it. `held` is the rows

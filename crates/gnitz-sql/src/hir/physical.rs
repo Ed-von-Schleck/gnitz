@@ -14,6 +14,9 @@ use gnitz_wire::ColumnDef;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// A frame slot: the identity that names it, if any, and its column.
+pub(crate) type Slot = (Option<ColId>, ColumnDef);
+
 /// A relation's physical addressing: the `ColId` at each slot and the schema
 /// typing those slots. A reference resolves to a position in `layout` and is
 /// typed against `schema` at that position, so the two travel as one value.
@@ -27,10 +30,7 @@ pub(crate) struct Frame {
 impl Frame {
     /// `slots` behind a leading key region of `npk`, admitted as a schema the
     /// engine can hold.
-    pub(crate) fn new(
-        slots: impl IntoIterator<Item = (Option<ColId>, ColumnDef)>,
-        npk: usize,
-    ) -> Result<Frame, GnitzSqlError> {
+    pub(crate) fn new(slots: impl IntoIterator<Item = Slot>, npk: usize) -> Result<Frame, GnitzSqlError> {
         let (layout, columns): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
         Ok(Frame {
             layout,
@@ -41,7 +41,7 @@ impl Frame {
     /// `pk_cols` as an identity-free leading key region, then `payload`.
     pub(crate) fn keyed(
         pk_cols: Vec<ColumnDef>,
-        payload: impl IntoIterator<Item = (Option<ColId>, ColumnDef)>,
+        payload: impl IntoIterator<Item = Slot>,
     ) -> Result<Frame, GnitzSqlError> {
         let npk = pk_cols.len();
         Frame::new(pk_cols.into_iter().map(|d| (None, d)).chain(payload), npk)
@@ -95,7 +95,10 @@ impl Frame {
     /// the payload order puts it. The regions are this frame's own, so the engine
     /// relabels a batch rather than moving a column. Refused for a `root` that
     /// would move a payload column.
-    pub(crate) fn schema_in_order(&self, root: impl IntoIterator<Item = ColId>) -> Result<Schema, GnitzSqlError> {
+    pub(crate) fn schema_in_order(
+        &self,
+        root: impl IntoIterator<Item = ColId>,
+    ) -> Result<(Schema, Vec<u32>), GnitzSqlError> {
         let internal = |m: &str| GnitzSqlError::Internal(format!("output order: {m}"));
         let is_pk = |s: usize| self.schema.is_pk_col(s);
         let mut rooted = vec![false; self.layout.len()];
@@ -125,11 +128,12 @@ impl Frame {
         for (to, &from) in order.iter().enumerate() {
             moved_to[from] = to as u32;
         }
-        Schema::from_parts(
+        let schema = Schema::from_parts(
             order.iter().map(|&s| self.schema.columns[s].clone()).collect(),
             self.schema.pk_cols.iter().map(|&s| moved_to[s as usize]).collect(),
         )
-        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
+        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
+        Ok((schema, moved_to))
     }
 
     /// This frame under `rename`'s identities. A slot it does not name loses its
@@ -173,12 +177,10 @@ impl Rename {
     }
 }
 
-/// A projection's slots over `input`, in output order: each entry resolved and
-/// classified, then the input's PK pinned to the leading slots.
-pub(crate) fn project_slots(
-    items: &[ProjEntry],
-    input: &Frame,
-) -> Result<Vec<(ProjItem, Option<ColId>, ColumnDef)>, GnitzSqlError> {
+/// A projection's slots over `input`, in output order — each entry resolved and
+/// classified, then the input's PK pinned to the leading slots — as the emission
+/// items and the identity and definition of each.
+pub(crate) fn project_slots(items: &[ProjEntry], input: &Frame) -> Result<(Vec<ProjItem>, Vec<Slot>), GnitzSqlError> {
     let mut slots = items
         .iter()
         .map(|e| {
@@ -192,7 +194,7 @@ pub(crate) fn project_slots(
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     place_pk_front(&mut slots, &input.schema);
-    Ok(slots)
+    Ok(slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip())
 }
 
 /// [`project_slots`] as emission items and the output frame.
@@ -200,10 +202,7 @@ pub(crate) fn physicalize_projection(
     items: &[ProjEntry],
     input: &Frame,
 ) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
-    let (proj, cols): (Vec<_>, Vec<_>) = project_slots(items, input)?
-        .into_iter()
-        .map(|(item, id, def)| (item, (id, def)))
-        .unzip();
+    let (proj, cols) = project_slots(items, input)?;
     Ok((proj, Frame::new(cols, input.schema.pk_cols.len())?))
 }
 

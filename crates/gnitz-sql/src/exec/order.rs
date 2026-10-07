@@ -2,7 +2,7 @@
 //! pass over a fetched result (base tables and views).
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{cmp_order_keys, order_locators};
+use gnitz_expr::{order_locators, RowRanking};
 
 /// The client-side cut a sink applies to its own result. `limit: None` is
 /// unbounded.
@@ -43,35 +43,50 @@ pub(crate) fn order_and_window(
     let end = window.end().unwrap_or(usize::MAX);
     let tiebroken = order_locators(order, schema);
     // A cut breaks ties by identity, so it keeps the rows the worker's top-k kept. Uncut ties
-    // stay open: equal keys sort in n·log k, a total order in n·log n.
+    // stay open: a total order costs every comparison of equal keys a read of the whole row.
     let keys = if cut { &tiebroken[..] } else { &tiebroken[..order.len()] };
-    let mut perm: Vec<usize> = (0..batch.len()).collect();
+    let mut ranking = RowRanking::new(keys, &batch);
     if !keys.is_empty() {
-        let cmp = |&a: &usize, &b: &usize| cmp_order_keys(keys, &batch, a, &batch, b);
         // Every entry holds at least one logical row, so the first `end` entries cover the window.
-        if end > 0 && end < perm.len() {
-            perm.select_nth_unstable_by(end - 1, cmp);
-            perm.truncate(end);
-        }
-        perm.sort_by(cmp);
+        ranking.keep_smallest(end);
     }
-    // Entry `r` holds logical rows `[at, at + w)`; it keeps their overlap with the window.
+    let rows = ranking.sorted();
+    if !cut {
+        return batch.gather(&rows);
+    }
+    // Entry `r` holds logical rows `[at, at + w)`; the window keeps `span` of the entries, whole
+    // but for what it clips off the first and the last.
     let mut at = 0usize;
-    let mut survivors = Vec::new();
-    for r in perm {
-        let next = at.saturating_add(batch.weights[r] as usize);
-        let kept = next.min(end).saturating_sub(at.max(window.offset));
+    let mut span = 0..0;
+    let (mut head, mut tail) = (0i64, 0i64);
+    for (i, &r) in rows.iter().enumerate() {
+        let next = at.saturating_add(batch.weights[r as usize] as usize);
+        let kept = next.min(end).saturating_sub(at.max(window.offset)) as i64;
         if kept > 0 {
-            survivors.push((r, kept as i64));
+            if span.is_empty() {
+                (span.start, head) = (i, kept);
+            }
+            (span.end, tail) = (i + 1, kept);
         }
         at = next;
         if at >= end {
             break;
         }
     }
-    batch.gather(&survivors)
+    let mut out = batch.gather(&rows[span]);
+    if let Some(w) = out.weights.first_mut() {
+        *w = head;
+    }
+    if let Some(w) = out.weights.last_mut() {
+        *w = tail;
+    }
+    out
 }
 
 #[cfg(test)]
 #[path = "tests/order.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/order.rs"]
+mod bench;

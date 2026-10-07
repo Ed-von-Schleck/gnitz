@@ -303,3 +303,12 @@ pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
         other => panic!("not a query: {other}"),
     }
 }
+
+/// One step of a xorshift generator over `state`: the deterministic stream the randomized
+/// tests and the benches draw from.
+pub(crate) fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}

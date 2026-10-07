@@ -3,8 +3,8 @@
 use std::cmp::Ordering;
 
 use crate::test_support::{TestSchema, TestView};
-use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator, SchemaFacts};
-use gnitz_wire::{FixedInt, OrderKey, TypeCode};
+use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator, RowRanking, SchemaFacts};
+use gnitz_wire::{FixedInt, OrderKey, RowSource, TypeCode};
 
 /// Every locator read of every key type, from a key column and from a payload
 /// slot holding the same values, against the value's own encoding.
@@ -182,4 +182,111 @@ fn a_pk_key_never_takes_the_null_arm() {
         let want = if desc { Ordering::Greater } else { Ordering::Less };
         assert_eq!(cmp_order_keys(&keys, &v, 0, &v, 1), want, "desc={desc}");
     }
+}
+
+/// `RowRanking` against the comparator it stands in for, over `keys` on `v`: `sorted` is the
+/// stable comparator sort, and under a total order `keep_smallest` keeps that sort's prefix.
+fn assert_ranks_as_the_comparator(keys: &[OrderLocator], total: bool, v: &TestView, label: &str) {
+    let n = v.row_count();
+    let mut want: Vec<u32> = (0..n as u32).collect();
+    want.sort_by(|&a, &b| cmp_order_keys(keys, v, a as usize, v, b as usize));
+    assert_eq!(RowRanking::new(keys, v).sorted(), want, "{label}");
+    if !total {
+        return;
+    }
+    for k in [0, 1, n / 3, n - 1, n, n + 1] {
+        let mut ranking = RowRanking::new(keys, v);
+        ranking.keep_smallest(k);
+        let mut kept: Vec<u32> = ranking.rows().collect();
+        kept.sort_unstable();
+        let mut prefix = want[..k.min(n)].to_vec();
+        prefix.sort_unstable();
+        assert_eq!(kept, prefix, "{label} k={k}");
+        assert_eq!(ranking.sorted(), want[..k.min(n)], "{label} k={k}");
+    }
+}
+
+/// A leading key of every type, as a payload column with NULLs on both sides of a tie and, where
+/// the type allows, as a key column: in both directions and NULL placements, alone (its ties
+/// left in input order) and under the identity tiebreak.
+#[test]
+fn a_ranking_orders_rows_as_the_comparator_does() {
+    const ROWS: usize = 48;
+    // Values that tie, that differ only in the low half of 16 bytes, and that cross each
+    // width's sign bit.
+    const PATTERNS: &[u128] = &[
+        0,
+        1,
+        0x7F,
+        0x80,
+        0xFF,
+        0x7FFF,
+        0x8000,
+        1 << 31,
+        i64::MAX as u128,
+        1 << 63,
+        u64::MAX as u128,
+        1 << 64,
+        (1 << 64) + 1,
+        i128::MAX as u128,
+        1 << 127,
+        u128::MAX,
+    ];
+    const STRINGS: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"a\0",
+        b"abcdefgh",
+        b"abcdefgh\0",
+        b"abcdefghi",
+        b"abcdefghijklmnop",
+        b"abcdefghijklmnoq",
+        b"b",
+    ];
+    let mut st = 0x9E3779B97F4A7C15u64;
+    let mut rng = move || crate::test_support::xorshift(&mut st) as usize;
+    for &tc in TypeCode::ALL {
+        // `(key column 0, the leading key, a payload column)`, the leading key a payload column.
+        let schema = TestSchema::new(&[(TypeCode::U64, false), (tc, true), (TypeCode::I64, false)], &[0]);
+        let mut v = TestView::for_schema(&schema, ROWS);
+        for row in 0..ROWS {
+            match tc.is_german_string() {
+                true => v.set_string(row, 0, STRINGS[rng() % STRINGS.len()]),
+                false => v.set_native(&schema, row, 1, PATTERNS[rng() % PATTERNS.len()]),
+            }
+            if rng() % 5 == 0 {
+                v.set_null(row, 0);
+            }
+            v.set_int(row, 1, (rng() % 3) as i64);
+        }
+        let mut cases = vec![(schema, v, 1u16)];
+        if tc.is_pk_eligible() {
+            // The leading key the first of two key columns, the second telling its ties apart.
+            let schema = TestSchema::new(&[(tc, false), (TypeCode::U16, false), (TypeCode::I64, true)], &[0, 1]);
+            let mut v = TestView::for_schema(&schema, ROWS);
+            for row in 0..ROWS {
+                v.set_native(&schema, row, 0, PATTERNS[rng() % PATTERNS.len()]);
+            }
+            cases.push((schema, v, 0));
+        }
+        for (schema, v, col) in &cases {
+            for (desc, nulls_first) in [(false, false), (false, true), (true, false), (true, true)] {
+                let label = format!("{tc} column {col} desc={desc} nulls_first={nulls_first}");
+                let total = order_locators(&[OrderKey { col: *col, desc, nulls_first }], schema);
+                assert_ranks_as_the_comparator(&total[..1], false, v, &label);
+                assert_ranks_as_the_comparator(&total, true, v, &label);
+                // A second written key, ranked by its own image inside the first's ties.
+                let second = OrderKey { col: 2, desc: !desc, nulls_first };
+                let two = order_locators(&[OrderKey { col: *col, desc, nulls_first }, second], schema);
+                assert_ranks_as_the_comparator(&two[..2], false, v, &label);
+            }
+        }
+    }
+    let schema = TestSchema::new(&[(TypeCode::U64, false)], &[0]);
+    let v = TestView::for_schema(&schema, 5);
+    assert_eq!(
+        RowRanking::new(&[], &v).sorted(),
+        [0, 1, 2, 3, 4],
+        "no key keeps input order"
+    );
 }

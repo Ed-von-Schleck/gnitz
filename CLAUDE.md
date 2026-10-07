@@ -338,7 +338,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 |-------|------|
 | `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and the syscall idioms `std` lacks — independent leaves every other crate may name |
 | `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
-| `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through |
+| `gnitz-expr` | The one expression evaluator, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
 | `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle |

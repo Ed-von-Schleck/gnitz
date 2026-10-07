@@ -173,6 +173,17 @@ pub fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
     }
 }
 
+/// A cell's first 8 content bytes, zero-padded, big-endian: an integer whose order never
+/// contradicts [`compare_german_strings`].
+#[inline(always)]
+pub fn german_string_lead(cell: &[u8], blob: &[u8]) -> u64 {
+    let content = german_string_content(cell, blob);
+    let mut lead = [0u8; 8];
+    let n = content.len().min(8);
+    lead[..n].copy_from_slice(&content[..n]);
+    u64::from_be_bytes(lead)
+}
+
 /// Byte-lexicographic order over two German string cells — the order
 /// `compare_rows`, every merge heap and every compaction sorts by.
 #[inline(always)]

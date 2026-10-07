@@ -1,11 +1,11 @@
 //! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
 //! with no aggregate — as layout for a stateless fold the client finishes. It
 //! shares `lower::reduce`'s rules, output key included, and builds no evaluator.
-//! Its input is the flat body [`super::read`] composes: the reduce, or the
-//! DISTINCT's projection, directly over the relation read.
+//! Its input is the pieces of the flat body [`super::read`] composes: the reduce, or
+//! the DISTINCT's projection, directly over the relation read.
 
 use super::super::physical::{self, Frame};
-use super::super::{as_col, split_filter, AggCol, ColId, HirExpr, ProjEntry, RelExpr};
+use super::super::{as_col, AggCol, ColId, HirExpr, ProjEntry};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
@@ -43,72 +43,36 @@ pub(crate) struct FoldPieces {
     pub(crate) finalize: Vec<(BoundExpr, ColumnDef)>,
 }
 
-/// The relation a bound fold body reads, as a frame.
-fn source_frame(base: &RelExpr) -> Result<Frame, GnitzSqlError> {
-    let RelExpr::Get { desc, cols } = base else {
-        return Err(GnitzSqlError::Internal(
-            "an ad-hoc fold body does not read a relation".into(),
-        ));
+/// `SELECT DISTINCT items` over `src`. Bare items group the source columns where they lie; any
+/// computed item makes the projection the pre-map and groups its columns.
+pub(super) fn distinct_fold(src: Frame, items: &[ProjEntry]) -> Result<FoldPieces, GnitzSqlError> {
+    let (pre, group_cols) = match items.iter().map(|e| as_col(&e.expr)).collect::<Option<Vec<_>>>() {
+        Some(ids) => (None, ids),
+        None => (Some(items), items.iter().map(|e| e.out.id).collect()),
     };
-    Ok(Frame::scan(desc, cols))
-}
-
-/// Lower a flat ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces.
-pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
-    match rel {
-        RelExpr::Distinct { input } => {
-            let RelExpr::Project { input: base, items } = input.as_ref() else {
-                return Err(GnitzSqlError::Internal(
-                    "ad-hoc SELECT DISTINCT body is not a projection".into(),
-                ));
-            };
-            // Bare items group the source columns where they lie; any computed item
-            // makes the projection the pre-map and groups its columns.
-            let (pre, group_cols) = match items.iter().map(|e| as_col(&e.expr)).collect::<Option<Vec<_>>>() {
-                Some(ids) => (None, ids),
-                None => (Some(items.as_slice()), items.iter().map(|e| e.out.id).collect()),
-            };
-            // Every item passes its own group column through: the reduce already
-            // evaluated a computed one into that column.
-            let finalize: Vec<ProjEntry> = items
-                .iter()
-                .zip(&group_cols)
-                .map(|(e, &id)| ProjEntry {
-                    expr: BExpr::ColRef(id),
-                    out: e.out.clone(),
-                })
-                .collect();
-            fold(base, pre, &group_cols, &[], &[], &finalize)
-        }
-        RelExpr::Project { input, items } => {
-            // HAVING is a Filter between the projection and the reduce.
-            let (having, reduce) = split_filter(input);
-            let RelExpr::Reduce { input, group_cols, aggs } = reduce.as_ref() else {
-                return Err(GnitzSqlError::Internal("ad-hoc grouped body has no reduce".into()));
-            };
-            let (pre, base) = match input.as_ref() {
-                RelExpr::Project { input, items } => (Some(items.as_slice()), input),
-                _ => (None, input),
-            };
-            fold(base, pre, group_cols, aggs, having, items)
-        }
-        _ => Err(GnitzSqlError::Internal(
-            "ad-hoc grouped body is not a projection".into(),
-        )),
-    }
+    // Every item passes its own group column through: the reduce already evaluated a computed
+    // one into that column.
+    let finalize: Vec<ProjEntry> = items
+        .iter()
+        .zip(&group_cols)
+        .map(|(e, &id)| ProjEntry {
+            expr: BExpr::ColRef(id),
+            out: e.out.clone(),
+        })
+        .collect();
+    fold(src, pre, &group_cols, &[], &[], &finalize)
 }
 
 /// The fold of `group_cols` / `aggs` over `pre` (or the source itself) applied to
-/// `base`, then `having` and `finalize` over the partial reply.
-fn fold(
-    base: &RelExpr,
+/// `src`, then `having` and `finalize` over the partial reply.
+pub(super) fn fold(
+    src: Frame,
     pre: Option<&[ProjEntry]>,
     group_cols: &[ColId],
     aggs: &[AggCol],
     having: &[HirExpr],
     finalize: &[ProjEntry],
 ) -> Result<FoldPieces, GnitzSqlError> {
-    let src = source_frame(base)?;
     // The pre-map, physicalized over the source — the same projection `lower_reduce`
     // fuses, so the reduce input's column order is identical on both paths.
     let (reduce_in, map) = match pre {

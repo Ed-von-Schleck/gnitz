@@ -718,6 +718,9 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ),
         // ORDER BY parses before the SELECT list binds, on every surface.
         ("SELECT nope FROM t ORDER BY 1.5", "ORDER BY position"),
+        // The reply is numbered after the WHERE compiles, so a statement wrong in both
+        // reports the WHERE.
+        ("SELECT v FROM t WHERE v ORDER BY 2", "a condition must be BOOLEAN"),
         ("SELECT id FROM jv", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "not found"),

@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{
     between, cut, img, make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec,
-    RelationFixture, TID,
+    RelationFixture, Rng, TID,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::TypeCode;
@@ -723,4 +723,48 @@ fn drain_ramp_doubles_onto_the_chunk_grid() {
         drain_ramp(chunk, chunk).take(4).all(|rows| rows == chunk),
         "an unwindowed drain stays flat"
     );
+}
+
+/// An ordered cut over many chunks keeps what a sort of every row keeps: the smallest rows
+/// by `(val, id)` whose weight covers the window, the boundary row whole.
+#[test]
+fn a_chunked_top_k_is_the_sorted_prefix() {
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
+    let mut rng = move || rng.next_u64();
+    let schema = make_schema_u64_i64();
+    for round in 0..300 {
+        let n = 1 + rng() % 200;
+        let shape = rng() % 5;
+        let rows: Vec<(u64, i64, i64)> = (0..n)
+            .map(|id| {
+                let val = match shape {
+                    0 => id as i64,
+                    1 => -(id as i64),
+                    2 => (rng() % 4) as i64,
+                    3 => (rng() % 1000) as i64 - 500,
+                    _ => 7,
+                };
+                (id, 1 + (rng() % 3) as i64, val)
+            })
+            .collect();
+        let mut r = view(&rows);
+        r.set_scan_chunk_rows(1 + (rng() % 16) as usize);
+        let (desc, k) = (rng() % 2 == 0, 1 + rng() % 40);
+        let mut sorted = rows.clone();
+        sorted.sort_by_key(|&(id, _, val)| (if desc { -val } else { val }, id));
+        let mut covered = 0i64;
+        let mut want: Vec<_> = sorted
+            .into_iter()
+            .take_while(|&(_, w, _)| {
+                let take = covered < k as i64;
+                covered += w;
+                take
+            })
+            .collect();
+        want.sort_unstable();
+        for map in [None, map_of(LogicalProgram::copy_cols(&[1]), &schema)] {
+            let got = run(&r, rows_spec(map, cut(k, order_by(1, desc)))).unwrap();
+            assert_eq!(rows_of(&got), want, "round {round} shape {shape} desc {desc} k {k}");
+        }
+    }
 }

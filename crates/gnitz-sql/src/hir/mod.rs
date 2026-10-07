@@ -53,7 +53,7 @@ pub(crate) fn bind_and_lower<'a>(
 }
 
 pub(crate) use lower::fold::FoldPieces;
-pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape};
+pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape, RowsReply};
 
 /// The ad-hoc read path's entry to the same core: bind a query that reads one
 /// relation — its CTEs, then its body — and lower it to one read of that

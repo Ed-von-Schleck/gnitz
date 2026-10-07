@@ -25,12 +25,12 @@
 use crate::agg::ground_partial_schema;
 use crate::ast_util::{body_is_grouped, classify_from, extract_table_name_and_alias, select_is_distinct, FromShape};
 use crate::bind::Catalog;
-use crate::dml::plan::{bound_and_predicate, rows_reply, walks_in_pk_order, RowsReply};
+use crate::dml::plan::{bound_and_predicate, walks_in_pk_order};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces};
+use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces, RowsReply};
 use crate::ir::BoundExpr;
 use crate::project::compute_map;
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, wire_keys};
@@ -107,7 +107,7 @@ impl ReadPlan {
     /// that read of a delta.
     pub(crate) fn into_subscription(self) -> Result<gnitz_core::Subscription, GnitzSqlError> {
         // Only a LIMIT cuts the sink, so no window is no cut.
-        let plain = self.order.is_empty() && self.window.offset == 0 && self.window.limit.is_none();
+        let plain = self.order.is_empty() && !self.window.cuts();
         match self.case {
             ReadCase::Rows { read, reply_schema, copied } if plain => {
                 // An index survives where every column it lists does, under the
@@ -268,7 +268,20 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
     };
     let (case, order) = match shape {
         AdhocShape::Fold(pieces, order_cols) => {
-            let FoldPlan { sink, finish, reduce_schema, order } = plan_fold(*pieces, &keys, &order_cols)?;
+            let FoldPieces {
+                reduce_schema,
+                agg,
+                partial_schema,
+                pre,
+                having,
+                finalize,
+            } = *pieces;
+            // Compiled here rather than at finish, so every rejection is pre-dispatch.
+            let finish = FoldFinish::new(partial_schema, &agg.aggs, &having, finalize)?;
+            // The finalize items follow the output's key.
+            let out = finish.out_schema();
+            let order = wire_keys(&keys, &out.columns, order_cols.iter().map(|&at| out.pk_cols.len() + at))?;
+            let sink = ReadSink { map: pre, kind: SinkKind::Fold(agg) };
             let case = ReadCase::Fold {
                 read: read(sink),
                 finish: Box::new(finish),
@@ -285,7 +298,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 sink_order,
                 pk_ordered,
                 copied,
-            } = rows_reply(rows, &keys, &desc)?;
+            } = rows.reply(&keys)?;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
             let cut = window
                 .end()
@@ -309,50 +322,6 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
     Ok(ReadPlan { case, order, window })
 }
 
-/// A planned fold read.
-struct FoldPlan {
-    sink: ReadSink,
-    finish: FoldFinish,
-    /// The reduce input the sink's columns index.
-    reduce_schema: Arc<Schema>,
-    /// ORDER BY over the finished output.
-    order: Vec<gnitz_wire::OrderKey>,
-}
-
-/// A GROUP BY / global aggregate / HAVING / DISTINCT read's sink and client finish.
-fn plan_fold(
-    pieces: FoldPieces,
-    keys: &[crate::tail::OrderKey<'_>],
-    order_cols: &[usize],
-) -> Result<FoldPlan, GnitzSqlError> {
-    // Compiled here rather than at finish, so every rejection is pre-dispatch — and
-    // the same one a view gives, the finalize being compiled as a view's map is.
-    let finish = FoldFinish::new(
-        pieces.partial_schema,
-        pieces.agg.aggs.iter().map(|d| d.agg_op),
-        &pieces.having,
-        pieces.finalize,
-    )?;
-    // `group_cols` / `col_idx` index the reduce input — the pre-map's output when
-    // the fold carries one.
-    let sink = ReadSink {
-        map: pieces.pre,
-        kind: SinkKind::Fold(pieces.agg),
-    };
-    // The finalize items follow the output's key.
-    let order = wire_keys(
-        keys,
-        &finish.out_schema().columns,
-        order_cols.iter().map(|&at| finish.out_schema().pk_cols.len() + at),
-    )?;
-    Ok(FoldPlan {
-        sink,
-        finish,
-        reduce_schema: pieces.reduce_schema,
-        order,
-    })
-}
-
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
 /// expression, compiled as a fold's finalize item over the ground row. A hidden
 /// item is an ORDER BY key, which is compiled and dropped.
@@ -362,7 +331,7 @@ fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<
     for (key, _) in &keys {
         compile_scalar_evaluator(key, &ground)?;
     }
-    let mut finish = FoldFinish::new(Arc::new(ground), [], &[], items)?;
+    let mut finish = FoldFinish::new(Arc::new(ground), &[], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
     BatchAppender::new(&mut ground_row).add_row(gnitz_wire::global_group_key(), 1);
     Ok((Arc::clone(finish.out_schema()), finish.finish(ground_row)))

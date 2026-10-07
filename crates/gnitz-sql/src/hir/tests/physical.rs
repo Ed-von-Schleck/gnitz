@@ -36,7 +36,7 @@ fn a_root_renumbers_a_frame_without_moving_a_payload_column() {
         (vec![a, b], ["a", "b", "c", "d"], 0),
         (vec![d, a], ["b", "c", "d", "a"], 3),
     ] {
-        let s = f.schema_in_order(root.iter().copied()).unwrap();
+        let s = f.schema_in_order(root.iter().copied()).unwrap().0;
         assert_eq!((names(&s), &s.pk_cols[..]), (want.to_vec(), &[key][..]), "{root:?}");
         assert!(s.same_region_types(f.schema.as_ref()), "{root:?}");
     }

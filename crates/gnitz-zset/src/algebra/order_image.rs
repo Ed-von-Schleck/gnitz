@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
+pub(crate) use gnitz_expr::{ieee_order_bits, ieee_order_bits_f32, order_bits};
 use gnitz_wire::RowSource;
 use gnitz_wire::{cmp_col_window, ScalarKind};
 
@@ -50,19 +51,6 @@ impl WideKind {
 // Scalar order image: `order_bits` encodes a value, `order_inverse` undoes it.
 // ---------------------------------------------------------------------------
 
-/// The column's value in `row` as a `u64` whose unsigned order is the column's
-/// typed order (`total_cmp`'s for floats). `kind` is the column's own.
-#[inline(always)]
-pub(crate) fn order_bits(loc: &ColumnLocator, src: &impl RowSource, row: usize, kind: ScalarKind) -> u64 {
-    debug_assert_eq!(ScalarKind::from_type_code(loc.type_code()), Some(kind));
-    match kind {
-        ScalarKind::Int(fi) => (loc.decode_i64(src, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
-        // Floats are never PK columns, so these bytes are native.
-        ScalarKind::F32 => ieee_order_bits_f32(u32::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
-        ScalarKind::F64 => ieee_order_bits(u64::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
-    }
-}
-
 /// Inverse of [`order_bits`]: the value's own little-endian bits.
 #[inline(always)]
 pub(crate) fn order_inverse(kind: ScalarKind, e: u64) -> u64 {
@@ -71,28 +59,6 @@ pub(crate) fn order_inverse(kind: ScalarKind, e: u64) -> u64 {
         ScalarKind::F32 => ieee_order_bits_f32_reverse(e) as u64,
         ScalarKind::F64 => ieee_order_bits_reverse(e),
     }
-}
-
-/// IEEE 754 order-preserving encoding of an `f64`'s raw bits: negatives invert
-/// wholly, non-negatives flip the sign bit, so plain unsigned order over the
-/// result is `total_cmp` order.
-#[inline(always)]
-pub(crate) fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-/// [`ieee_order_bits`] for an `f32`.
-#[inline(always)]
-pub(crate) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u32 << 31)
-    }) as u64
 }
 
 /// Reverse of [`ieee_order_bits`].

@@ -606,60 +606,80 @@ impl ZSetBatch {
         }
     }
 
-    /// The rows `rows` names, in order, at their paired weights; each row at most once.
-    /// A gather naming every row in place is the batch itself. When every row survives the
-    /// arena moves whole, else only survivors' strings are copied.
-    pub fn gather(self, rows: &[(usize, i64)]) -> ZSetBatch {
-        if rows.len() == self.len()
-            && rows
-                .iter()
-                .enumerate()
-                .all(|(i, &(r, w))| r == i && w == self.weights[i])
-        {
+    /// The rows `rows` names, in order, each at most once. A gather naming every row in place is
+    /// the batch itself. When every row survives the arena moves whole, else only survivors'
+    /// strings are copied.
+    pub fn gather(self, rows: &[u32]) -> ZSetBatch {
+        if rows.len() == self.len() && rows.iter().enumerate().all(|(i, &r)| r as usize == i) {
             return self;
         }
         debug_assert!(
             {
                 let mut seen = vec![false; self.len()];
-                rows.iter().all(|&(r, _)| !std::mem::replace(&mut seen[r], true))
+                rows.iter().all(|&r| !std::mem::replace(&mut seen[r as usize], true))
             },
             "gather: a row named twice"
         );
-        let n = rows.len();
-        let whole = n == self.len();
+        let whole = rows.len() == self.len();
         let mut blob = Vec::new();
-        let mut pks = PkColumn {
-            buf: Vec::with_capacity(n * self.pks.stride()),
+        let pks = PkColumn {
+            buf: gather_cells(&self.pks.buf, self.pks.stride(), rows),
             ..self.pks
         };
-        for &(r, _) in rows {
-            pks.push_from(&self.pks, r);
-        }
         let payload = self
             .payload
             .iter()
             .map(|src| {
-                let s = src.stride();
-                let mut bytes = Vec::with_capacity(n * s);
-                if !whole && src.tc.is_german_string() {
+                let bytes = if !whole && src.tc.is_german_string() {
                     let cells = src.bytes.as_chunks::<16>().0;
-                    for &(r, _) in rows {
-                        bytes.extend_from_slice(&gnitz_wire::relocate_german_string(&cells[r], &self.blob, &mut blob));
+                    let mut bytes = Vec::with_capacity(rows.len() * 16);
+                    for &r in rows {
+                        bytes.extend_from_slice(&gnitz_wire::relocate_german_string(
+                            &cells[r as usize],
+                            &self.blob,
+                            &mut blob,
+                        ));
                     }
+                    bytes
                 } else {
-                    for &(r, _) in rows {
-                        bytes.extend_from_slice(&src.bytes[r * s..(r + 1) * s]);
-                    }
-                }
+                    gather_cells(&src.bytes, src.stride(), rows)
+                };
                 PayloadColumn { tc: src.tc, bytes }
             })
             .collect();
         ZSetBatch {
             pks,
-            weights: rows.iter().map(|&(_, w)| w).collect(),
-            nulls: rows.iter().map(|&(r, _)| self.nulls[r]).collect(),
+            weights: rows.iter().map(|&r| self.weights[r as usize]).collect(),
+            nulls: rows.iter().map(|&r| self.nulls[r as usize]).collect(),
             payload,
             blob: if whole { self.blob } else { blob },
+        }
+    }
+}
+
+/// The `stride`-wide cells of `src` that `rows` names, in order.
+fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
+    fn fixed<const N: usize>(src: &[u8], rows: &[u32]) -> Vec<u8> {
+        let cells = src.as_chunks::<N>().0;
+        let mut out = vec![0u8; rows.len() * N];
+        for (dst, &r) in out.as_chunks_mut::<N>().0.iter_mut().zip(rows) {
+            *dst = cells[r as usize];
+        }
+        out
+    }
+    match stride {
+        1 => fixed::<1>(src, rows),
+        2 => fixed::<2>(src, rows),
+        4 => fixed::<4>(src, rows),
+        8 => fixed::<8>(src, rows),
+        16 => fixed::<16>(src, rows),
+        // A compound key's stride.
+        _ => {
+            let mut out = Vec::with_capacity(rows.len() * stride);
+            for &r in rows {
+                out.extend_from_slice(&src[r as usize * stride..][..stride]);
+            }
+            out
         }
     }
 }
@@ -799,6 +819,11 @@ impl<'a> BatchAppender<'a> {
 
     /// Append an f64 value to the next column.
     pub fn f64_val(&mut self, v: f64) -> &mut Self {
+        self.fixed_val(&v.to_le_bytes())
+    }
+
+    /// Append an f32 value to the next column.
+    pub fn f32_val(&mut self, v: f32) -> &mut Self {
         self.fixed_val(&v.to_le_bytes())
     }
 

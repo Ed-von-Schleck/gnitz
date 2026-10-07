@@ -1,7 +1,7 @@
 //! [`SinkPlan`]: the sink of an ad-hoc read over one worker's surviving rows —
 //! the map, then a forward, a top-k or a fold.
 
-use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator};
+use gnitz_expr::{order_locators, Lead, OrderLocator, RowRanking};
 use std::num::NonZeroI64;
 
 use gnitz_wire::{ReadSink, RowsCut, SinkKind};
@@ -36,6 +36,8 @@ struct Cut {
     window: NonZeroI64,
     /// The survivor weight the keeper currently holds.
     summed: i64,
+    /// The largest lead the last trim kept: a later row above it is outside the window.
+    bound: Option<Lead>,
 }
 
 impl SinkPlan {
@@ -66,6 +68,7 @@ impl SinkPlan {
                             // the answer.
                             window: NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX),
                             summed: 0,
+                            bound: None,
                         })
                     }
                 };
@@ -140,7 +143,7 @@ impl SinkPlan {
                 // would re-sort after every chunk to shed rows the next chunk
                 // replaces.
                 if cut.summed > cut.window.get().saturating_mul(2) {
-                    cut.summed = topk_keep(keeper, &cut.order, cut.window);
+                    cut.summed = topk_keep(keeper, &cut.order, cut.window, &mut cut.bound);
                 }
                 Ok(false)
             }
@@ -168,8 +171,8 @@ impl SinkPlan {
                 // STRING/BLOB column goes out as one frame — so shed an ordered
                 // keeper down to the smallest superset the client can still cut
                 // exactly. At or below the window it provably cuts nothing.
-                if let Some(cut) = cut.filter(|c| !c.order.is_empty() && c.summed > c.window.get()) {
-                    topk_keep(&mut keeper, &cut.order, cut.window);
+                if let Some(mut cut) = cut.filter(|c| !c.order.is_empty() && c.summed > c.window.get()) {
+                    topk_keep(&mut keeper, &cut.order, cut.window, &mut cut.bound);
                 }
                 keeper
             }
@@ -190,36 +193,33 @@ fn append_survivors(map: Option<&mut MapPlan>, chunk: &Batch, keeper: &mut Batch
 /// Trim `keeper` to its comparator-smallest rows whose summed weight covers
 /// `window`, in no particular order, and return that weight. The boundary row
 /// stays whole: only the client, which sees every worker's rows, may clip it.
-fn topk_keep(keeper: &mut Batch, order: &[OrderLocator], window: NonZeroI64) -> i64 {
+/// `bound` carries the largest lead kept from one trim to the next.
+fn topk_keep(keeper: &mut Batch, order: &[OrderLocator], window: NonZeroI64, bound: &mut Option<Lead>) -> i64 {
     if keeper.is_empty() {
         return 0;
     }
     let window = window.get();
-    let mut perm: Vec<u32> = (0..keeper.len() as u32).collect();
-    let cmp = |a: &u32, b: &u32| {
-        let (ra, rb) = (*a as usize, *b as usize);
-        cmp_order_keys(order, &*keeper, ra, &*keeper, rb)
-    };
-    let k = (window as usize).min(perm.len());
-    if k < perm.len() {
-        perm.select_nth_unstable_by(k - 1, cmp);
-        perm.truncate(k);
+    let mut ranking = RowRanking::new(order, &*keeper);
+    if let Some(bound) = *bound {
+        ranking.drop_above(bound);
     }
-    let mut acc: i64 = perm.iter().map(|&r| keeper.get_weight(r as usize)).sum();
-    // Every row weighs ≥ 1, so the k selected rows cover the window; a surplus is
-    // the only way a comparator-larger row among them is droppable.
-    if acc > window {
-        perm.sort_unstable_by(cmp);
+    ranking.keep_smallest(window as usize);
+    *bound = ranking.max_lead();
+    let mut acc: i64 = ranking.rows().map(|r| keeper.get_weight(r as usize)).sum();
+    // Every row weighs ≥ 1, so the kept rows cover the window; a surplus is the only way a
+    // comparator-larger row among them is droppable.
+    let perm = if acc > window {
+        let mut perm = ranking.sorted();
         acc = 0;
-        let cut = perm
-            .iter()
-            .position(|&r| {
-                acc += keeper.get_weight(r as usize);
-                acc >= window
-            })
-            .map_or(perm.len(), |i| i + 1);
-        perm.truncate(cut);
-    }
+        let cut = perm.iter().position(|&r| {
+            acc += keeper.get_weight(r as usize);
+            acc >= window
+        });
+        perm.truncate(cut.map_or(perm.len(), |i| i + 1));
+        perm
+    } else {
+        ranking.rows().collect()
+    };
     *keeper = keeper.indexed_rows(&perm);
     acc
 }
