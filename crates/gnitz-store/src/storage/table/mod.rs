@@ -469,17 +469,14 @@ impl Table {
         from_runs(self.runs(cut), self.shard_index.schema, cap)
     }
 
-    /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
-    /// columns of one — positioned on the first, over the rows `cut` reads.
-    pub(crate) fn cursor_for_keys(&self, keys: &Batch, cut: Cut) -> ReadCursor {
-        debug_assert!(keys.is_consolidated() && !keys.is_empty());
-        self.cursor_between(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), cut)
-    }
-
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
     /// same leading bytes of one — positioned on the first, over the rows `cut`
     /// reads.
     pub(crate) fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
+        // The zero-width prefix is every key: no run to rule out, no key to seek.
+        if first.is_empty() {
+            return self.open_cursor(cut);
+        }
         let (runs, cap, start) = self.runs_over_prefixes(first, last, cut);
         from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
     }

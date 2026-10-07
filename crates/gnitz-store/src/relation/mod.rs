@@ -309,12 +309,6 @@ impl Relation {
         self.table().gather(keys, cut)
     }
 
-    /// A cursor for probing at the PKs of `keys` — whole PKs, or the same leading
-    /// columns of one — positioned on the first, over the rows `cut` reads.
-    pub fn cursor_for_keys(&self, keys: &Batch, cut: Cut) -> ReadCursor {
-        self.table().cursor_for_keys(keys, cut)
-    }
-
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
     /// same leading bytes of one — positioned on the first, over the rows `cut`
     /// reads.

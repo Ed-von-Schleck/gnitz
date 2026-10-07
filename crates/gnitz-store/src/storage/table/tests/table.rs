@@ -197,6 +197,37 @@ proptest! {
     }
 }
 
+/// A cursor opened between zero-width prefixes reads what one opened over the
+/// whole store does, at either cut: a row and its retraction in two runs cancel,
+/// and a retraction above the cut cancels only at `Cut::Now`.
+#[test]
+fn a_cursor_between_empty_prefixes_reads_the_whole_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES);
+    t.ingest_owned_batch(rows(&[(1, 1, 10), (2, 1, 20), (5, 1, 50)]))
+        .unwrap();
+    t.fold_to_ram().unwrap();
+    t.ingest_owned_batch(rows(&[(2, -1, 20), (3, 1, 30)])).unwrap();
+    t.ingest_pending(rows(&[(1, -1, 10), (4, 1, 40)]));
+    assert_eq!(
+        (t.ram_tier.len(), t.memtable.len(), t.pending.len()),
+        (1, 1, 1),
+        "premise: one run a tier"
+    );
+
+    for (cut, want) in [
+        (Cut::Now, rows(&[(3, 1, 30), (4, 1, 40), (5, 1, 50)])),
+        (Cut::Sealed, rows(&[(1, 1, 10), (3, 1, 30), (5, 1, 50)])),
+    ] {
+        let between = t.cursor_between(&[], &[], cut).materialize();
+        let whole = t.open_cursor(cut).materialize();
+        assert_eq!(between.len(), whole.len(), "{cut:?}: row count");
+        assert_eq!(zset_of(&between, &schema), zset_of(&whole, &schema), "{cut:?}");
+        assert_eq!(zset_of(&between, &schema), zset_of(&want, &schema), "{cut:?}");
+    }
+}
+
 /// An ingest past the memtable's budget folds it into the RAM tier on its own.
 #[test]
 fn a_memtable_over_budget_folds_into_the_ram_tier() {

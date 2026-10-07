@@ -1,4 +1,4 @@
-//! DBSP VM: executes compiled circuit programs entirely in Rust.
+//! DBSP VM: executes compiled circuit programs.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -9,7 +9,6 @@ use gnitz_wire::ClampKind;
 use gnitz_zset::algebra::MapPlan;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
-use gnitz_zset::schema::Slot;
 use gnitz_zset::stream;
 
 mod builder;
@@ -72,9 +71,7 @@ pub(in crate::query) enum Op {
         trace: Integral,
         probe: stream::JoinProbe,
     },
-    WorkerFilter {
-        slot: Slot,
-    },
+    WorkerFilter,
     /// Widen every row with NULL-filled payload columns — the LEFT JOIN
     /// null-fill's unmatched preserved rows — on the side `nulls_first` names.
     /// The column count is the difference between the two registers' schemas.
@@ -110,8 +107,7 @@ pub(in crate::query) enum Integral {
     Source(u64),
 }
 
-/// Everything the VM's passes need to know about one operator, classified in one
-/// place.
+/// What the VM's passes ask of one operator.
 #[derive(Clone, Copy)]
 struct OpFacts {
     /// It reads its input at net weights, so the VM folds that register when it
@@ -133,12 +129,7 @@ fn facts(op: &Op) -> OpFacts {
         inert_on_empty: true,
     };
     match op {
-        Op::Filter(_)
-        | Op::Map(_)
-        | Op::Negate
-        | Op::Union { .. }
-        | Op::WorkerFilter { .. }
-        | Op::NullExtend { .. } => linear,
+        Op::Filter(_) | Op::Map(_) | Op::Negate | Op::Union { .. } | Op::WorkerFilter | Op::NullExtend { .. } => linear,
         Op::WeightClamp { .. } => OpFacts {
             consolidates_in: true,
             stateful: true,
@@ -168,7 +159,7 @@ impl Instr {
             | Op::Negate
             | Op::WeightClamp { hist: _, kind: _ }
             | Op::JoinDT { trace: _, probe: _ }
-            | Op::WorkerFilter { slot: _ }
+            | Op::WorkerFilter
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, index: _, plan: _ }
             | Op::TopN { out_trace: _, index: _, plan: _ } => None,
@@ -189,7 +180,7 @@ impl Instr {
             | Op::Negate
             | Op::Union { .. }
             | Op::JoinDT { .. }
-            | Op::WorkerFilter { .. }
+            | Op::WorkerFilter
             | Op::NullExtend { .. } => None,
         }
     }
@@ -281,9 +272,7 @@ impl Vm {
     /// True iff some instruction trims the delta to this worker's own rows, so
     /// the result is a slice rather than a copy of what every worker computes.
     pub(in crate::query) fn trims_per_worker(&self) -> bool {
-        self.instructions
-            .iter()
-            .any(|i| matches!(i.op, Op::WorkerFilter { .. }))
+        self.instructions.iter().any(|i| matches!(i.op, Op::WorkerFilter))
     }
 
     /// Enter a read-only replay at `reg`'s first reader. Refused where the seed

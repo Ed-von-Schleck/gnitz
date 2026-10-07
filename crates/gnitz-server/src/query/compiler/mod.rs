@@ -1,5 +1,5 @@
-//! Circuit compiler: reads system tables, builds a DBSP circuit graph,
-//! derives its routing metadata, and emits VM instructions.
+//! Circuit compiler: loads a view's circuit, derives its routing metadata, and
+//! emits VM instructions.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its

@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, TypeCode};
-use crate::test_support::{rekey_plan, TestTrace};
+use crate::test_support::{opens, rekey_plan, TestTrace};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::RangeRel;
 
@@ -69,8 +69,8 @@ fn probe(counter: &Counter, plan: &JoinPlan, delta: &Batch, trace: &Batch, runs:
     let trace = TestTrace::dealt(trace, runs);
     // The first pass takes the pool's first allocations.
     let [_, (out, instructions)] = [(); 2].map(|()| {
-        let mut cursor = trace.cursor();
-        counter.measure(|| op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe))
+        let mut open = opens(trace.cursor());
+        counter.measure(|| op_join_delta_trace(delta, &mut open, &plan.out_schema, &plan.probe))
     });
     (instructions as f64 / delta.count as f64, out.count)
 }

@@ -422,7 +422,8 @@ fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
             probe.begin_row_natives(&[k as u128], 1);
             probe.end_row();
         }
-        let cursor = relation.cursor_for_keys(&probe.finish().into_consolidated(), cut);
+        let probe = probe.finish().into_consolidated();
+        let cursor = relation.cursor_between(probe.get_pk_bytes(0), probe.get_pk_bytes(probe.len() - 1), cut);
         let mut read = zset_of(&cursor.materialize(), &schema);
         read.retain(|row, _| keys.iter().any(|k| row.0[..8] == k.to_be_bytes()));
         assert_eq!(read, under(state, &keys), "cursor, {cut:?}, {what}");

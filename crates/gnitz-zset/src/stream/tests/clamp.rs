@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch, make_schema_u64_i64, trace_cursor, weighted_rows};
+use crate::test_support::{make_batch, make_schema_u64_i64, opens, trace_cursor, weighted_rows};
 use gnitz_wire::ClampKind::{Distinct, PositivePart};
 
 /// `(pk, weight, payload)` fixture rows, pre-sorted by `(pk, payload)`.
@@ -62,8 +62,8 @@ fn weight_clamp_emits_each_elements_transition() {
     ];
     for (delta, trace) in cases {
         for kind in [Distinct, PositivePart] {
-            let mut ch = trace_cursor(make_batch(&schema, trace));
-            let out = op_weight_clamp(&make_batch(&schema, delta), &mut ch, kind);
+            let ch = trace_cursor(make_batch(&schema, trace));
+            let out = op_weight_clamp(&make_batch(&schema, delta), &mut opens(ch), kind);
             assert!(out.is_consolidated());
             assert_eq!(
                 weighted_rows(&out),
@@ -71,5 +71,20 @@ fn weight_clamp_emits_each_elements_transition() {
                 "{kind:?}: delta={delta:?} trace={trace:?}"
             );
         }
+    }
+}
+
+/// An empty delta touches no element: the clamp returns it empty and opens no
+/// history.
+#[test]
+fn weight_clamp_of_an_empty_delta_opens_nothing() {
+    let schema = make_schema_u64_i64();
+    for kind in [Distinct, PositivePart] {
+        let out = op_weight_clamp(
+            &Batch::empty_with_schema(&schema),
+            &mut |_, _| panic!("an empty delta opened its history"),
+            kind,
+        );
+        assert!(out.is_empty());
     }
 }

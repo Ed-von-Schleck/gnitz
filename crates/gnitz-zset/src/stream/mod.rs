@@ -1,5 +1,5 @@
-//! The stream operators: the kernels that take this tick's delta together with
-//! a cursor over its history, and emit the output delta.
+//! The stream operators: the kernels that take this tick's delta, open a cursor
+//! over its history, and emit the output delta.
 //!
 //!   - `clamp`  — distinct and positive_part, the weight clamps
 //!   - `join`   — the bilinear operator, equi, range and cross, over one probe

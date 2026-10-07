@@ -20,6 +20,7 @@ use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 
 use crate::algebra::MapPlan;
+use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
 use gnitz_wire::RowSource;
 use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
@@ -53,13 +54,6 @@ pub struct JoinProbe {
     /// The walked rows are the trace's own, so they arrive in the order the
     /// output gives their columns.
     trace_ordered: bool,
-}
-
-impl JoinProbe {
-    /// Whether the walk reads the trace only at the delta's own PKs.
-    pub fn probes_delta_keys(&self) -> bool {
-        matches!(self.walk, Walk::Equi)
-    }
 }
 
 /// A half-open span of the output row: the payload slots one input fills, or
@@ -329,7 +323,7 @@ impl Pairing {
 /// in output order and either lead the payload or met single delta rows.
 pub fn op_join_delta_trace(
     delta: &Batch,
-    cursor: &mut ReadCursor,
+    trace: OpenAt<'_>,
     out_schema: &SchemaDescriptor,
     probe: &JoinProbe,
 ) -> Batch {
@@ -338,6 +332,14 @@ pub fn op_join_delta_trace(
     if n == 0 {
         return Batch::empty_with_schema(out_schema);
     }
+    // Every trace row a walk can meet begins with a delta row's key under `Equi`,
+    // with its equality prefix under `Range`, and with nothing under `Cross`.
+    let prefix = match probe.walk {
+        Walk::Equi => delta.schema().pk_stride(),
+        Walk::Range(range) => range.eq_size,
+        Walk::Cross { .. } => 0,
+    };
+    let cursor = &mut trace(&delta.get_pk_bytes(0)[..prefix], &delta.get_pk_bytes(n - 1)[..prefix]);
     // Grown, not pre-sized: a walk can match nothing.
     let mut pairs: Vec<Pairing> = Vec::new();
     let mut rows = 0usize;
@@ -365,10 +367,7 @@ pub fn op_join_delta_trace(
     match probe.walk {
         Walk::Equi => equi_merge_walk(delta, cursor, emit),
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
-        Walk::Cross { .. } => {
-            cursor.rewind();
-            cursor.for_each_row_while(|_| true, |c| emit(0, n, c));
-        }
+        Walk::Cross { .. } => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
     let mut out = write_pairings(delta, cursor, out_schema, probe, &pairs, rows);
     if ordered && !out.is_empty() {

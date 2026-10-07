@@ -69,18 +69,9 @@ impl CircuitState {
         Ok(CircuitState { tables })
     }
 
-    pub fn cursor(&self, idx: StateIdx) -> ReadCursor {
-        self.at(idx).open_cursor(super::Cut::Now)
-    }
-
     /// Every live row of `keys` in `idx`.
     pub fn gather(&self, idx: StateIdx, keys: PkKeys) -> PkSetGather {
         self.at(idx).gather(keys, super::Cut::Now)
-    }
-
-    /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
-    pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
-        self.at(idx).cursor_for_keys(keys, super::Cut::Now)
     }
 
     /// A cursor over `idx` for probing at the keys in `[first, last]` — whole

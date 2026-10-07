@@ -3,9 +3,9 @@
 use std::borrow::Cow;
 
 use super::*;
-use gnitz_store::relation::{Cut, RelationRegistry};
+use gnitz_store::relation::{Cut, Relation, RelationRegistry};
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
+use gnitz_zset::repr::{empty_cursor, Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::{algebra, stream};
 
 /// The stores an epoch reads and writes: the view's own children, and the
@@ -20,37 +20,48 @@ pub(in crate::query) struct Stores<'a> {
     pub(in crate::query) unfed: &'a [u64],
 }
 
-impl Stores<'_> {
-    /// A cursor over `integral` for a join probing it with `delta`: at `delta`'s
-    /// keys when `keyed`, over every row otherwise. A source's rows are there as
-    /// the view last absorbed them.
-    fn probe_cursor(&self, integral: Integral, delta: &Batch, keyed: bool) -> Result<ReadCursor, String> {
-        let source = match integral {
-            Integral::Own(trace) if keyed => return Ok(self.own.cursor_for_keys(trace, delta)),
-            Integral::Own(trace) => return Ok(self.own.cursor(trace)),
-            Integral::Source(source) => source,
-        };
-        debug_assert!(keyed, "the compiler bakes a source under an equi probe alone");
-        let relation = self.registry.relation_or_err(source)?;
-        if self.unfed.contains(&source) {
-            return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
-        }
-        Ok(relation.cursor_for_keys(delta, Cut::Sealed))
-    }
+/// A store an operator reads its history from, resolved for one dispatch.
+#[derive(Clone, Copy)]
+enum Trace<'a> {
+    /// One of the view's own children.
+    Child(StateIdx),
+    Relation(&'a Relation, Cut),
+    /// A source the view has been fed no row of.
+    Unfed(&'a Relation),
+}
 
-    /// The opener of a reduce's or top-N's output history: its own trace, or the
-    /// view's store, which every earlier epoch's output was ingested into.
-    fn out_trace(&self, own: Option<StateIdx>) -> Result<impl FnMut(&[u8], &[u8]) -> ReadCursor + '_, String> {
-        let view = self.registry.relation_or_err(self.view)?;
-        Ok(move |first: &[u8], last: &[u8]| match own {
-            Some(trace) => self.own.cursor_between(trace, first, last),
-            None => view.cursor_between(first, last, Cut::Now),
+impl Stores<'_> {
+    /// Where a join reads `integral`: a source's rows as the view last
+    /// absorbed them.
+    fn integral(&self, integral: Integral) -> Result<Trace<'_>, String> {
+        Ok(match integral {
+            Integral::Own(idx) => Trace::Child(idx),
+            Integral::Source(id) => {
+                let relation = self.registry.relation_or_err(id)?;
+                match self.unfed.contains(&id) {
+                    true => Trace::Unfed(relation),
+                    false => Trace::Relation(relation, Cut::Sealed),
+                }
+            }
         })
     }
 
-    /// The opener of a reduce's or top-N's index.
-    fn index(&self, idx: StateIdx) -> impl FnMut(&[u8], &[u8]) -> ReadCursor + '_ {
-        move |first: &[u8], last: &[u8]| self.own.cursor_between(idx, first, last)
+    /// Where a reduce or top-N reads its output history: its own trace, or the
+    /// view's store, which every earlier epoch's output was ingested into.
+    fn out_trace(&self, own: Option<StateIdx>) -> Result<Trace<'_>, String> {
+        Ok(match own {
+            Some(idx) => Trace::Child(idx),
+            None => Trace::Relation(self.registry.relation_or_err(self.view)?, Cut::Now),
+        })
+    }
+
+    /// The opener of `store`, as a kernel takes it.
+    fn open<'s>(&'s self, store: Trace<'s>) -> impl FnMut(&[u8], &[u8]) -> ReadCursor + 's {
+        move |first: &[u8], last: &[u8]| match store {
+            Trace::Child(idx) => self.own.cursor_between(idx, first, last),
+            Trace::Relation(relation, cut) => relation.cursor_between(first, last, cut),
+            Trace::Unfed(relation) => empty_cursor(relation.schema()),
+        }
     }
 
     /// Every live row of `keys` in `integral`: a source's as the view last
@@ -156,7 +167,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
         let takes = |r: DeltaReg| regs[r.at()].last_read == LastRead::Instr(pc);
 
         let all_empty = instr.reads().into_iter().flatten().all(|r| batches[r.at()].is_empty());
-        // The kernel would return exactly this, so skip it and its trace cursor.
+        // The kernel would return exactly this, so the dispatch is saved.
         let out = if instr.facts.inert_on_empty && all_empty {
             Batch::empty_with_schema(&regs[out_reg.at()].schema)
         } else {
@@ -192,18 +203,15 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
                 }
 
                 Op::WeightClamp { hist, kind } => {
-                    let delta = &batches[in_reg.at()];
-                    let mut cursor = stores.own.cursor_for_keys(*hist, delta);
-                    stream::op_weight_clamp(delta, &mut cursor, *kind)
+                    stream::op_weight_clamp(&batches[in_reg.at()], &mut stores.open(Trace::Child(*hist)), *kind)
                 }
 
                 Op::JoinDT { trace, probe } => {
-                    let delta = &batches[in_reg.at()];
-                    let mut cursor = stores.probe_cursor(*trace, delta, probe.probes_delta_keys())?;
-                    stream::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, probe)
+                    let mut open = stores.open(stores.integral(*trace)?);
+                    stream::op_join_delta_trace(&batches[in_reg.at()], &mut open, &regs[out_reg.at()].schema, probe)
                 }
 
-                Op::WorkerFilter { slot } => algebra::op_worker_filter(&batches[in_reg.at()], *slot),
+                Op::WorkerFilter => algebra::op_worker_filter(&batches[in_reg.at()], stores.registry.slot()),
 
                 Op::NullExtend { nulls_first } => {
                     batches[in_reg.at()].widened_with_nulls(&regs[out_reg.at()].schema, *nulls_first)
@@ -226,8 +234,8 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
 
                     gnitz_debug!("vm: REDUCE in_count={} avi={}", delta.len(), index.is_some());
 
-                    let mut open_out = stores.out_trace(*out_trace)?;
-                    let mut open_index = index.map(|idx| stores.index(idx));
+                    let mut open_out = stores.open(stores.out_trace(*out_trace)?);
+                    let mut open_index = index.map(|idx| stores.open(Trace::Child(idx)));
                     let history = open_index.as_mut().map(|open| open as stream::OpenAt<'_>);
                     stream::op_reduce(delta, &mut open_out, history, plan)
                 }
@@ -237,8 +245,8 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
                     // Ingested before the index is opened, as the reduce's is.
                     let res = stores.own.ingest_owned(*index, plan.index_batch(delta));
                     res.map_err(|e| ingest_err("topn index", *index, e))?;
-                    let mut open_out = stores.out_trace(*out_trace)?;
-                    stream::op_topn(delta, &mut open_out, &mut stores.index(*index), plan)
+                    let mut open_out = stores.open(stores.out_trace(*out_trace)?);
+                    stream::op_topn(delta, &mut open_out, &mut stores.open(Trace::Child(*index)), plan)
                 }
             }
         };

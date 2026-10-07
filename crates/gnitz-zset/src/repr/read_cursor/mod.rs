@@ -193,8 +193,8 @@ impl ReadCursor {
     }
 
     /// Reset every source to its first row, positioning the cursor at the first
-    /// row in storage order — by row index, so no key has to be spelled. The
-    /// keyless join probe opens with it, having no key to seek by.
+    /// row in storage order — by row index, so no key has to be spelled.
+    #[cfg(test)]
     pub(crate) fn rewind(&mut self) {
         for state in self.states.iter_mut() {
             state.position = 0;

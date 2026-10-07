@@ -225,10 +225,7 @@ pub(super) fn emit_node<'a>(
             if ctx.self_contained {
                 return Ok(in_reg);
             }
-            let slot = ctx.registry.slot();
-            Ok(ctx
-                .prog
-                .push(in_reg, ctx.prog.schema_of(in_reg), Op::WorkerFilter { slot }))
+            Ok(ctx.prog.push(in_reg, ctx.prog.schema_of(in_reg), Op::WorkerFilter))
         }
 
         gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
@@ -369,9 +366,7 @@ fn push_reduce(
 ) -> DeltaReg {
     let out_schema = *plan.output_schema();
     let out_trace = ctx.out_trace(trace_kind, nid, out_schema);
-    // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
-    // share a table_id, scratch dir and compaction namespace and cannot collide on
-    // a memory-pressure flush.
+    // One index table serves every MIN/MAX of the reduce.
     let index = plan
         .index_schema()
         .map(|schema| ctx.declare_child(index_kind, nid, *schema));

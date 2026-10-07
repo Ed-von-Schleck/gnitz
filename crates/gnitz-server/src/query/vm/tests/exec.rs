@@ -185,8 +185,7 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
         epoch(&[(2, -1, 5)]),
         vec![(vec![Some(5), Some(2)], -1), (vec![Some(10), Some(1)], 1)],
     );
-    let held = vm.state.cursor(trace).materialize();
-    assert_eq!(int_rows(&held), vec![(vec![Some(10), Some(1)], 1)]);
+    assert_eq!(int_rows(&vm.held(trace)), vec![(vec![Some(10), Some(1)], 1)]);
 }
 
 /// A non-empty first epoch mints V₀ through the reduce's ordinary path, so it
@@ -214,7 +213,7 @@ fn an_epoch_leaves_every_register_free() {
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
-    let out = p.push(r0, schema, Op::WorkerFilter { slot: Slot::SOLO });
+    let out = p.push(r0, schema, Op::WorkerFilter);
     // Written and never read, so no reader frees it.
     let dead = p.push(r0, schema, Op::Negate);
     let mut vm = p.open(out);
@@ -283,6 +282,100 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
         let (want, _) = join_reference(kind, false, &schema, &schema, &a_rows, &b_rows);
         assert_eq!(zset_of(&vm.epoch([(b, b_rows.clone())]), &out_schema), want, "{kind:?}");
     }
+}
+
+/// A program joining the delta `d` against the integral of `t`, each seeded in
+/// epochs of its own: `(vm, t, d, out_schema)`.
+fn join_against_an_integral(
+    kind: gnitz_wire::JoinKind,
+    schema: SchemaDescriptor,
+) -> (TestVm, DeltaReg, DeltaReg, SchemaDescriptor) {
+    let plan = stream::JoinPlan::from_wire(kind, true, &schema, &schema).unwrap();
+    let mut p = TestPlan::default();
+    let trace = p.table("t", schema);
+    let (t, d) = (p.seed(schema), p.seed(schema));
+    let out = p.push(
+        d,
+        plan.out_schema,
+        Op::JoinDT {
+            trace: Integral::Own(trace),
+            probe: plan.probe,
+        },
+    );
+    p.integrate(t, trace);
+    (p.open(out), t, d, plan.out_schema)
+}
+
+/// A band join reads its trace between the delta's least and greatest equality
+/// prefix. The trace is integrated one equality group an epoch, so each is a run
+/// of its own: groups below, between, at and above the delta's two, a row at
+/// weight 2, and a later epoch retracting a row of a matched group. Each rel
+/// emits the matched groups' spans at their weight products and nothing else.
+#[test]
+fn a_band_join_emits_the_spans_of_the_groups_its_delta_names() {
+    let cols = [
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+    ];
+    let schema = SchemaDescriptor::new(&cols, &[0, 1]);
+    // `(eq, range, weight, payload)`.
+    let batch = |rows: &[(u64, u64, i64, i64)]| {
+        let mut b = BatchBuilder::new(&schema);
+        for &(eq, range, w, val) in rows {
+            b.begin_row_natives(&[eq as u128, range as u128], w);
+            b.put_int(val as u128);
+            b.end_row();
+        }
+        b.finish()
+    };
+    let t_epochs: [&[(u64, u64, i64, i64)]; 6] = [
+        &[(1, 5, 1, 105), (1, 15, 1, 115)],
+        &[(3, 5, 1, 305), (3, 10, 2, 310), (3, 15, 1, 315)],
+        &[(5, 5, 1, 505), (5, 15, 1, 515)],
+        &[(7, 5, 1, 705), (7, 10, 1, 710), (7, 15, 1, 715)],
+        &[(9, 5, 1, 905), (9, 15, 1, 915)],
+        &[(3, 15, -1, 315)],
+    ];
+    let trace = batch(&t_epochs.concat()).into_consolidated();
+    let delta = batch(&[(3, 10, 2, 1), (7, 10, 3, 2)]);
+
+    for &rel in gnitz_wire::RangeRel::ALL {
+        let kind = gnitz_wire::JoinKind::Range { rel };
+        let (mut vm, t, d, out_schema) = join_against_an_integral(kind, schema);
+        for rows in t_epochs {
+            assert!(vm.epoch([(t, batch(rows))]).is_empty());
+        }
+        let (want, want_rows) = join_reference(kind, true, &schema, &schema, &delta, &trace);
+        assert!(want_rows > 0, "premise: {rel:?} matches something");
+        let got = vm.epoch([(d, delta.clone())]);
+        assert_eq!(got.len(), want_rows, "{rel:?}: row count");
+        assert_eq!(zset_of(&got, &out_schema), want, "{rel:?}");
+    }
+}
+
+/// A cross join reads its whole trace, however many epochs integrated it: every
+/// pair at its weight product, a row an epoch retracted in none.
+#[test]
+fn a_cross_join_pairs_every_row_of_a_trace_integrated_across_epochs() {
+    let schema = make_schema_u128_i64();
+    let t_epochs: [&[(u128, i64, i64)]; 3] = [
+        &[(9, 1, 90), (4, 2, 40)],
+        &[(1, 1, 10), (6, 1, 60)],
+        &[(9, -1, 90), (5, 3, 50)],
+    ];
+    let trace = make_batch_u128_raw(&schema, &t_epochs.concat()).into_consolidated();
+    let delta = make_batch_u128_raw(&schema, &[(5, 2, 500), (7, -1, 700)]);
+
+    let (mut vm, t, d, out_schema) = join_against_an_integral(gnitz_wire::JoinKind::Cross, schema);
+    for rows in t_epochs {
+        assert!(vm.epoch([(t, make_batch_u128_raw(&schema, rows))]).is_empty());
+    }
+    let (want, want_rows) = join_reference(gnitz_wire::JoinKind::Cross, true, &schema, &schema, &delta, &trace);
+    assert_eq!(want_rows, 8);
+    let got = vm.epoch([(d, delta)]);
+    assert_eq!(got.len(), want_rows, "row count");
+    assert_eq!(zset_of(&got, &out_schema), want);
 }
 
 /// A join whose B side is a table's own store: the A-sourced term reads the
@@ -427,10 +520,7 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
         int_rows(&vm.epoch([(r0, make_batch_u128(&schema, &[(2, 1, 99)]))])),
         vec![(vec![Some(1), Some(10)], -1), (vec![Some(2), Some(99)], 1)],
     );
-    assert_eq!(
-        int_rows(&vm.state.cursor(out_trace).materialize()),
-        vec![(vec![Some(2), Some(99)], 1)]
-    );
+    assert_eq!(int_rows(&vm.held(out_trace)), vec![(vec![Some(2), Some(99)], 1)]);
 }
 
 /// A hydration replay seeds a register mid-program and runs from its first
@@ -444,7 +534,7 @@ fn a_replay_runs_from_its_entry_and_leaves_every_trace_as_it_found_it() {
     let trace = p.table("trace", schema);
     let r0 = p.seed(schema);
     let mid = p.push(r0, schema, Op::Negate);
-    let out = p.push(mid, schema, Op::WorkerFilter { slot: Slot::SOLO });
+    let out = p.push(mid, schema, Op::WorkerFilter);
     p.integrate(out, trace);
     let mut vm = p.open(out);
 
@@ -467,7 +557,7 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
     let r0 = p.seed(schema);
     let (reduced, _) = p.reduce(r0, plan);
     let reduced_schema = p.schema_of(reduced);
-    let out = p.push(reduced, reduced_schema, Op::WorkerFilter { slot: Slot::SOLO });
+    let out = p.push(reduced, reduced_schema, Op::WorkerFilter);
     let vm = p.open(out);
     assert!(vm.replay_entry(r0).is_err(), "the reduce reads the seed");
     assert!(vm.replay_entry(reduced).is_ok());

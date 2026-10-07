@@ -2,7 +2,8 @@
 
 use gnitz_wire::ClampKind;
 
-use crate::repr::{materialize_carrying, Batch, ReadCursor};
+use crate::repr::{materialize_carrying, Batch};
+use crate::stream::OpenAt;
 
 /// The weight a clamp caps at; every clamp's floor is 0.
 fn cap(kind: ClampKind) -> i64 {
@@ -13,11 +14,15 @@ fn cap(kind: ClampKind) -> i64 {
 }
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
-/// clamp(w_old, 0, cap)` against its weight `w_old` in `cursor` — the lift of a
-/// per-element weight clamp to its delta.
-pub fn op_weight_clamp(delta: &Batch, cursor: &mut ReadCursor, kind: ClampKind) -> Batch {
-    let cap = cap(kind);
+/// clamp(w_old, 0, cap)` against its weight `w_old` in the history `hist` opens —
+/// the lift of a per-element weight clamp to its delta.
+pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, kind: ClampKind) -> Batch {
     debug_assert!(delta.is_consolidated());
+    if delta.is_empty() {
+        return Batch::empty_with_schema(delta.schema());
+    }
+    let cursor = &mut hist(delta.get_pk_bytes(0), delta.get_pk_bytes(delta.len() - 1));
+    let cap = cap(kind);
     let mb = delta.as_mem_batch();
     let mut rows: Vec<(u32, u32, i64)> = Vec::new();
     // Every row emitting its own weight — an insert-only tick — is the delta itself.

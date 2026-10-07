@@ -5,7 +5,7 @@ use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64,
-    opk_pk, pk_only_schema, pk_payload_schema, rekey_plan, trace_cursor, zset_of, TestTrace,
+    opens, opk_pk, pk_only_schema, pk_payload_schema, rekey_plan, trace_cursor, zset_of, TestTrace,
 };
 use gnitz_wire::read_i64_le;
 
@@ -27,11 +27,11 @@ fn join(
     delta_schema: &SchemaDescriptor,
     trace_schema: &SchemaDescriptor,
     delta: &Batch,
-    cursor: &mut ReadCursor,
+    cursor: ReadCursor,
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
     // The VM hands the kernel a folded register; these fixtures build raw ones.
-    op_join_delta_trace(&delta.to_consolidated(), cursor, &p.out_schema, &p.probe)
+    op_join_delta_trace(&delta.to_consolidated(), &mut opens(cursor), &p.out_schema, &p.probe)
 }
 
 // -----------------------------------------------------------------------
@@ -166,8 +166,8 @@ fn an_equi_join_claims_the_output_it_writes_in_order() {
     for (what, rows, left, right) in cases {
         let delta = make_batch(&schema, rows);
         for (delta_is_right, claimed) in [(false, left), (true, right)] {
-            let mut cursor = trace_cursor(Batch::clone(&trace));
-            let out = join(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, &mut cursor);
+            let cursor = trace_cursor(Batch::clone(&trace));
+            let out = join(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, cursor);
             assert_eq!(
                 out.is_consolidated(),
                 claimed || out.is_empty(),
@@ -181,7 +181,7 @@ fn an_equi_join_claims_the_output_it_writes_in_order() {
 
 /// The range join with the delta on the right, so the wire's `left REL right`
 /// reads as `trace_slot REL delta_slot` — how every literal case below is spelled.
-fn range_join(schema: &SchemaDescriptor, rel: RangeRel, delta: &Batch, cursor: &mut ReadCursor) -> Batch {
+fn range_join(schema: &SchemaDescriptor, rel: RangeRel, delta: &Batch, cursor: ReadCursor) -> Batch {
     let kind = JoinKind::Range { rel };
     join(kind, true, schema, schema, delta, cursor)
 }
@@ -198,9 +198,9 @@ fn range_join_cuts_the_span_each_rel_names() {
         (RangeRel::Gt, vec![130]),      // y > 20
         (RangeRel::Ge, vec![120, 130]), // y >= 20
     ] {
-        let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]));
+        let ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]));
         let delta = make_batch(&schema, &[(20, 1, 200)]);
-        let out = range_join(&schema, rel, &delta, &mut ch);
+        let out = range_join(&schema, rel, &delta, ch);
 
         // Delta on the right, so the trace payload leads each output row.
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
@@ -222,47 +222,10 @@ fn range_join_orders_a_signed_key_by_its_opk_image() {
     let trace_rows = [(-100i64 as u64, 1, 1), (0, 1, 2), (50, 1, 3)];
     let delta = make_batch(&schema, &[(0, 1, 9)]);
     for (rel, want) in [(RangeRel::Gt, vec![3]), (RangeRel::Lt, vec![1])] {
-        let mut ch = trace_cursor(make_batch(&schema, &trace_rows));
-        let out = range_join(&schema, rel, &delta, &mut ch);
+        let ch = trace_cursor(make_batch(&schema, &trace_rows));
+        let out = range_join(&schema, rel, &delta, ch);
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
         assert_eq!(got, want, "rel {rel:?}");
-    }
-}
-
-/// The range and cross walks against a *used* trace cursor: a parked and an
-/// exhausted cursor must both produce the fresh-cursor output — the range
-/// group skip reads the cursor position, and the cross walk states its own
-/// start.
-#[test]
-fn a_used_trace_cursor_yields_the_fresh_cursor_output() {
-    let schema = make_range_schema(1, false);
-    let delta = make_range_batch(&schema, &[(vec![1], 5, 1, 1), (vec![3], 5, 1, 3)]);
-    let trace_rows = [
-        (vec![1u64], 0u64, 1i64, 10i64),
-        (vec![1], 9, 1, 19),
-        (vec![3], 0, 1, 30),
-        (vec![3], 9, 1, 39),
-    ];
-    let ranges = RangeRel::ALL.iter().map(|&rel| JoinKind::Range { rel });
-    for kind in ranges.chain([JoinKind::Cross]) {
-        let out_schema = plan(kind, true, &schema, &schema).out_schema;
-        let cursor = || trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated());
-        let want = join(kind, true, &schema, &schema, &delta, &mut cursor());
-        for park_past_end in [false, true] {
-            let mut ch = cursor();
-            ch.advance_to(&opk_pk(&schema, &[3, 9]));
-            if park_past_end {
-                ch.advance();
-                assert!(!ch.valid);
-            }
-            let got = join(kind, true, &schema, &schema, &delta, &mut ch);
-            assert_eq!(got.count, want.count, "{kind:?} past_end={park_past_end}");
-            assert_eq!(
-                zset_of(&got, &out_schema),
-                zset_of(&want, &out_schema),
-                "{kind:?} past_end={park_past_end}",
-            );
-        }
     }
 }
 
@@ -505,8 +468,8 @@ fn assert_matches_reference(
         ("one run", trace_cursor(folded)),
         ("three runs", TestTrace::dealt(trace, 3).cursor()),
     ];
-    for (runs, mut ch) in cursors {
-        let out = op_join_delta_trace(delta, &mut ch, &p.out_schema, &p.probe);
+    for (runs, ch) in cursors {
+        let out = op_join_delta_trace(delta, &mut opens(ch), &p.out_schema, &p.probe);
         let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}, {runs}");
         assert_eq!(out.count, want_rows, "{at}: row count");
         assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
@@ -710,7 +673,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
             let stored = plan(JoinKind::Equi, delta_is_right, &delta_schema, &trace_schema);
             let want = op_join_delta_trace(
                 &delta,
-                &mut trace_cursor(trace.clone()),
+                &mut opens(trace_cursor(trace.clone())),
                 &stored.out_schema,
                 &stored.probe,
             );
@@ -720,7 +683,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
             for runs in [1, 3] {
                 let got = op_join_delta_trace(
                     &delta,
-                    &mut TestTrace::dealt(&source, runs).cursor(),
+                    &mut opens(TestTrace::dealt(&source, runs).cursor()),
                     &over.out_schema,
                     &over.probe,
                 );

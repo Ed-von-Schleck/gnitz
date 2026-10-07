@@ -55,6 +55,13 @@ pub fn trace_cursor(batch: Batch) -> ReadCursor {
     create_read_cursor(&[Rc::new(batch)], &[], schema)
 }
 
+/// An opener that hands `cursor` over, whatever keys it is asked for: a kernel's
+/// one open of its trace.
+pub(crate) fn opens(cursor: ReadCursor) -> impl FnMut(&[u8], &[u8]) -> ReadCursor {
+    let mut cursor = Some(cursor);
+    move |_, _| cursor.take().expect("one open per probe")
+}
+
 /// An operator's trace in a test: one consolidated run per ingest, read through
 /// one cursor — what a store's memtable holds between folds.
 pub(crate) struct TestTrace {

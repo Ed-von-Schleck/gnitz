@@ -5,6 +5,7 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig};
 use gnitz_wire::ViewProps;
+use gnitz_zset::schema::Slot;
 
 /// What the emitter assembles, assembled by a test: the program, and the child
 /// stores its operators declare.
@@ -111,10 +112,15 @@ impl TestVm {
         replay_chunk(vm, &mut stores, entry, seed).unwrap()
     }
 
+    /// The rows one child store holds, at their net weights.
+    pub(super) fn held(&self, idx: StateIdx) -> std::rc::Rc<Batch> {
+        self.state.cursor_between(idx, &[], &[]).materialize()
+    }
+
     /// The net contents of one child store, as a Z-set — how a test sees what an
     /// epoch left in a trace.
     pub(super) fn trace(&self, idx: StateIdx) -> std::collections::HashMap<crate::test_support::RowKey, i64> {
-        let b = self.state.cursor(idx).materialize();
+        let b = self.held(idx);
         crate::test_support::zset_of(&b, b.schema())
     }
 }
