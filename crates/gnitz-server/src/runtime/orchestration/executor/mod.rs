@@ -803,40 +803,28 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
 
     shared.cat().recheck_record(target_id, &seen)?;
 
-    // The validator's own predicate decides the guard: a push that reads no
-    // committed state cannot be invalidated by a concurrent one, so it may share
-    // its table's lock and reach the committer alongside other pushes to the same
-    // table, which fold into one SAL zone and one fsync. Every other push takes
-    // all FK-related table locks exclusively.
-    let held = if shared.cat().push_reads_committed_state(target_id, mode) {
-        shared
-            .lock_tables_exclusive(shared.cat().fk_lock_set(target_id).collect())
-            .await
+    // A push that reads no committed state cannot be invalidated by a concurrent
+    // one, so it shares its table's lock and reaches the committer alongside
+    // other pushes to the same table, which fold into one SAL zone and one
+    // fsync. Every other push is a one-family transaction: it takes its whole
+    // write lock set exclusively and commits whatever its deletes cascade to.
+    let zone_lsn = if shared.cat().push_reads_committed_state(target_id, mode) {
+        let locks = shared.cat().write_lock_set(target_id, !batch.all_weights_positive());
+        let held = shared.lock_tables_exclusive(locks).await;
+        let families = vec![TxnFamily { tid: target_id, mode, batch }];
+        commit_validated(shared, &catalog, &held, families).await?
     } else {
-        shared.lock_table_shared(target_id).await
-    };
-
-    // Distributed validation (PK / FK / unique indices). A plain push is a
-    // one-family bundle — the same four rules over the same fold — so the batch
-    // rides into the family for the validation and back out for the commit
-    // request. The validator itself skips a bundle no rule would read a row for.
-    let family = TxnFamily { tid: target_id, mode, batch };
-    shared
-        .disp()
-        .validate_txn_distributed(std::slice::from_ref(&family))
-        .await?;
-    let TxnFamily { batch, .. } = family;
-
-    let zone_lsn = shared
-        .commit(&catalog, &held, [target_id], |done| {
+        let held = shared.lock_table_shared(target_id).await;
+        let push = |done| {
             CommitRequest::Push(PendingPush {
                 tid: target_id,
                 batch,
                 recoverable: !is_stream,
                 done,
             })
-        })
-        .await?;
+        };
+        shared.commit(&catalog, &held, [target_id], push).await?
+    };
     // A stream replies `0`: its push is not durable, and an ACK reports an LSN
     // only for a write a restart must recover. Keyed on the target rather than on
     // whether this batch happened to open a zone, so a stream push the committer
@@ -844,6 +832,23 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     let reply_lsn = if is_stream { 0 } else { zone_lsn };
     send_ack(peer, target_id, reply_lsn);
     Ok(())
+}
+
+/// Validate `families` as one bundle and commit it, with the families its
+/// deletes cascade to, as one zone. `held` is its tables' whole write lock sets.
+async fn commit_validated(
+    shared: &Rc<Shared>,
+    catalog: &ReadGuard,
+    held: &HeldTables,
+    mut families: Vec<TxnFamily>,
+) -> Result<u64, WireFault> {
+    shared.disp().validate_txn_distributed(&mut families).await?;
+    let tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
+    shared
+        .commit(catalog, held, tids, |done| {
+            CommitRequest::Txn(PendingTxn { families, done })
+        })
+        .await
 }
 
 /// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
@@ -867,8 +872,11 @@ async fn handle_push_txn(
         shared.cat().recheck_record(head.target.tid, &head.seen)?;
     }
 
-    // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
-    let union = families.iter().flat_map(|f| shared.cat().fk_lock_set(f.tid)).collect();
+    // 3. Acquire the per-table lock union ⋃ write_lock_set(tid) exclusively.
+    let union = families
+        .iter()
+        .flat_map(|f| shared.cat().write_lock_set(f.tid, !f.batch.all_weights_positive()))
+        .collect();
     let held = shared.lock_tables_exclusive(union).await;
 
     // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.
@@ -885,15 +893,8 @@ async fn handle_push_txn(
         });
     }
 
-    // 4. Distributed bundle validation (the four rules).
-    shared.disp().validate_txn_distributed(&families).await?;
-
-    // 5. Commit.
-    let lsn = shared
-        .commit(&catalog, &held, heads.iter().map(|h| h.target.tid), |done| {
-            CommitRequest::Txn(PendingTxn { families, done })
-        })
-        .await?;
+    // 4. Distributed bundle validation, and the commit.
+    let lsn = commit_validated(shared, &catalog, &held, families).await?;
     send_ack(peer, 0, lsn);
     Ok(())
 }

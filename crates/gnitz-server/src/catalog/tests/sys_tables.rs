@@ -178,6 +178,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
         is_nullable: 1,
         fk_table_id: 12,
         fk_col_idx: 2,
+        fk_on_delete: 1,
         is_hidden: 1,
         scale: 4,
     };

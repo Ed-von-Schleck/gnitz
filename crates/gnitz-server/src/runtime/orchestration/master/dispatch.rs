@@ -41,6 +41,8 @@ impl MasterDispatcher {
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
             boot_nonce: boot_nonce(),
+            cascade_bytes: gnitz_foundation::env::env_num("GNITZ_CASCADE_BYTES", gnitz_wire::MAX_FRAME_PAYLOAD)
+                .min(gnitz_wire::MAX_FRAME_PAYLOAD),
         }
     }
 

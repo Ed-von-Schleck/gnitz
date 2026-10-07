@@ -44,8 +44,9 @@ fn a_probe_roundtrips_through_its_wire_words() {
     let probes = [
         Probe::Pk,
         Probe::PkColumn(4),
-        Probe::Index(cols, cap(1)),
-        Probe::Index(cols, cap(9)),
+        Probe::Index(cols),
+        Probe::IndexAll(cols, cap(1)),
+        Probe::IndexAll(cols, cap(9)),
     ];
     for probe in probes {
         let (mode, arg0, arg1) = probe.wire();
@@ -58,9 +59,12 @@ fn a_probe_roundtrips_through_its_wire_words() {
         (WireProbeMode::Pk, 0, 7),
         (WireProbeMode::PkColumn, 1 << 32, 0),
         (WireProbeMode::PkColumn, 4, index),
-        (WireProbeMode::Index, 0, index),
-        (WireProbeMode::Index, 9, 0),
-        (WireProbeMode::Index, 9, 7),
+        (WireProbeMode::Index, 9, index),
+        (WireProbeMode::Index, 0, 0),
+        (WireProbeMode::Index, 0, 7),
+        (WireProbeMode::IndexAll, 0, index),
+        (WireProbeMode::IndexAll, 9, 0),
+        (WireProbeMode::IndexAll, 9, 7),
     ] {
         assert!(Probe::from_wire(mode, arg0, arg1).is_err(), "{mode:?} {arg0} {arg1}");
     }

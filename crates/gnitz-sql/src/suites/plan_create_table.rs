@@ -3,7 +3,7 @@
 //! and the bundle a plan carries.
 
 use gnitz_core::{FkTarget, InlineUniqueIndex};
-use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::{PkColList, RelClass, TableDistribution, TypeCode};
 
 use super::*;
@@ -169,7 +169,13 @@ fn primary_key_precedence() {
         "CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)",
     );
     assert_eq!(c.schema.pk_cols, vec![1]);
-    assert_eq!(c.fks, vec![Some(FkTarget::SelfTable { col: 1 }), None]);
+    assert_eq!(
+        c.fks,
+        vec![
+            Some(FkTarget::SelfTable { col: 1, on_delete: FkAction::Restrict }),
+            None
+        ]
+    );
 }
 
 // ── the constraint spellings that are rejected ───────────────────────────────
@@ -321,8 +327,24 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         ),
         ("CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT DEFAULT 5)", "DEFAULT"),
         (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON DELETE CASCADE)",
-            "ON DELETE",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON DELETE SET NULL)",
+            "ON DELETE SET NULL / SET DEFAULT",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT, FOREIGN KEY (r) REFERENCES p(id) ON DELETE SET DEFAULT)",
+            "ON DELETE SET NULL / SET DEFAULT",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON UPDATE CASCADE)",
+            "ON UPDATE",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION)",
+            "ON UPDATE",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT, FOREIGN KEY (r) REFERENCES p(id) ON UPDATE RESTRICT)",
+            "ON UPDATE",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES p(id))",
@@ -408,7 +430,17 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
     assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I64, "widened to the parent's type");
-    assert_eq!(c.fks, vec![None, Some(FkTarget::Table(FkRef { table_id: 41, col: 0 }))]);
+    assert_eq!(
+        c.fks,
+        vec![
+            None,
+            Some(FkTarget::Table(FkRef {
+                table_id: 41,
+                col: 0,
+                on_delete: FkAction::Restrict
+            }))
+        ]
+    );
     assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
 
     // A non-PK parent column is a legal target only with a single-column UNIQUE
@@ -419,6 +451,43 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
     );
     let sql = "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES q(u))";
     assert_rejects(sql, plan_table(&cat, sql), "UNIQUE index");
+}
+
+/// `ON DELETE` plans to its action in each spelling of a reference: a column
+/// option, a table constraint and a self-reference. An absent action, `NO
+/// ACTION` and `RESTRICT` are one.
+#[test]
+fn an_fk_carries_its_on_delete_action() {
+    let cat = fk_catalog();
+    for (clause, on_delete) in [
+        ("", FkAction::Restrict),
+        (" ON DELETE NO ACTION", FkAction::Restrict),
+        (" ON DELETE RESTRICT", FkAction::Restrict),
+        (" ON DELETE CASCADE", FkAction::Cascade),
+    ] {
+        let to_p = Some(FkTarget::Table(FkRef { table_id: 41, col: 0, on_delete }));
+        let to_self = Some(FkTarget::SelfTable { col: 0, on_delete });
+        for (sql, want) in [
+            (
+                format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id){clause})"),
+                to_p,
+            ),
+            (
+                format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT, FOREIGN KEY (r) REFERENCES p(id){clause})"),
+                to_p,
+            ),
+            (
+                format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT REFERENCES c(id){clause})"),
+                to_self,
+            ),
+            (
+                format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT, FOREIGN KEY (r) REFERENCES c{clause})"),
+                to_self,
+            ),
+        ] {
+            assert_eq!(created(&cat, &sql).fks, vec![None, want], "{sql}");
+        }
+    }
 }
 
 /// A self-referencing FK resolves against the in-flight columns: it targets the
@@ -437,7 +506,7 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
     ] {
         let c = created(&cat, sql);
         let mut fks = vec![None; c.schema.columns.len()];
-        fks[col_idx] = Some(FkTarget::SelfTable { col: 0 });
+        fks[col_idx] = Some(FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict });
         assert_eq!(c.fks, fks, "{sql}");
         assert_eq!(c.schema.columns[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
@@ -600,15 +669,23 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
         // Two tables named `t`: the session's own and `other`'s.
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
-            FkTarget::Table(FkRef { table_id: 42, col: 0 }),
+            FkTarget::Table(FkRef {
+                table_id: 42,
+                col: 0,
+                on_delete: FkAction::Restrict,
+            }),
         ),
         (
             "CREATE TABLE other.t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
-            FkTarget::SelfTable { col: 0 },
+            FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict },
         ),
         (
             "CREATE TABLE other.x (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id))",
-            FkTarget::Table(FkRef { table_id: 41, col: 0 }),
+            FkTarget::Table(FkRef {
+                table_id: 41,
+                col: 0,
+                on_delete: FkAction::Restrict,
+            }),
         ),
     ] {
         assert_eq!(created(&cat, sql).fks[1], Some(want), "`{sql}`");

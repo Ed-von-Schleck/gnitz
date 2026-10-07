@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{
-    CircuitRow, ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SchemaTabSlot, SysRow, TableTabRow, ViewTabRow,
+    CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, SchemaTabRow, SchemaTabSlot, SysRow, TableTabRow,
+    ViewTabRow,
 };
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
@@ -96,7 +97,7 @@ pub struct IndexRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FkTarget {
     Table(FkRef),
-    SelfTable { col: u32 },
+    SelfTable { col: u32, on_delete: FkAction },
 }
 
 impl FkTarget {
@@ -104,7 +105,7 @@ impl FkTarget {
     fn resolve(self, own_id: u64) -> FkRef {
         match self {
             FkTarget::Table(fk) => fk,
-            FkTarget::SelfTable { col } => FkRef { table_id: own_id, col },
+            FkTarget::SelfTable { col, on_delete } => FkRef { table_id: own_id, col, on_delete },
         }
     }
 }

@@ -320,7 +320,7 @@ fn alter_rejection_matrix() {
         (
             "ALTER TABLE t ADD COLUMN x BIGINT REFERENCES t (id)",
             Rejected,
-            "ADD CONSTRAINT",
+            "only at CREATE TABLE",
         ),
         ("ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)", Rejected, "CHECK"),
         ("ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8", Rejected, "COLLATE"),

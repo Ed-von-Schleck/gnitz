@@ -389,10 +389,12 @@ pub enum Probe {
     Pk,
     /// The own PK store: each key a live row carries, with that row's column.
     PkColumn(u32),
-    /// The secondary index on this exact column list: each key answered with up
-    /// to this many of the stored entries under its span, each
-    /// `[span ‖ holder PK]`.
-    Index(PkColList, NonZeroU64),
+    /// The secondary index on this exact column list: each key answered with
+    /// the first stored entry under its span, `[span ‖ holder PK]`.
+    Index(PkColList),
+    /// The same index: the stored entries under the keys' spans, in key order,
+    /// up to this many in all.
+    IndexAll(PkColList, NonZeroU64),
 }
 
 impl Probe {
@@ -401,20 +403,22 @@ impl Probe {
         match self {
             Probe::Pk => (WireProbeMode::Pk, 0, 0),
             Probe::PkColumn(col) => (WireProbeMode::PkColumn, col as u64, 0),
-            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), cols.pack()),
+            Probe::Index(cols) => (WireProbeMode::Index, 0, cols.pack()),
+            Probe::IndexAll(cols, cap) => (WireProbeMode::IndexAll, cap.get(), cols.pack()),
         }
     }
 
     /// The inverse of [`Self::wire`], refusing every other triple.
     pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
         let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
+        let unpack = |cols| PkColList::unpack(cols).map_err(|e| e.for_role(PkListRole::ColumnList));
         match (mode, arg0, arg1) {
             (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
             (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
-            (WireProbeMode::Index, cap, cols) => {
+            (WireProbeMode::Index, 0, cols) => Ok(Probe::Index(unpack(cols)?)),
+            (WireProbeMode::IndexAll, cap, cols) => {
                 let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
-                let cols = PkColList::unpack(cols).map_err(|e| e.for_role(PkListRole::ColumnList))?;
-                Ok(Probe::Index(cols, cap))
+                Ok(Probe::IndexAll(unpack(cols)?, cap))
             }
             _ => Err(refused()),
         }

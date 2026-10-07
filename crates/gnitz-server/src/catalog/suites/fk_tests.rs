@@ -1,19 +1,25 @@
 use super::*;
-use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::sys_rows::{FkAction, FkRef};
 
-// ── test_fk_lock_set ─────────────────────────────────────────────────
+// ── test_write_lock_set ─────────────────────────────────────────────────
 
-/// `tid`'s lock set as `lock_tables_exclusive` acquires it: sorted and deduped.
-fn lock_set(engine: &CatalogEngine, tid: u64) -> Vec<u64> {
-    let mut set: Vec<u64> = engine.fk_lock_set(tid).collect();
+/// The lock set of a write to `tid` that `deletes` or does not, as
+/// `lock_tables_exclusive` acquires it: sorted and deduped.
+fn lock_set_of(engine: &CatalogEngine, tid: u64, deletes: bool) -> Vec<u64> {
+    let mut set = engine.write_lock_set(tid, deletes);
     set.sort_unstable();
     set.dedup();
     set
 }
 
+/// A deleting write's lock set.
+fn lock_set(engine: &CatalogEngine, tid: u64) -> Vec<u64> {
+    lock_set_of(engine, tid, true)
+}
+
 #[test]
-fn test_fk_lock_set() {
-    let dir = temp_dir("fk_lock_set");
+fn test_write_lock_set() {
+    let dir = temp_dir("write_lock_set");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // A base table with no FK yet: needs a lock for itself (its writes run
@@ -59,6 +65,75 @@ fn test_fk_lock_set() {
     engine.drop_table("public.child").unwrap();
     assert_eq!(lock_set(&engine, parent_tid), expected_c2);
 
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A deleting write locks the children, restricting ones included, of every
+/// table a chain of cascading edges reaches from it, none beyond a restricting
+/// edge, and no parent of a table it only cascades to; a write that deletes
+/// nothing locks no further than its own children. An edge carries its column's
+/// action.
+#[test]
+fn a_write_locks_what_its_cascade_can_delete_from() {
+    let dir = temp_dir("write_lock_set_cascade");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut table = |name: &str, fks: &[(u64, FkAction)]| {
+        let mut cols = vec![col_def("id", TypeCode::U64)];
+        for (i, &(parent, on_delete)) in fks.iter().enumerate() {
+            cols.push(fk_def_on_delete(&format!("r{i}"), TypeCode::U64, parent, 0, on_delete));
+        }
+        engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap()
+    };
+    use FkAction::{Cascade, Restrict};
+    //   root ◄─cascade─ mid ◄─cascade─ leaf ◄─restrict─ guard ◄─cascade─ beyond
+    //                    │                 └─cascade─► other (a second parent of leaf)
+    //   root ◄─restrict─ held ◄─cascade─ under
+    let root = table("root", &[]);
+    let other = table("other", &[]);
+    let mid = table("mid", &[(root, Cascade)]);
+    let leaf = table("leaf", &[(mid, Cascade), (other, Cascade)]);
+    let guard = table("guard", &[(leaf, Restrict)]);
+    let beyond = table("beyond", &[(guard, Cascade)]);
+    let held = table("held", &[(root, Restrict)]);
+    let under = table("under", &[(held, Cascade)]);
+
+    assert_eq!(lock_set(&engine, root), [root, mid, leaf, guard, held]);
+    assert_eq!(lock_set(&engine, mid), [root, mid, leaf, guard]);
+    assert_eq!(lock_set(&engine, leaf), [other, mid, leaf, guard]);
+    assert_eq!(lock_set(&engine, other), [other, leaf, guard]);
+    assert_eq!(lock_set(&engine, guard), [leaf, guard, beyond]);
+    assert_eq!(lock_set(&engine, held), [root, held, under]);
+    assert_eq!(lock_set_of(&engine, root, false), [root, mid, held]);
+    assert_eq!(lock_set_of(&engine, mid, false), [root, mid, leaf]);
+    let _ = (beyond, under);
+
+    let actions = |tid| -> Vec<FkAction> { engine.fk_constraints_of(tid).iter().map(|e| e.on_delete).collect() };
+    assert_eq!(actions(leaf), [Cascade, Cascade]);
+    assert_eq!(actions(guard), [Restrict]);
+    let by_parent: Vec<_> = engine
+        .fk_children_of(root)
+        .iter()
+        .map(|e| (e.child_tid, e.on_delete))
+        .collect();
+    assert_eq!(by_parent, [(mid, Cascade), (held, Restrict)]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A self-referencing cascade ends the walk at the table it started from.
+#[test]
+fn a_self_cascading_table_locks_itself_once() {
+    let dir = temp_dir("write_lock_set_self");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tid = engine.next_id;
+    let cols = vec![
+        col_def("id", TypeCode::U64),
+        fk_def_on_delete("parent", TypeCode::U64, tid, 0, FkAction::Cascade),
+    ];
+    assert_eq!(engine.create_table("public.tree", &cols, &[0]).unwrap(), tid);
+    assert_eq!(lock_set(&engine, tid), [tid]);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -280,7 +355,11 @@ fn a_decimal_fk_child_must_carry_the_parents_scale() {
     };
     let parent_tid = engine.create_table("public.p", &[decimal("id", 4)], &[0]).unwrap();
     let child = |scale: u8| {
-        let fk = Some(FkRef { table_id: parent_tid, col: 0 });
+        let fk = Some(FkRef {
+            table_id: parent_tid,
+            col: 0,
+            on_delete: FkAction::Restrict,
+        });
         vec![
             col_def("cid", TypeCode::U64),
             CatalogColumn { fk, ..decimal("pid", scale) },
@@ -330,7 +409,11 @@ fn test_fk_self_reference() {
     let emp_cols = vec![
         col_def("emp_id", TypeCode::U64),
         CatalogColumn {
-            fk: Some(FkRef { table_id: next_tid, col: 0 }),
+            fk: Some(FkRef {
+                table_id: next_tid,
+                col: 0,
+                on_delete: FkAction::Restrict,
+            }),
             ..nullable_def("mgr_id", TypeCode::U64)
         },
     ];
@@ -426,7 +509,11 @@ fn test_push_reads_committed_state() {
     let tree_cols = vec![
         col_def("id", TypeCode::U64),
         CatalogColumn {
-            fk: Some(FkRef { table_id: next_tid, col: 0 }),
+            fk: Some(FkRef {
+                table_id: next_tid,
+                col: 0,
+                on_delete: FkAction::Restrict,
+            }),
             ..nullable_def("parent_id", TypeCode::U64)
         },
     ];

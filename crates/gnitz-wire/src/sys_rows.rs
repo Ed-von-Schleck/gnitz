@@ -160,6 +160,9 @@ sys_row! {
         /// The parent table of a foreign key; `0` for none, which no relation has.
         fk_table_id: U64,
         fk_col_idx: U64,
+        /// [`FkAction`]'s word: what a delete of the referenced row does to
+        /// this one. `0` where the column references nothing.
+        fk_on_delete: U64,
         /// `1` for a hidden key slot, echoed into reply schema blocks.
         is_hidden: U64,
         /// [`crate::ColType`]'s scale: a DECIMAL column's, else `0`.
@@ -199,11 +202,22 @@ sys_row! {
     }
 }
 
-/// The column a FOREIGN KEY column references.
+wire_enum! {
+    /// What deleting a referenced row does to the rows referencing it.
+    pub enum FkAction: u8 {
+        /// The delete is refused while a referencing row remains.
+        Restrict = 0,
+        /// The referencing rows are deleted with it.
+        Cascade = 1,
+    }
+}
+
+/// The column a FOREIGN KEY column references, and what a delete there does here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FkRef {
     pub table_id: u64,
     pub col: u32,
+    pub on_delete: FkAction,
 }
 
 impl<'a> ColTabRow<'a> {
@@ -211,7 +225,9 @@ impl<'a> ColTabRow<'a> {
     /// the **resolved** parent column: a client's deferred self-reference is
     /// substituted before a row reaches here.
     pub fn of(owner_id: u64, col_idx: u64, col: &'a crate::ColumnDef, fk: Option<FkRef>) -> Self {
-        let (fk_table_id, fk_col_idx) = fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
+        let (fk_table_id, fk_col_idx, fk_on_delete) = fk.map_or((0, 0, 0), |fk| {
+            (fk.table_id, fk.col as u64, fk.on_delete.as_wire() as u64)
+        });
         ColTabRow {
             owner_id,
             col_idx,
@@ -220,6 +236,7 @@ impl<'a> ColTabRow<'a> {
             is_nullable: col.is_nullable as u64,
             fk_table_id,
             fk_col_idx,
+            fk_on_delete,
             is_hidden: col.is_hidden as u64,
             scale: col.ty.scale as u64,
         }
@@ -244,10 +261,14 @@ impl<'a> ColTabRow<'a> {
         let ty = crate::ColType::from_wire(code, scale)
             .ok_or_else(|| format!("column record carries an invalid column type {code}/{scale}"))?;
         let fk_col = word("fk_col_idx", self.fk_col_idx, u32::MAX as u64)? as u32;
+        let on_delete = word("fk_on_delete", self.fk_on_delete, u8::MAX as u64)?;
+        let on_delete = FkAction::from_wire(on_delete as u8)
+            .ok_or_else(|| format!("column record carries an invalid fk_on_delete {on_delete}"))?;
         let fk = match (self.fk_table_id, fk_col) {
-            (0, 0) => None,
+            (0, 0) if on_delete == FkAction::Restrict => None,
+            (0, 0) => return Err("column record carries an FK action with no FK table".into()),
             (0, col) => return Err(format!("column record carries FK column {col} with no FK table")),
-            (table_id, col) => Some(FkRef { table_id, col }),
+            (table_id, col) => Some(FkRef { table_id, col, on_delete }),
         };
         let def = crate::ColumnDef {
             name: self.name.to_owned(),

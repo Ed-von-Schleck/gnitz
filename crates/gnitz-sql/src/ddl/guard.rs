@@ -4,6 +4,7 @@
 //! contract `crate::validate` states.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use gnitz_wire::sys_rows::FkAction;
 
 /// The values of a `CREATE` statement's `WITH (key = value, …)` clause, one slot per
 /// entry of `keys`. Any other option form, unknown key or repeated key is rejected.
@@ -48,16 +49,12 @@ pub(super) fn kv_options<'a, const N: usize>(
     )))
 }
 
-/// Reject every FOREIGN KEY field beyond the target (`foreign_table` /
-/// `referred_columns` / `columns`) and the inert names: a referential action
-/// (`ON DELETE` / `ON UPDATE`), a `MATCH` kind, and constraint characteristics
-/// (DEFERRABLE) are all semantics gnitz does not implement. Since sqlparser 0.60
-/// the column-level and table-level FK both wrap the same `ForeignKeyConstraint`,
-/// so both guards share this one check (exhaustive destructure, no `..`).
-pub(super) fn reject_unhonored_fk_fields(
+/// A FOREIGN KEY's `ON DELETE` action, rejecting every field gnitz does not
+/// implement. Column-level and table-level FKs both read through here.
+pub(super) fn fk_on_delete(
     fk: &sqlparser::ast::ForeignKeyConstraint,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<FkAction, GnitzSqlError> {
     let sqlparser::ast::ForeignKeyConstraint {
         // Consumed by `resolve_fk_target`.
         columns: _,
@@ -66,19 +63,25 @@ pub(super) fn reject_unhonored_fk_fields(
         // Inert metadata: gnitz has no FK constraint/index naming surface.
         name: _,
         index_name: _,
-        // Rejected: unimplemented semantics.
         on_delete,
+        // Rejected: unimplemented semantics.
         on_update,
         match_kind,
         characteristics,
     } = fk;
-    reject_if(
-        on_delete.is_some() || on_update.is_some(),
-        context,
-        "FOREIGN KEY ON DELETE/ON UPDATE action",
-    )?;
+    reject_if(on_update.is_some(), context, "FOREIGN KEY ON UPDATE action")?;
     reject_if(match_kind.is_some(), context, "FOREIGN KEY MATCH")?;
-    reject_constraint_characteristics(characteristics, context)
+    reject_constraint_characteristics(characteristics, context)?;
+    use sqlparser::ast::ReferentialAction as A;
+    match on_delete {
+        // Both name the check a write's fold is held to.
+        None | Some(A::NoAction | A::Restrict) => Ok(FkAction::Restrict),
+        Some(A::Cascade) => Ok(FkAction::Cascade),
+        Some(A::SetNull | A::SetDefault) => Err(unsupported_clause(
+            context,
+            "FOREIGN KEY ON DELETE SET NULL / SET DEFAULT",
+        )),
+    }
 }
 
 /// Constraint characteristics (`DEFERRABLE …`) are semantics gnitz does not
@@ -210,8 +213,8 @@ impl ColumnOptionSite {
 
 /// Reject every column option `site` does not honor. Honored by CREATE TABLE: NULL/NOT NULL
 /// (nullability), PRIMARY KEY, UNIQUE, FOREIGN KEY target — the honored constraint variants are
-/// descended into (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside them
-/// (a referential action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. Every
+/// descended into (`reject_unhonored_{pk,unique}_fields`, `fk_on_delete`) so an unimplemented field inside them
+/// (an `ON UPDATE` action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. Every
 /// constraint/semantic option gnitz lacks (DEFAULT, CHECK, GENERATED, IDENTITY, ON UPDATE, COLLATE,
 /// SRID, INVISIBLE, …) is rejected; pure metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. Exhaustive
 /// over the `ColumnDef` / `ColumnOptionDef` fields (no `..`) and over all 23 `ColumnOption` variants
@@ -253,8 +256,8 @@ pub(super) fn reject_unhonored_column_options(
             }
             // Target consumed; the rest rejected.
             O::ForeignKey(fk) => {
-                honored("REFERENCES (add the column, then ALTER TABLE … ADD CONSTRAINT)")?;
-                reject_unhonored_fk_fields(fk, context)?
+                honored("REFERENCES (a foreign key is declared only at CREATE TABLE)")?;
+                fk_on_delete(fk, context).map(drop)?
             }
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
             O::Default(_) => return Err(unsupported_clause(context, "DEFAULT")),

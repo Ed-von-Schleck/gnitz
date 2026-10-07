@@ -58,38 +58,34 @@ fn probe_bench() {
             instructions as f64 / keys.len() as f64
         );
     };
-    let index = |cap| Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::new(cap).unwrap());
+    let index = Probe::Index(PkColList::from_slice(&[1]));
+    let index_all = |cap| Probe::IndexAll(PkColList::from_slice(&[1]), NonZeroU64::new(cap).unwrap());
     let span = pk_only_schema(&[TypeCode::I64]);
     let pk = pk_only_schema(&[TypeCode::U64]);
 
     // One holder per value, every sixteenth value held.
     let unique = fixture(|id| id as i64 * 16);
     let held = || (0..ROWS).map(|id| id * 16);
-    cell("index, hits", &unique, index(1), keys(&span, held()), ROWS);
+    cell("index, hits", &unique, index, keys(&span, held()), ROWS);
     // The open is the whole cost.
-    cell(
-        "index, one hit",
-        &unique,
-        index(1),
-        keys(&span, held().skip(1).take(1)),
-        1,
-    );
+    cell("index, one hit", &unique, index, keys(&span, held().skip(1).take(1)), 1);
     // Every miss lands below the next key.
     let between = keys(&span, held().map(|v| v + 8));
-    cell("index, lone misses", &unique, index(1), between, 0);
+    cell("index, lone misses", &unique, index, between, 0);
     // The fifteen values between two held ones: a miss lands past the keys
     // that follow it.
     let unheld = keys(&span, (0..ROWS).filter(|v| v % 16 != 0));
-    cell("index, runs of misses", &unique, index(1), unheld, 0);
+    cell("index, runs of misses", &unique, index, unheld, 0);
     cell("pk", &unique, Probe::Pk, keys(&pk, 0..ROWS), ROWS);
     // Above every run.
     cell("pk, misses", &unique, Probe::Pk, keys(&pk, ROWS..2 * ROWS), 0);
     cell("pk column", &unique, Probe::PkColumn(1), keys(&pk, 0..ROWS), ROWS);
 
     // Four holders per value, every value probed: the group ends the walk, then
-    // the cap does.
+    // the first entry does, then the reply's cap does.
     let groups = fixture(|id| (id / 4) as i64);
     let vals = || keys(&span, 0..ROWS / 4);
-    cell("index, 4 holders, cap 8", &groups, index(8), vals(), ROWS);
-    cell("index, 4 holders, cap 1", &groups, index(1), vals(), ROWS / 4);
+    cell("index, 4 holders, all", &groups, index_all(2 * ROWS), vals(), ROWS);
+    cell("index, 4 holders, first", &groups, index, vals(), ROWS / 4);
+    cell("index, 4 holders, half", &groups, index_all(ROWS / 2), vals(), ROWS / 2);
 }

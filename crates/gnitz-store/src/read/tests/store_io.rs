@@ -319,21 +319,28 @@ fn cap(n: u64) -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(n).unwrap()
 }
 
-/// An index probe answers a held span with its stored entries, up to the cap,
-/// and a span no row holds with nothing.
+/// An index probe answers a held span with its first stored entry, or with
+/// every one up to a cap counted across the keys, and a span no row holds with
+/// nothing.
 #[test]
 fn an_index_probe_answers_a_held_span_with_its_holders() {
     // Ids 2k and 2k + 1 share `val = 10k`.
     let r = fixture(|id| (id / 2) as i64 * 10);
     let cols = PkColList::from_slice(&[1]);
     let ix = ValIndex::of(&r);
-    let keys = ix.keys(&[20, 25]);
-    let probe = |n| reply_rows(&r.probe(TID, Probe::Index(cols, cap(n)), &keys).unwrap());
-    let (first, second) = (ix.entry(4, 20), ix.entry(5, 20));
+    let probe = |probe, vals: &[i64]| reply_rows(&r.probe(TID, probe, &ix.keys(vals)).unwrap());
+    let all = |n| Probe::IndexAll(cols, cap(n));
+    let entry = |id, val| (ix.entry(id, val), 1);
 
-    assert_eq!(probe(1), [(first.clone(), 1)]);
-    assert_eq!(probe(2), [(first.clone(), 1), (second.clone(), 1)]);
-    assert_eq!(probe(8), [(first, 1), (second, 1)]);
+    assert_eq!(probe(Probe::Index(cols), &[20, 25]), [entry(4, 20)]);
+    assert_eq!(probe(Probe::Index(cols), &[10, 20]), [entry(2, 10), entry(4, 20)]);
+    assert_eq!(probe(all(1), &[20, 25]), [entry(4, 20)]);
+    assert_eq!(probe(all(2), &[20, 25]), [entry(4, 20), entry(5, 20)]);
+    assert_eq!(probe(all(8), &[20, 25]), [entry(4, 20), entry(5, 20)]);
+    // The cap is the reply's, not a key's: it is reached inside the second span.
+    let three = [entry(2, 10), entry(3, 10), entry(4, 20)];
+    assert_eq!(probe(all(3), &[10, 15, 20, 30]), three);
+    assert_eq!(probe(all(7), &[10, 15, 20, 30]).len(), 6);
 }
 
 /// An index probe's one cursor answers each key as a seek of its own does: a
@@ -346,14 +353,14 @@ fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
     let cols = PkColList::from_slice(&[1]);
     let ix = ValIndex::of(&r);
     let vals = [-5, 1, 2, 3, 10, 20, 21, 30, 5000];
-    for n in [1, 2, 8] {
-        let probe = |vals: &[i64]| r.probe(TID, Probe::Index(cols, cap(n)), &ix.keys(vals));
+    for (probe, per_value) in [(Probe::Index(cols), 1), (Probe::IndexAll(cols, cap(64)), 2)] {
+        let probe = |vals: &[i64]| r.probe(TID, probe, &ix.keys(vals));
         let alone: Vec<_> = vals.iter().flat_map(|&v| reply_rows(&probe(&[v]).unwrap())).collect();
-        assert_eq!(reply_rows(&probe(&vals).unwrap()), alone, "cap {n}");
-        assert_eq!(alone.len(), 3 * (n as usize).min(2), "cap {n}: three held values");
+        assert_eq!(reply_rows(&probe(&vals).unwrap()), alone, "{per_value} per value");
+        assert_eq!(alone.len(), 3 * per_value, "three held values");
     }
     for vals in [&[10, 10][..], &[20, 10]] {
-        let got = r.probe(TID, Probe::Index(cols, cap(1)), &ix.keys(vals));
+        let got = r.probe(TID, Probe::Index(cols), &ix.keys(vals));
         assert!(got.is_err(), "{vals:?}");
     }
 }
@@ -363,7 +370,7 @@ fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
 #[test]
 fn a_probe_refuses_a_missing_index_and_a_foreign_key_stride() {
     let r = fixture(|id| id as i64);
-    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), cap(1));
+    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols));
     let span_keys = ValIndex::of(&r).keys(&[2]);
     for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1]))] {
         assert!(r.probe(id, probe, &span_keys).is_err(), "{id} {probe:?}");

@@ -155,20 +155,21 @@ proptest! {
         keys.sort();
         keys.dedup();
 
-        // A capped gather takes each key's positive rows up to the cap, whole
-        // PKs and leading bytes of one alike.
+        // A capped gather takes each key's positive rows up to the per-key cap
+        // and stops at the total, whole PKs and leading bytes of one alike.
         for n in [1, stride] {
             let mut prefixes: Vec<&[u8]> = keys.iter().map(|k| &k[..n]).collect();
             prefixes.dedup();
-            for max in [0, 1, 3] {
+            for (max, total) in [(0, usize::MAX), (1, usize::MAX), (3, usize::MAX), (3, 4), (usize::MAX, 5), (2, 0)] {
                 let want: Vec<_> = prefixes
                     .iter()
                     .flat_map(|prefix| rows_where(&|p, w| &p[..n] == *prefix && w > 0).into_iter().take(max))
+                    .take(total)
                     .collect();
                 let keys = PkKeys::from_sorted(n, prefixes.concat());
                 let mut capped = Vec::new();
                 PkSetGather::over_runs(runs.iter().cloned(), s, runs.len(), keys)
-                    .for_each_positive_capped(max, |c| capped.push(current(c)));
+                    .for_each_positive_capped(max, total, |c| capped.push(current(c)));
                 prop_assert_eq!(capped, want);
             }
         }

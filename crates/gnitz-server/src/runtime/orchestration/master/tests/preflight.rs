@@ -73,19 +73,19 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     let (disp, _) = test_dispatcher(vec![0], &mut engine);
 
     let write = |rows: &[(u64, i64, i64)]| {
-        [TxnFamily {
+        vec![TxnFamily {
             tid: parent,
             mode: WireConflictMode::Update,
             batch: make_batch_raw(&schema, rows),
         }]
     };
-    let upsert = write(&[(1, 1, 10), (2, 1, 20)]);
+    let mut upsert = write(&[(1, 1, 10), (2, 1, 20)]);
     assert!(matches!(
-        try_poll_once(disp.validate_txn_distributed(&upsert)),
+        try_poll_once(disp.validate_txn_distributed(&mut upsert)),
         Some(Ok(()))
     ));
-    let retraction = write(&[(1, -1, 10)]);
-    assert!(try_poll_once(disp.validate_txn_distributed(&retraction)).is_none());
+    let mut retraction = write(&[(1, -1, 10)]);
+    assert!(try_poll_once(disp.validate_txn_distributed(&mut retraction)).is_none());
 
     drop(disp);
     engine.close();

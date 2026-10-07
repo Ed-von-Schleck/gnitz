@@ -57,8 +57,8 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit, fk_def, idx_tab_batch,
-    left_join_engine, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_sys_row,
+    cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit, fk_def, fk_def_on_delete,
+    idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_sys_row,
     push_view_tab_row, read_rows, register_identity_view, scan_all, schema_tab_batch, scratch_dir, seek_by_index,
     seek_by_index_range, sum_weights, table_tab_batch, try_register_identity_view, try_register_view,
     two_term_join_circuit, uuid_def, write_circuit, write_identity_circuit, LocalDrive,

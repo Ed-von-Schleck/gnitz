@@ -21,7 +21,7 @@ impl RelationRegistry {
                 "probe: key stride {stride} != the probed store's {expected} (table {id})"
             )),
         };
-        let (cols, cap) = match probe {
+        let (cols, per_key, total) = match probe {
             Probe::Pk => {
                 let mut echo = Batch::empty_with_schema(keys.schema());
                 // An id this process has not registered holds no row.
@@ -39,7 +39,8 @@ impl RelationRegistry {
                 let live = PkKeys::from_sorted(stride, live);
                 return relation.gather(live, Cut::Now).project_live(&[col]);
             }
-            Probe::Index(cols, cap) => (cols, cap),
+            Probe::Index(cols) => (cols, 1, usize::MAX),
+            Probe::IndexAll(cols, cap) => (cols, usize::MAX, usize::try_from(cap.get()).unwrap_or(usize::MAX)),
         };
         let index = self
             .relation(id)
@@ -50,11 +51,10 @@ impl RelationRegistry {
         keyed_as(span)?;
         let spans =
             PkKeys::checked(span, keys.pk_data().to_vec()).map_err(|e| format!("probe: index {e} (table {id})"))?;
-        let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
         let mut entries = Batch::empty_with_schema(&index.schema());
         index
             .gather(spans)
-            .for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));
+            .for_each_positive_capped(per_key, total, |c| entries.push_key_row(c.current_pk_bytes(), 1));
         Ok(entries)
     }
 

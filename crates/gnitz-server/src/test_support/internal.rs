@@ -6,7 +6,7 @@
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_wire::sys_rows::{CircuitRow, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
+use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
@@ -53,10 +53,25 @@ pub fn nullable_def(name: &str, type_code: TypeCode) -> CatalogColumn {
     }
 }
 
-/// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
+/// A column of `type_code` carrying a restricting FK onto `(parent_tid, parent_col)`.
 pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32) -> CatalogColumn {
+    fk_def_on_delete(name, type_code, parent_tid, parent_col, FkAction::Restrict)
+}
+
+/// [`fk_def`] under an explicit `ON DELETE` action.
+pub fn fk_def_on_delete(
+    name: &str,
+    type_code: TypeCode,
+    parent_tid: u64,
+    parent_col: u32,
+    on_delete: FkAction,
+) -> CatalogColumn {
     CatalogColumn {
-        fk: Some(FkRef { table_id: parent_tid, col: parent_col }),
+        fk: Some(FkRef {
+            table_id: parent_tid,
+            col: parent_col,
+            on_delete,
+        }),
         ..col_def(name, type_code)
     }
 }

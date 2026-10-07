@@ -198,6 +198,29 @@ fn hiding_a_foreign_key_column_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A column's `ON DELETE` action is fixed when it is declared.
+#[test]
+fn changing_a_foreign_keys_action_rejected() {
+    let dir = temp_dir("alter_fk_action");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let ptid = engine
+        .create_table("public.p", &[col_def("id", TypeCode::U64)], &[0])
+        .unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, ptid, 0)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    let cascade = |c: &mut CatalogColumn| {
+        c.fk.as_mut().unwrap().on_delete = gnitz_wire::sys_rows::FkAction::Cascade;
+    };
+    let err = engine
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], cascade))
+        .unwrap_err();
+    assert!(err.contains("changes a field it may not"), "{err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("c", TypeCode::U64)];

@@ -2,7 +2,7 @@
 //! and CREATE INDEX.
 
 use super::guard::{
-    kv_options, reject_index_type_and_options, reject_unhonored_column_options, reject_unhonored_fk_fields,
+    fk_on_delete, kv_options, reject_index_type_and_options, reject_unhonored_column_options,
     reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
 };
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
@@ -14,7 +14,7 @@ use crate::types::column_def;
 use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema};
 use gnitz_expr::SchemaFacts;
-use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
 use sqlparser::ast::{
@@ -103,6 +103,7 @@ struct FkSite<'a> {
     col_idx: usize,
     foreign_table: &'a sqlparser::ast::ObjectName,
     referred_columns: &'a [sqlparser::ast::Ident],
+    on_delete: FkAction,
 }
 
 /// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX column list against `cols`, in
@@ -175,7 +176,10 @@ fn resolve_fk_target_inline(
 
     check_fk_type_compat(current_cols[site.col_idx].ty, current_cols[ref_col_idx].ty)?;
     Ok((
-        FkTarget::SelfTable { col: ref_col_idx as u32 },
+        FkTarget::SelfTable {
+            col: ref_col_idx as u32,
+            on_delete: site.on_delete,
+        },
         current_cols[ref_col_idx].ty,
     ))
 }
@@ -234,6 +238,7 @@ fn resolve_fk_target(
         FkTarget::Table(FkRef {
             table_id: ref_tid,
             col: ref_col_idx as u32,
+            on_delete: site.on_delete,
         }),
         ref_schema.columns[ref_col_idx].ty,
     ))
@@ -319,12 +324,12 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::PrimaryKey(_) => inline_pk.push(i as u32),
-                ColumnOption::ForeignKey(ForeignKeyConstraint { foreign_table, referred_columns, .. }) => fk_sites
-                    .push(FkSite {
-                        col_idx: i,
-                        foreign_table,
-                        referred_columns,
-                    }),
+                ColumnOption::ForeignKey(fk) => fk_sites.push(FkSite {
+                    col_idx: i,
+                    foreign_table: &fk.foreign_table,
+                    referred_columns: &fk.referred_columns,
+                    on_delete: fk_on_delete(fk, "column definition")?,
+                }),
                 ColumnOption::Unique(_) => push_unique(
                     &mut unique,
                     vec![i as u32],
@@ -356,9 +361,10 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                 }
                 table_pk = Some(resolved);
             }
-            TableConstraint::ForeignKey(ForeignKeyConstraint {
-                columns, foreign_table, referred_columns, ..
-            }) => {
+            TableConstraint::ForeignKey(fk) => {
+                let ForeignKeyConstraint {
+                    columns, foreign_table, referred_columns, ..
+                } = fk;
                 if columns.len() != 1 {
                     return Err(GnitzSqlError::Rejected(
                         "multi-column FOREIGN KEY constraints are not supported".into(),
@@ -366,7 +372,12 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                 }
                 let local_col_name = &columns[0].value;
                 let col_idx = require_column(&cols, local_col_name).map_err(|e| e.in_clause("FOREIGN KEY"))?;
-                fk_sites.push(FkSite { col_idx, foreign_table, referred_columns });
+                fk_sites.push(FkSite {
+                    col_idx,
+                    foreign_table,
+                    referred_columns,
+                    on_delete: fk_on_delete(fk, "table constraint")?,
+                });
             }
             TableConstraint::Unique(UniqueConstraint { name: name_ident, columns, .. }) => {
                 if columns.is_empty() {
@@ -577,9 +588,9 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
 }
 
 /// Reject every table constraint CREATE TABLE does not honor. Honored: PRIMARY KEY, UNIQUE,
-/// FOREIGN KEY target — each honored variant is descended into
-/// (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside it (a referential
-/// action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. `CHECK`, inline `INDEX`,
+/// FOREIGN KEY target and `ON DELETE` action — each honored variant is descended into
+/// (`reject_unhonored_{pk,unique}_fields`, `fk_on_delete`) so an unimplemented field inside it (an
+/// `ON UPDATE` action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. `CHECK`, inline `INDEX`,
 /// `FULLTEXT`/`SPATIAL` indexes, and the Postgres `{PRIMARY KEY,UNIQUE} USING INDEX` promotions (no
 /// pre-existing index at CREATE TABLE) are rejected. Exhaustive over all 8 `TableConstraint`
 /// variants (no `_`).
@@ -592,7 +603,7 @@ fn reject_unhonored_table_constraints(constraints: &[sqlparser::ast::TableConstr
             // unimplemented field is rejected, not silently dropped.
             C::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, CTX)?,
             C::Unique(u) => reject_unhonored_unique_fields(u, CTX)?,
-            C::ForeignKey(fk) => reject_unhonored_fk_fields(fk, CTX)?,
+            C::ForeignKey(fk) => fk_on_delete(fk, CTX).map(drop)?,
             C::Check(_) => return Err(unsupported_clause(CTX, "CHECK constraint")),
             C::Index(_) => return Err(unsupported_clause(CTX, "INDEX in table definition")),
             C::FulltextOrSpatial(_) => return Err(unsupported_clause(CTX, "FULLTEXT/SPATIAL index")),

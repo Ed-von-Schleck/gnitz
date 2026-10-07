@@ -243,6 +243,39 @@ fn put_null_leaves_a_zeroed_cell_under_its_bit() {
     b.debug_verify_null_bits();
 }
 
+/// `key_retractions` is one `-1` row per key, every payload cell a non-NULL
+/// zero, over a recycled buffer and under NOT NULL and string columns.
+#[test]
+fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U16, false),
+        ],
+        &[0],
+    );
+    // Leave a dirty buffer of the same size in the pool.
+    let mut dirty = Batch::with_capacity(&schema, 3);
+    dirty.data.fill(0xFF);
+    drop(dirty);
+
+    let pks: Vec<u8> = [7u64, 3, 9].iter().flat_map(|pk| pk.to_be_bytes()).collect();
+    let b = Batch::key_retractions(&schema, &pks);
+    assert_eq!(b.len(), 3);
+    assert_eq!(b.pk_data(), &pks[..]);
+    for row in 0..3 {
+        assert_eq!(b.get_weight(row), -1, "row {row}");
+        assert_eq!(b.get_null_word(row), 0, "row {row}");
+        assert_eq!(b.get_col_ptr(row, 0, 16), &[0; 16], "row {row}");
+        assert_eq!(b.get_col_ptr(row, 1, 8), &[0; 8], "row {row}");
+        assert_eq!(b.get_col_ptr(row, 2, 2), &[0; 2], "row {row}");
+    }
+    b.debug_verify_null_bits();
+    assert!(Batch::key_retractions(&schema, &[]).is_empty());
+}
+
 /// Dropping a batch returns its data buffer to the thread-local pool; an empty
 /// batch holds none to return.
 #[test]

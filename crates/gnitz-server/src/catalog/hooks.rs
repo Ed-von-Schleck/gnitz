@@ -131,6 +131,7 @@ impl CatalogEngine {
                     fk_col: ci,
                     parent_tid: fk.table_id,
                     parent_col: fk.col as usize,
+                    on_delete: fk.on_delete,
                 })
             })
             .collect();

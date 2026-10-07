@@ -141,6 +141,7 @@ wire_enum! {
         Pk = 0,
         PkColumn = 1,
         Index = 2,
+        IndexAll = 3,
     }
 }
 

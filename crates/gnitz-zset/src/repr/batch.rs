@@ -956,6 +956,27 @@ impl Batch {
         }
     }
 
+    /// One `-1` row per key of `pks`, whole `schema` PKs back to back, every
+    /// payload cell a zeroed non-NULL filler: the retraction a base table's
+    /// unique-PK rule resolves by key alone.
+    pub fn key_retractions(schema: &SchemaDescriptor, pks: &[u8]) -> Batch {
+        let n = pks.len() / schema.pk_stride();
+        debug_assert_eq!(n * schema.pk_stride(), pks.len(), "key_retractions: pks are whole keys");
+        let mut out = Self::with_capacity(schema, n);
+        out.append_session(0).write(n, |w| {
+            for pi in 0..schema.num_payload_cols() {
+                w.col_mut(pi).fill(0);
+            }
+            let (pk, weight, nulls) = w.fixed_mut();
+            pk.copy_from_slice(pks);
+            nulls.fill(0);
+            for word in weight.as_chunks_mut::<8>().0 {
+                *word = (-1i64).to_le_bytes();
+            }
+        });
+        out
+    }
+
     /// Copy every row of `src` onto this batch's tail.
     pub fn append_batch(&mut self, src: &Batch) {
         debug_assert_eq!(

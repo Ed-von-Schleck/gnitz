@@ -87,17 +87,22 @@ impl PkSetGather {
         visited
     }
 
-    /// Call `f` on up to `cap` positive-weight rows of each remaining key's
-    /// group, in key order.
-    pub fn for_each_positive_capped(&mut self, cap: usize, mut f: impl FnMut(&ReadCursor)) {
+    /// Call `f` on up to `per_key` positive-weight rows of each remaining key's
+    /// group, in key order, and on at most `total` rows in all.
+    pub fn for_each_positive_capped(&mut self, per_key: usize, total: usize, mut f: impl FnMut(&ReadCursor)) {
+        let mut room = total;
         for key in self.keys.iter().skip(self.next) {
-            if cap == 0 || !self.cursor.seek_pk_group_ascending(key) {
+            let mut left = per_key.min(room);
+            if left == 0 {
+                break;
+            }
+            if !self.cursor.seek_pk_group_ascending(key) {
                 continue;
             }
-            let mut left = cap;
             self.cursor.walk_positive_with_prefix_until(key, |c| {
                 f(c);
                 left -= 1;
+                room -= 1;
                 match left {
                     0 => ControlFlow::Break(()),
                     _ => ControlFlow::Continue(()),

@@ -272,7 +272,11 @@ fn create_table_refuses_an_fk_it_cannot_write() {
     drop(peer);
     let mut c = GnitzClient::from_session(s);
     let schema = kv_schema(TypeCode::I64);
-    let fk = Some(FkTarget::Table(FkRef { table_id: 16, col: 0 }));
+    let fk = Some(FkTarget::Table(FkRef {
+        table_id: 16,
+        col: 0,
+        on_delete: gnitz_wire::sys_rows::FkAction::Restrict,
+    }));
     for fks in [vec![fk], vec![None, fk, None]] {
         let err = block_on(c.create_table(&rel("public", "t"), &schema, &fks, TableProps::default(), &[]))
             .unwrap_err()

@@ -61,6 +61,11 @@ pub struct MasterDispatcher {
     /// A `u64` taken from the OS at boot, mixed into every delta reply's cursor
     /// tag; `MasterDispatcher::delta_cursor_tag` states what the tag answers.
     boot_nonce: u64,
+
+    /// Bytes of rows one write's cascade may delete, at each row's fixed width:
+    /// what a client's own delete of them could carry in one frame.
+    /// `GNITZ_CASCADE_BYTES` lowers it, so tests reach it on small tables.
+    cascade_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------

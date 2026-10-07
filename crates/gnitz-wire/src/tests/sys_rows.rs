@@ -116,9 +116,23 @@ fn a_column_reads_back_out_of_its_row() {
         ..score.clone().hidden()
     };
     for (col, fk) in [
-        (&score, Some(FkRef { table_id: 17, col: 3 })),
+        (
+            &score,
+            Some(FkRef {
+                table_id: 17,
+                col: 3,
+                on_delete: FkAction::Restrict,
+            }),
+        ),
         (&score, None),
-        (&flipped, Some(FkRef { table_id: 17, col: 0 })),
+        (
+            &flipped,
+            Some(FkRef {
+                table_id: 17,
+                col: 0,
+                on_delete: FkAction::Cascade,
+            }),
+        ),
     ] {
         let row = ColTabRow::of(16, 2, col, fk);
         assert_eq!((row.owner_id, row.col_idx), (16, 2));
@@ -140,6 +154,8 @@ fn a_column_row_refuses_forged_words() {
         (ColTabRow { is_hidden: 2, ..sound }, "is_hidden"),
         (ColTabRow { fk_col_idx: 1 << 32, ..sound }, "fk_col_idx"),
         (ColTabRow { fk_col_idx: 3, ..sound }, "FK column 3 with no FK table"),
+        (ColTabRow { fk_on_delete: 2, ..sound }, "fk_on_delete"),
+        (ColTabRow { fk_on_delete: 1, ..sound }, "an FK action with no FK table"),
         (ColTabRow { scale: 256, ..sound }, "scale"),
         (ColTabRow { scale: 3, ..sound }, "invalid column type"),
     ] {

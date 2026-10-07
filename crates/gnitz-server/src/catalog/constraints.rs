@@ -2,6 +2,7 @@
 //! directions, and the unique secondary indexes a write must check.
 
 use gnitz_store::relation::Relation;
+use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::PkColList;
 use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
 
@@ -21,6 +22,8 @@ pub(crate) struct FkEdge {
     pub(crate) parent_tid: u64,
     /// Referenced parent column position.
     pub(crate) parent_col: usize,
+    /// What a delete of the referenced row does to the child's.
+    pub(crate) on_delete: FkAction,
 }
 
 /// Every constraint on one table whose validation reads committed state.
@@ -47,12 +50,25 @@ impl CatalogEngine {
         self.caches.fk_by_parent.get(&parent_id).map_or(&[], Vec::as_slice)
     }
 
-    /// The tables a write to `table_id` locks exclusively: itself, its FK parents
-    /// (against a parent DELETE) and its FK children (against a child INSERT).
-    pub(crate) fn fk_lock_set(&self, table_id: u64) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(table_id)
-            .chain(self.fk_constraints_of(table_id).iter().map(|e| e.parent_tid))
-            .chain(self.fk_children_of(table_id).iter().map(|e| e.child_tid))
+    /// The tables a write to `table_id` locks exclusively: itself; its FK parents,
+    /// against a parent DELETE; and its FK children, against a child INSERT. One
+    /// that `deletes` rows takes the children of every table its deletes cascade
+    /// to as well.
+    pub(crate) fn write_lock_set(&self, table_id: u64, deletes: bool) -> Vec<u64> {
+        let mut set: Vec<u64> = self.fk_constraints_of(table_id).iter().map(|e| e.parent_tid).collect();
+        let mut deleted_from = vec![table_id];
+        let mut at = 0;
+        while let Some(&tid) = deleted_from.get(at) {
+            at += 1;
+            for e in self.fk_children_of(tid) {
+                set.push(e.child_tid);
+                if deletes && e.on_delete == FkAction::Cascade && !deleted_from.contains(&e.child_tid) {
+                    deleted_from.push(e.child_tid);
+                }
+            }
+        }
+        set.push(table_id);
+        set
     }
 
     /// FK edges as child, FK edges as parent, and the relation whose unique

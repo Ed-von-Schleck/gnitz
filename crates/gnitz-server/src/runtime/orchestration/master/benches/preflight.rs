@@ -22,12 +22,12 @@ fn preflight_probe_bench() {
     let counter = Counter::instructions();
     for rows in [1u64, 100, 20_000] {
         let inserted: Vec<_> = (0..rows).map(|i| (i, 1, i as i64)).collect();
-        let families = [TxnFamily {
+        let mut families = vec![TxnFamily {
             tid,
             mode: WireConflictMode::Error,
             batch: make_batch_raw(&schema, &inserted),
         }];
-        let validate = || counter.measure(|| try_poll_once(disp.validate_txn_distributed(&families)));
+        let mut validate = || counter.measure(|| try_poll_once(disp.validate_txn_distributed(&mut families)));
         validate(); // the fold's and the scatter's first allocations
         let (verdict, instructions) = validate();
         assert!(verdict.is_none(), "{rows} rows: a verdict with no worker answering");

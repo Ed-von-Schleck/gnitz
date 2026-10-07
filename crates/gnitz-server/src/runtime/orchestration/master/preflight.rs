@@ -4,11 +4,14 @@
 //! Every user write — a plain push and an atomic multi-family transaction
 //! alike — is validated by `validate_txn_distributed`: a plain push is a
 //! bundle of one family, so the four rules (U-PK, U-SEC, F1, F2) have one
-//! implementation each. The DDL-time pre-flight for CREATE UNIQUE INDEX is
+//! implementation each. Validating a write also completes it: the rows its
+//! deletes reach through `ON DELETE CASCADE` edges join the bundle as families
+//! of their own, under the same rules. The DDL-time pre-flight for CREATE UNIQUE INDEX is
 //! `unique_preflight.rs`, which shares nothing with this file but the
 //! `UniqueFilter` it seeds.
 
 use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use rustc_hash::FxHashSet;
@@ -21,7 +24,8 @@ use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, ColumnTable, SchemaFacts};
 use gnitz_store::relation::Relation;
-use gnitz_wire::{PkColList, PkKeys, Probe, WireConflictMode, WireStatus, MAX_PK_BYTES};
+use gnitz_wire::sys_rows::FkAction;
+use gnitz_wire::{PkBuf, PkColList, PkKeys, Probe, WireConflictMode, WireStatus, MAX_PK_BYTES};
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::{encode_schema_block, KeySpec};
 
@@ -288,11 +292,6 @@ impl<'a> TxnBundle<'a> {
         })
     }
 
-    /// Is `tid` one of the bundle's listed tables?
-    fn has(&self, tid: u64) -> bool {
-        self.tables.iter().any(|t| t.tid == tid)
-    }
-
     fn table(&self, tid: u64) -> &TxnTable<'a> {
         self.tables.iter().find(|t| t.tid == tid).expect("a bundled table")
     }
@@ -329,9 +328,11 @@ impl<'a> TxnBundle<'a> {
 
     /// Whether the bundle retires `holder`'s claim on `span` in `tid`'s index
     /// `spec`: its surviving state is deleted, or holds a NULL or another span
-    /// there. A holder the bundle does not touch keeps its claim.
+    /// there. A holder the bundle does not touch, in a table it lists or not,
+    /// keeps its claim.
     fn retires(&self, tid: u64, spec: &KeySpec, holder: &[u8], span: &[u8]) -> bool {
-        match self.fold(tid).get(holder).map(|e| e.last) {
+        let fold = self.tables.iter().find(|t| t.tid == tid).map(|t| &t.fold);
+        match fold.and_then(|fold| fold.get(holder)).map(|e| e.last) {
             None => false,
             Some(FoldOp::Deleted) => true,
             Some(FoldOp::Inserted(f, r)) => {
@@ -399,7 +400,7 @@ async fn execute_probe_burst<P>(
                     }
                     // Index entries are partitioned independently of the probe
                     // key, so every worker holding the relation is probed.
-                    Probe::Index(..) => cut.read(DirectGroup {
+                    Probe::Index(..) | Probe::IndexAll(..) => cut.read(DirectGroup {
                         data: GroupData::Same(check.keys.wire_whole()),
                         ..probe
                     })?,
@@ -417,10 +418,11 @@ async fn execute_probe_burst<P>(
 }
 
 impl MasterDispatcher {
-    /// Validate a write bundle against the state its families leave together;
-    /// an Error family's PK existence alone is cumulative in frame order. The
-    /// first violation, in the order U-PK, U-SEC, F1, F2, refuses the bundle.
-    pub async fn validate_txn_distributed(&self, families: &[TxnFamily]) -> Result<(), WireFault> {
+    /// Validate a write bundle against the state its families leave together,
+    /// appending the families its deletes cascade to; an Error family's PK
+    /// existence alone is cumulative in frame order. The first violation, in
+    /// the order U-PK, U-SEC, F1, F2, refuses the bundle.
+    pub async fn validate_txn_distributed(&self, families: &mut Vec<TxnFamily>) -> Result<(), WireFault> {
         // No family whose write reads committed state ⇒ every rule below would
         // find nothing to check, so the bundle (an O(rows) fold) is not built.
         let cat = self.cat();
@@ -428,6 +430,28 @@ impl MasterDispatcher {
         if !reads_committed {
             return Ok(());
         }
+        let mut cascade = Cascade {
+            budget: self.cascade_bytes,
+            probed: FxHashSet::default(),
+        };
+        // A pass that finds further rows to delete gives no verdict: the rules
+        // hold of the bundle those rows are part of.
+        loop {
+            let further = self.validate_bundle(families, &mut cascade).await?;
+            if further.is_empty() {
+                return Ok(());
+            }
+            families.extend(further);
+        }
+    }
+
+    /// The four rules over `families` — or, where their deletes cascade to rows
+    /// outside them, those rows' families and no verdict.
+    async fn validate_bundle(
+        &self,
+        families: &[TxnFamily],
+        cascade: &mut Cascade,
+    ) -> Result<Vec<TxnFamily>, WireFault> {
         let mut b = TxnBundle::new(self, families)?;
 
         for t in &b.tables {
@@ -493,22 +517,26 @@ impl MasterDispatcher {
         })
         .await?;
 
+        // A cascade deletes rows, which no Error family's insert turns on.
         pk_verdict(self, &b)?;
-        if let Some(e) = unique_violation {
-            return Err(e);
-        }
-        // Every FK whose parent is bundled: F2 checks the values it removes
-        // are unreferenced.
+
+        // ── Burst 2: every FK whose parent is bundled, keyed by the deltas ──
         let children: Vec<FkEdge> = b
             .tables
             .iter()
             .flat_map(|t| t.cons.fks_as_parent.iter().copied())
             .collect();
         let deltas = resolve_parent_deltas(&b, &checks, &children);
-        fk_existence_verdict(self, &checks, &deltas)?;
+        let (further, restricted) = removed_references(self, &b, &children, &deltas, cascade).await?;
+        if !further.is_empty() {
+            return Ok(further);
+        }
 
-        // ── Burst 2: F2, keyed by the deltas ─────────────────────────────
-        txn_check_fk_restrict(self, &b, &children, &deltas).await
+        if let Some(e) = unique_violation {
+            return Err(e);
+        }
+        fk_existence_verdict(self, &checks, &deltas)?;
+        restricted.map_or(Ok(Vec::new()), Err)
     }
 }
 
@@ -621,7 +649,7 @@ fn plan_unique_checks<'a>(
                 reply: idx_schema,
                 ..Check::new(
                     tid,
-                    Probe::Index(col_indices, NonZeroU64::MIN),
+                    Probe::Index(col_indices),
                     build_check_batch_pk_bytes(&spec.span_schema(), order.iter().map(|&x| span(x))),
                     Rule::Unique { cols: col_indices, span: key_size },
                 )
@@ -645,6 +673,7 @@ fn plan_fk_existence<'a>(
             parent_tid,
             parent_col,
             fk_col,
+            on_delete: _,
         } = edge;
         let loc = b.schema(tid).locate(fk_col);
 
@@ -677,11 +706,7 @@ fn plan_fk_existence<'a>(
                 .index_on(&[parent_col as u32])
                 .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
             let cols = PkColList::from_slice(&[parent_col as u32]);
-            (
-                index.key_spec().span_schema(),
-                index.schema(),
-                Probe::Index(cols, NonZeroU64::MIN),
-            )
+            (index.key_spec().span_schema(), index.schema(), Probe::Index(cols))
         };
         let span = key_schema.pk_stride();
         let keys = build_check_batch(&key_schema, &mut values);
@@ -798,94 +823,201 @@ fn parent_retired_added(
     (retired, added)
 }
 
-/// One planned FK RESTRICT probe on one child index.
-struct RestrictPlan {
+/// What one write's cascade may still delete, and what it has asked, across
+/// the passes of its validation.
+struct Cascade {
+    /// Row bytes left, at each deleted row's fixed width.
+    budget: usize,
+    /// `(child tid, FK col, referenced value)`: the references already read for
+    /// deletion. A later pass folds the rows they named, and finds none new.
+    probed: FxHashSet<(u64, usize, u128)>,
+}
+
+/// The rows of one table a pass's cascade deletes.
+struct Cascaded {
+    schema: SchemaDescriptor,
+    /// Their PKs, back to back, in the order they were found.
+    pks: Vec<u8>,
+    seen: FxHashSet<PkBuf>,
+}
+
+/// One planned probe of a child's FK index for the committed rows referencing
+/// values that leave the parent.
+struct ReferencePlan {
     edge: FkEdge,
     /// Splits a reply entry into `[span ‖ holder PK]`, and re-encodes a
     /// surviving holder's own span for the exemption test.
     spec: KeySpec,
-    /// The probed referenced values' key images, sorted: key row `j` encodes
-    /// `values[j]`. A reply names a span, the rejection names a value.
-    values: Vec<u128>,
-    /// The bundle touches this child, so a committed holder it retires is
-    /// exempt; for an unbundled child the first committed holder is fatal.
-    bundled: bool,
+    /// The values' rows are deleted and `edge` cascades, so a referencing row is
+    /// deleted with them; otherwise it is an F2 violation.
+    cascades: bool,
 }
 
-/// Rule F2: a referenced value the bundle removes and does not re-add —
-/// `retired ∖ added` — must have no surviving child row referencing it.
-async fn txn_check_fk_restrict(
+/// Rule F2 and the cascade, which read the same rows: the committed rows that
+/// reference a value the bundle removes and does not re-add — `retired ∖ added`
+/// — and whose reference the bundle does not itself retire. Through an `ON
+/// DELETE CASCADE` edge from a deleted row, such a row is deleted too, and so
+/// are the rows referencing it in turn; anywhere else it is a violation.
+///
+/// Answers one `-1` family per table the cascade deletes from, and F2's first
+/// violation, which stands only where there is no such family: a later pass may
+/// find the violating row deleted.
+async fn removed_references(
     disp: &MasterDispatcher,
     b: &TxnBundle<'_>,
     children: &[FkEdge],
     deltas: &ParentDeltas,
-) -> Result<(), WireFault> {
-    let mut checks: Vec<Check<RestrictPlan>> = Vec::new();
+    cascade: &mut Cascade,
+) -> Result<(Vec<TxnFamily>, Option<WireFault>), WireFault> {
+    let over_budget = |edge: &FkEdge| -> WireFault {
+        let cat = disp.cat();
+        format!(
+            "a delete from '{}' cascades to more rows of '{}' than one write deletes; delete them first",
+            cat.qualified_name(edge.parent_tid),
+            cat.qualified_name(edge.child_tid),
+        )
+        .into()
+    };
+    // `(edge, cascades, values)`: one probe each.
+    let mut seeds: Vec<(FkEdge, bool, Vec<u128>)> = Vec::new();
     for &edge in children {
-        let FkEdge { child_tid, fk_col, .. } = edge;
         let (retired, added) = &deltas[&delta_key(&edge)];
-        let mut values: Vec<u128> = retired.keys().copied().filter(|v| !added.contains(v)).collect();
-        if values.is_empty() {
-            continue;
+        let (mut deleted, mut restricted) = (Vec::new(), Vec::new());
+        for (&v, verb) in retired.iter().filter(|(v, _)| !added.contains(v)) {
+            let cascades = edge.on_delete == FkAction::Cascade && matches!(verb, RetireVerb::Delete);
+            if cascades { &mut deleted } else { &mut restricted }.push(v);
         }
-        let (idx_schema, spec) = disp
-            .cat()
-            .registry
-            .relation(child_tid)
-            .and_then(|r| r.index_on(&[fk_col as u32]))
-            .map(|ic| (ic.schema(), ic.key_spec()))
-            .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
-        // The parent column has the FK column's type, so its image is the span's.
-        let keys = build_check_batch(&spec.span_schema(), &mut values);
-        let bundled = b.has(child_tid);
-        // Past `K` holders one is not a key of the child's `K`-key fold, and
-        // only a fold key is exempt. An unbundled child exempts none.
-        let exempt = if bundled { b.fold(child_tid).len() as u64 } else { 0 };
-        let probe = Probe::Index(
-            PkColList::from_slice(&[fk_col as u32]),
-            NonZeroU64::MIN.saturating_add(exempt),
-        );
-        let plan = RestrictPlan { edge, spec, values, bundled };
-        checks.push(Check {
-            reply: idx_schema,
-            ..Check::new(child_tid, probe, keys, plan)
-        });
+        seeds.push((edge, true, deleted));
+        seeds.push((edge, false, restricted));
     }
+    let mut cascaded: BTreeMap<u64, Cascaded> = BTreeMap::new();
+    let mut violation: Option<WireFault> = None;
+    loop {
+        for (edge, cascades, values) in &mut seeds {
+            if *cascades {
+                // A value a surviving row of the bundle holds has not left.
+                if let Some((_, added)) = deltas.get(&delta_key(edge)) {
+                    values.retain(|v| !added.contains(v));
+                }
+                values.retain(|&v| cascade.probed.insert((edge.child_tid, edge.fk_col, v)));
+            }
+        }
+        seeds.retain(|(.., values)| !values.is_empty());
+        if seeds.is_empty() {
+            break;
+        }
 
-    // The first non-exempt holder aborts the drain, whose lease drop discards
-    // every train still in flight.
-    execute_probe_burst(disp, &mut checks, |check, rows| {
-        let plan = &check.plan;
-        let retired = &deltas[&delta_key(&plan.edge)].0;
-        for j in 0..rows.len() {
-            if rows.get_weight(j) != 1 {
-                continue;
+        let mut checks: Vec<Check<ReferencePlan>> = Vec::new();
+        for (edge, cascades, mut values) in seeds.drain(..) {
+            let FkEdge { child_tid, fk_col, .. } = edge;
+            let child = disp.cat().registry.relation_or_err(child_tid)?;
+            let cols = PkColList::from_slice(&[fk_col as u32]);
+            let index = child
+                .index_on(cols.as_slice())
+                .ok_or_else(|| format!("FK check: no index on child {child_tid} col {fk_col}"))?;
+            let schema = child.schema();
+            // Only a key of the child's fold is exempt, so one entry past its
+            // key count is a violation. A cascade's reply holds as well the rows
+            // already found and the new ones the budget has room for: cut short
+            // at that, it holds one more new row than the budget pays for.
+            let mut admitted = b.tables.iter().find(|t| t.tid == child_tid).map_or(0, |t| t.fold.len());
+            if cascades {
+                let c = cascaded.entry(child_tid).or_insert_with(|| Cascaded {
+                    schema,
+                    pks: Vec::new(),
+                    seen: FxHashSet::default(),
+                });
+                admitted += c.seen.len() + cascade.budget / schema.row_width();
             }
-            let (span, holder) = plan.spec.split_entry(rows.get_pk_bytes(j));
-            let Some(r) = row_of(&check.keys, span) else {
-                continue;
-            };
-            if plan.bundled && b.retires(plan.edge.child_tid, &plan.spec, holder, span) {
-                continue;
-            }
-            // Anything but a surviving row holding a new value reads as a delete.
-            let verb = match retired.get(&plan.values[r]) {
-                Some(RetireVerb::Update) => "update",
-                _ => "delete from",
-            };
-            let cat = disp.cat();
-            return Err(WireFault {
-                status: WireStatus::IntegrityViolation,
-                text: format!(
-                    "Foreign Key violation: cannot {verb} '{}', row still referenced by '{}'",
-                    cat.qualified_name(plan.edge.parent_tid),
-                    cat.qualified_name(plan.edge.child_tid),
-                ),
+            let cap = NonZeroU64::MIN.saturating_add(admitted as u64);
+            let spec = index.key_spec();
+            // The parent column has the FK column's type, so its image is the span's.
+            let keys = build_check_batch(&spec.span_schema(), &mut values);
+            checks.push(Check {
+                reply: index.schema(),
+                ..Check::new(
+                    child_tid,
+                    Probe::IndexAll(cols, cap),
+                    keys,
+                    ReferencePlan { edge, spec, cascades },
+                )
             });
         }
-        Ok(())
-    })
-    .await
+        let found: Vec<usize> = cascaded.values().map(|c| c.pks.len()).collect();
+        execute_probe_burst(disp, &mut checks, |check, rows| {
+            let ReferencePlan { edge, spec, cascades } = &check.plan;
+            for j in 0..rows.len() {
+                if rows.get_weight(j) != 1 {
+                    continue;
+                }
+                let (span, holder) = spec.split_entry(rows.get_pk_bytes(j));
+                if b.retires(edge.child_tid, spec, holder, span) {
+                    continue;
+                }
+                if *cascades {
+                    let c = cascaded.get_mut(&edge.child_tid).expect("entered with its check");
+                    if c.seen.insert(PkBuf::from_bytes(holder)) {
+                        let left = cascade.budget.checked_sub(c.schema.row_width());
+                        cascade.budget = left.ok_or_else(|| over_budget(edge))?;
+                        c.pks.extend_from_slice(holder);
+                    }
+                } else if violation.is_none() {
+                    // Anything but a surviving row holding a new value reads as a delete.
+                    let verb = match deltas[&delta_key(edge)].0.get(&gnitz_wire::widen_pk_be(span)) {
+                        Some(RetireVerb::Update) => "update",
+                        _ => "delete from",
+                    };
+                    let cat = disp.cat();
+                    violation = Some(WireFault {
+                        status: WireStatus::IntegrityViolation,
+                        text: format!(
+                            "Foreign Key violation: cannot {verb} '{}', row still referenced by '{}'",
+                            cat.qualified_name(edge.parent_tid),
+                            cat.qualified_name(edge.child_tid),
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        // What the rows just found are referenced by. A found row is committed,
+        // so its key holds a PK column's value; a payload column's is read by
+        // the next pass, which folds the row.
+        for ((&tid, c), from) in cascaded.iter().zip(found) {
+            let stride = c.schema.pk_stride();
+            let new = &c.pks[from..];
+            if new.is_empty() {
+                continue;
+            }
+            let cascading = disp
+                .cat()
+                .fk_children_of(tid)
+                .iter()
+                .filter(|e| e.on_delete == FkAction::Cascade);
+            for &edge in cascading {
+                if let ColumnLocator::Pk { byte_off, size, .. } = c.schema.locate(edge.parent_col) {
+                    let at = byte_off as usize..byte_off as usize + size as usize;
+                    let values = new
+                        .chunks_exact(stride)
+                        .map(|pk| gnitz_wire::widen_pk_be(&pk[at.clone()]));
+                    seeds.push((edge, true, values.collect()));
+                }
+            }
+        }
+    }
+
+    let further = cascaded
+        .into_iter()
+        .filter(|(_, c)| !c.pks.is_empty())
+        .map(|(tid, c)| TxnFamily {
+            tid,
+            mode: WireConflictMode::Update,
+            batch: Batch::key_retractions(&c.schema, &c.pks),
+        })
+        .collect();
+    Ok((further, violation))
 }
 
 #[cfg(test)]

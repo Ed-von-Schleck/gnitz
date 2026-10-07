@@ -27,9 +27,10 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Read::HasPk { tid: 20, probe: Probe::PkColumn(21) }.into(),
         Read::HasPk {
             tid: 22,
-            probe: Probe::Index(cols, NonZeroU64::new(23).unwrap()),
+            probe: Probe::IndexAll(cols, NonZeroU64::new(23).unwrap()),
         }
         .into(),
+        Read::HasPk { tid: 37, probe: Probe::Index(cols) }.into(),
         Read::KeySpans { tid: 24, cols }.into(),
         Read::ScanSpec {
             tid: 25,
