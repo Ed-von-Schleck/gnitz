@@ -30,7 +30,7 @@ pub(super) fn access_path(
     indexes: &[RelIndex],
 ) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
     let conjuncts = match selection {
-        Some(we) => crate::bind::bind_conjuncts(we, &crate::bind::SingleTable { schema, alias })?,
+        Some(we) => crate::hir::bind_single_table(we, schema, alias)?.conjuncts(),
         None => Vec::new(),
     };
     bound_and_predicate(schema, &conjuncts, indexes)

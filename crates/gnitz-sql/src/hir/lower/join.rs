@@ -281,13 +281,10 @@ fn join_keep(
 /// Substitute `ColRef(mark_id)` with `LitBool(val)` throughout an expression —
 /// the mark column's per-branch constant; every other leaf passes through.
 fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: bool) -> HirExpr {
-    let Ok(out) = e.try_rebuild::<ColId, std::convert::Infallible>(&mut |id| {
-        Ok(match *id == mark_id {
-            true => BExpr::LitBool(val),
-            false => BExpr::ColRef(*id),
-        })
-    });
-    out
+    e.rebuild(&mut |id| match *id == mark_id {
+        true => BExpr::LitBool(val),
+        false => BExpr::ColRef(*id),
+    })
 }
 
 /// One half of the outer input split by match existence.

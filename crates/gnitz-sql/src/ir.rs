@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use gnitz_expr::CalendarOp;
 use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
@@ -277,6 +279,17 @@ impl NumFunc {
 /// a `usize` column index.
 pub(crate) type BoundExpr = BExpr<usize>;
 
+/// How a leaf reference is declared: its type, and whether it can be NULL.
+pub(crate) trait LeafTyping<R> {
+    fn decl(&self, r: &R) -> (ColType, bool);
+}
+
+impl LeafTyping<usize> for [ColumnDef] {
+    fn decl(&self, i: &usize) -> (ColType, bool) {
+        (self[*i].ty, self[*i].is_nullable)
+    }
+}
+
 /// An integer literal as sign and magnitude: a column of any integer type,
 /// U128 included, reads its value from this without a width it may not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,8 +549,8 @@ pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), crate::error::GnitzSq
 /// float literal beside a DECIMAL operand, which is read as the exact decimal
 /// it spells — so `price * 1.1` stays exact over a DECIMAL column where it
 /// stays a float over a DOUBLE one.
-pub(crate) fn operand_tys<R, F: Fn(&R) -> ColType>(items: &[&BExpr<R>], leaf_ty: &F) -> Vec<ColType> {
-    let mut tys: Vec<ColType> = items.iter().map(|e| e.infer_ty_with(leaf_ty)).collect();
+pub(crate) fn operand_tys<R>(items: &[&BExpr<R>], t: &(impl LeafTyping<R> + ?Sized)) -> Vec<ColType> {
+    let mut tys: Vec<ColType> = items.iter().map(|e| e.infer_ty(t)).collect();
     adopt_decimal_literals(items, &mut tys);
     tys
 }
@@ -546,8 +559,8 @@ pub(crate) fn operand_tys<R, F: Fn(&R) -> ColType>(items: &[&BExpr<R>], leaf_ty:
 /// string is a string NULL here, and one beside a BOOLEAN a BOOLEAN NULL: a
 /// blend needs no such rule, its neutral I64 yielding to either sibling, but a
 /// comparison takes two operands of one class.
-pub(crate) fn operand_ty_pair<R, F: Fn(&R) -> ColType>(l: &BExpr<R>, r: &BExpr<R>, leaf_ty: &F) -> (ColType, ColType) {
-    let mut tys = [l.infer_ty_with(leaf_ty), r.infer_ty_with(leaf_ty)];
+pub(crate) fn operand_ty_pair<R>(l: &BExpr<R>, r: &BExpr<R>, t: &(impl LeafTyping<R> + ?Sized)) -> (ColType, ColType) {
+    let mut tys = [l.infer_ty(t), r.infer_ty(t)];
     adopt_decimal_literals(&[l, r], &mut tys);
     let adopts = |t: ColType| t == STRING || t == BOOL;
     match (l, r) {
@@ -687,15 +700,15 @@ impl<R> BExpr<R> {
         }
     }
 
-    /// The type of the value this node computes, parameterized over how a leaf
-    /// reference is typed. A `ColRef` is the referenced column's declared type; a
+    /// The type of the value this node computes, a leaf reference typed through
+    /// `t`. A `ColRef` is the referenced column's declared type; a
     /// narrowing integer `CAST` is its target (the cast range-checks the register
     /// into it, which is what a narrow output slot admits); every other node is
     /// the type of the register it computes.
-    pub(crate) fn infer_ty_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> ColType {
+    pub(crate) fn infer_ty(&self, t: &(impl LeafTyping<R> + ?Sized)) -> ColType {
         let int = ColType::of(TypeCode::I64);
         match self {
-            BExpr::ColRef(r) => leaf_ty(r),
+            BExpr::ColRef(r) => t.decl(r).0,
             BExpr::LitWide(n) if n.to_u64().is_some() => ColType::of(TypeCode::U64),
             BExpr::LitInt(_) | BExpr::LitWide(_) | BExpr::LitNull => int,
             BExpr::LitFloat { .. } => ColType::of(TypeCode::F64),
@@ -711,17 +724,17 @@ impl<R> BExpr<R> {
             BExpr::BinOp(_, op, _) if op.as_cmp().is_some() => BOOL,
             // A pair the operator does not take is refused by lowering.
             BExpr::BinOp(l, op, r) => {
-                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
+                let (lt, rt) = operand_ty_pair(l, r, t);
                 bin_types(*op, lt, rt).map_or(int, |t| t.out)
             }
             BExpr::Case { branches, else_ } => {
                 let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
-                blend_type(&operand_tys(&results, leaf_ty))
+                blend_type(&operand_tys(&results, t))
             }
-            BExpr::Func { f, arg } => f.result_type(arg.infer_ty_with(leaf_ty)),
-            BExpr::Calendar { op, arg } if op.keeps_type() => arg.infer_ty_with(leaf_ty),
+            BExpr::Func { f, arg } => f.result_type(arg.infer_ty(t)),
+            BExpr::Calendar { op, arg } if op.keeps_type() => arg.infer_ty(t),
             BExpr::Calendar { .. } => int,
-            BExpr::MinMaxN { args, .. } => blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty)),
+            BExpr::MinMaxN { args, .. } => blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), t)),
             BExpr::Cast { to, .. } if to.tc.is_float() => ColType::of(TypeCode::F64),
             BExpr::Cast { to, .. } => *to,
             BExpr::StrCall { f, .. } => ColType::of(f.result_type()),
@@ -731,8 +744,8 @@ impl<R> BExpr<R> {
 
     /// Whether every integer this value's register can hold is a value of `fi`,
     /// so a range check into `fi` refuses none and reading it as `fi` is exact.
-    pub(crate) fn within_with<F: Fn(&R) -> ColType>(&self, fi: FixedInt, leaf_ty: &F) -> bool {
-        let ((lo, hi), (min, max)) = (self.int_range_with(leaf_ty), fi.range());
+    pub(crate) fn within(&self, fi: FixedInt, t: &(impl LeafTyping<R> + ?Sized)) -> bool {
+        let ((lo, hi), (min, max)) = (self.int_range(t), fi.range());
         min <= lo && hi <= max
     }
 
@@ -740,17 +753,17 @@ impl<R> BExpr<R> {
     /// holds its type's, a CAST its target's, an integer literal is a point and
     /// a BOOLEAN is 0 or 1; anything else computed may hold whatever its
     /// register does, a DATE sum included.
-    fn int_range_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> (i128, i128) {
+    fn int_range(&self, t: &(impl LeafTyping<R> + ?Sized)) -> (i128, i128) {
         let point = |v: i128| (v, v);
         let stored = match self {
             BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => return point(i128::from(*v)),
             // No value at all, so every interval holds it.
             BExpr::LitNull => return point(0),
-            BExpr::ColRef(r) => FixedInt::from_type_code(leaf_ty(r).tc),
+            BExpr::ColRef(r) => FixedInt::from_type_code(t.decl(r).0.tc),
             BExpr::Cast { to, .. } => FixedInt::from_type_code(to.tc),
             _ => None,
         };
-        let ty = self.infer_ty_with(leaf_ty);
+        let ty = self.infer_ty(t);
         if ty == BOOL {
             return (0, 1);
         }
@@ -761,22 +774,18 @@ impl<R> BExpr<R> {
         stored.unwrap_or(register).range()
     }
 
-    /// Whether the expression can never evaluate to NULL, parameterized over
-    /// whether a leaf reference can and over its type. Each arm mirrors which
+    /// Whether the expression can never evaluate to NULL, a leaf reference
+    /// declared through `t`. Each arm mirrors which
     /// engine kernels make a NULL of their own from non-NULL operands.
     /// Conservative: `false` is always safe.
-    pub(crate) fn never_null_with<N, T>(&self, leaf_nullable: &N, leaf_ty: &T) -> bool
-    where
-        N: Fn(&R) -> bool,
-        T: Fn(&R) -> ColType,
-    {
-        let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable, leaf_ty);
+    pub(crate) fn never_null(&self, t: &(impl LeafTyping<R> + ?Sized)) -> bool {
+        let go = |e: &BExpr<R>| e.never_null(t);
         // An operand of type `from` that lowering brings to `to` unchecked.
         let whole = |e: &BExpr<R>, from: ColType, to: ColType| {
-            go(e) && range_step(from, to, e.within_with(FixedInt::U64, leaf_ty)) == RangeStep::None
+            go(e) && range_step(from, to, e.within(FixedInt::U64, t)) == RangeStep::None
         };
         match self {
-            BExpr::ColRef(r) => !leaf_nullable(r),
+            BExpr::ColRef(r) => !t.decl(r).1,
             BExpr::LitInt(_)
             | BExpr::LitFloat { .. }
             | BExpr::LitStr(_)
@@ -788,7 +797,7 @@ impl<R> BExpr<R> {
             // A concatenation past `u32::MAX` bytes is NULL.
             BExpr::BinOp(_, BinOp::Concat, _) => false,
             BExpr::BinOp(l, op, r) => {
-                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
+                let (lt, rt) = operand_ty_pair(l, r, t);
                 // A zero divisor is NULL.
                 let divides =
                     !matches!(op, BinOp::Div | BinOp::Mod) || matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0);
@@ -798,7 +807,7 @@ impl<R> BExpr<R> {
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
                 let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
-                let tys = operand_tys(&results, leaf_ty);
+                let tys = operand_tys(&results, t);
                 let blend = blend_type(&tys);
                 results.iter().zip(&tys).all(|(e, ty)| whole(e, *ty, blend))
             }
@@ -807,12 +816,12 @@ impl<R> BExpr<R> {
             BExpr::Calendar { op, arg } => !op.may_null() && go(arg),
             // Each item is compared with `inner` as `=` compares the pair.
             BExpr::InList { inner, items } => items.iter().all(|item| {
-                let (lt, rt) = operand_ty_pair(inner, item, leaf_ty);
+                let (lt, rt) = operand_ty_pair(inner, item, t);
                 bin_types(BinOp::Eq, lt, rt).is_ok_and(|t| whole(inner, lt, t.l) && whole(item, rt, t.r))
             }),
             // GREATEST/LEAST skip a NULL argument, one a range check made included.
             BExpr::MinMaxN { args, .. } => {
-                let tys = operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty);
+                let tys = operand_tys(&args.iter().collect::<Vec<_>>(), t);
                 let blend = blend_type(&tys);
                 args.iter().zip(&tys).any(|(a, ty)| whole(a, *ty, blend))
             }
@@ -827,7 +836,7 @@ impl<R> BExpr<R> {
 impl<R> BExpr<R> {
     /// Rebuild the expression structurally, replacing each `ColRef` by whatever
     /// `leaf` returns for it — another leaf, or a whole sub-expression. The one
-    /// rebuilding walk (`for_each_ref` reads, `infer_ty_with` types); the match
+    /// rebuilding walk (`for_each_ref` reads, `infer_ty` types); the match
     /// is exhaustive.
     pub(crate) fn try_rebuild<S, E>(&self, leaf: &mut impl FnMut(&R) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
         let mut go = |e: &BExpr<R>| e.try_rebuild(&mut *leaf);
@@ -884,6 +893,12 @@ impl<R> BExpr<R> {
         })
     }
 
+    /// [`Self::try_rebuild`] for a `leaf` that cannot fail.
+    pub(crate) fn rebuild<S>(&self, leaf: &mut dyn FnMut(&R) -> BExpr<S>) -> BExpr<S> {
+        let Ok(out) = self.try_rebuild::<S, Infallible>(&mut |r| Ok(leaf(r)));
+        out
+    }
+
     /// Visit every leaf reference (the `ColRef` positions), depth-first. The
     /// one reference-collection walk.
     pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {
@@ -922,14 +937,6 @@ impl<R> BExpr<R> {
             BExpr::TrimCall { s, .. } | BExpr::Like { s, .. } => s.for_each_ref(f),
             BExpr::ConcatN { args } => args.iter().for_each(|a| a.for_each_ref(f)),
         }
-    }
-}
-
-impl BExpr<usize> {
-    /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
-    /// declared type (`cols[idx].ty()`, panicking on an out-of-bounds index).
-    pub(crate) fn infer_ty(&self, cols: &[ColumnDef]) -> ColType {
-        self.infer_ty_with(&|idx: &usize| cols[*idx].ty)
     }
 }
 

@@ -2,98 +2,28 @@ use super::*;
 use crate::test_support::{col, parse_expr_sql, rejected};
 use gnitz_wire::TypeCode;
 
-/// One row per operand position `bind_structural` recurses into, an aggregate
-/// planted in it. A position [`expr_operands`] misses looks aggregate-free,
-/// routing the query to the scalar path — where the binder then reaches the
-/// aggregate it was told was not there.
+/// An aggregate is found wherever it is written outside a subquery's body — the
+/// `IS` tests included — and a subquery's own aggregate is not this body's.
 #[test]
-fn expr_operands_reaches_every_position_the_binder_recurses_into() {
-    for src in [
-        // The dedicated AST nodes — CEIL/FLOOR/CAST/EXTRACT/SUBSTRING/POSITION
-        // are keyword-dispatched and never arrive as `Expr::Function`.
-        "CAST(SUM(x) AS INT)",
-        "EXTRACT(YEAR FROM MAX(d))",
-        "SUM(x)::INT",
-        "TRY_CAST(SUM(x) AS INT)",
-        "CEIL(SUM(x))",
-        "FLOOR(SUM(x))",
-        "ABS(CAST(SUM(x) AS INT))",
-        "SUBSTRING(MIN(s) FROM 1 FOR 2)",
-        "SUBSTRING(s FROM SUM(x) FOR 2)",
-        "SUBSTRING(s FROM 1 FOR SUM(x))",
-        "POSITION(MIN(s) IN s)",
-        "POSITION('a' IN MIN(s))",
-        "TRIM(MIN(s))",
-        "TRIM('x' FROM MIN(s))",
-        // Both must be literals, and the binder says so only if the walk gets
-        // there.
-        "TRIM(MIN(s) FROM s)",
-        "MIN(s) LIKE 'a%'",
-        "s LIKE MIN(s)",
-        "s ILIKE MIN(s)",
-        // Operators and parentheses.
-        "SUM(x) + 1",
-        "1 + SUM(x)",
-        "-SUM(x)",
-        "(SUM(x))",
-        "SUM(x) IS NULL",
-        "SUM(x) IS NOT NULL",
-        "SUM(x) BETWEEN 1 AND 2",
-        "1 BETWEEN SUM(x) AND 2",
-        "1 BETWEEN 2 AND SUM(x)",
-        "SUM(x) IS DISTINCT FROM 1",
-        "1 IS NOT DISTINCT FROM SUM(x)",
-        "SUM(x) IN (1, 2)",
-        "1 IN (2, SUM(x))",
-        // CASE, in each of its four operand positions.
-        "CASE SUM(x) WHEN 1 THEN 2 ELSE 3 END",
-        "CASE WHEN SUM(x) > 1 THEN 2 ELSE 3 END",
-        "CASE WHEN a > 1 THEN SUM(x) ELSE 3 END",
-        "CASE WHEN a > 1 THEN 2 ELSE SUM(x) END",
-        // A call's arguments, and an inline window specification's keys — a
-        // windowed call is not itself an aggregate, so only the planted one counts.
-        "ABS(SUM(x))",
-        "COUNT(*) OVER (PARTITION BY SUM(x) ORDER BY a)",
-        "COUNT(*) OVER (PARTITION BY a ORDER BY SUM(x))",
-    ] {
-        let mut seen = 0usize;
-        for_each_agg_call::<()>(&parse_expr_sql(src), &mut |_| {
-            seen += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(seen, 1, "{src}: the aggregate must be collected exactly once");
-    }
-}
-
-/// The walk reports whether the expression *is* an aggregate, parentheses aside,
-/// or merely contains one.
-#[test]
-fn for_each_agg_call_tells_an_aggregate_from_a_wrapper_over_one() {
-    for (src, is_aggregate) in [
-        ("SUM(x)", true),
-        ("((SUM(x)))", true),
-        ("ABS(SUM(x))", false),
+fn expr_has_aggregate_searches_every_position_outside_a_subquery() {
+    for (src, want) in [
+        ("(SUM(x) > 0) IS TRUE", true),
+        ("(SUM(x) > 0) IS NOT TRUE", true),
+        ("(SUM(x) > 0) IS FALSE", true),
+        ("(SUM(x) > 0) IS NOT FALSE", true),
+        ("(SUM(x) > 0) IS UNKNOWN", true),
+        ("(SUM(x) > 0) IS NOT UNKNOWN", true),
+        ("COUNT(*) OVER (PARTITION BY a ORDER BY SUM(x))", true),
         ("SUM(x) OVER ()", false),
-        ("x + 1", false),
+        ("(SELECT SUM(x) FROM t)", false),
+        ("EXISTS (SELECT SUM(x) FROM t)", false),
+        ("a IN (SELECT SUM(x) FROM t)", false),
+        ("a > ALL (SELECT SUM(x) FROM t)", false),
+        ("(SELECT MAX(x) FROM t) + SUM(y)", true),
+        ("SUM(y) + (SELECT MAX(x) FROM t)", true),
     ] {
-        let top = for_each_agg_call::<()>(&parse_expr_sql(src), &mut |_| Ok(())).unwrap();
-        assert_eq!(top, is_aggregate, "{src}");
+        assert_eq!(expr_has_aggregate(&parse_expr_sql(src)), want, "{src}");
     }
-}
-
-/// Same walker, the subquery consumers: a subquery under a CAST must still
-/// route the view to the subquery-bearing builder.
-#[test]
-fn expr_operands_exposes_a_subquery_under_a_cast() {
-    assert!(expr_any(
-        &parse_expr_sql("CAST((SELECT 1) AS INT)"),
-        &is_scalar_subquery
-    ));
-    assert!(expr_any(
-        &parse_expr_sql("CAST(x AS INT) IN (SELECT y FROM t)"),
-        &is_exists_in
-    ));
 }
 
 /// The options of the single `*` item of `SELECT … FROM t`.

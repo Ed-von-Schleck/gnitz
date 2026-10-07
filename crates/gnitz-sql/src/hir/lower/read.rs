@@ -264,10 +264,7 @@ fn flat_reduce(
         }
     }
     let at = |id: ColId| copies.get(&id).copied().unwrap_or(id);
-    let rename = |e: &HirExpr| -> HirExpr {
-        let Ok(out) = e.try_rebuild::<ColId, std::convert::Infallible>(&mut |id| Ok(BExpr::ColRef(at(*id))));
-        out
-    };
+    let rename = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(at(*id)));
     let input = match computed {
         0 => Rc::clone(lin.base),
         _ => RelExpr::project(Rc::clone(lin.base), pre),

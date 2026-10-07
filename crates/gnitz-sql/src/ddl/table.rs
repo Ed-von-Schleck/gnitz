@@ -6,8 +6,9 @@ use super::guard::{
     reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
 };
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{require_column, Catalog};
+use crate::bind::{bind_constant, require_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::ir::BExpr;
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
@@ -18,7 +19,7 @@ use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
-    UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
+    UniqueConstraint, WrappedCollection,
 };
 use std::collections::HashSet;
 
@@ -242,9 +243,9 @@ fn resolve_fk_target(
 /// prefix is left at its default; the CLUSTER BY phase fills it.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
     let [replicated, stream] = kv_options(table_options, "CREATE TABLE", ["replicated", "stream"])?;
-    let flag = |key: &str, value: Option<&Expr>| match value {
+    let flag = |key: &str, value: Option<&Expr>| match value.map(bind_constant) {
         None => Ok(false),
-        Some(Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. })) => Ok(*b),
+        Some(Ok(BExpr::LitBool(b))) => Ok(b),
         Some(_) => Err(GnitzSqlError::Rejected(format!(
             "WITH ({key} = …) expects a boolean (true/false)"
         ))),

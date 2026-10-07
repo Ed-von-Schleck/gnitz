@@ -138,14 +138,13 @@ fn zero_absent_counts(e: HirExpr, counts: &[ColId]) -> HirExpr {
     if counts.is_empty() {
         return e;
     }
-    let Ok(out) = e.try_rebuild::<ColId, std::convert::Infallible>(&mut |id| {
+    e.rebuild(&mut |id| {
         let col = BExpr::ColRef(*id);
-        Ok(match counts.contains(id) {
+        match counts.contains(id) {
             true => BExpr::coalesce(col, BExpr::LitInt(0)),
             false => col,
-        })
-    });
-    out
+        }
+    })
 }
 
 /// An IN over a nullable operand is three-valued; only a top-level conjunct — a

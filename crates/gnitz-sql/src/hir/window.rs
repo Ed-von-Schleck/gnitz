@@ -52,13 +52,13 @@
 //! under its fold — one row per ordered pair of peer groups of a partition.
 
 use super::bind::{bind_projection, place_order_keys, ItemLeaf};
-use super::{as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr};
+use super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr};
 use super::{TopNKey, Value};
 use crate::agg::{agg_func_from_name, AggFunc};
-use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, CallSurface, PlainCall};
-use crate::bind::{bind_conjuncts, bind_structural, output_column, LeafBinder};
+use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, AggArg, CallSurface, PlainCall};
+use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, LeafBinder};
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp};
+use crate::ir::{BExpr, BinOp, LeafTyping};
 use crate::rules::reject_float_key;
 use crate::tail::parse_order_key;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
@@ -70,16 +70,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A view body's SELECT list over `rel`, its pre-projection relation, with the
-/// item each ORDER BY key sorts on. Window calls in the list, in QUALIFY and in
-/// the ORDER BY keys are found by binding them; a body holding one is desugared
-/// into joins and reduces. `leaf` is the body's own item leaf, `order_leaf` the
-/// one its ORDER BY keys bind through; `ctx` names the surface.
+/// A view body's SELECT list over the relation `rel` builds, with the item each
+/// ORDER BY key sorts on. Window calls in the list, in the ORDER BY keys and in
+/// QUALIFY are found by binding them; a body holding one is desugared into joins
+/// and reduces. `leaf` is the body's own item leaf; `ctx` names the surface.
 pub(crate) fn bind_view_select_list<L: ItemLeaf>(
     ids: &ColIdGen,
     select: &Select,
-    rel: Rc<RelExpr>,
-    [leaf, order_leaf]: [&L; 2],
+    rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
+    leaf: &L,
     ctx: &str,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
@@ -95,12 +94,13 @@ pub(crate) fn bind_view_select_list<L: ItemLeaf>(
         aliases: &[],
     };
     let mut items = bind_projection(&select.projection, &over, ids, ctx)?;
-    let placed = place_order_keys(order_exprs, &mut items, ids, &WindowLeaf { inner: order_leaf, ..over })?;
+    let placed = place_order_keys(order_exprs, &mut items, ids, &over)?;
     let qualify = match &select.qualify {
-        Some(q) => bind_conjuncts(q, &WindowLeaf { aliases: &items, ..over })?,
+        Some(q) => bind_conjuncts(q, &WindowLeaf { aliases: &items, ..over }).map_err(|e| e.in_clause("QUALIFY"))?,
         None => Vec::new(),
     };
     let win = state.into_inner();
+    let rel = rel()?;
     if win.calls.is_empty() {
         if select.qualify.is_some() {
             return Err(GnitzSqlError::Rejected(
@@ -150,15 +150,14 @@ impl Windows {
         if let Some(it) = self.w.iter().find(|it| it.expr == *e) {
             return it.out.id;
         }
-        let ty = e.infer_ty_with(&|r| leaf.type_of(r));
+        let ty = e.infer_ty(leaf);
         // A slot narrower than the register is written through a range check,
         // which is NULL for a value past it.
-        let checked = FixedInt::from_type_code(ty.tc).is_some_and(|fi| !e.within_with(fi, &|r| leaf.type_of(r)));
-        let nullable = checked || !e.never_null_with(&|r| leaf.is_nullable(r), &|r| leaf.type_of(r));
+        let checked = FixedInt::from_type_code(ty.tc).is_some_and(|fi| !e.within(fi, leaf));
+        let nullable = checked || !e.never_null(leaf);
         let name = as_col(e)
-            .and_then(|id| col_by_id(leaf.env(), id))
-            .filter(|c| !c.def.is_hidden)
-            .map_or_else(|| format!("_w{}", self.w.len()), |c| c.def.name.clone());
+            .and_then(|id| leaf.source_name(id))
+            .unwrap_or_else(|| format!("_w{}", self.w.len()));
         let out = HirCol::new(ids.next(), ColumnDef::typed(name, ty, nullable));
         let id = out.id;
         self.w.push(ProjEntry { expr: e.clone(), out });
@@ -167,19 +166,13 @@ impl Windows {
 
     /// `e` with every source reference replaced by its `W` column; a reference to
     /// one of `placeholders` stays.
-    fn over_w<L: ItemLeaf>(
-        &mut self,
-        ids: &ColIdGen,
-        leaf: &L,
-        placeholders: &[ColId],
-        e: &HirExpr,
-    ) -> Result<HirExpr, GnitzSqlError> {
-        e.try_rebuild(&mut |id| -> Result<HirExpr, GnitzSqlError> {
-            Ok(BExpr::ColRef(if placeholders.contains(id) {
+    fn over_w<L: ItemLeaf>(&mut self, ids: &ColIdGen, leaf: &L, placeholders: &[ColId], e: &HirExpr) -> HirExpr {
+        e.rebuild(&mut |id| {
+            BExpr::ColRef(if placeholders.contains(id) {
                 *id
             } else {
                 self.hoist(ids, leaf, &BExpr::ColRef(*id))
-            }))
+            })
         })
     }
 }
@@ -291,7 +284,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             ));
         }
         // Over an argument that is never NULL, COUNT(e) is COUNT(*).
-        let never_null = |e: &HirExpr| e.never_null_with(&|r| self.inner.is_nullable(r), &|r| self.inner.type_of(r));
+        let never_null = |e: &HirExpr| e.never_null(self.inner);
         if func == WinFunc::Agg(AggFunc::Count) && arg.as_ref().is_some_and(never_null) {
             arg = None;
         }
@@ -353,6 +346,13 @@ fn call_typing(func: WinFunc, arg: Option<&ColumnDef>) -> Result<(ColType, bool)
     Ok((crate::agg::agg_view_type(agg, raw), nullable))
 }
 
+impl<L: ItemLeaf> LeafTyping<ColId> for WindowLeaf<'_, L> {
+    /// This leaf's own placeholders; everything else is the body's.
+    fn decl(&self, r: &ColId) -> (ColType, bool) {
+        self.placeholder(r).unwrap_or_else(|| self.inner.decl(r))
+    }
+}
+
 impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
     fn bind_node(&self, e: &Expr) -> Option<HirExpr> {
         self.inner.bind_node(e)
@@ -360,31 +360,28 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
     /// A source column outranks a SELECT alias of the same name; the alias
     /// table is consulted only where the body's own scope has nothing, and where
     /// it has no single answer the body's own error stands.
-    fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        let err = match self.inner.bind_column(e) {
+    fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<HirExpr, GnitzSqlError> {
+        let err = match self.inner.bind_column(qual, name) {
             Ok(bound) => return Ok(bound),
             Err(err) => err,
         };
-        match output_column(e, self.aliases.iter().map(|it| &it.out.def)) {
+        // An output column belongs to no relation, so only a bare name is one.
+        let aliased = match qual {
+            None => find_unique_column(self.aliases.iter().map(|it| &it.out.def), name),
+            Some(_) => Ok(None),
+        };
+        match aliased {
             Ok(Some(at)) => Ok(self.aliases[at].expr.clone()),
             _ => Err(err),
         }
     }
-    fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        self.inner.bind_function(f)
+    fn bind_aggregate(&self, func: AggFunc, arg: AggArg<&Expr>) -> Result<HirExpr, GnitzSqlError> {
+        self.inner.bind_aggregate(func, arg)
     }
     /// The one context that admits a window call: it binds to the placeholder
     /// column its value stands in for until the desugar joins it in.
     fn bind_window(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         Ok(BExpr::ColRef(self.bind_window_call(f)?.id))
-    }
-    /// This leaf's own placeholders; everything else is the body's.
-    fn is_nullable(&self, r: &ColId) -> bool {
-        self.placeholder(r)
-            .map_or_else(|| self.inner.is_nullable(r), |(_, nullable)| nullable)
-    }
-    fn type_of(&self, r: &ColId) -> ColType {
-        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(ty, _)| ty)
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_subquery(e)
@@ -392,8 +389,8 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
 }
 
 impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
-    fn env(&self) -> &[HirCol] {
-        self.inner.env()
+    fn source_name(&self, id: ColId) -> Option<String> {
+        self.inner.source_name(id)
     }
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         self.inner.project(source, items)
@@ -674,19 +671,17 @@ fn desugar<L: ItemLeaf>(
         }
     }
 
-    let items = items
+    let items: Vec<ProjEntry> = items
         .into_iter()
-        .map(|it| {
-            Ok(ProjEntry {
-                expr: win.over_w(ids, leaf, &placeholders, &it.expr)?,
-                out: it.out,
-            })
+        .map(|it| ProjEntry {
+            expr: win.over_w(ids, leaf, &placeholders, &it.expr),
+            out: it.out,
         })
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-    let qualify = qualify
+        .collect();
+    let qualify: Vec<HirExpr> = qualify
         .iter()
         .map(|q| win.over_w(ids, leaf, &placeholders, q))
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+        .collect();
 
     // W: the narrowing projection every read of the input aliases.
     let w = leaf.project(input, win.w)?;
@@ -711,14 +706,12 @@ fn desugar<L: ItemLeaf>(
 
     // A `W` reference reads the outer side; a placeholder is the id its value
     // column was minted under, so it already names a column of the join.
-    let to_outer = |e: &HirExpr| {
-        e.try_rebuild(&mut |id| Ok::<_, GnitzSqlError>(BExpr::ColRef(outer.at.get(id).copied().unwrap_or(*id))))
-    };
-    let qualify = qualify.iter().map(to_outer).collect::<Result<Vec<_>, _>>()?;
+    let to_outer = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(outer.at.get(id).copied().unwrap_or(*id)));
+    let qualify = qualify.iter().map(to_outer).collect();
     let items = items
         .into_iter()
-        .map(|it| Ok(ProjEntry { expr: to_outer(&it.expr)?, out: it.out }))
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+        .map(|it| ProjEntry { expr: to_outer(&it.expr), out: it.out })
+        .collect();
     Ok(RelExpr::project(RelExpr::filter(cur, qualify)?, items))
 }
 
@@ -733,6 +726,7 @@ struct Aggs<'a> {
 
 impl Aggs<'_> {
     fn slot(&mut self, func: AggFunc, arg: Option<ColId>) -> Result<usize, GnitzSqlError> {
+        let arg = arg.map_or(AggArg::Star, AggArg::All);
         let agg = HirAgg::new(self.ids, func, arg, self.env, self.is_global, &self.list)?;
         // `HirAgg::new` shares physical columns, so `COUNT(x)` over a NOT NULL `x` is
         // the `COUNT(*)` already listed.

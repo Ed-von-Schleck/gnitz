@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::ast_util::{extract_object_name, single_part_ident};
-use crate::bind::structural::bind_constant;
+use crate::bind::bind_constant;
 use crate::bind::{require_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};

@@ -10,8 +10,10 @@ use gnitz_core::RelName;
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{
-    ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, TableAliasColumnDef, Value, WildcardAdditionalOptions,
+    ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, TableAliasColumnDef, Value, Visit, Visitor,
+    WildcardAdditionalOptions,
 };
+use std::ops::ControlFlow;
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
 /// not a plain identifier.
@@ -325,11 +327,32 @@ pub(crate) fn select_is_distinct(select: &sqlparser::ast::Select) -> bool {
     matches!(select.distinct, Some(sqlparser::ast::Distinct::Distinct))
 }
 
-/// Whether `e` or any node beneath it satisfies `p` — the one recursive
-/// existence walk over the [`expr_operands`] node set, so a walker written
-/// against it inherits that set rather than re-spelling the recursion.
-pub(crate) fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Expr) -> bool) -> bool {
-    p(e) || expr_operands(e).into_iter().any(|o| expr_any(o, p))
+/// Whether `e` or any expression beneath it satisfies `p`. A subquery's body is
+/// not searched.
+pub(crate) fn expr_any(e: &sqlparser::ast::Expr, p: &dyn Fn(&sqlparser::ast::Expr) -> bool) -> bool {
+    use sqlparser::ast::{Expr, Query};
+    struct Outside<'p> {
+        p: &'p dyn Fn(&Expr) -> bool,
+        depth: usize,
+    }
+    impl Visitor for Outside<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match self.depth == 0 && (self.p)(e) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            }
+        }
+    }
+    e.visit(&mut Outside { p, depth: 0 }).is_break()
 }
 
 /// Recursively test whether an expression contains an aggregate function call:
@@ -355,13 +378,6 @@ pub(crate) fn is_agg_call(f: &sqlparser::ast::Function) -> bool {
     f.over.is_none() && single_part_ident(&f.name).and_then(agg_func_from_name).is_some()
 }
 
-/// The expressions a window specification keys on: its PARTITION BY, then its
-/// ORDER BY. The one definition, so no two readers can disagree on what a
-/// specification references.
-pub(crate) fn window_spec_keys(spec: &sqlparser::ast::WindowSpec) -> impl Iterator<Item = &sqlparser::ast::Expr> {
-    spec.partition_by.iter().chain(spec.order_by.iter().map(|o| &o.expr))
-}
-
 /// Strip redundant parentheses.
 pub(crate) fn peel_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
     let mut cur = e;
@@ -369,33 +385,6 @@ pub(crate) fn peel_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
         cur = inner;
     }
     cur
-}
-
-/// Visit every aggregate call in `e`, outermost-first: when `e` is itself one, `f`
-/// runs on it and the walk stops (an aggregate's arguments cannot contain another
-/// aggregate); otherwise every operand is visited. Returns whether `e`'s own top
-/// level was the aggregate — the callers use it to tell "this item *is* an
-/// aggregate" from "it merely contains one".
-///
-/// The one traversal behind the grouped bind: what it reaches is exactly what the
-/// reduce materializes, because the same walk collects the aggregates and binds
-/// the expressions over them. An aggregate a second walk reached and this one
-/// missed would bind against a reduce-output column that does not exist.
-pub(crate) fn for_each_agg_call<E>(
-    e: &sqlparser::ast::Expr,
-    f: &mut impl FnMut(&sqlparser::ast::Function) -> Result<(), E>,
-) -> Result<bool, E> {
-    let peeled = peel_nested(e);
-    if let sqlparser::ast::Expr::Function(func) = peeled {
-        if is_agg_call(func) {
-            f(func)?;
-            return Ok(true);
-        }
-    }
-    for op in expr_operands(peeled) {
-        for_each_agg_call(op, f)?;
-    }
-    Ok(false)
 }
 
 /// The GROUP BY clause's expression list. Only the plain list form is supported —
@@ -407,79 +396,6 @@ pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlpar
         _ => Err(GnitzSqlError::Rejected(
             "GROUP BY: only expression list supported".to_string(),
         )),
-    }
-}
-
-/// The direct operand subexpressions of `e`. Subquery nodes contribute none: no
-/// walker may silently descend into a subquery. Must cover every node
-/// `bind_structural` recurses through — only this module's tests enforce that,
-/// and a node it misses is invisible to every walker, silently.
-pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
-    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, WindowType};
-    match e {
-        Expr::BinaryOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-            vec![expr.as_ref()]
-        }
-        Expr::Between { expr, low, high, .. } => vec![expr.as_ref(), low.as_ref(), high.as_ref()],
-        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a.as_ref(), b.as_ref()],
-        Expr::Position { expr, r#in } => vec![expr.as_ref(), r#in.as_ref()],
-        // Keyword-dispatched: sqlparser gives these their own node rather than an
-        // `Expr::Function`, so their operand is named here explicitly.
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
-            vec![expr.as_ref()]
-        }
-        // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
-        // literal by the time the binder accepts it, but it is a bound operand
-        // position and belongs in the walk regardless.
-        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_ref())
-            .chain(substring_from.as_deref())
-            .chain(substring_for.as_deref())
-            .collect(),
-        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
-        // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
-        // so it contributes nothing.
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            vec![expr.as_ref(), pattern.as_ref()]
-        }
-        Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            case_token: _,
-            end_token: _,
-        } => {
-            let mut ops = Vec::new();
-            ops.extend(operand.as_deref());
-            for CaseWhen { condition, result } in conditions {
-                ops.push(condition);
-                ops.push(result);
-            }
-            ops.extend(else_result.as_deref());
-            ops
-        }
-        // An inline window specification's keys ([`window_spec_keys`]) are
-        // operands too, so the walkers see the aggregate in `ORDER BY SUM(x)`
-        // and a subquery written there.
-        Expr::Function(f) => {
-            let mut ops: Vec<_> = match &f.args {
-                FunctionArguments::List(list) => list
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                ops.extend(window_spec_keys(spec));
-            }
-            ops
-        }
-        _ => Vec::new(),
     }
 }
 
@@ -514,43 +430,6 @@ pub(crate) fn scalar_projection_item<'a>(
             "{ctx}: SELECT <table>.* is not a supported SELECT item"
         ))),
     }
-}
-
-/// The expression surfaces subquery detection scans — a SELECT's
-/// WHERE, its projection items (a wildcard contributes none) and its QUALIFY.
-/// The one definition of "which surfaces decide detection", shared by the
-/// EXISTS/IN and scalar/ANY/ALL detectors.
-fn select_exprs(select: &sqlparser::ast::Select) -> impl Iterator<Item = &sqlparser::ast::Expr> {
-    select
-        .selection
-        .iter()
-        .chain(select.projection.iter().filter_map(projection_item_expr))
-        .chain(select.qualify.iter())
-}
-
-/// Whether `select` carries a `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery in
-/// its WHERE or projection. Subqueries are opaque leaves to `expr_operands`, so the
-/// walk visits each (under OR/NOT, inside CASE, in a projection) without descending
-/// into its body.
-pub(crate) fn has_exists_in_subquery(select: &sqlparser::ast::Select) -> bool {
-    select_exprs(select).any(|e| expr_any(e, &is_exists_in))
-}
-
-fn is_exists_in(e: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. })
-}
-
-/// Whether `select` carries a scalar `Expr::Subquery` or an `Expr::AnyOp` /
-/// `Expr::AllOp` anywhere in its WHERE or projection. (EXISTS/IN are detected
-/// separately by [`has_exists_in_subquery`].)
-pub(crate) fn has_scalar_subquery(select: &sqlparser::ast::Select) -> bool {
-    select_exprs(select).any(|e| expr_any(e, &is_scalar_subquery))
-}
-
-fn is_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    matches!(e, Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. })
 }
 
 /// The classified shape of a FROM clause — the one definition of "a single plain

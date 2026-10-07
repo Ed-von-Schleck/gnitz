@@ -506,6 +506,8 @@ fn every_read_shape_plans_to_its_sink() {
         ("SELECT id FROM t LIMIT 0", false, false),
         ("SELECT COUNT(*) FROM t", true, true),
         ("SELECT g, SUM(v) AS s FROM t GROUP BY g", true, true),
+        ("SELECT g, (SUM(v) > 0) IS TRUE AS p FROM t GROUP BY g", true, true),
+        ("SELECT (SUM(v) > 0) IS NOT FALSE AS p FROM t", true, true),
         ("SELECT DISTINCT g FROM t", true, true),
         ("SELECT DISTINCT g, v FROM t", true, true),
         ("SELECT DISTINCT id + 1 FROM t", true, true),
@@ -648,8 +650,8 @@ fn a_read_the_planner_rejects_names_its_rule() {
     cat.insert(&in_sn("st"), st);
 
     for (sql, msg) in [
-        // A query deriving a new relation is refused from the AST alone, naming
-        // the construct and pointing at CREATE VIEW.
+        // A query deriving a new relation is refused naming the construct and
+        // pointing at CREATE VIEW.
         ("SELECT t.id FROM t JOIN u ON t.v = u.k", "(JOIN)"),
         ("SELECT v FROM t UNION SELECT k FROM u", "(set operation)"),
         (
@@ -658,6 +660,12 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ),
         ("SELECT id FROM t WHERE v IN (SELECT k FROM u)", "(EXISTS/IN subquery)"),
         ("SELECT id, (SELECT MAX(k) FROM u) FROM t", "(scalar subquery)"),
+        // An operand COALESCE folds away is still bound.
+        ("SELECT COALESCE(1, (SELECT MAX(k) FROM u)) FROM t", "(scalar subquery)"),
+        (
+            "WITH x AS (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.v)) SELECT id FROM x",
+            "(EXISTS/IN subquery)",
+        ),
         ("SELECT x FROM (SELECT v AS x FROM t) d", "(derived table in FROM)"),
         ("SELECT t.id FROM t, u WHERE t.v = u.k", "CREATE VIEW"),
         // A clause the parser accepts and the read path would otherwise drop.

@@ -1,5 +1,5 @@
 use super::*;
-use crate::bind::structural::bind_constant;
+use crate::bind::bind_constant;
 use crate::test_support::parse_expr_sql;
 use std::convert::Infallible;
 use Placed::*;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::bind::structural::bind_constant;
+use crate::bind::bind_constant;
 use crate::test_support::{ncol, parse_expr_sql};
 
 const U128_MAX: &str = "340282366920938463463374607431768211455";

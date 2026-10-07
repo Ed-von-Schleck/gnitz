@@ -116,7 +116,7 @@ fn each_node_types_as_the_value_it_computes() {
         ("SIGN(q)", t(I64)),
     ] {
         let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(bound.infer_ty(&s.columns), want, "{sql}");
+        assert_eq!(bound.infer_ty(&s.columns[..]), want, "{sql}");
     }
 }
 
@@ -196,7 +196,7 @@ fn num_func_result_types() {
 }
 
 /// Each shape with `{x}` a NOT NULL column and with it a nullable one:
-/// `never_null_with` proves the first exactly when no kernel the shape lowers to
+/// `never_null` proves the first exactly when no kernel the shape lowers to
 /// makes a NULL of its own, and never proves the second.
 #[test]
 fn never_null_follows_the_kernels_that_make_a_null() {
@@ -217,7 +217,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
     let never_null = |sql: &str| {
         bind_sql(sql, &s)
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .never_null_with(&|i: &usize| s.columns[*i].is_nullable, &|i: &usize| s.columns[*i].ty)
+            .never_null(&s.columns[..])
     };
     for (shape, over_not_null) in [
         ("{x} + 1", true),

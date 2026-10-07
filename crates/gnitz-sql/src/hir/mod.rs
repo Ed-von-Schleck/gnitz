@@ -19,11 +19,12 @@ mod physical;
 mod place;
 mod window;
 
-pub(crate) use bind::ViewBody;
+pub(crate) use bind::{bind_single_table, ViewBody};
 
 use crate::agg::AggFunc;
+use crate::ast_util::AggArg;
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp};
+use crate::ir::{BExpr, BinOp, LeafTyping};
 use gnitz_core::{RelDescriptor, ViewBundle};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
@@ -130,6 +131,13 @@ pub(crate) fn col_by_id(cols: &[HirCol], id: ColId) -> Option<&HirCol> {
 /// there), so absence is an internal compile error, not a user-facing one.
 pub(crate) fn hircol_of(cols: &[HirCol], id: ColId) -> &HirCol {
     col_by_id(cols, id).expect("HIR ColRef references a column of its list")
+}
+
+impl LeafTyping<ColId> for [HirCol] {
+    fn decl(&self, id: &ColId) -> (ColType, bool) {
+        let def = &hircol_of(self, *id).def;
+        (def.ty, def.is_nullable)
+    }
 }
 
 /// The `ColId` of a bare `ColRef` leaf, else `None` (a literal or a computed
@@ -341,12 +349,13 @@ impl IntoIterator for AggCols {
 /// with.
 pub(crate) type Value = (HirExpr, ColType, bool);
 
-/// One aggregate over a reduce: the logical `func(arg)`, and the physical value
-/// and count columns ([`crate::agg::agg_ops`]) it may share with other aggregates.
+/// One aggregate over a reduce: the logical `func(arg)` — a call's identity
+/// within its reduce — and the physical value and count columns
+/// ([`crate::agg::agg_ops`]) it may share with other aggregates.
 #[derive(Clone)]
 pub(crate) struct HirAgg {
     pub func: AggFunc,
-    pub arg: Option<ColId>,
+    pub arg: AggArg<ColId>,
     pub out: AggCol,
     pub companion: Option<AggCol>,
 }
@@ -357,16 +366,17 @@ impl HirAgg {
     pub(crate) fn new(
         ids: &ColIdGen,
         func: AggFunc,
-        arg: Option<ColId>,
+        arg: AggArg<ColId>,
         env: &[HirCol],
         is_global: bool,
         prior: &[HirAgg],
     ) -> Result<Self, GnitzSqlError> {
-        let arg_def = arg.map(|id| &hircol_of(env, id).def);
+        let read = arg.ignoring_distinct();
+        let arg_def = read.map(|id| &hircol_of(env, id).def);
         let (value, count) = crate::agg::agg_ops(func, arg_def, is_global)?;
         let col = |op: WireAggFunc| {
             // COUNT(*) reads no column, whatever argument the aggregate names.
-            let arg = arg.filter(|_| op != WireAggFunc::Count);
+            let arg = read.filter(|_| op != WireAggFunc::Count);
             let def = crate::agg::agg_col_def(op, arg.and(arg_def), is_global);
             match prior
                 .iter()
@@ -405,9 +415,7 @@ impl HirAgg {
         AggCols(out)
     }
 
-    /// The finalize composite over this aggregate's raw reduce column(s) — the one
-    /// home, shared with a scalar subquery's value column and the grouped
-    /// binder's SELECT / HAVING leaf.
+    /// The finalize composite over this aggregate's raw reduce column(s).
     pub(crate) fn finalize(&self) -> HirExpr {
         let col = |c: &AggCol| BExpr::ColRef(c.col.id);
         crate::agg::finalize_agg_bexpr(col(&self.out), self.companion.as_ref().map(col), self.func)

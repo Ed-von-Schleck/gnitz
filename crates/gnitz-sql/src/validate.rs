@@ -43,13 +43,13 @@ impl HonoredClauses {
     };
 
     /// The grouped-vs-DISTINCT split every SELECT-bodied surface makes, in one
-    /// home: GROUP BY is honored only on the grouped, **non**-DISTINCT path, so a
-    /// `SELECT DISTINCT … GROUP BY` body keeps the pinned "GROUP BY is not
-    /// supported" rejection — DISTINCT wins the routing split and its builder does
-    /// not group.
-    pub(crate) fn for_body(grouped: bool, distinct: bool) -> Self {
+    /// home: GROUP BY and HAVING are honored on the **non**-DISTINCT path, where
+    /// either makes the body grouped, so a `SELECT DISTINCT … GROUP BY` body
+    /// keeps the pinned "GROUP BY is not supported" rejection — DISTINCT wins the
+    /// routing split and its builder does not group.
+    pub(crate) fn for_body(distinct: bool) -> Self {
         HonoredClauses {
-            grouping: grouped && !distinct,
+            grouping: !distinct,
             distinct,
             windows: false,
         }

@@ -2,7 +2,7 @@
 
 use super::super::{ColId, HirCol, JoinType, RelExpr};
 use super::{resolve_table_factor, BindCx, JoinScope, ScopeLeaf, SubPolicy};
-use crate::bind::{bind_conjuncts, find_unique_column};
+use crate::bind::{bind_conjuncts, find_unique_column, unsupported_subquery};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use sqlparser::ast::{JoinConstraint, JoinOperator, TableFactor};
@@ -82,14 +82,13 @@ pub(super) fn fold_join_step(
     // Every other form states its keys as `pairs`, empty for a keyless step — so a
     // step with no constraint of its own needs no arm, and the WHERE may key it.
     let on = match keys {
-        JoinConstraint::On(e) => bind_conjuncts(
-            e,
-            &ScopeLeaf {
+        JoinConstraint::On(e) => {
+            let leaf = ScopeLeaf {
                 scope,
-                clause: "JOIN ON",
-                sub: SubPolicy::PerKind,
-            },
-        )?,
+                sub: SubPolicy::Reject(unsupported_subquery),
+            };
+            bind_conjuncts(e, &leaf).map_err(|e| e.in_clause("JOIN ON"))?
+        }
         _ => pairs
             .iter()
             .map(|&(l, r)| BExpr::bin(BExpr::ColRef(l), BinOp::Eq, BExpr::ColRef(r)))

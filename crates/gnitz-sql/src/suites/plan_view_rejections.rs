@@ -282,6 +282,10 @@ fn subquery_rules() {
         // A pure-range correlation runs the same threshold a pure-range LEFT
         // JOIN does, at the range pair's common width.
         "SELECT * FROM ty WHERE EXISTS (SELECT 1 FROM w WHERE w.big < ty.big)",
+        // A subquery binds wherever an expression does: under an IS test, and
+        // as an ORDER BY key with no other subquery in the body.
+        "SELECT id FROM a WHERE (EXISTS (SELECT 1 FROM b WHERE b.k = a.k)) IS TRUE",
+        "SELECT id FROM a ORDER BY (SELECT MAX(w) FROM b) LIMIT 3",
     ] {
         view(&cat, body);
     }
@@ -298,6 +302,8 @@ fn subquery_rules() {
             ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "tuple"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "needs at least one equijoin"),
             ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "GROUP BY/aggregates"),
+            ("SELECT k, COUNT(*) FROM a GROUP BY k HAVING COUNT(*) > (SELECT COUNT(*) FROM b)", "HAVING: a subquery is not supported together with GROUP BY/aggregates"),
+            ("SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", "a subquery is not supported together with SELECT DISTINCT"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "single FROM table without JOINs"),
             ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "GROUP BY"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))", "nested subqueries"),
@@ -331,6 +337,9 @@ fn grouped_body_rules() {
         "SELECT s, COUNT(*) AS n FROM ty GROUP BY s",
         "SELECT id, MIN(uid) AS x, MAX(s) AS y, MIN(big) AS z FROM ty GROUP BY id",
         "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING MIN(s) > 'a'",
+        // An aggregate under an IS test is the reduce's, and groups its body.
+        "SELECT g, (SUM(v) > 0) IS TRUE AS p FROM t GROUP BY g",
+        "SELECT (SUM(v) > 0) IS NOT FALSE AS p FROM t",
     ] {
         view(&cat, body);
     }
@@ -368,21 +377,26 @@ fn grouped_body_rules() {
                 "SELECT f + 1 AS x, COUNT(*) AS c FROM m GROUP BY f + 1",
                 "float-valued expression cannot be a key",
             ),
+            // A COALESCE operand the fold skips still binds.
+            (
+                "SELECT g, COALESCE(g, SUM(nope)) AS x FROM t GROUP BY g",
+                "column 'nope' not found",
+            ),
             (
                 "SELECT b + 1 AS x FROM m GROUP BY a",
-                "GROUP BY SELECT: column 'b' must appear in GROUP BY",
+                "GROUP BY: column 'b' must appear in GROUP BY",
             ),
             (
                 "SELECT b FROM m GROUP BY a",
-                "GROUP BY SELECT: column 'b' must appear in GROUP BY",
+                "GROUP BY: column 'b' must appear in GROUP BY",
             ),
             (
                 "SELECT a + 1 AS x FROM m GROUP BY a + b",
-                "GROUP BY SELECT: column 'a' must appear in GROUP BY",
+                "GROUP BY: column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT a * b AS x, SUM(a * b) AS s FROM m GROUP BY k",
-                "GROUP BY SELECT: column 'a' must appear in GROUP BY",
+                "GROUP BY: column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT a, COUNT(*) AS n FROM m GROUP BY a HAVING b > 0",

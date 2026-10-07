@@ -1,12 +1,13 @@
 use super::*;
-use crate::ir::NumLit;
+use crate::hir::bind_single_table;
+use crate::ir::{BoundExpr, NumLit};
 use crate::test_support::{bind_sql, col, ncol, parse_expr_sql, rejected};
 use gnitz_wire::TypeCode;
 
-/// `(pk U64, c I64 nullable, n I64 NOT NULL)`. The binder reads a column's
-/// position and nullability only, so one schema serves the numeric and the
-/// string surface alike.
-fn schema() -> Schema {
+/// `(pk U64, c I64 nullable, n I64 NOT NULL)`. A function's operand types are
+/// lowering's to check, so one schema serves the numeric and the string surface
+/// alike.
+fn schema() -> gnitz_core::Schema {
     crate::test_support::schema(
         vec![
             col("pk", TypeCode::U64),
@@ -363,6 +364,7 @@ fn bind_constant_reads_a_literal_through_parens_and_signs() {
         assert_eq!(constant(src).unwrap(), BExpr::LitNull, "{src}");
     }
     assert_eq!(constant("'abc'").unwrap(), BExpr::LitStr("abc".into()));
+    assert_eq!(constant("CAST(-1 AS BOOLEAN)").unwrap(), BExpr::LitBool(true));
     assert_eq!(
         constant("DATE '2020-01-01'").unwrap(),
         BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }
@@ -394,6 +396,9 @@ fn each_unsupported_form_is_rejected_by_name() {
         // Columns.
         ("nope", "column 'nope' not found"),
         ("nope IS NULL", "column 'nope' not found"),
+        // An operand COALESCE folds away is still bound.
+        ("COALESCE(pk, no_such_col)", "column 'no_such_col' not found"),
+        ("COALESCE(1, FOO(c))", "function 'foo' not supported"),
         ("x.c", "table alias 'x' not found (the relation in scope is 't')"),
         ("a.b.c", "expected a column reference"),
         // Names.

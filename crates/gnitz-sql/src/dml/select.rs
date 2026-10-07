@@ -10,8 +10,9 @@
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
 //! or scalar subquery, a derived table — has no single-relation sink and is
 //! rejected ([`crate::error::derivation`]), pointing at CREATE VIEW:
-//! [`plan_query`] refuses the body's own shape from the AST alone, and the read
-//! lowering refuses a CTE that derives. A read the direct path merely cannot
+//! [`plan_query`] refuses a set operation and a deriving FROM, the binder a
+//! subquery where it meets one, and the read lowering a CTE that derives. A
+//! read the direct path merely cannot
 //! express is a feature-named rejection, never that template. The body and its
 //! CTEs bind through the view binder (`hir::bind_adhoc_read`), so a CTE reads
 //! through the sink of the flat query it composes to.
@@ -22,10 +23,7 @@
 //! `dml::explain` formats the same plan instead of dispatching it.
 
 use crate::agg::ground_partial_schema;
-use crate::ast_util::{
-    body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
-    select_is_distinct, FromShape,
-};
+use crate::ast_util::{body_is_grouped, classify_from, extract_table_name_and_alias, select_is_distinct, FromShape};
 use crate::bind::Catalog;
 use crate::dml::plan::{bound_and_predicate, rows_reply, walks_in_pk_order, RowsReply};
 use crate::error::{derivation, reject_if, GnitzSqlError};
@@ -218,13 +216,6 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         // Not the derivation template: CREATE VIEW refuses these bodies too.
         body => as_plain_select(body, "direct SELECT")?,
     };
-    // Detected nowhere else: without this the binder rejects these without naming CREATE VIEW.
-    if has_exists_in_subquery(select) {
-        return Err(derivation("EXISTS/IN subquery"));
-    }
-    if has_scalar_subquery(select) {
-        return Err(derivation("scalar subquery"));
-    }
     let window = Window {
         limit: extract_limit(query)?,
         offset: extract_offset(query)?,
@@ -249,7 +240,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         FromShape::SinglePlainRelation(factor) => {
             // The FROM name is checked before the clause gate.
             extract_table_name_and_alias(factor, cat.schema_name(), "FROM")?;
-            reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
+            reject_unhonored_select_clauses(select, HonoredClauses::for_body(distinct), ctx)?;
         }
         FromShape::Derived(construct) => return Err(derivation(construct)),
     }

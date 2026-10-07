@@ -5,7 +5,7 @@
 //! rejection here cannot name a surface it does not know.
 
 use crate::ast_util::{expr_has_aggregate, peel_nested, projection_item_expr};
-use crate::bind::structural::bind_constant;
+use crate::bind::bind_constant;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::BExpr;
 use gnitz_wire::ColumnDef;

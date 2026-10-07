@@ -37,7 +37,7 @@ fn lower_rejected<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> String {
 fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]], want: &[Cell]) {
     let s = typed_schema(tys);
     let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    let ty = bound.infer_ty(&s.columns).tc;
+    let ty = bound.infer_ty(&s.columns[..]).tc;
     let mut ev = compile_scalar_evaluator(&bound, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let out = ev.eval_all(&batch_of(&s, rows));
     let got: Vec<Cell> = match &out {

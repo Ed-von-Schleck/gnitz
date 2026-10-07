@@ -5,13 +5,13 @@ use super::super::{
     cross_comparison, hircol_of, side, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side,
     SubqueryKind, SubqueryRef,
 };
-use super::{bind_body_suffix, resolve_relation, BindCx, JoinScope, ScopeLeaf, SubPolicy};
+use super::{bind_body_suffix, resolve_relation, BindCx, BodyShape, JoinScope, ScopeLeaf, SubPolicy};
 use crate::agg::AggFunc;
 use crate::ast_util::{
-    classify_agg_call, classify_from, extract_table_name_and_alias, is_agg_call, peel_nested, FromShape,
+    classify_agg_call, classify_from, col_ref_parts, extract_table_name_and_alias, is_agg_call, peel_nested, AggArg,
+    FromShape,
 };
-use crate::bind::structural::maybe_negate;
-use crate::bind::{bind_conjuncts, bind_structural, single_relation_col_idx};
+use crate::bind::{bind_conjuncts, bind_structural, maybe_negate, single_relation_col_idx, unsupported_subquery};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::validate::{as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses};
@@ -46,9 +46,10 @@ pub(super) fn bind_linear_subquery_body(
     get: Rc<RelExpr>,
     scope: &JoinScope,
     outer_alias: &str,
+    shape: BodyShape,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let (ids, stmt, surface) = (cx.ids, cx.view.stmt, cx.surface);
+    let ids = cx.ids;
     let subs = RefCell::new(Vec::new());
     let sub = RefCell::new(SubCtx {
         cx,
@@ -59,10 +60,9 @@ pub(super) fn bind_linear_subquery_body(
     let bind_sub = |e: &Expr| bind_one_subquery(&mut sub.borrow_mut(), e);
     let leaf = ScopeLeaf {
         scope,
-        clause: stmt,
         sub: SubPolicy::Bind { bind: &bind_sub, subs: &subs },
     };
-    bind_body_suffix(ids, select, get, &leaf, surface, order_exprs)
+    bind_body_suffix(ids, select, get, &leaf, shape, order_exprs)
 }
 
 /// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
@@ -111,12 +111,13 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
         scope.push(&inner_alias, inner_cols.clone());
         let leaf = ScopeLeaf {
             scope: &scope,
-            clause: "subquery",
-            sub: SubPolicy::Reject(
-                "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views",
-            ),
+            sub: SubPolicy::Reject(|_| {
+                GnitzSqlError::Rejected(
+                    "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views".into(),
+                )
+            }),
         };
-        for bound in bind_conjuncts(where_expr, &leaf)? {
+        for bound in bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("subquery"))? {
             match side(&bound, &inner_cols, outer_env) {
                 Side::Left | Side::Neither => local_preds.push(bound),
                 Side::Right => {
@@ -281,8 +282,7 @@ fn bind_quantifier_sub(
     let outer_scope = JoinScope::single(outer_alias, outer_env.to_vec());
     let outer_leaf = ScopeLeaf {
         scope: &outer_scope,
-        clause: cx.cx.view.stmt,
-        sub: SubPolicy::PerKind,
+        sub: SubPolicy::Reject(unsupported_subquery),
     };
     let x = bind_structural(left, &outer_leaf)?;
     let cmp = BExpr::bin(x, bop, m.clone());
@@ -296,9 +296,10 @@ fn bind_quantifier_sub(
 /// Every rejection is `err`: the caller's surface states what shape it needed,
 /// which is more use here than "column 'x' not found".
 fn bind_plain_col(e: &Expr, env: &[HirCol], alias: &str, err: &str) -> Result<ColId, GnitzSqlError> {
-    single_relation_col_idx(env.iter().map(|c| &c.def), alias, e)
+    col_ref_parts(e)
+        .and_then(|(qual, name)| single_relation_col_idx(env.iter().map(|c| &c.def), alias, qual, name).ok())
         .map(|i| env[i].id)
-        .map_err(|_| GnitzSqlError::Rejected(err.into()))
+        .ok_or_else(|| GnitzSqlError::Rejected(err.into()))
 }
 
 /// Classify a scalar subquery's single-aggregate projection into `(func, arg)`.
@@ -364,6 +365,7 @@ fn scalar_leaf(
     arg: Option<ColId>,
 ) -> Result<SubqueryRef, GnitzSqlError> {
     let group_cols = scalar_group_cols(&ir.correlation, outer_env, &ir.inner_cols)?;
+    let arg = arg.map_or(AggArg::Star, AggArg::All);
     let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty(), &[])?;
     let (expr, ty, nullable) = agg.as_value();
     let value = HirCol::new(ids.next(), ColumnDef::typed("_agg", ty, nullable).hidden());

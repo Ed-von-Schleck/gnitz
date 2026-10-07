@@ -11,11 +11,12 @@
 use crate::ast_util::{
     classify_from, col_ref_parts, expr_any, extract_table_name_and_alias, single_part_ident, FromShape,
 };
-use crate::bind::{bind_single_table, require_column, Catalog};
+use crate::bind::{require_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::expr_lower::compile_scalar_evaluator;
+use crate::hir::bind_single_table;
 use crate::ir::{BoundExpr, RegClass};
 use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
@@ -254,7 +255,7 @@ fn bind_set_rhs(
             let col_idx = require_column(&schema.columns, col_name).map_err(|e| e.in_clause("EXCLUDED"))?;
             // Through the same classifier as a bare RHS, so `SET int_col =
             // EXCLUDED.str_col` is rejected here rather than per row.
-            return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
+            return classify_set_rhs(BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
         }
         // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
         // relation in scope); this says why, which its message cannot.
@@ -266,12 +267,7 @@ fn bind_set_rhs(
             ));
         }
     }
-    classify_set_rhs(
-        &bind_single_table(expr, schema, alias)?,
-        Scope::Existing,
-        target,
-        schema,
-    )
+    classify_set_rhs(bind_single_table(expr, schema, alias)?, Scope::Existing, target, schema)
 }
 
 /// The column an `EXCLUDED.<col>` reference names.
@@ -286,20 +282,20 @@ fn excluded_col(e: &Expr) -> Option<&str> {
 /// rows it reads carry. Every kind rejection happens here, before any row is
 /// read; a computed value's range and a NULL into a NOT NULL column are the
 /// verdicts [`apply_set`] takes per row.
-fn classify_set_rhs(expr: &BoundExpr, scope: Scope, target: usize, schema: &Schema) -> Result<SetRhs, GnitzSqlError> {
+fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schema) -> Result<SetRhs, GnitzSqlError> {
     let col = &schema.columns[target];
     let ty = col.ty;
     if expr.is_literal() {
         let (mut cell, mut spill) = (Vec::new(), Vec::new());
-        append_value_to_col(&mut cell, &mut spill, col, expr)?;
+        append_value_to_col(&mut cell, &mut spill, col, &expr)?;
         return Ok(SetRhs::Const {
             cell,
             spill,
             null: matches!(expr, BoundExpr::LitNull),
         });
     }
-    let src = expr.infer_ty(&schema.columns);
-    if let BoundExpr::ColRef(c) = expr {
+    let src = expr.infer_ty(&schema.columns[..]);
+    if let BoundExpr::ColRef(c) = &expr {
         if let (true, Some(slot)) = (src == ty, schema.payload_slot(*c)) {
             return Ok(SetRhs::Copy { scope, src: slot });
         }
@@ -336,8 +332,8 @@ fn classify_set_rhs(expr: &BoundExpr, scope: Scope, target: usize, schema: &Sche
         None
     };
     let expr = match cast_to {
-        Some(to) => BoundExpr::Cast { expr: Box::new(expr.clone()), to },
-        None => expr.clone(),
+        Some(to) => BoundExpr::Cast { expr: Box::new(expr), to },
+        None => expr,
     };
     let ev = compile_scalar_evaluator(&expr, schema)?;
     Ok(SetRhs::Expr { scope, ev: Box::new(ev) })

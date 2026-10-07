@@ -89,7 +89,7 @@ impl Lowering<'_> {
 
     /// Whether every value `e`'s register can hold is a value of `fi`.
     fn within(&self, e: &BoundExpr, fi: FixedInt) -> bool {
-        e.within_with(fi, &|i: &usize| self.cols[*i].ty)
+        e.within(fi, self.cols)
     }
 
     fn col_ref(&mut self, idx: usize) -> Result<Reg, GnitzSqlError> {
@@ -452,7 +452,7 @@ impl Lowering<'_> {
 
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes.
     fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<Reg, GnitzSqlError> {
-        let types = operand_tys(&args.iter().collect::<Vec<_>>(), &|i: &usize| self.cols[*i].ty);
+        let types = operand_tys(&args.iter().collect::<Vec<_>>(), self.cols);
         if let Some((a, _)) = args.iter().zip(&types).find(|(_, t)| t.tc == TypeCode::String) {
             return Err(self.not_scalar(a));
         }
@@ -550,7 +550,7 @@ impl Lowering<'_> {
     /// at the type they blend to.
     fn case(&mut self, branches: &[(BoundExpr, BoundExpr)], else_: &BoundExpr) -> Result<Reg, GnitzSqlError> {
         let results: Vec<&BoundExpr> = branches.iter().map(|(_, r)| r).chain([else_]).collect();
-        let ty = blend_type(&operand_tys(&results, &|idx: &usize| self.cols[*idx].ty));
+        let ty = blend_type(&operand_tys(&results, self.cols));
         let mut arms = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
             arms.push((self.lower_bool(cond)?, self.lower_blended(result, ty)?));
@@ -688,7 +688,7 @@ impl Lowering<'_> {
         if let Some(reg) = self.string_cmp(left, op, right) {
             return Ok(reg);
         }
-        let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty);
+        let (lt, rt) = operand_ty_pair(left, right, self.cols);
         let t = bin_types(op, lt, rt).map_err(GnitzSqlError::Rejected)?;
         if t.out.is_decimal() {
             check_decimal_scale(t.out.scale)?;

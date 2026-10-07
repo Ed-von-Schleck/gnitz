@@ -232,7 +232,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
 /// Parse + bind an expression against `schema` as relation `t`, which is what
 /// every qualified reference in these tests writes.
 pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-    crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t")
+    crate::hir::bind_single_table(&parse_expr_sql(sql), schema, "t")
 }
 
 /// The message of the `Rejected` error `r` must be.

@@ -3,9 +3,10 @@
 
 use super::guard::kv_options;
 use crate::ast_util::extract_object_name;
-use crate::bind::Catalog;
+use crate::bind::{bind_constant, Catalog};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::ViewBody;
+use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
@@ -13,7 +14,7 @@ use gnitz_core::{GnitzClient, RelName, ViewBundle};
 use gnitz_wire::ViewProps;
 use std::num::NonZeroU64;
 
-use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
+use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -30,15 +31,12 @@ fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzS
 
 /// The byte count of one size-valued `CREATE VIEW` option.
 fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64, GnitzSqlError> {
-    let sqlparser::ast::Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(text), ..
-    }) = value
-    else {
+    let Ok(BExpr::LitStr(text)) = bind_constant(value) else {
         return Err(GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}` takes a single-quoted size string, e.g. '256 MB'"
         )));
     };
-    parse_size(option, text)
+    parse_size(option, &text)
 }
 
 /// `<uint><unit>` with an optional space, unit in {KB, MB, GB}, binary

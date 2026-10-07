@@ -14,7 +14,7 @@ categories.workspace = true
 integration = []
 
 [dependencies]
-sqlparser  = "0.62"
+sqlparser  = { version = "0.62", features = ["visitor"] }
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
 gnitz-wire.workspace = true

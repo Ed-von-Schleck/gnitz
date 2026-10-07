@@ -1,38 +1,26 @@
 use std::convert::Infallible;
 
 use super::resolve::require_column;
+use crate::agg::AggFunc;
 use crate::ast_util::{
-    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_part_ident, CallSurface, PlainCall,
+    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_part_ident, AggArg, CallSurface, PlainCall,
 };
 use crate::codec::literal::{invalid_literal, parse_bool, parse_temporal};
 use crate::error::{reject_if, GnitzSqlError};
-use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode, BOOL};
+use crate::ir::{BExpr, BinOp, FloatUnaryOp, LeafTyping, NumFunc, StrArg, StrFunc, TrimMode, BOOL};
 use crate::types::sql_col_type;
-use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
-use gnitz_wire::{ColType, ColumnDef};
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
     UnaryOperator, Value, ValueWithSpan,
 };
 
-/// Bind an expression against a single-relation schema (WHERE, projections,
-/// set-op branches, DML). The structural recursion lives in `bind_structural`;
-/// the `SingleTable` leaf supplies the schema-aware decisions (column lookup,
-/// aggregate calls, nullability). Context is fully determined by
-/// `(expr, schema, alias)` — no binder state is involved.
-pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Result<BoundExpr, GnitzSqlError> {
-    bind_structural(expr, &SingleTable { schema, alias })
-}
-
 /// A WHERE / ON clause as its bound conjunct list — the one home of that shape,
 /// which every access recognizer and predicate compiler reads. Bound whole, then
 /// split at every top-level `AND`, so a desugar that produces one (BETWEEN)
 /// contributes its conjuncts like the written ones.
-pub(crate) fn bind_conjuncts<R: Clone, L: LeafBinder<R>>(
-    expr: &Expr,
-    leaf: &L,
-) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
+pub(crate) fn bind_conjuncts<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
     Ok(bind_structural(expr, leaf)?.conjuncts())
 }
 
@@ -40,34 +28,33 @@ pub(crate) fn bind_conjuncts<R: Clone, L: LeafBinder<R>>(
 // Shared structural expression binding
 // ---------------------------------------------------------------------------
 //
-// One `Expr → BoundExpr` recursion, parametrized by a leaf. The only things that
+// One `Expr → BExpr` recursion, parametrized by a leaf. The only things that
 // differ across GnitzDB's binding contexts (WHERE/projection, HAVING, JOIN
-// residual) are the schema-aware positions — column reference, function call,
-// a column's nullability, and a whole expression the context names. Everything
-// structural (literals, the full operator map, unary ops, the BETWEEN desugar,
-// Nested unwrap) lives here once, so a new operator or fold lands on every
-// context at the same time and cannot silently drift between hand-copied walks.
+// residual) are the schema-aware positions — a column reference, an aggregate
+// or window call, a subquery, a reference's declaration, and a whole expression
+// the context names. Everything structural (literals, the full operator map,
+// unary ops, the BETWEEN desugar, Nested unwrap) lives here once, so a new
+// operator or fold lands on every context at the same time and cannot silently
+// drift between hand-copied walks.
 
 /// The schema-aware leaves of `bind_structural`, generic over the leaf reference
-/// type `R` (the `ColRef` payload).
-pub(crate) trait LeafBinder<R> {
+/// type `R` (the `ColRef` payload). [`LeafTyping`] is how a reference it handed
+/// out is declared, which [`nullness`] folds a test by.
+pub(crate) trait LeafBinder<R>: LeafTyping<R> {
     /// A whole expression this leaf's context names, claimed before the recursion
     /// descends into it — a GROUP BY key over a grouped relation. `None` recurses
     /// as usual, so declining cannot mask the recursion's own error.
     fn bind_node(&self, _e: &Expr) -> Option<BExpr<R>> {
         None
     }
-    /// An `Identifier` / `CompoundIdentifier` column reference.
-    fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
-    /// A function call. Only a grouped context admits an aggregate, so the
-    /// default rejects one.
-    fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
-        Err(aggregate_not_allowed(f))
+    /// A column reference, as its written qualifier and name.
+    fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<BExpr<R>, GnitzSqlError>;
+    /// An aggregate call. Only a grouped body hosts one.
+    fn bind_aggregate(&self, _func: AggFunc, _arg: AggArg<&Expr>) -> Result<BExpr<R>, GnitzSqlError> {
+        Err(GnitzSqlError::Rejected(
+            "aggregate functions are not allowed here".into(),
+        ))
     }
-    /// Whether the value a leaf reference names can be NULL, and its declared
-    /// type — the two facts a leaf owns that [`nullness`] folds a test by.
-    fn is_nullable(&self, r: &R) -> bool;
-    fn type_of(&self, r: &R) -> ColType;
     /// A windowed call (`f(…) OVER (…)`). Only a view body's SELECT list, QUALIFY
     /// and ORDER BY admit one; every other context keeps this rejection.
     fn bind_window(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
@@ -78,28 +65,15 @@ pub(crate) trait LeafBinder<R> {
         ))
     }
     /// A subquery node — `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, a scalar
-    /// `(SELECT …)`, or an `ANY`/`ALL`/`SOME` comparison. The HIR view leaf
-    /// overrides this to record/bind the subquery for decorrelation; every other
-    /// context (DML, HAVING, ad-hoc reads) keeps the per-kind placement rejection.
+    /// `(SELECT …)`, or an `ANY`/`ALL`/`SOME` comparison. The default is the
+    /// per-kind placement rejection.
     fn bind_subquery(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
         Err(unsupported_subquery(e))
     }
 }
 
-/// The rejection of a call in a context that admits no aggregate — the
-/// [`LeafBinder::bind_function`] default. Classified first, so an unknown or
-/// malformed call is named as such and the aggregate message goes only to a
-/// name that really is one.
-pub(crate) fn aggregate_not_allowed(f: &Function) -> GnitzSqlError {
-    match classify_agg_call(f) {
-        Err(e) => e,
-        Ok(_) => GnitzSqlError::Rejected("aggregate functions are not allowed here".to_string()),
-    }
-}
-
 /// The per-kind "no subquery here" rejection — the [`LeafBinder::bind_subquery`]
-/// default, and what a leaf that overrides the method for *some* shapes falls back
-/// to for the rest.
+/// default.
 pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
     GnitzSqlError::Rejected(match e {
         Expr::Subquery(_) => "scalar subqueries are not supported".into(),
@@ -127,19 +101,49 @@ fn bind_cast<R>(e: BExpr<R>, dt: &DataType) -> Result<BExpr<R>, GnitzSqlError> {
     })
 }
 
+/// `DATE '…'` (and the ODBC `{d '…'}`) is `CAST('…' AS DATE)`.
+fn bind_typed_string<R>(ts: &TypedString) -> Result<BExpr<R>, GnitzSqlError> {
+    let TypedString { data_type, value, uses_odbc_syntax: _ } = ts;
+    match &value.value {
+        Value::SingleQuotedString(s) => bind_cast(BExpr::LitStr(s.clone()), data_type),
+        v => Err(GnitzSqlError::Rejected(format!(
+            "{data_type} literal must be a single-quoted string, got {v}"
+        ))),
+    }
+}
+
+/// A unary operator over its bound operand. A negated literal leaves here as the
+/// literal `-1`. Unary `+` folds over a numeric literal or NULL and nothing
+/// else, as in PostgreSQL: a total identity would accept `+'abc'` and `+(a > 1)`.
+fn bind_unary<R>(op: &UnaryOperator, inner: BExpr<R>) -> Result<BExpr<R>, GnitzSqlError> {
+    match (op, inner) {
+        (UnaryOperator::Minus, inner) => Ok(inner.negate_literal().unwrap_or_else(|inner| BExpr::Func {
+            f: NumFunc::Unary(FloatUnaryOp::Neg),
+            arg: Box::new(inner),
+        })),
+        (UnaryOperator::Not, inner) => Ok(BExpr::Not(Box::new(inner))),
+        (
+            UnaryOperator::Plus,
+            inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) | BExpr::LitNull),
+        ) => Ok(inner),
+        (o, _) => Err(GnitzSqlError::Rejected(format!("unary operator {o} not supported"))),
+    }
+}
+
 /// The one structural recursion. Needs no schema — every schema-aware decision
-/// is a leaf method. Generic over `L` (static dispatch) so a leaf's
-/// `bind_function` can recurse via `bind_structural(arg, self)`.
-pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
+/// is a leaf method.
+pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -> Result<BExpr<R>, GnitzSqlError> {
     if let Some(claimed) = leaf.bind_node(expr) {
         return Ok(claimed);
     }
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
-        // The context-independent names (the CASE desugars and the numeric scalar
-        // functions) bind here, above the leaf, so no leaf impl carries them.
-        // Every other name falls through to the leaf — aggregates, or a context
-        // rejection.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let (qual, name) =
+                col_ref_parts(expr).ok_or_else(|| GnitzSqlError::Rejected("expected a column reference".into()))?;
+            leaf.bind_column(qual, name)
+        }
+        // The names of [`SCALAR_CALLS`] bind here, above the leaf, so no leaf
+        // carries them. Any other name is an aggregate's or no function's.
         Expr::Function(f) if f.over.is_some() => leaf.bind_window(f),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
@@ -150,7 +154,10 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                         n.to_ascii_uppercase()
                     )))
                 }
-                _ => leaf.bind_function(f),
+                _ => {
+                    let (func, arg) = classify_agg_call(f)?;
+                    leaf.bind_aggregate(func, arg)
+                }
             },
         },
         // CEIL/FLOOR are keyword-dispatched by sqlparser into their own AST nodes
@@ -288,7 +295,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // `b IS [NOT] UNKNOWN` is `IS [NOT] NULL` over a BOOLEAN.
         Expr::IsUnknown(i) | Expr::IsNotUnknown(i) => {
             let b = bind_structural(i, leaf)?;
-            let ty = b.infer_ty_with(&|r| leaf.type_of(r));
+            let ty = b.infer_ty(leaf);
             if ty != BOOL && !matches!(b, BExpr::LitNull) {
                 return Err(GnitzSqlError::Rejected(format!(
                     "IS UNKNOWN takes a BOOLEAN, not {ty}; use IS NULL"
@@ -298,13 +305,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         Expr::Nested(i) => bind_structural(i, leaf),
         Expr::Value(vws) => bind_literal(&vws.value),
-        // `DATE '…'` (and the ODBC `{d '…'}`) is `CAST('…' AS DATE)`.
-        Expr::TypedString(TypedString { data_type, value, uses_odbc_syntax: _ }) => match &value.value {
-            Value::SingleQuotedString(s) => bind_cast(BExpr::LitStr(s.clone()), data_type),
-            v => Err(GnitzSqlError::Rejected(format!(
-                "{data_type} literal must be a single-quoted string, got {v}"
-            ))),
-        },
+        Expr::TypedString(ts) => bind_typed_string(ts),
         // Searched CASE binds each `(condition, result)`; the simple-operand form
         // desugars each WHEN value `w` to `operand = w`. A missing ELSE is the
         // implicit ELSE NULL.
@@ -339,24 +340,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             let r = bind_structural(right, leaf)?;
             Ok(BExpr::bin(l, map_binop(op)?, r))
         }
-        Expr::UnaryOp { op, expr } => {
-            let inner = bind_structural(expr, leaf)?;
-            // A negated literal leaves here as the literal `-1`. Unary `+` folds
-            // over a numeric literal or NULL and nothing else, as in PostgreSQL:
-            // a total identity would accept `+'abc'` and `+(a > 1)`.
-            match (op, inner) {
-                (UnaryOperator::Minus, inner) => Ok(inner.negate_literal().unwrap_or_else(|inner| BExpr::Func {
-                    f: NumFunc::Unary(FloatUnaryOp::Neg),
-                    arg: Box::new(inner),
-                })),
-                (UnaryOperator::Not, inner) => Ok(BExpr::Not(Box::new(inner))),
-                (
-                    UnaryOperator::Plus,
-                    inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) | BExpr::LitNull),
-                ) => Ok(inner),
-                (o, _) => Err(GnitzSqlError::Rejected(format!("unary operator {o} not supported"))),
-            }
-        }
+        Expr::UnaryOp { op, expr } => bind_unary(op, bind_structural(expr, leaf)?),
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
         // NULL semantics are SQL-correct under either form (a NULL operand makes
         // the AND NULL, and NOT(NULL) is NULL → the row is excluded). The subject
@@ -384,9 +368,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             };
             Ok(maybe_negate(node, *negated))
         }
-        // Subquery placement is the leaf's decision: the HIR view leaf records the
-        // node for decorrelation; every other leaf keeps the default per-kind
-        // placement rejection (HAVING, DML, a direct SELECT, …).
+        // Subquery placement is the leaf's decision.
         Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
             leaf.bind_subquery(expr)
         }
@@ -427,46 +409,28 @@ fn literal_expr_string(e: &Expr) -> Option<String> {
     }
 }
 
-/// The one decoder for a constant position: a literal, parenthesized and signed
-/// as written, bound by the expression binder, so a VALUES cell and a WHERE
-/// operand cannot disagree on one.
+/// The one decoder for a constant position: a literal, parenthesized, signed and
+/// cast as written, read by the binder's own literal rules, so a VALUES cell and
+/// a WHERE operand cannot disagree on one.
 pub(crate) fn bind_constant(e: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError> {
     let not_constant = || GnitzSqlError::Rejected(format!("expected a constant, got the expression: {e}"));
-    // Checked on the AST first: the binder folds `COALESCE(2, x)` and `NULL IS
-    // NULL` to literals without binding the rest.
-    if !literal_shaped(e) {
-        return Err(not_constant());
-    }
-    let lit = bind_structural(e, &NoColumns)?;
-    lit.is_literal().then_some(lit).ok_or_else(not_constant)
-}
-
-/// Parentheses and `+`/`-` around a `Value`, a typed string, or a cast of a `Value`.
-fn literal_shaped(e: &Expr) -> bool {
-    match peel_nested(e) {
+    let lit = match peel_nested(e) {
+        Expr::Value(v) => bind_literal(&v.value)?,
+        Expr::TypedString(ts) => bind_typed_string(ts)?,
         Expr::UnaryOp {
-            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
             expr,
-        } => literal_shaped(expr),
-        Expr::Value(_) | Expr::TypedString(_) => true,
-        Expr::Cast { expr, .. } => matches!(peel_nested(expr), Expr::Value(_)),
-        _ => false,
-    }
-}
-
-/// A constant position names no column.
-struct NoColumns;
-
-impl LeafBinder<Infallible> for NoColumns {
-    fn bind_column(&self, _: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError> {
-        unreachable!("`literal_shaped` admits no identifier")
-    }
-    fn is_nullable(&self, r: &Infallible) -> bool {
-        match *r {}
-    }
-    fn type_of(&self, r: &Infallible) -> ColType {
-        match *r {}
-    }
+        } => bind_unary(op, bind_constant(expr)?)?,
+        Expr::Cast {
+            expr,
+            data_type,
+            array: false,
+            format: None,
+            kind: _,
+        } => bind_cast(bind_constant(expr)?, data_type)?,
+        _ => return Err(not_constant()),
+    };
+    lit.is_literal().then_some(lit).ok_or_else(not_constant)
 }
 
 /// A string literal only, so `s LIKE NULL` is rejected where PostgreSQL
@@ -636,15 +600,14 @@ fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
 }
 
 /// Bind one of the [`SCALAR_CALLS`].
-fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
+fn bind_scalar_call<R: Clone>(
     name: &str,
     call: Call,
     f: &Function,
-    leaf: &L,
+    leaf: &dyn LeafBinder<R>,
 ) -> Result<BExpr<R>, GnitzSqlError> {
     let args = PlainCall::check(f, CallSurface::Scalar(name))?.args(name, call.arity())?;
     match call {
-        // IFNULL/NVL is COALESCE at arity two; only `Call::arity` separates them.
         Call::Coalesce | Call::Ifnull => bind_coalesce(&args, leaf),
         // `NULLIF(a, b)` ≡ `CASE WHEN a = b THEN NULL ELSE a END`.
         Call::Nullif => {
@@ -717,7 +680,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
 /// A string function call, its omitted trailing slots supplied as the literal
 /// defaults [`StrFunc::signature`] declares, so the node carries every defaulted
 /// slot (an omitted `IntOpt` stays absent).
-fn bind_str_call<R: Clone, L: LeafBinder<R>>(f: StrFunc, args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
+fn bind_str_call<R: Clone>(f: StrFunc, args: &[&Expr], leaf: &dyn LeafBinder<R>) -> Result<BExpr<R>, GnitzSqlError> {
     let sig = f.signature();
     let mut bound = bind_all(args, leaf)?;
     bound.extend(
@@ -730,7 +693,7 @@ fn bind_str_call<R: Clone, L: LeafBinder<R>>(f: StrFunc, args: &[&Expr], leaf: &
 }
 
 /// Every argument of a call, bound in written order.
-fn bind_all<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
+fn bind_all<R: Clone>(args: &[&Expr], leaf: &dyn LeafBinder<R>) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
     args.iter().map(|a| bind_structural(a, leaf)).collect()
 }
 
@@ -748,12 +711,12 @@ fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
 /// `CEIL(x)` / `FLOOR(x)`. Only the bare-call parse binds: `CEIL(x TO DAY)` and
 /// `CEIL(x, 2)` carry a field the node has no place for, so they are rejected
 /// rather than having the field dropped.
-fn bind_ceil_floor<R: Clone, L: LeafBinder<R>>(
+fn bind_ceil_floor<R: Clone>(
     f: FloatUnaryOp,
     name: &str,
     e: &Expr,
     field: &CeilFloorKind,
-    leaf: &L,
+    leaf: &dyn LeafBinder<R>,
 ) -> Result<BExpr<R>, GnitzSqlError> {
     if !matches!(field, CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)) {
         return Err(GnitzSqlError::Rejected(format!(
@@ -788,19 +751,19 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
 }
 
 /// `COALESCE(args…)` desugars right-to-left into CASE: the first non-NULL operand
-/// is the result. An operand whose nullness is settled at bind time — a literal,
-/// a NOT NULL column — ends or skips the chain there, so the rest is never bound.
-fn bind_coalesce<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
-    let (a, rest) = args.split_first().expect("arity checked");
-    let value = bind_structural(a, leaf)?;
-    if rest.is_empty() {
-        return Ok(value); // last operand: its value is the result
+/// is the result. Every operand binds; one whose nullness is settled at bind time
+/// — a literal, a NOT NULL column — ends or leaves the chain there.
+fn bind_coalesce<R: Clone>(args: &[&Expr], leaf: &dyn LeafBinder<R>) -> Result<BExpr<R>, GnitzSqlError> {
+    let mut values = bind_all(args, leaf)?;
+    let mut out = values.pop().expect("arity checked");
+    for v in values.into_iter().rev() {
+        out = match nullness(&v, leaf) {
+            Nullness::Never => v,
+            Nullness::Always => out,
+            Nullness::Unknown => BExpr::coalesce(v, out),
+        };
     }
-    match nullness(&value, leaf) {
-        Nullness::Never => Ok(value),
-        Nullness::Always => bind_coalesce(rest, leaf),
-        Nullness::Unknown => Ok(BExpr::coalesce(value, bind_coalesce(rest, leaf)?)),
-    }
+    Ok(out)
 }
 
 /// What is settled about a bound value's nullness at bind time.
@@ -814,13 +777,13 @@ enum Nullness {
     Unknown,
 }
 
-/// A bound value's [`Nullness`], read through [`BExpr::never_null_with`] over the
-/// leaf's own verdict per reference. The verdict alone, for a caller that only
-/// needs to know which shape to emit and would otherwise clone the value to ask.
-fn nullness<R, L: LeafBinder<R>>(value: &BExpr<R>, leaf: &L) -> Nullness {
+/// A bound value's [`Nullness`], each reference as `leaf` declares it. The
+/// verdict alone, for a caller that only needs to know which shape to emit and
+/// would otherwise clone the value to ask.
+fn nullness<R>(value: &BExpr<R>, leaf: &dyn LeafBinder<R>) -> Nullness {
     match value {
         BExpr::LitNull => Nullness::Always,
-        v if v.never_null_with(&|r| leaf.is_nullable(r), &|r| leaf.type_of(r)) => Nullness::Never,
+        v if v.never_null(leaf) => Nullness::Never,
         _ => Nullness::Unknown,
     }
 }
@@ -828,7 +791,7 @@ fn nullness<R, L: LeafBinder<R>>(value: &BExpr<R>, leaf: &L) -> Nullness {
 /// `value IS [NOT] NULL`, settled at bind time wherever the value's nullness is
 /// provable, so a never-null operand costs no test at runtime and a filter over
 /// one can be elided whole. Anything else is a `NullTest` over the value.
-fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) -> BExpr<R> {
+fn null_test<R>(value: BExpr<R>, want_null: bool, leaf: &dyn LeafBinder<R>) -> BExpr<R> {
     match nullness(&value, leaf) {
         Nullness::Never => BExpr::LitBool(!want_null),
         Nullness::Always => BExpr::LitBool(want_null),
@@ -836,53 +799,22 @@ fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) ->
     }
 }
 
-/// The position of an `Identifier` / two-part `CompoundIdentifier` within one
-/// relation's columns. A written qualifier must name `alias`, the relation's
-/// effective alias, so `SELECT b.val FROM a` is a rejection rather than a read of
-/// `a.val`; it disambiguates nothing beyond that.
+/// The position of the column `name` within one relation's columns. A written
+/// qualifier must name `alias`, the relation's effective alias, so
+/// `SELECT b.val FROM a` is a rejection rather than a read of `a.val`; it
+/// disambiguates nothing beyond that.
 pub(crate) fn single_relation_col_idx<'a>(
     cols: impl IntoIterator<Item = &'a ColumnDef>,
     alias: &str,
-    e: &Expr,
+    qual: Option<&str>,
+    name: &str,
 ) -> Result<usize, GnitzSqlError> {
-    let (qual, name) = col_ref_parts(e).ok_or_else(|| GnitzSqlError::Rejected("expected a column reference".into()))?;
-    reject_foreign_qualifier(qual, alias)?;
-    require_column(cols, name)
-}
-
-/// The qualifier half of [`single_relation_col_idx`], for a resolver that carries
-/// its own name lookup.
-pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, alias: &str) -> Result<(), GnitzSqlError> {
-    let Some(q) = qual else { return Ok(()) };
-    if !q.eq_ignore_ascii_case(alias) {
+    if let Some(q) = qual.filter(|q| !q.eq_ignore_ascii_case(alias)) {
         return Err(GnitzSqlError::Rejected(format!(
             "table alias '{q}' not found (the relation in scope is '{alias}')"
         )));
     }
-    Ok(())
-}
-
-/// Leaf for one relation's columns under one alias.
-pub(crate) struct SingleTable<'a> {
-    pub schema: &'a Schema,
-    /// The relation's effective alias — what a written qualifier must name.
-    pub alias: &'a str,
-}
-
-impl LeafBinder<usize> for SingleTable<'_> {
-    fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
-        Ok(BoundExpr::ColRef(single_relation_col_idx(
-            &self.schema.columns,
-            self.alias,
-            e,
-        )?))
-    }
-    fn is_nullable(&self, r: &usize) -> bool {
-        self.schema.columns[*r].is_nullable
-    }
-    fn type_of(&self, r: &usize) -> ColType {
-        self.schema.columns[*r].ty
-    }
+    require_column(cols, name)
 }
 
 #[cfg(test)]
