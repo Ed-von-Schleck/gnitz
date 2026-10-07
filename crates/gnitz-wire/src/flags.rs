@@ -149,8 +149,7 @@ impl std::str::FromStr for WireConflictMode {
     type Err = String;
 
     /// The two modes' user-facing names, for the bindings that let a caller
-    /// choose one (Python's `push(mode=...)`; the async clients always push
-    /// `Update`). Owned here, so no binding invents a third spelling.
+    /// choose one. Owned here, so no binding invents a third spelling.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "update" => Ok(WireConflictMode::Update),

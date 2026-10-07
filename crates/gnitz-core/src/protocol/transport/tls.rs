@@ -15,7 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 use super::super::error::ProtocolError;
-use super::{timed_out, write_nonblocking, ClientTransport, Inner, WriteOutcome};
+use super::{timed_out, write_nonblocking, ClientTransport, Inner};
 
 /// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
 struct Target {
@@ -196,7 +196,7 @@ impl TlsInner {
     /// reported by `wants_write`.
     pub(super) fn ship(&mut self) -> Result<(), ProtocolError> {
         while self.conn.wants_write() {
-            if let WriteOutcome::WouldBlock = write_nonblocking(|| self.conn.write_tls(&mut self.sock))? {
+            if write_nonblocking(|| self.conn.write_tls(&mut self.sock))?.is_none() {
                 break;
             }
         }
@@ -205,7 +205,7 @@ impl TlsInner {
 
     /// The TLS write core: rustls takes a prefix of `slices`, held as plaintext
     /// until the handshake completes.
-    pub(super) fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<WriteOutcome, ProtocolError> {
+    pub(super) fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<Option<usize>, ProtocolError> {
         debug_assert!(!self.conn.wants_write());
         write_nonblocking(|| self.conn.writer().write_vectored(slices))
     }

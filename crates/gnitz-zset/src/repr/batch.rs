@@ -319,7 +319,7 @@ impl Batch {
         read_i64_le(&self.data, self.region_start(REG_WEIGHT) + row * FIXED_REGION_BYTES)
     }
     /// Indices of the live rows — those at positive weight, the elements the
-    /// batch asserts. Twin of `ZSetBatch::live_rows` in `gnitz-core`.
+    /// batch asserts.
     #[inline(always)]
     pub fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.count).filter(move |&i| self.get_weight(i) > 0)

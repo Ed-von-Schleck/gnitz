@@ -23,36 +23,23 @@ impl Schema {
     /// in slot order.
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
-        self.columns
-            .iter()
+        gnitz_expr::payload_cols(self)
             .enumerate()
-            .filter_map(|(ci, c)| Some((self.payload_slot(ci)?, ci, c)))
+            .map(|(pi, ci)| (pi, ci, &self.columns[ci]))
     }
 
-    /// Iterate over the *visible* (non-hidden) columns, yielding
-    /// `(physical_col_idx, &ColumnDef)`. The index is the column's real position
-    /// in the full physical schema — hidden slots are skipped but do not shift
-    /// the indices of the visible ones, so every wildcard/presentation surface
-    /// that enumerates through this stays byte-offset-correct. A base-table schema
-    /// has a hidden column only after `ALTER … DROP COLUMN` (a logical drop); for
-    /// a never-dropped table this is the full column list.
+    /// The visible (non-hidden) columns as `(col_idx, &ColumnDef)`. `col_idx` is
+    /// the position in the full schema, so a hidden column does not shift the
+    /// ones after it.
     #[inline]
     pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// The single definition of "this is an admissible schema": the
-    /// `MAX_COLUMNS` cap (the region null bitmap is one u64 word), the
-    /// structural PK rules (non-empty, ≤ `PK_LIST_MAX_COLS`, every index
-    /// `< columns.len()`, no duplicates), and the per-column invariants the
-    /// engine's `SchemaDescriptor::new` hard-asserts — each PK column
-    /// non-nullable and PK-eligible. Run by [`Schema::from_parts`] and the
-    /// client's DDL gateways, so a malformed spec is a clean client error.
-    ///
-    /// The arity cap is the persisted PK-list codec capacity, not the wider
-    /// in-memory `MAX_PK_COLUMNS`: a client never builds the engine-internal
-    /// secondary-index schema that uses the extra slot, so a PK it accepts must
-    /// round-trip through the codec.
+    /// Whether this is an admissible schema: at most `MAX_COLUMNS` columns,
+    /// every column type admissible, and a PK list that passes the shared PK
+    /// rules at `PK_LIST_MAX_COLS`, the capacity of a persisted PK list. Run by
+    /// [`Schema::from_parts`] and the client's DDL gateways.
     pub fn validate(&self) -> Result<(), String> {
         if self.columns.len() > MAX_COLUMNS {
             return Err(format!(
@@ -374,10 +361,11 @@ impl ZSetBatch {
             pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
             nulls: vec![],
-            payload: schema
-                .payload_columns()
-                .map(|(_, _, c)| PayloadColumn::new(c.ty.tc))
-                .collect(),
+            payload: {
+                let mut payload = Vec::with_capacity(schema.num_payload_cols());
+                payload.extend(schema.payload_columns().map(|(_, _, c)| PayloadColumn::new(c.ty.tc)));
+                payload
+            },
             blob: vec![],
         }
     }
@@ -544,7 +532,7 @@ impl ZSetBatch {
     }
 
     /// Every payload region is the length its type and the row count imply.
-    pub(crate) fn check_columns(&self) -> Result<(), std::string::String> {
+    pub(crate) fn check_columns(&self) -> Result<(), String> {
         let n = self.len();
         let regions = gnitz_wire::num_regions(self.payload.len());
         if regions > gnitz_wire::MAX_WIRE_REGIONS {
@@ -564,7 +552,7 @@ impl ZSetBatch {
 
     /// The batch's layout is `schema`'s: key column types, payload slot count,
     /// and each slot's type.
-    pub fn layout_matches(&self, schema: &Schema) -> Result<(), std::string::String> {
+    pub fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
         let want = schema.pk_cols.iter().map(|&c| schema.columns[c as usize].ty.tc);
         let got = self.pks.key_types();
         if !got.iter().copied().eq(want.clone()) {
@@ -593,7 +581,7 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema, and
     /// that every NULL is a zeroed cell of a nullable column.
-    pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
+    pub fn validate(&self, schema: &Schema) -> Result<(), String> {
         self.layout_matches(schema)?;
         let n = self.pks.len();
         if self.weights.len() != n {

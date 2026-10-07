@@ -746,14 +746,13 @@ impl GnitzClient {
     /// that spec applied to the view, in `reply_schema`, which is the view's own
     /// under `ReadSpec::all_rows` of no bound. Every later poll of the copy
     /// carries the same `spec`.
-    pub async fn delta_bootstrap(
+    pub fn delta_bootstrap(
         &mut self,
         view: impl Into<Target>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
+    ) -> Pending<'_, (ScanReply, DeltaCursor)> {
         self.delta_read(view.into(), None, Duration::ZERO, reply_schema, spec)
-            .await
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -768,29 +767,26 @@ impl GnitzClient {
     /// It carries every push acknowledged before it. With nothing to report, the
     /// server holds the reply until a round leaves the view a row `spec` keeps,
     /// or `wait` passes.
-    pub async fn delta_poll(
+    pub fn delta_poll(
         &mut self,
         view: impl Into<Target>,
         cursor: DeltaCursor,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
         wait: Duration,
-    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
+    ) -> Pending<'_, (ScanReply, DeltaCursor)> {
         self.delta_read(view.into(), Some(cursor), wait, reply_schema, spec)
-            .await
     }
 
-    /// One view's delta read after `from` — the view whole with none —
-    /// decoded under `reply_schema`, with the terminal frame's `(tag, T)` pair
-    /// as a cursor.
-    async fn delta_read(
+    /// One view's delta read after `from`, the view whole with none.
+    fn delta_read(
         &mut self,
         view: Target,
         from: Option<DeltaCursor>,
         wait: Duration,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
+    ) -> Pending<'_, (ScanReply, DeltaCursor)> {
         let (tag, after_tick) = DeltaCursor::flat(from);
         let item = DeltaPollItem {
             view,
@@ -799,19 +795,8 @@ impl GnitzClient {
             reply_layout: reply_schema.layout_digest(),
             spec,
         };
-        let schema = Arc::clone(reply_schema);
-        let mut batch = ZSetBatch::new(&schema);
-        let GnitzClient { session, host, .. } = self;
-        let mut poll = DeltaPoll::start(session, &[item], wait);
-        let mut end = None;
-        while let Some((_, polled)) = poll.next(&mut **host).await? {
-            match polled {
-                Polled::Block(b) => crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?,
-                Polled::End(e) => end = Some(e),
-            }
-        }
-        let cursor = end.expect("one item ends once")?;
-        Ok((ScanReply { schema, batch, lsn: None }, cursor))
+        let sent = self.session.submit_delta_read(item, wait, reply_schema);
+        Pending::submitted(self, sent)
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned

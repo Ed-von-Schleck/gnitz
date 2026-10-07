@@ -370,11 +370,7 @@ impl PyClient {
         spec: Option<Vec<u8>>,
     ) -> PyResult<Py<PyAny>> {
         let spec = spec.unwrap_or_else(whole_view);
-        Self::run(
-            slf,
-            whole!(|c| c.delta_bootstrap(view_id, &schema.rust, &spec).await?),
-            delta,
-        )
+        Self::run(slf, single!(|c| c.delta_bootstrap(view_id, &schema.rust, &spec)), delta)
     }
 
     /// delta_poll(view_id, schema, cursor, wait=0.0, spec=None) -> (rows, cursor)
@@ -400,7 +396,7 @@ impl PyClient {
         let (wait, spec) = (poll_wait(wait)?, spec.unwrap_or_else(whole_view));
         Self::run(
             slf,
-            whole!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec, wait).await?),
+            single!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec, wait)),
             delta,
         )
     }

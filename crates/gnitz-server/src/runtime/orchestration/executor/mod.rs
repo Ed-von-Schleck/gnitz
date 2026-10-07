@@ -963,8 +963,8 @@ enum Access {
 /// read. A view may be read
 /// but not written: a push would commit rows its circuit never produced.
 ///
-/// Enforced here even though the SQL binder refuses both: the C and Python bindings
-/// reach the engine directly.
+/// Enforced here even though the SQL binder refuses both: a client can push to
+/// or read a relation id without going through the binder.
 ///
 /// **Only the absent-relation arm carries a status of its own**
 /// ([`WireStatus::NotFound`]): the arms below name a relation that exists, which a

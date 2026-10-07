@@ -38,17 +38,11 @@ enum Inner {
     Tls(Box<tls::TlsInner>),
 }
 
-/// What one non-blocking vectored write accepted.
-enum WriteOutcome {
-    Written(usize),
-    WouldBlock,
-}
-
 impl Inner {
     /// The non-blocking write core: hand `slices` to the sink and report how
     /// many bytes it accepted. std's `write_vectored` clamps to `IOV_MAX`
     /// itself, so a caller may pass any number of slices and gets a prefix.
-    fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<WriteOutcome, ProtocolError> {
+    fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<Option<usize>, ProtocolError> {
         match self {
             Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(slices)),
             Inner::Tls(t) => t.write_slices(slices),
@@ -80,14 +74,15 @@ impl Inner {
     }
 }
 
-/// One non-blocking socket write: `EINTR` retried, `EAGAIN` reported, a zero-byte write refused.
-fn write_nonblocking(mut write: impl FnMut() -> std::io::Result<usize>) -> Result<WriteOutcome, ProtocolError> {
+/// One non-blocking socket write: `EINTR` retried, a zero-byte write refused;
+/// `None` where it would block.
+fn write_nonblocking(mut write: impl FnMut() -> std::io::Result<usize>) -> Result<Option<usize>, ProtocolError> {
     loop {
         match write() {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
-            Ok(n) => return Ok(WriteOutcome::Written(n)),
+            Ok(n) => return Ok(Some(n)),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
         }
     }
@@ -240,8 +235,8 @@ impl ClientTransport {
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * queue.len()));
             queue.build_slices(&mut slices);
             match inner.write_slices(&slices)? {
-                WriteOutcome::Written(n) => queue.advance(n),
-                WriteOutcome::WouldBlock => return Ok(()),
+                Some(n) => queue.advance(n),
+                None => return Ok(()),
             }
         }
     }

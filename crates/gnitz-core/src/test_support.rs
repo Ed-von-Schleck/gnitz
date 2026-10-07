@@ -42,6 +42,31 @@ pub(crate) fn kv_rows(rows: &[(u64, i64, i64)]) -> ZSetBatch {
     b
 }
 
+/// `(pk U64, column_1 I64, …)` of `ncols` columns, the payload ones `nullable`.
+pub(crate) fn wide_schema(ncols: usize, nullable: bool) -> Arc<Schema> {
+    let mut columns = vec![ColumnDef::new("pk", TypeCode::U64, false)];
+    columns.extend((1..ncols).map(|i| ColumnDef::new(format!("column_{i}"), TypeCode::I64, nullable)));
+    Arc::new(Schema { columns, pk_cols: vec![0] })
+}
+
+/// `n` rows of a [`wide_schema`]; with `null_every`, every that-many-th cell
+/// is NULL.
+pub(crate) fn wide_rows(schema: &Schema, n: usize, null_every: usize) -> ZSetBatch {
+    let mut b = ZSetBatch::with_capacity(schema, n);
+    let mut app = BatchAppender::new(&mut b);
+    for r in 0..n {
+        let row = app.add_row(r as u128, 1);
+        for c in 1..schema.columns.len() {
+            if null_every != 0 && (r + c) % null_every == 0 {
+                row.null();
+            } else {
+                row.i64_val(7);
+            }
+        }
+    }
+    b
+}
+
 /// A scripted peer: the blocking far end of the socketpair a transport runs over.
 pub(crate) struct Peer(pub(crate) UnixStream);
 

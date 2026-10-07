@@ -96,18 +96,37 @@ pub fn first_valued_null<'a>(
     null_bmp: &[u8],
     col: impl Fn(usize) -> (&'a [u8], usize),
 ) -> Option<(usize, usize)> {
-    for (row, word) in null_bmp.as_chunks::<8>().0.iter().enumerate() {
-        let mut set = u64::from_le_bytes(*word) & nullable;
-        while set != 0 {
-            let slot = set.trailing_zeros() as usize;
-            set &= set - 1;
-            let (cells, width) = col(slot);
-            if cells[row * width..(row + 1) * width].iter().any(|&b| b != 0) {
-                return Some((row, slot));
-            }
+    let words = null_bmp.as_chunks::<8>().0;
+    // A batch holding no NULL takes only this branch-free pass.
+    let present = words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & nullable;
+    let mut first: Option<(usize, usize)> = None;
+    // One pass per slot that holds a NULL anywhere.
+    for slot in crate::BitIter(present) {
+        let (cells, width) = col(slot);
+        let row = match width {
+            1 => valued_null_row::<1>(words, cells, slot),
+            2 => valued_null_row::<2>(words, cells, slot),
+            4 => valued_null_row::<4>(words, cells, slot),
+            8 => valued_null_row::<8>(words, cells, slot),
+            16 => valued_null_row::<16>(words, cells, slot),
+            _ => unreachable!("a payload cell is 1/2/4/8/16 bytes"),
+        };
+        if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
+            first = Some((row, slot));
         }
     }
-    None
+    first
+}
+
+/// The first row whose null word sets bit `slot` over a non-zero `W`-byte cell.
+fn valued_null_row<const W: usize>(words: &[[u8; 8]], cells: &[u8], slot: usize) -> Option<usize> {
+    let cells = cells.as_chunks::<W>().0;
+    let valued = |(w, c): (&[u8; 8], &[u8; W])| (u64::from_le_bytes(*w) >> slot) & 1 != 0 && *c != [0u8; W];
+    // A conforming column takes only this pass, which has no early exit to branch on.
+    if !words.iter().zip(cells).fold(false, |any, wc| any | valued(wc)) {
+        return None;
+    }
+    words.iter().zip(cells).position(valued)
 }
 
 /// A row's null word rebased onto output payload slot `at`; slot 64 and beyond

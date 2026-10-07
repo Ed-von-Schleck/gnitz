@@ -15,12 +15,14 @@ The mirroring client drives the same feed through its own poll path; its suites
 are `client_surface/test_mirror.py` and `crates/gnitz-mirror/tests`. These drive
 the raw `delta_bootstrap` / `delta_poll` verbs, whose refusals a mirror hides.
 """
+import asyncio
 import hashlib
 import os
 import time
 
 import pytest
 import gnitz
+from gnitz import aio
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP, SWEEP_ENV,
     Subscriber, base_tables, churn, flood, later, mk_feed,
@@ -188,6 +190,29 @@ def test_a_waiting_poll_is_held_until_a_commit_reaches_the_view(client, server):
 
     with pytest.raises(ValueError, match="non-negative"):
         sub.poll(wait=-1)
+
+
+@pytest.mark.asyncio
+async def test_a_held_poll_leaves_an_async_client_free(client, server):
+    """A poll held with nothing to report does not hold its client: a scan
+    submitted beside it is answered, and the server ends the poll for it, with
+    no rows and the cursor it was sent."""
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+    vid, schema = client.resolve_table("f")
+    tid, t_schema = client.resolve_table("t")
+    async with aio.connect(server) as conn:
+        _, cursor = await conn.delta_bootstrap(vid, schema)
+        t0 = time.monotonic()
+        (delta, after), rows = await asyncio.gather(
+            conn.delta_poll(vid, schema, cursor, 30),
+            conn.scan(tid, t_schema),
+        )
+        assert time.monotonic() - t0 < 10, "the scan released the poll, not the wait"
+    assert len(rows) == 1
+    assert len(delta) == 0
+    assert after == cursor
 
 
 # ── refused cursors ──────────────────────────────────────────────────────────

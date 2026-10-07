@@ -20,23 +20,23 @@ impl ZSetBatch {
     }
 }
 
-/// Each fixed region's per-row width under `schema`, in canonical order.
-fn fixed_strides(schema: &Schema) -> impl Iterator<Item = usize> + '_ {
-    [schema.pk_stride(), 8, 8]
-        .into_iter()
-        .chain(schema.payload_columns().map(|(_, _, c)| c.ty.tc.wire_stride()))
-}
-
 /// Decode a WAL block under `schema`, appending its rows to `sink`. On error
 /// `sink` is not usable.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    let (rows, fixed, heap, _) = gnitz_wire::wal::parse_block(data, fixed_strides(schema).sum())
-        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
+    let row_width = sink.pks.stride() + 16 + sink.payload.iter().map(|c| c.stride()).sum::<usize>();
+    let (rows, fixed, heap, _) =
+        gnitz_wire::wal::parse_block(data, row_width).map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
     let mut regions = Regions::new();
     let mut at = 0;
-    for s in fixed_strides(schema) {
+    let mut take = |s: usize| {
         regions.push(&fixed[at..at + rows * s]);
         at += rows * s;
+    };
+    take(sink.pks.stride());
+    take(8);
+    take(8);
+    for c in &sink.payload {
+        take(c.stride());
     }
     regions.push(heap);
     append_regions(sink, &regions, schema, true)
@@ -61,8 +61,14 @@ fn append_regions(
 ) -> Result<(), ProtocolError> {
     debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
     let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / 8);
-    if regions.len() != gnitz_wire::num_regions(schema.num_payload_cols())
-        || !fixed_strides(schema).zip(regions).all(|(s, r)| r.len() == count * s)
+    if regions.len() != gnitz_wire::num_regions(sink.payload.len())
+        || regions[REG_PK].len() != count * sink.pks.stride()
+        || regions[REG_NULL_BMP].len() != count * 8
+        || !sink
+            .payload
+            .iter()
+            .zip(&regions[REG_PAYLOAD_START..])
+            .all(|(c, r)| r.len() == count * c.stride())
     {
         return Err(ProtocolError::DecodeError(
             "a region list that does not lay out its schema".into(),
@@ -76,18 +82,20 @@ fn append_regions(
     check_not_null(&sink.nulls[nulls_at..], schema).map_err(ProtocolError::DecodeError)?;
 
     // A German cell's heap offset is relative to its own block's heap.
-    let block_blob = regions[REG_PAYLOAD_START + schema.num_payload_cols()];
+    let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
     let blob_base = sink.blob.len();
     sink.blob.extend_from_slice(block_blob);
 
-    for (pi, ci, col) in schema.payload_columns() {
-        let dst = &mut sink.payload[pi].bytes;
+    for (pi, col) in sink.payload.iter_mut().enumerate() {
+        let german = col.tc().is_german_string();
+        let dst = &mut col.bytes;
         let at = dst.len();
         dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
-        if col.ty.tc.is_german_string() {
+        if german {
             if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
                 return Err(ProtocolError::DecodeError(format!(
-                    "column {ci}: German string cell is not in canonical form"
+                    "column {}: German string cell is not in canonical form",
+                    schema.payload_col_idx(pi)
                 )));
             }
             gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);

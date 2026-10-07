@@ -72,9 +72,7 @@ pub trait SchemaFacts: ColumnTable {
     }
     /// Every payload column's locator, in slot order.
     fn payload_locators(&self) -> Vec<ColumnLocator> {
-        (0..self.num_payload_cols())
-            .map(|pi| self.locate(self.payload_col_idx(pi)))
-            .collect()
+        payload_cols(self).map(|ci| self.locate(ci)).collect()
     }
     /// Number of non-PK columns.
     fn num_payload_cols(&self) -> usize {
@@ -115,19 +113,19 @@ pub trait SchemaFacts: ColumnTable {
 
     /// Bit `pi` set iff payload slot `pi`'s column admits NULL.
     fn nullable_payload_slots(&self) -> u64 {
-        (0..self.num_columns())
-            .filter(|&ci| self.col_nullable(ci))
-            .filter_map(|ci| self.payload_slot(ci))
-            .fold(0u64, |m, pi| m | 1u64 << pi)
+        payload_cols(self)
+            .enumerate()
+            .filter(|&(_, ci)| self.col_nullable(ci))
+            .fold(0u64, |m, (pi, _)| m | 1u64 << pi)
     }
 
     /// Bit `pi` set iff payload slot `pi`'s column is a German string (STRING
     /// or BLOB).
     fn string_payload_slots(&self) -> u64 {
-        (0..self.num_columns())
-            .filter(|&ci| self.col_type_code(ci).is_german_string())
-            .filter_map(|ci| self.payload_slot(ci))
-            .fold(0u64, |m, pi| m | 1u64 << pi)
+        payload_cols(self)
+            .enumerate()
+            .filter(|&(_, ci)| self.col_type_code(ci).is_german_string())
+            .fold(0u64, |m, (pi, _)| m | 1u64 << pi)
     }
 
     /// The null bits a conforming batch never sets: every bit but the nullable
@@ -174,10 +172,18 @@ impl<T: ColumnTable + ?Sized> SchemaFacts for T {}
 /// then the payload columns in payload order.
 fn region_types<S: SchemaFacts + ?Sized>(s: &S) -> impl Iterator<Item = gnitz_wire::TypeCode> + '_ {
     let pk = s.pk_cols().iter().map(|&p| s.col_type_code(p as usize));
-    let payload = (0..s.num_columns())
-        .filter(|&c| s.payload_slot(c).is_some())
-        .map(|c| s.col_type_code(c));
-    pk.chain(payload)
+    pk.chain(payload_cols(s).map(|c| s.col_type_code(c)))
+}
+
+/// The payload columns' indices in slot order: the `pi`-th one is slot `pi`.
+pub fn payload_cols<S: ColumnTable + ?Sized>(s: &S) -> impl Iterator<Item = usize> + '_ {
+    let mut pk = [0u64; 2];
+    for &c in s.pk_cols() {
+        if let Some(w) = pk.get_mut(c as usize >> 6) {
+            *w |= 1 << (c & 63);
+        }
+    }
+    (0..s.num_columns()).filter(move |&ci| pk.get(ci >> 6).is_none_or(|w| w >> (ci & 63) & 1 == 0))
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@
 
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
-use crate::{ColumnLocator, SchemaFacts};
+use crate::{payload_cols, ColumnLocator, SchemaFacts};
 use gnitz_wire::{decode_all, encode_german_string, FixedInt, ScalarKind, TypeCode, Writer};
 use std::fmt;
 
@@ -1444,7 +1444,7 @@ impl LogicalProgram {
                 .sinks
                 .iter()
                 .copied()
-                .eq((0..in_schema.num_payload_cols()).map(|pi| Sink::Col(in_schema.payload_col_idx(pi) as u32)))
+                .eq(payload_cols(in_schema).map(|ci| Sink::Col(ci as u32)))
     }
 
     /// Check the program against `schema` and lower it to the resolved form, with

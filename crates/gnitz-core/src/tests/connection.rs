@@ -427,34 +427,39 @@ fn in_flight_cap_raises_rather_than_hanging() {
     assert!(matches!(submit_scan(&mut s, 1, &sa), Err(ClientError::Refused(_))));
 }
 
-/// A delta poll that fails whole — refused at target 0, or cut off by the
-/// connection — still ends every view it had yet to answer, once each.
-#[test]
-fn a_poll_that_fails_whole_ends_each_unanswered_view() {
-    let item = |view_id: u64| txn_frame::DeltaPollItem {
-        view: view_id.into(),
+/// A DELTA_POLL item: `view` after `(tag 1, tick 4)`, replied as `schema_a`.
+fn delta_item(view: u64) -> txn_frame::DeltaPollItem<'static> {
+    txn_frame::DeltaPollItem {
+        view: view.into(),
         tag: 1,
         after_tick: 4,
         reply_layout: schema_a().layout_digest(),
         spec: &[],
+    }
+}
+
+/// `view`'s terminal of a delta poll, carrying cursor `(tag 1, tick)`.
+fn delta_terminal(view: u64, tick: u64) -> Vec<u8> {
+    let hdr = ControlHeader {
+        target_id: view,
+        arg0: tick,
+        arg1: 1,
+        ..Default::default()
     };
+    encode_frame(hdr, &[], None, None)
+}
+
+/// A delta poll that fails whole — refused at target 0, or cut off by the
+/// connection — still ends every view it had yet to answer, once each.
+#[test]
+fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        s.submit_delta_poll(&[item(7), item(8), item(9)], Duration::ZERO);
+        s.submit_delta_poll(&[delta_item(7), delta_item(8), delta_item(9)], Duration::ZERO);
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
-        let mut wire = framed(&encode_frame(
-            ControlHeader {
-                target_id: 7,
-                arg0: 9,
-                arg1: 1,
-                ..Default::default()
-            },
-            &[],
-            None,
-            None,
-        ));
+        let mut wire = framed(&delta_terminal(7, 9));
         if refused {
             wire.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
         }
@@ -489,28 +494,15 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
 /// socket and dropped, and the next poll's results are the queue's alone.
 #[test]
 fn an_abandoned_poll_queues_nothing() {
-    let item = |view_id: u64| txn_frame::DeltaPollItem {
-        view: view_id.into(),
-        tag: 1,
-        after_tick: 4,
-        reply_layout: schema_a().layout_digest(),
-        spec: &[],
-    };
-    let terminal = |tid| ControlHeader {
-        target_id: tid,
-        arg0: 9,
-        arg1: 1,
-        ..Default::default()
-    };
     let (mut s, peer) = pair();
-    s.submit_delta_poll(&[item(7)], Duration::ZERO);
+    s.submit_delta_poll(&[delta_item(7)], Duration::ZERO);
     s.abandon_poll();
-    s.submit_delta_poll(&[item(8)], Duration::ZERO);
+    s.submit_delta_poll(&[delta_item(8)], Duration::ZERO);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {
         wire.extend(framed(&reply_rows(tid, &batch_a(&[tid]), 0, true)));
-        wire.extend(framed(&encode_frame(terminal(tid), &[], None, None)));
+        wire.extend(framed(&delta_terminal(tid, 9)));
     }
     peer.send_bytes(&wire);
     while !s.interest().is_empty() {
@@ -526,6 +518,60 @@ fn an_abandoned_poll_queues_nothing() {
     assert_eq!(rows, batch_a(&[8]));
     assert!(matches!(s.next_polled(), Some(Polled::End(Ok(_)))));
     assert!(s.polled_out());
+}
+
+/// A read of view 7's delta feed after `(tag 1, tick 4)`.
+fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
+    s.submit_delta_read(delta_item(7), Duration::ZERO, schema).unwrap()
+}
+
+#[test]
+fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
+    let (mut s, peer) = pair();
+    let schema = schema_a();
+    let sent = submit_delta_read(&mut s, &schema);
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&reply_rows(7, &batch_a(&[1, 2]), 0, true));
+    peer.send(&reply_rows(7, &batch_a(&[3]), 0, true));
+    peer.send(&delta_terminal(7, 9));
+    let (reply, cursor) = await_reply(&mut s, sent).unwrap();
+    assert_eq!(reply.batch, batch_a(&[1, 2, 3]));
+    assert_eq!(reply.lsn, None);
+    assert!(Arc::ptr_eq(&reply.schema, &schema));
+    assert_eq!(cursor.pair(), (1, 9));
+    assert_eq!(s.interest(), Interest::NONE);
+}
+
+#[test]
+fn a_fault_naming_a_delta_reads_view_refuses_it_alone() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a());
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&reply_status(7, WireStatus::Error, "refused"));
+    let r = await_reply(&mut s, sent);
+    assert!(
+        matches!(&r, Err(ClientError::Refused(f)) if f.text == "refused"),
+        "{r:?}"
+    );
+    assert!(!s.is_closed());
+    assert_eq!(s.interest(), Interest::NONE);
+}
+
+#[test]
+fn a_delta_read_terminal_at_round_0_ends_the_session() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a());
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&delta_terminal(7, 0));
+    let e = await_reply(&mut s, sent).expect_err("round 0 continues nothing");
+    assert!(
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
+        "{e:?}"
+    );
+    assert!(s.is_closed());
 }
 
 /// A RESOLVE reply that does not decode ends the session, whichever of its

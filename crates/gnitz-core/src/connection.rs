@@ -236,6 +236,14 @@ enum Slot {
         data: Option<ZSetBatch>,
         to: Promise<ScanReply>,
     },
+    /// One view's delta read: a scan's train, whose terminal carries the cursor
+    /// to read from next.
+    Delta {
+        tid: u64,
+        reply_schema: Arc<Schema>,
+        data: Option<ZSetBatch>,
+        to: Promise<(ScanReply, DeltaCursor)>,
+    },
     /// One train per relation, each decoded under the schema paired with it.
     /// The train in progress is `rels[replies.len()]`.
     Multi {
@@ -511,6 +519,25 @@ impl Session {
         Ok(sent)
     }
 
+    /// DELTA_POLL of one view, replied in `reply_schema`'s layout and held by the
+    /// server up to `wait` while the view has nothing new.
+    pub fn submit_delta_read(
+        &mut self,
+        item: txn_frame::DeltaPollItem<'_>,
+        wait: Duration,
+        reply_schema: &Arc<Schema>,
+    ) -> Result<Sent<(ScanReply, DeltaCursor)>, ClientError> {
+        let (to, sent) = promise();
+        let slot = Slot::Delta {
+            tid: item.view.tid,
+            reply_schema: Arc::clone(reply_schema),
+            data: None,
+            to,
+        };
+        self.enqueue(txn_frame::encode_delta_poll(&[item], wait_ms(wait)), slot)?;
+        Ok(sent)
+    }
+
     /// DELTA_POLL: one train per view of `views`, in order — the items of the
     /// live poll, held by the server up to `wait` while none has anything new.
     /// Their results queue for [`Self::next_polled`] as the steps that read
@@ -525,9 +552,7 @@ impl Session {
             at: 0,
             poll: self.polls.live,
         };
-        // Rounded up: a wait shorter than the wire's unit is still a wait.
-        let wait_ms = u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
-        if let Err(why) = self.enqueue(txn_frame::encode_delta_poll(views, wait_ms), slot) {
+        if let Err(why) = self.enqueue(txn_frame::encode_delta_poll(views, wait_ms(wait)), slot) {
             let ends = views.iter().map(|_| Polled::End(Err(why.clone())));
             self.polls.queue.extend(ends);
         }
@@ -674,6 +699,12 @@ impl Session {
     }
 }
 
+/// `wait` in the wire's milliseconds, rounded up: a wait shorter than one is
+/// still a wait.
+fn wait_ms(wait: Duration) -> u64 {
+    u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
 /// Feed one reply frame to the head slot, whose reply arrives if that completes
 /// it.
 fn feed(pending: &mut VecDeque<Slot>, buf: Cow<'_, [u8]>, polls: &mut Polls) -> Result<(), ProtocolError> {
@@ -704,7 +735,7 @@ impl Slot {
         // so a frame naming another would decode under the wrong schema
         // silently; make it loud.
         let want = match &*self {
-            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } => Some(*tid),
+            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } => Some(*tid),
             Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
             Slot::Resolve { .. } => None,
@@ -730,17 +761,11 @@ impl Slot {
         }
         // Only a RESOLVE is answered in the server's schema; every read decodes
         // under the schema its request named.
-        let frame_schema = match ctrl.schema.clone() {
-            None => None,
-            Some(r) if matches!(self, Slot::Resolve { .. }) => Some(Arc::new(
-                Schema::from_block(&buf[r]).map_err(ProtocolError::DecodeError)?,
-            )),
-            Some(_) => {
-                return Err(ProtocolError::DecodeError(
-                    "a schema block on a reply whose request named its schema".into(),
-                ))
-            }
-        };
+        if ctrl.schema.is_some() && !matches!(self, Slot::Resolve { .. }) {
+            return Err(ProtocolError::DecodeError(
+                "a schema block on a reply whose request named its schema".into(),
+            ));
+        }
 
         // Rows are decoded straight into the slot: a train carries one data
         // frame per worker, and a per-frame batch would be copied in and dropped.
@@ -755,7 +780,9 @@ impl Slot {
                 polls.hand(*poll, Polled::Block(RawBlock { frame, block }));
             }
             (Slot::DeltaPoll { .. }, Some(_)) => {}
-            (Slot::Scan { reply_schema, data, .. }, Some(r)) => decode(data, reply_schema, &buf[r])?,
+            (Slot::Scan { reply_schema, data, .. } | Slot::Delta { reply_schema, data, .. }, Some(r)) => {
+                decode(data, reply_schema, &buf[r])?
+            }
             (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
             (Slot::Ack { .. } | Slot::Resolve { .. }, Some(_)) => {
                 return Err(ProtocolError::DecodeError(
@@ -774,10 +801,21 @@ impl Slot {
             schema: Arc::clone(schema),
             lsn: Some(ctrl.hdr.arg0),
         };
+        let cursor = || {
+            DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
+                .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
+        };
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
-            Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf, frame_schema)?)),
+            Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
             Slot::Scan { reply_schema, data, to, .. } => to.fulfil(Ok(scan_reply(reply_schema, data))),
+            Slot::Delta { reply_schema, data, to, .. } => {
+                let reply = ScanReply {
+                    lsn: None,
+                    ..scan_reply(reply_schema, data)
+                };
+                to.fulfil(Ok((reply, cursor()?)))
+            }
             Slot::Multi { rels, replies, data, to } => {
                 let reply = scan_reply(&rels[replies.len()].1, data);
                 replies.push(reply);
@@ -787,9 +825,7 @@ impl Slot {
                 to.fulfil(Ok(std::mem::take(replies)))
             }
             Slot::DeltaPoll { views, at, poll } => {
-                let cursor = DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
-                    .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-                polls.hand(*poll, Polled::End(Ok(cursor)));
+                polls.hand(*poll, Polled::End(Ok(cursor()?)));
                 *at += 1;
                 if *at < views.len() {
                     return Ok(None);
@@ -806,6 +842,7 @@ impl Slot {
             Slot::Ack { mut to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { mut to } => to.fulfil(Err(why)),
             Slot::Scan { mut to, .. } => to.fulfil(Err(why)),
+            Slot::Delta { mut to, .. } => to.fulfil(Err(why)),
             Slot::Multi { mut to, .. } => to.fulfil(Err(why)),
             Slot::DeltaPoll { views, at, poll } => {
                 for _ in at..views.len() {
@@ -822,15 +859,15 @@ fn out_of_order(want: u64, got: u64) -> ProtocolError {
 }
 
 /// A RESOLVE train as its descriptor; `None` when the reply names no relation.
-fn resolve_descriptor(
-    ctrl: &DecodedControl,
-    frame: &[u8],
-    schema: Option<Arc<Schema>>,
-) -> Result<Option<Arc<RelDescriptor>>, ProtocolError> {
+fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<RelDescriptor>>, ProtocolError> {
     if ctrl.hdr.target_id == 0 {
         return Ok(None);
     }
-    let schema = schema.ok_or_else(|| ProtocolError::DecodeError("RESOLVE reply carries no schema".into()))?;
+    let schema = ctrl
+        .schema
+        .clone()
+        .ok_or_else(|| ProtocolError::DecodeError("RESOLVE reply carries no schema".into()))?;
+    let schema = Arc::new(Schema::from_block(&frame[schema]).map_err(ProtocolError::DecodeError)?);
     let desc = RelDescriptorBlob::decode(&frame[ctrl.blob.clone()]).map_err(ProtocolError::DecodeError)?;
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
@@ -846,3 +883,7 @@ fn resolve_descriptor(
 #[cfg(test)]
 #[path = "tests/connection.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/connection.rs"]
+mod bench;

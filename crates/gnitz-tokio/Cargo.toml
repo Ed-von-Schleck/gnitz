@@ -15,12 +15,12 @@ integration = []
 
 [dependencies]
 gnitz-core.workspace = true
-gnitz-wire.workspace = true
 # `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
 # `spawn_blocking`, and `sync` the mpsc the handle and driver share.
 tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]
+gnitz-wire.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 # The store the mirroring integration test attaches. A dev-dependency, so the

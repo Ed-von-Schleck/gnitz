@@ -65,13 +65,15 @@ impl TlsArgs {
         if self.cert_key.is_none() && !listen.ip().is_loopback() {
             if !listen.ip().is_unspecified() {
                 return Err(format!(
-                    "refusing to bind the TLS listener to {listen} without --tls-cert and --tls-key: the dev                      certificate names {} only, so no client dialling {} could verify it",
+                    "refusing to bind the TLS listener to {listen} without --tls-cert and --tls-key: the dev \
+                     certificate names {} only, so no client dialling {} could verify it",
                     DEV_CERT_NAMES.join(", "),
                     listen.ip(),
                 ));
             }
             gnitz_warn!(
-                "TLS listener on {listen} serves the dev certificate, minted at every boot for {} only: a                  client dialling any other address cannot verify it. Pass --tls-cert=PEM and --tls-key=PEM.",
+                "TLS listener on {listen} serves the dev certificate, minted at every boot for {} only: a \
+                 client dialling any other address cannot verify it. Pass --tls-cert=PEM and --tls-key=PEM.",
                 DEV_CERT_NAMES.join(", "),
             );
         }

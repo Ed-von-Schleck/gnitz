@@ -48,3 +48,16 @@ fn layout_digest_separates_every_region_axis() {
     assert_ne!(base, layout_digest(1, [U64, Str]), "type code");
     assert_ne!(base, layout_digest(1, [I64, U64]), "region order");
 }
+
+#[test]
+fn layout_digest_equals_the_streaming_digest_past_its_buffer_too() {
+    for regions in [1usize, 5, 65, 70] {
+        let types = (0..regions).map(|i| [crate::TypeCode::I64, crate::TypeCode::String, crate::TypeCode::U8][i % 3]);
+        let mut h = RowHasher::default();
+        h.update(&[2]);
+        for tc in types.clone() {
+            h.update(&[tc.as_wire()]);
+        }
+        assert_eq!(layout_digest(2, types), h.digest(), "{regions} regions");
+    }
+}
