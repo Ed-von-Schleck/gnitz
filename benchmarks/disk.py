@@ -1,11 +1,14 @@
 """Disk footprint of tables and the views over them, by scenario.
 
 Each scenario loads one shape of data under the views that stress it, shuts the
-server down so its final checkpoint puts every store on disk, and reports the
-data directory: `gnitz-server --disk-usage` for the bytes by relation, store and
-LSM level, and the same shards summed by region class — key, weight, null
-bitmap, payload by encoding, string heap, PK filter, and the header, directory
-and alignment padding around them.
+server down so its final checkpoint puts every store a boot resumes on disk, and
+reports the data directory: `gnitz-server --disk-usage` for the bytes by
+relation, store and LSM level, and the same shards summed by region class — key,
+weight, null bitmap, payload by encoding, string heap, PK filter, and the header,
+directory and alignment padding around them.
+
+No checkpoint publishes a view a stream reaches; what such a store spilled
+counts as written, and as no part of the footprint.
 
 A scenario runs under any of three regimes. `l0` leaves the server's own RAM
 tier, which a store of this size never fills, so every store is one L0 shard per
@@ -260,6 +263,14 @@ def load_stream(ld, rows, rng):
         for k in range(rows)))
 
 
+def load_stream_twin(ld, rows, rng):
+    users = max(rows // 40, 1)
+    clicks = [dict(id=k + 1, user_id=rng.randrange(users), page=rng.randrange(200), ms=rng.randrange(60_000))
+              for k in range(rows)]
+    ld.push("clicks", clicks)
+    return ld.push("visits", clicks)
+
+
 def load_bounded(ld, rows, rng):
     return ld.push("messages", (
         dict(id=k + 1, kind=rng.randrange(4),
@@ -414,8 +425,8 @@ SCENARIOS = [
         load_money),
     Scenario(
         "stream",
-        "a stream, which holds no row of its own, under two aggregates and a join to a table: every byte "
-        "is view or operator state",
+        "a stream, which holds no row of its own, under two aggregates and a join to a table: every view "
+        "is rebuilt at boot, so nothing but the table is published",
         ["CREATE TABLE users (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, country TEXT NOT NULL)",
          "CREATE TABLE clicks (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
          "ms INT NOT NULL) WITH (stream = true)",
@@ -424,6 +435,19 @@ SCENARIOS = [
          "CREATE VIEW v_country AS SELECT u.country, COUNT(*) AS n FROM clicks c JOIN users u "
          "ON c.user_id = u.id GROUP BY u.country"],
         load_stream),
+    Scenario(
+        "stream_twin",
+        "the same rows pushed to a stream and to a table, each under the same two aggregates: the table's "
+        "views are published, the stream's are not",
+        ["CREATE TABLE clicks (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
+         "ms INT NOT NULL) WITH (stream = true)",
+         "CREATE TABLE visits (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
+         "ms INT NOT NULL)",
+         *(f"CREATE VIEW v_{side}_{name} AS SELECT {body} FROM {source} GROUP BY {key}"
+           for side, source in (("stream", "clicks"), ("table", "visits"))
+           for name, key, body in (("page", "page", "page, COUNT(*) AS n, SUM(ms) AS total"),
+                                   ("slowest", "user_id", "user_id, MAX(ms) AS slowest")))],
+        load_stream_twin),
     Scenario(
         "bounded",
         "a filter view held under a capacity a sixth of what it would take, beside its unbounded twin",
@@ -531,7 +555,7 @@ def run(scenario, regime, args):
                     names[tid] = (name, len(conn.scan(tid, schema)))
                 except gnitz.GnitzError:
                     names[tid] = (name, 0)                              # a stream holds no row to scan
-        # Its final checkpoint puts every store on disk.
+        # Its final checkpoint puts every store a boot resumes on disk.
         server.stop_graceful(timeout=600)
         traced = trace.by_store()
     finally:
@@ -539,10 +563,16 @@ def run(scenario, regime, args):
 
     report, stores = disk_usage(data_dir)
     system = {s["line"] for s in stores if s["relation"] < gnitz.FIRST_USER_TABLE_ID}
-    shards = read_shards(data_dir, gnitz.FIRST_USER_TABLE_ID)
-    shard_bytes = sum(s.size for s in shards)
-    assert shard_bytes == sum(s["bytes"] for s in stores if s["line"] not in system), \
+    # Stores no checkpoint published.
+    unnamed = {(s["relation"], s["store"]) for s in stores if s["level"] == "-"}
+    assert not unnamed & {(s["relation"], s["store"]) for s in stores if s["level"] != "-"}, \
+        "a clean shutdown leaves no published store a shard its manifest does not name"
+    on_disk = read_shards(data_dir, gnitz.FIRST_USER_TABLE_ID)
+    assert sum(s.size for s in on_disk) == sum(s["bytes"] for s in stores if s["line"] not in system), \
         "the shards read here are the ones the server reports"
+    shards = [s for s in on_disk if (s.relation, s.store) not in unnamed]
+    shard_bytes = sum(s.size for s in shards)
+    unnamed_bytes = sum(s.size for s in on_disk) - shard_bytes
 
     # (relation, store) -> class -> bytes, and what zstd leaves of each store.
     by_store = defaultdict(lambda: defaultdict(int))
@@ -557,10 +587,14 @@ def run(scenario, regime, args):
         for r in s.regions:
             by_store[key][region_class(r)] += len(r.data)
             blobs[key].append(r.data)
+    # A line for a store that only wrote.
+    for (rel, store), n in (traced[0] if traced else {}).items():
+        if n and rel >= gnitz.FIRST_USER_TABLE_ID:
+            by_store[(rel, store)]
     store_records = []
     for (rel, store), classes in sorted(by_store.items()):
-        rows, retractions = classes.pop("rows"), classes.pop("retractions")
-        files, blocks = classes.pop("files"), classes.pop("blocks")
+        rows, retractions = classes.pop("rows", 0), classes.pop("retractions", 0)
+        files, blocks = classes.pop("files", 0), classes.pop("blocks", 0)
         store_records.append({
             "relation": rel, "name": names.get(rel, (f"relation {rel}", 0))[0], "store": store, "rows": rows,
             "retractions": retractions, "files": files, "block_bytes": blocks,
@@ -574,7 +608,7 @@ def run(scenario, regime, args):
     record = {
         "scenario": scenario.name, "regime": regime, "rows": args.rows, "workers": args.workers,
         "ram_tier_bytes": ram_tier, "value_bytes": value_bytes, "pushed_bytes": loader.pushed,
-        "shard_bytes": shard_bytes, "identical_bytes": identical,
+        "shard_bytes": shard_bytes, "unnamed_bytes": unnamed_bytes, "identical_bytes": identical,
         "written_bytes": traced and user_bytes(traced[0]), "published_bytes": traced and user_bytes(traced[1]),
         "relations": {name: live for name, live in names.values()},
         "stores": store_records,
@@ -635,6 +669,7 @@ def print_record(rec):
              f"; the workers wrote {rec['written_bytes'] / rec['pushed_bytes']:.2f} bytes per value byte pushed "
              f"and published {rec['published_bytes'] / rec['pushed_bytes']:.2f}")
           + (f"; {rec['identical_bytes']} bytes are a second copy of an identical shard" if rec["identical_bytes"] else "")
+          + (f"; {rec['unnamed_bytes']} more bytes are spill no manifest names" if rec["unnamed_bytes"] else "")
           + (f"; kept: {rec['kept']}" if "kept" in rec else ""))
 
 
