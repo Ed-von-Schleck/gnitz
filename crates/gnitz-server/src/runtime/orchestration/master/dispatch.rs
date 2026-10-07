@@ -37,6 +37,8 @@ impl MasterDispatcher {
             reactor,
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
+            fk_presence: RefCell::new(FxHashMap::default()),
+            fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
             unflushed_pushes: Cell::new(false),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
@@ -268,13 +270,6 @@ impl MasterDispatcher {
     /// bootstrap at `after_tick = 0` always falls through to the store.
     pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
         self.last_delta_round.borrow().get(&view_id).copied().unwrap_or(1)
-    }
-
-    /// Drop a dropped relation's gate entry. Ids are never reused, so nothing else
-    /// would ever reclaim it, and a per-DDL leak on the master is not a leak that
-    /// stops.
-    pub(crate) fn forget_delta_round(&self, id: u64) {
-        self.last_delta_round.borrow_mut().remove(&id);
     }
 
     // -----------------------------------------------------------------------

@@ -260,8 +260,8 @@ impl CommitUnit {
 
 /// Commit one batch of pushes. Emits every group's SAL writes, queues their tids
 /// for the tick and submits the fsync SQE under one SAL hold, THEN awaits worker
-/// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the unique-index
-/// filter update happen after fsync.
+/// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the update of the
+/// master's caches of committed rows happen after fsync.
 async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: Vec<PendingTxn>) {
     // Sort by tid so runs are homogeneous. Stable: arrival order within a run is
     // what makes intra-batch last-insert-wins mean last *inserted*.
@@ -387,9 +387,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // ------------------------------------------------------------------
     // Phase C (no lock): await push ACKs, per live group in unit order. Replies
     // for later groups wait in their routes meanwhile.
-    // unique_filter_ingest_batch is NOT called here: a filter entry for rows a
-    // crash would discard makes the next INSERT of the same key fail a
-    // uniqueness check nothing durable backs. It runs after Phase D's fsync.
+    // The master's caches of committed rows are NOT updated here: they hold
+    // only what is durable, so that runs after Phase D's fsync.
     // ------------------------------------------------------------------
     for g in units.iter().flat_map(|u| u.live()) {
         g.lease.as_ref().expect("a live group was laid out").acks().await;
@@ -405,18 +404,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         synced.await;
     }
 
-    // Update unique-index filters now that fsync confirms durability.
-    // Wrapped for task liveness: a panic here must not fail the commit —
-    // the data is already durable. Invalidate on panic so the next
-    // constrained INSERT re-validates from scratch.
+    // The master's caches of committed rows follow, now that fsync confirms
+    // durability and before any writer is answered.
     for g in units.iter().flat_map(|u| u.live()) {
-        if let Err(e) = guard_panic("unique_filter_ingest", || {
-            shared.disp().unique_filter_ingest_batch(g.tid, &g.merged);
-            Ok::<_, String>(())
-        }) {
-            shared.disp().unique_filter_invalidate_table(g.tid);
-            gnitz_warn!("{}", e);
-        }
+        shared.disp().committed(g.tid, &g.merged);
     }
 
     // Send responses: every client of a unit gets the unit's verdict.

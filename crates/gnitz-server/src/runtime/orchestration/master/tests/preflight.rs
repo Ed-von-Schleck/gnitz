@@ -42,18 +42,6 @@ fn an_own_pk_probe_follows_a_keyed_placement_and_spreads_a_replicated_one() {
     }
 }
 
-#[test]
-fn row_of_names_the_row_that_is_a_key() {
-    let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
-    let key = |a: u64, b: u64| opk_pk(&schema, &[a as u128, b as u128]);
-    let rows = [key(1, 0), key(3, 1), key(5, 9), key(7, 0)];
-    let keys = build_check_batch_pk_bytes(&schema, rows.iter().map(|k| &k[..]));
-    assert_eq!(row_of(&keys, &key(3, 1)), Some(1), "a present key");
-    assert_eq!(row_of(&keys, &key(3, 2)), None, "an absent key");
-    assert_eq!(row_of(&keys, &key(9, 0)), None, "an absent key past the last row");
-    assert_eq!(row_of(&keys, &key(0, 0)), None, "a key below every row");
-}
-
 /// A write to a parent referenced through its lone PK column probes nothing
 /// unless it deletes: an upsert resolves with no worker answering, and a
 /// retraction waits on the child-index probe of the key it removes.

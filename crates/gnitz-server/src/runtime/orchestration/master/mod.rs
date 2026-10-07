@@ -5,6 +5,7 @@
 pub(crate) mod scatter;
 
 mod dispatch;
+mod fk_presence;
 mod preflight;
 mod train;
 mod unique_filter;
@@ -46,6 +47,12 @@ pub struct MasterDispatcher {
     /// The filter of each unique index that has one, by (table_id, column
     /// list). Every entry holds all of its index's spans.
     unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
+
+    /// The presence cache of each table an FK probe found a key of, by table id.
+    fk_presence: RefCell<FxHashMap<u64, fk_presence::FkPresence>>,
+    /// Keys one presence cache holds before it is dropped whole.
+    /// `GNITZ_FK_PRESENCE_KEYS` lowers it, so tests reach it on small tables.
+    fk_presence_cap: usize,
 
     /// A recoverable push group was written since the last base round.
     unflushed_pushes: Cell<bool>,
@@ -165,6 +172,29 @@ impl<'d> ScanCut<'d> {
 }
 
 impl MasterDispatcher {
+    /// Bring every cache derived from `tid`'s committed rows up to a `batch` of
+    /// it that is now durable. A panic costs the table those caches, which its
+    /// next constrained write builds again; the write itself stands.
+    pub(crate) fn committed(&self, tid: u64, batch: &Batch) {
+        if let Err(e) = super::guard_panic("cache_ingest", || {
+            self.unique_filter_ingest_batch(tid, batch);
+            self.fk_presence_ingest_batch(tid, batch);
+            Ok::<_, String>(())
+        }) {
+            self.unique_filter_invalidate_table(tid);
+            self.fk_presence_invalidate_table(tid);
+            gnitz_warn!("{}", e);
+        }
+    }
+
+    /// Drop everything held for a dropped relation. Ids are never reused, so
+    /// nothing else would ever reclaim it.
+    pub(crate) fn forget_relation(&self, id: u64) {
+        self.last_delta_round.borrow_mut().remove(&id);
+        self.unique_filter_invalidate_table(id);
+        self.fk_presence_invalidate_table(id);
+    }
+
     /// The scan-shaped requests `build` writes under one SAL hold, one lease
     /// each; each worker replies in request order.
     pub(crate) async fn scan_cut(

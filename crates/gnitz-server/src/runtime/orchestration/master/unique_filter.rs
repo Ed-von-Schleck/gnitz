@@ -90,7 +90,7 @@ impl MasterDispatcher {
     }
 
     /// Record every indexed span of a durable `batch` on `table_id`.
-    pub(crate) fn unique_filter_ingest_batch(&self, table_id: u64, batch: &Batch) {
+    pub(super) fn unique_filter_ingest_batch(&self, table_id: u64, batch: &Batch) {
         let Some(relation) = self.cat().registry.relation(table_id) else {
             return;
         };
@@ -104,7 +104,7 @@ impl MasterDispatcher {
     }
 
     /// Drop every filter of `table_id`.
-    pub(crate) fn unique_filter_invalidate_table(&self, table_id: u64) {
+    pub(super) fn unique_filter_invalidate_table(&self, table_id: u64) {
         self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
     }
 

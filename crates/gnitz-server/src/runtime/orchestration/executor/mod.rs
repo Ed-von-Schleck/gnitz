@@ -344,8 +344,7 @@ impl Shared {
         self.poll_waiters.wake(id);
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
-        self.disp().forget_delta_round(id);
-        self.disp().unique_filter_invalidate_table(id);
+        self.disp().forget_relation(id);
     }
 
     /// Credit `rows` against each tid's pending-tick count and fire the auto-tick

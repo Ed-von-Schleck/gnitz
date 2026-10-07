@@ -53,12 +53,6 @@ impl<P> Check<P> {
     }
 }
 
-/// The row of the ascending `keys` that is `key`.
-fn row_of(keys: &Batch, key: &[u8]) -> Option<usize> {
-    let lo = keys.find_lower_bound_bytes(key);
-    (lo < keys.len() && keys.get_pk_bytes(lo) == key).then_some(lo)
-}
-
 /// Where an own-PK probe of `rel` goes: to the owners of its keys — or, every
 /// worker holding a replicated relation whole, spread over the full key.
 fn probe_placement(rel: &Relation) -> Placement {
@@ -357,12 +351,12 @@ enum Rule<'a> {
     },
     /// U-SEC on `cols`: a reply entry is `[span ‖ holder PK]`, `span` bytes of span.
     Unique { cols: PkColList, span: usize },
-    /// F1 on `edge`: key row `j` carries `values[j]`, flagged once a reply finds
-    /// it committed. A reply's leading `span` bytes are the key it answers.
+    /// F1 on `edge`: each probed reference, flagged once a reply finds it
+    /// committed. A reply's leading `span` bytes are the key it answers.
     FkExists {
         edge: FkEdge,
         span: usize,
-        values: Vec<(u128, bool)>,
+        values: FxHashMap<u128, bool>,
     },
 }
 
@@ -469,7 +463,7 @@ impl MasterDispatcher {
         // U-SEC's first violation is held until its turn in the verdict order.
         let mut unique_violation: Option<WireFault> = None;
         execute_probe_burst(self, &mut checks, |check, rows| {
-            let Check { tid, keys, plan, .. } = check;
+            let Check { tid, probe, plan, .. } = check;
             let mut answered = (0..rows.len())
                 .filter(|&j| rows.get_weight(j) == 1)
                 .map(|j| (j, rows.get_pk_bytes(j)));
@@ -507,8 +501,12 @@ impl MasterDispatcher {
                 }
                 Rule::FkExists { span, values, .. } => {
                     for (_, e) in answered {
-                        if let Some(r) = row_of(keys, &e[..*span]) {
-                            values[r].1 = true;
+                        let v = gnitz_wire::widen_pk_be(&e[..*span]);
+                        if let Some(found) = values.get_mut(&v) {
+                            *found = true;
+                            if matches!(probe, Probe::Pk) {
+                                self.fk_presence_found(*tid, v);
+                            }
                         }
                     }
                 }
@@ -661,7 +659,8 @@ fn plan_unique_checks<'a>(
 
 /// Rule F1, planning half: one committed-occupancy probe per FK constraint
 /// whose child is bundled, over the distinct non-NULL FK values of that child's
-/// surviving rows.
+/// surviving rows — less, where the reference is the parent's whole key, those
+/// the bundle writes into the parent or its presence cache proves committed.
 fn plan_fk_existence<'a>(
     disp: &MasterDispatcher,
     b: &TxnBundle<'a>,
@@ -677,16 +676,12 @@ fn plan_fk_existence<'a>(
         } = edge;
         let loc = b.schema(tid).locate(fk_col);
 
-        let mut seen: FxHashSet<u128> = FxHashSet::default();
-        let mut values: Vec<u128> = Vec::new();
+        let mut values: FxHashMap<u128, bool> = FxHashMap::default();
         for (_pk, fam, row) in b.surviving(tid) {
             let m = b.mem(fam);
             let r = row as usize;
             if !loc.is_null(m, r) {
-                let v = loc.opk_image(m, r);
-                if seen.insert(v) {
-                    values.push(v);
-                }
+                values.insert(loc.opk_image(m, r), false);
             }
         }
         if values.is_empty() {
@@ -709,8 +704,28 @@ fn plan_fk_existence<'a>(
             (index.key_spec().span_schema(), index.schema(), Probe::Index(cols))
         };
         let span = key_schema.pk_stride();
-        let keys = build_check_batch(&key_schema, &mut values);
-        let values = values.into_iter().map(|v| (v, false)).collect();
+        if matches!(probe, Probe::Pk) {
+            // The reference is the parent's whole key, so a key the bundle writes
+            // is decided by the bundle and any other by whether it is committed.
+            let fold = b.tables.iter().find(|t| t.tid == parent_tid).map(|t| &t.fold);
+            let cache = disp.fk_presence_of(parent_tid);
+            let mut key = [0u8; 16];
+            values.retain(|&v, _| {
+                gnitz_wire::store_opk(&mut key[..span], v, false);
+                match fold.and_then(|f| f.get(&key[..span])).map(|e| e.last) {
+                    // The parent's delta adds it.
+                    Some(FoldOp::Inserted(..)) => false,
+                    // The parent's delta retires it: kept for the verdict to refuse.
+                    Some(FoldOp::Deleted) => true,
+                    None => !cache.as_ref().is_some_and(|c| c.holds(v)),
+                }
+            });
+            if values.is_empty() {
+                continue;
+            }
+        }
+        let mut keys: Vec<u128> = values.keys().copied().collect();
+        let keys = build_check_batch(&key_schema, &mut keys);
         checks.push(Check {
             reply,
             ..Check::new(parent_tid, probe, keys, Rule::FkExists { edge, span, values })
@@ -733,8 +748,8 @@ fn fk_existence_verdict(
             continue;
         };
         let (retired, added) = deltas.get(&delta_key(edge)).unwrap_or(&no_delta);
-        for (v, in_committed) in values {
-            if (*in_committed && !retired.contains_key(v)) || added.contains(v) {
+        for (v, &in_committed) in values {
+            if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                 continue;
             }
             let cat = disp.cat();
