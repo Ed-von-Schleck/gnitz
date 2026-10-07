@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Christian Schramm"]
 license = "MIT OR Apache-2.0"
@@ -54,12 +54,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The workspace's own crates, as the published ones depend on each other. The
 # pin is exact: client and engine must agree on the wire protocol, so a release
 # resolves only against its own siblings. Bump these with `version` above.
-gnitz-foundation = { path = "gnitz-foundation", version = "=0.1.4" }
-gnitz-wire = { path = "gnitz-wire", version = "=0.1.4" }
-gnitz-expr = { path = "gnitz-expr", version = "=0.1.4" }
-gnitz-core = { path = "gnitz-core", version = "=0.1.4" }
-gnitz-zset = { path = "gnitz-zset", version = "=0.1.4" }
-gnitz-store = { path = "gnitz-store", version = "=0.1.4" }
+gnitz-foundation = { path = "gnitz-foundation", version = "=0.1.5" }
+gnitz-wire = { path = "gnitz-wire", version = "=0.1.5" }
+gnitz-expr = { path = "gnitz-expr", version = "=0.1.5" }
+gnitz-core = { path = "gnitz-core", version = "=0.1.5" }
+gnitz-zset = { path = "gnitz-zset", version = "=0.1.5" }
+gnitz-store = { path = "gnitz-store", version = "=0.1.5" }
 
 # Release: panic aborts the process so reactor-task panics surface as a
 # backtrace on stderr instead of being silently dropped.  Dev keeps unwind
