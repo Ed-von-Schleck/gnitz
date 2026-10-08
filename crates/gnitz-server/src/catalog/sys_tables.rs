@@ -63,9 +63,9 @@ pub(super) enum RelDetail {
         distribution: TableDistribution,
         serial: bool,
     },
-    /// `owner_view_id` is the user view this row is a chain segment of; `0` for a
-    /// user view.
-    View { owner_view_id: u64, pk_repeats: bool },
+    /// `owner` is the user view this row is a chain segment of; `None` for a user
+    /// view.
+    View { owner: Option<u64>, pk_repeats: bool },
 }
 
 impl RelRow<'_> {
@@ -143,9 +143,10 @@ fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
     let props =
         ViewProps::from_row(r.capacity_bytes, r.delta_bytes).map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
     let pk_repeats = bool_word(r.pk_repeats).map_err(|e| rel_violated(noun, name, id, format!("pk_repeats: {e}")))?;
+    let owner = (r.owner_view_id != 0).then_some(r.owner_view_id);
     // A chain segment is a relation the planner mints, never one an option
     // clause may name.
-    if props != ViewProps::Plain && r.owner_view_id != 0 {
+    if props != ViewProps::Plain && owner.is_some() {
         return Err(format!(
             "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
         ));
@@ -156,10 +157,7 @@ fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
         name,
         pk,
         kind: RelationKind::View(props),
-        detail: RelDetail::View {
-            owner_view_id: r.owner_view_id,
-            pk_repeats,
-        },
+        detail: RelDetail::View { owner, pk_repeats },
     })
 }
 

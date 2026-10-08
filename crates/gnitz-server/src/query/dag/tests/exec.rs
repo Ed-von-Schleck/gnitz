@@ -87,9 +87,21 @@ fn times(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)], k: i64) -> 
     zset_of(&batch, batch.schema())
 }
 
-/// One tick of `source` over `delta`; `None` where it brings this process no row.
-pub(super) fn tick(engine: &mut CatalogEngine, source: u64, delta: impl Into<Option<Batch>>) {
-    drive(&mut LocalDrive(engine), Drive::Tick { source, round: 1 }, delta.into()).unwrap();
+/// One tick of `source` on `host` over `delta`, in place of what a seal would
+/// answer; `None` where it brings this process no row.
+pub(super) fn drive(host: &mut impl DriveHost, source: u64, delta: Option<Batch>) {
+    let (dag, registry) = host.parts();
+    let schedule = dag.tick_schedule(source);
+    let delta = match delta {
+        Some(delta) => delta,
+        None => Batch::empty_with_schema(&registry.relation_or_err(source).unwrap().schema()),
+    };
+    run_schedule(host, source, &schedule, 1, delta).unwrap();
+}
+
+/// [`drive`] on a host that exchanges nothing.
+pub(super) fn tick_over(engine: &mut CatalogEngine, source: u64, delta: impl Into<Option<Batch>>) {
+    drive(&mut LocalDrive(engine), source, delta.into());
 }
 
 // ── The schedule ────────────────────────────────────────────────────────────
@@ -134,7 +146,7 @@ fn a_tick_drives_the_whole_closure() {
     let rows = [(1, 1, 10), (2, 1, 20), (3, -1, 30)];
 
     let delta = delta_for(&engine, base, &rows);
-    tick(&mut engine, base, delta);
+    tick_over(&mut engine, base, delta);
 
     for (vid, k) in [
         (views.twice, 2),
@@ -147,25 +159,112 @@ fn a_tick_drives_the_whole_closure() {
     }
 }
 
-/// A backfill drive runs the named view alone — not the source's closure, which
+/// A backfill runs the named view alone — not the source's closure, which
 /// would double-count into the dependents the source already populated — and
 /// not the view's own dependents, which backfill from its store afterwards.
 #[test]
 fn backfill_chunk_runs_only_the_named_view() {
     let (mut engine, base, views) = engine_with_views("backfill");
-    let backfill = |view| Drive::Backfill { view, source: base };
     let rows = [(1, 1, 10)];
 
-    let chunk = delta_for(&engine, base, &rows);
-    drive(&mut LocalDrive(&mut engine), backfill(views.twice), Some(chunk)).unwrap();
-    drive(&mut LocalDrive(&mut engine), backfill(views.twice), None).unwrap();
+    let held_rows = delta_for(&engine, base, &rows);
+    engine.registry.ingest(base, held_rows).unwrap();
+    backfill(&mut LocalDrive(&mut engine), views.twice).unwrap();
     assert_eq!(held(&mut engine, views.twice), times(&engine, base, &rows, 2));
     for vid in views.all().into_iter().filter(|&v| v != views.twice) {
         assert!(held(&mut engine, vid).is_empty(), "view {vid}");
     }
 
-    let err = drive(&mut LocalDrive(&mut engine), backfill(999_999), None).unwrap_err();
-    assert!(err.contains("is not registered"), "{err}");
+    backfill(&mut LocalDrive(&mut engine), 999_999).unwrap_err();
+}
+
+/// A backfill feeds a join its sources one after the other, each joined against
+/// the ones fed before it: the view holds every match once, at the product of
+/// its rows' weights.
+#[test]
+fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
+    let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", "backfill_join"), 1).unwrap();
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let a = engine.create_table("public.a", &cols, &[0]).unwrap();
+    let b = engine.create_table("public.b", &cols, &[0]).unwrap();
+    let join_cols = [
+        col_def("k", TypeCode::U64),
+        col_def("a_id", TypeCode::U64),
+        col_def("b_id", TypeCode::U64),
+    ];
+    let circuit = crate::test_support::two_term_join_circuit(a, b, TypeCode::U64);
+    let view = try_register_view(&mut engine, circuit, "join", &join_cols, 0, 0).unwrap();
+    for (tid, rows) in [
+        (a, &[(1, 1, 10), (2, 1, 20), (3, 1, 10)][..]),
+        (b, &[(7, 1, 10), (8, 1, 30), (9, 1, 20), (10, 1, 10)]),
+    ] {
+        let rows = delta_for(&engine, tid, rows);
+        engine.registry.ingest(tid, rows).unwrap();
+    }
+    // One row a chunk: a source fed in several epochs is joined once all the same.
+    engine.registry.set_scan_chunk_rows(1);
+
+    backfill(&mut LocalDrive(&mut engine), view).unwrap();
+
+    let want = rows_of(
+        &engine,
+        view,
+        1,
+        &[
+            (10, &[Some(1), Some(7)]),
+            (10, &[Some(1), Some(10)]),
+            (10, &[Some(3), Some(7)]),
+            (10, &[Some(3), Some(10)]),
+            (20, &[Some(2), Some(9)]),
+        ],
+    );
+    assert_eq!(held(&mut engine, view), zset_of(&want, want.schema()));
+}
+
+/// A backfill opens the bound its view's circuit recorded — a walk of the index
+/// while the catalog holds one, a full scan once it is dropped — and an
+/// unbounded view's opens a full scan.
+#[test]
+fn a_backfill_opens_the_bound_its_view_recorded() {
+    use gnitz_wire::{key_image, KeyRange, PkColList, ReadBound};
+    use gnitz_zset::repr::SourceCursor;
+    let (mut engine, base) = engine_with_base("backfill_bound");
+    let held_rows: Vec<(u64, i64, i64)> = (0..200).map(|id| (id, 1, id as i64 * 10)).collect();
+    let held_rows = delta_for(&engine, base, &held_rows);
+    engine.registry.ingest(base, held_rows).unwrap();
+    engine.create_index("public.base", &["v"], false).unwrap();
+    let img = |v: i64| key_image(TypeCode::I64, v as u64 as u128);
+    let range = KeyRange::new(
+        PkColList::from_slice(&[1]),
+        &[],
+        gnitz_wire::Cut::before(img(500)),
+        gnitz_wire::Cut::before(img(600)),
+    );
+    let identity = |bound| crate::test_support::identity_circuit(base, bound);
+    let bounded = try_register_view(
+        &mut engine,
+        identity(ReadBound::Range(range)),
+        "bounded",
+        &view_cols(),
+        0,
+        0,
+    );
+    let bounded = bounded.unwrap();
+    let whole = try_register_view(&mut engine, identity(ReadBound::None), "whole", &view_cols(), 0, 0).unwrap();
+    // What `backfill` opens for `view`'s one source.
+    let open = |engine: &CatalogEngine, view: u64| {
+        let bound = engine.dag.view_meta(view).unwrap().source_bound(base);
+        engine.registry.open_bound(base, bound, Cut::Sealed).unwrap().0
+    };
+
+    assert!(matches!(open(&engine, bounded), SourceCursor::Bounded(_)));
+    assert!(matches!(open(&engine, whole), SourceCursor::Full(_)));
+    backfill(&mut LocalDrive(&mut engine), bounded).unwrap();
+    let want: Vec<(u64, i64, i64)> = (50..60).map(|id| (id, 1, id as i64 * 10)).collect();
+    assert_eq!(held(&mut engine, bounded), times(&engine, base, &want, 1));
+
+    engine.drop_index("public__base__idx_v").unwrap();
+    assert!(matches!(open(&engine, bounded), SourceCursor::Full(_)));
 }
 
 /// A tick that brings this process no row still mints the ground row a global
@@ -185,14 +284,14 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     let count = try_register_view(&mut engine, circuit, "count", &cols_of(&counted), 0, 0).unwrap();
 
     for round in 1..=2 {
-        tick(&mut engine, base, None);
+        tick_over(&mut engine, base, None);
         assert_eq!(net_weight(&engine, count), 1, "round {round}: the ground row, once");
         assert!(held(&mut engine, once).is_empty(), "round {round}");
     }
 
     let rows = [(1, 1, 10)];
     let delta = delta_for(&engine, base, &rows);
-    tick(&mut engine, base, delta);
+    tick_over(&mut engine, base, delta);
     assert_eq!(held(&mut engine, once), times(&engine, base, &rows, 1));
     assert_eq!(net_weight(&engine, count), 1, "the count moved, its row count did not");
 }
@@ -213,10 +312,10 @@ fn rows_of(engine: &CatalogEngine, tid: u64, weight: i64, rows: &[(u64, &[Option
     bb.finish()
 }
 
-/// Push `rows` into table `tid`, and answer what the tick of it is driven over.
-fn pushed(engine: &mut CatalogEngine, tid: u64, rows: Batch) -> Option<Batch> {
+/// Push `rows` into table `tid` and tick it.
+fn push_and_tick(engine: &mut CatalogEngine, tid: u64, rows: Batch) {
     engine.ingest_unticked(tid, rows).unwrap();
-    engine.registry.seal(tid).unwrap()
+    tick(&mut LocalDrive(engine), tid, 1).unwrap();
 }
 
 /// Over a nullable key the preserved side's two re-keys differ in exactly the
@@ -226,8 +325,7 @@ fn pushed(engine: &mut CatalogEngine, tid: u64, rows: Batch) -> Option<Batch> {
 fn a_left_join_null_fills_its_null_keyed_preserved_row() {
     let (mut engine, [a, b], view) = left_join_engine(&scratch_dir("dag_exec", "left_join_null_key"), 2);
     let delta = rows_of(&engine, b, 1, &[(1, &[Some(7), Some(70)])]);
-    let delta = pushed(&mut engine, b, delta);
-    tick(&mut engine, b, delta);
+    push_and_tick(&mut engine, b, delta);
     let delta = rows_of(
         &engine,
         a,
@@ -238,8 +336,7 @@ fn a_left_join_null_fills_its_null_keyed_preserved_row() {
             (3, &[Some(30), Some(9)]),
         ],
     );
-    let delta = pushed(&mut engine, a, delta);
-    tick(&mut engine, a, delta);
+    push_and_tick(&mut engine, a, delta);
 
     let want = rows_of(
         &engine,

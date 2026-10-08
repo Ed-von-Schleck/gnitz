@@ -118,48 +118,24 @@ impl DagEngine {
         DepMap::closure(&self.dep.forward, seeds)
     }
 
-    /// The base tables — not streams — that `seeds`' source chains reach through
-    /// view sources, sorted.
-    pub(crate) fn base_tables_reachable_from(
-        &self,
-        registry: &RelationRegistry,
-        seeds: impl IntoIterator<Item = u64>,
-    ) -> Vec<u64> {
-        base_tables_among(registry, self.source_closure(seeds))
+    /// Whether a tick of `id` drives a view: one scans it that does not await its
+    /// rebuild.
+    pub(crate) fn is_ticked(&self, id: u64) -> bool {
+        self.dependents_of(id).iter().any(|v| !self.rebuild.contains(v))
     }
 
-    /// The base tables the circuits of `circuits` — a `CIRCUIT_TAB` delta not applied
-    /// yet — reach through view sources, sorted.
-    pub(crate) fn base_tables_scanned_by(
-        &self,
-        registry: &RelationRegistry,
-        circuits: &Batch,
-    ) -> Result<Vec<u64>, String> {
-        let mut reached = FxHashSet::default();
-        for i in circuits.live_rows() {
-            let Ok(row) = gnitz_wire::sys_rows::CircuitRow::read(circuits, i);
-            let circuit = gnitz_wire::Circuit::decode(row.circuit).map_err(|e| format!("view {}: {e}", row.view_id))?;
-            reached.extend(circuit.sources());
-        }
-        let through_views = self.source_closure(reached.iter().copied());
-        reached.extend(through_views);
-        Ok(base_tables_among(registry, reached))
+    /// The base tables — not streams — a view scans, sorted.
+    pub(crate) fn scanned_base_tables(&self, registry: &RelationRegistry) -> Vec<u64> {
+        let mut bases: Vec<u64> = self
+            .dep
+            .forward
+            .keys()
+            .copied()
+            .filter(|&s| registry.relation(s).is_some_and(|r| r.kind().is_base_table()))
+            .collect();
+        bases.sort_unstable();
+        bases
     }
-}
-
-/// The base tables — not streams — among `ids`, sorted.
-fn base_tables_among(registry: &RelationRegistry, ids: FxHashSet<u64>) -> Vec<u64> {
-    let mut bases: Vec<u64> = ids
-        .into_iter()
-        .filter(|&s| {
-            registry
-                .relation(s)
-                .map(Relation::kind)
-                .is_some_and(|k| k.is_base_table())
-        })
-        .collect();
-    bases.sort_unstable();
-    bases
 }
 
 // ---------------------------------------------------------------------------

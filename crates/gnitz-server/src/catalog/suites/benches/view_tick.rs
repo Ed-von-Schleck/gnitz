@@ -10,20 +10,17 @@
 //! ```
 
 use super::*;
-use crate::query::Drive;
 use gnitz_foundation::perf;
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, ReadBound};
 
 /// Base rows a table-sourced fixture loads before its view is created.
 const ROWS: u64 = 1_000_000;
 
-/// One tick of `source` over `rows`, pushed and sealed as a worker applies them;
-/// the instructions the drive took.
+/// One tick of `source` over `rows`, pushed as a worker applies them; the
+/// instructions the tick took, its seal among them.
 fn tick(engine: &mut CatalogEngine, counter: &perf::Counter, source: u64, rows: Batch) -> u64 {
     engine.ingest_unticked(source, rows).unwrap();
-    let delta = engine.registry.seal(source).unwrap();
-    let what = Drive::Tick { source, round: 1 };
-    let (res, instructions) = counter.measure(|| crate::query::drive(&mut LocalDrive(engine), what, delta));
+    let (res, instructions) = counter.measure(|| crate::query::tick(&mut LocalDrive(engine), source, 1));
     res.unwrap();
     instructions
 }
@@ -156,8 +153,7 @@ fn left_join_view_tick_bench() {
             tick(&mut engine, &counter, b, held);
         }
         // Compiles the plan outside the measurement.
-        let warm = Drive::Tick { source: a, round: 1 };
-        crate::query::drive(&mut LocalDrive(&mut engine), warm, None).unwrap();
+        seal_and_tick(&mut engine, a);
 
         let ticks = wide_ticks(&mut engine, &counter, a, 0, false, |id| [scramble(id); 2]);
         let (_, null_filled) = left_join_rows(&mut engine, v);
@@ -394,30 +390,15 @@ fn segment_view_tick_bench() {
     let matches = rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]);
     engine.registry.ingest(u, matches).unwrap();
 
-    // A segment is a view whose row names an owner, and only its owner's chain
-    // reads it; no tick of `t` reaches this owner.
-    let owner = register_identity_view(&mut engine, u, "owner", &cols);
-    let chained = |engine: &mut CatalogEngine, name: &str, circuit: Circuit, cols: &[CatalogColumn]| {
-        let vid = engine.allocate_ids(1).unwrap();
-        crate::test_support::write_circuit(engine, vid, circuit);
-        engine.write_column_records(vid, cols).unwrap();
-        let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
-        crate::test_support::push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
-        engine.submit(crate::catalog::SysFamily::View, bb.finish()).unwrap();
-        vid
-    };
+    // A segment is a view whose row names an owner, a user view created with it.
+    let segment = engine.allocate_ids(2).unwrap();
+    let view = segment + 1;
     let joined = [
         col_def("k", TypeCode::U64),
         col_def("t_id", TypeCode::U64),
         col_def("u_id", TypeCode::U64),
     ];
-    let segment = chained(
-        &mut engine,
-        "segment",
-        two_term_join_circuit(t, u, TypeCode::U64),
-        &joined,
-    );
-    let joined_schema = engine.registry.relation(segment).map(Relation::schema).unwrap();
+    let joined_schema = gnitz_zset::schema::SchemaDescriptor::new(&[u64c(); 3], &[0]);
     let aggs = [
         AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
         AggDescriptor::COUNT_STAR,
@@ -428,7 +409,22 @@ fn segment_view_tick_bench() {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(segment, ReadBound::None);
     circuit.reduce_multi_local(scan, &[0], &aggs);
-    let view = chained(&mut engine, "reduced", circuit, &cols_of(&reduced));
+    let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
+    for (vid, name, circuit, cols, owner) in [
+        (
+            segment,
+            "segment",
+            two_term_join_circuit(t, u, TypeCode::U64),
+            &joined[..],
+            view,
+        ),
+        (view, "reduced", circuit, &cols_of(&reduced), 0),
+    ] {
+        crate::test_support::write_circuit(&mut engine, vid, circuit);
+        engine.write_column_records(vid, cols).unwrap();
+        crate::test_support::push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
+    }
+    engine.submit(crate::catalog::SysFamily::View, bb.finish()).unwrap();
     backfill(&mut engine, segment);
     backfill(&mut engine, view);
 

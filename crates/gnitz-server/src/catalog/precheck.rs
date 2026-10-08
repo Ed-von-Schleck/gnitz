@@ -528,27 +528,6 @@ impl CatalogEngine {
         self.reject_if_dependent_views(owner_id, "ADD COLUMN")
     }
 
-    /// A `+1` VIEW_TAB row's `owner_view_id` must name `0` (a user view), a view
-    /// this bundle creates, or one the registry holds — the drop cascade keys on
-    /// it, so a forged owner would point a cascade at nothing. Precheck-only:
-    /// the paths that skip it replay rows this already accepted.
-    /// A rewrite pair is absent from `sorted_creates` and needs no entry: it
-    /// renames a view that already exists, so it falls through to the registry.
-    fn validate_view_owner(&self, vid: u64, name: &str, owner_view_id: u64, creates: &IdSet) -> Result<(), String> {
-        if owner_view_id == 0 {
-            return Ok(());
-        }
-        if owner_view_id == vid {
-            return Err(format!("view '{name}' (vid={vid}) declares itself its own owner"));
-        }
-        if creates.contains(owner_view_id) || self.registry.has_id(owner_view_id) {
-            return Ok(());
-        }
-        Err(format!(
-            "view '{name}' (vid={vid}) names owner_view_id={owner_view_id}, which no relation holds"
-        ))
-    }
-
     /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
     /// earlier families left it. Returns the ids the delta drops.
     ///
@@ -666,6 +645,17 @@ impl CatalogEngine {
         if let Some(id) = creates.ids().iter().find(|&&id| self.registry.has_id(id)) {
             return Err(format!("relation id {id} already exists"));
         }
+        // The only owners a created view may name: a chain is created whole.
+        let mut created_users = Vec::new();
+        if family == SysFamily::View {
+            for i in batch.live_rows() {
+                let rel = read_rel_row(family, batch, i)?;
+                if creates.contains(rel.id) && matches!(rel.detail, RelDetail::View { owner: None, .. }) {
+                    created_users.push(rel.id);
+                }
+            }
+        }
+        let created_users = IdSet::new(created_users);
 
         for i in batch.live_rows() {
             let rel = read_rel_row(family, batch, i)?;
@@ -696,9 +686,14 @@ impl CatalogEngine {
                     }
                     self.validate_fk_columns(rel.id, &col_defs, &schema, net_dead)?;
                 }
-                RelDetail::View { owner_view_id, .. } => {
-                    self.validate_view_owner(rel.id, rel.name, owner_view_id, &creates)?
+                RelDetail::View { owner: Some(owner), .. }
+                    if creates.contains(rel.id) && !created_users.contains(owner) =>
+                {
+                    return Err(format!(
+                        "{rel} names owner {owner}, which is not a user view this bundle creates"
+                    ));
                 }
+                RelDetail::View { .. } => {}
             }
             let displaced = self.claim_qname(rel.schema_id, rel.name, rel.id, net_dead, &mut claimed)?;
             // The drop cascade would take the outgoing relation's indexes with it.

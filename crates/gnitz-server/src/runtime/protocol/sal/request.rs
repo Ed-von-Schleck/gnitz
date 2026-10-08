@@ -45,8 +45,8 @@ pub(crate) enum Apply<'a> {
     FlushEph { generation: u64 },
     /// The catalog rows the group carries.
     DdlSync { family: u64 },
-    /// The initial full scan of `source` feeding the newly created `view`.
-    Backfill { source: u64, view: u64 },
+    /// The fill of each of `views`, in order, from the relations it scans.
+    Backfill { views: Cow<'a, [u64]> },
     /// The rows the group carries.
     Push { tid: u64 },
     /// One tick per tid, at consecutive rounds from `first_round`.
@@ -114,7 +114,10 @@ impl SalRequest<'_> {
             SalRequest::Apply(Apply::DdlSync { family: target_id } | Apply::Push { tid: target_id }) => {
                 WireMsg { target_id, ..head }
             }
-            SalRequest::Apply(Apply::Backfill { source, view }) => WireMsg { target_id: source, arg0: view, ..head },
+            SalRequest::Apply(Apply::Backfill { ref views }) => WireMsg {
+                blob: gnitz_wire::as_le_bytes(views),
+                ..head
+            },
             SalRequest::Apply(Apply::Tick { first_round, ref tids }) => WireMsg {
                 arg0: first_round,
                 blob: gnitz_wire::as_le_bytes(tids),
@@ -162,16 +165,13 @@ impl SalRequest<'static> {
             SalMessageKind::Flush => Apply::Flush.into(),
             SalMessageKind::FlushEph => Apply::FlushEph { generation: hdr.arg0 }.into(),
             SalMessageKind::DdlSync => Apply::DdlSync { family: tid }.into(),
-            SalMessageKind::Backfill => Apply::Backfill { source: tid, view: hdr.arg0 }.into(),
+            SalMessageKind::Backfill => Apply::Backfill { views: ids_of(blob, "backfill")?.into() }.into(),
             SalMessageKind::Push => Apply::Push { tid }.into(),
-            SalMessageKind::Tick => {
-                if !blob.len().is_multiple_of(8) {
-                    return Err("tick: the blob is not whole tids".into());
-                }
-                let mut tids = Vec::new();
-                gnitz_wire::extend_from_le_bytes(&mut tids, blob);
-                Apply::Tick { first_round: hdr.arg0, tids: tids.into() }.into()
+            SalMessageKind::Tick => Apply::Tick {
+                first_round: hdr.arg0,
+                tids: ids_of(blob, "tick")?.into(),
             }
+            .into(),
             SalMessageKind::HasPk => {
                 let probe =
                     Probe::from_wire(hdr.flags.probe_mode, hdr.arg0, hdr.arg1).map_err(|e| format!("has_pk: {e}"))?;
@@ -202,6 +202,16 @@ impl SalRequest<'static> {
             }
         })
     }
+}
+
+/// The ids a `what` group's blob lists.
+fn ids_of(blob: &[u8], what: &str) -> Result<Vec<u64>, String> {
+    if !blob.len().is_multiple_of(8) {
+        return Err(format!("{what}: the blob is not whole ids"));
+    }
+    let mut ids = Vec::new();
+    gnitz_wire::extend_from_le_bytes(&mut ids, blob);
+    Ok(ids)
 }
 
 impl<'a> From<Read<'a>> for SalRequest<'a> {

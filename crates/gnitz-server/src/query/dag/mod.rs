@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::compiler::{self, CompileOutput, ViewMeta};
 use crate::query::vm;
-use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
+use gnitz_store::relation::{CircuitState, Cut, Relation, RelationRegistry, StateLayout};
 use gnitz_zset::algebra::{self, ScatterPlan};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};
@@ -22,7 +22,7 @@ mod exec;
 mod hydrate;
 mod meta;
 
-pub(crate) use exec::{drive, Drive};
+pub(crate) use exec::{backfill, tick};
 
 use meta::{DepMap, Step};
 
@@ -30,11 +30,17 @@ use meta::{DepMap, Step};
 /// the other workers.
 pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
-    /// This worker's share of every worker's `batch` for `view_id` under
-    /// `plan`. `fold`: the share lands in a register that folds it, so gathering
-    /// consolidated slices merges them, saving that fold its sort; otherwise it
-    /// concatenates.
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, fold: bool) -> Batch;
+    /// This worker's share of every worker's `batch` for `view_id` under `plan`,
+    /// merged from consolidated slices where `fold` and concatenated otherwise,
+    /// and whether every worker passed `drained`.
+    fn exchange(
+        &mut self,
+        view_id: u64,
+        batch: Cow<'_, Batch>,
+        plan: &ScatterPlan,
+        fold: bool,
+        drained: bool,
+    ) -> (Batch, bool);
 }
 
 // ---------------------------------------------------------------------------
@@ -51,8 +57,8 @@ struct ViewPlan {
 struct RegisteredView {
     meta: ViewMeta,
     plan: Option<ViewPlan>,
-    /// The user view whose chain this view is a segment of; `0` for a user view.
-    owner: u64,
+    /// The user view whose chain holds this view: its owner, or itself.
+    chain: u64,
 }
 
 #[derive(Default)]
@@ -61,8 +67,7 @@ pub(crate) struct DagEngine {
     /// Every registered view, from its registration to its drop. `plan` is `None`
     /// until its first compile.
     views: FxHashMap<u64, RegisteredView>,
-    /// Views the boot verdict rejected, each until its rebuild backfill's first
-    /// drive.
+    /// Views the boot verdict rejected, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
 }
 
@@ -71,13 +76,13 @@ impl DagEngine {
 
     /// Derive `view_id`'s routing metadata and link it to its sources, both kept until
     /// [`Self::forget`], and answer the placement its store registers under.
-    /// `owner`: the user view whose chain it is a segment of, `0` for a user view.
+    /// `owner`: the user view whose chain it is a segment of, `None` for a user view.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
         view_id: u64,
         view: &SchemaDescriptor,
-        owner: u64,
+        owner: Option<u64>,
     ) -> Result<Placement, String> {
         let loaded = compiler::load_circuit(registry, view_id)?;
         // Tick scheduling and backfill take ascending id order as dependency order.
@@ -86,7 +91,8 @@ impl DagEngine {
         }
         let (meta, placement) = ViewMeta::derive(&loaded, registry, view)?;
         self.dep.link(view_id, loaded.sources());
-        self.views.insert(view_id, RegisteredView { meta, plan: None, owner });
+        let chain = owner.unwrap_or(view_id);
+        self.views.insert(view_id, RegisteredView { meta, plan: None, chain });
         Ok(placement)
     }
 
@@ -100,15 +106,12 @@ impl DagEngine {
     fn passes_through(&self, id: u64) -> bool {
         self.views
             .get(&id)
-            .is_some_and(|v| v.owner != 0 && v.plan.as_ref().is_some_and(|p| !p.code.vm.reads_view_store()))
+            .is_some_and(|v| v.chain != id && v.plan.as_ref().is_some_and(|p| !p.code.vm.reads_view_store()))
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
     pub(crate) fn chain_of(&self, id: u64) -> u64 {
-        match self.views.get(&id) {
-            Some(RegisteredView { owner, .. }) if *owner != 0 => *owner,
-            _ => id,
-        }
+        self.views.get(&id).map_or(id, |v| v.chain)
     }
 
     /// Drop everything this layer holds for relation `id`.
@@ -144,11 +147,6 @@ impl DagEngine {
             .get(&view_id)
             .map(|v| &v.meta)
             .ok_or_else(|| unregistered(view_id))
-    }
-
-    /// The bound `source`'s backfill scan into `view_id` narrows by.
-    pub(crate) fn source_bound(&self, view_id: u64, source: u64) -> Result<gnitz_wire::ReadBound, String> {
-        Ok(self.view_meta(view_id)?.source_bound(source))
     }
 
     /// Whether registered view `view_id`'s circuit compiles. Keeps and opens
@@ -193,13 +191,13 @@ fn compile(
     )
 }
 
-/// This view's metadata and its compiled plan, compiling and opening its
-/// operator state on a miss.
+/// This view's compiled plan, compiling and opening its operator state on a
+/// miss.
 fn ensure_compiled<'a>(
     views: &'a mut FxHashMap<u64, RegisteredView>,
     registry: &RelationRegistry,
     view_id: u64,
-) -> Result<(&'a ViewMeta, &'a mut ViewPlan), String> {
+) -> Result<&'a mut ViewPlan, String> {
     let RegisteredView { meta, plan, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
     if plan.is_none() {
         let view = registry.relation_or_err(view_id)?;
@@ -210,7 +208,7 @@ fn ensure_compiled<'a>(
         gnitz_debug!("dag: compiled view_id={}", view_id);
         *plan = Some(ViewPlan { code, state });
     }
-    Ok((meta, plan.as_mut().expect("filled above")))
+    Ok(plan.as_mut().expect("filled above"))
 }
 
 #[cfg(test)]

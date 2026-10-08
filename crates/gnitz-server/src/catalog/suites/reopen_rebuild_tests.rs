@@ -263,11 +263,11 @@ fn index_rebuild_forced_by_topology_change() {
 // registration, the traces at compile — so a checkpoint landing between them is
 // what these two tests put there.
 
-/// One tick of [`seed_base`]'s table `tid` carrying row `id` at weight 1.
-fn tick(engine: &mut CatalogEngine, tid: u64, id: u64) {
-    let delta = rows(engine, tid, 1, [id], |id| [id * 10]);
-    let what = crate::query::Drive::Tick { source: tid, round: 1 };
-    crate::query::drive(&mut LocalDrive(engine), what, Some(delta)).unwrap();
+/// A push of row `(id, val)` into [`seed_base`]'s table `tid`, and its tick.
+fn tick(engine: &mut CatalogEngine, tid: u64, id: u64, val: u64) {
+    let pushed = rows(engine, tid, 1, [id], |_| [val]);
+    engine.ingest_unticked(tid, pushed).unwrap();
+    seal_and_tick(engine, tid);
 }
 
 /// `public.vbase` plus a backfilled `DISTINCT` view over it, whose operator trace
@@ -299,7 +299,9 @@ fn view_traces_resume_with_their_output_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(net_weight(&engine, vid), N, "the output store resumes");
 
-    tick(&mut engine, tid, 0);
+    // An update: its retraction leaves the view only through a trace that holds
+    // the row it retracts.
+    tick(&mut engine, tid, 0, 1);
     assert_eq!(net_weight(&engine, vid), N, "a resumed trace already holds the row");
 
     engine.close();
@@ -384,7 +386,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
         "its last reader's backfill drops them"
     );
 
-    tick(&mut engine, tid, N as u64);
+    tick(&mut engine, tid, N as u64, 0);
     assert_eq!(
         (net_weight(&engine, seg), net_weight(&engine, top)),
         (0, N + 1),
@@ -403,7 +405,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     // behind; the segment has none to leave.
     let g2 = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g2).unwrap();
-    tick(&mut engine, tid, N as u64 + 1);
+    tick(&mut engine, tid, N as u64 + 1, 0);
     assert_eq!(net_weight(&engine, seg), 0, "a kept chain's segment stays empty");
     engine.close();
 

@@ -16,7 +16,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Apply::Flush.into(),
         Apply::FlushEph { generation: 11 }.into(),
         Apply::DdlSync { family: 12 }.into(),
-        Apply::Backfill { source: 13, view: 14 }.into(),
+        Apply::Backfill { views: vec![13, 14].into() }.into(),
         Apply::Push { tid: 15 }.into(),
         Apply::Tick {
             first_round: 16,

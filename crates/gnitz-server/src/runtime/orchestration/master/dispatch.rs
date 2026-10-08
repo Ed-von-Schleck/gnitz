@@ -140,42 +140,19 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    /// Distributed backfill of ONE view from `source_id`; view-scoped, see
-    /// [`crate::query::Drive::Backfill`].
-    async fn fan_out_backfill(&self, view_id: u64, source_id: u64) -> Result<(), WireFault> {
-        let group = DirectGroup::new(Apply::Backfill { source: source_id, view: view_id });
-        // Two statements: the `SalExcl`'s drop is the wake.
-        let lease = self.write_acked(&self.sal.lock().await, group)?;
-        lease.acks().await;
-        Ok(())
-    }
-
-    /// Backfill every view in `view_ids`, in dependency order, from each of its
-    /// sources. The one driver that populates a view — a live CREATE VIEW bundle
-    /// and the boot rebuild of generation-invalid views both run this.
-    ///
-    /// Ids ascend along every scan edge, so id order puts a source view before
-    /// every dependent that scans it, and an upstream hidden segment is filled
-    /// before a downstream view reads it.
-    ///
-    /// A multi-source join iterates every source: each joins against the sources
-    /// fed before it. A view that runs no exchange needs no cross-worker
-    /// barrier and `fan_out_backfill` accommodates that — no round completes, so
-    /// each worker stops on its own drain exhaustion — which is why one driver
-    /// serves every shape.
+    /// Backfill `view_ids` as one group, in id order: a view's id exceeds that of
+    /// every relation it scans.
     pub(crate) async fn backfill_views_in_dep_order(&self, view_ids: &[u64]) -> Result<(), WireFault> {
         let mut ordered = view_ids.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
-        for vid in ordered {
-            // Owned: no catalog reference is held across the await.
-            let sources = self.cat().dag.sources_of(vid).to_vec();
-            for src in sources {
-                self.fan_out_backfill(vid, src)
-                    .await
-                    .map_err(|e| e.in_context(format_args!("view={vid} source={src}")))?;
-            }
+        if ordered.is_empty() {
+            return Ok(());
         }
+        let group = DirectGroup::new(Apply::Backfill { views: ordered.into() });
+        // Two statements: the `SalExcl`'s drop is the wake.
+        let lease = self.write_acked(&self.sal.lock().await, group)?;
+        lease.acks().await;
         Ok(())
     }
 

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
-use crate::query::{DagEngine, Drive, DriveHost};
+use crate::query::{DagEngine, DriveHost};
 use crate::runtime::mesh::Mesh;
 use crate::runtime::park::WorkerPark;
 use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalRequest};
@@ -32,9 +32,6 @@ pub struct WorkerProcess<'c> {
     park: WorkerPark,
     /// Where this worker trades its exchange rounds with its peers.
     mesh: Mesh,
-    /// The running drive's vote on "every source is drained": this worker's own
-    /// claim until an exchange round closes, every worker's from then.
-    drained: bool,
     /// Replies this worker owes, in the order they reach the ring. A cut's reader
     /// drains its leases in request order and a ring frees only a released prefix,
     /// so within a cut ring order must be request order. Replies of different cuts
@@ -67,7 +64,6 @@ impl<'c> WorkerProcess<'c> {
             w2m_writer,
             park,
             mesh,
-            drained: false,
             replies: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
                 "GNITZ_REPLY_FRAME_BUDGET",
@@ -160,19 +156,15 @@ impl<'c> WorkerProcess<'c> {
             }
             Apply::Tick { first_round, ref tids } => {
                 for (i, &source) in tids.iter().enumerate() {
-                    let delta = self.catalog.registry.seal(source)?;
-                    self.drive(Drive::Tick { source, round: first_round + i as u64 }, delta)?;
+                    crate::query::tick(self, source, first_round + i as u64)?;
                 }
                 Ok(())
             }
-            Apply::Backfill { source, view } => {
-                let mut cursor = self.catalog.open_source_cursor(view, source)?;
-                let chunk_rows = self.catalog.registry.scan_chunk_rows();
-                // A drained worker keeps driving pad chunks, so every worker runs the
-                // same exchange rounds until every source is drained.
-                while !self.drive(Drive::Backfill { view, source }, cursor.drain_chunk(chunk_rows))? {}
-                let cat = &mut *self.catalog;
-                cat.dag.finish_backfill(&mut cat.registry, view, source)
+            Apply::Backfill { ref views } => {
+                debug_assert!(views.is_sorted(), "a backfill fills its views in id order");
+                views.iter().try_for_each(|&view| {
+                    crate::query::backfill(self, view).map_err(|e| format!("backfill of view {view}: {e}"))
+                })
             }
         }
     }

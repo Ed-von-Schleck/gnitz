@@ -7,7 +7,7 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::tests::{delta_for, engine_with_base, engine_with_views, tick, view_cols};
+use super::tests::{delta_for, drive, engine_with_base, engine_with_views, tick_over, view_cols};
 use super::*;
 use crate::test_support::{net_weight, register_identity_view};
 
@@ -29,12 +29,12 @@ fn drive_tick_bench() {
     let (mut engine, base, views) = engine_with_views("tick_bench_closure");
     let steps = engine.dag.tick_schedule(base).len() as u64;
     // Compiles every plan outside the measurement.
-    tick(&mut engine, base, None);
+    tick_over(&mut engine, base, None);
     let deltas: Vec<Batch> = (0..TICKS)
         .map(|i| delta_for(&engine, base, &[(i, 1, i as i64)]))
         .collect();
-    let ((), one_row) = counter.measure(|| deltas.into_iter().for_each(|delta| tick(&mut engine, base, delta)));
-    let ((), no_row) = counter.measure(|| (0..TICKS).for_each(|_| tick(&mut engine, base, None)));
+    let ((), one_row) = counter.measure(|| deltas.into_iter().for_each(|delta| tick_over(&mut engine, base, delta)));
+    let ((), no_row) = counter.measure(|| (0..TICKS).for_each(|_| tick_over(&mut engine, base, None)));
     assert_eq!(
         net_weight(&engine, views.over_union) as u64,
         3 * TICKS,
@@ -50,7 +50,7 @@ fn drive_tick_bench() {
         let views: Vec<u64> = (0..readers)
             .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &cols))
             .collect();
-        tick(&mut engine, base, None);
+        tick_over(&mut engine, base, None);
         let deltas: Vec<Batch> = (0..WIDE_TICKS)
             .map(|t| {
                 let ids = t * WIDE_TICK_ROWS..(t + 1) * WIDE_TICK_ROWS;
@@ -58,7 +58,7 @@ fn drive_tick_bench() {
                 delta_for(&engine, base, &rows)
             })
             .collect();
-        let ((), instr) = counter.measure(|| deltas.into_iter().for_each(|delta| tick(&mut engine, base, delta)));
+        let ((), instr) = counter.measure(|| deltas.into_iter().for_each(|delta| tick_over(&mut engine, base, delta)));
         for view in views {
             assert_eq!(
                 net_weight(&engine, view) as u64,
@@ -82,9 +82,16 @@ impl DriveHost for Echo<'_> {
         (&mut self.0.dag, &mut self.0.registry)
     }
 
-    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, _plan: &ScatterPlan, _fold: bool) -> Batch {
+    fn exchange(
+        &mut self,
+        _view_id: u64,
+        batch: Cow<'_, Batch>,
+        _plan: &ScatterPlan,
+        _fold: bool,
+        drained: bool,
+    ) -> (Batch, bool) {
         self.1 += 1;
-        batch.into_owned()
+        (batch.into_owned(), drained)
     }
 }
 
@@ -146,17 +153,17 @@ fn drive_round_bench() {
 
     let steps = engine.dag.tick_schedule(base).len() as u64;
     let mut host = Echo(&mut engine, 0);
-    drive(&mut host, Drive::Tick { source: base, round: 1 }, None).unwrap();
+    drive(&mut host, base, None);
     let before = host.1;
     let ((), one_row) = counter.measure(|| {
         for i in 0..TICKS {
             let d = delta(host.0, base, i..i + 1);
-            drive(&mut host, Drive::Tick { source: base, round: 1 }, Some(d)).unwrap();
+            drive(&mut host, base, Some(d));
         }
     });
     let ((), no_row) = counter.measure(|| {
         for _ in 0..TICKS {
-            drive(&mut host, Drive::Tick { source: base, round: 1 }, None).unwrap();
+            drive(&mut host, base, None);
         }
     });
     assert_eq!(host.1 - before, 2 * TICKS * steps, "a round a step, rows or none");
@@ -171,7 +178,7 @@ fn drive_round_bench() {
         .collect();
     let ((), wide_instr) = counter.measure(|| {
         for d in wide {
-            drive(&mut host, Drive::Tick { source: base, round: 1 }, Some(d)).unwrap();
+            drive(&mut host, base, Some(d));
         }
     });
     for (label, instr) in [("one row", one_row), ("no row", no_row)] {
@@ -191,11 +198,11 @@ fn drive_round_bench() {
         circuit.map(scan, &[2]);
         try_register_view(&mut engine, circuit, &format!("p{r}"), &narrow, 0, 0).unwrap();
     }
-    tick(&mut engine, base, None);
+    tick_over(&mut engine, base, None);
     let wide: Vec<Batch> = (0..WIDE_TICKS)
         .map(|t| delta(&engine, base, t * WIDE_TICK_ROWS..(t + 1) * WIDE_TICK_ROWS))
         .collect();
-    let ((), instr) = counter.measure(|| wide.into_iter().for_each(|d| tick(&mut engine, base, d)));
+    let ((), instr) = counter.measure(|| wide.into_iter().for_each(|d| tick_over(&mut engine, base, d)));
     println!(
         "{WIDE_TICK_ROWS}-row tick, source read by 8 projections: {:>6.1} instr/row",
         instr as f64 / (WIDE_TICKS * WIDE_TICK_ROWS) as f64

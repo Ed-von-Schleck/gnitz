@@ -118,33 +118,49 @@ fn an_index_row_repeating_a_column_is_refused() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A VIEW_TAB `+1`'s `owner_view_id` must name a real view other than itself —
-/// the drop cascade keys on it — and its name must be canonical.
+/// A VIEW_TAB `+1`'s `owner_view_id` must name a user view its own bundle
+/// creates, and its name must be canonical.
 #[test]
 fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     let dir = temp_dir("bundle_view_rows");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let vid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(vid, &id_v()).unwrap();
-    let view_row = |name: &str, owner_view_id: u64| {
+    let table = engine.create_table("public.t", &id_v(), &[0]).unwrap();
+    let existing = register_identity_view(&mut engine, table, "existing", &id_v());
+    let vid = engine.allocate_ids(3).unwrap();
+    let (user, other) = (vid + 1, vid + 2);
+    for id in [vid, user, other] {
+        engine.write_column_records(id, &id_v()).unwrap();
+    }
+    // `rows` of `(view id, name, owner)`.
+    let view_rows = |rows: &[(u64, &str, u64)]| {
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
-        push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner_view_id);
+        for &(id, name, owner) in rows {
+            push_view_tab_row(&mut bb, 1, id, name, 0, 0, owner);
+        }
         bb.finish()
     };
 
-    for (name, owner, why) in [
-        ("seg", 999_999, "which no relation holds"),
-        ("seg", vid, "declares itself its own owner"),
-        ("MixedCase", 0, "not canonical"),
+    let not_created = "is not a user view this bundle creates";
+    for (rows, why) in [
+        (&[(vid, "seg", 999_999)][..], not_created),
+        (&[(vid, "seg", table)], not_created),
+        (&[(vid, "seg", existing)], not_created),
+        // A segment of the bundle is no user view.
+        (
+            &[(vid, "seg", other), (other, "other", user), (user, "user", 0)],
+            not_created,
+        ),
+        (&[(vid, "seg", vid)], not_created),
+        (&[(vid, "MixedCase", 0)], "not canonical"),
     ] {
-        let err = engine
-            .precheck_family(SysFamily::View, &view_row(name, owner))
-            .unwrap_err();
-        assert!(err.contains(why), "{name}/{owner}: {err}");
+        let err = engine.precheck_family(SysFamily::View, &view_rows(rows)).unwrap_err();
+        assert!(err.contains(why), "{rows:?}: {err}");
     }
-    engine
-        .precheck_family(SysFamily::View, &view_row("v", 0))
-        .expect("a canonical user view is legal");
+    for rows in [&[(vid, "v", 0)][..], &[(vid, "seg", user), (user, "user", 0)]] {
+        engine
+            .precheck_family(SysFamily::View, &view_rows(rows))
+            .unwrap_or_else(|e| panic!("{rows:?}: {e}"));
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

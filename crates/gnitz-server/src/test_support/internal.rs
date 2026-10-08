@@ -165,16 +165,6 @@ pub fn distinct_circuit(source: u64) -> Circuit {
     circuit
 }
 
-/// One unbounded `ScanDelta` per source, the last its output: the
-/// dependency-map shape of a view over `sources`.
-pub fn scanning_circuit(sources: &[u64]) -> Circuit {
-    let mut circuit = Circuit::default();
-    for &source in sources {
-        circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    }
-    circuit
-}
-
 /// `ScanDelta(source)` then `n - 1` `Negate`s: an `n`-node circuit.
 pub fn negate_chain(source: u64, n: usize) -> Circuit {
     let mut circuit = Circuit::default();
@@ -305,7 +295,8 @@ impl crate::query::DriveHost for LocalDrive<'_> {
         _batch: std::borrow::Cow<'_, Batch>,
         _plan: &gnitz_zset::algebra::ScatterPlan,
         _fold: bool,
-    ) -> Batch {
+        _drained: bool,
+    ) -> (Batch, bool) {
         panic!("view {view_id} relayed: this host serves exchange-free circuits only");
     }
 }

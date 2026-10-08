@@ -199,7 +199,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
 
-    pub(in crate::catalog) fn create_index(
+    pub(crate) fn create_index(
         &mut self,
         qualified_owner: &str,
         col_names: &[&str],
@@ -239,7 +239,7 @@ impl CatalogEngine {
         res.map(|()| index_id)
     }
 
-    pub(in crate::catalog) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
+    pub(crate) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
         let idx_id = self
             .index_id_by_name(index_name)
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;

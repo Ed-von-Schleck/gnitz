@@ -1,12 +1,12 @@
 //! What the catalog owns above the registry because it needs both rungs: the
-//! boot resume verdict, the source cursor a circuit backfill drives, and the read
-//! wrappers that add what a caller cannot — the hydrator.
+//! boot resume verdict, and the read wrappers that add what a caller cannot —
+//! the hydrator.
 
 use std::rc::Rc;
 
-use gnitz_store::relation::{Cut, Relation, Residency};
+use gnitz_store::relation::{Relation, Residency};
 use gnitz_wire::ReadSpec;
-use gnitz_zset::repr::{Batch, SourceCursor};
+use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
@@ -121,15 +121,5 @@ impl CatalogEngine {
         let dag = &self.dag;
         self.registry
             .open_stores(rank, residency, |id| resume_at.filter(|_| !dag.awaits_rebuild(id)))
-    }
-
-    /// The cursor driving `source` through `view_id`'s circuit, under the bound the
-    /// circuit carries for it; the circuit's `Filter` applies the WHERE. Rows
-    /// above `source`'s cut are left to the tick that seals them.
-    pub(crate) fn open_source_cursor(&mut self, view_id: u64, source: u64) -> Result<SourceCursor, String> {
-        let bound = self.dag.source_bound(view_id, source)?;
-        self.registry
-            .open_bound(source, bound, Cut::Sealed)
-            .map(|(cursor, _unapplied)| cursor)
     }
 }

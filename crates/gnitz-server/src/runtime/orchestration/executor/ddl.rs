@@ -166,14 +166,16 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         }
     }
 
-    // For speed alone: a backfill walks a source's index only while nothing sits
-    // above the source's cut.
-    if let Some(circuits) = families[SysFamily::Circuit.index()].as_ref() {
-        let sources = {
-            let cat = shared.cat();
-            cat.dag.base_tables_scanned_by(&cat.registry, circuits)?
-        };
-        guard_panic_async("DDL", shared.disp().drain_tick(&sources)).await?;
+    // Before the views exist: a tick owed now carries rows pushed ahead of them,
+    // and a stream's must not reach them.
+    if families[SysFamily::Circuit.index()].is_some() {
+        let mut unticked = Vec::new();
+        shared.drain_live_tick_rows_into(&mut unticked);
+        let ticked = guard_panic_async("DDL", shared.disp().drain_tick(&unticked)).await;
+        if ticked.is_err() {
+            shared.requeue_tick_tids(&unticked);
+        }
+        ticked?;
     }
     let applied = guard_panic("DDL", || {
         shared.cat_mut().apply_bundle(families).map_err(WireFault::from)

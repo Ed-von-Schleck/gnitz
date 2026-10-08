@@ -47,8 +47,8 @@ impl CatalogEngine {
         let col_defs = self.read_column_defs(rel.id)?;
         let schema = build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice())?;
         let placement = match rel.detail {
-            RelDetail::View { owner_view_id, .. } => {
-                let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner_view_id)?;
+            RelDetail::View { owner, .. } => {
+                let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner)?;
                 for &src in self.dag.sources_of(rel.id) {
                     if SysFamily::from_id(src).is_some_and(|f| !f.reaches_workers()) {
                         return Err(format!(

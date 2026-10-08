@@ -1,6 +1,5 @@
 use super::*;
 use crate::catalog::CatalogEngine;
-use crate::query::{drive, Drive};
 use crate::test_support::{
     col_def, make_batch, scan_all, scratch_dir, try_register_identity_view, try_register_view, two_term_join_circuit,
     zset_of, LocalDrive, RowKey,
@@ -16,17 +15,7 @@ fn push(engine: &mut CatalogEngine, tid: u64, rows: &[(u64, i64, i64)]) {
 
 /// Tick `tid` over everything pushed into it since its last tick.
 fn tick(engine: &mut CatalogEngine, tid: u64) {
-    let delta = engine
-        .registry
-        .seal(tid)
-        .unwrap()
-        .expect("a view scans the pushed table");
-    drive(
-        &mut LocalDrive(engine),
-        Drive::Tick { source: tid, round: 1 },
-        Some(delta),
-    )
-    .unwrap();
+    crate::query::tick(&mut LocalDrive(engine), tid, 1).unwrap();
 }
 
 /// `view`'s rows recomputed for the U64 keys `ids`, as a Z-set.

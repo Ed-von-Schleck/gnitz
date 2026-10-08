@@ -9,7 +9,7 @@ impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String> {
         let view_schema = registry.relation_or_err(view_id)?.schema();
         let DagEngine { views, .. } = self;
-        let (_, ViewPlan { code, state }) = ensure_compiled(views, registry, view_id)?;
+        let ViewPlan { code, state } = ensure_compiled(views, registry, view_id)?;
         let hydration = code
             .hydration
             .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");

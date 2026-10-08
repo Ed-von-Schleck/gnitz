@@ -1,9 +1,4 @@
 use super::*;
-use crate::catalog::CatalogEngine;
-use crate::test_support::{
-    circuit_batch, circuit_cell_batch, col_def, scanning_circuit, scratch_dir, try_register_view,
-};
-use gnitz_wire::TypeCode;
 
 fn set(ids: &[u64]) -> FxHashSet<u64> {
     ids.iter().copied().collect()
@@ -84,45 +79,17 @@ fn forgetting_a_view_unlinks_only_its_own_edges() {
     assert_eq!(dag.sources_of(6), [1]);
 }
 
-/// A circuit delta not applied yet reaches the base tables its views will: for two
-/// new views, the second scanning the first and the first scanning an existing view
-/// over a base table and a stream, the answer is the one the dependency map gives
-/// once both are linked.
+/// A tick of a relation drives a view while one that scans it does not await
+/// its rebuild.
 #[test]
-fn an_unapplied_circuit_delta_reaches_the_bases_its_views_will() {
-    let dir = scratch_dir("dag_meta", "scanned_by");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
-    let table = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let stream = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
-    let existing = try_register_view(&mut engine, scanning_circuit(&[table, stream]), "existing", &cols, 0, 0).unwrap();
-    let first = engine.allocate_ids(1).unwrap();
-    let second = engine.allocate_ids(1).unwrap();
+fn a_relation_is_ticked_while_a_view_scanning_it_is_not_awaiting_its_rebuild() {
+    let mut dag = DagEngine::default();
+    dag.dep.link(5, [1].into_iter());
+    dag.dep.link(6, [1].into_iter());
+    assert!(dag.is_ticked(1) && !dag.is_ticked(2));
 
-    let mut circuits = circuit_batch(second, &scanning_circuit(&[first]));
-    circuits.append_batch(&circuit_batch(first, &scanning_circuit(&[existing])));
-    let scanned = engine.dag.base_tables_scanned_by(&engine.registry, &circuits).unwrap();
-    assert_eq!(scanned, [table]);
-
-    engine.dag.dep.link(first, [existing].into_iter());
-    engine.dag.dep.link(second, [first].into_iter());
-    assert_eq!(
-        engine.dag.base_tables_reachable_from(&engine.registry, [first, second]),
-        scanned
-    );
-
-    let err = engine
-        .dag
-        .base_tables_scanned_by(&engine.registry, &circuit_cell_batch(first, &[0xff]))
-        .unwrap_err();
-    assert!(err.starts_with(&format!("view {first}: circuit: truncated")), "{err}");
-
-    let _ = std::fs::remove_dir_all(&dir);
+    dag.set_rebuild(set(&[5]));
+    assert!(dag.is_ticked(1));
+    dag.set_rebuild(set(&[5, 6]));
+    assert!(!dag.is_ticked(1) && dag.is_scanned(1));
 }

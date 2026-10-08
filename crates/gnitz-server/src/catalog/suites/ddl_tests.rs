@@ -1015,24 +1015,22 @@ fn set_based_table_drop_queues_one_batch_per_family() {
 
 // ── A view drop retracts the internal segments it owns ───────────────────────
 
-/// Register view `V` over a fresh base table, then segment `S` whose VIEW_TAB
-/// row names `V` as its owner. Returns `(V, S)`.
+/// Register view `V` over a fresh base table together with segment `S`, whose
+/// VIEW_TAB row names `V` as its owner. Returns `(V, S)`.
 fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
     let base = engine
         .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
-    let register = |engine: &mut CatalogEngine, name: &str, owner: u64| {
-        let vid = engine.allocate_ids(1).unwrap();
+    let v = engine.allocate_ids(2).unwrap();
+    let s = v + 1;
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    for (vid, name, owner) in [(v, "v", 0), (s, "v__seg", v)] {
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, &cols).unwrap();
-        let mut bb = BatchBuilder::new(SysFamily::View.schema());
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
-        engine.submit(SysFamily::View, bb.finish()).unwrap();
-        vid
-    };
-    let v = register(engine, "v", 0);
-    let s = register(engine, "v__seg", v);
+    }
+    engine.submit(SysFamily::View, bb.finish()).unwrap();
     (v, s)
 }
 

@@ -24,13 +24,12 @@ fn stream_flag_registers_storeless_with_no_directory() {
         !std::path::Path::new(&stream_dir).exists(),
         "a stream gets no directory: {stream_dir}"
     );
-    // A view backfill over it drains nothing.
+    // A view's backfill over it reads nothing, whatever was pushed.
     let vid = register_identity_view(&mut engine, sid, "v_s", &cols);
-    let mut cursor = engine.open_source_cursor(vid, sid).unwrap();
-    assert!(
-        cursor.drain_chunk(64).is_none(),
-        "a stream's source cursor drains nothing"
-    );
+    let pushed = rows(&engine, sid, 1, [1], |id| [id]);
+    engine.ingest_unticked(sid, pushed).unwrap();
+    backfill(&mut engine, vid);
+    assert_eq!(held(&engine, vid), (0, 0), "a stream's backfill reads nothing");
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.
@@ -94,8 +93,8 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// Neither the live CREATE-VIEW drain nor boot's recovery sweep ticks a stream. Both
-/// read this one function, which is what is under test.
+/// Boot's recovery sweep ticks no stream: it reads this one function, which is
+/// what is under test.
 #[test]
 fn the_drive_set_excludes_a_stream() {
     let dir = temp_dir("stream_excluded_from_sweep");
@@ -103,14 +102,11 @@ fn the_drive_set_excludes_a_stream() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
-    let over_stream = register_identity_view(&mut engine, sid, "v_s", &cols);
-    let over_table = register_identity_view(&mut engine, tid, "v_t", &cols);
+    register_identity_view(&mut engine, sid, "v_s", &cols);
+    register_identity_view(&mut engine, tid, "v_t", &cols);
 
-    let driven = engine
-        .dag
-        .base_tables_reachable_from(&engine.registry, [over_stream, over_table]);
-    assert!(driven.contains(&tid), "a base table feeding a view is driven");
-    assert!(!driven.contains(&sid), "a stream must never be driven");
+    let driven = engine.dag.scanned_base_tables(&engine.registry);
+    assert_eq!(driven, [tid], "the base table a view scans, and not the stream");
 
     fs::remove_dir_all(&dir).ok();
 }

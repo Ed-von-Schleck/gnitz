@@ -404,17 +404,17 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 
     // One worker: its own publish completes the round.
     let part = make_batch_raw(&schema, &[(1, 1, 10)]);
-    let got = wp.exchange(9, Cow::Borrowed(&part), &ScatterPlan::broadcast(), false);
+    let (got, _) = wp.exchange(9, Cow::Borrowed(&part), &ScatterPlan::broadcast(), false, false);
     assert_eq!(weighted_rows(&got), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
     let next = wp.next_request().expect("the second read is still on the SAL");
     assert_eq!(next.route.request_id, 2);
 }
 
-/// A round is opened with the drive's own claim, and its close leaves every
-/// worker's in `drained`: a peer whose source is not drained overturns it.
+/// A round is opened with the drive's own claim, and its close answers every
+/// worker's: a peer whose source is not drained overturns it.
 #[test]
-fn exchange_leaves_the_rounds_verdict_in_drained() {
+fn exchange_answers_the_rounds_verdict() {
     let (mut engine, _) = engine_with_table("exchange_verdict");
     let (mut wp, _sal, _rx) = test_worker(&mut engine);
     let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
@@ -425,9 +425,8 @@ fn exchange_leaves_the_rounds_verdict_in_drained() {
         wp.mesh = meshes.pop().unwrap();
         // The peer arrives first, so this worker's own open completes the round.
         let _peers_round = peer.open(9, Cow::Borrowed(&part), &plan, false, peers);
-        wp.drained = own;
-        wp.exchange(9, Cow::Borrowed(&part), &plan, false);
-        assert_eq!(wp.drained, all, "own claim {own}, the peer's {peers}");
+        let (_, drained) = wp.exchange(9, Cow::Borrowed(&part), &plan, false, own);
+        assert_eq!(drained, all, "own claim {own}, the peer's {peers}");
     }
 }
 

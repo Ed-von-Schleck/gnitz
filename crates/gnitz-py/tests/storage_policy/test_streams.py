@@ -66,6 +66,21 @@ def test_views_over_a_stream_track_pushes_from_their_creation_on(client):
     assert _read(client, "big") == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
 
 
+def test_a_view_created_behind_an_unread_push_starts_empty(client):
+    """A push no read has drained yet is ticked before a view over the stream is
+    created, so the view holds none of it — and every row pushed from then on."""
+    _stream(client)
+    client.execute_sql(f"CREATE VIEW hot AS {_HOT}")
+    insert(client, "s", [(i, i % 3, i * 10) for i in range(1, 31)])
+
+    client.execute_sql(f"CREATE VIEW late AS {_HOT}")
+    assert _read(client, "late") == {}
+    assert _read(client, "hot") == {(0, 1650): 1, (1, 1450): 1, (2, 1550): 1}
+
+    insert(client, "s", [(99, 1, 7)])
+    assert _read(client, "late") == {(1, 7): 1}
+
+
 def test_drop_and_rename_stay_available_on_a_stream(client):
     """DROP of a stream restricts on dependent views exactly as for a table, and
     `RENAME TO` keeps its views fed."""

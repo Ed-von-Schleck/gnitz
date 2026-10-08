@@ -175,23 +175,9 @@ fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, Str
     (engine, tid, dir)
 }
 
-/// Backfill `view` from each of its sources in scan order, each ending with the
-/// pad chunk a drained worker drives.
+/// Backfill `view`, as a worker's `Backfill` does.
 fn backfill(engine: &mut CatalogEngine, view: u64) {
-    let chunk_rows = engine.registry.scan_chunk_rows();
-    for source in engine.dag.sources_of(view).to_vec() {
-        let mut cursor = engine.open_source_cursor(view, source).unwrap();
-        loop {
-            let chunk = cursor.drain_chunk(chunk_rows);
-            let drained = chunk.is_none();
-            let what = crate::query::Drive::Backfill { view, source };
-            crate::query::drive(&mut LocalDrive(engine), what, chunk).unwrap();
-            if drained {
-                break;
-            }
-        }
-        engine.dag.finish_backfill(&mut engine.registry, view, source).unwrap();
-    }
+    crate::query::backfill(&mut LocalDrive(engine), view).unwrap();
 }
 
 /// The child directories of relation `id` holding a manifest.
@@ -221,9 +207,7 @@ fn held(engine: &CatalogEngine, id: u64) -> (usize, i64) {
 
 /// Seal `source` and tick what the seal answers, as a worker's `Tick` does.
 fn seal_and_tick(engine: &mut CatalogEngine, source: u64) {
-    let delta = engine.registry.seal(source).unwrap();
-    let what = crate::query::Drive::Tick { source, round: 1 };
-    crate::query::drive(&mut LocalDrive(engine), what, delta).unwrap();
+    crate::query::tick(&mut LocalDrive(engine), source, 1).unwrap();
 }
 
 /// `ids` as rows of `tid` at `weight`, in the order given; `cells(id)` is one

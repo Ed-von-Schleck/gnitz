@@ -15,8 +15,15 @@ impl DriveHost for WorkerProcess<'_> {
     /// Publish `batch` as this worker's round of `view_id` and block until every
     /// part of it is complete. SAL groups arriving meanwhile go through
     /// [`Self::dispatch_in_wait`].
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, fold: bool) -> Batch {
-        let mut round = self.mesh.open(view_id, batch, plan, fold, self.drained);
+    fn exchange(
+        &mut self,
+        view_id: u64,
+        batch: Cow<'_, Batch>,
+        plan: &ScatterPlan,
+        fold: bool,
+        drained: bool,
+    ) -> (Batch, bool) {
+        let mut round = self.mesh.open(view_id, batch, plan, fold, drained);
         loop {
             self.park.park(|| self.sal_reader.is_empty() && !self.mesh.complete());
             while let Some(req) = self.next_request() {
@@ -27,9 +34,8 @@ impl DriveHost for WorkerProcess<'_> {
                 }
             }
             if self.mesh.complete() {
-                if let Some((rows, drained)) = self.mesh.step(&mut round) {
-                    self.drained = drained;
-                    return rows;
+                if let Some(gathered) = self.mesh.step(&mut round) {
+                    return gathered;
                 }
             }
         }
@@ -37,13 +43,6 @@ impl DriveHost for WorkerProcess<'_> {
 }
 
 impl WorkerProcess<'_> {
-    /// Run one drive; whether every worker's source was drained.
-    pub(super) fn drive(&mut self, what: Drive, delta: Option<Batch>) -> Result<bool, String> {
-        self.drained = delta.is_none();
-        crate::query::drive(self, what, delta)?;
-        Ok(self.drained)
-    }
-
     /// Dispatch a group drained inside an exchange wait; whether it was a read.
     /// Total, so a new request cannot compile without a decision.
     pub(super) fn dispatch_in_wait(&mut self, req: Inbound) -> bool {

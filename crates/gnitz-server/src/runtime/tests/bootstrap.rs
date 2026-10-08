@@ -151,7 +151,7 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
             (written_at, 1),
             "one payload, written for {written_at} worker(s)"
         );
-        recover_from_sal(tail, slot, &[], &mut engine).unwrap();
+        recover_from_sal(tail, slot, &mut engine).unwrap();
     }
 
     assert_eq!(held(&engine, r), ((0..ROWS).collect(), ROWS as i64), "replicated");
@@ -161,6 +161,52 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     assert!(!own.is_empty() && own.len() < ROWS as usize, "the key space is split");
     let net = own.len() as i64;
     assert_eq!(held(&engine, k), (own, net), "keyed: this rank's share");
+    engine.close();
+}
+
+/// A replayed push lands above its base's cut only for a tick to take: under a
+/// view that is kept, and not under one that awaits its rebuild, whose backfill
+/// reads the base whole.
+#[test]
+fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = Slot::new(0, 1);
+    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), slot.of).unwrap();
+    let kept = engine.create_table("public.kept", &cols(), &[0]).unwrap();
+    let rejected = engine.create_table("public.rejected", &cols(), &[0]).unwrap();
+    crate::test_support::register_identity_view(&mut engine, kept, "v_kept", &cols());
+    let rebuilt = crate::test_support::register_identity_view(&mut engine, rejected, "v_rejected", &cols());
+    engine.dag.set_rebuild([rebuilt].into_iter().collect());
+    let rows = make_batch(
+        &engine.registry.relation(kept).unwrap().schema(),
+        &[(1, 1, 10), (2, 1, 20)],
+    );
+
+    let log = TestLog::new(SAL_SIZE, slot.of as usize, 1);
+    for tid in [kept, rejected] {
+        let placement = engine.registry.relation(tid).unwrap().placement();
+        let record = engine.schema_record(tid).expect("a registered table");
+        with_routed(&rows, placement, slot.of as usize, |data| {
+            let targets = GroupTargets {
+                set: data.holders(),
+                ..GroupTargets::UNADDRESSED
+            };
+            log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
+        });
+    }
+    log.synced_through(log.cursor());
+    recover_from_sal(CommittedTail::read(log.log()).unwrap(), slot, &mut engine).unwrap();
+
+    for tid in [kept, rejected] {
+        assert_eq!(held(&engine, tid), (vec![1, 2], 2), "table {tid}");
+    }
+    let above = engine
+        .registry
+        .seal(kept)
+        .unwrap()
+        .expect("the kept view's tick takes the tail");
+    assert_eq!(above.len(), 2);
+    assert!(engine.registry.seal(rejected).unwrap().is_none());
     engine.close();
 }
 
