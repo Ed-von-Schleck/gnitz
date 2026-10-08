@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use crate::storage::{RecoverySource, ShardBudget, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind};
+use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewProps};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
@@ -73,6 +73,13 @@ impl std::ops::DerefMut for RelationFixture {
     }
 }
 
+/// A fed view, its feed retaining `delta_bytes`.
+pub(crate) fn fed_view(delta_bytes: u64) -> RelationKind {
+    RelationKind::View(ViewProps::Fed {
+        delta_bytes: NonZeroU64::new(delta_bytes).unwrap(),
+    })
+}
+
 /// A registry holding [`TID`] as a `kind` relation over `schema`, with an index
 /// on each column of `indexed`, holding `rounds`, one ingest each.
 pub(crate) fn relation_fixture(
@@ -81,8 +88,19 @@ pub(crate) fn relation_fixture(
     indexed: &[u32],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
+    relation_fixture_with(StoreConfig::default(), kind, schema, indexed, rounds)
+}
+
+/// [`relation_fixture`] under `config`.
+pub(crate) fn relation_fixture_with(
+    config: StoreConfig,
+    kind: RelationKind,
+    schema: SchemaDescriptor,
+    indexed: &[u32],
+    rounds: impl IntoIterator<Item = Batch>,
+) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, config);
     registry
         .register(RelationSpec {
             id: TID,

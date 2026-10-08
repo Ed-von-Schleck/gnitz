@@ -20,7 +20,7 @@ use gnitz_wire::PkKeys;
 use super::manifest::Manifest;
 use super::run_set::RunSet;
 use super::shard_index::{ShardBudget, ShardIndex};
-use gnitz_wire::PkBuf;
+use gnitz_wire::{PkBuf, RowSource};
 use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::Batch;
 #[cfg(test)]
@@ -395,6 +395,15 @@ impl Table {
             .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
     }
 
+    /// The runs `cut` reads whose PK extent can meet the inclusive `[start, hi]`.
+    fn runs_in_range(&self, start: PkBuf, hi: PkBuf, cut: Cut) -> impl Iterator<Item = Run> + '_ {
+        self.mem_runs(Some((start, hi)), cut).chain(
+            self.shard_index
+                .shard_arcs_in_range(start, hi, cut == Cut::Now)
+                .map(Run::Shard),
+        )
+    }
+
     /// Open a read-only cursor over the rows `cut` reads.
     pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
         let cap = self.mem_run_count() + self.shard_index.shard_count();
@@ -429,14 +438,47 @@ impl Table {
             start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
             "range_cursor: a bound is not pk_stride wide",
         );
-        let runs = self.mem_runs(Some((start, hi)), cut).chain(
-            self.shard_index
-                .shard_arcs_in_range(start, hi, cut == Cut::Now)
-                .map(Run::Shard),
-        );
+        let runs = self.runs_in_range(start, hi, cut);
         let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
+    }
+
+    /// [`Self::range_cursor`] as a chain: its runs split wherever every run so
+    /// far ends below the next one's first key, a cursor over each part, in key
+    /// order. Their rows end to end are the one cursor's, and only runs whose
+    /// key extents meet are merged.
+    pub(crate) fn range_cursors(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> Vec<ReadCursor> {
+        let Some((start, end)) = range else {
+            return Vec::new();
+        };
+        let schema = self.shard_index.schema;
+        let hi = end.unwrap_or_else(|| PkBuf::max(schema.pk_stride()));
+        let mut runs: Vec<Run> = self
+            .runs_in_range(start, hi, cut)
+            .filter(|run| run.row_count() > 0)
+            .collect();
+        runs.sort_by(|a, b| a.get_pk_bytes(0).cmp(b.get_pk_bytes(0)));
+        let last_key = |run: &Run| PkBuf::from_bytes(run.get_pk_bytes(run.row_count() - 1));
+        let mut parts: Vec<(Vec<Run>, PkBuf)> = Vec::new();
+        for run in runs {
+            let last = last_key(&run);
+            match parts.last_mut() {
+                Some((part, top)) if run.get_pk_bytes(0) <= top.pk_bytes() => {
+                    *top = (*top).max(last);
+                    part.push(run);
+                }
+                _ => parts.push((vec![run], last)),
+            }
+        }
+        let end = end.as_ref().map(PkBuf::pk_bytes);
+        parts
+            .into_iter()
+            .map(|(part, _)| {
+                let cap = part.len();
+                from_runs_in_band(part, schema, cap, start.pk_bytes(), end)
+            })
+            .collect()
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of

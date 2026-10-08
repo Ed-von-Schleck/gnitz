@@ -8,7 +8,7 @@ use gnitz_wire::{PkKeys, ReadSpec};
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
-use crate::relation::{Cut, RelationRegistry};
+use crate::relation::{Cut, RelationKind, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::{Batch, SkeletonKeys, SourceCursor};
@@ -25,6 +25,11 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, String> {
         let entry = self.relation_or_err(target_id)?;
+        if entry.kind() == RelationKind::Stream {
+            return Err(format!(
+                "relation {target_id} is a stream: a stream holds no rows and cannot be read"
+            ));
+        }
         let src_schema = entry.schema();
         // Nothing to hydrate either: the relation whole, off the store's cached
         // snapshot.
@@ -33,31 +38,76 @@ impl RelationRegistry {
             return Ok(entry.full_scan());
         }
         let ReadSpec { bound, predicate, sink } = spec;
-        let (source, unapplied) = self.open_bound(target_id, bound, Cut::Now)?;
+        let (source, walk) = self.open_bound(target_id, bound, Cut::Now)?;
         // A bad predicate and a bad walk are both a corrupt request: the client
         // pre-compiled the identical program at plan time.
-        let filter = RowFilter::for_read(&predicate, &unapplied, &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
+        let mut filter =
+            RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let mut sink = SinkPlan::from_wire(&src_schema, &sink, self.config.adhoc_group_cap)?;
         check_layout(reply_layout, sink.output_schema())?;
-        let mut rows = Survivors {
-            registry: self,
-            id: target_id,
-            source,
-            hydrator,
-            filter,
-            ranges: Vec::new(),
-        };
+        self.drive(target_id, source, &mut filter, &mut sink, hydrator)?;
+        Ok(Rc::new(sink.finish()))
+    }
+
+    /// Feed `sink` the rows of `source` that `filter` keeps, a chunk at a time,
+    /// until it needs no more. Each skeleton row a chunk meets is replaced by that
+    /// key's rows, recomputed through `hydrator`.
+    pub(super) fn drive(
+        &self,
+        id: u64,
+        mut source: SourceCursor,
+        filter: &mut RowFilter,
+        sink: &mut SinkPlan,
+        mut hydrator: Option<&mut dyn SkeletonHydrator>,
+    ) -> Result<(), String> {
         let chunk_rows = self.config.scan_chunk_rows;
+        let mut ranges = Vec::new();
         for drain_rows in drain_ramp(sink.first_drain(chunk_rows), chunk_rows) {
-            let Some((chunk, ranges)) = rows.next(drain_rows)? else {
+            let mut skeletons = SkeletonKeys::default();
+            // `drain_rows` bounds the merge groups visited; a skeleton row counts
+            // once however many rows it hydrates to.
+            let Some(mut chunk) = source.drain_live_chunk(drain_rows, &mut skeletons) else {
                 break;
             };
-            if sink.push(&chunk, ranges)? {
+            if !skeletons.keys.is_empty() {
+                chunk = hydrate(self, id, hydrator.as_deref_mut(), chunk, skeletons)?;
+            }
+            filter.ranges(&chunk.as_mem_batch(), &mut ranges);
+            if sink.push(&chunk, &mut ranges)? {
                 break;
             }
         }
-        Ok(Rc::new(sink.finish()))
+        Ok(())
     }
+}
+
+/// `live` merged with the rows of `id` recomputed at `skeletons`' keys.
+fn hydrate(
+    registry: &RelationRegistry,
+    id: u64,
+    hydrator: Option<&mut (dyn SkeletonHydrator + '_)>,
+    live: Batch,
+    mut skeletons: SkeletonKeys,
+) -> Result<Batch, String> {
+    let Some(hydrator) = hydrator else {
+        return Err(format!(
+            "relation {id} holds skeleton rows but this process maintains no circuit"
+        ));
+    };
+    let keys = PkKeys::from_sorted(live.schema().pk_stride(), std::mem::take(&mut skeletons.keys));
+    #[cfg(debug_assertions)]
+    let asked = keys.clone();
+    let hydrated = hydrator
+        .hydrate_keys(registry, id, keys)
+        .map_err(|e| format!("hydrate: view {id}: {e}"))?;
+    #[cfg(debug_assertions)]
+    assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
+    // Both consolidated and PK-disjoint.
+    let schema = *live.schema();
+    Ok(match live.is_empty() {
+        true => hydrated,
+        false => hydrated.merged_consolidated(&live, &schema),
+    })
 }
 
 /// The reply guard's refusal: a keeper built in any other layout would ship its
@@ -67,64 +117,6 @@ pub(super) fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Re
         return Err("reply schema does not match the output layout".to_string());
     }
     Ok(())
-}
-
-/// A source chunk and its surviving row ranges.
-type SurvivorChunk<'r> = (Batch, &'r mut Vec<(usize, usize)>);
-
-/// The rows surviving the bound and the predicate, one source chunk at a time —
-/// the one input every sink reads. Each skeleton row a chunk meets is replaced by
-/// that key's rows, recomputed through `hydrator`.
-struct Survivors<'a, 'h> {
-    registry: &'a RelationRegistry,
-    id: u64,
-    source: SourceCursor,
-    hydrator: Option<&'h mut dyn SkeletonHydrator>,
-    /// The predicate, and the part of the bound the source did not apply.
-    filter: RowFilter,
-    /// The current chunk's surviving row ranges; scratch reused across chunks.
-    ranges: Vec<(usize, usize)>,
-}
-
-impl Survivors<'_, '_> {
-    /// The next source chunk and its surviving row ranges; `None` once the source is
-    /// exhausted. `max_rows` bounds the merge groups visited; a skeleton row counts
-    /// once however many rows it hydrates to.
-    fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, String> {
-        let mut skeletons = SkeletonKeys::default();
-        let Some(mut chunk) = self.source.drain_live_chunk(max_rows, &mut skeletons) else {
-            return Ok(None);
-        };
-        if !skeletons.keys.is_empty() {
-            chunk = self.hydrate(chunk, skeletons)?;
-        }
-        self.filter.ranges(&chunk.as_mem_batch(), &mut self.ranges);
-        Ok(Some((chunk, &mut self.ranges)))
-    }
-
-    /// `live` merged with the rows recomputed at `skeletons`' keys.
-    fn hydrate(&mut self, live: Batch, mut skeletons: SkeletonKeys) -> Result<Batch, String> {
-        let Some(hydrator) = self.hydrator.as_deref_mut() else {
-            return Err(format!(
-                "relation {} holds skeleton rows but this process maintains no circuit",
-                self.id
-            ));
-        };
-        let keys = PkKeys::from_sorted(live.schema().pk_stride(), std::mem::take(&mut skeletons.keys));
-        #[cfg(debug_assertions)]
-        let asked = keys.clone();
-        let hydrated = hydrator
-            .hydrate_keys(self.registry, self.id, keys)
-            .map_err(|e| format!("hydrate: view {}: {e}", self.id))?;
-        #[cfg(debug_assertions)]
-        assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
-        // Both consolidated and PK-disjoint.
-        let schema = *live.schema();
-        Ok(match live.is_empty() {
-            true => hydrated,
-            false => hydrated.merged_consolidated(&live, &schema),
-        })
-    }
 }
 
 /// Tripwire: the replay's per-PK weight sum must equal the coarse weight the
@@ -163,7 +155,7 @@ fn drain_ramp(first: usize, chunk_rows: usize) -> impl Iterator<Item = usize> {
     let (mut step, mut drained) = (first, 0usize);
     std::iter::from_fn(move || {
         let rows = step.min(chunk_rows - drained % chunk_rows);
-        drained += rows;
+        drained = drained.saturating_add(rows);
         step = step.saturating_mul(2);
         Some(rows)
     })

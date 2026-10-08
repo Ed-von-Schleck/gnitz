@@ -104,6 +104,19 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, 
                 .map(|(k, &w)| (k.clone(), w))
                 .collect();
             assert_eq!(got, band, "range cursor at {cut:?}");
+            // The chain reads the one cursor's rows, in its order.
+            let whole = t.range_cursor(Some((lo, Some(hi))), cut).materialize();
+            let parts = t.range_cursors(Some((lo, Some(hi))), cut);
+            let chained = parts.into_iter().map(ReadCursor::materialize);
+            let chained = Batch::concat(&s, chained.collect::<Vec<_>>().iter().map(|b| b.as_mem_batch()));
+            assert_eq!(chained.len(), whole.len(), "chain rows at {cut:?}");
+            for row in 0..whole.len() {
+                assert_eq!(
+                    (row_key(&chained, &s, row), chained.get_weight(row)),
+                    (row_key(&*whole, &s, row), whole.get_weight(row)),
+                    "chain row {row} at {cut:?}"
+                );
+            }
         }
     }
 }

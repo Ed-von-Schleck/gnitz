@@ -4,7 +4,7 @@
 //!
 //! Row ranges are half-open everywhere in this file: `end` is EXCLUSIVE.
 
-use gnitz_wire::ReadBound;
+use gnitz_wire::{KeyRange, PkKeys};
 
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
 use crate::program::{ColCopy, MapSinks, ReadAs};
@@ -50,6 +50,7 @@ impl LogicalProgram {
         Ok(RowFilter {
             pred: Some(pred),
             walk: None,
+            keys: None,
             words: Vec::new(),
         })
     }
@@ -143,47 +144,57 @@ pub(crate) struct FilterEval {
 pub struct RowFilter {
     pred: Option<FilterEval>,
     walk: Option<RangeMembership>,
+    /// Keep only the rows whose trailing key bytes are one of these.
+    keys: Option<PkKeys>,
     /// One bit per row of the batch being filtered.
     words: Vec<u64>,
 }
 
 impl RowFilter {
-    /// A read's filter: its wire predicate (empty for none), and the part of its
-    /// bound the source did not apply.
+    /// A read's filter: its wire predicate (empty for none), and the walk its
+    /// source did not apply.
     pub fn for_read(
         predicate: &[u8],
-        unapplied: &ReadBound,
+        walk: Option<&KeyRange>,
         schema: &dyn SchemaFacts,
     ) -> Result<Self, ExprValidateErr> {
         let mut f = match predicate.is_empty() {
             true => RowFilter {
                 pred: None,
                 walk: None,
+                keys: None,
                 words: Vec::new(),
             },
             false => LogicalProgram::from_blob(predicate)?.resolve_filter(schema)?,
         };
-        f.walk = match unapplied {
-            ReadBound::Range(r) => Some(RangeMembership::new(r, schema)?),
-            ReadBound::None | ReadBound::PkSet(_) => None,
-        };
+        f.walk = walk.map(|r| RangeMembership::new(r, schema)).transpose()?;
         Ok(f)
     }
 
-    pub(crate) fn keeps_every_row(&self) -> bool {
-        self.pred.is_none() && self.walk.is_none()
+    /// Also keep only the rows whose trailing key bytes are one of `keys`.
+    pub fn with_key_suffix(mut self, keys: PkKeys) -> Self {
+        self.keys = Some(keys);
+        self
     }
 
     /// The surviving rows of `mb` as maximal runs into `out` (cleared first).
     pub fn ranges(&mut self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
         out.clear();
         let n = mb.row_count();
-        if self.keeps_every_row() {
+        if self.pred.is_none() && self.walk.is_none() {
             if n > 0 {
                 out.push((0, n));
             }
-            return;
+        } else {
+            self.filter_bits(mb, n, out);
         }
+        if let Some(keys) = &self.keys {
+            keep_keyed(mb, keys, out);
+        }
+    }
+
+    /// [`Self::ranges`] of the predicate and the walk, at least one of them present.
+    fn filter_bits(&mut self, mb: &dyn BatchView, n: usize, out: &mut Vec<(usize, usize)>) {
         self.words.resize(n.div_ceil(64), 0);
         let words = &mut self.words[..];
         match &mut self.pred {
@@ -203,6 +214,33 @@ impl RowFilter {
         }
         scan_filter_bits(words, n, out);
     }
+}
+
+/// Cut `ranges`, row ranges of `mb`, down to the rows whose trailing key bytes
+/// are one of `keys`.
+fn keep_keyed(mb: &dyn BatchView, keys: &PkKeys, ranges: &mut Vec<(usize, usize)>) {
+    let (pk, stride) = mb.pk_region();
+    let skip = stride
+        .checked_sub(keys.stride())
+        .expect("a key set is no wider than the keys it filters");
+    let mut kept = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges.iter() {
+        let mut run = None;
+        for (row, key) in (start..end).zip(pk[start * stride..end * stride].chunks_exact(stride)) {
+            match (keys.contains(&key[skip..]), run) {
+                (true, None) => run = Some(row),
+                (false, Some(first)) => {
+                    kept.push((first, row));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = run {
+            kept.push((first, end));
+        }
+    }
+    *ranges = kept;
 }
 
 // ---------------------------------------------------------------------------

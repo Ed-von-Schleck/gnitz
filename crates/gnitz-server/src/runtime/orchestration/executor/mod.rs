@@ -964,9 +964,8 @@ fn not_found(tid: u64) -> WireFault {
 enum Access {
     /// Any read, a system catalog family included.
     Read,
-    /// A read with only a fan-out realization, which a system catalog family has
-    /// no form of: every worker holds a full copy, so fanning one out would
-    /// concatenate W identical trains and inflate every row's weight W-fold.
+    /// A read with only a worker fan-out realization, which a system catalog
+    /// family has no form of: a family is read off the master's own copy.
     UserRead,
     Write,
     /// A write inside a `PUSH_TXN`. Refusing a stream keeps every family

@@ -43,17 +43,18 @@ impl RelationRegistry {
             return Ok(self.scan_spec(id, spec, reply_layout, None)?);
         }
         let view = entry.schema();
-        let whole = spec.is_whole();
-        // Before the floor: a layout no cursor could have been handed is a bad
-        // request, not an expired one.
-        let reply = match whole {
-            true => view,
-            false => *SinkPlan::from_wire(&view, &spec.sink, self.config.adhoc_group_cap)?.output_schema(),
-        };
-        check_layout(reply_layout, &reply)?;
         let feed = entry
             .delta()
             .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
+        let ReadSpec { bound, predicate, sink } = spec;
+        // The feed numbers the view's columns as the view does, so the spec's
+        // programs run on its chunks as they are, and the sink writes each
+        // survivor once, under the view's key.
+        let stamped = *feed.schema();
+        let mut plan = SinkPlan::without_key_prefix(&stamped, &view, &sink, self.config.adhoc_group_cap)?;
+        // Before the floor: a layout no cursor could have been handed is a bad
+        // request, not an expired one.
+        check_layout(reply_layout, plan.output_schema())?;
         let dropped_through = delta_round(feed.dropped_max().pk_bytes());
         // A cursor at the floor has lost nothing.
         if after_tick < dropped_through {
@@ -68,17 +69,35 @@ impl RelationRegistry {
         let band = key_range_between_cuts(
             KeyCut::above(&delta_round_prefix(after_tick)),
             KeyCut::above(&delta_round_prefix(cut_tick)),
-            feed.schema().pk_stride(),
+            stamped.pk_stride(),
         );
-        if whole {
-            let rows = feed.range_cursor(band, Cut::Now).materialize();
-            return Ok(Rc::new(rows.without_key_prefix(&view)));
-        }
-
-        let ReadSpec { bound, predicate, sink } = spec;
-        // Few enough keys are gathered round by round; the rest are picked out
-        // of a walk of the band.
-        let probes = match &bound {
+        // Rounds only ascend, so the band is mostly runs that end below the
+        // next one's first key: a chain of cursors, of which few merge.
+        let runs = || feed.range_cursors(band, Cut::Now);
+        // Resolved over the view first, as the sink's map is: the spec's
+        // programs name its columns, not the feed's stamp.
+        let filter = |walk| {
+            RowFilter::for_read(&predicate, walk, &view)
+                .and_then(|_| RowFilter::for_read(&predicate, walk, &stamped))
+                .map_err(|e| format!("delta_read: {e}"))
+        };
+        let walk = |mut filter: RowFilter, plan: &mut SinkPlan| {
+            runs()
+                .into_iter()
+                .map(|run| SourceCursor::Full(Box::new(run)))
+                .try_for_each(|run| self.drive(id, run, &mut filter, plan, None))
+        };
+        match bound {
+            // Nothing is dropped, so each part is read in one piece: a whole
+            // run in place, and a string heap carried whole.
+            ReadBound::None if predicate.is_empty() => {
+                for run in runs() {
+                    let rows = run.materialize();
+                    plan.push(&rows, &mut vec![(0, rows.len())])?;
+                }
+            }
+            ReadBound::None => walk(filter(None)?, &mut plan)?,
+            ReadBound::Range(r) => walk(filter(Some(&r))?, &mut plan)?,
             ReadBound::PkSet(keys) if keys.stride() != view.pk_stride() => {
                 return Err(format!(
                     "delta_read: PkSet key stride {} != pk_stride {} (relation {id})",
@@ -87,36 +106,21 @@ impl RelationRegistry {
                 )
                 .into());
             }
+            // Few enough keys are gathered round by round; the rest are picked
+            // out of a walk of the band.
             ReadBound::PkSet(keys) => {
                 let rounds = cut_tick.saturating_sub(after_tick);
-                (rounds.saturating_mul(keys.len() as u64) <= DELTA_GATHER_MAX_PROBES)
-                    .then(|| stamped_keys(after_tick + 1..=cut_tick, keys))
+                match rounds.saturating_mul(keys.len() as u64) <= DELTA_GATHER_MAX_PROBES {
+                    true => {
+                        let probes = stamped_keys(after_tick + 1..=cut_tick, &keys);
+                        let gather = SourceCursor::PkSet(Box::new(feed.gather(probes, Cut::Now)));
+                        self.drive(id, gather, &mut filter(None)?, &mut plan, None)?
+                    }
+                    false => walk(filter(None)?.with_key_suffix(keys), &mut plan)?,
+                }
             }
-            _ => None,
-        };
-        let (mut source, unapplied) = match probes {
-            Some(probes) => (
-                SourceCursor::PkSet(Box::new(feed.gather(probes, Cut::Now))),
-                ReadBound::None,
-            ),
-            None => (SourceCursor::Full(Box::new(feed.range_cursor(band, Cut::Now))), bound),
-        };
-        // The feed numbers the view's columns as the view does, so the spec's
-        // programs run on its chunks as they are and only survivors are copied.
-        let stamped = *feed.schema();
-        let mut filter =
-            RowFilter::for_read(&predicate, &unapplied, &stamped).map_err(|e| format!("delta_read: {e}"))?;
-        let mut plan = SinkPlan::from_wire(&stamped, &sink, self.config.adhoc_group_cap)?;
-        let mut ranges = Vec::new();
-        while let Some(chunk) = source.drain_chunk(self.config.scan_chunk_rows) {
-            filter.ranges(&chunk.as_mem_batch(), &mut ranges);
-            // The one bound the filter does not apply.
-            if let ReadBound::PkSet(keys) = &unapplied {
-                keep_keyed(&chunk, keys, &mut ranges);
-            }
-            plan.push(&chunk, &mut ranges)?;
         }
-        let rows = plan.finish().without_key_prefix(&reply);
+        let rows = plan.finish();
         // A map can send two rows to one, and a retraction and an insert that
         // differ only in a column it drops to nothing.
         Ok(Rc::new(match sink.map {
@@ -142,30 +146,6 @@ fn stamped_keys(rounds: std::ops::RangeInclusive<u64>, keys: &PkKeys) -> PkKeys 
         }
     }
     PkKeys::from_sorted(stride, bytes)
-}
-
-/// Cut `ranges`, row ranges of the delta-store chunk `chunk`, down to the rows
-/// whose view key is one of `keys`.
-fn keep_keyed(chunk: &Batch, keys: &PkKeys, ranges: &mut Vec<(usize, usize)>) {
-    let stamp = chunk.schema().pk_stride() - keys.stride();
-    let mut kept = Vec::with_capacity(ranges.len());
-    for &(start, end) in ranges.iter() {
-        let mut run = None;
-        for row in start..end {
-            match (keys.contains(&chunk.get_pk_bytes(row)[stamp..]), run) {
-                (true, None) => run = Some(row),
-                (false, Some(first)) => {
-                    kept.push((first, row));
-                    run = None;
-                }
-                _ => {}
-            }
-        }
-        if let Some(first) = run {
-            kept.push((first, end));
-        }
-    }
-    *ranges = kept;
 }
 
 #[cfg(test)]

@@ -2,10 +2,10 @@
 //! under the same one holds that spec applied to the view, weight for weight.
 
 use super::*;
-use crate::relation::{RelationKind, RelationSpec};
+use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    between, img, make_batch_raw, make_schema_u64_i64, map_of, payload0_i64, relation_fixture, RelationFixture, Rng,
-    TID,
+    between, fed_view, img, make_batch_raw, make_schema_u64_i64, map_of, payload0_i64, relation_fixture,
+    relation_fixture_with, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, SchemaFacts, Sink};
 use gnitz_wire::{Cut, KeyRange, PkColList, ReadSink, TypeCode, ViewProps};
@@ -258,9 +258,7 @@ fn cases() -> Vec<Case> {
 }
 
 fn fed() -> RelationFixture {
-    let kind = RelationKind::View(ViewProps::Fed {
-        delta_bytes: std::num::NonZeroU64::new(1 << 30).unwrap(),
-    });
+    let kind = fed_view(1 << 30);
     relation_fixture(kind, view_schema(), &[], [])
 }
 
@@ -286,12 +284,26 @@ fn expect(case: &Case, state: &HashMap<Row, i64>) -> HashMap<RowKey, i64> {
 
 /// Each case under two subscribers: one polling every few rounds, one that
 /// bootstraps early and polls once at the end, across every round in between.
+/// Every other seed spills the feed to shards and reads it a few rows a chunk,
+/// and a round's delta sometimes arrives as two ingests.
 #[test]
 fn a_subscriber_under_a_spec_holds_the_spec_of_the_view() {
     let mut polls = 0;
     for seed in 0..40u64 {
         let mut rng = Rng::new(seed * 7919 + 1);
-        let mut r = fed();
+        let mut r = match seed % 2 {
+            0 => fed(),
+            _ => {
+                let config = StoreConfig {
+                    ram_tier_bytes: 1 << 11,
+                    ..StoreConfig::default()
+                };
+                let kind = fed_view(1 << 30);
+                let mut r = relation_fixture_with(config, kind, view_schema(), &[], []);
+                r.set_scan_chunk_rows(1 + rng.gen_range(16) as usize);
+                r
+            }
+        };
         let mut state = HashMap::new();
         let cases = cases();
         // Per (case, lagging): the copy and its cursor.
@@ -304,8 +316,13 @@ fn a_subscriber_under_a_spec_holds_the_spec_of_the_view() {
             // The round counter is the master's, shared by every relation.
             round += 1 + rng.gen_range(3);
             let delta = step_delta(&mut rng, &mut state, false);
-            if !delta.is_empty() {
-                r.ingest_at(TID, batch(&delta), Some(round), false).unwrap();
+            // A view stepped twice in one schedule ingests twice in one round.
+            let (first, second): (HashMap<Row, i64>, HashMap<Row, i64>) = match rng.gen_range(4) {
+                0 => delta.iter().partition(|(row, _)| row.0 % 2 == 0),
+                _ => (delta, HashMap::new()),
+            };
+            for part in [first, second].iter().filter(|part| !part.is_empty()) {
+                r.ingest_at(TID, batch(part), Some(round), false).unwrap();
             }
             for (ci, lagging, copy, cursor) in subs.iter_mut() {
                 let due = match lagging {
@@ -370,9 +387,7 @@ fn an_update_of_a_dropped_column_ships_nothing() {
 #[test]
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
-    let kind = RelationKind::View(ViewProps::Fed {
-        delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
-    });
+    let kind = fed_view(1 << 20);
     let mut r = relation_fixture(kind, schema, &[], []);
     r.ingest_at(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
@@ -431,4 +446,77 @@ fn a_delta_read_refuses_what_is_not_a_plain_rows_spec() {
         assert!(r.delta_read(TID, after_tick, 2, cut.clone(), own).is_err());
     }
     assert!(r.delta_read(TID, 1, 2, short, own).is_err());
+}
+
+/// A view that is all key has no payload column to copy: its delta rows are
+/// their keys and weights.
+#[test]
+fn a_key_only_view_reads_its_deltas() {
+    let schema = crate::test_support::pk_only_schema(&[TypeCode::U64]);
+    let kind = fed_view(1 << 20);
+    let mut r = relation_fixture(kind, schema, &[], []);
+    let keys = |rows: &[(u64, i64)]| {
+        let mut b = BatchBuilder::new(&schema);
+        for &(id, w) in rows {
+            b.begin_row(id as u128, w);
+            b.end_row();
+        }
+        b.finish()
+    };
+    r.ingest_at(TID, keys(&[(7, 1)]), Some(4), false).unwrap();
+    r.ingest_at(TID, keys(&[(7, -1), (8, 1)]), Some(5), false).unwrap();
+    let b = r
+        .delta_read(TID, 3, 5, ReadSpec::all_rows(ReadBound::None), schema.layout_digest())
+        .unwrap();
+    let mut rows: Vec<_> = (0..b.len()).map(|i| (b.get_pk(i) as u64, b.get_weight(i))).collect();
+    rows.sort_unstable();
+    assert_eq!(rows, [(7, -1), (7, 1), (8, 1)]);
+}
+
+/// A spec is compiled over the view: a map, a predicate or a walk naming the
+/// feed's stamp column, numbered one past the view's own, is refused.
+#[test]
+fn a_spec_cannot_name_the_round_stamp() {
+    let mut r = fed();
+    r.ingest_at(TID, batch(&HashMap::from([((1, 1, 1, None, 1), 1)])), Some(2), false)
+        .unwrap();
+    let stamp = view_schema().num_columns() as u32;
+    let reply = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+        ],
+        &[0, 1],
+    );
+    let own = view_schema().layout_digest();
+    let rows = |map| ReadSink { map, kind: SinkKind::Rows { cut: None } };
+    let walk = KeyRange::new(
+        PkColList::from_slice(&[stamp]),
+        &[],
+        Cut::before(img(0)),
+        Cut::before(img(9)),
+    );
+    let specs = [
+        (
+            ReadSpec {
+                bound: ReadBound::None,
+                predicate: vec![],
+                sink: rows(map_of(LogicalProgram::copy_cols(&[stamp]), &reply)),
+            },
+            reply.layout_digest(),
+        ),
+        (
+            ReadSpec {
+                bound: ReadBound::None,
+                predicate: between(stamp, 0, None),
+                sink: rows(None),
+            },
+            own,
+        ),
+        (ReadSpec::all_rows(ReadBound::Range(walk)), own),
+    ];
+    for (spec, layout) in specs {
+        assert!(r.delta_read(TID, 1, 2, spec, layout).is_err());
+    }
 }

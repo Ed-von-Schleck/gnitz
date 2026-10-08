@@ -833,15 +833,6 @@ impl Batch {
         out
     }
 
-    /// Every row copied into `out_schema`, whose payload space is this batch's
-    /// and whose key is this batch's less its leading bytes — as many as the two
-    /// strides differ by. Left unconsolidated: rows that differed only in the prefix now
-    /// share a key.
-    pub fn without_key_prefix(&self, out_schema: &SchemaDescriptor) -> Batch {
-        let cut = self.schema.pk_stride() - out_schema.pk_stride();
-        self.rekeyed(out_schema, |src, dst| dst.copy_from_slice(&src[cut..]))
-    }
-
     /// Every row copied into `out_schema`, whose payload space is this batch's,
     /// keyed by its leading key bytes — as many as `out_schema`'s stride. Left
     /// unconsolidated: rows may now share a key.

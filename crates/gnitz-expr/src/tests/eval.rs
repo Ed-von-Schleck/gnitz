@@ -580,11 +580,10 @@ fn int_results_widen_by_the_result_registers_signedness() {
     }
 }
 
-/// A read's filter keeps the rows passing both its predicate and its bound, and
-/// is the pass-through exactly when neither can drop a row.
+/// A read's filter keeps the rows passing both its predicate and its walk.
 #[test]
 fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
-    use gnitz_wire::{key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};
+    use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
     let schema = schema_pk_ints(1, true);
     let v_gt_3 = crate::LogicalProgram::new(
         vec![
@@ -597,17 +596,15 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     )
     .to_blob_bytes();
     let null = |row: usize| row.is_multiple_of(5);
-    let walk = |col: u32, start, end| ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
+    let walk = |col: u32, start, end| Some(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
     let p = |x| key_image(TypeCode::I64, FixedInt::I64.pack(x));
-    let key = 5u64.to_be_bytes();
     type Keep<'a> = &'a dyn Fn(usize) -> bool;
     let preds: [(&str, &[u8], Keep<'_>); 2] = [
         ("none", &[], &|_| true),
         ("v > 3", &v_gt_3, &|row| row > 3 && !null(row)),
     ];
-    let bounds: [(&str, ReadBound, Keep<'_>); 4] = [
-        ("full scan", ReadBound::None, &|_| true),
-        ("key set", ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]])), &|_| true),
+    let bounds: [(&str, Option<KeyRange>, Keep<'_>); 3] = [
+        ("full scan", None, &|_| true),
         ("pk in [3, 80]", walk(0, Cut::before(3), Cut::after(80)), &|row| {
             (2..80).contains(&row)
         }),
@@ -618,12 +615,7 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     for (pred_name, pred, pred_keeps) in preds {
         for (bound_name, bound, bound_keeps) in &bounds {
             let label = format!("{pred_name} × {bound_name}");
-            let mut f = crate::RowFilter::for_read(pred, bound, &schema).unwrap();
-            assert_eq!(
-                f.keeps_every_row(),
-                pred.is_empty() && !matches!(bound, ReadBound::Range(_)),
-                "{label}"
-            );
+            let mut f = crate::RowFilter::for_read(pred, bound.as_ref(), &schema).unwrap();
             for n in [100, 0, 10] {
                 let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null(row));
                 assert_eq!(
@@ -634,6 +626,47 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
                     "{label}: n={n}"
                 );
             }
+        }
+    }
+}
+
+/// A key set keeps the rows whose trailing key bytes it lists, whatever leads
+/// them, among the rows the predicate keeps.
+#[test]
+fn row_filter_keeps_the_rows_a_key_suffix_lists() {
+    use gnitz_wire::PkKeys;
+    let schema = TestSchema::new(
+        &[(TypeCode::U64, false), (TypeCode::U64, false), (TypeCode::I64, true)],
+        &[0, 1],
+    );
+    let v_gt_30 = crate::LogicalProgram::new(
+        vec![
+            LogicalInstr::LoadCol { col: 2 },
+            LogicalInstr::LoadConst { val: 30, unsigned: false },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        vec![Sink::Reg(Reg(2))],
+        vec![],
+    )
+    .to_blob_bytes();
+    let keys = [3u64.to_be_bytes(), 7u64.to_be_bytes()];
+    let listed = |row: usize| matches!(row % 10, 3 | 7);
+    for n in [100, 0, 10] {
+        let mut v = make_n_col_view(&schema, n, |row, _| row as i64, |_, _| false);
+        for row in 0..n {
+            v.set_native(&schema, row, 0, (row / 10) as u128);
+            v.set_native(&schema, row, 1, (row % 10) as u128);
+        }
+        for (pred, keeps) in [(&[][..], 0), (&v_gt_30[..], 31)] {
+            let set = PkKeys::from_keys(8, keys.iter().map(|k| &k[..]));
+            let mut f = crate::RowFilter::for_read(pred, None, &schema)
+                .unwrap()
+                .with_key_suffix(set);
+            assert_eq!(
+                passing_rows(&mut f, &v),
+                (0..n).map(|row| listed(row) && row >= keeps).collect::<Vec<_>>(),
+                "n={n}"
+            );
         }
     }
 }

@@ -768,3 +768,20 @@ fn a_chunked_top_k_is_the_sorted_prefix() {
         }
     }
 }
+
+/// A stream holds no rows: a read of one is refused whatever its spec.
+#[test]
+fn a_stream_is_refused() {
+    let schema = make_schema_u64_i64();
+    let r = relation_fixture(RelationKind::Stream, schema, &[], []);
+    let filtered = ReadSpec {
+        predicate: between(1, 0, Some(10)),
+        ..ReadSpec::all_rows(ReadBound::None)
+    };
+    for spec in [ReadSpec::all_rows(ReadBound::None), filtered] {
+        let Err(err) = r.scan_spec(TID, spec, schema.layout_digest(), None) else {
+            panic!("a stream read must be refused");
+        };
+        assert!(err.contains("is a stream"), "{err}");
+    }
+}

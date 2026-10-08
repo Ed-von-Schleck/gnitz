@@ -1132,7 +1132,7 @@ fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
 /// The rows of `batch` that pass every conjunct, through the wire blob a read ships.
 fn residual_rows(conjuncts: &[&BoundExpr], batch: &gnitz_core::ZSetBatch, schema: &Schema) -> Vec<usize> {
     let blob = compile_wire_conjuncts(conjuncts.iter().copied(), &schema.columns).expect("residual must compile");
-    let mut filter = RowFilter::for_read(&blob, &gnitz_wire::ReadBound::None, schema).expect("the blob resolves");
+    let mut filter = RowFilter::for_read(&blob, None, schema).expect("the blob resolves");
     let mut ranges = Vec::new();
     filter.ranges(batch, &mut ranges);
     ranges.into_iter().flat_map(|(s, e)| s..e).collect()

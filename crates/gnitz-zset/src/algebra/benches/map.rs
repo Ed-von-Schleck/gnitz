@@ -140,8 +140,9 @@ fn map_ranges_bench() {
         whole(name, plan, &batch.finish());
     }
 
-    // --- Survivor runs. A computed map gathers runs of 1 and 64 rows and maps
-    // 256-row runs in place; a projection that inherits its PK never gathers.
+    // --- Survivor runs. A map that computes, or that copies fixed-width columns
+    // alone, gathers runs under 128 rows and maps longer ones in place; a
+    // projection over a string column never gathers.
     for (name, mut plan, src, run) in [
         ("int3_r1", int3(), &int_batch, 1),
         ("int3_r64", int3(), &int_batch, 64),
@@ -150,6 +151,15 @@ fn map_ranges_bench() {
         ("upper_r64", upper(), &str_batch, 64),
         ("upper_r256", upper(), &str_batch, 256),
         ("permute_r1", permute(), &int_batch, 1),
+        ("permute_r16", permute(), &int_batch, 16),
+        ("permute_r64", permute(), &int_batch, 64),
+        ("permute_r96", permute(), &int_batch, 96),
+        ("permute_r128", permute(), &int_batch, 128),
+        ("permute_r256", permute(), &int_batch, 256),
+        ("keep_str_r1", project(&strs, &[1, 2]), &strs_batch, 1),
+        ("keep_str_r16", project(&strs, &[1, 2]), &strs_batch, 16),
+        ("keep_str_r64", project(&strs, &[1, 2]), &strs_batch, 64),
+        ("drop_str_r16", project(&strs, &[1]), &strs_batch, 16),
     ] {
         let ranges: Vec<(usize, usize)> = (0..N).step_by(run + GAP).map(|s| (s, (s + run).min(N))).collect();
         let mut keeper = Batch::empty_with_schema(plan.out_schema());

@@ -486,10 +486,10 @@ fn consolidation_certifies_rows_already_in_order() {
     }
 }
 
-/// Stamping a delta key on and off through `rekeyed` gives back every row whole:
-/// compound key, weight, NULL word, and a long string's heap span.
+/// A key prefix stamped on a batch leaves every row whole behind it: compound
+/// key, weight, NULL word, and a long string's heap span.
 #[test]
-fn a_key_prefix_round_trips() {
+fn a_key_prefix_leads_every_row_whole() {
     let view = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -520,16 +520,14 @@ fn a_key_prefix_round_trips() {
     let stamped = b.with_key_prefix(&stamped_schema, &7u64.to_be_bytes());
     assert!(stamped.consolidated);
     assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
-    let out = stamped.without_key_prefix(&view);
-    assert!(!out.consolidated);
-    assert_eq!(out.count, b.count);
+    assert_eq!(stamped.count, b.count);
     for (i, row) in rows.iter().enumerate() {
-        assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
-        assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
-        assert_eq!(out.get_null_word(i), b.get_null_word(i), "row {i}: null word");
-        assert_eq!(gnitz_wire::payload_bytes(&out, i, 0), row.3, "row {i}: string");
+        assert_eq!(&stamped.get_pk_bytes(i)[8..], b.get_pk_bytes(i), "row {i}: key");
+        assert_eq!(stamped.get_weight(i), b.get_weight(i), "row {i}: weight");
+        assert_eq!(stamped.get_null_word(i), b.get_null_word(i), "row {i}: null word");
+        assert_eq!(gnitz_wire::payload_bytes(&stamped, i, 0), row.3, "row {i}: string");
         assert_eq!(
-            out.get_col_ptr(i, 1, 8),
+            stamped.get_col_ptr(i, 1, 8),
             b.get_col_ptr(i, 1, 8),
             "row {i}: nullable cell"
         );

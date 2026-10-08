@@ -2,7 +2,7 @@
 
 use crate::test_support::{passing_ranges, runs, TestSchema, TestView};
 use crate::{ColumnTable, ExprValidateErr, RowFilter, SchemaFacts};
-use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, ReadBound, TypeCode};
+use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, TypeCode};
 
 /// A walk pinning one column and bounding the next admits exactly the rows
 /// between its cuts, every image masked to its column's width — over every key
@@ -39,7 +39,7 @@ fn every_walk_admits_exactly_the_rows_between_its_cuts() {
             for &start in &cands {
                 for &end in &cands {
                     let range = KeyRange::new(cols, &[over_wide_pin], start, end);
-                    let mut f = RowFilter::for_read(&[], &ReadBound::Range(range), &schema).unwrap();
+                    let mut f = RowFilter::for_read(&[], Some(&range), &schema).unwrap();
                     let masked = |c: Cut| Cut { image: c.image & mask, ..c };
                     let want: Vec<bool> = (0..N)
                         .map(|row| {
@@ -70,7 +70,7 @@ fn a_malformed_walk_is_refused() {
     );
     let walk = |col| {
         let range = KeyRange::point(PkColList::from_slice(&[col]), &[], 0);
-        RowFilter::for_read(&[], &ReadBound::Range(range), &schema).err()
+        RowFilter::for_read(&[], Some(&range), &schema).err()
     };
     assert!(matches!(walk(1), Some(ExprValidateErr::BadWalk(_))));
     assert!(matches!(walk(3), Some(ExprValidateErr::BadWalk(_))));

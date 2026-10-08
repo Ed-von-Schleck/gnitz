@@ -5,7 +5,7 @@
 //! the PK, weight and column moves around the computed columns
 //! `gnitz_expr::MapEval` writes.
 
-use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
+use gnitz_expr::{payload_cols, ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, DirectWriter};
@@ -23,9 +23,9 @@ struct RowWindow {
     n: usize,
 }
 
-/// Average survivor-run length below which a computing map copies its survivors
-/// into one range first: below it, the copy costs less than the kernel's setup
-/// per range.
+/// Average survivor-run length below which a map that computes, or that copies
+/// fixed-width columns alone, copies its survivors into one range first: below
+/// it, the copy costs less than the kernel's setup per range.
 const COMPACT_RUN_LEN: usize = 128;
 
 /// [`COMPACT_RUN_LEN`] for a copy-only map packing a reindex key, whose
@@ -45,6 +45,10 @@ enum PkSource {
     Pack(ReindexPacker),
     /// Hash each output row's payload columns into its PK.
     HashRow(FoldCols),
+    /// Copy the input PK less its leading bytes, as many as the two strides
+    /// differ by, into an output schema whose key is the input key's trailing
+    /// columns.
+    Suffix,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +132,28 @@ fn widen_cells<const DW: usize>(src: &[u8], src_stride: usize, off: usize, fi: F
             false => zip_cells::<W, _>(src, src_stride, off, out, |c, d| store(FI.decode_le_i64(c), d)),
         }
     });
+}
+
+/// Each `stride`-byte key of `src` less its leading bytes, into `dst`'s
+/// `width`-byte keys.
+fn copy_key_suffix(src: &[u8], stride: usize, dst: &mut [u8], width: usize) {
+    let cut = stride - width;
+    macro_rules! fixed {
+        ($($w:literal),*) => {
+            match width {
+                $($w => {
+                    let keys = dst.as_chunks_mut::<$w>().0.iter_mut();
+                    zip_cells::<$w, _>(src, stride, cut, keys, |cell, key| *key = *cell)
+                })*
+                _ => {
+                    for (key, row) in dst.chunks_exact_mut(width).zip(src.chunks_exact(stride)) {
+                        key.copy_from_slice(&row[cut..]);
+                    }
+                }
+            }
+        };
+    }
+    fixed!(4, 8, 16, 24, 32, 40, 48, 56, 64)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +295,38 @@ impl MapPlan {
             .map_err(|e| format!("map: program/schema mismatch: {e}"))
     }
 
+    /// A read's map over `in_schema`, `keyed`'s rows under a key prefix, written
+    /// in `keyed`'s own key: `map` as [`Self::from_compute_map`] reads it over
+    /// `keyed`, or every payload column as it is. `Err` unless `in_schema`'s
+    /// key ends in `keyed`'s.
+    pub(crate) fn without_key_prefix(
+        in_schema: &SchemaDescriptor,
+        keyed: &SchemaDescriptor,
+        map: Option<&gnitz_wire::ComputeMap>,
+    ) -> Result<Self, String> {
+        let prefix = in_schema
+            .pk_columns()
+            .count()
+            .saturating_sub(keyed.pk_columns().count());
+        let tail = in_schema.pk_columns().skip(prefix).map(|(_, c)| c.type_code);
+        if prefix == 0 || !tail.eq(keyed.pk_columns().map(|(_, c)| c.type_code)) {
+            return Err("map: the input key does not end in the output key".to_string());
+        }
+        let (out_schema, prog) = match map {
+            // Resolved over `keyed` first: the program names only its columns.
+            Some(m) => (
+                Self::from_compute_map(keyed, m)?.out_schema,
+                LogicalProgram::from_blob(&m.program).map_err(|e| format!("map: invalid program: {e}"))?,
+            ),
+            None => {
+                let payload: Vec<u32> = payload_cols(keyed).map(|c| c as u32).collect();
+                (*keyed, LogicalProgram::copy_cols(&payload))
+            }
+        };
+        Self::from_map(prog, in_schema, &out_schema, PkSource::Suffix)
+            .map_err(|e| format!("map: program/schema mismatch: {e}"))
+    }
+
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
@@ -355,6 +413,9 @@ impl MapPlan {
         let compact_below = match (self.ev.emits_anything(), &self.pk_source) {
             (true, _) => COMPACT_RUN_LEN,
             (false, PkSource::Pack(_)) => PACK_COMPACT_RUN_LEN,
+            // Fixed-width columns gather as cheaply as they map; a string would
+            // be relocated twice.
+            (false, _) if src.schema().string_payload_slots() == 0 => COMPACT_RUN_LEN,
             (false, _) => 0,
         };
         let starves_kernel = ranges.len() > 1 && total < ranges.len() * compact_below;
@@ -413,6 +474,16 @@ impl MapPlan {
                 let stride = packer.out_stride;
                 let pk = &mut output.pk_mut()[dst_base * stride..];
                 packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), &[(src_start, src_start + n)]);
+            }
+            PkSource::Suffix => {
+                let (in_st, out_st) = (in_batch.schema().pk_stride(), output.schema.pk_stride());
+                let src = &in_batch.pk_data()[src_start * in_st..(src_start + n) * in_st];
+                copy_key_suffix(
+                    src,
+                    in_st,
+                    &mut output.pk_mut()[dst_base * out_st..(dst_base + n) * out_st],
+                    out_st,
+                );
             }
             // Hashes the finished output row, so `append_map_ranges` stamps it
             // once every window's payload is written.

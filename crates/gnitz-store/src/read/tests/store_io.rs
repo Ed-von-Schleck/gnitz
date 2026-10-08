@@ -61,7 +61,7 @@ fn a_selective_range_walks_the_index_at_every_chunk_size() {
     for chunk in [1, 3, 7, 64, usize::MAX] {
         let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
-        assert_eq!(unapplied, ReadBound::None, "chunk {chunk}");
+        assert_eq!(unapplied, None, "chunk {chunk}");
         assert_eq!(drain_all(&mut cur, chunk), ids(50..60), "chunk {chunk}");
     }
 }
@@ -75,7 +75,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
 
     let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)), "nothing pending: the index");
-    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(unapplied, None);
     assert_eq!(drain_all(&mut cur, 7), ids(50..60));
 
     // One pending row inside the range, one outside it.
@@ -84,7 +84,11 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
 
     let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)), "rows pending: the sealed store");
-    assert_eq!(unapplied, val_range(500, 600), "the range is the caller's to apply");
+    assert_eq!(
+        unapplied.map(ReadBound::Range).unwrap(),
+        val_range(500, 600),
+        "the range is the caller's to apply"
+    );
     assert_eq!(
         drain_all(&mut cur, 7),
         ids(0..NBASE as u128),
@@ -98,7 +102,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     r.seal(TID).unwrap().expect("rows were pending");
     let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600), At::Sealed).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)), "sealed: the cuts agree again");
-    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(unapplied, None);
     assert_eq!(drain_all(&mut cur, 7), ids((50..60).chain([NBASE as u128])));
 }
 
@@ -155,14 +159,14 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     ] {
         let (mut cur, unapplied) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "{bound:?}");
-        assert_eq!(unapplied, ReadBound::None, "{bound:?}");
+        assert_eq!(unapplied, None, "{bound:?}");
         assert_eq!(drain_all(&mut cur, 64), want, "{bound:?}");
     }
 
     let scanned = |r: &RelationRegistry, bound: ReadBound| {
         let (mut cur, unapplied) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert!(matches!(cur, SourceCursor::Full(_)), "{bound:?}");
-        assert_eq!(unapplied, bound);
+        assert_eq!(unapplied.map(ReadBound::Range).unwrap(), bound);
         assert_eq!(drain_all(&mut cur, 64), ids(0..NBASE as u128), "{bound:?}");
     };
     scanned(&r, val_range(500, 630));
@@ -185,7 +189,7 @@ fn a_views_index_walk_follows_its_deltas() {
 
     let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 560), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
-    assert_eq!(unapplied, ReadBound::None);
+    assert_eq!(unapplied, None);
     assert_eq!(
         drain_all(&mut cur, 4),
         [(50, 1), (52, 1), (53, 1), (54, 1), (55, 1), (90, 2)]
@@ -228,7 +232,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
     let (mut cur, unapplied) = r.open_bound(TID, ReadBound::Range(range), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)), "a PK walk, not the index");
-    assert_eq!(unapplied, ReadBound::None, "a PK walk applies the whole range");
+    assert_eq!(unapplied, None, "a PK walk applies the whole range");
     assert_eq!(drain_all(&mut cur, 64), ids((0..3).map(|b| 5 << 64 | b)));
 }
 

@@ -3,7 +3,7 @@ use gnitz_wire::{MapKind, NullKeys};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_COLUMNS};
 use crate::test_support::{make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, weighted_rows};
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
@@ -623,4 +623,153 @@ fn compute_map_refuses_an_over_wide_declaration() {
             MAX_COLUMNS + 1
         )
     );
+}
+
+/// A key prefix stamped on a batch and dropped again by the map gives back every
+/// row whole: compound key, weight, NULL word, and a long string's heap span. A
+/// computed map over the stamped rows lands under the same key.
+#[test]
+fn a_key_prefix_round_trips() {
+    let view = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0, 1],
+    );
+    // The view's key behind an 8-byte stamp, over the same payload space.
+    let stamped_schema = crate::schema::key_prefixed_schema(SchemaColumn::new(TypeCode::U64, false), &view)
+        .expect("a key column to spare");
+    // `(key, key, weight, string, nullable)`.
+    type Row<'a> = (u64, u32, i64, &'a [u8], Option<i64>);
+    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
+    let rows: [Row; 2] = [(1, 7, 1, long, Some(5)), (2, 3, -2, b"hi", None)];
+
+    let mut b = BatchBuilder::new(&view);
+    for &(k0, k1, w, s, n) in &rows {
+        b.begin_row_natives(&[k0 as u128, k1 as u128], w);
+        b.put_blob(s);
+        b.put_opt_int(n.map(|v| v as u128));
+        b.end_row();
+    }
+    let b = b.finish();
+
+    let stamped = b.with_key_prefix(&stamped_schema, &7u64.to_be_bytes());
+    assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
+    let mut plan = MapPlan::without_key_prefix(&stamped_schema, &view, None).unwrap();
+    assert_eq!(plan.out_schema().layout_digest(), view.layout_digest());
+    let out = plan.evaluate_map_batch(&stamped);
+    assert_eq!(out.count, b.count);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
+        assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
+        assert_eq!(out.get_null_word(i), b.get_null_word(i), "row {i}: null word");
+        assert_eq!(gnitz_wire::payload_bytes(&out, i, 0), row.3, "row {i}: string");
+        assert_eq!(
+            out.get_col_ptr(i, 1, 8),
+            b.get_col_ptr(i, 1, 8),
+            "row {i}: nullable cell"
+        );
+    }
+
+    // The nullable column alone, behind the view's key.
+    let slim = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0, 1],
+    );
+    let map = gnitz_wire::ComputeMap {
+        program: LogicalProgram::copy_cols(&[3]).to_blob_bytes(),
+        out_cols: vec![(TypeCode::I64, true)],
+    };
+    let mut plan = MapPlan::without_key_prefix(&stamped_schema, &view, Some(&map)).unwrap();
+    assert_eq!(plan.out_schema().layout_digest(), slim.layout_digest());
+    let out = plan.evaluate_map_batch(&stamped);
+    for i in 0..rows.len() {
+        assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
+        assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
+        assert_eq!(out.get_col_ptr(i, 0, 8), b.get_col_ptr(i, 1, 8), "row {i}: cell");
+    }
+}
+
+/// Dropping a key prefix copies a key column of every PK type byte for byte,
+/// from behind the prefix and from beside another key column.
+#[test]
+fn a_key_prefix_drops_from_a_key_of_every_pk_type() {
+    let mut eligible = 0;
+    for code in 1..=u8::MAX {
+        let Some(tc) = TypeCode::from_wire(code).filter(|tc| tc.is_pk_eligible()) else {
+            continue;
+        };
+        eligible += 1;
+        let c = SchemaColumn::new;
+        let view = SchemaDescriptor::new(
+            &[c(TypeCode::I64, true), c(tc, false), c(TypeCode::U16, false)],
+            &[2, 1],
+        );
+        let stamped_schema = crate::schema::key_prefixed_schema(c(TypeCode::U64, false), &view).unwrap();
+        let ones = u128::MAX >> (128 - 8 * tc.wire_stride());
+        let mut b = BatchBuilder::new(&view);
+        for (i, native) in [0, 1, ones, ones >> 1, ones ^ (ones >> 1)].into_iter().enumerate() {
+            // A Bool holds 0 or 1.
+            let native = if tc == TypeCode::Bool { native & 1 } else { native };
+            b.begin_row_natives(&[i as u128, native], 1 + i as i64);
+            b.put_opt_int(Some(i as u128));
+            b.end_row();
+        }
+        let b = b.finish();
+        let stamped = b.with_key_prefix(&stamped_schema, &9u64.to_be_bytes());
+        let out = MapPlan::without_key_prefix(&stamped_schema, &view, None)
+            .unwrap()
+            .evaluate_map_batch(&stamped);
+        assert_eq!(weighted_rows(&out), weighted_rows(&b), "{tc}");
+        assert_eq!(out.pk_data(), b.pk_data(), "{tc}");
+    }
+    assert!(eligible >= 10, "the sweep found {eligible} PK types");
+}
+
+/// The key copy has an arm per common width: each lands the trailing key
+/// columns byte for byte, over one range and over several.
+#[test]
+fn a_key_prefix_drops_from_keys_of_every_copy_width() {
+    use TypeCode::{U128, U16, U32, U64};
+    for key in [
+        &[U64][..],
+        &[U128],
+        &[U64, U64, U64],
+        &[U128, U64],
+        &[U64; 4],
+        &[U128, U128],
+        &[U32],
+        &[U128, U128, U64, U16],
+    ] {
+        let c = SchemaColumn::new;
+        let mut cols: Vec<SchemaColumn> = key.iter().map(|&tc| c(tc, false)).collect();
+        cols.push(c(TypeCode::I64, false));
+        let pk: Vec<u32> = (0..key.len() as u32).collect();
+        let view = SchemaDescriptor::new(&cols, &pk);
+        let stamped_schema = crate::schema::key_prefixed_schema(c(U64, false), &view).unwrap();
+        let mut b = BatchBuilder::new(&view);
+        for i in 0..40u128 {
+            let natives: Vec<u128> = (0..key.len() as u128).map(|k| i << 3 | k).collect();
+            b.begin_row_natives(&natives, 1 + i as i64);
+            b.put_int(i);
+            b.end_row();
+        }
+        let b = b.finish();
+        let stamped = b.with_key_prefix(&stamped_schema, &9u64.to_be_bytes());
+        let mut plan = MapPlan::without_key_prefix(&stamped_schema, &view, None).unwrap();
+        assert_eq!(plan.evaluate_map_batch(&stamped).pk_data(), b.pk_data(), "{key:?}");
+        let ranges = [(1, 2), (5, 30), (39, 40)];
+        let mut out = Batch::empty_with_schema(&view);
+        plan.append_map_ranges(&stamped, &mut out, &ranges);
+        let want = Batch::from_ranges(&b, &ranges, 0);
+        assert_eq!(out.pk_data(), want.pk_data(), "{key:?}: ranges");
+        assert_eq!(weighted_rows(&out), weighted_rows(&want), "{key:?}: ranges");
+    }
 }

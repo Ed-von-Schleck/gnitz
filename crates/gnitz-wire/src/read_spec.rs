@@ -164,15 +164,12 @@ impl PkKeys {
         &self.bytes
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
     pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
         self.bytes.chunks_exact(self.stride())
     }
 
     /// Whether `key`, of this list's stride, is one of its keys.
+    #[inline]
     pub fn contains(&self, key: &[u8]) -> bool {
         debug_assert_eq!(key.len(), self.stride());
         let (mut lo, mut hi) = (0, self.len());
