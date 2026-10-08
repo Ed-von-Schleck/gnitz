@@ -41,7 +41,7 @@ pub struct ControlHeader {
 /// The relation a request names: its id, and the token of the RESOLVE answer
 /// the request was built from — `0` for a request built from none, which is what
 /// a bare id converts to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
     pub tid: u64,
     pub token: u64,

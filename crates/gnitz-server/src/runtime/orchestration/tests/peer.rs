@@ -1,7 +1,7 @@
 //! Corked egress: what waits in `Peer`'s accumulator, what it leaves behind, and
 //! how a finished connection refuses it.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use super::*;
@@ -141,4 +141,53 @@ fn next_request_ships_before_parking() {
         frame,
         "the corked frame left before the park"
     );
+}
+
+/// A queued train is shipped whole and in queue order behind what the cork
+/// already holds — a small one corked, a large one sent alone — and counted
+/// until the connection's next sync is answered.
+#[test]
+fn a_queued_train_is_shipped_whole_behind_the_reply() {
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let peer = Rc::new(Peer::new(&r, conn, None));
+    let out = peer.outbox();
+    let large = COALESCE_MAX_BYTES / 2 + 1;
+    out.send(vec![0x10; 8], Rc::new(vec![0x11; 100]));
+    out.send(vec![0x20; 8], Rc::new(vec![0x21; large]));
+    assert_eq!(out.unsynced(), 116 + large);
+
+    peer.cork(b"reply");
+    let shipping = Rc::clone(&peer);
+    let reader = receiver.try_clone().unwrap();
+    let wire = std::thread::spawn(move || {
+        let mut wire = vec![0u8; 121 + large];
+        (&reader).read_exact(&mut wire).expect("the reply and both trains");
+        wire
+    });
+    r.block_on(async move { shipping.ship_pushed().await.expect("an open peer") });
+    assert_eq!(
+        (out.unsynced(), peer.corked_len()),
+        (116 + large, 0),
+        "a ship is no sync"
+    );
+    out.synced();
+    assert_eq!(out.unsynced(), 0);
+    let want = [&b"reply"[..], &[0x10; 8], &[0x11; 100], &[0x20; 8], &vec![0x21; large]].concat();
+    assert!(
+        wire.join().unwrap() == want,
+        "the large train left behind what was corked"
+    );
+
+    // A small train waits in the cork for a flush.
+    out.send(vec![0x30; 8], Rc::new(vec![0x31; 100]));
+    let shipping = Rc::clone(&peer);
+    r.block_on(async move { shipping.ship_pushed().await.expect("an open peer") });
+    assert_eq!(peer.corked_len(), 108);
+    assert!(
+        read_nonblocking(&receiver, 1024).is_none(),
+        "nothing leaves before a flush"
+    );
+    r.block_on(async move { peer.flush_egress().await.expect("an open peer") });
+    let wire = read_nonblocking(&receiver, 1024).unwrap_or_default();
+    assert_eq!(wire, [&[0x30; 8][..], &[0x31; 100]].concat());
 }

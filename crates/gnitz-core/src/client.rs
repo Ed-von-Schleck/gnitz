@@ -4,7 +4,7 @@ use crate::connection::{
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, RelName, Schema, ZSetBatch};
-use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_expr::ColumnTable;
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
@@ -492,6 +492,8 @@ pub struct GnitzClient {
     /// The local copy this client reads through, if a host attached one. Boxed,
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
+    /// The subscriptions this connection holds, a mirror's and a reader's own.
+    pub(crate) subs: crate::pushed::Subscriptions,
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     kept: HashMap<RelName, Arc<RelDescriptor>>,
@@ -547,6 +549,7 @@ impl GnitzClient {
             serial_cache: HashMap::new(),
             txn: None,
             mirror: None,
+            subs: Default::default(),
             kept: HashMap::new(),
         })
     }
@@ -559,7 +562,7 @@ impl GnitzClient {
 
     // ── Waiting ────────────────────────────────────────────────────────────
 
-    fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
+    pub(crate) fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
         let sent = self.session.submit(req);
         Pending::submitted(self, sent)
     }
@@ -741,6 +744,7 @@ impl GnitzClient {
             serial_cache,
             txn: _,
             mirror,
+            subs: _,
             kept,
         } = self;
         host.attach(fresh.as_fd())?;
@@ -767,7 +771,7 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        self.delta_read(view.into(), None, Duration::ZERO, reply_schema, spec)
+        self.delta_read(view.into(), None, reply_schema, spec)
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -779,18 +783,16 @@ impl GnitzClient {
     /// by another boot, relation or `spec` — is refused as `DeltaExpired`:
     /// discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
-    /// It carries every push acknowledged before it. With nothing to report, the
-    /// server holds the reply until a round leaves the view a row `spec` keeps,
-    /// or `wait` passes.
+    /// It carries every push acknowledged before it, and is answered at once:
+    /// only a mirror's poll waits for a view to change.
     pub fn delta_poll(
         &mut self,
         view: impl Into<Target>,
         cursor: DeltaCursor,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-        wait: Duration,
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        self.delta_read(view.into(), Some(cursor), wait, reply_schema, spec)
+        self.delta_read(view.into(), Some(cursor), reply_schema, spec)
     }
 
     /// One view's delta read after `from`, the view whole with none.
@@ -798,19 +800,11 @@ impl GnitzClient {
         &mut self,
         view: Target,
         from: Option<DeltaCursor>,
-        wait: Duration,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let (tag, after_tick) = DeltaCursor::flat(from);
-        let item = DeltaPollItem {
-            view,
-            tag,
-            after_tick,
-            reply_layout: reply_schema.layout_digest(),
-            spec,
-        };
-        let sent = self.session.submit_delta_read(item, wait, reply_schema);
+        let item = DeltaCursor::item(from, view, reply_schema, spec);
+        let sent = self.session.submit_delta_read(item, reply_schema);
         Pending::submitted(self, sent)
     }
 
@@ -1507,8 +1501,8 @@ impl Drop for DeltaPoll<'_> {
 }
 
 impl<'s> DeltaPoll<'s> {
-    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem], wait: Duration) -> Self {
-        session.submit_delta_poll(items, wait);
+    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem]) -> Self {
+        session.submit_delta_poll(items);
         DeltaPoll { session, total: items.len(), answered: 0 }
     }
 

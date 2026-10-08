@@ -40,6 +40,29 @@ wire_enum! {
         /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
+        /// Subscribe this connection to fed views, each from a cursor a delta
+        /// read handed out: a `DELTA_POLL`'s frame, whose prologue `arg0` is
+        /// the first of the subscription ids the client chose — item `i` asks
+        /// for `arg0 + i`, and an id the connection holds is replaced. An item
+        /// reading its view whole (tick `0`) is refused.
+        ///
+        /// The rounds after an item's cursor that leave its view a row the
+        /// spec keeps are then sent as pushed trains ([`WireFlags::pushed`]),
+        /// each behind the reply of a request the connection makes. A train
+        /// ending in a fault ends its subscription, and is how an item is
+        /// refused: the ACK says only that the frame was read.
+        Subscribe = 11,
+        /// End subscription `arg0`. An id this connection does not hold is
+        /// ACKed too.
+        Unsubscribe = 12,
+        /// Answer once every subscription of this connection has been sent
+        /// every push acknowledged before this request, the trains ahead of
+        /// the ACK. With no train sent since the last one, the reply is held
+        /// up to `arg0` milliseconds. The ACK's `arg0`
+        /// is a round every subscription the connection still holds has been
+        /// sent through — what the cursor of one sent no train moves to — or
+        /// `0` with none.
+        SyncPushed = 13,
     }
 }
 
@@ -66,13 +89,17 @@ pub struct WireFlags {
     pub scan_last: bool,
     /// Bits 36-37: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
+    /// Bit 38: this frame opens a pushed train — one no request is answered
+    /// by — of the subscription `arg0`. The train is the frames after it, to
+    /// the first without `continuation`: a delta read's terminal, or a fault.
+    pub pushed: bool,
 }
 
 pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
 pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
 
-/// Bits 16-31 and 38-63: no field.
-const RESERVED_BITS: u64 = !crate::low_bits_mask(38) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
+/// Bits 16-31 and 39-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(39) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
@@ -84,6 +111,7 @@ impl WireFlags {
             continuation: true,
             scan_last: last,
             probe_mode: WireProbeMode::Pk,
+            pushed: false,
         }
     }
 
@@ -93,6 +121,7 @@ impl WireFlags {
             | (self.continuation as u64) << 34
             | (self.scan_last as u64) << 35
             | (self.probe_mode as u64) << 36
+            | (self.pushed as u64) << 38
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -108,6 +137,7 @@ impl WireFlags {
             continuation: bit(34),
             scan_last: bit(35),
             probe_mode: WireProbeMode::from_wire(((w >> 36) & 3) as u8).ok_or("flags: unknown probe mode")?,
+            pushed: bit(38),
         })
     }
 }

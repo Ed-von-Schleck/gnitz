@@ -5,6 +5,7 @@ import time
 
 from _catalog import schema_id
 from _feedviews import FEED, Subscriber, later
+from _read import rows
 
 
 def _ddl_feed(client):
@@ -44,16 +45,23 @@ def test_a_poll_after_a_ddl_returns_that_ddls_rows_at_their_weights(client):
     sub.assert_converged("after a create")
 
 
-def test_a_waiting_poll_is_released_by_a_ddl(client, server):
-    sub = _ddl_feed(client)
+def test_a_waiting_poll_is_released_by_a_ddl(client, mirror, server):
+    sid = schema_id(client)
+    client.execute_sql(
+        f"CREATE VIEW ddl_feed WITH (delta = '{FEED}') AS "
+        f"SELECT table_id, name FROM _system.tables WHERE schema_id = {sid}")
+    mirror.mirror_view("ddl_feed")
+    mirror.poll()
+    names = lambda: sorted(r.name for r in rows(mirror, "SELECT name FROM ddl_feed"))
+    assert names() == []
+
     t0 = time.monotonic()
-    assert len(sub.poll(wait=0.3)) == 0
+    mirror.poll(wait=0.3)
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
 
     writer = later(server, client.schema, 0.2, "CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
     t0 = time.monotonic()
-    got = sub.poll(wait=60)
+    mirror.poll(wait=60)
     assert time.monotonic() - t0 < 20, "the DDL released it, not the wait"
     writer.join()
-    assert _names(got) == {"late": 1}
-    sub.assert_converged("after the waiting poll")
+    assert names() == ["late"]

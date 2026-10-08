@@ -10,6 +10,7 @@ mod connection;
 mod error;
 mod mirror;
 mod protocol;
+mod pushed;
 mod rel_name;
 #[cfg(test)]
 mod test_support;
@@ -33,4 +34,5 @@ pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
 pub use protocol::wal_block::append_own_regions;
+pub use pushed::{Pushed, SyncMark};
 pub use rel_name::RelName;

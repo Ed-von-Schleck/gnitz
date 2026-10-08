@@ -149,6 +149,21 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
     crate::encode_frame(hdr, &[], None, None)
 }
 
+/// The frame that opens a pushed train of subscription `sub` to `view`.
+pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
+    let hdr = gnitz_wire::control::ControlHeader {
+        target_id: view,
+        arg0: sub,
+        flags: gnitz_wire::WireFlags {
+            pushed: true,
+            continuation: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    crate::encode_frame(hdr, &[], None, None)
+}
+
 /// A fault frame naming `tid`, with `text` as its body.
 pub(crate) fn reply_status(tid: u64, status: WireStatus, text: &str) -> Vec<u8> {
     let hdr = gnitz_wire::control::ControlHeader {

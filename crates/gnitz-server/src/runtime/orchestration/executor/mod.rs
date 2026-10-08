@@ -1,14 +1,20 @@
 //! Server executor: the process lifecycle, the `Shared` state, the request
 //! router and every read/push handler, and the reply-frame vocabulary. The
-//! catalog-zone write path is the child `ddl`.
+//! catalog-zone write path is the child `ddl`; the delta feed's readers are
+//! the child `delta`.
 //!
 //! The master owns one `Reactor`: `ServerExecutor::run` spawns its tasks on it
 //! and races the signal loop against a worker's death.
 //!
 //! A request handler rejects by returning `Err`, and the router sends it: no
 //! handler writes a fault frame for its request as a whole.
+//!
+//! One connection's replies leave in request order, written by its own task.
+//! The one thing another task sends a client is a pushed train, and it only
+//! queues it: the connection's task ships it between two replies.
 
 mod ddl;
+mod delta;
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, OwnedFd};
@@ -21,6 +27,7 @@ use super::guard_panic;
 use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
+use self::delta::{handle_delta_poll, handle_subscribe, handle_sync_pushed, Feeds, Subscriptions};
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
@@ -31,23 +38,14 @@ use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadG
 use crate::runtime::sal::{DirectGroup, Read};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_wire::control::{ControlHeader, DecodedControl, Target};
-use gnitz_wire::txn_frame::DeltaPollItem;
+use gnitz_wire::control::{DecodedControl, Target};
 use gnitz_wire::{ReadBound, ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 
-/// Views one DELTA_POLL reads at one SAL cut: the ceiling on the leases and
-/// reply trains a poll puts on the master at a time. A poll naming more is
-/// answered a slice at a time.
-const DELTA_POLL_CUT_VIEWS: usize = 64;
-
-/// The longest a DELTA_POLL is held, whatever wait it asks for.
-const DELTA_POLL_MAX_WAIT: Duration = Duration::from_secs(3600);
-
-/// The least time between a tick and one only waiting polls ask for: such a
-/// poll is re-issued the moment it is answered, so unpaced it would tick per
+/// The least time between a tick and one only waiting syncs ask for: such a
+/// sync is re-issued the moment it is answered, so unpaced it would tick per
 /// commit.
 const PATIENT_TICK_GAP: Duration = Duration::from_millis(10);
 
@@ -105,7 +103,7 @@ enum TickTrigger {
     /// success would serve stale rows under `WireStatus::Ok`.
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
-        /// Asked for by a waiting poll: held to [`PATIENT_TICK_GAP`] unless a
+        /// Asked for by a waiting sync: held to [`PATIENT_TICK_GAP`] unless a
         /// trigger that is not joins the batch.
         patient: bool,
     },
@@ -126,41 +124,41 @@ fn request_barrier(shared: &Shared, kind: BarrierKind) -> oneshot::Receiver<()> 
     rx
 }
 
-/// The DELTA_POLLs held back with nothing to report, each with the relations
+/// The SYNC_PUSHEDs held back with nothing to report, each with the relations
 /// whose change ends its wait.
 #[derive(Default)]
-struct PollWaiters {
+struct SyncWaiters {
     next_id: Cell<u64>,
-    parked: RefCell<Vec<ParkedPoll>>,
+    parked: RefCell<Vec<ParkedSync>>,
 }
 
-struct ParkedPoll {
+struct ParkedSync {
     id: u64,
     watched: FxHashSet<u64>,
     wake: oneshot::Sender<()>,
 }
 
-/// One poll's place among the [`PollWaiters`], given up on drop.
+/// One sync's place among the [`SyncWaiters`], given up on drop.
 struct Parked<'a> {
-    waiters: &'a PollWaiters,
+    waiters: &'a SyncWaiters,
     id: u64,
     woken: oneshot::Receiver<()>,
 }
 
-impl PollWaiters {
+impl SyncWaiters {
     fn park(&self, watched: FxHashSet<u64>) -> Parked<'_> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let (wake, woken) = oneshot::channel();
-        self.parked.borrow_mut().push(ParkedPoll { id, watched, wake });
+        self.parked.borrow_mut().push(ParkedSync { id, watched, wake });
         Parked { waiters: self, id, woken }
     }
 
-    /// Wake every poll watching `relation`.
+    /// Wake every sync watching `relation`.
     fn wake(&self, relation: u64) {
         let mut parked = self.parked.borrow_mut();
-        for poll in parked.extract_if(.., |p| p.watched.contains(&relation)) {
-            poll.wake.send(());
+        for sync in parked.extract_if(.., |p| p.watched.contains(&relation)) {
+            sync.wake.send(());
         }
     }
 }
@@ -189,7 +187,13 @@ pub struct Shared {
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
     tick_rows: RefCell<FxHashMap<u64, usize>>,
-    poll_waiters: PollWaiters,
+    sync_waiters: SyncWaiters,
+    feeds: Feeds,
+    /// The most bytes of pushed trains sent one connection between two of its
+    /// SYNC_PUSHEDs, and so the most its client holds unread
+    /// (`GNITZ_PUSH_QUEUE_BYTES`). A subscription whose train would pass it
+    /// is ended, and continues by polling.
+    push_queue_bytes: usize,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
@@ -309,7 +313,7 @@ impl Shared {
             let e = map.entry(tid).or_default();
             *e = (*e).max(lsn);
             // After the raise, which is what a woken poll reads as staleness.
-            self.poll_waiters.wake(tid);
+            self.sync_waiters.wake(tid);
         }
         Ok(lsn)
     }
@@ -341,7 +345,7 @@ impl Shared {
     /// Every per-relation master state a drop must reclaim is cleared here: ids
     /// are never reused, so nothing else would ever reclaim it.
     fn forget_relation(&self, _catalog_write: &WriteGuard, id: u64) {
-        self.poll_waiters.wake(id);
+        self.sync_waiters.wake(id);
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
         self.disp().forget_relation(id);
@@ -418,7 +422,9 @@ impl ServerExecutor {
             tick_tx,
             last_tick_lsn: Cell::new(boot_seed),
             tick_rows: RefCell::new(FxHashMap::default()),
-            poll_waiters: PollWaiters::default(),
+            sync_waiters: SyncWaiters::default(),
+            feeds: Feeds::default(),
+            push_queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Cell::new(false),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
@@ -505,9 +511,14 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
         return;
     }
 
+    let mut subs = Subscriptions::default();
     while let Some(buf) = peer.next_request().await {
-        handle_message(peer, buf, shared).await;
+        handle_message(peer, &mut subs, buf, shared).await;
+        // Behind the reply, where a pushed train splits none. A client that
+        // is gone is found out by the next request.
+        let _ = peer.ship_pushed().await;
     }
+    subs.leave(&shared.feeds, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +681,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
+async fn handle_message(peer: &Peer, subs: &mut Subscriptions, buf: RecvBuf, shared: &Rc<Shared>) {
     // ONE control-header parse for the whole request: routing, the schema-hint
     // decision and the push decode all read this same parse.
     let ctrl = match gnitz_wire::control::peek_control_block(buf.as_slice()) {
@@ -681,7 +692,7 @@ async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
         }
     };
     let target_id = ctrl.hdr.target_id;
-    if let Err(f) = dispatch_request(peer, buf, ctrl, shared).await {
+    if let Err(f) = dispatch_request(peer, subs, buf, ctrl, shared).await {
         send_fault(peer, target_id, &f);
     }
 }
@@ -691,6 +702,7 @@ async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
 /// position of a streamed reply is the handler's own to send.
 async fn dispatch_request(
     peer: &Peer,
+    subs: &mut Subscriptions,
     buf: RecvBuf,
     ctrl: gnitz_wire::control::DecodedControl,
     shared: &Rc<Shared>,
@@ -701,6 +713,7 @@ async fn dispatch_request(
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
+        ClientVerb::Subscribe => handle_subscribe(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
         ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &data[ctrl.body]).await,
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl.hdr, &data[ctrl.body]).await,
@@ -735,6 +748,14 @@ async fn dispatch_request(
         }
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
+
+        ClientVerb::Unsubscribe => {
+            subs.leave(&shared.feeds, Some(ctrl.hdr.arg0));
+            send_ack(peer, target_id, 0);
+            Ok(())
+        }
+
+        ClientVerb::SyncPushed => handle_sync_pushed(shared, peer, subs, ctrl.hdr.arg0).await,
     }
 }
 
@@ -1171,233 +1192,6 @@ async fn handle_scan_spec(
     let result = fan_out_scan(shared, peer, g, kind, read).await;
     finish_scan_fanout(peer, target_id, 0, result);
     Ok(())
-}
-
-/// What one view of a poll is answered with.
-enum PollPosition {
-    /// The view cannot be read at all.
-    Fault(WireFault),
-    /// The view is already at its last round, so its terminal is master-local.
-    UpToDate,
-    /// The view moved, and takes the next dispatch of the poll's cut.
-    Moved,
-}
-
-/// Where a poll of `item` stands.
-fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
-    let tid = item.view.tid;
-    match target_kind(shared, item.view, Access::UserRead) {
-        Err(f) => PollPosition::Fault(f),
-        // A relation with no feed handed out no cursor to compare.
-        Ok(kind)
-            if kind.has_delta_feed()
-                && item.after_tick > 0
-                && item.tag != shared.disp().delta_cursor_tag(tid, item.spec) =>
-        {
-            PollPosition::Fault(WireFault {
-                status: WireStatus::DeltaExpired,
-                text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
-            })
-        }
-        Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
-        Ok(_) => PollPosition::Moved,
-    }
-}
-
-/// DELTA_POLL: advance N mirrored views in one request, holding the reply up to
-/// its wait while none of them has anything to report.
-///
-/// A view the rounds since its cursor left no rows for has nothing to report,
-/// whether no round reached it or its spec kept none of them. Where no view has
-/// anything and wait is left, the poll parks again behind the rounds it read.
-/// The cursor that moves across a park is this handler's own: the client's is
-/// the one the terminal finally carries.
-///
-/// An `Err` rejects the frame, at `target_id = 0`; a per-view failure is not an
-/// `Err` — it goes out as that view's own fault frame, and the rest of the poll
-/// continues.
-async fn handle_delta_poll(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    prologue: &ControlHeader,
-    body: &[u8],
-) -> Result<(), WireFault> {
-    let (wait_ms, mut views) =
-        gnitz_wire::txn_frame::decode_delta_poll(prologue, body).map_err(|e| format!("decode error: {e}"))?;
-    let deadline = Instant::now() + Duration::from_millis(wait_ms).min(DELTA_POLL_MAX_WAIT);
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let (lock, may_hold) = delta_poll_lock(shared, peer, &views, left).await?;
-        let Some(rounds) = delta_poll_pass(shared, peer, &views, lock, may_hold).await? else {
-            return Ok(());
-        };
-        // No row of a view lies between its cursor and the round it was read
-        // through, so that round is where the next pass reads it from.
-        for (view, round) in views.iter_mut().zip(rounds) {
-            view.tag = shared.disp().delta_cursor_tag(view.view.tid, view.spec);
-            view.after_tick = round;
-        }
-    }
-}
-
-/// Answer `views` once, the first slice under `lock`. With `may_hold`, a view
-/// with nothing to report has its terminal kept back until one that has
-/// something releases it; where none has, no terminal goes out and the round
-/// each view was read through is returned. `None` once the poll is answered, or
-/// the client is gone.
-async fn delta_poll_pass(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    views: &[DeltaPollItem<'_>],
-    lock: ReadGuard,
-    may_hold: bool,
-) -> Result<Option<Vec<u64>>, WireFault> {
-    let disp = shared.disp();
-    let terminal = |item: &DeltaPollItem, result: Result<u64, WireFault>| {
-        let tag = disp.delta_cursor_tag(item.view.tid, item.spec);
-        finish_scan_fanout(peer, item.view.tid, tag, result);
-    };
-    // The poll drained once, for `lock`; a later slice takes the lock alone.
-    let mut first_lock = Some(lock);
-    // The round each view so far was read through, while every one of them had
-    // nothing to report. `None` once a terminal has gone out.
-    let mut held: Option<Vec<u64>> = may_hold.then(Vec::new);
-
-    // One slice at a time: one catalog lock and — for however many of its views
-    // moved — one broadcast.
-    for slice in views.chunks(DELTA_POLL_CUT_VIEWS) {
-        // ── Phase 1: classify under the catalog lock, dispatch one cut ─────
-        // No await between a view's position and the round an up-to-date one
-        // reports, so no tick lands in between.
-        let catalog = match first_lock.take() {
-            Some(g) => g,
-            None => shared.catalog_rwlock.read().await,
-        };
-        let positions: Vec<PollPosition> = slice.iter().map(|&v| poll_position(shared, &catalog, v)).collect();
-        let up_to_date_round = disp.last_tick_round();
-        let moved = || {
-            let judged = slice.iter().zip(&positions);
-            judged.filter_map(|(v, p)| matches!(p, PollPosition::Moved).then_some(v))
-        };
-        let mut dispatch_round = 0;
-        let dispatches = if moved().next().is_none() {
-            Vec::new()
-        } else {
-            disp.scan_cut(|cut| {
-                dispatch_round = disp.last_tick_round();
-                for item in moved() {
-                    cut.read(DirectGroup::new(Read::delta(
-                        item.view.tid,
-                        item.after_tick,
-                        dispatch_round,
-                        item.spec,
-                        item.reply_layout,
-                    )))?;
-                }
-                Ok(())
-            })
-            .await?
-        };
-        // Phase 2 reads no catalog state, and holding the lock across the
-        // forward would block DDL.
-        drop(catalog);
-
-        // ── Phase 2: one terminal per view, in request order ───────────────
-        // Taken in step with the `Moved`s that were pushed. A dispatch left
-        // undrained — an earlier return dropped it — discards the rest of its
-        // train at the ring boundary.
-        let mut dispatches = dispatches.into_iter();
-        for (item, position) in slice.iter().zip(positions) {
-            let mut lease = None;
-            // The round the view's terminal carries, and the first frame of
-            // its rows.
-            let report = match position {
-                PollPosition::Fault(fault) => Err(fault),
-                PollPosition::UpToDate => Ok((up_to_date_round, None)),
-                PollPosition::Moved => {
-                    let lease = lease.insert(dispatches.next().expect("one dispatch per moved view"));
-                    // A train with no rows is read to its end here, so it pins
-                    // nothing of the ring while a later view's is read.
-                    lease.next().await.map(|first| (dispatch_round, first))
-                }
-            };
-            if let (Some(held), Ok((round, None))) = (&mut held, &report) {
-                held.push(*round);
-                continue;
-            }
-            for (view, round) in views.iter().zip(held.take().into_iter().flatten()) {
-                terminal(view, Ok(round));
-            }
-            let result = match (report, &lease) {
-                (Ok((round, Some(first))), Some(lease)) => match peer.send(first.slot).await {
-                    Ok(()) => forward_scan(peer, lease).await.map(|()| round),
-                    Err(_) => return Ok(None),
-                },
-                (report, _) => report.map(|(round, _)| round),
-            };
-            terminal(item, result);
-            // Carry no more than the budget into the next view, and learn here
-            // rather than at the end if the client is gone.
-            if peer.flush_if_full().await.is_err() {
-                return Ok(None);
-            }
-        }
-    }
-    Ok(held)
-}
-
-/// The catalog read lock a poll of `views` is answered under, and whether a
-/// view with nothing to report may still be held: behind a drain when a commit
-/// reaching one of them has not been ticked, and, with a `wait`, after holding
-/// the poll while none of them has anything to report — until a relation one
-/// of them reads changes, `wait` passes, or the client sends its next request
-/// or goes. Only the first of those leaves the poll one that may be held on.
-async fn delta_poll_lock(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    views: &[DeltaPollItem<'_>],
-    wait: Duration,
-) -> Result<(ReadGuard, bool), WireFault> {
-    let ids = || views.iter().map(|v| v.view.tid);
-    let waiting = !wait.is_zero();
-    let g = fresh_read_lock(shared, ids(), waiting).await?;
-    if !waiting {
-        return Ok((g, false));
-    }
-    // No await from the test to the park, so no commit is acknowledged between
-    // them. The drain above was one: a commit it did not take is un-ticked here.
-    let mut watched = shared.cat().dag.source_closure(ids());
-    let quiet = all_ticked(shared, &watched)
-        && views
-            .iter()
-            .all(|&v| matches!(poll_position(shared, &g, v), PollPosition::UpToDate));
-    if !quiet {
-        return Ok((g, true));
-    }
-    // A commit or a drop reaches a view through the view or anything it reads.
-    watched.extend(ids());
-    let mut parked = shared.poll_waiters.park(watched);
-    drop(g);
-    let released = select2(shared.disp().reactor().sleep(wait), peer.next_request_ready());
-    let woken = matches!(select2(&mut parked.woken, released).await, Either::A(_));
-    drop(parked);
-    Ok((fresh_read_lock(shared, ids(), true).await?, woken))
-}
-
-/// Whether a delta read after `after_tick` already sits at the view's last round,
-/// so it can be answered without reaching a worker — the steady state of a
-/// subscription, where a fan-out per poll would cost W wakeups.
-///
-/// `false` at `after_tick = 0` (the bootstrap bound) and for a relation with no
-/// feed: both must reach the store, the second to be refused there.
-fn delta_up_to_date(shared: &Shared, target_id: u64, after_tick: u64) -> bool {
-    after_tick > 0
-        && shared
-            .cat()
-            .registry
-            .relation(target_id)
-            .is_some_and(|r| r.kind().has_delta_feed())
-        && after_tick >= shared.disp().last_delta_round(target_id)
 }
 
 /// One relation's Phase-1 capture for `handle_scan_multi`, carried to the

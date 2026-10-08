@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{framed, kv_rows, kv_schema, reply_ctrl, reply_status, session_pair as pair};
+use crate::test_support::{framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair};
 use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
 
@@ -455,7 +455,7 @@ fn delta_terminal(view: u64, tick: u64) -> Vec<u8> {
 fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        s.submit_delta_poll(&[delta_item(7), delta_item(8), delta_item(9)], Duration::ZERO);
+        s.submit_delta_poll(&[delta_item(7), delta_item(8), delta_item(9)]);
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -495,9 +495,9 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
 #[test]
 fn an_abandoned_poll_queues_nothing() {
     let (mut s, peer) = pair();
-    s.submit_delta_poll(&[delta_item(7)], Duration::ZERO);
+    s.submit_delta_poll(&[delta_item(7)]);
     s.abandon_poll();
-    s.submit_delta_poll(&[delta_item(8)], Duration::ZERO);
+    s.submit_delta_poll(&[delta_item(8)]);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {
@@ -522,7 +522,7 @@ fn an_abandoned_poll_queues_nothing() {
 
 /// A read of view 7's delta feed after `(tag 1, tick 4)`.
 fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
-    s.submit_delta_read(delta_item(7), Duration::ZERO, schema).unwrap()
+    s.submit_delta_read(delta_item(7), schema).unwrap()
 }
 
 #[test]
@@ -600,4 +600,101 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
         );
         assert!(s.is_closed(), "{what}");
     }
+}
+
+// ── Pushed trains ────────────────────────────────────────────────────────────
+
+/// One pushed train of subscription `sub`: its opening frame, one block of
+/// `rows` and the terminal at `(tag 1, round)`.
+fn pushed_train(view: u64, sub: u64, rows: &[u64], round: u64) -> Vec<u8> {
+    let mut out = framed(&pushed_marker(view, sub));
+    out.extend(framed(&reply_rows(view, &batch_a(rows), 0, true)));
+    out.extend(framed(&delta_terminal(view, round)));
+    out
+}
+
+/// The cursor `(tag 1, tick)`.
+fn cursor(tick: u64) -> DeltaCursor {
+    DeltaCursor::from_pair(1, tick).unwrap()
+}
+
+/// Ask for subscription `sub` to view 40, from round 3.
+fn subscribe(s: &mut Session, sub: u64) {
+    let item = DeltaCursor::item(Some(cursor(3)), 40.into(), &schema_a(), &[]);
+    s.subscribe(sub, &[item]).unwrap();
+}
+
+/// A pushed train between two replies is set aside whole for the subscription
+/// it is of, and each reply still reaches the request it answers. A train of a
+/// subscription the session does not hold is dropped.
+#[test]
+fn a_pushed_train_between_replies_is_set_aside() {
+    let (mut s, peer) = pair();
+    subscribe(&mut s, 5);
+    let first = s.submit(COMMIT).unwrap();
+    let second = s.submit(COMMIT).unwrap();
+    let mut bytes = framed(&reply_ctrl(0, 0));
+    bytes.extend(framed(&reply_ctrl(0, 1)));
+    bytes.extend(pushed_train(40, 5, &[1, 2], 9));
+    bytes.extend(pushed_train(40, 6, &[3], 9));
+    bytes.extend(pushed_train(40, 5, &[4], 11));
+    bytes.extend(framed(&reply_ctrl(0, 2)));
+    peer.send_bytes(&bytes);
+    assert_eq!(await_reply(&mut s, first).unwrap(), 1);
+    assert_eq!(await_reply(&mut s, second).unwrap(), 2);
+    let (blocks, next) = s.take_pushed(5, cursor(3), 0).unwrap();
+    assert_eq!((blocks.len(), next), (2, cursor(11)), "its trains as one, in order");
+    // Handed out once; a subscription sent nothing moves to the round synced.
+    let (blocks, next) = s.take_pushed(5, cursor(11), 12).unwrap();
+    assert_eq!((blocks.len(), next), (0, cursor(12)));
+    assert!(s.take_pushed(6, cursor(3), 0).is_err(), "nobody holds 6");
+}
+
+/// A train that ends in a fault ends its subscription and nothing else: the
+/// request behind it is answered.
+#[test]
+fn a_pushed_fault_ends_its_subscription_and_no_request() {
+    let (mut s, peer) = pair();
+    subscribe(&mut s, 5);
+    let sent = s.submit(COMMIT).unwrap();
+    let mut bytes = framed(&reply_ctrl(0, 0));
+    bytes.extend(pushed_train(40, 5, &[1], 9));
+    bytes.extend(framed(&pushed_marker(40, 5)));
+    bytes.extend(framed(&reply_status(40, WireStatus::Error, "lagged")));
+    bytes.extend(framed(&reply_ctrl(0, 3)));
+    peer.send_bytes(&bytes);
+    assert_eq!(await_reply(&mut s, sent).unwrap(), 3);
+    let ended = s.take_pushed(5, cursor(3), 0);
+    assert!(matches!(ended, Err(ClientError::Refused(_))), "the fault is its end");
+    let gone = s
+        .take_pushed(5, cursor(3), 0)
+        .expect_err("the session holds it no more");
+    assert!(gone.to_string().contains("not held"), "{gone:?}");
+}
+
+/// A SUBSCRIBE the server refuses whole ends every subscription it asked for,
+/// as a fault train of each would.
+#[test]
+fn a_refused_subscribe_ends_what_it_asked_for() {
+    let (mut s, peer) = pair();
+    subscribe(&mut s, 5);
+    let sent = s.submit(COMMIT).unwrap();
+    let mut bytes = framed(&reply_status(0, WireStatus::Error, "unread"));
+    bytes.extend(framed(&reply_ctrl(0, 3)));
+    peer.send_bytes(&bytes);
+    assert_eq!(await_reply(&mut s, sent).unwrap(), 3);
+    assert!(matches!(s.take_pushed(5, cursor(3), 0), Err(ClientError::Refused(_))));
+}
+
+/// A frame of a pushed train naming another relation than the train opened
+/// for ends the session, as a misdirected reply frame does.
+#[test]
+fn a_pushed_train_naming_another_view_ends_the_session() {
+    let (mut s, peer) = pair();
+    let sent = s.submit(COMMIT).unwrap();
+    let mut bytes = framed(&pushed_marker(40, 5));
+    bytes.extend(framed(&delta_terminal(41, 9)));
+    peer.send_bytes(&bytes);
+    assert!(matches!(await_reply(&mut s, sent), Err(ClientError::ConnectionLost(_))));
+    assert!(s.is_closed());
 }

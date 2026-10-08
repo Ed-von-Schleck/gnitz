@@ -422,9 +422,9 @@ fn many_views_of_one_table_advance_in_one_poll() {
 
 /// What each mirror call costs in requests — counts, not clocks.
 ///
-/// Mirroring a view is one RESOLVE and one bootstrap read, first sighting of its
-/// schema or not: the store mints no ids, so no registration reaches upstream
-/// for one. A mirrored SELECT issues none, and neither does its `EXPLAIN` —
+/// Mirroring a view is one RESOLVE, one bootstrap read and the subscription
+/// that continues it, first sighting of its schema or not: the store mints no
+/// ids, so no registration reaches upstream for one. A mirrored SELECT issues none, and neither does its `EXPLAIN` —
 /// routed to the connection it would fail with the server down, and describe a
 /// plan against a relation the statement will not read. A delegated read
 /// resolves its relation once, and a poll of both views is one request.
@@ -436,7 +436,7 @@ fn each_mirror_call_costs_what_it_must() {
 
     for view in ["v_keyed", "v_repl"] {
         let (_, sent) = cost(m, |m| block_on(m.mirror_view(&rel("s", view))).expect("mirror"));
-        assert_eq!(sent, 2, "{view}: one RESOLVE and one bootstrap read");
+        assert_eq!(sent, 3, "{view}: one RESOLVE, one bootstrap read, one subscription");
     }
     let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM v_keyed WHERE a = 7"));
     assert_eq!(sent, 0, "a mirrored SELECT issues no request at all");
@@ -957,11 +957,12 @@ fn a_wait_covers_more_views_than_one_cut_reads() {
     }
 }
 
-/// The next request a connection sends ends its waiting poll, and both are
+/// The next request a connection sends ends its waiting sync, and both are
 /// answered in order; a request ahead of one is not held with it.
 #[test]
-fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
-    use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
+fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
+    use gnitz_wire::control::{append_frame, ControlHeader};
+    use gnitz_wire::txn_frame::{encode_subscribe, DeltaPollItem};
     use gnitz_zset::schema::SchemaFacts;
     use std::io::{Read, Write};
 
@@ -979,6 +980,12 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
         reply_layout: desc.schema.layout_digest(),
         spec: &whole,
     };
+    let sync = |wait: Duration| {
+        let hdr = ControlHeader::naming(gnitz_wire::ClientVerb::SyncPushed, 0.into(), wait.as_millis() as u64);
+        let mut frame = Vec::new();
+        append_frame(&mut frame, &hdr, &[], None, None);
+        frame
+    };
 
     let mut raw = std::os::unix::net::UnixStream::connect(fx.server.sock_path()).unwrap();
     let send = |raw: &mut std::os::unix::net::UnixStream, payload: &[u8]| {
@@ -992,25 +999,29 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
         raw.read_exact(&mut payload).unwrap();
         payload
     };
-    send(&mut raw, &gnitz_wire::HELLO);
-    assert_eq!(recv(&mut raw), gnitz_wire::HELLO);
-
-    let t0 = std::time::Instant::now();
-    send(&mut raw, &encode_delta_poll(&[item], HELD.as_millis() as u64));
-    send(&mut raw, &encode_delta_poll(&[item], 0));
-    for which in ["the waiting poll", "the request behind it"] {
-        let reply = recv(&mut raw);
+    let answered = |raw: &mut std::os::unix::net::UnixStream, which: &str| {
+        let reply = recv(raw);
         let ctrl = gnitz_wire::control::peek_control_block(&reply).expect("a control header");
         assert!(ctrl.fault(&reply).is_none(), "{which} is answered, not refused");
-        assert_eq!(ctrl.hdr.target_id, keyed, "{which}");
-    }
+        assert!(!ctrl.hdr.flags.pushed, "{which}: a quiet view is sent no train");
+    };
+    send(&mut raw, &gnitz_wire::HELLO);
+    assert_eq!(recv(&mut raw), gnitz_wire::HELLO);
+    send(&mut raw, &encode_subscribe(&[item], 1));
+    answered(&mut raw, "the subscribe");
+
+    let t0 = std::time::Instant::now();
+    send(&mut raw, &sync(HELD));
+    send(&mut raw, &sync(Duration::ZERO));
+    answered(&mut raw, "the waiting sync");
+    answered(&mut raw, "the request behind it");
     assert!(t0.elapsed() < RELEASED, "the second request released the first");
 
-    // A request ahead of a waiting poll, read in with it, is answered before
-    // the poll is held.
+    // A request ahead of a waiting sync, read in with it, is answered before
+    // the sync is held.
     let mut both = Vec::new();
-    for wait in [0, HELD.as_millis() as u64] {
-        let payload = encode_delta_poll(&[item], wait);
+    for wait in [Duration::ZERO, HELD] {
+        let payload = sync(wait);
         both.extend_from_slice(&gnitz_wire::frame_len_prefix(payload.len()));
         both.extend_from_slice(&payload);
     }
@@ -1019,22 +1030,239 @@ fn a_waiting_poll_is_answered_when_its_connection_sends_the_next_request() {
     recv(&mut raw);
     assert!(
         t0.elapsed() < RELEASED,
-        "the reply ahead of the poll did not wait with it"
+        "the reply ahead of the sync did not wait with it"
     );
-    send(&mut raw, &encode_delta_poll(&[item], 0));
+    send(&mut raw, &sync(Duration::ZERO));
     recv(&mut raw);
     recv(&mut raw);
 }
 
-/// A whole read that waits, over a view its spec keeps nothing of, is parked
-/// with nothing to report and then answered with a cursor: the position the
-/// server carries across the park is one it would hand out.
+/// A poll taken in its two halves leaves the client free while the server
+/// holds its request: a request made meanwhile is answered and ends the hold,
+/// and the second half then reports every view.
 #[test]
-fn a_whole_read_held_over_nothing_is_answered_with_a_cursor() {
-    use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
-    use gnitz_zset::schema::SchemaFacts;
-    use std::io::{Read, Write};
+fn a_held_poll_leaves_its_client_free() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let (keyed, repl) = fx.mirror_both();
+    fx.drain();
 
+    let t0 = std::time::Instant::now();
+    let (poll, synced) = fx.mirror().begin_poll_mirror(HELD).expect("the first half");
+    block_on(fx.mirror().resolve_relation(&rel("s", "t"))).expect("a request beside the held poll");
+    let synced = block_on(fx.mirror().wait(synced));
+    assert!(t0.elapsed() < RELEASED, "the request beside it released the poll");
+    let report = block_on(fx.mirror().finish_poll_mirror(poll, synced)).expect("the second half");
+    assert_eq!(report.len(), 2, "one entry per view: {report:?}");
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "{report:?}"
+    );
+
+    // A view forgotten between the halves is left out, and the rest go on.
+    sql(&mut fx.direct, "s", "INSERT INTO t VALUES (4000, 1, 5, 0.5, 'between')");
+    let (poll, synced) = fx.mirror().begin_poll_mirror(Duration::ZERO).expect("the first half");
+    block_on(fx.mirror().forget_view(repl)).expect("forget");
+    let synced = block_on(fx.mirror().wait(synced));
+    let report = block_on(fx.mirror().finish_poll_mirror(poll, synced)).expect("the second half");
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert_eq!(report[0].view_id, keyed);
+    assert!(fx.differential("s", "SELECT * FROM v_keyed WHERE a >= 4000") > 0);
+}
+
+/// A copy of `v_keyed` kept by hand: the bag its delta reads and pushed trains
+/// add up to, and the cursor past them.
+struct Reader {
+    desc: std::sync::Arc<gnitz_core::RelDescriptor>,
+    whole: Vec<u8>,
+    copy: std::collections::BTreeMap<gnitz_zset_testkit::RowKey, i64>,
+    cursor: gnitz_core::DeltaCursor,
+}
+
+impl Reader {
+    fn bootstrap(client: &mut GnitzClient) -> Reader {
+        let desc = block_on(client.resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
+        let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
+        let (rows, cursor) = block_on(client.delta_bootstrap(&*desc, &desc.schema, &whole)).expect("bootstrap");
+        let copy = canonical(&(rows.schema, rows.batch));
+        Reader { desc, whole, copy, cursor }
+    }
+
+    fn subscribe(&self, client: &mut GnitzClient) -> u64 {
+        client
+            .subscribe(&*self.desc, self.cursor, &self.desc.schema, &self.whole)
+            .expect("subscribe")
+    }
+
+    /// Add one delta to the copy, weights and all; its row count.
+    fn apply(&mut self, (rows, cursor): (gnitz_core::ScanReply, gnitz_core::DeltaCursor)) -> usize {
+        let n = rows.batch.len();
+        for (row, w) in canonical_rows(&(rows.schema, rows.batch)) {
+            *self.copy.entry(row).or_insert(0) += w;
+        }
+        self.copy.retain(|_, w| *w != 0);
+        self.cursor = cursor;
+        n
+    }
+
+    /// One sync of `client`, whose one subscription is `sub`, applied.
+    fn sync(&mut self, client: &mut GnitzClient, sub: u64, wait: Duration) -> usize {
+        let mut pushed = block_on(client.sync_pushed(wait)).expect("sync");
+        assert_eq!(pushed.len(), 1, "one entry per subscription");
+        let pushed = pushed.pop().unwrap();
+        assert_eq!(pushed.sub, sub);
+        self.apply(pushed.result.expect("the subscription is held"))
+    }
+
+    /// The copy is the view, weight for weight, and not the empty one.
+    fn assert_converged(&self, client: &mut GnitzClient, what: &str) {
+        let live = Reader::bootstrap(client).copy;
+        assert!(!live.is_empty(), "{what}: an empty view agrees with anything");
+        assert_eq!(self.copy, live, "{what}");
+    }
+}
+
+/// A reader subscribed from its cursor is handed, by each sync, exactly the
+/// deltas a delta read would have returned — retractions among them.
+#[test]
+fn a_sync_hands_a_reader_the_deltas_pushed_for_it() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let sub = reader.subscribe(&mut fx.direct);
+    assert_eq!(
+        reader.sync(&mut fx.direct, sub, Duration::ZERO),
+        0,
+        "nothing was pushed yet"
+    );
+
+    for round in 0..3 {
+        churn(&mut fx.direct, 100 * (round + 1), 100 * (round + 1) + 30);
+        sql(&mut fx.direct, "s", "UPDATE t SET v = v + 1 WHERE a <= 10");
+        let (rows, sent) = cost(&mut fx.direct, |c| reader.sync(c, sub, Duration::ZERO));
+        assert!(rows > 0, "round {round}: the sync carries the pushes before it");
+        assert_eq!(
+            sent, 1,
+            "round {round}: one request, and none of them a read of the view"
+        );
+        reader.assert_converged(&mut fx.direct, &format!("round {round}"));
+    }
+
+    // Ended, the subscription is no entry of a sync, and its cursor continues.
+    fx.direct.unsubscribe(sub);
+    churn(&mut fx.direct, 900, 910);
+    assert!(block_on(fx.direct.sync_pushed(Duration::ZERO))
+        .expect("sync")
+        .is_empty());
+    let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
+    let polled = block_on(fx.direct.delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
+    assert!(reader.apply(polled) > 0);
+    reader.assert_converged(&mut fx.direct, "after a delta read from the subscription's cursor");
+}
+
+/// A waiting sync with nothing to report is held for its wait, and a commit
+/// ends it at once with the commit's rows.
+#[test]
+fn a_waiting_sync_is_held_until_a_commit_reaches_a_subscription() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let sub = reader.subscribe(&mut fx.direct);
+
+    let wait = Duration::from_millis(300);
+    let t0 = std::time::Instant::now();
+    assert_eq!(reader.sync(&mut fx.direct, sub, wait), 0);
+    assert!(t0.elapsed() >= wait, "nothing changed, so the reply was held");
+
+    let writer = later(
+        &fx,
+        Duration::from_millis(200),
+        "INSERT INTO t VALUES (1000, 1, 5, 0.5, 'late')",
+    );
+    let t0 = std::time::Instant::now();
+    assert!(
+        reader.sync(&mut fx.direct, sub, HELD) > 0,
+        "the reply is the commit's delta"
+    );
+    assert!(t0.elapsed() < RELEASED, "the commit released it, not the wait");
+    writer.join().unwrap();
+    reader.assert_converged(&mut fx.direct, "after the waiting sync");
+}
+
+/// A mirror and a reader on one connection each get the trains of their own
+/// subscriptions, whichever of them syncs first.
+#[test]
+fn a_mirror_and_a_reader_share_a_connection() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    fx.mirror_both();
+    fx.drain();
+    let mut reader = Reader::bootstrap(fx.mirror());
+    let sub = reader.subscribe(fx.mirror());
+
+    for round in 0..4 {
+        churn(&mut fx.direct, 100 * (round + 1), 100 * (round + 1) + 30);
+        // Either sync brings the trains of both; each must leave the other's.
+        if round % 2 == 0 {
+            fx.drain();
+            assert!(reader.sync(fx.mirror(), sub, Duration::ZERO) > 0, "round {round}");
+        } else {
+            assert!(reader.sync(fx.mirror(), sub, Duration::ZERO) > 0, "round {round}");
+            fx.drain();
+        }
+        reader.assert_converged(&mut fx.direct, &format!("round {round}: the reader"));
+        assert!(
+            fx.differential("s", "SELECT * FROM v_keyed") > 30,
+            "round {round}: the mirror"
+        );
+    }
+}
+
+/// A subscription the server refuses is reported once, by the next sync, as
+/// one that ended; the reader's cursor is untouched.
+#[test]
+fn a_refused_subscription_ends_at_the_next_sync() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let held = reader.subscribe(&mut fx.direct);
+    let foreign = gnitz_core::DeltaCursor {
+        tag: reader.cursor.tag ^ 1,
+        ..reader.cursor
+    };
+    let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
+    let refused = fx
+        .direct
+        .subscribe(&*desc, foreign, &desc.schema, &whole)
+        .expect("the request is sent");
+
+    churn(&mut fx.direct, 100, 130);
+    let pushed = block_on(fx.direct.sync_pushed(Duration::ZERO)).expect("sync");
+    let subs: Vec<u64> = pushed.iter().map(|p| p.sub).collect();
+    assert_eq!(subs, [held, refused], "one entry each, in the order they were made");
+    for p in pushed {
+        match p.sub == held {
+            true => assert!(reader.apply(p.result.expect("held")) > 0),
+            false => {
+                let Err(ClientError::Refused(fault)) = p.result else {
+                    panic!("a foreign cursor is refused")
+                };
+                assert_eq!(fault.status, WireStatus::DeltaExpired);
+            }
+        }
+    }
+    reader.assert_converged(&mut fx.direct, "the held subscription");
+    assert_eq!(
+        reader.sync(&mut fx.direct, held, Duration::ZERO),
+        0,
+        "the refused one is gone"
+    );
+}
+
+/// A whole read over a view its spec keeps nothing of reports no row and is
+/// answered with a cursor the feed continues.
+#[test]
+fn a_whole_read_of_nothing_is_answered_with_a_cursor() {
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     let sub = block_on(gnitz_sql::plan_subscription(
@@ -1043,45 +1271,12 @@ fn a_whole_read_held_over_nothing_is_answered_with_a_cursor() {
         "SELECT a, v FROM v_keyed WHERE v < -1000000",
     ))
     .expect("a subscription that keeps no row");
-    let item = DeltaPollItem {
-        view: gnitz_core::Target::from(&*sub.upstream),
-        tag: 0,
-        after_tick: 0,
-        reply_layout: sub.schema.layout_digest(),
-        spec: &sub.spec,
-    };
 
-    let mut raw = std::os::unix::net::UnixStream::connect(fx.server.sock_path()).unwrap();
-    let mut exchange = |payload: &[u8]| {
-        raw.write_all(&gnitz_wire::frame_len_prefix(payload.len())).unwrap();
-        raw.write_all(payload).unwrap();
-        let mut len = [0u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES];
-        raw.read_exact(&mut len).unwrap();
-        let mut reply = vec![0u8; u32::from_le_bytes(len) as usize];
-        raw.read_exact(&mut reply).unwrap();
-        reply
-    };
-    assert_eq!(exchange(&gnitz_wire::HELLO), gnitz_wire::HELLO);
-
-    let wait = Duration::from_millis(150);
-    let t0 = std::time::Instant::now();
-    let reply = exchange(&encode_delta_poll(&[item], wait.as_millis() as u64));
-    assert!(t0.elapsed() >= wait, "the read was held, having nothing to report");
-    let ctrl = gnitz_wire::control::peek_control_block(&reply).expect("a control header");
-    assert!(
-        ctrl.fault(&reply).is_none(),
-        "answered, not refused: {:?}",
-        ctrl.fault(&reply)
-    );
-    assert_eq!(ctrl.hdr.target_id, sub.upstream.tid);
-    let cursor = gnitz_core::DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0).expect("a round to poll after");
-
-    // And the cursor it was answered with continues.
-    let (rows, next) = block_on(
-        fx.direct
-            .delta_poll(&*sub.upstream, cursor, &sub.schema, &sub.spec, Duration::ZERO),
-    )
-    .expect("the cursor is the feed's own");
+    let (rows, cursor) =
+        block_on(fx.direct.delta_bootstrap(&*sub.upstream, &sub.schema, &sub.spec)).expect("a whole read");
+    assert_eq!(rows.batch.len(), 0);
+    let (rows, next) = block_on(fx.direct.delta_poll(&*sub.upstream, cursor, &sub.schema, &sub.spec))
+        .expect("the cursor is the feed's own");
     assert_eq!((rows.batch.len(), next.tag), (0, cursor.tag));
 }
 
@@ -1609,7 +1804,10 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     let (report, sent) = cost(fx.mirror(), |m| {
         block_on(m.poll_mirror(Duration::ZERO)).expect("the poll after a reconnect")
     });
-    assert_eq!(sent, 1, "every stored cursor rides one request");
+    assert_eq!(
+        sent, 2,
+        "every stored cursor rides one request, and one more subscribes the copies on the new connection"
+    );
     assert_eq!(report.len(), 2);
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -2164,4 +2362,131 @@ fn a_mirrored_name_is_read_off_its_copy_whatever_is_kept() {
     assert_eq!(requests, 0, "the copy answers the read");
     let (_, plan) = query(fx.mirror(), "s", "EXPLAIN SELECT * FROM v_keyed");
     assert!(String::from_utf8_lossy(&plan.blob).contains("local copy"));
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------
+
+/// A copy is subscribed once it is read, so every later poll is one request
+/// however much it carries; and a subscription whose trains outgrow what the
+/// server queues for a connection is ended there, continued by a delta read in
+/// the same poll and taken up again.
+#[test]
+fn a_subscription_that_falls_behind_is_continued_by_a_delta_read() {
+    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_PUSH_QUEUE_BYTES", "4096")]);
+    churn(&mut fx.direct, 1, 20);
+    fx.mirror_both();
+    fx.drain();
+
+    sql(&mut fx.direct, "s", "INSERT INTO t VALUES (5000, 1, 2, 3.5, 'one row')");
+    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    assert_eq!(sent, 1, "a train that fits the queue rides the one request");
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "{report:?}"
+    );
+    fx.differential("s", "SELECT * FROM v_keyed");
+
+    // Far more than the queue holds, in several rounds.
+    for lo in [100, 400, 700] {
+        churn(&mut fx.direct, lo, lo + 250);
+    }
+    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    assert!(
+        sent > 1,
+        "the ended subscriptions were continued by a delta read: {sent} requests"
+    );
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "falling behind is nobody's failure, and nothing is re-read whole: {report:?}"
+    );
+    assert!(fx.differential("s", "SELECT * FROM v_keyed") > 100);
+    fx.differential("s", "SELECT * FROM v_repl");
+
+    sql(&mut fx.direct, "s", "INSERT INTO t VALUES (5001, 1, 2, 3.5, 'one row')");
+    let (_, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    assert_eq!(sent, 1, "and the copies are subscribed again");
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.differential("s", "SELECT * FROM v_repl");
+}
+
+/// Subscribers of one view share its reads and nothing else: each copy equals
+/// the view weight for weight, one that joins late catches up from its own
+/// cursor, and one that leaves — by forgetting the view, or with its
+/// connection — ends nothing for the rest.
+#[test]
+fn many_subscribers_of_one_view_each_converge() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let target = fx.server.sock_path().to_string();
+    let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+    let join = |dir: &tempfile::TempDir| {
+        let mut client = mirroring_client(&target, dir.path().to_str().unwrap());
+        block_on(client.mirror_view(&rel("s", "v_keyed"))).expect("mirror");
+        client
+    };
+    let agree = |client: &mut GnitzClient, direct: &mut GnitzClient, what: &str| {
+        let (report, sent) = cost(client, |c| block_on(c.poll_mirror(Duration::ZERO)).expect("poll"));
+        assert_eq!(sent, 1, "{what}: one request");
+        assert!(
+            report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+            "{what}: {report:?}"
+        );
+        let rows = differential(client, direct, "s", "SELECT * FROM v_keyed", Answer::Local);
+        assert!(rows > 0, "{what}");
+    };
+
+    let mut clients: Vec<GnitzClient> = dirs[..4].iter().map(join).collect();
+    for round in 0..4 {
+        churn(&mut fx.direct, 100 + round * 50, 130 + round * 50);
+        for (i, client) in clients.iter_mut().enumerate() {
+            agree(client, &mut fx.direct, &format!("round {round}, subscriber {i}"));
+        }
+    }
+
+    // One joins from a copy rounds behind the rest; one forgets the view and
+    // one goes with its connection.
+    let mut late = join(&dirs[4]);
+    churn(&mut fx.direct, 400, 430);
+    let mut gone = clients.pop().unwrap();
+    let view = gone.mirrored_ids()[0];
+    block_on(gone.forget_view(view)).expect("forget");
+    differential(
+        &mut gone,
+        &mut fx.direct,
+        "s",
+        "SELECT * FROM v_keyed",
+        Answer::Upstream,
+    );
+    drop(clients.pop().unwrap());
+    churn(&mut fx.direct, 500, 530);
+    agree(&mut late, &mut fx.direct, "the late subscriber");
+    for (i, client) in clients.iter_mut().enumerate() {
+        agree(client, &mut fx.direct, &format!("subscriber {i} after two left"));
+    }
+
+    // A wait is released for every subscriber by the one commit.
+    let waiters: Vec<_> = clients
+        .into_iter()
+        .map(|mut client| {
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                block_on(client.poll_mirror(Duration::from_secs(60))).expect("poll");
+                assert!(started.elapsed() < Duration::from_secs(30), "the commit ended the wait");
+                client
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    sql(
+        &mut fx.direct,
+        "s",
+        "INSERT INTO t VALUES (6000, 1, 2, 3.5, 'the release')",
+    );
+    for (i, waiter) in waiters.into_iter().enumerate() {
+        let mut client = waiter.join().unwrap();
+        let rows = differential(&mut client, &mut fx.direct, "s", "SELECT * FROM v_keyed", Answer::Local);
+        assert!(rows > 0, "waiter {i}");
+    }
 }

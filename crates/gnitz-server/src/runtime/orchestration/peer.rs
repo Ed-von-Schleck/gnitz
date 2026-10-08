@@ -2,7 +2,7 @@
 //! [`ClientConn`], which also owns the connection's end; only sending dispatches
 //! on the transport.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -25,6 +25,42 @@ pub struct Peer {
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
     egress: RefCell<Option<PooledBuf>>,
+    pushed: Rc<Outbox>,
+}
+
+/// The pushed trains queued for one connection by the tasks that produce them.
+/// The connection's own task ships them, whole and between replies, so a train
+/// splits no reply and nothing leaves for a client that is not reading one.
+#[derive(Default)]
+pub struct Outbox {
+    trains: RefCell<Vec<Train>>,
+    unsynced: Cell<usize>,
+}
+
+/// One queued train: its opening frame, and the frames after it, which every
+/// connection sent the same ones shares.
+struct Train {
+    head: Vec<u8>,
+    body: Rc<Vec<u8>>,
+}
+
+impl Outbox {
+    /// Bytes queued since the connection's last SYNC_PUSHED was answered:
+    /// what its client may hold unread.
+    pub fn unsynced(&self) -> usize {
+        self.unsynced.get()
+    }
+
+    /// A SYNC_PUSHED was answered behind everything queued.
+    pub fn synced(&self) {
+        self.unsynced.set(0);
+    }
+
+    /// Queue one train: its opening frame and the frames after it.
+    pub fn send(&self, head: Vec<u8>, body: Rc<Vec<u8>>) {
+        self.unsynced.set(self.unsynced.get() + head.len() + body.len());
+        self.trains.borrow_mut().push(Train { head, body });
+    }
 }
 
 enum Transport {
@@ -49,6 +85,35 @@ impl Peer {
             conn,
             transport,
             egress: RefCell::new(None),
+            pushed: Rc::default(),
+        }
+    }
+
+    /// Where a task queues this connection's pushed trains.
+    pub fn outbox(&self) -> Rc<Outbox> {
+        Rc::clone(&self.pushed)
+    }
+
+    /// Ship every queued train behind what is corked, under [`Self::send`]'s
+    /// policy: one too large to join the cork goes out alone, uncopied. Called
+    /// only where no reply is half written. On `Ok` the queue was empty with no
+    /// await since.
+    pub async fn ship_pushed(&self) -> Result<(), PeerGone> {
+        loop {
+            let trains = self.pushed.trains.take();
+            if trains.is_empty() {
+                return Ok(());
+            }
+            for Train { head, body } in trains {
+                self.cork(&head);
+                if body.len() > COALESCE_MAX_BYTES / 2 {
+                    self.flush_egress().await?;
+                    self.send_raw(SendBody::Shared(body)).await?;
+                } else {
+                    self.cork(&body);
+                    self.flush_if_full().await?;
+                }
+            }
         }
     }
 

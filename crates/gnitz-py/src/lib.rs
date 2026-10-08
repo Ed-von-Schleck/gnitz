@@ -12,7 +12,7 @@ mod read;
 mod schema;
 mod write;
 
-use client::{PyAsyncClient, PyClient, PyGnitzClient, PyPollResult, PyTxn};
+use client::{PyAsyncClient, PyClient, PyGnitzClient, PyPollResult, PyPushed, PyTxn};
 use drive::{LoopCore, PyPending, PyPipeline};
 use read::{PyRow, PyRowIterator, PyScanResult};
 use schema::{PyColumnDef, PySchema};
@@ -128,6 +128,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyPending>()?;
     m.add_class::<PyPollResult>()?;
+    m.add_class::<PyPushed>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzRefusedError", m.py().get_type::<GnitzRefusedError>())?;
     m.add("GnitzConnectionError", m.py().get_type::<GnitzConnectionError>())?;

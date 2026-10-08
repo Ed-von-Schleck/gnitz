@@ -264,6 +264,23 @@ struct Owed {
 }
 
 impl Owed {
+    /// The call that runs `op` and lands what it yields here.
+    fn call<T, O, C>(self, op: O, convert: C) -> Op
+    where
+        T: Send + 'static,
+        O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
+        C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+    {
+        Box::new(move |client| {
+            Box::pin(async move {
+                match op(client).await {
+                    Ok(sent) => sent.then(move |reply| self.land(landed(reply.map_err(Into::into), convert))),
+                    Err(fail) => self.land(landed(Err(fail), convert)),
+                }
+            })
+        })
+    }
+
     fn land(mut self, result: Landed) {
         let future = self.future.take().expect("landed once");
         self.shared.state().landed.push((future, result));
@@ -464,6 +481,50 @@ impl LoopHandle {
         O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
     {
+        self.queue(py, |owed| owed.call(op, convert))
+    }
+
+    /// Queue `first`, and once the reply it sent for arrives, `second` with
+    /// what `first` kept and that reply; hand back the loop future `second`'s
+    /// result resolves. The client is free in between.
+    pub(crate) fn submit_then<S, A, T, O, P, C>(
+        &self,
+        py: Python<'_>,
+        first: O,
+        second: P,
+        convert: C,
+    ) -> PyResult<Py<PyAny>>
+    where
+        S: Send + 'static,
+        A: Send + 'static,
+        T: Send + 'static,
+        O: FnOnce(&mut GnitzClient) -> Result<(S, Sent<A>), ClientError> + Send + 'static,
+        P: for<'a> FnOnce(&'a mut GnitzClient, S, Result<A, ClientError>) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>>
+            + Send
+            + 'static,
+        C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+    {
+        self.queue(py, |owed| {
+            Box::new(move |client| {
+                Box::pin(async move {
+                    match first(client) {
+                        // The step that reads the reply queues the rest, and
+                        // the `serve` loop takes it up before it waits again.
+                        Ok((kept, sent)) => sent.then(move |reply| {
+                            let shared = Arc::clone(&owed.shared);
+                            let rest = owed.call(move |client| second(client, kept, reply), convert);
+                            shared.state().queue.push_back(rest);
+                        }),
+                        Err(fail) => owed.land(landed(Err(fail.into()), convert)),
+                    }
+                })
+            })
+        })
+    }
+
+    /// Queue the call `build` makes of the loop future it owes, and hand that
+    /// future back.
+    fn queue(&self, py: Python<'_>, build: impl FnOnce(Owed) -> Op) -> PyResult<Py<PyAny>> {
         let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;
         let mut core = self.core.bind(py).try_borrow_mut()?;
         // At the cap, start what is queued before refusing: the session takes
@@ -506,14 +567,7 @@ impl LoopHandle {
             future: Some(future.clone_ref(py)),
             shared: Arc::clone(&self.shared),
         };
-        let call: Op = Box::new(move |client| {
-            Box::pin(async move {
-                match op(client).await {
-                    Ok(sent) => sent.then(move |reply| owed.land(landed(reply.map_err(Into::into), convert))),
-                    Err(fail) => owed.land(landed(Err(fail), convert)),
-                }
-            })
-        });
+        let call = build(owed);
         {
             let mut st = self.shared.state();
             st.queue.push_back(call);

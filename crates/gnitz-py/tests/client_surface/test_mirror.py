@@ -13,6 +13,7 @@ exposed to its own worst failure: a copy that is not valid makes every read
 delegate to the server, and a mirror-versus-server comparison then compares the
 server against itself and passes.
 """
+import asyncio
 import os
 import signal
 import threading
@@ -20,6 +21,7 @@ import time
 
 import pytest
 import gnitz
+from gnitz import aio
 from _feedviews import LINEAR, base_tables, churn, later, mk_feed
 from _read import bag, ordered, rows
 import _childproc
@@ -373,6 +375,25 @@ def test_a_mirror_is_not_read_your_own_writes(client, mirror):
     _samebag(q, local, rows(client, q))
 
 
+@pytest.mark.asyncio
+async def test_a_held_poll_leaves_an_async_client_free(client, server, mirror_dir):
+    """A poll held with nothing to report does not hold its client: a scan
+    submitted beside it is answered, and the server ends the poll for it."""
+    _fed_view(client)
+    churn(client, 1, 30)
+    tid, t_schema = client.resolve_table("t")
+    async with aio.connect(server, schema=client.schema) as m:
+        await m.mirror_at(mirror_dir)
+        await m.mirror_view("f")
+        await m.poll()
+        t0 = time.monotonic()
+        results, scanned = await asyncio.gather(m.poll(wait=30), m.scan(tid, t_schema))
+        assert time.monotonic() - t0 < 10, "the scan released the poll, not the wait"
+        assert [r.error for r in results] == [None]
+        assert len(scanned) > 0
+        await m.close_mirror()
+
+
 def test_a_waiting_poll_returns_when_a_commit_reaches_a_mirrored_view(client, mirror, server):
     """`poll(wait=…)` is held while no mirrored view changes, and back at once,
     the change already in the copy, when one does."""
@@ -384,6 +405,8 @@ def test_a_waiting_poll_returns_when_a_commit_reaches_a_mirrored_view(client, mi
     t0 = time.monotonic()
     mirror.poll(wait=0.3)
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
+    with pytest.raises(ValueError, match="non-negative"):
+        mirror.poll(wait=-1)
 
     writer = later(server, client.schema, 0.2, "INSERT INTO t VALUES (5000, 777, 'late')")
     t0 = time.monotonic()

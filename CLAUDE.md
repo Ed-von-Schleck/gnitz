@@ -561,12 +561,13 @@ the input's unique key, so the input must be a set with one.
 
 `CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back
 by polling from a client-held cursor as ordinary batches — **weights and all**,
-so a row-set comparison of a feed tests nothing. No subscription verb and no
-server-side cursor registry: the engine stays request/response, the cursor lives
-on the client, and nothing retained survives a restart.
+so a row-set comparison of a feed tests nothing. The cursor lives on the client,
+and nothing retained survives a restart.
 
-A delta read carries every push acknowledged before it, and may ask to be held
-while it has nothing to report.
+A delta read carries every push acknowledged before it. A connection may also
+subscribe from a cursor and sync, which may ask to be held while it has nothing
+to report; a subscription can end at any point, and its reader continues from
+that cursor with a delta read.
 
 **A delta read may carry a subscription**: a `SELECT` over the view with no
 aggregate, order or cut, answered with only the rows and columns it keeps. A

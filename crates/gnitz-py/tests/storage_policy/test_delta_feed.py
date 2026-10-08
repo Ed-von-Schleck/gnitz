@@ -166,53 +166,78 @@ def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
     sub.assert_converged("after the polls")
 
 
-def test_a_waiting_poll_is_held_until_a_commit_reaches_the_view(client, server):
-    """With `wait`, a poll that has nothing to report is held for the wait, and a
-    commit ends it at once with the commit's rows."""
+# ── pushed deltas ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("body", [LINEAR, JOIN, GROUPBY, SETOP])
+def test_a_subscribed_reader_is_pushed_its_deltas(client, body):
+    """A sync hands a subscribed reader the deltas a poll would have fetched,
+    weights and all: the copy they add up to is the view."""
+    base_tables(client)
+    mk_feed(client, "f", body)
+    sub = Subscriber(client, "f")
+    churn(client, 1, 30)
+    sub.bootstrap()
+    sub.subscribe()
+    assert len(sub.sync()) == 0, "nothing was pushed yet"
+
+    for r in range(3):
+        churn(client, 100 * (r + 1), 100 * (r + 1) + 30)
+        assert len(sub.sync()) > 0, f"sync {r} did not carry the pushes it followed"
+        assert len(sub.sync()) == 0, f"sync {r} left part of its rounds behind"
+        live = sub.scan()
+        assert live and sub.copy == live, f"after sync {r}"
+
+    client.unsubscribe(sub.sub)
+    assert client.sync_pushed() == []
+    sub.assert_converged("by polling from the subscription's cursor")
+
+
+def test_a_waiting_sync_is_held_until_a_commit_reaches_the_view(client, server):
+    """With `wait`, a sync that has nothing to report is held for the wait, and
+    a commit ends it at once with the commit's rows."""
     base_tables(client)
     mk_feed(client, "f", LINEAR)
     sub = Subscriber(client, "f")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub.bootstrap()
-    sub.drain()
+    sub.subscribe()
 
     t0 = time.monotonic()
-    assert len(sub.poll(wait=0.3)) == 0
+    assert len(sub.sync(wait=0.3)) == 0
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
 
     writer = later(server, client.schema, 0.2, "INSERT INTO t VALUES (2, 200, 'late')")
     t0 = time.monotonic()
-    got = sub.poll(wait=60)
+    got = sub.sync(wait=60)
     assert time.monotonic() - t0 < 20, "the commit released it, not the wait"
     writer.join()
     assert len(got) == 1, "the reply is the commit's delta"
-    sub.assert_converged("after the waiting poll")
+    assert sub.copy == sub.scan()
 
     with pytest.raises(ValueError, match="non-negative"):
-        sub.poll(wait=-1)
+        sub.sync(wait=-1)
 
 
 @pytest.mark.asyncio
-async def test_a_held_poll_leaves_an_async_client_free(client, server):
-    """A poll held with nothing to report does not hold its client: a scan
-    submitted beside it is answered, and the server ends the poll for it, with
-    no rows and the cursor it was sent."""
+async def test_a_held_sync_leaves_an_async_client_free(client, server):
+    """A sync held with nothing to report does not hold its client: a scan
+    submitted beside it is answered, and the server ends the sync for it, with
+    no rows and the cursor the subscription stood at."""
     base_tables(client)
     mk_feed(client, "f", LINEAR)
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     vid, schema = client.resolve_table("f")
     tid, t_schema = client.resolve_table("t")
-    async with aio.connect(server) as conn:
+    async with aio.connect(server, schema=client.schema) as conn:
         _, cursor = await conn.delta_bootstrap(vid, schema)
+        sub = await conn.subscribe(vid, schema, cursor)
         t0 = time.monotonic()
-        (delta, after), rows = await asyncio.gather(
-            conn.delta_poll(vid, schema, cursor, 30),
-            conn.scan(tid, t_schema),
-        )
-        assert time.monotonic() - t0 < 10, "the scan released the poll, not the wait"
+        (pushed,), rows = await asyncio.gather(conn.sync_pushed(30), conn.scan(tid, t_schema))
+        assert time.monotonic() - t0 < 10, "the scan released the sync, not the wait"
     assert len(rows) == 1
-    assert len(delta) == 0
-    assert after == cursor
+    assert (pushed.sub, pushed.error, len(pushed.rows)) == (sub, None, 0)
+    assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] >= cursor[1]
 
 
 # ── refused cursors ──────────────────────────────────────────────────────────

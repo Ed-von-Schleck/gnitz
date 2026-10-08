@@ -27,6 +27,8 @@ pub(super) struct Outbound {
 pub(crate) enum SendBody {
     Pooled(PooledBuf),
     Slot(W2mSlot),
+    /// Bytes several connections are sent.
+    Shared(Rc<Vec<u8>>),
 }
 
 impl SendBody {
@@ -34,6 +36,7 @@ impl SendBody {
         match self {
             SendBody::Pooled(b) => &b.0,
             SendBody::Slot(s) => s.frame_bytes(),
+            SendBody::Shared(b) => b,
         }
     }
 }

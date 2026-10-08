@@ -182,9 +182,8 @@ impl Peer {
     fn expect_poll(&self, what: &str) -> Vec<u64> {
         let frame = self.expect_frame(what);
         let ctrl = peek_control_block(&frame).expect("a control header");
-        gnitz_wire::txn_frame::decode_delta_poll(&ctrl.hdr, &frame[ctrl.body.clone()])
+        gnitz_wire::txn_frame::decode_delta_items(ctrl.hdr.flags.verb, &frame[ctrl.body.clone()])
             .expect("a delta poll")
-            .1
             .into_iter()
             .map(|v| v.view.tid)
             .collect()
@@ -200,6 +199,50 @@ impl Peer {
             ..Default::default()
         };
         self.send(&encode_frame(h, &[], None, None));
+    }
+
+    /// The next request's verb and control header.
+    fn expect_verb(&self, what: &str) -> (gnitz_wire::ClientVerb, ControlHeader) {
+        let frame = self.expect_frame(what);
+        let hdr = peek_control_block(&frame).expect("a control header").hdr;
+        (hdr.flags.verb, hdr)
+    }
+
+    /// Answer the next request, a SUBSCRIBE of `n` views; the id each view
+    /// asked for its subscription under.
+    fn grant_subscriptions(&self, n: usize) -> HashMap<u64, u64> {
+        let frame = self.expect_frame("a subscription");
+        let ctrl = peek_control_block(&frame).expect("a control header");
+        assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::Subscribe);
+        let first = ctrl.hdr.arg0;
+        let items = gnitz_wire::txn_frame::decode_delta_items(ctrl.hdr.flags.verb, &frame[ctrl.body.clone()])
+            .expect("a subscribe frame");
+        assert_eq!(items.len(), n, "one request subscribes every copy read");
+        self.send(&reply_ctrl(0, 0));
+        (first..).zip(items).map(|(id, item)| (item.view.tid, id)).collect()
+    }
+
+    /// The next request, which must be a SYNC_PUSHED.
+    fn expect_sync(&self, what: &str) {
+        assert_eq!(self.expect_verb(what).0, gnitz_wire::ClientVerb::SyncPushed, "{what}");
+    }
+
+    /// One pushed train of subscription `sub` to `view`: `rows`, ending at
+    /// round `tick` — or, with no round, in a fault.
+    fn push_train(&self, view: u64, sub: u64, rows: &[(u64, i64, i64)], tick: Option<u64>) {
+        self.send(&crate::test_support::pushed_marker(view, sub));
+        let Some(tick) = tick else {
+            return self.send(&reply_status(view, WireStatus::Error, "lagged"));
+        };
+        if !rows.is_empty() {
+            let hdr = ControlHeader {
+                target_id: view,
+                flags: gnitz_wire::WireFlags { continuation: true, ..Default::default() },
+                ..Default::default()
+            };
+            self.send(&encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows))));
+        }
+        self.reply_watermark(view, TAG, tick);
     }
 
     /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
@@ -286,7 +329,11 @@ fn one_poll_writes_one_request_for_every_view() {
         let report = block_on(client.poll_mirror(Duration::ZERO)).expect("every view advances");
         let seen = h.join().unwrap();
 
-        assert_eq!(client.requests_sent(), 1, "{m} views");
+        assert_eq!(
+            client.requests_sent(),
+            2,
+            "{m} views: the poll, then one subscription of every copy it read"
+        );
         let mut ids = seen;
         ids.sort_unstable();
         assert_eq!(
@@ -331,7 +378,8 @@ fn only_a_stale_registration_pays_a_resolve() {
         h.join().unwrap();
         let (requests, reseeded) = match status {
             WireStatus::StaleCatalog => (2, false),
-            WireStatus::DeltaExpired => (2, true),
+            // And the subscription of the copy the whole read left.
+            WireStatus::DeltaExpired => (3, true),
             _ => (1, false),
         };
         assert_eq!(client.requests_sent(), requests, "status {status:?}");
@@ -408,14 +456,9 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
 fn a_leftover_poll_does_not_shift_the_replies() {
     let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
     // A poll submitted and its reader gone: what an aborting park leaves behind.
-    let abandoned = DeltaPollItem {
-        view: 7.into(),
-        tag: TAG,
-        after_tick: 4,
-        reply_layout: kv_schema(TypeCode::I64).layout_digest(),
-        spec: &[],
-    };
-    drop(DeltaPoll::start(&mut client.session, &[abandoned], Duration::ZERO));
+    let from = DeltaCursor::from_pair(TAG, 4);
+    let abandoned = DeltaCursor::item(from, 7.into(), &kv_schema(TypeCode::I64), &[]);
+    drop(DeltaPoll::start(&mut client.session, &[abandoned]));
 
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the abandoned poll"), vec![7]);
@@ -465,7 +508,11 @@ fn no_recovery_runs_before_every_ingest_has() {
     });
     let report = block_on(client.poll_mirror(Duration::ZERO)).expect("a recovered view is not the call's failure");
     let (gone, alive) = h.join().unwrap();
-    assert_eq!(client.requests_sent(), 3, "both views ride one request");
+    assert_eq!(
+        client.requests_sent(),
+        4,
+        "both views ride one request, and one more subscribes the copies read"
+    );
 
     let events = log.take();
     let first_ingest = events
@@ -511,7 +558,11 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
     });
     let report = block_on(client.poll_mirror(Duration::ZERO)).expect("the recovery lands on a live copy");
     h.join().unwrap();
-    assert_eq!(client.requests_sent(), 4, "the live copy is not re-read");
+    assert_eq!(
+        client.requests_sent(),
+        5,
+        "the live copy is not re-read, and is subscribed once"
+    );
 
     let events = log.take();
     assert!(
@@ -547,7 +598,11 @@ fn a_recovery_onto_an_expired_view_reads_it_whole_once() {
     });
     let report = block_on(client.poll_mirror(Duration::ZERO)).expect("both recoveries land");
     h.join().unwrap();
-    assert_eq!(client.requests_sent(), 3);
+    assert_eq!(
+        client.requests_sent(),
+        4,
+        "the poll, the resolve, the whole read, the subscription"
+    );
 
     let events = log.take();
     let whole: Vec<&Ev> = events
@@ -661,11 +716,14 @@ fn an_interrupted_poll_reannounces_its_reseed() {
 
     let h = std::thread::spawn(move || {
         peer.send(&reply_ctrl(0, 0)); // the abandoned re-resolve
-        for tick in [21, 22] {
-            for id in peer.expect_poll("a poll") {
-                peer.reply_watermark(id, TAG, tick);
-            }
+        for id in peer.expect_poll("a poll") {
+            peer.reply_watermark(id, TAG, 21);
         }
+        // Both copies are read on this connection now, so each is subscribed,
+        // and the next poll is a sync.
+        peer.grant_subscriptions(2);
+        peer.expect_sync("the second poll");
+        peer.send(&reply_ctrl(0, 22));
     });
     let mut results = Vec::new();
     for _ in 0..2 {
@@ -790,4 +848,123 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
             "and both copies still answer at the round they reached",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------
+
+/// Two copies read by one poll, each of which has asked for its subscription:
+/// the two requests ride with the client's next, and a script opens by
+/// granting them.
+fn subscribed() -> (GnitzClient, Peer, Log) {
+    let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+    let h = std::thread::spawn(move || {
+        for id in peer.expect_poll("the poll") {
+            peer.reply_watermark(id, TAG, 9);
+        }
+        peer
+    });
+    block_on(client.poll_mirror(Duration::ZERO)).expect("both views advance");
+    let peer = h.join().unwrap();
+    log.take();
+    (client, peer, log)
+}
+
+/// Once its copy is subscribed a poll is one request whatever it carries: the
+/// trains pushed ahead of its answer are applied as one, and a view sent none
+/// moves to the round the answer names.
+#[test]
+fn a_subscribed_copy_is_advanced_by_what_was_pushed() {
+    let (mut client, peer, log) = subscribed();
+    let h = std::thread::spawn(move || {
+        let subs = peer.grant_subscriptions(2);
+        peer.expect_sync("the poll");
+        peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
+        peer.push_train(7, subs[&7], &[(1, 10, -1)], Some(12));
+        peer.send(&reply_ctrl(0, 12));
+    });
+    let before = client.requests_sent();
+    let mut report: Vec<(u64, u64)> = block_on(client.poll_mirror(Duration::ZERO))
+        .expect("both views advance")
+        .iter()
+        .map(|o| {
+            assert!(matches!(o.result, PollResult::Advanced), "{o:?}");
+            (o.view_id, o.cursor.expect("a copy that answers").tick.get())
+        })
+        .collect();
+    h.join().unwrap();
+    report.sort_unstable();
+    assert_eq!(client.requests_sent() - before, 1, "one request for both views");
+    assert_eq!(report, [(7, 12), (8, 12)]);
+    let mut applied = log.take();
+    applied.sort_unstable_by_key(|e| format!("{e:?}"));
+    assert_eq!(applied, [Ev::Advance(7, 12), Ev::Advance(8, 12)]);
+}
+
+/// A train pushed behind another request's reply waits for the poll that
+/// applies it, and misdirects nothing.
+#[test]
+fn a_train_behind_another_reply_waits_for_its_poll() {
+    let (mut client, peer, log) = subscribed();
+    let h = std::thread::spawn(move || {
+        let subs = peer.grant_subscriptions(2);
+        assert_eq!(peer.expect_request("an id allocation"), 0);
+        peer.send(&reply_ctrl(0, 4242));
+        peer.push_train(8, subs[&8], &[(2, 20, 1)], Some(15));
+        peer.expect_sync("the poll");
+        peer.send(&reply_ctrl(0, 15));
+    });
+    assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
+    assert!(log.take().is_empty(), "a copy moves only in a poll");
+    block_on(client.poll_mirror(Duration::ZERO)).expect("both views advance");
+    h.join().unwrap();
+    let mut applied = log.take();
+    applied.sort_unstable_by_key(|e| format!("{e:?}"));
+    assert_eq!(applied, [Ev::Advance(7, 15), Ev::Advance(8, 15)]);
+}
+
+/// A subscription the server ended is continued by a delta read from the
+/// copy's own cursor in the same poll, and asked for again; the other view's
+/// is untouched.
+#[test]
+fn a_subscription_that_ended_is_continued_by_a_delta_read() {
+    let (mut client, peer, log) = subscribed();
+    let h = std::thread::spawn(move || {
+        let subs = peer.grant_subscriptions(2);
+        peer.expect_sync("the poll");
+        peer.push_train(7, subs[&7], &[], None);
+        peer.send(&reply_ctrl(0, 12));
+        assert_eq!(peer.expect_poll("the delta read"), vec![7]);
+        peer.reply_watermark(7, TAG, 13);
+    });
+    let before = client.requests_sent();
+    let report = block_on(client.poll_mirror(Duration::ZERO)).expect("both views advance");
+    h.join().unwrap();
+    assert_eq!(
+        client.requests_sent() - before,
+        3,
+        "the sync, the delta read, the new subscription"
+    );
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "an ended subscription is nobody's failure: {report:?}"
+    );
+    assert_eq!(log.take(), [Ev::Advance(8, 12), Ev::Advance(7, 13)]);
+}
+
+/// A view let go of ends its subscription, by the id it asked for it under.
+#[test]
+fn a_forgotten_view_ends_its_subscription() {
+    let (mut client, peer, _log) = subscribed();
+    let h = std::thread::spawn(move || {
+        let subs = peer.grant_subscriptions(2);
+        peer.expect_sync("the poll");
+        peer.send(&reply_ctrl(0, 9));
+        let (verb, hdr) = peer.expect_verb("the unsubscribe");
+        assert_eq!((verb, hdr.arg0), (gnitz_wire::ClientVerb::Unsubscribe, subs[&7]));
+    });
+    block_on(client.poll_mirror(Duration::ZERO)).expect("both views advance");
+    block_on(client.forget_view(7)).unwrap();
+    h.join().unwrap();
 }

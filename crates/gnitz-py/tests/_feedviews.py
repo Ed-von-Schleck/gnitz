@@ -51,15 +51,30 @@ class Subscriber:
         # A bootstrap replaces state; it does not add to it.
         self.copy = bag(rows.including_hidden())
 
-    def poll(self, wait=0.0):
+    def poll(self):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor, wait)
+        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor)
         for k, w in bag(rows.including_hidden()).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
                 del self.copy[k]
         return rows
+
+    def subscribe(self):
+        """Have the server push what `poll` would fetch. From here on the copy
+        moves by `sync` alone: a poll beside it would apply a round twice."""
+        self.sub = self.client.subscribe(self.vid, self.schema, self.cursor)
+
+    def sync(self, wait=0.0):
+        (pushed,) = self.client.sync_pushed(wait)
+        assert pushed.sub == self.sub and pushed.error is None, pushed
+        self.cursor = pushed.cursor
+        for k, w in bag(pushed.rows.including_hidden()).items():
+            self.copy[k] = self.copy.get(k, 0) + w
+            if self.copy[k] == 0:
+                del self.copy[k]
+        return pushed.rows
 
     def drain(self):
         """Collect every push acknowledged so far: one poll, since a poll ticks

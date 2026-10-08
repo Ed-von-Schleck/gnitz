@@ -27,13 +27,13 @@ fn a_stream_push_admits_only_positive_weights_outside_error_mode() {
     }
 }
 
-/// A parked poll is woken by a relation it watches and by no other, once; and
+/// A parked sync is woken by a relation it watches and by no other, once; and
 /// one that stops waiting for a reason of its own leaves no entry behind.
 #[test]
-fn a_parked_poll_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
+fn a_parked_sync_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
     use crate::runtime::test_support::try_poll_once;
 
-    let waiters = PollWaiters::default();
+    let waiters = SyncWaiters::default();
     let mut on_7 = waiters.park([7, 8].into_iter().collect());
     let mut on_9 = waiters.park([9].into_iter().collect());
 
@@ -42,13 +42,13 @@ fn a_parked_poll_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
     waiters.wake(8);
     assert!(try_poll_once(&mut on_7.woken).is_some(), "8 is one of its relations");
     assert!(try_poll_once(&mut on_9.woken).is_none(), "and none of the other's");
-    assert_eq!(waiters.parked.borrow().len(), 1, "a woken poll is no longer parked");
+    assert_eq!(waiters.parked.borrow().len(), 1, "a woken sync is no longer parked");
 
     drop(on_7);
     assert_eq!(waiters.parked.borrow().len(), 1, "its guard removes only its own entry");
     drop(on_9);
     assert!(
         waiters.parked.borrow().is_empty(),
-        "a poll that timed out is not left parked"
+        "a sync that timed out is not left parked"
     );
 }

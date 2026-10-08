@@ -15,7 +15,8 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{
-    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, RelName, ScanReply, Sent,
+    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Pushed, RelName,
+    ScanReply, Sent,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
@@ -54,6 +55,60 @@ impl PyPollResult {
                 _ => None,
             },
         }
+    }
+}
+
+/// What a sync handed one subscription. `gnitz_core::Pushed` flattened for
+/// Python, as [`PyPollResult`] is.
+#[pyclass(name = "Pushed", frozen, get_all)]
+pub struct PyPushed {
+    /// The id `subscribe` returned.
+    sub: u64,
+    /// The deltas pushed since the last sync, weights and all; `None` once
+    /// the subscription ended.
+    rows: Option<Py<PyAny>>,
+    /// `(tag, tick)` past `rows`; `None` once the subscription ended.
+    cursor: Option<(u64, u64)>,
+    /// The exception the subscription ended with, or `None`.
+    error: Option<Py<PyAny>>,
+}
+
+impl PyPushed {
+    fn new(py: Python<'_>, pushed: Pushed) -> PyResult<PyPushed> {
+        let sub = pushed.sub;
+        Ok(match pushed.result {
+            Ok((reply, cursor)) => PyPushed {
+                sub,
+                rows: Some(scan_result(py, reply)?.into_any()),
+                cursor: Some(cursor.pair()),
+                error: None,
+            },
+            Err(e) => PyPushed {
+                sub,
+                rows: None,
+                cursor: None,
+                error: Some(client_err(e).into_value(py).into_any()),
+            },
+        })
+    }
+}
+
+#[pymethods]
+impl PyPushed {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let cursor = self
+            .cursor
+            .map_or("None".to_string(), |(tag, tick)| format!("({tag}, {tick})"));
+        let show = |value: &Option<Py<PyAny>>| match value {
+            Some(v) => Ok::<_, PyErr>(v.bind(py).repr()?.to_string()),
+            None => Ok("None".to_string()),
+        };
+        Ok(format!(
+            "Pushed(sub={}, rows={}, cursor={cursor}, error={})",
+            self.sub,
+            show(&self.rows)?,
+            show(&self.error)?,
+        ))
     }
 }
 
@@ -373,32 +428,89 @@ impl PyClient {
         Self::run(slf, single!(|c| c.delta_bootstrap(view_id, &schema.rust, &spec)), delta)
     }
 
-    /// delta_poll(view_id, schema, cursor, wait=0.0, spec=None) -> (rows, cursor)
+    /// delta_poll(view_id, schema, cursor, spec=None) -> (rows, cursor)
     ///
     /// The view's deltas since `cursor`, and the cursor past them: every push
     /// acknowledged before the call is in them. Raises
     /// `GnitzDeltaExpiredError` for a cursor whose rounds are gone, or that is
     /// another boot's, another relation's or another `spec`'s: bootstrap again.
-    ///
-    /// With nothing to report, the server holds the reply until a round leaves
-    /// the view a row `spec` keeps, or `wait` seconds pass.
-    #[pyo3(signature = (view_id, schema, cursor, wait = 0.0, spec = None))]
+    #[pyo3(signature = (view_id, schema, cursor, spec = None))]
     fn delta_poll(
         slf: &Bound<'_, Self>,
         view_id: u64,
         schema: PySchema,
         cursor: (u64, u64),
-        wait: f64,
         spec: Option<Vec<u8>>,
     ) -> PyResult<Py<PyAny>> {
         let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
             .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
-        let (wait, spec) = (poll_wait(wait)?, spec.unwrap_or_else(whole_view));
+        let spec = spec.unwrap_or_else(whole_view);
         Self::run(
             slf,
-            single!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec, wait)),
+            single!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec)),
             delta,
         )
+    }
+
+    /// subscribe(view_id, schema, cursor, spec=None) -> int
+    ///
+    /// Subscribe this connection to the view's delta feed from `cursor`, which
+    /// `delta_bootstrap` or `delta_poll` handed out under the same `spec`, and
+    /// return the subscription's id. `sync_pushed` then answers with the
+    /// deltas pushed for it. It ends with its connection.
+    #[pyo3(signature = (view_id, schema, cursor, spec = None))]
+    fn subscribe(
+        slf: &Bound<'_, Self>,
+        view_id: u64,
+        schema: PySchema,
+        cursor: (u64, u64),
+        spec: Option<Vec<u8>>,
+    ) -> PyResult<Py<PyAny>> {
+        let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
+            .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
+        let spec = spec.unwrap_or_else(whole_view);
+        Self::run(
+            slf,
+            whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec)?),
+            |py, id| id.into_py_any(py),
+        )
+    }
+
+    /// unsubscribe(sub) -> None
+    ///
+    /// End a subscription. An id this client does not hold is ignored.
+    fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
+        Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
+    }
+
+    /// sync_pushed(wait=0.0) -> list[Pushed]
+    ///
+    /// One entry per subscription of this client, in the order they were
+    /// made: the deltas pushed for it since the last sync and the cursor past
+    /// them, every push acknowledged before the call among them. With nothing
+    /// to report, the server holds the reply until a round leaves a
+    /// subscription a row it keeps, or `wait` seconds pass.
+    ///
+    /// A subscription that ended carries its exception in `error` and is
+    /// gone: `delta_poll` from its last cursor, and subscribe again from there.
+    #[pyo3(signature = (wait = 0.0))]
+    fn sync_pushed(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
+        let wait = poll_wait(wait)?;
+        let convert = |py: Python<'_>, pushed: Vec<Pushed>| {
+            let results: PyResult<Vec<PyPushed>> = pushed.into_iter().map(|p| PyPushed::new(py, p)).collect();
+            results?.into_py_any(py)
+        };
+        // On an event loop the client is free while the server holds the
+        // sync.
+        if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
+            return handle.submit_then(
+                slf.py(),
+                move |c| Ok(c.begin_sync_pushed(wait)),
+                |c, mark, synced| Box::pin(async move { Ok(Sent::ready(Ok(c.finish_sync_pushed(mark, synced)))) }),
+                convert,
+            );
+        }
+        Self::run(slf, whole!(|c| c.sync_pushed(wait).await?), convert)
     }
 
     /// scan_many(pairs) -> list[ScanResult]
@@ -557,15 +669,29 @@ impl PyClient {
     /// `error`; the others went on. It raises only for a failure of the call
     /// itself: no store attached, a poisoned one, or a `KeyboardInterrupt`.
     ///
-    /// The copies then hold every push acknowledged before the call. `wait` is
-    /// `delta_poll`'s, over every view at once.
+    /// The copies then hold every push acknowledged before the call. With
+    /// nothing to report, the server holds the reply until a round leaves a
+    /// copy a row it keeps, or `wait` seconds pass.
     #[pyo3(signature = (wait = 0.0))]
     fn poll(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
         let wait = poll_wait(wait)?;
-        Self::run(slf, whole!(|c| c.poll_mirror(wait).await?), |py, outcomes| {
+        let convert = |py: Python<'_>, outcomes: Vec<PollOutcome>| {
             let results: Vec<PyPollResult> = outcomes.into_iter().map(|o| PyPollResult::new(py, o)).collect();
             results.into_py_any(py)
-        })
+        };
+        // On an event loop the client is free while the server holds the
+        // poll's one request.
+        if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
+            return handle.submit_then(
+                slf.py(),
+                move |c| c.begin_poll_mirror(wait),
+                |c, poll, synced| {
+                    Box::pin(async move { Ok(Sent::ready(Ok(c.finish_poll_mirror(poll, synced).await?))) })
+                },
+                convert,
+            );
+        }
+        Self::run(slf, whole!(|c| c.poll_mirror(wait).await?), convert)
     }
 
     /// Make every copy and its cursor durable. A failure leaves the store

@@ -232,7 +232,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         .await
         .unwrap_or_else(|e| gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {}", e));
     for &family in &held_above {
-        shared.poll_waiters.wake(family);
+        shared.sync_waiters.wake(family);
     }
 
     drop(locks);
