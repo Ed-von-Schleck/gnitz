@@ -34,7 +34,7 @@ def erase(base, target, sn):
     assert m.mirror_poisoned is None, "the store stays usable"
 
     # Intact, so the calls that span the store still answer.
-    m.poll()
+    m.sync().mirrored
     m.checkpoint()
 
     # The bootstrap never finished, so this view has no valid copy, and a read of
@@ -68,7 +68,7 @@ def panic(base, target, sn):
     churn(m, 61, 120)
     m.execute_sql("SELECT COUNT(*) AS n FROM f")
     try:
-        m.poll()
+        m.sync().mirrored
         raise SystemExit("the armed seam must panic inside the guarded apply")
     except BaseException as e:  # pyo3 raises PanicException, a BaseException
         assert "panic" in type(e).__name__.lower(), f"unexpected {type(e).__name__}: {e}"
@@ -100,12 +100,12 @@ def crash(base, target, sn):
     m.mirror_at(base)
     m.mirror_view("f")
     m.execute_sql("SELECT COUNT(*) AS n FROM f")
-    m.poll()
+    m.sync().mirrored
     m.checkpoint()
 
     churn(m, 61, 120)
     m.execute_sql("SELECT COUNT(*) AS n FROM f")
-    m.poll()
+    m.sync().mirrored
 
     print(READY, flush=True)
     while True:

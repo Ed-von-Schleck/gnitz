@@ -63,7 +63,7 @@ def test_a_mirrored_read_equals_the_server_read(client, mirror):
     vid = mirror.mirror_view("f").view_id
 
     churn(client, 1, 200)
-    mirror.poll()
+    mirror.sync().mirrored
 
     for q in [
         "SELECT * FROM f",
@@ -86,7 +86,7 @@ def test_a_mirrored_view_keeps_its_select_order(client, mirror):
     _fed_view(client, "SELECT body, id, v FROM t WHERE v > 10")
     vid = mirror.mirror_view("f").view_id
     churn(client, 1, 120)
-    mirror.poll()
+    mirror.sync().mirrored
 
     q = "SELECT * FROM f"
     local, remote = _local(mirror, vid, q), rows(client, q)
@@ -104,7 +104,7 @@ def test_a_mirrored_view_with_an_index_reads_every_row_locally(client, mirror):
     client.execute_sql("CREATE INDEX ON f(v)")
     vid = mirror.mirror_view("f").view_id
     churn(client, 1, 2000)
-    mirror.poll()
+    mirror.sync().mirrored
 
     for q in [
         "SELECT id, v FROM f WHERE v = 301",
@@ -128,13 +128,13 @@ def test_an_index_changed_upstream_reaches_the_copy_at_the_next_poll(client, mir
 
     client.execute_sql("CREATE INDEX by_v ON f(v)")
     churn(client, 1, 2000)
-    (r,) = mirror.poll()
+    (r,) = mirror.sync().mirrored
     assert (r.view_id, r.reseeded, r.error) == (vid, False, None)
     for q in queries:
         _samebag(q, _local(mirror, vid, q), rows(client, q))
 
     client.execute_sql("DROP INDEX by_v")
-    (r,) = mirror.poll()
+    (r,) = mirror.sync().mirrored
     assert (r.view_id, r.reseeded, r.error) == (vid, False, None)
     for q in queries:
         _samebag(q, _local(mirror, vid, q), rows(client, q))
@@ -146,7 +146,7 @@ def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     _fed_view(client)
     vid = mirror.mirror_view("f").view_id
     churn(client, 1, 60)
-    mirror.poll()
+    mirror.sync().mirrored
 
     before = mirror.requests_sent
     _samebag("a table", rows(mirror, "SELECT * FROM t"), rows(client, "SELECT * FROM t"))
@@ -165,7 +165,7 @@ def test_a_point_read_is_answered_off_the_copy(client, mirror):
     _fed_view(client)
     vid = mirror.mirror_view("f").view_id
     churn(client, 1, 60)
-    mirror.poll()
+    mirror.sync().mirrored
     _, schema = mirror.resolve_table("f")
     for what, read in [
         ("seek", lambda c: c.seek(vid, schema, 30)),
@@ -204,7 +204,7 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
 
         first.close()
         first.close()  # idempotent — a host must be able to release a client twice
-    for call in (first.poll, first.mirrored_ids, first.checkpoint):
+    for call in (first.sync, first.mirrored_ids, first.checkpoint):
         with pytest.raises(gnitz.GnitzConnectionError):
             call()
 
@@ -220,8 +220,7 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
         third.mirror_at(base)
         third.close_mirror()
         assert third.mirrored_ids() == [], "the registrations went with the store"
-        with pytest.raises(gnitz.GnitzError, match="mirrors nothing"):
-            third.poll()
+        assert third.sync().mirrored == [], "a client that mirrors nothing has no copy to advance"
         assert rows(third, "SELECT * FROM t"), "the connection is untouched"
         third.mirror_at(base)
         assert third.mirror_view("f").view_id == r.view_id
@@ -265,7 +264,7 @@ def test_a_mirror_reads_a_view_of_another_schema_by_its_qualified_name(client, m
     assert vid == client.resolve_table("f")[0]
 
     churn(client, 1, 50)
-    mirror.poll()
+    mirror.sync().mirrored
     _samebag("qualified read", _local(mirror, vid, f"SELECT * FROM {qualified}"),
              rows(client, "SELECT * FROM f"))
     with pytest.raises(gnitz.GnitzNotFoundError, match="relation 'f' not found"):
@@ -323,10 +322,10 @@ def test_one_poll_reports_every_view(client, mirror):
     moved = mirror.mirror_view("f").view_id
 
     churn(client, 1, 60)
-    mirror.poll()
+    mirror.sync().mirrored
     before = {vid: mirror.cursor(vid) for vid in [*idle.values(), moved]}
     assert len({tag for tag, _ in before.values()}) == len(before), "the tag is per-view"
-    for r in mirror.poll():
+    for r in mirror.sync().mirrored:
         assert not r.reseeded, "an empty poll reseeds nothing"
         assert mirror.cursor(r.view_id) == before[r.view_id], "with nothing pushed, a poll moves no cursor"
 
@@ -334,7 +333,7 @@ def test_one_poll_reports_every_view(client, mirror):
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i:0>20}')" for i in range(9001, 9040)),
     )
-    report = {r.view_id: r for r in mirror.poll()}
+    report = {r.view_id: r for r in mirror.sync().mirrored}
     assert set(report) == set(before), "one poll reports every registration, moved or not"
     for vid, (tag, tick) in before.items():
         r = report[vid]
@@ -360,7 +359,7 @@ def test_a_mirror_is_not_read_your_own_writes(client, mirror):
     _fed_view(client)
     churn(client, 1, 40)
     vid = mirror.mirror_view("f").view_id
-    mirror.poll()
+    mirror.sync().mirrored
 
     q = "SELECT id, v FROM f WHERE id = 7"
     before = bag(_local(mirror, vid, q))
@@ -369,7 +368,7 @@ def test_a_mirror_is_not_read_your_own_writes(client, mirror):
         "the copy answers at its last poll, not at what the write just made true"
     )
 
-    mirror.poll()
+    mirror.sync().mirrored
     local = _local(mirror, vid, q)
     assert bag(local) != before, "a drain must carry the write into the copy"
     _samebag(q, local, rows(client, q))
@@ -385,11 +384,11 @@ async def test_a_held_poll_leaves_an_async_client_free(client, server, mirror_di
     async with aio.connect(server, schema=client.schema) as m:
         await m.mirror_at(mirror_dir)
         await m.mirror_view("f")
-        await m.poll()
+        await m.sync()
         t0 = time.monotonic()
-        results, scanned = await asyncio.gather(m.poll(wait=30), m.scan(tid, t_schema))
+        synced, scanned = await asyncio.gather(m.sync(wait=30), m.scan(tid, t_schema))
         assert time.monotonic() - t0 < 10, "the scan released the poll, not the wait"
-        assert [r.error for r in results] == [None]
+        assert [r.error for r in synced.mirrored] == [None]
         assert len(scanned) > 0
         await m.close_mirror()
 
@@ -400,17 +399,17 @@ def test_a_waiting_poll_returns_when_a_commit_reaches_a_mirrored_view(client, mi
     _fed_view(client)
     churn(client, 1, 30)
     vid = mirror.mirror_view("f").view_id
-    mirror.poll()
+    mirror.sync().mirrored
 
     t0 = time.monotonic()
-    mirror.poll(wait=0.3)
+    mirror.sync(wait=0.3).mirrored
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
     with pytest.raises(ValueError, match="non-negative"):
-        mirror.poll(wait=-1)
+        mirror.sync(wait=-1).mirrored
 
     writer = later(server, client.schema, 0.2, "INSERT INTO t VALUES (5000, 777, 'late')")
     t0 = time.monotonic()
-    (result,) = mirror.poll(wait=60)
+    (result,) = mirror.sync(wait=60).mirrored
     assert time.monotonic() - t0 < 20, "the commit released it, not the wait"
     writer.join()
     assert result.error is None and not result.reseeded
@@ -435,13 +434,13 @@ def test_the_copy_outlives_its_server_and_reseeds_on_reconnect(own_server, mirro
         churn(client, 1, 60)
         m = mirror_on(mirror_dir, own_server.target)
         vid = m.mirror_view("f").view_id
-        m.poll()
+        m.sync().mirrored
         expected = bag(rows(client, q))
     assert expected
 
     own_server.stop()
     assert bag(_local(m, vid, q)) == expected
-    assert all(isinstance(r.error, gnitz.GnitzConnectionError) for r in m.poll()), (
+    assert all(isinstance(r.error, gnitz.GnitzConnectionError) for r in m.sync().mirrored), (
         "a dead connection fails every view's poll, and the exception says it was the connection"
     )
     assert bag(_local(m, vid, q)) == expected, "and the copy still answers at the round it reached"
@@ -452,7 +451,7 @@ def test_the_copy_outlives_its_server_and_reseeds_on_reconnect(own_server, mirro
     m.reconnect(own_server.target)
     with gnitz.connect(own_server.target) as client:
         churn(client, 61, 120)
-        assert any(r.view_id == vid and r.reseeded for r in m.poll()), (
+        assert any(r.view_id == vid and r.reseeded for r in m.sync().mirrored), (
             "a tag that stopped continuing is a reseed"
         )
         _samebag(q, _local(m, vid, q), rows(client, q))
@@ -482,7 +481,7 @@ def test_a_killed_host_reopens_at_its_last_checkpoint(client, server, mirror_on,
 
     m = mirror_on(mirror_dir, server, client.schema)
     vid = m.mirror_view("f").view_id
-    m.poll()
+    m.sync().mirrored
     for q in ("SELECT * FROM f", "SELECT COUNT(*) AS n, SUM(v) AS total FROM f"):
         _samebag(q, _local(m, vid, q), rows(client, q))
 
@@ -558,13 +557,13 @@ def test_a_mirror_call_releases_the_gil(client, mirror):
     client.execute_sql("SELECT COUNT(*) AS n FROM f")
 
     with _Contender() as spin:
-        polled, poll_dropped_gil = spin.wins(mirror.poll)
+        synced, poll_dropped_gil = spin.wins(mirror.sync)
         before = mirror.requests_sent
         held, read_dropped_gil = spin.wins(lambda: rows(mirror, "SELECT * FROM f"))
         assert mirror.requests_sent == before, "the mirrored read must be answered off the copy"
         _, during_control = spin.during(mirror.cursor, vid)
 
-    assert polled, "the poll must have covered the registered view"
+    assert synced.mirrored, "the poll must have covered the registered view"
     assert held, "the mirrored read must return rows, or it proves nothing"
 
     assert poll_dropped_gil, "a poll must drop the GIL across its delta read"

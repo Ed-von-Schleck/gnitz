@@ -319,9 +319,8 @@ const fn contains_col(cols: &[u32], ci: usize) -> bool {
     false
 }
 
-/// Sizing cap for an engine schema's PK: the widest user-declared PK plus the one
-/// indexed-column prefix of a secondary index schema — modeled as
-/// `(indexed_col, src_pk_0, …, src_pk_{k-1})`.
+/// Sizing cap for an engine schema's PK: the widest user-declared PK plus the
+/// one key column a derived schema leads it with.
 pub const MAX_PK_COLUMNS: usize = PK_LIST_MAX_COLS + 1;
 
 /// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`

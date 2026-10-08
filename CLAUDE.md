@@ -567,7 +567,8 @@ and nothing retained survives a restart.
 A delta read carries every push acknowledged before it. A connection may also
 subscribe from a cursor and sync, which may ask to be held while it has nothing
 to report; a subscription can end at any point, and its reader continues from
-that cursor with a delta read.
+that cursor with a delta read. A sync covers every subscription of its
+connection, and hands out a reader's deltas once.
 
 **A delta read may carry a subscription**: a `SELECT` over the view with no
 aggregate, order or cut, answered with only the rows and columns it keeps. A

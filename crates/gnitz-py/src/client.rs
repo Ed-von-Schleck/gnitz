@@ -16,7 +16,7 @@ use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{
     retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Pushed, RelName,
-    ScanReply, Sent,
+    ScanReply, Sent, Synced,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
@@ -55,6 +55,26 @@ impl PyPollResult {
                 _ => None,
             },
         }
+    }
+}
+
+/// What one sync brought. `gnitz_core::Synced` for Python.
+#[pyclass(name = "Synced", frozen, get_all)]
+pub struct PySynced {
+    /// One `Pushed` per subscription `subscribe` made, in the order made.
+    pushed: Py<PyAny>,
+    /// One `PollResult` per mirrored view.
+    mirrored: Py<PyAny>,
+}
+
+impl PySynced {
+    fn new(py: Python<'_>, synced: Synced) -> PyResult<PySynced> {
+        let pushed: PyResult<Vec<PyPushed>> = synced.pushed.into_iter().map(|p| PyPushed::new(py, p)).collect();
+        let mirrored: Vec<PyPollResult> = synced.mirrored.into_iter().map(|o| PyPollResult::new(py, o)).collect();
+        Ok(PySynced {
+            pushed: pushed?.into_py_any(py)?,
+            mirrored: mirrored.into_py_any(py)?,
+        })
     }
 }
 
@@ -237,8 +257,8 @@ fn whole_view() -> Vec<u8> {
     gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode()
 }
 
-/// A poll's `wait`, given in seconds.
-fn poll_wait(seconds: f64) -> PyResult<Duration> {
+/// A sync's `wait`, given in seconds.
+fn sync_wait(seconds: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(seconds)
         .map_err(|_| PyValueError::new_err(format!("wait must be a non-negative number of seconds, not {seconds}")))
 }
@@ -456,7 +476,7 @@ impl PyClient {
     ///
     /// Subscribe this connection to the view's delta feed from `cursor`, which
     /// `delta_bootstrap` or `delta_poll` handed out under the same `spec`, and
-    /// return the subscription's id. `sync_pushed` then answers with the
+    /// return the subscription's id. `sync` then answers with the
     /// deltas pushed for it. It ends with its connection.
     #[pyo3(signature = (view_id, schema, cursor, spec = None))]
     fn subscribe(
@@ -481,36 +501,6 @@ impl PyClient {
     /// End a subscription. An id this client does not hold is ignored.
     fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
         Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
-    }
-
-    /// sync_pushed(wait=0.0) -> list[Pushed]
-    ///
-    /// One entry per subscription of this client, in the order they were
-    /// made: the deltas pushed for it since the last sync and the cursor past
-    /// them, every push acknowledged before the call among them. With nothing
-    /// to report, the server holds the reply until a round leaves a
-    /// subscription a row it keeps, or `wait` seconds pass.
-    ///
-    /// A subscription that ended carries its exception in `error` and is
-    /// gone: `delta_poll` from its last cursor, and subscribe again from there.
-    #[pyo3(signature = (wait = 0.0))]
-    fn sync_pushed(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
-        let wait = poll_wait(wait)?;
-        let convert = |py: Python<'_>, pushed: Vec<Pushed>| {
-            let results: PyResult<Vec<PyPushed>> = pushed.into_iter().map(|p| PyPushed::new(py, p)).collect();
-            results?.into_py_any(py)
-        };
-        // On an event loop the client is free while the server holds the
-        // sync.
-        if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
-            return handle.submit_then(
-                slf.py(),
-                move |c| Ok(c.begin_sync_pushed(wait)),
-                |c, mark, synced| Box::pin(async move { Ok(Sent::ready(Ok(c.finish_sync_pushed(mark, synced)))) }),
-                convert,
-            );
-        }
-        Self::run(slf, whole!(|c| c.sync_pushed(wait).await?), convert)
     }
 
     /// scan_many(pairs) -> list[ScanResult]
@@ -645,7 +635,7 @@ impl PyClient {
     ///
     /// A read of `_local.<alias>` is answered off the copy and never upstream;
     /// the view itself is still read upstream, whole. Several aliases may read
-    /// one view. `poll` advances an alias with the mirrored views, and may
+    /// one view. `sync` advances an alias with the mirrored views, and may
     /// plan `sql` again.
     fn mirror_subscription(slf: &Bound<'_, Self>, alias: String, sql: String) -> PyResult<Py<PyAny>> {
         let sn = Self::schema_name(slf)?;
@@ -662,36 +652,30 @@ impl PyClient {
         Self::run(slf, whole!(|c| c.forget_view(view_id).await?), none)
     }
 
-    /// poll(wait=0.0) -> list[PollResult]
+    /// sync(wait=0.0) -> Synced
     ///
-    /// Advance every registered view and alias by one poll each — one entry per
-    /// copy, whatever happened to it. A view that failed carries its exception in
-    /// `error`; the others went on. It raises only for a failure of the call
-    /// itself: no store attached, a poisoned one, or a `KeyboardInterrupt`.
+    /// Bring every subscription of this connection up to every push
+    /// acknowledged before the call. With nothing to report, the server holds
+    /// the reply for up to `wait` seconds.
     ///
-    /// The copies then hold every push acknowledged before the call. With
-    /// nothing to report, the server holds the reply until a round leaves a
-    /// copy a row it keeps, or `wait` seconds pass.
+    /// A subscription that ended and a view that failed carry the exception
+    /// in their entry's `error`. The call raises only for a poisoned store or
+    /// a `KeyboardInterrupt`.
     #[pyo3(signature = (wait = 0.0))]
-    fn poll(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
-        let wait = poll_wait(wait)?;
-        let convert = |py: Python<'_>, outcomes: Vec<PollOutcome>| {
-            let results: Vec<PyPollResult> = outcomes.into_iter().map(|o| PyPollResult::new(py, o)).collect();
-            results.into_py_any(py)
-        };
+    fn sync(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
+        let wait = sync_wait(wait)?;
+        let convert = |py: Python<'_>, synced: Synced| PySynced::new(py, synced)?.into_py_any(py);
         // On an event loop the client is free while the server holds the
-        // poll's one request.
+        // sync's one request.
         if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
             return handle.submit_then(
                 slf.py(),
-                move |c| c.begin_poll_mirror(wait),
-                |c, poll, synced| {
-                    Box::pin(async move { Ok(Sent::ready(Ok(c.finish_poll_mirror(poll, synced).await?))) })
-                },
+                move |c| c.begin_sync(wait),
+                |c, synced| Box::pin(async move { Ok(Sent::ready(Ok(c.finish_sync(synced).await?))) }),
                 convert,
             );
         }
-        Self::run(slf, whole!(|c| c.poll_mirror(wait).await?), convert)
+        Self::run(slf, whole!(|c| c.sync(wait).await?), convert)
     }
 
     /// Make every copy and its cursor durable. A failure leaves the store

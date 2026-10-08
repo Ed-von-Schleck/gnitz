@@ -34,5 +34,5 @@ pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
 pub use protocol::wal_block::append_own_regions;
-pub use pushed::{Pushed, SyncMark};
+pub use pushed::{Pushed, Synced};
 pub use rel_name::RelName;

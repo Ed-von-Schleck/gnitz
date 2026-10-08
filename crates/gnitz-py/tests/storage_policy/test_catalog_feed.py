@@ -51,17 +51,17 @@ def test_a_waiting_poll_is_released_by_a_ddl(client, mirror, server):
         f"CREATE VIEW ddl_feed WITH (delta = '{FEED}') AS "
         f"SELECT table_id, name FROM _system.tables WHERE schema_id = {sid}")
     mirror.mirror_view("ddl_feed")
-    mirror.poll()
+    mirror.sync().mirrored
     names = lambda: sorted(r.name for r in rows(mirror, "SELECT name FROM ddl_feed"))
     assert names() == []
 
     t0 = time.monotonic()
-    mirror.poll(wait=0.3)
+    mirror.sync(wait=0.3).mirrored
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
 
     writer = later(server, client.schema, 0.2, "CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
     t0 = time.monotonic()
-    mirror.poll(wait=60)
+    mirror.sync(wait=60).mirrored
     assert time.monotonic() - t0 < 20, "the DDL released it, not the wait"
     writer.join()
     assert names() == ["late"]

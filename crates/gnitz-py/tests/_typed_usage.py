@@ -47,7 +47,7 @@ def blocking(client: gnitz.GnitzClient) -> None:
     rows, cursor = client.delta_bootstrap(tid, KV)
     assert_type(client.delta_poll(tid, KV, cursor), tuple[ScanResult, tuple[int, int]])
     assert_type(client.mirror_view("v"), PollResult)
-    assert_type(client.poll(), list[PollResult])
+    assert_type(client.sync().mirrored, list[PollResult])
     assert_type(client.cursor(tid), tuple[int, int] | None)
     assert_type(client.mirror_poisoned, str | None)
     assert_type(client.requests_sent, int)

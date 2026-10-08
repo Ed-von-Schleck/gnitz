@@ -176,7 +176,7 @@ async def test_a_mirror_on_the_loop(aconn, client, server, mirror_dir):
 
     churn(client, 101, 200)
     client.execute_sql("SELECT COUNT(*) AS n FROM f")
-    (polled,) = await aconn.poll()
+    (polled,) = (await aconn.sync()).mirrored
     assert (polled.view_id, polled.reseeded, polled.error) == (vid, False, None)
     cursor = await aconn.cursor(vid)
     assert cursor == polled.cursor and cursor is not None

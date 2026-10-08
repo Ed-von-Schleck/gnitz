@@ -26,7 +26,7 @@ def _same(client, m, local_sql, upstream_sql, what):
 
 
 def _agree(client, m, alias, sql, what):
-    m.poll()
+    m.sync().mirrored
     _same(client, m, f"SELECT * FROM _local.{alias}", sql, what)
 
 
@@ -52,7 +52,7 @@ def test_two_aliases_of_one_view(client, mirror):
         client.execute_sql(f"DELETE FROM t WHERE id = {lo - 100}")
         _agree(client, mirror, "even", even, f"even through {hi}")
         _agree(client, mirror, "mine", mine, f"mine through {hi}")
-    assert all(not o.reseeded for o in mirror.poll()), "a steady state advances"
+    assert all(not o.reseeded for o in mirror.sync().mirrored), "a steady state advances"
 
     # A read plans against the alias's own columns.
     _same(client, mirror, "SELECT id FROM _local.even WHERE v > 300", "SELECT id FROM f WHERE v % 2 = 0 AND v > 300", "a local predicate")
@@ -123,7 +123,7 @@ def test_an_alias_keeps_the_indexes_whose_columns_it_keeps(client, mirror):
     # `w` leads the SELECT list, so it is not at its upstream column number.
     mirror.mirror_subscription("even", "SELECT w, id FROM g WHERE w % 2 = 0")
     mirror.mirror_subscription("low", "SELECT id, tid FROM g WHERE id < 500")
-    mirror.poll()
+    mirror.sync().mirrored
     assert access(mirror, "SELECT id FROM _local.even WHERE w = 700") == "index range on (w)"
     assert access(mirror, "SELECT id FROM _local.low WHERE tid = 42") == "index range on (tid)"
     assert access(mirror, "SELECT tid FROM _local.low WHERE id = 42") == "pk point lookup"
@@ -138,7 +138,7 @@ def test_an_alias_keeps_the_indexes_whose_columns_it_keeps(client, mirror):
     churn(client, 2001, 2600)
     client.execute_sql("UPDATE u SET w = 700 WHERE id IN (7, 8, 9)")
     client.execute_sql("UPDATE u SET w = 701 WHERE id = 200")
-    mirror.poll()
+    mirror.sync().mirrored
     _same(client, mirror, "SELECT id, w FROM _local.even WHERE w = 700", "SELECT id, w FROM g WHERE w = 700", "after churn")
     assert bag(rows(client, "SELECT id FROM g WHERE w = 701")) != {}
     assert bag(rows(mirror, "SELECT id FROM _local.even WHERE w = 701")) == {}, "an odd w is outside the alias, index and all"
@@ -153,7 +153,7 @@ def test_an_alias_gains_an_index_at_its_next_plan(client, mirror):
     q = "SELECT id FROM _local.even WHERE v = 304"
     assert access(mirror, q) == "full scan"
     client.execute_sql("CREATE INDEX by_v ON f(v)")
-    (again,) = mirror.poll()
+    (again,) = mirror.sync().mirrored
     assert again.error is None, again.error
     assert again.view_id == first.view_id and not again.reseeded, "the rows stay; the index is filled from them"
     assert access(mirror, q) == "index range on (v)"
@@ -190,7 +190,7 @@ def test_an_alias_resumes_and_another_select_under_it_reseeds(client, server, mi
 
 def test_an_alias_follows_its_view_through_a_drop_and_a_recreate(client, mirror):
     """The alias holds an id, which a recreated view does not keep, and a spec
-    compiled against a schema, which it may not keep either. `poll` plans the
+    compiled against a schema, which it may not keep either. `sync` plans the
     SELECT again from its text; until that succeeds the alias is failed, under
     the reason, and its copy answers at the round it reached."""
     base_tables(client)
@@ -201,25 +201,25 @@ def test_an_alias_follows_its_view_through_a_drop_and_a_recreate(client, mirror)
     held = bag(rows(mirror, "SELECT * FROM _local.even"))
     client.execute_sql("DROP VIEW f")
     for _ in range(2):
-        (r,) = mirror.poll()
+        (r,) = mirror.sync().mirrored
         assert r.error is not None and r.view_id == first.view_id
     assert bag(rows(mirror, "SELECT * FROM _local.even")) == held
 
     mk_feed(client, "f", "SELECT id, v, body FROM t WHERE v > 50")
     churn(client, 201, 300)
-    (r,) = mirror.poll()
+    (r,) = mirror.sync().mirrored
     assert r.error is None and r.reseeded and r.view_id == first.view_id, r.error
     _same(client, mirror, "SELECT * FROM _local.even", sql, "after the view came back")
     churn(client, 301, 400)
-    (r,) = mirror.poll()
+    (r,) = mirror.sync().mirrored
     assert r.error is None and not r.reseeded
     _same(client, mirror, "SELECT * FROM _local.even", sql, "and advances from there")
 
     # Recreated without a column the SELECT names: there is no plan to make.
     client.execute_sql("DROP VIEW f")
     mk_feed(client, "f", "SELECT id, body FROM t WHERE v > 50")
-    mirror.poll()
-    (r,) = mirror.poll()
+    mirror.sync().mirrored
+    (r,) = mirror.sync().mirrored
     assert r.error is not None and "v" in str(r.error), r.error
 
 
@@ -238,7 +238,7 @@ def test_an_alias_reseeds_after_a_restart(own_server, mirror_on, mirror_dir):
     m.reconnect(own_server.target)
     with gnitz.connect(own_server.target) as client:
         churn(client, 61, 120)
-        (r,) = m.poll()
+        (r,) = m.sync().mirrored
         assert r.error is None and r.reseeded, r.error
         _same(client, m, "SELECT * FROM _local.even", sql, "after the restart")
 
@@ -254,7 +254,7 @@ def test_a_held_poll_sleeps_through_commits_its_alias_keeps_nothing_of(client, m
     churn(client, 1, 60)
     sql = "SELECT id, v FROM f WHERE id = 7"
     mirror.mirror_subscription("one", sql)
-    mirror.poll()
+    mirror.sync().mirrored
     before = bag(rows(mirror, "SELECT * FROM _local.one"))
 
     def write():
@@ -267,7 +267,7 @@ def test_a_held_poll_sleeps_through_commits_its_alias_keeps_nothing_of(client, m
     t = threading.Thread(target=write)
     t0 = time.monotonic()
     t.start()
-    mirror.poll(wait=30)
+    mirror.sync(wait=30).mirrored
     took = time.monotonic() - t0
     t.join()
     assert took >= 0.4, "the first commit to the view ended the wait"
@@ -275,10 +275,10 @@ def test_a_held_poll_sleeps_through_commits_its_alias_keeps_nothing_of(client, m
     assert after != before and after == bag(rows(client, sql)), "the answer carries the one change"
 
     t0 = time.monotonic()
-    mirror.poll(wait=0.3)
+    mirror.sync(wait=0.3).mirrored
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
     writer = later(server, client.schema, 0.1, "DELETE FROM t WHERE id = 7")
-    mirror.poll(wait=30)
+    mirror.sync(wait=30).mirrored
     writer.join()
     assert bag(rows(mirror, "SELECT * FROM _local.one")) == {}
 
@@ -298,7 +298,7 @@ def test_a_held_poll_of_several_copies_answers_for_whichever_moved(client, mirro
     for alias, sql in subs.items():
         mirror.mirror_subscription(alias, sql)
     mirror.mirror_view("g")
-    mirror.poll()
+    mirror.sync().mirrored
 
     def agree(what):
         for alias, sql in subs.items():
@@ -321,13 +321,13 @@ def test_a_held_poll_of_several_copies_answers_for_whichever_moved(client, mirro
         t = threading.Thread(target=write, args=(first_key, last))
         t0 = time.monotonic()
         t.start()
-        mirror.poll(wait=30)
+        mirror.sync(wait=30).mirrored
         took = time.monotonic() - t0
         t.join()
-        mirror.poll()
+        mirror.sync().mirrored
         assert took >= 0.3, f"{what}: a commit no copy keeps a row of ended the wait"
         agree(what)
     t0 = time.monotonic()
-    mirror.poll(wait=0.3)
+    mirror.sync(wait=0.3).mirrored
     assert time.monotonic() - t0 >= 0.3
     agree("quiet")

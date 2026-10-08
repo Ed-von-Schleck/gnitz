@@ -67,7 +67,7 @@ class Subscriber:
         self.sub = self.client.subscribe(self.vid, self.schema, self.cursor)
 
     def sync(self, wait=0.0):
-        (pushed,) = self.client.sync_pushed(wait)
+        (pushed,) = self.client.sync(wait).pushed
         assert pushed.sub == self.sub and pushed.error is None, pushed
         self.cursor = pushed.cursor
         for k, w in bag(pushed.rows.including_hidden()).items():

@@ -618,10 +618,10 @@ fn cursor(tick: u64) -> DeltaCursor {
     DeltaCursor::from_pair(1, tick).unwrap()
 }
 
-/// Ask for subscription `sub` to view 40, from round 3.
-fn subscribe(s: &mut Session, sub: u64) {
+/// Subscribe to view 40 from round 3; the subscription's id.
+fn subscribe(s: &mut Session) -> u64 {
     let item = DeltaCursor::item(Some(cursor(3)), 40.into(), &schema_a(), &[]);
-    s.subscribe(sub, &[item]).unwrap();
+    s.subscribe(&[item]).unwrap().start
 }
 
 /// A pushed train between two replies is set aside whole for the subscription
@@ -630,24 +630,66 @@ fn subscribe(s: &mut Session, sub: u64) {
 #[test]
 fn a_pushed_train_between_replies_is_set_aside() {
     let (mut s, peer) = pair();
-    subscribe(&mut s, 5);
+    let sub = subscribe(&mut s);
     let first = s.submit(COMMIT).unwrap();
     let second = s.submit(COMMIT).unwrap();
     let mut bytes = framed(&reply_ctrl(0, 0));
     bytes.extend(framed(&reply_ctrl(0, 1)));
-    bytes.extend(pushed_train(40, 5, &[1, 2], 9));
-    bytes.extend(pushed_train(40, 6, &[3], 9));
-    bytes.extend(pushed_train(40, 5, &[4], 11));
+    bytes.extend(pushed_train(40, sub, &[1, 2], 9));
+    bytes.extend(pushed_train(40, sub + 1, &[3], 9));
+    bytes.extend(pushed_train(40, sub, &[4], 11));
     bytes.extend(framed(&reply_ctrl(0, 2)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, first).unwrap(), 1);
     assert_eq!(await_reply(&mut s, second).unwrap(), 2);
-    let (blocks, next) = s.take_pushed(5, cursor(3), 0).unwrap();
+    let (blocks, next) = s.take_pushed(sub).unwrap();
     assert_eq!((blocks.len(), next), (2, cursor(11)), "its trains as one, in order");
-    // Handed out once; a subscription sent nothing moves to the round synced.
-    let (blocks, next) = s.take_pushed(5, cursor(11), 12).unwrap();
-    assert_eq!((blocks.len(), next), (0, cursor(12)));
-    assert!(s.take_pushed(6, cursor(3), 0).is_err(), "nobody holds 6");
+    let (blocks, next) = s.take_pushed(sub).unwrap();
+    assert_eq!((blocks.len(), next), (0, cursor(11)), "handed out once");
+    assert!(s.take_pushed(sub + 1).is_err(), "nobody holds it");
+}
+
+#[test]
+fn a_sync_moves_the_subscriptions_asked_for_before_it() {
+    let (mut s, peer) = pair();
+    let (quiet, fed) = (subscribe(&mut s), subscribe(&mut s));
+    let synced = s.submit_sync(Duration::ZERO);
+    let late = subscribe(&mut s);
+    let mut bytes = framed(&reply_ctrl(0, 0));
+    bytes.extend(framed(&reply_ctrl(0, 0)));
+    bytes.extend(pushed_train(40, fed, &[1], 12));
+    bytes.extend(framed(&reply_ctrl(0, 9)));
+    bytes.extend(framed(&reply_ctrl(0, 0)));
+    peer.send_bytes(&bytes);
+    await_reply(&mut s, synced).unwrap();
+    let at = |s: &mut Session, sub| s.take_pushed(sub).unwrap().1;
+    assert_eq!(
+        at(&mut s, quiet),
+        cursor(9),
+        "sent nothing: it stands at the round synced"
+    );
+    assert_eq!(at(&mut s, fed), cursor(12), "its train is past that round");
+    assert_eq!(at(&mut s, late), cursor(3), "asked for after the sync");
+}
+
+#[test]
+fn a_sync_of_no_subscription_is_no_request() {
+    let (mut s, _peer) = pair();
+    let synced = s.submit_sync(Duration::from_secs(60));
+    assert_eq!(s.requests_sent(), 0);
+    await_reply(&mut s, synced).unwrap();
+}
+
+#[test]
+fn a_refused_sync_moves_no_subscription() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s);
+    let synced = s.submit_sync(Duration::ZERO);
+    let mut bytes = framed(&reply_ctrl(0, 0));
+    bytes.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
+    peer.send_bytes(&bytes);
+    assert!(matches!(await_reply(&mut s, synced), Err(ClientError::Refused(_))));
+    assert_eq!(s.take_pushed(sub).unwrap().1, cursor(3));
 }
 
 /// A train that ends in a fault ends its subscription and nothing else: the
@@ -655,20 +697,18 @@ fn a_pushed_train_between_replies_is_set_aside() {
 #[test]
 fn a_pushed_fault_ends_its_subscription_and_no_request() {
     let (mut s, peer) = pair();
-    subscribe(&mut s, 5);
+    let sub = subscribe(&mut s);
     let sent = s.submit(COMMIT).unwrap();
     let mut bytes = framed(&reply_ctrl(0, 0));
-    bytes.extend(pushed_train(40, 5, &[1], 9));
-    bytes.extend(framed(&pushed_marker(40, 5)));
+    bytes.extend(pushed_train(40, sub, &[1], 9));
+    bytes.extend(framed(&pushed_marker(40, sub)));
     bytes.extend(framed(&reply_status(40, WireStatus::Error, "lagged")));
     bytes.extend(framed(&reply_ctrl(0, 3)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, sent).unwrap(), 3);
-    let ended = s.take_pushed(5, cursor(3), 0);
+    let ended = s.take_pushed(sub);
     assert!(matches!(ended, Err(ClientError::Refused(_))), "the fault is its end");
-    let gone = s
-        .take_pushed(5, cursor(3), 0)
-        .expect_err("the session holds it no more");
+    let gone = s.take_pushed(sub).expect_err("the session holds it no more");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
 }
 
@@ -677,13 +717,23 @@ fn a_pushed_fault_ends_its_subscription_and_no_request() {
 #[test]
 fn a_refused_subscribe_ends_what_it_asked_for() {
     let (mut s, peer) = pair();
-    subscribe(&mut s, 5);
+    let sub = subscribe(&mut s);
     let sent = s.submit(COMMIT).unwrap();
     let mut bytes = framed(&reply_status(0, WireStatus::Error, "unread"));
     bytes.extend(framed(&reply_ctrl(0, 3)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, sent).unwrap(), 3);
-    assert!(matches!(s.take_pushed(5, cursor(3), 0), Err(ClientError::Refused(_))));
+    assert!(matches!(s.take_pushed(sub), Err(ClientError::Refused(_))));
+}
+
+#[test]
+fn a_replacing_session_continues_the_ids() {
+    let (mut old, _peer) = pair();
+    let last = [subscribe(&mut old), subscribe(&mut old)][1];
+    let (fresh, _peer) = pair();
+    let mut fresh = fresh.replacing(&old);
+    assert_eq!(subscribe(&mut fresh), last + 1);
+    assert!(fresh.take_pushed(last).is_err(), "the old session's is not held here");
 }
 
 /// A frame of a pushed train naming another relation than the train opened

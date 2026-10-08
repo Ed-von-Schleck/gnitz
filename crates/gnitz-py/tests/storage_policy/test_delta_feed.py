@@ -3,8 +3,8 @@ walks them.
 
 A fed view keeps its recent deltas in a store of its own, and "what changed
 since round N" is one more bound on the read verb that already exists. There is
-no subscription verb, no accumulator and no server-side cursor: a subscriber
-holds `(tag, tick)` and nothing else.
+no accumulator and no server-side cursor: a subscriber holds `(tag, tick)` and
+nothing else, and a subscription only has the server issue that read itself.
 
 **Every failure mode here is a weight error.** A row-set comparison tests
 nothing — a retraction that never arrived and an insert applied twice both leave
@@ -189,7 +189,7 @@ def test_a_subscribed_reader_is_pushed_its_deltas(client, body):
         assert live and sub.copy == live, f"after sync {r}"
 
     client.unsubscribe(sub.sub)
-    assert client.sync_pushed() == []
+    assert client.sync().pushed == []
     sub.assert_converged("by polling from the subscription's cursor")
 
 
@@ -233,7 +233,8 @@ async def test_a_held_sync_leaves_an_async_client_free(client, server):
         _, cursor = await conn.delta_bootstrap(vid, schema)
         sub = await conn.subscribe(vid, schema, cursor)
         t0 = time.monotonic()
-        (pushed,), rows = await asyncio.gather(conn.sync_pushed(30), conn.scan(tid, t_schema))
+        synced, rows = await asyncio.gather(conn.sync(30), conn.scan(tid, t_schema))
+        (pushed,) = synced.pushed
         assert time.monotonic() - t0 < 10, "the scan released the sync, not the wait"
     assert len(rows) == 1
     assert (pushed.sub, pushed.error, len(pushed.rows)) == (sub, None, 0)

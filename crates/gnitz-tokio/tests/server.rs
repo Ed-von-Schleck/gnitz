@@ -282,10 +282,16 @@ fn a_shared_client_mirrors() {
             push(50..100);
             let (a, b) = (client.clone(), client.clone());
             let (polled_a, polled_b) = tokio::join!(
-                a.run(|c| Box::pin(c.poll_mirror(Duration::ZERO))),
-                b.run(|c| Box::pin(c.poll_mirror(Duration::ZERO)))
+                a.run(|c| Box::pin(c.sync(Duration::ZERO))),
+                b.run(|c| Box::pin(c.sync(Duration::ZERO)))
             );
-            for outcome in polled_a.unwrap().unwrap().into_iter().chain(polled_b.unwrap().unwrap()) {
+            for outcome in polled_a
+                .unwrap()
+                .unwrap()
+                .mirrored
+                .into_iter()
+                .chain(polled_b.unwrap().unwrap().mirrored)
+            {
                 assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");
             }
 

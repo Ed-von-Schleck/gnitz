@@ -9,6 +9,7 @@
 
 use gnitz_expr::SchemaFacts;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -186,11 +187,6 @@ pub enum Request<'a> {
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
     PushTxn { families: &'a [PushFamily] },
-    /// End the subscription of this id.
-    Unsubscribe(u64),
-    /// Bring this connection's subscriptions up to date, held up to this long
-    /// while none has anything new.
-    SyncPushed(Duration),
     /// PUSH. The frame always carries `schema`'s record.
     Push {
         target: Target,
@@ -211,14 +207,6 @@ impl Request<'_> {
             Request::AllocSerial { table, count } => {
                 let hdr = ControlHeader::naming(ClientVerb::AllocSerialRange, table, count);
                 (encode_frame(hdr, &[], None, None), table.tid)
-            }
-            Request::Unsubscribe(id) => {
-                let hdr = ControlHeader::naming(ClientVerb::Unsubscribe, Target::from(0), id);
-                (encode_frame(hdr, &[], None, None), 0)
-            }
-            Request::SyncPushed(wait) => {
-                let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms(wait));
-                (encode_frame(hdr, &[], None, None), 0)
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
@@ -300,6 +288,8 @@ enum Slot {
     /// the frame was read, so nothing waits for it: one that fails ends each
     /// of them, as a fault train does.
     Subscribe { ids: Range<u64> },
+    /// A SYNC_PUSHED, sent when the subscriptions up to `asked` were asked for.
+    Sync { asked: u64, to: Promise<()> },
     /// A pushed train of subscription `sub` to `tid`, which no request is
     /// answered by: it never queues, and is fed ahead of the head while open.
     Pushed { tid: u64, sub: u64, blocks: Vec<RawBlock> },
@@ -438,12 +428,13 @@ struct Polls {
     queue: VecDeque<Polled>,
     /// By subscription id. An id with no entry is one nobody holds.
     subs: HashMap<u64, Parked>,
+    /// The last subscription id handed out.
+    asked: u64,
 }
 
-/// The trains pushed for one subscription since its owner last took them, as
-/// one: their blocks in arrival order and the cursor past the last, with any —
-/// or the fault that ended the subscription.
-type Parked = Result<(Vec<RawBlock>, Option<DeltaCursor>), ClientError>;
+/// The blocks pushed for one subscription and not yet taken, and the cursor
+/// past everything pushed — or the fault that ended the subscription.
+type Parked = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 
 impl Polls {
     fn hand(&mut self, poll: u64, polled: Polled) {
@@ -461,10 +452,29 @@ impl Polls {
         match (parked.as_mut(), train) {
             (Ok((blocks, end)), Ok((more, cursor))) => {
                 blocks.extend(more);
-                *end = Some(cursor);
+                *end = cursor;
             }
             (Ok(_), Err(why)) => *parked = Err(why),
             (Err(_), _) => {}
+        }
+    }
+
+    /// Whether a subscription holds a train or an end nobody took yet.
+    fn untaken(&self) -> bool {
+        let quiet = |parked: &Parked| matches!(parked, Ok((blocks, _)) if blocks.is_empty());
+        self.subs.values().any(|parked| !quiet(parked))
+    }
+
+    /// Move the subscriptions up to `asked` to `round`, the answer of their
+    /// sync. Round 0 is that of a connection the server holds none for.
+    fn sync_through(&mut self, asked: u64, round: u64) {
+        let Some(round) = NonZeroU64::new(round) else {
+            return;
+        };
+        for (_, parked) in self.subs.iter_mut().filter(|(id, _)| **id <= asked) {
+            if let Ok((_, cursor)) = parked {
+                cursor.tick = cursor.tick.max(round);
+            }
         }
     }
 }
@@ -514,6 +524,13 @@ impl Session {
     /// however the bytes were batched. HELLO predates the session, uncounted.
     pub fn requests_sent(&self) -> u64 {
         self.submitted
+    }
+
+    /// Blocks parked for a subscription and not yet taken.
+    #[cfg(test)]
+    pub(crate) fn parked_blocks(&self) -> usize {
+        let held = self.polls.subs.values().filter_map(|p| p.as_ref().ok());
+        held.map(|(blocks, _)| blocks.len()).sum()
     }
 
     /// The connection's socket, as a number: valid while this session lives.
@@ -605,18 +622,29 @@ impl Session {
         Ok(sent)
     }
 
-    /// SUBSCRIBE to each item's view from its cursor on, item `i` under the
-    /// id `first + i`, which this connection has not used. Nothing waits for
-    /// the answer: a refused item ends its subscription as a pushed train
-    /// does, and so does a request the server does not read.
-    pub(crate) fn subscribe(&mut self, first: u64, items: &[txn_frame::DeltaPollItem]) -> Result<(), ClientError> {
+    /// SUBSCRIBE to each item's view from its cursor on, and return their
+    /// ids, in order. Nothing waits for the answer: a refused item ends its
+    /// subscription as a pushed train does.
+    pub(crate) fn subscribe(&mut self, items: &[txn_frame::DeltaPollItem]) -> Result<Range<u64>, ClientError> {
+        let from = |item: &txn_frame::DeltaPollItem| {
+            DeltaCursor::from_pair(item.tag, item.after_tick).ok_or_else(|| {
+                ClientError::from("a subscription continues a cursor; read the view whole first".to_string())
+            })
+        };
+        let cursors: Vec<DeltaCursor> = items.iter().map(from).collect::<Result<_, _>>()?;
+        let first = self.polls.asked + 1;
         let ids = first..first + items.len() as u64;
         self.enqueue(
             txn_frame::encode_subscribe(items, first),
             Slot::Subscribe { ids: ids.clone() },
         )?;
-        self.polls.subs.extend(ids.map(|id| (id, Ok(Default::default()))));
-        Ok(())
+        self.polls.asked = ids.end - 1;
+        let parked = ids
+            .clone()
+            .zip(cursors)
+            .map(|(id, cursor)| (id, Ok((Vec::new(), cursor))));
+        self.polls.subs.extend(parked);
+        Ok(ids)
     }
 
     /// End each subscription of `ids` this session holds. Nothing waits for
@@ -625,40 +653,52 @@ impl Session {
     pub(crate) fn unsubscribe(&mut self, ids: impl IntoIterator<Item = u64>) {
         for id in ids {
             if self.polls.subs.remove(&id).is_some() {
-                let _ = self.submit(Request::Unsubscribe(id));
+                let hdr = ControlHeader::naming(ClientVerb::Unsubscribe, Target::from(0), id);
+                let (to, _) = promise();
+                let _ = self.enqueue(encode_frame(hdr, &[], None, None), Slot::Ack { tid: 0, to });
             }
         }
         // What the socket takes now; the rest rides with the next request.
         self.step(Interest::WRITE);
     }
 
+    /// SYNC_PUSHED: bring this connection's subscriptions up to date, held up
+    /// to `wait` while none has anything new.
+    pub(crate) fn submit_sync(&mut self, wait: Duration) -> Sent<()> {
+        if self.polls.subs.is_empty() {
+            return Sent::ready(Ok(()));
+        }
+        let wait = if self.polls.untaken() { Duration::ZERO } else { wait };
+        let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms(wait));
+        let (to, sent) = promise();
+        let slot = Slot::Sync { asked: self.polls.asked, to };
+        match self.enqueue(encode_frame(hdr, &[], None, None), slot) {
+            Ok(()) => sent,
+            Err(why) => Sent::ready(Err(why)),
+        }
+    }
+
     /// What was pushed for subscription `id` since it was last taken: the
-    /// blocks in arrival order, and the cursor past them. `from` is the cursor
-    /// past everything taken before, and `through` the answer of a
-    /// SYNC_PUSHED sent after `id` was asked for — a round every subscription
-    /// the server still holds has been sent through, so where the cursor of
-    /// one sent nothing past it moves to.
+    /// blocks in arrival order, and the cursor past everything pushed.
     ///
     /// `Err` is the end of the subscription, which the session then holds no
     /// more: the server ended it, or this connection never held it.
-    pub(crate) fn take_pushed(
-        &mut self,
-        id: u64,
-        from: DeltaCursor,
-        through: u64,
-    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let Some(parked) = self.polls.subs.remove(&id) else {
+    pub(crate) fn take_pushed(&mut self, id: u64) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
+        let Entry::Occupied(mut parked) = self.polls.subs.entry(id) else {
             return Err(ClientError::from(format!(
                 "subscription {id} is not held on this connection; read from its cursor and subscribe again"
             )));
         };
-        let (blocks, end) = parked?;
-        self.polls.subs.insert(id, Ok(Default::default()));
-        let mut cursor = end.unwrap_or(from);
-        if let Some(through) = NonZeroU64::new(through) {
-            cursor.tick = cursor.tick.max(through);
+        match parked.get_mut() {
+            Ok((blocks, cursor)) => Ok((std::mem::take(blocks), *cursor)),
+            Err(_) => parked.remove(),
         }
-        Ok((blocks, cursor))
+    }
+
+    /// This session, handing out no subscription id `old` did.
+    pub(crate) fn replacing(mut self, old: &Session) -> Self {
+        self.polls.asked = old.polls.asked;
+        self
     }
 
     /// DELTA_POLL: one train per view of `views`, in order — the items of the
@@ -874,7 +914,7 @@ impl Slot {
             Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } | Slot::Pushed { tid, .. } => {
                 Some(*tid)
             }
-            Slot::Subscribe { .. } => Some(0),
+            Slot::Subscribe { .. } | Slot::Sync { .. } => Some(0),
             Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
             Slot::Resolve { .. } => None,
@@ -927,7 +967,7 @@ impl Slot {
                 decode(data, reply_schema, &buf[r])?
             }
             (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
-            (Slot::Ack { .. } | Slot::Resolve { .. } | Slot::Subscribe { .. }, Some(_)) => {
+            (Slot::Ack { .. } | Slot::Resolve { .. } | Slot::Subscribe { .. } | Slot::Sync { .. }, Some(_)) => {
                 return Err(ProtocolError::DecodeError(
                     "a data block on a reply that carries no rows".into(),
                 ))
@@ -975,6 +1015,10 @@ impl Slot {
                 }
             }
             Slot::Subscribe { .. } => {}
+            Slot::Sync { asked, to } => {
+                polls.sync_through(*asked, ctrl.hdr.arg0);
+                to.fulfil(Ok(()))
+            }
             Slot::Pushed { sub, blocks, .. } => polls.park(*sub, Ok((std::mem::take(blocks), cursor()?))),
         }
         Ok(Some(Ok(())))
@@ -996,6 +1040,7 @@ impl Slot {
                 }
             }
             Slot::Subscribe { ids } => ids.for_each(|id| polls.park(id, Err(why.clone()))),
+            Slot::Sync { mut to, .. } => to.fulfil(Err(why)),
             Slot::Pushed { sub, .. } => polls.park(sub, Err(why)),
         }
     }

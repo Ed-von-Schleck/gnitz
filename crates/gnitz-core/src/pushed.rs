@@ -1,95 +1,41 @@
-//! The subscriptions one connection holds, and the verbs of a reader that
-//! keeps its own copy: subscribe from a cursor a delta read handed out, then
-//! sync, which answers with the deltas the server pushed since.
-//!
-//! A mirror's subscriptions and a reader's share the connection: one sync
-//! brings both up to date, and each takes what was pushed for its own.
+//! A connection's sync, and the verbs of a reader that keeps its own copy:
+//! subscribe from a cursor a delta read handed out, then sync, which answers
+//! with the deltas the server pushed since and advances every mirrored view.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gnitz_wire::txn_frame::DeltaPollItem;
-
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, Request, ScanReply, Sent, Session, Target};
+use crate::connection::{DeltaCursor, ScanReply, Sent, Target};
 use crate::error::ClientError;
+use crate::mirror::PollOutcome;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::{Schema, ZSetBatch};
-
-/// A reader's subscription: the layout its trains decode under, and the
-/// cursor past everything it has been handed.
-struct Held {
-    schema: Arc<Schema>,
-    cursor: DeltaCursor,
-}
-
-/// The ids a client's subscriptions are asked for under, and a reader's own.
-/// What was pushed for each is its [`Session`]'s, which a replaced connection
-/// starts without: so an id is never asked for twice.
-pub(crate) struct Subscriptions {
-    /// The id the next subscription is asked for under.
-    next: u64,
-    /// A reader's own, by id. A mirror keeps its with the views they feed.
-    held: HashMap<u64, Held>,
-}
-
-/// Where a client's subscriptions stood when a sync was sent: the ones asked
-/// for by then, which its answer speaks for, are the ids below this.
-pub struct SyncMark(pub(crate) u64);
-
-impl Default for Subscriptions {
-    fn default() -> Self {
-        Subscriptions { next: 1, held: HashMap::new() }
-    }
-}
-
-impl Subscriptions {
-    /// Subscribe to each of `items` in one request nothing waits for: item `i`
-    /// under the id returned plus `i`.
-    pub(crate) fn ask(&mut self, session: &mut Session, items: &[DeltaPollItem]) -> Result<u64, ClientError> {
-        let first = self.next;
-        session.subscribe(first, items)?;
-        self.next += items.len() as u64;
-        Ok(first)
-    }
-}
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {
     /// The id [`GnitzClient::subscribe`] returned.
     pub sub: u64,
-    /// The deltas pushed since the last sync — none, when nothing reached the
-    /// subscription — and the cursor past them. An `Err` is the end of the
-    /// subscription: continue the copy with a delta read from its last cursor,
-    /// which finds out why, and subscribe again from there.
+    /// The deltas pushed since the last sync and the cursor past them, or
+    /// the end of the subscription.
     pub result: Result<(ScanReply, DeltaCursor), ClientError>,
 }
 
-/// What was pushed for `held`, the subscription `sub`, since it was last
-/// handed any, and its cursor moved past that. `synced` is the answer of a
-/// sync sent after `sub` was asked for.
-fn drain(
-    session: &mut Session,
-    sub: u64,
-    held: &mut Held,
-    synced: &Result<u64, ClientError>,
-) -> Result<(ScanReply, DeltaCursor), ClientError> {
-    let (blocks, cursor) = session.take_pushed(sub, held.cursor, synced.clone()?)?;
-    let mut batch = ZSetBatch::new(&held.schema);
-    for block in &blocks {
-        decode_wal_block_into(&mut batch, block.block(), &held.schema)?;
-    }
-    held.cursor = cursor;
-    let schema = Arc::clone(&held.schema);
-    Ok((ScanReply { schema, batch, lsn: None }, cursor))
+/// What one sync brought a client.
+#[must_use]
+pub struct Synced {
+    /// One entry for each subscription [`GnitzClient::subscribe`] made, in
+    /// the order they were made.
+    pub pushed: Vec<Pushed>,
+    /// One entry for each mirrored view, at the id it is mirrored under now.
+    pub mirrored: Vec<PollOutcome>,
 }
 
 impl GnitzClient {
     /// Subscribe this connection to a view's delta feed from `cursor`, which a
     /// delta read of the same view under the same `spec` handed out. Returns
-    /// the subscription's id, at once: [`Self::sync_pushed`] reports a
-    /// subscription the server refused as one that ended.
+    /// the subscription's id, at once: [`Self::sync`] reports a subscription
+    /// the server refused as one that ended.
     ///
     /// The deltas come back in `reply_schema`, weights and all.
     pub fn subscribe(
@@ -100,9 +46,8 @@ impl GnitzClient {
         spec: &[u8],
     ) -> Result<u64, ClientError> {
         let item = DeltaCursor::item(Some(cursor), view.into(), reply_schema, spec);
-        let id = self.subs.ask(&mut self.session, &[item])?;
-        let schema = Arc::clone(reply_schema);
-        self.subs.held.insert(id, Held { schema, cursor });
+        let id = self.session.subscribe(&[item])?.start;
+        self.readers.insert(id, Arc::clone(reply_schema));
         Ok(id)
     }
 
@@ -110,62 +55,61 @@ impl GnitzClient {
     /// still on its way is dropped — and an id this client does not hold is
     /// ignored.
     pub fn unsubscribe(&mut self, id: u64) {
-        if self.subs.held.remove(&id).is_some() {
+        if self.readers.remove(&id).is_some() {
             self.session.unsubscribe([id]);
         }
     }
 
-    /// Bring this client's subscriptions up to every push acknowledged before
-    /// the call, and hand back what was pushed for each. With nothing to
-    /// report, the server holds the reply until a round leaves one of the
-    /// connection's subscriptions a row it keeps, or `wait` passes.
+    /// Bring every subscription of this connection, a reader's and a
+    /// mirror's, up to every push acknowledged before the call. With nothing
+    /// to report, the server holds the reply for up to `wait`.
     ///
-    /// `Err` is an interrupt; any other failure is each subscription's own.
-    pub async fn sync_pushed(&mut self, wait: Duration) -> Result<Vec<Pushed>, ClientError> {
-        let (mark, synced) = self.begin_sync_pushed(wait);
+    /// `Err` is a poisoned store or an interrupt; any other failure is in the
+    /// entry of the subscription or view it hit.
+    pub async fn sync(&mut self, wait: Duration) -> Result<Synced, ClientError> {
+        let synced = self.begin_sync(wait)?;
         let synced = self.wait(synced).await;
         if let Err(e @ ClientError::Interrupted(_)) = synced {
             return Err(e);
         }
-        Ok(self.finish_sync_pushed(mark, synced))
+        self.finish_sync(synced).await
     }
 
-    /// The first half of [`Self::sync_pushed`]: its one request, sent. Its
-    /// reply is the second half's, and the client is free until it arrives — a
-    /// request made meanwhile ends the hold.
-    pub fn begin_sync_pushed(&mut self, wait: Duration) -> (SyncMark, Sent<u64>) {
-        self.begin_sync(!self.subs.held.is_empty(), wait)
+    /// The first half of [`Self::sync`]: its request, sent. The client is free
+    /// until the reply arrives, and a request made meanwhile ends the hold.
+    pub fn begin_sync(&mut self, wait: Duration) -> Result<Sent<()>, ClientError> {
+        let wait = self.mirror_hold(wait)?;
+        Ok(self.session.submit_sync(wait))
     }
 
-    /// One SYNC_PUSHED, sent — none with nothing `subscribed`, which is
-    /// answered as one that held no subscription — and where this client's
-    /// subscriptions stood.
-    pub(crate) fn begin_sync(&mut self, subscribed: bool, wait: Duration) -> (SyncMark, Sent<u64>) {
-        let mark = SyncMark(self.subs.next);
-        let synced = match subscribed {
-            true => self.ack(Request::SyncPushed(wait)).detach(),
-            false => Sent::ready(Ok(0)),
-        };
-        (mark, synced)
+    /// The second half of [`Self::sync`], given the reply to the first's
+    /// request. A sync that failed is the end of every subscription.
+    pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Synced, ClientError> {
+        let mirrored = self.advance_mirror(&synced).await?;
+        let pushed = self.drain_readers(&synced);
+        Ok(Synced { pushed, mirrored })
     }
 
-    /// The second half of [`Self::sync_pushed`], given the reply to the
-    /// first's request: one entry for each subscription held when that was
-    /// sent, in the order they were made. One made since is the next sync's.
-    pub fn finish_sync_pushed(&mut self, mark: SyncMark, synced: Result<u64, ClientError>) -> Vec<Pushed> {
-        let GnitzClient { session, subs, .. } = self;
-        let mut ids: Vec<u64> = subs.held.keys().copied().filter(|id| *id < mark.0).collect();
-        ids.sort_unstable();
-        let mut pushed = Vec::with_capacity(ids.len());
-        for sub in ids {
-            let held = subs.held.get_mut(&sub).expect("just listed");
-            let result = drain(session, sub, held, &synced);
-            if result.is_err() {
-                subs.held.remove(&sub);
-            }
+    /// Take what was pushed for each of a reader's subscriptions, and let go
+    /// of the ones that ended.
+    fn drain_readers(&mut self, synced: &Result<(), ClientError>) -> Vec<Pushed> {
+        let GnitzClient { session, readers, .. } = self;
+        let mut pushed = Vec::with_capacity(readers.len());
+        readers.retain(|&sub, schema| {
+            let taken = synced.clone().and_then(|()| session.take_pushed(sub));
+            let result = taken.and_then(|(blocks, cursor)| {
+                let mut batch = ZSetBatch::new(schema);
+                for block in &blocks {
+                    decode_wal_block_into(&mut batch, block.block(), schema)?;
+                }
+                let schema = Arc::clone(schema);
+                Ok((ScanReply { schema, batch, lsn: None }, cursor))
+            });
+            let held = result.is_ok();
             pushed.push(Pushed { sub, result });
-        }
-        // One whose sync failed may still be held by the server.
+            held
+        });
+        // The server may still hold one that ended here.
         session.unsubscribe(pushed.iter().filter(|p| p.result.is_err()).map(|p| p.sub));
         pushed
     }

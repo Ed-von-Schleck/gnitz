@@ -152,7 +152,9 @@ impl Fixture {
     /// Carry every push so far into the copies: a poll drains the ticks they
     /// left pending, as a read against the server does.
     fn drain(&mut self) -> Vec<PollOutcome> {
-        block_on(self.mirror().poll_mirror(Duration::ZERO)).expect("poll")
+        block_on(self.mirror().sync(Duration::ZERO))
+            .map(|s| s.mirrored)
+            .expect("poll")
     }
 
     /// `m` mirrored delta-fed views of `t`, named `<prefix>0..m`, each selecting
@@ -388,7 +390,9 @@ fn many_views_of_one_table_advance_in_one_poll() {
         assert_eq!(out.view_id, *id, "{name}: the same relation keeps its id");
         assert!(!out.result.reseeded(), "{name}: a re-registration resumes");
     }
-    let report = block_on(fx.mirror().poll_mirror(Duration::ZERO)).expect("an empty poll");
+    let report = block_on(fx.mirror().sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("an empty poll");
     assert_eq!(report.len(), M, "one entry per view: {report:?}");
     assert!(
         !report.iter().any(|o| o.result.reseeded()),
@@ -452,7 +456,9 @@ fn each_mirror_call_costs_what_it_must() {
     let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM t WHERE a = 7"));
     assert_eq!(sent, 2, "a delegated read costs one RESOLVE and one read");
 
-    let (_, sent) = cost(m, |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    let (_, sent) = cost(m, |m| {
+        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+    });
     assert_eq!(sent, 1, "a poll of both views is one request");
 }
 
@@ -587,7 +593,9 @@ fn storage_fault_child() {
     // The store is intact, so it still publishes.
     block_on(mirror.checkpoint_mirror()).expect("a store with one erased copy is still safe to publish");
     // A poll succeeds at the call level, with that view's failure inside.
-    let report = block_on(mirror.poll_mirror(Duration::ZERO)).expect("a per-view fault is not the call's");
+    let report = block_on(mirror.sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("a per-view fault is not the call's");
     assert!(
         matches!(&report[..], [o] if o.view_id == tid && matches!(o.result, PollResult::Failed(_))),
         "the armed seam refuses every re-bootstrap too: {report:?}",
@@ -619,7 +627,9 @@ fn a_reopen_resumes_every_copy_and_a_quiet_close_writes_nothing() {
         .view_id;
     churn(&mut fx.direct, 81, 120);
     fx.drain();
-    block_on(second.poll_mirror(Duration::ZERO)).expect("poll the second store");
+    block_on(second.sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("poll the second store");
     block_on(fx.mirror().checkpoint_mirror()).expect("checkpoint");
     block_on(second.checkpoint_mirror()).expect("checkpoint the second store");
     let inodes = |base_dir: &str| [manifest_inode(base_dir, keyed), manifest_inode(&second_path, repl)];
@@ -657,7 +667,9 @@ fn a_reopen_resumes_every_copy_and_a_quiet_close_writes_nothing() {
     for (client, view) in [(fx.mirror(), "v_keyed"), (&mut second, "v_repl")] {
         let out = block_on(client.mirror_view(&rel("s", view))).expect("mirror it again");
         assert!(matches!(out.result, PollResult::Advanced), "{view}: {:?}", out.result);
-        let report = block_on(client.poll_mirror(Duration::ZERO)).expect("an idle poll");
+        let report = block_on(client.sync(Duration::ZERO))
+            .map(|s| s.mirrored)
+            .expect("an idle poll");
         assert!(
             matches!(&report[..], [o] if matches!(o.result, PollResult::Advanced)),
             "{view}: {report:?}"
@@ -785,7 +797,9 @@ fn a_poll_carries_a_push_no_read_has_ticked() {
     let before = canonical(&fx.local(q)).len();
 
     sql(&mut fx.direct, "s", "INSERT INTO t VALUES (1000, 1, 5, 0.5, 'late')");
-    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    let (report, sent) = cost(fx.mirror(), |m| {
+        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+    });
     assert_eq!(sent, 1, "one request, and none of them a read of the view");
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -806,7 +820,9 @@ fn a_waiting_poll_is_held_until_a_commit_reaches_a_view() {
 
     let wait = Duration::from_millis(300);
     let t0 = std::time::Instant::now();
-    let report = block_on(fx.mirror().poll_mirror(wait)).expect("a quiet poll");
+    let report = block_on(fx.mirror().sync(wait))
+        .map(|s| s.mirrored)
+        .expect("a quiet poll");
     assert!(t0.elapsed() >= wait, "nothing changed, so the reply was held");
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -819,7 +835,9 @@ fn a_waiting_poll_is_held_until_a_commit_reaches_a_view() {
         "UPDATE t SET v = v + 100 WHERE a <= 10; INSERT INTO t VALUES (1000, 1, 5, 0.5, 'late')",
     );
     let t0 = std::time::Instant::now();
-    let _ = block_on(fx.mirror().poll_mirror(HELD)).expect("a poll the commit ends");
+    let _ = block_on(fx.mirror().sync(HELD))
+        .map(|s| s.mirrored)
+        .expect("a poll the commit ends");
     assert!(t0.elapsed() < RELEASED, "the commit released it, not the wait");
     writer.join().unwrap();
     // The writer's second commit may have missed the poll its first one ended.
@@ -849,7 +867,9 @@ fn a_commit_the_view_filters_out_does_not_end_the_wait() {
         sql(&mut client, "s", "INSERT INTO t VALUES (2001, 1, 5, 0.5, 'kept')");
     });
     let t0 = std::time::Instant::now();
-    block_on(fx.mirror().poll_mirror(HELD)).expect("a poll the second commit ends");
+    block_on(fx.mirror().sync(HELD))
+        .map(|s| s.mirrored)
+        .expect("a poll the second commit ends");
     let took = t0.elapsed();
     writer.join().unwrap();
     assert!(took >= GAP, "the commit the view kept nothing of ended the wait");
@@ -888,7 +908,7 @@ fn a_waiting_loop_under_back_to_back_commits_is_paced() {
     let t0 = std::time::Instant::now();
     let mut replies = 0;
     while canonical(&fx.local(q)).len() < before + COMMITS {
-        block_on(fx.mirror().poll_mirror(HELD)).expect("poll");
+        block_on(fx.mirror().sync(HELD)).map(|s| s.mirrored).expect("poll");
         replies += 1;
     }
     let elapsed = t0.elapsed().as_millis();
@@ -915,7 +935,9 @@ fn a_view_dropped_under_a_waiting_poll_ends_the_wait() {
 
     let dropper = later(&fx, Duration::from_millis(200), "DROP VIEW v_doomed");
     let t0 = std::time::Instant::now();
-    let report = block_on(fx.mirror().poll_mirror(HELD)).expect("a per-view failure is not the call's");
+    let report = block_on(fx.mirror().sync(HELD))
+        .map(|s| s.mirrored)
+        .expect("a per-view failure is not the call's");
     assert!(t0.elapsed() < RELEASED, "the drop released it");
     dropper.join().unwrap();
     for o in &report {
@@ -943,7 +965,9 @@ fn a_wait_covers_more_views_than_one_cut_reads() {
         "INSERT INTO t VALUES (3000, 1, 69, 0.5, 'wide')",
     );
     let t0 = std::time::Instant::now();
-    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(HELD)).expect("poll"));
+    let (report, sent) = cost(fx.mirror(), |m| {
+        block_on(m.sync(HELD)).map(|s| s.mirrored).expect("poll")
+    });
     assert!(t0.elapsed() < RELEASED, "the commit released it");
     writer.join().unwrap();
     assert_eq!(sent, 1, "{M} views ride one request");
@@ -1048,11 +1072,13 @@ fn a_held_poll_leaves_its_client_free() {
     fx.drain();
 
     let t0 = std::time::Instant::now();
-    let (poll, synced) = fx.mirror().begin_poll_mirror(HELD).expect("the first half");
+    let synced = fx.mirror().begin_sync(HELD).expect("the first half");
     block_on(fx.mirror().resolve_relation(&rel("s", "t"))).expect("a request beside the held poll");
     let synced = block_on(fx.mirror().wait(synced));
     assert!(t0.elapsed() < RELEASED, "the request beside it released the poll");
-    let report = block_on(fx.mirror().finish_poll_mirror(poll, synced)).expect("the second half");
+    let report = block_on(fx.mirror().finish_sync(synced))
+        .expect("the second half")
+        .mirrored;
     assert_eq!(report.len(), 2, "one entry per view: {report:?}");
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -1061,10 +1087,12 @@ fn a_held_poll_leaves_its_client_free() {
 
     // A view forgotten between the halves is left out, and the rest go on.
     sql(&mut fx.direct, "s", "INSERT INTO t VALUES (4000, 1, 5, 0.5, 'between')");
-    let (poll, synced) = fx.mirror().begin_poll_mirror(Duration::ZERO).expect("the first half");
+    let synced = fx.mirror().begin_sync(Duration::ZERO).expect("the first half");
     block_on(fx.mirror().forget_view(repl)).expect("forget");
     let synced = block_on(fx.mirror().wait(synced));
-    let report = block_on(fx.mirror().finish_poll_mirror(poll, synced)).expect("the second half");
+    let report = block_on(fx.mirror().finish_sync(synced))
+        .expect("the second half")
+        .mirrored;
     assert_eq!(report.len(), 1, "{report:?}");
     assert_eq!(report[0].view_id, keyed);
     assert!(fx.differential("s", "SELECT * FROM v_keyed WHERE a >= 4000") > 0);
@@ -1107,7 +1135,7 @@ impl Reader {
 
     /// One sync of `client`, whose one subscription is `sub`, applied.
     fn sync(&mut self, client: &mut GnitzClient, sub: u64, wait: Duration) -> usize {
-        let mut pushed = block_on(client.sync_pushed(wait)).expect("sync");
+        let mut pushed = block_on(client.sync(wait)).expect("sync").pushed;
         assert_eq!(pushed.len(), 1, "one entry per subscription");
         let pushed = pushed.pop().unwrap();
         assert_eq!(pushed.sub, sub);
@@ -1151,8 +1179,9 @@ fn a_sync_hands_a_reader_the_deltas_pushed_for_it() {
     // Ended, the subscription is no entry of a sync, and its cursor continues.
     fx.direct.unsubscribe(sub);
     churn(&mut fx.direct, 900, 910);
-    assert!(block_on(fx.direct.sync_pushed(Duration::ZERO))
+    assert!(block_on(fx.direct.sync(Duration::ZERO))
         .expect("sync")
+        .pushed
         .is_empty());
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
     let polled = block_on(fx.direct.delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
@@ -1189,8 +1218,8 @@ fn a_waiting_sync_is_held_until_a_commit_reaches_a_subscription() {
     reader.assert_converged(&mut fx.direct, "after the waiting sync");
 }
 
-/// A mirror and a reader on one connection each get the trains of their own
-/// subscriptions, whichever of them syncs first.
+/// A mirror and a reader on one connection are brought up to date by one
+/// sync, each by the trains of its own subscriptions.
 #[test]
 fn a_mirror_and_a_reader_share_a_connection() {
     let mut fx = Fixture::start();
@@ -1202,20 +1231,60 @@ fn a_mirror_and_a_reader_share_a_connection() {
 
     for round in 0..4 {
         churn(&mut fx.direct, 100 * (round + 1), 100 * (round + 1) + 30);
-        // Either sync brings the trains of both; each must leave the other's.
-        if round % 2 == 0 {
-            fx.drain();
-            assert!(reader.sync(fx.mirror(), sub, Duration::ZERO) > 0, "round {round}");
-        } else {
-            assert!(reader.sync(fx.mirror(), sub, Duration::ZERO) > 0, "round {round}");
-            fx.drain();
-        }
+        // One sync brings the trains of both.
+        assert!(reader.sync(fx.mirror(), sub, Duration::ZERO) > 0, "round {round}");
         reader.assert_converged(&mut fx.direct, &format!("round {round}: the reader"));
         assert!(
             fx.differential("s", "SELECT * FROM v_keyed") > 30,
             "round {round}: the mirror"
         );
     }
+}
+
+#[test]
+fn a_sync_hands_a_readers_deltas_out_once() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    fx.mirror_both();
+    let mut reader = Reader::bootstrap(fx.mirror());
+    let sub = reader.subscribe(fx.mirror());
+    churn(&mut fx.direct, 100, 130);
+    let dropped = block_on(fx.mirror().sync(Duration::ZERO)).expect("sync").pushed;
+    let rows = |p: &gnitz_core::Pushed| p.result.as_ref().map(|(rows, _)| rows.batch.len()).ok();
+    assert!(
+        matches!(&dropped[..], [p] if rows(p) > Some(0)),
+        "the sync carried its deltas"
+    );
+    assert_eq!(
+        reader.sync(fx.mirror(), sub, Duration::ZERO),
+        0,
+        "and the next has none"
+    );
+}
+
+#[test]
+fn a_reconnect_ends_a_readers_subscription() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    fx.mirror_both();
+    let mut reader = Reader::bootstrap(fx.mirror());
+    let sub = reader.subscribe(fx.mirror());
+    assert_eq!(reader.sync(fx.mirror(), sub, Duration::ZERO), 0);
+
+    fx.reconnect_mirror();
+    churn(&mut fx.direct, 100, 130);
+    let mut pushed = block_on(fx.mirror().sync(Duration::ZERO)).expect("sync").pushed;
+    let ended = pushed.pop().expect("one entry for the subscription");
+    assert!(pushed.is_empty() && ended.sub == sub && ended.result.is_err());
+
+    let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
+    let polled = block_on(fx.mirror().delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
+    assert!(reader.apply(polled) > 0);
+    let again = reader.subscribe(fx.mirror());
+    assert_ne!(again, sub, "an id is one subscription's");
+    churn(&mut fx.direct, 200, 230);
+    assert!(reader.sync(fx.mirror(), again, Duration::ZERO) > 0);
+    reader.assert_converged(&mut fx.direct, "after the reconnect");
 }
 
 /// A subscription the server refuses is reported once, by the next sync, as
@@ -1237,7 +1306,7 @@ fn a_refused_subscription_ends_at_the_next_sync() {
         .expect("the request is sent");
 
     churn(&mut fx.direct, 100, 130);
-    let pushed = block_on(fx.direct.sync_pushed(Duration::ZERO)).expect("sync");
+    let pushed = block_on(fx.direct.sync(Duration::ZERO)).expect("sync").pushed;
     let subs: Vec<u64> = pushed.iter().map(|p| p.sub).collect();
     assert_eq!(subs, [held, refused], "one entry each, in the order they were made");
     for p in pushed {
@@ -1711,8 +1780,9 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
     );
 
     block_on(fx.mirror().forget_view(repl_id)).expect("forget the dead registration");
-    let report =
-        block_on(fx.mirror().poll_mirror(Duration::ZERO)).expect("the poll recovers once the dead view is gone");
+    let report = block_on(fx.mirror().sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("the poll recovers once the dead view is gone");
     assert!(
         matches!(&report[..], [o] if o.view_id == keyed && matches!(o.result, PollResult::Advanced)),
         "only the survivor is reported, and it advances: {report:?}",
@@ -1749,7 +1819,9 @@ fn a_recreated_view_is_followed_to_its_new_id() {
             fx.reconnect_mirror();
         }
 
-        let report = block_on(fx.mirror().poll_mirror(Duration::ZERO)).expect("the poll follows the view");
+        let report = block_on(fx.mirror().sync(Duration::ZERO))
+            .map(|s| s.mirrored)
+            .expect("the poll follows the view");
         let new = report
             .iter()
             .find(|o| o.view_id != old && o.view_id != repl)
@@ -1802,7 +1874,9 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
 
     churn(&mut fx.direct, 61, 90);
     let (report, sent) = cost(fx.mirror(), |m| {
-        block_on(m.poll_mirror(Duration::ZERO)).expect("the poll after a reconnect")
+        block_on(m.sync(Duration::ZERO))
+            .map(|s| s.mirrored)
+            .expect("the poll after a reconnect")
     });
     assert_eq!(
         sent, 2,
@@ -2247,7 +2321,7 @@ fn poisoned_read_child() {
 
     churn(&mut direct, 41, 80);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        block_on(mirror.poll_mirror(Duration::ZERO))
+        block_on(mirror.sync(Duration::ZERO)).map(|s| s.mirrored)
     }));
     assert!(unwound.is_err(), "the armed seam must panic inside the guarded region");
     assert!(
@@ -2271,7 +2345,7 @@ fn poisoned_read_child() {
     // Neither call-level verb spends a round trip finding out.
     let (refused, sent) = cost(&mut mirror, |m| {
         [
-            block_on(m.poll_mirror(Duration::ZERO)).err(),
+            block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).err(),
             block_on(m.mirror_view(&rel("s", "v_repl"))).err(),
         ]
     });
@@ -2380,7 +2454,9 @@ fn a_subscription_that_falls_behind_is_continued_by_a_delta_read() {
     fx.drain();
 
     sql(&mut fx.direct, "s", "INSERT INTO t VALUES (5000, 1, 2, 3.5, 'one row')");
-    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    let (report, sent) = cost(fx.mirror(), |m| {
+        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+    });
     assert_eq!(sent, 1, "a train that fits the queue rides the one request");
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -2392,7 +2468,9 @@ fn a_subscription_that_falls_behind_is_continued_by_a_delta_read() {
     for lo in [100, 400, 700] {
         churn(&mut fx.direct, lo, lo + 250);
     }
-    let (report, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    let (report, sent) = cost(fx.mirror(), |m| {
+        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+    });
     assert!(
         sent > 1,
         "the ended subscriptions were continued by a delta read: {sent} requests"
@@ -2405,7 +2483,9 @@ fn a_subscription_that_falls_behind_is_continued_by_a_delta_read() {
     fx.differential("s", "SELECT * FROM v_repl");
 
     sql(&mut fx.direct, "s", "INSERT INTO t VALUES (5001, 1, 2, 3.5, 'one row')");
-    let (_, sent) = cost(fx.mirror(), |m| block_on(m.poll_mirror(Duration::ZERO)).expect("poll"));
+    let (_, sent) = cost(fx.mirror(), |m| {
+        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+    });
     assert_eq!(sent, 1, "and the copies are subscribed again");
     fx.differential("s", "SELECT * FROM v_keyed");
     fx.differential("s", "SELECT * FROM v_repl");
@@ -2427,7 +2507,9 @@ fn many_subscribers_of_one_view_each_converge() {
         client
     };
     let agree = |client: &mut GnitzClient, direct: &mut GnitzClient, what: &str| {
-        let (report, sent) = cost(client, |c| block_on(c.poll_mirror(Duration::ZERO)).expect("poll"));
+        let (report, sent) = cost(client, |c| {
+            block_on(c.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll")
+        });
         assert_eq!(sent, 1, "{what}: one request");
         assert!(
             report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -2472,7 +2554,9 @@ fn many_subscribers_of_one_view_each_converge() {
         .map(|mut client| {
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                block_on(client.poll_mirror(Duration::from_secs(60))).expect("poll");
+                block_on(client.sync(Duration::from_secs(60)))
+                    .map(|s| s.mirrored)
+                    .expect("poll");
                 assert!(started.elapsed() < Duration::from_secs(30), "the commit ended the wait");
                 client
             })

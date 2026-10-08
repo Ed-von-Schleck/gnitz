@@ -495,8 +495,10 @@ pub struct GnitzClient {
     /// The local copy this client reads through, if a host attached one. Boxed,
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
-    /// The subscriptions this connection holds, a mirror's and a reader's own.
-    pub(crate) subs: crate::pushed::Subscriptions,
+    /// A reader's subscriptions, each with the layout its trains decode
+    /// under, in the order they were made. A mirror keeps its own with the
+    /// views they feed.
+    pub(crate) readers: std::collections::BTreeMap<u64, Arc<Schema>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     kept: HashMap<RelName, Arc<RelDescriptor>>,
@@ -510,7 +512,7 @@ const _: fn() = || {
     assert_send::<GnitzClient>();
     assert_send::<Sent<ScanReply>>();
     let _ = |mut c: GnitzClient, schema: &Arc<Schema>, batch: &ZSetBatch| {
-        assert_send_value(c.poll_mirror(Duration::ZERO));
+        assert_send_value(c.sync(Duration::ZERO));
         assert_send_value(c.create_schema(""));
         assert_send_value(c.push(0, schema, batch, WireConflictMode::Update));
         assert_send_value(serve(c, |_| Poll::Ready(None)));
@@ -552,7 +554,7 @@ impl GnitzClient {
             serial_cache: HashMap::new(),
             txn: None,
             mirror: None,
-            subs: Default::default(),
+            readers: Default::default(),
             kept: HashMap::new(),
         })
     }
@@ -747,11 +749,11 @@ impl GnitzClient {
             serial_cache,
             txn: _,
             mirror,
-            subs: _,
+            readers: _,
             kept,
         } = self;
         host.attach(fresh.as_fd())?;
-        *session = fresh;
+        *session = fresh.replacing(session);
         serial_cache.clear();
         kept.clear();
         if let Some(m) = mirror.as_deref_mut() {
@@ -787,7 +789,7 @@ impl GnitzClient {
     /// discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
     /// It carries every push acknowledged before it, and is answered at once:
-    /// only a mirror's poll waits for a view to change.
+    /// only a sync waits for a view to change.
     pub fn delta_poll(
         &mut self,
         view: impl Into<Target>,

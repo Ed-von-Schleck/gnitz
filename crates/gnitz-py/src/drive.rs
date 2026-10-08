@@ -485,9 +485,9 @@ impl LoopHandle {
     }
 
     /// Queue `first`, and once the reply it sent for arrives, `second` with
-    /// what `first` kept and that reply; hand back the loop future `second`'s
-    /// result resolves. The client is free in between.
-    pub(crate) fn submit_then<S, A, T, O, P, C>(
+    /// that reply; hand back the loop future `second`'s result resolves. The
+    /// client is free in between.
+    pub(crate) fn submit_then<A, T, O, P, C>(
         &self,
         py: Python<'_>,
         first: O,
@@ -495,11 +495,10 @@ impl LoopHandle {
         convert: C,
     ) -> PyResult<Py<PyAny>>
     where
-        S: Send + 'static,
         A: Send + 'static,
         T: Send + 'static,
-        O: FnOnce(&mut GnitzClient) -> Result<(S, Sent<A>), ClientError> + Send + 'static,
-        P: for<'a> FnOnce(&'a mut GnitzClient, S, Result<A, ClientError>) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>>
+        O: FnOnce(&mut GnitzClient) -> Result<Sent<A>, ClientError> + Send + 'static,
+        P: for<'a> FnOnce(&'a mut GnitzClient, Result<A, ClientError>) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>>
             + Send
             + 'static,
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
@@ -510,9 +509,9 @@ impl LoopHandle {
                     match first(client) {
                         // The step that reads the reply queues the rest, and
                         // the `serve` loop takes it up before it waits again.
-                        Ok((kept, sent)) => sent.then(move |reply| {
+                        Ok(sent) => sent.then(move |reply| {
                             let shared = Arc::clone(&owed.shared);
-                            let rest = owed.call(move |client| second(client, kept, reply), convert);
+                            let rest = owed.call(move |client| second(client, reply), convert);
                             shared.state().queue.push_back(rest);
                         }),
                         Err(fail) => owed.land(landed(Err(fail.into()), convert)),
