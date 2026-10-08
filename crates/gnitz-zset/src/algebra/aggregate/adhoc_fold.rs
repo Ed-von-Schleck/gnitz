@@ -1,10 +1,10 @@
 //! Ad-hoc aggregation hash-fold — the stateless per-worker sink behind a
 //! fold-sink `ReadSpec` (single-relation GROUP BY / global aggregate / DISTINCT
 //! over the committed base). No circuit, no operator traces, no exchange: each
-//! surviving scan chunk folds into per-group accumulators in bounded RAM, then
+//! surviving scan chunk folds into per-group aggregate values in bounded RAM, then
 //! one partial reduce-output batch is emitted.
 //!
-//! It runs the same `GroupOutKey`, accumulators and `emit_reduce_row` as a
+//! It runs the same `GroupOutKey`, aggregates and `emit_reduce_row` as a
 //! view's reduce, so its output is that reduce's output over the same group set.
 //!
 //! The scan cursor delivers consolidated, positive-weight rows, so there is no
@@ -14,7 +14,7 @@
 
 use gnitz_wire::AggReadSpec;
 
-use super::agg::{Accumulator, GroupedState};
+use super::agg::{AggValues, RangeGroups};
 use super::emit::emit_reduce_row;
 use super::shape::ReduceShape;
 use crate::algebra::group_key::{ground_pk, GroupNumbers, GroupOutKey, IdentityLoop};
@@ -27,10 +27,8 @@ pub(crate) struct AdhocFold {
     /// Row `ord` is group `ord`'s key and group columns; a global fold's one
     /// group is row 0 from [`Self::new`].
     groups: Batch,
-    /// A global fold's one group. A grouped fold holds [`Self::states`] instead.
-    global: Vec<Accumulator>,
-    /// Per aggregate, its running value for every group of `groups`.
-    states: Vec<GroupedState>,
+    /// Each aggregate's running value for every group of `groups`.
+    vals: AggValues,
     /// Group key → group ordinal.
     numbers: GroupNumbers,
     /// The group ordinal of each surviving row of the chunk being folded.
@@ -47,15 +45,12 @@ impl AdhocFold {
             GroupOutKey::new(src_schema, &agg.group_cols, agg.group_cols.iter().copied()).map_err(refuse)?;
         let mut groups = Batch::empty_with_schema(&prefix.finish().map_err(refuse)?);
         let shape = ReduceShape::new(src_schema, key, prefix, &agg.aggs).map_err(refuse)?;
-        let mut global = Vec::new();
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
             groups.push_key_row(ground_pk().bytes(), 1);
-            global.extend_from_slice(&shape.acc_template);
         }
         Ok(AdhocFold {
-            states: shape.acc_template.iter().map(Accumulator::grouped).collect(),
-            global,
+            vals: AggValues::new(&shape.aggs, groups.count),
             groups,
             shape,
             numbers: GroupNumbers::default(),
@@ -75,16 +70,15 @@ impl AdhocFold {
         let Self {
             shape,
             groups,
-            global,
-            states,
+            vals,
             numbers,
             ord,
             group_cap,
         } = self;
         let mb = chunk.as_mem_batch();
         if shape.key.is_global() {
-            for &(s, e) in ranges {
-                Accumulator::fold_rows(global, &mb, s..e, true);
+            for (k, agg) in shape.aggs.iter().enumerate() {
+                vals.fold(k, agg, &mb, ranges, RangeGroups::FIRST);
             }
             return Ok(());
         }
@@ -100,35 +94,28 @@ impl AdhocFold {
             ranges,
         };
         shape.key.with_identity(&mb, assign)?;
-        for (acc, state) in shape.acc_template.iter().zip(states) {
-            state.resize(groups.count, acc);
-            acc.fold_grouped(&mb, ranges, ord, state);
+        vals.resize(groups.count);
+        for (k, agg) in shape.aggs.iter().enumerate() {
+            vals.fold(k, agg, &mb, ranges, &ord[..]);
         }
         Ok(())
     }
 
     /// One partial row per present group (weight +1), in group-discovery order.
-    pub(crate) fn finish(mut self) -> Batch {
+    pub(crate) fn finish(self) -> Batch {
         let gs = self.groups.schema();
         let carried = gs.payload_locators();
         let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.count);
         let groups_mb = self.groups.as_mem_batch();
-        let grouped = !self.shape.key.is_global();
-        let mut accs = match grouped {
-            true => self.shape.acc_template.clone(),
-            false => self.global,
-        };
-        for ord in 0..self.groups.count {
-            if grouped {
-                for (acc, state) in accs.iter_mut().zip(&mut self.states) {
-                    state.take(ord, acc);
-                }
-            }
+        for g in 0..self.groups.count {
+            let group = Some((&groups_mb, g, &carried[..]));
             emit_reduce_row(
                 &mut output,
-                Some((&groups_mb, ord, &carried)),
-                groups_mb.get_pk_bytes(ord),
-                &accs,
+                group,
+                groups_mb.get_pk_bytes(g),
+                &self.shape.aggs,
+                &self.vals,
+                g,
             );
         }
         output
@@ -173,12 +160,9 @@ impl IdentityLoop for AssignGroups<'_> {
                          CREATE VIEW to maintain this aggregation incrementally"
                     ));
                 }
-                emit_reduce_row(
-                    groups,
-                    Some((mb, row, shape.key.carried())),
-                    shape.key.out_pk(mb, row).bytes(),
-                    &[],
-                );
+                groups.begin_row(shape.key.out_pk(mb, row).bytes(), 1);
+                groups.append_cells_from(0, shape.key.carried(), mb, row);
+                groups.commit_row();
                 Ok(g as u32)
             })?;
             ord.push(g);

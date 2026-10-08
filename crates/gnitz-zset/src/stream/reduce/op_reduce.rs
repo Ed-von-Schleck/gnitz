@@ -10,7 +10,7 @@ use super::avi::AviBake;
 use super::plan::ReducePlan;
 use crate::algebra::emit_reduce_row;
 use crate::algebra::ground_pk;
-use crate::algebra::{Accumulator, GroupOrdinals, GroupedState};
+use crate::algebra::{AggValues, GroupOrdinals, RangeGroups};
 use crate::stream::OpenAt;
 
 /// A group with more delta rows than this skips the pre-step and probes the
@@ -41,7 +41,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
             let v0 = ground_pk();
             if !trace_out(v0.bytes(), v0.bytes()).seek_pk_group_ascending(v0.bytes()) {
                 let mut out = Batch::with_capacity(output_schema, 1);
-                emit_reduce_row(&mut out, None, v0.bytes(), &shape.acc_template);
+                emit_reduce_row(&mut out, None, v0.bytes(), &shape.aggs, &plan.empty_group, 0);
                 return out;
             }
         }
@@ -52,7 +52,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     let weights = mb.weight().as_chunks::<8>().0;
     let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
     let indexed = plan.avi.is_some();
-    let mut accs = shape.acc_template.clone();
+    let aggs = &shape.aggs[..];
 
     let groups = match shape.key.runs(delta) {
         Some(runs) if runs.len() == 1 || 2 * runs.len() <= delta.count => {
@@ -71,11 +71,36 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
                 .filter_map(|(run, &probe)| probe.then_some(run.start));
             let ends = (0, runs.last_start());
             let mut groups = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, runs.len());
-            for (g, run) in runs.iter().enumerate() {
-                accs.iter_mut().for_each(Accumulator::reset);
-                let probe = indexed && probes[g];
-                Accumulator::fold_rows(&mut accs, &mb, run.clone(), indexed && !probe);
-                groups.emit(run.start, &mut accs, probe);
+            // One run — a delta of one row, a global aggregate — names its range in place.
+            let (whole, spans);
+            let ranges: &[(usize, usize)] = match runs.len() {
+                1 => {
+                    whole = [(0, delta.count)];
+                    &whole
+                }
+                _ => {
+                    spans = runs.iter().map(|run| (run.start, run.end)).collect::<Vec<_>>();
+                    &spans
+                }
+            };
+            // A probed run's extremes come off the index: an extreme folds the
+            // runs with each of those emptied, so it steps none of its rows.
+            let unprobed: Vec<(usize, usize)>;
+            let stepped: &[(usize, usize)] = match probes.contains(&true) {
+                true => {
+                    let keep = |(&(s, e), &probe): (&(usize, usize), &bool)| (s, if probe { s } else { e });
+                    unprobed = ranges.iter().zip(&probes).map(keep).collect();
+                    &unprobed
+                }
+                false => ranges,
+            };
+            let mut vals = AggValues::new(aggs, ranges.len());
+            for (k, agg) in aggs.iter().enumerate() {
+                let folded = if agg.is_linear() { ranges } else { stepped };
+                vals.fold(k, agg, &mb, folded, RangeGroups::EACH);
+            }
+            for (g, &(first, _)) in ranges.iter().enumerate() {
+                groups.emit(first, &mut vals, g, indexed && probes[g]);
             }
             return groups.finish();
         }
@@ -83,21 +108,16 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
         None => shape.key.numbered(delta),
     };
 
-    let mut states: Vec<GroupedState> = shape.acc_template.iter().map(Accumulator::grouped).collect();
-    let whole = [(0, delta.count)];
-    for (acc, state) in shape.acc_template.iter().zip(&mut states) {
-        state.resize(groups.len(), acc);
-        acc.fold_grouped(&mb, &whole, &groups.ord, state);
+    let mut vals = AggValues::new(aggs, groups.len());
+    for (k, agg) in aggs.iter().enumerate() {
+        vals.fold(k, agg, &mb, &[(0, delta.count)], &groups.ord[..]);
     }
-    // Per group, whether its extremes come off the index: too many rows to have
-    // pre-stepped, or a retraction among them.
+    // Per group, whether its extremes come off the index. Every row is stepped
+    // whatever its group then reads, so only a retraction sends one there.
     let mut probes = vec![false; if indexed { groups.len() } else { 0 }];
     if indexed {
-        let mut rows = vec![0u32; groups.len()];
         for (&g, w) in groups.ord.iter().zip(weights) {
-            let g = g as usize;
-            rows[g] += 1;
-            probes[g] |= retracts(w) || rows[g] as usize > PRESTEP_CAP;
+            probes[g as usize] |= retracts(w);
         }
     }
 
@@ -111,10 +131,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     let mut emit = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, groups.len());
     for &g in &groups.by_pk {
         let g = g as usize;
-        for (acc, state) in accs.iter_mut().zip(&mut states) {
-            state.take(g, acc);
-        }
-        emit.emit(groups.first[g] as usize, &mut accs, indexed && probes[g]);
+        emit.emit(groups.first[g] as usize, &mut vals, g, indexed && probes[g]);
     }
     emit.finish()
 }
@@ -155,11 +172,11 @@ impl<'a> GroupEmit<'a> {
         GroupEmit { plan, delta, trace_out, avi, groups, out }
     }
 
-    /// Emit the group of delta row `first`, whose delta `accs` hold. Under
-    /// `probe` its extremes are read off the value index, whatever `accs` hold
-    /// for them. Groups arrive in ascending output-PK order.
+    /// Emit the group of delta row `first`, whose delta group `g` of `vals`
+    /// holds. Under `probe` its extremes are read off the value index, whatever
+    /// `vals` hold for them. Groups arrive in ascending output-PK order.
     #[inline(always)]
-    fn emit(&mut self, first: usize, accs: &mut [Accumulator], probe: bool) {
+    fn emit(&mut self, first: usize, vals: &mut AggValues, g: usize, probe: bool) {
         let shape = &self.plan.shape;
         let out_pk = shape.key.out_pk(self.delta, first);
         let out_pk_bytes: &[u8] = out_pk.bytes();
@@ -169,26 +186,34 @@ impl<'a> GroupEmit<'a> {
             // −Agg(history) is the stored row, copied byte-identical at −1.
             self.trace_out.copy_current_row_into(&mut self.out, -1);
             let (stored_row, stored_idx) = self.trace_out.current_row_source();
-            for acc in accs.iter_mut().filter(|a| a.is_linear() || !probe) {
-                acc.fold_stored(stored_row, stored_idx);
+            for (k, agg) in shape.aggs.iter().enumerate().filter(|(_, a)| a.is_linear() || !probe) {
+                vals.fold_stored(k, agg, g, stored_row, stored_idx);
             }
         }
         if probe {
             let (bake, cursor) = self.avi.as_mut().expect("opened for every group that probes");
-            bake.seed_extremes(cursor, self.delta, first, accs);
+            bake.seed_extremes(cursor, self.delta, first, &shape.aggs, vals, g);
         }
 
-        let cardinality = accs[self.plan.cardinality].count_value();
+        let count = self.plan.cardinality;
+        let cardinality = vals.count_value(count, &shape.aggs[count], g);
         debug_assert!(
             cardinality >= 0,
             "reduce input must be bag-positive: negative group cardinality"
         );
         if cardinality > 0 {
             let group = Some((self.delta, first, shape.key.carried()));
-            emit_reduce_row(&mut self.out, group, out_pk_bytes, accs);
+            emit_reduce_row(&mut self.out, group, out_pk_bytes, &shape.aggs, vals, g);
         } else if self.plan.seeds_ground {
             // An emptied global aggregate still publishes one row.
-            emit_reduce_row(&mut self.out, None, out_pk_bytes, &shape.acc_template);
+            emit_reduce_row(
+                &mut self.out,
+                None,
+                out_pk_bytes,
+                &shape.aggs,
+                &self.plan.empty_group,
+                0,
+            );
         }
         consolidate_group(&mut self.out, &shape.output_schema, mark);
     }

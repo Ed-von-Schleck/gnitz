@@ -54,6 +54,7 @@ fn exchange_route_bench() {
         ("packed", &two, ScatterPlan::group(&two, &[1, 2]), 4),
         ("packed nullable", &nullable, ScatterPlan::group(&nullable, &[1]), 4),
         ("fold", &three, ScatterPlan::group(&three, &[1, 2, 3]), 4),
+        ("global", &one, ScatterPlan::group(&one, &[]), 4),
         // Reads no key, whatever the plan.
         ("one worker", &one, ScatterPlan::group(&one, &[0]), 1),
     ] {

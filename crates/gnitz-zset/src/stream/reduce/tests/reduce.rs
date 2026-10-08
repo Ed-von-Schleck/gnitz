@@ -365,8 +365,8 @@ proptest! {
     #[test]
     fn two_workers_partials_combine_to_the_global_aggregates(
         aggs in arb_aggs().prop_map(|mut aggs| {
-            // An extreme and the float sum have no partial.
-            aggs.retain(|d| d.agg_op.is_linear() && d.col_idx != 5);
+            // The float sum has no partial.
+            aggs.retain(|d| !(d.agg_op == AggFunc::Sum && d.col_idx == 5));
             aggs
         }),
         ticks in arb_ticks(),
@@ -559,10 +559,189 @@ fn only_counts_and_integer_sums_split() {
         (agg(AggFunc::Sum, 7), true),
         (agg(AggFunc::Sum, 5), false),
         (agg(AggFunc::Sum, 4), false),
-        (agg(AggFunc::Min, 0), false),
-        (agg(AggFunc::Max, 0), false),
+        (agg(AggFunc::Min, 0), true),
+        (agg(AggFunc::Max, 0), true),
     ] {
         let partial = ReducePlan::partial(&schema(), &[AggDescriptor::COUNT_STAR, extra]).unwrap();
         assert_eq!(partial.is_some(), splits, "{extra:?}");
+    }
+}
+
+// ---- proposed tests (appended to stream/reduce/tests/reduce.rs) ----
+
+/// A scalar extreme sharing the 16-byte value slot a wide extreme forces writes
+/// its 8 image bytes and then zeroes, so the same value always keys the same
+/// entry whatever the arena held.
+#[test]
+fn a_scalar_extreme_zero_pads_the_value_slot_a_wide_one_widens() {
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Min, 0), agg(AggFunc::Max, 6)];
+    let plan = ReducePlan::from_wire(&schema(), &[3], &aggs, false).unwrap();
+    let row = Row {
+        id: 1,
+        val: Some(7),
+        w: 9,
+        ..Row::default()
+    };
+    let idx = plan.index_batch(&batch(&[(row, 1)])).unwrap();
+    let mb = idx.as_mem_batch();
+    let key = mb.get_pk_bytes(0);
+    let n = key.len();
+    assert_eq!(key[n - 17], 0, "MIN(val) is ordinal 0");
+    assert_eq!(&key[n - 16..n - 8], &(7u64 ^ (1 << 63)).to_be_bytes(), "the I64 image");
+    assert_eq!(&key[n - 8..], &[0u8; 8], "zero padding");
+}
+
+/// SUM over an F64 column is each non-NULL value times its weight, added in row
+/// order — through the run arm, the ordinal arm and the ad-hoc fold.
+#[test]
+fn a_float_sum_weighs_each_value() {
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 4)];
+    let row = |id: u64, grp: i64, f: f64| Row {
+        id,
+        grp,
+        f: f.to_bits(),
+        ..Row::default()
+    };
+    let rows = [
+        (row(1, 0, 1.5), 3),
+        (row(2, 0, 0.25), 2),
+        (row(3, -1, 8.0), 5),
+        (row(4, 0, -4.0), 1),
+    ];
+    for group_cols in [&[][..], &[3], &[1], &[0]] {
+        let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, false).unwrap());
+        h.tick(batch(&rows));
+        let sums: Vec<f64> = {
+            let b = h.trace_out.cursor().materialize();
+            let mb = b.as_mem_batch();
+            let loc = b.schema().locate(b.schema().num_columns() - 1);
+            (0..b.count)
+                .map(|r| f64::from_le_bytes(cell(&mb, loc, r).unwrap().try_into().unwrap()))
+                .collect()
+        };
+        let mut want: Vec<f64> = match group_cols {
+            [] | [0] => vec![1.5 * 3.0 + 0.25 * 2.0 + 8.0 * 5.0 - 4.0],
+            [3] => vec![40.0, 1.5 * 3.0 + 0.25 * 2.0 - 4.0],
+            _ => vec![4.5, 0.5, 40.0, -4.0],
+        };
+        let mut got = sums.clone();
+        got.sort_by(f64::total_cmp);
+        want.sort_by(f64::total_cmp);
+        assert_eq!(got, want, "group {group_cols:?}");
+
+        let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
+        fold.push(&batch(&rows), &mut vec![(0, rows.len())]).unwrap();
+        let b = fold.finish();
+        let mb = b.as_mem_batch();
+        let loc = b.schema().locate(b.schema().num_columns() - 1);
+        let mut got: Vec<f64> = (0..b.count)
+            .map(|r| f64::from_le_bytes(cell(&mb, loc, r).unwrap().try_into().unwrap()))
+            .collect();
+        got.sort_by(f64::total_cmp);
+        assert_eq!(got, want, "ad hoc, group {group_cols:?}");
+    }
+}
+
+/// A wide extreme of a group whose rows follow another group's retraction in
+/// the delta is stepped into its own group: the ordinal arm numbers rows, not
+/// positive rows.
+#[test]
+fn a_wide_extreme_steps_its_own_group_past_another_groups_retraction() {
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Min, 6), agg(AggFunc::Max, 2)];
+    let row = |id: u64, grp: i64, w: u128, s: &'static str| Row { id, grp, w, s: Some(s), ..Row::default() };
+    let mut h = Harness::new(ReducePlan::from_wire(&schema(), &[3], &aggs, false).unwrap());
+    let mut model = BTreeMap::new();
+    let first = [
+        (row(1, -1, 10, "m"), 1),
+        (row(2, 0, 10, "m"), 1),
+        (row(5, -1, 12, "k"), 1),
+    ];
+    // Row 1 leaves group -1; rows 3 and 4 bring group 0 a new MIN and a new MAX.
+    let second = [
+        (row(1, -1, 10, "m"), 0),
+        (row(3, 0, 1, "a"), 1),
+        (row(4, 0, 20, "z"), 1),
+    ];
+    for targets in [&first[..], &second[..]] {
+        h.tick(batch(&delta_to(&mut model, targets)).into_consolidated());
+        assert_eq!(h.state(&[3]), aggregates(&model, &[3], &aggs, false));
+    }
+}
+
+/// Two string extremes of one reduce each keep their own images: a group that
+/// reads both off the index after a retraction gets its MIN and its MAX.
+#[test]
+fn two_string_extremes_keep_their_own_index_images() {
+    let aggs = [
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::Min, 2),
+        agg(AggFunc::Max, 2),
+        agg(AggFunc::Min, 0),
+    ];
+    let row = |id: u64, s: &'static str| Row {
+        id,
+        s: Some(s),
+        val: Some(id as i64),
+        ..Row::default()
+    };
+    let plan = ReducePlan::from_wire(&schema(), &[3], &aggs, false).unwrap();
+    // A fixed-width ordinal's payload cell is the zeroed empty string, not what
+    // the arena held: the cell is part of the entry's identity.
+    let idx = plan.index_batch(&batch(&[(row(1, "aa"), 1)])).unwrap();
+    assert_eq!(idx.count, 3);
+    assert_eq!(
+        gnitz_wire::RowSource::get_col_ptr(&idx, 2, 0, 16),
+        &[0u8; 16],
+        "MIN(val), ordinal 2"
+    );
+
+    let mut h = Harness::new(plan);
+    let mut model = BTreeMap::new();
+    let first = [(row(1, "aa"), 1), (row(2, "mm"), 1), (row(3, "zz"), 1)];
+    let second = [(row(1, "aa"), 0), (row(3, "zz"), 0), (row(4, "b\0b"), 1)];
+    for targets in [&first[..], &second[..]] {
+        h.tick(batch(&delta_to(&mut model, targets)).into_consolidated());
+        assert_eq!(h.state(&[3]), aggregates(&model, &[3], &aggs, false));
+    }
+}
+
+/// A float SUM adds in f64: an F32 value is widened before it is weighed, and
+/// an F64 sum keeps the bits an f32 cannot.
+#[test]
+fn a_float_sum_is_carried_in_f64() {
+    let row = |id: u64, f: f64, x: f32| Row {
+        id,
+        f: f.to_bits(),
+        x: x.to_bits(),
+        ..Row::default()
+    };
+    let rows = [
+        (row(1, 0.1, 0.1), 3),
+        (row(2, 1e-9, 16_777_217.0), 3),
+        (row(3, 1.0, 0.3), 7),
+    ];
+    let want_f = [0.1f64 * 3.0, 1e-9 * 3.0, 1.0 * 7.0].iter().fold(0f64, |a, v| a + v);
+    let want_x = [0.1f32 as f64 * 3.0, 16_777_217.0f32 as f64 * 3.0, 0.3f32 as f64 * 7.0]
+        .iter()
+        .fold(0f64, |a, v| a + v);
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 4), agg(AggFunc::Sum, 5)];
+    let read = |b: &Batch| {
+        let mb = b.as_mem_batch();
+        let n = b.schema().num_columns();
+        let f = |c: usize| f64::from_le_bytes(cell(&mb, b.schema().locate(c), 0).unwrap().try_into().unwrap());
+        assert_eq!(b.count, 1);
+        (f(n - 2), f(n - 1))
+    };
+    for group_cols in [&[][..], &[3]] {
+        let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, false).unwrap());
+        h.tick(batch(&rows));
+        assert_eq!(
+            read(&h.trace_out.cursor().materialize()),
+            (want_f, want_x),
+            "reduce, group {group_cols:?}"
+        );
+        let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
+        fold.push(&batch(&rows), &mut vec![(0, rows.len())]).unwrap();
+        assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
     }
 }

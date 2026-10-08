@@ -298,7 +298,9 @@ impl GroupOutKey {
         let mb = &batch.as_mem_batch();
         let n = mb.count;
         // A wide key's identity is a digest, and a sort compares the bytes.
-        let hashes = !matches!(self.key, GroupKey::PkRange { n: w, .. } if w > NARROW_PK_MAX_BYTES);
+        // Nor do too few rows pay for a hash table.
+        let hashes =
+            n >= HASH_MIN_ROWS && !matches!(self.key, GroupKey::PkRange { n: w, .. } if w > NARROW_PK_MAX_BYTES);
         if let Some(groups) = hashes.then(|| self.with_identity(mb, Hashed { n })).flatten() {
             return groups;
         }
@@ -375,6 +377,10 @@ impl GroupRuns {
 /// Fewest rows per group at which hashing a batch's rows into groups costs
 /// less than sorting them.
 const HASH_MIN_ROWS_PER_GROUP: usize = 4;
+
+/// Fewest rows at which hashing them costs less than sorting them, however few
+/// their groups.
+const HASH_MIN_ROWS: usize = 16;
 
 /// A batch's groups as one ordinal per row: no row moves, and a fold over the
 /// groups is one pass per column.

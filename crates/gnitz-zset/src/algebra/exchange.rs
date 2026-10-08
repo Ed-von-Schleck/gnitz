@@ -5,7 +5,7 @@ use crate::algebra::group_key::{cell_image, for_cell_width, GroupKey, KeyCells};
 use crate::algebra::reindex::{FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::Slot;
-use crate::schema::{worker_for_key, worker_for_pk_bytes};
+use crate::schema::{ground_owner, worker_for_key, worker_for_pk_bytes};
 use crate::schema::{Placement, SchemaDescriptor};
 use gnitz_wire::zip_cells;
 
@@ -88,7 +88,7 @@ impl ScatterPlan {
     fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
         match self.0 {
             // One worker owns every key, so no key is read or hashed.
-            _ if nw == 1 => route_rows(mb, sink, ListZero),
+            _ if nw == 1 => route_rows(mb, sink, Owner(0)),
             Some(ref key) => match key.cells(mb) {
                 Some(cells) => for_cell_width!(cells.width, |W| match cells.opk {
                     true => route_cells::<W, true>(&cells, mb.weight(), sink, nw),
@@ -97,11 +97,13 @@ impl ScatterPlan {
                 None => match *key {
                     GroupKey::PkRange { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
                     GroupKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
+                    // The one group of no columns has one owner, and no key to hash.
+                    GroupKey::Fold(ref fold) if fold.is_empty() => route_rows(mb, sink, Owner(ground_owner(nw))),
                     GroupKey::Fold(ref fold) => route_rows(mb, sink, FoldW { fold, nw }),
                     GroupKey::Image(_) => unreachable!("an image key is one cell"),
                 },
             },
-            None => route_rows(mb, sink, ListZero),
+            None => route_rows(mb, sink, Owner(0)),
         }
     }
 }
@@ -156,12 +158,13 @@ impl RowWorker for PkRangeW {
     }
 }
 
-struct ListZero;
+/// Every row to one worker.
+struct Owner(usize);
 
-impl RowWorker for ListZero {
+impl RowWorker for Owner {
     #[inline(always)]
     fn worker(&self, _: &MemBatch, _: usize) -> usize {
-        0
+        self.0
     }
 }
 

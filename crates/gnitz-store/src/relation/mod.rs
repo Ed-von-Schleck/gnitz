@@ -387,7 +387,7 @@ pub struct StoreConfig {
     /// peak scan memory at O(chunk × row_width). Never zero.
     pub scan_chunk_rows: usize,
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold; bounds the
-    /// accumulator matrix at `cap × aggregates × size_of::<Accumulator>()`.
+    /// fold's running values at one per aggregate per group.
     pub adhoc_group_cap: usize,
     /// Bytes a key-span sort holds in RAM before it spills a run.
     pub key_spans_spill_bytes: usize,

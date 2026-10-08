@@ -3,32 +3,96 @@ use crate::algebra::aggregate::ReduceShape;
 use crate::algebra::GroupOutKey;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::le_cell;
+use crate::test_support::{le_cell, pk_payload_schema, Rng};
 use gnitz_wire::AggDescriptor;
 
-/// Both column kernels reach the value one `apply` per row reaches, for every
-/// aggregate over every scalar payload width, with NULLs and non-unit weights:
-/// `fold_rows` over row ranges, and `fold_grouped` over the same ranges split
-/// into interleaved groups.
+const N: usize = 97;
+const INTS: [TypeCode; 8] = [
+    TypeCode::U8,
+    TypeCode::I8,
+    TypeCode::U16,
+    TypeCode::I16,
+    TypeCode::U32,
+    TypeCode::I32,
+    TypeCode::U64,
+    TypeCode::I64,
+];
+
+/// A random cell of `width` bytes.
+fn cell(rng: &mut Rng, width: usize) -> u128 {
+    le_cell(&rng.next_u64().to_le_bytes()[..width])
+}
+
+/// For every aggregate over column `ci` of `b`, `fold` reaches the value one
+/// `apply` per row reaches, in each group mode: row ranges into one group, the
+/// same ranges a group each, and their rows interleaved over three groups.
+fn assert_kernels_match(b: &Batch, ci: u32) {
+    let schema = b.schema();
+    let mb = b.as_mem_batch();
+    for agg_op in [
+        AggFunc::Count,
+        AggFunc::CountNonNull,
+        AggFunc::Sum,
+        AggFunc::Min,
+        AggFunc::Max,
+    ] {
+        let aggs = [AggDescriptor { col_idx: ci, agg_op }];
+        let (key, prefix) = GroupOutKey::new(schema, &[0], [0]).unwrap();
+        let aggs = ReduceShape::new(schema, key, prefix, &aggs).unwrap().aggs;
+        let agg = &aggs[0];
+        let ranges = [(0, 0), (0, 1), (3, 40), (40, 41), (41, N)];
+        let step = |vals: &mut AggValues, g: usize, row: usize| {
+            vals.apply(0, g, (agg.kind, agg.src), &mb, row, mb.get_weight(row))
+        };
+        let assert_same = |got: &AggValues, want: &AggValues, groups: usize, mode: &str| {
+            let bits = |vals: &AggValues, g: usize| {
+                vals.value(0, agg, g).map(|v| match v {
+                    AggValue::Bits(b) => b,
+                    AggValue::Wide(..) => unreachable!("a scalar column"),
+                })
+            };
+            for g in 0..groups {
+                assert_eq!(
+                    bits(got, g),
+                    bits(want, g),
+                    "{agg_op:?} over column {ci}, {mode}, group {g}"
+                );
+            }
+        };
+        let sized = |groups: usize| AggValues::new(&aggs, groups);
+
+        // The groups of the interleaved fold grow mid-fold, as an ad-hoc fold's
+        // do between chunks.
+        const GROUPS: usize = 3;
+        let (mut one, mut one_each) = (sized(1), sized(1));
+        let (mut ranged, mut ranged_each) = (sized(ranges.len()), sized(ranges.len()));
+        let (mut mixed, mut mixed_each) = (sized(0), sized(GROUPS));
+        ranged.fold(0, agg, &mb, &ranges, RangeGroups::EACH);
+        for (i, &(s, e)) in ranges.iter().enumerate() {
+            one.fold(0, agg, &mb, &[(s, e)], RangeGroups::FIRST);
+            let ord: Vec<u32> = (s..e).map(|row| (row % GROUPS) as u32).collect();
+            mixed.resize(if i < 2 { 1 } else { GROUPS });
+            mixed.fold(0, agg, &mb, &[(s, e)], &ord[..]);
+            for row in s..e {
+                step(&mut one_each, 0, row);
+                step(&mut ranged_each, i, row);
+                step(&mut mixed_each, row % GROUPS, row);
+            }
+        }
+        assert_same(&one, &one_each, 1, "one group");
+        assert_same(&ranged, &ranged_each, ranges.len(), "a group per range");
+        assert_same(&mixed, &mixed_each, GROUPS, "interleaved groups");
+    }
+}
+
+/// Over every scalar payload width, with NULLs and non-unit weights.
 #[test]
 fn the_column_kernels_match_a_step_per_row() {
-    const N: usize = 97;
-    let tcs = [
-        TypeCode::U8,
-        TypeCode::I8,
-        TypeCode::U16,
-        TypeCode::I16,
-        TypeCode::U32,
-        TypeCode::I32,
-        TypeCode::U64,
-        TypeCode::I64,
-        TypeCode::F32,
-        TypeCode::F64,
-    ];
+    let tcs: Vec<TypeCode> = INTS.into_iter().chain([TypeCode::F32, TypeCode::F64]).collect();
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend(tcs.iter().map(|&tc| SchemaColumn::new(tc, true)));
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    let mut rng = crate::test_support::Rng::new(0x5eed);
+    let mut rng = Rng::new(0x5eed);
     let mut b = BatchBuilder::new(&schema);
     for row in 0..N {
         b.begin_row(row as u128, rng.gen_range(5) as i64 + 1);
@@ -45,50 +109,30 @@ fn the_column_kernels_match_a_step_per_row() {
         b.end_row();
     }
     let b = b.finish();
-    let mb = b.as_mem_batch();
     for ci in 1..=tcs.len() as u32 {
-        for agg_op in [
-            AggFunc::Count,
-            AggFunc::CountNonNull,
-            AggFunc::Sum,
-            AggFunc::Min,
-            AggFunc::Max,
-        ] {
-            let aggs = [AggDescriptor { col_idx: ci, agg_op }, AggDescriptor::COUNT_STAR];
-            let (key, prefix) = GroupOutKey::new(&schema, &[0], [0]).unwrap();
-            let template = ReduceShape::new(&schema, key, prefix, &aggs).unwrap().acc_template;
-            let ranges = [(0, 0), (0, 1), (3, 40), (40, 41), (41, N)];
-            let step = |acc: &mut Accumulator, row: usize| acc.apply(acc.kind, acc.src, &mb, row, mb.get_weight(row));
-            let bits = |a: &Accumulator| {
-                a.value().map(|v| match v {
-                    AggValue::Bits(b) => b,
-                    AggValue::Wide(..) => unreachable!("a scalar column"),
-                })
-            };
+        assert_kernels_match(&b, ci);
+    }
+}
 
-            let (mut bulk, mut each) = (template[0].clone(), template[0].clone());
-            for (s, e) in ranges {
-                Accumulator::fold_rows(std::slice::from_mut(&mut bulk), &mb, s..e, true);
-                (s..e).for_each(|row| step(&mut each, row));
+/// Over a PK column of every integer width, whose cells are OPK images: the
+/// whole PK, and a column between two others of a compound one.
+#[test]
+fn the_column_kernels_read_a_pk_column() {
+    let mut rng = Rng::new(0x9e37);
+    for tc in INTS {
+        for (pk, ci) in [(vec![tc], 0), (vec![TypeCode::U16, tc, TypeCode::U32], 1)] {
+            let schema = pk_payload_schema(&pk);
+            let mut b = BatchBuilder::new(&schema);
+            for _ in 0..N {
+                let natives: Vec<u128> = pk
+                    .iter()
+                    .map(|&t| cell(&mut rng, SchemaColumn::new(t, false).size() as usize))
+                    .collect();
+                b.begin_row_natives(&natives, rng.gen_range(5) as i64 + 1);
+                b.put_int(0);
+                b.end_row();
             }
-            assert_eq!(bits(&bulk), bits(&each), "{agg_op:?} over column {ci}");
-
-            // Three groups, their rows interleaved; the state grows mid-fold, as
-            // an ad-hoc fold's does between chunks.
-            const GROUPS: usize = 3;
-            let mut per_group = vec![template[0].clone(); GROUPS];
-            let mut state = template[0].grouped();
-            for (i, &(s, e)) in ranges.iter().enumerate() {
-                let ord: Vec<u32> = (s..e).map(|row| (row % GROUPS) as u32).collect();
-                (s..e).for_each(|row| step(&mut per_group[row % GROUPS], row));
-                state.resize(if i < 2 { 1 } else { GROUPS }, &template[0]);
-                template[0].fold_grouped(&mb, &[(s, e)], &ord, &mut state);
-            }
-            for (g, want) in per_group.iter().enumerate() {
-                let mut got = template[0].clone();
-                state.take(g, &mut got);
-                assert_eq!(bits(&got), bits(want), "{agg_op:?} over column {ci}, group {g}");
-            }
+            assert_kernels_match(&b.finish(), ci);
         }
     }
 }

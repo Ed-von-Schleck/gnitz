@@ -19,45 +19,44 @@
 use crate::algebra::ReindexPacker;
 use crate::repr::Batch;
 use crate::schema::{oob_col, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use gnitz_expr::OrderLocator;
 use gnitz_wire::OrderKey;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 
-use crate::algebra::{
-    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,
-    IMAGE_COL,
-};
+use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
 
 /// The rank byte leading a nullable key's image.
 const RANK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
 
-/// One ORDER BY key, resolved against the input: the same `(loc, desc,
-/// nulls_first)` [`OrderLocator`] the read path's comparator reads, plus the
-/// image encoding that puts the same order into bytes. Sharing the spec is what
-/// ties the two — a maintained window and an ad-hoc `ORDER BY … LIMIT` must
-/// select the same rows.
+/// One ORDER BY key, resolved against the input: its image, complemented for
+/// DESC, and where a NULL — which has no image — stands.
 struct OrderSpec {
-    key: OrderLocator,
-    kind: ImageKind,
+    image: ImageCol,
+    nulls_first: bool,
     nullable: bool,
 }
 
 impl OrderSpec {
-    /// Append the key's image for `row`: over a nullable column the rank byte,
-    /// then — non-NULL only — the order image, complemented for DESC. The rank
-    /// places NULLs and `desc` does not flip it, exactly as
-    /// [`gnitz_expr::cmp_order_keys`] orders them.
+    /// Over a nullable column, the rank byte that places `row` and whether the
+    /// row is NULL. `desc` does not flip the rank, exactly as
+    /// [`gnitz_expr::cmp_order_keys`] orders NULLs.
+    #[inline]
+    fn rank(&self, src: &impl RowSource, row: usize) -> Option<(u8, bool)> {
+        self.nullable.then(|| {
+            let is_null = self.image.loc.is_null(src, row);
+            ((is_null != self.nulls_first) as u8, is_null)
+        })
+    }
+
+    /// Append the key's image for `row`: the rank byte of a nullable key, then —
+    /// non-NULL only — the order image.
     #[inline]
     fn append_image(&self, src: &impl RowSource, row: usize, out: &mut Vec<u8>) {
-        if self.nullable {
-            let is_null = self.key.loc.is_null(src, row);
-            out.push((is_null != self.key.nulls_first) as u8);
-            if is_null {
-                return;
-            }
+        let rank = self.rank(src, row);
+        out.extend(rank.map(|(rank, _)| rank));
+        if !matches!(rank, Some((_, true))) {
+            self.image.append(src, row, out);
         }
-        append_image(&self.key.loc, self.kind, self.key.desc, src, row, out);
     }
 
     /// Write the key's lead for `row` into `lead`, [`Self::lead_cols`] wide: the
@@ -65,12 +64,11 @@ impl OrderSpec {
     /// slot. A string's whole image is appended to `image`.
     #[inline]
     fn write_lead(&self, src: &impl RowSource, row: usize, lead: &mut [u8], image: &mut Vec<u8>) {
-        let slot = match self.nullable {
-            false => lead,
-            true => {
-                let is_null = self.key.loc.is_null(src, row);
-                let (rank, slot) = lead.split_at_mut(1);
-                rank[0] = (is_null != self.key.nulls_first) as u8;
+        let slot = match self.rank(src, row) {
+            None => lead,
+            Some((rank, is_null)) => {
+                let (first, slot) = lead.split_at_mut(1);
+                first[0] = rank;
                 if is_null {
                     slot.fill(0);
                     return;
@@ -78,27 +76,14 @@ impl OrderSpec {
                 slot
             }
         };
-        let (loc, desc) = (&self.key.loc, self.key.desc);
-        match self.kind {
-            ImageKind::Scalar(kind) => slot.copy_from_slice(&scalar_image(loc, kind, desc, src, row).to_be_bytes()),
-            ImageKind::Wide(WideKind::Fixed(_)) => slot.copy_from_slice(&int16_image(loc, desc, src, row)),
-            ImageKind::Wide(WideKind::Bytes) => {
-                append_image(loc, self.kind, desc, src, row, image);
-                write_image_slot(slot, image);
-            }
-        }
+        self.image.write_slot(src, row, slot, image);
     }
 
     /// The PK columns holding the image's lead: the rank byte of a nullable
     /// key, then the image slot.
     fn lead_cols(&self) -> impl Iterator<Item = SchemaColumn> {
-        let slot = image_slot_col(matches!(self.kind, ImageKind::Wide(_)));
+        let slot = image_slot_col(self.image.is_wide());
         self.nullable.then_some(RANK_COL).into_iter().chain([slot])
-    }
-
-    /// Whether the lead holds the image whole, so no payload column repeats it.
-    fn fits_lead(&self) -> bool {
-        has_fixed_image(self.kind)
     }
 }
 
@@ -127,8 +112,8 @@ impl TopNIndex {
                 .try_locate(key.col as usize)
                 .ok_or_else(|| oob_col("top-n: order column", key.col as u32, input))?;
             Ok(OrderSpec {
-                key: OrderLocator::of(loc, key),
-                kind: ImageKind::of(loc.type_code()),
+                image: ImageCol::new(loc, key.desc),
+                nulls_first: key.nulls_first,
                 nullable: input.columns[key.col as usize].nullable,
             })
         });
@@ -138,7 +123,7 @@ impl TopNIndex {
         let rest = order.collect::<Result<Vec<_>, String>>()?;
         let suffix: Vec<SchemaColumn> = lead.lead_cols().collect();
         let (key_packer, mut b) = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
-        for _ in 0..rest.len() + usize::from(!lead.fits_lead()) {
+        for _ in 0..rest.len() + usize::from(!lead.image.fits_slot()) {
             b.push(IMAGE_COL);
         }
         b.push_payload_of(output);
@@ -192,7 +177,7 @@ impl TopNIndex {
                 .write_lead(&mb, row, &mut key[stride..stride + self.lead_bytes], &mut image);
             out.begin_row(key, weight);
             let mut col = 0;
-            if !self.lead.fits_lead() {
+            if !self.lead.image.fits_slot() {
                 out.extend_col_blob(col, &image);
                 col += 1;
             }

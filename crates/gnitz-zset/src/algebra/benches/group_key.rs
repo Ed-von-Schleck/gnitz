@@ -62,3 +62,41 @@ fn group_ordinals_bench() {
         }
     }
 }
+
+/// Instructions per [`GroupOutKey::numbered`] call over a two-row delta of two
+/// groups — an UPDATE's retraction and insert — per key form.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn group_ordinals_tiny_bench() {
+    use TypeCode::U64;
+    let counter = gnitz_foundation::perf::Counter::instructions();
+    let three = pk_payload_schema(&[U64; 3]);
+    let four = pk_payload_schema(&[U64; 4]);
+    for (label, schema, group_cols) in [
+        ("I64 payload image", &three, &[3u32][..]),
+        ("packed PK and payload columns", &three, &[1, 3]),
+        ("24-byte PK prefix (fold)", &four, &[0, 1, 2]),
+    ] {
+        let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
+        let pk_cols = schema.pk_cols().len();
+        let mut bb = BatchBuilder::new(schema);
+        for i in 0..2u128 {
+            let natives: Vec<u128> = (0..pk_cols).map(|_| 7 + i).collect();
+            bb.begin_row_natives(&natives, 1);
+            bb.put_int(7 + i);
+            bb.end_row();
+        }
+        let batch = bb.finish();
+        const ITERS: u64 = 10_000;
+        std::hint::black_box(key.numbered(&batch));
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..ITERS {
+                std::hint::black_box(key.numbered(&batch));
+            }
+        });
+        println!(
+            "group_ordinals_tiny_bench {label:<32} {:>6} instr/call",
+            instructions / ITERS
+        );
+    }
+}

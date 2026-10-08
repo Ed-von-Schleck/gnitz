@@ -4,17 +4,16 @@
 use crate::schema::SchemaFacts;
 use crate::schema::{oob_col, DerivedSchema, SchemaColumn, SchemaDescriptor};
 
-use super::agg::Accumulator;
+use super::agg::Agg;
 use crate::algebra::group_key::GroupOutKey;
 use gnitz_wire::AggDescriptor;
 
 /// What a reduce's rows look like, shared by the circuit reduce and the ad-hoc
-/// fold: the output layout, the group key, and the accumulator set.
+/// fold: the output layout, the group key, and the aggregates.
 pub(crate) struct ReduceShape {
     pub(crate) output_schema: SchemaDescriptor,
     pub(crate) key: GroupOutKey,
-    /// The accumulator set in its empty-group state, cloned per use.
-    pub(crate) acc_template: Vec<Accumulator>,
+    pub(crate) aggs: Vec<Agg>,
 }
 
 impl ReduceShape {
@@ -41,11 +40,11 @@ impl ReduceShape {
         let output_schema = prefix.finish().map_err(|e| format!("reduce: output {e}"))?;
         // The aggregates are the trailing output columns.
         let cbase = output_schema.num_columns() - aggs.len();
-        let acc_template = aggs
+        let aggs = aggs
             .iter()
             .zip(cbase..)
-            .map(|(d, c)| Accumulator::new(d.agg_op, input.locate(d.col_idx as usize), output_schema.locate(c)))
+            .map(|(d, c)| Agg::new(d.agg_op, input.locate(d.col_idx as usize), output_schema.locate(c)))
             .collect();
-        Ok(ReduceShape { output_schema, key, acc_template })
+        Ok(ReduceShape { output_schema, key, aggs })
     }
 }

@@ -40,7 +40,7 @@ fn reduce_index_batch_bench() {
     const N: u64 = 65_536;
     let counter = Counter::instructions();
     type Put = fn(&mut BatchBuilder, u64);
-    let cases: [(&str, SchemaColumn, &[AggFunc], Put); 5] = [
+    let cases: [(&str, SchemaColumn, &[AggFunc], Put); 6] = [
         ("I64 MIN", SchemaColumn::new(TypeCode::I64, false), &[Min], |b, i| {
             b.put_u64(mix(i))
         }),
@@ -52,6 +52,13 @@ fn reduce_index_batch_bench() {
             SchemaColumn::new(TypeCode::String, false),
             &[Min],
             |b, i| b.put_string(&format!("{:040}", mix(i))),
+        ),
+        // Every image escapes a `0x00`.
+        (
+            "STRING MIN, NULs",
+            SchemaColumn::new(TypeCode::String, false),
+            &[Min],
+            |b, i| b.put_string(&format!("{:020}\0{:019}", mix(i), i)),
         ),
         (
             "nullable I64 MIN",
@@ -192,6 +199,12 @@ fn op_reduce_bench() {
     run("keyed_256_groups_sum", &one, &[1], Sum, &|s| {
         scattered(&one, s, &|i| mix(i) % 256)
     });
+    run("keyed_256_groups_min", &one, &[1], Min, &|s| {
+        scattered(&one, s, &|i| mix(i) % 256)
+    });
+    run("keyed_200_per_group_min", &one, &[1], Min, &|s| {
+        scattered(&one, s, &|i| mix(i) % (N / 200))
+    });
     run("keyed_8_per_group_min", &one, &[1], Min, &|s| {
         scattered(&one, s, &|i| i / 8)
     });
@@ -242,4 +255,310 @@ fn op_reduce_multi_run_bench() {
         instructions as f64 / delta.count as f64,
         out.count
     );
+}
+
+/// `[U64 a, U64 b | value]`, PK `(a, b)`.
+fn compound_schema(value: SchemaColumn) -> SchemaDescriptor {
+    let k = SchemaColumn::new(TypeCode::U64, false);
+    SchemaDescriptor::new(&[k, k, value], &[0, 1])
+}
+
+type PutValue = fn(&mut BatchBuilder, u64);
+fn value_shapes() -> [(&'static str, SchemaColumn, PutValue); 6] {
+    [
+        ("I64", SchemaColumn::new(TypeCode::I64, false), |b, i| b.put_u64(mix(i))),
+        ("U128", SchemaColumn::new(TypeCode::U128, false), |b, i| {
+            b.put_int((mix(i) as u128) << 64 | i as u128)
+        }),
+        ("STR40", SchemaColumn::new(TypeCode::String, false), |b, i| {
+            b.put_string(&format!("{:040}", mix(i)))
+        }),
+        ("STR8", SchemaColumn::new(TypeCode::String, false), |b, i| {
+            b.put_string(&format!("{:08}", mix(i) % 100_000_000))
+        }),
+        ("STRVAR", SchemaColumn::new(TypeCode::String, false), |b, i| {
+            let s = format!("{:060}", mix(i));
+            b.put_string(&s[..13 + (mix(i) % 47) as usize])
+        }),
+        ("F64", SchemaColumn::new(TypeCode::F64, false), |b, i| {
+            b.put_float((mix(i) >> 11) as f64 / 3.0)
+        }),
+    ]
+}
+
+/// The run arm: groups are runs of `run_len` rows of the leading PK column.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_runs_bench() {
+    use AggFunc::{Max, Min, Sum};
+    const N: u64 = 1 << 16;
+    let counter = Counter::instructions();
+    for run_len in [2u64, 16, 128, 1024] {
+        for (label, value, put) in value_shapes() {
+            for (aname, aggs) in [("min", &[Min][..]), ("min+max+sum", &[Min, Max, Sum][..])] {
+                if aggs.len() > 1 && label != "I64" {
+                    continue;
+                }
+                let schema = compound_schema(value);
+                let make = |salt: u64| {
+                    let mut bb = BatchBuilder::new(&schema);
+                    for i in 0..N {
+                        bb.begin_row_natives(&[(i / run_len) as u128, (i % run_len + salt * run_len) as u128], 1);
+                        put(&mut bb, i + salt * N);
+                        bb.end_row();
+                    }
+                    let mut b = bb.finish();
+                    b.certify_consolidated();
+                    b
+                };
+                let mut h = Harness::new(plan(&schema, &[0], aggs));
+                let (d1, d2) = (h.fold(make(1)), h.fold(make(2)));
+                let retraction = h.fold(d1.clone().negated());
+                let [empty, populated, retract] = [&d1, &d2, &retraction].map(|d| epoch(&counter, &mut h, d));
+                println!(
+                    "op_reduce_runs_bench len={run_len:<5} {label:<7} {aname:<12} empty {empty:7.1}, populated {populated:7.1}, \
+                     retraction {retract:7.1} instr/row"
+                );
+            }
+        }
+    }
+}
+
+/// Instructions per `op_reduce` call on a tiny delta against
+/// a populated trace.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_tiny_bench() {
+    use AggFunc::{Max, Min, Sum};
+    const ITERS: u64 = 2_000;
+    let counter = Counter::instructions();
+    let i64c = SchemaColumn::new(TypeCode::I64, false);
+    let strc = SchemaColumn::new(TypeCode::String, false);
+    // [U64 pk | I64 grp | value]
+    let keyed_i = grouped_schema(&[i64c], i64c);
+    let keyed_s = grouped_schema(&[i64c], strc);
+    let lead_i = compound_schema(i64c);
+    let lead_s = compound_schema(strc);
+    type Row = (u64, u64, u64, i64); // pk-or-a, grp-or-b, value seed, weight
+    let build = |schema: &SchemaDescriptor, rows: &[Row]| {
+        let compound = schema.pk_cols().len() == 2;
+        let string = schema.columns[2].type_code == TypeCode::String;
+        let mut bb = BatchBuilder::new(schema);
+        for &(a, b, v, w) in rows {
+            if compound {
+                bb.begin_row_natives(&[a as u128, b as u128], w);
+            } else {
+                bb.begin_row(a as u128, w);
+                bb.put_int(b as u128);
+            }
+            if string {
+                bb.put_string(&format!("{:040}", mix(v)));
+            } else {
+                bb.put_u64(mix(v));
+            }
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    // The stored rows: keyed → pk i, grp i/8; leading → (i/8, i%8).
+    let stored = |schema: &SchemaDescriptor| -> Vec<Row> {
+        let compound = schema.pk_cols().len() == 2;
+        (0..4096u64)
+            .map(|i| {
+                if compound {
+                    (i / 8, i % 8, i, 1)
+                } else {
+                    (i, i / 8, i, 1)
+                }
+            })
+            .collect()
+    };
+    let shapes: [(&str, &SchemaDescriptor, &[u32], &[AggFunc]); 10] = [
+        ("keyed sum", &keyed_i, &[1], &[Sum]),
+        ("keyed min", &keyed_i, &[1], &[Min]),
+        ("keyed min+max+sum", &keyed_i, &[1], &[Min, Max, Sum]),
+        ("keyed str min", &keyed_s, &[1], &[Min]),
+        ("leading sum", &lead_i, &[0], &[Sum]),
+        ("leading min", &lead_i, &[0], &[Min]),
+        ("leading min+max+sum", &lead_i, &[0], &[Min, Max, Sum]),
+        ("leading str min", &lead_s, &[0], &[Min]),
+        ("global sum", &keyed_i, &[], &[Sum]),
+        ("global min", &keyed_i, &[], &[Min]),
+    ];
+    for (label, schema, group, aggs) in shapes {
+        let compound = schema.pk_cols().len() == 2;
+        // Row i of the stored set, and a fresh row in group g.
+        let old = |i: u64, w: i64| -> Row {
+            if compound {
+                (i / 8, i % 8, i, w)
+            } else {
+                (i, i / 8, i, w)
+            }
+        };
+        let fresh = |g: u64, n: u64| -> Row {
+            if compound {
+                (g, 100 + n, 9000 + n, 1)
+            } else {
+                (100_000 + g * 16 + n, g, 9000 + n, 1)
+            }
+        };
+        let deltas: [(&str, Vec<Row>); 5] = [
+            ("1 insert", vec![fresh(7, 0)]),
+            ("2 inserts 1 group", vec![fresh(7, 0), fresh(7, 1)]),
+            ("2 inserts 2 groups", vec![fresh(7, 0), fresh(9, 0)]),
+            ("update in group", vec![old(57, -1), fresh(7, 0)]),
+            ("1 delete", vec![old(57, -1)]),
+        ];
+        for (dname, rows) in deltas {
+            let mut h = Harness::new(plan(schema, group, aggs));
+            let base = h.fold(build(schema, &stored(schema)));
+            epoch(&counter, &mut h, &base);
+            let delta = h.fold(build(schema, &rows));
+            h.index(&delta);
+            std::hint::black_box(h.reduce(&delta));
+            let ((), instructions) = counter.measure(|| {
+                for _ in 0..ITERS {
+                    std::hint::black_box(h.reduce(&delta));
+                }
+            });
+            println!(
+                "op_reduce_tiny_bench {label:<20} {dname:<19} {:>6} instr/call",
+                instructions / ITERS
+            );
+        }
+    }
+    // The ground row: an empty delta over an empty trace, and the delete of the
+    // last row of a global aggregate.
+    for (label, aggs) in [("ground sum", &[Sum][..]), ("ground min", &[Min][..])] {
+        let col_idx = 2;
+        let aggs: Vec<AggDescriptor> = aggs
+            .iter()
+            .map(|&agg_op| AggDescriptor { col_idx, agg_op })
+            .chain([AggDescriptor::COUNT_STAR])
+            .collect();
+        let mk = || Harness::new(ReducePlan::from_wire(&keyed_i, &[], &aggs, true).unwrap());
+        let h = mk();
+        let empty = Batch::empty_with_schema(&keyed_i);
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..ITERS {
+                std::hint::black_box(h.reduce(&empty));
+            }
+        });
+        println!(
+            "op_reduce_tiny_bench {label:<20} {:<19} {:>6} instr/call",
+            "empty delta",
+            instructions / ITERS
+        );
+        let mut h = mk();
+        let one = h.fold(build(&keyed_i, &[(1, 1, 1, 1)]));
+        epoch(&counter, &mut h, &one);
+        let del = h.fold(build(&keyed_i, &[(1, 1, 1, -1)]));
+        h.index(&del);
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..ITERS {
+                std::hint::black_box(h.reduce(&del));
+            }
+        });
+        println!(
+            "op_reduce_tiny_bench {label:<20} {:<19} {:>6} instr/call",
+            "delete last row",
+            instructions / ITERS
+        );
+    }
+}
+
+/// The ordinal arm over mixed-sign weights and wide values: 8 rows a group,
+/// scattered, every third row of the second delta a retraction of a stored row.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_wide_bench() {
+    use AggFunc::{Max, Min, Sum};
+    const N: u64 = 1 << 16;
+    let counter = Counter::instructions();
+    let grp = SchemaColumn::new(TypeCode::I64, false);
+    for (label, value, put) in value_shapes() {
+        for (aname, aggs) in [("min", &[Min][..]), ("min+max+sum", &[Min, Max, Sum][..])] {
+            let aggs = if aggs.len() > 1 && !matches!(label, "I64" | "F64") {
+                &[Min, Max][..]
+            } else {
+                aggs
+            };
+            let schema = grouped_schema(&[grp], value);
+            let make = |lo: u64, hi: u64, w: i64| {
+                let mut bb = BatchBuilder::new(&schema);
+                for i in lo..hi {
+                    bb.begin_row(mix(i) as u128, w);
+                    bb.put_int((i % N / 8) as u128);
+                    put(&mut bb, i);
+                    bb.end_row();
+                }
+                bb.finish()
+            };
+            let mut h = Harness::new(plan(&schema, &[1], aggs));
+            let d1 = h.fold(make(0, N, 1));
+            // Inserts into every group, and a retraction of every third stored row.
+            let mut mixed = make(N, 2 * N, 1);
+            let mut bb = BatchBuilder::new(&schema);
+            for i in (0..N).step_by(3) {
+                bb.begin_row(mix(i) as u128, -1);
+                bb.put_int((i % N / 8) as u128);
+                put(&mut bb, i);
+                bb.end_row();
+            }
+            mixed.append_batch(&bb.finish());
+            let d2 = h.fold(mixed);
+            let [empty, mixed] = [&d1, &d2].map(|d| epoch(&counter, &mut h, d));
+            println!("op_reduce_wide_bench {label:<7} {aname:<12} empty {empty:7.1}, mixed-sign {mixed:7.1} instr/row");
+        }
+    }
+}
+
+/// Index entries per string shape `reduce_index_batch_bench` has no cell for.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn reduce_index_strings_bench() {
+    use AggFunc::{Max, Min};
+    const N: u64 = 65_536;
+    let counter = Counter::instructions();
+    type Put = fn(&mut BatchBuilder, u64);
+    let s = SchemaColumn::new(TypeCode::String, false);
+    let cases: [(&str, &[AggFunc], Put); 8] = [
+        ("STR8 MIN", &[Min], |b, i| {
+            b.put_string(&format!("{:08}", mix(i) % 100_000_000))
+        }),
+        ("STR13 MIN", &[Min], |b, i| {
+            b.put_string(&format!("{:013}", mix(i) % 10_000_000_000_000))
+        }),
+        ("STR40 MIN", &[Min], |b, i| b.put_string(&format!("{:040}", mix(i)))),
+        ("STR40 MAX", &[Max], |b, i| b.put_string(&format!("{:040}", mix(i)))),
+        ("STR40 trailing NUL", &[Min], |b, i| {
+            b.put_string(&format!("{:039}\0", mix(i)))
+        }),
+        ("STR40 NUL every 4", &[Min], |b, i| {
+            b.put_string(&format!("{:040}", mix(i)).replace(['0', '5', '7'], "\0"))
+        }),
+        ("STR400 MIN", &[Min], |b, i| b.put_string(&format!("{:0400}", mix(i)))),
+        ("STR400 one NUL", &[Min], |b, i| {
+            b.put_string(&format!("{:0200}\0{:0199}", mix(i), i))
+        }),
+    ];
+    for (label, aggs, put) in cases {
+        let schema = grouped_schema(&[SchemaColumn::new(TypeCode::U32, false)], s);
+        let mut b = BatchBuilder::new(&schema);
+        for i in 0..N {
+            b.begin_row(i as u128, 1);
+            b.put_int((i % 4096) as u128);
+            put(&mut b, i);
+            b.end_row();
+        }
+        let mut delta = b.finish();
+        delta.certify_consolidated();
+        let plan = plan(&schema, &[1], aggs);
+        let [_, (entries, instructions)] = [(); 2].map(|()| counter.measure(|| plan.index_batch(&delta).unwrap()));
+        println!(
+            "reduce_index_strings_bench {label:<20} {:7.1} instr/row ({} entries)",
+            instructions as f64 / N as f64,
+            entries.count
+        );
+    }
 }

@@ -3,7 +3,7 @@
 //!   - `linear`      — filter, union (Theorem 3.3: no state added)
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
 //!   - `exchange`    — the scatter plan of a worker exchange
-//!   - `aggregate`   — the accumulators, a reduce's row shape, and the ad-hoc fold
+//!   - `aggregate`   — the aggregates, a reduce's row shape, and the ad-hoc fold
 //!   - `group_key`   — a group as the output PK a reduce over it stamps
 //!   - `reindex`     — the key composers a reindex Map and an exchange scatter share, and a
 //!     secondary index's entries
@@ -39,10 +39,7 @@ pub use map::MapPlan;
 pub use reindex::{append_spans, index_entries};
 pub use sink::SinkPlan;
 
-pub(crate) use aggregate::{emit_reduce_row, Accumulator, ExtremeSpec, GroupedState, ReduceShape};
+pub(crate) use aggregate::{emit_reduce_row, Agg, AggValues, RangeGroups, ReduceShape};
 pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey};
-pub(crate) use order_image::{
-    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,
-    IMAGE_COL,
-};
+pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};
 pub(crate) use reindex::ReindexPacker;

@@ -201,13 +201,7 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
         ("one worker", global_topn(), keyed, 1, false),
         ("a replicated source", global_reduce(AggFunc::Sum), replicated, 4, false),
         ("a replicated source", global_topn(), replicated, 4, false),
-        (
-            "a MIN's partials do not combine",
-            global_reduce(AggFunc::Min),
-            keyed,
-            4,
-            false,
-        ),
+        ("a partitioned MIN", global_reduce(AggFunc::Min), keyed, 4, true),
     ] {
         assert_eq!(split(global_circuit(&op, true), source, of), want, "{why}");
     }

@@ -114,3 +114,78 @@ fn wide_image_orders_and_round_trips() {
         }
     }
 }
+
+// ---- proposed test (appended to algebra/tests/order_image.rs) ----
+
+/// For every image kind, `ImageCol::append` under `invert` is the complement of
+/// the plain image, and `write_slot` leaves the slot holding exactly that
+/// image's leading bytes, zero-padded — whatever the slot held before — and
+/// hands a byte string's whole image to `whole`.
+#[test]
+fn an_image_col_appends_and_slots_one_image() {
+    use super::ImageCol;
+    let cols = [
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::F32, false),
+        SchemaColumn::new(TypeCode::U128, false),
+        SchemaColumn::new(TypeCode::I128, false),
+        SchemaColumn::new(TypeCode::String, false),
+    ];
+    let mut all = vec![SchemaColumn::new(TypeCode::U64, false)];
+    all.extend(cols);
+    let schema = crate::schema::SchemaDescriptor::new(&all, &[0]);
+    let mut b = BatchBuilder::new(&schema);
+    for (i, s) in ["", "a\0b", "longer than any sixteen-byte key slot"]
+        .into_iter()
+        .enumerate()
+    {
+        b.begin_row(i as u128, 1);
+        b.put_int((i as i64 - 1) as u128);
+        b.put_int((1.5f32 * i as f32).to_bits() as u128);
+        b.put_int(u128::MAX - i as u128);
+        b.put_int((i as i128 - 1) as u128);
+        b.put_string(s);
+        b.end_row();
+    }
+    let b = b.finish();
+    let mb = b.as_mem_batch();
+    for ci in 0..=cols.len() {
+        let loc = schema.locate(ci);
+        for row in 0..b.count {
+            let image = |invert: bool| {
+                let mut out = vec![0x5A];
+                ImageCol::new(loc, invert).append(&mb, row, &mut out);
+                out.split_off(1)
+            };
+            let (plain, inverted) = (image(false), image(true));
+            let complement: Vec<u8> = plain.iter().map(|b| !b).collect();
+            assert_eq!(inverted, complement, "column {ci} row {row}");
+            for invert in [false, true] {
+                let col = ImageCol::new(loc, invert);
+                let want = image(invert);
+                let widths: &[usize] = if col.is_wide() { &[16] } else { &[8, 16] };
+                for &width in widths {
+                    let mut slot = [0xAAu8; 16];
+                    let mut whole = vec![0x5A; 3];
+                    col.write_slot(&mb, row, &mut slot[..width], &mut whole);
+                    let mut padded = [0u8; 16];
+                    let take = want.len().min(width);
+                    padded[..take].copy_from_slice(&want[..take]);
+                    assert_eq!(
+                        &slot[..width],
+                        &padded[..width],
+                        "column {ci} row {row} invert={invert} slot{width}"
+                    );
+                    match col.fits_slot() {
+                        true => assert_eq!(whole, [0x5A; 3], "a fixed image leaves `whole` alone"),
+                        false => assert_eq!(
+                            &whole[3..],
+                            &want[..],
+                            "a string's whole image follows what `whole` held"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}

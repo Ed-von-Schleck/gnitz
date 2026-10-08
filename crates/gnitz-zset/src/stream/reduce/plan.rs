@@ -2,7 +2,7 @@
 //! `ReduceShape` the ad-hoc fold shares.
 
 use super::avi::{avi_batch, AviBake};
-use crate::algebra::{Accumulator, GroupOutKey, ReduceShape};
+use crate::algebra::{Agg, AggValues, GroupOutKey, ReduceShape};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::AggDescriptor;
@@ -17,6 +17,8 @@ pub struct ReducePlan {
     pub(super) cardinality: usize,
     /// The value index the non-linear aggregates read their history from.
     pub(super) avi: Option<AviBake>,
+    /// One group no row has stepped: the ground row's values.
+    pub(super) empty_group: AggValues,
 }
 
 impl ReducePlan {
@@ -30,13 +32,13 @@ impl ReducePlan {
         Self::new(input, group_cols, aggs, cardinality(aggs)?, seeds_ground)
     }
 
-    /// One worker's share of a global reduce over `aggs`, or `None` unless every
-    /// aggregate is a count or an integer sum, the aggregates [`Self::combine`]
-    /// folds.
+    /// One worker's share of a global reduce over `aggs`, or `None` for a float
+    /// sum, whose value depends on the order a split would change.
     pub fn partial(input: &SchemaDescriptor, aggs: &[AggDescriptor]) -> Result<Option<Self>, String> {
         // No ground row: a worker with no rows contributes no partial.
         let plan = Self::from_wire(input, &[], aggs, false)?;
-        Ok(plan.is_exact_linear().then_some(plan))
+        let splits = |agg: &Agg| agg.is_exact_linear() || !agg.is_linear();
+        Ok(plan.shape.aggs.iter().all(splits).then_some(plan))
     }
 
     /// The global reduce over relayed [`Self::partial`] outputs `[V₀ | aggregates…]`,
@@ -50,7 +52,6 @@ impl ReducePlan {
         // A COUNT merges as a SUM, so its position is read off `aggs`.
         let plan = Self::new(partials, &[], &merged, cardinality(aggs)?, seeds_ground)?;
         debug_assert_eq!(plan.shape.output_schema, *partials);
-        debug_assert!(plan.is_exact_linear(), "only exact linear partials are split off");
         Ok(plan)
     }
 
@@ -67,8 +68,15 @@ impl ReducePlan {
         );
         let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
         let shape = ReduceShape::new(input, key, prefix, aggs)?;
-        let avi = AviBake::new(input, group_cols, &shape.acc_template)?;
-        Ok(ReducePlan { shape, seeds_ground, cardinality, avi })
+        let avi = AviBake::new(input, group_cols, &shape.aggs)?;
+        let empty_group = AggValues::new(&shape.aggs, 1);
+        Ok(ReducePlan {
+            shape,
+            seeds_ground,
+            cardinality,
+            avi,
+            empty_group,
+        })
     }
 
     /// The layout `op_reduce` emits under this plan.
@@ -91,7 +99,7 @@ impl ReducePlan {
     /// True iff every aggregate is a count or an integer sum, whose value is the
     /// same whatever the row order and the partition.
     pub fn is_exact_linear(&self) -> bool {
-        self.shape.acc_template.iter().all(Accumulator::is_exact_linear)
+        self.shape.aggs.iter().all(Agg::is_exact_linear)
     }
 }
 
