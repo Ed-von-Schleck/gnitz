@@ -395,7 +395,7 @@ impl Host for PendingHost {
         if self.asked {
             return Poll::Pending;
         }
-        io(Interest::BOTH);
+        io(Interest { read: true, write: true });
         Poll::Ready(Ok(()))
     }
 

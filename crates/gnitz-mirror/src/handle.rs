@@ -263,13 +263,6 @@ impl Copies {
         Ok(())
     }
 
-    /// Drop `tid`'s cursor, keeping its rows and its registration.
-    fn drop_cursor(&mut self, tid: u64) {
-        if self.records.get_mut(&tid).and_then(|r| r.cursor.take()).is_some() {
-            self.unpublished = true;
-        }
-    }
-
     /// Drop `tid`'s record, and erase its copy with its directory.
     fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
         if self.records.remove(&tid).is_none() {
@@ -404,10 +397,6 @@ impl MirrorStore for Mirror {
 
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
         self.copies.touching("registering a view", |c| c.register(name, desc))
-    }
-
-    fn drop_cursor(&mut self, tid: u64) {
-        self.copies.even_if_poisoned_mut().drop_cursor(tid);
     }
 
     fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {

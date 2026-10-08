@@ -9,8 +9,7 @@ fn rel(tid: u64, reply_layout: u64) -> ScanMultiItem {
 fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem<'static> {
     DeltaPollItem {
         view: Target { tid: view_id, token: view_id ^ 0xA5A5 },
-        tag: !after_tick,
-        after_tick,
+        from: DeltaCursor::from_pair(!after_tick, after_tick),
         reply_layout,
         spec: b"spec",
     }
@@ -65,7 +64,7 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
 
 /// The views of a `DELTA_POLL` body.
 fn delta_poll_views(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
-    decode_delta_items(ClientVerb::DeltaPoll, body)
+    decode_delta_items(body)
 }
 
 /// Peek `frame`'s prologue — it carries only its verb, and its body starts right
@@ -151,35 +150,41 @@ fn delta_poll_roundtrips_every_view_in_order() {
         DeltaPollItem { spec: b"another spec", ..item(1, 0, 1) },
         item(1, 0, 1),
     ];
-    let frame = encode_delta_poll(&views);
+    let frame = encode_delta_poll(&views, None);
     assert_eq!(peeked(&frame, delta_poll_views).unwrap(), views);
 }
 
 /// The first id rides the prologue's `arg0` and nothing else of it moves.
 #[test]
-fn a_subscribe_carries_its_first_id_in_the_prologue() {
+fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {
     let views = [item(1, 5, 1)];
-    let frame = encode_subscribe(&views, 1_500);
+    let frame = encode_delta_poll(&views, Some(1_500));
     let ctrl = peek_control_block(&frame).unwrap();
     let prologue = ControlHeader {
         flags: WireFlags {
-            verb: ClientVerb::Subscribe,
+            verb: ClientVerb::DeltaPoll,
             ..Default::default()
         },
         arg0: 1_500,
         ..Default::default()
     };
     assert_eq!(ctrl.hdr, prologue);
-    assert_eq!(
-        decode_delta_items(ClientVerb::Subscribe, &frame[ctrl.body.clone()]).unwrap(),
-        views.to_vec()
-    );
+    assert_eq!(decode_delta_items(&frame[ctrl.body.clone()]).unwrap(), views.to_vec());
+    let kept = delta_poll_kept(&ctrl.hdr).expect("a kept poll");
+    assert_eq!(kept.take(2).collect::<Vec<_>>(), [1_500, 1_501]);
+
+    let unkept = encode_delta_poll(&views, None);
+    assert!(delta_poll_kept(&peek_control_block(&unkept).unwrap().hdr).is_none());
 }
 
 /// A delta poll names no view `0`: it is the id of a fault ending the request.
 #[test]
 fn a_delta_poll_refuses_view_id_zero() {
-    let err = peeked(&encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)]), delta_poll_views).expect_err("view id 0");
+    let err = peeked(
+        &encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)], None),
+        delta_poll_views,
+    )
+    .expect_err("view id 0");
     assert!(err.contains("view id 0"), "{err:?}");
 }
 
@@ -197,8 +202,7 @@ fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
         delta_poll_views(&body).unwrap(),
         [DeltaPollItem {
             view: Target { tid: 7, token: 3 },
-            tag: 0,
-            after_tick: 0,
+            from: None,
             reply_layout: 9,
             spec: b"",
         }]
@@ -233,7 +237,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
         .copied()
         .filter(|&v| item_shape(v).is_some())
         .collect();
-    assert_eq!(multi.len(), 5);
+    assert_eq!(multi.len(), 4);
     for verb in multi {
         let ItemShape { blob, schema, data, cap } = item_shape(verb).unwrap();
         let hdr = ControlHeader {

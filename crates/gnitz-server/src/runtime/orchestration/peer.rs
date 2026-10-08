@@ -56,6 +56,11 @@ impl Outbox {
         self.unsynced.set(0);
     }
 
+    /// Whether every train queued has been shipped.
+    pub fn is_empty(&self) -> bool {
+        self.trains.borrow().is_empty()
+    }
+
     /// Queue one train: its opening frame and the frames after it.
     pub fn send(&self, head: Vec<u8>, body: Rc<Vec<u8>>) {
         self.unsynced.set(self.unsynced.get() + head.len() + body.len());

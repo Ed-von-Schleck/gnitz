@@ -426,12 +426,10 @@ fn many_views_of_one_table_advance_in_one_poll() {
 
 /// What each mirror call costs in requests — counts, not clocks.
 ///
-/// Mirroring a view is one RESOLVE, one bootstrap read and the subscription
-/// that continues it, first sighting of its schema or not: the store mints no
-/// ids, so no registration reaches upstream for one. A mirrored SELECT issues none, and neither does its `EXPLAIN` —
-/// routed to the connection it would fail with the server down, and describe a
-/// plan against a relation the statement will not read. A delegated read
-/// resolves its relation once, and a poll of both views is one request.
+/// Mirroring a view is one RESOLVE and one bootstrap read, which leaves the
+/// copy subscribed. A mirrored SELECT issues none, and neither does its
+/// `EXPLAIN`. A delegated read resolves its relation once, and a poll of both
+/// views is one request.
 #[test]
 fn each_mirror_call_costs_what_it_must() {
     let mut fx = Fixture::start();
@@ -440,7 +438,7 @@ fn each_mirror_call_costs_what_it_must() {
 
     for view in ["v_keyed", "v_repl"] {
         let (_, sent) = cost(m, |m| block_on(m.mirror_view(&rel("s", view))).expect("mirror"));
-        assert_eq!(sent, 3, "{view}: one RESOLVE, one bootstrap read, one subscription");
+        assert_eq!(sent, 2, "{view}: one RESOLVE, one bootstrap read");
     }
     let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM v_keyed WHERE a = 7"));
     assert_eq!(sent, 0, "a mirrored SELECT issues no request at all");
@@ -981,12 +979,46 @@ fn a_wait_covers_more_views_than_one_cut_reads() {
     }
 }
 
+/// A copy's cursor is a round of its own view: a round that reaches only
+/// another view moves neither the cursor nor what a checkpoint publishes.
+#[test]
+fn a_round_of_another_view_moves_no_cursor() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let keyed = block_on(fx.mirror().mirror_view(&rel("s", "v_keyed")))
+        .expect("mirror v_keyed")
+        .view_id;
+    fx.drain();
+    block_on(fx.mirror().checkpoint_mirror()).expect("checkpoint");
+    let at = fx.mirror().cursor_of(keyed).expect("a settled copy");
+    let published = manifest_inode(&fx.base_dir(), keyed);
+
+    // `v_keyed` reads `t` alone; the read of `v_repl` ticks the push to `r`.
+    let before = canonical(&query(&mut fx.direct, "s", "SELECT * FROM v_repl"));
+    sql(&mut fx.direct, "s", "INSERT INTO r VALUES (9001, 18002), (9002, 18004)");
+    let after = canonical(&query(&mut fx.direct, "s", "SELECT * FROM v_repl"));
+    assert_ne!(before, after, "a round reached the other view");
+
+    let report = fx.drain();
+    assert!(
+        matches!(report.as_slice(), [o] if matches!(o.result, PollResult::Advanced)),
+        "{report:?}"
+    );
+    assert_eq!(fx.mirror().cursor_of(keyed), Some(at));
+    block_on(fx.mirror().checkpoint_mirror()).expect("checkpoint");
+    assert_eq!(
+        manifest_inode(&fx.base_dir(), keyed),
+        published,
+        "a copy that did not move is not published again"
+    );
+}
+
 /// The next request a connection sends ends its waiting sync, and both are
 /// answered in order; a request ahead of one is not held with it.
 #[test]
 fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     use gnitz_wire::control::{append_frame, ControlHeader};
-    use gnitz_wire::txn_frame::{encode_subscribe, DeltaPollItem};
+    use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
     use gnitz_zset::schema::SchemaFacts;
     use std::io::{Read, Write};
 
@@ -995,12 +1027,12 @@ fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     let (keyed, _) = fx.mirror_both();
     fx.drain();
     let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
-    let (tag, after_tick) = fx.mirror().cursor_of(keyed).expect("a settled copy").pair();
+    let from = fx.mirror().cursor_of(keyed);
+    assert!(from.is_some(), "a settled copy");
     let desc = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
     let item = DeltaPollItem {
         view: gnitz_core::Target::from(&*desc),
-        tag,
-        after_tick,
+        from,
         reply_layout: desc.schema.layout_digest(),
         spec: &whole,
     };
@@ -1031,8 +1063,8 @@ fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     };
     send(&mut raw, &gnitz_wire::HELLO);
     assert_eq!(recv(&mut raw), gnitz_wire::HELLO);
-    send(&mut raw, &encode_subscribe(&[item], 1));
-    answered(&mut raw, "the subscribe");
+    send(&mut raw, &encode_delta_poll(&[item], Some(1)));
+    answered(&mut raw, "the subscribing read");
 
     let t0 = std::time::Instant::now();
     send(&mut raw, &sync(HELD));
@@ -1878,10 +1910,7 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
             .map(|s| s.mirrored)
             .expect("the poll after a reconnect")
     });
-    assert_eq!(
-        sent, 2,
-        "every stored cursor rides one request, and one more subscribes the copies on the new connection"
-    );
+    assert_eq!(sent, 1, "every stored cursor rides one request");
     assert_eq!(report.len(), 2);
     assert!(
         report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
@@ -1900,12 +1929,7 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
 /// advice it has no way to act on.
 #[test]
 fn an_expired_cursor_reseeds_inside_the_poll() {
-    // A delta store spills once its RAM tier crosses this ceiling; shrinking it
-    // is how the capacity sweep is reached on modest data.
-    let mut fx = Fixture::start_with(
-        WORKERS,
-        &[("GNITZ_RAM_TIER_BYTES", "1024"), ("GNITZ_CHECKPOINT_BYTES", "32768")],
-    );
+    let mut fx = Fixture::start();
     sql(
         &mut fx.direct,
         "s",
@@ -1917,17 +1941,16 @@ fn an_expired_cursor_reseeds_inside_the_poll() {
         .view_id;
     fx.drain();
 
-    // Push the workers' retention floor past the copy's cursor, without polling.
-    // Wide rows and many rounds, so what the sweep drops is measured in hundreds
-    // of kilobytes against a one-kilobyte budget.
-    // Each body distinct: a fold shares one heap span among equal strings, and
-    // rows that collapsed that way would never fill a memtable.
-    for k in 0..20 {
-        let lo = 1_000 + k * 200;
-        let rows: Vec<String> = (lo..lo + 200)
+    // Push the workers' retention floor past the copy's cursor, without
+    // polling: a feed keeps its newest round whatever its size, so it takes
+    // rounds over the budget, each ticked by a read, to drop the first.
+    for k in 0..3 {
+        let lo = 1_000 + k * 400;
+        let rows: Vec<String> = (lo..lo + 400)
             .map(|i| format!("({i}, {}, {i}, 0.5, '{i:x>200}')", i % 7))
             .collect();
         sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
+        query(&mut fx.direct, "s", "SELECT a FROM v_tiny WHERE a = 1");
     }
 
     let report = fx.drain();
@@ -1937,7 +1960,7 @@ fn an_expired_cursor_reseeds_inside_the_poll() {
     );
     fx.drain();
     fx.differential("s", "SELECT * FROM v_tiny");
-    fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 4000");
+    fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 1500");
 }
 
 // ---------------------------------------------------------------------------
@@ -2572,5 +2595,284 @@ fn many_subscribers_of_one_view_each_converge() {
         let mut client = waiter.join().unwrap();
         let rows = differential(&mut client, &mut fx.direct, "s", "SELECT * FROM v_keyed", Answer::Local);
         assert!(rows > 0, "waiter {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store jobs a sync does not live to see end
+// ---------------------------------------------------------------------------
+
+mod cut_short {
+    use super::*;
+    use gnitz_core::{BlockingHost, Host, Interest, Job};
+    use std::future::Future;
+    use std::os::fd::BorrowedFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    /// What a test holds of its client's host: while `defer` is set, the jobs
+    /// the client offloaded and nothing has run yet.
+    #[derive(Clone, Default)]
+    struct Script {
+        defer: Arc<AtomicBool>,
+        jobs: Arc<Mutex<Vec<Job>>>,
+    }
+
+    struct ScriptHost {
+        inner: BlockingHost,
+        s: Script,
+    }
+
+    impl Host for ScriptHost {
+        fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+            self.inner.attach(fd)
+        }
+        fn poll_io(
+            &mut self,
+            want: Interest,
+            cx: &mut Context<'_>,
+            io: &mut dyn FnMut(Interest) -> bool,
+        ) -> Poll<Result<(), ClientError>> {
+            self.inner.poll_io(want, cx, io)
+        }
+        fn spawn(&mut self, job: Job) {
+            if self.s.defer.load(Ordering::SeqCst) {
+                self.s.jobs.lock().unwrap().push(job);
+            } else {
+                job()
+            }
+        }
+    }
+
+    fn scripted(target: &str, dir: &str) -> (GnitzClient, Script) {
+        let s = Script::default();
+        let host = ScriptHost {
+            inner: BlockingHost::default(),
+            s: s.clone(),
+        };
+        let mut client = block_on(GnitzClient::connect_with(target, Box::new(host))).unwrap();
+        client.attach_mirror(open_store(dir)).unwrap();
+        (client, s)
+    }
+
+    /// Drop a sync's future while its k-th store job is still to run, then run
+    /// the job: for every k of a sync that replaces an expired copy.
+    #[test]
+    fn a_copy_replaced_under_a_dropped_sync_is_reported_reseeded() {
+        let mut fx = Fixture::start();
+        fx.close();
+        sql(
+            &mut fx.direct,
+            "s",
+            "CREATE VIEW v_tiny WITH (delta = '1 KB') AS SELECT a, b, v, body FROM t WHERE v >= 0",
+        );
+        churn(&mut fx.direct, 1, 60);
+        let mut dirs = Vec::new();
+        let mut cuts = 0;
+        let mut lost = Vec::new();
+        for k in 1..=12usize {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut client, s) = scripted(fx.server.sock_path(), dir.path().to_str().unwrap());
+            dirs.push(dir);
+            let tid = block_on(client.mirror_view(&rel("s", "v_tiny")))
+                .expect("mirror")
+                .view_id;
+            let _ = block_on(client.sync(Duration::ZERO)).expect("drain");
+            let before = client.cursor_of(tid).expect("a copy");
+            // Expire the copy's cursor.
+            for j in 0..3 {
+                let lo = 100_000 * k as i64 + j * 400;
+                let rows: Vec<String> = (lo..lo + 400)
+                    .map(|i| format!("({i}, {}, {i}, 0.5, '{i:x>200}')", i % 7))
+                    .collect();
+                sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
+                query(&mut fx.direct, "s", "SELECT a FROM v_tiny WHERE a = 1");
+            }
+            s.defer.store(true, Ordering::SeqCst);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut ran = 0;
+            let done = {
+                let mut fut = Box::pin(client.sync(Duration::ZERO));
+                loop {
+                    match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(r) => break Some(r),
+                        Poll::Pending => {
+                            let job = s.jobs.lock().unwrap().pop().expect("pending on a job");
+                            ran += 1;
+                            if ran == k {
+                                drop(fut);
+                                job();
+                                break None;
+                            }
+                            job();
+                        }
+                    }
+                }
+            };
+            s.defer.store(false, Ordering::SeqCst);
+            let mut reseeded = match done {
+                Some(r) => {
+                    let r = r
+                        .expect("sync")
+                        .mirrored
+                        .iter()
+                        .any(|o| o.view_id == tid && o.result.reseeded());
+                    assert!(
+                        r,
+                        "k={k}: an uncut sync over an expired cursor must reseed (ran {ran} jobs)"
+                    );
+                    r
+                }
+                None => {
+                    cuts += 1;
+                    false
+                }
+            };
+            for _ in 0..3 {
+                let outs = block_on(client.sync(Duration::ZERO)).expect("sync").mirrored;
+                for o in &outs {
+                    assert!(!matches!(o.result, PollResult::Failed(_)), "k={k}: {o:?}");
+                }
+                reseeded |= outs.iter().any(|o| o.view_id == tid && o.result.reseeded());
+            }
+            let after = client.cursor_of(tid).expect("a copy");
+            assert_ne!(before, after);
+            if !reseeded {
+                lost.push((k, ran));
+            }
+            fx.mirror = Some(client);
+            fx.differential("s", "SELECT * FROM v_tiny");
+            let mut client = fx.mirror.take().unwrap();
+            block_on(client.close_mirror()).unwrap();
+        }
+        assert!(cuts >= 1, "no future was dropped");
+        assert!(
+            lost.is_empty(),
+            "a copy was replaced and no sync reported it: (k, jobs run) = {lost:?}"
+        );
+    }
+
+    /// A sync that advances subscribed copies by pushed trains, its k-th store
+    /// job dropped by the host: the trains it took are lost, so no subscription
+    /// may stand ahead of its copy.
+    #[test]
+    fn a_dropped_job_under_a_pushed_advance_leaves_no_subscription_ahead() {
+        let mut fx = Fixture::start();
+        fx.close();
+        churn(&mut fx.direct, 1, 60);
+        let mut dirs = Vec::new();
+        let mut cuts = 0;
+        for k in 1..=4usize {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut client, s) = scripted(fx.server.sock_path(), dir.path().to_str().unwrap());
+            dirs.push(dir);
+            block_on(client.mirror_view(&rel("s", "v_keyed"))).expect("mirror");
+            block_on(client.mirror_view(&rel("s", "v_repl"))).expect("mirror");
+            let _ = block_on(client.sync(Duration::ZERO)).expect("drain");
+            let lo = 20_000 * k as i64;
+            churn(&mut fx.direct, lo, lo + 40);
+            fx.tick("s", &["v_keyed", "v_repl"]);
+            s.defer.store(true, Ordering::SeqCst);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut ran = 0;
+            {
+                let mut fut = Box::pin(client.sync(Duration::ZERO));
+                loop {
+                    match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(r) => {
+                            if ran >= k {
+                                assert!(r.is_err(), "k={k}: a dropped job is an error");
+                            }
+                            break;
+                        }
+                        Poll::Pending => {
+                            let job = s.jobs.lock().unwrap().pop().expect("pending on a job");
+                            ran += 1;
+                            if ran == k {
+                                cuts += 1;
+                                drop(job);
+                            } else {
+                                job();
+                            }
+                        }
+                    }
+                }
+            }
+            s.defer.store(false, Ordering::SeqCst);
+            churn(&mut fx.direct, lo + 100, lo + 130);
+            fx.tick("s", &["v_keyed", "v_repl"]);
+            for _ in 0..3 {
+                let outs = block_on(client.sync(Duration::ZERO)).expect("sync").mirrored;
+                for o in &outs {
+                    assert!(!matches!(o.result, PollResult::Failed(_)), "k={k}: {o:?}");
+                }
+            }
+            fx.mirror = Some(client);
+            fx.differential("s", "SELECT * FROM v_keyed");
+            fx.differential("s", "SELECT * FROM v_repl");
+            let mut client = fx.mirror.take().unwrap();
+            block_on(client.close_mirror()).unwrap();
+        }
+        assert!(cuts >= 1, "nothing was cut");
+    }
+
+    /// A sync that advances copies by a delta read (no subscription yet), its
+    /// k-th store job dropped by the host: the read's blocks are lost, and no
+    /// subscription may stand ahead of the copy.
+    #[test]
+    fn a_dropped_job_under_a_read_keeps_no_subscription() {
+        let mut fx = Fixture::start();
+        fx.close();
+        churn(&mut fx.direct, 1, 60);
+        let mut dirs = Vec::new();
+        let mut cuts = 0;
+        for k in 1..=3usize {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut client, s) = scripted(fx.server.sock_path(), dir.path().to_str().unwrap());
+            dirs.push(dir);
+            block_on(client.mirror_view(&rel("s", "v_keyed"))).expect("mirror");
+            block_on(client.mirror_view(&rel("s", "v_repl"))).expect("mirror");
+            let _ = block_on(client.sync(Duration::ZERO)).expect("drain");
+            let lo = 40_000 * k as i64;
+            churn(&mut fx.direct, lo, lo + 40);
+            fx.tick("s", &["v_keyed", "v_repl"]);
+            // No subscription on the new connection: the sync reads.
+            let target = fx.server.sock_path().to_string();
+            block_on(client.reconnect(&target)).expect("reconnect");
+            s.defer.store(true, Ordering::SeqCst);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut ran = 0;
+            {
+                let mut fut = Box::pin(client.sync(Duration::ZERO));
+                loop {
+                    match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(_) => break,
+                        Poll::Pending => {
+                            let job = s.jobs.lock().unwrap().pop().expect("pending on a job");
+                            ran += 1;
+                            if ran == k {
+                                cuts += 1;
+                                drop(job);
+                            } else {
+                                job();
+                            }
+                        }
+                    }
+                }
+            }
+            s.defer.store(false, Ordering::SeqCst);
+            churn(&mut fx.direct, lo + 100, lo + 130);
+            fx.tick("s", &["v_keyed", "v_repl"]);
+            for _ in 0..3 {
+                let _ = block_on(client.sync(Duration::ZERO));
+            }
+            fx.mirror = Some(client);
+            fx.differential("s", "SELECT * FROM v_keyed");
+            fx.differential("s", "SELECT * FROM v_repl");
+            let mut client = fx.mirror.take().unwrap();
+            block_on(client.close_mirror()).unwrap();
+        }
+        assert!(cuts >= 1);
     }
 }

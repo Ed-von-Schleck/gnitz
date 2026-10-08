@@ -756,6 +756,12 @@ impl Batch {
         }
     }
 
+    /// Bytes its two buffers hold allocated, rows or not: what holding this
+    /// batch costs, where [`Self::total_bytes`] is what its rows take.
+    pub fn allocated_bytes(&self) -> usize {
+        self.data.capacity() + self.blob.capacity()
+    }
+
     /// Live row bytes: each region bounded to `count`, plus the blob. Excludes
     /// unused capacity, so a caller sizing a RAM budget against it is measuring
     /// rows held, not bytes allocated.
@@ -819,37 +825,17 @@ impl Batch {
         out
     }
 
-    /// Every row copied into `out_schema`, whose payload space is this batch's
-    /// and whose key is `prefix` followed by this batch's. The consolidated claim
-    /// carries over: one prefix on every key keeps (PK, payload) order and
-    /// distinctness.
-    pub fn with_key_prefix(&self, out_schema: &SchemaDescriptor, prefix: &[u8]) -> Batch {
-        let mut out = self.rekeyed(out_schema, |src, dst| {
-            let (head, key) = dst.split_at_mut(prefix.len());
-            head.copy_from_slice(prefix);
-            key.copy_from_slice(src);
-        });
-        out.inherit_consolidated(self);
-        out
-    }
-
     /// Every row copied into `out_schema`, whose payload space is this batch's,
     /// keyed by its leading key bytes — as many as `out_schema`'s stride. Left
     /// unconsolidated: rows may now share a key.
     pub fn keyed_by_prefix(&self, out_schema: &SchemaDescriptor) -> Batch {
-        self.rekeyed(out_schema, |src, dst| dst.copy_from_slice(&src[..dst.len()]))
-    }
-
-    /// Every row copied into `out_schema`, whose payload space is this batch's;
-    /// each output key written by `rekey(src_key, dst_key)`. Left unconsolidated.
-    fn rekeyed(&self, out_schema: &SchemaDescriptor, rekey: impl Fn(&[u8], &mut [u8])) -> Batch {
         debug_assert_eq!(out_schema.num_payload_cols(), self.schema.num_payload_cols());
         self.copied_into(out_schema, 0, |w| {
             let (pk, _, nulls) = w.fixed_mut();
             nulls.copy_from_slice(self.null_bmp_data());
             let keys = pk.chunks_exact_mut(out_schema.pk_stride());
             for (dst, src) in keys.zip(self.pk_data().chunks_exact(self.schema.pk_stride())) {
-                rekey(src, dst);
+                dst.copy_from_slice(&src[..dst.len()]);
             }
         })
     }
@@ -922,9 +908,31 @@ impl Batch {
         unsafe { super::seek::seek_advance_to(self.count, cp.stride, cp, key, hint) }
     }
 
+    /// The rows of this batch, which is in key order, whose PK is one of
+    /// `keys`, which ascend: as maximal runs into `out` (cleared first).
+    pub fn key_ranges<'k>(&self, keys: impl IntoIterator<Item = &'k [u8]>, out: &mut Vec<(usize, usize)>) {
+        debug_assert!(merge::in_consolidated_order(self));
+        out.clear();
+        let mut from = 0;
+        for key in keys {
+            let lo = self.advance_to(key, from);
+            from = lo;
+            if lo == self.count {
+                break;
+            }
+            if self.get_pk_bytes(lo) == key {
+                from = super::seek::pk_group_end(self, lo);
+                match out.last_mut() {
+                    Some(last) if last.1 == lo => last.1 = from,
+                    _ => out.push((lo, from)),
+                }
+            }
+        }
+    }
+
     /// Copy every `[start, end)` range of `src`, ascending and disjoint, onto
     /// this batch's tail, one append setup serving the whole list.
-    pub(crate) fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
+    pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         let rows = range_rows(ranges);
         // Before the session, which would be opened to copy nothing. An
         // all-DELETE push emits one empty range per row.
@@ -1248,6 +1256,30 @@ impl Batch {
             return self;
         }
         Batch::clone(&self)
+    }
+
+    /// `self`, or a copy in buffers of exactly what its rows take when its own
+    /// hold more.
+    pub fn shrunk(self) -> Batch {
+        let schema = self.schema;
+        let cap = schema.arena_rows(self.count);
+        let need = cap * schema.row_width();
+        if self.data.capacity() == need && self.blob.capacity() == self.blob.len() {
+            return self;
+        }
+        // Fresh off the allocator: a pooled buffer may hold twice what is
+        // asked of it, and one shrunk in place keeps its tail resident.
+        let mut data = vec![0; need];
+        copy_regions(&schema, &self.data, self.capacity, &mut data, cap, self.count);
+        Batch {
+            data: PooledBuf(data),
+            blob: PooledBuf(self.blob.to_vec()),
+            dead_heap: self.dead_heap,
+            capacity: cap,
+            count: self.count,
+            consolidated: self.consolidated,
+            schema,
+        }
     }
 
     /// A tight copy with every long string relocated, so its heap holds no

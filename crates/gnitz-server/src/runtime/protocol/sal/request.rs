@@ -22,16 +22,13 @@ pub(crate) enum Read<'a> {
         reply_layout: u64,
         spec: Cow<'a, [u8]>,
     },
-    /// `view`'s deltas in rounds `(after_tick, cut_round]`.
+    /// `view`'s deltas in the rounds after `after_tick`, under the encoded
+    /// `ReadSpec` `spec`, in the layout whose digest is `reply_layout`.
     Delta {
         view: u64,
         after_tick: u64,
-        cut_round: u64,
-        /// The encoded `ReadSpec` the view is read under, then the reply
-        /// layout's digest. The spec leads, so the read is routed by
-        /// its bound as a `ScanSpec` is; [`Read::delta`] builds it and
-        /// [`Read::delta_parts`] reads it.
-        read: Cow<'a, [u8]>,
+        reply_layout: u64,
+        spec: Cow<'a, [u8]>,
     },
 }
 
@@ -61,24 +58,6 @@ pub(crate) enum SalRequest<'a> {
 }
 
 impl Read<'_> {
-    /// `view`'s deltas in rounds `(after_tick, cut_round]`, under the encoded
-    /// `spec`, in the layout whose digest is `reply_layout`.
-    pub(crate) fn delta(view: u64, after_tick: u64, cut_round: u64, spec: &[u8], reply_layout: u64) -> Read<'static> {
-        let read = [spec, &reply_layout.to_le_bytes()].concat();
-        Read::Delta {
-            view,
-            after_tick,
-            cut_round,
-            read: read.into(),
-        }
-    }
-
-    /// A [`Read::Delta`]'s encoded spec and its reply layout's digest.
-    pub(crate) fn delta_parts(read: &[u8]) -> (&[u8], u64) {
-        let (spec, layout) = read.split_last_chunk().expect("a delta read ends in its reply layout");
-        (spec, u64::from_le_bytes(*layout))
-    }
-
     /// The relation it reads.
     pub(crate) fn target(&self) -> u64 {
         match *self {
@@ -144,11 +123,11 @@ impl SalRequest<'_> {
                 blob: spec,
                 ..head
             },
-            SalRequest::Read(Read::Delta { view, after_tick, cut_round, ref read }) => WireMsg {
+            SalRequest::Read(Read::Delta { view, after_tick, reply_layout, ref spec }) => WireMsg {
                 target_id: view,
-                arg0: cut_round,
+                arg0: reply_layout,
                 arg1: after_tick,
-                blob: read,
+                blob: spec,
                 ..head
             },
         }
@@ -188,18 +167,13 @@ impl SalRequest<'static> {
                 spec: blob.to_vec().into(),
             }
             .into(),
-            SalMessageKind::DeltaRead => {
-                if blob.len() < size_of::<u64>() {
-                    return Err("delta read: the blob holds no reply layout".into());
-                }
-                Read::Delta {
-                    view: tid,
-                    after_tick: hdr.arg1,
-                    cut_round: hdr.arg0,
-                    read: blob.to_vec().into(),
-                }
-                .into()
+            SalMessageKind::DeltaRead => Read::Delta {
+                view: tid,
+                after_tick: hdr.arg1,
+                reply_layout: hdr.arg0,
+                spec: blob.to_vec().into(),
             }
+            .into(),
         })
     }
 }

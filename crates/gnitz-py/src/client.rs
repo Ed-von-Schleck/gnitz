@@ -703,9 +703,8 @@ impl PyClient {
     /// cursor(view_id) -> (tag, tick) | None
     ///
     /// The round a local read of `view_id` answers at, or `None` when there is no
-    /// valid copy. The tick is the master's global round counter, shared by every
-    /// relation, so it advances over rounds that carried this view nothing —
-    /// whether a copy changed is `PollResult.reseeded`, not this.
+    /// valid copy. A discarded copy is told by `PollResult.reseeded`, never by
+    /// its cursor.
     fn cursor(slf: &Bound<'_, Self>, view_id: u64) -> PyResult<Py<PyAny>> {
         Self::peek(
             slf,

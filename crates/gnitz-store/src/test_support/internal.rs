@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use crate::storage::{RecoverySource, ShardBudget, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewProps};
 use gnitz_zset::repr::Batch;
@@ -18,14 +18,7 @@ pub(crate) fn new_table(
     recovery: RecoverySource,
     ram_tier_bytes: usize,
 ) -> Table {
-    Table::new(
-        dir.as_ref().to_str().unwrap(),
-        schema,
-        recovery,
-        ram_tier_bytes,
-        ShardBudget::Unbounded,
-    )
-    .unwrap()
+    Table::new(dir.as_ref().to_str().unwrap(), schema, recovery, ram_tier_bytes, None).unwrap()
 }
 
 /// A rederived table under `dir` at the default budgets — nothing a test puts

@@ -307,10 +307,9 @@ def test_one_poll_reports_every_view(client, mirror):
     The moved view's rows arrive as a train the workers produced while every
     idle one's terminal is answered master-locally, so the two reply shapes
     interleave on one connection: a poll correlating replies by arrival rather
-    than by request would hand a view another's tag. The tick is the master's
-    global round counter, so a cursor advances over rounds that carried its view
-    nothing — stated here rather than left for a host to infer "my copy changed"
-    from a tick that moved.
+    than by request would hand a view another's tag. A cursor's tick is a round
+    of its own view, so a round that reached only another view moves it not at
+    all.
     """
     base_tables(client)
     idle = {}
@@ -340,8 +339,10 @@ def test_one_poll_reports_every_view(client, mirror):
         assert r.error is None and not r.reseeded, f"{vid}: an ordinary advance neither fails nor reseeds"
         assert r.cursor == mirror.cursor(vid), "the report carries the round each copy now answers at"
         assert r.cursor[0] == tag, f"{vid}: a report carrying another view's tag is a mis-correlation"
-        assert r.cursor[1] >= tick, f"{vid}: the round never goes backwards"
-    assert len({r.cursor[1] for r in report.values()}) == 1, "the round is the master's global counter"
+        if vid == moved:
+            assert r.cursor[1] > tick, "the view the round reached moved"
+        else:
+            assert r.cursor[1] == tick, f"{vid}: a round of another view moves no cursor"
 
     for name, vid in [("f", moved), ("g0", idle["g0"])]:
         q = f"SELECT * FROM {name}"

@@ -142,6 +142,24 @@ impl<'d> ScanCut<'d> {
         Ok(())
     }
 
+    /// A read of `view`'s deltas after `after_tick`; the round it reaches,
+    /// the view's last.
+    pub(crate) fn delta(
+        &mut self,
+        view: u64,
+        after_tick: u64,
+        spec: &[u8],
+        reply_layout: u64,
+    ) -> Result<u64, WireFault> {
+        self.read(DirectGroup::new(Read::Delta {
+            view,
+            after_tick,
+            reply_layout,
+            spec: spec.into(),
+        }))?;
+        Ok(self.disp.last_delta_round(view))
+    }
+
     /// `group`, a read, written to the workers its target and bound reach, each
     /// sent its own key set when the bound splits one.
     pub(crate) fn read(&mut self, group: DirectGroup<'_>) -> Result<(), WireFault> {
@@ -149,7 +167,7 @@ impl<'d> ScanCut<'d> {
             unreachable!("a cut routes reads; {:?} is none", group.request)
         };
         let bound = match read {
-            Read::ScanSpec { spec, .. } | Read::Delta { read: spec, .. } => Some(&spec[..]),
+            Read::ScanSpec { spec, .. } | Read::Delta { spec, .. } => Some(&spec[..]),
             _ => None,
         };
         let tid = read.target();

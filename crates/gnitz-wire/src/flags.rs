@@ -17,7 +17,13 @@ wire_enum! {
         /// `arg0`. An empty batch is still a push, ACKed at LSN 0.
         Push = 1,
         /// A delta read of N views: one frame naming N fed views, each with its
-        /// own cursor and client-authored reply schema.
+        /// own cursor and client-authored reply schema. Each view's terminal
+        /// carries the cursor to read from next: the view's own last round.
+        ///
+        /// A prologue `arg0` other than `0` keeps item `i`, once answered with
+        /// a terminal, as the connection's subscription `arg0 + i` from that
+        /// terminal's cursor. The rounds reaching it afterwards are sent as
+        /// pushed trains ([`WireFlags::pushed`]); a fault ends it.
         DeltaPoll = 4,
         /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
         /// name in the blob; the reply's `arg0` is its descriptor token.
@@ -40,28 +46,13 @@ wire_enum! {
         /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
-        /// Subscribe this connection to fed views, each from a cursor a delta
-        /// read handed out: a `DELTA_POLL`'s frame, whose prologue `arg0` is
-        /// the first of the subscription ids the client chose — item `i` asks
-        /// for `arg0 + i`, and an id the connection holds is replaced. An item
-        /// reading its view whole (tick `0`) is refused.
-        ///
-        /// The rounds after an item's cursor that leave its view a row the
-        /// spec keeps are then sent as pushed trains ([`WireFlags::pushed`]),
-        /// each behind the reply of a request the connection makes. A train
-        /// ending in a fault ends its subscription, and is how an item is
-        /// refused: the ACK says only that the frame was read.
-        Subscribe = 11,
         /// End subscription `arg0`. An id this connection does not hold is
         /// ACKed too.
         Unsubscribe = 12,
         /// Answer once every subscription of this connection has been sent
         /// every push acknowledged before this request, the trains ahead of
-        /// the ACK. With no train sent since the last one, the reply is held
-        /// up to `arg0` milliseconds. The ACK's `arg0`
-        /// is a round every subscription the connection still holds has been
-        /// sent through — what the cursor of one sent no train moves to — or
-        /// `0` with none.
+        /// the ACK. While none of them was sent a row since the last one, the
+        /// reply is held up to `arg0` milliseconds.
         SyncPushed = 13,
     }
 }

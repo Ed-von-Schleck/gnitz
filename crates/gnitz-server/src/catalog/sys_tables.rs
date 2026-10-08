@@ -330,18 +330,9 @@ pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> 
         return Err("has no column records".into());
     }
     // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
-    // plain projection prepends the k source PK columns. A fed view gets one
-    // column less, since its delta store stamps a `_tick` key column ahead of
-    // the view's own.
-    let fed = kind.has_delta_feed();
-    let max = MAX_COLUMNS - usize::from(fed);
-    if col_defs.len() > max {
-        let why = if fed {
-            " with a delta feed: its `_tick` stamp is one more"
-        } else {
-            ""
-        };
-        return Err(format!("has {} columns (max {max}{why})", col_defs.len()));
+    // plain projection prepends the k source PK columns.
+    if col_defs.len() > MAX_COLUMNS {
+        return Err(format!("has {} columns (max {MAX_COLUMNS})", col_defs.len()));
     }
     if kind.is_ingestion_point() {
         let visible = col_defs.iter().filter(|c| !c.def.is_hidden);

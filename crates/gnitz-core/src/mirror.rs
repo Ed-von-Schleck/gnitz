@@ -1,14 +1,13 @@
 //! Mirroring: the store a client reads a local copy of a view through, and the
 //! reconciliation that keeps that copy current.
 //!
-//! The seam sits at the **store**, not at the read surface. [`GnitzClient`] owns
-//! the copy and delegates the reads it does not hold; the copy answers questions
-//! about itself and never about a connection. So the trait below carries the
-//! store's own lifecycle and one read, and everything that resolves a name,
-//! drives the feed or classifies a failure is the client's — [`GnitzClient`]'s
-//! mirror methods and the reconciliation at the bottom of this file.
+//! [`MirrorStore`] is the copy: its lifecycle and one read. It answers
+//! questions about itself and never about a connection, so everything that
+//! resolves a name, drives the feed or classifies a failure is
+//! [`GnitzClient`]'s — its mirror methods and the reconciliation at the bottom
+//! of this file — and so is delegating the reads the copy does not hold.
 //!
-//! **It is declared here so a client can hold a copy without linking an
+//! **The trait is declared here so a client can hold a copy without linking an
 //! engine.** Every signature is a `gnitz-core` type or a primitive, and
 //! `gnitz-mirror` is the one implementor: a host that mirrors takes that crate
 //! and its Linux-only engine, and a host that only reads remotely takes neither.
@@ -16,10 +15,10 @@
 //! # What a mirrored read promises
 //!
 //! **Freshness.** It answers at the copy's cursor round, which only a poll
-//! moves, and a local read never polls. So a copy is not read-your-own-writes, and two mirrored views can sit
-//! at different rounds — a read spanning both is no consistent cut. A relation
-//! the copy does not hold is delegated upstream and keeps every guarantee a
-//! server read has.
+//! moves, and a local read never polls. So a copy is not read-your-own-writes,
+//! and two mirrored views can sit at different rounds — a read spanning both
+//! is no consistent cut. A relation the copy does not hold is delegated
+//! upstream and keeps every guarantee a server read has.
 //!
 //! **Cost.** Each index the view had at its last resolve is a further local
 //! store, maintained on every applied delta.
@@ -32,8 +31,9 @@
 //! view's registration is derived by resolving its name, an alias's is by
 //! calling the [`Planner`] it was mirrored with.
 
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::RelClass;
 
 // ---------------------------------------------------------------------------
-// The seam
+// The store
 // ---------------------------------------------------------------------------
 
 /// The local copy a [`GnitzClient`] reads through, and everything a client does
@@ -67,9 +67,6 @@ pub trait MirrorStore: Send {
     /// under that name at another id. A registration that already stands as
     /// given is left as it is.
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError>;
-
-    /// Drop `tid`'s feed position, leaving its rows.
-    fn drop_cursor(&mut self, tid: u64);
 
     /// Retract `tid`: its cursor, its rows, its record and its directory.
     /// Idempotent, and a `tid` the store does not hold is `Ok(())`.
@@ -159,10 +156,6 @@ pub struct PollOutcome {
     /// with.
     pub view_id: u64,
     /// The round this view now answers at; `None` when it has no valid copy.
-    ///
-    /// Carried rather than read back through [`GnitzClient::cursor_of`]: an
-    /// async client shares one store across clones, where another clone can poll
-    /// between the two calls.
     pub cursor: Option<DeltaCursor>,
     pub result: PollResult,
 }
@@ -219,6 +212,10 @@ pub(crate) struct MirroredView {
     confirmed: bool,
     /// Whether its last delta read failed.
     failed: bool,
+    /// Whether its copy was read whole and no caller has been handed the
+    /// [`PollResult::Reseeded`] yet. Cleared only by [`MirrorState::report`],
+    /// so an interrupt that discards a report re-announces it next poll.
+    owed_reseed: bool,
     /// This connection's subscription to what this registration reads, by the
     /// id it was asked for under. While it holds one, a poll advances the copy
     /// by the trains pushed for it, and no delta read may.
@@ -294,6 +291,7 @@ impl MirroredView {
             plan,
             confirmed: false,
             failed: false,
+            owed_reseed: false,
             sub: None,
         })
     }
@@ -321,7 +319,12 @@ impl MirroredView {
     /// A delta read of this view after `from` — the view whole with none —
     /// replied in its own schema.
     fn poll_item(&self, from: Option<DeltaCursor>) -> DeltaPollItem<'_> {
-        DeltaCursor::item(from, self.upstream, &self.desc.schema, &self.spec)
+        DeltaPollItem {
+            view: self.upstream,
+            from,
+            reply_layout: self.desc.schema.layout_digest(),
+            spec: &self.spec,
+        }
     }
 }
 
@@ -377,10 +380,6 @@ pub(crate) struct MirrorState {
     /// [`GnitzClient::cursor_of`] reports a round for. Survives a
     /// [`GnitzClient::reconnect`].
     pub(crate) views: HashMap<u64, MirroredView>,
-    /// Views owed a [`PollResult::Reseeded`]: a bootstrap ran and no caller has
-    /// been handed the outcome yet. Cleared only by [`Self::report`], so an
-    /// interrupt that discards a report re-announces it next poll.
-    owed_reseed: HashSet<u64>,
 }
 
 impl MirrorState {
@@ -415,19 +414,19 @@ impl MirrorState {
 
     /// One entry for each view of `done` still registered, for a caller that is
     /// about to be handed it.
-    fn report(&mut self, done: Vec<(u64, Option<ClientError>)>) -> Vec<PollOutcome> {
-        let MirrorState { store, views, owed_reseed } = self;
+    fn report(&mut self, done: Vec<(u64, Result<(), ClientError>)>) -> Vec<PollOutcome> {
+        let MirrorState { store, views } = self;
         let store = store.get();
         done.into_iter()
-            .filter_map(|(view_id, failed)| {
-                let view = views.get(&view_id)?;
+            .filter_map(|(view_id, synced)| {
+                let view = views.get_mut(&view_id)?;
                 Some(PollOutcome {
                     view_id,
                     cursor: view.answers_at(&*store),
-                    result: match failed {
-                        Some(e) => PollResult::Failed(e),
-                        None if owed_reseed.remove(&view_id) => PollResult::Reseeded,
-                        None => PollResult::Advanced,
+                    result: match synced {
+                        Err(e) => PollResult::Failed(e),
+                        Ok(()) if std::mem::take(&mut view.owed_reseed) => PollResult::Reseeded,
+                        Ok(()) => PollResult::Advanced,
                     },
                 })
             })
@@ -438,14 +437,6 @@ impl MirrorState {
 // ---------------------------------------------------------------------------
 // The reconciliation
 // ---------------------------------------------------------------------------
-//
-// A copy is moved by exactly one of two things at a time. Until a delta read
-// on this connection has brought it up to date, and again whenever its
-// subscription ends, it is `settle`'s: delta reads, and the recovery each
-// refusal names. Once read it is subscribed, and from then on a poll applies
-// the trains the server pushed for it. A subscription that ends says only that
-// the copy is `settle`'s again — the delta read that follows meets whatever
-// ended it, and recovers as it always has.
 
 /// Rounds one view is synced in before its refusal is the caller's to see.
 const SETTLE_ATTEMPTS: usize = 4;
@@ -505,6 +496,7 @@ impl GnitzClient {
         let views = &mut mirror.as_deref_mut().ok_or_else(no_mirror_store)?.views;
         let held = views.get(&tid);
         entry.confirmed = held.is_some_and(|held| held.confirmed && held.reads_what(&entry));
+        entry.owed_reseed |= held.is_some_and(|held| held.owed_reseed);
         // One registration per name, and one at an id; a subscription outlives
         // only a rename, which carries it.
         let replaced = views
@@ -539,16 +531,17 @@ impl GnitzClient {
         }
     }
 
-    /// Bring every view of `tids`, none of them subscribed, up to date, in
-    /// rounds: each syncs every pending view, then takes the recovery each
-    /// refusal names. The copies it read are subscribed. Returns each view's
-    /// failure, if it has one, under the id it ended up mirrored at.
+    /// Bring every view of `tids` up to date and subscribed, each by a delta
+    /// read and then the recovery its refusal names. Returns how each view's
+    /// sync went, under the id it ended up mirrored at.
     async fn settle(
         &mut self,
         tids: impl IntoIterator<Item = u64>,
-    ) -> Result<Vec<(u64, Option<ClientError>)>, ClientError> {
+    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
         let mut pending: Vec<u64> = tids.into_iter().collect();
         let mut done = Vec::with_capacity(pending.len());
+        // The views whose cursor the feed no longer continues.
+        let mut expired = Vec::new();
         for attempt in 1..=SETTLE_ATTEMPTS {
             // A recovery may have moved a registration off its id.
             if attempt > 1 {
@@ -558,7 +551,7 @@ impl GnitzClient {
             if pending.is_empty() {
                 break;
             }
-            let synced = self.read_copies(&pending).await?;
+            let synced = self.read_copies(&pending, &expired).await?;
             pending.clear();
             for (tid, result) in synced {
                 // A view synced again answers for its last sync alone.
@@ -571,11 +564,11 @@ impl GnitzClient {
                             v.confirmed = true;
                             v.failed = false;
                         }
-                        done.push((tid, None));
+                        done.push((tid, Ok(())));
                         continue;
                     }
                     Err(e) if attempt == SETTLE_ATTEMPTS => Err(e),
-                    Err(e) => self.recover(tid, e).await,
+                    Err(e) => self.recover(tid, e, &mut expired).await,
                 };
                 match recovered {
                     Ok(now) if pending.contains(&now) => {}
@@ -585,18 +578,18 @@ impl GnitzClient {
                         if let Some(v) = self.mirror_state()?.views.get_mut(&tid) {
                             v.failed = true;
                         }
-                        done.push((tid, Some(e)))
+                        done.push((tid, Err(e)))
                     }
                 }
             }
         }
-        self.subscribe_copies(&done);
         Ok(done)
     }
 
     /// Take the recovery `failure` names for `tid`'s sync, and return the id to
-    /// sync next; a failure that names none is handed back.
-    async fn recover(&mut self, tid: u64, failure: ClientError) -> Result<u64, ClientError> {
+    /// sync next; a failure that names none is handed back. A view to read
+    /// whole joins `expired`.
+    async fn recover(&mut self, tid: u64, failure: ClientError, expired: &mut Vec<u64>) -> Result<u64, ClientError> {
         let ClientError::Refused(WireFault { status, .. }) = &failure else {
             return Err(failure);
         };
@@ -605,61 +598,124 @@ impl GnitzClient {
             WireStatus::StaleCatalog => self.rebind(tid).await,
             // The cursor does not continue.
             WireStatus::DeltaExpired => {
-                self.mirror_state()?.store.get().drop_cursor(tid);
+                expired.push(tid);
                 Ok(tid)
             }
             _ => Err(failure),
         }
     }
 
-    /// One sync of each view of `tids`: every one holding a cursor in a single
-    /// request, then each of the rest read whole. Only an interrupt ends the call.
-    async fn read_copies(&mut self, tids: &[u64]) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
-        let (mut polls, mut whole) = (Vec::new(), Vec::new());
-        {
-            let store = self.mirror_state()?.store.get();
-            for &tid in tids {
-                match store.cursor_of(tid) {
-                    Some(prev) => polls.push((tid, prev)),
-                    None => whole.push(tid),
+    /// One delta read of each view of `tids`, which keeps each one it brings
+    /// up to date subscribed: a copy is advanced from its cursor, and one that
+    /// holds none, or is one of `whole`, replaced with the view's whole value.
+    /// `Err` is the host's alone.
+    async fn read_copies(
+        &mut self,
+        tids: &[u64],
+        whole: &[u64],
+    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
+        let GnitzClient { session, host, mirror, .. } = self;
+        let MirrorState { store, views } = mirror.as_deref_mut().ok_or_else(no_mirror_store)?;
+        let host = &mut **host;
+        let froms: Vec<Option<DeltaCursor>> = {
+            let store = store.get();
+            let from = |tid: &u64| store.cursor_of(*tid).filter(|_| !whole.contains(tid));
+            tids.iter().map(from).collect()
+        };
+        let mut poll = {
+            let item = |(tid, from): (&u64, &Option<DeltaCursor>)| {
+                let view = views.get(tid);
+                let view = view.ok_or_else(|| ClientError::from(format!("relation {tid} is not mirrored")))?;
+                debug_assert!(view.sub.is_none(), "a subscribed copy is moved by its trains alone");
+                Ok(view.poll_item(*from))
+            };
+            let items: Result<Vec<DeltaPollItem>, ClientError> = tids.iter().zip(&froms).map(item).collect();
+            DeltaPoll::start(session, &items?)
+        };
+        let mut done = Vec::with_capacity(tids.len());
+        // The view being answered: its blocks not yet in the store and, for
+        // one read whole, whether its copy was opened and what failed it.
+        let mut blocks = Vec::new();
+        let (mut opened, mut failed) = (false, None);
+        // The views holding a cursor that one step ended — each its id, its
+        // blocks and the cursor they ended at, and in `ended` its item —
+        // applied together before the session reads on.
+        let mut ended: Vec<usize> = Vec::new();
+        let mut due: Vec<(u64, Vec<RawBlock>, DeltaCursor)> = Vec::new();
+        while let Some((i, polled)) = poll.next(host).await? {
+            let tid = tids[i];
+            let end = match polled {
+                // What follows a block the store refused goes nowhere.
+                Polled::Block(_) if failed.is_some() => None,
+                Polled::Block(b) => {
+                    blocks.push(b);
+                    None
+                }
+                Polled::End(end) => Some(end),
+            };
+            match (froms[i], end) {
+                // A copy read whole takes each step's blocks before the
+                // session reads on, and is erased by the first of them.
+                (None, end) => {
+                    let seal = end.as_ref().and_then(|end| end.as_ref().ok().copied());
+                    if failed.is_none() && (seal.is_some() || poll.drained() && !blocks.is_empty()) {
+                        // Registered again, for a registration whose record the store lost.
+                        let open = (!std::mem::replace(&mut opened, true))
+                            .then(|| views.get(&tid).map(|v| (v.name.clone(), Arc::clone(&v.desc))))
+                            .flatten();
+                        // Owed from here: the job erases the copy whether or
+                        // not this call lives to see it end.
+                        if let (Some(_), Some(view)) = (&open, views.get_mut(&tid)) {
+                            view.owed_reseed = true;
+                        }
+                        let taken = std::mem::take(&mut blocks);
+                        let fill = move |s: &mut dyn MirrorStore| {
+                            if let Some((name, desc)) = open {
+                                s.register(&name, &desc)?;
+                                s.refill(tid)?;
+                            }
+                            if !taken.is_empty() {
+                                let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
+                                s.fill(tid, &taken)?;
+                            }
+                            seal.map_or(Ok(()), |cursor| s.seal(tid, cursor))
+                        };
+                        failed = store.clone().run(host, fill).await?.err().map(ClientError::from);
+                    }
+                    if let Some(end) = end {
+                        blocks.clear();
+                        opened = false;
+                        let read = match (failed.take(), end) {
+                            (Some(e), _) | (None, Err(e)) => Err(e),
+                            (None, Ok(_)) => Ok(()),
+                        };
+                        if let (Ok(()), Some(view)) = (&read, views.get_mut(&tid)) {
+                            view.sub = Some(poll.keep(i));
+                        }
+                        done.push((tid, read));
+                    }
+                }
+                (Some(_), None) => {}
+                (Some(_), Some(Ok(next))) => {
+                    ended.push(i);
+                    due.push((tid, std::mem::take(&mut blocks), next));
+                }
+                (Some(_), Some(Err(e))) => {
+                    blocks.clear();
+                    done.push((tid, Err(e)));
+                }
+            }
+            if poll.drained() && !due.is_empty() {
+                let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
+                for (i, (tid, advanced)) in ended.drain(..).zip(advanced) {
+                    if let (Ok(()), Some(view)) = (&advanced, views.get_mut(&tid)) {
+                        view.sub = Some(poll.keep(i));
+                    }
+                    done.push((tid, advanced));
                 }
             }
         }
-        let mut synced = self.delta_poll_many(&polls).await?;
-        for tid in whole {
-            match self.bootstrap(tid).await {
-                Err(e @ ClientError::Interrupted(_)) => return Err(e),
-                read => synced.push((tid, read)),
-            }
-        }
-        Ok(synced)
-    }
-
-    /// Subscribe each copy `read` brought up to date, from its cursor, in one
-    /// request nothing waits for.
-    fn subscribe_copies(&mut self, read: &[(u64, Option<ClientError>)]) {
-        let GnitzClient { session, mirror, .. } = self;
-        let Some(m) = mirror.as_deref_mut() else { return };
-        let MirrorState { store, views, .. } = m;
-        let fresh: Vec<(u64, DeltaCursor)> = {
-            let store = store.get();
-            let fresh = |(tid, failed): &(u64, Option<ClientError>)| {
-                let view = views.get(tid).filter(|v| failed.is_none() && v.sub.is_none())?;
-                Some((*tid, view.answers_at(&*store)?))
-            };
-            read.iter().filter_map(fresh).collect()
-        };
-        if fresh.is_empty() {
-            return;
-        }
-        let items: Vec<DeltaPollItem> = fresh
-            .iter()
-            .map(|(tid, from)| views[tid].poll_item(Some(*from)))
-            .collect();
-        let Ok(ids) = session.subscribe(&items) else { return };
-        for (id, (tid, _)) in ids.zip(fresh) {
-            views.get_mut(&tid).expect("just read").sub = Some(id);
-        }
+        Ok(done)
     }
 
     /// Apply to every subscribed view what was pushed for it, given the reply
@@ -669,7 +725,7 @@ impl GnitzClient {
     async fn advance_pushed(
         &mut self,
         synced: &Result<(), ClientError>,
-    ) -> Result<Vec<(u64, Option<ClientError>)>, ClientError> {
+    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
         let GnitzClient { session, host, mirror, .. } = self;
         let MirrorState { views, store, .. } = mirror.as_deref_mut().ok_or_else(no_mirror_store)?;
         let (mut done, mut due, mut ended) = (Vec::new(), Vec::new(), Vec::new());
@@ -685,62 +741,35 @@ impl GnitzClient {
                     ended.extend(view.sub.take());
                     continue;
                 };
-                done.push((tid, None));
+                done.push((tid, Ok(())));
                 if next != at || !blocks.is_empty() {
                     due.push((tid, blocks, next));
                 }
             }
         }
-        for (tid, advanced) in store.clone().advance(&mut **host, due).await? {
+        let taken: Vec<u64> = due.iter().map(|(tid, ..)| *tid).collect();
+        let advanced = match store.clone().advance(&mut **host, due).await {
+            Ok(advanced) => advanced,
+            Err(lost) => {
+                // The trains taken went with the job: each copy is read from
+                // its own cursor again.
+                let behind = taken.iter().filter_map(|tid| views.get_mut(tid)?.sub.take());
+                ended.extend(behind);
+                session.unsubscribe(ended);
+                return Err(lost);
+            }
+        };
+        for (tid, advanced) in advanced {
             let Err(e) = advanced else { continue };
             // A copy its store let go of is read whole by the next poll.
             ended.extend(views.get_mut(&tid).and_then(|view| view.sub.take()));
             if let Some(failed) = done.iter_mut().find(|(done, _)| *done == tid) {
-                failed.1 = Some(e);
+                failed.1 = Err(e);
             }
         }
         // One the server ended is the session's no more, and sends nothing.
         session.unsubscribe(ended);
         Ok(done)
-    }
-
-    /// Replace `tid`'s copy with the view's whole current value.
-    async fn bootstrap(&mut self, tid: u64) -> Result<(), ClientError> {
-        let GnitzClient { session, host, mirror, .. } = self;
-        let m = mirror.as_deref().ok_or_else(no_mirror_store)?;
-        let view = m.view(tid)?;
-        let (store, item) = (m.store.clone(), view.poll_item(None));
-        let host = &mut **host;
-        // Registered again, for a registration whose record the store lost.
-        let (name, desc) = (view.name.clone(), Arc::clone(&view.desc));
-        let open = move |s: &mut dyn MirrorStore| {
-            s.register(&name, &desc)?;
-            s.refill(tid)
-        };
-        store.clone().run(host, open).await??;
-        let mut poll = DeltaPoll::start(session, &[item]);
-        let (mut blocks, mut end) = (Vec::new(), None);
-        while let Some((_, polled)) = poll.next(host).await? {
-            match polled {
-                Polled::Block(b) => blocks.push(b),
-                Polled::End(e) => end = Some(e),
-            }
-            // One job per step's blocks, which the store takes before the
-            // session reads on.
-            if poll.drained() && !blocks.is_empty() {
-                let blocks = std::mem::take(&mut blocks);
-                let fill = move |s: &mut dyn MirrorStore| {
-                    let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
-                    s.fill(tid, &blocks)
-                };
-                store.clone().run(host, fill).await??;
-            }
-        }
-        drop(poll);
-        let cursor = end.expect("one item ends once")?;
-        store.run(host, move |s| s.seal(tid, cursor)).await??;
-        self.mirror_state()?.owed_reseed.insert(tid);
-        Ok(())
     }
 }
 
@@ -774,7 +803,6 @@ impl GnitzClient {
         self.mirror = Some(Box::new(MirrorState {
             store: Store(Arc::new(Mutex::new(store))),
             views: HashMap::new(),
-            owed_reseed: HashSet::new(),
         }));
         Ok(())
     }
@@ -817,50 +845,6 @@ impl GnitzClient {
         let store = m.store.clone();
         store.run(&mut *self.host, move |s| s.forget(table_id)).await??;
         Ok(())
-    }
-
-    /// Advance every view in `views` in one request, applying the views each
-    /// step ended before the session reads on — so a poll over M views holds
-    /// one read's trains, not M.
-    ///
-    /// A view that fails gets **that view's** own entry. Only an interrupt ends
-    /// the call.
-    async fn delta_poll_many(
-        &mut self,
-        views: &[(u64, DeltaCursor)],
-    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
-        let GnitzClient { session, host, mirror, .. } = self;
-        let m = mirror.as_deref().ok_or_else(no_mirror_store)?;
-        let store = m.store.clone();
-        let host = &mut **host;
-        let items: Result<Vec<DeltaPollItem>, ClientError> = views
-            .iter()
-            .map(|&(tid, prev)| Ok(m.view(tid)?.poll_item(Some(prev))))
-            .collect();
-        let mut poll = DeltaPoll::start(session, &items?);
-        let mut applied = Vec::with_capacity(views.len());
-        // The blocks of the view being answered, held until its end; and the
-        // views one step ended — each its id, its blocks and the cursor they
-        // ended at — applied together before the session reads on.
-        let mut blocks = Vec::new();
-        let mut due: Vec<(u64, Vec<RawBlock>, DeltaCursor)> = Vec::new();
-        while let Some((i, polled)) = poll.next(host).await? {
-            match polled {
-                Polled::Block(b) => blocks.push(b),
-                Polled::End(end) => {
-                    let tid = views[i].0;
-                    let blocks = std::mem::take(&mut blocks);
-                    match end {
-                        Ok(next) => due.push((tid, blocks, next)),
-                        Err(e) => applied.push((tid, Err(e))),
-                    }
-                }
-            }
-            if poll.drained() && !due.is_empty() {
-                applied.extend(store.clone().advance(host, std::mem::take(&mut due)).await?);
-            }
-        }
-        Ok(applied)
     }
 
     /// The wait a sync may be held for: none while a copy is due a delta read.
@@ -916,14 +900,9 @@ impl GnitzClient {
     }
 
     /// The round a local read of `table_id` answers at, or `None` when there is
-    /// no valid copy to read one off.
-    ///
-    /// A copy an earlier session or connection left answers no read until a
-    /// sync on this connection succeeds.
-    ///
-    /// The tick is the master's global round counter, shared by every relation,
-    /// so it advances over rounds that carried this view nothing. Whether a copy
-    /// was discarded is [`PollResult::Reseeded`], not this.
+    /// no valid copy to read one off: a copy an earlier session or connection
+    /// left is none until a sync on this connection succeeds. A discarded copy
+    /// is told by [`PollResult::Reseeded`], never by its cursor.
     pub fn cursor_of(&self, table_id: u64) -> Option<DeltaCursor> {
         self.mirror.as_deref()?.cursor_of(table_id)
     }

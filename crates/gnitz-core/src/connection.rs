@@ -12,8 +12,6 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::num::NonZeroU64;
-use std::ops::Range;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -94,48 +92,7 @@ impl RawBlock {
     }
 }
 
-/// A delta-feed position, held by the client alone: the boot and relation its
-/// rounds belong to (`tag`), and the last round it covers (`tick`).
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct DeltaCursor {
-    pub tag: u64,
-    pub tick: NonZeroU64,
-}
-
-impl DeltaCursor {
-    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none.
-    pub fn from_pair(tag: u64, tick: u64) -> Option<DeltaCursor> {
-        NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick })
-    }
-
-    /// This cursor as a flat `(tag, tick)` pair.
-    pub fn pair(self) -> (u64, u64) {
-        (self.tag, self.tick.get())
-    }
-
-    /// The flat pair [`Self::from_pair`] reads `cursor` back from.
-    pub fn flat(cursor: Option<DeltaCursor>) -> (u64, u64) {
-        cursor.map_or((0, 0), DeltaCursor::pair)
-    }
-
-    /// The item of a delta read of `view` after `from` — the view whole with
-    /// none — under `spec`, replied in `reply_schema`'s layout.
-    pub(crate) fn item<'a>(
-        from: Option<DeltaCursor>,
-        view: Target,
-        reply_schema: &Schema,
-        spec: &'a [u8],
-    ) -> txn_frame::DeltaPollItem<'a> {
-        let (tag, after_tick) = DeltaCursor::flat(from);
-        txn_frame::DeltaPollItem {
-            view,
-            tag,
-            after_tick,
-            reply_layout: reply_schema.layout_digest(),
-            spec,
-        }
-    }
-}
+pub use gnitz_wire::txn_frame::DeltaCursor;
 
 // ── The request vocabulary ───────────────────────────────────────────────────
 
@@ -151,7 +108,6 @@ impl Interest {
     pub const NONE: Interest = Interest { read: false, write: false };
     pub const READ: Interest = Interest { read: true, write: false };
     pub const WRITE: Interest = Interest { read: false, write: true };
-    pub const BOTH: Interest = Interest { read: true, write: true };
 
     pub fn is_empty(self) -> bool {
         self == Interest::NONE
@@ -274,25 +230,21 @@ enum Slot {
         data: Option<ZSetBatch>,
         to: Promise<Vec<ScanReply>>,
     },
-    /// One train per view, its blocks kept raw. The train in progress is
-    /// `views[at]`. The ids are what correlates each
-    /// terminal: views differing only in a `WHERE` share a schema, so a
-    /// misdirected block would decode cleanly.
+    /// One train per view, its blocks kept raw; the train in progress is
+    /// `views[at]`, and goes to its [`Taker`]. A pushed train is one of these.
     DeltaPoll {
         views: Vec<u64>,
         at: usize,
-        /// The poll this request is; see [`Polls::live`].
-        poll: u64,
+        /// The poll this request is, see [`Polls::live`]; `None` for one that
+        /// never had a reader.
+        poll: Option<u64>,
+        /// The subscription id `views[0]` is kept as, the rest counting up.
+        first: u64,
+        /// The train in progress, when a [`Taker::Holder`] takes it.
+        blocks: Vec<RawBlock>,
     },
-    /// A SUBSCRIBE asking for the subscriptions `ids`. Its ACK says only that
-    /// the frame was read, so nothing waits for it: one that fails ends each
-    /// of them, as a fault train does.
-    Subscribe { ids: Range<u64> },
-    /// A SYNC_PUSHED, sent when the subscriptions up to `asked` were asked for.
-    Sync { asked: u64, to: Promise<()> },
-    /// A pushed train of subscription `sub` to `tid`, which no request is
-    /// answered by: it never queues, and is fed ahead of the head while open.
-    Pushed { tid: u64, sub: u64, blocks: Vec<RawBlock> },
+    /// A SYNC_PUSHED.
+    Sync { to: Promise<()> },
 }
 
 /// Where a reply is, between its writer and its reader.
@@ -417,16 +369,16 @@ pub(crate) enum Polled {
     End(PollEnd),
 }
 
-/// A delta poll's results, queued for its reader in item order: each view's
-/// blocks, then its one [`Polled::End`], however the poll ends. And what was
-/// pushed for each subscription the session holds, kept until its owner takes
-/// it.
+/// Where the trains of a delta poll go.
 #[derive(Default)]
 struct Polls {
-    /// The poll whose reader is live. A slot of any other drops what it is fed.
+    /// The poll whose reader is live.
     live: u64,
+    /// The live poll's results, in item order: each view's blocks, then its
+    /// one [`Polled::End`], however the poll ends.
     queue: VecDeque<Polled>,
-    /// By subscription id. An id with no entry is one nobody holds.
+    /// What was pushed for each subscription the session holds, by its id,
+    /// kept until its owner takes it. An id with no entry is one nobody holds.
     subs: HashMap<u64, Parked>,
     /// The last subscription id handed out.
     asked: u64,
@@ -436,26 +388,49 @@ struct Polls {
 /// past everything pushed — or the fault that ended the subscription.
 type Parked = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 
+/// Who takes one train of a delta poll.
+enum Taker {
+    /// The poll's reader, off [`Polls::queue`].
+    Reader,
+    /// Whoever holds this subscription, off [`Polls::subs`].
+    Holder(u64),
+    Nobody,
+}
+
 impl Polls {
-    fn hand(&mut self, poll: u64, polled: Polled) {
-        if poll == self.live {
-            self.queue.push_back(polled);
+    /// The taker of a train of the poll `poll` whose view is kept as `kept`.
+    fn taker(&self, poll: Option<u64>, kept: u64) -> Taker {
+        if poll == Some(self.live) {
+            Taker::Reader
+        } else if self.subs.contains_key(&kept) {
+            Taker::Holder(kept)
+        } else {
+            Taker::Nobody
         }
     }
 
-    /// One train of `sub` arrived whole: its blocks and the cursor past them,
-    /// or the fault that ends the subscription. One nobody holds is dropped.
-    fn park(&mut self, sub: u64, train: Result<(Vec<RawBlock>, DeltaCursor), ClientError>) {
-        let Some(parked) = self.subs.get_mut(&sub) else {
-            return;
-        };
-        match (parked.as_mut(), train) {
-            (Ok((blocks, end)), Ok((more, cursor))) => {
-                blocks.extend(more);
-                *end = cursor;
+    /// One view of the poll `poll`, kept as `kept`, ended with `end` after
+    /// the `blocks` held for a [`Taker::Holder`].
+    fn end(&mut self, poll: Option<u64>, kept: u64, blocks: &mut Vec<RawBlock>, end: PollEnd) {
+        let train = std::mem::take(blocks);
+        match self.taker(poll, kept) {
+            Taker::Reader => {
+                // Held before the reader takes the end: a train pushed for
+                // the id may be right behind this reply.
+                if let Ok(cursor) = &end {
+                    self.subs.insert(kept, Ok((Vec::new(), *cursor)));
+                }
+                self.queue.push_back(Polled::End(end));
             }
-            (Ok(_), Err(why)) => *parked = Err(why),
-            (Err(_), _) => {}
+            Taker::Holder(id) => match (self.subs.get_mut(&id), end) {
+                (Some(Ok((held, at))), Ok(cursor)) => {
+                    held.extend(train);
+                    *at = cursor;
+                }
+                (Some(parked @ Ok(_)), Err(why)) => *parked = Err(why),
+                _ => {}
+            },
+            Taker::Nobody => {}
         }
     }
 
@@ -463,19 +438,6 @@ impl Polls {
     fn untaken(&self) -> bool {
         let quiet = |parked: &Parked| matches!(parked, Ok((blocks, _)) if blocks.is_empty());
         self.subs.values().any(|parked| !quiet(parked))
-    }
-
-    /// Move the subscriptions up to `asked` to `round`, the answer of their
-    /// sync. Round 0 is that of a connection the server holds none for.
-    fn sync_through(&mut self, asked: u64, round: u64) {
-        let Some(round) = NonZeroU64::new(round) else {
-            return;
-        };
-        for (_, parked) in self.subs.iter_mut().filter(|(id, _)| **id <= asked) {
-            if let Ok((_, cursor)) = parked {
-                cursor.tick = cursor.tick.max(round);
-            }
-        }
     }
 }
 
@@ -524,13 +486,6 @@ impl Session {
     /// however the bytes were batched. HELLO predates the session, uncounted.
     pub fn requests_sent(&self) -> u64 {
         self.submitted
-    }
-
-    /// Blocks parked for a subscription and not yet taken.
-    #[cfg(test)]
-    pub(crate) fn parked_blocks(&self) -> usize {
-        let held = self.polls.subs.values().filter_map(|p| p.as_ref().ok());
-        held.map(|(blocks, _)| blocks.len()).sum()
     }
 
     /// The connection's socket, as a number: valid while this session lives.
@@ -605,58 +560,79 @@ impl Session {
         Ok(sent)
     }
 
-    /// DELTA_POLL of one view, replied in `reply_schema`'s layout.
+    /// DELTA_POLL of one view after `from` — the view whole with none — under
+    /// `spec`, replied in `reply_schema`'s layout.
     pub fn submit_delta_read(
         &mut self,
-        item: txn_frame::DeltaPollItem<'_>,
+        view: Target,
+        from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
+        spec: &[u8],
     ) -> Result<Sent<(ScanReply, DeltaCursor)>, ClientError> {
         let (to, sent) = promise();
         let slot = Slot::Delta {
-            tid: item.view.tid,
+            tid: view.tid,
             reply_schema: Arc::clone(reply_schema),
             data: None,
             to,
         };
-        self.enqueue(txn_frame::encode_delta_poll(&[item]), slot)?;
+        let item = txn_frame::DeltaPollItem {
+            view,
+            from,
+            reply_layout: reply_schema.layout_digest(),
+            spec,
+        };
+        self.enqueue(txn_frame::encode_delta_poll(&[item], None), slot)?;
         Ok(sent)
     }
 
-    /// SUBSCRIBE to each item's view from its cursor on, and return their
-    /// ids, in order. Nothing waits for the answer: a refused item ends its
-    /// subscription as a pushed train does.
-    pub(crate) fn subscribe(&mut self, items: &[txn_frame::DeltaPollItem]) -> Result<Range<u64>, ClientError> {
-        let from = |item: &txn_frame::DeltaPollItem| {
-            DeltaCursor::from_pair(item.tag, item.after_tick).ok_or_else(|| {
-                ClientError::from("a subscription continues a cursor; read the view whole first".to_string())
-            })
+    /// Subscribe to `view` under `spec` from `from`, replied in
+    /// `reply_schema`'s layout; the subscription's id. What the read brings is
+    /// its first train, and a refusal its end.
+    pub(crate) fn subscribe(
+        &mut self,
+        view: Target,
+        from: DeltaCursor,
+        reply_schema: &Schema,
+        spec: &[u8],
+    ) -> Result<u64, ClientError> {
+        let id = self.polls.asked + 1;
+        let item = txn_frame::DeltaPollItem {
+            view,
+            from: Some(from),
+            reply_layout: reply_schema.layout_digest(),
+            spec,
         };
-        let cursors: Vec<DeltaCursor> = items.iter().map(from).collect::<Result<_, _>>()?;
-        let first = self.polls.asked + 1;
-        let ids = first..first + items.len() as u64;
-        self.enqueue(
-            txn_frame::encode_subscribe(items, first),
-            Slot::Subscribe { ids: ids.clone() },
-        )?;
-        self.polls.asked = ids.end - 1;
-        let parked = ids
-            .clone()
-            .zip(cursors)
-            .map(|(id, cursor)| (id, Ok((Vec::new(), cursor))));
-        self.polls.subs.extend(parked);
-        Ok(ids)
+        let slot = Slot::DeltaPoll {
+            views: vec![view.tid],
+            at: 0,
+            poll: None,
+            first: id,
+            blocks: Vec::new(),
+        };
+        self.enqueue(txn_frame::encode_delta_poll(&[item], Some(id)), slot)?;
+        self.polls.asked = id;
+        self.polls.subs.insert(id, Ok((Vec::new(), from)));
+        Ok(id)
     }
 
     /// End each subscription of `ids` this session holds. Nothing waits for
     /// the answer: a train of one still on its way is dropped, and one the
     /// session refuses to end is ended with its connection.
     pub(crate) fn unsubscribe(&mut self, ids: impl IntoIterator<Item = u64>) {
+        let held: Vec<u64> = ids
+            .into_iter()
+            .filter(|id| self.polls.subs.remove(id).is_some())
+            .collect();
+        self.send_unsubscribe(held);
+    }
+
+    /// Ask the server to end each subscription of `ids`, held here or not.
+    fn send_unsubscribe(&mut self, ids: impl IntoIterator<Item = u64>) {
         for id in ids {
-            if self.polls.subs.remove(&id).is_some() {
-                let hdr = ControlHeader::naming(ClientVerb::Unsubscribe, Target::from(0), id);
-                let (to, _) = promise();
-                let _ = self.enqueue(encode_frame(hdr, &[], None, None), Slot::Ack { tid: 0, to });
-            }
+            let hdr = ControlHeader::naming(ClientVerb::Unsubscribe, Target::from(0), id);
+            let (to, _) = promise();
+            let _ = self.enqueue(encode_frame(hdr, &[], None, None), Slot::Ack { tid: 0, to });
         }
         // What the socket takes now; the rest rides with the next request.
         self.step(Interest::WRITE);
@@ -671,7 +647,7 @@ impl Session {
         let wait = if self.polls.untaken() { Duration::ZERO } else { wait };
         let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms(wait));
         let (to, sent) = promise();
-        let slot = Slot::Sync { asked: self.polls.asked, to };
+        let slot = Slot::Sync { to };
         match self.enqueue(encode_frame(hdr, &[], None, None), slot) {
             Ok(()) => sent,
             Err(why) => Sent::ready(Err(why)),
@@ -701,23 +677,30 @@ impl Session {
         self
     }
 
-    /// DELTA_POLL: one train per view of `views`, in order — the items of the
-    /// live poll. Their results queue for [`Self::next_polled`] as the steps that read
-    /// them run; a request the session refuses ends each view with the refusal.
-    /// No view is no request.
-    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) {
+    /// DELTA_POLL of `views`, the items of the live poll: each one's train
+    /// queues for [`Self::next_polled`], in order, and a request the session
+    /// refuses ends each with the refusal. A view answered with a cursor stays
+    /// subscribed from it: the id of the first, the rest counting up.
+    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) -> u64 {
+        let first = self.polls.asked + 1;
         if views.is_empty() {
-            return;
+            return first;
         }
         let slot = Slot::DeltaPoll {
             views: views.iter().map(|v| v.view.tid).collect(),
             at: 0,
-            poll: self.polls.live,
+            poll: Some(self.polls.live),
+            first,
+            blocks: Vec::new(),
         };
-        if let Err(why) = self.enqueue(txn_frame::encode_delta_poll(views), slot) {
-            let ends = views.iter().map(|_| Polled::End(Err(why.clone())));
-            self.polls.queue.extend(ends);
+        match self.enqueue(txn_frame::encode_delta_poll(views, Some(first)), slot) {
+            Ok(()) => self.polls.asked += views.len() as u64,
+            Err(why) => {
+                let ends = views.iter().map(|_| Polled::End(Err(why.clone())));
+                self.polls.queue.extend(ends);
+            }
         }
+        first
     }
 
     fn enqueue(&mut self, frame: Vec<u8>, slot: Slot) -> Result<(), ClientError> {
@@ -797,11 +780,19 @@ impl Session {
         self.polls.queue.is_empty()
     }
 
-    /// The live poll's reader is gone: drop what it was handed, and what its
-    /// slots are still to be fed.
-    pub(crate) fn abandon_poll(&mut self) {
+    /// The live poll's reader is gone: drop what it was handed and what its
+    /// slots are still to be fed, and end the subscriptions `unsettled` it
+    /// asked for, answered yet or not.
+    pub(crate) fn abandon_poll(&mut self, unsettled: impl IntoIterator<Item = u64>) {
         self.polls.live += 1;
         self.polls.queue.clear();
+        let ended: Vec<u64> = unsettled.into_iter().collect();
+        for id in &ended {
+            self.polls.subs.remove(id);
+        }
+        if !ended.is_empty() {
+            self.send_unsubscribe(ended);
+        }
     }
 
     /// The last step left a read unfinished: step `READ` again without waiting
@@ -871,9 +862,11 @@ fn feed(
 ) -> Result<(), ProtocolError> {
     let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
     if ctrl.hdr.flags.pushed {
-        let train = Slot::Pushed {
-            tid: ctrl.hdr.target_id,
-            sub: ctrl.hdr.arg0,
+        let train = Slot::DeltaPoll {
+            views: vec![ctrl.hdr.target_id],
+            at: 0,
+            poll: None,
+            first: ctrl.hdr.arg0,
             blocks: Vec::new(),
         };
         return match pushed.replace(train) {
@@ -911,10 +904,8 @@ impl Slot {
         // so a frame naming another would decode under the wrong schema
         // silently; make it loud.
         let want = match &*self {
-            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } | Slot::Pushed { tid, .. } => {
-                Some(*tid)
-            }
-            Slot::Subscribe { .. } | Slot::Sync { .. } => Some(0),
+            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } => Some(*tid),
+            Slot::Sync { .. } => Some(0),
             Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
             Slot::Resolve { .. } => None,
@@ -924,11 +915,11 @@ impl Slot {
             // A DELTA_POLL fault naming a view ends that view's position alone;
             // every other fault ends the request.
             return match (&mut *self, want) {
-                (Slot::DeltaPoll { views, at, poll }, Some(view)) if named != 0 => {
+                (Slot::DeltaPoll { views, at, poll, first, blocks }, Some(view)) if named != 0 => {
                     if named != view {
                         return Err(out_of_order(view, named));
                     }
-                    polls.hand(*poll, Polled::End(Err(refused)));
+                    polls.end(*poll, kept_as(*first, *at), blocks, Err(refused));
                     *at += 1;
                     Ok((*at == views.len()).then_some(Ok(())))
                 }
@@ -953,21 +944,22 @@ impl Slot {
         };
         match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
-            // An abandoned poll's block is dropped uncopied.
-            (Slot::DeltaPoll { poll, .. }, Some(block)) if *poll == polls.live => {
-                let frame = std::mem::take(&mut buf).into_owned();
-                polls.hand(*poll, Polled::Block(RawBlock { frame, block }));
-            }
-            (Slot::DeltaPoll { .. }, Some(_)) => {}
-            (Slot::Pushed { blocks, .. }, Some(block)) => {
-                let frame = std::mem::take(&mut buf).into_owned();
-                blocks.push(RawBlock { frame, block });
+            (Slot::DeltaPoll { poll, first, at, blocks, .. }, Some(block)) => {
+                let mut raw = || RawBlock {
+                    frame: std::mem::take(&mut buf).into_owned(),
+                    block: block.clone(),
+                };
+                match polls.taker(*poll, kept_as(*first, *at)) {
+                    Taker::Reader => polls.queue.push_back(Polled::Block(raw())),
+                    Taker::Holder(_) => blocks.push(raw()),
+                    Taker::Nobody => {}
+                }
             }
             (Slot::Scan { reply_schema, data, .. } | Slot::Delta { reply_schema, data, .. }, Some(r)) => {
                 decode(data, reply_schema, &buf[r])?
             }
             (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
-            (Slot::Ack { .. } | Slot::Resolve { .. } | Slot::Subscribe { .. } | Slot::Sync { .. }, Some(_)) => {
+            (Slot::Ack { .. } | Slot::Resolve { .. } | Slot::Sync { .. }, Some(_)) => {
                 return Err(ProtocolError::DecodeError(
                     "a data block on a reply that carries no rows".into(),
                 ))
@@ -1007,26 +999,20 @@ impl Slot {
                 }
                 to.fulfil(Ok(std::mem::take(replies)))
             }
-            Slot::DeltaPoll { views, at, poll } => {
-                polls.hand(*poll, Polled::End(Ok(cursor()?)));
+            Slot::DeltaPoll { views, at, poll, first, blocks } => {
+                polls.end(*poll, kept_as(*first, *at), blocks, Ok(cursor()?));
                 *at += 1;
                 if *at < views.len() {
                     return Ok(None);
                 }
             }
-            Slot::Subscribe { .. } => {}
-            Slot::Sync { asked, to } => {
-                polls.sync_through(*asked, ctrl.hdr.arg0);
-                to.fulfil(Ok(()))
-            }
-            Slot::Pushed { sub, blocks, .. } => polls.park(*sub, Ok((std::mem::take(blocks), cursor()?))),
+            Slot::Sync { to } => to.fulfil(Ok(())),
         }
         Ok(Some(Ok(())))
     }
 
-    /// The request ended unanswered: `why` is its reply, the end of each view
-    /// a delta poll had yet to answer, and the end of each subscription a
-    /// SUBSCRIBE asked for or a pushed train is of.
+    /// The request ended unanswered: `why` is its reply, and the end of each
+    /// view a delta poll had yet to answer.
     fn fail(self, why: ClientError, polls: &mut Polls) {
         match self {
             Slot::Ack { mut to, .. } => to.fulfil(Err(why)),
@@ -1034,16 +1020,19 @@ impl Slot {
             Slot::Scan { mut to, .. } => to.fulfil(Err(why)),
             Slot::Delta { mut to, .. } => to.fulfil(Err(why)),
             Slot::Multi { mut to, .. } => to.fulfil(Err(why)),
-            Slot::DeltaPoll { views, at, poll } => {
-                for _ in at..views.len() {
-                    polls.hand(poll, Polled::End(Err(why.clone())));
+            Slot::DeltaPoll { views, at, poll, first, mut blocks } => {
+                for at in at..views.len() {
+                    polls.end(poll, kept_as(first, at), &mut blocks, Err(why.clone()));
                 }
             }
-            Slot::Subscribe { ids } => ids.for_each(|id| polls.park(id, Err(why.clone()))),
             Slot::Sync { mut to, .. } => to.fulfil(Err(why)),
-            Slot::Pushed { sub, .. } => polls.park(sub, Err(why)),
         }
     }
+}
+
+/// The subscription id item `at` of a delta poll keeping from `first` is kept as.
+pub(crate) fn kept_as(first: u64, at: usize) -> u64 {
+    first + at as u64
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.

@@ -562,7 +562,7 @@ the input's unique key, so the input must be a set with one.
 `CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back
 by polling from a client-held cursor as ordinary batches — **weights and all**,
 so a row-set comparison of a feed tests nothing. The cursor lives on the client,
-and nothing retained survives a restart.
+and nothing retained survives a restart. A cursor names a round of its own view.
 
 A delta read carries every push acknowledged before it. A connection may also
 subscribe from a cursor and sync, which may ask to be held while it has nothing

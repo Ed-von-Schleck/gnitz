@@ -34,7 +34,7 @@ class Region:
 class Shard:
     path: Path
     relation: int
-    store: str         # "rows", "scratch_<child>", "idx_<cols>", "delta"
+    store: str         # "rows", "scratch_<child>", "idx_<cols>"
     rows: int
     retractions: int   # rows of negative weight: each cancels a row some other shard of the store holds
     size: int

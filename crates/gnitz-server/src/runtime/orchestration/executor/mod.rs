@@ -27,7 +27,7 @@ use super::guard_panic;
 use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
-use self::delta::{handle_delta_poll, handle_subscribe, handle_sync_pushed, Feeds, Subscriptions};
+use self::delta::{handle_delta_poll, handle_sync_pushed, Feeds, Subscriptions};
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
@@ -713,10 +713,9 @@ async fn dispatch_request(
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
-        ClientVerb::Subscribe => handle_subscribe(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
         ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &data[ctrl.body]).await,
-        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl.hdr, &data[ctrl.body]).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {

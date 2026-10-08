@@ -6,7 +6,7 @@ use super::dirs::children_at_generation;
 use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
-use crate::storage::{RecoverySource, ShardBudget, Table};
+use crate::storage::{RecoverySource, Table};
 use gnitz_zset::schema::Slot;
 
 impl RelationRegistry {
@@ -47,7 +47,7 @@ impl RelationRegistry {
                 placement: e.placement(),
                 pk_repeats: e.pk_repeats(),
             };
-            let (store, delta) = self.build_relation_store(spec, resume_at)?;
+            let (store, feed) = self.build_relation_store(spec, resume_at)?;
             let index_stores = e
                 .indexes
                 .iter()
@@ -57,12 +57,12 @@ impl RelationRegistry {
                         ChildKind::Index(ix.cols),
                         ix.schema(),
                         RecoverySource::Rederive { resume_at },
-                        ShardBudget::Unbounded,
+                        None,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let entry = self.tables.get_mut(&tid).expect("listed above");
-            (entry.store, entry.delta) = (store, delta);
+            (entry.store, entry.feed) = (store, feed);
             for (ix, t) in entry.indexes.iter_mut().zip(index_stores) {
                 ix.store = Store::Held(Box::new(t));
             }

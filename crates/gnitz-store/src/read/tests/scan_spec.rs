@@ -10,6 +10,7 @@ use gnitz_wire::{payload_is_null, payload_str, payload_u64};
 use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ReadBound, SinkKind, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::repr::SourceCursor;
 use gnitz_zset::schema::SchemaColumn;
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the

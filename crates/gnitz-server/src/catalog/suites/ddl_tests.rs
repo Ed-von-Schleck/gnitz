@@ -919,13 +919,10 @@ fn a_bounded_view_source_is_named() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A fed view's delta store prepends a `_tick` key column, so a view already at
-/// `MAX_COLUMNS` cannot carry a feed. Refused by the precheck, before any row
-/// applies: the master opens no user store at all, so leaving it to the store
-/// open would be a worker-side fatal abort taken after the client was told the
-/// CREATE succeeded.
+/// A feed keeps a view's deltas in the view's own schema, so a view at
+/// `MAX_COLUMNS` carries one as any other does.
 #[test]
-fn a_view_at_the_column_limit_cannot_carry_a_feed() {
+fn a_view_at_the_column_limit_carries_a_feed() {
     let dir = temp_dir("fed_view_at_the_column_limit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols: Vec<CatalogColumn> = (0..gnitz_wire::MAX_COLUMNS)
@@ -935,12 +932,7 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
         .create_table_with("public.wide", &cols, &[0], gnitz_wire::TableProps::default())
         .unwrap();
 
-    let err = try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20)
-        .expect_err("the stamp is a 66th column");
-    assert!(err.contains("delta feed"), "got: {err}");
-
-    // The same view without a feed is fine, so the rejection is about the stamp.
-    try_register_identity_view(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
+    try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20).expect("fed wide view");
 
     std::fs::remove_dir_all(&dir).ok();
 }

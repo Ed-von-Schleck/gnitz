@@ -251,13 +251,6 @@ impl MasterDispatcher {
         }
     }
 
-    /// The last tick round this master has **emitted** — the `T` a delta reply
-    /// promises, sampled under the read's own [`SalExcl`] so no tick group can
-    /// land between the sample and the read group.
-    pub(crate) fn last_tick_round(&self) -> u64 {
-        self.tick_round.get()
-    }
-
     /// The cursor tag a delta reply carries: distinct for every (boot, view) and,
     /// with fair odds, every spec the view is read under — so a cursor from
     /// another boot, from a dropped view, or polled under another spec is
@@ -272,7 +265,7 @@ impl MasterDispatcher {
     }
 
     /// The last round that reached `view_id`, or `1` for a view no round has
-    /// reached — the boot round, which is never emitted and stamps nothing, so a
+    /// reached — the boot round, which is never emitted and captures nothing, so a
     /// bootstrap at `after_tick = 0` always falls through to the store.
     pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
         self.last_delta_round.borrow().get(&view_id).copied().unwrap_or(1)

@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use super::super::manifest;
 use super::{
-    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardBudget, ShardEntry, ShardIndex, CANCEL_PERCENT,
+    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL,
 };
 use gnitz_wire::PkBuf;
@@ -145,11 +145,6 @@ impl ShardIndex {
         Ok(read)
     }
 
-    /// Whether this store's sweep evicts by dropping rows outright.
-    pub(crate) fn drops_rows(&self) -> bool {
-        matches!(self.budget, ShardBudget::Drop(_))
-    }
-
     /// Finish the fold under way, if any: a manifest names a tree, and a
     /// half-written fold's outputs are in none.
     pub(crate) fn finish_fold(&mut self) -> Result<(), StorageError> {
@@ -271,8 +266,7 @@ impl ShardIndex {
     /// hydrate. Only a budgeted view's sweep writes one, and only into the
     /// terminal level.
     pub(crate) fn has_skeleton_shard(&self) -> bool {
-        matches!(self.budget, ShardBudget::Dehydrate(_))
-            && self.levels[TERMINAL].guards.iter().any(LevelGuard::dehydrated)
+        self.capacity.is_some() && self.levels[TERMINAL].guards.iter().any(LevelGuard::dehydrated)
     }
 
     /// Visit each shard holding OPK `key`, with the row its matches start at;
@@ -438,7 +432,7 @@ impl ShardIndex {
     }
 
     /// The next fold the tree owes, or `None` when it owes none. What costs no
-    /// merge — a guard dropped, a band moved down whole — is done here.
+    /// merge — a band moved down whole — is done here.
     ///
     /// In order: the bands of a cut L1 guard, which were cut against the
     /// terminal partition as it stood; every guard over its byte target or file
@@ -472,7 +466,7 @@ impl ShardIndex {
                     }
                 }
             }
-            self.budget.cap().filter(|&cap| self.resident_bytes() > cap)?;
+            self.capacity.filter(|&cap| self.resident_bytes() > cap)?;
             // The oldest-written hydrated terminal guard: the only recency
             // signal the tree carries, since nothing records that a row was read.
             let victim = self.levels[TERMINAL]
@@ -482,12 +476,11 @@ impl ShardIndex {
                 .filter(|(_, g)| !g.dehydrated())
                 .min_by_key(|(_, g)| g.newest())
                 .map(|(gi, _)| gi);
-            match (victim, self.budget) {
-                (Some(gi), ShardBudget::Drop(_)) => self.drop_guard(gi),
-                (Some(gi), _) => return Some(self.plan_dehydration(gi)),
+            match victim {
+                Some(gi) => return Some(self.plan_dehydration(gi)),
                 // Nothing left to evict where it sits: push a level's worth of
                 // data down to make one, L1 before L0.
-                (None, _) => match self.cheapest_l1_guard_to_drain() {
+                None => match self.cheapest_l1_guard_to_drain() {
                     Some(gi) => match self.plan_drain(gi) {
                         Some(fold) => return Some(fold),
                         None => continue,
@@ -528,7 +521,7 @@ impl ShardIndex {
     /// large or very small `capacity` from naming a target outside
     /// `[MIN_GUARD_BYTES, R]`.
     fn guard_target_bytes(&self, level_idx: usize) -> u64 {
-        match self.budget.cap() {
+        match self.capacity {
             Some(cap) if level_idx == TERMINAL => (cap / SWEEP_STEPS).clamp(MIN_GUARD_BYTES, self.l0_run_bytes),
             _ => self.l0_run_bytes,
         }
@@ -539,7 +532,7 @@ impl ShardIndex {
     /// what the user asked for.
     fn l1_target_bytes(&self) -> u64 {
         let target = Self::balanced_l1_target(self.levels[TERMINAL].bytes(), self.l0_run_bytes);
-        match self.budget.cap() {
+        match self.capacity {
             Some(cap) => target.min(2 * (cap / SWEEP_STEPS)),
             None => target,
         }
@@ -708,16 +701,6 @@ impl ShardIndex {
             dest: TERMINAL,
             keys: vec![guard.guard_key],
         }
-    }
-
-    /// Evict a guard by **unlinking** it ([`ShardBudget::Drop`]): no output shard is
-    /// written at all, so the sweep costs unlinks where a bounded view's costs a
-    /// whole-guard rewrite.
-    fn drop_guard(&mut self, guard_idx: usize) {
-        let guard = self.levels[TERMINAL].guards.remove(guard_idx);
-        let (_, hi) = guard.key_extent();
-        self.dropped_max = self.dropped_max.max(hi);
-        self.retire(guard.entries);
     }
 
     /// The keys an L1 guard is cut at before it is folded down: the low end of its

@@ -124,8 +124,8 @@ fn two_checkpointed_copies() -> TempDir {
 ///
 /// **Keyed by the payload as well as the PK**, which is the element identity
 /// every store path uses. Folding on the PK alone would sum two rows that differ
-/// only in payload onto one entry, and would let a payload the round-stamp strip
-/// mangled pass unnoticed — the keys and their weights would still line up.
+/// only in payload onto one entry, and would let a mangled payload pass
+/// unnoticed — the keys and their weights would still line up.
 fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
     rows_of(&whole_copy(store, tid).expect("a scan of a held copy"))
 }
@@ -183,57 +183,39 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     assert_eq!(rows.unwrap().weights.len(), 0, "which starts empty");
 }
 
-/// Either teardown drops the cursor, so no delta continues it, and is
-/// idempotent. `drop_cursor` keeps the rows; `forget` takes them, the record and
-/// the directory.
+/// A forgotten copy is gone — cursor, rows, record and directory — so no delta
+/// continues it, and forgetting it again is a no-op.
 #[test]
-fn a_teardown_stops_where_it_is_asked() {
-    for forget in [false, true] {
-        let level = if forget { "forget" } else { "drop_cursor" };
-        let (mut store, dir) = registered();
-        seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
-        store.checkpoint().unwrap();
-        // A second teardown is a no-op.
-        for _ in 0..2 {
-            match forget {
-                true => store.forget(TID).unwrap(),
-                false => store.drop_cursor(TID),
-            }
-        }
-
-        assert_eq!(store.cursor_of(TID), None, "{level} drops the cursor");
-        assert!(
-            matches!(
-                store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)),
-                Err(MirrorError::Engine(_))
-            ),
-            "{level}: no cursor, so no delta continues it",
-        );
-        match forget {
-            false => assert_eq!(
-                held(&mut store, TID),
-                BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
-                "drop_cursor keeps the rows, and the refused delta touched none",
-            ),
-            true => {
-                let refilled = seed(&mut store, TID, &[&plain(&[(7, 1, 70)])], cursor(4));
-                assert!(
-                    matches!(refilled, Err(MirrorError::Engine(_))),
-                    "the registration that named its shape is gone",
-                );
-                assert!(whole_copy(&mut store, TID).is_err(), "and so is the copy");
-                assert!(!has_copy(path(&dir), TID), "directory and all, checkpointed or not");
-                // Dropped without another checkpoint: the retraction is durable
-                // on its own.
-                drop(store);
-                let mut store = open(&dir);
-                assert_eq!(store.cursor_of(TID), None, "a forgotten copy never comes back");
-                store
-                    .register(&rel("v"), &desc(TID))
-                    .expect("the id can be registered again");
-            }
-        }
+fn a_forgotten_copy_is_gone() {
+    let (mut store, dir) = registered();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+    for _ in 0..2 {
+        store.forget(TID).unwrap();
     }
+
+    assert_eq!(store.cursor_of(TID), None);
+    assert!(
+        matches!(
+            store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)),
+            Err(MirrorError::Engine(_))
+        ),
+        "no cursor, so no delta continues it",
+    );
+    let refilled = seed(&mut store, TID, &[&plain(&[(7, 1, 70)])], cursor(4));
+    assert!(
+        matches!(refilled, Err(MirrorError::Engine(_))),
+        "the registration that named its shape is gone",
+    );
+    assert!(whole_copy(&mut store, TID).is_err(), "and so is the copy");
+    assert!(!has_copy(path(&dir), TID), "directory and all, checkpointed or not");
+    // Dropped without another checkpoint: the retraction is durable on its own.
+    drop(store);
+    let mut store = open(&dir);
+    assert_eq!(store.cursor_of(TID), None, "a forgotten copy never comes back");
+    store
+        .register(&rel("v"), &desc(TID))
+        .expect("the id can be registered again");
 }
 
 /// A refill replaces what the copy held, rows and cursor, and answers no read
@@ -680,12 +662,6 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
         store.cursor_of(OTHER_TID),
         Some(cursor(4)),
         "no refused verb moved the sibling"
-    );
-    store.drop_cursor(OTHER_TID);
-    assert_eq!(
-        store.cursor_of(OTHER_TID),
-        None,
-        "a poisoned store still shuts the read gate"
     );
     drop(store);
 

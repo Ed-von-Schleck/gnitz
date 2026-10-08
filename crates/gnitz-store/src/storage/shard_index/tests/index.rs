@@ -76,7 +76,7 @@ impl ShardIndex {
     }
 }
 
-fn open(dir: &Path, schema: SchemaDescriptor, budget: ShardBudget) -> ShardIndex {
+fn open(dir: &Path, schema: SchemaDescriptor, budget: Option<u64>) -> ShardIndex {
     let dir = dir.to_str().unwrap();
     let shards = manifest::read(dir).unwrap().map(|m| m.shards).unwrap_or_default();
     ShardIndex::open(dir, schema, budget, false, &shards).unwrap()
@@ -84,7 +84,7 @@ fn open(dir: &Path, schema: SchemaDescriptor, budget: ShardBudget) -> ShardIndex
 
 /// An unbounded store at `dir`, reloaded from its manifest if it has one.
 pub(super) fn fresh(dir: &Path, schema: SchemaDescriptor) -> ShardIndex {
-    open(dir, schema, ShardBudget::Unbounded)
+    open(dir, schema, None)
 }
 
 /// Every file name in `dir`, sorted.
@@ -224,7 +224,7 @@ fn publish_manifest(idx: &mut ShardIndex) {
 }
 
 /// `idx` published and reopened under `budget`, which binds only at open.
-fn reopened_under(mut idx: ShardIndex, budget: ShardBudget) -> ShardIndex {
+fn reopened_under(mut idx: ShardIndex, budget: Option<u64>) -> ShardIndex {
     publish_manifest(&mut idx);
     let (dir, schema) = (idx.output_dir.clone(), idx.schema);
     drop(idx);
@@ -847,7 +847,7 @@ fn a_guard_far_over_target_splits_in_bounded_steps() {
 #[test]
 fn a_merge_run_does_not_cross_a_representation_boundary() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     for (i, base) in [1u64, 1000].into_iter().enumerate() {
         seed_guard(&mut idx, TERMINAL, gk(base), &dense_batch(base, 200), i as u64 + 1);
     }
@@ -870,7 +870,7 @@ fn a_merge_run_does_not_cross_a_representation_boundary() {
 #[test]
 fn a_first_dehydration_never_splits() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     seed_guard(&mut idx, TERMINAL, gk(1), &dense_batch(1, OVER_TARGET_ROWS), 1);
 
     idx.dehydrate_guard(0).unwrap();
@@ -886,7 +886,7 @@ fn a_first_dehydration_never_splits() {
 #[test]
 fn a_dehydrated_guard_over_target_splits_and_stays_skeleton() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     let rows = 8_000u64;
     seed_guard(&mut idx, TERMINAL, gk(1), &dense_batch(1, rows), 1);
     idx.dehydrate_guard(0).unwrap();
@@ -918,7 +918,7 @@ fn a_dehydrated_guard_over_target_splits_and_stays_skeleton() {
 #[test]
 fn the_guard_count_comes_back_down_after_the_bytes_do() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     // Eight rows per key: dehydration folds each key to one `(PK, Σweight)`
     // row, which is the order-of-magnitude shrink the merge pass exists for.
     let keys = 2_500u64;
@@ -1035,7 +1035,7 @@ fn a_budgeted_terminal_target_is_one_sweep_step_within_the_clamp() {
     let mid = (MIN_GUARD_BYTES + r) / 2;
 
     for (cap, want) in [(mid * SWEEP_STEPS, mid), (1024, MIN_GUARD_BYTES), (u64::MAX, r)] {
-        idx = reopened_under(idx, ShardBudget::Dehydrate(cap));
+        idx = reopened_under(idx, Some(cap));
         assert_eq!(idx.guard_target_bytes(TERMINAL), want, "capacity {cap}");
         assert_eq!(idx.guard_target_bytes(L1), r, "only the evicted level reads the budget");
     }
@@ -1058,7 +1058,7 @@ fn the_balanced_l1_target_computes_its_product_in_u128() {
 
 /// An index holding `n` L0 shards of 40 distinct keys each, stamped with
 /// ascending seqs so write-recency victim ordering is observable.
-fn index_with_l0(dir: &Path, n: u64, budget: ShardBudget) -> ShardIndex {
+fn index_with_l0(dir: &Path, n: u64, budget: Option<u64>) -> ShardIndex {
     let mut idx = open(dir, make_schema_u64_i64(), budget);
     for s in 0..n {
         idx.append_l0_run(&dense_batch(s * 1000 + 1, 40)).unwrap();
@@ -1090,9 +1090,9 @@ fn terminal_split(idx: &ShardIndex) -> (Vec<usize>, Vec<usize>) {
 #[test]
 fn a_slack_capacity_leaves_the_store_untouched() {
     let tmp = tempfile::tempdir().unwrap();
-    let idx = index_with_l0(tmp.path(), 3, ShardBudget::Unbounded);
+    let idx = index_with_l0(tmp.path(), 3, None);
     let before = idx.resident_bytes();
-    let mut idx = reopened_under(idx, ShardBudget::Dehydrate(before * 4));
+    let mut idx = reopened_under(idx, Some(before * 4));
     idx.drain().unwrap();
 
     assert_eq!(idx.resident_bytes(), before, "no compaction ran");
@@ -1109,7 +1109,7 @@ fn a_slack_capacity_leaves_the_store_untouched() {
 #[test]
 fn the_sweep_converges_to_the_skeleton_floor() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = index_with_l0(tmp.path(), 4, ShardBudget::Dehydrate(1));
+    let mut idx = index_with_l0(tmp.path(), 4, Some(1));
 
     // Bounded — the loop would not terminate if a call could make no progress.
     for _ in 0..8 {
@@ -1131,73 +1131,12 @@ fn the_sweep_converges_to_the_skeleton_floor() {
     assert_eq!(idx.resident_bytes(), floor, "the floor is the fixpoint");
 }
 
-// -----------------------------------------------------------------------
-// Delta-store retention (ShardBudget::Drop)
-// -----------------------------------------------------------------------
-
-/// A delta store's sweep **drops** its victim rather than dehydrating it: the
-/// guard is removed, its file unlinked at once, and the highest key it held
-/// becomes the retention floor.
-#[test]
-fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
-    let tmp = tempfile::tempdir().unwrap();
-    const SHARDS: u64 = 4;
-    // The highest key `index_with_l0` writes, which is the floor a full drop leaves.
-    const LAST_KEY: u64 = (SHARDS - 1) * 1000 + 40;
-    let mut idx = index_with_l0(tmp.path(), SHARDS, ShardBudget::Drop(1));
-    assert_eq!(idx.dropped_max(), PkBuf::zeroed(8), "nothing dropped yet");
-
-    // Same shape as the skeleton floor's convergence: one push-down per call,
-    // dehydration — here, dropping — unbudgeted above it.
-    for _ in 0..12 {
-        idx.drain().unwrap();
-    }
-
-    assert!(idx.levels[L0].guards.is_empty(), "L0 sank");
-    assert!(idx.levels[L1].guards.is_empty(), "L1 sank");
-    assert!(idx.levels[TERMINAL].guards.is_empty(), "a drop removes its guard");
-    assert_eq!(idx.resident_bytes(), 0, "a delta store has no floor to stop above");
-    assert_eq!(
-        idx.dropped_max(),
-        gk(LAST_KEY),
-        "the watermark is the HIGHEST key dropped, taken from the victim's pk_max"
-    );
-    assert!(shard_seqs(tmp.path()).is_empty(), "every dropped shard is unlinked");
-}
-
-/// Only the capacity sweep drops: a delta store's ordinary compactions keep
-/// every row and leave the floor at zero.
-#[test]
-fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
-    let tmp = tempfile::tempdir().unwrap();
-    let idx = index_with_l0(tmp.path(), 4, ShardBudget::Unbounded);
-    let before = idx.resident_bytes();
-    // A budget the store already meets, so the sweep's own step never runs.
-    let mut idx = reopened_under(idx, ShardBudget::Drop(before * 8));
-
-    idx.run_compact().unwrap(); // L0 fold
-    for gi in (0..idx.levels[L1].guards.len()).rev() {
-        idx.vertical_fold(gi).unwrap(); // push-down
-    }
-    idx.drain().unwrap();
-
-    assert_eq!(idx.dropped_max(), PkBuf::zeroed(8), "ordinary compaction drops nothing");
-    assert!(idx.resident_bytes() > 0, "the rows survived");
-    assert!(
-        idx.resident_bytes() <= before,
-        "a fold never grows the store: {} -> {}",
-        before,
-        idx.resident_bytes()
-    );
-    assert_all_found(&idx, l0_keys(4));
-}
-
 /// A superseded shard a manifest names waits for the barrier: the fold leaves it
 /// on disk, and the drain after the next publish removes it and nothing live.
 #[test]
 fn a_published_shard_a_fold_supersedes_waits_for_the_barrier() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut idx = index_with_l0(tmp.path(), 5, ShardBudget::Unbounded);
+    let mut idx = index_with_l0(tmp.path(), 5, None);
     publish_manifest(&mut idx);
     let inputs: Vec<String> = idx
         .all_entries()
@@ -1221,79 +1160,6 @@ fn a_published_shard_a_fold_supersedes_waits_for_the_barrier() {
         "only the live shards remain"
     );
     assert_all_found(&fresh(tmp.path(), make_schema_u64_i64()), l0_keys(5));
-}
-
-/// A delta store written and swept every round plateaus rather than tracking
-/// everything ever written.
-#[test]
-fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Drop(1));
-
-    let mut early = 0u64;
-    for round in 0..60u64 {
-        // Ascending keys, as a `_tick`-led delta store's always are.
-        idx.append_l0_run(&dense_batch(round * 1000 + 1, 40)).unwrap();
-        idx.drain().unwrap();
-        if round == 9 {
-            early = idx.resident_bytes();
-        }
-    }
-
-    let late = idx.resident_bytes();
-    assert!(
-        late <= early.max(1) * 2,
-        "footprint grew {early} -> {late} bytes over 50 further rounds of the same \
-         write rate — the sweep is not keeping pace",
-    );
-    assert!(idx.dropped_max() > PkBuf::zeroed(8), "the sweep dropped something");
-    // Nothing left behind on disk beyond what the index still registers.
-    assert_eq!(shard_seqs(tmp.path()).len(), idx.shard_count(), "no orphan shard files");
-}
-
-/// A drop removes only rows at or below the floor it raises — why a delta
-/// read can serve a cursor sitting exactly at the floor.
-#[test]
-fn a_drop_removes_nothing_above_the_floor_it_raises() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    let mut written: Vec<u64> = Vec::new();
-    let add = |idx: &mut ShardIndex, written: &mut Vec<u64>, round: u64| {
-        // Ascending and distinct, as a `_tick`-led delta store's keys are, so
-        // nothing cancels in a fold and a row count is a faithful census.
-        let base = round * 1000 + 1;
-        idx.append_l0_run(&dense_batch(base, 40)).unwrap();
-        written.extend(base..base + 40);
-    };
-
-    // Fill unbudgeted first, so the budget below is a size the store has
-    // actually reached rather than a guess.
-    for round in 0..6u64 {
-        add(&mut idx, &mut written, round);
-    }
-    idx.run_compact().unwrap();
-    let budget = idx.resident_bytes();
-    let mut idx = reopened_under(idx, ShardBudget::Drop(budget));
-
-    for round in 6..24u64 {
-        add(&mut idx, &mut written, round);
-        idx.drain().unwrap();
-    }
-
-    let floor = idx.dropped_max();
-    let retained = idx.total_rows();
-    assert!(
-        floor > PkBuf::zeroed(8),
-        "the sweep dropped nothing — nothing is being tested"
-    );
-    assert!(retained > 0, "the sweep emptied the store — nothing is being tested");
-
-    let above = written.iter().filter(|&&k| gk(k) > floor).count();
-    assert_eq!(
-        retained, above,
-        "floor {floor:?}: every one of the {above} rows above it must survive, and \
-         every row at or below it must be gone — {retained} retained",
-    );
 }
 
 /// Dehydration picks its victim by **write recency**: the terminal guard
@@ -1326,7 +1192,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     // A capacity just under the current size dehydrates exactly one guard,
     // and it is that one.
     let cap = idx.resident_bytes() - 1;
-    let mut idx = reopened_under(idx, ShardBudget::Dehydrate(cap));
+    let mut idx = reopened_under(idx, Some(cap));
     idx.drain().unwrap();
     let (dehy, _) = terminal_split(&idx);
     assert_eq!(dehy.len(), 1, "dehydration stops as soon as the cap is met");
@@ -1349,7 +1215,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
 fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     // Under a capacity this tight the upkeep drains L1 to the terminal level.
-    let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     // One key band, so every later fold routes back into the same guard.
     for _ in 0..2 {
         idx.append_l0_run(&dense_batch(1, 20)).unwrap();
@@ -1650,7 +1516,7 @@ impl Model {
     }
 }
 
-fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
+fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     // Structure.
     assert!(idx.levels[L0].guards.len() <= 1, "{what}: more than one L0 guard");
     for (li, level) in idx.levels.iter().enumerate() {
@@ -1682,19 +1548,17 @@ fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
         }
     }
     let skeleton = idx.all_entries().any(|e| e.shard.is_skeleton());
-    let dropping = matches!(idx.budget, ShardBudget::Drop(_));
-    if !matches!(idx.budget, ShardBudget::Dehydrate(_)) {
+    if idx.capacity.is_none() {
         assert!(!skeleton, "{what}: skeleton in a store that never dehydrates");
     }
     assert_eq!(skeleton, idx.has_skeleton_shard(), "{what}: has_skeleton_shard");
 
     // Weights through the guard partition.
-    let live = |pk: &[u8]| !dropping || PkBuf::from_bytes(pk) > floor;
     let mut per_pk: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     for ((pk, _), w) in &m.rows {
         *per_pk.entry(pk.clone()).or_default() += w;
     }
-    for pk in m.seen.iter().filter(|pk| live(pk)) {
+    for pk in m.seen.iter() {
         let mut sum = 0;
         idx.find_pk_bytes(pk, probe_key(pk), |shard, start| {
             sum += (start..pk_group_end(&**shard, start))
@@ -1731,19 +1595,12 @@ fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
         let mut elems: BTreeMap<Elem, i64> = BTreeMap::new();
         for r in 0..got.len() {
             let pk = got.get_pk_bytes(r).to_vec();
-            if live(&pk) {
-                *elems
-                    .entry((pk, crate::test_support::payload0_i64(&*got, r)))
-                    .or_default() += got.get_weight(r);
-            }
+            *elems
+                .entry((pk, crate::test_support::payload0_i64(&*got, r)))
+                .or_default() += got.get_weight(r);
         }
         elems.retain(|_, w| *w != 0);
-        let want: BTreeMap<Elem, i64> = m
-            .rows
-            .iter()
-            .filter(|((pk, _), _)| live(pk))
-            .map(|(e, &w)| (e.clone(), w))
-            .collect();
+        let want: BTreeMap<Elem, i64> = m.rows.iter().map(|(e, &w)| (e.clone(), w)).collect();
         assert_eq!(elems, want, "{what}: Z-set by cursor");
     }
 }
@@ -1755,11 +1612,11 @@ fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
 #[test]
 fn shard_index_model() {
     let configs = [
-        (ShardBudget::Unbounded, false),
-        (ShardBudget::Unbounded, true),
-        (ShardBudget::Dehydrate(150_000), false),
-        (ShardBudget::Dehydrate(1), true),
-        (ShardBudget::Drop(150_000), true),
+        (None, false),
+        (None, true),
+        (Some(150_000), false),
+        (Some(1), true),
+        (Some(150_000), true),
     ];
     let mut interrupted = 0;
     for seed in 1..=gnitz_foundation::env::env_num("GNITZ_MODEL_SEEDS", 1u64) {
@@ -1771,8 +1628,6 @@ fn shard_index_model() {
                 let mut idx = open(tmp.path(), schema, budget);
                 let mut m = Model::default();
                 let mut published = m.clone();
-                let mut floor = PkBuf::zeroed(schema.pk_stride());
-                let mut published_floor = floor;
                 for step in 0..30 {
                     // A blocker directory at an upcoming shard name fails that write.
                     let blocker = (rng.gen_range(5) == 0).then(|| {
@@ -1829,9 +1684,8 @@ fn shard_index_model() {
                                 std::fs::remove_dir(p).unwrap();
                             }
                             let _ = idx.finish_fold();
-                            floor = floor.max(idx.dropped_max());
                             idx = reopened_under(idx, budget);
-                            (published, published_floor) = (m.clone(), floor);
+                            published = m.clone();
                             assert_eq!(shard_seqs(tmp.path()).len(), idx.shard_count(), "{what}: shard files");
                         }
                         8 => {
@@ -1841,15 +1695,14 @@ fn shard_index_model() {
                             }
                             drop(idx);
                             idx = open(tmp.path(), schema, budget);
-                            (m, floor) = (published.clone(), published_floor);
+                            m = published.clone();
                         }
                         _ => {}
                     }
                     if let Some(p) = blocker.filter(|p| p.is_dir()) {
                         std::fs::remove_dir(&p).unwrap();
                     }
-                    floor = floor.max(idx.dropped_max());
-                    check_model(&idx, &m, floor, &what);
+                    check_model(&idx, &m, &what);
                 }
             }
         }
@@ -1866,7 +1719,7 @@ fn tier_folds_keep_the_zset() {
     use gnitz_zset::repr::merge_guard;
     use std::collections::BTreeMap;
     const KEYS: u64 = 400_000;
-    for budget in [ShardBudget::Unbounded, ShardBudget::Dehydrate(4 << 20)] {
+    for budget in [None, Some(4 << 20)] {
         let tmp = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = open(tmp.path(), schema, budget);
@@ -1910,7 +1763,7 @@ fn tier_folds_keep_the_zset() {
         }
         model.retain(|_, w| *w != 0);
         let skeleton = idx.has_skeleton_shard();
-        assert_eq!(skeleton, matches!(budget, ShardBudget::Dehydrate(_)));
+        assert_eq!(skeleton, budget.is_some());
         for reopen in [false, true] {
             if reopen {
                 idx = reopened_under(idx, budget);

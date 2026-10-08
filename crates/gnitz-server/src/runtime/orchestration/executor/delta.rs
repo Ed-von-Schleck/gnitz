@@ -1,13 +1,10 @@
 //! The delta feed's two readers: DELTA_POLL, which reads a view's rounds from
 //! the cursor each request names, and the pushed feeds, where the server
-//! re-issues that read itself for the connections subscribed to a view.
+//! re-issues that read itself for the items a poll asked it to keep.
 //!
-//! A subscription holds no state a cursor does not. The round a subscriber
-//! has been queued through is kept here so that the subscribers standing at
-//! one round of one view share one read; the copy's cursor stays the client's,
-//! moved by the trains it applies and the round a SYNC_PUSHED answers. So a
-//! subscription can end at any point — its connection's queue is full, its
-//! view is gone — and the client continues from its own cursor by polling.
+//! A cursor is a round of its own view, so the subscribers standing at one
+//! share one read. The copy's cursor stays the client's: a subscription can
+//! end at any point, and its client continues from that cursor by polling.
 //!
 //! A child of `executor`, reading that module's private items with no
 //! visibility widened.
@@ -25,10 +22,9 @@ use super::{
 use crate::runtime::master::forward_scan;
 use crate::runtime::peer::{Outbox, Peer};
 use crate::runtime::reactor::{oneshot, select2, Either, ReadGuard, TrainLease};
-use crate::runtime::sal::{DirectGroup, Read};
 use crate::runtime::wire as ipc;
 use gnitz_wire::control::{ControlHeader, Target};
-use gnitz_wire::txn_frame::{decode_delta_items, DeltaPollItem};
+use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
 use gnitz_wire::{WireFault, WireStatus};
 
 /// Views one DELTA_POLL reads at one SAL cut: the ceiling on the leases and
@@ -47,84 +43,86 @@ const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
 enum PollPosition {
     /// The view cannot be read at all.
     Fault(WireFault),
-    /// The view is already at its last round, so its terminal is master-local.
-    UpToDate,
-    /// The view moved, and takes the next dispatch of the poll's cut.
+    /// The cursor already stands at this round, the view's last, so its
+    /// terminal is master-local: a fan-out per quiet read would cost a wakeup
+    /// per worker.
+    UpToDate(u64),
+    /// The view moved, or is read whole, and takes the next dispatch of the
+    /// poll's cut.
     Moved,
 }
 
 /// Where a poll of `item` stands.
 fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
     let tid = item.view.tid;
-    match target_kind(shared, item.view, Access::UserRead) {
-        Err(f) => PollPosition::Fault(f),
-        // A relation with no feed handed out no cursor to compare.
-        Ok(kind)
-            if kind.has_delta_feed()
-                && item.after_tick > 0
-                && item.tag != shared.disp().delta_cursor_tag(tid, item.spec) =>
-        {
-            PollPosition::Fault(WireFault {
-                status: WireStatus::DeltaExpired,
-                text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
-            })
+    let kind = match target_kind(shared, item.view, Access::UserRead) {
+        Ok(kind) => kind,
+        Err(fault) => return PollPosition::Fault(fault),
+    };
+    if !kind.has_delta_feed() {
+        return PollPosition::Fault(WireFault::from(format!(
+            "delta_read: relation {tid} carries no delta feed; \
+             create the view WITH (delta = '<size>') to subscribe to it"
+        )));
+    }
+    let disp = shared.disp();
+    match item.from {
+        Some(cursor) if cursor.tag != disp.delta_cursor_tag(tid, item.spec) => PollPosition::Fault(WireFault {
+            status: WireStatus::DeltaExpired,
+            text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
+        }),
+        Some(cursor) if cursor.tick.get() >= disp.last_delta_round(tid) => {
+            PollPosition::UpToDate(disp.last_delta_round(tid))
         }
-        Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
-        Ok(_) => PollPosition::Moved,
+        _ => PollPosition::Moved,
     }
 }
 
-/// DELTA_POLL: advance N mirrored views in one request, each from its own
-/// cursor to the round the request is answered at.
+/// DELTA_POLL: read N views in one request, each from its own cursor to the
+/// last round that reached it, and keep each one the request asks to as a
+/// subscription of `subs` from there.
 ///
-/// An `Err` rejects the frame, at `target_id = 0`; a per-view failure is not an
-/// `Err` — it goes out as that view's own fault frame, and the rest of the poll
-/// continues.
+/// `Err` rejects the frame; a view's own failure is its fault frame, and the
+/// rest of the poll continues.
 pub(super) async fn handle_delta_poll(
     shared: &Rc<Shared>,
     peer: &Peer,
+    subs: &mut Subscriptions,
     prologue: &ControlHeader,
     body: &[u8],
 ) -> Result<(), WireFault> {
-    let views = decode_delta_items(prologue.flags.verb, body).map_err(|e| format!("decode error: {e}"))?;
+    let views = decode_delta_items(body).map_err(|e| format!("decode error: {e}"))?;
     let disp = shared.disp();
-    let terminal = |item: &DeltaPollItem, result: Result<u64, WireFault>| {
-        let tag = disp.delta_cursor_tag(item.view.tid, item.spec);
-        finish_scan_fanout(peer, item.view.tid, tag, result);
-    };
+    let mut kept = delta_poll_kept(prologue);
     // The poll drained once, for this lock; a later slice takes the lock alone.
     let mut first_lock = Some(fresh_read_lock(shared, views.iter().map(|v| v.view.tid), false).await?);
 
     // One slice at a time: one catalog lock and — for however many of its views
-    // moved — one broadcast.
-    for slice in views.chunks(DELTA_POLL_CUT_VIEWS) {
+    // moved — one broadcast. A view read whole is a slice of its own: a cut holds
+    // the workers until its last train is taken, and that train is a view long.
+    let slices = views
+        .chunk_by(|a, b| a.from.is_some() && b.from.is_some())
+        .flat_map(|run| run.chunks(DELTA_POLL_CUT_VIEWS));
+    for slice in slices {
         // ── Phase 1: classify under the catalog lock, dispatch one cut ─────
-        // No await between a view's position and the round an up-to-date one
-        // reports, so no tick lands in between.
         let catalog = match first_lock.take() {
             Some(g) => g,
             None => shared.catalog_rwlock.read().await,
         };
         let positions: Vec<PollPosition> = slice.iter().map(|&v| poll_position(shared, &catalog, v)).collect();
-        let up_to_date_round = disp.last_tick_round();
         let moved = || {
             let judged = slice.iter().zip(&positions);
             judged.filter_map(|(v, p)| matches!(p, PollPosition::Moved).then_some(v))
         };
-        let mut dispatch_round = 0;
+        // The round each moved view's read reaches.
+        let mut reached = Vec::new();
         let dispatches = if moved().next().is_none() {
             Vec::new()
         } else {
             disp.scan_cut(|cut| {
-                dispatch_round = disp.last_tick_round();
                 for item in moved() {
-                    cut.read(DirectGroup::new(Read::delta(
-                        item.view.tid,
-                        item.after_tick,
-                        dispatch_round,
-                        item.spec,
-                        item.reply_layout,
-                    )))?;
+                    let after = item.from.map_or(0, |cursor| cursor.tick.get());
+                    reached.push(cut.delta(item.view.tid, after, item.spec, item.reply_layout)?);
                 }
                 Ok(())
             })
@@ -138,17 +136,24 @@ pub(super) async fn handle_delta_poll(
         // Taken in step with the `Moved`s that were pushed. A dispatch left
         // undrained — an earlier return dropped it — discards the rest of its
         // train at the ring boundary.
-        let mut dispatches = dispatches.into_iter();
+        let mut dispatches = dispatches.into_iter().zip(reached);
         for (item, position) in slice.iter().zip(positions) {
             let result = match position {
                 PollPosition::Fault(fault) => Err(fault),
-                PollPosition::UpToDate => Ok(up_to_date_round),
+                PollPosition::UpToDate(round) => Ok(round),
                 PollPosition::Moved => {
-                    let lease = dispatches.next().expect("one dispatch per moved view");
-                    forward_scan(peer, &lease).await.map(|()| dispatch_round)
+                    let (lease, round) = dispatches.next().expect("one dispatch per moved view");
+                    forward_scan(peer, &lease).await.map(|()| round)
                 }
             };
-            terminal(item, result);
+            if let Some(id) = kept.as_mut().and_then(Iterator::next) {
+                subs.leave(&shared.feeds, Some(id));
+                if let Ok(round) = result {
+                    subs.join(&shared.feeds, id, item, round, peer.outbox());
+                }
+            }
+            let tag = disp.delta_cursor_tag(item.view.tid, item.spec);
+            finish_scan_fanout(peer, item.view.tid, tag, result);
             // Carry no more than the budget into the next view, and learn here
             // rather than at the end if the client is gone.
             if peer.flush_if_full().await.is_err() {
@@ -159,13 +164,10 @@ pub(super) async fn handle_delta_poll(
     Ok(())
 }
 
-/// The catalog read lock a read of the views `ids` is answered under, and
-/// whether it may still be held: behind a drain when a commit reaching one of
-/// them has not been ticked, and, with a `wait`, after holding the request
-/// while it is `quiet` — none of them has anything to report — until a
+/// The catalog read lock a sync of the views `ids` is answered under, every
+/// commit reaching one of them ticked. A `quiet` request is first held until a
 /// relation one of them reads changes, `wait` passes, or the client sends its
-/// next request or goes. Only the first of those leaves the request one that
-/// may be held on.
+/// next request or goes; `true` while it may be held again.
 async fn hold_lock(
     shared: &Rc<Shared>,
     peer: &Peer,
@@ -195,22 +197,6 @@ async fn hold_lock(
     Ok((fresh_read_lock(shared, ids(), true).await?, woken))
 }
 
-/// Whether a delta read after `after_tick` already sits at the view's last round,
-/// so it can be answered without reaching a worker: a fan-out per quiet read
-/// would cost W wakeups.
-///
-/// `false` at `after_tick = 0` (the bootstrap bound) and for a relation with no
-/// feed: both must reach the store, the second to be refused there.
-fn delta_up_to_date(shared: &Shared, target_id: u64, after_tick: u64) -> bool {
-    after_tick > 0
-        && shared
-            .cat()
-            .registry
-            .relation(target_id)
-            .is_some_and(|r| r.kind().has_delta_feed())
-        && after_tick >= shared.disp().last_delta_round(target_id)
-}
-
 // ---------------------------------------------------------------------------
 // Pushed feeds
 // ---------------------------------------------------------------------------
@@ -230,21 +216,18 @@ struct Subscriber {
     /// The round this subscriber has been queued every row through; `None`
     /// once its feed ended it.
     after_tick: Cell<Option<u64>>,
+    /// The round its client's cursor was last sent: the one it joined at, or
+    /// that of its last train.
+    told: Cell<u64>,
     out: Rc<Outbox>,
 }
 
 impl Subscriber {
     /// Whether no round since this subscriber's cursor reached the view `tid`
-    /// it is fed, in which case the cursor moves to the last round there is.
+    /// it is fed.
     fn caught_up(&self, shared: &Shared, tid: u64) -> bool {
-        let caught_up = self
-            .after_tick
-            .get()
-            .is_some_and(|after| delta_up_to_date(shared, tid, after));
-        if caught_up {
-            self.after_tick.set(Some(shared.disp().last_tick_round()));
-        }
-        caught_up
+        let last = shared.disp().last_delta_round(tid);
+        self.after_tick.get().is_some_and(|after| after >= last)
     }
 }
 
@@ -295,6 +278,48 @@ impl Feeds {
 pub(super) struct Subscriptions(Vec<(Rc<Subscriber>, Rc<Feed>)>);
 
 impl Subscriptions {
+    /// Keep `item` as the subscription `id`, queued through `round` on `out`.
+    fn join(&mut self, feeds: &Feeds, id: u64, item: &DeltaPollItem, round: u64, out: Rc<Outbox>) {
+        let joined = Rc::new(Subscriber {
+            id,
+            after_tick: Cell::new(Some(round)),
+            told: Cell::new(round),
+            out,
+        });
+        let key = FeedKey {
+            view: item.view,
+            layout: item.reply_layout,
+            spec: item.spec.to_vec(),
+        };
+        let feed = Rc::clone(feeds.live.borrow_mut().entry(key.clone()).or_insert_with(|| {
+            Rc::new(Feed {
+                key,
+                members: RefCell::default(),
+                asked: Cell::new(false),
+            })
+        }));
+        feed.members.borrow_mut().push(Rc::clone(&joined));
+        self.0.push((joined, feed));
+    }
+
+    /// Send each subscription queued through rounds that left it no row where
+    /// it stands, as a train of its terminal alone: its client's cursor passes
+    /// those rounds too.
+    fn tell(&self, shared: &Shared, peer: &Peer) {
+        debug_assert!(peer.outbox().is_empty(), "a position is sent behind every train");
+        for (sub, feed) in &self.0 {
+            let Some(after) = sub.after_tick.get() else { continue };
+            if sub.told.replace(after) != after {
+                let tid = feed.key.view.tid;
+                let tag = shared.disp().delta_cursor_tag(tid, &feed.key.spec);
+                peer.cork_with(|out| {
+                    out.extend_from_slice(&pushed_marker(tid, sub.id));
+                    encode_response_into(out, terminal_scan_msg(tid, after, tag));
+                });
+            }
+        }
+    }
+
     /// Leave `id`'s feed; `None` for every one.
     pub(super) fn leave(&mut self, feeds: &Feeds, id: Option<u64>) {
         for (sub, feed) in self.0.extract_if(.., |(sub, _)| id.is_none_or(|id| id == sub.id)) {
@@ -344,56 +369,6 @@ fn fail_subscribers<'a>(view: u64, members: impl IntoIterator<Item = &'a Rc<Subs
 
 fn lagged(view: u64) -> WireFault {
     format!("subscription to relation {view} fell behind what one connection is queued; poll from its cursor").into()
-}
-
-/// SUBSCRIBE: join, for each item, the feed of the view, spec and layout it
-/// names, from its cursor. An item that cannot join is refused as a
-/// subscription is ended: by a fault train of its id.
-pub(super) async fn handle_subscribe(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    subs: &mut Subscriptions,
-    prologue: &ControlHeader,
-    body: &[u8],
-) -> Result<(), WireFault> {
-    let items = decode_delta_items(prologue.flags.verb, body).map_err(|e| format!("decode error: {e}"))?;
-    let feeds = &shared.feeds;
-    let catalog = shared.catalog_rwlock.read().await;
-    for (id, item) in (prologue.arg0..).zip(items) {
-        subs.leave(feeds, Some(id));
-        let joined = Rc::new(Subscriber {
-            id,
-            after_tick: Cell::new(Some(item.after_tick)),
-            out: peer.outbox(),
-        });
-        let refusal = match poll_position(shared, &catalog, item) {
-            _ if item.after_tick == 0 => Some(WireFault::from(
-                "Subscribe: a subscription continues a cursor; read the view whole first".to_string(),
-            )),
-            PollPosition::Fault(fault) => Some(fault),
-            PollPosition::UpToDate | PollPosition::Moved => None,
-        };
-        if let Some(fault) = refusal {
-            fail_subscribers(item.view.tid, [&joined], &fault);
-            continue;
-        }
-        let key = FeedKey {
-            view: item.view,
-            layout: item.reply_layout,
-            spec: item.spec.to_vec(),
-        };
-        let feed = Rc::clone(feeds.live.borrow_mut().entry(key.clone()).or_insert_with(|| {
-            Rc::new(Feed {
-                key,
-                members: RefCell::default(),
-                asked: Cell::new(false),
-            })
-        }));
-        feed.members.borrow_mut().push(Rc::clone(&joined));
-        subs.0.push((joined, feed));
-    }
-    send_ack(peer, 0, 0);
-    Ok(())
 }
 
 /// SYNC_PUSHED: bring every subscription of the connection up to the pushes
@@ -455,11 +430,8 @@ pub(super) async fn handle_sync_pushed(
             break;
         }
     }
-    // No await since the queue was found empty: every train through this
-    // round is ahead of the ACK, for every subscription the connection still
-    // holds.
-    let through = subs.0.iter().filter_map(|(sub, _)| sub.after_tick.get());
-    send_ack(peer, 0, through.min().unwrap_or(0));
+    subs.tell(shared, peer);
+    send_ack(peer, 0, 0);
     out.synced();
     Ok(())
 }
@@ -506,13 +478,13 @@ async fn pump(shared: Rc<Shared>) {
             if behind.is_empty() {
                 continue;
             }
-            let mut round = 0;
+            // The round each read reaches.
+            let mut reached = Vec::with_capacity(behind.len());
             let leases = disp
                 .scan_cut(|cut| {
-                    round = disp.last_tick_round();
                     for &(feed, cursor) in &behind {
                         let FeedKey { view, layout, ref spec } = feed.key;
-                        cut.read(DirectGroup::new(Read::delta(view.tid, cursor, round, spec, layout)))?;
+                        reached.push(cut.delta(view.tid, cursor, spec, layout)?);
                     }
                     Ok(())
                 })
@@ -520,7 +492,7 @@ async fn pump(shared: Rc<Shared>) {
             drop(catalog);
             match leases {
                 Ok(leases) => {
-                    for ((feed, cursor), lease) in behind.into_iter().zip(leases) {
+                    for (((feed, cursor), round), lease) in behind.into_iter().zip(reached).zip(leases) {
                         queue_train(&shared, feed, cursor, round, lease).await;
                     }
                 }
@@ -534,7 +506,7 @@ async fn pump(shared: Rc<Shared>) {
 }
 
 /// Queue the subscribers of `feed` standing at `cursor` the train `lease`
-/// reads: the feed's rounds after `cursor`, through `round`.
+/// reads: the feed's rounds after `cursor`, through `round`, the view's last.
 async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, lease: TrainLease) {
     let tid = feed.key.view.tid;
     let cap = shared.push_queue_bytes;
@@ -557,8 +529,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     match read {
         Err(fault) => fail_subscribers(tid, reading, &fault),
         Ok(()) => {
-            // A round that left the subscription no row is sent as no train:
-            // a SYNC_PUSHED answers the round its subscriptions stand at.
+            // Rounds that left the subscription no row are sent as no train.
             let rows = !body.is_empty();
             let tag = shared.disp().delta_cursor_tag(tid, &feed.key.spec);
             encode_response_into(&mut body, terminal_scan_msg(tid, round, tag));
@@ -570,6 +541,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
                 }
                 m.after_tick.set(Some(round));
                 if rows {
+                    m.told.set(round);
                     m.out.send(pushed_marker(tid, m.id), Rc::clone(&body));
                 }
             }

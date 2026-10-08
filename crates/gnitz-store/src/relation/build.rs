@@ -24,7 +24,7 @@ impl RelationRegistry {
         Ok(())
     }
 
-    fn enter(&mut self, spec: RelationSpec, (store, delta): (Store, Option<Box<Table>>)) {
+    fn enter(&mut self, spec: RelationSpec, (store, feed): (Store, Option<Feed>)) {
         let RelationSpec { id, kind, placement, pk_repeats, .. } = spec;
         let prev = self.tables.insert(
             id,
@@ -32,7 +32,7 @@ impl RelationRegistry {
                 id,
                 store,
                 unsealed: None,
-                delta,
+                feed,
                 indexes: Vec::new(),
                 kind,
                 placement,
@@ -42,30 +42,24 @@ impl RelationRegistry {
         debug_assert!(prev.is_none(), "relation {id} registered twice");
     }
 
-    /// This process's stores for a relation: its rows, and a fed view's deltas. A
+    /// This process's stores for a relation: its rows, and a fed view's feed. A
     /// view's rows resume from the manifest at `resume_at`, or are rebuilt.
     pub(super) fn build_relation_store(
         &self,
         spec: RelationSpec,
         resume_at: Option<u64>,
-    ) -> Result<(Store, Option<Box<Table>>), String> {
+    ) -> Result<(Store, Option<Feed>), String> {
         let RelationSpec { id, kind, schema, placement, .. } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
-        let (recovery, shard, feed) = match kind {
+        let (recovery, capacity, feed) = match kind {
             RelationKind::Stream => return absent(),
             // Its store is the relation directory itself, outside the per-slot child
             // layout that a worker-count change relays and reclaims.
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
                 let ram_tier_bytes = self.config.ram_tier_bytes;
-                let table = Table::new(
-                    &dir,
-                    schema,
-                    RecoverySource::SalReplay,
-                    ram_tier_bytes,
-                    ShardBudget::Unbounded,
-                )
-                .map_err(|e| format!("open store '{dir}': {e}"))?;
+                let table = Table::new(&dir, schema, RecoverySource::SalReplay, ram_tier_bytes, None)
+                    .map_err(|e| format!("open store '{dir}': {e}"))?;
                 return Ok((Store::Held(Box::new(table)), None));
             }
             // The master opens no user store, but it still creates the relation's
@@ -78,7 +72,7 @@ impl RelationRegistry {
                 if let Some(ms) = TABLE_CREATE_DELAY.count() {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
-                (RecoverySource::SalReplay, ShardBudget::Unbounded, None)
+                (RecoverySource::SalReplay, None, None)
             }
             RelationKind::View(p) => {
                 if resume_at.is_none() {
@@ -92,31 +86,15 @@ impl RelationRegistry {
                 }
                 (
                     RecoverySource::Rederive { resume_at },
-                    p.capacity_bytes()
-                        .map_or(ShardBudget::Unbounded, ShardBudget::Dehydrate),
+                    p.capacity_bytes(),
                     p.delta_bytes(),
                 )
             }
         };
-        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, shard)?;
-        let delta = match feed {
-            Some(budget) if placement.counts_on(self.slot.rank) => {
-                // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
-                let delta_schema = super::delta::make_delta_schema(&schema)
-                    .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))?;
-                // Erased at open: no delta expresses what a boot does to a view, so every cursor restarts.
-                let table = self.open_child(
-                    id,
-                    ChildKind::Delta,
-                    delta_schema,
-                    RecoverySource::Rederive { resume_at: None },
-                    ShardBudget::Drop(budget),
-                )?;
-                Some(Box::new(table))
-            }
-            _ => None,
-        };
-        Ok((Store::Held(Box::new(rows)), delta))
+        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, capacity)?;
+        // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.
+        let feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
+        Ok((Store::Held(Box::new(rows)), feed))
     }
 
     /// [`Self::open_child`], `Err` for a store asked to resume that did not.
@@ -126,9 +104,9 @@ impl RelationRegistry {
         kind: ChildKind<'_>,
         schema: SchemaDescriptor,
         recovery: RecoverySource,
-        shard: ShardBudget,
+        capacity: Option<u64>,
     ) -> Result<Table, String> {
-        let table = self.open_child(id, kind, schema, recovery, shard)?;
+        let table = self.open_child(id, kind, schema, recovery, capacity)?;
         // A resume that found no manifest at its generation.
         if matches!(recovery, RecoverySource::Rederive { resume_at: Some(_) }) && table.loaded_mark().is_none() {
             return Err(format!(
@@ -145,10 +123,10 @@ impl RelationRegistry {
         kind: ChildKind<'_>,
         schema: SchemaDescriptor,
         recovery: RecoverySource,
-        shard: ShardBudget,
+        capacity: Option<u64>,
     ) -> Result<Table, String> {
         let dir = self.child_dir(id, kind);
-        Table::new(&dir, schema, recovery, self.config.ram_tier_bytes, shard)
+        Table::new(&dir, schema, recovery, self.config.ram_tier_bytes, capacity)
             .map_err(|e| format!("open store '{dir}': {e}"))
     }
 }

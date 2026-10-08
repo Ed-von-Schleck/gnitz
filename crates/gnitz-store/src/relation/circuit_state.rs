@@ -3,7 +3,7 @@
 
 use super::ChildKind;
 use super::RelationRegistry;
-use crate::storage::{RecoverySource, ShardBudget, Table};
+use crate::storage::{RecoverySource, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -56,13 +56,7 @@ impl CircuitState {
             .into_iter()
             .map(|(child, schema)| {
                 // Unbounded: a bounded view's hydration reads these traces back.
-                reg.open_child_as(
-                    view_id,
-                    ChildKind::Scratch(&child),
-                    schema,
-                    recovery,
-                    ShardBudget::Unbounded,
-                )
+                reg.open_child_as(view_id, ChildKind::Scratch(&child), schema, recovery, None)
             })
             .collect::<Result<_, _>>()?;
         Ok(CircuitState { tables })

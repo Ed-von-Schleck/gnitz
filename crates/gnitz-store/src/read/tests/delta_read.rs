@@ -8,7 +8,7 @@ use crate::test_support::{
     relation_fixture_with, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, SchemaFacts, Sink};
-use gnitz_wire::{Cut, KeyRange, PkColList, ReadSink, TypeCode, ViewProps};
+use gnitz_wire::{Cut, KeyRange, PkColList, PkKeys, ReadSink, TypeCode, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_zset_testkit::{zset_of, RowKey};
@@ -335,7 +335,7 @@ fn a_subscriber_under_a_spec_holds_the_spec_of_the_view() {
                 let case = &cases[*ci];
                 let out = if case.slim { slim_schema() } else { view_schema() };
                 let reply = r
-                    .delta_read(TID, *cursor, round, case.spec.clone(), out.layout_digest())
+                    .delta_read(TID, *cursor, case.spec.clone(), out.layout_digest())
                     .unwrap_or_else(|e| panic!("{}: {e:?}", case.name));
                 if *cursor == 0 {
                     copy.clear();
@@ -374,16 +374,13 @@ fn an_update_of_a_dropped_column_ships_nothing() {
     }
     assert!(churned > 100);
     let case = cases().into_iter().find(|c| c.name == "projection").unwrap();
-    let reply = r
-        .delta_read(TID, 2, 199, case.spec, slim_schema().layout_digest())
-        .unwrap();
+    let reply = r.delta_read(TID, 2, case.spec, slim_schema().layout_digest()).unwrap();
     assert_eq!(reply.len(), 0);
 }
 
-/// A fed view's delta read answers the rounds `(after_tick, cut_tick]` at each
-/// round's own weights — both sides of a pair the output store folded away — in the
-/// view's layout; `after_tick = 0` reads the view whole. Any other layout, or a view
-/// with no feed, is refused.
+/// A delta read answers the rounds after `after_tick` at each round's own
+/// weights, both sides of a pair the output store folded away; `after_tick = 0`
+/// reads the view whole. Another layout, or a view with no feed, is refused.
 #[test]
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
@@ -397,7 +394,7 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let whole = || ReadSpec::all_rows(ReadBound::None);
     // `(id, weight, val)`, sorted: a reply's order is not a contract.
     let read = |after_tick| {
-        let b = r.delta_read(TID, after_tick, 5, whole(), own).unwrap();
+        let b = r.delta_read(TID, after_tick, whole(), own).unwrap();
         let mut rows: Vec<_> = (0..b.len())
             .map(|i| (b.get_pk(i) as u64, b.get_weight(i), payload0_i64(&*b, i)))
             .collect();
@@ -418,7 +415,7 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
     })
     .unwrap();
     for (id, after_tick, layout) in [(TID, 0, own ^ 1), (TID, 3, own ^ 1), (TID + 1, 0, own)] {
-        let Err(err) = r.delta_read(id, after_tick, 5, whole(), layout) else {
+        let Err(err) = r.delta_read(id, after_tick, whole(), layout) else {
             panic!("relation {id} at {after_tick} must be refused");
         };
         assert!(matches!(err.status, WireStatus::Error), "{err:?}");
@@ -443,9 +440,9 @@ fn a_delta_read_refuses_what_is_not_a_plain_rows_spec() {
     };
     let short = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, [&[0u8; 8][..]])));
     for after_tick in [0, 1] {
-        assert!(r.delta_read(TID, after_tick, 2, cut.clone(), own).is_err());
+        assert!(r.delta_read(TID, after_tick, cut.clone(), own).is_err());
     }
-    assert!(r.delta_read(TID, 1, 2, short, own).is_err());
+    assert!(r.delta_read(TID, 1, short, own).is_err());
 }
 
 /// A view that is all key has no payload column to copy: its delta rows are
@@ -466,57 +463,201 @@ fn a_key_only_view_reads_its_deltas() {
     r.ingest_at(TID, keys(&[(7, 1)]), Some(4), false).unwrap();
     r.ingest_at(TID, keys(&[(7, -1), (8, 1)]), Some(5), false).unwrap();
     let b = r
-        .delta_read(TID, 3, 5, ReadSpec::all_rows(ReadBound::None), schema.layout_digest())
+        .delta_read(TID, 3, ReadSpec::all_rows(ReadBound::None), schema.layout_digest())
         .unwrap();
     let mut rows: Vec<_> = (0..b.len()).map(|i| (b.get_pk(i) as u64, b.get_weight(i))).collect();
     rows.sort_unstable();
     assert_eq!(rows, [(7, -1), (7, 1), (8, 1)]);
 }
 
-/// A spec is compiled over the view: a map, a predicate or a walk naming the
-/// feed's stamp column, numbered one past the view's own, is refused.
-#[test]
-fn a_spec_cannot_name_the_round_stamp() {
-    let mut r = fed();
-    r.ingest_at(TID, batch(&HashMap::from([((1, 1, 1, None, 1), 1)])), Some(2), false)
-        .unwrap();
-    let stamp = view_schema().num_columns() as u32;
-    let reply = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-        ],
-        &[0, 1],
-    );
-    let own = view_schema().layout_digest();
-    let rows = |map| ReadSink { map, kind: SinkKind::Rows { cut: None } };
-    let walk = KeyRange::new(
-        PkColList::from_slice(&[stamp]),
-        &[],
-        Cut::before(img(0)),
-        Cut::before(img(9)),
-    );
-    let specs = [
-        (
-            ReadSpec {
-                bound: ReadBound::None,
-                predicate: vec![],
-                sink: rows(map_of(LogicalProgram::copy_cols(&[stamp]), &reply)),
-            },
-            reply.layout_digest(),
-        ),
-        (
-            ReadSpec {
-                bound: ReadBound::None,
-                predicate: between(stamp, 0, None),
-                sink: rows(None),
-            },
-            own,
-        ),
-        (ReadSpec::all_rows(ReadBound::Range(walk)), own),
-    ];
-    for (spec, layout) in specs {
-        assert!(r.delta_read(TID, 1, 2, spec, layout).is_err());
+// ---------------------------------------------------------------------------
+// Rounds of every size, under budgets that drop, against a model
+// ---------------------------------------------------------------------------
+
+fn random_delta(rng: &mut Rng, state: &mut HashMap<Row, i64>, ops: u64) -> HashMap<Row, i64> {
+    let mut delta: HashMap<Row, i64> = HashMap::new();
+    for _ in 0..ops {
+        let fresh = |rng: &mut Rng| -> Row {
+            (
+                rng.gen_range(6),
+                rng.gen_range(7) as i64 - 3,
+                rng.gen_range(20) as i64 - 5,
+                (rng.gen_range(3) > 0).then(|| rng.gen_range(4) as i64),
+                rng.gen_range(20) as u8,
+            )
+        };
+        let kind = rng.gen_range(10);
+        if kind < 6 || state.is_empty() {
+            let r = fresh(rng);
+            let w = 1 + rng.gen_range(3) as i64;
+            *delta.entry(r).or_default() += w;
+            *state.entry(r).or_default() += w;
+        } else {
+            // Not uniform over the live rows, but cheap: the first in hash order.
+            let skip = rng.gen_range(state.len().min(50) as u64) as usize;
+            let r = *state.keys().nth(skip).unwrap();
+            let w = state[&r];
+            *delta.entry(r).or_default() -= w;
+            state.remove(&r);
+            if kind >= 8 {
+                let f = fresh(rng);
+                let n = (r.0, r.1, f.2, f.3, f.4);
+                *delta.entry(n).or_default() += w;
+                *state.entry(n).or_default() += w;
+            }
+        }
     }
+    delta.retain(|_, w| *w != 0);
+    state.retain(|_, w| *w != 0);
+    delta
+}
+
+fn expected(case: &Case, rows: &HashMap<Row, i64>) -> HashMap<RowKey, i64> {
+    let mut kept: HashMap<Row, i64> = HashMap::new();
+    let mut slim: HashMap<RowKey, i64> = HashMap::new();
+    for (r, w) in rows.iter().filter(|(r, _)| (case.keep)(r)) {
+        kept.insert(*r, *w);
+    }
+    if !case.slim {
+        return zset_of(&batch(&kept), &view_schema());
+    }
+    // Rows that differ only in what the map drops are one mapped row.
+    for (r, w) in &kept {
+        let one = HashMap::from([(*r, 1i64)]);
+        for (k, _) in zset_of(&slim_batch(&one), &slim_schema()) {
+            *slim.entry(k).or_default() += *w;
+        }
+    }
+    slim.retain(|_, w| *w != 0);
+    slim
+}
+
+#[test]
+fn reads_over_rounds_of_every_size_match_a_model() {
+    let (mut reads, mut expired, mut dropped_seeds, mut big_rounds) = (0u64, 0u64, 0u64, 0u64);
+    // Twelve seeds: every budget under every RAM tier and chunk size.
+    for seed in 0..12u64 {
+        let mut rng = Rng::new(seed * 104_729 + 7);
+        let budget = match seed % 3 {
+            0 => 1 << 30,
+            1 => 400_000,
+            _ => 60_000,
+        };
+        let config = StoreConfig {
+            ram_tier_bytes: if seed % 2 == 0 {
+                1 << 11
+            } else {
+                StoreConfig::default().ram_tier_bytes
+            },
+            ..StoreConfig::default()
+        };
+        let mut r = relation_fixture_with(config, fed_view(budget), view_schema(), &[], []);
+        r.set_scan_chunk_rows([3, 200, 1000, 8192][(seed % 4) as usize]);
+        let mut state = HashMap::new();
+        // Per ingest: its round and its net delta.
+        let mut log: Vec<(u64, HashMap<Row, i64>)> = Vec::new();
+        let cases = cases();
+        let mut round = 1;
+        for _ in 0..50 {
+            round += 1 + rng.gen_range(3);
+            let ops = match rng.gen_range(6) {
+                0 => 1 + rng.gen_range(4),
+                1 => 100 + rng.gen_range(80),
+                2 => 300 + rng.gen_range(500),
+                3 => 120 + rng.gen_range(20),
+                _ => 10 + rng.gen_range(40),
+            };
+            let delta = random_delta(&mut rng, &mut state, ops);
+            let captured = delta.clone();
+            big_rounds += u64::from(delta.len() >= 128);
+            let (first, second): (HashMap<Row, i64>, HashMap<Row, i64>) = match rng.gen_range(4) {
+                0 => delta.iter().partition(|(row, _)| row.0 % 2 == 0),
+                _ => (delta, HashMap::new()),
+            };
+            for part in [first, second] {
+                if part.is_empty() {
+                    continue;
+                }
+                r.ingest_at(TID, batch(&part), Some(round), false).unwrap();
+                log.push((round, part));
+            }
+            if rng.gen_range(5) == 0 {
+                // An ingest that consolidates to nothing captures nothing.
+                let ghost: Row = (1u64, 1i64, 1i64, None, 1u8);
+                let schema = view_schema();
+                let mut b = BatchBuilder::new(&schema);
+                for w in [2, -2] {
+                    b.begin_row_natives(&[ghost.1 as u64 as u128, ghost.0 as u128], w);
+                    b.put_int(ghost.2 as u64 as u128);
+                    b.put_opt_int(None);
+                    b.put_string("x");
+                    b.end_row();
+                }
+                r.ingest_at(TID, b.finish(), Some(round), false).unwrap();
+            }
+            // The round just captured, read alone, is what went in.
+            if !captured.is_empty() {
+                let reply = r
+                    .delta_read(TID, round - 1, cases[0].spec.clone(), view_schema().layout_digest())
+                    .unwrap();
+                let mut got = HashMap::new();
+                add(&mut got, &reply, &view_schema());
+                assert_eq!(
+                    got,
+                    zset_of(&batch(&captured), &view_schema()),
+                    "seed {seed} round {round}"
+                );
+            }
+            let floor = r.relation_or_err(TID).unwrap().feed().unwrap().dropped_through();
+            let rounds: Vec<u64> = log.iter().map(|(r, _)| *r).collect();
+            for _ in 0..5 * usize::from(!rounds.is_empty()) {
+                let case = &cases[rng.gen_range(cases.len() as u64) as usize];
+                let pick = |rng: &mut Rng| rounds[rng.gen_range(rounds.len() as u64) as usize];
+                let after = match rng.gen_range(8) {
+                    0 => floor.max(1),
+                    1 => floor.saturating_sub(1).max(1),
+                    2 => floor + 1,
+                    3 => round,
+                    4 => round - 1,
+                    _ => pick(&mut rng),
+                };
+                let out = if case.slim { slim_schema() } else { view_schema() };
+                let reply = r.delta_read(TID, after, case.spec.clone(), out.layout_digest());
+                if after < floor {
+                    let Err(err) = reply else {
+                        panic!("seed {seed}: cursor {after} below the floor {floor} was accepted")
+                    };
+                    assert!(matches!(err.status, WireStatus::DeltaExpired), "seed {seed}: {err:?}");
+                    expired += 1;
+                    continue;
+                }
+                let reply =
+                    reply.unwrap_or_else(|e| panic!("seed {seed} {} after {after} floor {floor}: {e:?}", case.name));
+                let mut band: HashMap<Row, i64> = HashMap::new();
+                for (at, delta) in &log {
+                    if after < *at {
+                        for (row, w) in delta {
+                            *band.entry(*row).or_default() += *w;
+                        }
+                    }
+                }
+                band.retain(|_, w| *w != 0);
+                let mut got = HashMap::new();
+                add(&mut got, &reply, &out);
+                assert_eq!(
+                    got,
+                    expected(case, &band),
+                    "seed {seed} {} after {after} floor {floor} round {round}",
+                    case.name
+                );
+                reads += 1;
+            }
+        }
+        let floor = r.relation_or_err(TID).unwrap().feed().unwrap().dropped_through();
+        dropped_seeds += u64::from(floor > 0);
+    }
+    assert!(
+        reads > 1000 && expired > 20 && dropped_seeds >= 4 && big_rounds > 100,
+        "{reads} {expired} {dropped_seeds} {big_rounds}"
+    );
 }

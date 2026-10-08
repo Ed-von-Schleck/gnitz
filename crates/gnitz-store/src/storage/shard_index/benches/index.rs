@@ -115,7 +115,7 @@ fn compaction_amplification_bench() {
     /// Spills between two barriers.
     const BARRIERS: [u64; 3] = [1, 8, 64];
     type Rows = Vec<(u64, i64, i64)>;
-    // Fresh ascending keys: an INSERT stream, and every delta store.
+    // Fresh ascending keys: an INSERT stream.
     let ascending = |run: u64, _: &mut Rng| -> Rows {
         (run * RUN_ROWS..(run + 1) * RUN_ROWS)
             .map(|k| (k, 1, spread(k)))
@@ -153,17 +153,17 @@ fn compaction_amplification_bench() {
     type Arm = (
         &'static str,
         fn(u64, &mut Rng) -> Rows,
-        ShardBudget,
+        Option<u64>,
         bool,
         bool,
         u64,
         &'static [CompactionKind],
     );
-    let arms: [Arm; 10] = [
+    let arms: [Arm; 9] = [
         (
             "scattered, under the L1 floor",
             scattered,
-            ShardBudget::Unbounded,
+            None,
             true,
             false,
             60,
@@ -172,25 +172,17 @@ fn compaction_amplification_bench() {
         (
             "scattered updates",
             updates,
-            ShardBudget::Unbounded,
+            None,
             true,
             false,
             400,
             &[L0Fold, GuardSplit, TierFold],
         ),
-        (
-            "ascending",
-            ascending,
-            ShardBudget::Unbounded,
-            true,
-            false,
-            400,
-            &[L0Fold],
-        ),
+        ("ascending", ascending, None, true, false, 400, &[L0Fold]),
         (
             "scattered",
             scattered,
-            ShardBudget::Unbounded,
+            None,
             true,
             false,
             400,
@@ -200,7 +192,7 @@ fn compaction_amplification_bench() {
         (
             "scattered, PK filters",
             scattered,
-            ShardBudget::Unbounded,
+            None,
             true,
             true,
             400,
@@ -209,7 +201,7 @@ fn compaction_amplification_bench() {
         (
             "scattered, 4x",
             scattered,
-            ShardBudget::Unbounded,
+            None,
             true,
             false,
             1600,
@@ -218,7 +210,7 @@ fn compaction_amplification_bench() {
         (
             "churn",
             churn,
-            ShardBudget::Unbounded,
+            None,
             true,
             false,
             400,
@@ -227,7 +219,7 @@ fn compaction_amplification_bench() {
         (
             "scattered, dehydrating",
             scattered,
-            ShardBudget::Dehydrate(40 << 20),
+            Some(40 << 20),
             true,
             false,
             400,
@@ -237,20 +229,11 @@ fn compaction_amplification_bench() {
         (
             "scattered, at the skeleton floor",
             scattered,
-            ShardBudget::Dehydrate(16 << 20),
+            Some(16 << 20),
             false,
             false,
             400,
             &[BandCut, Dehydrate],
-        ),
-        (
-            "ascending, dropping",
-            ascending,
-            ShardBudget::Drop(16 << 20),
-            true,
-            false,
-            400,
-            &[L0Fold],
         ),
     ];
 
@@ -291,14 +274,9 @@ fn compaction_amplification_bench() {
         for kind in reaches {
             assert!(phases.contains_key(kind), "{label}: no {kind:?} ran");
         }
-        assert_eq!(
-            idx.dropped_max() != PkBuf::zeroed(8),
-            matches!(budget, ShardBudget::Drop(_)),
-            "{label}: dropped a guard"
-        );
         let resident = idx.resident_bytes();
         assert_eq!(
-            budget.cap().is_none_or(|cap| resident <= cap),
+            budget.is_none_or(|cap| resident <= cap),
             fits,
             "{label}: {resident} B resident"
         );
@@ -313,7 +291,7 @@ fn compaction_amplification_bench() {
              {resident} B resident{}",
             idx.l1_target_bytes(),
             levels.join(" "),
-            budget.cap().map_or(String::new(), |cap| format!(" of {cap}")),
+            budget.map_or(String::new(), |cap| format!(" of {cap}")),
         );
         println!(
             "  {} rows resident, {} of them retractions",

@@ -55,8 +55,9 @@ impl RunSet {
         self.push_run(Rc::new(run.trimmed()), schema);
     }
 
-    /// [`Self::push`] for a run another set held.
-    fn push_run(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
+    /// [`Self::push`] for a consolidated run something else holds too.
+    pub(super) fn push_run(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
+        debug_assert!(run.is_consolidated(), "RunSet::push_run requires a consolidated run");
         if run.is_empty() {
             return;
         }

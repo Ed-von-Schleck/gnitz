@@ -2,27 +2,24 @@
 //! cursor, under the `ReadSpec` the subscriber reads the view by.
 
 use gnitz_expr::RowFilter;
-use gnitz_wire::{PkKeys, ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
+use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
 use super::scan_spec::check_layout;
-use crate::relation::{delta_round, delta_round_prefix, Cut, RelationRegistry};
+use crate::relation::RelationRegistry;
 use gnitz_zset::algebra::SinkPlan;
-use gnitz_zset::repr::{Batch, SourceCursor};
-use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
+use gnitz_zset::repr::Batch;
 
 impl RelationRegistry {
-    /// `spec` applied to every delta `id`'s feed recorded in rounds
-    /// `(after_tick, cut_tick]`, which are the deltas of `spec` applied to the
-    /// view: a filter and a map are linear. `after_tick = 0` reads the view's
-    /// own output store instead. A cursor below the retained floor is refused as
+    /// `spec` applied to every delta `id`'s feed recorded in the rounds after
+    /// `after_tick`; `after_tick = 0` reads the view's own output store
+    /// instead. A cursor below the retained floor is refused as
     /// [`WireStatus::DeltaExpired`]; every other refusal is `Error`.
     pub fn delta_read(
         &self,
         id: u64,
         after_tick: u64,
-        cut_tick: u64,
         spec: ReadSpec,
         reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
@@ -44,18 +41,15 @@ impl RelationRegistry {
         }
         let view = entry.schema();
         let feed = entry
-            .delta()
-            .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
+            .feed()
+            .ok_or_else(|| format!("delta_read: this process holds no delta feed for relation {id}"))?;
+        let whole = spec.is_whole();
         let ReadSpec { bound, predicate, sink } = spec;
-        // The feed numbers the view's columns as the view does, so the spec's
-        // programs run on its chunks as they are, and the sink writes each
-        // survivor once, under the view's key.
-        let stamped = *feed.schema();
-        let mut plan = SinkPlan::without_key_prefix(&stamped, &view, &sink, self.config.adhoc_group_cap)?;
+        let mut plan = SinkPlan::from_wire(&view, &sink, self.config.adhoc_group_cap)?;
         // Before the floor: a layout no cursor could have been handed is a bad
         // request, not an expired one.
         check_layout(reply_layout, plan.output_schema())?;
-        let dropped_through = delta_round(feed.dropped_max().pk_bytes());
+        let dropped_through = feed.dropped_through();
         // A cursor at the floor has lost nothing.
         if after_tick < dropped_through {
             return Err(WireFault {
@@ -66,39 +60,28 @@ impl RelationRegistry {
                 ),
             });
         }
-        let band = key_range_between_cuts(
-            KeyCut::above(&delta_round_prefix(after_tick)),
-            KeyCut::above(&delta_round_prefix(cut_tick)),
-            stamped.pk_stride(),
-        );
-        // Rounds only ascend, so the band is mostly runs that end below the
-        // next one's first key: a chain of cursors, of which few merge.
-        let runs = || feed.range_cursors(band, Cut::Now);
-        // Resolved over the view first, as the sink's map is: the spec's
-        // programs name its columns, not the feed's stamp.
-        let filter = |walk| {
-            RowFilter::for_read(&predicate, walk, &view)
-                .and_then(|_| RowFilter::for_read(&predicate, walk, &stamped))
-                .map_err(|e| format!("delta_read: {e}"))
+        let rounds = feed.rounds(after_tick);
+        if whole {
+            let mut held = rounds.clone();
+            return Ok(match (held.next(), held.next()) {
+                // One round is the reply as it was captured.
+                (Some(only), None) => Rc::clone(only),
+                _ => Rc::new(Batch::concat(&view, rounds.map(|round| round.as_mem_batch()))),
+            });
+        }
+        let walk = match &bound {
+            ReadBound::Range(r) => Some(r),
+            ReadBound::None | ReadBound::PkSet(_) => None,
         };
-        let walk = |mut filter: RowFilter, plan: &mut SinkPlan| {
-            runs()
-                .into_iter()
-                .map(|run| SourceCursor::Full(Box::new(run)))
-                .try_for_each(|run| self.drive(id, run, &mut filter, plan, None))
+        let mut filter = RowFilter::for_read(&predicate, walk, &view).map_err(|e| format!("delta_read: {e}"))?;
+        let chunk_rows = self.config.scan_chunk_rows;
+        let mut ranges = Vec::new();
+        let mut read = |rows: &Batch| {
+            filter.ranges(&rows.as_mem_batch(), &mut ranges);
+            plan.push(rows, &mut ranges).map(drop)
         };
-        match bound {
-            // Nothing is dropped, so each part is read in one piece: a whole
-            // run in place, and a string heap carried whole.
-            ReadBound::None if predicate.is_empty() => {
-                for run in runs() {
-                    let rows = run.materialize();
-                    plan.push(&rows, &mut vec![(0, rows.len())])?;
-                }
-            }
-            ReadBound::None => walk(filter(None)?, &mut plan)?,
-            ReadBound::Range(r) => walk(filter(Some(&r))?, &mut plan)?,
-            ReadBound::PkSet(keys) if keys.stride() != view.pk_stride() => {
+        if let ReadBound::PkSet(keys) = &bound {
+            if keys.stride() != view.pk_stride() {
                 return Err(format!(
                     "delta_read: PkSet key stride {} != pk_stride {} (relation {id})",
                     keys.stride(),
@@ -106,18 +89,37 @@ impl RelationRegistry {
                 )
                 .into());
             }
-            // Few enough keys are gathered round by round; the rest are picked
-            // out of a walk of the band.
-            ReadBound::PkSet(keys) => {
-                let rounds = cut_tick.saturating_sub(after_tick);
-                match rounds.saturating_mul(keys.len() as u64) <= DELTA_GATHER_MAX_PROBES {
-                    true => {
-                        let probes = stamped_keys(after_tick + 1..=cut_tick, &keys);
-                        let gather = SourceCursor::PkSet(Box::new(feed.gather(probes, Cut::Now)));
-                        self.drive(id, gather, &mut filter(None)?, &mut plan, None)?
-                    }
-                    false => walk(filter(None)?.with_key_suffix(keys), &mut plan)?,
+            // The keyed rows of every round, read a chunk at a time.
+            let mut keyed = Vec::new();
+            let mut chunk = Batch::empty_with_schema(&view);
+            for round in rounds {
+                round.key_ranges(keys.iter(), &mut keyed);
+                chunk.append_ranges(&round.as_mem_batch(), &keyed);
+                if chunk.len() >= chunk_rows {
+                    read(&chunk)?;
+                    chunk.clear();
                 }
+            }
+            if !chunk.is_empty() {
+                read(&chunk)?;
+            }
+        } else {
+            // The spec runs on each round where it lies; a run of small rounds
+            // is read as one chunk.
+            let rounds: Vec<&Rc<Batch>> = rounds.collect();
+            let small = |round: &Rc<Batch>| round.len() < CHUNKED_BELOW_ROWS;
+            let mut i = 0;
+            while i < rounds.len() {
+                let (mut j, mut rows) = (i + 1, rounds[i].len());
+                while small(rounds[i]) && j < rounds.len() && small(rounds[j]) && rows + rounds[j].len() <= chunk_rows {
+                    rows += rounds[j].len();
+                    j += 1;
+                }
+                match &rounds[i..j] {
+                    [round] => read(round)?,
+                    chunk => read(&Batch::concat(&view, chunk.iter().map(|round| round.as_mem_batch())))?,
+                }
+                i = j;
             }
         }
         let rows = plan.finish();
@@ -130,23 +132,10 @@ impl RelationRegistry {
     }
 }
 
-/// The most `(round, key)` probes a keyed delta read gathers before it walks the
-/// band instead. A probe costs the same whatever the band holds and a walk costs
-/// per band row, so the cap is what bounds a read whose cursor lags many rounds.
-const DELTA_GATHER_MAX_PROBES: u64 = 4096;
-
-/// `keys` under each round of `rounds`, as keys of the delta store.
-fn stamped_keys(rounds: std::ops::RangeInclusive<u64>, keys: &PkKeys) -> PkKeys {
-    let stride = keys.stride() + delta_round_prefix(0).len();
-    let mut bytes = Vec::with_capacity(keys.len() * stride * rounds.clone().count());
-    for round in rounds {
-        for key in keys.iter() {
-            bytes.extend_from_slice(&delta_round_prefix(round));
-            bytes.extend_from_slice(key);
-        }
-    }
-    PkKeys::from_sorted(stride, bytes)
-}
+/// The rows below which a round is read in a chunk with the small rounds beside
+/// it: under them, copying it costs less than a filter and a sink set up for it
+/// alone.
+const CHUNKED_BELOW_ROWS: usize = 128;
 
 #[cfg(test)]
 #[path = "tests/delta_read.rs"]

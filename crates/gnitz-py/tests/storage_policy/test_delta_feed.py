@@ -24,10 +24,10 @@ import pytest
 import gnitz
 from gnitz import aio
 from _feedviews import (
-    FEED, GROUPBY, JOIN, LINEAR, SETOP, SWEEP_ENV,
-    Subscriber, base_tables, churn, flood, later, mk_feed,
+    FEED, GROUPBY, JOIN, LINEAR, SETOP,
+    Subscriber, base_tables, churn, later, mk_feed,
 )
-from _paths import relation_dir
+from _read import rows
 from _serverproc import NEEDS_MULTI
 
 
@@ -71,8 +71,7 @@ def test_a_delta_touching_one_worker_only(client):
 
 
 def test_a_four_column_pk_view_carries_a_feed(client):
-    """The stamp is one more PK column, so the widest declarable view PK plus the
-    stamp is exactly `MAX_PK_COLUMNS`."""
+    """The widest declarable view PK carries a feed as any other does."""
     client.execute_sql(
         "CREATE TABLE q (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL, "
         "v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
@@ -140,6 +139,87 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
         for _ in range(20):
             assert len(sub.poll()) == 0
         assert sal_digest() == before, "an up-to-date poll must write no SAL bytes"
+
+
+def test_a_poll_after_a_round_of_another_view_keeps_its_cursor(client):
+    """A poll answers with the last round that reached its own view: a round
+    that reached only another view leaves the cursor where it was, and the
+    next one that reaches this view moves it."""
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    client.execute_sql("CREATE VIEW other AS SELECT id, w FROM u WHERE w > 0")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+    sub = Subscriber(client, "f")
+    sub.bootstrap()
+    sub.drain()
+    at = sub.cursor
+
+    client.execute_sql("INSERT INTO u VALUES (1, 1, 7)")
+    assert len(rows(client, "SELECT * FROM other")) == 1
+    assert len(sub.poll()) == 0
+    assert sub.cursor == at
+
+    client.execute_sql("INSERT INTO t VALUES (2, 200, 'moved')")
+    assert len(sub.poll()) == 1 and sub.cursor != at
+
+
+def test_subscribers_at_one_position_share_one_read(own_server):
+    """A cursor is a round of its own view, so two subscribers standing at one
+    position of a feed hold one cursor whatever ticked elsewhere between their
+    syncs, and the round that moves the view is read for both at once: the sync
+    that finds it writes the SAL what it writes when nothing ticked between."""
+    own_server.start()
+    sal = os.path.join(own_server.data_dir, "wal.sal")
+
+    def sal_written():
+        # The SAL is MAP_SHARED and zero past its last group, so what a
+        # request appended is visible through the file at once — to within the
+        # zero bytes that group happens to end in.
+        with open(sal, "rb") as fh:
+            return len(fh.read(4 << 20).rstrip(b"\0"))
+
+    target = own_server.target
+    with gnitz.connect(target) as writer, gnitz.connect(target) as a, gnitz.connect(target) as b:
+        base_tables(writer)
+        mk_feed(writer, "f", LINEAR)
+        writer.execute_sql("CREATE VIEW other AS SELECT id, w FROM u WHERE w > 0")
+        writer.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+        subs = []
+        for client in (a, b):
+            sub = Subscriber(client, "f")
+            sub.bootstrap()
+            sub.drain()
+            sub.subscribe()
+            subs.append(sub)
+
+        def round_read_by_the_first(key, between):
+            """Move the view after `between` ran between the two subscribers'
+            syncs; the SAL bytes the first one's next sync writes."""
+            subs[0].sync()
+            between()
+            subs[1].sync()
+            assert subs[0].cursor == subs[1].cursor, "one position, one cursor"
+            writer.execute_sql(f"INSERT INTO t VALUES ({key}, 200, 'moved')")
+            before = sal_written()
+            subs[0].sync()
+            wrote = sal_written() - before
+            # The second subscriber's train was queued by that read.
+            before = sal_written()
+            subs[1].sync()
+            assert sal_written() == before
+            for sub in subs:
+                assert sub.copy == sub.scan() and len(sub.copy) == key
+            return wrote
+
+        def a_round_elsewhere():
+            # A round of a table the view does not read.
+            writer.execute_sql("INSERT INTO u VALUES (1, 1, 7)")
+            assert len(rows(writer, "SELECT * FROM other")) == 1
+
+        alone = round_read_by_the_first(2, lambda: None)
+        again = round_read_by_the_first(3, a_round_elsewhere)
+        # A second read is a whole group more, several times this slack.
+        assert alone > 64 and abs(again - alone) <= 16, f"one read, as with nothing between: {alone} then {again}"
 
 
 def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
@@ -244,31 +324,35 @@ async def test_a_held_sync_leaves_an_async_client_free(client, server):
 # ── refused cursors ──────────────────────────────────────────────────────────
 
 
-def test_a_cursor_below_the_floor_is_refused_as_a_code(own_server):
+def test_a_cursor_below_the_floor_is_refused_as_a_code(client):
     """Retention drops the oldest rounds whether or not anyone still reads them,
     and a cursor below what was dropped is refused with `GnitzDeltaExpiredError`
     — a type the subscriber reacts to, not a string it matches. Recovery is the
     read it made on its first day."""
-    with gnitz.connect(own_server.start(extra_env=SWEEP_ENV).target) as client:
-        base_tables(client)
-        mk_feed(client, "f", LINEAR, feed="1 KB")
-        sub = Subscriber(client, "f")
-        sub.bootstrap()
-        sub.drain()
+    base_tables(client)
+    mk_feed(client, "f", LINEAR, feed="1 KB")
+    sub = Subscriber(client, "f")
+    sub.bootstrap()
+    sub.drain()
 
-        # Twice the volume measured to reach the first drop, so the margin is
-        # the test's and not the box's.
-        flood(client, 1, 8_000)
+    # Rounds that each overrun the budget on every worker, each ticked by a
+    # read of the view: a feed keeps its newest round whatever its size, so the
+    # second is what drops the first.
+    for lo in (1, 401, 801):
+        client.execute_sql(
+            "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, '{'x' * 200}-{i}')" for i in range(lo, lo + 400)),
+        )
+        sub.scan()
 
-        with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            sub.poll()
+    with pytest.raises(gnitz.GnitzDeltaExpiredError):
+        sub.poll()
 
-        # Settle before re-reading rather than going through `assert_converged`:
-        # on a 1 KB budget one round of these rows overruns it outright, so a
-        # round ticked by that helper's scan is dropped before its poll arrives.
-        live = sub.scan()
-        sub.bootstrap()
-        assert sub.copy == live, "after re-reading at 0"
+    # Settle before re-reading rather than going through `assert_converged`:
+    # on a 1 KB budget one round of these rows overruns it outright, so a
+    # round ticked by that helper's scan is dropped before its poll arrives.
+    live = sub.scan()
+    sub.bootstrap()
+    assert sub.copy == live, "after re-reading at 0"
 
 
 def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
@@ -328,10 +412,10 @@ def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
 
 def test_a_feed_survives_a_restart_on_every_worker(own_server):
     """A restart leaves a fed view fed on every worker — not a catalog that says
-    "fed" over no delta store, which every other test reports only as "no rows".
+    "fed" over no feed, which every other test reports only as "no rows".
 
-    A cursor held across the restart must be rejected: the delta store is erased
-    at open and the boot mints a fresh tag.
+    A cursor held across the restart must be rejected: a feed starts empty at
+    every open and the boot mints a fresh tag.
     """
     own_server.start()
     with gnitz.connect(own_server.target) as client:
@@ -361,10 +445,8 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
 def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
     """A replicated view computes its entire result on every worker, so the feed
     is read from one copy: a gather over all W identical stores would hand back
-    every row W times — invisible to a row-set comparison. Worker 0 serves it, so
-    worker 0 is the only rank that opens a delta store for it. Asserted on the
-    directories: the feed itself is per-worker and every other rank's store would
-    be written and never read.
+    every row W times — invisible to a row-set comparison. Worker 0 serves it,
+    and the copy converging weight for weight is what shows one rank did.
 
     A view over only replicated sources is itself replicated, which is what makes
     this a feed over a replicated placement rather than over a partitioned one.
@@ -386,8 +468,3 @@ def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
         # The bootstrap ran before the inserts, so every row in the copy reached
         # it as a retained round through the one rank that serves the feed.
         assert sub.copy, "the feed carried the rounds the churn produced"
-        vid = sub.vid
-
-    view_dir = relation_dir(own_server.data_dir, vid)
-    feeds = sorted(d for d in os.listdir(view_dir) if d.startswith("delta_w"))
-    assert feeds == [f"delta_w0of{own_server.workers}"], f"only worker 0 serves this feed, found {feeds}"

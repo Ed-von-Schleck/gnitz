@@ -38,7 +38,13 @@ fn every_request() -> Vec<SalRequest<'static>> {
             spec: vec![27u8, 28, 29].into(),
         }
         .into(),
-        Read::delta(30, 31, 32, &[33, 34, 35], 36).into(),
+        Read::Delta {
+            view: 30,
+            after_tick: 31,
+            reply_layout: 36,
+            spec: vec![33u8, 34, 35].into(),
+        }
+        .into(),
     ]
 }
 
@@ -95,15 +101,5 @@ fn every_request_decodes_from_its_written_group() {
 #[test]
 fn a_blob_of_the_wrong_width_is_refused() {
     let hdr = ControlHeader::default();
-    for (kind, blob) in [
-        (SalMessageKind::Tick, &[0u8; 12][..]),
-        (SalMessageKind::DeltaRead, &[0u8; 7][..]),
-        (SalMessageKind::DeltaRead, &[][..]),
-    ] {
-        assert!(
-            SalRequest::decode(kind, &hdr, blob).is_err(),
-            "{kind:?} over {} bytes",
-            blob.len()
-        );
-    }
+    assert!(SalRequest::decode(SalMessageKind::Tick, &hdr, &[0u8; 12]).is_err());
 }

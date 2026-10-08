@@ -22,11 +22,9 @@ from _read import bag
 FEED = "32 MB"
 
 # `own_server.extra_env` for a server whose stores sweep on modest data — the
-# capacity, retention and cursor-expiry cases. A store spills once its RAM tier
-# crosses this ceiling, which only happens at a memtable fold or a checkpoint's
-# ephemeral round — so the checkpoint threshold is squeezed too. Together they
-# give a few thousand rows the many spills a capacity sweep needs: it budgets
-# itself to one push-down per spill.
+# capacity cases. A store spills once its RAM tier crosses this ceiling, which
+# only happens at a memtable fold or a checkpoint's ephemeral round — so the
+# checkpoint threshold is squeezed too.
 SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}
 
 LINEAR = "SELECT id, v, body FROM t WHERE v > 10"
@@ -38,43 +36,53 @@ SETOP = "SELECT id FROM t EXCEPT SELECT tid FROM u"
 class Subscriber:
     """A client-side copy of a view, maintained the way the feed intends: one
     bootstrap, then polls, applying weights. It is deliberately not a set — the
-    whole content of a delta row is its weight."""
+    whole content of a delta row is its weight.
 
-    def __init__(self, client, name):
-        self.client = client
-        self.vid, self.schema = client.resolve_table(name)
+    With `sql`, the copy is that `SELECT` over the view instead of the view
+    whole, and is held against the same filter in Python — `keep`, over the
+    columns `cols` — applied to a plain scan of the view."""
+
+    def __init__(self, client, name, sql=None, keep=lambda r: True, cols=()):
+        self.client, self.keep, self.cols = client, keep, cols
+        self.vid, self.view_schema = client.resolve_table(name)
+        self.schema, self.spec = self.view_schema, None
+        if sql is not None:
+            vid, self.schema, self.spec = client.subscription(sql)
+            assert vid == self.vid
         self.copy = {}
         self.cursor = (0, 0)
 
-    def bootstrap(self):
-        rows, self.cursor = self.client.delta_bootstrap(self.vid, self.schema)
-        # A bootstrap replaces state; it does not add to it.
-        self.copy = bag(rows.including_hidden())
+    def _bag(self, rows):
+        return bag(rows, *self.cols) if self.spec is not None else bag(rows.including_hidden())
 
-    def poll(self):
-        # No hand-written tag check: `delta_poll` refuses a foreign cursor
-        # itself, so a reply that arrives here is one this copy may apply.
-        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor)
-        for k, w in bag(rows.including_hidden()).items():
+    def _apply(self, rows):
+        for k, w in self._bag(rows).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
                 del self.copy[k]
         return rows
 
+    def bootstrap(self):
+        rows, self.cursor = self.client.delta_bootstrap(self.vid, self.schema, self.spec)
+        # A bootstrap replaces state; it does not add to it.
+        self.copy = self._bag(rows)
+
+    def poll(self):
+        # No hand-written tag check: `delta_poll` refuses a foreign cursor
+        # itself, so a reply that arrives here is one this copy may apply.
+        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor, self.spec)
+        return self._apply(rows)
+
     def subscribe(self):
         """Have the server push what `poll` would fetch. From here on the copy
         moves by `sync` alone: a poll beside it would apply a round twice."""
-        self.sub = self.client.subscribe(self.vid, self.schema, self.cursor)
+        self.sub = self.client.subscribe(self.vid, self.schema, self.cursor, self.spec)
 
     def sync(self, wait=0.0):
         (pushed,) = self.client.sync(wait).pushed
         assert pushed.sub == self.sub and pushed.error is None, pushed
         self.cursor = pushed.cursor
-        for k, w in bag(pushed.rows.including_hidden()).items():
-            self.copy[k] = self.copy.get(k, 0) + w
-            if self.copy[k] == 0:
-                del self.copy[k]
-        return pushed.rows
+        return self._apply(pushed.rows)
 
     def drain(self):
         """Collect every push acknowledged so far: one poll, since a poll ticks
@@ -84,14 +92,20 @@ class Subscriber:
         assert len(self.poll()) == 0, "one poll left a round behind"
 
     def scan(self):
-        return bag(self.client.scan(self.vid, self.schema).including_hidden())
+        full = self.client.scan(self.vid, self.view_schema)
+        if self.spec is None:
+            return bag(full.including_hidden())
+        return bag([r for r in full if self.keep(r)], *self.cols)
 
     def assert_converged(self, what=""):
-        """Poll, then require the copy to equal the view as a multiset."""
+        """Poll, then require the copy to equal what it copies as a multiset;
+        how many rows that is. A subscription may keep nothing of a view, so
+        its caller checks that it kept something at some point."""
         self.drain()
         live = self.scan()
-        assert live or self.copy, f"{what}: both sides are empty, so they agree about nothing"
+        assert live or self.copy or self.spec is not None, f"{what}: both sides are empty, so they agree about nothing"
         assert self.copy == live, what
+        return len(live)
 
 
 def later(target, schema, after, statement):
@@ -145,21 +159,3 @@ def churn(client, lo, hi, chunk=None):
     # a copy-versus-view comparison over it then agrees about nothing.
     client.execute_sql(f"DELETE FROM t WHERE id > {hi - span // 5}")
     client.execute_sql(f"DELETE FROM u WHERE id > {hi - span // 4}")
-
-
-# The delta store is in neither checkpoint round and nothing flushes it, so it
-# reaches disk only through its own memtable fold (~192 KiB) and then the RAM
-# tier above. Reaching the sweep therefore takes real volume, not just a small
-# ceiling — this is the byte width of one delta row, wide enough that a few
-# thousand rows cross the fold several times.
-_WIDE = "x" * 200
-
-
-def flood(client, lo_key, rows, chunk=500):
-    """Push `rows` wide rows into `t` starting at `lo_key`, in `chunk`-sized
-    statements. Each statement is its own settle, so each is its own tick round."""
-    for lo in range(lo_key, lo_key + rows, chunk):
-        hi = min(lo + chunk - 1, lo_key + rows - 1)
-        client.execute_sql(
-            "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, '{_WIDE}-{i}')" for i in range(lo, hi + 1)),
-        )

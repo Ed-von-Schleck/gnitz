@@ -1,5 +1,5 @@
 use crate::connection::{
-    promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
+    kept_as, promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -779,8 +779,8 @@ impl GnitzClient {
         self.delta_read(view.into(), None, reply_schema, spec)
     }
 
-    /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
-    /// under `spec`, with the cursor to poll from next. The reply comes back in
+    /// Poll a view's delta feed: every delta it emitted after `cursor`, under
+    /// `spec`, with the cursor to poll from next. The reply comes back in
     /// `reply_schema`, weights and all. Apply what comes back and store the new
     /// cursor; there is nothing to reconcile.
     ///
@@ -808,8 +808,7 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let item = DeltaCursor::item(from, view, reply_schema, spec);
-        let sent = self.session.submit_delta_read(item, reply_schema);
+        let sent = self.session.submit_delta_read(view, from, reply_schema, spec);
         Pending::submitted(self, sent)
     }
 
@@ -1490,25 +1489,36 @@ impl GnitzClient {
 }
 
 /// A delta poll in flight: `items` in one request, handed out as each item's
-/// blocks and then its one end, the items in order. Dropped unfinished, the
-/// session drops what is left of its trains.
+/// blocks and then its one end, the items in order. Dropping it drops what is
+/// left of its trains and ends each kept subscription [`Self::keep`] did not
+/// take.
 pub(crate) struct DeltaPoll<'s> {
     session: &'s mut Session,
-    total: usize,
     /// Ends handed out so far: the index of the item being answered.
     answered: usize,
+    /// The subscription id item 0 is kept as, the rest counting up.
+    first_id: u64,
+    /// Per item, whether its subscription is nobody's to end: it ended in a
+    /// fault, or its reader took it.
+    settled: Vec<bool>,
 }
 
 impl Drop for DeltaPoll<'_> {
     fn drop(&mut self) {
-        self.session.abandon_poll();
+        let unsettled = (self.first_id..).zip(&self.settled).filter(|(_, &settled)| !settled);
+        self.session.abandon_poll(unsettled.map(|(id, _)| id));
     }
 }
 
 impl<'s> DeltaPoll<'s> {
     pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem]) -> Self {
-        session.submit_delta_poll(items);
-        DeltaPoll { session, total: items.len(), answered: 0 }
+        let first_id = session.submit_delta_poll(items);
+        DeltaPoll {
+            session,
+            answered: 0,
+            first_id,
+            settled: vec![false; items.len()],
+        }
     }
 
     /// Everything the last step queued has been handed out.
@@ -1517,19 +1527,29 @@ impl<'s> DeltaPoll<'s> {
     }
 
     /// The next block or end, with its item's index; `None` once every item
-    /// has ended. `Err` is the host's alone — an interrupt.
+    /// has ended. `Err` is the host's alone.
     pub(crate) async fn next(&mut self, host: &mut dyn Host) -> Result<Option<(usize, Polled)>, ClientError> {
         loop {
             if let Some(next) = self.session.next_polled() {
                 let item = self.answered;
-                self.answered += usize::from(matches!(next, Polled::End(_)));
+                if let Polled::End(end) = &next {
+                    self.answered += 1;
+                    self.settled[item] = end.is_err();
+                }
                 return Ok(Some((item, next)));
             }
-            if self.answered == self.total {
+            if self.answered == self.settled.len() {
                 return Ok(None);
             }
             poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
         }
+    }
+
+    /// Take the subscription `item`, which ended with a cursor, is kept as:
+    /// its id, and from here its end is the caller's to ask for.
+    pub(crate) fn keep(&mut self, item: usize) -> u64 {
+        self.settled[item] = true;
+        kept_as(self.first_id, item)
     }
 }
 

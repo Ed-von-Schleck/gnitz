@@ -1,9 +1,6 @@
 //! A delta read, in instructions per row of the band it covers.
 //!
 //! `cd crates && cargo test -p gnitz-store --release delta_read_bench -- --ignored --nocapture --test-threads=1`
-//!
-//! A fixture ingests one batch per round, which the delta store folds into runs
-//! of ascending rounds, so a band of more than one round is a chain of them.
 
 use std::hint::black_box;
 
@@ -55,7 +52,6 @@ fn delta_read_bench() {
     for (rounds, per_round) in [(1u64, 262144u64), (64, 4096), (4096, 64)] {
         let r = fixture(rounds, per_round);
         let band = rounds * per_round;
-        let cut = 1 + rounds;
         println!("--- {rounds} rounds of {per_round} rows");
         let cells: Vec<(&str, ReadSpec, usize)> = vec![
             ("the view's rows", ReadSpec::all_rows(ReadBound::None), 3),
@@ -68,10 +64,11 @@ fn delta_read_bench() {
             ("one column", spec(ReadBound::None, vec![], rows(slim())), 1),
             ("one key", spec(keys(1), vec![], rows(None)), 3),
             ("64 keys", spec(keys(64), vec![], rows(None)), 3),
+            ("64 keys, c0 < 256", spec(keys(64), lt(256), rows(None)), 3),
         ];
         for (label, spec, payload) in cells {
             let layout = schema(payload).layout_digest();
-            let run = || r.delta_read(TID, 1, cut, spec.clone(), layout).unwrap();
+            let run = || r.delta_read(TID, 1, spec.clone(), layout).unwrap();
             black_box(run());
             let (reply, instructions) = counter.measure(run);
             println!(
@@ -81,6 +78,18 @@ fn delta_read_bench() {
             );
         }
     }
+    // A read's fixed cost: one round of one row under a predicate and a map.
+    let r = fixture(1, 1);
+    let spec = spec(ReadBound::None, lt(256), rows(slim()));
+    let layout = schema(1).layout_digest();
+    let run = || r.delta_read(TID, 1, spec.clone(), layout).unwrap();
+    black_box(run());
+    const CALLS: u64 = 1000;
+    let (out, instructions) = counter.measure(|| (0..CALLS).map(|_| run().len()).sum::<usize>());
+    println!(
+        "delta_read_bench one row, predicate + map       {out:>7} rows out {:>8.1} instr/call",
+        instructions as f64 / CALLS as f64
+    );
 }
 
 /// A fed view over `keys` U64 key columns, then `c0 = id % 512`, then `s` where
@@ -131,10 +140,7 @@ fn delta_read_keys_bench() {
                     predicate,
                     ..ReadSpec::all_rows(ReadBound::None)
                 };
-                let run = || {
-                    r.delta_read(TID, 1, 1 + rounds, spec.clone(), s.layout_digest())
-                        .unwrap()
-                };
+                let run = || r.delta_read(TID, 1, spec.clone(), s.layout_digest()).unwrap();
                 black_box(run());
                 let (reply, instructions) = counter.measure(run);
                 println!(

@@ -2,9 +2,8 @@
 //! and `DELTA_POLL` — in both directions.
 //!
 //! A frame is a prologue header naming the verb (`target_id = 0`), then items to
-//! the end of the frame, each a control frame of that verb. A
-//! `SUBSCRIBE` is a `DELTA_POLL`'s frame whose prologue `arg0` is its first
-//! subscription id; every other prologue field is zero.
+//! the end of the frame, each a control frame of that verb. A `DELTA_POLL`'s
+//! prologue `arg0` is [`delta_poll_kept`]; every other prologue field is zero.
 //!
 //! | Verb         | Item header                                              | Sections                  |
 //! |--------------|----------------------------------------------------------|---------------------------|
@@ -21,6 +20,7 @@ use crate::control::{
 };
 use crate::region::Regions;
 use crate::{ClientVerb, WireFlags, WireStatus};
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
@@ -86,7 +86,7 @@ pub(crate) const fn item_shape(verb: ClientVerb) -> Option<ItemShape> {
         ClientVerb::DdlTxn => (false, false, true, usize::MAX),
         ClientVerb::PushTxn => (false, true, true, usize::MAX),
         ClientVerb::ScanMulti => (false, false, false, SCAN_MULTI_MAX_RELATIONS),
-        ClientVerb::DeltaPoll | ClientVerb::Subscribe => (true, false, false, usize::MAX),
+        ClientVerb::DeltaPoll => (true, false, false, usize::MAX),
         _ => return None,
     };
     Some(ItemShape { blob, schema, data, cap })
@@ -179,17 +179,36 @@ pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanMultiItem>, String> {
         .collect())
 }
 
-/// One item of a DELTA_POLL or a SUBSCRIBE: `spec` applied to every delta `view` recorded after the
-/// cursor `(tag, after_tick)`, replied in the layout whose digest is
-/// `reply_layout`, which is the spec's.
+/// A delta-feed position, held by the client alone: the boot, relation and
+/// spec its rounds belong to (`tag`), and the last round of the view it covers
+/// (`tick`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct DeltaCursor {
+    pub tag: u64,
+    pub tick: NonZeroU64,
+}
+
+impl DeltaCursor {
+    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none.
+    pub fn from_pair(tag: u64, tick: u64) -> Option<DeltaCursor> {
+        NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick })
+    }
+
+    /// This cursor as a flat `(tag, tick)` pair.
+    pub fn pair(self) -> (u64, u64) {
+        (self.tag, self.tick.get())
+    }
+}
+
+/// One item of a DELTA_POLL: `spec` applied to every delta `view` recorded
+/// after `from`, replied in the layout whose digest is `reply_layout`, which is
+/// the spec's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaPollItem<'a> {
     /// The view, and the token of the RESOLVE answer this read was built from.
     pub view: Target,
-    /// The cursor read from. `after_tick = 0` reads the view whole and its tag
-    /// is not read.
-    pub tag: u64,
-    pub after_tick: u64,
+    /// The cursor read from; `None` reads the view whole.
+    pub from: Option<DeltaCursor>,
     pub reply_layout: u64,
     /// An encoded `ReadSpec` forwarding rows with no cut; `ReadSpec::all_rows`
     /// of no bound for the view's own rows. The worker's decode is the trust
@@ -197,28 +216,21 @@ pub struct DeltaPollItem<'a> {
     pub spec: &'a [u8],
 }
 
-/// The bytes an item's blob opens with: the cursor's tag, then its tick.
+/// The bytes an item's blob opens with: the cursor's tag, then its tick, both
+/// zero for none.
 const CURSOR_SIZE: usize = 16;
 
-/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix.
-pub fn encode_delta_poll(views: &[DeltaPollItem<'_>]) -> Vec<u8> {
-    encode_delta_items(ClientVerb::DeltaPoll, 0, views)
-}
-
-/// Encode a `SUBSCRIBE` frame, without the 4-byte frame length prefix: item
-/// `i` asks for the subscription `first_id + i`.
-pub fn encode_subscribe(views: &[DeltaPollItem<'_>], first_id: u64) -> Vec<u8> {
-    encode_delta_items(ClientVerb::Subscribe, first_id, views)
-}
-
-fn encode_delta_items(verb: ClientVerb, arg0: u64, views: &[DeltaPollItem<'_>]) -> Vec<u8> {
+/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. Item
+/// `i` is kept as the subscription `keep + i`.
+pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<u64>) -> Vec<u8> {
     let mut blobs = Vec::with_capacity(views.iter().map(|v| CURSOR_SIZE + v.spec.len()).sum());
     let ranges: Vec<Range<usize>> = views
         .iter()
         .map(|v| {
             let start = blobs.len();
-            blobs.extend_from_slice(&v.tag.to_le_bytes());
-            blobs.extend_from_slice(&v.after_tick.to_le_bytes());
+            let (tag, tick) = v.from.map_or((0, 0), DeltaCursor::pair);
+            blobs.extend_from_slice(&tag.to_le_bytes());
+            blobs.extend_from_slice(&tick.to_le_bytes());
             blobs.extend_from_slice(v.spec);
             start..blobs.len()
         })
@@ -227,33 +239,41 @@ fn encode_delta_items(verb: ClientVerb, arg0: u64, views: &[DeltaPollItem<'_>]) 
         .iter()
         .zip(ranges)
         .map(|(v, blob)| FrameItem {
-            hdr: ControlHeader::naming(verb, v.view, v.reply_layout),
+            hdr: ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
             blob: &blobs[blob],
             schema: None,
             data: None,
         })
         .collect();
-    encode_items_under(verb, arg0, &items)
+    encode_items_under(ClientVerb::DeltaPoll, keep.unwrap_or(0), &items)
 }
 
-/// Decode the items of a `DELTA_POLL` or `SUBSCRIBE` frame, whichever `verb`
-/// its prologue names. View id `0` is refused: it is the id of a fault ending
-/// the request.
-pub fn decode_delta_items(verb: ClientVerb, body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
-    decode_items(body, verb)?
+/// The subscription id item 0 of the `DELTA_POLL` under `prologue` is kept
+/// as, the rest counting up, wrapping.
+pub fn delta_poll_kept(prologue: &ControlHeader) -> Option<impl Iterator<Item = u64>> {
+    let first = prologue.arg0;
+    (first != 0).then(|| (0u64..).map(move |i| first.wrapping_add(i)))
+}
+
+/// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the
+/// id of a fault ending the request.
+pub fn decode_delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
+    decode_items(body, ClientVerb::DeltaPoll)?
         .into_iter()
         .map(|(item, c)| {
             if c.hdr.target_id == 0 {
-                return Err(format!("{verb:?}: view id 0 names no view"));
+                return Err("DeltaPoll: view id 0 names no view".to_string());
             }
             let Some((cursor, spec)) = item[c.blob.clone()].split_first_chunk::<CURSOR_SIZE>() else {
-                return Err(format!("{verb:?}: view {} carries no cursor", c.hdr.target_id));
+                return Err(format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id));
             };
             let (tag, tick) = cursor.split_at(8);
             Ok(DeltaPollItem {
                 view: c.hdr.target(),
-                tag: u64::from_le_bytes(tag.try_into().unwrap()),
-                after_tick: u64::from_le_bytes(tick.try_into().unwrap()),
+                from: DeltaCursor::from_pair(
+                    u64::from_le_bytes(tag.try_into().unwrap()),
+                    u64::from_le_bytes(tick.try_into().unwrap()),
+                ),
                 reply_layout: c.hdr.arg0,
                 spec,
             })

@@ -1,6 +1,6 @@
 //! A connection's sync, and the verbs of a reader that keeps its own copy:
 //! subscribe from a cursor a delta read handed out, then sync, which answers
-//! with the deltas the server pushed since and advances every mirrored view.
+//! with the view's deltas since and advances every mirrored view.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,11 +33,9 @@ pub struct Synced {
 
 impl GnitzClient {
     /// Subscribe this connection to a view's delta feed from `cursor`, which a
-    /// delta read of the same view under the same `spec` handed out. Returns
-    /// the subscription's id, at once: [`Self::sync`] reports a subscription
-    /// the server refused as one that ended.
-    ///
-    /// The deltas come back in `reply_schema`, weights and all.
+    /// delta read of the same view under the same `spec` handed out; the
+    /// subscription's id. [`Self::sync`] hands out its deltas since `cursor`,
+    /// in `reply_schema` and weights and all, or the server's refusal as its end.
     pub fn subscribe(
         &mut self,
         view: impl Into<Target>,
@@ -45,8 +43,7 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Result<u64, ClientError> {
-        let item = DeltaCursor::item(Some(cursor), view.into(), reply_schema, spec);
-        let id = self.session.subscribe(&[item])?.start;
+        let id = self.session.subscribe(view.into(), cursor, reply_schema, spec)?;
         self.readers.insert(id, Arc::clone(reply_schema));
         Ok(id)
     }
@@ -64,8 +61,8 @@ impl GnitzClient {
     /// mirror's, up to every push acknowledged before the call. With nothing
     /// to report, the server holds the reply for up to `wait`.
     ///
-    /// `Err` is a poisoned store or an interrupt; any other failure is in the
-    /// entry of the subscription or view it hit.
+    /// `Err` fails the sync as a whole; what failed one subscription or view
+    /// is in its entry.
     pub async fn sync(&mut self, wait: Duration) -> Result<Synced, ClientError> {
         let synced = self.begin_sync(wait)?;
         let synced = self.wait(synced).await;
@@ -99,7 +96,7 @@ impl GnitzClient {
             let taken = synced.clone().and_then(|()| session.take_pushed(sub));
             let result = taken.and_then(|(blocks, cursor)| {
                 let mut batch = ZSetBatch::new(schema);
-                for block in &blocks {
+                for block in blocks {
                     decode_wal_block_into(&mut batch, block.block(), schema)?;
                 }
                 let schema = Arc::clone(schema);

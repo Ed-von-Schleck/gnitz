@@ -453,7 +453,7 @@ fn retired_children_are_reclaimed() {
     for k in 0..2 {
         fabricate_dir(&child_path(&rel, k, 2), "marker");
     }
-    let retired = ["scratch_agg_w1of2", "delta_w5of7", "idx_7_w0of2"];
+    let retired = ["scratch_agg_w1of2", "idx_3_w5of7", "idx_7_w0of2"];
     let current = "scratch_agg_w2of3";
     for name in retired.iter().chain([&current]) {
         fabricate_dir(&format!("{rel}/{name}"), "marker");

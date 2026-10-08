@@ -19,8 +19,8 @@ use gnitz_wire::PkKeys;
 
 use super::manifest::Manifest;
 use super::run_set::RunSet;
-use super::shard_index::{ShardBudget, ShardIndex};
-use gnitz_wire::{PkBuf, RowSource};
+use super::shard_index::ShardIndex;
+use gnitz_wire::PkBuf;
 use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::Batch;
 #[cfg(test)]
@@ -133,14 +133,14 @@ pub(crate) use flush::flush_barrier;
 
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
-    /// whatever is already on disk; the RAM-tier ceiling and `shard`, which
+    /// whatever is already on disk; the RAM-tier ceiling and `capacity`, which
     /// bounds the registered on-disk shard bytes, bind for the store's whole life.
     pub(crate) fn new(
         dir: &str,
         schema: SchemaDescriptor,
         recovery_source: RecoverySource,
         ram_tier_bytes: usize,
-        shard: ShardBudget,
+        capacity: Option<u64>,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
@@ -181,7 +181,7 @@ impl Table {
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(ram_tier_bytes),
-            shard_index: ShardIndex::open(dir, schema, shard, skip_pk_filter, &shards)?,
+            shard_index: ShardIndex::open(dir, schema, capacity, skip_pk_filter, &shards)?,
             rederived,
             loaded_mark,
             caller_record,
@@ -197,12 +197,6 @@ impl Table {
     /// The schema this store's rows are read in.
     pub(crate) fn schema(&self) -> &SchemaDescriptor {
         &self.shard_index.schema
-    }
-
-    /// The highest key this store's capacity sweep has dropped.
-    /// See [`ShardIndex::dropped_max`].
-    pub(crate) fn dropped_max(&self) -> PkBuf {
-        self.shard_index.dropped_max()
     }
 
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
@@ -260,13 +254,17 @@ impl Table {
     /// calls it once per epoch.
     #[inline]
     pub(crate) fn ingest(&mut self, batch: Batch) -> Result<(), StorageError> {
-        let batch = batch.into_consolidated();
-        if batch.is_empty() {
+        self.ingest_run(Rc::new(batch.into_consolidated().trimmed()))
+    }
+
+    /// [`Self::ingest`] of a consolidated run its caller keeps a handle to.
+    pub(crate) fn ingest_run(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
+        if run.is_empty() {
             return Ok(());
         }
         self.cached_full_scan.set(None);
-        let ingested = batch.total_bytes();
-        self.memtable.push(batch, &self.shard_index.schema);
+        let ingested = run.total_bytes();
+        self.memtable.push_run(run, &self.shard_index.schema);
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -395,15 +393,6 @@ impl Table {
             .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
     }
 
-    /// The runs `cut` reads whose PK extent can meet the inclusive `[start, hi]`.
-    fn runs_in_range(&self, start: PkBuf, hi: PkBuf, cut: Cut) -> impl Iterator<Item = Run> + '_ {
-        self.mem_runs(Some((start, hi)), cut).chain(
-            self.shard_index
-                .shard_arcs_in_range(start, hi, cut == Cut::Now)
-                .map(Run::Shard),
-        )
-    }
-
     /// Open a read-only cursor over the rows `cut` reads.
     pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
         let cap = self.mem_run_count() + self.shard_index.shard_count();
@@ -438,47 +427,14 @@ impl Table {
             start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
             "range_cursor: a bound is not pk_stride wide",
         );
-        let runs = self.runs_in_range(start, hi, cut);
+        let runs = self.mem_runs(Some((start, hi)), cut).chain(
+            self.shard_index
+                .shard_arcs_in_range(start, hi, cut == Cut::Now)
+                .map(Run::Shard),
+        );
         let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
-    }
-
-    /// [`Self::range_cursor`] as a chain: its runs split wherever every run so
-    /// far ends below the next one's first key, a cursor over each part, in key
-    /// order. Their rows end to end are the one cursor's, and only runs whose
-    /// key extents meet are merged.
-    pub(crate) fn range_cursors(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> Vec<ReadCursor> {
-        let Some((start, end)) = range else {
-            return Vec::new();
-        };
-        let schema = self.shard_index.schema;
-        let hi = end.unwrap_or_else(|| PkBuf::max(schema.pk_stride()));
-        let mut runs: Vec<Run> = self
-            .runs_in_range(start, hi, cut)
-            .filter(|run| run.row_count() > 0)
-            .collect();
-        runs.sort_by(|a, b| a.get_pk_bytes(0).cmp(b.get_pk_bytes(0)));
-        let last_key = |run: &Run| PkBuf::from_bytes(run.get_pk_bytes(run.row_count() - 1));
-        let mut parts: Vec<(Vec<Run>, PkBuf)> = Vec::new();
-        for run in runs {
-            let last = last_key(&run);
-            match parts.last_mut() {
-                Some((part, top)) if run.get_pk_bytes(0) <= top.pk_bytes() => {
-                    *top = (*top).max(last);
-                    part.push(run);
-                }
-                _ => parts.push((vec![run], last)),
-            }
-        }
-        let end = end.as_ref().map(PkBuf::pk_bytes);
-        parts
-            .into_iter()
-            .map(|(part, _)| {
-                let cap = part.len();
-                from_runs_in_band(part, schema, cap, start.pk_bytes(), end)
-            })
-            .collect()
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of
@@ -497,10 +453,7 @@ impl Table {
             .cached_full_scan
             .take()
             .unwrap_or_else(|| self.open_cursor(Cut::Now).materialize());
-        // A sweep that drops rows moves the row set with no ingest to say so.
-        if !self.shard_index.drops_rows() {
-            self.cached_full_scan.set(Some(Rc::clone(&rc)));
-        }
+        self.cached_full_scan.set(Some(Rc::clone(&rc)));
         rc
     }
 

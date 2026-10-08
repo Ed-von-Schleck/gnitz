@@ -54,28 +54,6 @@ impl SinkPlan {
             .map(|m| MapPlan::from_compute_map(src_schema, m))
             .transpose()
             .map_err(|e| format!("scan_spec map: {e}"))?;
-        Self::over(src_schema, map, sink, group_cap)
-    }
-
-    /// [`Self::from_wire`] of `sink` over `keyed`, fed `src_schema` rows:
-    /// `keyed`'s rows under a key prefix, which the reply drops.
-    pub fn without_key_prefix(
-        src_schema: &SchemaDescriptor,
-        keyed: &SchemaDescriptor,
-        sink: &ReadSink,
-        group_cap: usize,
-    ) -> Result<Self, String> {
-        let map = MapPlan::without_key_prefix(src_schema, keyed, sink.map.as_ref())
-            .map_err(|e| format!("scan_spec map: {e}"))?;
-        Self::over(src_schema, Some(map), sink, group_cap)
-    }
-
-    fn over(
-        src_schema: &SchemaDescriptor,
-        map: Option<MapPlan>,
-        sink: &ReadSink,
-        group_cap: usize,
-    ) -> Result<Self, String> {
         let sink_in = map.as_ref().map_or(*src_schema, |m| *m.out_schema());
         let kind = match &sink.kind {
             SinkKind::Fold(agg) => Kind::Fold {

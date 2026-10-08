@@ -47,9 +47,4 @@ impl<T> Guarded<T> {
     pub(crate) fn even_if_poisoned(&self) -> &T {
         &self.inner
     }
-
-    /// The state, poisoned or not.
-    pub(crate) fn even_if_poisoned_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
 }

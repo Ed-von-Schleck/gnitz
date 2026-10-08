@@ -9,7 +9,6 @@ fn parse_inverts_name_for_every_grammar() {
             ChildKind::Rows,
             ChildKind::Scratch("_reduce_9_3"),
             ChildKind::Scratch("agg_w3"),
-            ChildKind::Delta,
             ChildKind::Index(PkColList::from_slice(&[7])),
             ChildKind::Index(PkColList::from_slice(&[1, 3])),
         ] {
@@ -72,7 +71,7 @@ fn children_at_generation_reads_the_rows_and_the_scratch() {
     }
     assert!(children_at_generation(&dir, 2, G));
 
-    for name in ["delta_w0of2", "idx_7_w0of2", "w0of4", "not_a_child"] {
+    for name in ["idx_7_w0of2", "w0of4", "not_a_child"] {
         std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
     }
     assert!(children_at_generation(&dir, 2, G), "unstamped kinds are not read");

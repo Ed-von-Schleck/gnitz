@@ -104,7 +104,7 @@ fn every_producer_states_its_claim() {
         ("append", appended, RAW),
         ("clear", cleared, RAW),
         ("indexed_rows", src.indexed_rows(&[2, 0]), RAW),
-        ("rekeyed", src.rekeyed(&schema, |s, d| d.copy_from_slice(s)), RAW),
+        ("keyed_by_prefix", src.keyed_by_prefix(&schema), RAW),
     ] {
         assert_eq!(b.consolidated, want, "{what}");
     }
@@ -486,54 +486,6 @@ fn consolidation_certifies_rows_already_in_order() {
     }
 }
 
-/// A key prefix stamped on a batch leaves every row whole behind it: compound
-/// key, weight, NULL word, and a long string's heap span.
-#[test]
-fn a_key_prefix_leads_every_row_whole() {
-    let view = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I32, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0, 1],
-    );
-    // The view's key behind an 8-byte stamp, over the same payload space.
-    let stamped_schema = crate::schema::key_prefixed_schema(SchemaColumn::new(TypeCode::U64, false), &view)
-        .expect("a key column to spare");
-    // `(key, key, weight, string, nullable)`.
-    type Row<'a> = (u64, u32, i64, &'a [u8], Option<i64>);
-    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-    let rows: [Row; 2] = [(1, 7, 1, long, Some(5)), (2, 3, -2, b"hi", None)];
-
-    let mut b = BatchBuilder::new(&view);
-    for &(k0, k1, w, s, n) in &rows {
-        b.begin_row_natives(&[k0 as u128, k1 as u128], w);
-        b.put_blob(s);
-        b.put_opt_int(n.map(|v| v as u128));
-        b.end_row();
-    }
-    let mut b = b.finish();
-    b.certify_consolidated();
-
-    let stamped = b.with_key_prefix(&stamped_schema, &7u64.to_be_bytes());
-    assert!(stamped.consolidated);
-    assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
-    assert_eq!(stamped.count, b.count);
-    for (i, row) in rows.iter().enumerate() {
-        assert_eq!(&stamped.get_pk_bytes(i)[8..], b.get_pk_bytes(i), "row {i}: key");
-        assert_eq!(stamped.get_weight(i), b.get_weight(i), "row {i}: weight");
-        assert_eq!(stamped.get_null_word(i), b.get_null_word(i), "row {i}: null word");
-        assert_eq!(gnitz_wire::payload_bytes(&stamped, i, 0), row.3, "row {i}: string");
-        assert_eq!(
-            stamped.get_col_ptr(i, 1, 8),
-            b.get_col_ptr(i, 1, 8),
-            "row {i}: nullable cell"
-        );
-    }
-}
-
 /// Rows keyed by their leading key bytes keep their weights, and two that
 /// differed only past the cut both remain.
 #[test]
@@ -714,4 +666,97 @@ fn trimmed_compacts_past_a_quarter_dead() {
     assert_eq!((compacted.blob.len(), compacted.dead_heap), (60, 0));
     assert_eq!(read_strings(&compacted), [vec![b'a'; 20], vec![b'b'; 40]]);
     assert!(compacted.consolidated);
+}
+
+/// A batch cut to its rows holds every row as it was — keys, weights, NULL
+/// words, short and long strings — in buffers of exactly their size, whatever
+/// room it was built with.
+#[test]
+fn a_shrunk_batch_holds_its_rows_in_no_more_than_they_take() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0, 1],
+    );
+    for rows in [1usize, 7, 8, 9, 100, 1000] {
+        let mut b = BatchBuilder::new(&schema);
+        for i in 0..rows {
+            b.begin_row_natives(&[i as u128, 3], 1 + i as i64 % 3);
+            match i % 2 {
+                0 => b.put_blob(format!("a-fairly-long-string-value-{i}").as_bytes()),
+                _ => b.put_blob(b"hi"),
+            }
+            b.put_opt_int((i % 5 != 0).then_some(i as u128));
+            b.end_row();
+        }
+        let mut b = b.finish();
+        b.certify_consolidated();
+        let before = b.clone();
+        let roomy = b.allocated_bytes();
+        let out = b.shrunk();
+        assert!(out.consolidated);
+        assert_eq!(out.count, rows);
+        assert_eq!(
+            out.allocated_bytes(),
+            schema.arena_rows(rows) * schema.row_width() + out.blob.len(),
+            "{rows} rows, built with {roomy} bytes"
+        );
+        for i in 0..rows {
+            assert_eq!(out.get_pk_bytes(i), before.get_pk_bytes(i), "row {i}: key");
+            assert_eq!(out.get_weight(i), before.get_weight(i), "row {i}: weight");
+            assert_eq!(out.get_null_word(i), before.get_null_word(i), "row {i}: null word");
+            assert_eq!(
+                gnitz_wire::payload_bytes(&out, i, 0),
+                gnitz_wire::payload_bytes(&before, i, 0),
+                "row {i}: string"
+            );
+            assert_eq!(out.get_col_ptr(i, 1, 8), before.get_col_ptr(i, 1, 8), "row {i}: int");
+        }
+    }
+}
+
+/// A key set names the rows keyed by one of its keys: every row of a key
+/// several rows share, listed keys side by side as one run, and nothing for a
+/// key between two rows or past the last.
+#[test]
+fn key_ranges_are_the_rows_a_key_set_lists() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0, 1],
+    );
+    let key = |k: usize| [(k as u64 / 10).to_be_bytes(), (k as u64 % 10).to_be_bytes()].concat();
+    // Key 155 is between two rows; 250 and 999 are past the last of 100.
+    let listed = [3usize, 7, 13, 14, 15, 40, 99, 155, 250, 999];
+    let keys: Vec<Vec<u8>> = listed.iter().map(|&k| key(k)).collect();
+    for n in [100usize, 0, 10, 1] {
+        // Key `k` holds `1 + k % 3` rows, apart in their payload.
+        let mut b = BatchBuilder::new(&schema);
+        let (mut want, mut row) = (Vec::new(), 0);
+        for k in 0..n {
+            for copy in 0..=k % 3 {
+                if listed.contains(&k) {
+                    want.push(row);
+                }
+                row += 1;
+                b.begin_row_natives(&[k as u128 / 10, k as u128 % 10], 1);
+                b.put_int(copy as u128);
+                b.end_row();
+            }
+        }
+        let mut b = b.finish();
+        b.certify_consolidated();
+        let mut ranges = vec![(7, 9)];
+        b.key_ranges(keys.iter().map(|k| &k[..]), &mut ranges);
+        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "maximal runs: {ranges:?}");
+        let got: Vec<usize> = ranges.iter().flat_map(|&(start, end)| start..end).collect();
+        assert_eq!(got, want, "n={n}");
+    }
 }

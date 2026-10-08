@@ -1,10 +1,10 @@
 //! The ingestion pipeline: unique-PK enforcement, store + secondary-index
 //! application, delta capture, and the flush / checkpoint table collection.
 
-use super::delta::delta_round_prefix;
 use super::{RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
+use std::rc::Rc;
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -90,7 +90,7 @@ impl RelationRegistry {
     /// empty. For a view with no index and no delta feed.
     pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
-        debug_assert!(entry.kind.is_view() && entry.delta.is_none() && entry.indexes.is_empty());
+        debug_assert!(entry.kind.is_view() && entry.feed.is_none() && entry.indexes.is_empty());
         entry.store.held_mut().clear();
         Ok(())
     }
@@ -148,12 +148,6 @@ impl RelationRegistry {
             return Ok(echo.then_some(effective));
         }
 
-        let pending = entry
-            .delta
-            .as_deref()
-            .zip(round)
-            .map(|(feed, r)| (effective.with_key_prefix(feed.schema(), &delta_round_prefix(r)), r));
-
         for ix in entry.indexes.iter_mut() {
             let cols = ix.cols;
             let res = match ix.project_and_ingest(&effective) {
@@ -170,30 +164,30 @@ impl RelationRegistry {
         }
 
         let store = entry.store.held_mut();
-        let (res, applied) = match (above, echo) {
-            (true, _) => {
-                store.ingest_pending(effective);
-                (Ok(()), None)
-            }
-            (false, true) => (store.ingest(effective.to_consolidated()), Some(effective)),
-            (false, false) => (store.ingest(effective), None),
-        };
-        inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
-
-        let Some((stamped, round)) = pending else {
-            return Ok(applied);
-        };
-        let feed = entry.delta.as_deref_mut().expect("capture implies a feed");
-        if let Err(e) = feed.ingest(stamped) {
-            // Logged, not fatal: the round is captured and the next spill retries,
-            // where a restart would erase every retained round instead.
-            gnitz_error!(
-                "relation: delta-store spill failed (view_id={}, round={}): {} — the spill or \
-                 its upkeep failed; the next spill retries it; the feed is intact",
-                id,
-                round,
-                e,
+        if above {
+            // No round has rows above the cut yet, so no feed captures them.
+            debug_assert!(
+                round.is_none() && !echo,
+                "rows above the cut are neither captured nor echoed"
             );
+            store.ingest_pending(effective);
+            return Ok(None);
+        }
+        let (run, applied) = match echo {
+            true => (effective.to_consolidated(), Some(effective)),
+            false => (effective.into_consolidated(), None),
+        };
+        let capture = entry.feed.as_mut().zip(round);
+        // One allocation for the store's run and the feed's round, which is
+        // charged every byte it holds: none it has no row in.
+        let run = Rc::new(match capture {
+            Some(_) => run.trimmed().shrunk(),
+            None => run.trimmed(),
+        });
+        let res = store.ingest_run(Rc::clone(&run));
+        inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
+        if let Some((feed, round)) = capture {
+            feed.record(round, run);
         }
         Ok(applied)
     }
@@ -268,3 +262,7 @@ impl RelationRegistry {
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }
 }
+
+#[cfg(test)]
+#[path = "benches/capture.rs"]
+mod bench;

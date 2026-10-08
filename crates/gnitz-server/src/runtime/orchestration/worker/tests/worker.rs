@@ -215,13 +215,14 @@ fn in_wait_dispositions() {
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    let delta = Read::delta(
-        vid,
-        0,
-        1,
-        &gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode(),
-        schema.layout_digest(),
-    );
+    let delta = Read::Delta {
+        view: vid,
+        after_tick: 0,
+        reply_layout: schema.layout_digest(),
+        spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None)
+            .encode()
+            .into(),
+    };
     let spans = Read::KeySpans { tid, cols: PkColList::from_slice(&[1]) };
     let ddl = DirectGroup {
         targets: GroupTargets {
@@ -365,13 +366,14 @@ fn a_burst_passes_what_another_cut_owes() {
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    let delta = Read::delta(
-        vid,
-        0,
-        1,
-        &gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode(),
-        schema.layout_digest(),
-    );
+    let delta = Read::Delta {
+        view: vid,
+        after_tick: 0,
+        reply_layout: schema.layout_digest(),
+        spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None)
+            .encode()
+            .into(),
+    };
     let keys = pk_keys(&[1]);
     sal.excl().write(&addressed(delta, 1, false)).expect("group fits");
     {

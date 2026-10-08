@@ -21,8 +21,6 @@ pub enum ChildKind<'a> {
     Rows,
     /// Operator-state table `child` of a compiled view.
     Scratch(&'a str),
-    /// A fed view's retained deltas.
-    Delta,
     /// Secondary index over column list `cols` of the relation.
     Index(PkColList),
 }
@@ -41,7 +39,6 @@ impl ChildKind<'_> {
         match self {
             ChildKind::Rows => None,
             ChildKind::Scratch(child) => Some(format!("scratch_{child}")),
-            ChildKind::Delta => Some("delta".to_string()),
             ChildKind::Index(cols) => {
                 let list: Vec<String> = cols.as_slice().iter().map(u32::to_string).collect();
                 Some(format!("idx_{}", list.join("-")))
@@ -92,7 +89,6 @@ impl<'a> ChildAddr<'a> {
         let slot = (rank < of).then_some(Slot { rank, of })?;
         let kind = match prefix {
             None => ChildKind::Rows,
-            Some("delta") => ChildKind::Delta,
             Some(p) => match p.strip_prefix("idx_") {
                 Some(list) => {
                     let cols: Vec<u32> = list.split('-').map(|c| c.parse().ok()).collect::<Option<_>>()?;

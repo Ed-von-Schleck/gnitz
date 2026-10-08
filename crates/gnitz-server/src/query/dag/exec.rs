@@ -74,7 +74,7 @@ impl DagEngine {
 }
 
 /// Seal `source` and run its whole dependent closure over what the seal answers,
-/// stamping fed views' deltas with `round`.
+/// fed views' deltas captured as `round`.
 pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result<(), String> {
     let (dag, registry) = host.parts();
     let delta = match registry.seal(source)? {

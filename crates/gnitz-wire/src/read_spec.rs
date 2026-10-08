@@ -168,22 +168,6 @@ impl PkKeys {
         self.bytes.chunks_exact(self.stride())
     }
 
-    /// Whether `key`, of this list's stride, is one of its keys.
-    #[inline]
-    pub fn contains(&self, key: &[u8]) -> bool {
-        debug_assert_eq!(key.len(), self.stride());
-        let (mut lo, mut hi) = (0, self.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match self.bytes[mid * self.stride()..][..self.stride()].cmp(key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return true,
-            }
-        }
-        false
-    }
-
     /// The first and last key, or `None` for an empty list.
     pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
         let first = self.iter().next()?;

@@ -186,16 +186,12 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>, rows: Option<&Batch>) -> Res
             gnitz_wire::ReadSpec::decode(spec)?,
             reply_layout,
         )?)),
-        Read::Delta { view, after_tick, cut_round, ref read } => {
-            let (spec, reply_layout) = Read::delta_parts(read);
-            Ok(Rows::Shared(cat.registry.delta_read(
-                view,
-                after_tick,
-                cut_round,
-                gnitz_wire::ReadSpec::decode(spec)?,
-                reply_layout,
-            )?))
-        }
+        Read::Delta { view, after_tick, reply_layout, ref spec } => Ok(Rows::Shared(cat.registry.delta_read(
+            view,
+            after_tick,
+            gnitz_wire::ReadSpec::decode(spec)?,
+            reply_layout,
+        )?)),
         Read::KeySpans { tid, cols } => {
             if KEY_SPANS_ERROR.armed() {
                 return Err("injected key-spans fault".into());

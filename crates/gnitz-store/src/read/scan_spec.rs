@@ -11,7 +11,7 @@ use super::SkeletonHydrator;
 use crate::relation::{Cut, RelationKind, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
-use gnitz_zset::repr::{Batch, SkeletonKeys, SourceCursor};
+use gnitz_zset::repr::{Batch, SkeletonKeys};
 use gnitz_zset::schema::SchemaDescriptor;
 
 impl RelationRegistry {
@@ -22,7 +22,7 @@ impl RelationRegistry {
         target_id: u64,
         spec: ReadSpec,
         reply_layout: u64,
-        hydrator: Option<&mut dyn SkeletonHydrator>,
+        mut hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, String> {
         let entry = self.relation_or_err(target_id)?;
         if entry.kind() == RelationKind::Stream {
@@ -38,28 +38,15 @@ impl RelationRegistry {
             return Ok(entry.full_scan());
         }
         let ReadSpec { bound, predicate, sink } = spec;
-        let (source, walk) = self.open_bound(target_id, bound, Cut::Now)?;
+        let (mut source, walk) = self.open_bound(target_id, bound, Cut::Now)?;
         // A bad predicate and a bad walk are both a corrupt request: the client
         // pre-compiled the identical program at plan time.
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let mut sink = SinkPlan::from_wire(&src_schema, &sink, self.config.adhoc_group_cap)?;
         check_layout(reply_layout, sink.output_schema())?;
-        self.drive(target_id, source, &mut filter, &mut sink, hydrator)?;
-        Ok(Rc::new(sink.finish()))
-    }
-
-    /// Feed `sink` the rows of `source` that `filter` keeps, a chunk at a time,
-    /// until it needs no more. Each skeleton row a chunk meets is replaced by that
-    /// key's rows, recomputed through `hydrator`.
-    pub(super) fn drive(
-        &self,
-        id: u64,
-        mut source: SourceCursor,
-        filter: &mut RowFilter,
-        sink: &mut SinkPlan,
-        mut hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<(), String> {
+        // Each skeleton row a chunk meets is replaced by that key's rows,
+        // recomputed through `hydrator`.
         let chunk_rows = self.config.scan_chunk_rows;
         let mut ranges = Vec::new();
         for drain_rows in drain_ramp(sink.first_drain(chunk_rows), chunk_rows) {
@@ -70,14 +57,14 @@ impl RelationRegistry {
                 break;
             };
             if !skeletons.keys.is_empty() {
-                chunk = hydrate(self, id, hydrator.as_deref_mut(), chunk, skeletons)?;
+                chunk = hydrate(self, target_id, hydrator.as_deref_mut(), chunk, skeletons)?;
             }
             filter.ranges(&chunk.as_mem_batch(), &mut ranges);
             if sink.push(&chunk, &mut ranges)? {
                 break;
             }
         }
-        Ok(())
+        Ok(Rc::new(sink.finish()))
     }
 }
 

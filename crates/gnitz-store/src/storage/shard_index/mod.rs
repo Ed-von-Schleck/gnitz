@@ -297,30 +297,6 @@ impl FLSMLevel {
     }
 }
 
-/// What bounds this store's registered shard bytes, and what a sweep does to
-/// its victim.
-#[derive(Clone, Copy)]
-pub(crate) enum ShardBudget {
-    /// Every store but a capacity-bounded view's output store and a delta store.
-    Unbounded,
-    /// `CREATE VIEW … WITH (capacity = …)`: evict by leaving skeleton rows behind.
-    Dehydrate(u64),
-    /// A view's delta store: evict by unlinking the guard outright — its rows are
-    /// the change itself, so there is no summed weight worth a stub of.
-    Drop(u64),
-}
-
-impl ShardBudget {
-    /// The ceiling, for the targets that read the number and not the eviction it
-    /// implies.
-    fn cap(self) -> Option<u64> {
-        match self {
-            ShardBudget::Unbounded => None,
-            ShardBudget::Dehydrate(cap) | ShardBudget::Drop(cap) => Some(cap),
-        }
-    }
-}
-
 pub(super) struct ShardIndex {
     pub(super) output_dir: String,
     pub schema: SchemaDescriptor,
@@ -343,12 +319,10 @@ pub(super) struct ShardIndex {
     /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of one terminal run, floored at [`MIN_GUARD_BYTES`] and
     /// persisted in the manifest header.
     l0_run_bytes: u64,
-    /// What bounds this store's registered on-disk shard bytes, and how a sweep
-    /// evicts. Unbounded for every store but a capacity-bounded view's output
-    /// store and a view's delta store.
-    budget: ShardBudget,
-    /// The highest key any drop removed. Zero until the first drop.
-    dropped_max: PkBuf,
+    /// `CREATE VIEW … WITH (capacity = …)`: the registered shard bytes past
+    /// which a sweep leaves skeleton rows behind. `None` for every store but a
+    /// capacity-bounded view's output store.
+    capacity: Option<u64>,
     /// Passed to every shard write.
     skip_pk_filter: bool,
     /// What the in-place guard folds so far cancelled per retraction they read.
@@ -401,7 +375,7 @@ impl ShardIndex {
     pub(super) fn open(
         output_dir: &str,
         schema: SchemaDescriptor,
-        budget: ShardBudget,
+        capacity: Option<u64>,
         skip_pk_filter: bool,
         shards: &ShardSet,
     ) -> Result<Self, StorageError> {
@@ -414,8 +388,7 @@ impl ShardIndex {
             published_through: 0,
             retired: Vec::new(),
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
-            budget,
-            dropped_max: PkBuf::zeroed(schema.pk_stride()),
+            capacity,
             skip_pk_filter,
             cancel_yield: CancelYield::FRESH,
             // A reopened tree is asked once whether it owes anything.
@@ -461,11 +434,6 @@ impl ShardIndex {
             }))
             .collect();
         ShardSet { run_bytes: self.l0_run_bytes, entries }
-    }
-
-    /// The highest key any drop removed; see [`Self::drop_guard`].
-    pub(super) fn dropped_max(&self) -> PkBuf {
-        self.dropped_max
     }
 
     /// Publish `schema`, rebinding every registered shard to it. A failure on any

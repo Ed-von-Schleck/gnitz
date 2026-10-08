@@ -10,16 +10,16 @@ use gnitz_zset::algebra::index_entries;
 use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
-use crate::storage::{RecoverySource, ShardBudget, Table};
+use crate::storage::{RecoverySource, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
 use gnitz_zset::schema::{Placement, Slot};
 
 mod build;
 mod circuit_state;
-mod delta;
 mod dirs;
 mod disk_usage;
+mod feed;
 mod ingest;
 mod repartition;
 mod store;
@@ -27,10 +27,10 @@ mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-pub(crate) use delta::{delta_round, delta_round_prefix};
 use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
+pub(crate) use feed::Feed;
 use store::Store;
 
 // ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ pub struct Relation {
     /// A stream's pushes since its last seal. Nothing reads them before it, so
     /// they are held as they arrived.
     unsealed: Option<Batch>,
-    delta: Option<Box<Table>>,
+    feed: Option<Feed>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
     placement: Placement,
@@ -261,9 +261,9 @@ pub struct Relation {
 }
 
 impl Relation {
-    /// This relation's delta store, if this process serves its feed.
-    pub(crate) fn delta(&self) -> Option<&Table> {
-        self.delta.as_deref()
+    /// This relation's delta feed, if this process serves it.
+    pub(crate) fn feed(&self) -> Option<&Feed> {
+        self.feed.as_ref()
     }
 
     /// By value, for the reason [`SecondaryIndex::cols`] is: the `tables` borrow
@@ -522,7 +522,7 @@ impl RelationRegistry {
                 ChildKind::Index(ix.cols),
                 index_schema,
                 RecoverySource::Rederive { resume_at },
-                ShardBudget::Unbounded,
+                None,
             )?));
             if !ix.resumed() {
                 let owner_store = &self.tables[&owner].store;
