@@ -46,6 +46,11 @@ pub(super) struct Running {
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
+        self.settled_entries().chain(&self.pending)
+    }
+
+    /// Every shard at or below the store's cut.
+    fn settled_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.levels.iter().flat_map(FLSMLevel::entries)
     }
 
@@ -56,6 +61,7 @@ impl ShardIndex {
         self.levels
             .iter_mut()
             .flat_map(|l| l.guards.iter_mut().flat_map(|g| g.entries.iter_mut()))
+            .chain(&mut self.pending)
     }
 
     /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
@@ -88,6 +94,30 @@ impl ShardIndex {
         self.levels[L0].get_or_create_guard(whole).entries.push(entry);
         self.owed = true;
         Ok(())
+    }
+
+    /// Write `run`, rows above the store's cut, as one unpublished shard outside
+    /// every level.
+    pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        let entry = self.write_shard(run, false, None)?;
+        self.pending.push(entry);
+        Ok(())
+    }
+
+    /// The shards above the cut.
+    pub(crate) fn pending_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.pending.iter().map(|e| Rc::clone(&e.shard))
+    }
+
+    /// Move the cut past every pending shard: each enters L0 as it stands.
+    pub(crate) fn seal_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let whole = PkBuf::zeroed(self.schema.pk_stride());
+        let pending = std::mem::take(&mut self.pending);
+        self.levels[L0].get_or_create_guard(whole).entries.extend(pending);
+        self.owed = true;
     }
 
     /// Whether the tree may owe a fold. Set by every shard that enters it and
@@ -150,7 +180,7 @@ impl ShardIndex {
     /// them to the guards whose own folds then cancel them.
     fn l0_cancels(&self) -> bool {
         let retractions: usize = self.levels[L0].entries().map(|e| e.shard.retraction_rows()).sum();
-        retractions > 0 && self.cancels(retractions, self.all_entries().map(|e| e.shard.row_count()).sum())
+        retractions > 0 && self.cancels(retractions, self.settled_entries().map(|e| e.shard.row_count()).sum())
     }
 
     /// Write `run` as one unpublished shard at the terminal level, under a new
@@ -194,19 +224,27 @@ impl ShardIndex {
         self.published_through = self.shard_seq;
     }
 
-    /// Every shard.
-    pub(crate) fn shard_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.all_entries().map(|e| Rc::clone(&e.shard))
+    /// Every shard; the pending ones iff `pending`.
+    pub(crate) fn shard_arcs(&self, pending: bool) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.settled_entries()
+            .chain(self.pending.iter().filter(move |_| pending))
+            .map(|e| Rc::clone(&e.shard))
     }
 
-    /// Every shard whose PK extent meets `[lo, hi]`.
-    pub(crate) fn shard_arcs_in_range(&self, lo: PkBuf, hi: PkBuf) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    /// Every shard whose PK extent meets `[lo, hi]`; the pending ones iff `pending`.
+    pub(crate) fn shard_arcs_in_range(
+        &self,
+        lo: PkBuf,
+        hi: PkBuf,
+        pending: bool,
+    ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.levels
             .iter()
             .flat_map(move |level| {
                 let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
                 level.guards[run].iter().flat_map(|g| g.entries.iter())
             })
+            .chain(self.pending.iter().filter(move |_| pending))
             .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
             .map(|e| Rc::clone(&e.shard))
     }
@@ -251,6 +289,11 @@ impl ShardIndex {
                 }
             }
         }
+        for e in &self.pending {
+            if let Some(row) = e.probe_pk_bytes(key, filter_key) {
+                visitor(&e.shard, row);
+            }
+        }
     }
 
     /// Start `fold`: pin its inputs and verify them.
@@ -259,7 +302,7 @@ impl ShardIndex {
             .sources
             .iter()
             .map(|seq| {
-                self.all_entries()
+                self.settled_entries()
                     .find(|e| e.seq == *seq)
                     .expect("a fold names registered shards")
             })
@@ -389,7 +432,9 @@ impl ShardIndex {
     pub(crate) fn clear(&mut self) {
         self.abandon_fold();
         let levels = std::mem::take(&mut self.levels);
-        self.retire(levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries));
+        let settled = levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries);
+        let pending = std::mem::take(&mut self.pending);
+        self.retire(settled.chain(pending));
     }
 
     /// The next fold the tree owes, or `None` when it owes none. What costs no

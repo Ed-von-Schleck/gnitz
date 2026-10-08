@@ -1,4 +1,4 @@
-//! Unified Table: four [`RunSet`]s in RAM over a `ShardIndex`.
+//! Unified Table: three [`RunSet`]s in RAM over a `ShardIndex`.
 //!
 //! Ingest lands in the `memtable` run set and folds into the `ram_tier` once it
 //! passes its byte budget; the RAM tier spills to a shard past its own ceiling,
@@ -7,8 +7,8 @@
 //! A store's runs are its history in order, so a read may stop short of the
 //! newest: a pending ingest lands in the `pending` run set, above the store's
 //! [`Cut`], and [`Table::seal`] moves the cut past it. A barrier that comes
-//! first writes the pending rows down with the rest and keeps their negation
-//! in `flushed`, which a reader at the cut reads in `pending`'s place.
+//! first writes the pending rows to shards the disk tier holds apart, which a
+//! reader at the cut leaves out.
 
 use std::cell::Cell;
 use std::fs;
@@ -88,9 +88,6 @@ pub(crate) struct Table {
     /// Runs ingested above the cut, folded among themselves only: [`Self::seal`]
     /// moves them into `memtable` as one run.
     pending: RunSet,
-    /// The pending rows a barrier wrote into the disk tier, negated: a reader at
-    /// [`Cut::Sealed`] reads them where one at [`Cut::Now`] reads `pending`.
-    flushed: RunSet,
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
@@ -180,10 +177,8 @@ impl Table {
         // A rederived store's shards carry no PK filter.
         let skip_pk_filter = rederived;
         Ok(Table {
-            // Neither is ever full: the budget only sizes `pending`'s PK filter, to
-            // a tick's worth of rows, and nothing probes `flushed`.
+            // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
             pending: RunSet::new(MEMTABLE_BYTES),
-            flushed: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(ram_tier_bytes),
             shard_index: ShardIndex::open(dir, schema, shard, skip_pk_filter, &shards)?,
@@ -242,7 +237,6 @@ impl Table {
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         self.shard_index.swap_schema(schema)?;
         self.pending.widen_runs(&schema);
-        self.flushed.widen_runs(&schema);
         self.memtable.widen_runs(&schema);
         self.ram_tier.widen_runs(&schema);
         self.cached_full_scan.set(None);
@@ -284,7 +278,6 @@ impl Table {
     pub(crate) fn clear(&mut self) {
         self.cached_full_scan.set(None);
         self.pending.clear();
-        self.flushed.clear();
         self.memtable.clear();
         self.ram_tier.clear();
         self.shard_index.clear();
@@ -303,7 +296,7 @@ impl Table {
 
     /// Whether any row sits above the cut.
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending.len() > 0 || self.flushed.len() > 0
+        self.pending.len() > 0 || self.shard_index.pending_arcs().next().is_some()
     }
 
     /// Move the cut past every pending row and answer them, consolidated: the
@@ -322,17 +315,17 @@ impl Table {
         {
             self.memtable.fold(&schema);
         }
-        let delta = match self.flushed.take(&schema) {
-            None => run,
-            // A barrier since the last seal wrote part of the delta into the shards.
-            Some(flushed) => {
-                let flushed = Rc::unwrap_or_clone(flushed).negated();
-                Some(Rc::new(match run {
-                    Some(run) => flushed.merged_consolidated(&run, &schema),
-                    None => flushed,
-                }))
+        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
+        let delta = match shards.is_empty() {
+            true => run,
+            // A barrier since the last seal left part of the delta in shards.
+            false => {
+                let cap = shards.len() + 1;
+                let mem = run.into_iter().map(Run::Mem);
+                Some(from_runs(mem.chain(shards), schema, cap).materialize())
             }
         };
+        self.shard_index.seal_pending();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -377,11 +370,9 @@ impl Table {
 
     /// The heap-resident tiers `cut` reads, newest first.
     fn ram_tiers(&self, cut: Cut) -> impl Iterator<Item = &RunSet> + Clone {
-        let above = match cut {
-            Cut::Now => &self.pending,
-            Cut::Sealed => &self.flushed,
-        };
-        [above, &self.memtable, &self.ram_tier].into_iter()
+        [&self.pending, &self.memtable, &self.ram_tier]
+            .into_iter()
+            .skip(usize::from(cut == Cut::Sealed))
     }
 
     /// The heap-resident runs whose PK extent meets the inclusive `bound`; `None`
@@ -401,7 +392,7 @@ impl Table {
     /// Every run `cut` reads.
     pub(crate) fn runs(&self, cut: Cut) -> impl Iterator<Item = Run> + '_ {
         self.mem_runs(None, cut)
-            .chain(self.shard_index.shard_arcs().map(Run::Shard))
+            .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
     }
 
     /// Open a read-only cursor over the rows `cut` reads.
@@ -438,9 +429,11 @@ impl Table {
             start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
             "range_cursor: a bound is not pk_stride wide",
         );
-        let runs = self
-            .mem_runs(Some((start, hi)), cut)
-            .chain(self.shard_index.shard_arcs_in_range(start, hi).map(Run::Shard));
+        let runs = self.mem_runs(Some((start, hi)), cut).chain(
+            self.shard_index
+                .shard_arcs_in_range(start, hi, cut == Cut::Now)
+                .map(Run::Shard),
+        );
         let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
@@ -477,7 +470,7 @@ impl Table {
     /// Every registered shard.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.shard_index.shard_arcs().collect()
+        self.shard_index.shard_arcs(true).collect()
     }
 
     /// `(L0 shard count, L1 and terminal guard counts)`.

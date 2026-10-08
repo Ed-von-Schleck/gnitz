@@ -379,8 +379,8 @@ fn barrier_seal_bench() {
         let barrier_peak = mib(resident);
         assert_eq!(
             t.all_shard_arcs().len(),
-            1,
-            "one shard holds the tier and the pending rows"
+            1 + usize::from(tier > 0),
+            "the tier's shard, and the pending rows' own"
         );
         let resident = perf::Resident::baseline();
         let (delta, seal) = counter.measure(|| t.seal().unwrap());

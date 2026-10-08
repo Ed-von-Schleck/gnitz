@@ -137,8 +137,8 @@ proptest! {
         let mut t = open();
         let (mut live, mut sealed, mut durable) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut stream = stream.into_iter().cycle();
-        // A barrier writes into L0 whatever L0 holds, so L0 is at its trigger
-        // only once the upkeep has run.
+        // A reopen finds the pending shards its last barrier published in L0,
+        // however many they are, until the next upkeep.
         for op in ops {
             match op {
                 Op::Ingest(n) | Op::IngestPending(n) => {
@@ -537,8 +537,8 @@ fn a_seal_folds_the_memtable_only_for_a_sizable_delta() {
     assert_eq!(t.memtable.len(), 1, "a delta as long as the memtable folds it");
 }
 
-/// A seal pays the disk tier's upkeep for the shards the barriers before it
-/// wrote into L0, whether or not its delta also overflows the memtable.
+/// A seal that moves pending shards into L0 runs the disk tier's upkeep,
+/// whether or not its delta also overflows the memtable.
 #[test]
 fn a_seal_that_enters_shards_into_l0_compacts_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -563,11 +563,7 @@ fn a_seal_that_enters_shards_into_l0_compacts_it() {
             // Past the memtable's budget, under the RAM tier's.
             push(&mut t, 100..10_100);
         }
-        assert_eq!(
-            t.level_shape().0,
-            L0_COMPACT_THRESHOLD + 1,
-            "each barrier wrote a shard into L0"
-        );
+        assert_eq!(t.level_shape().0, 0, "pending shards sit outside L0");
         let delta = t.seal().unwrap().expect("rows were pending");
         assert_eq!(t.level_shape().0, 0, "overflow={overflow}: the seal folded L0 into L1");
         assert_eq!(t.level_shape().1[0], 1, "overflow={overflow}: L1 holds the fold");

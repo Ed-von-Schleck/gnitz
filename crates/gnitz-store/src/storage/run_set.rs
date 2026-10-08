@@ -194,18 +194,12 @@ impl RunSet {
         Ok(())
     }
 
-    /// Fold to a single run and answer it; this set is left empty. `None` when
-    /// the set is empty or fully cancelled.
-    pub(super) fn take(&mut self, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+    /// Fold to a single run, move it into `dst` and answer it; this set is left
+    /// empty. `None` when the set is empty or fully cancelled.
+    pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
         self.fold(schema);
         let run = self.runs.pop();
         self.clear();
-        run
-    }
-
-    /// [`Self::take`], the run moved into `dst` as well.
-    pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
-        let run = self.take(schema);
         if let Some(run) = &run {
             dst.push_run(Rc::clone(run), schema);
         }

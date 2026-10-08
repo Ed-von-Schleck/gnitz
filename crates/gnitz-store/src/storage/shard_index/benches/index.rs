@@ -80,7 +80,7 @@ fn shard_probe_bench() {
             let (selected, instructions) = counter.measure(|| {
                 let mut selected = Vec::with_capacity(bounds.len());
                 for &(lo, hi) in &bounds {
-                    selected.push(idx.shard_arcs_in_range(lo, hi).count());
+                    selected.push(idx.shard_arcs_in_range(lo, hi, true).count());
                 }
                 selected
             });

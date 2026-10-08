@@ -3,7 +3,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use io_uring::types::FsyncFlags;
 
@@ -106,17 +105,12 @@ impl Table {
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
-        // Rows above the cut are written with the rest, and their negation kept
-        // for a reader at the cut. The spill leaves the run unshared, so it is
-        // negated where it stands; a failed spill still holds it, and then it is
-        // copied — either way both cuts read what they read.
+        self.spill_ram_tier()?;
+        // Rows above the cut go to a shard of their own, which no compaction
+        // folds below it.
         let schema = self.shard_index.schema;
-        let above = self.pending.drain_into(&mut self.ram_tier, &schema);
-        let spilled = self.spill_ram_tier();
-        if let Some(run) = above {
-            self.flushed.push(Rc::unwrap_or_clone(run).negated(), &schema);
-        }
-        spilled?;
+        self.pending
+            .spill(&schema, |run| self.shard_index.append_pending_run(run))?;
         // A manifest names a tree; a fold under way has outputs in none.
         self.shard_index.finish_fold()?;
         let bytes = manifest::encode(&Manifest {

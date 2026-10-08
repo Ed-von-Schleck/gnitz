@@ -960,11 +960,11 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, L1, gk(base), &dense_batch(base, 200), i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk))
+        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), true)
             .count()
     };
 
-    assert_eq!(idx.shard_arcs().count(), 4);
+    assert_eq!(idx.shard_arcs(true).count(), 4);
     assert_eq!(count(1100, Some(1100)), 1, "a point read routes to one guard");
     assert_eq!(count(1100, Some(2100)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
@@ -1705,7 +1705,7 @@ fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
     }
 
     // The full cursor.
-    let cursor = from_runs(idx.shard_arcs().map(Run::Shard), idx.schema, idx.shard_count());
+    let cursor = from_runs(idx.shard_arcs(true).map(Run::Shard), idx.schema, idx.shard_count());
     if skeleton {
         let mut src = gnitz_zset::repr::SourceCursor::Full(Box::new(cursor));
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
@@ -1915,7 +1915,7 @@ fn tier_folds_keep_the_zset() {
             if reopen {
                 idx = reopened_under(idx, budget);
             }
-            let shards: Vec<Rc<MappedShard>> = idx.shard_arcs().collect();
+            let shards: Vec<Rc<MappedShard>> = idx.shard_arcs(true).collect();
             let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
             let mut held: BTreeMap<(u64, i64), i64> = BTreeMap::new();
             let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();

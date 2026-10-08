@@ -326,6 +326,10 @@ pub(super) struct ShardIndex {
     pub schema: SchemaDescriptor,
 
     levels: [FLSMLevel; LEVELS],
+    /// Shards a flush wrote of rows above the store's cut: read by every reader
+    /// but one at the cut, compacted with nothing, and entered into L0 by
+    /// [`Self::seal_pending`]. A reopen finds them in L0.
+    pending: Vec<ShardEntry>,
 
     /// The last seq drawn; a shard is named by its seq.
     shard_seq: u64,
@@ -405,6 +409,7 @@ impl ShardIndex {
             output_dir: output_dir.to_string(),
             schema,
             levels: Default::default(),
+            pending: Vec::new(),
             shard_seq: 0,
             published_through: 0,
             retired: Vec::new(),
@@ -435,6 +440,7 @@ impl ShardIndex {
 
     /// The shard set this index publishes.
     pub(super) fn shard_set(&self) -> ShardSet {
+        let whole = PkBuf::zeroed(self.schema.pk_stride());
         let entries = (0u64..)
             .zip(&self.levels)
             .flat_map(|(level, l)| {
@@ -447,6 +453,12 @@ impl ShardIndex {
                     })
                 })
             })
+            .chain(self.pending.iter().map(|e| ManifestEntry {
+                seq: e.seq,
+                newest: e.newest,
+                level: L0 as u64,
+                guard_key: whole,
+            }))
             .collect();
         ShardSet { run_bytes: self.l0_run_bytes, entries }
     }
