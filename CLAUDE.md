@@ -341,7 +341,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-expr` | The one expression evaluator, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
 | `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
-| `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle |
+| `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
 | `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |

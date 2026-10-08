@@ -389,7 +389,7 @@ impl Host for PendingHost {
         &mut self,
         _: Interest,
         _: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         self.asked = !self.asked;
         if self.asked {
@@ -550,4 +550,38 @@ fn block_on_refuses_a_host_that_pends() {
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
     let _ = block_on(c.alloc_id());
+}
+
+/// A host that fails ends the session as that failure: the replies it owed
+/// resolve as what went wrong, and the loop ends once its calls have.
+#[test]
+fn serve_ends_the_session_as_the_hosts_failure() {
+    struct Failing;
+    impl Host for Failing {
+        fn attach(&mut self, _: BorrowedFd<'_>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll_io(
+            &mut self,
+            _: Interest,
+            _: &mut Context<'_>,
+            _: &mut dyn FnMut(Interest) -> bool,
+        ) -> Poll<Result<(), ClientError>> {
+            Poll::Ready(Err(std::io::Error::other("the reactor is gone").into()))
+        }
+        fn spawn(&mut self, _: Job) {}
+    }
+    let (s, _peer) = session_pair();
+    let c = GnitzClient::over(s, Box::new(Failing)).unwrap();
+    let owed: Arc<Mutex<Option<Sent<u64>>>> = Arc::default();
+    let out = Arc::clone(&owed);
+    let mut call: Option<Op> = Some(Box::new(move |c| {
+        Box::pin(async move { *out.lock().unwrap() = Some(c.ack(Request::AllocIds(1)).detach()) })
+    }));
+    block_on(serve(c, |_| Poll::Ready(call.take())));
+    let failed = owed.lock().unwrap().take().unwrap().try_take();
+    assert!(
+        matches!(&failed, Some(Err(e)) if e.to_string().contains("the reactor is gone")),
+        "{failed:?}"
+    );
 }

@@ -282,14 +282,16 @@ pub trait Host: Send {
     /// this host's drop — either of which comes before the socket closes.
     fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()>;
 
-    /// Once the socket is ready for any of `want`, run `io` on what is ready.
-    /// `io` reads until the socket has no more, and answers what the client
-    /// still waits for: write, if the socket refused bytes.
+    /// Once the socket is ready for any of `want`, step the client on what is
+    /// ready by calling `io`. It answers whether bytes are still waiting to be
+    /// written: after a write, ones the socket refused. Read readiness is spent
+    /// by the call — before it asks again, the client reads on by itself until
+    /// the socket has no more.
     fn poll_io(
         &mut self,
         want: Interest,
         cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>>;
 
     /// Run `job` where it may block. A host that cannot run it drops it.
@@ -324,19 +326,19 @@ impl Host for BlockingHost {
         &mut self,
         want: Interest,
         _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         let fd = self.fd.expect("a client attaches its host before it waits");
         // A socket takes bytes until it says otherwise, so asking first would
         // be a syscall per request.
         if want.write && !self.refused {
-            self.refused = io(Interest::WRITE).write;
+            self.refused = io(Interest::WRITE);
             return Poll::Ready(Ok(()));
         }
         loop {
             match poll_fd(fd, want.poll_events(), None) {
                 Ok(revents) => {
-                    self.refused = io(Interest::from_revents(revents)).write;
+                    self.refused = io(Interest::from_revents(revents));
                     return Poll::Ready(Ok(()));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -379,7 +381,7 @@ fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -
     }
     host.poll_io(want, cx, &mut |ready| {
         session.step(ready);
-        session.interest()
+        session.interest().write
     })
 }
 
@@ -404,8 +406,6 @@ pub struct Pending<'a, T> {
     client: &'a mut GnitzClient,
     sent: Sent<T>,
 }
-
-impl<T> Unpin for Pending<'_, T> {}
 
 impl<'a, T> Pending<'a, T> {
     /// A refusal that sent nothing is the reply.
@@ -465,15 +465,18 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
             }
             match poll_turn(session, &mut **host, cx) {
                 Poll::Ready(Ok(())) => {}
-                // The replies outstanding resolve as the session's end.
-                Poll::Ready(Err(_)) => session.close(),
+                // The replies outstanding resolve as the host's failure.
+                Poll::Ready(Err(e)) => session.end(e),
                 Poll::Pending => return Poll::Pending,
             }
         })
         .await;
         let Some(op) = op else { return };
-        // A connection that is gone refuses the op's own requests.
-        let _ = client.make_room().await;
+        // A connection that is gone refuses the op's own requests, as what
+        // ended it.
+        if let Err(e) = client.make_room().await {
+            client.session.end(e);
+        }
         op(&mut client).await;
     }
 }

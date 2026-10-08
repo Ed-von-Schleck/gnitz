@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gnitz_core::{BatchAppender, ClientError, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES};
+use gnitz_core::{
+    BatchAppender, ClientError, GnitzClient, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+};
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::control::{append_frame, peek_control_block, ControlHeader};
 use gnitz_wire::{
@@ -51,23 +53,37 @@ fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> impl Future<Output = Res
     c.send(move |c| c.push(tid, &schema(), batch, WireConflictMode::Update))
 }
 
-/// A client connected to a peer that has answered its HELLO, and the peer's end.
-fn connect_to_peer(rt: &Runtime) -> (AsyncClient, Connection, UnixStream) {
+/// A listener on a socket of its own, and the path to it.
+fn listen() -> (UnixListener, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("peer.sock");
     let listener = UnixListener::bind(&path).expect("bind");
+    (listener, path.to_str().expect("utf-8 path").to_owned(), dir)
+}
+
+/// The next connection to `listener`, its HELLO answered.
+fn accept(listener: &UnixListener) -> UnixStream {
+    let (mut s, _) = listener.accept().expect("accept");
+    s.set_read_timeout(Some(PATIENCE)).unwrap();
+    read_frame(&mut s);
+    write_frame(&mut s, &gnitz_wire::HELLO);
+    s
+}
+
+/// A client connected to `listener`'s socket at `path`, and the peer's end.
+fn connect_to(rt: &Runtime, listener: UnixListener, path: &str) -> (GnitzClient, UnixStream) {
     // `connect` blocks until the HELLO is answered.
-    let peer = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().expect("accept");
-        s.set_read_timeout(Some(PATIENCE)).unwrap();
-        read_frame(&mut s);
-        write_frame(&mut s, &gnitz_wire::HELLO);
-        s
-    });
-    let (client, conn) = rt
-        .block_on(gnitz_tokio::connect(path.to_str().expect("utf-8 path")))
-        .expect("connect");
-    (client, conn, peer.join().unwrap())
+    let peer = std::thread::spawn(move || accept(&listener));
+    let client = rt.block_on(gnitz_tokio::connect(path)).expect("connect");
+    (client, peer.join().unwrap())
+}
+
+/// A shared client connected to a scripted peer, its driver, and the peer's end.
+fn connect_to_peer(rt: &Runtime) -> (AsyncClient, Connection, UnixStream) {
+    let (listener, path, _dir) = listen();
+    let (client, peer) = connect_to(rt, listener, &path);
+    let (client, conn) = gnitz_tokio::share(client);
+    (client, conn, peer)
 }
 
 /// The length the next frame's prefix states.
@@ -323,4 +339,42 @@ fn a_waiting_driver_is_not_polled() {
     peer.read_exact(&mut vec![0u8; len]).expect("the rest of the push");
     reply(&mut peer, 3, 33);
     assert_eq!(settled(&rt, stuck).unwrap(), 33);
+}
+
+/// A client its task owns awaits its verbs itself, with no driver; and a
+/// reconnect moves its registration to the new socket.
+#[test]
+fn an_owned_client_waits_on_the_runtime_and_reconnects() {
+    let rt = Runtime::new().unwrap();
+    let (listener, path, _dir) = listen();
+    let (mut client, peer) = connect_to(&rt, listener, &path);
+    let answering = |mut peer: UnixStream, tids: std::ops::RangeInclusive<u64>| {
+        std::thread::spawn(move || {
+            for tid in tids {
+                assert_eq!(request(&mut peer), tid);
+                reply(&mut peer, tid, tid * 11);
+            }
+            peer
+        })
+    };
+    let spec = ReadSpec::all_rows(ReadBound::None);
+
+    let answered = answering(peer, 1..=3);
+    settled(&rt, async {
+        assert_eq!(client.scan_spec(1, &spec, &schema()).await.unwrap().lsn, Some(11));
+        let first = client.scan_spec(2, &spec, &schema()).detach();
+        assert_eq!(client.scan_spec(3, &spec, &schema()).await.unwrap().lsn, Some(33));
+        assert_eq!(first.await.unwrap().lsn, Some(22));
+    });
+    let mut old = answered.join().unwrap();
+
+    let (listener, path, _dir) = listen();
+    let accepted = std::thread::spawn(move || accept(&listener));
+    settled(&rt, client.reconnect(&path)).unwrap();
+    assert_eq!(old.read(&mut [0]).map_err(|e| e.kind()), Ok(0), "the old socket closed");
+    let answered = answering(accepted.join().unwrap(), 4..=4);
+    settled(&rt, async {
+        assert_eq!(client.scan_spec(4, &spec, &schema()).await.unwrap().lsn, Some(44));
+    });
+    answered.join().unwrap();
 }

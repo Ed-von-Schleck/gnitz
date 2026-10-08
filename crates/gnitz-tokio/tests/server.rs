@@ -105,7 +105,7 @@ fn pipelined_verbs() {
         let (_blocking, tid, schema, sn) = table(&target);
         let (_, empty, ..) = table(&target);
         settled(&Runtime::new().unwrap(), async {
-            let (client, conn) = gnitz_tokio::connect(&target).await.expect("connect");
+            let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(&target).await.expect("connect"));
             let driver = tokio::spawn(conn);
 
             // Megabytes each way, so neither direction fits a socket buffer: writes
@@ -185,7 +185,7 @@ fn syscall_count_child() {
         .build()
         .unwrap();
     settled(&rt, async {
-        let (client, conn) = gnitz_tokio::connect(&target).await.unwrap();
+        let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(&target).await.unwrap());
         let pushes: Vec<_> = (0..BURST)
             .map(|pk| push(&client, tid, &schema, rows(&schema, pk..pk + 1)))
             .collect();
@@ -229,8 +229,7 @@ fn one_writev_per_burst() {
 // ── The shared client's mirror ────────────────────────────────────────────
 
 /// A shared client mirrors a view: calls from its clones run one at a time on
-/// the one client, the copy's disk work leaves the runtime's threads, and a
-/// local-first read routes on what the client mirrors.
+/// the one client, and a local-first read routes on what the client mirrors.
 #[test]
 fn a_shared_client_mirrors() {
     let srv = ServerHandle::start_n(4);
@@ -250,7 +249,7 @@ fn a_shared_client_mirrors() {
     push(0..50);
 
     settled(&Runtime::new().unwrap(), async {
-        let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
+        let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(srv.sock_path()).await.expect("connect"));
         let driver = tokio::spawn(conn);
         {
             let read = |tid| {

@@ -477,8 +477,8 @@ pub struct Session {
     transport: ClientTransport,
     pending: VecDeque<Slot>,
     submitted: u64,
-    /// The error every request gets once the session has ended — `Closed` or
-    /// `ConnectionLost`; `None` while it is open.
+    /// The error every request gets once the session has ended: what ended
+    /// it. `None` while it is open.
     ended: Option<ClientError>,
     /// The last read filled its window, so more may be waiting.
     unread: bool,
@@ -795,14 +795,14 @@ impl Session {
         }
     }
 
-    /// Whether this session refuses work: closed by its owner, or lost.
+    /// Whether this session has ended, and refuses work.
     pub fn is_closed(&self) -> bool {
         self.ended.is_some()
     }
 
     /// Fail every pending slot with `why` and refuse further work. The shutdown
     /// shows the server EOF now rather than when the session drops.
-    fn end(&mut self, why: ClientError) {
+    pub(crate) fn end(&mut self, why: ClientError) {
         if self.ended.is_some() {
             return;
         }
@@ -812,12 +812,6 @@ impl Session {
             slot.fail(why.clone(), polls);
         }
         self.ended = Some(why);
-    }
-
-    /// Close the session: every reply still owed arrives as `Closed`, as it
-    /// does for a session dropped.
-    pub fn close(&mut self) {
-        self.end(ClientError::Closed);
     }
 }
 

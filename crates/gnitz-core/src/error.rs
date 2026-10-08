@@ -11,7 +11,7 @@ pub enum ClientError {
     /// A refusal, classified by the status a caller branches on — sent by the
     /// server, or raised by a client-side check in the same terms.
     Refused(WireFault),
-    /// The session's owner closed it; it accepts no further work.
+    /// The session that owed the reply is gone.
     Closed,
     /// The connection failed: every request outstanding on it, and every later
     /// one, carries this one cause.

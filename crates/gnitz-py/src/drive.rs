@@ -352,7 +352,7 @@ impl Host for LoopHost {
         &mut self,
         want: Interest,
         _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         let ready = {
             let mut st = self.shared.state();
@@ -368,10 +368,10 @@ impl Host for LoopHost {
             }
             return Poll::Pending;
         }
-        let left = io(ready);
+        let refused = io(ready);
         if ready.write {
             // The loop watches for writability only while the socket refuses bytes.
-            Python::attach(|py| self.shared.watch(py, true, left.write));
+            Python::attach(|py| self.shared.watch(py, true, refused));
         }
         Poll::Ready(Ok(()))
     }

@@ -352,12 +352,12 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
 }
 
 #[test]
-fn close_abandons_every_pending_slot_and_refuses_further_work() {
+fn end_abandons_every_pending_slot_and_refuses_further_work() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
     let mut owed = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa).unwrap());
     assert_eq!(s.interest(), Interest::BOTH);
-    s.close();
+    s.end(ClientError::Closed);
     for sent in &mut owed {
         assert!(matches!(sent.try_take(), Some(Err(ClientError::Closed))));
     }

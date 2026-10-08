@@ -301,7 +301,7 @@ impl Host for Interruptible {
         &mut self,
         want: Interest,
         cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         if self.armed.swap(false, Ordering::Relaxed) {
             let why: Box<dyn std::error::Error + Send + Sync> = "interrupted".into();

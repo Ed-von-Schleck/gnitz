@@ -1,7 +1,7 @@
 //! The Rust async client: `gnitz-core`'s client on tokio's reactor.
 //!
-//! [`client`] is a `gnitz-core` client that waits on this runtime, for the task
-//! that owns it; [`connect`] is the same client shared among tasks.
+//! [`connect`] is a `gnitz-core` client that waits on this runtime, for the task
+//! that owns it; [`share`] hands one to a driver, and tasks share the handle.
 
 use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -30,8 +30,9 @@ fn fired(
 
 impl Host for TokioHost {
     fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
-        // The old socket is still open, so its number is still its own, and
-        // its registration goes only once the new one is made.
+        // Registered before the old registration drops, so a socket the
+        // reactor refuses leaves this host on the old one. That one is still
+        // open here, so the two are different fds.
         self.fd = Some(AsyncFd::new(fd.as_raw_fd())?);
         Ok(())
     }
@@ -43,7 +44,7 @@ impl Host for TokioHost {
         &mut self,
         want: Interest,
         cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> Interest,
+        io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         let fd = self.fd.as_ref().expect("a client attaches its host before waiting");
         let read = match want.read {
@@ -61,13 +62,13 @@ impl Host for TokioHost {
         if ready.is_empty() {
             return Poll::Pending;
         }
-        let left = io(ready);
-        // `AsyncFd` reports edges: a read ran the socket dry, and a write did
-        // only if bytes are left.
+        let refused = io(ready);
+        // `AsyncFd` reports edges. The client reads the socket dry before it
+        // asks again; write readiness lasts until the socket refuses bytes.
         if let Some(mut guard) = read {
             guard.clear_ready();
         }
-        if let (Some(mut guard), true) = (write, left.write) {
+        if let (Some(mut guard), true) = (write, refused) {
             guard.clear_ready();
         }
         Poll::Ready(Ok(()))
@@ -81,18 +82,19 @@ impl Host for TokioHost {
 
 /// Connect to `target`, on the blocking pool, and hand back a client whose
 /// verbs wait on this runtime.
-pub async fn client(target: &str) -> Result<GnitzClient, ClientError> {
+pub async fn connect(target: &str) -> Result<GnitzClient, ClientError> {
     GnitzClient::connect_with(target, Box::new(TokioHost::default())).await
 }
 
-/// Connect to `target` and hand back the handle paired with the driver that
-/// serves it. Nothing reaches the connection until the [`Connection`] is
-/// polled.
-pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
-    let client = client(target).await?;
+/// Share `client` among tasks: the handle, paired with the driver that serves
+/// it. Nothing reaches the connection until the [`Connection`] is polled.
+///
+/// The driver waits the way `client`'s host does, so `client` is one
+/// [`connect`] made: a blocking host would park a runtime thread.
+pub fn share(client: GnitzClient) -> (AsyncClient, Connection) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Op>();
     let driver = serve(client, move |cx| rx.poll_recv(cx));
-    Ok((AsyncClient { tx }, Connection(Box::pin(driver))))
+    (AsyncClient { tx }, Connection(Box::pin(driver)))
 }
 
 /// The handle to a [`Connection`], shared by cloning. Its calls run on the one
