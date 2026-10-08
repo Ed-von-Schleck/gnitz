@@ -55,34 +55,23 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     let aggs = &shape.aggs[..];
 
     let groups = match shape.key.runs(delta) {
-        Some(runs) if runs.len() == 1 || 2 * runs.len() <= delta.count => {
+        Some(ranges) if ranges.len() == 1 || 2 * ranges.len() <= delta.count => {
             // An extreme recedes only on a retraction, so an all-insert group's
             // extremes are its rows' and its stored row's: no probe.
             let probes: Vec<bool> = match indexed {
-                true => runs
+                true => ranges
                     .iter()
-                    .map(|run| run.len() > PRESTEP_CAP || weights[run].iter().any(retracts))
+                    .map(|&(s, e)| e - s > PRESTEP_CAP || weights[s..e].iter().any(retracts))
                     .collect(),
                 false => Vec::new(),
             };
-            let probed = runs
+            let probed = ranges
                 .iter()
                 .zip(&probes)
-                .filter_map(|(run, &probe)| probe.then_some(run.start));
-            let ends = (0, runs.last_start());
-            let mut groups = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, runs.len());
-            // One run — a delta of one row, a global aggregate — names its range in place.
-            let (whole, spans);
-            let ranges: &[(usize, usize)] = match runs.len() {
-                1 => {
-                    whole = [(0, delta.count)];
-                    &whole
-                }
-                _ => {
-                    spans = runs.iter().map(|run| (run.start, run.end)).collect::<Vec<_>>();
-                    &spans
-                }
-            };
+                .filter_map(|(&(start, _), &probe)| probe.then_some(start));
+            let ends = (0, ranges[ranges.len() - 1].0);
+            let mut groups = GroupEmit::new(plan, &mb, trace_out, history, ends, probed, ranges.len());
+            let ranges = &ranges[..];
             // A probed run's extremes come off the index: an extreme folds the
             // runs with each of those emptied, so it steps none of its rows.
             let unprobed: Vec<(usize, usize)>;

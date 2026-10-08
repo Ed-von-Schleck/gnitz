@@ -5,6 +5,8 @@
 //! its behalf.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -222,4 +224,47 @@ pub(crate) fn map_shard(path: &Path, batch: &Batch) -> Rc<MappedShard> {
 /// are rejected by `SchemaDescriptor::new`).
 pub(crate) fn arb_pk_type() -> impl Strategy<Value = TypeCode> {
     arb_type_code().prop_filter("type code must be PK-eligible", |&tc| tc.is_pk_eligible())
+}
+
+/// Strings that are prefixes of one another, one escaping `0x00`, and two that
+/// share more leading bytes than an index key's lead slot holds.
+pub(crate) const STRS: [&str; 6] = [
+    "",
+    "a",
+    "ab",
+    "\0b",
+    "shared-lead-slot-prefix-x",
+    "shared-lead-slot-prefix-y",
+];
+
+/// Floats `total_cmp` tells apart though `==` does not, and the ones it places
+/// past every finite value.
+pub(crate) const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
+
+/// Ticks of `(row, target multiplicity)`: each moves some rows of a small pool
+/// to a new multiplicity in `0..=3`, so a row recurs across ticks and most
+/// ticks retract.
+pub(crate) fn arb_ticks<R: Copy + Debug + 'static>(
+    row: impl Strategy<Value = R>,
+) -> impl Strategy<Value = Vec<Vec<(R, i64)>>> {
+    use proptest::collection::vec;
+    vec(row, 1..6).prop_flat_map(|pool| vec(vec((proptest::sample::select(pool), 0i64..=3), 0..6), 1..6))
+}
+
+/// The retractions and insertions moving `model` to each `target` — so a delta
+/// carries cancelling pairs and weight-0 rows, and the integrated input stays
+/// a relation.
+pub(crate) fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(R, i64)]) -> Vec<(R, i64)> {
+    let mut delta = Vec::new();
+    for &(row, target) in targets {
+        let cur = model.insert(row, target).unwrap_or(0);
+        delta.extend([(row, -cur), (row, target)]);
+    }
+    model.retain(|_, w| *w != 0);
+    delta
+}
+
+/// A bijection of `u64` that scatters consecutive values.
+pub(crate) fn mix(i: u64) -> u64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }

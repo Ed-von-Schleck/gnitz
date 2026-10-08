@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{index_spec_and_schema, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::pk_payload_schema;
+use crate::test_support::{mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -28,7 +28,7 @@ fn reindex_pack_bench() {
     for i in 0..N as u64 {
         jb.begin_row(i as u128, 1i64);
         jb.put_int((i.wrapping_mul(2_654_435_761)) as u128);
-        jb.put_int((i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u128);
+        jb.put_int(mix(i) as u128);
         jb.put_int((!i) as u128);
         jb.put_int((i as i32).wrapping_mul(-3) as u32 as u128);
         jb.put_blob(format!("key-{}", i % 50_000).as_bytes());

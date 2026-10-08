@@ -10,7 +10,7 @@ use proptest::prelude::*;
 
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use crate::test_support::{assert_folds, cell, le_cell, TestTrace};
+use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, le_cell, TestTrace, FLOATS, STRS};
 use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind};
 
 use super::op_reduce::op_reduce;
@@ -248,19 +248,6 @@ const GROUPS: [&[u32]; 8] = [&[], &[1, 3], &[1], &[3], &[6], &[0], &[3, 2], &[0,
 
 const VALS: [i64; 5] = [i64::MIN, -1, 0, 1, i64::MAX];
 const IDS: [u64; 4] = [0, 1, 1 << 63, u64::MAX];
-/// Strings that are prefixes of one another, one escaping `0x00`, and two that
-/// share more leading bytes than an index key's lead slot holds.
-const STRS: [&str; 6] = [
-    "",
-    "a",
-    "ab",
-    "\0b",
-    "shared-lead-slot-prefix-x",
-    "shared-lead-slot-prefix-y",
-];
-/// Floats `total_cmp` tells apart though `==` does not, and the ones it places
-/// past every finite value.
-const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
 /// Dyadic and non-zero, so a sum of them is exact in any order and never `-0.0`.
 const DYADICS: [f32; 4] = [-1.5, 0.25, 2.0, 4.5];
 /// Pairs equal in their high and in their low eight bytes.
@@ -288,30 +275,6 @@ fn arb_row() -> impl Strategy<Value = Row> {
             w,
             n,
         })
-}
-
-/// Each tick moves some rows of a small pool to a new multiplicity in `0..=3`,
-/// so a row recurs across ticks and most ticks retract.
-fn arb_ticks() -> impl Strategy<Value = Vec<Vec<(Row, i64)>>> {
-    prop::collection::vec(arb_row(), 1..6).prop_flat_map(|pool| {
-        prop::collection::vec(
-            prop::collection::vec((prop::sample::select(pool), 0i64..=3), 0..6),
-            1..6,
-        )
-    })
-}
-
-/// The retractions and insertions moving `model` to each `target` — so a delta
-/// carries cancelling pairs and weight-0 rows, and the integrated input stays
-/// a relation.
-fn delta_to(model: &mut BTreeMap<Row, i64>, targets: &[(Row, i64)]) -> Vec<(Row, i64)> {
-    let mut delta = Vec::new();
-    for &(row, target) in targets {
-        let cur = model.insert(row, target).unwrap_or(0);
-        delta.extend([(row, -cur), (row, target)]);
-    }
-    model.retain(|_, w| *w != 0);
-    delta
 }
 
 const fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
@@ -346,7 +309,7 @@ proptest! {
         aggs in arb_aggs(),
         seeds in any::<bool>(),
         folded in any::<bool>(),
-        ticks in arb_ticks(),
+        ticks in arb_ticks(arb_row()),
     ) {
         let ground = seeds && group_cols.is_empty();
         let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, ground).unwrap());
@@ -369,7 +332,7 @@ proptest! {
             aggs.retain(|d| !(d.agg_op == AggFunc::Sum && d.col_idx == 5));
             aggs
         }),
-        ticks in arb_ticks(),
+        ticks in arb_ticks(arb_row()),
     ) {
         let partial = || Harness::new(ReducePlan::partial(&schema(), &aggs).unwrap().unwrap());
         let mut workers = [partial(), partial()];
@@ -548,11 +511,10 @@ fn the_output_is_the_key_the_group_columns_and_the_aggregates() {
     assert_eq!(output(&[]), (layout(&[(U128, false)], true), vec![0]));
 }
 
-/// Only counts and integer sums split into per-worker partials: a float sum
-/// depends on the order a split would change, and an extreme has no partial a
-/// retraction could be subtracted from.
+/// Every aggregate but a float sum splits into per-worker partials: a float sum
+/// depends on the order a split would change.
 #[test]
-fn only_counts_and_integer_sums_split() {
+fn every_aggregate_but_a_float_sum_splits() {
     for (extra, splits) in [
         (agg(AggFunc::Count, 4), true),
         (agg(AggFunc::CountNonNull, 2), true),
@@ -566,8 +528,6 @@ fn only_counts_and_integer_sums_split() {
         assert_eq!(partial.is_some(), splits, "{extra:?}");
     }
 }
-
-// ---- proposed tests (appended to stream/reduce/tests/reduce.rs) ----
 
 /// A scalar extreme sharing the 16-byte value slot a wide extreme forces writes
 /// its 8 image bytes and then zeroes, so the same value always keys the same

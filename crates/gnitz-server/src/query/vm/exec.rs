@@ -333,13 +333,12 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 stream::op_reduce(delta, &mut open_out, history, plan)
             }
 
-            Op::TopN { out_trace, index, plan } => {
+            Op::TopN { index, plan } => {
                 let delta = &batches[in_reg.at()];
-                // Ingested before the index is opened, as the reduce's is.
-                let res = stores.own.ingest(*index, plan.index_batch(delta));
+                let epoch = stream::op_topn(delta, &mut stores.open(Trace::Child(*index)), plan);
+                let res = stores.own.ingest(*index, epoch.index_entries);
                 res.map_err(|e| ingest_err("topn index", *index, e))?;
-                let mut open_out = stores.open(stores.trace(*out_trace)?);
-                stream::op_topn(delta, &mut open_out, &mut stores.open(Trace::Child(*index)), plan)
+                epoch.out
             }
         };
         batches[out_reg.at()] = out;

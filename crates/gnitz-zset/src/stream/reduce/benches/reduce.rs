@@ -2,13 +2,9 @@ use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::pk_payload_schema;
+use crate::test_support::{mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, AggFunc};
-
-fn mix(i: u64) -> u64 {
-    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
 
 /// A U64 PK, the `group` columns, then one `value` column.
 fn grouped_schema(group: &[SchemaColumn], value: SchemaColumn) -> SchemaDescriptor {

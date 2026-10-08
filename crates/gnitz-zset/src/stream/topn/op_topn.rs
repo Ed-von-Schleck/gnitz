@@ -1,10 +1,10 @@
 //! Incremental TOP-N: δ_out = TopN(history + δ_in) − TopN(history), per group
 //! the delta touched.
 
-use std::ops::ControlFlow;
+use std::cmp::Ordering;
 
-use crate::repr::Batch;
-use crate::schema::MAX_PK_BYTES;
+use crate::repr::{pk_prefix_group_end, Batch};
+use crate::schema::payload_order::compare_full_rows;
 use crate::stream::OpenAt;
 
 use super::plan::TopNPlan;
@@ -12,85 +12,112 @@ use super::plan::TopNPlan;
 /// The most rows the output batch reserves up front; it grows past that.
 const MAX_TOPN_CAP_HINT: usize = 1 << 16;
 
-/// Visits only the groups `delta` touched — the only ones whose window can have
-/// moved — retracting each stored window and re-emitting the post-delta one,
-/// both `O(offset + limit)`; the output fold cancels a row that held its slot.
-/// `trace_out` opens the output's history and `history` the operator's index,
-/// populated with this epoch's rows before the call; each is opened at the
-/// touched groups.
-pub fn op_topn(delta: &Batch, trace_out: OpenAt<'_>, history: OpenAt<'_>, plan: &TopNPlan) -> Batch {
-    let output_schema = &plan.output_schema;
-    let n = delta.count;
-    let mb = delta.as_mem_batch();
+/// The weight slots of one group still to skip, then to keep.
+#[derive(Clone, Copy, PartialEq)]
+struct Window {
+    skip: u64,
+    keep: u64,
+}
 
-    let groups = plan.key.ordinals(delta);
-    // Each group's first live row; a group whose every delta row is a ghost was
-    // not touched.
-    const UNTOUCHED: u32 = u32::MAX;
-    let mut exemplars = vec![UNTOUCHED; groups.len()];
-    for (row, &g) in groups.ord.iter().enumerate() {
-        if exemplars[g as usize] == UNTOUCHED && mb.get_weight(row) != 0 {
-            exemplars[g as usize] = row as u32;
-        }
+impl Window {
+    /// How many of the next element's `weight` slots fall in the window.
+    #[inline]
+    fn take(&mut self, weight: i64) -> i64 {
+        let slots = weight.max(0) as u64;
+        let skipped = slots.min(self.skip);
+        self.skip -= skipped;
+        let take = (slots - skipped).min(self.keep);
+        self.keep -= take;
+        take as i64
     }
+}
 
-    // Groups ascend in output-PK order, so the `trace_out` probes do too.
-    let touched = || {
-        groups.by_pk.iter().filter_map(|&g| match exemplars[g as usize] {
-            UNTOUCHED => None,
-            row => Some(row as usize),
-        })
-    };
-    let (Some(lo), Some(hi)) = (touched().next(), touched().next_back()) else {
-        return Batch::empty_with_schema(output_schema);
-    };
-    let mut trace_out = trace_out(plan.key.out_pk(&mb, lo).bytes(), plan.key.out_pk(&mb, hi).bytes());
-    let (first, last) = plan.index.group_span(&mb, touched()).expect("a touched group");
-    let mut history = history(first.pk_bytes(), last.pk_bytes());
+/// One epoch of a top-N.
+pub struct TopNEpoch {
+    /// δ_out.
+    pub out: Batch,
+    /// What the epoch adds to the index, which `op_topn` read without it.
+    pub index_entries: Batch,
+}
 
-    // A retracted and a re-emitted window per touched group.
-    let window = usize::try_from(plan.limit).map_or(usize::MAX, |l| l.saturating_mul(2));
-    let cap = window
-        .saturating_mul(groups.len())
-        .min(n)
-        .max(window)
-        .min(MAX_TOPN_CAP_HINT);
-    let mut out = Batch::with_capacity(output_schema, cap);
-    let mut key = [0u8; MAX_PK_BYTES];
+/// Walks each touched group's stored rows and delta entries together in index
+/// order, emitting every element at its share of the new window less its share
+/// of the old.
+pub fn op_topn(delta: &Batch, history: OpenAt<'_>, plan: &TopNPlan) -> TopNEpoch {
+    let index = &plan.index;
+    // Entry `i` is delta row `i`'s, until a fold moves it to where `moved` records.
+    let mut folded = index.batch(delta, plan.key.carried());
+    debug_assert_eq!(folded.count, delta.count);
+    let mut moved: Vec<(u32, u32, i64)> = Vec::new();
+    let folds = !folded.stands_consolidated();
+    match folds {
+        true => folded = Batch::consolidated_from(&folded, &mut moved),
+        false => folded.certify_consolidated(),
+    }
+    let delta_row = |entry: usize| if folds { moved[entry].1 as usize } else { entry };
+    let entries = folded.as_mem_batch();
+    let n = entries.count;
+    if n == 0 {
+        return TopNEpoch {
+            out: Batch::empty_with_schema(&plan.output_schema),
+            index_entries: folded,
+        };
+    }
+    let group = index.group_bytes();
+    let prefix = |row: usize| &entries.get_pk_bytes(row)[..group];
+    let mut history = history(prefix(0), prefix(n - 1));
 
-    for exemplar in touched() {
-        let out_pk = plan.key.out_pk(&mb, exemplar);
-        let out_pk_bytes = out_pk.bytes();
-
-        // −TopN(history): the stored rows, at minus their stored weight.
-        trace_out.for_each_positive_with_prefix(out_pk_bytes, |c| c.copy_current_row_into(&mut out, -c.current_weight));
-
-        // +TopN(history + δ): the window of the post-delta index. Only a
-        // positive entry fills a slot: the input is a relation, bag-positive by
-        // the contract every reduce reads.
-        let prefix = plan.index.group_prefix(&mut key, &mb, exemplar);
-        let mut skip = plan.offset;
-        let mut budget = plan.limit;
-        history.for_each_positive_with_prefix_until(prefix, |c| {
-            let slots = c.current_weight as u64;
-            let skipped = slots.min(skip);
-            skip -= skipped;
-            let take = (slots - skipped).min(budget);
-            if take > 0 {
-                budget -= take;
-                let (src, row) = c.current_row_source();
-                out.begin_row(out_pk_bytes, take as i64);
-                out.append_cells_from(0, &plan.index.carried_in_index, src, row);
+    let mb = delta.as_mem_batch();
+    let mut out = Batch::with_capacity(&plan.output_schema, n.min(MAX_TOPN_CAP_HINT));
+    let fresh = Window { skip: plan.offset, keep: plan.limit };
+    let mut next = 0;
+    while next < n {
+        let end = pk_prefix_group_end(&entries, next, group);
+        let out_pk = plan.key.out_pk(&mb, delta_row(next));
+        let out_pk = out_pk.bytes();
+        let prefix = prefix(next);
+        history.seek_pk_group_ascending(prefix);
+        let (mut old, mut new) = (fresh, fresh);
+        // Past the group's last entry, windows in one state take alike from every later row.
+        while (next < end || old != new) && (old.keep != 0 || new.keep != 0) {
+            let stored = history.valid && history.current_pk_bytes().starts_with(prefix);
+            // The next element in index order: the stored row, the entry, or both as one.
+            let ord = match (stored, next < end) {
+                (false, false) => break,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (true, true) => {
+                    let (src, at) = history.current_row_source();
+                    compare_full_rows(&index.schema, src, at, &entries, next)
+                }
+            };
+            let (at_stored, at_entry) = (ord.is_le(), ord.is_ge());
+            let w_old = if at_stored { history.current_weight } else { 0 };
+            let w_new = w_old.wrapping_add(if at_entry { entries.get_weight(next) } else { 0 });
+            let share = new.take(w_new) - old.take(w_old);
+            if share != 0 {
+                out.begin_row(out_pk, share);
+                match at_stored {
+                    true => {
+                        let (src, at) = history.current_row_source();
+                        out.append_cells_from(0, &index.carried_in_index, src, at);
+                    }
+                    false => out.append_cells_from(0, &index.carried_in_index, &entries, next),
+                }
                 out.commit_row();
             }
-            match budget {
-                0 => ControlFlow::Break(()),
-                _ => ControlFlow::Continue(()),
+            if at_stored {
+                history.advance();
             }
-        });
+            if at_entry {
+                // A full new window takes nothing more, so no later entry moves anything.
+                next = if new.keep == 0 { end } else { next + 1 };
+            }
+        }
+        next = end;
     }
-
-    let out = out.into_consolidated();
-    gnitz_debug!("op_topn: in={} groups={} out={}", n, groups.len(), out.count);
-    out
+    TopNEpoch {
+        out: out.into_consolidated(),
+        index_entries: folded,
+    }
 }

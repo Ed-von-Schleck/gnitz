@@ -42,7 +42,7 @@ pub(super) fn whole<'a>(
     meta: &'a ViewMeta,
     store: bool,
 ) -> Result<EmitCtx<'a>, String> {
-    let mut ctx = EmitCtx::new(loaded, registry, meta, store.then(|| (VIEW, loaded.out())));
+    let mut ctx = EmitCtx::new(loaded, registry, meta, store.then_some(VIEW));
     for (nid, op) in loaded.ops() {
         let reg = emit_node(&mut ctx, nid, op)?;
         ctx.regs.push(reg);

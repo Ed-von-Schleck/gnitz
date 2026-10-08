@@ -10,6 +10,7 @@ use crate::test_support::{
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 
 /// A consolidated `Rc<Batch>` over [`make_schema_u128_i64`]: `(pk, weight, payload)`
@@ -133,7 +134,10 @@ proptest! {
             for n in [1, stride] {
                 let want = rows_where(&|p, w| p[..n] == k[..n] && w > 0);
                 let mut positive = Vec::new();
-                open().for_each_positive_with_prefix(&k[..n], |c| positive.push(current(c)));
+                open().for_each_positive_with_prefix_until(&k[..n], |c| {
+                    positive.push(current(c));
+                    ControlFlow::Continue(())
+                });
                 prop_assert_eq!(&positive, &want);
             }
         }

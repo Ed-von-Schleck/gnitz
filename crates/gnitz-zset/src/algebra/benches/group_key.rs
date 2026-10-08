@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
-use crate::test_support::{pk_payload_schema, u64_pk_schema};
+use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
 
 /// Instructions per row of [`GroupOutKey::ordinals`] over 262 144 unconsolidated
 /// rows, per key form: in 1000 groups, where a key that hashes is hashed into
@@ -38,7 +38,7 @@ fn group_ordinals_bench() {
             let mut bb = BatchBuilder::new(schema);
             for i in 0..N {
                 // Odd, so distinct for every row at any column width.
-                let g = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let g = mix(i);
                 let g = if groups == N { g } else { g % groups };
                 // The group in every grouped column, the row number in every other.
                 let cell = |c: usize| {
@@ -51,8 +51,14 @@ fn group_ordinals_bench() {
                 bb.end_row();
             }
             let batch = bb.finish();
-            std::hint::black_box(key.ordinals(&batch));
-            let (ordinals, instructions) = counter.measure(|| key.ordinals(&batch));
+            std::hint::black_box(
+                key.runs(&batch)
+                    .map_or_else(|| key.numbered(&batch), |r| GroupOrdinals::of_runs(&r)),
+            );
+            let (ordinals, instructions) = counter.measure(|| {
+                key.runs(&batch)
+                    .map_or_else(|| key.numbered(&batch), |r| GroupOrdinals::of_runs(&r))
+            });
             assert_eq!(ordinals.len() as u64, groups, "{label}");
             std::hint::black_box(&ordinals.ord);
             println!(

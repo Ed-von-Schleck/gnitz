@@ -96,13 +96,8 @@ impl DagEngine {
         Ok(placement)
     }
 
-    /// Whether nothing reads the rows of view `id`'s store once its chain is
-    /// built: a compiled segment's, unless a reduce or top-N of its own reads them
-    /// as its output trace.
-    ///
-    /// A segment's rows are otherwise read by the backfills of the chain members
-    /// that scan it and by nothing else: its circuit keeps what it needs of them in
-    /// traces, and a tick hands its delta to its readers directly.
+    /// Whether view `id` is a chain segment whose store no reduce of its own
+    /// reads back.
     fn passes_through(&self, id: u64) -> bool {
         self.views
             .get(&id)

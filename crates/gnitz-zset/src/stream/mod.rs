@@ -33,4 +33,4 @@ pub type OpenAt<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> ReadCursor;
 pub use clamp::op_weight_clamp;
 pub use join::{op_join_delta_trace, JoinPlan};
 pub use reduce::{op_reduce, ReducePlan};
-pub use topn::{op_topn, TopNPlan};
+pub use topn::{op_topn, TopNEpoch, TopNPlan};

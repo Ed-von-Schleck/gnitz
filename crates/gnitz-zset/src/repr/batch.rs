@@ -1214,15 +1214,19 @@ impl Batch {
 
     /// Sort and weight-fold `batch` into a fresh certified batch — the
     /// consolidation slow path the entry points above share.
-    ///
-    /// The fold runs first so the arena is sized to the survivor count, not the
-    /// input row count.
     fn consolidate_into_new(batch: &Batch) -> Batch {
+        Self::consolidated_from(batch, &mut Vec::with_capacity(batch.count))
+    }
+
+    /// [`Self::consolidate_into_new`], handing back in `survivors` what
+    /// [`merge::consolidate_groups`] found: per output row, the `batch` row it is.
+    #[inline(always)]
+    pub(crate) fn consolidated_from(batch: &Batch, survivors: &mut Vec<(u32, u32, i64)>) -> Batch {
         let schema = &batch.schema;
         let mb = batch.as_mem_batch();
-        let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
-        merge::consolidate_groups(&mb, schema, &mut survivors);
-        let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), schema, &survivors);
+        // Folded first, so the arena is sized to the survivors.
+        merge::consolidate_groups(&mb, schema, survivors);
+        let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), schema, survivors);
         result.certify_consolidated();
         result
     }

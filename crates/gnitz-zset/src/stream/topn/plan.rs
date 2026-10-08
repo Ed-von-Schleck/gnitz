@@ -1,7 +1,6 @@
 //! `TopNPlan` — everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 
-use crate::repr::Batch;
 use crate::schema::ColumnTable;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::OrderKey;
@@ -13,14 +12,14 @@ use crate::algebra::GroupOutKey;
 pub struct TopNPlan {
     /// The group key region a reduce over the same group set would have, then
     /// every input column not in that region, in input schema order.
-    pub output_schema: SchemaDescriptor,
+    pub(super) output_schema: SchemaDescriptor,
     /// How a row's group is found and keyed in the output.
     pub(super) key: GroupOutKey,
     /// Weight slots to skip, then to keep, per group. `limit ≥ 1`.
     pub(super) offset: u64,
     pub(super) limit: u64,
     /// The ordered index of every input row this operator is maintained through.
-    pub index: TopNIndex,
+    pub(super) index: TopNIndex,
 }
 
 impl TopNPlan {
@@ -42,9 +41,14 @@ impl TopNPlan {
         Ok(TopNPlan { output_schema, key, offset, limit, index })
     }
 
-    /// The index entries `delta` contributes; see [`TopNIndex::batch`].
-    pub fn index_batch(&self, delta: &Batch) -> Batch {
-        self.index.batch(delta, self.key.carried())
+    /// The layout `op_topn` emits under this plan.
+    pub fn output_schema(&self) -> &SchemaDescriptor {
+        &self.output_schema
+    }
+
+    /// The layout of the ordered index the operator is maintained through.
+    pub fn index_schema(&self) -> &SchemaDescriptor {
+        &self.index.schema
     }
 
     /// One worker's window of a global top-N: its first `limit + offset` slots,

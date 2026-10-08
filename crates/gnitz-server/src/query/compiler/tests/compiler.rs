@@ -164,9 +164,9 @@ fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<Compil
                     .output_schema(),
             ),
             OpNode::TopN { order, limit, offset, .. } => Some(
-                gnitz_zset::stream::TopNPlan::from_wire(&schema, &[], order, *limit, *offset)
+                *gnitz_zset::stream::TopNPlan::from_wire(&schema, &[], order, *limit, *offset)
                     .unwrap()
-                    .output_schema,
+                    .output_schema(),
             ),
             _ => None,
         })

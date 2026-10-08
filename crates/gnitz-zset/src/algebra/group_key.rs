@@ -3,8 +3,6 @@
 //! over it stamps, and the one grouping mechanism built on it — a group is its
 //! output PK.
 
-use std::ops::Range;
-
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::key::{pk_width_dispatch, NarrowPkOpk, PkSortKey};
@@ -270,30 +268,23 @@ impl GroupOutKey {
 
     /// `batch`'s groups as row runs, where its rows already stand in ascending
     /// output-PK order; `None` where they need not.
-    pub(crate) fn runs(&self, batch: &Batch) -> Option<GroupRuns> {
+    pub(crate) fn runs(&self, batch: &Batch) -> Option<Vec<(usize, usize)>> {
         let mb = &batch.as_mem_batch();
         let n = mb.count;
         match &self.key {
             // One run, with no key to compute.
-            _ if n <= 1 || self.is_global() => Some(GroupRuns::of(n, |_| ())),
+            _ if n <= 1 || self.is_global() => Some(equal_runs(n, |_| ())),
             // A consolidated batch is in PK order, so already grouped by any PK prefix.
             &GroupKey::PkRange { at: 0, n: w } if batch.is_consolidated() => Some(pk_width_dispatch!(w, |K| {
-                GroupRuns::of(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)))
+                equal_runs(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)))
             })),
             _ => None,
         }
     }
 
-    /// `batch`'s groups as one ordinal per row.
-    pub(crate) fn ordinals(&self, batch: &Batch) -> GroupOrdinals {
-        match self.runs(batch) {
-            Some(runs) => GroupOrdinals::of_runs(&runs),
-            None => self.numbered(batch),
-        }
-    }
-
-    /// [`Self::ordinals`] of a batch [`Self::runs`] does not answer for: its
-    /// rows hashed into groups while those are few for the rows, else sorted.
+    /// The groups of a batch [`Self::runs`] does not answer for, as one ordinal
+    /// per row: its rows hashed into groups while those are few for the rows,
+    /// else sorted.
     pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
         let mb = &batch.as_mem_batch();
         let n = mb.count;
@@ -330,48 +321,23 @@ fn packed_identity<L: IdentityLoop>(p: &ReindexPacker, mb: &MemBatch, body: L) -
     body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]))
 }
 
-/// A batch's groups as contiguous row runs, in ascending output-PK order.
-pub(crate) struct GroupRuns {
-    /// Each run's exclusive end row, ascending; the last is the row count.
-    ends: Vec<u32>,
-}
-
-impl GroupRuns {
-    /// The runs of equal adjacent keys over rows `0..n`.
-    fn of<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Self {
-        let mut ends = Vec::new();
-        if n == 0 {
-            return GroupRuns { ends };
+/// The runs of equal adjacent keys over rows `0..n`, each as `[start, end)`.
+fn equal_runs<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    if n == 0 {
+        return runs;
+    }
+    let (mut start, mut prev) = (0, key(0));
+    for i in 1..n {
+        let k = key(i);
+        if k != prev {
+            runs.push((start, i));
+            start = i;
         }
-        let mut prev = key(0);
-        for i in 1..n {
-            let k = key(i);
-            if k != prev {
-                ends.push(i as u32);
-            }
-            prev = k;
-        }
-        ends.push(n as u32);
-        GroupRuns { ends }
+        prev = k;
     }
-
-    /// The group count.
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.ends.len()
-    }
-
-    /// The first row of the last group; row 0 for no group.
-    #[inline]
-    pub(crate) fn last_start(&self) -> usize {
-        self.ends.iter().rev().nth(1).map_or(0, |&e| e as usize)
-    }
-
-    /// Each group's row range, ascending.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = Range<usize>> + '_ {
-        let starts = std::iter::once(0).chain(self.ends.iter().map(|&e| e as usize));
-        starts.zip(self.ends.iter().map(|&e| e as usize)).map(|(s, e)| s..e)
-    }
+    runs.push((start, n));
+    runs
 }
 
 /// Fewest rows per group at which hashing a batch's rows into groups costs
@@ -401,12 +367,12 @@ impl GroupOrdinals {
     }
 
     /// Run `g` is group `g`.
-    pub(crate) fn of_runs(runs: &GroupRuns) -> Self {
-        let mut ord = Vec::with_capacity(runs.ends.last().map_or(0, |&e| e as usize));
+    pub(crate) fn of_runs(runs: &[(usize, usize)]) -> Self {
+        let mut ord = Vec::with_capacity(runs.last().map_or(0, |&(_, end)| end));
         let mut first = Vec::with_capacity(runs.len());
-        for (g, run) in runs.iter().enumerate() {
-            first.push(run.start as u32);
-            ord.extend(std::iter::repeat_n(g as u32, run.len()));
+        for (g, &(start, end)) in runs.iter().enumerate() {
+            first.push(start as u32);
+            ord.extend(std::iter::repeat_n(g as u32, end - start));
         }
         GroupOrdinals {
             ord,

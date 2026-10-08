@@ -178,7 +178,7 @@ pub(super) fn compile_view(
     meta: &ViewMeta,
     bounded: bool,
 ) -> Result<(CompileOutput, StateLayout), String> {
-    let mut ctx = EmitCtx::new(loaded, registry, meta, (!bounded).then(|| (view_id, loaded.out())));
+    let mut ctx = EmitCtx::new(loaded, registry, meta, (!bounded).then_some(view_id));
     for (nid, op) in loaded.ops() {
         let reg = emit_node(&mut ctx, nid, op)?;
         ctx.regs.push(reg);

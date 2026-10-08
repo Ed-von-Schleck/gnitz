@@ -7,11 +7,11 @@ use proptest::prelude::*;
 
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use crate::test_support::{assert_folds, cell, TestTrace};
+use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, TestTrace, FLOATS, STRS};
 use gnitz_expr::{cmp_order_keys, order_locators};
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
-use super::op_topn::op_topn;
+use super::op_topn::{op_topn, TopNEpoch};
 use super::plan::TopNPlan;
 
 /// `[U64 id (pk), I64 grp, I64 val NULL, STRING s NULL, F64 f]`.
@@ -59,19 +59,20 @@ fn batch(rows: &[(Row, i64)]) -> Batch {
     b.finish()
 }
 
-/// The operator with its two traces, driven the way the VM drives it.
-struct Harness {
-    plan: TopNPlan,
-    index: TestTrace,
-    trace_out: TestTrace,
+/// The operator with its index, driven the way the VM drives it.
+pub(super) struct Harness {
+    pub(super) plan: TopNPlan,
+    pub(super) index: TestTrace,
+    /// The integral of the output, which only the test reads.
+    out: TestTrace,
     /// Output column → the input column it holds; `None` for a synthetic key.
     layout: Vec<Option<usize>>,
 }
 
 impl Harness {
-    fn new(plan: TopNPlan, group_cols: &[u32]) -> Self {
+    pub(super) fn new(plan: TopNPlan, group_cols: &[u32]) -> Self {
         let index = TestTrace::new(plan.index.schema);
-        let trace_out = TestTrace::new(plan.output_schema);
+        let out = TestTrace::new(plan.output_schema);
         let layout = schema()
             .reduce_out_key(group_cols)
             .output_layout(group_cols, 0..5)
@@ -81,27 +82,29 @@ impl Harness {
                 ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => Some(c as usize),
             })
             .collect();
-        Harness { plan, index, trace_out, layout }
+        Harness { plan, index, out, layout }
     }
 
-    /// One epoch: populate, run, integrate the output. Returns the raw delta.
+    /// One epoch: run, add the returned entries to the index, integrate the
+    /// output. Returns the raw delta.
     fn tick(&mut self, delta: &Batch) -> Batch {
-        self.index.ingest(self.plan.index_batch(delta));
-        let (index, trace_out) = (&self.index, &self.trace_out);
-        let out = op_topn(
-            delta,
-            &mut |first, last| trace_out.cursor_within(first, last),
-            &mut |first, last| index.cursor_within(first, last),
-            &self.plan,
+        let index = &self.index;
+        let TopNEpoch { out, index_entries: entries } =
+            op_topn(delta, &mut |first, last| index.cursor_within(first, last), &self.plan);
+        assert_folds(
+            &[self.plan.index.batch(delta, self.plan.key.carried())],
+            &entries,
+            "op_topn's index entries",
         );
+        self.index.ingest(entries);
         assert_folds(std::slice::from_ref(&out), &out, "op_topn's delta");
-        self.trace_out.ingest(out.clone());
+        self.out.ingest(out.clone());
         out
     }
 
     /// The maintained output, each row read back as the input row it carries.
     fn state(&self) -> BTreeMap<Cells, i64> {
-        let b = self.trace_out.cursor().materialize();
+        let b = self.out.cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema;
         (0..b.count)
@@ -152,21 +155,6 @@ fn window(
     want
 }
 
-/// Strings that are prefixes of one another, one escaping `0x00`, and two that
-/// share more leading bytes than an index key's lead slot holds.
-const STRS: [&str; 6] = [
-    "",
-    "a",
-    "ab",
-    "\0b",
-    "shared-lead-slot-prefix-x",
-    "shared-lead-slot-prefix-y",
-];
-
-/// Floats `total_cmp` tells apart though `==` does not, and the ones it places
-/// past every finite value.
-const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
-
 fn arb_row() -> impl Strategy<Value = Row> {
     (
         0u64..4,
@@ -188,32 +176,8 @@ fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
     )
 }
 
-/// Each tick moves some rows of a small pool to a new multiplicity in `0..=3`,
-/// as a retraction of the old one and an insertion of the new — so a row recurs
-/// across ticks and most ticks retract, a delta carries cancelling pairs and
-/// weight-0 rows, and the integrated input stays a relation.
-fn arb_ticks() -> impl Strategy<Value = Vec<Vec<(Row, i64)>>> {
-    prop::collection::vec(arb_row(), 1..6).prop_flat_map(|pool| {
-        prop::collection::vec(
-            prop::collection::vec((prop::sample::select(pool), 0i64..=3), 0..6),
-            1..6,
-        )
-    })
-}
-
 fn arb_bound() -> impl Strategy<Value = u64> {
     prop_oneof![4 => 0u64..4, 1 => Just(u64::MAX)]
-}
-
-/// The retractions and insertions moving `model` to each `target`.
-fn delta_to(model: &mut BTreeMap<Row, i64>, targets: &[(Row, i64)]) -> Vec<(Row, i64)> {
-    let mut delta = Vec::new();
-    for &(row, target) in targets {
-        let cur = model.insert(row, target).unwrap_or(0);
-        delta.extend([(row, -cur), (row, target)]);
-    }
-    model.retain(|_, w| *w != 0);
-    delta
 }
 
 proptest! {
@@ -228,7 +192,7 @@ proptest! {
         keys in arb_keys(),
         limit in arb_bound().prop_map(|l| l.max(1)),
         offset in arb_bound(),
-        ticks in arb_ticks(),
+        ticks in arb_ticks(arb_row()),
     ) {
         let group_cols: &[u32] = [&[][..], &[0], &[1], &[2], &[1, 3]][gi];
         let plan = TopNPlan::from_wire(&schema(), group_cols, &keys, limit, offset).unwrap();
@@ -247,7 +211,7 @@ proptest! {
         keys in arb_keys(),
         limit in arb_bound().prop_map(|l| l.max(1)),
         offset in arb_bound(),
-        ticks in arb_ticks(),
+        ticks in arb_ticks(arb_row()),
     ) {
         let partial = || Harness::new(TopNPlan::partial(&schema(), &keys, limit, offset).unwrap(), &[]);
         let mut workers = [partial(), partial()];
@@ -308,10 +272,10 @@ fn a_fixed_width_key_sits_whole_in_the_index_pk() {
         plan.output_schema.num_payload_cols(),
         "the carried columns alone"
     );
-    let idx = plan.index_batch(&batch(&[
-        ((1, 0x100, None, None, 0), 1),
-        ((2, 0x101, None, None, 0), 1),
-    ]));
+    let idx = plan.index.batch(
+        &batch(&[((1, 0x100, None, None, 0), 1), ((2, 0x101, None, None, 0), 1)]),
+        plan.key.carried(),
+    );
     let mb = idx.as_mem_batch();
     assert_ne!(mb.get_pk_bytes(0), mb.get_pk_bytes(1));
 }

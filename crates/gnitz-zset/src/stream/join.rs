@@ -10,7 +10,6 @@
 
 use crate::schema::ColumnTable;
 use std::cmp::Ordering;
-use std::ops::Range;
 
 use crate::repr::{
     copy_runs, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
@@ -36,8 +35,6 @@ use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
 pub struct JoinPlan {
     out_schema: SchemaDescriptor,
     walk: Walk,
-    /// The first output payload slot the delta's columns fill.
-    d_first: u16,
     /// Each trace payload column: where the rows the cursor walks hold it, and
     /// the output slot it fills. Those rows are the trace's own, or the rows of
     /// the relation the trace re-keys.
@@ -51,26 +48,6 @@ pub struct JoinPlan {
     trace_ordered: bool,
 }
 
-/// A half-open span of the output row: the payload slots one input fills, or
-/// the bytes its key occupies in the pair key.
-#[derive(Clone, Copy)]
-struct Slots {
-    start: u16,
-    end: u16,
-}
-
-impl Slots {
-    fn new(start: usize, end: usize) -> Slots {
-        debug_assert!(start <= end && end <= u16::MAX as usize);
-        Slots { start: start as u16, end: end as u16 }
-    }
-
-    #[inline]
-    fn range(self) -> Range<usize> {
-        self.start as usize..self.end as usize
-    }
-}
-
 /// Which trace walk a probe drives.
 #[derive(Clone, Copy)]
 enum Walk {
@@ -80,9 +57,8 @@ enum Walk {
     /// An ordered span within an equality group.
     Range(RangeProbe),
     /// Every trace row, for every delta row: the keyless join. No key decides a
-    /// match, so both key regions ride into the output as the pair key, at the
-    /// spans this arm carries.
-    Cross { pk_len: u16, d_key: Slots, t_key: Slots },
+    /// match, so both key regions ride into the output as the pair key.
+    Cross,
 }
 
 impl JoinPlan {
@@ -155,12 +131,11 @@ impl JoinPlan {
         b.push_payload_of(right);
         let out_schema = b.finish().map_err(|e| format!("join: merged schema {e}"))?;
 
-        // Both regions run the left SQL side first, so one split serves either.
-        let halves = |l: usize, total: usize| match delta_is_right {
-            true => (Slots::new(l, total), Slots::new(0, l)),
-            false => (Slots::new(0, l), Slots::new(l, total)),
+        // The left SQL side's payload leads.
+        let t_first = match delta_is_right {
+            true => 0,
+            false => delta.num_payload_cols(),
         };
-        let (d_slots, t_slots) = halves(left.num_payload_cols(), out_schema.num_payload_cols());
         let walk = match kind {
             JoinKind::Equi => {
                 same_pk_types(delta, trace)?;
@@ -170,16 +145,9 @@ impl JoinPlan {
                 same_pk_types(delta, trace)?;
                 Walk::Range(RangeProbe::new(trace, rel, delta_is_right))
             }
-            JoinKind::Cross => {
-                let (d_key, t_key) = halves(left.pk_stride(), out_schema.pk_stride());
-                Walk::Cross {
-                    pk_len: out_schema.pk_stride() as u16,
-                    d_key,
-                    t_key,
-                }
-            }
+            JoinKind::Cross => Walk::Cross,
         };
-        let t_cols: Box<[ColCopy]> = (t_slots.start as usize..)
+        let t_cols: Box<[ColCopy]> = (t_first..)
             .zip(t_cols)
             .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
             .collect();
@@ -187,7 +155,6 @@ impl JoinPlan {
         Ok(JoinPlan {
             out_schema,
             walk,
-            d_first: d_slots.start,
             t_cols,
             t_nulls,
             trace_leads: delta_is_right,
@@ -333,7 +300,7 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
     let prefix = match plan.walk {
         Walk::Equi => delta.schema().pk_stride(),
         Walk::Range(range) => range.eq_size,
-        Walk::Cross { .. } => 0,
+        Walk::Cross => 0,
     };
     let cursor = &mut trace(&delta.get_pk_bytes(0)[..prefix], &delta.get_pk_bytes(n - 1)[..prefix]);
     // Grown, not pre-sized: a walk can match nothing.
@@ -363,7 +330,7 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
     match plan.walk {
         Walk::Equi => equi_merge_walk(delta, cursor, emit),
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
-        Walk::Cross { .. } => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
+        Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
     let mut out = write_pairings(delta, cursor, plan, &pairs, rows);
     if ordered && !out.is_empty() {
@@ -395,7 +362,9 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
         false => None,
     };
 
-    let d_first = plan.d_first as usize;
+    // The delta's payload follows the trace's where the trace is the left side,
+    // and so does its key in a pair key.
+    let d_first = if plan.trace_leads { plan.t_cols.len() } else { 0 };
     let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
     let any_ghost = out.append_session(rows).write(rows, |w| {
         let mut any_ghost = false;
@@ -403,9 +372,13 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
         match plan.walk {
             // No key decides a match, so the pair `[left PK…, right PK…]` is minted
             // per row.
-            Walk::Cross { pk_len, d_key, t_key } => {
-                let (d_key, t_key) = (d_key.range(), t_key.range());
-                let mut keys = pk.chunks_exact_mut(pk_len as usize);
+            Walk::Cross => {
+                let (pk_len, d_len) = (out_schema.pk_stride(), d_schema.pk_stride());
+                let (d_key, t_key) = match plan.trace_leads {
+                    true => (pk_len - d_len..pk_len, 0..pk_len - d_len),
+                    false => (0..d_len, d_len..pk_len),
+                };
+                let mut keys = pk.chunks_exact_mut(pk_len);
                 for p in pairs {
                     let (t_src, t_row) = trace_row(p);
                     let t_pk = t_src.get_pk_bytes(t_row);

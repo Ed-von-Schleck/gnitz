@@ -472,29 +472,18 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
 
 // ── Integrates run after the range, and a replay runs none ───────────────
 
-/// A `TopN` returns the register its integrate reads, so an integrate running
-/// against the extracted output would write nothing and the operator would never
-/// see its own history: the second epoch would add a row instead of displacing
-/// the first one's.
+/// A `TopN` instruction ingests its index entries itself, so the second epoch
+/// sees the first one's row and displaces it instead of adding a row beside it.
 #[test]
 fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let schema = make_schema_u128_i64();
     let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
     let plan = stream::TopNPlan::from_wire(&schema, &[], &order, 1, 0).unwrap();
-    let out_schema = plan.output_schema;
+    let out_schema = *plan.output_schema();
     let mut p = TestPlan::default();
-    let out_trace = p.table("topn", out_schema);
-    let index_table = p.table("topnidx", plan.index.schema);
+    let index_table = p.table("topnidx", *plan.index_schema());
     let r0 = p.seed(schema);
-    let out = p.push(
-        r0,
-        out_schema,
-        Op::TopN {
-            out_trace: Integral::Own(out_trace),
-            index: index_table,
-            plan: Box::new(plan),
-        },
-    );
+    let out = p.push(r0, out_schema, Op::TopN { index: index_table, plan: Box::new(plan) });
     let mut vm = p.open(out);
 
     // The output row carries the input row whole: its PK, then its value.
@@ -505,7 +494,6 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
         int_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(2, 1, 99)]))),
         vec![(vec![Some(1), Some(10)], -1), (vec![Some(2), Some(99)], 1)],
     );
-    assert_eq!(int_rows(&vm.held(out_trace)), vec![(vec![Some(2), Some(99)], 1)]);
 }
 
 /// A hydration replay seeds a register mid-program and runs from its first

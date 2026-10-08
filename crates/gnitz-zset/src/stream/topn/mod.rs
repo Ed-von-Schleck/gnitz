@@ -20,5 +20,5 @@ mod bench;
 #[path = "tests/topn.rs"]
 mod tests;
 
-pub use op_topn::op_topn;
+pub use op_topn::{op_topn, TopNEpoch};
 pub use plan::TopNPlan;

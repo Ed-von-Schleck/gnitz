@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch, pk_payload_schema};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -15,7 +15,6 @@ use std::hint::black_box;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn consolidate_bench() {
     const N: u64 = 65_536;
-    const SCATTER: u64 = 0x9E37_79B9_7F4A_7C15;
     let counter = Counter::instructions();
     let schema = make_schema_u64_i64();
     /// Row `i` as `(pk, payload)`.
@@ -24,17 +23,9 @@ fn consolidate_bench() {
         ("ascending", |i| (i + 1, i), N),
         ("ascending but the last", |i| (if i == N - 1 { 0 } else { i + 1 }, i), N),
         ("descending", |i| (N - i, i), N),
-        ("scattered", |i| (i.wrapping_mul(SCATTER) >> 8, i), N),
-        (
-            "scattered, 8 payloads per PK",
-            |i| ((i / 8).wrapping_mul(SCATTER) >> 8, i.wrapping_mul(SCATTER)),
-            N,
-        ),
-        (
-            "scattered, every row twice",
-            |i| ((i / 2).wrapping_mul(SCATTER) >> 8, i / 2),
-            N / 2,
-        ),
+        ("scattered", |i| (mix(i) >> 8, i), N),
+        ("scattered, 8 payloads per PK", |i| (mix(i / 8) >> 8, mix(i)), N),
+        ("scattered, every row twice", |i| (mix(i / 2) >> 8, i / 2), N / 2),
     ];
     for (label, row, survivors) in shapes {
         let rows: Vec<(u64, i64, i64)> = (0..N).map(row).map(|(pk, v)| (pk, 1, v as i64)).collect();
@@ -54,7 +45,7 @@ fn consolidate_bench() {
         let [_, (out, instructions)] = [(); 2].map(|()| {
             let mut b = BatchBuilder::new(&schema);
             for i in 0..N {
-                b.begin_row_natives(&vec![i.wrapping_mul(SCATTER) as u128; pk_cols], 1);
+                b.begin_row_natives(&vec![mix(i) as u128; pk_cols], 1);
                 b.put_u64(i);
                 b.end_row();
             }

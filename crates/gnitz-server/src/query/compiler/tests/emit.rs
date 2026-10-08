@@ -317,7 +317,7 @@ fn two_joins_probing_one_integrand_declare_one_child() {
     assert_eq!(vm.ops().filter(|op| matches!(op, Op::JoinDT { .. })).count(), 4);
 }
 
-// ── A reduce or top-N whose output is the view's ──────────────────────────
+// ── A reduce whose output is the view's ───────────────────────────────────
 
 /// The children declared by a plan over table 10 `(id | v)` whose last node is
 /// `tip`'s, output as `out` makes of it.
@@ -332,9 +332,9 @@ fn children_of(tip: fn(&mut Circuit, NodeId) -> NodeId, store: bool) -> Vec<Stri
     ctx.layout.names().map(str::to_string).collect()
 }
 
-/// A reduce or top-N that is the view's output declares no output trace where the
-/// view's store holds every row it emits. A bounded view's does not, and behind
-/// another operator the store holds other rows than the trace would.
+/// A reduce that is the view's output declares no output trace where the view's
+/// store holds every row it emits. A bounded view's does not, and behind another
+/// operator the store holds other rows than the trace would.
 #[test]
 fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
     use gnitz_wire::{AggDescriptor, OpNode, OrderKey};
@@ -356,6 +356,6 @@ fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
     assert_eq!(children_of(reduce, true), [""; 0]);
     assert_eq!(children_of(reduce, false), ["reduce_1"]);
     assert_eq!(children_of(top, true), ["topnidx_1"]);
-    assert_eq!(children_of(top, false), ["topn_1", "topnidx_1"]);
+    assert_eq!(children_of(top, false), ["topnidx_1"]);
     assert_eq!(children_of(negated, true), ["reduce_1"]);
 }

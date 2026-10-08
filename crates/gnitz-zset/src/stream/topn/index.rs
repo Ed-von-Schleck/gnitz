@@ -1,7 +1,6 @@
 //! The top-N index: every input row, keyed so that a prefix walk of one group
 //! visits its rows in ORDER BY order. The reduce's aggregate-value index with
-//! the row attached — the same group-key packer, the same order images, the
-//! same "populate before the operator reads" contract.
+//! the row attached — the same group-key packer, the same order images.
 //!
 //! ```text
 //! PK      = group key (the AVI packer) ‖ rank_0 ‖ image_0, a string's cut to its slot
@@ -20,7 +19,6 @@ use crate::algebra::ReindexPacker;
 use crate::repr::Batch;
 use crate::schema::{oob_col, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use gnitz_wire::OrderKey;
-use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 
 use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
@@ -88,9 +86,9 @@ impl OrderSpec {
 }
 
 /// The index resources a `TopNPlan` carries, baked once at compile time.
-pub struct TopNIndex {
+pub(super) struct TopNIndex {
     key_packer: ReindexPacker,
-    pub schema: SchemaDescriptor,
+    pub(super) schema: SchemaDescriptor,
     /// The first ORDER BY key, whose image leads the PK.
     lead: OrderSpec,
     rest: Vec<OrderSpec>,
@@ -139,25 +137,15 @@ impl TopNIndex {
         })
     }
 
-    /// Pack `row`'s group columns into the leading bytes of `buf`, returning the
-    /// prefix `for_each_positive_with_prefix_until` matches.
+    /// Width of the group key leading an entry's PK: entries of one group, and
+    /// no others, agree on these bytes.
     #[inline]
-    pub(super) fn group_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], src: &R, row: usize) -> &'a [u8] {
-        self.key_packer.pack_prefix(buf, src, row)
+    pub(super) fn group_bytes(&self) -> usize {
+        self.key_packer.out_stride
     }
 
-    /// The least and the greatest [`Self::group_prefix`] among `rows`; `None` for
-    /// no row.
-    pub(super) fn group_span<R: RowSource>(
-        &self,
-        src: &R,
-        rows: impl Iterator<Item = usize>,
-    ) -> Option<(PkBuf, PkBuf)> {
-        self.key_packer.prefix_span(src, rows)
-    }
-
-    /// The index entries `delta` contributes, one per row at its weight,
-    /// unsorted. `carried` locates the output's payload columns in `delta`.
+    /// The index entries `delta` contributes, entry `i` delta row `i`'s at its
+    /// weight, unsorted. `carried` locates the output's payload columns in `delta`.
     pub(super) fn batch(&self, delta: &Batch, carried: &[ColumnLocator]) -> Batch {
         let mb = delta.as_mem_batch();
         // One entry per row, and every carried string plus every wide image lands
@@ -168,10 +156,6 @@ impl TopNIndex {
         let mut image = Vec::new();
         self.key_packer.for_each_key(&mb, stride + self.lead_bytes, |row, key| {
             let weight = mb.get_weight(row);
-            // A weight-0 row contributes nothing: consolidation would drop it.
-            if weight == 0 {
-                return;
-            }
             image.clear();
             self.lead
                 .write_lead(&mb, row, &mut key[stride..stride + self.lead_bytes], &mut image);

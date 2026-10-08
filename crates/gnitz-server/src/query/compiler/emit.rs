@@ -38,10 +38,9 @@ pub(super) struct EmitCtx<'a> {
     /// source table id → the register its delta seeds, and the register its
     /// scans read: the seed's, or the relay's the source's route puts behind it.
     pub(super) sources: FxHashMap<u64, (DeltaReg, DeltaReg)>,
-    /// The view, and its output node where the view's store holds every row the
-    /// node emits — which a bounded view's may not, holding a skeleton row in
-    /// their place — and is so the integral of that node's register.
-    store_out: Option<(u64, NodeId)>,
+    /// The view, where its store is the integral of its output node's register:
+    /// a bounded view's may hold a skeleton row in a row's place.
+    store_out: Option<u64>,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -55,7 +54,7 @@ impl<'a> EmitCtx<'a> {
         loaded: &'a LoadedCircuit,
         registry: &'a RelationRegistry,
         meta: &'a ViewMeta,
-        store_out: Option<(u64, NodeId)>,
+        store_out: Option<u64>,
     ) -> Self {
         EmitCtx {
             loaded,
@@ -71,11 +70,11 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
-    /// The output trace of reduce or top-N `nid`: the view's store where that
+    /// The output trace of reduce `nid`: the view's store where that
     /// holds the node's rows, else a child declared under `kind`.
     fn out_trace(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> Integral {
         match self.store_out {
-            Some((view, out)) if out == nid => Integral::Relation(view, Cut::Now),
+            Some(view) if self.loaded.out() == nid => Integral::Relation(view, Cut::Now),
             _ => Integral::Own(self.declare_child(kind, nid, schema)),
         }
     }
@@ -226,7 +225,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 true => gnitz_zset::stream::TopNPlan::combine(&in_schema, order, *limit, *offset)?,
                 false => gnitz_zset::stream::TopNPlan::from_wire(&in_schema, group_cols, order, *limit, *offset)?,
             };
-            Ok(push_topn(ctx, nid, FUNNEL_TOPN, in_reg, plan))
+            Ok(push_topn(ctx, nid, in_reg, plan))
         }
 
         gnitz_wire::OpNode::Join { kind } => {
@@ -363,11 +362,10 @@ fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group_cols: &[u32], agg: &[AggDes
     Ok(push_reduce(ctx, nid, FUNNEL_REDUCE, in_reg, plan))
 }
 
-/// The child-store names of a reduce or top-N: its output trace, then its index.
+/// The child-store names of a reduce: its output trace, then its index.
 type StateKinds = [&'static str; 2];
 const FUNNEL_REDUCE: StateKinds = ["reduce", "avidx"];
-const FUNNEL_TOPN: StateKinds = ["topn", "topnidx"];
-/// An exchange's per-worker partial of either.
+/// An exchange's per-worker partial of one.
 const PARTIAL: StateKinds = ["partial", "partialidx"];
 
 /// Declare `plan`'s children under `kinds`, and push the reduce over `in_reg`.
@@ -388,20 +386,13 @@ fn push_reduce(
     ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan })
 }
 
-/// Declare `plan`'s children under `kinds`, and push the top-N over `in_reg`.
-fn push_topn(
-    ctx: &mut EmitCtx,
-    nid: NodeId,
-    [trace_kind, index_kind]: StateKinds,
-    in_reg: DeltaReg,
-    plan: gnitz_zset::stream::TopNPlan,
-) -> DeltaReg {
-    let out_schema = plan.output_schema;
-    let out_trace = ctx.out_trace(trace_kind, nid, out_schema);
+/// Declare `plan`'s index, and push the top-N over `in_reg`.
+fn push_topn(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: gnitz_zset::stream::TopNPlan) -> DeltaReg {
+    let out_schema = *plan.output_schema();
     // The ordered index of every input row — the operator's whole history.
-    let index = ctx.declare_child(index_kind, nid, plan.index.schema);
+    let index = ctx.declare_child("topnidx", nid, *plan.index_schema());
     let plan = Box::new(plan);
-    ctx.prog.push(in_reg, out_schema, Op::TopN { out_trace, index, plan })
+    ctx.prog.push(in_reg, out_schema, Op::TopN { index, plan })
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce
@@ -415,7 +406,7 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
             .map(|plan| push_reduce(ctx, shard, PARTIAL, in_reg, plan)),
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
             let plan = gnitz_zset::stream::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
-            Some(push_topn(ctx, shard, PARTIAL, in_reg, plan))
+            Some(push_topn(ctx, shard, in_reg, plan))
         }
         _ => unreachable!("`keyed_reader` names only a Reduce or a TopN"),
     })

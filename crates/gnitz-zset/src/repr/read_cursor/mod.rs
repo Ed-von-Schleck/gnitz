@@ -557,27 +557,15 @@ impl ReadCursor {
         compare_pk_ordering(self.current_pk_bytes(), key)
     }
 
-    /// Visit every positive-weight row whose PK begins with `prefix`, invoking
-    /// `f(&*self)` at each.
-    pub(crate) fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
-        self.for_each_positive_with_prefix_until(prefix, |c| {
-            f(c);
-            ControlFlow::Continue(())
-        });
-    }
-
-    /// [`Self::for_each_positive_with_prefix`] until `f` breaks, which leaves the
-    /// cursor on that row. `true` iff `f` broke.
-    ///
-    /// `prefix` is the OPK image of the leading PK column(s). Zero-padded to
-    /// `pk_stride` it is the least key beginning with it: 0x00 is the OPK minimum
-    /// for every PK type (signed MIN maps to all-zeros after the sign flip).
+    /// Visit every positive-weight row whose PK begins with `prefix` until `f`
+    /// breaks, which leaves the cursor on that row. `true` iff `f` broke.
     pub(crate) fn for_each_positive_with_prefix_until<F: FnMut(&ReadCursor) -> ControlFlow<()>>(
         &mut self,
         prefix: &[u8],
         f: F,
     ) -> bool {
         let stride = self.schema.pk_stride();
+        // Zero-padded, a prefix is the least key beginning with it.
         self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
         self.walk_positive_with_prefix_until(prefix, f)
     }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
-use crate::test_support::{arb_fold_case, cell, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema};
+use crate::test_support::{arb_fold_case, cell, fold_batch, fold_schemas, le_cell, mix, opk_pk, pk_only_schema};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -92,7 +92,9 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
         for batch in [raw, &consolidated] {
             let mb = batch.as_mem_batch();
             let out_pk = |row: usize| key.out_pk(&mb, row).bytes().to_vec();
-            let groups = key.ordinals(batch);
+            let groups = key
+                .runs(batch)
+                .map_or_else(|| key.numbered(batch), |r| GroupOrdinals::of_runs(&r));
             prop_assert_eq!(groups.ord.len(), batch.count, "{:?}", cols);
             for (row, &g) in groups.ord.iter().enumerate() {
                 let first = groups.first[g as usize] as usize;
@@ -112,7 +114,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             let runs = key.runs(batch);
             if let Some(runs) = &runs {
                 prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
-                for (g, run) in runs.iter().enumerate() {
+                for (g, run) in runs.iter().map(|&(s, e)| s..e).enumerate() {
                     prop_assert!(
                         run.clone().all(|row| groups.ord[row] == g as u32),
                         "{:?}: run {} is not group {}",
@@ -184,7 +186,7 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     );
     let mut bb = BatchBuilder::new(&schema);
     for i in 0..64u64 {
-        let m = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+        let m = mix(i) >> 40;
         bb.begin_row_natives(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);
         bb.put_int(((m % 9) as i64 - 4) as u128);
         bb.put_int(u128::from(m % 3) << 100);

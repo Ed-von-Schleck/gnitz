@@ -255,8 +255,8 @@ tier depends on §2's sort invariant. An operator reading a trace sees
 
 **A trace is not always a store of its own.** A join side that is a base table
 re-keyed onto leading columns of its own PK reads the table's store — **as the
-view last absorbed it** — instead of keeping a copy. A reduce or top-N whose
-output is the view's reads the view's own store, unless that view is
+view last absorbed it** — instead of keeping a copy. A reduce whose output is
+the view's reads the view's own store, unless that view is
 capacity-bounded.
 
 ## 4. The Region Convention

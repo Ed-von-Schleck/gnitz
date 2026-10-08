@@ -1,8 +1,8 @@
-"""A view whose last operator is a GROUP BY or a top-N keeps that operator's
-output once.
+"""A view whose last operator is a GROUP BY keeps that operator's output once,
+and a top-N keeps no copy of its output at all.
 
-Such an operator needs the integral of its own output, which is what the view's
-store holds: the view's directory carries no second copy of it. The store is
+A reduce needs the integral of its own output, which is what the view's store
+holds: the view's directory carries no second copy of it. The store is
 driven into the disk regime, so the operator reads its history off shards the
 view's readers also read, and each step is checked at its weights: a group
 whose aggregate moved must be there once, at the new value. A crash and a

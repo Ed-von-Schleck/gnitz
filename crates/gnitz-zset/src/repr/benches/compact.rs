@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::merge::run_merge;
-use crate::test_support::map_shard;
+use crate::test_support::{map_shard, mix};
 use gnitz_wire::PkBuf;
 use std::rc::Rc;
 
@@ -73,7 +73,6 @@ fn distinct_compaction_bench() {
     const TOTAL: u64 = 1 << 20;
     let dir = tempfile::tempdir().unwrap();
     let instructions = Counter::instructions();
-    let mix = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // Label, PK columns, the column the key is in.
     let pks = [
         ("8-byte PK", 1, 0),

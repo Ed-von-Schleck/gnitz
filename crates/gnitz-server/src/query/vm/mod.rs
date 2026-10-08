@@ -98,10 +98,8 @@ pub(in crate::query) enum Op {
         index: Option<StateIdx>,
         plan: Box<stream::ReducePlan>,
     },
-    /// Per-group top-N: `index`, the ordered index of every input row, is
-    /// populated with the delta before the walk. `out_trace` as [`Op::Reduce`]'s.
+    /// Per-group top-N over `index`, the ordered index of every input row.
     TopN {
-        out_trace: Integral,
         index: StateIdx,
         plan: Box<stream::TopNPlan>,
     },
@@ -176,19 +174,19 @@ impl Instr {
             | Op::Round { plan: _, seeds: _ }
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, index: _, plan: _ }
-            | Op::TopN { out_trace: _, index: _, plan: _ } => None,
+            | Op::TopN { index: _, plan: _ } => None,
         };
         [Some(self.in_reg), second]
     }
 
     /// The trace this instruction's op owns as the integral of one of its own
-    /// registers — the clamp's input history, a reduce's or top-N's output — which
+    /// registers — the clamp's input history, a reduce's output — which
     /// `finish` schedules as an integrate. No `_` arm, as in [`Self::reads`]: a new
     /// opcode must say whether it owns one.
     fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
         match &self.op {
             Op::WeightClamp { hist, .. } => Some((self.in_reg, *hist)),
-            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => match out_trace {
+            Op::Reduce { out_trace, .. } => match out_trace {
                 Integral::Own(trace) => Some((self.out_reg, *trace)),
                 Integral::Relation(..) => None,
             },
@@ -199,7 +197,8 @@ impl Instr {
             | Op::JoinDT { .. }
             | Op::Share(_)
             | Op::Round { .. }
-            | Op::NullExtend { .. } => None,
+            | Op::NullExtend { .. }
+            | Op::TopN { .. } => None,
         }
     }
 }
@@ -274,15 +273,11 @@ impl Vm {
         self.instructions.iter().map(|i| &i.op)
     }
 
-    /// True iff a reduce or top-N reads the view's own store as its output trace.
+    /// True iff a reduce reads the view's own store as its output trace.
     pub(in crate::query) fn reads_view_store(&self) -> bool {
-        self.instructions.iter().any(|i| {
-            matches!(
-                i.op,
-                Op::Reduce { out_trace: Integral::Relation(..), .. }
-                    | Op::TopN { out_trace: Integral::Relation(..), .. }
-            )
-        })
+        self.instructions
+            .iter()
+            .any(|i| matches!(i.op, Op::Reduce { out_trace: Integral::Relation(..), .. }))
     }
 
     /// An epoch seeding `reg` with an empty delta does nothing: it owes no ground

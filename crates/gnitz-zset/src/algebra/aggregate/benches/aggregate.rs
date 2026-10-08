@@ -1,6 +1,7 @@
 use super::adhoc_fold::AdhocFold;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec};
 
@@ -9,10 +10,6 @@ const N: u64 = 1 << 20;
 const CHUNK: u64 = 65_536;
 /// A store's cap on the groups of one fold.
 const GROUP_CAP: usize = 65_536;
-
-fn mix(i: u64) -> u64 {
-    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
 
 /// Instructions per row of a whole fold — every chunk and the finish — over
 /// `[U64 pk | I64 grp | I64 a | I32 b NULL | F64 c]`, across aggregate sets and
