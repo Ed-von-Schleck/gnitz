@@ -5,12 +5,12 @@ use std::ops::Range;
 
 use crate::repr::{Batch, MemBatch};
 use crate::schema::{ColumnLocator, TypeCode};
+use gnitz_expr::order_bits;
 use gnitz_wire::RowSource;
 use gnitz_wire::{for_each_fixed_int, AggFunc, FixedInt, ScalarKind};
 
 use crate::algebra::order_image::{
-    ieee_order_bits, ieee_order_bits_f32, order_bits, scalar_image, scalar_native_of_image, wide_native,
-    wide_native_of_image, ImageKind, WideKind,
+    scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageKind, WideKind,
 };
 
 /// The value-index parameters of one MIN/MAX aggregate: the column the index
@@ -302,7 +302,7 @@ impl Accumulator {
                     StepKind::Count | StepKind::CountNonNull => {
                         let counted = match kind {
                             StepKind::Count => None,
-                            _ => payload_slot(src),
+                            _ => src.payload_slot(),
                         };
                         grouped_rows::<0>(mb, counted, ranges, ord, |g, _, w, null| {
                             let slot = &mut out[g];
@@ -341,22 +341,22 @@ impl Accumulator {
                         has[g] = true;
                     }
                 };
-                match (payload_slot(src), scalar) {
+                match (src.payload_slot(), scalar) {
                     (Some(_), ScalarKind::Int(fi)) => for_each_fixed_int!(fi, |FI| {
                         grouped_col::<{ FI.width() }>(mb, src, ranges, ord, |g, v, w, null| {
                             if w > 0 && !null {
-                                step(g, FI.decode_le_i64(&v) as u64 ^ (FI.is_signed() as u64) << 63);
+                                step(g, ScalarKind::Int(FI).order_image(FI.decode_le_i64(&v) as u64));
                             }
                         })
                     }),
                     (Some(_), ScalarKind::F32) => grouped_col::<4>(mb, src, ranges, ord, |g, v, w, null| {
                         if w > 0 && !null {
-                            step(g, ieee_order_bits_f32(u32::from_le_bytes(v)));
+                            step(g, ScalarKind::F32.order_image(u32::from_le_bytes(v) as u64));
                         }
                     }),
                     (Some(_), ScalarKind::F64) => grouped_col::<8>(mb, src, ranges, ord, |g, v, w, null| {
                         if w > 0 && !null {
-                            step(g, ieee_order_bits(u64::from_le_bytes(v)));
+                            step(g, ScalarKind::F64.order_image(u64::from_le_bytes(v)));
                         }
                     }),
                     // A PK column: OPK bytes, decoded a row at a time.
@@ -453,14 +453,6 @@ impl GroupedState {
     }
 }
 
-/// The payload slot `src` names, or `None` for a PK column.
-fn payload_slot(src: ColumnLocator) -> Option<usize> {
-    match src {
-        ColumnLocator::Payload { slot, .. } => Some(slot as usize),
-        ColumnLocator::Pk { .. } => None,
-    }
-}
-
 /// [`grouped_rows`] over payload column `src`.
 #[inline(always)]
 fn grouped_col<const N: usize>(
@@ -470,7 +462,9 @@ fn grouped_col<const N: usize>(
     ord: &[u32],
     f: impl FnMut(usize, [u8; N], i64, bool),
 ) {
-    let slot = payload_slot(src).expect("a grouped kernel folds a payload column only");
+    let slot = src
+        .payload_slot()
+        .expect("a grouped kernel folds a payload column only");
     grouped_rows(mb, Some(slot), ranges, ord, f)
 }
 
@@ -527,10 +521,8 @@ fn fold_col<const N: usize, T>(
     init: T,
     mut f: impl FnMut(T, [u8; N], i64, bool) -> T,
 ) -> T {
-    let ColumnLocator::Payload { slot, .. } = src else {
-        unreachable!("bulk_step folds a payload column only")
-    };
-    let (slot, Range { start, end }) = (slot as usize, rows);
+    let slot = src.payload_slot().expect("bulk_step folds a payload column only");
+    let Range { start, end } = rows;
     let weights = mb.weight()[start * 8..end * 8].as_chunks::<8>().0;
     let nulls = mb.null_bmp()[start * 8..end * 8].as_chunks::<8>().0;
     let rows = weights.iter().zip(nulls).map(|(w, nw)| {

@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
-pub(crate) use gnitz_expr::{ieee_order_bits, ieee_order_bits_f32, order_bits};
+use gnitz_expr::order_bits;
 use gnitz_wire::RowSource;
 use gnitz_wire::{cmp_col_window, ScalarKind};
 
@@ -44,41 +44,6 @@ impl WideKind {
             Self::Fixed(tc) => cmp_col_window(a, &[], b, &[], tc),
             Self::Bytes => a.cmp(b),
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar order image: `order_bits` encodes a value, `order_inverse` undoes it.
-// ---------------------------------------------------------------------------
-
-/// Inverse of [`order_bits`]: the value's own little-endian bits.
-#[inline(always)]
-pub(crate) fn order_inverse(kind: ScalarKind, e: u64) -> u64 {
-    match kind {
-        ScalarKind::Int(fi) => e ^ ((fi.is_signed() as u64) << 63),
-        ScalarKind::F32 => ieee_order_bits_f32_reverse(e) as u64,
-        ScalarKind::F64 => ieee_order_bits_reverse(e),
-    }
-}
-
-/// Reverse of [`ieee_order_bits`].
-#[inline(always)]
-fn ieee_order_bits_reverse(encoded: u64) -> u64 {
-    if encoded >> 63 != 0 {
-        encoded ^ (1u64 << 63)
-    } else {
-        !encoded
-    }
-}
-
-/// Reverse of [`ieee_order_bits_f32`].
-#[inline(always)]
-fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
-    let e = encoded as u32;
-    if e >> 31 != 0 {
-        e ^ (1u32 << 31)
-    } else {
-        !e
     }
 }
 
@@ -196,7 +161,7 @@ pub(crate) fn scalar_image(
 /// an image.
 #[inline(always)]
 pub(crate) fn scalar_native_of_image(kind: ScalarKind, invert: bool, image: u64) -> u64 {
-    order_inverse(kind, if invert { !image } else { image })
+    kind.order_inverse(if invert { !image } else { image })
 }
 
 /// Append the order image of the column at `loc` in `row`, **known non-NULL**,

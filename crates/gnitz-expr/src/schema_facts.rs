@@ -17,9 +17,7 @@ pub trait ColumnTable {
 }
 
 /// Everything derived from a [`ColumnTable`]. Blanket-implemented, so every
-/// implementor derives these the same way. `SchemaDescriptor` answers
-/// `pk_stride`, `num_payload_cols` and `payload_col_idx` from values it computed
-/// at construction.
+/// implementor derives these the same way.
 pub trait SchemaFacts: ColumnTable {
     /// Where column `ci`'s value physically lives, or `None` when `ci` is out of
     /// range.
@@ -60,10 +58,7 @@ pub trait SchemaFacts: ColumnTable {
     /// Dense payload slot of `ci`, or `None` for a PK column or an out-of-range
     /// `ci`.
     fn payload_slot(&self, ci: usize) -> Option<usize> {
-        match self.try_locate(ci)? {
-            ColumnLocator::Payload { slot, .. } => Some(slot as usize),
-            ColumnLocator::Pk { .. } => None,
-        }
+        self.try_locate(ci)?.payload_slot()
     }
     /// Inverse of [`Self::payload_slot`]. Panics unless `pi < num_payload_cols()`.
     fn payload_col_idx(&self, pi: usize) -> usize {

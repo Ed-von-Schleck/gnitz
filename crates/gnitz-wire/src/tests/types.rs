@@ -332,3 +332,83 @@ fn narrow_f32_refuses_only_a_finite_overflow() {
     // Just above `f32::MAX` rounds down onto it rather than overflowing.
     assert_eq!(narrow_f32(f32::MAX as f64 + 2.0f64.powi(102)), Some(f32::MAX));
 }
+
+/// An integer's order image is its OPK key in an 8-byte slot of its own sign, and
+/// the inverse recovers the value.
+#[test]
+fn an_integers_order_image_is_its_opk_key_promoted() {
+    for fi in [
+        FixedInt::U8,
+        FixedInt::I8,
+        FixedInt::U16,
+        FixedInt::I16,
+        FixedInt::U32,
+        FixedInt::I32,
+        FixedInt::U64,
+        FixedInt::I64,
+    ] {
+        let w = fi.width();
+        let mask = u64::MAX >> (64 - 8 * w);
+        // Exhaustive where the width allows, else the edges plus a sweep.
+        let vals: Vec<u64> = match w {
+            1 | 2 => (0..=mask).collect(),
+            _ => [0, 1, mask, mask >> 1, (mask >> 1) + 1]
+                .into_iter()
+                .chain((1..=64u64).map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i) & mask))
+                .collect(),
+        };
+        let kind = ScalarKind::Int(fi);
+        for x in vals {
+            let widened = fi.decode_le_i64(&x.to_le_bytes()[..w]);
+            let mut key = [0u8; 8];
+            crate::store_opk(&mut key, widened as u128, fi.is_signed());
+            let image = kind.order_image(widened as u64);
+            assert_eq!(image, u64::from_be_bytes(key), "{fi:?} value {x:#x}");
+            assert_eq!(
+                kind.order_inverse(image).to_le_bytes()[..w],
+                x.to_le_bytes()[..w],
+                "{fi:?} inverse, value {x:#x}"
+            );
+        }
+    }
+}
+
+/// A float's order image orders as [`cmp_col_window`] and the inverse recovers its
+/// bits, over the values only floats have: ±0.0, ±NaN and both infinities.
+#[test]
+fn a_floats_order_image_is_the_total_order() {
+    const FLOATS: [f64; 9] = [
+        f64::NEG_INFINITY,
+        -1.5,
+        -0.0,
+        0.0,
+        f64::MIN_POSITIVE,
+        1.5,
+        f64::INFINITY,
+        f64::NAN,
+        -f64::NAN,
+    ];
+    for (kind, tc, w) in [(ScalarKind::F32, TypeCode::F32, 4), (ScalarKind::F64, TypeCode::F64, 8)] {
+        let bits: Vec<u64> = FLOATS
+            .iter()
+            .map(|&f| {
+                if w == 4 {
+                    (f as f32).to_bits() as u64
+                } else {
+                    f.to_bits()
+                }
+            })
+            .collect();
+        for &a in &bits {
+            let image = kind.order_image(a);
+            assert_eq!(kind.order_inverse(image), a, "{kind:?} inverse of {a:#x}");
+            for &b in &bits {
+                assert_eq!(
+                    image.cmp(&kind.order_image(b)),
+                    cmp_col_window(&a.to_le_bytes()[..w], &[], &b.to_le_bytes()[..w], &[], tc),
+                    "{kind:?}: {a:#x} vs {b:#x}"
+                );
+            }
+        }
+    }
+}

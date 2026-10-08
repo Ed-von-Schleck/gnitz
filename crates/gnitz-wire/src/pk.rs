@@ -186,17 +186,22 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
 pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     use crate::FixedInt as F;
     debug_assert!(opk.len() == fi.width(), "decode_opk_i64: slice width != FixedInt width");
+    // The last byte is read first, so its bounds check covers the others.
+    macro_rules! be {
+        ($ty:ty, $($i:literal),+; $last:literal) => {{
+            let last = opk[$last];
+            <$ty>::from_be_bytes([$(opk[$i]),+, last])
+        }};
+    }
     match fi {
         F::U8 => opk[0] as i64,
         F::I8 => (opk[0] ^ 0x80) as i8 as i64,
-        F::U16 => u16::from_be_bytes([opk[0], opk[1]]) as i64,
-        F::I16 => (u16::from_be_bytes([opk[0], opk[1]]) ^ (1 << 15)) as i16 as i64,
-        F::U32 => u32::from_be_bytes([opk[0], opk[1], opk[2], opk[3]]) as i64,
-        F::I32 => (u32::from_be_bytes([opk[0], opk[1], opk[2], opk[3]]) ^ (1 << 31)) as i32 as i64,
-        F::U64 => u64::from_be_bytes([opk[0], opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) as i64,
-        F::I64 => {
-            (u64::from_be_bytes([opk[0], opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) ^ (1 << 63)) as i64
-        }
+        F::U16 => be!(u16, 0; 1) as i64,
+        F::I16 => (be!(u16, 0; 1) ^ (1 << 15)) as i16 as i64,
+        F::U32 => be!(u32, 0, 1, 2; 3) as i64,
+        F::I32 => (be!(u32, 0, 1, 2; 3) ^ (1 << 31)) as i32 as i64,
+        F::U64 => be!(u64, 0, 1, 2, 3, 4, 5, 6; 7) as i64,
+        F::I64 => (be!(u64, 0, 1, 2, 3, 4, 5, 6; 7) ^ (1 << 63)) as i64,
     }
 }
 

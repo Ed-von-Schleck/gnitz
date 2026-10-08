@@ -132,10 +132,13 @@ fn cut_names_a_ghost_it_would_discard_unseen() {
 fn comparator_sort(schema: &Schema, batch: &ZSetBatch, order: &[OrderKey], window: Window) -> ZSetBatch {
     let cut = window.cuts();
     let end = window.end().unwrap_or(usize::MAX);
-    let tiebroken = order_locators(order, schema);
-    let keys = if cut { &tiebroken[..] } else { &tiebroken[..order.len()] };
+    let keys = if order.is_empty() {
+        Vec::new()
+    } else {
+        order_locators(order, schema, cut)
+    };
     let mut perm: Vec<usize> = (0..batch.len()).collect();
-    perm.sort_by(|&a, &b| gnitz_expr::cmp_order_keys(keys, batch, a, batch, b));
+    perm.sort_by(|&a, &b| gnitz_expr::cmp_order_keys(&keys, batch, a, b));
     let mut out = ZSetBatch::new(schema);
     let mut at = 0usize;
     for r in perm {

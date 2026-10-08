@@ -41,16 +41,17 @@ pub(crate) fn order_and_window(
         "ordering sink: non-positive weight violates the bag invariant"
     );
     let end = window.end().unwrap_or(usize::MAX);
-    let tiebroken = order_locators(order, schema);
-    // A cut breaks ties by identity, so it keeps the rows the worker's top-k kept. Uncut ties
-    // stay open: a total order costs every comparison of equal keys a read of the whole row.
-    let keys = if cut { &tiebroken[..] } else { &tiebroken[..order.len()] };
-    let mut ranking = RowRanking::new(keys, &batch);
-    if !keys.is_empty() {
+    let rows: Vec<u32> = if order.is_empty() {
         // Every entry holds at least one logical row, so the first `end` entries cover the window.
+        (0..batch.len().min(end) as u32).collect()
+    } else {
+        // A cut breaks ties by identity, so which tied rows it keeps is a function of the
+        // rows alone. Uncut ties stay in input order.
+        let keys = order_locators(order, schema, cut);
+        let mut ranking = RowRanking::new(&keys, &batch);
         ranking.keep_smallest(end);
-    }
-    let rows = ranking.sorted();
+        ranking.sorted()
+    };
     if !cut {
         return batch.gather(&rows);
     }

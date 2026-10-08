@@ -134,9 +134,9 @@ fn window(
         .collect();
     let b = batch(&slots);
     let mb = b.as_mem_batch();
-    let locs = order_locators(keys, &schema());
+    let locs = order_locators(keys, &schema(), true);
     let mut order: Vec<usize> = (0..slots.len()).collect();
-    order.sort_by(|&x, &y| cmp_order_keys(&locs, &mb, x, &mb, y));
+    order.sort_by(|&x, &y| cmp_order_keys(&locs, &mb, x, y));
     let mut groups: BTreeMap<Cells, Vec<Cells>> = BTreeMap::new();
     for i in order {
         let row = cells(&slots[i].0);

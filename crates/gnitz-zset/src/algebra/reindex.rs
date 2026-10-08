@@ -620,10 +620,7 @@ fn promote_image(image: u128, src: TypeCode, out: TypeCode) -> u128 {
 /// The row runs of `mb` that `spec` indexes — no NULL in an indexed column — and whose
 /// weight `keep` admits.
 fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -> Vec<(usize, usize)> {
-    let indexed_slots = spec.locators().iter().fold(0u64, |slots, loc| match *loc {
-        ColumnLocator::Payload { slot, .. } => slots | 1u64 << slot,
-        ColumnLocator::Pk { .. } => slots,
-    });
+    let indexed_slots = spec.locators().iter().fold(0, |slots, loc| slots | loc.null_bit());
     let weights = mb.weight().as_chunks::<8>().0;
     let nulls = mb.null_bmp().as_chunks::<8>().0;
     runs_where(weights.len(), |row| {

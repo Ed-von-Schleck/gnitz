@@ -28,16 +28,19 @@ enum Kind {
     },
 }
 
-/// A rows sink's weight `window`. With no `order`, survivors until their summed
-/// weight reaches the window; with one, every survivor, trimmed back down with
-/// [`topk_keep`] at two thresholds.
-struct Cut {
-    order: Vec<OrderLocator>,
-    window: NonZeroI64,
-    /// The survivor weight the keeper currently holds.
-    summed: i64,
-    /// The largest lead the last trim kept: a later row above it is outside the window.
-    bound: Option<Lead>,
+/// A rows sink's weight `window`; `summed` is the survivor weight the keeper holds.
+enum Cut {
+    /// Survivors until their summed weight reaches the window.
+    Prefix { window: NonZeroI64, summed: i64 },
+    /// Every survivor, trimmed back down to the smallest under `order` with
+    /// [`topk_keep`] at two thresholds.
+    TopK {
+        order: Vec<OrderLocator>,
+        window: NonZeroI64,
+        summed: i64,
+        /// The largest lead the last trim kept: a later row above it is outside the window.
+        bound: Option<Lead>,
+    },
 }
 
 impl SinkPlan {
@@ -62,13 +65,16 @@ impl SinkPlan {
                     None => None,
                     Some(RowsCut { k, order }) => {
                         sink_in.check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))?;
-                        Some(Cut {
-                            order: order_locators(order, &sink_in),
-                            // Saturated: a wrapped negative window would truncate
-                            // the answer.
-                            window: NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX),
-                            summed: 0,
-                            bound: None,
+                        // Saturated: a wrapped negative window would truncate the answer.
+                        let window = NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX);
+                        Some(match order.is_empty() {
+                            true => Cut::Prefix { window, summed: 0 },
+                            false => Cut::TopK {
+                                order: order_locators(order, &sink_in, true),
+                                window,
+                                summed: 0,
+                                bound: None,
+                            },
                         })
                     }
                 };
@@ -93,7 +99,9 @@ impl SinkPlan {
     /// `chunk_rows`: an unordered cut needs no more than its window.
     pub fn first_drain(&self, chunk_rows: usize) -> usize {
         match &self.kind {
-            Kind::Rows { cut: Some(cut), .. } if cut.order.is_empty() => (cut.window.get() as usize).min(chunk_rows),
+            Kind::Rows {
+                cut: Some(Cut::Prefix { window, .. }), ..
+            } => (window.get() as usize).min(chunk_rows),
             _ => chunk_rows,
         }
     }
@@ -108,20 +116,23 @@ impl SinkPlan {
                 append_survivors(self.map.as_mut(), chunk, keeper, ranges);
                 Ok(false)
             }
-            Kind::Rows { keeper, cut: Some(cut) } if cut.order.is_empty() => {
-                let window = cut.window.get();
+            Kind::Rows {
+                keeper,
+                cut: Some(Cut::Prefix { window, summed }),
+            } => {
+                let window = window.get();
                 // Cut at the row whose weight reaches the window: a range, or a
                 // hydrated group, can run far past it.
                 for i in 0..ranges.len() {
                     let (s, e) = ranges[i];
                     let range_sum = mb.sum_weights(s, e);
-                    if cut.summed + range_sum < window {
-                        cut.summed += range_sum;
+                    if *summed + range_sum < window {
+                        *summed += range_sum;
                         continue;
                     }
                     let mut end = s;
-                    while cut.summed < window && end < e {
-                        cut.summed += mb.get_weight(end);
+                    while *summed < window && end < e {
+                        *summed += mb.get_weight(end);
                         end += 1;
                     }
                     ranges[i].1 = end;
@@ -129,21 +140,24 @@ impl SinkPlan {
                     break;
                 }
                 append_survivors(self.map.as_mut(), chunk, keeper, ranges);
-                Ok(cut.summed >= window)
+                Ok(*summed >= window)
             }
-            Kind::Rows { keeper, cut: Some(cut) } => {
+            Kind::Rows {
+                keeper,
+                cut: Some(Cut::TopK { order, window, summed, bound }),
+            } => {
                 // Weighed off the source — the same weights that land in the
                 // keeper, read from a contiguous region rather than row-by-row
                 // off the destination.
-                cut.summed = ranges
+                *summed = ranges
                     .iter()
-                    .fold(cut.summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
+                    .fold(*summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
                 append_survivors(self.map.as_mut(), chunk, keeper, ranges);
                 // Mid-scan the keeper is still growing, so a trim at `window`
                 // would re-sort after every chunk to shed rows the next chunk
                 // replaces.
-                if cut.summed > cut.window.get().saturating_mul(2) {
-                    cut.summed = topk_keep(keeper, &cut.order, cut.window, &mut cut.bound);
+                if *summed > window.get().saturating_mul(2) {
+                    *summed = topk_keep(keeper, order, *window, bound);
                 }
                 Ok(false)
             }
@@ -171,8 +185,10 @@ impl SinkPlan {
                 // STRING/BLOB column goes out as one frame — so shed an ordered
                 // keeper down to the smallest superset the client can still cut
                 // exactly. At or below the window it provably cuts nothing.
-                if let Some(mut cut) = cut.filter(|c| !c.order.is_empty() && c.summed > c.window.get()) {
-                    topk_keep(&mut keeper, &cut.order, cut.window, &mut cut.bound);
+                if let Some(Cut::TopK { order, window, summed, mut bound }) = cut {
+                    if summed > window.get() {
+                        topk_keep(&mut keeper, &order, window, &mut bound);
+                    }
                 }
                 keeper
             }

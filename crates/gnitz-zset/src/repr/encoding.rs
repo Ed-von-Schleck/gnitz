@@ -7,7 +7,8 @@
 //! last entry, the empty string or zero.
 
 use gnitz_wire::{
-    read_u32_le, read_u64_le, write_u32_le, write_u64_le, FixedInt, GERMAN_INLINE_OFF, SHORT_STRING_THRESHOLD,
+    read_u32_le, read_u64_le, write_u32_le, write_u64_le, FixedInt, ScalarKind, GERMAN_INLINE_OFF,
+    SHORT_STRING_THRESHOLD,
 };
 
 gnitz_wire::wire_enum! {
@@ -144,17 +145,17 @@ pub(crate) fn for_encode(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
         const W: usize = FI.width();
         let cells = src.as_chunks::<W>().0;
         let widen = |cell: &[u8; W]| FI.decode_le_i64(cell) as u64;
-        // XOR with the sign bit maps i64 order onto u64 order, so one unsigned
-        // min/max serves both signednesses.
-        let bias = if FI.is_signed() { 1u64 << 63 } else { 0 };
+        // The order image maps i64 order onto u64 order, so one unsigned min/max
+        // serves both signednesses.
+        const KIND: ScalarKind = ScalarKind::Int(FI);
         let (mut min, mut max) = (u64::MAX, 0u64);
         for cell in cells {
-            let b = widen(cell) ^ bias;
+            let b = KIND.order_image(widen(cell));
             min = min.min(b);
             max = max.max(b);
         }
-        let reference = min ^ bias;
-        let bw = for_bw((max ^ bias).wrapping_sub(reference));
+        let reference = KIND.order_inverse(min);
+        let bw = for_bw(KIND.order_inverse(max).wrapping_sub(reference));
         (bw > 0 && for_image_len(cells.len(), bw) < src.len())
             .then(|| for_image(cells.len(), cells.iter().map(widen), reference, bw))
     })

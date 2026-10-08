@@ -16,7 +16,7 @@ use crate::algebra::{
 };
 use crate::algebra::{Accumulator, ExtremeSpec};
 use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
-use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use gnitz_wire::payload_bytes;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
@@ -156,10 +156,7 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     for (j, a) in bake.aggs.iter().enumerate() {
         let ExtremeSpec { loc, kind, max } = a.spec;
         // A NULL has no image: MIN/MAX skips it.
-        let runs = delta.runs_without_nulls(match loc {
-            ColumnLocator::Payload { slot, .. } => 1 << slot,
-            ColumnLocator::Pk { .. } => 0,
-        });
+        let runs = delta.runs_without_nulls(loc.null_bit());
         let live = || runs.iter().flat_map(|&(s, e)| s..e);
 
         if let ImageKind::Wide(WideKind::Bytes) = kind {

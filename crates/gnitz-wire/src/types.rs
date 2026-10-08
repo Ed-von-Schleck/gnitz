@@ -706,6 +706,38 @@ impl ScalarKind {
             _ => None,
         }
     }
+
+    /// The order image of a value's register bits — an integer widened to `i64` as
+    /// [`FixedInt::decode_le_i64`] widens it, a float's raw bits: a `u64` whose
+    /// unsigned order is the typed order (`total_cmp`'s for floats). An integer's
+    /// is its OPK key promoted to 8 bytes.
+    #[inline(always)]
+    pub const fn order_image(self, bits: u64) -> u64 {
+        match self {
+            Self::Int(fi) => bits ^ ((fi.is_signed() as u64) << 63),
+            // IEEE 754: a negative inverts wholly, a non-negative flips its sign bit —
+            // the sign bit smeared over the word, with the sign bit always set.
+            Self::F32 => {
+                let b = bits as u32;
+                (b ^ (((b as i32) >> 31) as u32 | 1 << 31)) as u64
+            }
+            Self::F64 => bits ^ (((bits as i64) >> 63) as u64 | 1 << 63),
+        }
+    }
+
+    /// Inverse of [`Self::order_image`]: the value's own little-endian bits.
+    #[inline(always)]
+    pub const fn order_inverse(self, image: u64) -> u64 {
+        match self {
+            Self::Int(fi) => image ^ ((fi.is_signed() as u64) << 63),
+            // The image's sign bit is the value's inverted.
+            Self::F32 => {
+                let e = image as u32;
+                (e ^ ((!(e as i32) >> 31) as u32 | 1 << 31)) as u64
+            }
+            Self::F64 => image ^ ((!(image as i64) >> 63) as u64 | 1 << 63),
+        }
+    }
 }
 
 // A new `TypeCode` is classified by `FixedInt::from_type_code`'s exhaustive

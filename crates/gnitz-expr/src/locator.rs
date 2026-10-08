@@ -1,6 +1,5 @@
-//! Resolved column addressing: where a logical column physically lives in a
-//! row, the canonical `u128` keys derived from it, and the ranking of rows under
-//! ORDER BY keys.
+//! Resolved column addressing: where a logical column physically lives in a row
+//! and the reads through it, and the ranking of rows under ORDER BY keys.
 
 use std::cmp::Ordering;
 
@@ -25,7 +24,7 @@ pub enum ColumnLocator {
 
 const _: () = assert!(
     std::mem::size_of::<ColumnLocator>() <= 8,
-    "ColumnLocator must stay packed; a usize coordinate would balloon it to 24 bytes",
+    "ColumnLocator must stay within 8 bytes",
 );
 const _: () = assert!(
     gnitz_wire::MAX_PK_BYTES <= u8::MAX as usize,
@@ -49,6 +48,21 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { type_code, .. } | ColumnLocator::Payload { type_code, .. } => type_code,
         }
+    }
+
+    /// The payload slot, which is also the null bit; `None` for a PK column.
+    #[inline(always)]
+    pub fn payload_slot(&self) -> Option<usize> {
+        match *self {
+            ColumnLocator::Pk { .. } => None,
+            ColumnLocator::Payload { slot, .. } => Some(slot as usize),
+        }
+    }
+
+    /// This column's bit in a null word; no bit for a PK column, which is never NULL.
+    #[inline(always)]
+    pub fn null_bit(&self) -> u64 {
+        self.payload_slot().map_or(0, |slot| 1 << slot)
     }
 
     /// True iff this column is NULL in `row`.
@@ -171,40 +185,35 @@ impl OrderLocator {
             nulls_first: wire.nulls_first,
         }
     }
+
+    /// Whether the 8-byte image is the key's whole order.
+    #[inline]
+    fn image_is_whole(&self) -> bool {
+        ScalarKind::from_type_code(self.loc.type_code()).is_some()
+    }
 }
 
-/// The keys `order` names over `schema`, then — unless there are none — the
-/// identity tiebreak. Panics on a column `schema` does not have.
-pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts) -> Vec<OrderLocator> {
+/// The keys `order` names over `schema`, then under `total` every column ascending, NULLS
+/// FIRST, PK columns leading: a total order over distinct rows. Panics on a column `schema`
+/// does not have.
+pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts, total: bool) -> Vec<OrderLocator> {
     let mut keys: Vec<OrderLocator> = order
         .iter()
         .map(|k| OrderLocator::of(schema.locate(k.col as usize), k))
         .collect();
-    if !keys.is_empty() {
-        push_identity_tiebreak(&mut keys, schema);
+    if total {
+        let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
+        keys.extend(schema.pk_cols().iter().map(|&c| asc(schema.locate(c as usize))));
+        keys.extend(schema.payload_locators().into_iter().map(asc));
     }
     keys
 }
 
-/// Every column ascending, NULLS FIRST, PK columns leading as in the (PK,
-/// payload) consolidation order: a total order over distinct rows.
-fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
-    let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
-    keys.extend(schema.pk_cols().iter().map(|&c| asc(schema.locate(c as usize))));
-    keys.extend(schema.payload_locators().into_iter().map(asc));
-}
-
 /// Lexicographic over `keys`.
 #[inline(always)]
-pub fn cmp_order_keys<A: RowSource, B: RowSource>(
-    keys: &[OrderLocator],
-    a: &A,
-    ra: usize,
-    b: &B,
-    rb: usize,
-) -> Ordering {
-    let na = a.get_null_word(ra);
-    let nb = b.get_null_word(rb);
+pub fn cmp_order_keys<S: RowSource>(keys: &[OrderLocator], src: &S, ra: usize, rb: usize) -> Ordering {
+    let na = src.get_null_word(ra);
+    let nb = src.get_null_word(rb);
     for key in keys {
         let (xa, xb) = (key.loc.is_null_word(na), key.loc.is_null_word(nb));
         if xa != xb {
@@ -217,7 +226,7 @@ pub fn cmp_order_keys<A: RowSource, B: RowSource>(
         if xa {
             continue;
         }
-        let mut ord = key.loc.cmp_non_null(a, ra, b, rb);
+        let mut ord = key.loc.cmp_non_null(src, ra, src, rb);
         if key.desc {
             ord = ord.reverse();
         }
@@ -228,39 +237,16 @@ pub fn cmp_order_keys<A: RowSource, B: RowSource>(
     Ordering::Equal
 }
 
-/// The column's value in `row` as a `u64` whose unsigned order is the column's
-/// typed order (`total_cmp`'s for floats). `kind` is the column's own.
+/// The [`ScalarKind::order_image`] of the column's value in `row`. `kind` is the column's own.
 #[inline(always)]
 pub fn order_bits(loc: &ColumnLocator, src: &impl RowSource, row: usize, kind: ScalarKind) -> u64 {
     debug_assert_eq!(ScalarKind::from_type_code(loc.type_code()), Some(kind));
     match kind {
-        ScalarKind::Int(fi) => (loc.decode_i64(src, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
+        ScalarKind::Int(fi) => kind.order_image(loc.decode_i64(src, row, fi) as u64),
         // Floats are never PK columns, so these bytes are native.
-        ScalarKind::F32 => ieee_order_bits_f32(u32::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
-        ScalarKind::F64 => ieee_order_bits(u64::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
+        ScalarKind::F32 => kind.order_image(u32::from_le_bytes(loc.bytes(src, row).try_into().unwrap()) as u64),
+        ScalarKind::F64 => kind.order_image(u64::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
     }
-}
-
-/// IEEE 754 order-preserving encoding of an `f64`'s raw bits: negatives invert
-/// wholly, non-negatives flip the sign bit, so plain unsigned order over the
-/// result is `total_cmp` order.
-#[inline(always)]
-pub fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-/// [`ieee_order_bits`] for an `f32`.
-#[inline(always)]
-pub fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u32 << 31)
-    }) as u64
 }
 
 /// A row with one of its order keys as integers.
@@ -284,13 +270,8 @@ impl Ranked {
 }
 
 /// `rows` of `src`, each with its image under `key`: an integer whose order never contradicts
-/// the key's. Returns whether the image is the key's whole order.
-fn rank_rows<S: RowSource>(
-    key: &OrderLocator,
-    src: &S,
-    rows: impl Iterator<Item = u32>,
-    out: &mut Vec<Ranked>,
-) -> bool {
+/// the key's.
+fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: impl Iterator<Item = u32>, out: &mut Vec<Ranked>) {
     #[inline(always)]
     fn fill<S: RowSource>(
         key: &OrderLocator,
@@ -326,27 +307,26 @@ fn rank_rows<S: RowSource>(
         // A 16-byte integer's high half.
         None => fill(key, src, rows, out, |r| (loc.opk_image(src, r) >> 64) as u64),
     }
-    ScalarKind::from_type_code(tc).is_some()
 }
 
 /// Sort `run`, whose images are `keys[0]`'s, by `keys`; rows the keys do not tell apart keep
 /// their order. The images sort first, and each run they leave tied is sorted by the rest.
-fn sort_run<S: RowSource>(keys: &[OrderLocator], exact: bool, src: &S, run: &mut [Ranked]) {
+fn sort_run<S: RowSource>(keys: &[OrderLocator], src: &S, run: &mut [Ranked]) {
     run.sort_by_key(Ranked::lead);
-    let rest = if exact { &keys[1..] } else { keys };
-    if rest.is_empty() {
+    let whole = keys[0].image_is_whole();
+    if whole && keys.len() == 1 {
         return;
     }
     let mut scratch = Vec::new();
     for tie in run.chunk_by_mut(|a, b| a.lead() == b.lead()).filter(|t| t.len() > 1) {
-        match exact {
+        match whole {
             true => {
                 scratch.clear();
-                let exact = rank_rows(&rest[0], src, tie.iter().map(|r| r.row), &mut scratch);
+                rank_rows(&keys[1], src, tie.iter().map(|r| r.row), &mut scratch);
                 tie.copy_from_slice(&scratch);
-                sort_run(rest, exact, src, tie);
+                sort_run(&keys[1..], src, tie);
             }
-            false => tie.sort_by(|a, b| cmp_order_keys(rest, src, a.row as usize, src, b.row as usize)),
+            false => tie.sort_by(|a, b| cmp_order_keys(keys, src, a.row as usize, b.row as usize)),
         }
     }
 }
@@ -355,33 +335,27 @@ fn sort_run<S: RowSource>(keys: &[OrderLocator], exact: bool, src: &S, run: &mut
 /// them reads the batch only for rows the image leaves tied.
 pub struct RowRanking<'a, S> {
     keys: &'a [OrderLocator],
-    /// Whether the image is the leading key's whole order.
-    exact: bool,
     src: &'a S,
     rows: Vec<Ranked>,
 }
 
 impl<'a, S: RowSource> RowRanking<'a, S> {
+    /// Panics on no key.
+    #[inline(never)]
     pub fn new(keys: &'a [OrderLocator], src: &'a S) -> Self {
         let n = src.row_count();
         assert!(n <= u32::MAX as usize, "row count exceeds u32");
         let mut rows = Vec::with_capacity(n);
-        let exact = match keys.first() {
-            Some(key) => rank_rows(key, src, 0..n as u32, &mut rows),
-            None => {
-                rows.extend((0..n as u32).map(|row| Ranked { image: 0, row, rank: 0 }));
-                false
-            }
-        };
-        RowRanking { keys, exact, src, rows }
+        rank_rows(&keys[0], src, 0..n as u32, &mut rows);
+        RowRanking { keys, src, rows }
     }
 
     /// Keep the `k` smallest rows, in no order; every row when `k` covers them.
     pub fn keep_smallest(&mut self, k: usize) {
-        let RowRanking { keys, exact, src, rows } = self;
+        let RowRanking { keys, src, rows } = self;
         if k < rows.len() {
             if k > 0 {
-                let tail = if *exact { &keys[1..] } else { keys };
+                let tail = &keys[keys[0].image_is_whole() as usize..];
                 rows.select_nth_unstable_by(k - 1, |a, b| match a.lead().cmp(&b.lead()) {
                     Ordering::Equal if !tail.is_empty() => cmp_tail(tail, *src, a.row, b.row),
                     ord => ord,
@@ -408,9 +382,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
 
     /// The rows ascending; rows the keys do not tell apart keep their order.
     pub fn sorted(mut self) -> Vec<u32> {
-        if !self.keys.is_empty() {
-            sort_run(self.keys, self.exact, self.src, &mut self.rows);
-        }
+        sort_run(self.keys, self.src, &mut self.rows);
         self.rows().collect()
     }
 }
@@ -418,7 +390,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
 /// Out of line: the images decide most comparisons, and this body inlined would crowd them.
 #[inline(never)]
 fn cmp_tail<S: RowSource>(tail: &[OrderLocator], src: &S, a: u32, b: u32) -> Ordering {
-    cmp_order_keys(tail, src, a as usize, src, b as usize)
+    cmp_order_keys(tail, src, a as usize, b as usize)
 }
 
 #[cfg(test)]

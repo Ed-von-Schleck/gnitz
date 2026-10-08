@@ -1,14 +1,11 @@
 //! Order-image tests: the byte string whose plain lexicographic order is the
 //! column's typed order, and its inverse.
 
-use super::{
-    append_bytes_image, int16_image, order_bits, order_inverse, wide_native_of_image, write_image_slot, WideKind,
-};
+use super::{append_bytes_image, int16_image, wide_native_of_image, write_image_slot, WideKind};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaFacts;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{pk_payload_schema, u64_pk_schema};
-use gnitz_wire::{FixedInt, ScalarKind};
 
 /// `vals` (native bit patterns) as one integer column of type `tc`, one row per
 /// value: the PK column of a batch, or its sole payload column.
@@ -114,118 +111,6 @@ fn wide_image_orders_and_round_trips() {
         for tc in [TypeCode::I128, TypeCode::U128] {
             let images: Vec<Vec<u8>> = int16_images(tc, &ints, invert).iter().map(|i| i.to_vec()).collect();
             assert_images_order(WideKind::Fixed(tc), invert, &int_natives, &images);
-        }
-    }
-}
-
-/// `order_bits`' integer half is the value's OPK key in the 8-byte slot of its
-/// own sign, on both arms, and `order_inverse` recovers the value from it.
-#[test]
-fn order_bits_matches_the_opk_promotion_on_both_arms() {
-    fn oracle(native: u64, fi: FixedInt) -> u64 {
-        let mut key = [0u8; 8];
-        gnitz_wire::store_opk(&mut key, fi.unpack(native as u128) as u128, fi.is_signed());
-        u64::from_be_bytes(key)
-    }
-
-    // (FixedInt, type code, the values to check as raw native-LE u64s.)
-    let mut cases: Vec<(FixedInt, TypeCode, Vec<u64>)> = vec![
-        (FixedInt::U8, TypeCode::U8, (0..=u8::MAX).map(u64::from).collect()),
-        (FixedInt::I8, TypeCode::I8, (0..=u8::MAX).map(u64::from).collect()),
-        (FixedInt::U16, TypeCode::U16, (0..=u16::MAX).map(u64::from).collect()),
-        (FixedInt::I16, TypeCode::I16, (0..=u16::MAX).map(u64::from).collect()),
-    ];
-    // Edges plus a deterministic sweep for the widths exhaustion cannot reach.
-    let mut rng = crate::test_support::Rng::new(0x2545_F491_4F6C_DD1D);
-    for (fi, type_code) in [
-        (FixedInt::U32, TypeCode::U32),
-        (FixedInt::I32, TypeCode::I32),
-        (FixedInt::U64, TypeCode::U64),
-        (FixedInt::I64, TypeCode::I64),
-    ] {
-        let mask = u64::MAX >> (64 - 8 * fi.width());
-        let mut vals = vec![0, 1, mask, mask >> 1, (mask >> 1) + 1];
-        vals.extend((0..64).map(|_| rng.next_u64() & mask));
-        cases.push((fi, type_code, vals));
-    }
-
-    for (fi, type_code, vals) in cases {
-        let w = fi.width();
-        let natives: Vec<u128> = vals.iter().map(|&v| v as u128).collect();
-        let (pk, payload) = (
-            column_batch(type_code, &natives, true),
-            column_batch(type_code, &natives, false),
-        );
-        let (pk_loc, payload_loc) = (pk.schema().locate(0), payload.schema().locate(1));
-        let (pk, payload) = (pk.as_mem_batch(), payload.as_mem_batch());
-        let kind = ScalarKind::Int(fi);
-        for (row, &x) in vals.iter().enumerate() {
-            let want = oracle(x, fi);
-            assert_eq!(order_bits(&pk_loc, &pk, row, kind), want, "{fi:?} pk arm, value {x:#x}");
-            assert_eq!(
-                order_bits(&payload_loc, &payload, row, kind),
-                want,
-                "{fi:?} payload arm, value {x:#x}",
-            );
-            assert_eq!(
-                order_inverse(kind, want).to_le_bytes()[..w],
-                x.to_le_bytes()[..w],
-                "{fi:?} order_inverse, value {x:#x}",
-            );
-        }
-    }
-}
-
-/// `order_bits`' float half round-trips through `order_inverse` and orders by
-/// `total_cmp`, over the values only floats have: ±0.0, ±NaN and both
-/// infinities. A float is never a PK column, so only the payload arm exists.
-#[test]
-fn order_bits_gives_floats_the_total_order() {
-    const FLOATS: [f64; 9] = [
-        f64::NEG_INFINITY,
-        -1.5,
-        -0.0,
-        0.0,
-        f64::MIN_POSITIVE,
-        1.5,
-        f64::INFINITY,
-        f64::NAN,
-        -f64::NAN,
-    ];
-    for (kind, type_code, w) in [(ScalarKind::F32, TypeCode::F32, 4), (ScalarKind::F64, TypeCode::F64, 8)] {
-        let cells: Vec<[u8; 8]> = FLOATS
-            .iter()
-            .map(|&f| {
-                if w == 4 {
-                    ((f as f32).to_bits() as u64).to_le_bytes()
-                } else {
-                    f.to_bits().to_le_bytes()
-                }
-            })
-            .collect();
-        let mut b = BatchBuilder::new(&u64_pk_schema(SchemaColumn::new(type_code, false)));
-        for (i, &f) in FLOATS.iter().enumerate() {
-            b.begin_row(i as u128, 1);
-            b.put_float(f);
-            b.end_row();
-        }
-        let b = b.finish();
-        let loc = b.schema().locate(1);
-        let v = b.as_mem_batch();
-        for (a, ca) in cells.iter().enumerate() {
-            let enc = order_bits(&loc, &v, a, kind);
-            assert_eq!(
-                &order_inverse(kind, enc).to_le_bytes()[..w],
-                &ca[..w],
-                "{kind:?}: order_inverse must recover the value's own bits",
-            );
-            for (b, cb) in cells.iter().enumerate() {
-                assert_eq!(
-                    enc.cmp(&order_bits(&loc, &v, b, kind)),
-                    gnitz_wire::cmp_col_window(&ca[..w], &[], &cb[..w], &[], type_code),
-                    "{kind:?}: order disagrees with cmp_col_window for {ca:02x?} vs {cb:02x?}",
-                );
-            }
         }
     }
 }

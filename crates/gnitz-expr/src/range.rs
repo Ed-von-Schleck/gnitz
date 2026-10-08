@@ -30,10 +30,7 @@ impl RangeMembership {
             return Err(bad(format!("column type {} has no key order", l.type_code())));
         }
         let range_col = locs[range.eq_vals().len()];
-        let null_mask = locs.iter().fold(0, |m, l| match *l {
-            ColumnLocator::Payload { slot, .. } => m | 1 << slot,
-            ColumnLocator::Pk { .. } => m,
-        });
+        let null_mask = locs.iter().fold(0, |m, l| m | l.null_bit());
         let mask = image_mask(range_col.size());
         let (start, end) = (range.start.image & mask, range.end.image & mask);
         let lo = if range.start.after {
