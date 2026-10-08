@@ -489,7 +489,7 @@ fn test_nullable_pk_rejected() {
 // ── test_hook_relation_register_rejects_malformed_pk ─────────────────
 
 // Drives crafted/malformed packed PK values through the production
-// wire-ingest path (`ingest_to_family` → `fire_hooks` →
+// bundle path (`apply_bundle` → `fire_hooks` →
 // `hook_relation_register`) and asserts each is rejected with an `Err`
 // rather than panicking the server via a `SchemaDescriptor::new`
 // `assert!`.
@@ -506,11 +506,13 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         col_def("c3", TypeCode::F32),
     ];
     let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
-        let batch = table_tab_row_words(tid, "bad_table", raw_pk_cols, 0);
-        let res = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
+        let blocks = [
+            (SysFamily::Column, col_tab_batch(tid, &col_defs, 1)),
+            (SysFamily::Table, table_tab_row_words(tid, "bad_table", raw_pk_cols, 0)),
+        ];
+        let res = apply_ddl(&mut engine, blocks);
         let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
@@ -598,15 +600,7 @@ fn test_drop_view_removes_directory() {
     let base_cols = vec![col_def("id", TypeCode::U64)];
     let base = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
-    // Register a view via the raw system-table path.
-    // Column records and the circuit must precede the VIEW_TAB row (hook invariant).
-    let vid = engine.allocate_ids(1).unwrap();
-    let view_cols = vec![col_def("id", TypeCode::U64)];
-    engine.write_column_records(vid, &view_cols).unwrap();
-    write_identity_circuit(&mut engine, vid, base, gnitz_wire::ReadBound::None);
-
-    let batch = build_view_tab_row(vid, "myview");
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
+    let vid = register_identity_view(&mut engine, base, "myview", &base_cols);
 
     // The register hook created the physical view directory on disk.
     let view_dir = relation_dir(&dir, vid);
@@ -619,7 +613,6 @@ fn test_drop_view_removes_directory() {
     // orphan sweep, which production runs once every worker has applied the
     // drop; drive both steps directly here.
     engine.drop_view("public.myview").unwrap();
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
     assert!(
         !std::path::Path::new(&view_dir).exists(),
@@ -650,14 +643,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     let base_cols = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let base_circuits = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
 
-    // Register a view (column and circuit records precede the VIEW_TAB row).
-    let vid = engine.allocate_ids(1).unwrap();
-    let view_cols = vec![col_def("id", TypeCode::U64)];
-    write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
-    engine.write_column_records(vid, &view_cols).unwrap();
-
-    let batch = build_view_tab_row(vid, "depview");
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
+    register_identity_view(&mut engine, base_tid, "depview", &[col_def("id", TypeCode::U64)]);
 
     assert!(
         count_records(engine.sys_relation(SysFamily::Column).cursor()) > base_cols,
@@ -693,8 +679,7 @@ fn drop_table_retracts_its_serial_sequence_row() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let tid = engine.create_serial_table("public.t").unwrap();
-    let (_base, delta) = engine.reserve_user_sequence(tid, 64).unwrap();
-    engine.submit(SysFamily::Sequence, delta).unwrap();
+    reserve(&mut engine, tid, 64).unwrap();
     assert_eq!(engine.sequence_value(tid), Some(64));
 
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
@@ -705,7 +690,7 @@ fn drop_table_retracts_its_serial_sequence_row() {
 }
 
 // ── drop_cascade_broadcasts_index_owner_columns_in_order ─────────────
-// Workers apply the queue in this order, which no end-state assertion can see.
+// Workers apply the zone in this order, which no end-state assertion can see.
 #[test]
 fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     let dir = temp_dir("drop_cascade_broadcast_order");
@@ -716,15 +701,11 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
-    // Clear the broadcasts accumulated by create_table + create_index.
-    let _ = engine.drain_pending_broadcasts();
-
-    // Submit the table retraction; `submit` retracts the owned index (IDX) ahead
-    // of it and the columns (COL) behind it.
-    engine.submit_retraction(SysFamily::Table, tid).unwrap();
-
-    // Collect the broadcast family-id sequence.
-    let tids: Vec<u64> = engine.drain_pending_broadcasts().iter().map(|(f, ..)| f.id()).collect();
+    // The table's retraction: its apply retracts the owned index (IDX) ahead of
+    // it and the columns (COL) behind it.
+    let drop = engine.retract_under(SysFamily::Table, &[tid]);
+    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop)])).unwrap();
+    let tids: Vec<u64> = zone.iter().map(|g| g.family.id()).collect();
 
     let pos = |id: u64| tids.iter().position(|&t| t == id);
     let idx_pos =
@@ -801,7 +782,17 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
 
     // A REPLICATED base table.
-    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
+    let rt = engine
+        .create_table_with(
+            "public.rt",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps {
+                distribution: gnitz_wire::TableDistribution::Replicated,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
@@ -812,15 +803,18 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let p_producer = engine.allocate_ids(1).unwrap();
     let p_consumer = engine.allocate_ids(1).unwrap();
 
-    for (vid, src) in [
+    let views = [
         (r_producer, rt),
         (r_consumer, r_producer),
         (p_producer, pt),
         (p_consumer, p_producer),
-    ] {
-        write_identity_circuit(&mut engine, vid, src, gnitz_wire::ReadBound::None);
-        engine.write_column_records(vid, &cols).unwrap();
-    }
+    ]
+    .map(|(vid, src)| {
+        (
+            vid,
+            crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None),
+        )
+    });
 
     // One VIEW_TAB batch, consumers first — the dependency-reversed row order.
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
@@ -832,7 +826,8 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     ] {
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, 0);
     }
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
+    let created = views.iter().map(|(vid, circuit)| (*vid, circuit, &cols[..]));
+    apply_ddl(&mut engine, view_blocks(created, bb.finish())).unwrap();
 
     let stamp = |e: &mut CatalogEngine, id: u64| {
         e.registry
@@ -885,7 +880,9 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
         crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
         crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
     ];
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
     let err = try_register_identity_view(&mut engine, tid, "both", &cols, 4 << 20, 4 << 20)
         .expect_err("the pair must be refused");
@@ -908,7 +905,9 @@ fn a_bounded_view_source_is_named() {
         crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
         crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
     ];
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
     let bv = try_register_identity_view(&mut engine, tid, "bv", &cols, 4 << 20, 0).expect("a bounded view");
 
     let err = try_register_identity_view(&mut engine, bv, "over_bv", &cols, 0, 0).expect_err("a leaf view");
@@ -932,7 +931,9 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
     let cols: Vec<CatalogColumn> = (0..gnitz_wire::MAX_COLUMNS)
         .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::TypeCode::U64))
         .collect();
-    let tid = create_flagged_table(&mut engine, "wide", &cols, &[0], 0);
+    let tid = engine
+        .create_table_with("public.wide", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
     let err = try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20)
         .expect_err("the stamp is a 66th column");
@@ -954,7 +955,8 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let dir = temp_dir("duplicate_column_names");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    for (name, flags) in [("dup_table", 0), ("dup_stream", stream_flags())] {
+    let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
+    for (name, flags) in [("dup_table", 0), ("dup_stream", stream.pack())] {
         let col_defs = vec![
             col_def("id", TypeCode::U64),
             col_def("a", TypeCode::I64),
@@ -962,11 +964,14 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             col_def("A", TypeCode::I64),
         ];
         let tid = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(tid, &col_defs).unwrap();
-        let batch = table_tab_row_words(tid, name, PkColList::from_slice(&[0]).pack(), flags);
-        let err = engine
-            .ingest_to_family(gnitz_wire::TABLE_TAB, &batch)
-            .expect_err("a duplicate visible column name must be refused");
+        let blocks = [
+            (SysFamily::Column, col_tab_batch(tid, &col_defs, 1)),
+            (
+                SysFamily::Table,
+                table_tab_row_words(tid, name, PkColList::from_slice(&[0]).pack(), flags),
+            ),
+        ];
+        let err = apply_ddl(&mut engine, blocks).expect_err("a duplicate visible column name must be refused");
         assert!(err.contains("duplicate column name"), "{name}: {err}");
     }
 
@@ -979,10 +984,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             fk: None,
         },
     ];
-    let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, &col_defs).unwrap();
-    let batch = table_tab_batch(&[(tid, "hidden_dup", 1)]);
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
+    engine.create_table("public.hidden_dup", &col_defs, &[0]).unwrap();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -991,7 +993,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
 // ── One TABLE_TAB batch drops several tables, one batch per family ───────────
 
 #[test]
-fn set_based_table_drop_queues_one_batch_per_family() {
+fn set_based_table_drop_applies_one_group_per_family() {
     let dir = temp_dir("set_based_table_drop");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
@@ -1000,12 +1002,11 @@ fn set_based_table_drop_queues_one_batch_per_family() {
         tids.push(engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
         engine.create_index(&format!("public.{name}"), &["val"], false).unwrap();
     }
-    let _ = engine.drain_pending_broadcasts();
 
     let drop = engine.retract_under(SysFamily::Table, &tids);
-    engine.submit(SysFamily::Table, drop).unwrap();
+    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop)])).unwrap();
 
-    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, ..)| f).collect();
+    let families: Vec<SysFamily> = zone.iter().map(|g| g.family).collect();
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
     assert!(tids.iter().all(|&t| !engine.registry.has_id(t)));
 
@@ -1021,16 +1022,16 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
     let base = engine
         .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let cols = vec![col_def("id", TypeCode::U64)];
+    let cols = [col_def("id", TypeCode::U64)];
     let v = engine.allocate_ids(2).unwrap();
     let s = v + 1;
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    for (vid, name, owner) in [(v, "v", 0), (s, "v__seg", v)] {
-        write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
-        engine.write_column_records(vid, &cols).unwrap();
+    let identity = crate::test_support::identity_circuit(base, gnitz_wire::ReadBound::None);
+    for (vid, name, owner) in [(v, "v", 0), (s, "_seg", v)] {
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
     }
-    engine.submit(SysFamily::View, bb.finish()).unwrap();
+    let created = [v, s].map(|vid| (vid, &identity, &cols[..]));
+    apply_ddl(engine, view_blocks(created, bb.finish())).unwrap();
     (v, s)
 }
 
@@ -1039,11 +1040,11 @@ fn view_drop_retracts_its_segments() {
     let dir = temp_dir("view_drop_segments");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (v, s) = view_with_segment(&mut engine);
-    let _ = engine.drain_pending_broadcasts();
 
-    engine.submit_retraction(SysFamily::View, v).unwrap();
+    let drop = engine.retract_under(SysFamily::View, &[v]);
+    let zone = engine.apply_bundle(bundle([(SysFamily::View, drop)])).unwrap();
 
-    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, ..)| f).collect();
+    let families: Vec<SysFamily> = zone.iter().map(|g| g.family).collect();
     assert_eq!(families, [SysFamily::View, SysFamily::Circuit, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry.has_id(id));
@@ -1062,7 +1063,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
     let (v, s) = view_with_segment(&mut engine);
 
     let drop = engine.retract_under(SysFamily::View, &[v, s]);
-    engine.submit(SysFamily::View, drop).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::View, drop)]).unwrap();
 
     assert!(!engine.registry.has_id(v) && !engine.registry.has_id(s));
     assert_eq!(
@@ -1084,24 +1085,20 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
 
     // In its own bundle, against a committed table.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let err = engine
-        .submit(SysFamily::View, build_view_tab_row(tid, "v"))
+    let err = apply_ddl(&mut engine, [(SysFamily::View, build_view_tab_row(tid, "v"))])
         .expect_err("a view create at a table's id must be refused");
     assert!(err.contains(&format!("relation id {tid} already exists")), "{err}");
     assert!(engine.registry.relation(tid).is_some_and(|r| r.kind().is_base_table()));
-    let _ = engine.drain_pending_broadcasts();
 
     // In the same bundle as the TABLE_TAB create.
     let both = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(both, &cols).unwrap();
-    engine
-        .submit(SysFamily::Table, table_tab_batch(&[(both, "both", 1)]))
-        .unwrap();
-    let err = engine
-        .submit(SysFamily::View, build_view_tab_row(both, "both_v"))
-        .expect_err("one bundle may not create one id as a table and a view");
+    let blocks = [
+        (SysFamily::Column, col_tab_batch(both, &cols, 1)),
+        (SysFamily::Table, table_tab_batch(&[(both, "both", 1)])),
+        (SysFamily::View, build_view_tab_row(both, "both_v")),
+    ];
+    let err = apply_ddl(&mut engine, blocks).expect_err("one bundle may not create one id as a table and a view");
     assert!(err.contains(&format!("relation id {both} already exists")), "{err}");
-    engine.compensate_stage_a().unwrap();
     assert!(!engine.registry.has_id(both));
     assert_eq!(
         engine.qualified_name_or_unknown(both),

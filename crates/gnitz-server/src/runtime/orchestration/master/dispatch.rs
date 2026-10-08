@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::scatter::with_routed;
 use super::*;
-use crate::catalog::SysFamily;
+use crate::catalog::{SysFamily, ZoneGroup};
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
 use gnitz_foundation::posix_io::retry_eintr;
@@ -170,14 +170,14 @@ impl MasterDispatcher {
     /// groups, so recovery groups them atomically — and send it to every worker.
     /// A family that reaches no worker is logged and addresses none. Publishes
     /// nothing; that is the scope's commit.
-    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
+    fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
         let target_id = family.id();
         let record = self
             .cat()
             .schema_record(target_id)
             .expect("a wire target is registered under the catalog lock");
         let mut group = DirectGroup::ddl_sync(target_id, &record, batch);
-        if !family.reaches_workers() {
+        if family.master_only() {
             group.targets = GroupTargets {
                 set: WorkerSet::EMPTY,
                 ..GroupTargets::UNADDRESSED
@@ -186,6 +186,36 @@ impl MasterDispatcher {
         scope.write(&group, true)?;
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.len());
         Ok(())
+    }
+
+    /// Emit `zone`, which the catalog has applied, as one SAL zone and mark it
+    /// applied; answers the zone LSN. Submits no fdatasync. A zone the log
+    /// refuses reached no worker — its scope drops unpublished — so the catalog
+    /// is put back and the refusal answered.
+    pub(crate) fn emit_zone(
+        &self,
+        excl: &mut SalExcl<'_>,
+        zone: Vec<ZoneGroup>,
+        op: &'static str,
+    ) -> Result<u64, WireFault> {
+        let scope = excl.begin("ddl");
+        let zone_lsn = scope.lsn();
+        let laid_out = zone
+            .iter()
+            .try_for_each(|g| self.broadcast_ddl(&scope, g.family, &g.batch));
+        if let Err(refused) = laid_out {
+            drop(scope);
+            if let Err(e) = self.cat_mut().undo(zone) {
+                gnitz_fatal_abort!("{op}: the log refused the zone ({refused}); undoing it failed: {e}");
+            }
+            return Err(refused);
+        }
+        // Only a closed zone raises the replay floor: an LSN no member carries can
+        // be the next scope's, whose zone boot replay would then skip.
+        if scope.commit() {
+            self.cat_mut().mark_zone_applied(zone_lsn);
+        }
+        Ok(zone_lsn)
     }
 
     /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
@@ -356,10 +386,6 @@ impl MasterDispatcher {
     /// leaves the SAL intact and aborts or fails the boot.
     pub(crate) fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
         let cat = self.cat_mut();
-        debug_assert!(
-            !cat.has_uncommitted_families(),
-            "a checkpoint's system-table flush would make an uncommitted DDL durable"
-        );
         cat.flush_all_system_tables()?;
         // Every worker ACKed the FLUSH, so each has applied every DdlSync written
         // before it; the flush above made every applied DROP durable.

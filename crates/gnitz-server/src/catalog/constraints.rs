@@ -41,7 +41,7 @@ impl RowConstraints {
 
 impl CatalogEngine {
     /// All FK edges where `table_id` is the child.
-    pub(crate) fn fk_constraints_of(&self, table_id: u64) -> &[FkEdge] {
+    pub(in crate::catalog) fn fk_constraints_of(&self, table_id: u64) -> &[FkEdge] {
         self.caches.relations.get(&table_id).map_or(&[], |e| e.fks.as_slice())
     }
 
@@ -82,7 +82,7 @@ impl CatalogEngine {
     }
 
     /// Whether [`Self::row_constraints`] of `tid` is non-empty, without the copy.
-    pub(crate) fn has_row_constraints(&self, tid: u64) -> bool {
+    pub(in crate::catalog) fn has_row_constraints(&self, tid: u64) -> bool {
         let (as_child, as_parent, rel) = self.constraint_sources(tid);
         !as_child.is_empty()
             || !as_parent.is_empty()

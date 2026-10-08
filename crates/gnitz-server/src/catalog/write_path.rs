@@ -1,6 +1,6 @@
 //! Catalog write path: `apply_bundle` over `submit` (precheck → owned-row cascade →
-//! ingest → `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
-//! orphan-directory sweep.
+//! ingest → `fire_hooks`), the zone a write returns and its undo, the zone pin,
+//! and the orphan-directory sweep.
 
 use gnitz_wire::payload_u64;
 use gnitz_wire::sys_rows::{IdxTabSlot, ViewTabSlot};
@@ -10,13 +10,33 @@ use super::sys_reads::IdSet;
 use super::sys_tables::{family_pk_partition, SysFamily};
 use super::CatalogEngine;
 
+/// One system-family delta as the master applied it: one group of the zone a
+/// catalog write emits.
+pub(crate) struct ZoneGroup {
+    pub(crate) family: SysFamily,
+    pub(crate) batch: Batch,
+    /// A view scanned the family when the group was applied, so a worker's
+    /// `ddl_sync` holds it above its cut, owed a tick.
+    pub(crate) scanned: bool,
+}
+
+/// Why a catalog write emits no zone.
+#[derive(Debug)]
+pub(crate) enum ZoneError {
+    /// Refused; the catalog is as it was.
+    Refused(String),
+    /// The catalog holds part of the write and cannot be put back.
+    Diverged(String),
+}
+
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
 
     /// Precheck one system-family delta and apply it with the retraction of every
-    /// system row its dropped relations own. Each batch is queued before its ingest,
-    /// which can fail after writing rows `compensate_stage_a` must negate.
-    pub(crate) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+    /// system row its dropped relations own. Each group is pushed onto `zone`
+    /// before its ingest, which can fail after writing rows [`Self::undo`] must
+    /// negate.
+    fn submit(&mut self, family: SysFamily, batch: Batch, zone: &mut Vec<ZoneGroup>) -> Result<(), String> {
         let net_dead = self.precheck_family(family, &batch)?;
         for (family, batch) in self.with_owned_retractions(family, batch, net_dead) {
             if batch.is_empty() {
@@ -25,7 +45,7 @@ impl CatalogEngine {
             // What a worker's `ddl_sync` of this group will read: it applies the
             // same groups in the same order.
             let scanned = self.dag.is_scanned(family.id());
-            self.pending_broadcasts.push((family, batch.clone(), scanned));
+            zone.push(ZoneGroup { family, batch: batch.clone(), scanned });
             self.apply_family(family, batch, false)?;
         }
         Ok(())
@@ -72,18 +92,45 @@ impl CatalogEngine {
         parts
     }
 
-    /// Apply one `DDL_TXN` bundle: the cross-family guards, each family through
-    /// [`Self::submit`], then a compile of every view it creates. A bundle that
-    /// creates is applied in [`SysFamily::ALL`] order, so every register hook finds
-    /// the families it reads applied; one that only drops in the reverse, so a
-    /// dependent is retired first. On `Err` what was applied stays queued for
-    /// [`Self::compensate_stage_a`].
-    pub(crate) fn apply_bundle(&mut self, families: [Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
-        self.precheck_bundle(&families)?;
+    /// Apply one `DDL_TXN` bundle and answer the zone it applied. A bundle that
+    /// fails is undone here: `Refused` leaves the catalog as it was.
+    pub(crate) fn apply_bundle(
+        &mut self,
+        families: [Option<Batch>; SysFamily::COUNT],
+    ) -> Result<Vec<ZoneGroup>, ZoneError> {
+        let mut zone = Vec::new();
+        let Err(cause) = self.apply_families(families, &mut zone) else {
+            return Ok(zone);
+        };
+        Err(match self.undo(zone) {
+            Ok(()) => ZoneError::Refused(cause),
+            Err(e) => ZoneError::Diverged(format!("DDL refused ({cause}); undoing what it applied failed: {e}")),
+        })
+    }
+
+    /// Negate every group of `zone`, newest first: a group's hook reads what the
+    /// groups before it registered.
+    pub(crate) fn undo(&mut self, zone: Vec<ZoneGroup>) -> Result<(), String> {
+        zone.into_iter()
+            .rev()
+            .try_for_each(|g| self.apply_family(g.family, g.batch.negated(), false))
+    }
+
+    /// The cross-family guards, each family through [`Self::submit`], then a
+    /// compile of every view the bundle creates. A bundle that creates is applied
+    /// in [`SysFamily::ALL`] order, so every register hook finds the families it
+    /// reads applied; one that only drops in the reverse, so a dependent is
+    /// retired first. On `Err`, `zone` holds what was applied.
+    fn apply_families(
+        &mut self,
+        families: [Option<Batch>; SysFamily::COUNT],
+        zone: &mut Vec<ZoneGroup>,
+    ) -> Result<(), String> {
         let new_views = families[SysFamily::View.index()]
             .as_ref()
             .map(|b| family_pk_partition(SysFamily::View, b).creates)
             .unwrap_or_default();
+        self.precheck_bundle(&families, &new_views)?;
         let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
             .into_iter()
             .zip(families)
@@ -93,7 +140,7 @@ impl CatalogEngine {
             ordered.reverse();
         }
         for (family, batch) in ordered {
-            self.submit(family, batch)?;
+            self.submit(family, batch, zone)?;
         }
         // On the master, while the bundle is still undoable: a worker's compile verdict
         // comes after the DDL is durable.
@@ -134,69 +181,25 @@ impl CatalogEngine {
     }
 
     /// Apply one DdlSync group: above the store's cut when a view scans the
-    /// family, for the tick the master sends behind the zone. Never queues.
+    /// family, for the tick the master sends behind the zone.
     pub(crate) fn ddl_sync(&mut self, table_id: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         self.apply_family(family, batch, self.dag.is_scanned(table_id))
     }
 
-    // -- Broadcast queue, applied zone, directory sweep -------------------------
+    // -- Applied zone, directory sweep -------------------------------------------
 
-    /// Record that the system families hold every row of zone `zone_lsn`, before
-    /// awaiting the SAL: a checkpoint holding it flushes with this floor.
+    /// Record that the system families hold every row of zone `zone_lsn`: every
+    /// system flush after it records this floor.
     pub(crate) fn mark_zone_applied(&mut self, zone_lsn: u64) {
         self.system_zone = self.system_zone.max(zone_lsn);
     }
 
-    /// Catalog families are applied in memory but not yet committed to the SAL.
-    pub(crate) fn has_uncommitted_families(&self) -> bool {
-        !self.pending_broadcasts.is_empty()
-    }
-
-    /// Drain the pending-broadcast queue. Taken by `emit_zone_to_sal` on success and
-    /// by `compensate_stage_a` on failure.
-    pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch, bool)> {
-        std::mem::take(&mut self.pending_broadcasts)
-    }
-
-    /// The queued families a worker holds above its cut once the zone is
-    /// emitted, each owed the tick that seals it.
-    pub(crate) fn broadcasts_owed_a_tick(&self) -> Vec<u64> {
-        SysFamily::ALL
-            .into_iter()
-            .filter(|f| self.pending_broadcasts.iter().any(|(q, _, scanned)| q == f && *scanned))
-            .map(SysFamily::id)
-            .collect()
-    }
-
     /// Remove every relation and index directory no live entity owns. Only sound once
-    /// every worker has ACKed a round written after the last DdlSync, so it declines
-    /// while an applied DDL's broadcasts are still queued.
+    /// every worker has ACKed a round written after the last DdlSync.
     pub(crate) fn reclaim_orphan_dirs(&self) {
-        if !self.pending_broadcasts.is_empty() {
-            return;
-        }
         if let Err(e) = self.registry.reclaim_orphan_relation_dirs() {
             gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Stage-A compensation (DDL rollback)
-    // -----------------------------------------------------------------------
-
-    /// Undo a failed `DDL_TXN` bundle in master memory: negate every batch it applied,
-    /// newest first. `Err` means the catalog cannot be restored; the caller aborts.
-    pub(crate) fn compensate_stage_a(&mut self) -> Result<(), String> {
-        self.drain_pending_broadcasts()
-            .into_iter()
-            .rev()
-            .try_for_each(|(family, batch, _)| self.apply_family(family, batch.negated(), false))
-            .map_err(|e| {
-                format!(
-                    "Stage-A DDL compensation failed — catalog cannot be restored, \
-                     and serving it would serve a diverged catalog. Cause: {e}"
-                )
-            })
     }
 }

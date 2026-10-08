@@ -184,7 +184,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 /// A failed round aborts: the workers are re-epoched against an un-reset SAL,
 /// which only a restart's replay repairs.
 async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
-    // A DDL holding the tick gate has uncommitted families step 1 must not flush.
+    // A checkpoint sequence starts after a DDL that holds the tick gate.
     if shared.tick_gate.is_write_held() {
         drop(shared.tick_gate.read().await);
     }

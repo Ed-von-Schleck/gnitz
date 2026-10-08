@@ -57,11 +57,11 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit, fk_def, fk_def_on_delete,
-    idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_sys_row,
-    push_view_tab_row, read_rows, register_identity_view, scan_all, schema_tab_batch, scratch_dir, seek_by_index,
-    seek_by_index_range, sum_weights, table_tab_batch, try_register_identity_view, try_register_view,
-    two_term_join_circuit, uuid_def, write_circuit, write_identity_circuit, LocalDrive,
+    apply_ddl, bundle, circuit_batch, cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
+    fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
+    pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, refusal, register_identity_view, scan_all,
+    schema_tab_batch, scratch_dir, seek_by_index, seek_by_index_range, sum_weights, table_tab_batch,
+    try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, LocalDrive,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -120,13 +120,11 @@ fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
     bb.finish()
 }
 
-/// A `DDL_TXN` bundle of `blocks`, one per family.
-fn bundle(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> [Option<Batch>; SysFamily::COUNT] {
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    for (family, batch) in blocks {
-        assert!(families[family.index()].replace(batch).is_none());
-    }
-    families
+/// Reserve `count` SERIAL ids of `seq`: their base and the `sequences` delta it
+/// applied, or the refusal's text.
+fn reserve(engine: &mut CatalogEngine, seq: u64, count: u64) -> Result<(i64, Batch), String> {
+    let (base, group) = engine.reserve_user_sequence(seq, count).map_err(refusal)?;
+    Ok((base, group.batch))
 }
 
 /// `(live rows, net-negative rows)` of every system family.
@@ -266,47 +264,6 @@ fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) 
     sink.put_u64(flags);
     sink.end_row();
     bb.finish()
-}
-
-/// Register a base table through the DDL hooks with an explicit packed `flags`
-/// word — the routing shapes `create_table` cannot make (it always builds a
-/// full-PK-distributed, non-replicated table): REPLICATED and
-/// CLUSTER BY (a distribution prefix shorter than the PK).
-fn create_flagged_table(
-    engine: &mut CatalogEngine,
-    table_name: &str,
-    cols: &[CatalogColumn],
-    pk_cols: &[u32],
-    flags: u64,
-) -> u64 {
-    let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, cols).unwrap();
-    let batch = table_tab_row_words(tid, table_name, PkColList::from_slice(pk_cols).pack(), flags);
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
-    tid
-}
-
-/// The three non-default `TABLE_TAB.flags` words the fixtures use, so a test reads
-/// as the property under test rather than as a bit pattern.
-fn replicated_flags() -> u64 {
-    gnitz_wire::TableProps {
-        distribution: gnitz_wire::TableDistribution::Replicated,
-        ..Default::default()
-    }
-    .pack()
-}
-
-/// CLUSTER BY the PK's leading `k` columns.
-fn clustered_flags(k: usize) -> u64 {
-    gnitz_wire::TableProps {
-        distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: k as u8 },
-        ..Default::default()
-    }
-    .pack()
-}
-
-fn stream_flags() -> u64 {
-    gnitz_wire::TableProps { stream: true, ..Default::default() }.pack()
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces

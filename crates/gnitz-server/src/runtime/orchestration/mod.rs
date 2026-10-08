@@ -42,8 +42,8 @@ pub(super) mod worker;
 /// propagates through `block_on` and takes the process down. Two kinds of call site
 /// wrap against that, and they want opposite things from the `Err`: a request
 /// handler returns it to the client as `WireStatus::Error` and stays live, while a
-/// site whose panic would leave master and workers inconsistent — DDL
-/// compensation, view backfill — turns it into
+/// site whose panic would leave master and workers inconsistent — a view
+/// backfill, the catalog tick — turns it into
 /// `gnitz_fatal_abort!`. Which one a site is, is in its `Err` arm, not here.
 ///
 /// Debug and test builds only: an optimized build dies at the panic — by

@@ -20,7 +20,7 @@ fn test_index_creation_and_fill() {
         bb.end_row();
     }
     let batch = bb.finish();
-    engine.ingest_to_family(tid, &batch).unwrap();
+    engine.registry.ingest(tid, batch).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Create index
@@ -53,18 +53,18 @@ fn test_index_live_fanout() {
         bb.put_u64(i * 100);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Create index — fills from the 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
 
-    // Live fan-out: ingest 1 more row via ingest_to_family (which does index projection)
+    // Live fan-out: ingest 1 more row via the registry (which does index projection)
     let mut bb2 = BatchBuilder::new(&schema);
     bb2.begin_row(99u128, 1);
     bb2.put_u64(777);
     bb2.end_row();
-    engine.ingest_to_family(tid, &bb2.finish()).unwrap();
+    engine.registry.ingest(tid, bb2.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
@@ -114,9 +114,8 @@ fn test_failed_create_index_rolls_back() {
     bb.begin_row(1u128, 1);
     bb.put_u64(42);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
-    let _ = engine.drain_pending_broadcasts();
 
     // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_id;
@@ -148,14 +147,6 @@ fn test_failed_create_index_rolls_back() {
         Vec::<i64>::new(),
         "a failed create must leave no stored weight under its id"
     );
-    for (family, batch, _) in &engine.drain_pending_broadcasts() {
-        if *family == SysFamily::Index {
-            assert!(
-                (0..batch.len()).all(|i| batch.get_weight(i) >= 0),
-                "no negative-weight IDX_TAB broadcast may be enqueued on rollback"
-            );
-        }
-    }
 
     // The failed attempt does not block a later index on the same column.
     fs::remove_file(&blocker).unwrap();
@@ -187,7 +178,7 @@ fn test_seek_by_index_found() {
     bb.begin_row(30u128, 1);
     bb.put_u64(300);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Seek by index: val=200 → should find PK=20
@@ -214,7 +205,7 @@ fn test_seek_by_index_not_found() {
     bb.begin_row(1u128, 1);
     bb.put_u64(42);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Seek by index: val=999 → should return None
@@ -249,7 +240,7 @@ fn test_seek_by_index_negative_i64() {
     bb.begin_row(4u128, 1);
     bb.put_u64(10);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // The seek key is the value's native bit pattern (2's complement); the index
@@ -296,7 +287,7 @@ fn test_seek_by_index_negative_i32() {
     bb.begin_row(3u128, 1);
     bb.put_int(42);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // The seek key is the I32 value's zero-extended native bit pattern; projection
@@ -340,7 +331,7 @@ fn test_seek_by_index_u8_column() {
     bb.begin_row(20u128, 1);
     bb.put_int(99);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let result = seek_by_index(&mut engine, tid, &[1], &[42u128]).unwrap().0;
@@ -371,7 +362,7 @@ fn test_seek_by_index_u16_column() {
     bb.begin_row(2u128, 1);
     bb.put_int(443);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let result = seek_by_index(&mut engine, tid, &[1], &[443u128]).unwrap().0;
@@ -583,7 +574,7 @@ fn test_compound_pk_secondary_index_seek() {
         bb.end_row();
     }
     let b = bb.finish();
-    engine.ingest_to_family(tid, &b).unwrap();
+    engine.registry.ingest(tid, b).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // val=100 → exactly one match
@@ -622,7 +613,7 @@ fn test_compound_pk_secondary_index_retract() {
     bb.put_int(500);
     bb.end_row();
     let b = bb.finish();
-    engine.ingest_to_family(tid, &b).unwrap();
+    engine.registry.ingest(tid, b).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     assert!(seek_by_index(&mut engine, tid, &[2], &[500u128]).unwrap().0.is_some());
@@ -633,7 +624,7 @@ fn test_compound_pk_secondary_index_retract() {
     rb.put_int(500);
     rb.end_row();
     let r = rb.finish();
-    engine.ingest_to_family(tid, &r).unwrap();
+    engine.registry.ingest(tid, r).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     assert!(
@@ -654,7 +645,7 @@ fn drop_table_removes_the_relation_entry() {
     engine.create_index("public.t", &["val"], false).unwrap();
 
     let rename = col_alter_pair(tid, 1, &col_def("val", TypeCode::I64), |c| c.def.name = "val2".into());
-    engine.submit(SysFamily::Column, rename).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Column, rename)]).unwrap();
 
     assert!(
         engine.caches.relations.contains_key(&tid),
@@ -788,11 +779,11 @@ fn test_promote_unique_index_over_fk_column_empty() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A shared circuit's directory is named by its column list, so compensating the
+/// A shared circuit's directory is named by its column list, so undoing the
 /// drop of the last index on it re-opens the directory it already had — the one
-/// the workers, which never saw the compensated drop, still hold.
+/// the workers, which never saw the undone drop, still hold.
 #[test]
-fn compensated_drop_of_a_shared_index_keeps_its_directory() {
+fn undone_drop_of_a_shared_index_keeps_its_directory() {
     let (mut engine, tid, dir) = table_fixture(
         "shared_index_dir_stable",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
@@ -801,11 +792,10 @@ fn compensated_drop_of_a_shared_index_keeps_its_directory() {
     for name in ["public__t__a", "public__t__b"] {
         let id = engine.allocate_ids(1).unwrap();
         let idx = idx_tab_batch(id, tid, &[1], name, false, 1);
-        engine.submit(SysFamily::Index, idx).unwrap();
+        apply_ddl(&mut engine, [(SysFamily::Index, idx)]).unwrap();
         ids.push(id);
     }
     engine.submit_retraction(SysFamily::Index, ids[0]).unwrap();
-    let _ = engine.drain_pending_broadcasts();
 
     let reldir = relation_dir(&dir, tid);
     let index_dirs = || {
@@ -820,8 +810,9 @@ fn compensated_drop_of_a_shared_index_keeps_its_directory() {
     let before = index_dirs();
     assert_eq!(before.len(), 1, "{before:?}");
 
-    engine.submit_retraction(SysFamily::Index, ids[1]).unwrap();
-    engine.compensate_stage_a().unwrap();
+    let drop = engine.retract_under(SysFamily::Index, &ids[1..]);
+    let zone = engine.apply_bundle(bundle([(SysFamily::Index, drop)])).unwrap();
+    engine.undo(zone).unwrap();
     assert_eq!(engine.index_ids_of(tid), vec![ids[1]]);
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
     assert_eq!(index_dirs(), before);
@@ -846,7 +837,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    // Seed DISTINCT refc values (ingest_to_family bypasses FK validation).
+    // Seed DISTINCT refc values (a registry ingest bypasses FK validation).
     let schema = engine.registry.relation(child_tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
@@ -855,7 +846,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     bb.begin_row(2u128, 1);
     bb.put_u64(20);
     bb.end_row();
-    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
+    engine.registry.ingest(child_tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
@@ -939,7 +930,7 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
         bb.put_u64(100 + i);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.registry.set_scan_chunk_rows(3);
@@ -985,7 +976,7 @@ fn test_composite_index_full_key_seek() {
     bb.put_u64(2);
     bb.put_u64(100);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Full-key seek (a=1, b=200) → PK 20 only. cols a=1, b=2.
@@ -1028,7 +1019,7 @@ fn test_composite_index_leading_prefix_seek() {
     bb.put_u64(2);
     bb.put_u64(100);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Leading-prefix seek over (a, b) supplying only a=1 (K=1 < N=2) must match
@@ -1072,7 +1063,7 @@ fn test_composite_index_signed_unsigned_u128_mix() {
     bb.put_u64(7);
     bb.put_int(big);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // i32(-5) is its zero-extended u32 bit pattern as the native key.
@@ -1111,7 +1102,7 @@ fn test_composite_index_null_in_any_key_skipped() {
     bb.put_u64(1);
     bb.put_u64(200);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Leading-prefix seek a=1 must find only PK 20 (PK 10 has NULL b → not indexed).
@@ -1239,7 +1230,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1294,7 +1285,7 @@ fn test_seek_by_index_range_signed_between() {
         bb.put_int(x as u128);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let pk = |v: i32| key_image(TypeCode::I32, (v as u32) as u128);
@@ -1342,7 +1333,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
         bb.put_u64(b);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
@@ -1384,7 +1375,7 @@ fn test_seek_by_index_range_open_ended() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1431,7 +1422,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     bb.begin_row(101, 1);
     bb.put_u64(30);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1466,7 +1457,7 @@ fn test_seek_by_index_range_retraction() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Retract PK 2 (x=15) → net weight 0; it must vanish from the range scan
@@ -1476,7 +1467,7 @@ fn test_seek_by_index_range_retraction() {
     rb.begin_row(2, -1);
     rb.put_u64(15);
     rb.end_row();
-    engine.ingest_to_family(tid, &rb.finish()).unwrap();
+    engine.registry.ingest(tid, rb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1510,7 +1501,7 @@ fn test_seek_by_index_range_null_excluded() {
     bb.begin_row(3u128, 1);
     bb.put_u64(15);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1547,7 +1538,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1585,7 +1576,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
@@ -1622,7 +1613,7 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
         bb.put_u64(b);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
@@ -1692,7 +1683,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // x ∈ [10, 20] → all six rows, each at weight 1.
@@ -1710,7 +1701,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     rb.begin_row(5, -1);
     rb.put_u64(10);
     rb.end_row();
-    engine.ingest_to_family(tid, &rb.finish()).unwrap();
+    engine.registry.ingest(tid, rb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::before(10), Cut::after(20))
@@ -1758,7 +1749,7 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
         bb.put_u64(b);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Prefix seek a=7 → PKs {1,2,5,8}, all with a=7; PK 99 (a=8) absent.
@@ -1800,7 +1791,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::after(15), Cut::before(25))
@@ -1911,7 +1902,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
         bb.put_u64(x);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1], &[50u128])
@@ -1982,7 +1973,7 @@ fn test_seek_by_index_composite_prefix_null_gate() {
     bb.put_u64(5);
     bb.put_u64(9);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1, 2], &[5u128]).unwrap().0;
@@ -2014,7 +2005,7 @@ fn test_seek_by_index_multi_value_regression() {
         bb.put_u64(val);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1], &[20u128]).unwrap().0;
@@ -2030,12 +2021,12 @@ fn test_seek_by_index_multi_value_regression() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Compensating a DROP INDEX refills the restored circuit ───────────────
+// ── Undoing a DROP INDEX refills the restored circuit ────────────────────
 
 #[test]
-fn compensated_drop_index_refills_the_restored_circuit() {
+fn undone_drop_index_refills_the_restored_circuit() {
     let (mut engine, tid, dir) = table_fixture(
-        "compensated_drop_index_refills",
+        "undone_drop_index_refills",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2043,17 +2034,16 @@ fn compensated_drop_index_refills_the_restored_circuit() {
     bb.begin_row(20u128, 1);
     bb.put_u64(200);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
-    let _ = engine.drain_pending_broadcasts();
 
     let drop = engine.retract_under(SysFamily::Index, &[idx_id]);
-    engine.submit(SysFamily::Index, drop).unwrap();
+    let zone = engine.apply_bundle(bundle([(SysFamily::Index, drop)])).unwrap();
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_none());
 
-    engine.compensate_stage_a().unwrap();
+    engine.undo(zone).unwrap();
 
     let found = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
     let row = found.expect("the restored index must hold the flushed row");

@@ -8,9 +8,10 @@ use gnitz_zset::schema::Placement;
 
 use super::cache::{encode_record, RelationEntry};
 use super::constraints::FkEdge;
-use super::precheck::build_schema_from_col_defs;
 use super::sys_reads::IdSet;
-use super::sys_tables::{index_parts, pk_signatures, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily};
+use super::sys_tables::{
+    build_schema_from_col_defs, pk_signatures, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily,
+};
 use super::CatalogEngine;
 use gnitz_wire::sys_rows::IdxTabRow;
 
@@ -50,7 +51,7 @@ impl CatalogEngine {
             RelDetail::View { owner, .. } => {
                 let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner)?;
                 for &src in self.dag.sources_of(rel.id) {
-                    if SysFamily::from_id(src).is_some_and(|f| !f.reaches_workers()) {
+                    if SysFamily::from_id(src).is_some_and(SysFamily::master_only) {
                         return Err(format!(
                             "reads '{}', which holds no set a view can scan",
                             self.qualified_name(src)
@@ -188,7 +189,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Apply a column ALTER (or its compensation) to every registered owner.
+    /// Apply a column ALTER (or its undo) to every registered owner.
     fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
         let owners = IdSet::new((0..batch.len()).map(|i| SysFamily::Column.leading_id(batch.get_pk(i))));
         for &owner in owners.ids() {
@@ -216,7 +217,7 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as u64;
             let (owner_id, cols, unique) = IdxTabRow::read(batch, i)
-                .and_then(|r| index_parts(&r))
+                .and_then(|r| r.parts())
                 .map_err(|e| format!("index {idx_id}: {e}"))?;
             if batch.get_weight(i) > 0 {
                 self.registry

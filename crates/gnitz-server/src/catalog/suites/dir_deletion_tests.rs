@@ -14,7 +14,6 @@ fn dropped_relation_dir_survives_until_the_sweep() {
     let tbl_dir = relation_dir(&dir, tid);
 
     engine.drop_table("public.t").unwrap();
-    let _ = engine.drain_pending_broadcasts();
     assert!(Path::new(&tbl_dir).exists(), "a drop removes no directory itself");
 
     engine.reclaim_orphan_dirs();
@@ -22,33 +21,6 @@ fn dropped_relation_dir_survives_until_the_sweep() {
         !Path::new(&tbl_dir).exists(),
         "the sweep must reclaim a dropped relation's directory"
     );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// A change still queued for broadcast may not have reached a worker that is
-// creating the directory it names, so the sweep leaves every directory alone.
-#[test]
-fn sweep_declines_while_an_applied_change_is_queued() {
-    let dir = temp_dir("sweep_declines_queued");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let tid = engine
-        .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
-    let tbl_dir = relation_dir(&dir, tid);
-    let _ = engine.drain_pending_broadcasts();
-
-    engine.submit_retraction(SysFamily::Table, tid).unwrap();
-    engine.reclaim_orphan_dirs();
-    assert!(
-        Path::new(&tbl_dir).exists(),
-        "the sweep must decline while the drop is still queued"
-    );
-
-    let _ = engine.drain_pending_broadcasts();
-    engine.reclaim_orphan_dirs();
-    assert!(!Path::new(&tbl_dir).exists(), "the drained drop's directory is swept");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -65,7 +37,6 @@ fn sweep_keeps_a_re_registered_id() {
     let tbl_dir = relation_dir(&dir, tid);
 
     engine.drop_table("public.t").unwrap();
-    let _ = engine.drain_pending_broadcasts();
     engine.register_table(tid, PUBLIC_SCHEMA_ID, "t", &cols, &[0]).unwrap();
 
     engine.reclaim_orphan_dirs();
@@ -96,7 +67,7 @@ fn gc_reclaims_orphan_table_dir() {
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
     let live_dir = relation_dir(&dir, tid);
     assert!(Path::new(&live_dir).exists());
@@ -106,7 +77,6 @@ fn gc_reclaims_orphan_table_dir() {
     let ghost = format!("{}/ghost_{}", relations_dir(&dir), tid + 9999);
     std::fs::create_dir_all(&ghost).unwrap();
 
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
 
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
@@ -132,7 +102,6 @@ fn gc_reclaims_unregistered_relation_dir() {
     let ghost = relation_dir(&dir, 4242);
     std::fs::create_dir_all(&ghost).unwrap();
 
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
 
     assert!(
@@ -173,7 +142,6 @@ fn gc_reclaims_orphan_index_dir() {
     let non_idx = format!("{tbl_dir}/data_keep");
     std::fs::create_dir_all(&non_idx).unwrap();
 
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
 
     assert!(!Path::new(&ghost_idx).exists(), "orphan index dir must be reclaimed");
@@ -198,7 +166,7 @@ fn gc_leaves_live_entities_untouched() {
     bb.begin_row(1u128, 1);
     bb.put_u64(7);
     bb.end_row();
-    engine.ingest_to_family(t1, &bb.finish()).unwrap();
+    engine.registry.ingest(t1, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
     engine.create_index("public.flushed", &["val"], false).unwrap();
 
@@ -222,7 +190,6 @@ fn gc_leaves_live_entities_untouched() {
         assert!(Path::new(d).exists(), "precondition: {d} exists");
     }
 
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
 
     for d in &dirs {
@@ -250,7 +217,6 @@ fn gc_is_idempotent() {
     let ghost = format!("{}/ghost_{}", relations_dir(&dir), tid + 5000);
     std::fs::create_dir_all(&ghost).unwrap();
 
-    let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
     assert!(!Path::new(&ghost).exists());
     assert!(Path::new(&live).exists());
@@ -274,14 +240,24 @@ fn gc_is_idempotent() {
 /// `(tid, relation_directory)`.
 fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (u64, String) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
-    let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
+    let rt = engine
+        .create_table_with(
+            "public.rt",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps {
+                distribution: gnitz_wire::TableDistribution::Replicated,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let rel_dir = relation_dir(engine.registry.base_dir(), rt);
     let mut bb = BatchBuilder::new(&engine.registry.relation(rt).map(Relation::schema).unwrap());
     bb.begin_row(1u128, 1);
     bb.put_int(7);
     bb.end_row();
-    engine.ingest_to_family(rt, &bb.finish()).unwrap();
+    engine.registry.ingest(rt, bb.finish()).unwrap();
     if flush {
         engine.registry.checkpoint_base().unwrap();
     }
@@ -586,7 +562,17 @@ fn repartition_handles_a_relation_with_empty_children() {
     ];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
-    let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
+    let tid = engine
+        .create_table_with(
+            "public.cb",
+            &cols,
+            &[0, 1],
+            gnitz_wire::TableProps {
+                distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let rel = relation_dir(&dir, tid);
     let (schema, placement) = placed(&engine, tid);
     engine.close();
@@ -732,11 +718,15 @@ fn repartition_refuses_an_unreadable_child_grammar() {
 /// its rows are still in the SAL tail: nothing moves, and the sweep retires it.
 #[test]
 fn a_torn_foreign_set_moves_nothing() {
-    for (name, flags) in [("keyed", 0), ("replicated", replicated_flags())] {
+    let replicated = gnitz_wire::TableProps {
+        distribution: gnitz_wire::TableDistribution::Replicated,
+        ..Default::default()
+    };
+    for (name, props) in [("keyed", Default::default()), ("replicated", replicated)] {
         let dir = temp_dir(&format!("repartition_torn_foreign_{name}"));
         let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
         let mut engine = CatalogEngine::open(&dir, 4).unwrap();
-        let tid = create_flagged_table(&mut engine, "t", &cols, &[0], flags);
+        let tid = engine.create_table_with("public.t", &cols, &[0], props).unwrap();
         let rel = relation_dir(&dir, tid);
         let (schema, placement) = placed(&engine, tid);
         engine.close();
@@ -771,7 +761,17 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let dir = temp_dir("repartition_partial_target_replicated");
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
-    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
+    let rt = engine
+        .create_table_with(
+            "public.rt",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps {
+                distribution: gnitz_wire::TableDistribution::Replicated,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let rel = relation_dir(&dir, rt);
     let (schema, placement) = placed(&engine, rt);
     engine.close();

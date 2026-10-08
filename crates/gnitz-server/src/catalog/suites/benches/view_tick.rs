@@ -99,7 +99,14 @@ fn echo_fold_view_tick_bench() {
     let cells = |id: u64| [scramble(id)];
     for readers in [0usize, 1, 2, 4] {
         let mut engine = CatalogEngine::open(&temp_dir(&format!("echo_fold_{readers}")), 1).unwrap();
-        let s = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
+        let s = engine
+            .create_table_with(
+                "public.s",
+                &cols,
+                &[0],
+                gnitz_wire::TableProps { stream: true, ..Default::default() },
+            )
+            .unwrap();
         let a = register_identity_view(&mut engine, s, "a", &cols);
         let last = (0..readers).fold(a, |_, r| {
             try_register_view(&mut engine, distinct_circuit(a), &format!("d{r}"), &cols, 0, 0).unwrap()
@@ -448,21 +455,12 @@ fn segment_view_tick_bench() {
     let scan = circuit.input_delta(segment, ReadBound::None);
     circuit.reduce_multi_local(scan, &[0], &aggs);
     let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
-    for (vid, name, circuit, cols, owner) in [
-        (
-            segment,
-            "segment",
-            two_term_join_circuit(t, u, TypeCode::U64),
-            &joined[..],
-            view,
-        ),
-        (view, "reduced", circuit, &cols_of(&reduced), 0),
-    ] {
-        crate::test_support::write_circuit(&mut engine, vid, circuit);
-        engine.write_column_records(vid, cols).unwrap();
-        crate::test_support::push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
-    }
-    engine.submit(crate::catalog::SysFamily::View, bb.finish()).unwrap();
+    crate::test_support::push_view_tab_row(&mut bb, 1, segment, "_segment", 0, 0, view);
+    crate::test_support::push_view_tab_row(&mut bb, 1, view, "reduced", 0, 0, 0);
+    let join = two_term_join_circuit(t, u, TypeCode::U64);
+    let reduced_cols = cols_of(&reduced);
+    let created = [(segment, &join, &joined[..]), (view, &circuit, &reduced_cols[..])];
+    crate::test_support::apply_ddl(&mut engine, view_blocks(created, bb.finish())).unwrap();
     backfill(&mut engine, segment);
     backfill(&mut engine, view);
 

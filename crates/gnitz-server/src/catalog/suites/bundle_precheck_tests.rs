@@ -128,8 +128,11 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     let existing = register_identity_view(&mut engine, table, "existing", &id_v());
     let vid = engine.allocate_ids(3).unwrap();
     let (user, other) = (vid + 1, vid + 2);
+    // Staged as a worker applies them: no bundle carries an ownerless column block.
     for id in [vid, user, other] {
-        engine.write_column_records(id, &id_v()).unwrap();
+        engine
+            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, &id_v(), 1))
+            .unwrap();
     }
     // `rows` of `(view id, name, owner)`.
     let view_rows = |rows: &[(u64, &str, u64)]| {
@@ -142,21 +145,27 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
 
     let not_created = "is not a user view this bundle creates";
     for (rows, why) in [
-        (&[(vid, "seg", 999_999)][..], not_created),
-        (&[(vid, "seg", table)], not_created),
-        (&[(vid, "seg", existing)], not_created),
+        (&[(vid, "_seg", 999_999)][..], not_created),
+        (&[(vid, "_seg", table)], not_created),
+        (&[(vid, "_seg", existing)], not_created),
         // A segment of the bundle is no user view.
         (
-            &[(vid, "seg", other), (other, "other", user), (user, "user", 0)],
+            &[(vid, "_seg", other), (other, "_other", user), (user, "user", 0)],
             not_created,
         ),
-        (&[(vid, "seg", vid)], not_created),
+        (&[(vid, "_seg", vid)], not_created),
         (&[(vid, "MixedCase", 0)], "not canonical"),
+        // A leading `_` names a segment and nothing else.
+        (&[(vid, "_v", 0)], "cannot start with '_'"),
+        (
+            &[(vid, "seg", user), (user, "user", 0)],
+            "a chain segment's name starts with '_'",
+        ),
     ] {
         let err = engine.precheck_family(SysFamily::View, &view_rows(rows)).unwrap_err();
         assert!(err.contains(why), "{rows:?}: {err}");
     }
-    for rows in [&[(vid, "v", 0)][..], &[(vid, "seg", user), (user, "user", 0)]] {
+    for rows in [&[(vid, "v", 0)][..], &[(vid, "_seg", user), (user, "user", 0)]] {
         engine
             .precheck_family(SysFamily::View, &view_rows(rows))
             .unwrap_or_else(|e| panic!("{rows:?}: {e}"));
@@ -173,16 +182,15 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
     let dir = temp_dir("bundle_column_owner");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.allocate_ids(1).unwrap();
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    families[SysFamily::Column.index()] = Some(col_tab_batch(tid, &id_v(), 1));
+    let columns = || (SysFamily::Column, col_tab_batch(tid, &id_v(), 1));
 
-    let err = engine.precheck_bundle(&families).unwrap_err();
+    let err = apply_ddl(&mut engine, [columns()]).unwrap_err();
     assert!(
         err.contains(&format!("owner {tid}, which this transaction does not create")),
         "{err}"
     );
-    families[SysFamily::Table.index()] = Some(table_tab_batch(&[(tid, "t", 1)]));
-    engine.precheck_bundle(&families).unwrap();
+    let table = (SysFamily::Table, table_tab_batch(&[(tid, "t", 1)]));
+    apply_ddl(&mut engine, [columns(), table]).unwrap();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -204,8 +212,10 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
         for &(weight, vid) in rows {
             push_view_tab_row(&mut bb, weight, vid, "v", 0, 0, 0);
         }
-        families[SysFamily::View.index()] = Some(bb.finish());
-        engine.precheck_bundle(&families)
+        let views = bb.finish();
+        let created = family_pk_partition(SysFamily::View, &views).creates;
+        families[SysFamily::View.index()] = Some(views);
+        engine.precheck_bundle(&families, &created)
     };
 
     for (rows, uncreated) in [(&[][..], 30), (&[(1, 30)], 20), (&[(1, 30), (-1, 20), (1, 20)], 20)] {
@@ -232,12 +242,14 @@ fn a_creating_bundle_registers_its_table() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.allocate_ids(1).unwrap();
 
-    engine
-        .apply_bundle(bundle([
+    apply_ddl(
+        &mut engine,
+        [
             (SysFamily::Table, table_tab_batch(&[(tid, "t", 1)])),
             (SysFamily::Column, col_tab_batch(tid, &id_v(), 1)),
-        ]))
-        .unwrap();
+        ],
+    )
+    .unwrap();
     assert_eq!(engine.get_by_name("public", "t"), Some(tid));
     assert!(engine.registry.has_id(tid));
 
@@ -273,19 +285,15 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
 
 /// Three bundles refused after rows of theirs applied — a view whose circuit does
 /// not compile, a view whose column records carry an FK, a view over a table its
-/// own bundle drops — each compensate to the catalog they found.
+/// own bundle drops — each leave the catalog they found.
 #[test]
-fn a_refused_view_bundle_compensates_to_the_prior_catalog() {
+fn a_refused_view_bundle_leaves_the_prior_catalog() {
     let dir = temp_dir("bundle_apply_refused_view");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base = engine.create_table("public.base", &id_v(), &[0]).unwrap();
     let before = sys_row_counts(&engine);
     let view_bundle = |vid: u64, circuit: gnitz_wire::Circuit, cols: &[CatalogColumn]| {
-        [
-            (SysFamily::Circuit, crate::test_support::circuit_batch(vid, &circuit)),
-            (SysFamily::Column, col_tab_batch(vid, cols, 1)),
-            (SysFamily::View, build_view_tab_row(vid, "v")),
-        ]
+        view_blocks([(vid, &circuit, cols)], build_view_tab_row(vid, "v"))
     };
     let identity = || crate::test_support::identity_circuit(base, gnitz_wire::ReadBound::None);
     // A filter whose predicate blob the expression decoder refuses.
@@ -317,13 +325,10 @@ fn a_refused_view_bundle_compensates_to_the_prior_catalog() {
         ),
     ];
     for (want, blocks) in cases {
-        let _ = engine.drain_pending_broadcasts();
         let vid = engine.allocate_ids(1).unwrap();
-        let err = engine
-            .apply_bundle(bundle(blocks(&engine, vid)))
-            .expect_err("the bundle is refused");
+        let blocks = blocks(&engine, vid);
+        let err = apply_ddl(&mut engine, blocks).expect_err("the bundle is refused");
         assert!(err.contains(want), "{want}: {err}");
-        engine.compensate_stage_a().unwrap();
 
         assert_eq!(sys_row_counts(&engine), before, "{want}");
         assert!(engine.registry.has_id(base) && !engine.registry.has_id(vid), "{want}");

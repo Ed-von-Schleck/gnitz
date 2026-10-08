@@ -102,7 +102,7 @@ impl CatalogEngine {
 
     /// `tid`'s descriptor token (see [`Self::resolve_answer`]); `None` for an
     /// unregistered id.
-    pub(crate) fn resolve_token(&self, tid: u64) -> Option<u64> {
+    pub(in crate::catalog) fn resolve_token(&self, tid: u64) -> Option<u64> {
         let memo = self.caches.resolve_tokens.borrow().get(&tid).copied();
         memo.or_else(|| self.resolve_answer(tid).map(|(_, _, token)| token))
     }

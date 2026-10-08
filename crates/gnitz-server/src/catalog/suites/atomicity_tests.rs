@@ -17,10 +17,13 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let view = register_identity_view(&mut engine, taken, "a_view", &cols);
     let bounded = try_register_identity_view(&mut engine, taken, "a_bounded_view", &cols, 1 << 20, 0).unwrap();
 
-    // A fresh relation id carrying `cols` as its column records.
+    // A fresh relation id carrying `cols` as its column records: staged as a
+    // worker applies them, since no bundle carries an ownerless column block.
     let mut with_cols = |cols: &[CatalogColumn]| {
         let id = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(id, cols).unwrap();
+        engine
+            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, cols, 1))
+            .unwrap();
         id
     };
     let no_cols = with_cols(&[]);
@@ -37,7 +40,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     for col_idx in [0, 2] {
         col_def("c", TypeCode::U64).write_col_tab_row(&mut bb, gapped, col_idx, 1);
     }
-    engine.submit(SysFamily::Column, bb.finish()).unwrap();
+    engine.ddl_sync(SysFamily::Column.id(), bb.finish()).unwrap();
     let unregistered = engine.allocate_ids(2).unwrap();
     let index_on = |owner: u64, cols: &[u32], name: &str| idx_tab_batch(unregistered + 1, owner, cols, name, false, 1);
 
@@ -146,9 +149,11 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         "precondition: dependency edge T -> V must be present"
     );
 
-    engine
-        .submit(SysFamily::Schema, schema_tab_batch(&[(tid, "victim", 1)]))
-        .unwrap();
+    apply_ddl(
+        &mut engine,
+        [(SysFamily::Schema, schema_tab_batch(&[(tid, "victim", 1)]))],
+    )
+    .unwrap();
     assert_eq!(
         engine.schema_id("victim").expect("the schema exists"),
         tid,
@@ -167,8 +172,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 }
 
 // ---------------------------------------------------------------------------
-// DDL_TXN bundle rollback: `apply_bundle`, then `compensate_stage_a`, as
-// `handle_ddl_txn` does.
+// DDL_TXN bundle rollback: a bundle `apply_bundle` refuses is undone there.
 // ---------------------------------------------------------------------------
 
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB fails **precheck**
@@ -183,20 +187,16 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
-    // The setup is not part of the bundle being compensated.
-    let _ = engine.drain_pending_broadcasts();
 
     let new_tid = engine.allocate_ids(1).unwrap();
     // COL_TAB is applied first; TABLE_TAB then fails its precheck, so nothing of
-    // it is queued or applied.
-    let err = engine
-        .apply_bundle(bundle([
-            (SysFamily::Table, table_tab_batch(&[(new_tid, "dupname", 1)])),
-            (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
-        ]))
-        .expect_err("duplicate-name TABLE_TAB must fail precheck");
+    // it is applied.
+    let blocks = [
+        (SysFamily::Table, table_tab_batch(&[(new_tid, "dupname", 1)])),
+        (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
+    ];
+    let err = apply_ddl(&mut engine, blocks).expect_err("duplicate-name TABLE_TAB must fail precheck");
     assert!(err.contains("already exists: public.dupname"), "{err}");
-    engine.compensate_stage_a().unwrap();
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
@@ -222,7 +222,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 /// in its register hook — a plain file where the relation's directory must go —
 /// must net both families to zero.
 #[test]
-fn ddl_txn_hook_failure_is_compensated() {
+fn ddl_txn_hook_failure_is_undone() {
     let dir = temp_dir("ddl_txn_hook_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -230,20 +230,18 @@ fn ddl_txn_hook_failure_is_compensated() {
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let _ = engine.drain_pending_broadcasts();
     let new_tid = engine.allocate_ids(1).unwrap();
     let blocker = relation_dir(&dir, new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
     // The precheck reads no path, so the blocker is invisible to it.
-    let err = engine
-        .apply_bundle(bundle([
-            (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
-            (SysFamily::Table, table_tab_batch(&[(new_tid, "hooktbl", 1)])),
-        ]))
+    let blocks = [
+        (SysFamily::Column, col_tab_batch(new_tid, &cols, 1)),
+        (SysFamily::Table, table_tab_batch(&[(new_tid, "hooktbl", 1)])),
+    ];
+    let err = apply_ddl(&mut engine, blocks)
         .expect_err("register_relation must fail when the relation directory cannot be made");
     assert!(err.starts_with(&format!("table 'hooktbl' (id={new_tid}) ")), "{err}");
-    engine.compensate_stage_a().unwrap();
 
     assert!(
         std::path::Path::new(&blocker).is_file(),
@@ -298,30 +296,26 @@ fn sequence_advances_leave_no_negative_ghost() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Compensating a DROP must not stage the restored relation's directory ─────
-// `compensate_stage_a` negates a dropped relation's `-1` back to `+1`, so the
+// ── Undoing a DROP must not stage the restored relation's directory ──────────
+// `undo` negates a dropped relation's `-1` back to `+1`, so the
 // register hook runs on a directory that already holds live shards. Staging it
 // for crash-cleanup would let a failure inside the re-registration delete them,
 // and the next boot — replaying the same TABLE_TAB row, since the DDL never
 // reached the SAL — would bring the table back empty, with no error.
 
 #[test]
-fn compensating_a_drop_keeps_the_restored_relation_directory() {
+fn undoing_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("compensate_drop_keeps_dir", &cols);
+    let (mut engine, tid, dir) = table_fixture("undo_drop_keeps_dir", &cols);
     let reldir = relation_dir(&dir, tid);
-    // The fixture's own CREATE is a committed DDL; only the bundle below is the
-    // one being compensated.
-    engine.drain_pending_broadcasts();
-
-    // The failed bundle's DROP: applied and enqueued, so compensation drains it.
+    // The DROP of a bundle the log then refuses: applied, its zone in hand.
     let drop_batch = engine.retract_under(SysFamily::Table, &[tid]);
     assert_eq!(
         drop_batch.len(),
         1,
         "the fixture table must have one live TABLE_TAB row"
     );
-    engine.submit(SysFamily::Table, drop_batch).unwrap();
+    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop_batch)])).unwrap();
     assert!(!engine.registry.has_id(tid), "the drop must unregister the table");
     assert!(
         std::path::Path::new(&reldir).is_dir(),
@@ -339,11 +333,9 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     fs::remove_dir_all(&child).unwrap();
     fs::write(&child, b"not a directory").unwrap();
 
-    let err = engine.compensate_stage_a().unwrap_err();
-    assert!(
-        err.contains("Stage-A DDL compensation failed"),
-        "unexpected error: {err}"
-    );
+    engine
+        .undo(zone)
+        .expect_err("the restored relation's store cannot be opened");
     assert!(
         std::path::Path::new(&reldir).is_dir(),
         "the restored relation's directory must survive a failure inside its re-registration"
@@ -352,17 +344,16 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── A compensated CREATE TABLE leaves nothing of the table behind ────────────
+// ── A refused CREATE TABLE leaves nothing of the table behind ────────────────
 // Its IDX_TAB family fails after COL_TAB and TABLE_TAB applied.
 
 #[test]
-fn compensated_create_table_leaves_no_trace() {
-    let dir = temp_dir("compensated_create_table");
+fn refused_create_table_leaves_no_trace() {
+    let dir = temp_dir("refused_create_table");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent = engine
         .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
-    let _ = engine.drain_pending_broadcasts();
     let tid = engine.allocate_ids(1).unwrap();
     let idx_id = engine.allocate_ids(1).unwrap();
     let before = sys_row_counts(&engine);
@@ -372,21 +363,22 @@ fn compensated_create_table_leaves_no_trace() {
         fk_def("pid", TypeCode::U64, parent, 0),
         col_def("val", TypeCode::I64),
     ];
-    for (family, batch) in [
-        (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
-        (SysFamily::Table, table_tab_batch(&[(tid, "child", 1)])),
-    ] {
-        engine.submit(family, batch).unwrap();
-    }
-    assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
-
+    // The blocker's path is a pure function of the ids; the precheck reads no path.
+    fs::create_dir_all(relation_dir(&dir, tid)).unwrap();
     let blocker = engine
         .registry
         .child_dir(tid, ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])));
     fs::write(&blocker, b"not a directory").unwrap();
-    let idx = idx_tab_batch(idx_id, tid, &[2], "public__child__idx_val", false, 1);
-    assert!(engine.submit(SysFamily::Index, idx).is_err());
-    engine.compensate_stage_a().unwrap();
+    let blocks = [
+        (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
+        (SysFamily::Table, table_tab_batch(&[(tid, "child", 1)])),
+        (
+            SysFamily::Index,
+            idx_tab_batch(idx_id, tid, &[2], "public__child__idx_val", false, 1),
+        ),
+    ];
+    let err = apply_ddl(&mut engine, blocks).expect_err("the index's store cannot be opened");
+    assert!(!err.contains("undoing"), "the bundle is undone: {err}");
 
     assert!(!engine.caches.relations.contains_key(&tid));
     assert!(!engine.registry.has_id(tid));

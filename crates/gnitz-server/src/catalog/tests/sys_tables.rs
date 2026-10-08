@@ -70,9 +70,7 @@ fn an_index_row_refuses_an_unpacked_column_list() {
         }
     });
     assert_eq!(
-        IdxTabRow::read(&bb.finish(), 0)
-            .and_then(|r| index_parts(&r))
-            .unwrap_err(),
+        IdxTabRow::read(&bb.finish(), 0).and_then(|r| r.parts()).unwrap_err(),
         "column list word carries no packed-list flag"
     );
 }
@@ -81,20 +79,22 @@ fn an_index_row_refuses_an_unpacked_column_list() {
 /// a user view's may.
 #[test]
 fn read_rel_row_refuses_a_segment_with_an_option() {
-    let row = |owner_view_id: u64| {
+    let row = |name: &str, owner_view_id: u64| {
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
-        push_view_tab_row(&mut bb, 1, 30, "seg", 4 << 20, 0, owner_view_id);
+        push_view_tab_row(&mut bb, 1, 30, name, 4 << 20, 0, owner_view_id);
         bb.finish()
     };
-    let err = read_rel_row(SysFamily::View, &row(29), 0).map(drop).unwrap_err();
+    let err = read_rel_row(SysFamily::View, &row("_seg", 29), 0)
+        .map(drop)
+        .unwrap_err();
     assert_eq!(
         err,
-        "catalog invariant violated: internal segment 'seg' (id=30) carries a WITH option"
+        "catalog invariant violated: internal segment '_seg' (id=30) carries a WITH option"
     );
-    let user = row(0);
+    let user = row("v", 0);
     let rel = read_rel_row(SysFamily::View, &user, 0).map_err(drop).unwrap();
     assert!(rel.kind.is_bounded());
-    assert_eq!(rel.to_string(), "view 'seg' (id=30)");
+    assert_eq!(rel.to_string(), "view 'v' (id=30)");
 }
 
 /// A stream's PK repeats; a base table's does not.

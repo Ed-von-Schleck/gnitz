@@ -33,7 +33,7 @@ fn test_uuid_non_pk_column() {
     bb.begin_row(1u128, 1);
     bb.put_int(UUID_A);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.drop_table("public.uuid_payload").unwrap();
@@ -56,7 +56,7 @@ fn test_uuid_secondary_index() {
     bb.begin_row(1u128, 1);
     bb.put_int(UUID_A);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.create_index("public.uuid_idxtab", &["uid"], false).unwrap();

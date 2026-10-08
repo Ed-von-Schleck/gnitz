@@ -60,7 +60,6 @@ impl CatalogEngine {
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             next_id: FIRST_ALLOCATED_ID,
-            pending_broadcasts: Vec::new(),
             system_zone: 0,
             resume_generation: 0,
         };

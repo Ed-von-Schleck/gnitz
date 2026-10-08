@@ -5,16 +5,16 @@ use gnitz_expr::SchemaFacts;
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow};
-use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, MAX_COLUMNS};
+use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter};
 use gnitz_wire::{payload_bytes, RowSource};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{KeySpec, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
 use rustc_hash::FxHashSet;
 
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    family_pk_partition, index_parts, pk_signatures, read_rel_row, CatalogColumn, PkSignature, RelDetail, SysFamily,
-    SYSTEM_SCHEMA_ID,
+    build_schema_from_col_defs, check_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkSignature, RelDetail,
+    SysFamily, SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
 
@@ -35,52 +35,6 @@ fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// The rules a relation's column records must satisfy on their own, with no PK
-/// list in hand; messages are bare predicates, and callers add the context. The
-/// duplicate-name rule is ingestion points only — a view segment legitimately
-/// carries two visible columns of one name (a join chain's output).
-fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), String> {
-    if col_defs.is_empty() {
-        return Err("has no column records".into());
-    }
-    // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
-    // plain projection prepends the k source PK columns. A fed view gets one
-    // column less, since its delta store stamps a `_tick` key column ahead of
-    // the view's own.
-    let fed = kind.has_delta_feed();
-    let max = MAX_COLUMNS - usize::from(fed);
-    if col_defs.len() > max {
-        let why = if fed {
-            " with a delta feed: its `_tick` stamp is one more"
-        } else {
-            ""
-        };
-        return Err(format!("has {} columns (max {max}{why})", col_defs.len()));
-    }
-    if kind.is_ingestion_point() {
-        let visible = col_defs.iter().filter(|c| !c.def.is_hidden);
-        if let Some(name) = gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
-            return Err(format!("has duplicate column name '{name}'"));
-        }
-    }
-    Ok(())
-}
-
-/// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
-/// rule they break.
-pub(in crate::catalog) fn build_schema_from_col_defs(
-    kind: RelationKind,
-    col_defs: &[CatalogColumn],
-    pk_cols: &[u32],
-) -> Result<SchemaDescriptor, String> {
-    check_col_defs(kind, col_defs)?;
-    let cols: Vec<SchemaColumn> = col_defs
-        .iter()
-        .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
-        .collect();
-    SchemaDescriptor::try_new(&cols, pk_cols)
 }
 
 /// A system row carries weight ±1: a zero weight carries no contract, and the
@@ -116,7 +70,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
 /// a pair renames one.
 fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<(), String> {
     let id = sig.leading;
-    if family.first_user_id().is_some_and(|floor| id < floor) {
+    if id < gnitz_wire::FIRST_USER_TABLE_ID {
         return Err(format!(
             "cannot {} a system {} ({})",
             sig.verb(),
@@ -211,24 +165,9 @@ fn check_circuit_rows(batch: &Batch, created: &IdSet) -> Result<(), String> {
 }
 
 impl CatalogEngine {
-    /// Check every FK-carrying column of relation `tid`, about to be registered
-    /// with `schema` over `col_defs`. `net_dead` is what the same TABLE_TAB delta
-    /// drops.
-    pub(super) fn validate_fk_columns(
-        &self,
-        tid: u64,
-        col_defs: &[CatalogColumn],
-        schema: &SchemaDescriptor,
-        net_dead: &IdSet,
-    ) -> Result<(), String> {
-        for cd in col_defs {
-            if let Some(fk) = cd.fk {
-                self.validate_fk_column(cd, fk, tid, col_defs, schema, net_dead)?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Check FK column `col` of relation `self_table_id`, about to be registered
+    /// with `self_schema` over `self_cols`. `net_dead` is what the same TABLE_TAB
+    /// delta drops.
     fn validate_fk_column(
         &self,
         col: &CatalogColumn,
@@ -553,14 +492,23 @@ impl CatalogEngine {
     pub(in crate::catalog) fn precheck_bundle(
         &self,
         families: &[Option<Batch>; SysFamily::COUNT],
+        new_views: &[u64],
     ) -> Result<(), String> {
+        if let Some(f) = SysFamily::ALL
+            .into_iter()
+            .find(|f| f.master_only() && families[f.index()].is_some())
+        {
+            return Err(format!(
+                "family {} ({}) is not writable from the wire",
+                f.id(),
+                f.name()
+            ));
+        }
         if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
             self.check_column_owners(cols, families)?;
         }
         if let Some(b) = families[SysFamily::Circuit.index()].as_ref() {
-            let views = families[SysFamily::View.index()].as_ref();
-            let created = views.map(|v| family_pk_partition(SysFamily::View, v).creates);
-            check_circuit_rows(b, &IdSet::new(created.unwrap_or_default()))?;
+            check_circuit_rows(b, &IdSet::new(new_views.iter().copied()))?;
         }
         Ok(())
     }
@@ -666,6 +614,14 @@ impl CatalogEngine {
             let col_defs = self.read_column_defs(rel.id)?;
             let schema =
                 build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
+            // A leading `_` names a chain segment and nothing else.
+            match rel.detail {
+                RelDetail::View { owner: Some(_), .. } if !rel.name.starts_with('_') => {
+                    return Err(format!("{rel}: a chain segment's name starts with '_'"));
+                }
+                RelDetail::View { owner: Some(_), .. } => {}
+                _ => validate_user_identifier(rel.name)?,
+            }
             reject_unstorable_name(rel.name, rel.kind.noun())?;
             // An FK probes its parent's store on every write of the child, which only
             // a base table's ingest runs; a stream push must stay a pure append.
@@ -684,7 +640,11 @@ impl CatalogEngine {
                         gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
                             .map_err(|e| format!("{rel}: {e}"))?;
                     }
-                    self.validate_fk_columns(rel.id, &col_defs, &schema, net_dead)?;
+                    for cd in &col_defs {
+                        if let Some(fk) = cd.fk {
+                            self.validate_fk_column(cd, fk, rel.id, &col_defs, &schema, net_dead)?;
+                        }
+                    }
                 }
                 RelDetail::View { owner: Some(owner), .. }
                     if creates.contains(rel.id) && !created_users.contains(owner) =>
@@ -787,8 +747,9 @@ impl CatalogEngine {
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
-            let (owner_id, cols, unique) = index_parts(&r).map_err(|e| format!("Index: {e}"))?;
+            let (owner_id, cols, unique) = r.parts().map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
+            validate_user_identifier(index_name)?;
             reject_unstorable_name(index_name, noun)?;
             self.validate_index_create(owner_id, cols.as_slice(), unique)?;
             if !taken.insert(index_name.as_bytes()) {
@@ -800,7 +761,7 @@ impl CatalogEngine {
             // The row, not `net_dead`: this needs `cols`, which a list of ids
             // does not carry.
             let (owner_id, cols, _) = IdxTabRow::read(batch, i)
-                .and_then(|r| index_parts(&r))
+                .and_then(|r| r.parts())
                 .map_err(|e| format!("Index: {e}"))?;
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never

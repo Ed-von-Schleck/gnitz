@@ -1,11 +1,12 @@
 //! The catalog-zone write path: one protocol, two entry points.
 //! [`handle_ddl_txn`] ingests a client bundle of system-table families;
-//! [`reserve_serial_range`] advances one sequence. Both mutate the catalog,
-//! then [`emit_zone_to_sal`]; only the DDL awaits the zone's fsync.
+//! [`reserve_serial_range`] advances one sequence. Both take the SAL lock,
+//! mutate the catalog, then emit the zone the write returned;
+//! only the DDL awaits the zone's fsync.
 //!
 //! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs
-//! none of that: a `sys_sequences` advance has no DAG evaluation and no rollback
-//! path, and the row it broadcasts is one no worker reads.
+//! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
+//! it logs is one no worker reads.
 //!
 //! A child of `executor`, so it reads that module's private items — `Shared` and
 //! its accessors included — with no visibility widened, and the DDL seams sit
@@ -15,14 +16,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{guard_panic, park_until, request_barrier, send_ack, Shared};
-use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
+use super::{park_until, request_barrier, send_ack, Shared};
+use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily, ZoneError};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::orchestration::guard_panic_async;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::WriteGuard;
-use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::control::{DecodedControl, Target};
@@ -45,8 +45,8 @@ struct DdlLocks {
 
 /// Take [`DdlLocks`]. The committer barrier comes first, holding no lock: a
 /// checkpoint sequence it is deferred behind drains ticks the gate would stop,
-/// and a low SAL gets its checkpoint there. Past the gate, wait out a committer
-/// round in flight; the committer starts none under the gate.
+/// and a low SAL gets its checkpoint there. A committer round in flight holds
+/// the SAL lock to its end, which the driver waits on before it mutates.
 async fn enter_ddl(shared: &Shared) -> DdlLocks {
     request_barrier(shared, BarrierKind::Ddl).await;
     let catalog = shared.catalog_rwlock.write().await;
@@ -58,7 +58,6 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     if counted {
         DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
     }
-    drop(shared.disp().sal().lock().await);
     DdlLocks { catalog, _ticks: ticks }
 }
 
@@ -83,17 +82,10 @@ fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily)
         .unwrap_or_default()
 }
 
-/// Decode one `DDL_TXN` item's block under its family's own schema, behind the
-/// [`SysFamily::client_writable`] allowlist.
+/// Decode one `DDL_TXN` item's block under its family's own schema.
 fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
     let tid = ctrl.hdr.target_id;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
-    if !family.client_writable() {
-        return Err(format!(
-            "family {tid} ({}) is not writable from the wire",
-            family.name()
-        ));
-    }
     let batch = ipc::decode_client_rows(frame, &ctrl, family.schema())
         .map_err(|e| format!("family {tid} decode error: {e}"))?
         .expect("a DDL_TXN item carries a data block");
@@ -105,8 +97,9 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
 /// family — flows here, so there is one system-write code path end to end.
 ///
-/// On any failure the applied families are negated in master memory before
-/// broadcast, so neither a crash nor a precheck failure can strand an orphan row.
+/// The bundle is applied and its zone laid out under one hold of the SAL lock,
+/// with no await between: a bundle the catalog or the log refuses is negated in
+/// master memory there, so no system flush sees a row no zone carries.
 ///
 /// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent once the
 /// DDL guards have dropped — so a client stalled on its
@@ -177,24 +170,17 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         }
         ticked?;
     }
-    let applied = guard_panic("DDL", || {
-        shared.cat_mut().apply_bundle(families).map_err(WireFault::from)
-    });
-    if let Err(e) = &applied {
-        guard_panic("DDL-compensate", || shared.cat_mut().compensate_stage_a()).unwrap_or_else(|ce| {
-            gnitz_fatal_abort!("Stage-A DDL compensation failed after DDL error '{}': {}", e, ce);
-        });
-    }
-    applied?;
-
-    // SAL emission window: broadcast each queued family as one zone, then fsync.
-    // A failure here is unrecoverable — workers already applied the DdlSync
-    // groups in real time — so abort.
-    let held_above = shared.cat().broadcasts_owed_a_tick();
-    let (zone_lsn, synced) = {
+    let (zone_lsn, held_above, synced) = {
         let mut excl = shared.disp().sal().lock().await;
-        let zone_lsn = emit_zone_to_sal(shared, &mut excl, "DDL");
-        (zone_lsn, excl.sync(shared.disp().reactor(), "DDL"))
+        let zone = zone_or_abort(shared.cat_mut().apply_bundle(families), "DDL")?;
+        // The families a worker holds above its cut once the zone is emitted.
+        let held_above: Vec<u64> = SysFamily::ALL
+            .into_iter()
+            .filter(|f| zone.iter().any(|g| g.family == *f && g.scanned))
+            .map(SysFamily::id)
+            .collect();
+        let zone_lsn = shared.disp().emit_zone(&mut excl, zone, "DDL")?;
+        (zone_lsn, held_above, excl.sync(shared.disp().reactor(), "DDL"))
     };
     synced.await;
 
@@ -208,8 +194,9 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         shared.disp().unique_filter_remove(owner_id, cols);
     }
 
-    // Post-fsync: a broadcast or fsync failure aborts the process before this
-    // point, so no filter is published for an index that never committed.
+    // Post-fsync: a refused zone has returned and an fsync failure has aborted
+    // the process before this point, so no filter is published for an index
+    // that never committed.
     for (owner_id, cols, filter) in filter_seeds {
         shared.disp().unique_filter_seed(owner_id, cols, filter);
     }
@@ -246,32 +233,14 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     Ok(())
 }
 
-/// Emit every queued family broadcast as one zone and mark it applied; answers
-/// the zone LSN. Submits no fdatasync. Aborts on failure: the catalog is already
-/// mutated in memory.
-fn emit_zone_to_sal(shared: &Shared, excl: &mut SalExcl<'_>, op: &'static str) -> u64 {
-    let disp = shared.disp();
-    let drained = shared.cat_mut().drain_pending_broadcasts();
-    // Nothing inside the scope is visible until it commits, so a refused group
-    // leaves no half-written zone behind. The block is synchronous throughout,
-    // which is what the scope requires.
-    let scope = excl.begin("ddl");
-    let zone_lsn = scope.lsn();
-    let emitted = guard_panic(op, || {
-        for (family, bat, _) in &drained {
-            disp.broadcast_ddl(&scope, *family, bat)?;
-        }
-        Ok::<_, WireFault>(())
-    });
-    if let Err(e) = emitted {
-        gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
+/// A catalog write's value, or its refusal for the client. A diverged catalog
+/// is one no log describes, so the process ends on it.
+fn zone_or_abort<T>(written: Result<T, ZoneError>, op: &str) -> Result<T, WireFault> {
+    match written {
+        Ok(v) => Ok(v),
+        Err(ZoneError::Refused(e)) => Err(e.into()),
+        Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{op}: {e}"),
     }
-    // Only a closed zone raises the replay floor: an LSN no member carries can
-    // be the next scope's, whose zone boot replay would then skip.
-    if scope.commit() {
-        shared.cat_mut().mark_zone_applied(zone_lsn);
-    }
-    zone_lsn
 }
 
 /// Reserve a SERIAL id range for `seq` and return its base. The advance is a
@@ -290,16 +259,7 @@ pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count
     shared.cat().check_token(seq)?;
 
     let mut excl = shared.disp().sal().lock().await;
-
-    let (base, delta) = shared.cat().reserve_user_sequence(seq.tid, count)?;
-
-    // A sys_sequences advance is a pure system-table write (no view tick,
-    // no rollback); a hook failure on a well-formed 2-row delta is an
-    // invariant violation — abort rather than compensate.
-    if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
-        gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
-    }
-
-    emit_zone_to_sal(shared, &mut excl, "serial-range");
+    let (base, group) = zone_or_abort(shared.cat_mut().reserve_user_sequence(seq.tid, count), "serial-range")?;
+    shared.disp().emit_zone(&mut excl, vec![group], "serial-range")?;
     Ok(base)
 }

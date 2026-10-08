@@ -141,7 +141,7 @@ fn index_rebuilds_across_chunk_boundary() {
             bb.put_u64((i * 10) as u64);
             bb.end_row();
         }
-        engine.ingest_to_family(tid, &bb.finish()).unwrap();
+        engine.registry.ingest(tid, bb.finish()).unwrap();
         next += 8192;
     }
 
@@ -347,18 +347,13 @@ fn register_chain(
 ) -> Result<(u64, u64), String> {
     let seg = engine.allocate_ids(2).unwrap();
     let top = seg + 1;
-    write_circuit(
-        engine,
-        seg,
-        crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None),
-    );
-    write_circuit(engine, top, distinct_circuit(seg));
-    engine.write_column_records(seg, cols).unwrap();
-    engine.write_column_records(top, cols).unwrap();
+    let identity = crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
+    let distinct = distinct_circuit(seg);
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, seg, &format!("seg{seg}"), 0, 0, top);
+    push_view_tab_row(&mut bb, 1, seg, &format!("_seg{seg}"), 0, 0, top);
     push_view_tab_row(&mut bb, 1, top, &format!("top{top}"), capacity_bytes, 0, 0);
-    engine.submit(SysFamily::View, bb.finish())?;
+    let created = [(seg, &identity, cols), (top, &distinct, cols)];
+    apply_ddl(engine, view_blocks(created, bb.finish()))?;
     Ok((seg, top))
 }
 

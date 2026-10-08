@@ -230,7 +230,7 @@ fn co_dropped_fk_parent_and_child_leave_no_edge() {
         };
         let mut drop = engine.retract_under(SysFamily::Table, &order[..1]);
         drop.append_batch(&engine.retract_under(SysFamily::Table, &order[1..]));
-        engine.submit(SysFamily::Table, drop).unwrap();
+        apply_ddl(&mut engine, [(SysFamily::Table, drop)]).unwrap();
 
         assert!(engine.fk_constraints_of(child_tid).is_empty());
         assert!(engine.fk_children_of(parent_tid).is_empty());
@@ -253,21 +253,18 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
         .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
     let child_tid = engine.allocate_ids(1).unwrap();
-    engine
-        .write_column_records(
-            child_tid,
-            &[
-                col_def("cid", TypeCode::U64),
-                fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-            ],
-        )
-        .unwrap();
+    let child_cols = [
+        col_def("cid", TypeCode::U64),
+        fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
+    ];
 
     let mut batch = engine.retract_under(SysFamily::Table, &[parent_tid]);
     batch.append_batch(&table_tab_batch(&[(child_tid, "child", 1)]));
-    let err = engine
-        .submit(SysFamily::Table, batch)
-        .expect_err("a child of a parent this delta drops must be refused");
+    let blocks = [
+        (SysFamily::Column, col_tab_batch(child_tid, &child_cols, 1)),
+        (SysFamily::Table, batch),
+    ];
+    let err = apply_ddl(&mut engine, blocks).expect_err("a child of a parent this delta drops must be refused");
     assert!(err.contains("which this transaction drops"), "{err}");
     assert!(engine.registry.has_id(parent_tid));
     assert!(!engine.registry.has_id(child_tid));

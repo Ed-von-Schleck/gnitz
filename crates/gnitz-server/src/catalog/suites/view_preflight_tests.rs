@@ -11,28 +11,34 @@
 
 use super::*;
 
-/// `ScanDelta(base_tid) → Filter(pred) → Distinct` for `vid`. The
-/// filter blob is what decides whether the view compiles.
-fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, pred: &[u8]) {
+/// `ScanDelta(base_tid) → Filter(pred) → Distinct`. The filter blob is what
+/// decides whether the view compiles.
+fn filtered_circuit(base_tid: u64, pred: &[u8]) -> gnitz_wire::Circuit {
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(base_tid, gnitz_wire::ReadBound::None);
     let filter = circuit.filter(scan, pred.to_vec());
     circuit.distinct(filter);
-    write_circuit(engine, vid, circuit);
+    circuit
 }
 
-/// Register `vid` as a view over `base_tid` whose filter is `pred`, exactly as
-/// `apply_bundle` does: circuit and columns first, then the VIEW_TAB row
-/// (the hook invariant).
-fn register_filtered_view(engine: &mut CatalogEngine, base_tid: u64, name: &str, pred: &[u8]) -> u64 {
-    let vid = engine.allocate_ids(1).unwrap();
-    write_filtered_circuit(engine, vid, base_tid, pred);
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
-    engine.write_column_records(vid, &cols).unwrap();
-    engine
-        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, name))
-        .unwrap();
-    vid
+fn view_cols() -> Vec<CatalogColumn> {
+    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
+}
+
+/// Register a view over `base_tid` whose filter is `pred`, as one bundle.
+fn try_register_filtered_view(
+    engine: &mut CatalogEngine,
+    base_tid: u64,
+    name: &str,
+    pred: &[u8],
+) -> Result<u64, String> {
+    try_register_view(engine, filtered_circuit(base_tid, pred), name, &view_cols(), 0, 0)
+}
+
+/// The blocks creating `vid` as a view over `base_tid` whose filter is `pred`,
+/// with `views` as its VIEW_TAB block.
+fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [(SysFamily, Batch); 3] {
+    view_blocks([(vid, &filtered_circuit(base_tid, pred), &view_cols()[..])], views)
 }
 
 // ── The pre-flight verdict ──────────────────────────────────────────────────
@@ -47,29 +53,23 @@ fn test_preflight_compile_verdict() {
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
-    let ok_vid = register_filtered_view(
-        &mut engine,
-        base_tid,
-        "vok",
-        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
-    );
-    assert!(
-        engine.dag.preflight_compile(&engine.registry, ok_vid).is_ok(),
-        "a well-formed circuit must pass the pre-flight"
-    );
+    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let ok_vid = try_register_filtered_view(&mut engine, base_tid, "vok", &pred)
+        .expect("a well-formed circuit must pass the pre-flight");
+    assert!(engine.registry.has_id(ok_vid));
 
     // A predicate blob the expression decoder refuses — only a corrupt circuit
     // can carry one, since the client's builder cannot — and the message is the
     // decoder's own.
-    let bad_vid = register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF]);
-    let msg = engine
-        .dag
-        .preflight_compile(&engine.registry, bad_vid)
+    let bad_vid = engine.next_id;
+    let msg = try_register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF])
         .expect_err("an undecodable predicate must fail the pre-flight");
     assert!(
         msg.contains("expr blob"),
         "the rejection must be the decoder's, got: {msg}"
     );
+    assert!(!engine.registry.has_id(bad_vid), "the refused view is not registered");
+    assert!(engine.live_sys_row(SysFamily::View, bad_vid).is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -85,8 +85,6 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
 
-    // The setup is not part of the bundle being compensated.
-    let _ = engine.drain_pending_broadcasts();
     let vid = engine.next_id;
     let circuit = equi_join_circuit(a, b, TypeCode::I64, [false, true]);
     let err =
@@ -95,7 +93,6 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
         err.contains(&format!("source {a} feeds a join and states no scatter key")),
         "got: {err}"
     );
-    engine.compensate_stage_a().unwrap();
     assert!(!engine.registry.has_id(vid), "the view is not registered");
     assert!(
         engine.live_sys_row(SysFamily::View, vid).is_none(),
@@ -107,10 +104,10 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
 }
 
 /// A view bundle whose circuit cell does not decode, and one whose circuit the
-/// register hook cannot route, are each refused at the view's row and compensated:
+/// register hook cannot route, are each refused at the view's row and undone:
 /// no view, no circuit row, and nothing depending on the source.
 #[test]
-fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
+fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
     let dir = temp_dir("preflight_unusable_circuit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
@@ -130,17 +127,15 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_compensated() {
         (&unroutable, "feeds a join and states no scatter key"),
     ];
     for (rows, want) in cases {
-        // The setup is not part of the bundle being compensated.
-        let _ = engine.drain_pending_broadcasts();
         let vid = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(vid, &cols).unwrap();
-        engine.submit(SysFamily::Circuit, rows(vid)).unwrap();
-        let err = engine
-            .submit(SysFamily::View, build_view_tab_row(vid, "v"))
-            .expect_err("the view's registration is refused");
+        let blocks = [
+            (SysFamily::Column, col_tab_batch(vid, &cols, 1)),
+            (SysFamily::Circuit, rows(vid)),
+            (SysFamily::View, build_view_tab_row(vid, "v")),
+        ];
+        let err = apply_ddl(&mut engine, blocks).expect_err("the view's registration is refused");
         assert!(err.starts_with(&format!("view 'v' (id={vid}) ")), "got: {err}");
         assert!(err.contains(want), "got: {err}");
-        engine.compensate_stage_a().unwrap();
 
         assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
         assert!(!engine.registry.has_id(vid), "the view is not registered");
@@ -163,34 +158,21 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let _ = engine.drain_pending_broadcasts();
     let bounded = engine.allocate_ids(1).unwrap();
     let over = engine.allocate_ids(1).unwrap();
 
-    let identity = |vid, source| {
-        let circuit = crate::test_support::identity_circuit(source, gnitz_wire::ReadBound::None);
-        crate::test_support::circuit_batch(vid, &circuit)
-    };
-    let mut circuits = identity(bounded, base);
-    circuits.append_batch(&identity(over, bounded));
-    let mut columns = col_tab_batch(bounded, &cols, 1);
-    columns.append_batch(&col_tab_batch(over, &cols, 1));
+    let identity = |source| crate::test_support::identity_circuit(source, gnitz_wire::ReadBound::None);
+    let circuits = [identity(base), identity(bounded)];
+    let created = [(bounded, &circuits[0], &cols[..]), (over, &circuits[1], &cols[..])];
     let mut views = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut views, 1, over, "over", 0, 0, 0);
     push_view_tab_row(&mut views, 1, bounded, "bounded", 4 << 20, 0, 0);
 
-    let err = engine
-        .apply_bundle(bundle([
-            (SysFamily::Circuit, circuits),
-            (SysFamily::Column, columns),
-            (SysFamily::View, views.finish()),
-        ]))
-        .expect_err("a bounded view is a leaf");
+    let err = apply_ddl(&mut engine, view_blocks(created, views.finish())).expect_err("a bounded view is a leaf");
     assert!(
         err.contains("reads 'public.bounded', which is a capacity-bounded view"),
         "got: {err}"
     );
-    engine.compensate_stage_a().unwrap();
 
     for id in [base, bounded, over] {
         assert!(engine.dag.dependents_of(id).is_empty(), "{id}");
@@ -216,23 +198,15 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let old_vid = register_filtered_view(
-        &mut engine,
-        base_tid,
-        "vw",
-        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
-    );
+    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
 
-    // The replacement's own rows must exist before its VIEW_TAB row is checked.
+    // The replacement's column records must be stored before its VIEW_TAB row is
+    // checked: staged as a worker applies them, since no bundle carries them alone.
     let new_vid = engine.allocate_ids(1).unwrap();
-    write_filtered_circuit(
-        &mut engine,
-        new_vid,
-        base_tid,
-        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes(),
-    );
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
-    engine.write_column_records(new_vid, &cols).unwrap();
+    engine
+        .ddl_sync(SysFamily::Column.id(), col_tab_batch(new_vid, &view_cols(), 1))
+        .unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
@@ -266,38 +240,26 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let old_vid = register_filtered_view(
-        &mut engine,
-        base_tid,
-        "vw",
-        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
-    );
+    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
     let old_dir = relation_dir(&dir, old_vid);
 
-    // The setup is not part of the bundle being compensated.
-    let _ = engine.drain_pending_broadcasts();
-
-    // The replacing bundle: the new chain's own rows, then one VIEW_TAB batch
+    // The replacing bundle: the new chain's own rows, and one VIEW_TAB batch
     // carrying the incumbent's `-1` and the replacement's `+1`.
     let new_vid = engine.allocate_ids(1).unwrap();
-    write_filtered_circuit(
-        &mut engine,
-        new_vid,
-        base_tid,
-        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes(),
-    );
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
-    engine.write_column_records(new_vid, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
+    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes();
+    let zone = engine
+        .apply_bundle(bundle(filtered_view_blocks(new_vid, base_tid, &pred, bb.finish())))
+        .unwrap();
     let new_dir = relation_dir(&dir, new_vid);
     assert!(!engine.registry.has_id(old_vid), "the bundle retires the incumbent");
+    assert!(engine.registry.has_id(new_vid), "and registers the replacement");
 
-    // The pre-flight rejects the replacement's circuit — the bundle fails after
-    // VIEW_TAB was applied, exactly where the handler compensates.
-    engine.compensate_stage_a().unwrap();
+    // The log refuses the zone: the driver undoes it.
+    engine.undo(zone).unwrap();
     engine.reclaim_orphan_dirs();
 
     assert!(

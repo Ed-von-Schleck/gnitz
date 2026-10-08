@@ -280,6 +280,19 @@ impl<'a> ColTabRow<'a> {
     }
 }
 
+impl IdxTabRow<'_> {
+    /// The row's `(owner_id, col_indices, is_unique)` — the one decoding of
+    /// `source_col_idx`, so no consumer holds its undecoded word.
+    pub fn parts(&self) -> Result<(u64, crate::PkColList, bool), String> {
+        Ok((
+            self.owner_id,
+            crate::PkColList::unpack(self.source_col_idx)
+                .map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))?,
+            crate::bool_word(self.is_unique).map_err(|e| format!("is_unique: {e}"))?,
+        ))
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/sys_rows.rs"]
 mod tests;

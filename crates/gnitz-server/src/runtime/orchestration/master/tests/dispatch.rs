@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use super::super::fixtures::test_dispatcher;
-use crate::catalog::{CatalogEngine, SysFamily};
+use crate::catalog::CatalogEngine;
 use crate::runtime::sal::{Apply, DirectGroup};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;
@@ -90,6 +90,64 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
     });
 }
 
+/// A zone the log has no room for is refused with the SAL's own status and
+/// reaches no store: every system family holds the rows and weights it held
+/// before, and the same bundle applies once a checkpoint has reset the log.
+#[test]
+fn a_zone_the_log_refuses_is_undone_and_applies_after_a_checkpoint() {
+    use crate::catalog::SysFamily;
+    use crate::test_support::{bundle, col_def, col_tab_batch, net_weight, scan_all, table_tab_batch};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
+    let cols: Vec<_> = (0..32)
+        .map(|i| col_def(&format!("a_column_with_a_long_name_{i}"), gnitz_wire::TypeCode::U64))
+        .collect();
+    let create = || {
+        bundle([
+            (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
+            (SysFamily::Table, table_tab_batch(&[(tid, "t", 1)])),
+        ])
+    };
+    let held = |engine: &mut CatalogEngine| -> Vec<(usize, i64)> {
+        SysFamily::ALL
+            .map(|f| (scan_all(engine, f.id()).len(), net_weight(engine, f.id())))
+            .to_vec()
+    };
+    let before = held(&mut engine);
+
+    let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+    let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
+    // Fill the log until it refuses a group far smaller than the zone.
+    for tids in [1 << 12, 1 << 4] {
+        let tick = || Apply::Tick {
+            first_round: 2,
+            tids: vec![0; tids].into(),
+        };
+        while excl.write(&DirectGroup::new(tick())).is_ok() {}
+    }
+
+    let zone = engine.apply_bundle(create()).unwrap();
+    assert!(engine.registry.has_id(tid));
+    let refused = disp
+        .emit_zone(&mut excl, zone, "test")
+        .expect_err("no room for the zone");
+    assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
+    assert!(!engine.registry.has_id(tid), "the refused table is unregistered");
+    assert_eq!(held(&mut engine), before);
+
+    disp.checkpoint_post_ack(&mut excl).unwrap();
+    let zone = engine.apply_bundle(create()).unwrap();
+    disp.emit_zone(&mut excl, zone, "test")
+        .expect("the reset log takes the zone");
+    assert!(engine.registry.has_id(tid));
+
+    drop(excl);
+    drop(disp);
+    engine.close();
+}
+
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A
 /// sequence advance can reach the `sys_sequences` MemTable after the base
 /// round's reset, so the finalizer is its only durability event before the
@@ -102,12 +160,9 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     {
         let mut engine = CatalogEngine::open(dir, 1).unwrap();
         user_seq = engine.create_serial_table("public.t").unwrap();
-        // Reserve + ingest straight into the catalog — no SAL involved, so the
-        // advance lands ONLY in the sys_sequences MemTable.
-        let (_base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
-        engine.submit(SysFamily::Sequence, delta).unwrap();
-        // As the serial path's emit does: the broadcast leaves, the rows stay.
-        engine.drain_pending_broadcasts();
+        // Reserve straight into the catalog — no SAL involved, so the advance
+        // lands ONLY in the sys_sequences MemTable.
+        engine.reserve_user_sequence(user_seq, 64).unwrap();
 
         let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
         disp.checkpoint_post_ack(&mut try_poll_once(disp.sal().lock()).expect("uncontended"))

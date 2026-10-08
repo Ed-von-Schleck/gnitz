@@ -2,10 +2,11 @@
 //! checkpoint generation, topology word), user SERIAL ranges and the checkpoint
 //! records.
 
-use gnitz_wire::sys_rows::SeqTabRow;
+use gnitz_wire::sys_rows::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::sys_tables::{SysFamily, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_NEXT_ID, SEQ_ID_TOPOLOGY};
+use super::write_path::{ZoneError, ZoneGroup};
 use super::CatalogEngine;
 
 /// Operator-state format version. Bump on any change to an operator-state
@@ -62,41 +63,46 @@ impl CatalogEngine {
         Some(stored.next_val)
     }
 
-    /// The delta moving `sequences` row `seq_id` from its live value to `new`;
-    /// empty when it already holds `new`.
-    pub(in crate::catalog) fn sequence_delta(&self, seq_id: u64, new: u64) -> Batch {
-        let old = self.sequence_value(seq_id);
-        let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
-        if old != Some(new) {
-            for (value, w) in old.map(|v| (v, -1)).into_iter().chain([(new, 1)]) {
-                bb.begin_row(seq_id as u128, w);
-                bb.put_u64(value);
-                bb.end_row();
-            }
-        }
-        bb.finish()
-    }
-
-    /// The base of the next `count` SERIAL ids of table `seq_id`, and the
-    /// `sequences` delta recording them.
-    pub(crate) fn reserve_user_sequence(&self, seq_id: u64, count: u64) -> Result<(i64, Batch), String> {
+    /// Reserve the next `count` SERIAL ids of table `seq_id`: their base, and the
+    /// applied `sequences` group recording them.
+    pub(crate) fn reserve_user_sequence(&mut self, seq_id: u64, count: u64) -> Result<(i64, ZoneGroup), ZoneError> {
         if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
-            return Err(format!("relation {seq_id} is not a SERIAL table"));
+            return Err(ZoneError::Refused(format!("relation {seq_id} is not a SERIAL table")));
         }
-        let invalid = || format!("SERIAL range of {count} on sequence {seq_id} is invalid or exhausted");
+        let invalid = || {
+            ZoneError::Refused(format!(
+                "SERIAL range of {count} on sequence {seq_id} is invalid or exhausted"
+            ))
+        };
         let base = self
             .sequence_value(seq_id)
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(invalid)?;
         let last = validated_run_last(base, count, i64::MAX as u64).ok_or_else(invalid)?;
-        Ok((base as i64, self.sequence_delta(seq_id, last)))
+        let batch = self.set_sequence(seq_id, last).map_err(ZoneError::Diverged)?;
+        // No view scans `sequences`: its registration is refused.
+        let group = ZoneGroup {
+            family: SysFamily::Sequence,
+            batch,
+            scanned: false,
+        };
+        Ok((base as i64, group))
     }
 
-    /// Move `sequences` row `seq_id` to `value`.
-    fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
-        let delta = self.sequence_delta(seq_id, value);
-        self.registry.ingest(SysFamily::Sequence.id(), delta)
+    /// Move `sequences` row `seq_id` to `value`: the delta applied, empty when
+    /// the row already held it.
+    pub(in crate::catalog) fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<Batch, String> {
+        let old = self.sequence_value(seq_id);
+        let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
+        if old != Some(value) {
+            for (next_val, w) in old.map(|v| (v, -1)).into_iter().chain([(value, 1)]) {
+                SeqTabRow { seq_id, next_val }.write(&mut bb, w);
+            }
+        }
+        let delta = bb.finish();
+        self.registry.ingest(SysFamily::Sequence.id(), delta.clone())?;
+        Ok(delta)
     }
 
     /// Write the next catalog id to `sequences`, then flush every system table
@@ -138,6 +144,7 @@ impl CatalogEngine {
     /// Record the launched topology. Durable at the next system flush.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), String> {
         self.set_sequence(SEQ_ID_TOPOLOGY, topology_word(worker_count))
+            .map(drop)
     }
 }
 

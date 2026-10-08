@@ -4,14 +4,15 @@
 //! **Not** a production code path. Every real DDL statement (SQL planner,
 //! C-API, `gnitz-py`) is built client-side and pushed over the wire as a
 //! `DDL_TXN` bundle of system-table deltas, which the executor applies
-//! through `submit`. These wrappers let a unit test reach the same appliers
-//! without a server.
+//! through `apply_bundle`. These wrappers build such a bundle and apply it the
+//! same way, without a server.
 
 use super::super::*;
-use crate::test_support::{col_tab_batch, idx_tab_batch, schema_tab_batch};
+use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch};
 use gnitz_wire::payload_u64;
 use gnitz_wire::sys_rows::{IdxTabSlot, SysRow, TableTabRow};
 use gnitz_wire::validate_user_identifier;
+use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::BatchBuilder;
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
@@ -67,14 +68,14 @@ impl CatalogEngine {
         (0..rows.len()).map(|i| rows.get_pk(i) as u64).collect()
     }
 
-    /// Retract the live row at `id` in `family` through `submit`, which expands the
-    /// drop cascade.
+    /// Retract the live row at `id` in `family` as a one-block bundle, whose apply
+    /// expands the drop cascade.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, id: u64) -> Result<(), String> {
         let batch = self.retract_under(family, &[id]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
-        self.submit(family, batch)
+        apply_ddl(self, [(family, batch)])
     }
 
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
@@ -86,39 +87,30 @@ impl CatalogEngine {
         }
         let sid = self.allocate_ids(1).unwrap();
 
-        self.submit(SysFamily::Schema, schema_tab_batch(&[(sid, name, 1)]))?;
-        Ok(())
+        apply_ddl(self, [(SysFamily::Schema, schema_tab_batch(&[(sid, name, 1)]))])
     }
 
-    /// Drop every member of a schema, then the schema row — views before
-    /// tables, since a view may read a member table.
-    ///
-    /// The engine has no `DROP SCHEMA CASCADE`; `precheck_schema_family` rejects
-    /// a non-empty drop. Cascade is a client-side composition of ordinary drops
-    /// (`gnitz-core`'s `Client::drop_schema`), and so is this fixture. It does
-    /// not reproduce that client's retry-until-stable drain or hidden-segment
-    /// filter, which resolve view-on-view and FK chains — the client's algorithm
-    /// to get right, covered end-to-end, not the guard these tests are about.
+    /// Drop a schema with every table and view in it, as the one all-negative
+    /// bundle the client's `drop_schema` commits. The engine has no
+    /// `DROP SCHEMA CASCADE`: `precheck_schema_family` rejects a non-empty drop,
+    /// and the bundle's reverse apply order retires the members first.
     pub(in crate::catalog) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         let sid = self.schema_id(name).ok_or("Schema does not exist")?;
-
+        let mut blocks = vec![(SysFamily::Schema, self.retract_under(SysFamily::Schema, &[sid]))];
         for family in [SysFamily::View, SysFamily::Table] {
             let members = self.schema_members(family, sid);
-            for i in 0..members.len() {
-                self.submit_retraction(family, members.get_pk(i) as u64)?;
+            if !members.is_empty() {
+                blocks.push((family, members.negated()));
             }
         }
-
-        // The schema is empty now, so the engine's member-count guard accepts
-        // this row.
-        self.submit_retraction(SysFamily::Schema, sid)
+        apply_ddl(self, blocks)
     }
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------
 
-    /// Build a table directly in the catalog: allocate the id, write the COL_TAB
-    /// records, then submit the TABLE_TAB `+1` that fires the register hook.
+    /// Build a table directly in the catalog: allocate the id, then apply its
+    /// COL_TAB records and TABLE_TAB `+1` as one bundle.
     pub(crate) fn create_table(
         &mut self,
         qualified_name: &str,
@@ -149,18 +141,16 @@ impl CatalogEngine {
     ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
 
-        // Only what `submit` cannot derive for itself: the schema id, and an id
+        // Only what the bundle cannot derive for itself: the schema id, and an id
         // for the new table. Every rule this shape must satisfy is the
-        // production precheck's, a few lines below — restating one here would
-        // let a test asserting that rejection pass against this copy while the
-        // production arm was broken.
+        // production precheck's — restating one here would let a test asserting
+        // that rejection pass against this copy while the production arm was
+        // broken.
         let sid = self
             .schema_id(schema_name)
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_ids(1).unwrap();
 
-        // Columns first: the table's register hook reads them.
-        self.write_column_records(tid, col_defs)?;
         let mut bb = BatchBuilder::new(SysFamily::Table.schema());
         let row = TableTabRow {
             table_id: tid,
@@ -170,7 +160,11 @@ impl CatalogEngine {
             flags: props.pack(),
         };
         row.write(&mut bb, 1);
-        self.submit(SysFamily::Table, bb.finish())?;
+        let blocks = [
+            (SysFamily::Column, col_tab_batch(tid, col_defs, 1)),
+            (SysFamily::Table, bb.finish()),
+        ];
+        apply_ddl(self, blocks)?;
         Ok(tid)
     }
 
@@ -227,16 +221,7 @@ impl CatalogEngine {
         let index_id = self.allocate_ids(1).unwrap();
 
         let batch = idx_tab_batch(index_id, owner_id, &col_indices, &index_name, is_unique, 1);
-        // Compensate this DDL alone, as the DDL_TXN handler does a failed bundle:
-        // the earlier fixture DDLs are committed, so they sit outside the undo log.
-        let committed = std::mem::take(&mut self.pending_broadcasts);
-        let res = self.submit(SysFamily::Index, batch);
-        if res.is_err() {
-            self.compensate_stage_a().expect("compensating a fixture CREATE INDEX");
-        }
-        let this_ddl = std::mem::replace(&mut self.pending_broadcasts, committed);
-        self.pending_broadcasts.extend(this_ddl);
-        res.map(|()| index_id)
+        apply_ddl(self, [(SysFamily::Index, batch)]).map(|()| index_id)
     }
 
     pub(crate) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
@@ -249,31 +234,12 @@ impl CatalogEngine {
         self.submit_retraction(SysFamily::Index, idx_id)
     }
 
-    // -- Write helpers for system tables -----------------------------------
-
-    pub(crate) fn write_column_records(&mut self, owner_id: u64, col_defs: &[CatalogColumn]) -> Result<(), String> {
-        let batch = col_tab_batch(owner_id, col_defs, 1);
-        self.submit(SysFamily::Column, batch)
-    }
-
-    /// Ingest into any relation by raw id: a system family through
-    /// [`CatalogEngine::submit`], a user table through the registry's DML path.
-    pub(in crate::catalog) fn ingest_to_family(&mut self, table_id: u64, batch: &Batch) -> Result<(), String> {
-        if table_id < gnitz_wire::FIRST_USER_TABLE_ID {
-            let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
-            self.submit(family, batch.clone())
-        } else {
-            self.registry
-                .ingest(table_id, Batch::clone(batch))
-                .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
-        }
-    }
+    // -- The worker's path ---------------------------------------------------
 
     /// Register a base table at a caller-chosen `tid` the way a worker does: the
     /// COL_TAB and TABLE_TAB rows a DDL bundle carries, each through `ddl_sync`,
     /// so the register hooks fire and the relation store is built. `pk` names PK
-    /// column indices into `cols`, in key order. The register hook raises the id
-    /// counter past `tid`, so a later engine-side allocation cannot collide.
+    /// column indices into `cols`, in key order.
     pub(crate) fn register_table(
         &mut self,
         tid: u64,

@@ -25,8 +25,8 @@ use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_wire::{Circuit, ComputeMap, Cut, KeyRange, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
-    PkColList, PkListRole, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
-    SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    PkColList, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
+    TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -1740,12 +1740,9 @@ fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
         .map(|i| {
             let r = IdxTabRow::read(batch, i).map_err(|e| ProtocolError::DecodeError(format!("index row {i}: {e}")))?;
             let name = r.name.to_owned();
-            let cols = PkColList::unpack(r.source_col_idx).map_err(|rule| {
-                ProtocolError::DecodeError(format!("index '{name}': {}", rule.for_role(PkListRole::ColumnList)))
-            })?;
-            let is_unique = gnitz_wire::bool_word(r.is_unique)
+            let (owner, cols, is_unique) = r
+                .parts()
                 .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
-            let owner = r.owner_id;
             Ok((i, IndexRow { owner, name, cols, is_unique }))
         })
         .collect()

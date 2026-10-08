@@ -35,7 +35,6 @@ mod write_path;
 mod suites;
 
 use gnitz_store::relation::{DirLock, RelationRegistry};
-use gnitz_zset::repr::Batch;
 
 use crate::query::DagEngine;
 use cache::CatalogCacheSet;
@@ -49,6 +48,7 @@ pub(crate) use sys_tables::{write_col_tab_rows, CatalogColumn, PUBLIC_SCHEMA_ID}
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
+pub(crate) use write_path::{ZoneError, ZoneGroup};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
@@ -73,10 +73,6 @@ pub(crate) struct CatalogEngine {
     /// hands out. Boot raises it past every stored id; the precheck admits no id
     /// at or above it.
     pub(in crate::catalog) next_id: u64,
-    /// The master's applied families in apply order, each queued before its ingest
-    /// with whether a view scanned the family then: the zone's broadcast and the
-    /// undo log `compensate_stage_a` replays. `ddl_sync` never enqueues.
-    pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch, bool)>,
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) system_zone: u64,

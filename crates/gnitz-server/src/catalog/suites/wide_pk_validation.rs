@@ -27,8 +27,8 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 }
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
-/// with `base_rows`. Bypasses `create_table`'s stride gate and
-/// `ingest_to_family`, so it does not exercise the enforcement path.
+/// with `base_rows`. Bypasses `create_table`'s stride gate and the push path,
+/// so it does not exercise the enforcement path.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
     engine
@@ -149,7 +149,7 @@ fn native_and_byte_point_reads_agree_narrow() {
         bb.put_u64(i * 10);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Retract key 2 so it is present-but-dead.
@@ -157,7 +157,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     del.begin_row(2u128, -1);
     del.put_u64(20);
     del.end_row();
-    engine.ingest_to_family(tid, &del.finish()).unwrap();
+    engine.registry.ingest(tid, del.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.

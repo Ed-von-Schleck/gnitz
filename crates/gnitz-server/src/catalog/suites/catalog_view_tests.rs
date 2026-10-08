@@ -148,10 +148,10 @@ fn the_system_schema_takes_no_relation() {
         flags: gnitz_wire::TableProps::default().pack(),
     }
     .write(&mut table, 1);
-    let table = bundle([
+    let table = vec![
         (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
         (SysFamily::Table, table.finish()),
-    ]);
+    ];
 
     let vid = engine.allocate_ids(1).unwrap();
     let mut view = BatchBuilder::new(SysFamily::View.schema());
@@ -168,18 +168,11 @@ fn the_system_schema_takes_no_relation() {
     .write(&mut view, 1);
     let family_cols = SysFamily::Table.column_defs();
     let circuit = crate::test_support::identity_circuit(TABLES, gnitz_wire::ReadBound::None);
-    let view = bundle([
-        (SysFamily::Column, col_tab_batch(vid, &family_cols, 1)),
-        (SysFamily::Circuit, crate::test_support::circuit_batch(vid, &circuit)),
-        (SysFamily::View, view.finish()),
-    ]);
+    let view: Vec<_> = view_blocks([(vid, &circuit, &family_cols[..])], view.finish()).into();
 
-    for families in [table, view] {
-        let err = engine
-            .apply_bundle(families)
-            .expect_err("a relation in the system schema");
+    for blocks in [table, view] {
+        let err = apply_ddl(&mut engine, blocks).expect_err("a relation in the system schema");
         assert!(err.contains("the system schema takes no relation"), "{err}");
-        engine.compensate_stage_a().unwrap();
         assert_eq!(sys_row_counts(&engine), before);
     }
     assert!(!engine.registry.has_id(tid) && !engine.registry.has_id(vid));
@@ -200,16 +193,10 @@ fn no_view_scans_sequences() {
     let mut view = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut view, 1, vid, "v_seq", 0, 0, 0);
     let circuit = crate::test_support::identity_circuit(seq, gnitz_wire::ReadBound::None);
-    let err = engine
-        .apply_bundle(bundle([
-            (SysFamily::Column, col_tab_batch(vid, &cols, 1)),
-            (SysFamily::Circuit, crate::test_support::circuit_batch(vid, &circuit)),
-            (SysFamily::View, view.finish()),
-        ]))
+    let err = apply_ddl(&mut engine, view_blocks([(vid, &circuit, &cols[..])], view.finish()))
         .expect_err("a view over sequences");
     assert!(err.contains("holds no set a view can scan"), "{err}");
     assert!(err.contains("_system.sequences"), "{err}");
-    engine.compensate_stage_a().unwrap();
 
     assert!(!engine.dag.is_scanned(seq), "the refused view left no edge");
     assert!(engine.dag.sources_of(vid).is_empty());

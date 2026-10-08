@@ -21,8 +21,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
     let table = "a_schema_with_a_long_name.a_table_with_a_long_name";
     let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
     let tid = engine.create_table_with(table, &cols, &[0], serial).unwrap();
-    let (_, reserved) = engine.reserve_user_sequence(tid, 64).unwrap();
-    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &reserved).unwrap();
+    reserve(&mut engine, tid, 64).unwrap();
     let idx = engine.create_index(table, &["a_long_column_name"], false).unwrap();
     let vid = register_identity_view(&mut engine, tid, "a_view_with_a_long_name", &cols);
     let unused = engine.allocate_ids(1).unwrap();

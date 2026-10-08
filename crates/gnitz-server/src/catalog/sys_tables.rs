@@ -10,9 +10,9 @@ use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::sys_rows::{
-    ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SeqTabSlot, SysRow, SysRowSink, TableTabRow, ViewTabRow,
+    ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow, ViewTabRow,
 };
-use gnitz_wire::{ColumnDef, TableDistribution, ViewProps};
+use gnitz_wire::{ColumnDef, TableDistribution, ViewProps, MAX_COLUMNS};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -161,16 +161,6 @@ fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
     })
 }
 
-/// An IDX_TAB row's `(owner_id, col_indices, is_unique)` — the one decoding of
-/// `source_col_idx`, so no consumer holds its undecoded word.
-pub(super) fn index_parts(r: &IdxTabRow<'_>) -> Result<(u64, PkColList, bool), String> {
-    Ok((
-        r.owner_id,
-        PkColList::unpack(r.source_col_idx).map_err(|rule| rule.for_role(PkListRole::ColumnList))?,
-        bool_word(r.is_unique).map_err(|e| format!("is_unique: {e}"))?,
-    ))
-}
-
 /// A catalog column: the logical column plus its FK, already resolved.
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogColumn {
@@ -305,7 +295,7 @@ pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
             continue;
         }
         let row = sig.pos.or(sig.neg).expect("pk_signatures skips a zero-weight row");
-        let Ok((owner_id, cols, is_unique)) = IdxTabRow::read(batch, row).and_then(|r| index_parts(&r)) else {
+        let Ok((owner_id, cols, is_unique)) = IdxTabRow::read(batch, row).and_then(|r| r.parts()) else {
             continue;
         };
         if sig.pos.is_some() {
@@ -330,6 +320,52 @@ static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|
         SchemaDescriptor::new(&cols, f.pk_cols)
     })
 });
+
+/// The rules a relation's column records must satisfy on their own, with no PK
+/// list in hand; messages are bare predicates, and callers add the context. The
+/// duplicate-name rule is ingestion points only — a view segment legitimately
+/// carries two visible columns of one name (a join chain's output).
+pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), String> {
+    if col_defs.is_empty() {
+        return Err("has no column records".into());
+    }
+    // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
+    // plain projection prepends the k source PK columns. A fed view gets one
+    // column less, since its delta store stamps a `_tick` key column ahead of
+    // the view's own.
+    let fed = kind.has_delta_feed();
+    let max = MAX_COLUMNS - usize::from(fed);
+    if col_defs.len() > max {
+        let why = if fed {
+            " with a delta feed: its `_tick` stamp is one more"
+        } else {
+            ""
+        };
+        return Err(format!("has {} columns (max {max}{why})", col_defs.len()));
+    }
+    if kind.is_ingestion_point() {
+        let visible = col_defs.iter().filter(|c| !c.def.is_hidden);
+        if let Some(name) = gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
+            return Err(format!("has duplicate column name '{name}'"));
+        }
+    }
+    Ok(())
+}
+
+/// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
+/// rule they break.
+pub(super) fn build_schema_from_col_defs(
+    kind: RelationKind,
+    col_defs: &[CatalogColumn],
+    pk_cols: &[u32],
+) -> Result<SchemaDescriptor, String> {
+    check_col_defs(kind, col_defs)?;
+    let cols: Vec<SchemaColumn> = col_defs
+        .iter()
+        .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
+        .collect();
+    SchemaDescriptor::try_new(&cols, pk_cols)
+}
 
 // ---------------------------------------------------------------------------
 // Typed system family
@@ -478,22 +514,6 @@ impl SysFamily {
         }
     }
 
-    /// The lowest id a client may write in this family's id space; everything
-    /// below is bootstrap-owned. Read against [`Self::leading_id`], so Column's
-    /// floor is its owner's. `None` for Circuit, whose rows `check_circuit_rows`
-    /// ties to a view this bundle creates.
-    pub(super) fn first_user_id(self) -> Option<u64> {
-        match self {
-            SysFamily::Schema
-            | SysFamily::Table
-            | SysFamily::View
-            | SysFamily::Column
-            | SysFamily::Sequence
-            | SysFamily::Index => Some(gnitz_wire::FIRST_USER_TABLE_ID),
-            SysFamily::Circuit => None,
-        }
-    }
-
     /// Does this family's PK draw from the catalog object-id counter?
     pub(super) fn allocates_ids(self) -> bool {
         match self {
@@ -513,8 +533,7 @@ impl SysFamily {
                     | (1 << ColTabSlot::is_hidden as usize)
                     | (1 << ColTabSlot::is_nullable as usize),
             ),
-            SysFamily::Sequence => Some(1 << SeqTabSlot::next_val as usize),
-            SysFamily::Schema | SysFamily::Index | SysFamily::Circuit => None,
+            SysFamily::Schema | SysFamily::Index | SysFamily::Sequence | SysFamily::Circuit => None,
         }
     }
 
@@ -527,35 +546,19 @@ impl SysFamily {
         }
     }
 
-    /// May a client-pushed `DDL_TXN` bundle carry a block for this family?
-    /// `false` for Sequence alone: boot feeds its rows straight into the id
-    /// counters and the resume verdict, where a forged value aborts every
-    /// subsequent start. Every legitimate sequence write is engine-built.
-    pub(crate) fn client_writable(self) -> bool {
+    /// Does this family hold the master's positions rather than a set? `true`
+    /// for Sequence alone: its rows move with every SERIAL reservation and
+    /// checkpoint and feed the id counters and the resume verdict at boot. So no
+    /// client bundle may carry one, no worker is sent one, and no view scans it.
+    pub(crate) fn master_only(self) -> bool {
         match self {
-            SysFamily::Sequence => false,
+            SysFamily::Sequence => true,
             SysFamily::Schema
             | SysFamily::Table
             | SysFamily::View
             | SysFamily::Column
             | SysFamily::Index
-            | SysFamily::Circuit => true,
-        }
-    }
-
-    /// Is this family's delta sent to the workers? `false` for Sequence alone:
-    /// its rows are the master's positions, moved by every SERIAL reservation
-    /// and checkpoint, so a worker's copy is the one it forked with and no view
-    /// can be maintained over it.
-    pub(crate) fn reaches_workers(self) -> bool {
-        match self {
-            SysFamily::Sequence => false,
-            SysFamily::Schema
-            | SysFamily::Table
-            | SysFamily::View
-            | SysFamily::Column
-            | SysFamily::Index
-            | SysFamily::Circuit => true,
+            | SysFamily::Circuit => false,
         }
     }
 

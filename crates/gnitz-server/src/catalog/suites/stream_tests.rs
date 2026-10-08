@@ -12,8 +12,17 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
 
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
     let entry = engine.registry.relation_or_err(sid).expect("stream registered");
     assert_eq!(entry.kind(), RelationKind::Stream);
@@ -47,7 +56,14 @@ fn stream_reads_no_committed_state() {
     let dir = temp_dir("stream_reads_no_committed_state");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
 
     assert!(!engine.push_reads_committed_state(sid, gnitz_wire::WireConflictMode::Update));
     fs::remove_dir_all(&dir).ok();
@@ -60,20 +76,23 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     let dir = temp_dir("bounded_view_over_stream");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
-    let linear = try_register_identity_view(&mut engine, sid, "bounded_over_stream", &cols, 4 << 20, 0).unwrap();
-    let err = engine
-        .dag
-        .preflight_compile(&engine.registry, linear)
+    let err = try_register_identity_view(&mut engine, sid, "bounded_over_stream", &cols, 4 << 20, 0)
         .expect_err("must be rejected");
     assert!(err.contains("over a stream"), "got: {err}");
 
-    let over_table = try_register_identity_view(&mut engine, tid, "bounded_over_table", &cols, 4 << 20, 0).unwrap();
-    engine
-        .dag
-        .preflight_compile(&engine.registry, over_table)
+    try_register_identity_view(&mut engine, tid, "bounded_over_table", &cols, 4 << 20, 0)
         .expect("bounded view over a table");
 
     let join_cols = vec![
@@ -82,10 +101,7 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
         col_def("t_id", TypeCode::U64),
     ];
     let circuit = crate::test_support::two_term_join_circuit(sid, tid, TypeCode::I64);
-    let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 4 << 20, 0).unwrap();
-    engine
-        .dag
-        .preflight_compile(&engine.registry, join)
+    try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 4 << 20, 0)
         .expect("a bounded join over a stream compiles");
 
     register_identity_view(&mut engine, sid, "unbounded_over_stream", &cols);
@@ -100,8 +116,17 @@ fn the_drive_set_excludes_a_stream() {
     let dir = temp_dir("stream_excluded_from_sweep");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
     register_identity_view(&mut engine, sid, "v_s", &cols);
     register_identity_view(&mut engine, tid, "v_t", &cols);
 
@@ -124,8 +149,17 @@ fn stream_fed_views_are_invalid_at_boot() {
     let dir = temp_dir("stream_fed_views_invalid");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
     let direct = register_identity_view(&mut engine, sid, "v_direct", &cols);
     let downstream = register_identity_view(&mut engine, direct, "v_downstream", &cols);
@@ -157,8 +191,17 @@ fn an_ephemeral_round_publishes_no_view_a_stream_reaches() {
     let dir = temp_dir("stream_views_unpublished");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let sid = engine
+        .create_table_with(
+            "public.s",
+            &cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap();
+    let tid = engine
+        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
+        .unwrap();
 
     let direct = traced_view(&mut engine, sid, "v_direct", &cols);
     let downstream = traced_view(&mut engine, direct, "v_downstream", &cols);

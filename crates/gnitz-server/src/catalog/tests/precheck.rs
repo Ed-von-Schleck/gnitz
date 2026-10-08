@@ -94,30 +94,21 @@ fn only_an_owned_row_refuses_an_unpaired_retraction() {
 #[test]
 fn an_id_outside_a_familys_range_is_rejected_whatever_its_sign() {
     for family in SysFamily::ALL {
-        let floor = match family {
-            SysFamily::Schema
-            | SysFamily::Table
-            | SysFamily::View
-            | SysFamily::Column
-            | SysFamily::Index
-            | SysFamily::Sequence => FIRST_USER_TABLE_ID,
-            SysFamily::Circuit => 0,
-        };
+        let floor = FIRST_USER_TABLE_ID;
         assert_eq!(shape(family, &[(floor, 1, "")]), "", "{family:?}");
-        if let Some(below) = floor.checked_sub(1) {
-            let drop = if owned(family) {
-                "retracted only with its owner"
-            } else {
-                "cannot DROP a system"
-            };
-            for (rows, want) in [
-                (&[(below, 1, "")][..], "cannot CREATE a system"),
-                (&[(below, -1, "")], drop),
-                (&[(below, -1, ""), (below, 1, "name")], "cannot ALTER a system"),
-            ] {
-                let err = shape(family, rows);
-                assert!(err.contains(want), "{family:?} {want}: {err}");
-            }
+        let below = floor - 1;
+        let drop = if owned(family) {
+            "retracted only with its owner"
+        } else {
+            "cannot DROP a system"
+        };
+        for (rows, want) in [
+            (&[(below, 1, "")][..], "cannot CREATE a system"),
+            (&[(below, -1, "")], drop),
+            (&[(below, -1, ""), (below, 1, "name")], "cannot ALTER a system"),
+        ] {
+            let err = shape(family, rows);
+            assert!(err.contains(want), "{family:?} {want}: {err}");
         }
 
         let capped = matches!(
@@ -145,8 +136,7 @@ fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
         let may_change: &[&str] = match family {
             SysFamily::Table | SysFamily::View => &["name"],
             SysFamily::Column => &["name", "is_nullable", "is_hidden"],
-            SysFamily::Sequence => &["next_val"],
-            SysFamily::Schema | SysFamily::Index | SysFamily::Circuit => &[],
+            SysFamily::Schema | SysFamily::Index | SysFamily::Sequence | SysFamily::Circuit => &[],
         };
         let wire = family.wire();
         for col in &wire.cols[wire.pk_cols.len()..] {

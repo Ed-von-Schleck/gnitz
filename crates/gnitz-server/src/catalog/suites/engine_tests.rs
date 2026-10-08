@@ -36,21 +36,19 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let seq_id = engine.create_serial_table("public.t").unwrap();
 
-    let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64).unwrap();
+    let (base1, delta1) = reserve(&mut engine, seq_id, 64).unwrap();
     assert_eq!(base1, 1);
     assert_eq!(delta1.len(), 1, "first use inserts, retracts nothing");
     assert_eq!(delta1.get_weight(0), 1);
-    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta1).unwrap();
     assert_eq!(engine.sequence_value(seq_id), Some(64));
 
-    let (base2, delta2) = engine.reserve_user_sequence(seq_id, 64).unwrap();
+    let (base2, delta2) = reserve(&mut engine, seq_id, 64).unwrap();
     assert_eq!(base2, 65);
     assert_eq!(delta2.len(), 2);
     assert_eq!(delta2.get_weight(0), -1);
     assert_eq!(payload_u64(&delta2, 0, 0), 64, "the -1 must carry the live high-water");
     assert_eq!(delta2.get_weight(1), 1);
     assert_eq!(payload_u64(&delta2, 1, 0), 128);
-    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta2).unwrap();
     assert_eq!(engine.sequence_value(seq_id), Some(128));
 
     engine.close();
@@ -63,23 +61,17 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let full = engine.create_serial_table("public.full").unwrap();
-    engine
-        .ingest_to_family(gnitz_wire::SEQ_TAB, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
-        .unwrap();
-    let err = engine.reserve_user_sequence(full, 64).err().unwrap();
+    engine.set_sequence(full, (i64::MAX - 1) as u64).unwrap();
+    let err = reserve(&mut engine, full, 64).err().unwrap();
     assert!(err.contains("invalid or exhausted"), "{err}");
     let edge = engine.create_serial_table("public.edge").unwrap();
-    engine.reserve_user_sequence(edge, 0).err().unwrap();
-    engine.reserve_user_sequence(edge, 1 << 63).err().unwrap();
-    engine.reserve_user_sequence(edge + 1000, 1).err().unwrap();
+    reserve(&mut engine, edge, 0).err().unwrap();
+    reserve(&mut engine, edge, 1 << 63).err().unwrap();
+    reserve(&mut engine, edge + 1000, 1).err().unwrap();
+    assert_eq!(engine.sequence_value(edge), None, "a refused reservation moves nothing");
 
-    engine
-        .ingest_to_family(
-            gnitz_wire::SEQ_TAB,
-            &engine.sequence_delta(edge, (i64::MAX - 65) as u64),
-        )
-        .unwrap();
-    let (base, delta) = engine.reserve_user_sequence(edge, 64).unwrap();
+    engine.set_sequence(edge, (i64::MAX - 65) as u64).unwrap();
+    let (base, delta) = reserve(&mut engine, edge, 64).unwrap();
     assert_eq!(base, i64::MAX - 64);
     assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
 
@@ -111,15 +103,19 @@ fn a_row_at_an_unallocated_id_is_refused_and_leaves_allocation_working() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let next = engine.allocate_ids(1).unwrap() + 1;
     for id in [next, next + 4096, gnitz_wire::CATALOG_ID_CEILING - 1] {
-        let err = engine
-            .submit(SysFamily::Schema, schema_tab_batch(&[(id, "forged", 1)]))
-            .unwrap_err();
+        let err = apply_ddl(
+            &mut engine,
+            [(SysFamily::Schema, schema_tab_batch(&[(id, "forged", 1)]))],
+        )
+        .unwrap_err();
         assert!(err.contains("never allocated"), "schema {id}: {err}");
     }
     assert_eq!(engine.allocate_ids(1).unwrap(), next);
-    engine
-        .submit(SysFamily::Schema, schema_tab_batch(&[(next, "granted", 1)]))
-        .unwrap();
+    apply_ddl(
+        &mut engine,
+        [(SysFamily::Schema, schema_tab_batch(&[(next, "granted", 1)]))],
+    )
+    .unwrap();
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -131,16 +127,15 @@ fn test_user_sequence_durable_roundtrip() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         user_seq = engine.create_serial_table("public.t").unwrap();
-        let (base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
+        let (base, _) = reserve(&mut engine, user_seq, 64).unwrap();
         assert_eq!(base, 1);
-        engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta).unwrap();
         assert_eq!(engine.sequence_value(user_seq), Some(64));
         let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(engine.sequence_value(user_seq), Some(64));
-    let (base2, _delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
+    let (base2, _delta) = reserve(&mut engine, user_seq, 64).unwrap();
     assert_eq!(base2, 65, "next id continues after the recovered high-water");
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -273,7 +268,7 @@ fn test_ingest_scan_seek_family() {
     bb.begin_row(3u128, 1);
     bb.put_u64(300);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Scan
@@ -329,7 +324,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.begin_row(1u128, 1);
     bb.put_u64(100);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
@@ -337,7 +332,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.begin_row(1u128, 1);
     bb.put_u64(200);
     bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry.ingest(tid, bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Scan — should have exactly 1 row with val=200
@@ -382,13 +377,10 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
-    let _ = engine.drain_pending_broadcasts();
     engine.create_schema("z").unwrap();
     engine.mark_zone_applied(5);
-    let _ = engine.drain_pending_broadcasts();
     engine.create_table("z.t", &cols, &[0]).unwrap();
     engine.mark_zone_applied(7);
-    let _ = engine.drain_pending_broadcasts();
     engine.create_table("z.t2", &cols, &[0]).unwrap();
     engine.mark_zone_applied(9);
     assert_eq!(engine.system_zone, 9);
@@ -538,12 +530,11 @@ fn test_dep_map_drops_a_retired_views_edges() {
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_ids(1).unwrap();
-    write_identity_circuit(&mut engine, v2, tid, gnitz_wire::ReadBound::None);
-    engine.write_column_records(v2, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
+    let identity = crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
+    apply_ddl(&mut engine, view_blocks([(v2, &identity, &cols[..])], bb.finish())).unwrap();
     assert_eq!(
         engine.dag.dependents_of(tid),
         &[v2][..],
@@ -592,10 +583,13 @@ fn test_circuit_table_surface_introspectable() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Inject a row directly into CIRCUIT_TAB so the store is non-empty: view 107,
-    // with a single node, through the shared row codec.
+    // with a single node, through the shared row codec — as a worker applies it,
+    // since no bundle carries a circuit without its view.
     let mut circuit = gnitz_wire::Circuit::default();
     circuit.input_delta(100, gnitz_wire::ReadBound::None);
-    write_circuit(&mut engine, 107, circuit);
+    engine
+        .ddl_sync(gnitz_wire::CIRCUIT_TAB, circuit_batch(107, &circuit))
+        .unwrap();
 
     // The family is SQL-introspectable — `SELECT * FROM _system.circuits` must return
     // what we just inserted (full-scan path, used by SQL planner).
@@ -628,7 +622,7 @@ fn the_relation_name_index_follows_renames_and_drops() {
     assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "only"), None);
 
     let pair = table_tab_batch(&[(tid, "orig", -1), (tid, "renamed", 1)]);
-    engine.submit(SysFamily::Table, pair).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Table, pair)]).unwrap();
     assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "orig"), None);
     assert_eq!(engine.relation_id(PUBLIC_SCHEMA_ID, "renamed"), Some(tid));
 
@@ -661,8 +655,7 @@ fn a_descriptor_token_follows_the_resolve_answer() {
 
     let serial = engine.create_serial_table("public.sr").unwrap();
     let before = engine.resolve_token(serial);
-    let (_, reserved) = engine.reserve_user_sequence(serial, 64).unwrap();
-    engine.submit(SysFamily::Sequence, reserved).unwrap();
+    reserve(&mut engine, serial, 64).unwrap();
     assert_eq!(engine.resolve_token(serial), before);
     assert_eq!(engine.resolve_token(tid), Some(token));
 
@@ -672,7 +665,7 @@ fn a_descriptor_token_follows_the_resolve_answer() {
         engine.resolve_token(tid)
     };
     let pair = table_tab_batch(&[(tid, "t", -1), (tid, "renamed", 1)]);
-    engine.submit(SysFamily::Table, pair).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Table, pair)]).unwrap();
     let renamed = stale(&engine, token).unwrap();
     engine.create_index("public.renamed", &["id"], false).unwrap();
     let indexed = stale(&engine, renamed).unwrap();
@@ -699,7 +692,7 @@ fn an_index_name_is_claimed_once() {
     };
 
     let live = index(&mut engine, 1, "ix");
-    engine.submit(SysFamily::Index, live).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Index, live)]).unwrap();
     let second = index(&mut engine, 2, "ix");
     let err = engine.precheck_family(SysFamily::Index, &second).unwrap_err();
     assert_eq!(err, "Index already exists: ix");

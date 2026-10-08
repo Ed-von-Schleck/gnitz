@@ -38,7 +38,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     assert!(Path::new(&table_path).exists());
 
     let pair = table_rename_pair(&engine, tid, "renamed");
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
 
     // The registration survives, so its directory is live.
     assert!(engine.registry.has_id(tid), "rename must not unregister the table");
@@ -72,11 +72,11 @@ fn rename_then_reopen_resolves_flushed_data() {
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
         bb.end_row();
-        engine.ingest_to_family(tid, &bb.finish()).unwrap();
+        engine.registry.ingest(tid, bb.finish()).unwrap();
         engine.registry.checkpoint_base().unwrap();
 
         let pair = table_rename_pair(&engine, tid, "renamed");
-        engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
+        apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
         engine.close();
     }
 
@@ -107,7 +107,7 @@ fn valid_long_name_rename_accepted() {
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
     assert!(engine.get_by_name("public", "renamed_to_a_long_name").is_some());
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -315,9 +315,11 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
 fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_dropped_col", &cols);
-    engine
-        .ingest_to_family(gnitz_wire::COL_TAB, &col_alter_pair(tid, 1, &cols[1], hide))
-        .unwrap();
+    apply_ddl(
+        &mut engine,
+        [(SysFamily::Column, col_alter_pair(tid, 1, &cols[1], hide))],
+    )
+    .unwrap();
     let mut hidden = cols[1].clone();
     hidden.def.is_hidden = true;
 
@@ -335,7 +337,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
 }
 
 // ── The hook canonicalizer repairs a `+1`-first rewrite pair ────────────────
-// A raw `DDL_TXN` block or a compensation can hand the hooks one.
+// A raw `DDL_TXN` block or an undo can hand the hooks one.
 
 #[test]
 fn insert_first_rename_pair_lands_the_new_name() {
@@ -346,7 +348,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
 
     let [minus, mut pair] = table_rename_rows(&engine, tid, "renamed");
     pair.append_batch(&minus);
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
+    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
 
     assert!(
         engine.get_by_name("public", "renamed").is_some(),
@@ -397,26 +399,22 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     // An append bundled with an index family.
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     append(tid, &mut bb);
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    families[SysFamily::Column.index()] = Some(bb.finish());
-    families[SysFamily::Index.index()] = Some(idx_tab_batch(
-        engine.allocate_ids(1).unwrap(),
-        tid,
-        &[1],
-        "public__t__idx_v",
-        false,
-        1,
-    ));
-    let err = engine.precheck_bundle(&families).unwrap_err();
+    let index_id = engine.allocate_ids(1).unwrap();
+    let blocks = [
+        (SysFamily::Column, bb.finish()),
+        (
+            SysFamily::Index,
+            idx_tab_batch(index_id, tid, &[1], "public__t__idx_v", false, 1),
+        ),
+    ];
+    let err = apply_ddl(&mut engine, blocks).unwrap_err();
     assert!(err.contains("only change"), "{err}");
 
     // One column block altering two owners.
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     append(tid, &mut bb);
     append(other, &mut bb);
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    families[SysFamily::Column.index()] = Some(bb.finish());
-    let err = engine.precheck_bundle(&families).unwrap_err();
+    let err = apply_ddl(&mut engine, [(SysFamily::Column, bb.finish())]).unwrap_err();
     assert!(err.contains("only change"), "{err}");
 
     engine.close();

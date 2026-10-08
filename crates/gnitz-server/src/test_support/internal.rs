@@ -4,7 +4,7 @@
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
-use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
+use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
 use gnitz_wire::Circuit;
@@ -143,11 +143,6 @@ pub fn circuit_cell_batch(vid: u64, cell: &[u8]) -> Batch {
     bb.put_blob(cell);
     bb.end_row();
     bb.finish()
-}
-
-/// Write `vid`'s circuit through the applied-delta path.
-pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
-    engine.submit(SysFamily::Circuit, circuit_batch(vid, &circuit)).unwrap();
 }
 
 /// The minimal identity circuit: `ScanDelta(source, bound)`, its own output.
@@ -301,9 +296,49 @@ impl crate::query::DriveHost for LocalDrive<'_> {
     }
 }
 
-/// [`identity_circuit`] written as `vid`'s circuit.
-pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: u64, source_tid: u64, bound: gnitz_wire::ReadBound) {
-    write_circuit(engine, vid, identity_circuit(source_tid, bound));
+// ── DDL entry ────────────────────────────────────────────────────────────
+
+/// A `DDL_TXN` bundle of `blocks`, one per family.
+pub fn bundle(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> [Option<Batch>; SysFamily::COUNT] {
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    for (family, batch) in blocks {
+        assert!(families[family.index()].replace(batch).is_none());
+    }
+    families
+}
+
+/// Apply `blocks` as one DDL bundle, as the DDL driver does; either refusal as its text.
+pub fn apply_ddl(
+    engine: &mut CatalogEngine,
+    blocks: impl IntoIterator<Item = (SysFamily, Batch)>,
+) -> Result<(), String> {
+    engine.apply_bundle(bundle(blocks)).map(drop).map_err(refusal)
+}
+
+/// Either refusal of a catalog write, as its text.
+pub fn refusal(e: ZoneError) -> String {
+    match e {
+        ZoneError::Refused(e) | ZoneError::Diverged(e) => e,
+    }
+}
+
+/// The blocks of a bundle creating `views`, each `(vid, circuit, columns)`:
+/// their CIRCUIT_TAB and COL_TAB rows, and `rows` as the VIEW_TAB block.
+pub fn view_blocks<'a>(
+    views: impl IntoIterator<Item = (u64, &'a Circuit, &'a [CatalogColumn])>,
+    rows: Batch,
+) -> [(SysFamily, Batch); 3] {
+    let mut circuits = Batch::empty_with_schema(SysFamily::Circuit.schema());
+    let mut columns = Batch::empty_with_schema(SysFamily::Column.schema());
+    for (vid, circuit, cols) in views {
+        circuits.append_batch(&circuit_batch(vid, circuit));
+        columns.append_batch(&col_tab_batch(vid, cols, 1));
+    }
+    [
+        (SysFamily::Circuit, circuits),
+        (SysFamily::Column, columns),
+        (SysFamily::View, rows),
+    ]
 }
 
 // ── System-row fixtures ──────────────────────────────────────────────────
@@ -394,8 +429,8 @@ pub fn push_view_tab_row(
     sink.end_row();
 }
 
-/// Register a view running `circuit` through the raw system-table path,
-/// returning its vid or the registration's own error. Budgets in bytes,
+/// Register a view running `circuit` as one DDL bundle, returning its vid or
+/// the bundle's refusal. Budgets in bytes,
 /// `0` = off.
 pub fn try_register_view(
     engine: &mut CatalogEngine,
@@ -406,11 +441,9 @@ pub fn try_register_view(
     delta_bytes: u64,
 ) -> Result<u64, String> {
     let vid = engine.allocate_ids(1).unwrap();
-    write_circuit(engine, vid, circuit);
-    engine.write_column_records(vid, cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
-    engine.submit(SysFamily::View, bb.finish())?;
+    apply_ddl(engine, view_blocks([(vid, &circuit, cols)], bb.finish()))?;
     Ok(vid)
 }
 
