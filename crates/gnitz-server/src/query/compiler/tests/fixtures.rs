@@ -8,7 +8,42 @@ use gnitz_wire::Circuit;
 use gnitz_zset::schema::{Placement, Slot};
 
 pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
+    assert!(!circuit.nodes().is_empty(), "a decoded circuit has an output");
     LoadedCircuit(circuit)
+}
+
+/// `loaded`'s routing. A view's schema decides only which key its placement
+/// names, which no route reads.
+pub(super) fn routing(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
+    let view = crate::test_support::make_schema_u64_i64();
+    ViewMeta::derive(loaded, registry, &view).map(|(meta, _)| meta)
+}
+
+/// `circuit` compiled into a view of schema `view`, under the routing derived
+/// from it.
+pub(super) fn compile(
+    circuit: Circuit,
+    registry: &RelationRegistry,
+    view: &SchemaDescriptor,
+    bounded: bool,
+) -> Result<(CompileOutput, StateLayout), String> {
+    let loaded = loaded(circuit);
+    let (meta, _) = ViewMeta::derive(&loaded, registry, view)?;
+    compile_view(&loaded, registry, view, &meta, bounded)
+}
+
+/// `loaded` emitted whole, exchange-free, into one plan that outputs `out`, and
+/// the children it declared.
+pub(super) fn whole(
+    loaded: &LoadedCircuit,
+    registry: &RelationRegistry,
+    meta: &ViewMeta,
+    out: PlanOut,
+) -> Result<(Built, StateLayout), String> {
+    let mut layout = StateLayout::default();
+    let all = loaded.ordered_where(|_| true);
+    let built = build_plan(loaded, &all, registry, &mut layout, meta, &[], out)?;
+    Ok((built, layout))
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].

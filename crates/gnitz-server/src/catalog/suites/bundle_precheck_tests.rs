@@ -275,8 +275,7 @@ fn a_refused_view_bundle_compensates_to_the_prior_catalog() {
     // A filter whose predicate blob the expression decoder refuses.
     let mut uncompilable = gnitz_wire::Circuit::default();
     let scan = uncompilable.input_delta(base, gnitz_wire::ReadBound::None);
-    let filter = uncompilable.filter(scan, vec![0xFF]);
-    uncompilable.sink(filter);
+    uncompilable.filter(scan, vec![0xFF]);
     let fk_cols = [col_def("id", TypeCode::U64), fk_def("v", TypeCode::U64, base, 0)];
 
     type Case<'a> = (

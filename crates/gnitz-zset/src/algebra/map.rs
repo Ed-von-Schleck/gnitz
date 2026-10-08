@@ -315,12 +315,6 @@ impl MapPlan {
         Some(self.ev.copies().iter().map(|c| c.src).collect())
     }
 
-    /// Whether some row can be dropped: a [`gnitz_wire::NullKeys::Drop`] re-key over
-    /// a nullable key column.
-    pub fn drops_null_keys(&self) -> bool {
-        self.null_key_mask != 0
-    }
-
     /// True iff running this map would reproduce its input batch. A compiler
     /// elides such a node entirely and lets its consumers read the input.
     pub fn is_identity(&self) -> bool {

@@ -70,7 +70,7 @@ impl ProgramBuilder {
         for (i, &(reg, _)) in integrates.iter().enumerate() {
             regs[reg.at()].last_read = LastRead::Integrate(i);
         }
-        // After the scan, not before: the sink can itself be an operand.
+        // After the scan, not before: the output register can itself be an operand.
         regs[out_reg.at()].last_read = LastRead::Nobody;
 
         Vm {

@@ -17,10 +17,10 @@ pub(super) fn lower_setop(
     out: &[HirCol],
 ) -> Result<EmitPieces, GnitzSqlError> {
     let mut cb = Circuit::default();
-    let top = combine(chain, &mut cb, rel, out)?;
+    combine(chain, &mut cb, rel, out)?;
     // An ALL root can hold an element at weight above 1; any other clamps to a set.
     let bag = matches!(rel.as_ref(), RelExpr::SetOp { all: true, .. });
-    hashed_pieces(cb, top, "_set_pk", out, bag)
+    hashed_pieces(cb, "_set_pk", out, bag)
 }
 
 /// `rel` as weight arithmetic over its hashed leaves.
@@ -43,8 +43,10 @@ fn combine(
         }
         return Ok(if *all { sum } else { cb.distinct(sum) });
     }
-    let a = combine(chain, cb, left, out)?;
+    // A backfill feeds the sources in scan order, and the first is combined with
+    // nothing: the operand that outputs its rows on its own goes second.
     let b = combine(chain, cb, right, out)?;
+    let a = combine(chain, cb, left, out)?;
     let is_set = |r: &RelExpr| r.unique_key().is_some();
     // B ≥ 0, so positive_part(A − B) and min(A, B) are sets once A is; min also
     // once B is.
@@ -79,8 +81,8 @@ pub(super) fn lower_distinct(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Resu
     let cols = input.cols();
     let mut cb = Circuit::default();
     let side = hashed_side(chain, &mut cb, input, &cols)?;
-    let top = cb.distinct(side);
-    hashed_pieces(cb, top, "_distinct_pk", &cols, false)
+    cb.distinct(side);
+    hashed_pieces(cb, "_distinct_pk", &cols, false)
 }
 
 /// `side` opened and keyed by a hash of its columns, each widened to its
@@ -105,16 +107,9 @@ fn hashed_side(
 /// The circuit and its frame: the hidden U128 content-hash PK, then `cols`. A
 /// content hash identifies its own element, so the PK repeats only where an
 /// element's weight can exceed 1 — `bag`.
-fn hashed_pieces(
-    cb: Circuit,
-    top: NodeId,
-    pk_name: &str,
-    cols: &[HirCol],
-    bag: bool,
-) -> Result<EmitPieces, GnitzSqlError> {
+fn hashed_pieces(cb: Circuit, pk_name: &str, cols: &[HirCol], bag: bool) -> Result<EmitPieces, GnitzSqlError> {
     Ok(EmitPieces {
         circuit: cb,
-        top,
         out: Frame::keyed(
             vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
             cols.iter().map(|c| (Some(c.id), c.def.clone())),

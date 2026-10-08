@@ -18,7 +18,7 @@ use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
 use crate::test_support::*;
 use gnitz_core::PlannedView;
-use gnitz_wire::{Circuit, OpNode, RelClass, TypeCode};
+use gnitz_wire::{OpNode, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
 /// The fixture every pure file plans against. Every `BIGINT` column is `I64`.
@@ -129,11 +129,6 @@ fn output_shape(chain: &PlannedChain) -> Vec<(String, bool, bool)> {
         .iter()
         .map(|c| (c.name.clone(), c.is_hidden, c.is_nullable))
         .collect()
-}
-
-/// How many of `circuit`'s nodes satisfy `pred`.
-fn count(circuit: &Circuit, pred: impl Fn(&OpNode) -> bool) -> usize {
-    circuit.nodes().iter().filter(|n| pred(&n.op)).count()
 }
 
 /// Plan against `known`, recording the names the plan asks for, each once, in

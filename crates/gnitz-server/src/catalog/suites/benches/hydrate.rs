@@ -45,7 +45,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
     engine.registry.ingest(base, loaded).unwrap();
 
     let view = try_register_identity_view(&mut engine, base, "bounded", &cols, capacity, 0).unwrap();
-    backfill(&mut engine, view, &[base]);
+    backfill(&mut engine, view);
     sweep(&mut engine);
     (engine, base, view)
 }
@@ -212,7 +212,7 @@ fn hydrate_join_seek_bench() {
     ];
     let circuit = two_term_join_circuit(bases[0], bases[1], TypeCode::U64);
     let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 64 << 10, 0).unwrap();
-    backfill(&mut engine, join, &bases);
+    backfill(&mut engine, join);
     sweep(&mut engine);
     // Shows where the traces the seek reads sit.
     print!(

@@ -158,9 +158,8 @@ impl MasterDispatcher {
     /// every dependent that scans it, and an upstream hidden segment is filled
     /// before a downstream view reads it.
     ///
-    /// A multi-source equi-join iterates every source: each joins against the
-    /// sources fed before it, so the first emits nothing, and the rest join
-    /// against it. A view that runs no exchange needs no cross-worker
+    /// A multi-source join iterates every source: each joins against the sources
+    /// fed before it. A view that runs no exchange needs no cross-worker
     /// barrier and `fan_out_backfill` accommodates that — no round completes, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.

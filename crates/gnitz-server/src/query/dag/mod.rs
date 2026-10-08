@@ -139,11 +139,23 @@ impl DagEngine {
 
     /// The routing metadata derived when `view_id` registered. `Err` for an id
     /// that is not a registered view.
-    pub(crate) fn view_meta(&self, view_id: u64) -> Result<&ViewMeta, String> {
+    fn view_meta(&self, view_id: u64) -> Result<&ViewMeta, String> {
         self.views
             .get(&view_id)
             .map(|v| &v.meta)
             .ok_or_else(|| unregistered(view_id))
+    }
+
+    /// The bound `source`'s backfill scan into `view_id` narrows by.
+    pub(crate) fn source_bound(&self, view_id: u64, source: u64) -> Result<gnitz_wire::ReadBound, String> {
+        Ok(self.view_meta(view_id)?.source_bound(source))
+    }
+
+    /// Whether registered view `view_id`'s circuit compiles. Keeps and opens
+    /// nothing, so the master can ask before a DDL is durable.
+    pub(crate) fn preflight_compile(&self, registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
+        let meta = self.view_meta(view_id)?;
+        compile(registry, registry.relation_or_err(view_id)?, meta).map(drop)
     }
 
     /// `view_id`'s plan, if it is registered and compiled.
@@ -163,16 +175,15 @@ fn unregistered(view_id: u64) -> String {
     format!("view {view_id} is not registered")
 }
 
-/// Load and compile `view`'s circuit. Opens nothing.
-fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutput, StateLayout), String> {
+/// Load and compile `view`'s circuit under the routing derived when it registered.
+/// Opens nothing.
+fn compile(
+    registry: &RelationRegistry,
+    view: &Relation,
+    meta: &ViewMeta,
+) -> Result<(CompileOutput, StateLayout), String> {
     let loaded = compiler::load_circuit(registry, view.id())?;
-    compiler::compile_view(
-        &loaded,
-        registry,
-        &view.schema(),
-        view.placement(),
-        view.kind().is_bounded(),
-    )
+    compiler::compile_view(&loaded, registry, &view.schema(), meta, view.kind().is_bounded())
 }
 
 /// This view's metadata and its compiled plan, compiling and opening its
@@ -185,7 +196,7 @@ fn ensure_compiled<'a>(
     let RegisteredView { meta, plan, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
     if plan.is_none() {
         let view = registry.relation_or_err(view_id)?;
-        let (code, layout) = compile(registry, view)
+        let (code, layout) = compile(registry, view, meta)
             .map_err(|e| format!("view_id={view_id} does not compile from its durable circuit: {e}"))?;
         let state = CircuitState::open(registry, view_id, layout)
             .map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?;
@@ -193,12 +204,6 @@ fn ensure_compiled<'a>(
         *plan = Some(ViewPlan { code, state });
     }
     Ok((meta, plan.as_mut().expect("filled above")))
-}
-
-/// Whether registered view `view_id`'s circuit compiles. Keeps and opens
-/// nothing, so the master can ask before a DDL is durable.
-pub(crate) fn preflight_compile(registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
-    compile(registry, registry.relation_or_err(view_id)?).map(drop)
 }
 
 #[cfg(test)]

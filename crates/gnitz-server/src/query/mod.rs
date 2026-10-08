@@ -6,4 +6,4 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use dag::{drive, preflight_compile, DagEngine, Drive, DriveHost};
+pub(crate) use dag::{drive, DagEngine, Drive, DriveHost};

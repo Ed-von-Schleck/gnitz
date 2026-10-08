@@ -50,18 +50,16 @@ pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
     let mut circuit = gnitz_wire::Circuit::default();
     let sides = [0, 1].map(|_| {
         let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
-        circuit.shard(scan, &[0])
+        circuit.shard(scan)
     });
-    let merged = circuit.union(sides[0], sides[1]);
-    circuit.sink(merged);
+    circuit.union(sides[0], sides[1]);
     let twice = try_register_view(&mut engine, circuit, "twice", &cols, 0, 0).unwrap();
     let once = register_identity_view(&mut engine, base, "once", &cols);
     let deep = register_identity_view(&mut engine, twice, "deep", &cols);
     let mut circuit = gnitz_wire::Circuit::default();
     let left = circuit.input_delta(twice, gnitz_wire::ReadBound::None);
     let right = circuit.input_delta(once, gnitz_wire::ReadBound::None);
-    let merged = circuit.union(left, right);
-    circuit.sink(merged);
+    circuit.union(left, right);
     let union = try_register_view(&mut engine, circuit, "union", &cols, 0, 0).unwrap();
     let over_union = register_identity_view(&mut engine, union, "over_union", &cols);
     (engine, base, Views { twice, once, deep, union, over_union })
@@ -184,8 +182,7 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
         .output_schema();
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
-    let reduced = circuit.reduce_multi(scan, &[], &aggs);
-    circuit.sink(reduced);
+    circuit.reduce_multi(scan, &[], &aggs);
     let count = try_register_view(&mut engine, circuit, "count", &cols_of(&counted), 0, 0).unwrap();
 
     for round in 1..=2 {

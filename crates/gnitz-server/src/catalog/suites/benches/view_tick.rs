@@ -1,7 +1,8 @@
 //! Release benchmarks: instructions a view's maintenance costs per source row of
 //! a wide tick, for a projection, for a view `distinct` readers consume and for
-//! the preserved side of a left join, and per one-row tick for an identity and
-//! for the operators that keep state, with that state in RAM and spilled.
+//! the preserved side of a left join, per final row of a left join's backfill,
+//! and per one-row tick for an identity and for the operators that keep state,
+//! with that state in RAM and spilled.
 //!
 //! ```text
 //! cd crates && cargo test -p gnitz --release view_tick_bench \
@@ -71,12 +72,11 @@ fn projection_view_tick_bench() {
     let (mut engine, t) = ingest_fixture("projection_view_tick_bench", &cols, ROWS, cells);
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(t, ReadBound::None);
-    let projected = circuit.map(scan, &[2]);
-    circuit.sink(projected);
+    circuit.map(scan, &[2]);
     let view_cols = [col_def("id", TypeCode::U64), col_def("b", TypeCode::U64)];
     let v = try_register_view(&mut engine, circuit, "p", &view_cols, 0, 0).unwrap();
 
-    let ((), fill) = counter.measure(|| backfill(&mut engine, v, &[t]));
+    let ((), fill) = counter.measure(|| backfill(&mut engine, v));
     let ticks = wide_ticks(&mut engine, &counter, t, ROWS, false, cells);
     assert_eq!(
         net_weight(&engine, v) as u64,
@@ -122,6 +122,17 @@ fn echo_fold_view_tick_bench() {
     }
 }
 
+/// The rows a [`left_join_engine`] view holds, and how many of them are
+/// null-filled.
+fn left_join_rows(engine: &mut CatalogEngine, view: u64) -> (u64, u64) {
+    let out = scan_all(engine, view);
+    let b_w = out.schema().num_payload_cols() - 1;
+    let null_filled = (0..out.len())
+        .filter(|&i| gnitz_wire::payload_is_null(&*out, i, b_w))
+        .count();
+    (out.len() as u64, null_filled as u64)
+}
+
 /// The wide ticks into the preserved side of `a LEFT JOIN b ON a.<key> = b.k`, by
 /// `a`'s key column and by whether `b` holds one match for every row: the PK
 /// reaches the join in order and a payload key scattered, a nullable key is
@@ -149,17 +160,48 @@ fn left_join_view_tick_bench() {
         crate::query::drive(&mut LocalDrive(&mut engine), warm, None).unwrap();
 
         let ticks = wide_ticks(&mut engine, &counter, a, 0, false, |id| [scramble(id); 2]);
-        let out = scan_all(&mut engine, v);
-        let b_w = out.schema().num_payload_cols() - 1;
-        let null_filled = (0..out.len())
-            .filter(|&i| gnitz_wire::payload_is_null(&*out, i, b_w))
-            .count() as u64;
+        let (_, null_filled) = left_join_rows(&mut engine, v);
         assert_eq!(
             (net_weight(&engine, v) as u64, null_filled),
             (total, if matched { 0 } else { total }),
             "{label}"
         );
         println!("left join view, {label:<31}: {ticks:>6.1} instr/row");
+        discard(engine);
+    }
+}
+
+/// Rows each side of a [`left_join_backfill_bench`] holds.
+const BACKFILL_ROWS: u64 = 200_000;
+
+/// The backfill of `a LEFT JOIN b ON a.nn = b.k` over populated tables, by
+/// whether `b` holds one match for every row of `a`. A backfill feeds the sources
+/// in scan order, so the side fed first is joined against nothing.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn left_join_backfill_bench() {
+    let counter = perf::Counter::instructions();
+    for (label, matched) in [("every row matched", true), ("no row matched", false)] {
+        let dir = temp_dir(&format!("left_join_backfill_bench_{matched}"));
+        let (mut engine, [a, b], v) = left_join_engine(&dir, 1);
+        let held = rows(&engine, a, 1, 0..BACKFILL_ROWS, |id| [scramble(id); 2]);
+        engine.registry.ingest(a, held).unwrap();
+        // A scramble is a bijection, so the keys past `a`'s ids match none of them.
+        let first = if matched { 0 } else { BACKFILL_ROWS };
+        let held = rows(&engine, b, 1, 0..BACKFILL_ROWS, |id| [scramble(first + id), id]);
+        engine.registry.ingest(b, held).unwrap();
+
+        let ((), fill) = counter.measure(|| backfill(&mut engine, v));
+        let (held, null_filled) = left_join_rows(&mut engine, v);
+        assert_eq!(
+            (net_weight(&engine, v) as u64, held, null_filled),
+            (BACKFILL_ROWS, BACKFILL_ROWS, if matched { 0 } else { BACKFILL_ROWS }),
+            "{label}"
+        );
+        println!(
+            "left join backfill, {label:<17}: {:>7.1} instr/final row",
+            fill as f64 / BACKFILL_ROWS as f64
+        );
         discard(engine);
     }
 }
@@ -227,8 +269,7 @@ fn one_row_ticks(what: &str, register: impl Fn(&mut CatalogEngine, u64) -> u64) 
         engine.registry.ingest(t, base).unwrap();
 
         let v = register(&mut engine, t);
-        let sources = engine.dag.sources_of(v).to_vec();
-        backfill(&mut engine, v, &sources);
+        backfill(&mut engine, v);
         let files = files_under(&relation_dir(engine.registry.base_dir(), v));
         match fewer.replace(files) {
             None => assert_eq!(files, 0, "{what}, {label}: the view's state spilled"),
@@ -278,8 +319,7 @@ fn minmax_view_tick_bench() {
         );
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(t, ReadBound::None);
-        let reduced = circuit.reduce_multi(scan, &group, &aggs);
-        circuit.sink(reduced);
+        circuit.reduce_multi(scan, &group, &aggs);
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = *gnitz_zset::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)
             .unwrap()
@@ -300,8 +340,7 @@ fn topn_view_tick_bench() {
         );
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(t, ReadBound::None);
-        let top = circuit.top_n(scan, &group, &order, 3, 0);
-        circuit.sink(top);
+        circuit.top_n(scan, &group, &order, 3, 0);
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = gnitz_zset::stream::TopNPlan::from_wire(&schema, &group, &order, 3, 0)
             .unwrap()

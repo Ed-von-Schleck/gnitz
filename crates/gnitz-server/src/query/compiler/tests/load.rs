@@ -38,6 +38,8 @@ fn a_missing_or_undecodable_cell_is_refused() {
     for (cell, want) in [
         (UNDECODABLE, "circuit: unknown Opcode 200"),
         (&[][..], "circuit: truncated (need 2 bytes at offset 0, 0 remain)"),
+        // A circuit's output is its last node.
+        (&[0, 0], "circuit: a circuit has no nodes"),
     ] {
         assert_eq!(rejection(load(circuit_cell_batch(VIEW_ID, cell))), want);
     }
@@ -53,8 +55,7 @@ fn the_load_returns_one_views_circuit_as_written() {
     let bounded = c.input_delta(10, bound);
     let filtered = c.filter(bounded, vec![0xff]);
     let other = scan(&mut c, 11);
-    let both = c.union(filtered, other);
-    c.sink(both);
+    c.union(filtered, other);
 
     let mut rows = circuit_batch(VIEW_ID, &c);
     // Undecodable, so a load that ignored the view prefix would fail outright.

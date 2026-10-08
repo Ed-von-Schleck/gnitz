@@ -175,11 +175,11 @@ fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, Str
     (engine, tid, dir)
 }
 
-/// Backfill `view` from each of `sources` in turn, each ending with the pad
-/// chunk a drained worker drives.
-fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
+/// Backfill `view` from each of its sources in scan order, each ending with the
+/// pad chunk a drained worker drives.
+fn backfill(engine: &mut CatalogEngine, view: u64) {
     let chunk_rows = engine.registry.scan_chunk_rows();
-    for &source in sources {
+    for source in engine.dag.sources_of(view).to_vec() {
         let mut cursor = engine.open_source_cursor(view, source).unwrap();
         loop {
             let chunk = cursor.drain_chunk(chunk_rows);
@@ -209,7 +209,7 @@ fn published_children(dir: &str, id: u64) -> Vec<String> {
 /// A backfilled `DISTINCT` view over `source`: an output store and one trace.
 fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
     let vid = try_register_view(engine, distinct_circuit(source), name, cols, 0, 0).unwrap();
-    backfill(engine, vid, &[source]);
+    backfill(engine, vid);
     vid
 }
 

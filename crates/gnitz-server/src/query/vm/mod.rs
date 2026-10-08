@@ -211,8 +211,8 @@ pub(in crate::query) struct Vm {
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
-/// every instruction — or nobody: unread, or the sink, which the epoch extracts
-/// after both.
+/// every instruction — or nobody: unread, or the output register, which the
+/// epoch extracts after both.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum LastRead {
     Nobody,

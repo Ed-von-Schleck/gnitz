@@ -20,10 +20,9 @@ use gnitz_zset::stream::JoinPlan;
 /// to the emit arms as one `&mut` instead of a dozen parallel parameters.
 pub(super) struct EmitCtx<'a> {
     loaded: &'a LoadedCircuit,
-    /// This worker holds the view's whole input: the `WorkerFilter` arm emits
-    /// nothing (the trim would drop rows it legitimately owns a copy of), and it
-    /// owns the global-aggregate ground row.
-    self_contained: bool,
+    /// The view's routing. Where it is self-contained the `WorkerFilter` arm emits
+    /// nothing: the trim would drop rows this worker legitimately owns a copy of.
+    meta: &'a ViewMeta,
     /// The [`Seed::partials`] seeds, whose reader combines.
     partial_seeds: Vec<NodeId>,
     /// Answers the schemas and the slot.
@@ -34,15 +33,12 @@ pub(super) struct EmitCtx<'a> {
     out_reg_of: Vec<Option<DeltaReg>>,
     /// The integral of each node some join of this plan probes.
     integrals: Vec<Option<Integral>>,
-    /// Each re-key emitted so far: its input, its key and kept columns, whether it
-    /// drops NULL-keyed rows, and its output.
-    rekeys: Vec<(DeltaReg, &'a gnitz_wire::MapKind, bool, DeltaReg)>,
     source_reg_map: FxHashMap<u64, DeltaReg>,
-    /// The plan's [`PlanOut::Store`] sink.
-    store_sink: Option<NodeId>,
+    /// The plan's [`PlanOut::Store`] node.
+    store_out: Option<NodeId>,
 }
 
-impl EmitCtx<'_> {
+impl<'a> EmitCtx<'a> {
     /// Declare one child store of the view's operator state, named after `kind`
     /// and the node. The returned [`StateIdx`] is the only way to reach it.
     fn declare_child(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> StateIdx {
@@ -57,12 +53,10 @@ impl EmitCtx<'_> {
     }
 
     /// The output trace of reduce or top-N `nid`, declared under `kind` — or
-    /// `None` where the sink alone reads the node, so that the view's store holds
-    /// the same rows.
+    /// `None` where the node is the plan's [`PlanOut::Store`], so that the view's
+    /// store holds the same rows.
     fn out_trace(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> Option<StateIdx> {
-        let mut readers = self.loaded.readers(nid);
-        let feeds_store = self.store_sink.is_some() && readers.next() == self.store_sink && readers.next().is_none();
-        (!feeds_store).then(|| self.declare_child(kind, nid, schema))
+        (self.store_out != Some(nid)).then(|| self.declare_child(kind, nid, schema))
     }
 
     fn reads_partials(&self, nid: NodeId) -> bool {
@@ -74,39 +68,45 @@ impl EmitCtx<'_> {
         self.reg_of(self.loaded.inputs(nid)[0])
     }
 
-    /// The integral of node `of`'s output: the store of the relation it re-keys
-    /// where that is one, else a child declared and scheduled the first time a
-    /// join asks.
-    fn integral_of(&mut self, of: NodeId) -> Result<Integral, String> {
-        if let Some(known) = self.integrals[of] {
-            return Ok(known);
-        }
-        let reg = self.reg_of(of)?;
-        let integral = match source_trace(self, of) {
-            Some(relation) => Integral::Source(relation),
-            None => {
-                let trace = self.declare_child("int", of, self.prog.schema_of(reg));
-                self.prog.integrate(reg, trace);
-                Integral::Own(trace)
-            }
+    /// The base table whose store is already the integral of `of`, and `of`'s re-key
+    /// over that table's rows.
+    fn source_rekey(&self, of: NodeId) -> Option<(&'a Relation, MapPlan)> {
+        use gnitz_wire::{JoinKind, MapKind, OpNode};
+        let OpNode::Map(mk @ MapKind::Reindex { .. }) = self.loaded.op(of) else {
+            return None;
         };
-        self.integrals[of] = Some(integral);
-        Ok(integral)
+        let OpNode::ScanDelta { source, .. } = self.loaded.op(self.loaded.inputs(of)[0]) else {
+            return None;
+        };
+        let registry: &'a RelationRegistry = self.registry;
+        let relation = registry.relation(*source)?;
+        // A view's store has absorbed, within one drive, a delta its reader is yet to be fed.
+        if !relation.kind().is_base_table() {
+            return None;
+        }
+        let rekey = MapPlan::from_wire(&relation.schema(), mk).ok()?;
+        // The table's rows then sort by the integral's key first.
+        rekey.rekeys_onto_pk_prefix()?;
+        // A trace holds the delta where it lands, which is where the table holds it
+        // only if no relay moves it.
+        let unmoved = relation.placement().is_replicated() || self.meta.source_route(*source).is_none();
+        // An equal-key probe alone walks rows keyed wider than its delta.
+        let probes_are_equi = self.loaded.readers(of).all(|n| match self.loaded.op(n) {
+            OpNode::Join { kind, .. } if self.loaded.inputs(n)[1] == of => *kind == JoinKind::Equi,
+            _ => true,
+        });
+        (unmoved && probes_are_equi).then_some((relation, rekey))
     }
 
-    /// The base relation `rekey` is a reindex of, with nothing in between, and
-    /// that reindex over the relation's rows.
-    fn scanned_rekey(&self, rekey: NodeId) -> Option<(&Relation, &gnitz_wire::MapKind, MapPlan)> {
-        use gnitz_wire::{MapKind, OpNode};
-        let OpNode::Map(mk @ MapKind::Reindex { .. }) = self.loaded.op(rekey) else {
-            return None;
-        };
-        let OpNode::ScanDelta { source, .. } = self.loaded.op(self.loaded.inputs(rekey)[0]) else {
-            return None;
-        };
-        let relation = self.registry.relation(*source)?;
-        let map = MapPlan::from_wire(&relation.schema(), mk).ok()?;
-        Some((relation, mk, map))
+    /// The child integrating `of`'s register, declared and scheduled the first time
+    /// a join asks.
+    fn own_integral(&mut self, of: NodeId, reg: DeltaReg) -> StateIdx {
+        if let Some(Integral::Own(trace)) = self.integrals[of] {
+            return trace;
+        }
+        let trace = self.declare_child("int", of, self.prog.schema_of(reg));
+        self.prog.integrate(reg, trace);
+        trace
     }
 }
 
@@ -116,11 +116,7 @@ impl EmitCtx<'_> {
 
 /// Emit `nid`'s instructions and return the register its output lands in: its
 /// own, or an input's when the node emits nothing.
-pub(super) fn emit_node<'a>(
-    ctx: &mut EmitCtx<'a>,
-    nid: NodeId,
-    op: &'a gnitz_wire::OpNode,
-) -> Result<DeltaReg, String> {
+pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<DeltaReg, String> {
     match op {
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
         // VM: emission is identical bounded or not.
@@ -171,12 +167,9 @@ pub(super) fn emit_node<'a>(
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
 
-        gnitz_wire::OpNode::Reduce { group_cols, agg, global_ground } => {
-            emit_reduce(ctx, nid, group_cols, agg, *global_ground)
-        }
+        gnitz_wire::OpNode::Reduce { group_cols, agg } => emit_reduce(ctx, nid, group_cols, agg),
 
         gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
-            check_exchange_key(ctx, nid, group_cols)?;
             let in_reg = ctx.unary_delta_in(nid)?;
             let in_schema = ctx.prog.schema_of(in_reg);
             let plan = match ctx.reads_partials(nid) {
@@ -191,38 +184,33 @@ pub(super) fn emit_node<'a>(
                 unreachable!("a join is wired on two inputs")
             };
             let delta_reg = ctx.reg_of(delta)?;
-            let trace = ctx.integral_of(integrand)?;
+            let integrand_reg = ctx.reg_of(integrand)?;
             let delta_schema = ctx.prog.schema_of(delta_reg);
             // One constructor owns every kind's guards and its output layout.
-            let plan = match trace {
-                Integral::Own(trace) => {
-                    JoinPlan::from_wire(*kind, *delta_is_right, &delta_schema, ctx.layout.schema_of(trace))?
-                }
-                Integral::Source(_) => {
-                    let (relation, _, rekey) = ctx
-                        .scanned_rekey(integrand)
-                        .expect("`source_trace` found the reindex this store is the integral of");
-                    JoinPlan::over_source(*delta_is_right, &delta_schema, &relation.schema(), &rekey)?
+            let (trace, plan) = match ctx.source_rekey(integrand) {
+                Some((relation, rekey)) => (
+                    Integral::Source(relation.id()),
+                    JoinPlan::over_source(*delta_is_right, &delta_schema, &relation.schema(), &rekey)?,
+                ),
+                None => {
+                    let trace = ctx.own_integral(integrand, integrand_reg);
+                    let plan = JoinPlan::from_wire(*kind, *delta_is_right, &delta_schema, ctx.layout.schema_of(trace))?;
+                    (Integral::Own(trace), plan)
                 }
             };
+            ctx.integrals[integrand] = Some(trace);
             Ok(ctx
                 .prog
                 .push(delta_reg, plan.out_schema, Op::JoinDT { trace, probe: plan.probe }))
         }
 
-        gnitz_wire::OpNode::IntegrateSink => {
-            // Emits no instruction: the sink register's batch is what
-            // the epoch extracts at its end.
-            ctx.unary_delta_in(nid)
-        }
-
-        gnitz_wire::OpNode::ExchangeShard { .. } => {
+        gnitz_wire::OpNode::ExchangeShard => {
             unreachable!("carve keeps every ExchangeShard out of every plan's node list")
         }
 
         gnitz_wire::OpNode::WorkerFilter => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            if ctx.self_contained {
+            if ctx.meta.self_contained {
                 return Ok(in_reg);
             }
             Ok(ctx.prog.push(in_reg, ctx.prog.schema_of(in_reg), Op::WorkerFilter))
@@ -238,36 +226,6 @@ pub(super) fn emit_node<'a>(
     }
 }
 
-/// The base table whose store is already the integral of node `of`, if one is.
-fn source_trace(ctx: &EmitCtx, of: NodeId) -> Option<u64> {
-    use gnitz_wire::{JoinKind, MapKind, OpNode, ReindexRole};
-    let (relation, MapKind::Reindex { key, role, .. }, rekey) = ctx.scanned_rekey(of)? else {
-        return None;
-    };
-    // A view's store has absorbed, within one drive, a delta its reader is yet to be fed.
-    if !relation.kind().is_base_table() {
-        return None;
-    }
-    // The table's rows then sort by the integral's key first.
-    rekey.rekeys_onto_pk_prefix()?;
-    let all_here = ctx.self_contained
-        || match relation.placement() {
-            Placement::Replicated => true,
-            // The delta scatters by this key, which is what places the table's rows.
-            Placement::Keyed { dist_stride } => {
-                dist_stride as usize == rekey.out_schema().pk_stride()
-                    && matches!(role, ReindexRole::ScatterKey { source_key } if source_key == key)
-            }
-            Placement::Local => false,
-        };
-    // An equal-key probe alone walks rows keyed wider than its delta.
-    let probes_are_equi = ctx.loaded.readers(of).all(|n| match ctx.loaded.op(n) {
-        OpNode::Join { kind, .. } if ctx.loaded.inputs(n)[1] == of => *kind == JoinKind::Equi,
-        _ => true,
-    });
-    (all_here && probes_are_equi).then_some(relation.id())
-}
-
 // ---------------------------------------------------------------------------
 // MAP emission
 // ---------------------------------------------------------------------------
@@ -275,8 +233,7 @@ fn source_trace(ctx: &EmitCtx, of: NodeId) -> Option<u64> {
 /// Every `MapKind`'s output schema, program and PK source are one fact, derived
 /// by [`MapPlan::from_wire`]; this arm resolves the operand, asks for the plan,
 /// and either elides it or allocates a register for it.
-fn emit_map<'a>(ctx: &mut EmitCtx<'a>, nid: NodeId, mk: &'a gnitz_wire::MapKind) -> Result<DeltaReg, String> {
-    use gnitz_wire::MapKind::Reindex;
+fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<DeltaReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let plan = MapPlan::from_wire(&ctx.prog.schema_of(in_reg), mk)?;
     // A MAP that reproduces its input row verbatim emits nothing; the node's
@@ -284,69 +241,31 @@ fn emit_map<'a>(ctx: &mut EmitCtx<'a>, nid: NodeId, mk: &'a gnitz_wire::MapKind)
     if plan.is_identity() {
         return Ok(in_reg);
     }
-    let drops = plan.drops_null_keys();
-    // Two re-keys of one register on one key, keeping the same columns and the
-    // same rows, write the same batch: the second reads the first's register.
-    let twin = ctx.rekeys.iter().find(|&&(reg, twin, twin_drops, _)| {
-        reg == in_reg
-            && twin_drops == drops
-            && matches!((twin, mk), (Reindex { keep: k1, key: y1, .. }, Reindex { keep: k2, key: y2, .. })
-                if k1 == k2 && y1 == y2)
-    });
-    if let Some(&(.., out)) = twin {
-        return Ok(out);
-    }
-    let out = ctx.prog.push(in_reg, *plan.out_schema(), Op::Map(Box::new(plan)));
-    if matches!(mk, Reindex { .. }) {
-        ctx.rekeys.push((in_reg, mk, drops, out));
-    }
-    Ok(out)
+    Ok(ctx.prog.push(in_reg, *plan.out_schema(), Op::Map(Box::new(plan))))
 }
 
 // ---------------------------------------------------------------------------
 // REDUCE emission
 // ---------------------------------------------------------------------------
 
-fn emit_reduce(
-    ctx: &mut EmitCtx,
-    nid: NodeId,
-    group_cols: &[u32],
-    agg: &[AggDescriptor],
-    global_ground: bool,
-) -> Result<DeltaReg, String> {
-    check_exchange_key(ctx, nid, group_cols)?;
+fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group_cols: &[u32], agg: &[AggDescriptor]) -> Result<DeltaReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let in_schema = ctx.prog.schema_of(in_reg);
-    let seeds_ground = global_ground && owns_ground(ctx, nid)?;
+    let exchanged = matches!(
+        ctx.loaded.op(ctx.loaded.inputs(nid)[0]),
+        gnitz_wire::OpNode::ExchangeShard
+    );
+    let slot = ctx.registry.slot();
+    // Each worker that holds the whole input seeds the row, else the one worker
+    // V₀'s empty-keyed shard routes to.
+    let seeds_ground = group_cols.is_empty()
+        && exchanged
+        && (ctx.meta.self_contained || slot.rank as usize == gnitz_zset::schema::ground_owner(slot.of as usize));
     let plan = match ctx.reads_partials(nid) {
         true => gnitz_zset::stream::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
         false => gnitz_zset::stream::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
     };
     Ok(push_reduce(ctx, nid, FUNNEL_REDUCE, in_reg, plan))
-}
-
-/// Refuse an exchange in front of reduce or top-N `nid` that shards on other
-/// than its group columns.
-fn check_exchange_key(ctx: &EmitCtx, nid: NodeId, group_cols: &[u32]) -> Result<(), String> {
-    match ctx.loaded.op(ctx.loaded.inputs(nid)[0]) {
-        gnitz_wire::OpNode::ExchangeShard { shard_cols } if shard_cols != group_cols => {
-            Err("an exchange in front of a reduce or top-N shards on other than its group columns".into())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Whether this worker seeds global reduce `nid`'s ground row: each worker that
-/// holds the whole input does, else the one worker V₀'s empty-keyed shard routes to.
-fn owns_ground(ctx: &EmitCtx, nid: NodeId) -> Result<bool, String> {
-    let slot = ctx.registry.slot();
-    match ctx.loaded.op(ctx.loaded.inputs(nid)[0]) {
-        _ if ctx.self_contained => Ok(true),
-        gnitz_wire::OpNode::ExchangeShard { .. } => {
-            Ok(slot.rank as usize == gnitz_zset::schema::ground_owner(slot.of as usize))
-        }
-        _ => Err("reduce: a global aggregate over a partitioned input with no exchange".into()),
-    }
 }
 
 /// The child-store names of a reduce or top-N: its output trace, then its index.
@@ -403,7 +322,7 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
             let plan = gnitz_zset::stream::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
             Some(push_topn(ctx, shard, PARTIAL, in_reg, plan))
         }
-        _ => unreachable!("`global_split` names only a Reduce or a TopN"),
+        _ => unreachable!("`keyed_reader` names only a Reduce or a TopN"),
     })
 }
 
@@ -415,12 +334,12 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
 #[derive(Clone, Copy)]
 pub(super) enum PlanOut {
     Node(NodeId),
-    /// The sink of a view whose store holds every row it is fed — a bounded one
-    /// may hold a skeleton row in their place — and is so the integral of the
-    /// register the sink reads.
+    /// The output node of a view whose store holds every row it is fed — a bounded
+    /// one may hold a skeleton row in their place — and is so the integral of that
+    /// node's register.
     Store(NodeId),
     /// The per-worker partial of `consumer`, a global reduce or top-N behind an
-    /// empty-keyed shard — or the shard's input, when it has none.
+    /// exchange — or the exchange's input, when it has none.
     Split {
         consumer: NodeId,
     },
@@ -453,23 +372,22 @@ pub(super) fn build_plan(
     ordered: &[NodeId],
     registry: &RelationRegistry,
     layout: &mut StateLayout,
-    self_contained: bool,
+    meta: &ViewMeta,
     seeds: &[Seed],
     out: PlanOut,
 ) -> Result<Built, String> {
     let mut ctx = EmitCtx {
         loaded,
-        self_contained,
+        meta,
         partial_seeds: seeds.iter().filter(|s| s.partials).map(|s| s.shard).collect(),
         registry,
         layout,
         prog: ProgramBuilder::default(),
         out_reg_of: vec![None; loaded.len()],
         integrals: vec![None; loaded.len()],
-        rekeys: Vec::new(),
         source_reg_map: FxHashMap::default(),
-        store_sink: match out {
-            PlanOut::Store(sink) => Some(sink),
+        store_out: match out {
+            PlanOut::Store(nid) => Some(nid),
             PlanOut::Node(_) | PlanOut::Split { .. } => None,
         },
     };

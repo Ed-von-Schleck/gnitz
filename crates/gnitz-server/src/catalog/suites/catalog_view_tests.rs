@@ -23,7 +23,7 @@ fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
     let first = tables_view(&mut engine, "v_first");
-    backfill(&mut engine, first, &[TABLES]);
+    backfill(&mut engine, first);
     assert_eq!(held(&engine, first), (seeds, seeds as i64), "the seed rows");
 
     let tid = engine.allocate_ids(1).unwrap();
@@ -36,7 +36,7 @@ fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
     );
 
     let second = tables_view(&mut engine, "v_second");
-    backfill(&mut engine, second, &[TABLES]);
+    backfill(&mut engine, second);
     assert_eq!(
         held(&engine, second),
         (seeds, seeds as i64),
@@ -59,7 +59,7 @@ fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // A view over `tables` alone: `columns` stays unscanned.
     let view = tables_view(&mut engine, "v_tables");
-    backfill(&mut engine, view, &[TABLES]);
+    backfill(&mut engine, view);
 
     let tid = engine.allocate_ids(1).unwrap();
     engine.register_table(tid, PUBLIC_SCHEMA_ID, "t", &cols, &[0]).unwrap();

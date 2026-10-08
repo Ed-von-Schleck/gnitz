@@ -98,7 +98,7 @@ impl CatalogEngine {
         // On the master, while the bundle is still undoable: a worker's compile verdict
         // comes after the DDL is durable.
         for &vid in &new_views {
-            crate::query::preflight_compile(&self.registry, vid)?;
+            self.dag.preflight_compile(&self.registry, vid)?;
         }
         Ok(())
     }

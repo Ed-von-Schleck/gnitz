@@ -15,18 +15,22 @@ fn side_reindex_key(cols: &[usize], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
 }
 
 /// `(all, reindex)`: `input` re-keyed onto its join key, `reindex` without its
-/// NULL-keyed rows and `all` with them where `emits_unmatched`.
+/// NULL-keyed rows and `all` with them where `emits_unmatched`. The side's delta
+/// is scattered by the key's leading `routed` slots.
 fn keyed_side(
     cb: &mut Circuit,
     side: &JoinSide,
     input: NodeId,
     tcs: &[TypeCode],
+    routed: usize,
     emits_unmatched: bool,
 ) -> Result<(NodeId, NodeId), GnitzSqlError> {
     let key = side_reindex_key(&side.key, tcs);
-    let role = side.scatter_key(&key)?;
+    let role = side.scatter_key(&key[..routed])?;
     let reindex = cb.map_reindex(input, &key, &side.keep, role.clone(), NullKeys::Drop);
-    let all = match emits_unmatched {
+    // With no nullable key column the two re-keys keep the same rows.
+    let nullable = side.key.iter().any(|&c| side.frame.schema.columns[c].is_nullable);
+    let all = match emits_unmatched && nullable {
         true => cb.map_reindex(input, &key, &side.keep, role, NullKeys::Keep),
         false => reindex,
     };
@@ -64,7 +68,9 @@ pub(super) fn equi_prologue(
     b_unique: bool,
 ) -> Result<EquiPrologue, GnitzSqlError> {
     let tcs = class.key_tcs();
-    let side = |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], inputs[i], &tcs, kind.emits_unmatched(i == 0));
+    let side = |cb: &mut Circuit, i: usize| {
+        keyed_side(cb, &sides[i], inputs[i], &tcs, tcs.len(), kind.emits_unmatched(i == 0))
+    };
     let (all_b, reindex_b) = side(cb, 1)?;
     let (all_a, reindex_a) = side(cb, 0)?;
     // A decorrelated join asks only whether a key exists: B as a set weighs every
@@ -131,13 +137,13 @@ fn rekey_pinned(cb: &mut Circuit, node: NodeId, lead: usize, sides: &[JoinSide])
 }
 
 /// Re-key `node`, which carries `side`'s source rows, onto that source's PK.
-/// `scatter`: this re-key states the relay route of `side`'s delta (see
-/// `ReindexRole::ScatterKey`).
+/// `route`: the leading key slots this re-key states `side`'s delta is scattered
+/// by (see `ReindexRole::ScatterKey`), `None` where it states no route.
 pub(super) fn rekey_on_source_pk(
     cb: &mut Circuit,
     node: NodeId,
     side: &JoinSide,
-    scatter: bool,
+    route: Option<usize>,
 ) -> Result<NodeId, GnitzSqlError> {
     let schema = &side.frame.schema;
     let key: Vec<ReindexSlot> = schema
@@ -145,9 +151,9 @@ pub(super) fn rekey_on_source_pk(
         .iter()
         .map(|&c| (c, schema.columns[c as usize].ty.tc.reindex_output_type()))
         .collect();
-    let role = match scatter {
-        true => side.scatter_key(&key)?,
-        false => ReindexRole::Auxiliary,
+    let role = match route {
+        Some(n) => side.scatter_key(&key[..n])?,
+        None => ReindexRole::Auxiliary,
     };
     Ok(cb.map_reindex(node, &key, &side.keep, role, NullKeys::Keep))
 }
@@ -247,7 +253,7 @@ impl RangePrologue<'_> {
         let i = usize::from(!is_left);
         let base = self.k + if is_left { 0 } else { self.sides[0].n() };
         let pi = rekey_pinned(cb, merged, base, std::slice::from_ref(&self.sides[i]));
-        let all = rekey_on_source_pk(cb, self.inputs[i], &self.sides[i], false)?;
+        let all = rekey_on_source_pk(cb, self.inputs[i], &self.sides[i], None)?;
         // `π` is P's matched multiplicity, which only a side unique on the
         // equality key bounds by `all`; otherwise the difference is clamped at 0.
         let nu = match other_unique {
@@ -282,7 +288,8 @@ pub(super) fn range_prologue<'a>(
         gnitz_wire::MAX_COLUMNS,
     )?;
     let pure = class.eq.is_empty();
-    let reindex = |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], inputs[i], &tcs, false).map(|(_, r)| r);
+    let reindex =
+        |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], inputs[i], &tcs, class.eq.len(), false).map(|(_, r)| r);
     let reindex_a = match pure && kind.is_decorrelated() {
         true => None,
         false => Some(reindex(cb, 0)?),
@@ -320,7 +327,7 @@ fn own_a(
     range_tc: TypeCode,
     scatter: bool,
 ) -> Result<(NodeId, NodeId), GnitzSqlError> {
-    let owned = rekey_on_source_pk(cb, input, side, scatter)?;
+    let owned = rekey_on_source_pk(cb, input, side, scatter.then_some(side.frame.schema.pk_cols.len()))?;
     let owned = cb.worker_filter(owned); // [a.pk, kept A]
     let &[range_slot] = side.key.as_slice() else {
         unreachable!("a pure range keys on its range column alone")

@@ -65,11 +65,17 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
     let linear = try_register_identity_view(&mut engine, sid, "bounded_over_stream", &cols, 4 << 20, 0).unwrap();
-    let err = crate::query::preflight_compile(&engine.registry, linear).expect_err("must be rejected");
+    let err = engine
+        .dag
+        .preflight_compile(&engine.registry, linear)
+        .expect_err("must be rejected");
     assert!(err.contains("over a stream"), "got: {err}");
 
     let over_table = try_register_identity_view(&mut engine, tid, "bounded_over_table", &cols, 4 << 20, 0).unwrap();
-    crate::query::preflight_compile(&engine.registry, over_table).expect("bounded view over a table");
+    engine
+        .dag
+        .preflight_compile(&engine.registry, over_table)
+        .expect("bounded view over a table");
 
     let join_cols = vec![
         col_def("k", TypeCode::I64),
@@ -78,7 +84,10 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     ];
     let circuit = crate::test_support::two_term_join_circuit(sid, tid, TypeCode::I64);
     let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 4 << 20, 0).unwrap();
-    crate::query::preflight_compile(&engine.registry, join).expect("a bounded join over a stream compiles");
+    engine
+        .dag
+        .preflight_compile(&engine.registry, join)
+        .expect("a bounded join over a stream compiles");
 
     register_identity_view(&mut engine, sid, "unbounded_over_stream", &cols);
 

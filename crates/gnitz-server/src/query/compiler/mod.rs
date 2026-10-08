@@ -36,9 +36,8 @@ pub(super) use hydration::Hydration;
 pub(super) use load::load_circuit;
 pub(super) use routing::{Relay, ViewMeta};
 
-// Register and child-store ids are `u16`. A plan allocates at most one register
-// per node and one per seed; a node declares at most three children — an output
-// trace, an index, and the integral a join probes.
+// Register and child-store ids are `u16`: a plan allocates a bounded number of
+// each per node.
 const _: () = assert!(3 * MAX_CIRCUIT_NODES < u16::MAX as usize);
 
 // ---------------------------------------------------------------------------
@@ -46,7 +45,8 @@ const _: () = assert!(3 * MAX_CIRCUIT_NODES < u16::MAX as usize);
 // ---------------------------------------------------------------------------
 
 /// A loaded circuit: the client's graph, whose index order is a topological
-/// order because every input names an earlier node.
+/// order because every input names an earlier node. It holds at least one node,
+/// and the last is its output.
 pub(super) struct LoadedCircuit(gnitz_wire::Circuit);
 
 impl LoadedCircuit {
@@ -57,6 +57,11 @@ impl LoadedCircuit {
 
     fn len(&self) -> usize {
         self.0.nodes().len()
+    }
+
+    /// The node whose rows are the view's.
+    fn out(&self) -> NodeId {
+        self.len() - 1
     }
 
     fn op(&self, nid: NodeId) -> &gnitz_wire::OpNode {
@@ -74,13 +79,11 @@ impl LoadedCircuit {
         self.0.nodes().iter().map(|n| &n.op).enumerate()
     }
 
-    /// Every `ExchangeShard` and its key, in topological order — so the last is
-    /// the sink-nearest, the one whose key the view's output carries.
-    fn exchange_shards(&self) -> impl Iterator<Item = (NodeId, &[u32])> {
-        self.ops().filter_map(|(nid, op)| match op {
-            gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
-            _ => None,
-        })
+    /// Every `ExchangeShard`, in topological order.
+    fn exchange_shards(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.ops()
+            .filter(|(_, op)| matches!(op, gnitz_wire::OpNode::ExchangeShard))
+            .map(|(nid, _)| nid)
     }
 
     /// The node ids restricted to `keep`, in topological order. Every node list a
@@ -132,32 +135,26 @@ fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> NodeId {
 // Carve — the circuit split at its exchanges
 // ---------------------------------------------------------------------------
 
-/// One side of a [`Carve`]: an `ExchangeShard`, its key, and the nodes computing
-/// its input — the shard's ancestors — in topological order.
-struct CarvedSide<'a> {
+/// One side of a [`Carve`]: an `ExchangeShard` and the nodes computing its input
+/// — the shard's ancestors — in topological order.
+struct CarvedSide {
     shard: NodeId,
-    cols: &'a [u32],
     nodes: Vec<NodeId>,
 }
 
 /// The circuit split at its exchanges: one side per `ExchangeShard`, and the
 /// post phase — every node in no side, the shards excluded. For an
 /// exchange-free circuit `post` is the whole circuit.
-struct Carve<'a> {
-    sides: Vec<CarvedSide<'a>>,
+struct Carve {
+    sides: Vec<CarvedSide>,
     post: Vec<NodeId>,
 }
 
 impl LoadedCircuit {
-    fn carve(&self) -> Result<Carve<'_>, String> {
-        let shards: Vec<(NodeId, &[u32])> = self.exchange_shards().collect();
-        // The view routes every side's output by one key.
-        if !shards.windows(2).all(|w| w[0].1 == w[1].1) {
-            return Err("exchange sides shard on different keys".into());
-        }
+    fn carve(&self) -> Result<Carve, String> {
         let mut claimed = vec![false; self.len()];
-        let mut sides = Vec::with_capacity(shards.len());
-        for (shard, cols) in shards {
+        let mut sides = Vec::new();
+        for shard in self.exchange_shards() {
             let ancestors = self.ancestors_inclusive(shard);
             // A node in two sides — a shared ancestor, or a shard upstream of
             // another shard — would declare one scratch child twice.
@@ -168,7 +165,7 @@ impl LoadedCircuit {
                 *c |= a;
             }
             let nodes = self.ordered_where(|n| n != shard && ancestors[n]);
-            sides.push(CarvedSide { shard, cols, nodes });
+            sides.push(CarvedSide { shard, nodes });
         }
         let post = self.ordered_where(|n| !claimed[n]);
         // A delta is routed to the side scanning its source, so a post-phase scan
@@ -182,37 +179,20 @@ impl LoadedCircuit {
         Ok(Carve { sides, post })
     }
 
-    /// `shard`'s one reader, when it is a global `Reduce` or `TopN` behind an empty
-    /// key: the node whose partial a side may end in.
-    fn global_split(&self, shard: NodeId) -> Option<NodeId> {
-        if !matches!(self.op(shard), gnitz_wire::OpNode::ExchangeShard { shard_cols } if shard_cols.is_empty()) {
-            return None;
-        }
-        let mut readers = self.readers(shard);
-        let (Some(consumer), None) = (readers.next(), readers.next()) else {
-            return None;
-        };
-        match self.op(consumer) {
-            gnitz_wire::OpNode::Reduce { group_cols, .. } | gnitz_wire::OpNode::TopN { group_cols, .. }
-                if group_cols.is_empty() =>
-            {
-                Some(consumer)
-            }
+    /// The `Reduce` or `TopN` reading `shard`, and its group columns — the key the
+    /// exchange co-locates by. `None` where no reader is one: the rows are placed by
+    /// their own PK.
+    fn keyed_reader(&self, shard: NodeId) -> Result<Option<(NodeId, &[u32])>, String> {
+        use gnitz_wire::OpNode::{Reduce, TopN};
+        let keyed = self.readers(shard).find_map(|n| match self.op(n) {
+            Reduce { group_cols, .. } | TopN { group_cols, .. } => Some((n, group_cols.as_slice())),
             _ => None,
+        });
+        // A second reader would be handed rows placed by a key that is not its own.
+        if keyed.is_some() && self.readers(shard).nth(1).is_some() {
+            return Err("an exchange in front of a reduce or top-N has another reader".into());
         }
-    }
-
-    /// The circuit's one `IntegrateSink`.
-    fn sink(&self) -> Result<NodeId, String> {
-        let mut sinks = self
-            .ops()
-            .filter(|(_, op)| matches!(op, gnitz_wire::OpNode::IntegrateSink))
-            .map(|(nid, _)| nid);
-        match (sinks.next(), sinks.next()) {
-            (Some(sink), None) => Ok(sink),
-            (None, _) => Err("circuit has no IntegrateSink".into()),
-            (Some(_), Some(_)) => Err("circuit has more than one IntegrateSink".into()),
-        }
+        Ok(keyed)
     }
 }
 
@@ -267,37 +247,37 @@ pub(super) struct CompileOutput {
     pub(in crate::query) post: SubPlan,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Hydration>,
-    /// This worker computes the view's whole result locally: it is replicated, or
-    /// this process is the only worker.
-    pub(in crate::query) self_contained: bool,
 }
 
-/// Compile one view's already-loaded circuit: carve it at its exchanges, then
-/// `build_plan` each side and the post phase. Opens nothing: the returned
-/// layout declares every child store the plan's operators address.
+/// Compile one view's already-loaded circuit under the routing `meta` derived
+/// from it: carve it at its exchanges, then `build_plan` each side and the post
+/// phase. Opens nothing: the returned layout declares every child store the
+/// plan's operators address.
 pub(super) fn compile_view(
     loaded: &LoadedCircuit,
     registry: &RelationRegistry,
     view_schema: &SchemaDescriptor,
-    view_placement: Placement,
+    meta: &ViewMeta,
     bounded: bool,
 ) -> Result<(CompileOutput, StateLayout), String> {
     let carve = loaded.carve()?;
-    let self_contained = view_placement.is_replicated() || registry.slot().of <= 1;
     let mut layout = StateLayout::default();
     let mut side_plans = Vec::with_capacity(carve.sides.len());
     let mut seeds = Vec::with_capacity(carve.sides.len());
     for side in &carve.sides {
+        let reader = loaded.keyed_reader(side.shard)?;
         // A worker holding the whole input has nothing to pre-aggregate.
-        let out = match loaded.global_split(side.shard).filter(|_| !self_contained) {
-            Some(consumer) => PlanOut::Split { consumer },
+        let out = match reader.filter(|(_, group)| group.is_empty() && !meta.self_contained) {
+            Some((consumer, _)) => PlanOut::Split { consumer },
             None => PlanOut::Node(loaded.inputs(side.shard)[0]),
         };
-        let Built { plan, partial, .. } =
-            build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], out)?;
+        let Built { plan, partial, .. } = build_plan(loaded, &side.nodes, registry, &mut layout, meta, &[], out)?;
         let schema = *plan.vm.out_schema();
-        let scatter = Rc::new(ScatterPlan::group(&schema, side.cols)?);
-        let stays = self_contained
+        let scatter = Rc::new(match reader {
+            Some((_, group)) => ScatterPlan::group(&schema, group)?,
+            None => ScatterPlan::native(Placement::full_pk(&schema)),
+        });
+        let stays = meta.self_contained
             || (carve.sides.len() == 1 && routing::skips_output_exchange(loaded, side.shard, &scatter, registry));
         let relay = match () {
             _ if stays => None,
@@ -322,17 +302,17 @@ pub(super) fn compile_view(
         &carve.post,
         registry,
         &mut layout,
-        self_contained,
+        meta,
         &seeds,
         match bounded {
-            true => PlanOut::Node(loaded.sink()?),
-            false => PlanOut::Store(loaded.sink()?),
+            true => PlanOut::Node(loaded.out()),
+            false => PlanOut::Store(loaded.out()),
         },
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !post.vm.out_schema().same_region_types(view_schema) {
-        return Err("sink schema does not match view output schema".into());
+        return Err("the circuit's output schema is not the view's".into());
     }
     let sides = side_plans
         .into_iter()
@@ -342,7 +322,7 @@ pub(super) fn compile_view(
     let hydration = bounded
         .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs, &post_integrals))
         .transpose()?;
-    Ok((CompileOutput { sides, post, hydration, self_contained }, layout))
+    Ok((CompileOutput { sides, post, hydration }, layout))
 }
 
 #[cfg(test)]

@@ -88,16 +88,15 @@ pub(super) fn lower_join_view(
         });
     }
     let (node, out) = acc.expect("a join step emits at least one branch");
-    let node = match out_key.exchanged() {
-        true => cb.shard(node, &(0..out.schema.pk_cols.len() as u32).collect::<Vec<_>>()),
-        false => node,
-    };
+    if out_key.exchanged() {
+        cb.shard(node);
+    }
     // A join key and a pair PK each identify a matched pair, not a row.
     let pk_repeats = match out_key {
         OutKey::JoinKey | OutKey::PairPk => true,
         OutKey::OuterPk { .. } => sides[0].pk_repeats(),
     };
-    Ok(EmitPieces { circuit: cb, top: node, out, pk_repeats })
+    Ok(EmitPieces { circuit: cb, out, pk_repeats })
 }
 
 /// A join's two inputs opened through the spine and emitted into `cb`, each
@@ -137,8 +136,15 @@ fn emit_join_inputs(
         r = Spine::segment(materialize(chain, right, &live_r)?);
         origin_r = r.origin();
     }
-    let (a, left_frame) = l.emit(cb, Top::Slots)?;
-    let (b, right_frame) = r.emit(cb, Top::Slots)?;
+    // A backfill feeds the sources in scan order, and the first is joined against
+    // nothing: where one side alone outputs its unmatched rows, it goes second.
+    let ((a, left_frame), (b, right_frame)) = match kind.emits_unmatched(true) && !kind.emits_unmatched(false) {
+        true => {
+            let b = r.emit(cb, Top::Slots)?;
+            (l.emit(cb, Top::Slots)?, b)
+        }
+        false => (l.emit(cb, Top::Slots)?, r.emit(cb, Top::Slots)?),
+    };
     let frames = [left_frame, right_frame];
     let [kept_l, kept_r] = join_keep(down, class, kind, &frames)?;
     let [frame_l, frame_r] = frames;
@@ -424,8 +430,8 @@ fn emit_cross(
     [input_a, input_b]: [NodeId; 2],
     sides: &[JoinSide; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
-    let reindex_a = rekey_on_source_pk(cb, input_a, &sides[0], true)?;
-    let reindex_b = rekey_on_source_pk(cb, input_b, &sides[1], true)?;
+    let reindex_a = rekey_on_source_pk(cb, input_a, &sides[0], Some(0))?;
+    let reindex_b = rekey_on_source_pk(cb, input_b, &sides[1], Some(0))?;
     let int_a = cb.worker_filter(reindex_a);
     let int_b = cb.worker_filter(reindex_b);
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,

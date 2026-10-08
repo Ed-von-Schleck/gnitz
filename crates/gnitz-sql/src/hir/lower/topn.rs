@@ -63,22 +63,17 @@ pub(super) fn lower_topn(
 
     let out = keyed_frame(&frame, &group, 0..frame.schema.columns.len() as u32, Vec::new())?;
     let node = cb.top_n(node, &group, &keys, *limit, *offset);
-    let (node, out) = match above {
-        None => (node, out),
+    let out = match above {
+        None => out,
         Some(Above { alias, preds, items }) => {
             let out = match alias {
                 Some(cols) => out.renamed(&Rename::alias(&rel.cols(), cols))?,
                 None => out,
             };
             let filtered = emit_filter(&mut cb, node, preds, &out)?;
-            project_front(&mut cb, filtered, items, &out)?
+            project_front(&mut cb, filtered, items, &out)?.1
         }
     };
     // Keyed by the partition, which holds `limit` slots.
-    Ok(EmitPieces {
-        circuit: cb,
-        top: node,
-        out,
-        pk_repeats: *limit > 1,
-    })
+    Ok(EmitPieces { circuit: cb, out, pk_repeats: *limit > 1 })
 }

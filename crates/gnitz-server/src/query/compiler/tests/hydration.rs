@@ -3,13 +3,12 @@ use crate::query::compiler::fixtures::{dummy_expr_blob, loaded, scan};
 use crate::test_support::reindexed_on_col1;
 use gnitz_wire::{Circuit, JoinKind, TypeCode};
 
-/// Sides reindexed from `sources`, with `terms` building the sink's input out of
+/// Sides reindexed from `sources`, with `terms` building the output out of
 /// `[da, db]`.
 fn join_with(sources: [u64; 2], terms: impl FnOnce(&mut Circuit, [NodeId; 2]) -> NodeId) -> LoadedCircuit {
     let mut c = Circuit::default();
     let deltas = sources.map(|s| reindexed_on_col1(&mut c, s, TypeCode::I64));
-    let out = terms(&mut c, deltas);
-    c.sink(out);
+    terms(&mut c, deltas);
     loaded(c)
 }
 
@@ -20,8 +19,7 @@ fn a_linear_chain_seeds_at_its_scan() {
     let mut c = Circuit::default();
     let source = scan(&mut c, 77);
     let filtered = c.filter(source, dummy_expr_blob());
-    let mapped = c.map(filtered, &[0]);
-    c.sink(mapped);
+    c.map(filtered, &[0]);
     assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Scan { node: source, source: 77 }));
 }
 
@@ -36,8 +34,7 @@ fn a_two_term_join_seeds_from_side_as_integral() {
         if semi {
             db = c.distinct(db);
         }
-        let joined = c.join_terms([da, db], [da, db], JoinKind::Equi);
-        c.sink(joined);
+        c.join_terms([da, db], [da, db], JoinKind::Equi);
         assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Trace { delta: da }), "semi: {semi}");
     }
 }
@@ -91,19 +88,16 @@ fn a_shape_outside_the_equation_is_refused() {
 
     let mut c = Circuit::default();
     let (a, b) = (scan(&mut c, 1), scan(&mut c, 2));
-    let u = c.union(a, b);
-    c.sink(u);
+    c.union(a, b);
     refused(loaded(c), "a union input that is not a join");
 
     let mut c = Circuit::default();
     let a = scan(&mut c, 1);
-    let reduced = c.reduce_multi_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR]);
-    c.sink(reduced);
-    refused(loaded(c), "a reduce under the sink");
+    c.reduce_multi_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR]);
+    refused(loaded(c), "a reduce as the output");
 
     let mut c = Circuit::default();
     let a = scan(&mut c, 1);
-    let sharded = c.shard(a, &[0]);
-    c.sink(sharded);
+    c.shard(a);
     refused(loaded(c), "an exchange");
 }

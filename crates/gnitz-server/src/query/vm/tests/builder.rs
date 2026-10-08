@@ -6,10 +6,10 @@ use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
 
 /// An integrate runs after every instruction, so it takes its register from the
-/// instructions reading it — unless that register is the sink, which the epoch
-/// extracts after the integrates.
+/// instructions reading it — unless that register is the plan's output, which
+/// the epoch extracts after the integrates.
 #[test]
-fn an_integrate_takes_its_register_unless_it_is_the_sink() {
+fn an_integrate_takes_its_register_unless_it_is_the_output() {
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
@@ -30,7 +30,7 @@ fn an_integrate_takes_its_register_unless_it_is_the_sink() {
     }
 }
 
-/// An instruction takes a register only as its last reader, and never the sink:
+/// An instruction takes a register only as its last reader, and never the output:
 /// each op below reads `r0` before a later `Negate` does, and must leave it a
 /// full batch to read.
 #[test]
@@ -56,13 +56,13 @@ fn only_the_last_reader_takes_a_register() {
         assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
     }
 
-    // A union reading the sink, which the epoch extracts after every
+    // A union reading the output register, which the epoch extracts after every
     // instruction, must not take it — or the epoch would emit nothing.
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
-    let sink = p.push(r0, schema, Op::Negate);
-    p.push(sink, schema, Op::Union { in_b: r0 });
-    let mut vm = p.open(sink);
+    let out = p.push(r0, schema, Op::Negate);
+    p.push(out, schema, Op::Union { in_b: r0 });
+    let mut vm = p.open(out);
     assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
 }
 

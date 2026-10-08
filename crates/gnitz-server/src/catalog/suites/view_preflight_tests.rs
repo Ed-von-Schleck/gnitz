@@ -11,14 +11,13 @@
 
 use super::*;
 
-/// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The
+/// `ScanDelta(base_tid) → Filter(pred) → Distinct` for `vid`. The
 /// filter blob is what decides whether the view compiles.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, pred: &[u8]) {
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(base_tid, gnitz_wire::ReadBound::None);
     let filter = circuit.filter(scan, pred.to_vec());
-    let distinct = circuit.distinct(filter);
-    circuit.sink(distinct);
+    circuit.distinct(filter);
     write_circuit(engine, vid, circuit);
 }
 
@@ -55,7 +54,7 @@ fn test_preflight_compile_verdict() {
         &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
     );
     assert!(
-        crate::query::preflight_compile(&engine.registry, ok_vid).is_ok(),
+        engine.dag.preflight_compile(&engine.registry, ok_vid).is_ok(),
         "a well-formed circuit must pass the pre-flight"
     );
 
@@ -63,7 +62,9 @@ fn test_preflight_compile_verdict() {
     // can carry one, since the client's builder cannot — and the message is the
     // decoder's own.
     let bad_vid = register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF]);
-    let msg = crate::query::preflight_compile(&engine.registry, bad_vid)
+    let msg = engine
+        .dag
+        .preflight_compile(&engine.registry, bad_vid)
         .expect_err("an undecodable predicate must fail the pre-flight");
     assert!(
         msg.contains("expr blob"),

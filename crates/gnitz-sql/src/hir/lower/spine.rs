@@ -78,13 +78,13 @@ impl SourceOrigin {
         by_id.or(by_pk)
     }
 
-    /// `key`, restated over the source relation. Each slot keeps its type.
+    /// The columns of `key`, restated over the source relation.
     pub(crate) fn scatter_role(&self, frame: &Frame, key: &[ReindexSlot]) -> Option<ReindexRole> {
-        let source_key = key
+        let source_cols = key
             .iter()
-            .map(|&(c, tc)| Some((self.slot(frame, c as usize)?, tc)))
-            .collect::<Option<Vec<ReindexSlot>>>()?;
-        Some(ReindexRole::ScatterKey { source_key })
+            .map(|&(c, _)| self.slot(frame, c as usize))
+            .collect::<Option<Vec<u32>>>()?;
+        Some(ReindexRole::ScatterKey { source_cols })
     }
 }
 
@@ -278,6 +278,6 @@ pub(super) fn lower_linear(
     let spine = open(chain, rel, &live)?;
     let mut cb = Circuit::default();
     let pk_repeats = spine.pk_repeats();
-    let (node, out) = spine.emit(&mut cb, Top::Output)?;
-    Ok(EmitPieces { circuit: cb, top: node, out, pk_repeats })
+    let (_, out) = spine.emit(&mut cb, Top::Output)?;
+    Ok(EmitPieces { circuit: cb, out, pk_repeats })
 }

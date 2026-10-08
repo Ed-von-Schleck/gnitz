@@ -49,12 +49,7 @@ pub(super) fn lower_reduce(
     // HAVING over the raw reduce output, then the finalize projection.
     let having_frame = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
     let filtered = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
-    let (node, out) = project_front(&mut cb, filtered, items, &having_frame)?;
+    let (_, out) = project_front(&mut cb, filtered, items, &having_frame)?;
     // One row per group key, which the reduce output is keyed on.
-    Ok(EmitPieces {
-        circuit: cb,
-        top: node,
-        out,
-        pk_repeats: false,
-    })
+    Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
 }

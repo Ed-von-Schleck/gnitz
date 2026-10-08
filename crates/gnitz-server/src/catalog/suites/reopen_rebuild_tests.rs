@@ -371,13 +371,13 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     let (tid, cols) = seed_base(&mut engine, "public.cbase");
     let (seg, top) = register_chain(&mut engine, tid, &cols, 0).unwrap();
 
-    backfill(&mut engine, seg, &[tid]);
+    backfill(&mut engine, seg);
     assert_eq!(
         net_weight(&engine, seg),
         N,
         "a segment holds its rows for its chain's build"
     );
-    backfill(&mut engine, top, &[seg]);
+    backfill(&mut engine, top);
     assert_eq!(
         (net_weight(&engine, seg), net_weight(&engine, top)),
         (0, N),

@@ -66,7 +66,7 @@ fn a_backfill_leaves_the_rows_above_the_cut_to_their_tick() {
     let late = rows(&engine, tid, 1, 200..203, |id| [id * 10]);
     engine.ingest_unticked(tid, late).unwrap();
 
-    backfill(&mut engine, vid, &[tid]);
+    backfill(&mut engine, vid);
     assert_eq!(held(&engine, vid), (200, 200));
     seal_and_tick(&mut engine, tid);
     assert_eq!(held(&engine, vid), (203, 203));

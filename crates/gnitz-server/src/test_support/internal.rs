@@ -150,32 +150,28 @@ pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
     engine.submit(SysFamily::Circuit, circuit_batch(vid, &circuit)).unwrap();
 }
 
-/// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
+/// The minimal identity circuit: `ScanDelta(source, bound)`, its own output.
 pub fn identity_circuit(source_tid: u64, bound: gnitz_wire::ReadBound) -> Circuit {
     let mut circuit = Circuit::default();
-    let scan = circuit.input_delta(source_tid, bound);
-    circuit.sink(scan);
+    circuit.input_delta(source_tid, bound);
     circuit
 }
 
-/// `ScanDelta(source) → Distinct → sink`.
+/// `ScanDelta(source) → Distinct`.
 pub fn distinct_circuit(source: u64) -> Circuit {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    let distinct = circuit.distinct(scan);
-    circuit.sink(distinct);
+    circuit.distinct(scan);
     circuit
 }
 
-/// One unbounded `ScanDelta` per source, the first sunk: the dependency-map
-/// shape of a view over `sources`.
+/// One unbounded `ScanDelta` per source, the last its output: the
+/// dependency-map shape of a view over `sources`.
 pub fn scanning_circuit(sources: &[u64]) -> Circuit {
     let mut circuit = Circuit::default();
-    let scans: Vec<_> = sources
-        .iter()
-        .map(|&s| circuit.input_delta(s, gnitz_wire::ReadBound::None))
-        .collect();
-    circuit.sink(scans[0]);
+    for &source in sources {
+        circuit.input_delta(source, gnitz_wire::ReadBound::None);
+    }
     circuit
 }
 
@@ -189,12 +185,25 @@ pub fn negate_chain(source: u64, n: usize) -> Circuit {
     circuit
 }
 
-/// `source` scanned and reindexed on `key`, keeping its column 0, with `key`
-/// stated as its scatter key — what a spine that moves no column produces.
-pub fn scan_keyed(circuit: &mut Circuit, source: u64, key: &[gnitz_wire::ReindexSlot]) -> gnitz_wire::NodeId {
+/// `source` scanned and reindexed on `key`, keeping its column 0, with the
+/// leading `routed` slots of `key` stated as its scatter key — what a spine that
+/// moves no column produces.
+pub fn scan_routed(
+    circuit: &mut Circuit,
+    source: u64,
+    key: &[gnitz_wire::ReindexSlot],
+    routed: usize,
+) -> gnitz_wire::NodeId {
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    let role = gnitz_wire::ReindexRole::ScatterKey { source_key: key.to_vec() };
+    let role = gnitz_wire::ReindexRole::ScatterKey {
+        source_cols: key[..routed].iter().map(|slot| slot.0).collect(),
+    };
     circuit.map_reindex(scan, key, &[0], role, gnitz_wire::NullKeys::Keep)
+}
+
+/// [`scan_routed`] by the whole of `key`.
+pub fn scan_keyed(circuit: &mut Circuit, source: u64, key: &[gnitz_wire::ReindexSlot]) -> gnitz_wire::NodeId {
+    scan_routed(circuit, source, key, key.len())
 }
 
 /// [`scan_keyed`] on `source`'s column 1, of type `tc`.
@@ -210,8 +219,7 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
         true => reindexed_on_col1(&mut circuit, source, tc),
         false => circuit.input_delta(source, gnitz_wire::ReadBound::None),
     });
-    let joined = circuit.join(ka, kb, gnitz_wire::JoinKind::Equi, false);
-    circuit.sink(joined);
+    circuit.join(ka, kb, gnitz_wire::JoinKind::Equi, false);
     circuit
 }
 
@@ -220,35 +228,39 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
 pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circuit {
     let mut circuit = Circuit::default();
     let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source, tc));
-    let joined = circuit.join_terms(deltas, deltas, gnitz_wire::JoinKind::Equi);
-    circuit.sink(joined);
+    circuit.join_terms(deltas, deltas, gnitz_wire::JoinKind::Equi);
     circuit
 }
 
 /// `a (c0, c1, c2) LEFT JOIN b (c0, c1, c2) ON a.<key> = b.c1` over U64 keys, as
 /// `[key, a.c0, a.c1, a.c2, b.c2]`: `b` is not unique on its key, so `a`'s
-/// matched rows are its re-key against `b`'s key set. Answers the circuit and
-/// `a`'s join re-key.
+/// matched rows are its re-key against `b`'s key set. Of `a`'s columns `c2`
+/// alone is nullable, so only a join on it re-keys `a` a second time, keeping
+/// its NULL-keyed rows. Answers the circuit and `a`'s join re-key.
 pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::NodeId) {
     use gnitz_wire::{JoinKind, NullKeys, ReindexRole};
     let mut c = Circuit::default();
     let a_key = [(key, TypeCode::U64)];
-    let role = || ReindexRole::ScatterKey { source_key: a_key.to_vec() };
-    let sa = c.input_delta(a, gnitz_wire::ReadBound::None);
+    let role = || ReindexRole::ScatterKey { source_cols: vec![key] };
+    // `b` first: a backfill feeds the sources in scan order, and `a`'s rows are
+    // then null-filled against a `b` that is already there.
     let sb = c.input_delta(b, gnitz_wire::ReadBound::None);
+    let sa = c.input_delta(a, gnitz_wire::ReadBound::None);
     let b_key = [(1, TypeCode::U64)];
-    let b_role = ReindexRole::ScatterKey { source_key: b_key.to_vec() };
+    let b_role = ReindexRole::ScatterKey { source_cols: vec![1] };
     let rb = c.map_reindex(sb, &b_key, &[2], b_role, NullKeys::Drop);
     let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Drop);
-    let all = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep);
+    let all = match key == 2 {
+        true => c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep),
+        false => ra,
+    };
     let inner = c.join_terms([ra, rb], [ra, rb], JoinKind::Equi);
     let keys = c.map(rb, &[]);
     let set = c.distinct(keys);
     let matched = c.join_terms([ra, set], [ra, set], JoinKind::Equi);
     let nu = c.difference(all, matched);
     let filled = c.null_extend(nu, &[TypeCode::U64], false);
-    let out = c.union(filled, inner);
-    c.sink(out);
+    c.union(filled, inner);
     (c, ra)
 }
 

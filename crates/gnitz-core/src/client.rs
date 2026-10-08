@@ -1182,11 +1182,9 @@ impl GnitzClient {
         source: &RelDescriptor,
         props: ViewProps,
     ) -> Result<u64, ClientError> {
-        // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
-        // builder so the row materialisation matches the stored layout exactly.
+        // The one scan is the circuit's output.
         let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(source.tid, ReadBound::None);
-        circuit.sink(scan);
+        circuit.input_delta(source.tid, ReadBound::None);
 
         // A passthrough's layout must equal its source's, so the whole output
         // schema and its PK-repeat flag are the source's own.

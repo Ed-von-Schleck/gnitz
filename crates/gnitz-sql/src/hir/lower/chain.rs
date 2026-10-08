@@ -6,16 +6,15 @@ use super::super::physical::Frame;
 use super::super::RelExpr;
 use super::{SegInput, SegSource};
 use gnitz_core::{segment_id, PlannedView, ViewBundle};
-use gnitz_wire::{Circuit, NodeId};
+use gnitz_wire::Circuit;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// What every view emitter returns: the unsealed circuit, the node its output
-/// leaves, and its output frame — the view's schema, and the layout a cut
-/// segment exposes to its parent.
+/// What every view emitter returns: the circuit, whose last node is its output,
+/// and its output frame — the view's schema, and the layout a cut segment
+/// exposes to its parent.
 pub(crate) struct EmitPieces {
     pub circuit: Circuit,
-    pub top: NodeId,
     pub out: Frame,
     /// Whether two output rows may share the frame's leading key, or one may stand
     /// at weight above 1.
@@ -59,10 +58,9 @@ impl ViewChain {
 }
 
 impl EmitPieces {
-    /// The sunk circuit as a planned view, and the frame a parent reads it through.
+    /// The circuit as a planned view, and the frame a parent reads it through.
     fn seal(self) -> (PlannedView, Frame) {
-        let EmitPieces { mut circuit, top, out, pk_repeats } = self;
-        circuit.sink(top);
+        let EmitPieces { circuit, out, pk_repeats } = self;
         (
             PlannedView {
                 circuit,

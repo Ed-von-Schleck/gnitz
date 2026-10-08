@@ -127,7 +127,7 @@ impl CatalogEngine {
     /// circuit carries for it; the circuit's `Filter` applies the WHERE. Rows
     /// above `source`'s cut are left to the tick that seals them.
     pub(crate) fn open_source_cursor(&mut self, view_id: u64, source: u64) -> Result<SourceCursor, String> {
-        let bound = self.dag.view_meta(view_id)?.source_bound(source);
+        let bound = self.dag.source_bound(view_id, source)?;
         self.registry
             .open_bound(source, bound, Cut::Sealed)
             .map(|(cursor, _unapplied)| cursor)

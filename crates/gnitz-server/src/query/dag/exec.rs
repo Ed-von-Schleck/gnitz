@@ -68,17 +68,12 @@ fn run_view_epoch(
         let (dag, registry) = host.parts();
         let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
         let code = &plan.code;
-        let route = match code.self_contained {
-            true => None,
-            false => meta.source_route(src_id).cloned(),
-        };
-        let fold = match code.sides.is_empty() {
-            true => code.post.seed_folds(src_id),
-            false => code.sides.iter().any(|s| s.plan.seed_folds(src_id)),
-        };
+        let route = meta.source_route(src_id).cloned();
+        let sub_plans = || code.sides.iter().map(|s| &s.plan).chain([&code.post]);
+        // With sides the post phase scans nothing, so this is the sides' answer alone.
+        let fold = sub_plans().any(|p| p.seed_folds(src_id));
         // An empty delta into a plan that runs no exchange round and owes no
         // ground row is an epoch every sub-plan would answer empty.
-        let sub_plans = || code.sides.iter().map(|s| &s.plan).chain([&code.post]);
         if input.is_empty()
             && route.is_none()
             && code.sides.iter().all(|s| s.relay.is_none())

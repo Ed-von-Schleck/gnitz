@@ -601,7 +601,7 @@ impl OutKey {
         }
     }
 
-    /// Whether the output needs the `shard(0..npk)` exchange.
+    /// Whether the output needs an exchange onto its own PK.
     pub(crate) fn exchanged(self) -> bool {
         matches!(self, OutKey::PairPk | OutKey::OuterPk { owned: false })
     }

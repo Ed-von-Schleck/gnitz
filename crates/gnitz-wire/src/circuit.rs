@@ -36,7 +36,6 @@ wire_enum! {
         JoinRange = 13,
         /// Symmetric delta-trace join, full cross product.
         JoinCross = 14,
-        IntegrateSink = 15,
         ExchangeShard = 16,
         NullExtend = 17,
         WorkerFilter = 18,
@@ -48,7 +47,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 9;
+pub(crate) const CIRCUIT_VERSION: u8 = 10;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -292,9 +291,10 @@ pub enum ClampKind {
 pub enum ReindexRole {
     /// A re-key that states no route.
     Auxiliary,
-    /// The Map's `key`, restated in the columns of the source whose scan the
-    /// node reads: what each worker scatters that source's delta by.
-    ScatterKey { source_key: Vec<ReindexSlot> },
+    /// The columns, in the source whose scan the node reads, of the leading slots
+    /// of the Map's `key` that source's delta is scattered by — each at its key
+    /// slot's type; none broadcasts it.
+    ScatterKey { source_cols: Vec<u32> },
 }
 
 wire_enum! {
@@ -349,13 +349,13 @@ pub enum OpNode {
     Negate,
     Union,
     WeightClamp(ClampKind),
+    /// Over no group columns, behind an `ExchangeShard` it aggregates the whole
+    /// relation and owes one row over an empty input; with no exchange it
+    /// aggregates each worker's slice and owes none.
     Reduce {
         group_cols: Vec<u32>,
         /// Aggregate specs `(func, source column)`. Carries a `Count`.
         agg: Vec<AggDescriptor>,
-        /// The user's scalar aggregate, which emits one row over an empty source
-        /// (COUNT(*)=0, the rest NULL). Other group-less reduces leave it false.
-        global_ground: bool,
     },
     /// `slot 0 ⋈ z⁻¹(I(slot 1))`, written `[key, left payload…, right payload…]`:
     /// `delta_is_right` names the SQL side slot 0 carries.
@@ -363,11 +363,9 @@ pub enum OpNode {
         kind: JoinKind,
         delta_is_right: bool,
     },
-    /// Marks the circuit's output.
-    IntegrateSink,
-    ExchangeShard {
-        shard_cols: Vec<u32>,
-    },
+    /// Co-locates its input by the key of what reads it — the group columns of a
+    /// `Reduce` or `TopN` reader, else the input's own PK.
+    ExchangeShard,
     /// Widen every row with NULL columns of `type_codes`, ahead of the input's
     /// payload under `nulls_first` and behind it otherwise — the side order an
     /// outer join's null-fill needs.
@@ -400,8 +398,7 @@ impl OpNode {
             | OpNode::Negate
             | OpNode::WeightClamp(_)
             | OpNode::Reduce { .. }
-            | OpNode::IntegrateSink
-            | OpNode::ExchangeShard { .. }
+            | OpNode::ExchangeShard
             | OpNode::NullExtend { .. }
             | OpNode::WorkerFilter
             | OpNode::TopN { .. } => 1,
@@ -415,20 +412,15 @@ impl OpNode {
                 if key.is_empty() {
                     return Err("a reindex names no key columns".into());
                 }
-                // The scatter hashes the bytes these types pack; the trace is keyed by `key`'s.
-                if let ReindexRole::ScatterKey { source_key } = role {
-                    if !source_key.iter().map(|s| s.1).eq(key.iter().map(|s| s.1)) {
-                        return Err("a scatter key's slot types are not its reindex key's".into());
+                if let ReindexRole::ScatterKey { source_cols } = role {
+                    if source_cols.len() > key.len() {
+                        return Err("a scatter key is longer than its reindex key".into());
                     }
                 }
             }
             // An empty list hashes no bytes, collapsing every row onto one PK.
             OpNode::Map(MapKind::HashRow { cols }) if cols.is_empty() => {
                 return Err("a hash-row map names no columns".into());
-            }
-            // The ground row carries no group columns.
-            OpNode::Reduce { group_cols, global_ground: true, .. } if !group_cols.is_empty() => {
-                return Err("a global-ground reduce over a non-empty group set".into());
             }
             _ => {}
         }
@@ -446,7 +438,7 @@ impl OpNode {
                 w.put(&Opcode::MapReindex).put(nulls).list(key).list(keep);
                 match role {
                     ReindexRole::Auxiliary => w.bool(false),
-                    ReindexRole::ScatterKey { source_key } => w.bool(true).list(source_key),
+                    ReindexRole::ScatterKey { source_cols } => w.bool(true).list(source_cols),
                 }
             }
             OpNode::Map(MapKind::HashRow { cols }) => w.put(&Opcode::MapHashRow).list(cols),
@@ -454,17 +446,14 @@ impl OpNode {
             OpNode::Union => w.put(&Opcode::Union),
             OpNode::WeightClamp(ClampKind::Distinct) => w.put(&Opcode::Distinct),
             OpNode::WeightClamp(ClampKind::PositivePart) => w.put(&Opcode::PositivePart),
-            OpNode::Reduce { group_cols, agg, global_ground } => {
-                w.put(&Opcode::Reduce).bool(*global_ground).list(group_cols).list(agg)
-            }
+            OpNode::Reduce { group_cols, agg } => w.put(&Opcode::Reduce).list(group_cols).list(agg),
             OpNode::Join { kind, delta_is_right } => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
                 JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
                 JoinKind::Cross => w.put(&Opcode::JoinCross),
             }
             .bool(*delta_is_right),
-            OpNode::IntegrateSink => w.put(&Opcode::IntegrateSink),
-            OpNode::ExchangeShard { shard_cols } => w.put(&Opcode::ExchangeShard).list(shard_cols),
+            OpNode::ExchangeShard => w.put(&Opcode::ExchangeShard),
             OpNode::NullExtend { type_codes, nulls_first } => {
                 w.put(&Opcode::NullExtend).bool(*nulls_first).list(type_codes)
             }
@@ -497,7 +486,7 @@ impl OpNode {
                 let keep = cols(r)?;
                 let role = match r.bool()? {
                     false => ReindexRole::Auxiliary,
-                    true => ReindexRole::ScatterKey { source_key: slots(r)? },
+                    true => ReindexRole::ScatterKey { source_cols: cols(r)? },
                 };
                 OpNode::Map(MapKind::Reindex { keep, key, role, nulls })
             }
@@ -507,10 +496,9 @@ impl OpNode {
             Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
             Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
             Opcode::Reduce => {
-                let global_ground = r.bool()?;
                 let group_cols = cols(r)?;
                 let agg = r.list("aggregate list", MAX_COLUMNS)?;
-                OpNode::Reduce { group_cols, agg, global_ground }
+                OpNode::Reduce { group_cols, agg }
             }
             Opcode::JoinEqui => OpNode::Join {
                 kind: JoinKind::Equi,
@@ -524,8 +512,7 @@ impl OpNode {
                 kind: JoinKind::Cross,
                 delta_is_right: r.bool()?,
             },
-            Opcode::IntegrateSink => OpNode::IntegrateSink,
-            Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: cols(r)? },
+            Opcode::ExchangeShard => OpNode::ExchangeShard,
             Opcode::NullExtend => {
                 let nulls_first = r.bool()?;
                 let type_codes = r.list("type list", MAX_COLUMNS)?;
@@ -571,7 +558,8 @@ impl Node {
 }
 
 /// A node's id is its index and every input names an earlier node: [`Self::push`]
-/// is the only constructor, so index order is a topological order.
+/// is the only constructor, so index order is a topological order. Its last node
+/// is its output.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Circuit {
     nodes: Vec<Node>,
@@ -614,7 +602,7 @@ impl Circuit {
     }
 
     /// [`Self::encode`]'s inverse, through [`Self::push`]: a decoded circuit is
-    /// held to everything a built one is.
+    /// held to everything a built one is, and has an output.
     pub fn decode(buf: &[u8]) -> Result<Circuit, String> {
         decode_all(buf, "circuit", |r| {
             let mut circuit = Circuit::default();
@@ -626,6 +614,9 @@ impl Circuit {
                     *slot = r.u16()? as NodeId;
                 }
                 circuit.push(op, inputs)?;
+            }
+            if circuit.nodes.is_empty() {
+                return Err("a circuit has no nodes".into());
             }
             Ok(circuit)
         })
@@ -691,7 +682,7 @@ impl Circuit {
     /// exchange puts equal rows on one worker.
     pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot]) -> NodeId {
         let map = self.add(OpNode::Map(MapKind::HashRow { cols: cols.to_vec() }), &[input]);
-        self.shard(map, &[0])
+        self.shard(map)
     }
 
     /// [`MapKind::Projection`].
@@ -747,21 +738,20 @@ impl Circuit {
     /// [`OpNode::Reduce`] behind an [`OpNode::ExchangeShard`] on its group columns.
     /// Over no group columns it owes a row over an empty input.
     pub fn reduce_multi(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
-        let sharded = self.shard(input, group_cols);
-        self.reduce(sharded, group_cols, agg_specs, group_cols.is_empty())
+        let sharded = self.shard(input);
+        self.reduce(sharded, group_cols, agg_specs)
     }
 
     /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
     /// each worker holds it, and emits nothing over an empty input.
     pub fn reduce_multi_local(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
-        self.reduce(input, group_cols, agg_specs, false)
+        self.reduce(input, group_cols, agg_specs)
     }
 
-    fn reduce(&mut self, input: NodeId, group_cols: &[u32], agg: &[AggDescriptor], global_ground: bool) -> NodeId {
+    fn reduce(&mut self, input: NodeId, group_cols: &[u32], agg: &[AggDescriptor]) -> NodeId {
         let op = OpNode::Reduce {
             group_cols: group_cols.to_vec(),
             agg: agg.to_vec(),
-            global_ground,
         };
         self.add(op, &[input])
     }
@@ -775,7 +765,7 @@ impl Circuit {
         limit: u64,
         offset: u64,
     ) -> NodeId {
-        let sharded = self.shard(input, group_cols);
+        let sharded = self.shard(input);
         let op = OpNode::TopN {
             group_cols: group_cols.to_vec(),
             order: order.to_vec(),
@@ -786,9 +776,8 @@ impl Circuit {
     }
 
     /// [`OpNode::ExchangeShard`].
-    pub fn shard(&mut self, input: NodeId, shard_cols: &[u32]) -> NodeId {
-        let op = OpNode::ExchangeShard { shard_cols: shard_cols.to_vec() };
-        self.add(op, &[input])
+    pub fn shard(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::ExchangeShard, &[input])
     }
 
     /// [`OpNode::NullExtend`]. `nulls_first` places the NULL columns ahead of the
@@ -799,11 +788,6 @@ impl Circuit {
             nulls_first,
         };
         self.add(op, &[input])
-    }
-
-    /// [`OpNode::IntegrateSink`].
-    pub fn sink(&mut self, input: NodeId) -> NodeId {
-        self.add(OpNode::IntegrateSink, &[input])
     }
 }
 

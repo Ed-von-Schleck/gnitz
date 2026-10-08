@@ -27,8 +27,7 @@ fn base_rows(schema: &Schema) -> ZSetBatch {
 /// One identity segment reading `source_id`.
 fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
     let mut circuit = Circuit::default();
-    let inp = circuit.input_delta(source_id, ReadBound::None);
-    circuit.sink(inp);
+    circuit.input_delta(source_id, ReadBound::None);
     PlannedView {
         circuit,
         schema: Arc::clone(schema),
@@ -157,8 +156,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // A node list past the column cap encodes, and the engine refuses it at load.
     let mut wide = Circuit::default();
     let scan = wide.input_delta(base_tid, ReadBound::None);
-    let proj = wide.map(scan, &vec![0; gnitz_wire::MAX_COLUMNS + 1]);
-    wide.sink(proj);
+    wide.map(scan, &vec![0; gnitz_wire::MAX_COLUMNS + 1]);
     let planned = PlannedView {
         circuit: wide,
         ..segment(base_tid, &schema)
