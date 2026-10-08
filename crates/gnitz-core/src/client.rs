@@ -8,7 +8,7 @@ use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{
-    CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, SchemaTabRow, SchemaTabSlot, SysRow, TableTabRow,
-    ViewTabRow,
+    CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, SysRow,
+    TableTabRow, ViewTabRow,
 };
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
@@ -135,6 +135,21 @@ impl DdlBundle {
     /// `row` at `weight`, in its own family's batch.
     fn put<R: SysRow>(&mut self, row: &R, weight: i64) {
         row.write(&mut BatchAppender::new(self.batch(R::FAMILY)), weight);
+    }
+
+    /// The relations whose descriptor the bundle changes: every row names its
+    /// relation in its leading key column, an index row in `owner_id`.
+    fn relations_written(&self) -> HashSet<u64> {
+        let mut ids = HashSet::new();
+        for (family, rows) in &self.0 {
+            for i in 0..rows.len() {
+                ids.insert(match *family {
+                    IDX_TAB => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
+                    _ => u64::from_be_bytes(rows.pks.get_bytes(i)[..8].try_into().expect("a u64 key column")),
+                });
+            }
+        }
+        ids
     }
 
     /// Whether `other` holds the same live rows, family for family.
@@ -478,7 +493,7 @@ pub struct GnitzClient {
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
-    /// [`Self::kept_desc`]. This client's own DDL empties it.
+    /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     kept: HashMap<RelName, Arc<RelDescriptor>>,
 }
 
@@ -1021,7 +1036,8 @@ impl GnitzClient {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
         self.ack(Request::DdlTxn(&bundle.0)).await?;
-        self.kept.clear();
+        let written = bundle.relations_written();
+        self.kept.retain(|_, rel| !written.contains(&rel.tid));
         self.after_ddl_commit(&bundle.0).await;
         Ok(())
     }

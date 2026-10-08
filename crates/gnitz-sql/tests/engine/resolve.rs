@@ -117,7 +117,7 @@ fn cost(db: &mut Db, sql: &str) -> u64 {
 /// DML resolves a name once and keeps the answer: the statements after the
 /// first send their own requests alone, inside a transaction and out. A miss is
 /// not kept, a DDL statement always resolves, and this client's own DDL forgets
-/// what it kept. An equality, not a bound, so a regression to a second resolve
+/// the relations it wrote and no other. An equality, not a bound, so a regression to a second resolve
 /// fails here instead of fitting under a slack ceiling.
 #[test]
 fn a_statement_resolves_each_relation_once() {
@@ -130,7 +130,11 @@ fn a_statement_resolves_each_relation_once() {
          CREATE VIEW v AS SELECT id, x FROM t",
     );
     for (sql, want, what) in [
-        ("SELECT * FROM t", 2, "resolve, read"),
+        (
+            "SELECT * FROM t",
+            1,
+            "read: the CREATE VIEW resolved `t` and wrote no row of it",
+        ),
         ("SELECT * FROM t WHERE id = 2", 1, "read"),
         ("SELECT * FROM t WHERE x = 10", 1, "read"),
         ("SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g", 1, "read"),
@@ -167,9 +171,15 @@ fn a_statement_resolves_each_relation_once() {
         ("ALTER TABLE w ADD COLUMN c BIGINT", 2, "resolve, push"),
         ("ALTER TABLE w DROP COLUMN c", 3, "resolve, seek, push"),
         (
-            "BEGIN; INSERT INTO t VALUES (3, 1, 30); INSERT INTO t VALUES (4, 1, 40); COMMIT",
+            "INSERT INTO w (id) VALUES (1)",
             2,
-            "resolve, PUSH_TXN: this client's DDL forgot `t`",
+            "resolve, push: the ALTER wrote a column of `w`",
+        ),
+        ("INSERT INTO w (id) VALUES (2)", 1, "push"),
+        (
+            "BEGIN; INSERT INTO t VALUES (3, 1, 30); INSERT INTO t VALUES (4, 1, 40); COMMIT",
+            1,
+            "PUSH_TXN: the DDL on `w` wrote no row of `t`",
         ),
         (
             "BEGIN; UPDATE t SET x = x + 1 WHERE id = 3; UPDATE t SET x = x + 1 WHERE id = 4; COMMIT",
@@ -202,8 +212,11 @@ fn a_statement_resolves_each_relation_once() {
             7,
             "two resolves, one read per catalog family, alloc, push",
         ),
-        ("SELECT * FROM u", 2, "resolve, read"),
-        ("SELECT * FROM u", 1, "read"),
+        (
+            "SELECT * FROM u",
+            1,
+            "read: the replace resolved `u` and wrote no row of it",
+        ),
         (
             "CREATE OR REPLACE VIEW v AS SELECT id, x FROM u",
             5,
@@ -213,6 +226,12 @@ fn a_statement_resolves_each_relation_once() {
             "SELECT * FROM u",
             1,
             "read: a replace that wrote nothing drops no descriptor",
+        ),
+        ("CREATE INDEX ug ON u(g)", 3, "resolve, alloc, push"),
+        (
+            "SELECT * FROM u",
+            2,
+            "resolve, read: the index row names `u` as its owner",
         ),
     ] {
         assert_eq!(cost(&mut db, sql), want, "`{sql}`: {what}");
