@@ -168,14 +168,21 @@ proptest! {
                     .collect();
                 let keys = PkKeys::from_sorted(n, prefixes.concat());
                 let mut capped = Vec::new();
-                PkSetGather::over_runs(runs.iter().cloned(), s, runs.len(), keys)
+                let cursor = match prefixes.first() {
+                    Some(first) => {
+                        let first = PkBuf::from_bytes(first).widened(stride);
+                        from_runs_in_band(runs.iter().cloned(), s, runs.len(), first.pk_bytes(), None)
+                    }
+                    None => empty_cursor(s),
+                };
+                PkSetGather::over(cursor, keys)
                     .for_each_positive_capped(max, total, |c| capped.push(current(c)));
                 prop_assert_eq!(capped, want);
             }
         }
 
         // A key-set gather, drained across chunk boundaries.
-        let mut gather = PkSetGather::new(open(), PkKeys::from_sorted(stride, keys.concat()));
+        let mut gather = PkSetGather::over(open(), PkKeys::from_sorted(stride, keys.concat()));
         let mut gathered = Vec::new();
         while let Some(b) = gather.drain_chunk(chunk) {
             prop_assert!(b.count > 0);

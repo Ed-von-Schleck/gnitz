@@ -45,14 +45,15 @@ proptest! {
             }
         }
         let held = zset_sum(&pushed, &s);
-        let failed = set.spill(&s, |_| Err(()));
-        prop_assert_eq!(failed, if held.is_empty() { Ok(false) } else { Err(()) });
+        let refused = StorageError::Io(libc::EIO);
+        let failed = set.spill(&s, |_| Err(refused));
+        prop_assert_eq!(failed, if held.is_empty() { Ok(()) } else { Err(refused) });
         let mut written = Default::default();
         let wrote = set.spill(&s, |run| {
             written = zset_of(run, &s);
-            Ok::<(), ()>(())
+            Ok(())
         });
-        prop_assert_eq!(wrote, Ok(!held.is_empty()));
+        prop_assert_eq!(wrote, Ok(()));
         prop_assert_eq!(written, held, "the failed write left every row held");
         prop_assert_eq!((set.len(), set.bytes), (0, 0));
     }

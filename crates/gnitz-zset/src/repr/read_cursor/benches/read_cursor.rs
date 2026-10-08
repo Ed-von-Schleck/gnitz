@@ -235,7 +235,14 @@ fn pk_set_gather_drain_bench() {
                 // The first pass takes the pool's first allocations.
                 let [_, instructions] = [(); 2].map(|()| {
                     let keys = PkKeys::from_sorted(8, keys.clone());
-                    let mut g = PkSetGather::over_runs(runs.iter().cloned(), schema, runs.len(), keys);
+                    let cursor = from_runs_in_band(
+                        runs.iter().cloned(),
+                        schema,
+                        runs.len(),
+                        keys.iter().next().unwrap(),
+                        None,
+                    );
+                    let mut g = PkSetGather::over(cursor, keys);
                     let (rows, instructions) = counter.measure(|| {
                         let mut rows = 0;
                         while let Some(c) = g.drain_chunk(65_536) {

@@ -6,7 +6,7 @@ use super::dirs::children_at_generation;
 use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
-use crate::storage::{RecoverySource, Table};
+use crate::storage::{RecoverySource, ShardBudget, Table};
 use gnitz_zset::schema::Slot;
 
 impl RelationRegistry {
@@ -57,7 +57,7 @@ impl RelationRegistry {
                         ChildKind::Index(ix.cols),
                         ix.schema(),
                         RecoverySource::Rederive { resume_at },
-                        self.store_budgets(),
+                        ShardBudget::Unbounded,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -129,7 +129,7 @@ impl RelationRegistry {
         self.tables
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&tid, entry)| (tid, entry.store.held().checkpoint_mark()))
+            .map(|(&tid, entry)| (tid, entry.store.held().loaded_mark().unwrap_or(0)))
             .collect()
     }
 }

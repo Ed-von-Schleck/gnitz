@@ -3,7 +3,7 @@
 
 use super::ChildKind;
 use super::RelationRegistry;
-use crate::storage::Table;
+use crate::storage::{RecoverySource, ShardBudget, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -51,7 +51,7 @@ impl CircuitState {
     pub fn open(reg: &RelationRegistry, view_id: u64, layout: StateLayout) -> Result<Self, String> {
         let view = reg.relation_or_err(view_id)?;
         // The traces resume from the generation the output they feed resumed from.
-        let recovery = view.table().recovery_source();
+        let recovery = RecoverySource::Rederive { resume_at: view.table().loaded_mark() };
         let tables = layout
             .children
             .into_iter()
@@ -62,7 +62,7 @@ impl CircuitState {
                     ChildKind::Scratch(&child),
                     schema,
                     recovery,
-                    reg.store_budgets(),
+                    ShardBudget::Unbounded,
                 )
             })
             .collect::<Result<_, _>>()?;
@@ -75,17 +75,13 @@ impl CircuitState {
     }
 
     /// A cursor over `idx` for probing at the keys in `[first, last]` — whole
-    /// PKs, or the same leading bytes of one — positioned on the first.
+    /// PKs, or the same leading bytes of one — positioned on the band they span.
     pub fn cursor_between(&self, idx: StateIdx, first: &[u8], last: &[u8]) -> ReadCursor {
         self.at(idx).cursor_between(first, last, super::Cut::Now)
     }
 
-    pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
-        self.at_mut(idx).ingest_owned_batch(batch)
-    }
-
-    pub fn ingest_borrowed(&mut self, idx: StateIdx, batch: &Batch) -> Result<(), StorageError> {
-        self.at_mut(idx).ingest_borrowed_batch(batch)
+    pub fn ingest(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
+        self.at_mut(idx).ingest(batch)
     }
 
     /// Every child store, for the checkpoint round that publishes them.

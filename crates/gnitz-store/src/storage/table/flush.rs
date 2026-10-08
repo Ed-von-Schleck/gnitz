@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use io_uring::types::FsyncFlags;
 
@@ -68,13 +69,6 @@ pub(crate) fn flush_barrier<'a>(
 }
 
 impl Table {
-    /// The base round's barrier over this one table.
-    #[cfg(test)]
-    pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
-        assert!(!self.is_rederived(), "the base round never visits a rederived table");
-        flush_barrier([&mut *self], 0)
-    }
-
     // ------------------------------------------------------------------
     // RAM-tier fold (ingest overflow)
     // ------------------------------------------------------------------
@@ -112,15 +106,19 @@ impl Table {
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
-        self.spill_ram_tier()?;
-        // Rows above the cut go to a shard of their own, which no compaction
-        // folds below it.
+        // Rows above the cut are written with the rest, and their negation kept
+        // for a reader at the cut. The spill leaves the run unshared, so it is
+        // negated where it stands; a failed spill still holds it, and then it is
+        // copied — either way both cuts read what they read.
         let schema = self.shard_index.schema;
-        self.pending
-            .spill(&schema, |run| self.shard_index.append_pending_run(run))?;
+        let above = self.pending.drain_into(&mut self.ram_tier, &schema);
+        let spilled = self.spill_ram_tier();
+        if let Some(run) = above {
+            self.flushed.push(Rc::unwrap_or_clone(run).negated(), &schema);
+        }
+        spilled?;
         // A manifest names a tree; a fold under way has outputs in none.
-        let done = self.shard_index.finish_fold()?;
-        self.evicted(done.evicted);
+        self.shard_index.finish_fold()?;
         let bytes = manifest::encode(&Manifest {
             checkpoint_mark,
             caller_record: self.caller_record.clone(),
@@ -154,8 +152,6 @@ impl Table {
     /// Move the RAM tier's rows to an unsynced L0 shard.
     fn spill_ram_tier(&mut self) -> Result<(), StorageError> {
         let schema = self.shard_index.schema;
-        self.ram_tier
-            .spill(&schema, |run| self.shard_index.append_l0_run(run))?;
-        Ok(())
+        self.ram_tier.spill(&schema, |run| self.shard_index.append_l0_run(run))
     }
 }

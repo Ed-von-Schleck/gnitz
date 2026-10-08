@@ -175,8 +175,8 @@ impl RelationRegistry {
                 store.ingest_pending(effective);
                 (Ok(()), None)
             }
-            (false, true) => (store.ingest_borrowed_batch(&effective), Some(effective)),
-            (false, false) => (store.ingest_owned_batch(effective), None),
+            (false, true) => (store.ingest(effective.to_consolidated()), Some(effective)),
+            (false, false) => (store.ingest(effective), None),
         };
         inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
 
@@ -184,7 +184,7 @@ impl RelationRegistry {
             return Ok(applied);
         };
         let feed = entry.delta.as_deref_mut().expect("capture implies a feed");
-        if let Err(e) = feed.ingest_owned_batch(stamped) {
+        if let Err(e) = feed.ingest(stamped) {
             // Logged, not fatal: the round is captured and the next spill retries,
             // where a restart would erase every retained round instead.
             gnitz_error!(

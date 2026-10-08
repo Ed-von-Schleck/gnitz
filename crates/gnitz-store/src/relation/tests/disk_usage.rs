@@ -19,7 +19,7 @@ fn publish(base: &str, id: u64, kind: ChildKind, rows: &[(u64, i64, i64)]) -> St
     std::fs::create_dir_all(&dir).unwrap();
     let schema = make_schema_u64_i64();
     let mut table = scratch_table(&dir, schema);
-    table.ingest_owned_batch(make_batch(&schema, rows)).unwrap();
+    table.ingest(make_batch(&schema, rows)).unwrap();
     flush_barrier([&mut table], 0).unwrap();
     dir
 }
@@ -37,9 +37,7 @@ fn a_directory_is_summed_by_store_with_identical_shards_named() {
     let system = relation_dir(base, 3);
     std::fs::create_dir_all(&system).unwrap();
     let mut table = scratch_table(&system, make_schema_u64_i64());
-    table
-        .ingest_owned_batch(make_batch(&make_schema_u64_i64(), &rows[..3]))
-        .unwrap();
+    table.ingest(make_batch(&make_schema_u64_i64(), &rows[..3])).unwrap();
     flush_barrier([&mut table], 0).unwrap();
     // A shard file the manifest does not name, and a second name of one it does.
     std::fs::copy(format!("{view_rows}/shard_1.db"), format!("{view_rows}/shard_9.db")).unwrap();

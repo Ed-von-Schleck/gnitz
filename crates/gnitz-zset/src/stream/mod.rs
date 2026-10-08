@@ -24,7 +24,8 @@ use crate::repr::ReadCursor;
 
 /// Opens a cursor over one store of an operator's history, for probing at the
 /// keys in `[first, last]` — whole PKs, or the same leading bytes of one, each
-/// then naming every row it prefixes — and positioned on the first. Supplied by
+/// then naming every row it prefixes — positioned on the band they span, which
+/// is all it need hold. Supplied by
 /// the caller, which holds the store; the operator calls it once it knows which
 /// keys the delta touches, and not at all for a store it turns out not to read.
 pub type OpenAt<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> ReadCursor;

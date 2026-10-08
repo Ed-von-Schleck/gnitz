@@ -7,11 +7,10 @@ use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
-use crate::storage::{RecoverySource, StoreBudgets, Table};
+use crate::storage::{RecoverySource, ShardBudget, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
 use gnitz_zset::schema::{Placement, Slot};
@@ -117,13 +116,13 @@ impl SecondaryIndex {
         if projected.is_empty() {
             return Ok(false);
         }
-        table.ingest_owned_batch(projected).map(|()| true)
+        table.ingest(projected).map(|()| true)
     }
 
     /// Whether this process's store of the index came back from a checkpoint
     /// manifest at its open.
     pub fn resumed(&self) -> bool {
-        self.store.held().resumed_from_checkpoint()
+        self.store.held().loaded_mark().is_some()
     }
 }
 
@@ -310,21 +309,17 @@ impl Relation {
     }
 
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
-    /// same leading bytes of one — positioned on the first, over the rows `cut`
-    /// reads.
+    /// same leading bytes of one — positioned on the band they span, over the
+    /// rows `cut` reads.
     pub fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
         self.table().cursor_between(first, last, cut)
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`.
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
-        let table = self.table();
-        let band = key_range_between_cuts(
-            KeyCut::min_of(prefix),
-            KeyCut::above(prefix),
-            table.schema().pk_stride(),
-        );
-        table.range_cursor(band, Cut::Now).for_each_positive_while(|_| true, f);
+        self.table()
+            .cursor_between(prefix, prefix, Cut::Now)
+            .for_each_positive_while(|_| true, f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.
@@ -527,7 +522,7 @@ impl RelationRegistry {
                 ChildKind::Index(ix.cols),
                 index_schema,
                 RecoverySource::Rederive { resume_at },
-                self.store_budgets(),
+                ShardBudget::Unbounded,
             )?));
             if !ix.resumed() {
                 let owner_store = &self.tables[&owner].store;
@@ -654,12 +649,6 @@ impl RelationRegistry {
     /// Every registered view id.
     pub fn view_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.tables.iter().filter(|(_, e)| e.kind.is_view()).map(|(&id, _)| id)
-    }
-
-    /// What every store this registry opens starts from; the two bounded kinds
-    /// narrow it.
-    pub(crate) fn store_budgets(&self) -> StoreBudgets {
-        StoreBudgets::new(self.config.ram_tier_bytes)
     }
 }
 

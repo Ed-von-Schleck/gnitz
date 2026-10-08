@@ -11,8 +11,8 @@ use proptest::prelude::*;
 
 use gnitz_wire::MAX_PK_COLUMNS;
 
-use crate::storage::{RecoverySource, StoreBudgets, Table};
-use crate::test_support::{arb_schema, row_key, zset_of};
+use crate::storage::{flush_barrier, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::test_support::{self, arb_schema, row_key, zset_of};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -66,7 +66,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         batch.end_row();
     }
 
-    // Raw, so ingest_owned_batch sorts and consolidates it.
+    // Raw, so ingest sorts and consolidates it.
     (batch.finish(), leading)
 }
 
@@ -92,7 +92,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     } else {
         RecoverySource::Rederive { resume_at: None }
     };
-    Table::new(dir.to_str().unwrap(), schema, p, StoreBudgets::default()).unwrap()
+    test_support::new_table(dir, schema, p, DEFAULT_RAM_TIER_BYTES)
 }
 
 proptest! {
@@ -109,8 +109,8 @@ proptest! {
         let mut table = new_table(&dir.path().join("rt"), schema, durable);
         let (original, _) = arb_batch(&schema, rows, seed);
 
-        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
-        if durable { table.flush() } else { table.fold_to_ram() }.unwrap();
+        table.ingest(Batch::clone(&original)).unwrap();
+        if durable { flush_barrier([&mut table], 0) } else { table.fold_to_ram() }.unwrap();
 
         let expected = zset_of(&original, &schema);
 
@@ -150,14 +150,14 @@ proptest! {
         absent_vals.push(rows as u128);
         let absent = crate::test_support::opk_pk(&schema, &absent_vals);
 
-        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
+        table.ingest(Batch::clone(&original)).unwrap();
 
         for i in 0..rows {
             prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
         }
         prop_assert!(!table.has_pk_bytes(&absent));
 
-        table.flush().unwrap();
+        flush_barrier([&mut table], 0).unwrap();
 
         for i in 0..rows {
             prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
@@ -173,8 +173,8 @@ proptest! {
         let mut table = new_table(&dir.path().join("rx"), schema, true);
         let (original, _) = arb_batch(&schema, rows, seed);
 
-        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
-        table.flush().unwrap(); // rows now live in one on-disk shard
+        table.ingest(Batch::clone(&original)).unwrap();
+        flush_barrier([&mut table], 0).unwrap(); // rows now live in one on-disk shard
 
         let half = rows / 2; // retract rows [0, half)
 
@@ -187,7 +187,7 @@ proptest! {
 
         // Physical retraction: ingest the same rows negated into the memtable.
         let neg = Batch::from_ranges(&original, &[(0, half)], 0);
-        table.ingest_owned_batch(neg.negated()).unwrap();
+        table.ingest(neg.negated()).unwrap();
 
         for i in 0..half {
             prop_assert!(!table.has_pk_bytes(original.get_pk_bytes(i)));
@@ -220,8 +220,8 @@ proptest! {
             let start = k * rows / WAVES;
             let end = (k + 1) * rows / WAVES;
             let wave = Batch::from_ranges(&original, &[(start, end)], 0);
-            table.ingest_owned_batch(wave).unwrap();
-            table.flush().unwrap();
+            table.ingest(wave).unwrap();
+            flush_barrier([&mut table], 0).unwrap();
         }
         // Registering the WAVES'th shard crosses `l0.len() > 4`, so the store
         // owes the fold into guards below L0.

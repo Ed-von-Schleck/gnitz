@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::bloom::BloomFilter;
 use gnitz_wire::PkBuf;
-use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
+use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
 use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -180,27 +180,32 @@ impl RunSet {
     }
 
     /// Fold to a single run and hand it to `write`, emptying the set once that
-    /// succeeds. `Ok(false)` when the set held no row to write.
-    pub(super) fn spill<E>(
+    /// succeeds. A set holding no row writes nothing.
+    pub(super) fn spill(
         &mut self,
         schema: &SchemaDescriptor,
-        write: impl FnOnce(&Batch) -> Result<(), E>,
-    ) -> Result<bool, E> {
+        write: impl FnOnce(&Batch) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         self.fold(schema);
-        let Some(run) = self.runs.first() else {
-            return Ok(false);
-        };
-        write(run)?;
-        self.clear();
-        Ok(true)
+        if let Some(run) = self.runs.first() {
+            write(run)?;
+            self.clear();
+        }
+        Ok(())
     }
 
-    /// Fold to a single run, move it into `dst` and answer it; this set is left
-    /// empty. `None` when the set is empty or fully cancelled.
-    pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+    /// Fold to a single run and answer it; this set is left empty. `None` when
+    /// the set is empty or fully cancelled.
+    pub(super) fn take(&mut self, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
         self.fold(schema);
         let run = self.runs.pop();
         self.clear();
+        run
+    }
+
+    /// [`Self::take`], the run moved into `dst` as well.
+    pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+        let run = self.take(schema);
         if let Some(run) = &run {
             dst.push_run(Rc::clone(run), schema);
         }
@@ -209,12 +214,24 @@ impl RunSet {
 
     /// Bloom probe for a PK by its [`probe_key`]. The first probe builds the
     /// filter from all live runs.
+    #[inline]
     fn may_contain(&self, probe_key: u64) -> bool {
         // Answered without building a budget-sized filter.
         if self.runs.is_empty() {
             return false;
         }
-        let bloom = self.bloom.get_or_init(|| {
+        match self.bloom.get() {
+            Some(bloom) => bloom.may_contain(probe_key),
+            None => self.build_bloom().may_contain(probe_key),
+        }
+    }
+
+    /// The filter over every live run. Out of line: it runs once per filter,
+    /// and inlined it keeps the probe from inlining into its caller.
+    #[cold]
+    #[inline(never)]
+    fn build_bloom(&self) -> &BloomFilter {
+        self.bloom.get_or_init(|| {
             // Sized to the rows the budget holds, not the current ones: later
             // pushes add to it.
             let row_width = self.runs[0].schema().row_width();
@@ -223,8 +240,7 @@ impl RunSet {
                 bloom_add_batch(&mut bloom, run);
             }
             bloom
-        });
-        bloom.may_contain(probe_key)
+        })
     }
 }
 

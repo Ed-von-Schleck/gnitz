@@ -1,8 +1,7 @@
 //! In-memory FLSM index state + the compaction trigger/orchestration for
-//! [`ShardIndex`]: the one shard writer, PK probes, the post-spill upkeep
-//! (`maintain`), and `run_compact` — the L0→L1 fold, the byte targets every
-//! level's guard partition is held at, and the vertical drain into the terminal
-//! level.
+//! [`ShardIndex`]: the one shard writer, PK probes, and the upkeep (`maintain`)
+//! with the folds it plans — the L0→L1 fold, the byte targets every level's
+//! guard partition is held at, and the vertical drain into the terminal level.
 
 use std::fs;
 use std::ops::Range;
@@ -29,8 +28,6 @@ struct Fold {
     dest: usize,
     /// The destination guards, sorted and distinct.
     keys: Vec<PkBuf>,
-    /// The retractions a whole-guard fold in place can cancel.
-    retractions: usize,
 }
 
 /// A fold under way: its inputs stay registered and read, its outputs are
@@ -47,22 +44,8 @@ pub(super) struct Running {
     opened: Vec<(PkBuf, ShardEntry)>,
 }
 
-/// What a [`ShardIndex::maintain`] did.
-#[derive(Default)]
-pub(crate) struct Upkeep {
-    /// Input bytes the folds merged.
-    pub(crate) read: u64,
-    /// A sweep dehydrated or dropped rows.
-    pub(crate) evicted: bool,
-}
-
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
-        self.settled_entries().chain(&self.pending)
-    }
-
-    /// Every shard at or below the store's cut.
-    fn settled_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.levels.iter().flat_map(FLSMLevel::entries)
     }
 
@@ -73,7 +56,6 @@ impl ShardIndex {
         self.levels
             .iter_mut()
             .flat_map(|l| l.guards.iter_mut().flat_map(|g| g.entries.iter_mut()))
-            .chain(&mut self.pending)
     }
 
     /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
@@ -108,30 +90,6 @@ impl ShardIndex {
         Ok(())
     }
 
-    /// Write `run`, rows above the store's cut, as one unpublished shard outside
-    /// every level.
-    pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        let entry = self.write_shard(run, false, None)?;
-        self.pending.push(entry);
-        Ok(())
-    }
-
-    /// The shards above the cut.
-    pub(crate) fn pending_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.pending.iter().map(|e| Rc::clone(&e.shard))
-    }
-
-    /// Move the cut past every pending shard: each enters L0 as it stands.
-    pub(crate) fn seal_pending(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let whole = PkBuf::zeroed(self.schema.pk_stride());
-        let pending = std::mem::take(&mut self.pending);
-        self.levels[L0].get_or_create_guard(whole).entries.extend(pending);
-        self.owed = true;
-    }
-
     /// Whether the tree may owe a fold. Set by every shard that enters it and
     /// cleared by the [`Self::maintain`] that finds none left.
     pub(crate) fn owed(&self) -> bool {
@@ -141,30 +99,35 @@ impl ShardIndex {
     /// The disk tier's upkeep: the folds the tree owes, one destination at a
     /// time, until none is left or `budget` input bytes are merged. A fold is
     /// resumed where the last call left it, so a call is held for one
-    /// destination past its budget at most.
-    pub(crate) fn maintain(&mut self, budget: u64) -> Result<Upkeep, StorageError> {
-        let mut done = Upkeep::default();
-        while self.owed && done.read < budget {
+    /// destination past its budget at most. Answers the input bytes merged.
+    pub(crate) fn maintain(&mut self, budget: u64) -> Result<u64, StorageError> {
+        let mut read = 0;
+        while self.owed && read < budget {
             if self.running.is_none() {
-                match self.plan(&mut done.evicted) {
+                match self.plan() {
                     Some(fold) => self.begin(fold)?,
                     None => self.owed = false,
                 }
                 continue;
             }
-            self.step(&mut done)?;
+            self.step(&mut read)?;
         }
-        Ok(done)
+        Ok(read)
+    }
+
+    /// Whether this store's sweep evicts by dropping rows outright.
+    pub(crate) fn drops_rows(&self) -> bool {
+        matches!(self.budget, ShardBudget::Drop(_))
     }
 
     /// Finish the fold under way, if any: a manifest names a tree, and a
     /// half-written fold's outputs are in none.
-    pub(crate) fn finish_fold(&mut self) -> Result<Upkeep, StorageError> {
-        let mut done = Upkeep::default();
+    pub(crate) fn finish_fold(&mut self) -> Result<(), StorageError> {
+        let mut read = 0;
         while self.running.is_some() {
-            self.step(&mut done)?;
+            self.step(&mut read)?;
         }
-        Ok(done)
+        Ok(())
     }
 
     /// Give up the fold under way and what it wrote; its inputs were never
@@ -187,7 +150,7 @@ impl ShardIndex {
     /// them to the guards whose own folds then cancel them.
     fn l0_cancels(&self) -> bool {
         let retractions: usize = self.levels[L0].entries().map(|e| e.shard.retraction_rows()).sum();
-        retractions > 0 && self.cancels(retractions, self.settled_entries().map(|e| e.shard.row_count()).sum())
+        retractions > 0 && self.cancels(retractions, self.all_entries().map(|e| e.shard.row_count()).sum())
     }
 
     /// Write `run` as one unpublished shard at the terminal level, under a new
@@ -231,27 +194,19 @@ impl ShardIndex {
         self.published_through = self.shard_seq;
     }
 
-    /// Every shard; the pending ones iff `pending`.
-    pub(crate) fn shard_arcs(&self, pending: bool) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.settled_entries()
-            .chain(self.pending.iter().filter(move |_| pending))
-            .map(|e| Rc::clone(&e.shard))
+    /// Every shard.
+    pub(crate) fn shard_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.all_entries().map(|e| Rc::clone(&e.shard))
     }
 
-    /// Every shard whose PK extent meets `[lo, hi]`; the pending ones iff `pending`.
-    pub(crate) fn shard_arcs_in_range(
-        &self,
-        lo: PkBuf,
-        hi: PkBuf,
-        pending: bool,
-    ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    /// Every shard whose PK extent meets `[lo, hi]`.
+    pub(crate) fn shard_arcs_in_range(&self, lo: PkBuf, hi: PkBuf) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.levels
             .iter()
             .flat_map(move |level| {
                 let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
                 level.guards[run].iter().flat_map(|g| g.entries.iter())
             })
-            .chain(self.pending.iter().filter(move |_| pending))
             .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
             .map(|e| Rc::clone(&e.shard))
     }
@@ -296,11 +251,6 @@ impl ShardIndex {
                 }
             }
         }
-        for e in &self.pending {
-            if let Some(row) = e.probe_pk_bytes(key, filter_key) {
-                visitor(&e.shard, row);
-            }
-        }
     }
 
     /// Start `fold`: pin its inputs and verify them.
@@ -309,7 +259,7 @@ impl ShardIndex {
             .sources
             .iter()
             .map(|seq| {
-                self.settled_entries()
+                self.all_entries()
                     .find(|e| e.seq == *seq)
                     .expect("a fold names registered shards")
             })
@@ -335,7 +285,7 @@ impl ShardIndex {
     /// after the last, exchange the fold's inputs for its outputs.
     ///
     /// A failure registers nothing and unlinks every output the fold wrote.
-    fn step(&mut self, done: &mut Upkeep) -> Result<(), StorageError> {
+    fn step(&mut self, read: &mut u64) -> Result<(), StorageError> {
         let mut run = self.running.take().expect("a fold is under way");
         let inputs: Vec<&MappedShard> = run.shards.iter().map(|s| &**s).collect();
         let before: usize = run.starts.iter().sum();
@@ -346,14 +296,14 @@ impl ShardIndex {
         let (rows, bytes): (usize, u64) = inputs
             .iter()
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
-        let read = (run.starts.iter().sum::<usize>() - before) as u128;
-        done.read += (u128::from(bytes) * read / rows.max(1) as u128) as u64 + 1;
+        let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
+        *read += (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
         if let Some((skeleton, batch)) = merged {
             match self.write_shard(&batch, skeleton, Some(run.newest)) {
                 Ok(entry) => run.opened.push((run.fold.keys[run.next], entry)),
                 Err(e) => {
-                    self.bands.clear();
-                    self.retire(run.opened.into_iter().map(|(_, entry)| entry));
+                    self.running = Some(run);
+                    self.abandon_fold();
                     return Err(e);
                 }
             }
@@ -362,7 +312,6 @@ impl ShardIndex {
         if run.next < run.fold.keys.len() {
             self.running = Some(run);
         } else {
-            done.evicted |= dehydrate;
             self.install(run);
         }
         Ok(())
@@ -385,7 +334,10 @@ impl ShardIndex {
             // every row its retractions can cancel there.
             let read: usize = shards.iter().map(|s| s.row_count()).sum();
             let wrote: usize = opened.iter().map(|(_, e)| e.shard.row_count()).sum();
-            self.cancel_yield.observe(fold.retractions, read.saturating_sub(wrote));
+            // Its inputs are the guard's shards in order, and the oldest has no
+            // older one there to retract from.
+            let retractions = shards.iter().skip(1).map(|s| s.retraction_rows()).sum();
+            self.cancel_yield.observe(retractions, read.saturating_sub(wrote));
         }
         #[cfg(test)]
         super::cstats::record(
@@ -437,9 +389,7 @@ impl ShardIndex {
     pub(crate) fn clear(&mut self) {
         self.abandon_fold();
         let levels = std::mem::take(&mut self.levels);
-        let settled = levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries);
-        let pending = std::mem::take(&mut self.pending);
-        self.retire(settled.chain(pending));
+        self.retire(levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries));
     }
 
     /// The next fold the tree owes, or `None` when it owes none. What costs no
@@ -450,7 +400,7 @@ impl ShardIndex {
     /// threshold, before the L0 fold lands more on it; the L0 fold; the
     /// underfull runs, which must see the sizes a split left; L1 down to its
     /// byte target; and the store down to its capacity.
-    fn plan(&mut self, evicted: &mut bool) -> Option<Fold> {
+    fn plan(&mut self) -> Option<Fold> {
         loop {
             if let Some(band) = self.bands.pop() {
                 match self.plan_band(band) {
@@ -488,10 +438,7 @@ impl ShardIndex {
                 .min_by_key(|(_, g)| g.newest())
                 .map(|(gi, _)| gi);
             match (victim, self.budget) {
-                (Some(gi), ShardBudget::Drop(_)) => {
-                    self.drop_guard(gi);
-                    *evicted = true;
-                }
+                (Some(gi), ShardBudget::Drop(_)) => self.drop_guard(gi),
                 (Some(gi), _) => return Some(self.plan_dehydration(gi)),
                 // Nothing left to evict where it sits: push a level's worth of
                 // data down to make one, L1 before L0.
@@ -524,7 +471,6 @@ impl ShardIndex {
             sources: Self::seqs(&self.levels[L0].guards),
             dest: L1,
             keys: self.l1_guard_keys(),
-            retractions: 0,
         }
     }
 
@@ -533,7 +479,7 @@ impl ShardIndex {
     /// guards' worth.
     ///
     /// A budgeted store's terminal level takes one sweep step instead, since that
-    /// is the granularity `enforce_capacity` evicts at. The clamp keeps a very
+    /// is the granularity the capacity sweep evicts at. The clamp keeps a very
     /// large or very small `capacity` from naming a target outside
     /// `[MIN_GUARD_BYTES, R]`.
     fn guard_target_bytes(&self, level_idx: usize) -> u64 {
@@ -544,7 +490,7 @@ impl ShardIndex {
     }
 
     /// Bytes L1 is drained to. Capped at two sweep steps for a budgeted store:
-    /// `enforce_capacity` cannot evict from L1, so bytes parked there come out of
+    /// the capacity sweep cannot evict from L1, so bytes parked there come out of
     /// what the user asked for.
     fn l1_target_bytes(&self) -> u64 {
         let target = Self::balanced_l1_target(self.levels[TERMINAL].bytes(), self.l0_run_bytes);
@@ -638,39 +584,36 @@ impl ShardIndex {
     /// [`Self::plan_split`] for the one guard.
     fn split_of(&self, level_idx: usize, guard: &LevelGuard) -> Option<Fold> {
         let target = self.guard_target_bytes(level_idx);
-        {
-            let keys = fold_destinations(guard.guard_key, guard.entries.iter(), target);
-            let mut start = 0;
-            if keys.len() == 1 && !self.cancels(guard.retractions(), guard.rows()) {
-                if guard.entries.len() <= GUARD_FILE_THRESHOLD {
-                    return None;
-                }
-                debug_assert!(!guard.dehydrated(), "a skeleton shard is folded with its whole guard");
-                let bytes = |e: &ShardEntry| e.shard.file_len();
-                start = guard.entries.len() - 2;
-                let mut taken: u64 = guard.entries[start..].iter().map(bytes).sum();
-                while start > 0 && bytes(&guard.entries[start - 1]) <= taken {
-                    start -= 1;
-                    taken += bytes(&guard.entries[start]);
-                }
+        let keys = fold_destinations(guard.guard_key, guard.entries.iter(), target);
+        let mut start = 0;
+        if keys.len() == 1 && !self.cancels(guard.retractions(), guard.rows()) {
+            if guard.entries.len() <= GUARD_FILE_THRESHOLD {
+                return None;
             }
-            Some(Fold {
-                kind: match start {
-                    0 => CompactionKind::GuardSplit,
-                    _ => CompactionKind::TierFold,
-                },
-                sources: guard.entries[start..].iter().map(|e| e.seq).collect(),
-                dest: level_idx,
-                keys,
-                retractions: guard.retractions(),
-            })
+            debug_assert!(!guard.dehydrated(), "a skeleton shard is folded with its whole guard");
+            let bytes = |e: &ShardEntry| e.shard.file_len();
+            start = guard.entries.len() - 2;
+            let mut taken: u64 = guard.entries[start..].iter().map(bytes).sum();
+            while start > 0 && bytes(&guard.entries[start - 1]) <= taken {
+                start -= 1;
+                taken += bytes(&guard.entries[start]);
+            }
         }
+        Some(Fold {
+            kind: match start {
+                0 => CompactionKind::GuardSplit,
+                _ => CompactionKind::TierFold,
+            },
+            sources: guard.entries[start..].iter().map(|e| e.seq).collect(),
+            dest: level_idx,
+            keys,
+        })
     }
 
     /// Maximal runs of two or more adjacent guards whose combined bytes fit
     /// `bound`. A run also breaks at a change of representation, because folding
     /// a hydrated guard together with a dehydrated one would evict it (see
-    /// [`merge_and_route`]).
+    /// [`merge_guard`]).
     fn underfull_runs(&self, level_idx: usize, bound: u64) -> Vec<Range<usize>> {
         let guards = &self.levels[level_idx].guards;
         let mut runs = Vec::new();
@@ -706,7 +649,6 @@ impl ShardIndex {
             sources: Self::seqs(guards),
             dest: level_idx,
             keys: vec![guards[0].guard_key],
-            retractions: 0,
         })
     }
 
@@ -720,7 +662,6 @@ impl ShardIndex {
             sources: Self::seqs([guard]),
             dest: TERMINAL,
             keys: vec![guard.guard_key],
-            retractions: 0,
         }
     }
 
@@ -767,7 +708,6 @@ impl ShardIndex {
             sources: Self::seqs([guard]),
             dest: L1,
             keys,
-            retractions: 0,
         })
     }
 
@@ -805,7 +745,6 @@ impl ShardIndex {
                 Some(g) if g.dehydrated() => vec![key],
                 _ => fold_destinations(key, inputs, self.guard_target_bytes(TERMINAL)),
             },
-            retractions: 0,
         })
     }
 

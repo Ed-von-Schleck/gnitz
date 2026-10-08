@@ -228,7 +228,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
                     // Ingested before the index is opened, so a prefix seek over
                     // it sees the rows this epoch wrote.
                     if let Some((idx, entries)) = entries {
-                        let res = stores.own.ingest_owned(idx, entries);
+                        let res = stores.own.ingest(idx, entries);
                         res.map_err(|e| ingest_err("avi", idx, e))?;
                     }
 
@@ -243,7 +243,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, start_pc: usize) -> Re
                 Op::TopN { out_trace, index, plan } => {
                     let delta = &batches[in_reg.at()];
                     // Ingested before the index is opened, as the reduce's is.
-                    let res = stores.own.ingest_owned(*index, plan.index_batch(delta));
+                    let res = stores.own.ingest(*index, plan.index_batch(delta));
                     res.map_err(|e| ingest_err("topn index", *index, e))?;
                     let mut open_out = stores.open(stores.out_trace(*out_trace)?);
                     stream::op_topn(delta, &mut open_out, &mut stores.open(Trace::Child(*index)), plan)
@@ -278,11 +278,13 @@ fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), String> {
     for (i, &(reg, trace)) in integrates.iter().enumerate() {
         let take = regs[reg.at()].last_read == LastRead::Integrate(i);
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
-        let res = match operand(&mut batches[reg.at()], take) {
-            Cow::Owned(batch) => state.ingest_owned(trace, batch),
-            Cow::Borrowed(batch) => state.ingest_borrowed(trace, batch),
+        let batch = match operand(&mut batches[reg.at()], take) {
+            Cow::Owned(batch) => batch,
+            Cow::Borrowed(batch) => batch.to_consolidated(),
         };
-        res.map_err(|e| ingest_err("integrate", trace, e))?;
+        state
+            .ingest(trace, batch)
+            .map_err(|e| ingest_err("integrate", trace, e))?;
     }
     Ok(())
 }

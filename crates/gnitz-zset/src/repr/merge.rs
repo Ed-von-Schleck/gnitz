@@ -370,7 +370,7 @@ impl PosCursor {
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
 /// the single owner of the merge that a store's flush and shard compaction
-/// (`compact::merge_and_route`) share.
+/// (`compact::merge_guard`) share.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
 /// (PK, payload) groups are dropped. The payload-aware heap ordering puts equal
@@ -559,7 +559,7 @@ impl MergeOrder {
     /// small values in wide columns do not all tie. A source is sorted, so what
     /// its first and last rows share, all of its rows share. Never coarsened:
     /// a compaction that writes skeleton rows merges under the PK-only schema
-    /// instead (`compact::merge_and_route`).
+    /// instead (`compact::merge_guard`).
     fn past_shared_prefix<S: ColumnarSource>(sources: &[S], stride: usize) -> Self {
         if stride <= NARROW_PK_MAX_BYTES {
             return Self::leading(stride, false);

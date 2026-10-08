@@ -155,7 +155,7 @@ impl TopNIndex {
     }
 
     /// Pack `row`'s group columns into the leading bytes of `buf`, returning the
-    /// prefix `seek_first_positive_with_prefix` matches.
+    /// prefix `for_each_positive_with_prefix_until` matches.
     #[inline]
     pub(super) fn group_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], src: &R, row: usize) -> &'a [u8] {
         self.key_packer.pack_prefix(buf, src, row)

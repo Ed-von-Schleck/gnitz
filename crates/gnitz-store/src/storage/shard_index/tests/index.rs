@@ -15,10 +15,10 @@ impl ShardIndex {
     fn run(&mut self, fold: Fold) -> Result<(), StorageError> {
         debug_assert!(self.running.is_none(), "one fold at a time");
         self.begin(fold)?;
-        self.finish_fold().map(drop)
+        self.finish_fold()
     }
 
-    /// Every fold the tree owes.
+    /// Every fold the tree owes, in the order the upkeep runs them.
     fn drain(&mut self) -> Result<(), StorageError> {
         self.maintain(u64::MAX).map(drop)
     }
@@ -63,28 +63,16 @@ impl ShardIndex {
         self.rebalance_guards(TERMINAL)
     }
 
+    /// The L0 fold, whether or not L0 is over its threshold, then [`Self::drain`].
     fn run_compact(&mut self) -> Result<(), StorageError> {
         let fold = self.plan_l0_fold();
         self.run(fold)?;
-        for level in [L1, TERMINAL] {
-            self.rebalance_guards(level)?;
-        }
-        while self.levels[L1].bytes() > self.l1_target_bytes() {
-            let Some(gi) = self.cheapest_l1_guard_to_drain() else {
-                break;
-            };
-            self.vertical_fold(gi)?;
-        }
-        Ok(())
+        self.drain()
     }
 
     fn dehydrate_guard(&mut self, guard_idx: usize) -> Result<(), StorageError> {
         let fold = self.plan_dehydration(guard_idx);
         self.run(fold)
-    }
-
-    fn enforce_capacity(&mut self) -> Result<(), StorageError> {
-        self.drain()
     }
 }
 
@@ -972,11 +960,11 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, L1, gk(base), &dense_batch(base, 200), i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), true)
+        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk))
             .count()
     };
 
-    assert_eq!(idx.shard_arcs(true).count(), 4);
+    assert_eq!(idx.shard_arcs().count(), 4);
     assert_eq!(count(1100, Some(1100)), 1, "a point read routes to one guard");
     assert_eq!(count(1100, Some(2100)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
@@ -1105,7 +1093,7 @@ fn a_slack_capacity_leaves_the_store_untouched() {
     let idx = index_with_l0(tmp.path(), 3, ShardBudget::Unbounded);
     let before = idx.resident_bytes();
     let mut idx = reopened_under(idx, ShardBudget::Dehydrate(before * 4));
-    idx.enforce_capacity().unwrap();
+    idx.drain().unwrap();
 
     assert_eq!(idx.resident_bytes(), before, "no compaction ran");
     assert_eq!(idx.level_shape().0, 3, "L0 was not pushed down");
@@ -1125,7 +1113,7 @@ fn the_sweep_converges_to_the_skeleton_floor() {
 
     // Bounded — the loop would not terminate if a call could make no progress.
     for _ in 0..8 {
-        idx.enforce_capacity().unwrap();
+        idx.drain().unwrap();
     }
     let (dehy, hyd) = terminal_split(&idx);
     assert!(
@@ -1139,7 +1127,7 @@ fn the_sweep_converges_to_the_skeleton_floor() {
     // At the floor the sweep is a no-op even though the cap is still unmet.
     let floor = idx.resident_bytes();
     assert!(floor > 1);
-    idx.enforce_capacity().unwrap();
+    idx.drain().unwrap();
     assert_eq!(idx.resident_bytes(), floor, "the floor is the fixpoint");
 }
 
@@ -1162,7 +1150,7 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     // Same shape as the skeleton floor's convergence: one push-down per call,
     // dehydration — here, dropping — unbudgeted above it.
     for _ in 0..12 {
-        idx.enforce_capacity().unwrap();
+        idx.drain().unwrap();
     }
 
     assert!(idx.levels[L0].guards.is_empty(), "L0 sank");
@@ -1177,7 +1165,7 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     assert!(shard_seqs(tmp.path()).is_empty(), "every dropped shard is unlinked");
 }
 
-/// Only `enforce_capacity` drops: a delta store's ordinary compactions keep
+/// Only the capacity sweep drops: a delta store's ordinary compactions keep
 /// every row and leave the floor at zero.
 #[test]
 fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
@@ -1191,7 +1179,7 @@ fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
     for gi in (0..idx.levels[L1].guards.len()).rev() {
         idx.vertical_fold(gi).unwrap(); // push-down
     }
-    idx.enforce_capacity().unwrap();
+    idx.drain().unwrap();
 
     assert_eq!(idx.dropped_max(), PkBuf::zeroed(8), "ordinary compaction drops nothing");
     assert!(idx.resident_bytes() > 0, "the rows survived");
@@ -1339,7 +1327,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     // and it is that one.
     let cap = idx.resident_bytes() - 1;
     let mut idx = reopened_under(idx, ShardBudget::Dehydrate(cap));
-    idx.enforce_capacity().unwrap();
+    idx.drain().unwrap();
     let (dehy, _) = terminal_split(&idx);
     assert_eq!(dehy.len(), 1, "dehydration stops as soon as the cap is met");
     assert_eq!(
@@ -1360,14 +1348,14 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
 #[test]
 fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     let tmp = tempfile::tempdir().unwrap();
-    // Under a capacity this tight `run_compact` drains L1 to the terminal level.
+    // Under a capacity this tight the upkeep drains L1 to the terminal level.
     let mut idx = open(tmp.path(), make_schema_u64_i64(), ShardBudget::Dehydrate(1));
     // One key band, so every later fold routes back into the same guard.
     for _ in 0..2 {
         idx.append_l0_run(&dense_batch(1, 20)).unwrap();
     }
     idx.run_compact().unwrap();
-    idx.enforce_capacity().unwrap();
+    idx.drain().unwrap();
     assert_eq!(terminal_split(&idx), (vec![0], vec![]), "the one guard is dehydrated");
 
     // New hydrated rows over the same keys sink into it by the ordinary path.
@@ -1407,10 +1395,7 @@ fn a_jump_in_r_is_merged_within_each_calls_budget() {
     assert!(idx.owed(), "premise: one budget does not finish the job");
     let merged = cstats::dump()[&CompactionKind::GuardMerge].in_bytes;
     // The call stops at the first destination past its budget.
-    assert!(
-        done.read < 2 * r && merged < 2 * r,
-        "{merged} B merged against R = {r} B"
-    );
+    assert!(done < 2 * r && merged < 2 * r, "{merged} B merged against R = {r} B");
     let after_one = idx.levels[TERMINAL].guards.len();
     assert!(after_one > GUARDS as usize / 2, "the level was not rewritten whole");
 
@@ -1442,7 +1427,7 @@ fn a_call_stops_at_the_destination_past_its_budget() {
         let done = idx.maintain(1).unwrap();
         // One destination reads no more than the fold it belongs to, and no
         // fold reads more than two guards' worth.
-        assert!(done.read <= 2 * idx.l0_run_bytes + 1, "one call read {} B", done.read);
+        assert!(done <= 2 * idx.l0_run_bytes + 1, "one call read {done} B");
         assert!(idx.shard_seq - before <= 1, "one call wrote more than one shard");
         calls += 1;
         part_way += usize::from(idx.running.is_some());
@@ -1720,7 +1705,7 @@ fn check_model(idx: &ShardIndex, m: &Model, floor: PkBuf, what: &str) {
     }
 
     // The full cursor.
-    let cursor = from_runs(idx.shard_arcs(true).map(Run::Shard), idx.schema, idx.shard_count());
+    let cursor = from_runs(idx.shard_arcs().map(Run::Shard), idx.schema, idx.shard_count());
     if skeleton {
         let mut src = gnitz_zset::repr::SourceCursor::Full(Box::new(cursor));
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
@@ -1831,7 +1816,7 @@ fn shard_index_model() {
                             }
                         }
                         5 => {
-                            let _ = idx.enforce_capacity();
+                            let _ = idx.drain();
                         }
                         6 => {
                             let _ = idx.finish_fold();
@@ -1878,7 +1863,7 @@ fn shard_index_model() {
 #[test]
 fn tier_folds_keep_the_zset() {
     use crate::test_support::Rng;
-    use gnitz_zset::repr::merge_and_route;
+    use gnitz_zset::repr::merge_guard;
     use std::collections::BTreeMap;
     const KEYS: u64 = 400_000;
     for budget in [ShardBudget::Unbounded, ShardBudget::Dehydrate(4 << 20)] {
@@ -1930,11 +1915,13 @@ fn tier_folds_keep_the_zset() {
             if reopen {
                 idx = reopened_under(idx, budget);
             }
-            let shards: Vec<Rc<MappedShard>> = idx.shard_arcs(true).collect();
+            let shards: Vec<Rc<MappedShard>> = idx.shard_arcs().collect();
             let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
             let mut held: BTreeMap<(u64, i64), i64> = BTreeMap::new();
             let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();
-            merge_and_route(&inputs, &[gk(0)], false, &schema, &mut |_, _, batch| {
+            idx.verify_shards().unwrap();
+            let mut starts = vec![0; inputs.len()];
+            if let Some((_, batch)) = merge_guard(&inputs, &[gk(0)], 0, &mut starts, false, &schema) {
                 for row in 0..batch.len() {
                     let k = u64::from_be_bytes(batch.get_pk_bytes(row).try_into().unwrap());
                     *per_key.entry(k).or_default() += batch.get_weight(row);
@@ -1943,9 +1930,7 @@ fn tier_folds_keep_the_zset() {
                         *held.entry((k, val)).or_default() += batch.get_weight(row);
                     }
                 }
-                Ok(())
-            })
-            .unwrap();
+            }
             let mut expect: BTreeMap<u64, i64> = BTreeMap::new();
             for (&(k, _), &w) in &model {
                 *expect.entry(k).or_default() += w;

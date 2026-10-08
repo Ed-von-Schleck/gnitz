@@ -51,14 +51,21 @@ impl RelationRegistry {
     ) -> Result<(Store, Option<Box<Table>>), String> {
         let RelationSpec { id, kind, schema, placement, .. } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
-        let (recovery, budgets, feed) = match kind {
+        let (recovery, shard, feed) = match kind {
             RelationKind::Stream => return absent(),
             // Its store is the relation directory itself, outside the per-slot child
             // layout that a worker-count change relays and reclaims.
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
-                let table = Table::new(&dir, schema, RecoverySource::SalReplay, self.store_budgets())
-                    .map_err(|e| format!("open store '{dir}': {e}"))?;
+                let ram_tier_bytes = self.config.ram_tier_bytes;
+                let table = Table::new(
+                    &dir,
+                    schema,
+                    RecoverySource::SalReplay,
+                    ram_tier_bytes,
+                    ShardBudget::Unbounded,
+                )
+                .map_err(|e| format!("open store '{dir}': {e}"))?;
                 return Ok((Store::Held(Box::new(table)), None));
             }
             // The master opens no user store, but it still creates the relation's
@@ -71,7 +78,7 @@ impl RelationRegistry {
                 if let Some(ms) = TABLE_CREATE_DELAY.count() {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
-                (RecoverySource::SalReplay, self.store_budgets(), None)
+                (RecoverySource::SalReplay, ShardBudget::Unbounded, None)
             }
             RelationKind::View(p) => {
                 if resume_at.is_none() {
@@ -85,12 +92,13 @@ impl RelationRegistry {
                 }
                 (
                     RecoverySource::Rederive { resume_at },
-                    self.store_budgets().bounded(p.capacity_bytes()),
+                    p.capacity_bytes()
+                        .map_or(ShardBudget::Unbounded, ShardBudget::Dehydrate),
                     p.delta_bytes(),
                 )
             }
         };
-        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, budgets)?;
+        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, shard)?;
         let delta = match feed {
             Some(budget) if placement.counts_on(self.slot.rank) => {
                 // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
@@ -102,7 +110,7 @@ impl RelationRegistry {
                     ChildKind::Delta,
                     delta_schema,
                     RecoverySource::Rederive { resume_at: None },
-                    self.store_budgets().delta(budget),
+                    ShardBudget::Drop(budget),
                 )?;
                 Some(Box::new(table))
             }
@@ -111,18 +119,18 @@ impl RelationRegistry {
         Ok((Store::Held(Box::new(rows)), delta))
     }
 
-    /// [`Self::open_child`], `Err` unless the store opened under `recovery` itself —
-    /// a resume that found no manifest at its generation.
+    /// [`Self::open_child`], `Err` for a store asked to resume that did not.
     pub(super) fn open_child_as(
         &self,
         id: u64,
         kind: ChildKind<'_>,
         schema: SchemaDescriptor,
         recovery: RecoverySource,
-        budgets: StoreBudgets,
+        shard: ShardBudget,
     ) -> Result<Table, String> {
-        let table = self.open_child(id, kind, schema, recovery, budgets)?;
-        if table.recovery_source() != recovery {
+        let table = self.open_child(id, kind, schema, recovery, shard)?;
+        // A resume that found no manifest at its generation.
+        if matches!(recovery, RecoverySource::Rederive { resume_at: Some(_) }) && table.loaded_mark().is_none() {
             return Err(format!(
                 "relation {id}: {kind:?} store did not resume from its manifest"
             ));
@@ -137,9 +145,10 @@ impl RelationRegistry {
         kind: ChildKind<'_>,
         schema: SchemaDescriptor,
         recovery: RecoverySource,
-        budgets: StoreBudgets,
+        shard: ShardBudget,
     ) -> Result<Table, String> {
         let dir = self.child_dir(id, kind);
-        Table::new(&dir, schema, recovery, budgets).map_err(|e| format!("open store '{dir}': {e}"))
+        Table::new(&dir, schema, recovery, self.config.ram_tier_bytes, shard)
+            .map_err(|e| format!("open store '{dir}': {e}"))
     }
 }

@@ -2,14 +2,13 @@
 //! per-guard output shards.
 //!
 //! [`merge_guard`] merges the rows one guard owns → column-first scatter → one
-//! output batch, handed to the caller to write; [`merge_and_route`] is every
-//! guard of a fold in one call. The merge kernel itself is the shared
+//! output batch, handed to the caller to write, one guard of a fold per call.
+//! The merge kernel itself is the shared
 //! [`run_merge_in`](crate::repr::merge::run_merge_in), which owns the
 //! (PK, payload) total order; this module only drives it and materializes
 //! survivors.
 
 use super::batch::Batch;
-use super::error::StorageError;
 use super::merge::run_merge_in;
 use super::scatter::UnifiedSet;
 use super::shard_reader::MappedShard;
@@ -76,30 +75,6 @@ pub fn merge_guard(
     }
     let set = UnifiedSet::of(shards, &out_schema, windows);
     Some((skeleton, set.materialize(&survivors, set.src_rows())))
-}
-
-/// [`merge_guard`] over every guard in order, handing `emit` each non-empty
-/// batch under its guard key.
-pub fn merge_and_route(
-    shards: &[&MappedShard],
-    guards: &[PkBuf],
-    dehydrate: bool,
-    schema: &SchemaDescriptor,
-    emit: &mut dyn FnMut(PkBuf, bool, Batch) -> Result<(), StorageError>,
-) -> Result<(), StorageError> {
-    // An empty guard list would drop every survivor on the floor while the caller
-    // went on to clear the source tier — silent data loss, so reject it.
-    assert!(!guards.is_empty(), "merge_and_route requires at least one guard");
-    for s in shards {
-        s.verify_body()?;
-    }
-    let mut starts = vec![0usize; shards.len()];
-    for (g, &key) in guards.iter().enumerate() {
-        if let Some((skeleton, batch)) = merge_guard(shards, guards, g, &mut starts, dehydrate, schema) {
-            emit(key, skeleton, batch)?;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

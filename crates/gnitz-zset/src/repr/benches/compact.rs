@@ -37,13 +37,15 @@ fn for_compaction_bench() {
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
         let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
+        for s in &inputs {
+            s.verify_body().unwrap();
+        }
         let (((), i), c) = cycles.measure(|| {
             instructions.measure(|| {
-                merge_and_route(&inputs, &guard_keys, skeleton, &schema, &mut |_, _, batch| {
-                    black_box(batch);
-                    Ok(())
-                })
-                .unwrap()
+                let mut starts = vec![0usize; inputs.len()];
+                for g in 0..guard_keys.len() {
+                    black_box(merge_guard(&inputs, &guard_keys, g, &mut starts, skeleton, &schema));
+                }
             })
         });
         println!(
@@ -109,13 +111,14 @@ fn distinct_compaction_bench() {
                 .collect();
             let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
             let guard_keys = [PkBuf::zeroed(schema.pk_stride())];
+            for s in &inputs {
+                s.verify_body().unwrap();
+            }
+            let mut starts = vec![0usize; inputs.len()];
             let ((), whole) = instructions.measure(|| {
-                merge_and_route(&inputs, &guard_keys, false, &schema, &mut |_, _, batch| {
-                    assert_eq!(batch.len() as u64, TOTAL);
-                    black_box(batch);
-                    Ok(())
-                })
-                .unwrap()
+                let (_, batch) = merge_guard(&inputs, &guard_keys, 0, &mut starts, false, &schema).unwrap();
+                assert_eq!(batch.len() as u64, TOTAL);
+                black_box(batch);
             });
             let (rows, merge) = instructions.measure(|| {
                 let mut rows = 0u64;

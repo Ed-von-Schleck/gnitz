@@ -74,8 +74,9 @@ fn weight_clamp_bench() {
     for (name, trace, runs, delta) in shapes {
         let trace = TestTrace::dealt(&trace, runs);
         // The first pass takes the pool's first allocations.
-        let [_, (out, instructions)] = [(); 2]
-            .map(|()| counter.measure(|| op_weight_clamp(&delta, &mut |first, _| trace.cursor_from(first), Distinct)));
+        let [_, (out, instructions)] = [(); 2].map(|()| {
+            counter.measure(|| op_weight_clamp(&delta, &mut |first, last| trace.cursor_within(first, last), Distinct))
+        });
         println!(
             "weight_clamp_bench {name:<42} {:>8.1} instr/row (out {})",
             instructions as f64 / delta.count as f64,

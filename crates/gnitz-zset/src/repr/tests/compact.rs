@@ -11,7 +11,8 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-/// Every `(guard_key, skeleton, batch)` [`merge_and_route`] emits, in order.
+/// Every `(guard_key, skeleton, batch)` [`merge_guard`] answers over `guards`
+/// in order.
 fn route(
     shards: &[Rc<MappedShard>],
     guards: &[PkBuf],
@@ -19,13 +20,16 @@ fn route(
     schema: &SchemaDescriptor,
 ) -> Vec<(PkBuf, bool, Batch)> {
     let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
-    let mut out = Vec::new();
-    merge_and_route(&inputs, guards, dehydrate, schema, &mut |gk, skeleton, batch| {
-        out.push((gk, skeleton, batch));
-        Ok(())
-    })
-    .unwrap();
-    out
+    for s in &inputs {
+        s.verify_body().unwrap();
+    }
+    let mut starts = vec![0usize; inputs.len()];
+    (0..guards.len())
+        .filter_map(|g| {
+            let (skeleton, batch) = merge_guard(&inputs, guards, g, &mut starts, dehydrate, schema)?;
+            Some((guards[g], skeleton, batch))
+        })
+        .collect()
 }
 
 /// Guard routing is a saturating slot lookup: slot 0 owns every key below the
@@ -51,14 +55,6 @@ fn guard_slot_saturates_at_both_ends() {
             "guards={guards:?} key={key}"
         );
     }
-}
-
-/// An empty guard list would drop every survivor while the caller went on to
-/// clear the source tier.
-#[test]
-#[should_panic(expected = "at least one guard")]
-fn merge_and_route_rejects_empty_guards() {
-    route(&[], &[], false, &make_schema_u64_i64());
 }
 
 proptest! {

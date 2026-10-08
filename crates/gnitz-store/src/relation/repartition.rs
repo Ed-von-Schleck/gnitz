@@ -10,7 +10,7 @@ use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
-use crate::storage::{flush_barrier, fsync_dir, link_store, retire_store, Cut, RecoverySource, StoreBudgets, Table};
+use crate::storage::{flush_barrier, fsync_dir, link_store, retire_store, Cut, RecoverySource, ShardBudget, Table};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
 use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
@@ -121,10 +121,17 @@ fn rewrite_targets(
     ram_tier_bytes: usize,
     chunk_rows: usize,
 ) -> Result<(), StorageError> {
-    let budgets = StoreBudgets::new(ram_tier_bytes);
     let open = |of: u32| {
         cluster_children(of)
-            .map(|c| Table::new(&c.dir(rel_dir), *schema, RecoverySource::SalReplay, budgets))
+            .map(|c| {
+                Table::new(
+                    &c.dir(rel_dir),
+                    *schema,
+                    RecoverySource::SalReplay,
+                    ram_tier_bytes,
+                    ShardBudget::Unbounded,
+                )
+            })
             .collect::<Result<Vec<Table>, _>>()
     };
     let sources = open(source)?;

@@ -43,7 +43,8 @@ fn pushes(schema: &SchemaDescriptor, per: u64, row: Row) -> Vec<Batch> {
                 }
                 bb.end_row();
             }
-            bb.finish()
+            // As a pushed batch arrives: decoded at its row count.
+            bb.finish().trimmed()
         })
         .collect()
 }
@@ -100,7 +101,7 @@ fn unique_pk_bench() {
                 let path = dir.path().join(format!("{case}-{per}-{tick:?}"));
                 let mut table = new_table(path, schema, RecoverySource::SalReplay, tier);
                 for b in pushes(&schema, 1000, |s| (s, 1, 0)) {
-                    table.ingest_owned_batch(b).unwrap();
+                    table.ingest(b).unwrap();
                 }
                 let spilled = tier == SPILL_TIER;
                 assert_eq!(!table.all_shard_arcs().is_empty(), spilled, "{label}: held in shards");
@@ -110,7 +111,7 @@ fn unique_pk_bench() {
                     let (eff, e) = counter.measure(|| enforce_unique_pk(&table, b));
                     eff_rows += eff.len() as u64;
                     let ((), s) = counter.measure(|| match tick {
-                        None => table.ingest_owned_batch(eff).unwrap(),
+                        None => table.ingest(eff).unwrap(),
                         Some(rows) => {
                             table.ingest_pending(eff);
                             if push * per % rows == 0 {

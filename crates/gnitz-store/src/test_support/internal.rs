@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use crate::storage::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{RecoverySource, ShardBudget, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind};
 use gnitz_zset::repr::Batch;
@@ -22,7 +22,8 @@ pub(crate) fn new_table(
         dir.as_ref().to_str().unwrap(),
         schema,
         recovery,
-        StoreBudgets::new(ram_tier_bytes),
+        ram_tier_bytes,
+        ShardBudget::Unbounded,
     )
     .unwrap()
 }

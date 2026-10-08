@@ -1,10 +1,10 @@
-use super::{Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
+use super::{flush_barrier, Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table};
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{self, Counter};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
 
-/// Instructions per row of `Table::ingest_owned_batch` at the cadence a worker
+/// Instructions per row of `Table::ingest` at the cadence a worker
 /// runs it: a tick is one ingest and the memtable drains on its own budget. One
 /// case per way the drain ends — the memtable's own fold, a batch past the
 /// memtable budget, a RAM-tier fold whose cancellation spares the spill, and the
@@ -46,7 +46,8 @@ fn table_ingest_bench() {
         let ticks: Vec<Batch> = (0..UPDATES / per_tick)
             .map(|t| {
                 let rows: Vec<_> = (t * per_tick..(t + 1) * per_tick).flat_map(update).flatten().collect();
-                make_batch_raw(&schema, &rows)
+                // As a pushed batch arrives: decoded at its row count.
+                make_batch_raw(&schema, &rows).trimmed()
             })
             .collect();
         let rows: usize = ticks.iter().map(Batch::len).sum();
@@ -54,7 +55,7 @@ fn table_ingest_bench() {
         let mut table = new_table(dir.path().join(case.to_string()), schema, rederive, tier);
         let ((), instructions) = counter.measure(|| {
             for tick in ticks {
-                table.ingest_owned_batch(tick).unwrap();
+                table.ingest(tick).unwrap();
             }
         });
         assert!(table.ram_tier.row_count() > 0, "{label}: the memtable never drained");
@@ -90,7 +91,7 @@ fn ram_tier_ceiling_bench() {
         let mut table = new_table(dir.path().join(fill.to_string()), schema, rederive, TIER);
         let load: Vec<_> = (0..hot).map(|k| (k, 1, 0)).collect();
         for chunk in load.chunks(1000) {
-            table.ingest_owned_batch(make_batch_raw(&schema, chunk)).unwrap();
+            table.ingest(make_batch_raw(&schema, chunk)).unwrap();
         }
         // Each update retracts the row its key holds and inserts the next.
         let mut version = vec![0i64; hot as usize];
@@ -109,7 +110,7 @@ fn ram_tier_ceiling_bench() {
         let (((), instr), cyc) = cycles.measure(|| {
             instructions.measure(|| {
                 for tick in ticks {
-                    table.ingest_owned_batch(tick).unwrap();
+                    table.ingest(tick).unwrap();
                 }
             })
         });
@@ -123,7 +124,7 @@ fn ram_tier_ceiling_bench() {
     }
 }
 
-/// What one `Table::ingest_owned_batch` costs its caller once the store has a
+/// What one `Table::ingest` costs its caller once the store has a
 /// disk tier to keep up: the mean call, the costliest one, and how many calls
 /// found upkeep owed, over fresh ascending keys and over keys scattered
 /// across the key space. A call pays for the upkeep its own bytes owe and
@@ -153,7 +154,7 @@ fn ingest_call_bench() {
                 .collect();
             let tick = make_batch_raw(&schema, &rows);
             kept_up += u64::from(table.shard_index.owed());
-            let ((), instructions) = counter.measure(|| table.ingest_owned_batch(tick).unwrap());
+            let ((), instructions) = counter.measure(|| table.ingest(tick).unwrap());
             total += instructions;
             costliest = costliest.max(instructions);
         }
@@ -189,10 +190,10 @@ fn pk_set_gather_bench() {
     );
     for r in 0..8u64 {
         let rows: Vec<(u64, i64, i64)> = (0..ROWS / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
-        t.ingest_owned_batch(make_batch(&schema, &rows)).unwrap();
+        t.ingest(make_batch(&schema, &rows)).unwrap();
     }
     let late: Vec<(u64, i64, i64)> = (0..64u64).map(|k| (k * (ROWS / 64) + 1, 1, 7)).collect();
-    t.ingest_owned_batch(make_batch(&schema, &late)).unwrap();
+    t.ingest(make_batch(&schema, &late)).unwrap();
     assert_eq!(
         (
             t.shard_index.total_rows(),
@@ -216,6 +217,180 @@ fn pk_set_gather_bench() {
         println!(
             "pk_set_gather_bench {n} keys: {} instr/gather",
             instructions / ITERS as u64
+        );
+    }
+}
+
+/// Instructions per read at `Cut::Sealed` — a `Table::gather` of 1, 64 and 4096
+/// keys, and per row of a `cursor_between` over the whole span walked to its
+/// end — of a table whose rows sit in shards, by what stands above the cut:
+/// nothing; rows pending in RAM, pushed onto held keys one or a thousand at a
+/// time; and pending rows a barrier wrote down, a tick's worth and as many as
+/// the table holds.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn sealed_read_bench() {
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = Counter::instructions();
+    // Rows held, rows pending, rows per pending push, whether a barrier wrote them down.
+    let cases: [(u64, u64, u64, bool); 5] = [
+        (1 << 18, 0, 1, false),
+        (1 << 18, 10_000, 1, false),
+        (1 << 18, 10_000, 1000, false),
+        (1 << 18, 10_000, 1000, true),
+        (1 << 20, 1_000_000, 1000, true),
+    ];
+    for (case, (held, pending, per, written)) in cases.into_iter().enumerate() {
+        // A tier of less than a round, so every round spills.
+        let mut t = new_table(
+            dir.path().join(case.to_string()),
+            schema,
+            RecoverySource::SalReplay,
+            1 << 19,
+        );
+        for r in 0..8u64 {
+            let rows: Vec<_> = (0..held / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
+            t.ingest(make_batch(&schema, &rows)).unwrap();
+        }
+        for from in (0..pending).step_by(per as usize) {
+            let row = |s: u64| ((s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) % held, 1, -1 - s as i64);
+            let rows: Vec<_> = (from..from + per).map(row).collect();
+            t.ingest_pending(make_batch_raw(&schema, &rows));
+        }
+        if written {
+            flush_barrier([&mut t], 0).unwrap();
+        }
+        assert_eq!(
+            t.pending.len() == 0,
+            pending == 0 || written,
+            "where the pending rows sit"
+        );
+        let above = match (pending, written) {
+            (0, _) => "nothing pending".to_string(),
+            (_, false) => format!("{pending} pending in {per}-row pushes"),
+            (_, true) => format!("{pending} pending written by a barrier"),
+        };
+        let label = format!("{held} rows, {above}");
+        // The larger store is read fewer times.
+        let (gathers, walks) = if held > 1 << 18 { (20, 2) } else { (200, 8) };
+        for n in [1u64, 64, 4096] {
+            let step = held / (n + 1);
+            let key_bytes: Vec<[u8; 8]> = (1..=n).map(|i| (i * step).to_be_bytes()).collect();
+            let passes = vec![PkKeys::from_keys(8, key_bytes.iter().map(|k| &k[..])); gathers];
+            let (rows, instructions) = counter.measure(|| {
+                let gather = |keys| {
+                    t.gather(keys, Cut::Sealed)
+                        .drain_chunk(usize::MAX)
+                        .map_or(0, |b| b.len())
+                };
+                passes.into_iter().map(gather).sum::<usize>()
+            });
+            assert_eq!(
+                rows,
+                gathers * n as usize,
+                "{label}: a sealed gather leaves the pending rows out"
+            );
+            println!(
+                "sealed_read_bench {label}, {n} keys: {} instr/gather",
+                instructions / gathers as u64
+            );
+        }
+        let (first, last) = (0u64.to_be_bytes(), (held - 1).to_be_bytes());
+        let (rows, instructions) = counter.measure(|| {
+            (0..walks)
+                .map(|_| t.cursor_between(&first, &last, Cut::Sealed).materialize().len())
+                .sum::<usize>()
+        });
+        assert_eq!(
+            rows,
+            walks * held as usize,
+            "{label}: a sealed walk leaves the pending rows out"
+        );
+        println!(
+            "sealed_read_bench {label}, whole span: {:.1} instr/row",
+            instructions as f64 / rows as f64
+        );
+    }
+}
+
+/// What one barrier costs over a RAM tier with rows above the cut, and the seal
+/// after it: instructions, and the most each added to the resident set. By how
+/// the pending rows lie against an ascending tier — past its last key, between
+/// its keys, as updates of the rows it holds — and for as many pending rows as
+/// a crash leaves, over an empty tier.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn barrier_seal_bench() {
+    /// Rows per pending push.
+    const PER: u64 = 1000;
+    /// Coprime to every span below, so `s * STRIDE % span` visits each key once.
+    const STRIDE: u64 = 7919;
+    #[derive(Clone, Copy, Debug)]
+    enum Lie {
+        Past,
+        Between,
+        Updates,
+    }
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = Counter::instructions();
+    // Rows in the RAM tier, at the even keys; rows pending; how they lie.
+    let cases: [(u64, u64, Lie); 4] = [
+        (500_000, 10_000, Lie::Past),
+        (500_000, 10_000, Lie::Between),
+        (500_000, 10_000, Lie::Updates),
+        (0, 1_000_000, Lie::Between),
+    ];
+    for (case, (tier, pending, lie)) in cases.into_iter().enumerate() {
+        let mut t = new_table(
+            dir.path().join(case.to_string()),
+            schema,
+            RecoverySource::SalReplay,
+            DEFAULT_RAM_TIER_BYTES,
+        );
+        for from in (0..tier).step_by(PER as usize) {
+            let rows: Vec<_> = (from..from + PER).map(|k| (2 * k, 1, k as i64)).collect();
+            t.ingest(make_batch(&schema, &rows)).unwrap();
+        }
+        assert!(t.all_shard_arcs().is_empty(), "the tier's rows are held in RAM");
+        let span = tier.max(pending);
+        for from in (0..pending).step_by(PER as usize) {
+            let rows: Vec<(u64, i64, i64)> = match lie {
+                Lie::Past => (from..from + PER).map(|s| (2 * span + s, 1, -1 - s as i64)).collect(),
+                Lie::Between => (from..from + PER)
+                    .map(|s| (2 * (s * STRIDE % span) + 1, 1, -1 - s as i64))
+                    .collect(),
+                // An update is two rows: the held row retracted, and its successor.
+                Lie::Updates => (from / 2..(from + PER) / 2)
+                    .map(|s| (s * STRIDE % span, s))
+                    .flat_map(|(k, s)| [(2 * k, -1, k as i64), (2 * k, 1, -1 - s as i64)])
+                    .collect(),
+            };
+            t.ingest_pending(make_batch_raw(&schema, &rows));
+        }
+
+        let mib = |resident: Option<perf::Resident>| match resident {
+            Some(r) => format!("+{:.1} MiB", r.peak_added() as f64 / (1 << 20) as f64),
+            None => format!("n/a without {}", perf::PIN_MMAP_THRESHOLD),
+        };
+        let resident = perf::Resident::baseline();
+        let ((), barrier) = counter.measure(|| flush_barrier([&mut t], 1).unwrap());
+        let barrier_peak = mib(resident);
+        assert_eq!(
+            t.all_shard_arcs().len(),
+            1,
+            "one shard holds the tier and the pending rows"
+        );
+        let resident = perf::Resident::baseline();
+        let (delta, seal) = counter.measure(|| t.seal().unwrap());
+        let seal_peak = mib(resident);
+        assert_eq!(delta.map_or(0, |d| d.len()) as u64, pending, "the seal's delta");
+        println!(
+            "barrier_seal_bench {tier} rows in the tier, {pending} pending {lie:?}: \
+             barrier {:.1} M instr, peak {barrier_peak}; seal {:.1} instr/pending row, peak {seal_peak}",
+            barrier as f64 / 1e6,
+            seal as f64 / pending as f64,
         );
     }
 }

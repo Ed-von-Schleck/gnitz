@@ -557,25 +557,6 @@ impl ReadCursor {
         compare_pk_ordering(self.current_pk_bytes(), key)
     }
 
-    /// Position the cursor at the first row whose PK begins with `prefix` and
-    /// whose weight is `> 0`. Returns `true` on a hit (cursor stays positioned;
-    /// `current_pk_bytes`, `current_weight` etc. are valid). Returns `false` on
-    /// miss (cursor may be past the prefix range or fully invalid).
-    pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
-        let stride = self.schema.pk_stride();
-        self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
-        while self.valid {
-            if !self.current_pk_bytes().starts_with(prefix) {
-                return false;
-            }
-            if self.current_weight > 0 {
-                return true;
-            }
-            self.advance();
-        }
-        false
-    }
-
     /// Visit every positive-weight row whose PK begins with `prefix`, invoking
     /// `f(&*self)` at each.
     pub(crate) fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
@@ -753,16 +734,6 @@ impl ReadCursor {
 /// for the source vectors.
 pub fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize) -> ReadCursor {
     build(runs, schema, cap, ReadCursor::rebuild_and_advance)
-}
-
-/// [`from_runs`] positioned on the first live row `>= key`.
-pub fn from_runs_at(
-    runs: impl IntoIterator<Item = Run>,
-    schema: SchemaDescriptor,
-    cap: usize,
-    key: &[u8],
-) -> ReadCursor {
-    build(runs, schema, cap, |c| c.reposition_to(key))
 }
 
 /// [`from_runs`] positioned on the OPK band `[start, end)`, as

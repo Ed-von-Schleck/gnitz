@@ -20,6 +20,7 @@ use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, 
 use gnitz_wire::payload_bytes;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
+use std::ops::ControlFlow;
 
 // ---------------------------------------------------------------------------
 // Key layout
@@ -118,7 +119,7 @@ impl AviBake {
         for (j, a) in self.aggs.iter().enumerate() {
             let acc = &mut accs[a.acc_idx as usize];
             let prefix_len = self.prefix(&mut key, j as u8).len();
-            if !cur.seek_first_positive_with_prefix(&key[..prefix_len]) {
+            if !cur.for_each_positive_with_prefix_until(&key[..prefix_len], |_| ControlFlow::Break(())) {
                 acc.reset();
                 continue;
             }

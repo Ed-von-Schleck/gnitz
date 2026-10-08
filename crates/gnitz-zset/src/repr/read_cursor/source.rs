@@ -58,7 +58,7 @@ impl BoundedIndexCursor {
         let none = PkKeys::from_sorted(src.schema.pk_stride(), Vec::new());
         BoundedIndexCursor {
             idx,
-            src: PkSetGather::new(src, none),
+            src: PkSetGather::over(src, none),
             spec,
             pks: Vec::new(),
             order: Vec::new(),

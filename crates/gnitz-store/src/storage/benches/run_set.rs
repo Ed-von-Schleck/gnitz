@@ -244,7 +244,7 @@ fn run_set_tier_bench() {
                             let merged = rows_folded(&before, rows, &tier);
                             let spilled = tier.is_full().then(|| {
                                 let refolded = if tier.len() > 1 { tier.row_count() } else { 0 };
-                                tier.spill(&schema, |_| Ok::<(), ()>(())).unwrap();
+                                tier.spill(&schema, |_| Ok(())).unwrap();
                                 refolded
                             });
                             (merged, spilled)

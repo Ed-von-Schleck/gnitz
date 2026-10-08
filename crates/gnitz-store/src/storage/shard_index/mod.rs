@@ -32,7 +32,7 @@ pub(crate) enum CompactionKind {
     Dehydrate,
 }
 
-/// Per-trigger byte accounting over [`ShardIndex::compact`].
+/// Per-trigger byte accounting over the folds [`ShardIndex::maintain`] runs.
 #[cfg(test)]
 pub(crate) mod cstats {
     use super::CompactionKind;
@@ -109,7 +109,7 @@ const CANCEL_PERCENT: usize = 25;
 /// would otherwise shatter one fold into shards of a few hundred bytes.
 const MIN_GUARD_BYTES: u64 = 64 * 1024;
 /// How many eviction steps a budgeted store's capacity is cut into. One step is
-/// the terminal guard target, and so the granularity `enforce_capacity` evicts
+/// the terminal guard target, and so the granularity the capacity sweep evicts
 /// at; L1 may park two, leaving the sweep the rest.
 const SWEEP_STEPS: u64 = 8;
 /// Keys sampled per guard when deriving its split points.
@@ -201,7 +201,7 @@ impl LevelGuard {
 
     /// The key span this guard's entries actually cover. The guard *key* is only
     /// the span's lower fence, so a fold out of this guard must route by this
-    /// instead — see [`ShardIndex::vertical_fold`].
+    /// instead.
     fn key_extent(&self) -> (PkBuf, PkBuf) {
         let lo = self.entries.iter().map(|e| e.pk_min).min();
         let hi = self.entries.iter().map(|e| e.pk_max).max();
@@ -210,7 +210,7 @@ impl LevelGuard {
 }
 
 /// The destination keys a fold of `entries` into the guard at `key` routes into
-/// — sorted and distinct, as `merge_and_route` requires. `key` alone until the
+/// — sorted and distinct, as `merge_guard` requires. `key` alone until the
 /// entries hold more than `target` bytes, then row quantiles of a bounded sample
 /// as well.
 ///
@@ -326,10 +326,6 @@ pub(super) struct ShardIndex {
     pub schema: SchemaDescriptor,
 
     levels: [FLSMLevel; LEVELS],
-    /// Shards a flush wrote of rows above the store's cut: read by every reader
-    /// but one at the cut, compacted with nothing, and entered into L0 by
-    /// [`Self::seal_pending`]. A reopen finds them in L0.
-    pending: Vec<ShardEntry>,
 
     /// The last seq drawn; a shard is named by its seq.
     shard_seq: u64,
@@ -340,8 +336,7 @@ pub(super) struct ShardIndex {
     /// [`Self::unlink_retired`].
     retired: Vec<u64>,
     /// `R`, the unit every byte target is stated in: the running max of the
-    /// registered L0 bytes one `run_compact` consumed, of one shard its fold
-    /// wrote and of one terminal run, floored at [`MIN_GUARD_BYTES`] and
+    /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of one terminal run, floored at [`MIN_GUARD_BYTES`] and
     /// persisted in the manifest header.
     l0_run_bytes: u64,
     /// What bounds this store's registered on-disk shard bytes, and how a sweep
@@ -410,7 +405,6 @@ impl ShardIndex {
             output_dir: output_dir.to_string(),
             schema,
             levels: Default::default(),
-            pending: Vec::new(),
             shard_seq: 0,
             published_through: 0,
             retired: Vec::new(),
@@ -441,7 +435,6 @@ impl ShardIndex {
 
     /// The shard set this index publishes.
     pub(super) fn shard_set(&self) -> ShardSet {
-        let whole = PkBuf::zeroed(self.schema.pk_stride());
         let entries = (0u64..)
             .zip(&self.levels)
             .flat_map(|(level, l)| {
@@ -454,12 +447,6 @@ impl ShardIndex {
                     })
                 })
             })
-            .chain(self.pending.iter().map(|e| ManifestEntry {
-                seq: e.seq,
-                newest: e.newest,
-                level: L0 as u64,
-                guard_key: whole,
-            }))
             .collect();
         ShardSet { run_bytes: self.l0_run_bytes, entries }
     }

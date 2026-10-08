@@ -1,12 +1,14 @@
-//! Unified Table: three RAM-tier [`RunSet`]s over a `ShardIndex`.
+//! Unified Table: four [`RunSet`]s in RAM over a `ShardIndex`.
 //!
 //! Ingest lands in the `memtable` run set and folds into the `ram_tier` once it
-//! passes its byte budget; the RAM tier spills to a shard past its own
-//! ([`StoreBudgets`]), and a checkpoint folds it into one durable shard.
+//! passes its byte budget; the RAM tier spills to a shard past its own ceiling,
+//! and a barrier folds it into one durable shard.
 //!
 //! A store's runs are its history in order, so a read may stop short of the
 //! newest: a pending ingest lands in the `pending` run set, above the store's
-//! [`Cut`], and [`Table::seal`] moves the cut past it.
+//! [`Cut`], and [`Table::seal`] moves the cut past it. A barrier that comes
+//! first writes the pending rows down with the rest and keeps their negation
+//! in `flushed`, which a reader at the cut reads in `pending`'s place.
 
 use std::cell::Cell;
 use std::fs;
@@ -24,7 +26,7 @@ use gnitz_zset::repr::Batch;
 #[cfg(test)]
 use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
+use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
 use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -48,51 +50,12 @@ const UPKEEP_LEVY: u64 = 64;
 /// a test reaches the disk regime on small data.
 pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
 
-/// What one `Table` opens with: its RAM-tier ceiling, and what bounds its
-/// registered on-disk shard bytes.
-#[derive(Clone, Copy)]
-pub(crate) struct StoreBudgets {
-    ram_tier_bytes: usize,
-    shard: ShardBudget,
-}
-
-#[cfg(test)]
-impl Default for StoreBudgets {
-    fn default() -> Self {
-        StoreBudgets::new(DEFAULT_RAM_TIER_BYTES)
-    }
-}
-
-impl StoreBudgets {
-    /// An unbounded store at `ram_tier_bytes`.
-    pub(crate) fn new(ram_tier_bytes: usize) -> Self {
-        StoreBudgets {
-            ram_tier_bytes,
-            shard: ShardBudget::Unbounded,
-        }
-    }
-
-    /// `CREATE VIEW … WITH (capacity = …)` — see [`ShardBudget::Dehydrate`].
-    /// `None` is an unbounded view.
-    pub(crate) fn bounded(self, capacity_bytes: Option<u64>) -> Self {
-        StoreBudgets {
-            shard: capacity_bytes.map_or(ShardBudget::Unbounded, ShardBudget::Dehydrate),
-            ..self
-        }
-    }
-
-    /// A fed view's **delta store** — see [`ShardBudget::Drop`].
-    pub(crate) fn delta(self, budget: u64) -> Self {
-        StoreBudgets { shard: ShardBudget::Drop(budget), ..self }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RecoverySource
 // ---------------------------------------------------------------------------
 
 /// How a relation's tail is recovered across a restart.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
     /// from the manifest at open.
@@ -125,6 +88,9 @@ pub(crate) struct Table {
     /// Runs ingested above the cut, folded among themselves only: [`Self::seal`]
     /// moves them into `memtable` as one run.
     pending: RunSet,
+    /// The pending rows a barrier wrote into the disk tier, negated: a reader at
+    /// [`Cut::Sealed`] reads them where one at [`Cut::Now`] reads `pending`.
+    flushed: RunSet,
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
@@ -170,12 +136,14 @@ pub(crate) use flush::flush_barrier;
 
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
-    /// whatever is already on disk; `budgets` binds for the store's whole life.
+    /// whatever is already on disk; the RAM-tier ceiling and `shard`, which
+    /// bounds the registered on-disk shard bytes, bind for the store's whole life.
     pub(crate) fn new(
         dir: &str,
         schema: SchemaDescriptor,
         recovery_source: RecoverySource,
-        budgets: StoreBudgets,
+        ram_tier_bytes: usize,
+        shard: ShardBudget,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
@@ -209,14 +177,16 @@ impl Table {
         let loaded_mark = loaded.as_ref().map(|m| m.checkpoint_mark);
         let manifest_in_place = loaded.as_ref().map(super::manifest::encode);
         let Manifest { caller_record, shards, .. } = loaded.unwrap_or_default();
-        // Only a `SalReplay` store is point-probed by PK.
+        // A rederived store's shards carry no PK filter.
         let skip_pk_filter = rederived;
         Ok(Table {
-            // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
+            // Neither is ever full: the budget only sizes `pending`'s PK filter, to
+            // a tick's worth of rows, and nothing probes `flushed`.
             pending: RunSet::new(MEMTABLE_BYTES),
+            flushed: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
-            ram_tier: RunSet::new(budgets.ram_tier_bytes),
-            shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, &shards)?,
+            ram_tier: RunSet::new(ram_tier_bytes),
+            shard_index: ShardIndex::open(dir, schema, shard, skip_pk_filter, &shards)?,
             rederived,
             loaded_mark,
             caller_record,
@@ -251,17 +221,9 @@ impl Table {
         self.rederived
     }
 
-    /// The policy this open's on-disk state was accepted under.
-    pub(crate) fn recovery_source(&self) -> RecoverySource {
-        match self.rederived {
-            true => RecoverySource::Rederive { resume_at: self.loaded_mark },
-            false => RecoverySource::SalReplay,
-        }
-    }
-
-    /// Whether this open reloaded checkpointed state rather than starting empty.
-    pub(crate) fn resumed_from_checkpoint(&self) -> bool {
-        self.rederived && self.loaded_mark.is_some()
+    /// The checkpoint mark of the manifest this open loaded; `None` without one.
+    pub(crate) fn loaded_mark(&self) -> Option<u64> {
+        self.loaded_mark
     }
 
     /// See [`ShardIndex::append_terminal_run`].
@@ -280,6 +242,7 @@ impl Table {
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         self.shard_index.swap_schema(schema)?;
         self.pending.widen_runs(&schema);
+        self.flushed.widen_runs(&schema);
         self.memtable.widen_runs(&schema);
         self.ram_tier.widen_runs(&schema);
         self.cached_full_scan.set(None);
@@ -302,18 +265,8 @@ impl Table {
     /// `#[inline]`: it takes a `Batch` by value, and every stateful operator
     /// calls it once per epoch.
     #[inline]
-    pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        self.push_memtable(batch.into_consolidated())
-    }
-
-    /// [`Self::ingest_owned_batch`] for a caller that keeps reading `batch`.
-    pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
-        self.push_memtable(batch.to_consolidated())
-    }
-
-    /// The tail both entry points share, taking a batch already certified
-    /// consolidated.
-    fn push_memtable(&mut self, batch: Batch) -> Result<(), StorageError> {
+    pub(crate) fn ingest(&mut self, batch: Batch) -> Result<(), StorageError> {
+        let batch = batch.into_consolidated();
         if batch.is_empty() {
             return Ok(());
         }
@@ -331,12 +284,13 @@ impl Table {
     pub(crate) fn clear(&mut self) {
         self.cached_full_scan.set(None);
         self.pending.clear();
+        self.flushed.clear();
         self.memtable.clear();
         self.ram_tier.clear();
         self.shard_index.clear();
     }
 
-    /// [`Self::ingest_owned_batch`] above the cut: every reader sees the rows
+    /// [`Self::ingest`] above the cut: every reader sees the rows
     /// but one at [`Cut::Sealed`], until [`Self::seal`].
     pub(crate) fn ingest_pending(&mut self, batch: Batch) {
         let batch = batch.into_consolidated();
@@ -349,7 +303,7 @@ impl Table {
 
     /// Whether any row sits above the cut.
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending.len() > 0 || self.shard_index.pending_arcs().next().is_some()
+        self.pending.len() > 0 || self.flushed.len() > 0
     }
 
     /// Move the cut past every pending row and answer them, consolidated: the
@@ -368,17 +322,17 @@ impl Table {
         {
             self.memtable.fold(&schema);
         }
-        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
-        let delta = match shards.is_empty() {
-            true => run,
-            // A flush since the last seal left part of the delta in shards.
-            false => {
-                let cap = shards.len() + 1;
-                let mem = run.into_iter().map(Run::Mem);
-                Some(from_runs(mem.chain(shards), schema, cap).materialize())
+        let delta = match self.flushed.take(&schema) {
+            None => run,
+            // A barrier since the last seal wrote part of the delta into the shards.
+            Some(flushed) => {
+                let flushed = Rc::unwrap_or_clone(flushed).negated();
+                Some(Rc::new(match run {
+                    Some(run) => flushed.merged_consolidated(&run, &schema),
+                    None => flushed,
+                }))
             }
         };
-        self.shard_index.seal_pending();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -398,9 +352,8 @@ impl Table {
         let levy = ingested as u64 * UPKEEP_LEVY;
         let budget = levy.saturating_sub(self.upkeep_overdraft);
         self.upkeep_overdraft = self.upkeep_overdraft.saturating_sub(levy);
-        let done = self.shard_index.maintain(budget)?;
-        self.upkeep_overdraft += done.read.saturating_sub(budget);
-        self.evicted(done.evicted);
+        let read = self.shard_index.maintain(budget)?;
+        self.upkeep_overdraft += read.saturating_sub(budget);
         Ok(())
     }
 
@@ -410,21 +363,7 @@ impl Table {
         if self.held_in_ram {
             return Ok(());
         }
-        let done = self.shard_index.maintain(u64::MAX)?;
-        self.evicted(done.evicted);
-        Ok(())
-    }
-
-    /// A sweep that dehydrated or dropped rows moved the row set.
-    fn evicted(&mut self, evicted: bool) {
-        if evicted {
-            self.cached_full_scan.set(None);
-        }
-    }
-
-    /// The checkpoint mark of the manifest this open loaded; 0 without one.
-    pub(crate) fn checkpoint_mark(&self) -> u64 {
-        self.loaded_mark.unwrap_or(0)
+        self.shard_index.maintain(u64::MAX).map(drop)
     }
 
     /// The bytes this store's next published manifest carries for its owner.
@@ -438,9 +377,11 @@ impl Table {
 
     /// The heap-resident tiers `cut` reads, newest first.
     fn ram_tiers(&self, cut: Cut) -> impl Iterator<Item = &RunSet> + Clone {
-        [&self.pending, &self.memtable, &self.ram_tier]
-            .into_iter()
-            .skip(usize::from(cut == Cut::Sealed))
+        let above = match cut {
+            Cut::Now => &self.pending,
+            Cut::Sealed => &self.flushed,
+        };
+        [above, &self.memtable, &self.ram_tier].into_iter()
     }
 
     /// The heap-resident runs whose PK extent meets the inclusive `bound`; `None`
@@ -460,7 +401,7 @@ impl Table {
     /// Every run `cut` reads.
     pub(crate) fn runs(&self, cut: Cut) -> impl Iterator<Item = Run> + '_ {
         self.mem_runs(None, cut)
-            .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
+            .chain(self.shard_index.shard_arcs().map(Run::Shard))
     }
 
     /// Open a read-only cursor over the rows `cut` reads.
@@ -470,70 +411,49 @@ impl Table {
     }
 
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
-    /// same leading bytes of one — positioned on the first, over the rows `cut`
-    /// reads.
+    /// same leading bytes of one — positioned on the band they span, over the
+    /// rows `cut` reads.
     pub(crate) fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
         // The zero-width prefix is every key: no run to rule out, no key to seek.
         if first.is_empty() {
             return self.open_cursor(cut);
         }
-        let (runs, cap, start) = self.runs_over_prefixes(first, last, cut);
-        from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
-    }
-
-    /// The runs `cut` reads that can hold a row whose PK begins with a key in
-    /// `[first, last]`; a capacity hint for a cursor over them; and the least PK
-    /// such a row can have.
-    fn runs_over_prefixes<'a>(
-        &'a self,
-        first: &[u8],
-        last: &[u8],
-        cut: Cut,
-    ) -> (impl Iterator<Item = Run> + 'a, usize, PkBuf) {
         let stride = self.shard_index.schema.pk_stride();
-        let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+        let band = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        let (runs, cap) = self.runs_in_range(start, end, cut);
-        (runs, cap, start)
-    }
-
-    /// The runs that can hold a key in `[start, end]` (`None`: the top of the key
-    /// space), and a capacity hint for a cursor over them.
-    fn runs_in_range(&self, lo: PkBuf, end: Option<PkBuf>, cut: Cut) -> (impl Iterator<Item = Run> + '_, usize) {
-        let stride = self.shard_index.schema.pk_stride();
-        let hi = end.unwrap_or_else(|| PkBuf::max(stride));
-        debug_assert!(
-            lo.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
-            "runs_in_range: a bound is not pk_stride wide",
-        );
-        let runs = self.mem_runs(Some((lo, hi)), cut).chain(
-            self.shard_index
-                .shard_arcs_in_range(lo, hi, cut == Cut::Now)
-                .map(Run::Shard),
-        );
-        (runs, self.mem_run_count() + self.shard_index.narrow_range_shards())
+        self.range_cursor(Some(band), cut)
     }
 
     /// A cursor positioned on the OPK key band `[start, end)` of the rows `cut`
-    /// reads; `None` opens empty.
+    /// reads (`None` for `end`: the top of the key space), over the runs that can
+    /// hold a key of it; `None` opens empty.
     pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> ReadCursor {
+        let schema = self.shard_index.schema;
         let Some((start, end)) = range else {
-            return empty_cursor(self.shard_index.schema);
+            return empty_cursor(schema);
         };
-        let (runs, cap) = self.runs_in_range(start, end, cut);
+        let stride = schema.pk_stride();
+        let hi = end.unwrap_or_else(|| PkBuf::max(stride));
+        debug_assert!(
+            start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
+            "range_cursor: a bound is not pk_stride wide",
+        );
+        let runs = self
+            .mem_runs(Some((start, hi)), cut)
+            .chain(self.shard_index.shard_arcs_in_range(start, hi).map(Run::Shard));
+        let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
+        from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of
     /// one — over the runs `cut` reads that the span they cover can reach.
     pub(crate) fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
-        let schema = self.shard_index.schema;
-        let Some((first, last)) = keys.bounds() else {
-            return PkSetGather::over_runs(std::iter::empty(), schema, 0, keys);
+        let cursor = match keys.bounds() {
+            Some((first, last)) => self.cursor_between(first, last, cut),
+            None => empty_cursor(self.shard_index.schema),
         };
-        let (runs, cap, _) = self.runs_over_prefixes(first, last, cut);
-        PkSetGather::over_runs(runs, schema, cap, keys)
+        PkSetGather::over(cursor, keys)
     }
 
     /// The consolidated batch of all live rows, cached until the row set moves.
@@ -542,7 +462,10 @@ impl Table {
             .cached_full_scan
             .take()
             .unwrap_or_else(|| self.open_cursor(Cut::Now).materialize());
-        self.cached_full_scan.set(Some(Rc::clone(&rc)));
+        // A sweep that drops rows moves the row set with no ingest to say so.
+        if !self.shard_index.drops_rows() {
+            self.cached_full_scan.set(Some(Rc::clone(&rc)));
+        }
         rc
     }
 
@@ -554,7 +477,7 @@ impl Table {
     /// Every registered shard.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.shard_index.shard_arcs(true).collect()
+        self.shard_index.shard_arcs().collect()
     }
 
     /// `(L0 shard count, L1 and terminal guard counts)`.

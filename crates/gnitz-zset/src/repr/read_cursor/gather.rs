@@ -9,12 +9,10 @@
 use gnitz_wire::PkKeys;
 use std::ops::ControlFlow;
 
-use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
+use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::run::Run;
 use crate::repr::scatter::gather_rows;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor, SchemaFacts};
-use gnitz_wire::PkBuf;
 
 pub struct PkSetGather {
     cursor: ReadCursor,
@@ -24,24 +22,9 @@ pub struct PkSetGather {
 }
 
 impl PkSetGather {
-    /// A gather of `keys` over `cursor`, from wherever it stands.
-    pub(crate) fn new(cursor: ReadCursor, keys: PkKeys) -> Self {
-        debug_assert_eq!(keys.stride(), cursor.schema.pk_stride());
-        let mut gather = PkSetGather { cursor, keys, next: 0 };
-        gather.position();
-        gather
-    }
-
-    /// A gather of `keys` over a cursor it opens on `runs` at the first key.
-    pub fn over_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize, keys: PkKeys) -> Self {
-        debug_assert!(keys.stride() <= schema.pk_stride());
-        let cursor = match keys.iter().next() {
-            Some(first) => {
-                let first = PkBuf::from_bytes(first).widened(schema.pk_stride());
-                from_runs_at(runs, schema, cap, first.pk_bytes())
-            }
-            None => empty_cursor(schema),
-        };
+    /// A gather of `keys` over `cursor`, which stands at or below the first.
+    pub fn over(cursor: ReadCursor, keys: PkKeys) -> Self {
+        debug_assert!(keys.stride() <= cursor.schema.pk_stride());
         PkSetGather { cursor, keys, next: 0 }
     }
 
@@ -49,10 +32,6 @@ impl PkSetGather {
     pub(crate) fn reload(&mut self, keys: PkKeys) {
         self.keys = keys;
         self.next = 0;
-        self.position();
-    }
-
-    fn position(&mut self) {
         if let Some(first) = self.keys.iter().next() {
             self.cursor.advance_to(first);
         }

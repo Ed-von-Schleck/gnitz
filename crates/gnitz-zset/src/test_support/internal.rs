@@ -8,9 +8,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::repr::{
-    from_runs, from_runs_at, from_runs_in_band, Batch, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
-};
+use crate::repr::{from_runs, from_runs_in_band, Batch, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts};
 use crate::schema::key::{key_range_between_cuts, KeyCut};
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
@@ -55,11 +53,25 @@ pub fn trace_cursor(batch: Batch) -> ReadCursor {
     create_read_cursor(&[Rc::new(batch)], &[], schema)
 }
 
-/// An opener that hands `cursor` over, whatever keys it is asked for: a kernel's
-/// one open of its trace.
+/// The key band `[start, end)` of every PK beginning with a key in `[first, last]`.
+fn band(first: &[u8], last: &[u8], stride: usize) -> (PkBuf, Option<PkBuf>) {
+    key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+        .expect("`first <= last`, so the band holds a key")
+}
+
+/// An opener that hands `cursor` over, positioned on the band of the keys it is
+/// asked for and clamped at its end, as a store's open is: a kernel's one open
+/// of its trace.
 pub(crate) fn opens(cursor: ReadCursor) -> impl FnMut(&[u8], &[u8]) -> ReadCursor {
     let mut cursor = Some(cursor);
-    move |_, _| cursor.take().expect("one open per probe")
+    move |first, last| {
+        let mut cursor = cursor.take().expect("one open per probe");
+        if !first.is_empty() {
+            let (start, end) = band(first, last, cursor.schema.pk_stride());
+            cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
+        }
+        cursor
+    }
 }
 
 /// An operator's trace in a test: one consolidated run per ingest, read through
@@ -103,18 +115,10 @@ impl TestTrace {
     /// over no other: an operator that reads outside the keys it opened its
     /// history at finds nothing there.
     pub(crate) fn cursor_within(&self, first: &[u8], last: &[u8]) -> ReadCursor {
-        let stride = self.schema.pk_stride();
-        let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
-            .expect("`first <= last`, so the band holds a key");
+        let (start, end) = band(first, last, self.schema.pk_stride());
         let runs = self.runs.iter().cloned().map(Run::Mem);
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, self.schema, self.runs.len(), start.pk_bytes(), end)
-    }
-
-    /// A cursor positioned on the first live row `>= first`.
-    pub(crate) fn cursor_from(&self, first: &[u8]) -> ReadCursor {
-        let runs = self.runs.iter().cloned().map(Run::Mem);
-        from_runs_at(runs, self.schema, self.runs.len(), first)
     }
 }
 

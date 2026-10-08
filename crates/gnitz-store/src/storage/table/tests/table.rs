@@ -137,8 +137,8 @@ proptest! {
         let mut t = open();
         let (mut live, mut sealed, mut durable) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut stream = stream.into_iter().cycle();
-        // A reopen finds the pending shards its last barrier published in L0,
-        // however many they are, until the next upkeep.
+        // A barrier writes into L0 whatever L0 holds, so L0 is at its trigger
+        // only once the upkeep has run.
         for op in ops {
             match op {
                 Op::Ingest(n) | Op::IngestPending(n) => {
@@ -158,7 +158,7 @@ proptest! {
                         // Below the cut, as the registry ingests: no row is left above it.
                         _ => {
                             t.seal().unwrap();
-                            t.ingest_owned_batch(batch).unwrap();
+                            t.ingest(batch).unwrap();
                             sealed = live.clone();
                         }
                     }
@@ -205,10 +205,9 @@ fn a_cursor_between_empty_prefixes_reads_the_whole_store() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES);
-    t.ingest_owned_batch(rows(&[(1, 1, 10), (2, 1, 20), (5, 1, 50)]))
-        .unwrap();
+    t.ingest(rows(&[(1, 1, 10), (2, 1, 20), (5, 1, 50)])).unwrap();
     t.fold_to_ram().unwrap();
-    t.ingest_owned_batch(rows(&[(2, -1, 20), (3, 1, 30)])).unwrap();
+    t.ingest(rows(&[(2, -1, 20), (3, 1, 30)])).unwrap();
     t.ingest_pending(rows(&[(1, -1, 10), (4, 1, 40)]));
     assert_eq!(
         (t.ram_tier.len(), t.memtable.len(), t.pending.len()),
@@ -239,8 +238,7 @@ fn a_memtable_over_budget_folds_into_the_ram_tier() {
         DEFAULT_RAM_TIER_BYTES,
     );
     let n = MEMTABLE_BYTES as u64 / 32 + 1;
-    t.ingest_owned_batch(rows(&(0..n).map(|k| (k, 1, 0)).collect::<Vec<_>>()))
-        .unwrap();
+    t.ingest(rows(&(0..n).map(|k| (k, 1, 0)).collect::<Vec<_>>())).unwrap();
     assert_eq!(t.memtable.len(), 0, "the ingest folded the memtable");
     assert_eq!(t.ram_tier.row_count() as u64, n);
 }
@@ -273,12 +271,18 @@ fn a_damaged_manifest_fails_a_replayed_open_and_rebuilds_a_rederived_one() {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES);
-            t.ingest_owned_batch(rows(&[(1, 1, 100)])).unwrap();
+            t.ingest(rows(&[(1, 1, 100)])).unwrap();
             flush_barrier([&mut t], 7).unwrap();
             drop(t);
             damage(Path::new(&manifest_path(dir.path().to_str().unwrap())));
 
-            let opened = Table::new(dir.path().to_str().unwrap(), schema, rs, StoreBudgets::default());
+            let opened = Table::new(
+                dir.path().to_str().unwrap(),
+                schema,
+                rs,
+                DEFAULT_RAM_TIER_BYTES,
+                ShardBudget::Unbounded,
+            );
             match (rs, name) {
                 (RecoverySource::Rederive { .. }, "unreadable") => {
                     assert_eq!(opened.err(), Some(StorageError::Io(libc::EISDIR)))
@@ -314,15 +318,15 @@ fn rederive_checkpointed_conditional_load() {
     };
     {
         let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
-        t.ingest_owned_batch(rows(&[(1, 1, 100), (2, 1, 200)])).unwrap();
+        t.ingest(rows(&[(1, 1, 100), (2, 1, 200)])).unwrap();
         flush_barrier([&mut t], 7).unwrap();
     }
     let t = reopen(7);
-    assert!(t.resumed_from_checkpoint());
+    assert!(t.loaded_mark().is_some());
     assert_eq!(t.full_scan().len(), 2, "a matching generation loads");
     drop(t);
     let t = reopen(8);
-    assert!(!t.resumed_from_checkpoint());
+    assert!(t.loaded_mark().is_none());
     assert_eq!(t.full_scan().len(), 0, "a mismatched generation erases");
     assert!(!std::fs::exists(&manifest).unwrap());
 }
@@ -333,15 +337,15 @@ fn a_barriers_checkpoint_mark_is_what_the_reopen_reports() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
-    assert_eq!(t.checkpoint_mark(), 0, "a fresh store carries no mark");
-    t.ingest_owned_batch(rows(&[(1, 1, 10)])).unwrap();
+    assert_eq!(t.loaded_mark(), None, "a fresh store carries no mark");
+    t.ingest(rows(&[(1, 1, 10)])).unwrap();
     flush_barrier([&mut t], 9).unwrap();
-    t.ingest_owned_batch(rows(&[(2, 1, 10)])).unwrap();
+    t.ingest(rows(&[(2, 1, 10)])).unwrap();
     flush_barrier([&mut t], 7).unwrap();
-    assert_eq!(t.checkpoint_mark(), 0, "the open's mark is read-only");
+    assert_eq!(t.loaded_mark(), None, "the open's mark is read-only");
     drop(t);
     let t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
-    assert_eq!(t.checkpoint_mark(), 7, "the last published mark, not the highest");
+    assert_eq!(t.loaded_mark(), Some(7), "the last published mark, not the highest");
 }
 
 /// A barrier publishes exactly when the manifest would change — rows, shards or
@@ -367,11 +371,11 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     // whole L0 to nothing.
     let round = |r: u64, w: i64| rows(&(0..10).map(|k| (r * 100 + k, w, 1)).collect::<Vec<_>>());
     for r in 0..L0_COMPACT_THRESHOLD as u64 {
-        t.ingest_owned_batch(round(r, 1)).unwrap();
+        t.ingest(round(r, 1)).unwrap();
         assert!(publishes(&mut t), "written rows publish");
     }
     for r in 0..L0_COMPACT_THRESHOLD as u64 {
-        t.ingest_owned_batch(round(r, -1)).unwrap();
+        t.ingest(round(r, -1)).unwrap();
     }
     t.fold_to_ram().unwrap();
     t.settle().unwrap();
@@ -400,7 +404,7 @@ fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
         let mut t = new_table(dir.path(), schema, resume, 100);
         // Several shards over two levels, so the reloaded order is not trivial.
         for r in 0..2 * L0_COMPACT_THRESHOLD as u64 {
-            t.ingest_owned_batch(rows(&[(r, 1, 10)])).unwrap();
+            t.ingest(rows(&[(r, 1, 10)])).unwrap();
             flush_barrier([&mut t], 4).unwrap();
         }
         t.set_caller_record(b"rec".to_vec());
@@ -427,7 +431,7 @@ fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
     // So are new rows, and the manifest read at open stops counting once one is staged.
     let resume = RecoverySource::Rederive { resume_at: Some(5) };
     let mut t = new_table(dir.path(), schema, resume, 100);
-    t.ingest_owned_batch(rows(&[(900, 1, 10)])).unwrap();
+    t.ingest(rows(&[(900, 1, 10)])).unwrap();
     assert!(t.flush_prepare(5).unwrap().is_some());
     assert!(staging.exists(), "new rows stage a manifest");
     flush_barrier([&mut t], 5).unwrap();
@@ -451,7 +455,7 @@ fn pk_filter_follows_whether_the_store_is_probed() {
         let dir = tempfile::tempdir().unwrap();
         let mut t = new_table(dir.path(), make_schema_u64_i64(), rs, 100);
         for r in 0..6u64 {
-            t.ingest_owned_batch(rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>()))
+            t.ingest(rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>()))
                 .unwrap();
             t.fold_to_ram().unwrap();
         }
@@ -479,13 +483,13 @@ fn a_tier_folded_to_just_under_its_ceiling_spills() {
             RecoverySource::Rederive { resume_at: None },
             CEILING_ROWS as usize * 32,
         );
-        t.ingest_owned_batch(rows(&(0..held).map(|k| (k, 1, 0)).collect::<Vec<_>>()))
+        t.ingest(rows(&(0..held).map(|k| (k, 1, 0)).collect::<Vec<_>>()))
             .unwrap();
         t.fold_to_ram().unwrap();
         assert_eq!(t.all_shard_arcs().len(), 0, "{held}: under the ceiling");
         // Updates of a quarter of the ceiling's rows: each a retraction and an insert.
         let updates = (0..CEILING_ROWS / 4).flat_map(|k| [(k, -1, 0), (k, 1, 1)]);
-        t.ingest_owned_batch(rows(&updates.collect::<Vec<_>>())).unwrap();
+        t.ingest(rows(&updates.collect::<Vec<_>>())).unwrap();
         t.fold_to_ram().unwrap();
         assert_eq!(!t.all_shard_arcs().is_empty(), spills, "{held} rows held");
         assert_eq!(t.full_scan().len() as u64, held);
@@ -500,7 +504,7 @@ fn a_store_held_in_ram_never_spills() {
     let mut t = new_table(dir.path(), make_schema_u64_i64(), RecoverySource::SalReplay, 96);
     t.hold_in_ram();
     for r in 0..20u64 {
-        t.ingest_owned_batch(rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>()))
+        t.ingest(rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>()))
             .unwrap();
         t.fold_to_ram().unwrap();
     }
@@ -533,8 +537,8 @@ fn a_seal_folds_the_memtable_only_for_a_sizable_delta() {
     assert_eq!(t.memtable.len(), 1, "a delta as long as the memtable folds it");
 }
 
-/// A seal that moves pending shards into L0 runs the disk tier's upkeep,
-/// whether or not its delta also overflows the memtable.
+/// A seal pays the disk tier's upkeep for the shards the barriers before it
+/// wrote into L0, whether or not its delta also overflows the memtable.
 #[test]
 fn a_seal_that_enters_shards_into_l0_compacts_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -559,7 +563,11 @@ fn a_seal_that_enters_shards_into_l0_compacts_it() {
             // Past the memtable's budget, under the RAM tier's.
             push(&mut t, 100..10_100);
         }
-        assert_eq!(t.level_shape().0, 0, "pending shards sit outside L0");
+        assert_eq!(
+            t.level_shape().0,
+            L0_COMPACT_THRESHOLD + 1,
+            "each barrier wrote a shard into L0"
+        );
         let delta = t.seal().unwrap().expect("rows were pending");
         assert_eq!(t.level_shape().0, 0, "overflow={overflow}: the seal folded L0 into L1");
         assert_eq!(t.level_shape().1[0], 1, "overflow={overflow}: L1 holds the fold");
