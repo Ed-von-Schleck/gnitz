@@ -1,10 +1,8 @@
-use std::collections::hash_map::Entry;
-
-use gnitz_expr::ColumnTable;
 use gnitz_store::relation::{IndexClaim, RelationSpec};
 use gnitz_wire::TableDistribution;
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::Placement;
+use std::collections::hash_map::Entry;
 
 use super::cache::{encode_record, RelationEntry};
 use super::constraints::FkEdge;

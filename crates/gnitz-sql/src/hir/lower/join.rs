@@ -212,7 +212,7 @@ impl JoinSide {
 
     /// The kept payload columns' defs, in keep order.
     pub(super) fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
-        self.keep.iter().map(|&i| &self.frame.schema.columns[i as usize])
+        self.keep.iter().map(|&i| &self.frame.schema.columns()[i as usize])
     }
 
     /// The type codes of the kept payload columns — what `null_extend` needs to
@@ -260,7 +260,7 @@ fn join_keep(
         // Rule 4: a side whose source PK the output key packs out of the payload
         // keeps it, at the front.
         if pins[side] {
-            for &c in &frames[side].schema.pk_cols {
+            for &c in frames[side].schema.pk_cols() {
                 keep[side][c as usize] = true;
             }
         }
@@ -278,7 +278,7 @@ fn join_keep(
         keep[0][0] = true;
     }
     Ok([0, 1].map(|side| {
-        let pinned: &[u32] = if pins[side] { &frames[side].schema.pk_cols } else { &[] };
+        let pinned: &[u32] = if pins[side] { frames[side].schema.pk_cols() } else { &[] };
         let rest = (0..keep[side].len() as u32).filter(|&i| keep[side][i as usize] && !pinned.contains(&i));
         (pinned.iter().copied().chain(rest).collect(), pinned.len())
     }))

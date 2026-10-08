@@ -1,11 +1,14 @@
+use crate::test_support::schema_with_pk_at;
+use crate::SchemaColumn;
 use gnitz_wire::{FixedInt, TypeCode};
 
 use super::{ColKind, ExprOp, FloatUnaryOp, IntUnaryOp, ReadAs, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS};
 use crate::eval::Resolved;
 use crate::test_support::{
     filter_prog, is_not_null_op, is_null_op, make_n_col_view, make_string_view, passing_rows, row_values, scalar_prog,
-    schema_pk_ints, schema_pk_strings, TestSchema,
+    schema_pk_ints, schema_pk_strings,
 };
+use crate::SchemaDescriptor;
 use crate::{
     CalendarOp, CmpOp, ColumnLocator, ConstIdx, ExprValidateErr, IntArithOp, LogicalInstr, LogicalProgram, NullPerm,
     PoolEntry, Reg, RowFilter, ScalarEval, Sink, TrimMode,
@@ -38,7 +41,15 @@ fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
     use LogicalInstr as L;
     let ints = |nullable| schema_pk_ints(3, nullable);
     let strs = |nullable| schema_pk_strings(2, nullable);
-    let f64s = |nullable| TestSchema::new(&[(TypeCode::U64, false), (TypeCode::F64, nullable)], &[0]);
+    let f64s = |nullable| {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::F64, nullable),
+            ],
+            &[0],
+        )
+    };
     let k = |val| L::LoadConst { val, unsigned: false };
     let (col, text) = (L::LoadCol { col: 1 }, L::LoadColStr { col: 1 });
     let vs_const = L::StrColConst {
@@ -50,7 +61,7 @@ fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
     let select = L::Select { cond: Reg(0), a: Reg(1), b: Reg(2) };
     let substr = |len_reg| L::StrSubstr { src: Reg(0), start_reg: Reg(1), len_reg };
     let calendar = |op| L::Calendar { op, a: Reg(0), micros: false };
-    let cases: Vec<(&str, TestSchema, Vec<LogicalInstr>, bool)> = vec![
+    let cases: Vec<(&str, SchemaDescriptor, Vec<LogicalInstr>, bool)> = vec![
         ("nullable int load", ints(true), vec![col], false),
         ("NOT NULL int load", ints(false), vec![col], true),
         ("nullable float load", f64s(true), vec![L::LoadCol { col: 1 }], false),
@@ -59,12 +70,6 @@ fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
         ("NOT NULL string compare", strs(false), vec![vs_const], true),
         ("nullable column pair", strs(true), vec![pair], false),
         ("NOT NULL column pair", strs(false), vec![pair], true),
-        (
-            "nullable PK load",
-            TestSchema::new(&[(TypeCode::U64, true), (TypeCode::I64, false)], &[0]),
-            vec![L::LoadCol { col: 0 }],
-            true,
-        ),
         ("IS NULL", ints(true), vec![is_null_op(1)], true),
         ("IS NOT NULL", ints(true), vec![is_not_null_op(1)], true),
         ("IS NULL, then a load", ints(true), vec![is_null_op(1), col], false),
@@ -585,7 +590,7 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
         },
     ];
     let validate = |tc: TypeCode, instr: LogicalInstr| {
-        let schema = TestSchema::with_pk_at(PK as usize, &[T::U64, tc, T::String]);
+        let schema = schema_with_pk_at(PK as usize, &[T::U64, tc, T::String]);
         LogicalProgram::new(vec![instr], vec![], vec![b"x".to_vec()])
             .resolve_program(&schema, ReadAs::Value)
             .map(drop)
@@ -618,8 +623,8 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
 fn copy_col_admits_only_a_widening_destination() {
     // in: [U64 PK, <src>]; out: [U64 PK, <dst>] — one payload slot each.
     let pair = |src: TypeCode, dst: TypeCode| {
-        let in_schema = TestSchema::with_pk_at(0, &[TypeCode::U64, src]);
-        let out_schema = TestSchema::with_pk_at(0, &[TypeCode::U64, dst]);
+        let in_schema = schema_with_pk_at(0, &[TypeCode::U64, src]);
+        let out_schema = schema_with_pk_at(0, &[TypeCode::U64, dst]);
         LogicalProgram::copy_cols(&[1])
             .resolve_map(&in_schema, &out_schema)
             .map(drop)
@@ -651,8 +656,8 @@ fn copy_col_admits_only_a_widening_destination() {
         );
     }
     // A PK source into a payload slot of the same type is a copy, not a promotion.
-    let in_pk = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
-    let out_pk = TestSchema::with_pk_at(0, &[TypeCode::I64, TypeCode::U64]);
+    let in_pk = schema_with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
+    let out_pk = schema_with_pk_at(0, &[TypeCode::I64, TypeCode::U64]);
     let prog = LogicalProgram::copy_cols(&[0]);
     assert_eq!(prog.resolve_map(&in_pk, &out_pk).map(drop), Ok(()));
 }
@@ -663,7 +668,14 @@ fn copy_col_admits_only_a_widening_destination() {
 #[test]
 fn a_register_sinks_slot_holds_its_whole_value() {
     use TypeCode as T;
-    let in_schema = TestSchema::new(&[(T::U64, false), (T::I64, true), (T::String, true)], &[0]);
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(T::U64, false),
+            SchemaColumn::new(T::I64, true),
+            SchemaColumn::new(T::String, true),
+        ],
+        &[0],
+    );
     let int = [
         LogicalInstr::LoadCol { col: 1 },
         LogicalInstr::IntUnary { op: IntUnaryOp::Neg, a: Reg(0) },
@@ -705,7 +717,7 @@ fn a_register_sinks_slot_holds_its_whole_value() {
         (T::String, text, Ok(())),
         (T::I64, text, class(T::I64)),
     ] {
-        let out = TestSchema::with_pk_at(0, &[T::U64, tc]);
+        let out = schema_with_pk_at(0, &[T::U64, tc]);
         let prog = LogicalProgram::new(instrs.to_vec(), vec![Sink::Reg(Reg(1))], vec![]);
         assert_eq!(
             prog.resolve_map(&in_schema, &out).map(drop),
@@ -740,8 +752,8 @@ fn a_sink_list_that_does_not_cover_the_output_is_refused() {
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
 /// `col1 IN (…)` — as a value and as a filter. `col_tc` picks col1's type
 /// (I64 / U64 / …).
-fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval, RowFilter) {
-    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, col_tc]);
+fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (SchemaDescriptor, ScalarEval, RowFilter) {
+    let schema = schema_with_pk_at(0, &[TypeCode::U64, col_tc]);
     let instrs = vec![
         LogicalInstr::LoadCol { col: 1 },
         LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
@@ -1161,8 +1173,12 @@ fn a_scalar_register_past_a_string_one_has_its_lane() {
 /// own slot, computes nothing, and the two schemas locate every column alike.
 #[test]
 fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
-    let schema = TestSchema::new(
-        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::I64, false)],
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
         &[0],
     );
     assert!(LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &schema));
@@ -1176,16 +1192,24 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
         vec![],
     );
     assert!(!computed.is_identity_map(&schema, &schema), "computed sink");
-    let other_payload = TestSchema::new(
-        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::I32, false)],
+    let other_payload = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I32, false),
+        ],
         &[0],
     );
     assert!(
         !LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &other_payload),
         "different payload type"
     );
-    let other_pk = TestSchema::new(
-        &[(TypeCode::U64, false), (TypeCode::I64, false), (TypeCode::I64, false)],
+    let other_pk = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
         &[1],
     );
     assert!(
@@ -1193,8 +1217,12 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
         "different PK layout"
     );
     // A PK that does not lead: the payload columns are 0 and 2.
-    let mid_pk = TestSchema::new(
-        &[(TypeCode::I64, true), (TypeCode::U64, false), (TypeCode::I64, false)],
+    let mid_pk = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
         &[1],
     );
     assert!(LogicalProgram::copy_cols(&[0, 2]).is_identity_map(&mid_pk, &mid_pk));
@@ -1203,7 +1231,7 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
         "a PK column copied into a payload slot"
     );
     // A PK-only schema: nothing to copy, so the empty program is its identity.
-    let pk_only = TestSchema::new(&[(TypeCode::U64, false)], &[0]);
+    let pk_only = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     assert!(LogicalProgram::copy_cols(&[]).is_identity_map(&pk_only, &pk_only));
 }
 

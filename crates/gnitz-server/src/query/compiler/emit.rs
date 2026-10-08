@@ -354,7 +354,7 @@ fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group_cols: &[u32], agg: &[AggDes
     // Each worker that holds the whole input seeds the row, else the one worker
     // V₀'s empty-keyed shard routes to.
     let seeds_ground = ctx.loaded.owes_ground_row(nid)
-        && (ctx.meta.self_contained || slot.rank as usize == gnitz_zset::schema::ground_owner(slot.of as usize));
+        && (ctx.meta.self_contained || slot.rank as usize == gnitz_zset::algebra::ground_owner(slot.of as usize));
     let plan = match ctx.reads_partials(nid) {
         true => gnitz_zset::stream::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
         false => gnitz_zset::stream::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,

@@ -66,7 +66,7 @@ fn a_corrupt_filter_program_aborts_the_compile() {
 #[derive(Clone, Copy)]
 struct Wide {
     kind: gnitz_store::relation::RelationKind,
-    placement: fn(&SchemaDescriptor) -> gnitz_zset::schema::Placement,
+    placement: fn(&SchemaDescriptor) -> gnitz_zset::algebra::Placement,
     a: gnitz_wire::TypeCode,
     /// Table 11 is replicated, where it is otherwise placed by its PK.
     replicated_partner: bool,
@@ -74,10 +74,11 @@ struct Wide {
 
 /// Relation 10 as `wide` has it and table 11 `(k | w)`, registered for worker
 /// `slot` under a fresh directory.
-fn two_tables(slot: gnitz_zset::schema::Slot, wide: Wide) -> (RelationRegistry, tempfile::TempDir) {
+fn two_tables(slot: gnitz_zset::algebra::Slot, wide: Wide) -> (RelationRegistry, tempfile::TempDir) {
     use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
     use gnitz_wire::TypeCode;
-    use gnitz_zset::schema::{Placement, SchemaColumn};
+    use gnitz_zset::algebra::Placement;
+    use gnitz_zset::schema::SchemaColumn;
     let col = SchemaColumn::new(TypeCode::U64, false);
     let (kind_of_10, placement, replicated_partner) = (wide.kind, wide.placement, wide.replicated_partner);
     let wide = SchemaDescriptor::new(&[SchemaColumn::new(wide.a, false), col, col], &[0, 1]);
@@ -112,7 +113,7 @@ fn two_tables(slot: gnitz_zset::schema::Slot, wide: Wide) -> (RelationRegistry, 
 /// The integral of the node `build` answers and every child declared, as its
 /// circuit compiled on worker `slot` under the routing derived from it.
 fn trace_and_children(
-    slot: gnitz_zset::schema::Slot,
+    slot: gnitz_zset::algebra::Slot,
     wide: Wide,
     build: fn(&mut Circuit) -> NodeId,
 ) -> (Integral, Vec<String>) {
@@ -128,7 +129,7 @@ fn trace_and_children(
     )
 }
 
-fn trace_of(slot: gnitz_zset::schema::Slot, wide: Wide, build: fn(&mut Circuit) -> NodeId) -> Integral {
+fn trace_of(slot: gnitz_zset::algebra::Slot, wide: Wide, build: fn(&mut Circuit) -> NodeId) -> Integral {
     trace_and_children(slot, wide, build).0
 }
 
@@ -168,7 +169,7 @@ fn id(_: &mut Circuit, n: NodeId) -> NodeId {
 fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
     use gnitz_store::relation::RelationKind::{BaseTable, Stream};
     use gnitz_wire::TypeCode::{U128, U32, U64, UUID};
-    use gnitz_zset::schema::{Placement, Slot};
+    use gnitz_zset::algebra::{Placement, Slot};
     let is_source = |t: Integral| t == Integral::Relation(10, gnitz_store::relation::Cut::Sealed);
     let table = Wide {
         kind: BaseTable,
@@ -249,7 +250,7 @@ fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
 #[test]
 fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
     use gnitz_store::relation::RelationKind::BaseTable;
-    use gnitz_zset::schema::{Placement, Slot};
+    use gnitz_zset::algebra::{Placement, Slot};
     let table = Wide {
         kind: BaseTable,
         placement: Placement::full_pk,

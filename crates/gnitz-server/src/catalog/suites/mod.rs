@@ -34,8 +34,9 @@ use gnitz_store::relation::{
 };
 use gnitz_wire::payload_u64;
 use gnitz_wire::{PkColList, TypeCode, PK_LIST_PACKED_FLAG};
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
-use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
+use gnitz_zset::schema::SchemaDescriptor;
 
 use super::sys_tables::*;
 use super::*;

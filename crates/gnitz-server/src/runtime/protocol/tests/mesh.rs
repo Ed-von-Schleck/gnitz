@@ -4,7 +4,7 @@ use crate::test_support::{
     opk_pk, weighted_rows,
 };
 use gnitz_wire::wal::WAL_HEADER_SIZE;
-use gnitz_zset::schema::{Placement, Slot};
+use gnitz_zset::algebra::{Placement, Slot};
 
 const NW: usize = 3;
 

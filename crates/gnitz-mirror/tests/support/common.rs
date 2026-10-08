@@ -3,7 +3,7 @@
 
 use gnitz_store::relation::relation_dir;
 use gnitz_store::relation::{ChildAddr, ChildKind};
-use gnitz_zset::schema::Slot;
+use gnitz_zset::algebra::Slot;
 
 const ROWS: ChildAddr = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
 

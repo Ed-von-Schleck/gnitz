@@ -1,31 +1,84 @@
-use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_expr::{SchemaColumn, SchemaDescriptor, SchemaRefusal};
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
-use gnitz_wire::{ColumnDef, PkKeys, TypeCode};
-use gnitz_wire::{MAX_COLUMNS, MAX_PK_COLUMNS};
+use gnitz_wire::{ColumnDef, PkKeys, PkListRole, PkRule, TypeCode};
+use gnitz_wire::{MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
-    pub columns: Vec<ColumnDef>,
-    /// PK column indices in compound-key order; length >= 1.
-    pub pk_cols: Vec<u32>,
+    columns: Vec<ColumnDef>,
+    layout: SchemaDescriptor,
 }
 
 impl Schema {
+    /// The one constructor. `Err` for a column list over `MAX_COLUMNS`, an
+    /// inadmissible column type, or a PK list that breaks the PK rules at
+    /// `PK_LIST_MAX_COLS`, the capacity of a persisted PK list.
+    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Result<Schema, String> {
+        if let Some(cd) = columns.iter().find(|cd| !cd.ty.is_admissible()) {
+            return Err(format!(
+                "column '{}' ({:?}) carries scale {}",
+                cd.name, cd.ty.tc, cd.ty.scale
+            ));
+        }
+        let pk_refusal = |rule: PkRule| {
+            rule.named(PkListRole::PrimaryKey, |c| {
+                columns.get(c as usize).map(|cd| cd.name.as_str())
+            })
+        };
+        if pk_cols.len() > PK_LIST_MAX_COLS {
+            return Err(pk_refusal(PkRule::TooManyColumns {
+                count: pk_cols.len(),
+                max: PK_LIST_MAX_COLS,
+            }));
+        }
+        let cols: Vec<SchemaColumn> = columns
+            .iter()
+            .map(|cd| SchemaColumn::new(cd.ty.tc, cd.is_nullable))
+            .collect();
+        let layout = SchemaDescriptor::try_new(&cols, pk_cols).map_err(|refusal| match refusal {
+            SchemaRefusal::Pk(rule) => pk_refusal(rule),
+            other => other.to_string(),
+        })?;
+        Ok(Schema { columns, layout })
+    }
+
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
+    /// PK column indices in compound-key order; length >= 1.
+    pub fn pk_cols(&self) -> &[u32] {
+        self.layout.pk_cols()
+    }
+
+    /// The layout facts of this schema's columns and PK list.
+    pub fn layout(&self) -> &SchemaDescriptor {
+        &self.layout
+    }
+
+    /// A name carries no layout.
+    pub fn rename_column(&mut self, ci: usize, name: String) {
+        self.columns[ci].name = name;
+    }
+
     /// The PK columns in PK-list order, hidden: the leading key of a reply that
     /// carries this schema's key.
     pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> + '_ {
-        self.pk_cols.iter().map(|&c| self.columns[c as usize].clone().hidden())
+        self.pk_cols()
+            .iter()
+            .map(|&c| self.columns[c as usize].clone().hidden())
     }
 
     /// The non-PK ("payload") columns as `(payload slot, col_idx, &ColumnDef)`,
     /// in slot order.
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
-        gnitz_expr::payload_cols(self)
-            .enumerate()
-            .map(|(pi, ci)| (pi, ci, &self.columns[ci]))
+        (0..self.layout.num_payload_cols()).map(|pi| {
+            let ci = self.layout.payload_col_idx(pi);
+            (pi, ci, &self.columns[ci])
+        })
     }
 
     /// The visible (non-hidden) columns as `(col_idx, &ColumnDef)`. `col_idx` is
@@ -36,46 +89,9 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// Whether this is an admissible schema: at most `MAX_COLUMNS` columns,
-    /// every column type admissible, and a PK list that passes the shared PK
-    /// rules at `PK_LIST_MAX_COLS`, the capacity of a persisted PK list. Run by
-    /// [`Schema::from_parts`] and the client's DDL gateways.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.columns.len() > MAX_COLUMNS {
-            return Err(format!(
-                "column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
-                self.columns.len()
-            ));
-        }
-        if let Some(cd) = self.columns.iter().find(|cd| !cd.ty.is_admissible()) {
-            return Err(format!(
-                "column '{}' ({:?}) carries scale {}",
-                cd.name, cd.ty.tc, cd.ty.scale
-            ));
-        }
-        gnitz_wire::validate_pk_tuple(&self.pk_cols, self.columns.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
-            let cd = &self.columns[c as usize];
-            (cd.ty.tc, cd.is_nullable)
-        })
-        .map_err(|r| {
-            r.named(gnitz_wire::PkListRole::PrimaryKey, |c| {
-                self.columns.get(c as usize).map(|cd| cd.name.as_str())
-            })
-        })
-    }
-
-    /// Fallible constructor for a schema assembled from untrusted parts — a
-    /// wire schema block or catalog rows. Runs [`Schema::validate`],
-    /// so every decode boundary applies the same rule set.
-    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Result<Schema, String> {
-        let s = Schema { columns, pk_cols };
-        s.validate()?;
-        Ok(s)
-    }
-
     /// This schema's meta-schema record — the bytes a schema-bearing push embeds.
     pub fn to_block(&self) -> Vec<u8> {
-        gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), &self.pk_cols)
+        gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), self.pk_cols())
     }
 
     /// The schema a meta-schema record describes.
@@ -91,7 +107,7 @@ impl Schema {
             });
             Ok(())
         })?;
-        Schema::from_parts(columns, pk.as_slice().to_vec())
+        Schema::from_parts(columns, pk.as_slice())
     }
 }
 
@@ -104,37 +120,17 @@ pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
         gnitz_wire::SYS_FAMILIES
             .iter()
             .map(|f| {
-                Arc::new(Schema {
-                    columns: f
-                        .cols
-                        .iter()
-                        .map(|c| ColumnDef::new(c.name, c.type_code, false))
-                        .collect(),
-                    pk_cols: f.pk_cols.to_vec(),
-                })
+                let columns = f
+                    .cols
+                    .iter()
+                    .map(|c| ColumnDef::new(c.name, c.type_code, false))
+                    .collect();
+                Arc::new(Schema::from_parts(columns, f.pk_cols).expect("a system family is an admissible schema"))
             })
             .collect()
     });
     let idx = gnitz_wire::sys_family_index(tid).unwrap_or_else(|| panic!("not a system table id: {tid}"));
     &schemas[idx]
-}
-
-impl ColumnTable for Schema {
-    fn pk_cols(&self) -> &[u32] {
-        &self.pk_cols
-    }
-
-    fn num_columns(&self) -> usize {
-        self.columns.len()
-    }
-
-    fn col_type_code(&self, ci: usize) -> TypeCode {
-        self.columns[ci].ty.tc
-    }
-
-    fn col_nullable(&self, ci: usize) -> bool {
-        self.columns[ci].is_nullable
-    }
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
@@ -158,13 +154,13 @@ impl PkColumn {
     /// derived from them here and only copied from a column after, so it is
     /// never zero or wider than a key.
     pub fn empty_for_schema(schema: &Schema) -> Self {
-        let n = schema.pk_cols.len();
+        let n = schema.pk_cols().len();
         assert!(
             (1..=MAX_PK_COLUMNS).contains(&n),
             "PkColumn: {n} key columns is outside 1..={MAX_PK_COLUMNS}"
         );
         let mut types = [TypeCode::U8; MAX_PK_COLUMNS];
-        for (t, &c) in types.iter_mut().zip(&schema.pk_cols) {
+        for (t, &c) in types.iter_mut().zip(schema.pk_cols()) {
             *t = schema.columns[c as usize].ty.tc;
         }
         let stride: usize = types[..n].iter().map(|t| t.wire_stride()).sum();
@@ -362,7 +358,7 @@ impl ZSetBatch {
             weights: vec![],
             nulls: vec![],
             payload: {
-                let mut payload = Vec::with_capacity(schema.num_payload_cols());
+                let mut payload = Vec::with_capacity(schema.layout().num_payload_cols());
                 payload.extend(schema.payload_columns().map(|(_, _, c)| PayloadColumn::new(c.ty.tc)));
                 payload
             },
@@ -553,17 +549,17 @@ impl ZSetBatch {
     /// The batch's layout is `schema`'s: key column types, payload slot count,
     /// and each slot's type.
     pub fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
-        let want = schema.pk_cols.iter().map(|&c| schema.columns[c as usize].ty.tc);
+        let want = schema.pk_cols().iter().map(|&c| schema.columns[c as usize].ty.tc);
         let got = self.pks.key_types();
         if !got.iter().copied().eq(want.clone()) {
             let want: Vec<TypeCode> = want.collect();
             return Err(format!("mismatched key column types: expected {want:?}, got {got:?}"));
         }
-        if self.payload.len() != schema.num_payload_cols() {
+        if self.payload.len() != schema.layout().num_payload_cols() {
             return Err(format!(
                 "payload slot count {} != schema payload column count {}",
                 self.payload.len(),
-                schema.num_payload_cols()
+                schema.layout().num_payload_cols()
             ));
         }
         for ((pi, _, def), col) in schema.payload_columns().zip(&self.payload) {
@@ -594,14 +590,14 @@ impl ZSetBatch {
         check_not_null(&self.nulls, schema)?;
         let col = |pi: usize| (self.payload[pi].bytes.as_slice(), self.payload[pi].stride());
         match gnitz_wire::first_valued_null(
-            schema.nullable_payload_slots(),
+            schema.layout().nullable_payload_slots(),
             gnitz_wire::as_le_bytes(&self.nulls),
             col,
         ) {
             None => Ok(()),
             Some((row, slot)) => Err(format!(
                 "row {row} holds a value under NULL in column '{}'",
-                schema.columns[schema.payload_col_idx(slot)].name
+                schema.columns[schema.layout().payload_col_idx(slot)].name
             )),
         }
     }
@@ -688,14 +684,15 @@ fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
 /// column, whose declaration every reader past the decoder trusts, or one past
 /// the last payload column.
 pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), String> {
-    match gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), gnitz_wire::as_le_bytes(nulls)) {
+    match gnitz_wire::first_not_null_violation(schema.layout().not_null_payload_slots(), gnitz_wire::as_le_bytes(nulls))
+    {
         None => Ok(()),
-        Some((row, slot)) if slot >= schema.num_payload_cols() => {
+        Some((row, slot)) if slot >= schema.layout().num_payload_cols() => {
             Err(format!("row {row} sets null bit {slot}, past the last payload column"))
         }
         Some((row, slot)) => Err(format!(
             "row {row} sets a null bit on NOT NULL column '{}'",
-            schema.columns[schema.payload_col_idx(slot)].name
+            schema.columns[schema.layout().payload_col_idx(slot)].name
         )),
     }
 }

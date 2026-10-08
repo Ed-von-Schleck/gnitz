@@ -100,7 +100,7 @@ fn rows_of(src: &impl ColumnarSource, schema: &SchemaDescriptor) -> Vec<RowImage
                     if col.type_code.is_german_string() {
                         gnitz_wire::payload_bytes(src, r, pi).to_vec()
                     } else {
-                        src.get_col_ptr(r, pi, col.size() as usize).to_vec()
+                        src.get_col_ptr(r, pi, col.size()).to_vec()
                     }
                 })
                 .collect();
@@ -586,7 +586,7 @@ fn every_column_type_reads_back_whatever_its_values() {
     ] {
         for nullable in [false, true] {
             let schema = u64_pk_schema(SchemaColumn::new(tc, nullable));
-            let mask = u128::MAX >> (128 - 8 * schema.columns[1].size());
+            let mask = u128::MAX >> (128 - 8 * schema.columns()[1].size());
             for (what, value) in values {
                 for n in [1, 700, DECODE_BLOCK_ROWS + 3] {
                     let batch = build(schema, n, |b, i| {

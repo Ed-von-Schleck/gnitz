@@ -1,7 +1,6 @@
-use gnitz_expr::ColumnTable;
 use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::Placement;
 
 use super::cache::CatalogCacheSet;
 use super::sys_tables::{SysFamily, FIRST_ALLOCATED_ID};

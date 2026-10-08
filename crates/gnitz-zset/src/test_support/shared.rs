@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use gnitz_wire::RowSource;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
 /// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
@@ -26,7 +26,7 @@ pub fn pk_payload_schema(tcs: &[TypeCode]) -> SchemaDescriptor {
 /// `cols` of `schema` as join-key slots, each at the column's own slot type.
 pub fn self_typed_slots(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<gnitz_wire::ReindexSlot> {
     cols.iter()
-        .map(|&c| (c, schema.columns[c as usize].type_code.reindex_output_type()))
+        .map(|&c| (c, schema.columns()[c as usize].type_code.reindex_output_type()))
         .collect()
 }
 
@@ -194,14 +194,14 @@ pub type RowKey = (Vec<u8>, Vec<Option<Vec<u8>>>);
 /// reflected. STRING / BLOB cells are **decoded**:
 /// the 16-byte German-string struct embeds a blob offset, so two batches holding
 /// the same logical string carry different struct bytes.
-pub fn row_key<S: RowSource>(src: &S, schema: &(impl SchemaFacts + ?Sized), row: usize) -> RowKey {
+pub fn row_key<S: RowSource>(src: &S, schema: &SchemaDescriptor, row: usize) -> RowKey {
     let nw = src.get_null_word(row);
     let vals = (0..schema.num_payload_cols())
         .map(|pi| {
             if gnitz_wire::null_word_get(nw, pi) {
                 return None;
             }
-            let tc = schema.col_type_code(schema.payload_col_idx(pi));
+            let tc = schema.columns()[schema.payload_col_idx(pi)].type_code;
             let raw = src.get_col_ptr(row, pi, tc.wire_stride());
             Some(if tc.is_german_string() {
                 gnitz_wire::german_string_content(raw, src.blob()).to_vec()
@@ -353,10 +353,7 @@ pub fn join_reference(
 ) -> (HashMap<RowKey, i64>, usize) {
     let eq_size = match kind {
         // Every key column but the last is an equality slot.
-        gnitz_wire::JoinKind::Range { .. } => {
-            let range_col = *gnitz_expr::ColumnTable::pk_cols(trace_schema).last().unwrap();
-            trace_schema.pk_stride() - trace_schema.columns[range_col as usize].size() as usize
-        }
+        gnitz_wire::JoinKind::Range { .. } => trace_schema.pk_prefix_stride(trace_schema.pk_cols().len() - 1),
         _ => 0,
     };
     let mut m: HashMap<RowKey, i64> = std::collections::HashMap::new();

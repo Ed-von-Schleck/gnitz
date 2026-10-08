@@ -5,10 +5,8 @@
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
-use crate::schema::key::{pk_width_dispatch, NarrowPkOpk, PkSortKey};
-use crate::schema::{
-    ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
-};
+use crate::schema::key::{pk_width_dispatch, PkSortKey};
+use crate::schema::{ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
@@ -33,7 +31,7 @@ impl GroupKey {
     pub(crate) fn new(schema: &SchemaDescriptor, group_cols: &[u32]) -> Result<Self, String> {
         let locs: Vec<ColumnLocator> = group_cols
             .iter()
-            .map(|&c| locate_key_col(schema, c, "group key"))
+            .map(|&c| locate_key_col(schema, c, "group key").map(|(_, loc)| loc))
             .collect::<Result<_, _>>()?;
         Ok(match (schema.reduce_out_key(group_cols), &locs[..]) {
             (ReduceOutKey::Natural, &[loc]) => Self::column(loc),
@@ -141,7 +139,37 @@ pub(crate) use for_cell_width;
 /// The synthetic `_group_pk` key — the whole PK region of an output whose group
 /// set has no natural key.
 const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
-const GROUP_PK_BYTES: usize = GROUP_PK_COL.size() as usize;
+const GROUP_PK_BYTES: usize = GROUP_PK_COL.size();
+
+/// The `stride`-byte OPK region of a narrow key, from its `u128` image: the
+/// inverse of `gnitz_wire::widen_pk_be`.
+pub(crate) struct NarrowPkOpk {
+    be: [u8; 16],
+    stride: usize,
+}
+
+impl NarrowPkOpk {
+    #[inline(always)]
+    pub(crate) fn new(image: u128, stride: usize) -> Self {
+        // Static message: `#[inline(always)]` puts this in every per-row caller,
+        // and an `Arguments` value costs a stack slot even on a cold panic path.
+        assert!(
+            stride <= NARROW_PK_MAX_BYTES,
+            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES"
+        );
+        debug_assert!(
+            stride == 16 || (image >> (stride * 8)) == 0,
+            "narrow PK image {image} does not fit {stride} bytes",
+        );
+        NarrowPkOpk { be: image.to_be_bytes(), stride }
+    }
+
+    /// The `stride` order-preserving bytes — a full PK region for one row.
+    #[inline(always)]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.be[16 - self.stride..]
+    }
+}
 
 /// One row's group output PK: borrowed out of the batch, or held inline.
 pub(crate) enum OutPk<'a> {
@@ -197,10 +225,10 @@ impl GroupOutKey {
         for slot in kind.output_layout(group_cols, row) {
             match slot {
                 ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL),
-                ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize]),
+                ReduceOutSlot::Key(c) => b.push_pk(input.columns()[c as usize]),
                 ReduceOutSlot::Carried(c) => {
                     carried.push(input.locate(c as usize));
-                    b.push(input.columns[c as usize])
+                    b.push(input.columns()[c as usize])
                 }
             }
         }

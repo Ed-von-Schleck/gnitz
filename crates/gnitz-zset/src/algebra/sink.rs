@@ -64,7 +64,9 @@ impl SinkPlan {
                 let cut = match cut {
                     None => None,
                     Some(RowsCut { k, order }) => {
-                        sink_in.check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))?;
+                        for k in order {
+                            sink_in.wire_col("scan_spec: order key column", k.col as u32)?;
+                        }
                         // Saturated: a wrapped negative window would truncate the answer.
                         let window = NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX);
                         Some(match order.is_empty() {

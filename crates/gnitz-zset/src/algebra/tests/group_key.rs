@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{arb_fold_case, cell, fold_batch, fold_schemas, le_cell, mix, opk_pk, pk_only_schema};
 use proptest::prelude::*;
 
@@ -38,7 +38,7 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
         (TypeCode::U16, vec![0, 1, 0xBEEF, u16::MAX as i128]),
         (TypeCode::U64, vec![0, 1, u64::MAX as i128]),
     ] {
-        let width = SchemaColumn::new(tc, false).size() as usize;
+        let width = SchemaColumn::new(tc, false).size();
         for v in vals {
             let le = &(v as u128).to_le_bytes()[..width];
             let want_pk = opk_pk(&pk_only_schema(&[tc]), &[v as u128]);
@@ -125,7 +125,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 }
             }
             // A longer proper prefix is a fold, which no PK order groups.
-            let bytes: usize = cols.iter().map(|&c| schema.columns[c as usize].size() as usize).sum();
+            let bytes: usize = cols.iter().map(|&c| schema.columns()[c as usize].size()).sum();
             let in_place = *cols == pk || bytes <= GROUP_PK_BYTES;
             if std::ptr::eq(batch, &consolidated) && !cols.is_empty() && pk.starts_with(cols) && in_place {
                 prop_assert!(runs.is_some(), "{:?}: a PK prefix of a consolidated batch", cols);
@@ -197,4 +197,21 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
         bb.end_row();
     }
     assert_groups_follow_out_pk(&bb.finish()).unwrap();
+}
+
+/// A narrow key's image, right-aligned at the key's width, is the key.
+#[test]
+fn narrow_pk_opk_inverts_the_widening() {
+    let mut rng = crate::test_support::Rng::new(0x0A11_6E00);
+    for _ in 0..2000 {
+        let bytes = rng.gen_u128().to_be_bytes();
+        for w in 1..=16 {
+            let opk = &bytes[..w];
+            assert_eq!(
+                NarrowPkOpk::new(gnitz_wire::widen_pk_be(opk), w).bytes(),
+                opk,
+                "width {w}"
+            );
+        }
+    }
 }

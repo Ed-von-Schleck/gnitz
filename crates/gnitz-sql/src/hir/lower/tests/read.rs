@@ -38,7 +38,7 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
 fn a_projection_keeping_the_relations_payload_ships_no_map() {
     let (t, mid) = (u64_table(&["id", "v", "w"], &[0]), u64_table(&["v", "id", "w"], &[1]));
     let cols = |keys: &[gnitz_wire::OrderKey]| keys.iter().map(|k| k.col).collect::<Vec<_>>();
-    let names = |s: &gnitz_core::Schema| s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    let names = |s: &gnitz_core::Schema| s.columns().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
     // `(relation, statement, reply columns, the key's column, ORDER BY in the
     // reply, ORDER BY in the relation)`.
     for (desc, sql, reply_cols, key, in_reply, in_relation) in [
@@ -67,9 +67,12 @@ fn a_projection_keeping_the_relations_payload_ships_no_map() {
             ..
         } = rows_reply_of(sql, desc);
         assert!(program.is_none(), "`{sql}`");
-        assert!(reply.same_region_types(desc.schema.as_ref()), "`{sql}`");
+        assert!(
+            reply.layout().same_region_types(desc.schema.as_ref().layout()),
+            "`{sql}`"
+        );
         assert_eq!(
-            (names(&reply), &reply.pk_cols[..]),
+            (names(&reply), reply.pk_cols()),
             (reply_cols.map(String::from).to_vec(), &[key][..]),
             "`{sql}`"
         );
@@ -103,7 +106,7 @@ fn a_projection_keeping_the_relations_payload_ships_no_map() {
             ..
         } = rows_reply_of(sql, &t);
         assert!(program.is_some(), "`{sql}`");
-        assert_eq!(reply.pk_cols, [key], "`{sql}`");
+        assert_eq!(reply.pk_cols(), [key], "`{sql}`");
         let shown: Vec<&str> = reply.visible_columns().map(|(_, c)| c.name.as_str()).collect();
         assert_eq!(shown, visible, "`{sql}`");
         assert_eq!(
@@ -142,8 +145,11 @@ fn an_ordering_key_column_no_item_names_is_the_hidden_key() {
             "`{sql}`"
         );
         // The key region is the relation's, a column no item names hidden.
-        for (&at, &pk) in reply.schema.pk_cols.iter().zip(&desc.schema.pk_cols) {
-            let (got, want) = (&reply.schema.columns[at as usize], &desc.schema.columns[pk as usize]);
+        for (&at, &pk) in reply.schema.pk_cols().iter().zip(desc.schema.pk_cols()) {
+            let (got, want) = (
+                &reply.schema.columns()[at as usize],
+                &desc.schema.columns()[pk as usize],
+            );
             let named = sql.starts_with("SELECT id");
             assert_eq!(
                 *got,

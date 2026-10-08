@@ -10,7 +10,6 @@
 
 use super::*;
 use gnitz_core::key_reply;
-use gnitz_expr::SchemaFacts;
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
 
 /// `col > threshold` as a compiled predicate blob, over the SOURCE schema's
@@ -29,8 +28,12 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
 /// payload slot and no blob heap, every row at weight 1.
 fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec<u8>) -> (Arc<Schema>, ZSetBatch) {
     let (reply_schema, sink) = key_reply(schema);
-    assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
-    assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
+    assert_eq!(
+        reply_schema.layout().num_payload_cols(),
+        0,
+        "the reply is nothing but the key"
+    );
+    assert_eq!(reply_schema.layout().pk_stride(), schema.layout().pk_stride());
     let spec = ReadSpec { bound: ReadBound::None, predicate, sink };
     let reply = block_on(client.scan_spec(tid, &spec, &reply_schema))
         .expect("a PK-only reply must not be rejected")
@@ -77,15 +80,15 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     // Column order deliberately unrelated to PK order: the key is (c3, c0).
-    let mut schema = schema_of(&[
+    let schema = schema_of(&[
         ("c0", TypeCode::U32),
         ("c1", TypeCode::String),
         ("c2", TypeCode::I64),
         ("c3", TypeCode::I64),
     ]);
-    schema.pk_cols = vec![3, 0];
+    let schema = Schema::from_parts(schema.columns().to_vec(), &[3, 0]).unwrap();
     let (_, tid, schema) = create_table(&mut client, schema);
-    assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
+    assert_eq!(schema.layout().pk_stride(), 12, "I64 then U32, tightly packed");
 
     let rows: Vec<(i64, u32, i64)> = vec![(-9_000_000_000, 7, 10), (-1, 4_294_967_295, 20), (0, 0, 30), (5, 1, 40)];
     let mut batch = ZSetBatch::new(&schema);

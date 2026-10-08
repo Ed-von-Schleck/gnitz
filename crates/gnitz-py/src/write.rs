@@ -17,7 +17,6 @@ use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::place::{place_scaled, Placed};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::decimal::parse_decimal_text;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
 
@@ -32,7 +31,7 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
     let mut scratch = Vec::with_capacity(16);
     for pk in pks {
         let tuple;
-        let vals = if schema.pk_cols.len() == 1 {
+        let vals = if schema.pk_cols().len() == 1 {
             std::slice::from_ref(pk)
         } else {
             tuple = pk.cast::<PyTuple>().map_err(|_| {
@@ -40,16 +39,16 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
             })?;
             tuple.as_slice()
         };
-        if vals.len() != schema.pk_cols.len() {
+        if vals.len() != schema.pk_cols().len() {
             return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                 "a compound pk takes {} values, got {}",
-                schema.pk_cols.len(),
+                schema.pk_cols().len(),
                 vals.len()
             )));
         }
         let mut natives = [0u128; MAX_PK_COLUMNS];
         for (k, (native, v)) in natives.iter_mut().zip(vals).enumerate() {
-            let col = &schema.columns[schema.pk_cols[k] as usize];
+            let col = &schema.columns()[schema.pk_cols()[k] as usize];
             if v.is_none() {
                 return Err(not_nullable_err(&col.name));
             }
@@ -139,7 +138,7 @@ fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &B
 /// A PK column had no value supplied.
 #[cold]
 fn missing_pk_err(schema: &Schema, ci: usize) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(format!("missing PK column {:?}", schema.columns[ci].name))
+    pyo3::exceptions::PyValueError::new_err(format!("missing PK column {:?}", schema.columns()[ci].name))
 }
 
 /// `None` reached a NOT NULL column — every PK column is one.
@@ -254,16 +253,16 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
     if let Some(i) = weight {
         consumed[i] = true;
     }
-    let mut pks = Vec::with_capacity(schema.pk_cols.len());
-    for &ci in &schema.pk_cols {
+    let mut pks = Vec::with_capacity(schema.pk_cols().len());
+    for &ci in schema.pk_cols() {
         let ci = ci as usize;
-        let Some(i) = kw_position(&names, &schema.columns[ci].name) else {
+        let Some(i) = kw_position(&names, &schema.columns()[ci].name) else {
             return Err(missing_pk_err(schema, ci));
         };
         consumed[i] = true;
-        pks.push(PkPlan { pos: i, ci, ty: schema.columns[ci].ty });
+        pks.push(PkPlan { pos: i, ci, ty: schema.columns()[ci].ty });
     }
-    let mut payload = Vec::with_capacity(schema.num_payload_cols());
+    let mut payload = Vec::with_capacity(schema.layout().num_payload_cols());
     for (_, ci, col) in schema.payload_columns() {
         let src = if col.is_hidden {
             PayloadSrc::Filler
@@ -338,7 +337,7 @@ impl Rows<'_> {
         for (native, &PkPlan { pos, ci, ty }) in natives.iter_mut().zip(&plan.pks) {
             let v = arg(pos);
             if v.is_none() {
-                return Err(not_nullable_err(&schema.columns[ci].name));
+                return Err(not_nullable_err(&schema.columns()[ci].name));
             }
             *native = py_native(key_scratch, ty, &v, Inexact::Round)?;
         }
@@ -362,7 +361,7 @@ impl Rows<'_> {
                 }
                 _ => {
                     if !nullable {
-                        return Err(not_nullable_err(&schema.columns[ci].name));
+                        return Err(not_nullable_err(&schema.columns()[ci].name));
                     }
                     gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
                     batch.payload[payload_idx].push_zero();

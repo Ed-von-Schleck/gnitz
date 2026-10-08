@@ -1,7 +1,6 @@
 use super::*;
 use crate::relation::RelationKind;
 use crate::test_support::{relation_fixture, RelationFixture, TID};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};

@@ -12,7 +12,6 @@ use std::hint::black_box;
 
 use crate::relation::RelationKind;
 use crate::test_support::{relation_fixture, RelationFixture, TID};
-use gnitz_expr::SchemaFacts;
 use gnitz_foundation::perf::{Counter, Resident};
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewProps, WireStatus};
 use gnitz_zset::repr::{Batch, BatchBuilder};

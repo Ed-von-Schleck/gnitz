@@ -47,7 +47,7 @@ fn agg_combine_bench() {
         let mut b = ZSetBatch::new(schema);
         let mut app = BatchAppender::new(&mut b);
         for i in 0..N {
-            app.add_row_natives(&[key(i) as u128, 0, 0][..schema.pk_cols.len()], 1);
+            app.add_row_natives(&[key(i) as u128, 0, 0][..schema.pk_cols().len()], 1);
             // By row, so a group's partials differ and an extreme is replaced.
             for (_, _, c) in schema.payload_columns() {
                 match c.ty.tc.is_float() {

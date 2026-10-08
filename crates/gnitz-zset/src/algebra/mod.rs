@@ -31,12 +31,14 @@ mod linear;
 mod map;
 mod order_image;
 mod reindex;
+mod route;
 mod sink;
 
 pub use exchange::ScatterPlan;
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
 pub use reindex::{append_spans, index_entries};
+pub use route::{ground_owner, Placement, Slot};
 pub use sink::SinkPlan;
 
 pub(crate) use aggregate::{emit_reduce_row, Agg, AggValues, RangeGroups, ReduceShape};

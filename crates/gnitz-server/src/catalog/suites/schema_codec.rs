@@ -7,7 +7,7 @@
 use crate::catalog::cache::encode_record;
 use crate::catalog::CatalogColumn;
 use crate::test_support::arb_schema;
-use gnitz_expr::{ColumnTable, SchemaFacts};
+
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
 use gnitz_zset::repr::Batch;
@@ -19,16 +19,9 @@ fn catalog_defs(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
     column_defs(schema).map(|def| CatalogColumn { def, fk: None }).collect()
 }
 
-/// The client's schema for `schema`, named `c{i}`.
-fn client_schema(schema: &SchemaDescriptor) -> gnitz_core::Schema {
-    gnitz_core::Schema {
-        columns: column_defs(schema).collect(),
-        pk_cols: schema.pk_cols().to_vec(),
-    }
-}
-
 fn column_defs(schema: &SchemaDescriptor) -> impl Iterator<Item = ColumnDef> + '_ {
-    schema.columns[..schema.num_columns()]
+    schema
+        .columns()
         .iter()
         .enumerate()
         .map(|(i, c)| ColumnDef::new(format!("c{i}"), c.type_code, c.nullable))
@@ -46,12 +39,12 @@ proptest! {
     /// to differ — decodes to the relation's own schema.
     #[test]
     fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
-        let mut client = client_schema(&schema);
-        for c in &mut client.columns {
+        let mut defs: Vec<ColumnDef> = column_defs(&schema).collect();
+        for c in &mut defs {
             c.name = format!("renamed_{}", c.name);
             c.is_hidden = hidden;
         }
-        let frame = client.to_block();
+        let frame = gnitz_wire::schema_block::encode(defs.iter().map(ColumnDef::block_col), schema.pk_cols());
         prop_assert_eq!(
             check_same_types(&frame, &encode_record(schema.pk_cols(), &catalog_defs(&schema))),
             Ok(())
@@ -69,7 +62,7 @@ proptest! {
         a in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
         b in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
     ) {
-        let flipped: Vec<SchemaColumn> = a.columns[..a.num_columns()]
+        let flipped: Vec<SchemaColumn> = a.columns()
             .iter()
             .enumerate()
             .map(|(i, c)| SchemaColumn::new(c.type_code, !a.pk_cols().contains(&(i as u32)) && !c.nullable))

@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_expr::{ColumnLocator, ColumnTable, SchemaFacts};
+use gnitz_expr::ColumnLocator;
 
 use std::path::Path;
 

@@ -4,8 +4,9 @@ use crate::runtime::sal::fixtures::TestLog;
 use crate::runtime::sal::DirectGroup;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::Counter;
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{encode_schema_block, Placement};
+use gnitz_zset::schema::encode_schema_block;
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {

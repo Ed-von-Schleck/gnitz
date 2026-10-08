@@ -14,7 +14,7 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 /// weight, sorted — the Z-set of an output whose key the test need not spell.
 /// The share of rows a worker owns by their whole PK.
 fn own_rows(schema: &SchemaDescriptor) -> std::rc::Rc<algebra::ScatterPlan> {
-    std::rc::Rc::new(algebra::ScatterPlan::native(gnitz_zset::schema::Placement::full_pk(
+    std::rc::Rc::new(algebra::ScatterPlan::native(gnitz_zset::algebra::Placement::full_pk(
         schema,
     )))
 }
@@ -409,7 +409,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
             id: TABLE,
             kind: RelationKind::BaseTable,
             schema,
-            placement: gnitz_zset::schema::Placement::full_pk(&schema),
+            placement: gnitz_zset::algebra::Placement::full_pk(&schema),
             pk_repeats: false,
         })
         .unwrap();

@@ -52,7 +52,7 @@ pub fn canonical(reply: &Reply) -> BTreeMap<RowKey, i64> {
 /// accepts the right rows in the wrong order.
 pub fn canonical_rows((schema, batch): &Reply) -> Vec<(RowKey, i64)> {
     (0..batch.weights.len())
-        .map(|row| (row_key(batch, schema.as_ref(), row), batch.weights[row]))
+        .map(|row| (row_key(batch, schema.as_ref().layout(), row), batch.weights[row]))
         .collect()
 }
 

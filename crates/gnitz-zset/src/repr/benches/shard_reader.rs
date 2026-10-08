@@ -226,7 +226,7 @@ fn shard_read_bench() {
                 for (pi, col) in schema.payload_columns() {
                     sink += match col.type_code.is_german_string() {
                         true => gnitz_wire::payload_bytes(&shard, black_box(row), pi).len(),
-                        false => shard.get_col_ptr(black_box(row), pi, col.size() as usize)[0] as usize,
+                        false => shard.get_col_ptr(black_box(row), pi, col.size())[0] as usize,
                     };
                 }
             }

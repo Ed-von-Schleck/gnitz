@@ -32,14 +32,17 @@ fn schema_a() -> Arc<Schema> {
 }
 
 fn schema_b() -> Arc<Schema> {
-    Arc::new(Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("s", TypeCode::String, false),
-            ColumnDef::new("f", TypeCode::F64, false),
-        ],
-        pk_cols: vec![0],
-    })
+    Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("s", TypeCode::String, false),
+                ColumnDef::new("f", TypeCode::F64, false),
+            ],
+            &[0],
+        )
+        .unwrap(),
+    )
 }
 
 /// `kv_rows` at weight 1, each `v` ten times its pk.
@@ -116,7 +119,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     let layouts: Vec<(u64, u64)> = items.iter().map(|i| (i.tid, i.reply_layout)).collect();
     assert_eq!(
         layouts,
-        [(1, sa.layout_digest()), (2, sb.layout_digest())],
+        [(1, sa.layout().layout_digest()), (2, sb.layout().layout_digest())],
         "each item names its reply layout"
     );
     peer.send(&reply_rows(1, &batch_a(&[10, 11]), 0, false));
@@ -432,7 +435,7 @@ fn delta_item(view: u64) -> txn_frame::DeltaPollItem<'static> {
     txn_frame::DeltaPollItem {
         view: view.into(),
         from: DeltaCursor::from_pair(1, 4),
-        reply_layout: schema_a().layout_digest(),
+        reply_layout: schema_a().layout().layout_digest(),
         spec: &[],
     }
 }

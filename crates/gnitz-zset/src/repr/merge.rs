@@ -20,7 +20,7 @@ use super::scatter::DecodedColumns;
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
-use crate::schema::payload_order::{compare_full_rows, with_payload_cmp, PayloadOrder};
+use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::BatchView;
 use gnitz_wire::read_u64_le;
@@ -114,7 +114,7 @@ pub(crate) fn mem_batch_to_unified<'a>(
     for (pi, col) in schema.payload_columns() {
         cols.push(ColPtr {
             base: unsafe { data_ptr.add(mb.region_start(REG_PAYLOAD_START + pi)) },
-            stride: col.size() as usize,
+            stride: col.size(),
         });
     }
     UnifiedSource {
@@ -1024,19 +1024,23 @@ pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
     if batch.count == 0 {
         return true;
     }
+    with_payload_cmp!(batch.schema(), ascending_with, batch) && !batch.has_ghost()
+}
+
+/// Whether `batch`, of at least one row, is strictly (PK, payload)-ascending.
+fn ascending_with<P: PayloadOrder>(batch: &Batch, payload: P) -> bool {
     let schema = batch.schema();
     let stride = schema.pk_stride();
-    let ascending = pk_width_dispatch!(stride, |K| {
+    pk_width_dispatch!(stride, |K| {
         let mut keys = batch.pk_data().chunks_exact(stride).map(K::from_opk);
         let mut prev = keys.next().expect("a batch of at least one row");
         keys.zip(1..).all(|(key, i)| {
             // The payload order is read only where two rows share a PK.
-            let below = Ord::cmp(&prev, &key).then_with(|| compare_full_rows(schema, batch, i - 1, batch, i));
+            let below = Ord::cmp(&prev, &key).then_with(|| payload.compare(schema, batch, i - 1, batch, i));
             prev = key;
             below.is_lt()
         })
-    });
-    ascending && !batch.has_ghost()
+    })
 }
 
 /// One argsort element: a row's PK sort key and its index.
@@ -1068,8 +1072,22 @@ impl<K: Copy + Eq> ArgEntry for SortEntry<K> {
 /// A 17..=[`PACKED_MAX_STRIDE`]-byte PK's `[u128; 2]` key with the row index in
 /// its low four bytes, which the left-aligned key leaves zero: ordered by one
 /// plain compare.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct PackedEntry([u128; 2]);
+
+impl Ord for PackedEntry {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.0[0], self.0[1]).cmp(&(other.0[0], other.0[1]))
+    }
+}
+
+impl PartialOrd for PackedEntry {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 const PACKED_MAX_STRIDE: usize = size_of::<PackedEntry>() - size_of::<u32>();
 

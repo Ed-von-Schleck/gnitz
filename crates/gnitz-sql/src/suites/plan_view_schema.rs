@@ -15,12 +15,12 @@ fn sh(cols: &[(&str, bool, bool)]) -> Shape {
 
 /// The final view's PK column set.
 fn pk(chain: &PlannedChain) -> Vec<u32> {
-    final_view(chain).schema.pk_cols.clone()
+    final_view(chain).schema.pk_cols().to_vec()
 }
 
 /// The final view's output type codes.
 fn types(chain: &PlannedChain) -> Vec<TypeCode> {
-    final_view(chain).schema.columns.iter().map(|c| c.ty.tc).collect()
+    final_view(chain).schema.columns().iter().map(|c| c.ty.tc).collect()
 }
 
 // ── linear projection ────────────────────────────────────────────────────────
@@ -767,7 +767,7 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
     ];
     for &(body, name, tc, nullable) in rows {
         let chain = view(&cat, body);
-        let cols = &final_view(&chain).schema.columns;
+        let cols = &final_view(&chain).schema.columns();
         let c = cols
             .iter()
             .find(|c| c.name == name)
@@ -970,7 +970,7 @@ fn a_chain_segment_keeps_only_its_live_columns() {
     assert_eq!(view_count(&chain), 2);
     let seg: Vec<&str> = chain.bundle.segments[0]
         .schema
-        .columns
+        .columns()
         .iter()
         .map(|c| c.name.as_str())
         .collect();
@@ -1012,7 +1012,7 @@ fn a_collision_segment_keeps_only_its_live_columns() {
     assert_eq!(view_count(&chain), 2);
     let wrapper: Vec<&str> = chain.bundle.segments[0]
         .schema
-        .columns
+        .columns()
         .iter()
         .map(|c| c.name.as_str())
         .collect();

@@ -1,7 +1,5 @@
 //! `TopNPlan` — everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
-
-use crate::schema::ColumnTable;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::OrderKey;
 

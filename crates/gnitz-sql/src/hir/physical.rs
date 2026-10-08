@@ -9,7 +9,6 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::project::{leading_schema, ProjItem};
 use gnitz_core::{RelDescriptor, Schema};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::ColumnDef;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,7 +72,7 @@ impl Frame {
     /// order.
     pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
         let group: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
-        let lead = self.schema.pk_cols.get(..group.len());
+        let lead = self.schema.pk_cols().get(..group.len());
         Ok(match lead {
             Some(lead) if lead.iter().all(|p| group.contains(p)) => lead.to_vec(),
             _ => group,
@@ -100,7 +99,7 @@ impl Frame {
         root: impl IntoIterator<Item = ColId>,
     ) -> Result<(Schema, Vec<u32>), GnitzSqlError> {
         let internal = |m: &str| GnitzSqlError::Internal(format!("output order: {m}"));
-        let is_pk = |s: usize| self.schema.is_pk_col(s);
+        let is_pk = |s: usize| self.schema.layout().is_pk_col(s);
         let mut rooted = vec![false; self.layout.len()];
         let mut named = Vec::new();
         for id in root {
@@ -128,11 +127,9 @@ impl Frame {
         for (to, &from) in order.iter().enumerate() {
             moved_to[from] = to as u32;
         }
-        let schema = Schema::from_parts(
-            order.iter().map(|&s| self.schema.columns[s].clone()).collect(),
-            self.schema.pk_cols.iter().map(|&s| moved_to[s as usize]).collect(),
-        )
-        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
+        let pk: Vec<u32> = self.schema.pk_cols().iter().map(|&s| moved_to[s as usize]).collect();
+        let schema = Schema::from_parts(order.iter().map(|&s| self.schema.columns()[s].clone()).collect(), &pk)
+            .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
         Ok((schema, moved_to))
     }
 
@@ -140,19 +137,15 @@ impl Frame {
     /// identity.
     pub(crate) fn renamed(&self, rename: &Rename) -> Result<Frame, GnitzSqlError> {
         let mut layout = vec![None; self.layout.len()];
-        let mut columns = self.schema.columns.clone();
+        let mut columns = self.schema.columns().to_vec();
         for (src, out) in &rename.0 {
             let slot = self.slot(*src)?;
             layout[slot] = Some(out.id);
             columns[slot] = out.def.clone();
         }
-        Ok(Frame {
-            layout,
-            schema: Arc::new(Schema {
-                columns,
-                pk_cols: self.schema.pk_cols.clone(),
-            }),
-        })
+        let schema = Schema::from_parts(columns, self.schema.pk_cols())
+            .map_err(|e| GnitzSqlError::Internal(format!("renamed schema: {e}")))?;
+        Ok(Frame { layout, schema: Arc::new(schema) })
     }
 }
 
@@ -203,21 +196,21 @@ pub(crate) fn physicalize_projection(
     input: &Frame,
 ) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
     let (proj, cols) = project_slots(items, input)?;
-    Ok((proj, Frame::new(cols, input.schema.pk_cols.len())?))
+    Ok((proj, Frame::new(cols, input.schema.pk_cols().len())?))
 }
 
 /// Pin the source PK to slots `0..k` in PK-list order, as the engine's
 /// `project_schema` does: each PK column's first pass-through moves there, and
 /// one nothing passes through is prepended hidden.
 fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source: &Schema) {
-    for (target, &pk) in source.pk_cols.iter().enumerate() {
+    for (target, &pk) in source.pk_cols().iter().enumerate() {
         let pk = pk as usize;
         let slot = match slots.iter().position(|(item, ..)| item.passthrough_src() == Some(pk)) {
             Some(pos) => slots.remove(pos),
             None => (
                 ProjItem::PassThrough { src_col: pk },
                 None,
-                source.columns[pk].clone().hidden(),
+                source.columns()[pk].clone().hidden(),
             ),
         };
         slots.insert(target, slot);

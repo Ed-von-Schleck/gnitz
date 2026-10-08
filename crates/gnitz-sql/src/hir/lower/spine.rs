@@ -66,7 +66,7 @@ impl SourceOrigin {
         // An auto-prepended PK column carries no id to look up.
         let by_pk = frame
             .schema
-            .pk_cols
+            .pk_cols()
             .iter()
             .position(|&c| c as usize == slot)
             .and_then(|j| self.pk.get(j))
@@ -185,7 +185,7 @@ impl Spine<'_> {
         SourceOrigin {
             src: self.seg.src.clone(),
             cols,
-            pk: self.seg.frame.schema.pk_cols.clone(),
+            pk: self.seg.frame.schema.pk_cols().to_vec(),
         }
     }
 
@@ -253,7 +253,7 @@ fn source(
                 // full scan, which it cannot do for a PK range.
                 .min_by_key(|b| match b {
                     ReadBound::PkSet(_) => 0,
-                    ReadBound::Range(r) if !r.walks_pk(&frame.schema.pk_cols) => 1,
+                    ReadBound::Range(r) if !r.walks_pk(frame.schema.pk_cols()) => 1,
                     _ => 2,
                 })
                 .unwrap_or(ReadBound::None)

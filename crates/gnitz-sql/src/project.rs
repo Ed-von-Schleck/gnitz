@@ -43,8 +43,8 @@ impl ProjItem {
 /// `columns` behind a leading key region of `npk`, admitted as a schema the engine
 /// can hold.
 pub(crate) fn leading_schema(columns: Vec<ColumnDef>, npk: usize) -> Result<Schema, GnitzSqlError> {
-    Schema::from_parts(columns, (0..npk as u32).collect())
-        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
+    let pk: Vec<u32> = (0..npk as u32).collect();
+    Schema::from_parts(columns, &pk).map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
 }
 
 /// The payload program of a physicalized projection, whose first `k` items copy
@@ -54,13 +54,13 @@ pub(crate) fn payload_program(
     out: &Schema,
     input: &Schema,
 ) -> Result<LogicalProgram, GnitzSqlError> {
-    let k = input.pk_cols.len();
-    debug_assert_eq!(out.pk_cols.len(), k, "a projection keeps its input's key");
+    let k = input.pk_cols().len();
+    debug_assert_eq!(out.pk_cols().len(), k, "a projection keeps its input's key");
     debug_assert!(
-        (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols[i] as usize)),
+        (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols()[i] as usize)),
         "a physicalized projection copies its input's PK in front"
     );
-    projection_program(&items[k..], &out.columns[k..], input)
+    projection_program(&items[k..], &out.columns()[k..], input)
 }
 
 /// A compiled payload program paired with the `(type_code, nullable)` declaration of `out`'s
@@ -95,7 +95,7 @@ pub(crate) fn projection_program(
             match item {
                 ProjItem::PassThrough { src_col } => Ok(Sink::Col(*src_col as u32)),
                 ProjItem::Computed { bound_expr } => {
-                    let mut reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
+                    let mut reg = compile_bound_expr(bound_expr, schema.columns(), &mut eb)?;
                     // A slot narrower than the register takes a value range-checked
                     // into the slot's declared type; a BOOLEAN slot stores the
                     // register's truth, which needs no check.
@@ -124,5 +124,5 @@ pub(crate) fn reply_program(
         .unzip();
     let program = projection_program(&items, &cols, source)?;
     let columns = source.hidden_key_columns().chain(cols).collect();
-    Ok((leading_schema(columns, source.pk_cols.len())?, program))
+    Ok((leading_schema(columns, source.pk_cols().len())?, program))
 }

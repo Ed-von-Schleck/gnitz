@@ -15,7 +15,7 @@ fn frame() -> (Frame, Vec<ColId>) {
 }
 
 fn names(s: &Schema) -> Vec<&str> {
-    s.columns.iter().map(|c| c.name.as_str()).collect()
+    s.columns().iter().map(|c| c.name.as_str()).collect()
 }
 
 /// The root's numbering is a label over the frame's regions: the key column
@@ -37,8 +37,8 @@ fn a_root_renumbers_a_frame_without_moving_a_payload_column() {
         (vec![d, a], ["b", "c", "d", "a"], 3),
     ] {
         let s = f.schema_in_order(root.iter().copied()).unwrap().0;
-        assert_eq!((names(&s), &s.pk_cols[..]), (want.to_vec(), &[key][..]), "{root:?}");
-        assert!(s.same_region_types(f.schema.as_ref()), "{root:?}");
+        assert_eq!((names(&s), s.pk_cols()), (want.to_vec(), &[key][..]), "{root:?}");
+        assert!(s.layout().same_region_types(f.schema.as_ref().layout()), "{root:?}");
     }
 }
 

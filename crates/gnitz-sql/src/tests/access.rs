@@ -46,8 +46,11 @@ fn rng(cols: &[u32], eq: &[u128], lo: u128, hi: u128) -> ReadBound {
 
 /// The key set of `keys`, each the PK columns' native values in PK-list order.
 fn keys(schema: &Schema, keys: &[&[u128]]) -> ReadBound {
-    let bufs: Vec<PkBuf> = keys.iter().map(|k| schema.opk_key_cols(k)).collect();
-    ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), bufs.iter().map(|b| b.pk_bytes())))
+    let bufs: Vec<PkBuf> = keys.iter().map(|k| schema.layout().opk_key_cols(k)).collect();
+    ReadBound::PkSet(PkKeys::from_keys(
+        schema.layout().pk_stride(),
+        bufs.iter().map(|b| b.pk_bytes()),
+    ))
 }
 
 /// `(id U64 pk, a tc, b tc)`, `b` nullable per the flag.

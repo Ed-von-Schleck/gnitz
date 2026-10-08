@@ -58,7 +58,7 @@ fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
 /// region would else, since both cost a decode a frame does not.
 fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) -> Option<(Encoding, Vec<u8>)> {
     let n = nulls.len() / FIXED_REGION_BYTES;
-    let width = col.size() as usize;
+    let width = col.size();
     let framed = col.fixed_int().and_then(|fi| framed(src, fi));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
     let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
@@ -256,7 +256,7 @@ impl Batch {
                 let (encoding, image) = pack_string_column(src.as_chunks::<16>().0, mb.blob, &mut heap);
                 (encoding, Cow::Owned(image))
             } else {
-                encode_region(src, col.size() as usize, || pack_fixed_column(col, pi, src, nulls))
+                encode_region(src, col.size(), || pack_fixed_column(col, pi, src, nulls))
             });
         }
         images.push((Encoding::Raw, Cow::Owned(heap)));

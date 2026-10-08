@@ -9,7 +9,7 @@ use super::merge::MemBatch;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, TypeCode};
 
@@ -314,7 +314,7 @@ impl Batch {
 pub(super) fn first_valued_null_cell(mb: &MemBatch<'_>) -> Option<(usize, usize)> {
     let schema = mb.schema;
     let col = |pi| {
-        let width = schema.columns[schema.payload_col_idx(pi)].size() as usize;
+        let width = schema.columns()[schema.payload_col_idx(pi)].size();
         (mb.col_data(pi, width), width)
     };
     gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)

@@ -196,7 +196,7 @@ fn a_wide_key_groups_by_its_bytes() {
         vec![0, 1, 2],
     );
     let mut f = plan("SELECT a, b, c, COUNT(*), MAX(x) FROM t GROUP BY a, b, c", &c);
-    assert_eq!(f.partial_schema.pk_stride(), 20);
+    assert_eq!(f.partial_schema.layout().pk_stride(), 20);
     let got = f.finish(reply(
         &f,
         &[

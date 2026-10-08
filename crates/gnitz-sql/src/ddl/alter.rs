@@ -103,7 +103,7 @@ pub(crate) async fn execute_alter_table(
         require_class(&rel, &source_name, ClassWant::BaseTable, ctx)?;
     }
 
-    let cols = &rel.schema.columns;
+    let cols = rel.schema.columns();
     match action {
         Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name).await?,
         Action::RenameColumn { old, new } => {

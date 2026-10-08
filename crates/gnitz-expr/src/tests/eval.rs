@@ -1,6 +1,7 @@
 //! The evaluator types' read-backs, and the 3VL / bit_only / AND-chain behaviour
 //! visible through them.
 
+use crate::SchemaColumn;
 use crate::{ConstIdx, Reg, Sink};
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -8,9 +9,10 @@ use crate::batch::{encode_f64, MORSEL};
 use crate::eval::Resolved;
 use crate::test_support::{
     filter_prog, is_not_null_op, is_null_op, make_n_col_view, map_prog, passing_ranges, passing_rows, row_values, runs,
-    scalar_prog, schema_pk_ints, TestSchema, TestView,
+    scalar_prog, schema_pk_ints, TestView,
 };
-use crate::{CmpOp, IntArithOp, LogicalInstr, SchemaFacts};
+use crate::SchemaDescriptor;
+use crate::{CmpOp, IntArithOp, LogicalInstr};
 use gnitz_wire::{payload_bytes, payload_u64, RowSource};
 
 /// A map writes each computed slot from `dst_start` on — zeroing a NULL result's
@@ -18,18 +20,22 @@ use gnitz_wire::{payload_bytes, payload_u64, RowSource};
 /// stores 1 for any non-zero register value.
 #[test]
 fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
-    let in_schema = TestSchema::new(
-        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::String, true)],
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::String, true),
+        ],
         &[0],
     );
-    let out_schema = TestSchema::new(
+    let out_schema = SchemaDescriptor::new(
         &[
-            (TypeCode::U64, false),
-            (TypeCode::I64, true),
-            (TypeCode::I16, true),
-            (TypeCode::String, true),
-            (TypeCode::I64, true),
-            (TypeCode::Bool, true),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I16, true),
+            SchemaColumn::new(TypeCode::String, true),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::Bool, true),
         ],
         &[0],
     );
@@ -417,15 +423,15 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
 /// column's null bit is never read, and each nullable one's is read at its slot.
 #[test]
 fn nullable_and_not_null_columns_side_by_side() {
-    let schema = TestSchema::new(
+    let schema = SchemaDescriptor::new(
         &[
-            (TypeCode::U64, false),    // 0: pk
-            (TypeCode::I64, true),     // 1: payload slot 0
-            (TypeCode::I64, false),    // 2: payload slot 1
-            (TypeCode::String, true),  // 3: payload slot 2
-            (TypeCode::String, false), // 4: payload slot 3
-            (TypeCode::F32, true),     // 5: payload slot 4
-            (TypeCode::F32, false),    // 6: payload slot 5
+            SchemaColumn::new(TypeCode::U64, false),    // 0: pk
+            SchemaColumn::new(TypeCode::I64, true),     // 1: payload slot 0
+            SchemaColumn::new(TypeCode::I64, false),    // 2: payload slot 1
+            SchemaColumn::new(TypeCode::String, true),  // 3: payload slot 2
+            SchemaColumn::new(TypeCode::String, false), // 4: payload slot 3
+            SchemaColumn::new(TypeCode::F32, true),     // 5: payload slot 4
+            SchemaColumn::new(TypeCode::F32, false),    // 6: payload slot 5
         ],
         &[0],
     );
@@ -499,8 +505,12 @@ fn nullable_and_not_null_columns_side_by_side() {
 /// U64.
 #[test]
 fn int_results_widen_by_the_result_registers_signedness() {
-    let schema = TestSchema::new(
-        &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::I64, true)],
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, true),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
         &[0],
     );
     // Bit 63 set, so an unsigned and a signed reading differ.

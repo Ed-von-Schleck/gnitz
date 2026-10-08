@@ -5,8 +5,6 @@
 //! `KeyRange`'s cut pair denotes, and compose a multi-column key span
 //! ([`KeySpec`]). The per-column codec is `gnitz_wire::pk`'s, shared with the
 //! client.
-
-use crate::schema::ColumnTable;
 use std::cmp::Ordering;
 
 use gnitz_wire::RowSource;
@@ -14,25 +12,7 @@ use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 
 use gnitz_wire::{PkBuf, PkListRole};
 
-use crate::schema::{
-    ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_COLUMNS,
-};
-
-/// Raw byte comparator for PK regions.
-///
-/// Unsigned byte order over OPK regions, which is the typed PK order at any width.
-///
-/// This and [`compare_pk_ordering`] return the same `Ordering` for equal-width
-/// inputs. The rule between them: this one is **total** — it accepts operands of
-/// differing width and orders them lexicographically — while
-/// `compare_pk_ordering` requires equal widths and settles everything up to 16
-/// bytes on the packed `u128` image instead. Reach for that one wherever the two
-/// operands are one relation's rows (a merge, a group fold, a probe); reach for
-/// this one where a width may differ or the operand is untrusted.
-#[inline(always)]
-pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
-    a.cmp(b)
-}
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
 
 /// Sort `idx` into the order of `flat`'s `stride`-byte records, which stay in
 /// place. A record of at most 16 bytes is sorted by its [`PkSortKey`] image.
@@ -53,26 +33,25 @@ pub fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
             idx.sort_unstable_by(|&a, &b| {
                 let a = a as usize * stride;
                 let b = b as usize * stride;
-                compare_pk_bytes(&flat[a..a + stride], &flat[b..b + stride])
+                flat[a..a + stride].cmp(&flat[b..b + stride])
             });
         }
     }
 }
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
-/// comparator the N-way merge and the read-cursor loser tree read through their
-/// sources. Returns the same `Ordering` as [`compare_pk_bytes`] at every width,
-/// settling the common case on the leading-16 `pack_pk_be` image. For `len ≤ 16`
-/// that image is the *whole* PK and is injective, so a `pack_pk_be` tie is
-/// already a byte-equal PK — the byte
-/// compare is skipped (it would be a guaranteed-`Equal` `memcmp`). Only `len > 16`
-/// can tie on the 16-byte prefix while differing later, so the full-byte
-/// `compare_pk_bytes` tiebreak runs only there. No stride / width-class dispatch.
+/// comparator the read-cursor loser tree reads through its sources. Slice order
+/// at every width, settled on the leading-16 `pack_pk_be` image where that
+/// decides: for `len ≤ 16` the image is the *whole* PK and is injective, so a
+/// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
+/// differing later, and the slice compare runs only there.
+///
+/// Equal-width operands use this or [`pk_bytes_eq`]; anything else is slice order.
 #[inline(always)]
 pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
     match pack_pk_be(a).cmp(&pack_pk_be(b)) {
-        Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => compare_pk_bytes(a, b),
+        Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
         ord => ord,
     }
 }
@@ -87,13 +66,10 @@ pub fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     compare_pk_ordering(a, b) == Ordering::Equal
 }
 
-/// `min <= key <= max` over OPK bytes. The exact-match probes gate on this
-/// before searching, so a key outside a block's bounds costs two `memcmp`s
-/// instead of a `log n` walk over cold cache lines. The cursor's lower-bound
-/// seeks do not: they need a landing position on a miss, not a verdict.
+/// `min <= key <= max` over OPK bytes.
 #[inline]
 pub fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
-    compare_pk_bytes(min, key) != Ordering::Greater && compare_pk_bytes(key, max) != Ordering::Greater
+    min <= key && key <= max
 }
 
 /// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
@@ -102,7 +78,7 @@ pub fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
 /// the safe direction.
 #[inline]
 pub fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
-    compare_pk_bytes(max, lo) != Ordering::Less && compare_pk_bytes(min, hi) != Ordering::Greater
+    max >= lo && min <= hi
 }
 
 // ---------------------------------------------------------------------------
@@ -111,18 +87,17 @@ pub fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
 
 /// BE sort-key packer over an OPK region. Left-aligns the bytes at the MSB end
 /// of a `u128` and reads big-endian, so `pack_pk_be(a).cmp(&pack_pk_be(b))`
-/// equals the lexicographic byte order of the OPK regions — exactly
-/// `compare_pk_bytes`. Narrow (`len ≤ 16`) = the exact key; wide (`len > 16`) =
-/// the order-preserving leading-16 prefix (authoritative whenever two prefixes
-/// differ; a prefix collision needs a `compare_pk_bytes` tiebreak).
+/// equals the lexicographic byte order of the OPK regions. Narrow (`len ≤ 16`) =
+/// the exact key; wide (`len > 16`) = the order-preserving leading-16 prefix
+/// (authoritative whenever two prefixes differ; a prefix collision needs a
+/// slice-order tiebreak).
 ///
 /// The `{2, 4, 8, ≥16}` arms load the dominant scalar and `U128`/wide-prefix
 /// widths straight into a register, value-equal to the pad-and-copy (a narrow
 /// value occupies the high bits, the low bits zero; `≥16` reads the
-/// order-preserving leading 16 bytes) — pinned at every width by
-/// `opk_byte_primitives_agree_with_memcmp_at_every_width`. The
-/// remaining arms compose the same fixed-width loads: none copies through a
-/// runtime length, which would be an out-of-line `memcpy` per key.
+/// order-preserving leading 16 bytes). The remaining arms compose the same
+/// fixed-width loads: none copies through a runtime length, which would be an
+/// out-of-line `memcpy` per key.
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Opposite alignment from `gnitz_wire::widen_pk_be`
@@ -164,50 +139,8 @@ pub fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
-/// The leading eight OPK bytes as a `u64`, right-zero-padded for a narrower key.
-/// A value accessor, where [`pack_pk_be`] is deliberately not one.
-#[inline(always)]
-pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
-    if pk_bytes.len() >= 8 {
-        u64::from_be_bytes(pk_bytes[..8].try_into().unwrap())
-    } else {
-        // `pack_pk_be` left-aligns a narrow key with register loads at 2 and 4.
-        (pack_pk_be(pk_bytes) >> 64) as u64
-    }
-}
-
-/// The `stride`-byte OPK region of a narrow key, from its `u128` image: the
-/// inverse of `gnitz_wire::widen_pk_be`.
-pub(crate) struct NarrowPkOpk {
-    be: [u8; 16],
-    stride: usize,
-}
-
-impl NarrowPkOpk {
-    #[inline(always)]
-    pub(crate) fn new(image: u128, stride: usize) -> Self {
-        // Static message: `#[inline(always)]` puts this in every per-row caller,
-        // and an `Arguments` value costs a stack slot even on a cold panic path.
-        assert!(
-            stride <= NARROW_PK_MAX_BYTES,
-            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES"
-        );
-        debug_assert!(
-            stride == 16 || (image >> (stride * 8)) == 0,
-            "narrow PK image {image} does not fit {stride} bytes",
-        );
-        NarrowPkOpk { be: image.to_be_bytes(), stride }
-    }
-
-    /// The `stride` order-preserving bytes — a full PK region for one row.
-    #[inline(always)]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.be[16 - self.stride..]
-    }
-}
-
-/// A whole-PK sort key ordered exactly as `compare_pk_bytes` orders the bytes it
-/// was built from, so a key sort needs no PK-byte tiebreak. Keys compare only
+/// A whole-PK sort key in the slice order of the bytes it was built from, so a
+/// key sort needs no PK-byte tiebreak. Keys compare only
 /// against keys built from the same number of bytes.
 pub(crate) trait PkSortKey<'a>: Ord + Copy {
     fn from_opk(opk: &'a [u8]) -> Self;
@@ -242,7 +175,12 @@ pub(crate) use pk_width_dispatch;
 impl PkSortKey<'_> for u64 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u64 {
-        leading_u64(opk)
+        if opk.len() >= 8 {
+            u64::from_be_bytes(opk[..8].try_into().unwrap())
+        } else {
+            // `pack_pk_be` left-aligns a narrow key with register loads at 2 and 4.
+            (pack_pk_be(opk) >> 64) as u64
+        }
     }
 }
 
@@ -288,8 +226,8 @@ pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
 
-/// A key span: columns at their own types, packed tightly in order. Built once
-/// per circuit, `Copy`, so the row paths allocate nothing.
+/// A key span: columns at their own types, packed tightly in order. `Copy`, so
+/// the row paths allocate nothing.
 #[derive(Clone, Copy)]
 pub struct KeySpec {
     n: u8,
@@ -332,7 +270,7 @@ impl KeySpec {
     /// `cols` then `owner`'s PK, passes the PK arity limit.
     pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
         gnitz_wire::validate_pk_tuple(cols, owner.num_columns(), MAX_PK_COLUMNS - owner.pk_cols().len(), |c| {
-            (owner.columns[c as usize].type_code, false)
+            (owner.columns()[c as usize].type_code, false)
         })
         .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
         Ok(Self::over(cols.iter().map(|&c| owner.locate(c as usize))))
@@ -340,7 +278,7 @@ impl KeySpec {
 
     /// The index schema this spec's entries land in: the key columns, then
     /// `source`'s PK columns, all in the PK.
-    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
+    pub fn index_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
         let mut b = self.key_columns();
         b.push_pk_of(source);
         b.finish().expect("KeySpec::new bounds the index schema")
@@ -363,7 +301,7 @@ impl KeySpec {
 
     /// A base table's own PK as the degenerate span, so a PK range walk reads
     /// through [`Self::range_keys`] as an index walk does.
-    pub(crate) fn for_pk(schema: &SchemaDescriptor) -> Self {
+    pub fn for_pk(schema: &SchemaDescriptor) -> Self {
         Self::over(schema.pk_columns().map(|(ci, _)| schema.locate(ci)))
     }
 
@@ -535,14 +473,6 @@ pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: us
         None => PkBuf::max(start.pk_bytes().len()),
     };
     start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
-}
-
-impl SchemaDescriptor {
-    /// The OPK key band `r` names over this schema's whole PK list; `None` when it
-    /// names no key.
-    pub fn pk_range_keys(&self, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-        KeySpec::for_pk(self).range_keys(self.pk_stride(), r)
-    }
 }
 
 #[cfg(test)]

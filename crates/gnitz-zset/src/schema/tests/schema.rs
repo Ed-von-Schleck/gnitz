@@ -1,6 +1,7 @@
 use super::*;
-use crate::test_support::Rng;
-use crate::test_support::{opk_pk, pk_only_schema, random_schema};
+use crate::test_support::{random_schema, Rng};
+use gnitz_wire::schema_block::SchemaBlockCol;
+use gnitz_wire::ColType;
 
 fn col(tc: TypeCode) -> SchemaColumn {
     SchemaColumn::new(tc, false)
@@ -9,37 +10,22 @@ fn col(tc: TypeCode) -> SchemaColumn {
 // ── Layout ───────────────────────────────────────────────────────────────
 
 /// Over random schemas — any column types and nullability, the PK anywhere and
-/// in any order — every layout fact the descriptor caches at construction is
-/// the one `SchemaFacts` derives from its columns, and the schema record
-/// round-trips it.
+/// in any order — the regions lie back to back at their columns' widths, an
+/// arena of eight rows or more starts each one 8-aligned, and the schema record
+/// round-trips the descriptor.
 #[test]
-fn cached_layout_matches_the_derivation() {
+fn regions_follow_the_columns_and_the_record_round_trips() {
     let mut rng = Rng::new(0x005C_4E3A);
     for _ in 0..2000 {
         let s = random_schema(&mut rng, TypeCode::ALL, true);
-        assert_eq!(s.pk_stride(), SchemaFacts::pk_stride(&s), "{s:?}");
-        assert_eq!(s.num_payload_cols(), SchemaFacts::num_payload_cols(&s), "{s:?}");
         for (pi, c) in s.payload_columns() {
-            let ci = SchemaFacts::payload_col_idx(&s, pi);
-            assert_eq!(s.payload_col_idx(pi), ci, "{s:?}");
-            assert!(*c == s.columns[ci], "{s:?}: payload slot {pi}");
+            assert!(*c == s.columns()[s.payload_col_idx(pi)], "{s:?}: payload slot {pi}");
         }
         assert!(s.pk_columns().map(|(ci, _)| ci as u32).eq(s.pk_cols().iter().copied()));
         assert_eq!(s.has_german_string(), s.string_payload_slots() != 0, "{s:?}");
-        assert_eq!(s.string_payload_slots(), SchemaFacts::string_payload_slots(&s), "{s:?}");
-        assert_eq!(
-            s.nullable_payload_slots(),
-            SchemaFacts::nullable_payload_slots(&s),
-            "{s:?}"
-        );
-        assert_eq!(
-            s.not_null_payload_slots(),
-            SchemaFacts::not_null_payload_slots(&s),
-            "{s:?}"
-        );
         let widths = [s.pk_stride(), 8, 8]
             .into_iter()
-            .chain(s.payload_columns().map(|(_, c)| c.size() as usize));
+            .chain(s.payload_columns().map(|(_, c)| c.size()));
         for (r, width) in widths.enumerate() {
             assert_eq!(s.region_stride(r), width, "{s:?}: region {r}");
         }
@@ -107,49 +93,7 @@ fn trailing_append_keeps_every_earlier_column() {
     }
 }
 
-// ── PK rendering and coverage ────────────────────────────────────────────
-
-/// `format_pk_bytes` decodes each column out of the OPK image at its own
-/// offset and width. The signed arms are what a native-LE read would get
-/// wrong (OPK flips the sign bit), and a compound PK wider than 16 bytes is
-/// what a `u128` key form could not carry at all.
-#[test]
-fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
-    for (tc, v, want) in [
-        (TypeCode::I8, -5i128, "-5"),
-        (TypeCode::I16, -300, "-300"),
-        (TypeCode::I32, -70_000, "-70000"),
-        (TypeCode::I64, i64::MIN as i128, "-9223372036854775808"),
-        (TypeCode::U8, 200, "200"),
-        (TypeCode::U64, u64::MAX as i128, "18446744073709551615"),
-        (
-            TypeCode::U128,
-            u128::MAX as i128,
-            "340282366920938463463374607431768211455",
-        ),
-        (TypeCode::I128, -1, "-1"),
-        (TypeCode::I128, i128::MIN, "-170141183460469231731687303715884105728"),
-    ] {
-        let schema = pk_only_schema(&[tc]);
-        assert_eq!(
-            schema.format_pk_bytes(&opk_pk(&schema, &[v as u128])),
-            want,
-            "type {tc}"
-        );
-    }
-
-    let uuid = pk_only_schema(&[TypeCode::UUID]);
-    let v = 0x550e8400_e29b_41d4_a716_446655440000u128;
-    assert_eq!(
-        uuid.format_pk_bytes(&opk_pk(&uuid, &[v])),
-        "550e8400-e29b-41d4-a716-446655440000",
-        "a UUID renders from all 128 bits, not a truncated low word",
-    );
-
-    // 24-byte compound PK: every column read at its own offset.
-    let wide = pk_only_schema(&[TypeCode::U64; 3]);
-    assert_eq!(wide.format_pk_bytes(&opk_pk(&wide, &[7, 8, 9])), "7, 8, 9");
-}
+// ── PK coverage ──────────────────────────────────────────────────────────
 
 /// `covers_pk` asks containment, not equality: any order, and any extra column.
 #[test]

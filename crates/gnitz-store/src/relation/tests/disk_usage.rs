@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{relation_dir, ChildKind};
 use crate::storage::flush_barrier;
 use crate::test_support::{make_batch, make_schema_u64_i64, scratch_table};
-use gnitz_zset::schema::Slot;
+use gnitz_zset::algebra::Slot;
 
 /// `(files, rows, bytes)` of relation `id`'s store `store` across its levels.
 fn store(usage: &DiskUsage, id: u64, store: &str) -> (u64, u64, u64) {

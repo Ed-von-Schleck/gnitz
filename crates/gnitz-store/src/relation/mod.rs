@@ -7,13 +7,13 @@ use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
+use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
-use gnitz_zset::schema::{Placement, Slot};
 
 mod build;
 mod circuit_state;
@@ -508,7 +508,8 @@ impl RelationRegistry {
             ix.claims.push(claim);
             return Ok(());
         }
-        let (key_spec, index_schema) = index_spec_and_schema(cols.as_slice(), &owner_schema)?;
+        let key_spec = KeySpec::new(cols.as_slice(), &owner_schema)?;
+        let index_schema = key_spec.index_schema(&owner_schema);
         let mut ix = SecondaryIndex {
             cols,
             store: Store::Absent(Box::new(index_schema)),

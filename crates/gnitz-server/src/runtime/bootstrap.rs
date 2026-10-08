@@ -25,7 +25,7 @@ use crate::runtime::tls::TlsConfig;
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Residency, StoreConfig};
-use gnitz_zset::schema::Slot;
+use gnitz_zset::algebra::Slot;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`

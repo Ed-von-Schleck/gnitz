@@ -17,7 +17,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName, ScanReply, Schema, ZSetBatch};
-use gnitz_expr::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{FixedInt, TypeCode, WireFault, WireStatus};
@@ -171,7 +170,7 @@ impl Db {
                     .cols
                     .as_slice()
                     .iter()
-                    .map(|&c| rel.schema.columns[c as usize].name.clone())
+                    .map(|&c| rel.schema.columns()[c as usize].name.clone())
                     .collect();
                 (cols, ix.is_unique)
             })
@@ -197,11 +196,11 @@ pub fn visible_names(s: &Schema) -> Vec<String> {
 
 /// Column `ci` of `row` as [`Db::rows`] reads it.
 pub fn cell(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
-    let loc = SchemaFacts::locate(schema, ci);
+    let loc = schema.layout().locate(ci);
     if loc.is_null(batch, row) {
         return NULL;
     }
-    let f = match schema.columns[ci].ty.tc {
+    let f = match schema.columns()[ci].ty.tc {
         TypeCode::F64 => f64::from_le_bytes(loc.bytes(batch, row).try_into().unwrap()),
         TypeCode::F32 => f32::from_le_bytes(loc.bytes(batch, row).try_into().unwrap()) as f64,
         tc => return loc.decode_i64(batch, row, FixedInt::from_type_code(tc).expect("an integer column")),

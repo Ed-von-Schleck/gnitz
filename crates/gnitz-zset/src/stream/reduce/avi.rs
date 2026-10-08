@@ -13,7 +13,7 @@ use crate::algebra::ReindexPacker;
 use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
 use crate::algebra::{Agg, AggValues};
 use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
-use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use gnitz_wire::payload_bytes;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
@@ -26,7 +26,7 @@ use std::ops::ControlFlow;
 const ORDINAL_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
 /// [`IMAGE_COL`] is the only payload column.
 const IMAGE_SLOT: usize = 0;
-const ORDINAL_BYTES: usize = ORDINAL_COL.size() as usize;
+const ORDINAL_BYTES: usize = ORDINAL_COL.size();
 // [`AviBake::prefix`] stores the ordinal as one bare byte.
 const _: () = assert!(ORDINAL_BYTES == 1);
 
@@ -78,7 +78,7 @@ impl AviBake {
             schema,
             key_packer,
             aggs,
-            value_bytes: suffix[1].size() as usize,
+            value_bytes: suffix[1].size(),
         }))
     }
 

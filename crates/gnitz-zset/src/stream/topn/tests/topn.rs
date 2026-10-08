@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, TestTrace, FLOATS, STRS};
 use gnitz_expr::{cmp_order_keys, order_locators};
 use gnitz_wire::{OrderKey, ReduceOutSlot};

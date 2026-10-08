@@ -7,10 +7,11 @@ use crate::test_support::{
     between, fed_view, img, make_batch_raw, make_schema_u64_i64, map_of, payload0_i64, relation_fixture,
     relation_fixture_with, RelationFixture, Rng, TID,
 };
-use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, SchemaFacts, Sink};
+use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{Cut, KeyRange, PkColList, PkKeys, ReadSink, TypeCode, ViewProps};
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_zset_testkit::{zset_of, RowKey};
 use std::collections::HashMap;
 

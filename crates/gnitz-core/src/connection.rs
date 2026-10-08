@@ -7,7 +7,6 @@
 //! a frame marked as one, arrives whole between two replies and is set aside
 //! for whoever holds the subscription it is of.
 
-use gnitz_expr::SchemaFacts;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -524,7 +523,7 @@ impl Session {
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<Sent<ScanReply>, ClientError> {
-        let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout_digest());
+        let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout().layout_digest());
         let (to, sent) = promise();
         let slot = Slot::Scan {
             tid: target.tid,
@@ -546,7 +545,7 @@ impl Session {
             .iter()
             .map(|(tid, schema)| txn_frame::ScanMultiItem {
                 tid: *tid,
-                reply_layout: schema.layout_digest(),
+                reply_layout: schema.layout().layout_digest(),
             })
             .collect();
         let (to, sent) = promise();
@@ -579,7 +578,7 @@ impl Session {
         let item = txn_frame::DeltaPollItem {
             view,
             from,
-            reply_layout: reply_schema.layout_digest(),
+            reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
         self.enqueue(txn_frame::encode_delta_poll(&[item], None), slot)?;
@@ -600,7 +599,7 @@ impl Session {
         let item = txn_frame::DeltaPollItem {
             view,
             from: Some(from),
-            reply_layout: reply_schema.layout_digest(),
+            reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
         let slot = Slot::DeltaPoll {

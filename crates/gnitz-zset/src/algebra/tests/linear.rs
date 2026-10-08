@@ -144,7 +144,7 @@ fn union_merges_nullability() {
         (nullable, nonnull, true),
     ] {
         let m = union_nullability_merge(&a, &b).expect("shared layout");
-        assert_eq!(m.columns[1].nullable, want_nullable);
+        assert_eq!(m.columns()[1].nullable, want_nullable);
     }
 }
 
@@ -196,7 +196,7 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     let narrow = make_schema_u64_i64();
     let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
     assert_eq!(out.num_columns(), narrow.num_columns() + 1);
-    assert!(out.columns[out.num_columns() - 1].nullable);
+    assert!(out.columns()[out.num_columns() - 1].nullable);
     // One column short of the limit, extended by two: the merged width
     // overflows, which a bound on the list length misses.
     let wide = {

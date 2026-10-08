@@ -41,7 +41,10 @@ pub(crate) fn create_read_cursor(
 pub(crate) fn rekey_plan(source: &SchemaDescriptor, key: &[u32], keep: &[u32]) -> crate::algebra::MapPlan {
     let rekey = gnitz_wire::MapKind::Reindex {
         keep: keep.to_vec(),
-        key: key.iter().map(|&c| (c, source.columns[c as usize].type_code)).collect(),
+        key: key
+            .iter()
+            .map(|&c| (c, source.columns()[c as usize].type_code))
+            .collect(),
         role: gnitz_wire::ReindexRole::Auxiliary,
         nulls: gnitz_wire::NullKeys::Drop,
     };

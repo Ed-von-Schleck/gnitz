@@ -188,9 +188,9 @@ fn fold_family_separates_every_stored_axis() {
 }
 
 /// Every PK list of up to 4 distinct indices, in every order, over 1..=6
-/// columns, against the naive "`pi`-th non-PK column".
+/// columns, against the naive "position among the non-PK columns".
 #[test]
-fn payload_col_idx_and_payload_slot_number_the_non_pk_columns() {
+fn payload_slot_numbers_the_non_pk_columns() {
     fn lists(n: u32, len: usize, cur: &mut Vec<u32>, out: &mut Vec<Vec<u32>>) {
         out.push(cur.clone());
         if cur.len() == len {
@@ -209,9 +209,6 @@ fn payload_col_idx_and_payload_slot_number_the_non_pk_columns() {
         lists(n, 4.min(n as usize), &mut Vec::new(), &mut all);
         for pk in &all {
             let payload: Vec<usize> = (0..n).filter(|c| !pk.contains(c)).map(|c| c as usize).collect();
-            for (pi, &ci) in payload.iter().enumerate() {
-                assert_eq!(payload_col_idx(pk, pi), ci, "n {n}, pk {pk:?}, pi {pi}");
-            }
             for ci in 0..n as usize {
                 let want = payload.iter().position(|&c| c == ci);
                 assert_eq!(payload_slot(pk, ci), want, "n {n}, pk {pk:?}, ci {ci}");

@@ -1019,7 +1019,6 @@ fn a_round_of_another_view_moves_no_cursor() {
 fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     use gnitz_wire::control::{append_frame, ControlHeader};
     use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
-    use gnitz_zset::schema::SchemaFacts;
     use std::io::{Read, Write};
 
     let mut fx = Fixture::start();
@@ -1033,7 +1032,7 @@ fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     let item = DeltaPollItem {
         view: gnitz_core::Target::from(&*desc),
         from,
-        reply_layout: desc.schema.layout_digest(),
+        reply_layout: desc.schema.layout().layout_digest(),
         spec: &whole,
     };
     let sync = |wait: Duration| {
@@ -1466,7 +1465,7 @@ fn seed_shapes(client: &mut GnitzClient) {
     ];
     block_on(client.create_table(
         &rel(SH, "blb"),
-        &Schema { columns: cols, pk_cols: vec![0] },
+        &Schema::from_parts(cols, &[0]).unwrap(),
         &[],
         gnitz_wire::TableProps::default(),
         &[],
@@ -1866,7 +1865,7 @@ fn a_recreated_view_is_followed_to_its_new_id() {
         );
         assert!(fx.mirror().mirrors(new));
         assert_eq!(
-            fx.local("SELECT * FROM v_keyed").0.columns.len(),
+            fx.local("SELECT * FROM v_keyed").0.columns().len(),
             cols.len(),
             "round {round}: the copy reads under the new column set",
         );

@@ -88,7 +88,9 @@ fn the_output_lays_out_the_key_then_both_payloads() {
             "{kind:?}: the delta's port"
         );
         assert_eq!(joined.pk_cols(), pk, "{kind:?}");
-        let got: Vec<TypeCode> = (0..joined.num_columns()).map(|c| joined.columns[c].type_code).collect();
+        let got: Vec<TypeCode> = (0..joined.num_columns())
+            .map(|c| joined.columns()[c].type_code)
+            .collect();
         assert_eq!(got, types, "{kind:?}");
     }
 }
@@ -647,7 +649,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
         // A delta on the same key: a payload of its own, keys present and absent.
         let delta_schema = SchemaDescriptor::new(
             &key.iter()
-                .map(|&c| source_schema.columns[c as usize])
+                .map(|&c| source_schema.columns()[c as usize])
                 .chain([SchemaColumn::new(TypeCode::I64, false)])
                 .collect::<Vec<_>>(),
             &(0..key.len() as u32).collect::<Vec<_>>(),
@@ -693,7 +695,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
 #[test]
 fn over_source_refuses_a_trace_its_source_does_not_prefix() {
     let source = keyed_source();
-    let col = |c: u32| source.columns[c as usize];
+    let col = |c: u32| source.columns()[c as usize];
     for key in [&[1u32][..], &[1, 0], &[3]] {
         let delta = SchemaDescriptor::new(
             &key.iter()

@@ -17,7 +17,7 @@
 
 use crate::algebra::ReindexPacker;
 use crate::repr::Batch;
-use crate::schema::{oob_col, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::OrderKey;
 use gnitz_wire::RowSource;
 
@@ -106,13 +106,11 @@ impl TopNIndex {
         output: &SchemaDescriptor,
     ) -> Result<Self, String> {
         let mut order = order.iter().map(|key| {
-            let loc = input
-                .try_locate(key.col as usize)
-                .ok_or_else(|| oob_col("top-n: order column", key.col as u32, input))?;
+            let (col, loc) = input.wire_col("top-n: order column", key.col as u32)?;
             Ok(OrderSpec {
                 image: ImageCol::new(loc, key.desc),
                 nulls_first: key.nulls_first,
-                nullable: input.columns[key.col as usize].nullable,
+                nullable: col.nullable,
             })
         });
         // Without a key the index orders a group's rows arbitrarily, so which rows
@@ -133,7 +131,7 @@ impl TopNIndex {
             rest,
             carried_in_index: (tail..schema.num_columns()).map(|c| schema.locate(c)).collect(),
             schema,
-            lead_bytes: suffix.iter().map(|c| c.size() as usize).sum(),
+            lead_bytes: suffix.iter().map(|c| c.size()).sum(),
         })
     }
 

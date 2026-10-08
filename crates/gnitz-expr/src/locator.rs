@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use gnitz_wire::{ScalarKind, TypeCode};
 
-use crate::SchemaFacts;
+use crate::SchemaDescriptor;
 use gnitz_wire::RowSource;
 
 /// Where a logical column's value physically lives in a row, resolved once from
@@ -196,7 +196,7 @@ impl OrderLocator {
 /// The keys `order` names over `schema`, then under `total` every column ascending, NULLS
 /// FIRST, PK columns leading: a total order over distinct rows. Panics on a column `schema`
 /// does not have.
-pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts, total: bool) -> Vec<OrderLocator> {
+pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &SchemaDescriptor, total: bool) -> Vec<OrderLocator> {
     let mut keys: Vec<OrderLocator> = order
         .iter()
         .map(|k| OrderLocator::of(schema.locate(k.col as usize), k))

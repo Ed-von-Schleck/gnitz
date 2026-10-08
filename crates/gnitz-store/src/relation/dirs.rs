@@ -11,8 +11,8 @@ use gnitz_wire::PkColList;
 
 use super::RelationRegistry;
 use crate::storage::{fsync_dir, manifest_path, read_at, read_intact, retire_store};
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::schema::Slot;
 
 /// What a child directory holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

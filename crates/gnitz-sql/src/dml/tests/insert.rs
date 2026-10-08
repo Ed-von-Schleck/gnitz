@@ -136,7 +136,7 @@ fn an_inserted_key_is_the_key_its_literal_seeks() {
         (UUID, "'550e8400-e29b-41d4-a716-446655440000'"),
     ] {
         let s = pk_schema(tc);
-        let cat = catalog(vec![("t", table(1, s.columns.clone(), vec![0]))]);
+        let cat = catalog(vec![("t", table(1, s.columns().to_vec(), vec![0]))]);
         let plan =
             insert(&cat, &format!("INSERT INTO t VALUES ({lit}, 0)")).unwrap_or_else(|e| panic!("{tc:?}: {e:?}"));
         let (bound, _) = access_path(&s, "t", Some(&parse_expr_sql(&format!("id = {lit}"))), &[]).unwrap();
@@ -277,9 +277,9 @@ fn returning_a_relations_columns_ships_no_program() {
         let plan = insert(&cat, &format!("INSERT INTO m VALUES (10, 1) RETURNING {list}")).unwrap();
         let (schema, map) = plan.returning.unwrap();
         assert!(map.is_none(), "RETURNING {list}");
-        let got: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        let got: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
-            (got, &schema.pk_cols[..]),
+            (got, schema.pk_cols()),
             (names.to_vec(), &[key][..]),
             "RETURNING {list}"
         );

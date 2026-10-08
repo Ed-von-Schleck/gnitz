@@ -11,7 +11,7 @@ fn frame(ids: &ColIdGen, names: [&str; 4], pk: u32) -> Frame {
     let cols: Vec<ColumnDef> = names.iter().map(|&n| ColumnDef::new(n, TypeCode::U64, false)).collect();
     Frame {
         layout: cols.iter().map(|_| Some(ids.next())).collect(),
-        schema: Arc::new(Schema::from_parts(cols, vec![pk]).unwrap()),
+        schema: Arc::new(Schema::from_parts(cols, &[pk]).unwrap()),
     }
 }
 

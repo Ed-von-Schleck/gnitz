@@ -42,7 +42,7 @@ fn cat() -> TestCatalog {
 
 /// The final view's visible output columns as `(name, type, nullable)`.
 fn visible(chain: &PlannedChain) -> Vec<(String, TypeCode, bool)> {
-    let cols = &final_view(chain).schema.columns;
+    let cols = &final_view(chain).schema.columns();
     cols.iter()
         .filter(|c| !c.is_hidden)
         .map(|c| (c.name.clone(), c.ty.tc, c.is_nullable))

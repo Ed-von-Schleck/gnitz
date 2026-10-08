@@ -279,44 +279,18 @@ pub fn qualified_key(schema_name: &str, name: &str) -> String {
 pub const MAX_COLUMNS: usize = 65;
 
 /// Payload slot of column `ci`: its position among the columns not in `pk`, or
-/// `None` for a PK column. Inverse of [`payload_col_idx`].
+/// `None` for a PK column.
 pub const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
-    if contains_col(pk, ci) {
-        return None;
-    }
     let mut below = 0;
     let mut k = 0;
     while k < pk.len() {
+        if pk[k] as usize == ci {
+            return None;
+        }
         below += ((pk[k] as usize) < ci) as usize;
         k += 1;
     }
     Some(ci - below)
-}
-
-/// Column index of payload slot `pi`: the `pi`-th column not in `pk`.
-pub const fn payload_col_idx(pk: &[u32], pi: usize) -> usize {
-    let mut ci = 0;
-    let mut slot = 0;
-    loop {
-        if !contains_col(pk, ci) {
-            if slot == pi {
-                return ci;
-            }
-            slot += 1;
-        }
-        ci += 1;
-    }
-}
-
-const fn contains_col(cols: &[u32], ci: usize) -> bool {
-    let mut k = 0;
-    while k < cols.len() {
-        if cols[k] as usize == ci {
-            return true;
-        }
-        k += 1;
-    }
-    false
 }
 
 /// Sizing cap for an engine schema's PK: the widest user-declared PK plus the

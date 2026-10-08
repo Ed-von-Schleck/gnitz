@@ -16,7 +16,7 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
         .filter(|&k| {
             let opk = PkColumn::from_natives(&schema, [k as u128]);
             let pk = opk.get_bytes(0);
-            gnitz_zset::schema::Placement::Keyed { dist_stride: pk.len() as u8 }.owner(pk, WORKERS) == Some(1)
+            gnitz_zset::algebra::Placement::Keyed { dist_stride: pk.len() as u8 }.owner(pk, WORKERS) == Some(1)
         })
         .take(420)
         .collect();

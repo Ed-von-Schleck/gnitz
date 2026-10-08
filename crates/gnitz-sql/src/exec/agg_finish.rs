@@ -7,7 +7,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
+use gnitz_expr::{ColumnLocator, RowFilter};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::ColumnDef;
 use rustc_hash::FxHashMap;
@@ -45,8 +45,8 @@ impl FoldFinish {
                 _ => None,
             })
             .collect();
-        let having = compile_filter_program(having, &partial_schema.columns)?
-            .map(|p| p.resolve_filter(partial_schema.as_ref()))
+        let having = compile_filter_program(having, partial_schema.columns())?
+            .map(|p| p.resolve_filter(partial_schema.as_ref().layout()))
             .transpose()?;
         let (out_schema, program) = reply_program(finalize, &partial_schema)?;
         let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
@@ -74,7 +74,7 @@ impl FoldFinish {
     /// group, in reply order; the absorbed rows are then dropped.
     fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
         let schema = self.partial_schema.as_ref();
-        let n_group = schema.num_payload_cols() - self.merge.len();
+        let n_group = schema.layout().num_payload_cols() - self.merge.len();
         debug_assert!(
             partial.weights.iter().all(|&w| w == 1),
             "a fold partial is one reduce row"
@@ -86,7 +86,7 @@ impl FoldFinish {
             return partial;
         }
         let absorbed = || first.iter().enumerate().filter(|&(row, &f)| f as usize != row);
-        let locs = schema.payload_locators();
+        let locs = schema.layout().payload_locators();
         let aggs = locs[n_group..].iter().zip(&self.merge);
         for ((pi, _, col), (loc, &extreme)) in schema.payload_columns().skip(n_group).zip(aggs) {
             match extreme {

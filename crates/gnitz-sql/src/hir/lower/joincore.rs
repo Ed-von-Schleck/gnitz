@@ -29,7 +29,7 @@ fn keyed_side(
     let role = side.scatter_key(&key[..routed])?;
     let reindex = cb.map_reindex(input, &key, &side.keep, role.clone(), NullKeys::Drop);
     // With no nullable key column the two re-keys keep the same rows.
-    let nullable = side.key.iter().any(|&c| side.frame.schema.columns[c].is_nullable);
+    let nullable = side.key.iter().any(|&c| side.frame.schema.columns()[c].is_nullable);
     let all = match emits_unmatched && nullable {
         true => cb.map_reindex(input, &key, &side.keep, role, NullKeys::Keep),
         false => reindex,
@@ -94,7 +94,7 @@ fn rekey_pk_coldefs<'a>(
     cols.into_iter()
         .enumerate()
         .map(|(slot, (schema, c))| {
-            let src = &schema.columns[c as usize];
+            let src = &schema.columns()[c as usize];
             ColumnDef::new(name(slot, src), src.ty.tc.reindex_output_type(), false).hidden()
         })
         .collect()
@@ -105,10 +105,10 @@ fn rekey_pk_coldefs<'a>(
 pub(super) fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef> {
     rekey_pk_coldefs(
         left_schema
-            .pk_cols
+            .pk_cols()
             .iter()
             .map(|&c| (left_schema, c))
-            .chain(right_schema.pk_cols.iter().map(|&c| (right_schema, c))),
+            .chain(right_schema.pk_cols().iter().map(|&c| (right_schema, c))),
         |slot, _| format!("_pair_pk_{slot}"),
     )
 }
@@ -116,7 +116,7 @@ pub(super) fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Ve
 /// The output PK columns of a range-correlated EXISTS/IN view: the outer source
 /// PK under its own names (it also rides the payload verbatim).
 pub(crate) fn src_pk_coldefs(schema: &Schema) -> Vec<ColumnDef> {
-    rekey_pk_coldefs(schema.pk_cols.iter().map(|&c| (schema, c)), |_, src| src.name.clone())
+    rekey_pk_coldefs(schema.pk_cols().iter().map(|&c| (schema, c)), |_, src| src.name.clone())
 }
 
 /// Re-key `node`, laid out `[lead…, each of `sides`' kept payload in order]`, onto
@@ -127,7 +127,7 @@ fn rekey_pinned(cb: &mut Circuit, node: NodeId, lead: usize, sides: &[JoinSide])
     for s in sides {
         let pinned = &s.keep[..s.pa()];
         key.extend(pinned.iter().enumerate().map(|(j, &c)| {
-            let tc = s.frame.schema.columns[c as usize].ty.tc;
+            let tc = s.frame.schema.columns()[c as usize].ty.tc;
             ((at + j) as u32, tc.reindex_output_type())
         }));
         at += s.n();
@@ -147,9 +147,9 @@ pub(super) fn rekey_on_source_pk(
 ) -> Result<NodeId, GnitzSqlError> {
     let schema = &side.frame.schema;
     let key: Vec<ReindexSlot> = schema
-        .pk_cols
+        .pk_cols()
         .iter()
-        .map(|&c| (c, schema.columns[c as usize].ty.tc.reindex_output_type()))
+        .map(|&c| (c, schema.columns()[c as usize].ty.tc.reindex_output_type()))
         .collect();
     let role = match route {
         Some(n) => side.scatter_key(&key[..n])?,
@@ -327,7 +327,7 @@ fn own_a(
     range_tc: TypeCode,
     scatter: bool,
 ) -> Result<(NodeId, NodeId), GnitzSqlError> {
-    let owned = rekey_on_source_pk(cb, input, side, scatter.then_some(side.frame.schema.pk_cols.len()))?;
+    let owned = rekey_on_source_pk(cb, input, side, scatter.then_some(side.frame.schema.pk_cols().len()))?;
     let owned = cb.worker_filter(owned); // [a.pk, kept A]
     let &[range_slot] = side.key.as_slice() else {
         unreachable!("a pure range keys on its range column alone")

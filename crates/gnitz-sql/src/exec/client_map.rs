@@ -20,9 +20,9 @@ pub(crate) struct ClientMap {
 impl ClientMap {
     pub(crate) fn new(program: LogicalProgram, src: &Schema, out_schema: Arc<Schema>) -> Result<Self, GnitzSqlError> {
         let key = |s: &Schema| {
-            s.pk_cols
+            s.pk_cols()
                 .iter()
-                .map(|&c| s.columns[c as usize].ty.tc)
+                .map(|&c| s.columns()[c as usize].ty.tc)
                 .collect::<Vec<_>>()
         };
         if key(src) != key(&out_schema) {
@@ -30,7 +30,7 @@ impl ClientMap {
                 "a client map must keep its source's key".into(),
             ));
         }
-        let ev = program.resolve_map(src, out_schema.as_ref())?;
+        let ev = program.resolve_map(src.layout(), out_schema.layout())?;
         if ev.copies().iter().any(|c| c.src.size() != c.width) {
             return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
         }

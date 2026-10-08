@@ -31,7 +31,6 @@
 //! view's registration is derived by resolving its name, an alias's is by
 //! calling the [`Planner`] it was mirrored with.
 
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -322,7 +321,7 @@ impl MirroredView {
         DeltaPollItem {
             view: self.upstream,
             from,
-            reply_layout: self.desc.schema.layout_digest(),
+            reply_layout: self.desc.schema.layout().layout_digest(),
             spec: &self.spec,
         }
     }

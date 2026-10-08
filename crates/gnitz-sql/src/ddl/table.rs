@@ -13,7 +13,6 @@ use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, C
 use crate::types::column_def;
 use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
@@ -211,8 +210,8 @@ fn resolve_fk_target(
     require_class(&ref_rel, ref_table, ClassWant::BaseTable, "a FOREIGN KEY target")?;
     let ref_tid = ref_rel.tid;
 
-    let pk_single = ref_schema.lone_pk_col();
-    let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, &ref_schema.columns, pk_single)?;
+    let pk_single = ref_schema.layout().lone_pk_col();
+    let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, ref_schema.columns(), pk_single)?;
 
     // Legal target iff the referenced column is the parent's lone PK or carries a
     // UNIQUE index of its own. A composite unique `(a, b)` does not make `a`
@@ -226,13 +225,14 @@ fn resolve_fk_target(
             return Err(GnitzSqlError::Rejected(format!(
                 "FK against table '{}' must reference the primary key or a column \
                  with a UNIQUE index; column '{}' has neither",
-                ref_table, ref_schema.columns[ref_col_idx].name,
+                ref_table,
+                ref_schema.columns()[ref_col_idx].name,
             )));
         }
     }
 
     // Child column widens to the referenced parent column's type.
-    check_fk_type_compat(current_cols[site.col_idx].ty, ref_schema.columns[ref_col_idx].ty)?;
+    check_fk_type_compat(current_cols[site.col_idx].ty, ref_schema.columns()[ref_col_idx].ty)?;
 
     Ok((
         FkTarget::Table(FkRef {
@@ -240,7 +240,7 @@ fn resolve_fk_target(
             col: ref_col_idx as u32,
             on_delete: site.on_delete,
         }),
-        ref_schema.columns[ref_col_idx].ty,
+        ref_schema.columns()[ref_col_idx].ty,
     ))
 }
 
@@ -719,12 +719,12 @@ pub(crate) fn plan_create_table(
         cols[i as usize].is_nullable = false;
     }
 
-    let schema = Schema::from_parts(cols, pk_indices).map_err(GnitzSqlError::Rejected)?;
-    let (cols, pk_indices) = (&schema.columns, &schema.pk_cols);
+    let schema = Schema::from_parts(cols, &pk_indices).map_err(GnitzSqlError::Rejected)?;
+    let (cols, pk_indices) = (schema.columns(), schema.pk_cols());
 
     // The generated id has no compound form: a column spelled SERIAL is the table's
     // whole primary key.
-    if let Some(&c) = serial.iter().find(|&&c| pk_indices.as_slice() != [c]) {
+    if let Some(&c) = serial.iter().find(|&&c| pk_indices != [c]) {
         return Err(GnitzSqlError::Rejected(format!(
             "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
             cols[c as usize].name
@@ -936,9 +936,9 @@ pub(crate) async fn create_index_core(
     }
 
     let (owner_id, schema) = (target.tid, &target.schema);
-    let (col_names, col_indices) = resolve_index_columns(req.columns, &schema.columns, ctx)?;
+    let (col_names, col_indices) = resolve_index_columns(req.columns, schema.columns(), ctx)?;
 
-    let cols = index_key(&schema.columns, &col_indices, schema.pk_cols.len(), ctx)?;
+    let cols = index_key(schema.columns(), &col_indices, schema.pk_cols().len(), ctx)?;
 
     let index_name = match req.explicit_name.clone() {
         Some(name) => {

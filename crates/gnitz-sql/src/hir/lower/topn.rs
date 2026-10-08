@@ -36,10 +36,10 @@ pub(super) fn lower_topn(
     debug_assert!(
         frame
             .schema
-            .pk_cols
+            .pk_cols()
             .iter()
             .copied()
-            .eq(0..frame.schema.pk_cols.len() as u32),
+            .eq(0..frame.schema.pk_cols().len() as u32),
         "a top-N input leads with its key, which the index carries as its tie-break"
     );
 
@@ -61,7 +61,7 @@ pub(super) fn lower_topn(
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let out = keyed_frame(&frame, &group, 0..frame.schema.columns.len() as u32, Vec::new())?;
+    let out = keyed_frame(&frame, &group, 0..frame.schema.columns().len() as u32, Vec::new())?;
     let node = cb.top_n(node, &group, &keys, *limit, *offset);
     let out = match above {
         None => out,

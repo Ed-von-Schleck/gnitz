@@ -355,7 +355,7 @@ pub(super) fn build_schema_from_col_defs(
         .iter()
         .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
         .collect();
-    SchemaDescriptor::try_new(&cols, pk_cols)
+    Ok(SchemaDescriptor::try_new(&cols, pk_cols)?)
 }
 
 // ---------------------------------------------------------------------------

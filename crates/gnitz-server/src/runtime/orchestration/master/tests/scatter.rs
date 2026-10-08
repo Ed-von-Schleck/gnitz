@@ -7,8 +7,9 @@ use crate::test_support::{
 };
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::TypeCode;
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::schema::encode_schema_block;
-use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// The targets of a push of `data` nothing answers: the workers that hold its rows.
 pub(super) fn holders_of(data: &GroupData) -> GroupTargets {

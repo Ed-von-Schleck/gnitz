@@ -11,6 +11,7 @@
 //! set every evaluator's kernels run at and `GNITZ_BENCH_ROWS` the rows of a
 //! batch.
 
+use crate::SchemaColumn;
 use gnitz_foundation::perf::bench_passes;
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -20,8 +21,9 @@ use crate::simd;
 use crate::eval::Resolved;
 use crate::test_support::{
     filter_prog, is_null_op, make_n_col_view, make_string_view, map_prog, passing_rows, scalar_prog, schema_pk_ints,
-    schema_pk_strings, simd_levels, TestSchema, TestView,
+    schema_pk_strings, simd_levels, TestView,
 };
+use crate::SchemaDescriptor;
 use crate::{
     BatchView, CalendarOp, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram,
     MapEval, Reg, RowFilter, ScalarEval, Sink,
@@ -190,7 +192,7 @@ fn filter_kernel_bench() {
     let n = bench_rows();
 
     // `col <op> k` over one column of `schema`.
-    let col_cmp = |schema: &TestSchema, col: u32, op, val| {
+    let col_cmp = |schema: &SchemaDescriptor, col: u32, op, val| {
         let instrs = vec![
             LogicalInstr::LoadCol { col },
             LogicalInstr::LoadConst { val, unsigned: false },
@@ -206,18 +208,36 @@ fn filter_kernel_bench() {
 
     // The same compare over an `I64` PK: the signed OPK decode, which `pk`'s
     // `U64` key does not reach.
-    let pk_i64_schema = TestSchema::new(&[(TypeCode::I64, false), (TypeCode::I64, false)], &[0]);
+    let pk_i64_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
+    );
     let pk_i64_view = make_n_col_view(&pk_i64_schema, n, |_, _| 1, |_, _| false);
     let mut pk_i64_filter = col_cmp(&pk_i64_schema, 0, CmpOp::Gt, (n / 2) as i64);
 
     // `a > 500` over one NOT NULL `I32` payload column: a payload load narrower
     // than the 8-byte arm every other shape reads.
-    let i32_schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I32, false)], &[0]);
+    let i32_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+        ],
+        &[0],
+    );
     let i32_view = make_n_col_view(&i32_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
     let mut i32_filter = col_cmp(&i32_schema, 1, CmpOp::Gt, 500);
 
     // `f > 500.0` over one NOT NULL `F32` payload column: the widening load.
-    let f32_schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::F32, false)], &[0]);
+    let f32_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F32, false),
+        ],
+        &[0],
+    );
     let mut f32_view = TestView::for_schema(&f32_schema, n);
     for row in 0..n {
         f32_view.set_payload(row, 0, &((row % 1000) as f32).to_le_bytes());
@@ -376,10 +396,13 @@ fn is_null_chain(k: i64, n_cmp: u32) -> Vec<LogicalInstr> {
 }
 
 /// One nullable column for the null test, four NOT NULL ones for the compares.
-fn is_null_bench_schema() -> TestSchema {
-    let mut cols = vec![(TypeCode::U64, false), (TypeCode::I64, true)];
-    cols.extend(std::iter::repeat_n((TypeCode::I64, false), 4));
-    TestSchema::new(&cols, &[0])
+fn is_null_bench_schema() -> SchemaDescriptor {
+    let mut cols = vec![
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+    ];
+    cols.extend(std::iter::repeat_n(SchemaColumn::new(TypeCode::I64, false), 4));
+    SchemaDescriptor::new(&cols, &[0])
 }
 
 /// The `no_nulls` arm against the nullable one (`GNITZ_BENCH_ARM`) for an
@@ -468,7 +491,13 @@ fn range_walk_bench() {
     use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
     let passes = bench_passes();
     let n = bench_rows();
-    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]);
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
     let view = make_n_col_view(&schema, n, |row, _| (row % 1000) as i64, |row, _| row % 16 == 0);
     let range = KeyRange::new(
         PkColList::from_slice(&[1]),
@@ -484,7 +513,7 @@ fn range_walk_bench() {
 
 /// `n` rows of `unit` repeated to `len` bytes, one ASCII byte per row turned
 /// into a digit so no matcher hoists out of the row loop.
-fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) -> TestView {
+fn fixed_len_str_view(schema: &SchemaDescriptor, n: usize, len: usize, unit: &[u8]) -> TestView {
     let base: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
     make_string_view(
         schema,
@@ -503,7 +532,7 @@ fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) ->
 /// One German string per payload slot, alternating either side of
 /// the 12-byte inline boundary so a string bench drives both the in-place inline
 /// view and the blob view.
-fn str_bench_view(schema: &TestSchema, n: usize) -> TestView {
+fn str_bench_view(schema: &SchemaDescriptor, n: usize) -> TestView {
     make_string_view(
         schema,
         n,
@@ -567,7 +596,7 @@ fn expr_kernel_bench() {
     let int_to_str = scalar_prog(&ints, vec![load2(1), LogicalInstr::IntToStr { a: Reg(0) }], vec![]);
     // `GREATEST(a, b)`: over the nullable columns the null-skipping arm, over the
     // NOT NULL ones the plain pick.
-    let minmax_of = |schema: &TestSchema| {
+    let minmax_of = |schema: &SchemaDescriptor| {
         scalar_prog(
             schema,
             vec![
@@ -807,12 +836,12 @@ fn expr_kernel_bench() {
     // --- `CASE WHEN k > 500 THEN s1 ELSE s2 END`: a condition no branch
     //     predictor learns, and a NULL in the first branch so the blend runs on
     //     the nullable arm.
-    let sel_schema = TestSchema::new(
+    let sel_schema = SchemaDescriptor::new(
         &[
-            (TypeCode::U64, false),
-            (TypeCode::I64, false),
-            (TypeCode::String, true),
-            (TypeCode::String, true),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::String, true),
+            SchemaColumn::new(TypeCode::String, true),
         ],
         &[0],
     );
@@ -846,7 +875,7 @@ fn expr_kernel_bench() {
 
     // --- booleans read as values, where a compare writes lanes and `IN` and
     //     `IS NULL` unpack their bits.
-    let cmp_value = |schema: &TestSchema| {
+    let cmp_value = |schema: &SchemaDescriptor| {
         scalar_prog(
             schema,
             vec![
@@ -868,7 +897,7 @@ fn expr_kernel_bench() {
             .expect("resolves")
     };
     // `GREATEST` over floats, which orders by `total_cmp`.
-    let fminmax = |schema: &TestSchema| {
+    let fminmax = |schema: &SchemaDescriptor| {
         scalar_prog(
             schema,
             vec![

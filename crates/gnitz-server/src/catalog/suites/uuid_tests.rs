@@ -9,7 +9,7 @@ fn test_uuid_pk_create_and_drop() {
 
     let tid = engine.create_table("public.uuid_tab", &[uuid_def("id")], &[0]).unwrap();
     let s = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    assert_eq!(s.columns[0].type_code, TypeCode::UUID);
+    assert_eq!(s.columns()[0].type_code, TypeCode::UUID);
 
     engine.drop_table("public.uuid_tab").unwrap();
     engine.close();
@@ -26,7 +26,7 @@ fn test_uuid_non_pk_column() {
     let cols = vec![col_def("id", TypeCode::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_payload", &cols, &[0]).unwrap();
     let s = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    assert_eq!(s.columns[1].type_code, TypeCode::UUID);
+    assert_eq!(s.columns()[1].type_code, TypeCode::UUID);
 
     // Ingest a row with a UUID payload column
     let mut bb = BatchBuilder::new(&s);

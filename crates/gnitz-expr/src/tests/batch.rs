@@ -1,3 +1,4 @@
+use crate::SchemaColumn;
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -5,9 +6,9 @@ use super::{decode_f64, encode_f64, eval_batch, scan_filter_bits, with_str_bufs,
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    filter_prog, make_string_view, passing_rows, row_strs, row_values, runs, scalar_prog, schema_pk_strings,
-    TestSchema, TestView,
+    filter_prog, make_string_view, passing_rows, row_strs, row_values, runs, scalar_prog, schema_pk_strings, TestView,
 };
+use crate::SchemaDescriptor;
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
 
 // ---------------------------------------------------------------------------
@@ -73,10 +74,13 @@ fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col 
 
 /// The schema, instructions and rows of [`prog`]: one U64 PK and `cols`, each
 /// loaded into its own register, in order, ahead of `mk`'s instructions.
-fn build(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (TestSchema, Vec<LogicalInstr>, TestView) {
-    let mut schema_cols = vec![(TypeCode::U64, false)];
-    schema_cols.extend(cols.iter().map(|c| (c.tc, c.nullable())));
-    let schema = TestSchema::new(&schema_cols, &[0]);
+fn build(
+    cols: &[Col],
+    mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>,
+) -> (SchemaDescriptor, Vec<LogicalInstr>, TestView) {
+    let mut schema_cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    schema_cols.extend(cols.iter().map(|c| SchemaColumn::new(c.tc, c.nullable())));
+    let schema = SchemaDescriptor::new(&schema_cols, &[0]);
     let mut view = TestView::for_schema(&schema, cols[0].cells.len());
     for (pi, c) in cols.iter().enumerate() {
         for (row, cell) in c.cells.iter().enumerate() {
@@ -250,12 +254,12 @@ fn every_int_load_reads_its_value_from_either_region() {
         FixedInt::I64,
     ] {
         let tc = fi.type_code();
-        let schema = TestSchema::new(
+        let schema = SchemaDescriptor::new(
             &[
-                (tc, false),            // payload slot 0
-                (TypeCode::U16, false), // key column 0
-                (tc, false),            // key column 1, at byte 2
-                (tc, false),            // payload slot 1
+                SchemaColumn::new(tc, false),            // payload slot 0
+                SchemaColumn::new(TypeCode::U16, false), // key column 0
+                SchemaColumn::new(tc, false),            // key column 1, at byte 2
+                SchemaColumn::new(tc, false),            // payload slot 1
             ],
             &[1, 2],
         );

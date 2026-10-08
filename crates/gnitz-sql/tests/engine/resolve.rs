@@ -71,7 +71,7 @@ fn descriptor_fields_round_trip() {
     }
 
     let p = db.rel("p");
-    let hidden: Vec<bool> = p.schema.columns.iter().map(|c| c.is_hidden).collect();
+    let hidden: Vec<bool> = p.schema.columns().iter().map(|c| c.is_hidden).collect();
     assert_eq!(
         hidden,
         [false, false, true],
@@ -80,9 +80,9 @@ fn descriptor_fields_round_trip() {
     let c = db.rel("c");
     let pk: Vec<(u32, TypeCode)> = c
         .schema
-        .pk_cols
+        .pk_cols()
         .iter()
-        .map(|&i| (i, c.schema.columns[i as usize].ty.tc))
+        .map(|&i| (i, c.schema.columns()[i as usize].ty.tc))
         .collect();
     assert_eq!(pk, [(2, TypeCode::U32), (1, TypeCode::U64)]);
     assert!(db.rel("sr").serial && !p.serial);
@@ -359,7 +359,7 @@ fn a_second_client_pushes_after_a_column_alter() {
 
     let rel2 = b.rel("t");
     assert_eq!(rel2.tid, rel.tid);
-    assert!(rel2.schema.columns[1].is_nullable, "B sees the relaxed column");
+    assert!(rel2.schema.columns()[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&rel2.schema);
     BatchAppender::new(&mut batch).add_row(2, 1).null();
     block_on(b.client.push(rel2.tid, &rel2.schema, &batch, Update)).unwrap();

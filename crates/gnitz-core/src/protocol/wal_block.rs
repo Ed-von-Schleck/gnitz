@@ -2,7 +2,6 @@
 
 use super::error::ProtocolError;
 use super::types::{check_not_null, Schema, ZSetBatch};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{as_le_bytes, Regions, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 impl ZSetBatch {
@@ -23,20 +22,12 @@ impl ZSetBatch {
 /// Decode a WAL block under `schema`, appending its rows to `sink`. On error
 /// `sink` is not usable.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    let row_width = sink.pks.stride() + 16 + sink.payload.iter().map(|c| c.stride()).sum::<usize>();
-    let (rows, fixed, heap, _) =
-        gnitz_wire::wal::parse_block(data, row_width).map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
+    let layout = schema.layout();
+    let (rows, fixed, heap, _) = gnitz_wire::wal::parse_block(data, layout.row_width())
+        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
     let mut regions = Regions::new();
-    let mut at = 0;
-    let mut take = |s: usize| {
-        regions.push(&fixed[at..at + rows * s]);
-        at += rows * s;
-    };
-    take(sink.pks.stride());
-    take(8);
-    take(8);
-    for c in &sink.payload {
-        take(c.stride());
+    for r in 0..layout.num_regions() {
+        regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
     }
     regions.push(heap);
     append_regions(sink, &regions, schema, true)
@@ -95,7 +86,7 @@ fn append_regions(
             if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
                 return Err(ProtocolError::DecodeError(format!(
                     "column {}: German string cell is not in canonical form",
-                    schema.payload_col_idx(pi)
+                    schema.layout().payload_col_idx(pi)
                 )));
             }
             gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);

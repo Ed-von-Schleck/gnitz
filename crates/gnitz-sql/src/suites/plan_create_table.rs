@@ -69,9 +69,16 @@ fn primary_key_admission() {
         ),
     ] {
         let s = created(&cat, sql).schema;
-        let got: Vec<(u32, TypeCode)> = s.pk_cols.iter().map(|&c| (c, s.columns[c as usize].ty.tc)).collect();
+        let got: Vec<(u32, TypeCode)> = s
+            .pk_cols()
+            .iter()
+            .map(|&c| (c, s.columns()[c as usize].ty.tc))
+            .collect();
         assert_eq!(got, want, "{sql}");
-        assert!(s.pk_cols.iter().all(|&c| !s.columns[c as usize].is_nullable), "{sql}");
+        assert!(
+            s.pk_cols().iter().all(|&c| !s.columns()[c as usize].is_nullable),
+            "{sql}"
+        );
     }
     for (sql, needle) in [
         ("CREATE TABLE t (id INT)", "primary key must name at least one column"),
@@ -168,7 +175,7 @@ fn primary_key_precedence() {
         &cat,
         "CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)",
     );
-    assert_eq!(c.schema.pk_cols, vec![1]);
+    assert_eq!(c.schema.pk_cols(), vec![1]);
     assert_eq!(
         c.fks,
         vec![
@@ -413,8 +420,8 @@ fn a_serial_table_carries_serial_on_its_props() {
     let cat = catalog(vec![]);
     let c = created(&cat, "CREATE TABLE s (id BIGSERIAL PRIMARY KEY, v BIGINT)");
     assert!(c.props.serial);
-    assert_eq!(c.schema.columns[0].ty.tc, TypeCode::I64);
-    assert!(!c.schema.columns[0].is_nullable);
+    assert_eq!(c.schema.columns()[0].ty.tc, TypeCode::I64);
+    assert!(!c.schema.columns()[0].is_nullable);
     assert!(!created(&cat, "CREATE TABLE t (id BIGINT PRIMARY KEY)").props.serial);
 }
 
@@ -429,7 +436,11 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         &cat,
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
-    assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I64, "widened to the parent's type");
+    assert_eq!(
+        c.schema.columns()[1].ty.tc,
+        TypeCode::I64,
+        "widened to the parent's type"
+    );
     assert_eq!(
         c.fks,
         vec![
@@ -505,10 +516,10 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
         ("CREATE TABLE tree (id BIGINT PRIMARY KEY REFERENCES tree(id))", 0),
     ] {
         let c = created(&cat, sql);
-        let mut fks = vec![None; c.schema.columns.len()];
+        let mut fks = vec![None; c.schema.columns().len()];
         fks[col_idx] = Some(FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict });
         assert_eq!(c.fks, fks, "{sql}");
-        assert_eq!(c.schema.columns[col_idx].ty.tc, TypeCode::I64, "{sql}");
+        assert_eq!(c.schema.columns()[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
     for (sql, needle) in [
         (
@@ -544,7 +555,7 @@ fn a_self_fk_adopts_the_type_its_pk_column_adopted() {
         "CREATE TABLE t (id INT PRIMARY KEY REFERENCES p(id), parent INT REFERENCES t(id))",
     ] {
         let c = created(&cat, sql);
-        let types: Vec<TypeCode> = c.schema.columns.iter().map(|c| c.ty.tc).collect();
+        let types: Vec<TypeCode> = c.schema.columns().iter().map(|c| c.ty.tc).collect();
         assert_eq!(types, [TypeCode::I64, TypeCode::I64], "{sql}");
     }
 }
@@ -559,7 +570,7 @@ fn an_fk_column_may_be_any_key_type() {
         &cat,
         "CREATE TABLE c (id BIGINT PRIMARY KEY, p HUGEINT REFERENCES parent(id))",
     );
-    assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I128);
+    assert_eq!(c.schema.columns()[1].ty.tc, TypeCode::I128);
 }
 
 /// A repeated column is the definition's error, reported before a column list

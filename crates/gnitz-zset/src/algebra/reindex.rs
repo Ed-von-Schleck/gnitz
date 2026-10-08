@@ -15,8 +15,7 @@ use gnitz_wire::RowSource;
 use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
 
 use crate::schema::{
-    oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
-    MAX_PK_BYTES, MAX_PK_COLUMNS,
+    ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -26,16 +25,18 @@ use crate::schema::{
 
 /// Column `c` of `schema` as a key column, `what` naming the key in a refusal.
 /// A float has none: `+0.0` and `-0.0` differ byte-wise but compare equal.
-pub(crate) fn locate_key_col(schema: &SchemaDescriptor, c: u32, what: &str) -> Result<ColumnLocator, String> {
-    let loc = schema
-        .try_locate(c as usize)
-        .ok_or_else(|| oob_col(&format!("{what}: column"), c, schema))?;
+pub(crate) fn locate_key_col(
+    schema: &SchemaDescriptor,
+    c: u32,
+    what: &str,
+) -> Result<(SchemaColumn, ColumnLocator), String> {
+    let (col, loc) = schema.wire_col(format_args!("{what}: column"), c)?;
     if loc.type_code().is_float() {
         return Err(format!(
             "{what}: column {c} is a float, which has no order-preserving key image"
         ));
     }
-    Ok(loc)
+    Ok((col, loc))
 }
 
 /// Append one column's key bytes to `buf`: a null marker, then a German string's
@@ -134,8 +135,8 @@ impl FoldCols {
 /// presence bitmap and a trailing overflow fold.
 const BITMAP_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
 const FOLD_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
-const BITMAP_BYTES: usize = BITMAP_COL.size() as usize;
-const FOLD_BYTES: usize = FOLD_COL.size() as usize;
+const BITMAP_BYTES: usize = BITMAP_COL.size();
+const FOLD_BYTES: usize = FOLD_COL.size();
 // `pack_into` writes the bitmap as a `u8` and the fold as a `u128`.
 const _: () = assert!(BITMAP_BYTES == size_of::<u8>() && FOLD_BYTES == size_of::<u128>());
 // The bitmap has a bit for every column packed behind it.
@@ -163,7 +164,7 @@ impl KeyCol {
             size: 0,
             type_code: TypeCode::U8,
         },
-        out: SchemaColumn::EMPTY,
+        out: SchemaColumn::new(TypeCode::U8, false),
     };
 }
 
@@ -193,7 +194,7 @@ impl ReindexPacker {
         }
         let mut cols = Vec::with_capacity(key.len());
         for &(c, t) in key {
-            let loc = locate_key_col(schema, c, "reindex key")?;
+            let (_, loc) = locate_key_col(schema, c, "reindex key")?;
             let src = loc.type_code();
             if !src.packs_at(t) {
                 return Err(format!("reindex key: column {c} of type {src} does not pack at {t}"));
@@ -223,7 +224,7 @@ impl ReindexPacker {
             packer.cols[packer.n as usize] = KeyCol { loc, out: SchemaColumn::new(tc, false) };
             packer.n += 1;
         }
-        packer.out_stride = packer.key_columns().map(|c| c.size() as usize).sum();
+        packer.out_stride = packer.key_columns().map(|c| c.size()).sum();
         packer
     }
 
@@ -247,7 +248,7 @@ impl ReindexPacker {
         let identity = |c: &KeyCol| {
             let src = c.loc.type_code();
             !src.is_german_string()
-                && c.out.size() as usize == c.loc.size()
+                && c.out.size() == c.loc.size()
                 && gnitz_wire::opk_bias(src) == gnitz_wire::opk_bias(c.out.type_code)
         };
         let cols = self.columns();
@@ -305,10 +306,7 @@ impl ReindexPacker {
         let mut b = DerivedSchema::new();
         self.key_columns().for_each(|c| b.push_pk(c));
         for &c in payload_cols {
-            let col = in_schema
-                .column(c as usize)
-                .ok_or_else(|| oob_col("reindex map: payload column", c, in_schema))?;
-            b.push(col);
+            b.push(in_schema.wire_col("reindex map: payload column", c)?.0);
         }
         b.finish().map_err(|e| format!("reindex map: output {e}"))
     }
@@ -324,17 +322,14 @@ impl ReindexPacker {
         suffix: &[SchemaColumn],
     ) -> Result<(Self, DerivedSchema), String> {
         let max_cols = MAX_PK_COLUMNS - suffix.len();
-        let max_bytes = MAX_PK_BYTES - suffix.iter().map(|c| c.size() as usize).sum::<usize>();
+        let max_bytes = MAX_PK_BYTES - suffix.iter().map(|c| c.size()).sum::<usize>();
         assert!(
             max_cols >= 2 && max_bytes >= BITMAP_BYTES + FOLD_BYTES,
             "a group-key suffix must leave room for a bitmap byte and a fold slot",
         );
         let group: Vec<(SchemaColumn, ColumnLocator)> = group_cols
             .iter()
-            .map(|&c| {
-                let loc = locate_key_col(schema, c, "group key")?;
-                Ok((schema.columns[c as usize], loc))
-            })
+            .map(|&c| locate_key_col(schema, c, "group key"))
             .collect::<Result<_, String>>()?;
         let has_bitmap = group.iter().any(|(col, _)| col.nullable);
 
@@ -394,7 +389,7 @@ impl ReindexPacker {
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         let mut null_bits = 0u8;
         for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
-            let w = out.size() as usize;
+            let w = out.size();
             let cell = &mut dst[off..off + w];
             off += w;
             match loc {
@@ -458,7 +453,7 @@ impl ReindexPacker {
             dst.chunks_exact_mut(stride).for_each(|key| key[0] = 0);
         }
         for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
-            let (sw, dw) = (loc.size(), out.size() as usize);
+            let (sw, dw) = (loc.size(), out.size());
             let col = IntCol {
                 dst: &mut *dst,
                 runs,

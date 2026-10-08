@@ -1,8 +1,6 @@
 //! `ReduceShape`: what a reduce's rows look like, shared by the circuit reduce
 //! and the ad-hoc fold.
-
-use crate::schema::SchemaFacts;
-use crate::schema::{oob_col, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 
 use super::agg::Agg;
 use crate::algebra::group_key::GroupOutKey;
@@ -27,9 +25,7 @@ impl ReduceShape {
         aggs: &[AggDescriptor],
     ) -> Result<Self, String> {
         for d in aggs {
-            let src = input
-                .column(d.col_idx as usize)
-                .ok_or_else(|| oob_col("reduce: aggregate column", d.col_idx, input))?;
+            let (src, _) = input.wire_col("reduce: aggregate column", d.col_idx)?;
             let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code)
                 .ok_or_else(|| format!("reduce: {:?} is not defined over type code {}", d.agg_op, src.type_code))?;
             prefix.push(SchemaColumn::new(

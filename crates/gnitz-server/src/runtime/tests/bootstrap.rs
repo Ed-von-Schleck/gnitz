@@ -8,8 +8,8 @@ use crate::test_support::{
     table_tab_batch,
 };
 use gnitz_wire::TypeCode;
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::Placement;
 
 // -- Boot staging -----------------------------------------------------------
 

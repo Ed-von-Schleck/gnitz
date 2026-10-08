@@ -11,7 +11,7 @@
 
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
-use crate::{payload_cols, ColumnLocator, SchemaFacts};
+use crate::{ColumnLocator, SchemaDescriptor};
 use gnitz_wire::{decode_all, encode_german_string, FixedInt, ScalarKind, TypeCode, Writer};
 use std::fmt;
 
@@ -1437,21 +1437,19 @@ impl LogicalProgram {
     /// Whether this program, run as a map from `in_schema` to `out_schema` with the input PK carried
     /// through, reproduces its input: one layout on both sides, and the program copies each payload
     /// column into its own slot and computes nothing.
-    pub(crate) fn is_identity_map(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> bool {
+    pub(crate) fn is_identity_map(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> bool {
         in_schema.same_layout(out_schema)
             && self.instrs.is_empty()
-            && self
-                .sinks
-                .iter()
-                .copied()
-                .eq(payload_cols(in_schema).map(|ci| Sink::Col(ci as u32)))
+            && self.sinks.iter().copied().eq(in_schema
+                .payload_columns()
+                .map(|(pi, _)| Sink::Col(in_schema.payload_col_idx(pi) as u32)))
     }
 
     /// Check the program against `schema` and lower it to the resolved form, with
     /// `sink_read` how the consumer reads each sink's register.
     pub(crate) fn resolve_program(
         &self,
-        schema: &dyn SchemaFacts,
+        schema: &SchemaDescriptor,
         sink_read: ReadAs,
     ) -> Result<ResolvedProgram, ExprValidateErr> {
         use Instr as I;
@@ -1679,7 +1677,7 @@ impl LogicalProgram {
     /// Hold every column operand to `schema` and derive [`ProgramFacts`], in one
     /// pass over the operand table. A sink is one more read of its register, as
     /// `sink_read`.
-    fn analyze(&self, schema: &dyn SchemaFacts, sink_read: ReadAs) -> Result<ProgramFacts, ExprValidateErr> {
+    fn analyze(&self, schema: &SchemaDescriptor, sink_read: ReadAs) -> Result<ProgramFacts, ExprValidateErr> {
         let (mut bool_produced, mut non_bool_read, mut bool_input) = (0u64, 0u64, 0u64);
         let mut read_as = |reg: Reg, read: ReadAs| match read {
             ReadAs::Bool => bool_input |= 1u64 << reg.0,
@@ -2092,7 +2090,7 @@ fn flag(op: u32, selector: u32) -> Result<bool, ExprValidateErr> {
 
 /// Column operand `col` located in `s`, held to what `need`'s kernel can read:
 /// in range, a payload column where it must be one, and of a type it decodes.
-fn locate_col(s: &dyn SchemaFacts, col: u32, need: ColKind) -> Result<ColumnLocator, ExprValidateErr> {
+fn locate_col(s: &SchemaDescriptor, col: u32, need: ColKind) -> Result<ColumnLocator, ExprValidateErr> {
     let Some(loc) = s.try_locate(col as usize) else {
         return Err(ExprValidateErr::ColOutOfRange { col, num_columns: s.num_columns() });
     };
@@ -2310,8 +2308,8 @@ impl LogicalProgram {
     /// slot is a count.
     pub(crate) fn map_sinks(
         &self,
-        in_schema: &dyn SchemaFacts,
-        out_schema: &dyn SchemaFacts,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
     ) -> Result<MapSinks, ExprValidateErr> {
         use ExprValidateErr as E;
         let out_slots = out_schema.payload_locators();

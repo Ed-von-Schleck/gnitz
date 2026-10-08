@@ -22,13 +22,14 @@ pub(crate) fn rel(schema: &str, name: &str) -> RelName {
 
 /// `(pk U64, v <v>)`.
 pub(crate) fn kv_schema(v: TypeCode) -> Schema {
-    Schema {
-        columns: vec![
+    Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("v", v, false),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
+    .unwrap()
 }
 
 /// `(pk, v, weight)` rows of `kv_schema(I64)`.
@@ -46,7 +47,7 @@ pub(crate) fn kv_rows(rows: &[(u64, i64, i64)]) -> ZSetBatch {
 pub(crate) fn wide_schema(ncols: usize, nullable: bool) -> Arc<Schema> {
     let mut columns = vec![ColumnDef::new("pk", TypeCode::U64, false)];
     columns.extend((1..ncols).map(|i| ColumnDef::new(format!("column_{i}"), TypeCode::I64, nullable)));
-    Arc::new(Schema { columns, pk_cols: vec![0] })
+    Arc::new(Schema::from_parts(columns, &[0]).unwrap())
 }
 
 /// `n` rows of a [`wide_schema`]; with `null_every`, every that-many-th cell
@@ -56,7 +57,7 @@ pub(crate) fn wide_rows(schema: &Schema, n: usize, null_every: usize) -> ZSetBat
     let mut app = BatchAppender::new(&mut b);
     for r in 0..n {
         let row = app.add_row(r as u128, 1);
-        for c in 1..schema.columns.len() {
+        for c in 1..schema.columns().len() {
             if null_every != 0 && (r + c) % null_every == 0 {
                 row.null();
             } else {

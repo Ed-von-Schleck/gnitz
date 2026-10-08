@@ -1,7 +1,6 @@
-//! The one [`SchemaFacts`] derivation, checked against absolute answers.
+//! The descriptor's layout facts, checked against absolute answers.
 
-use crate::test_support::TestSchema;
-use crate::{ColumnLocator, ColumnTable, SchemaFacts};
+use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 
 /// One case: a column table as `(type_code, nullable)`, and its PK list in
@@ -81,9 +80,13 @@ const CASES: &[Case] = &[
 ];
 
 #[test]
-fn schema_facts_match_the_column_table() {
+fn layout_facts_match_the_column_table() {
     for &(cols, pk) in CASES {
-        let s = TestSchema::new(cols, pk);
+        let schema_cols: Vec<SchemaColumn> = cols
+            .iter()
+            .map(|&(tc, nullable)| SchemaColumn::new(tc, nullable))
+            .collect();
+        let s = SchemaDescriptor::new(&schema_cols, pk);
         let ctx = format!("cols {cols:?}, pk {pk:?}");
 
         assert_eq!(s.pk_cols(), pk, "{ctx}: pk_cols()");

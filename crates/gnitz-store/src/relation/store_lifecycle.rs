@@ -7,7 +7,7 @@ use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
 use crate::storage::{RecoverySource, Table};
-use gnitz_zset::schema::Slot;
+use gnitz_zset::algebra::Slot;
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------

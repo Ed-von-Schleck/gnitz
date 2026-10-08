@@ -28,7 +28,7 @@ pub(super) fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
         .enumerate()
         .map(|(i, e)| {
             let bound = crate::test_support::bind_sql(e, src).unwrap();
-            let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(&src.columns[..]).tc, true);
+            let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(src.columns()).tc, true);
             (bound, def)
         })
         .collect();

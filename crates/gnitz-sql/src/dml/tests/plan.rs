@@ -34,7 +34,7 @@ fn the_first_servable_candidate_bounds_the_read_and_ships_its_residual() {
         assert_eq!(bound, want, "{sql}");
         assert_eq!(
             predicate,
-            compile_wire_conjuncts(&conjuncts(residual), &s.columns).unwrap(),
+            compile_wire_conjuncts(&conjuncts(residual), s.columns()).unwrap(),
             "{sql}: the residual is what ships as a predicate"
         );
     }
@@ -57,7 +57,7 @@ fn an_unsupported_residual_reports_the_best_candidates_blocker() {
     let blockers: Vec<String> = candidates(&conjuncts, &schema, &indexes)
         .iter()
         .map(|c| {
-            compile_wire_conjuncts(residual(&conjuncts, &c.consumed).iter().copied(), &schema.columns)
+            compile_wire_conjuncts(residual(&conjuncts, &c.consumed).iter().copied(), schema.columns())
                 .expect_err("every residual keeps `name + 1`")
                 .to_string()
         })

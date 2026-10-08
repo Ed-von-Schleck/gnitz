@@ -1,8 +1,6 @@
 //! The worker half of an ad-hoc `ReadSpec` read, over this worker's slice: open
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
-
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{PkKeys, ReadSpec};
 
 use std::rc::Rc;
@@ -16,7 +14,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in the layout whose
-    /// [`SchemaFacts::layout_digest`] is `reply_layout`.
+    /// [`SchemaDescriptor::layout_digest`] is `reply_layout`.
     pub fn scan_spec(
         &self,
         target_id: u64,
@@ -112,14 +110,13 @@ pub(super) fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Re
 #[cfg(debug_assertions)]
 fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
     use gnitz_zset::repr::pk_group_end;
-    use gnitz_zset::schema::key::compare_pk_bytes;
 
     assert_eq!(keys.len(), coarse.len());
     let mut expected = keys.iter().zip(coarse).peekable();
     let mut i = 0;
     while i < out.len() {
         let pk = out.get_pk_bytes(i);
-        if let Some((key, _)) = expected.next_if(|(key, _)| compare_pk_bytes(key, pk).is_lt()) {
+        if let Some((key, _)) = expected.next_if(|(key, _)| *key < pk) {
             panic!("hydration produced no rows for skeleton key {key:?}");
         }
         let Some((_, &weight)) = expected.next().filter(|(key, _)| *key == pk) else {

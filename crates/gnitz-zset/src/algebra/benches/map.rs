@@ -1,7 +1,7 @@
 use super::tests::{compute, make_schema, project, reindex_on};
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{pk_payload_schema, u64_pk_schema};
 use gnitz_expr::{IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
 use gnitz_wire::{MapKind, NullKeys};

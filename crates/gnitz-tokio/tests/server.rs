@@ -29,13 +29,14 @@ fn rel(schema: &str, name: &str) -> RelName {
 
 /// `(pk BIGINT, a BIGINT)`.
 fn schema() -> Schema {
-    Schema {
-        columns: vec![
+    Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::I64, false),
             ColumnDef::new("a", TypeCode::I64, false),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
+    .unwrap()
 }
 
 /// A [`schema`] table `t`: the blocking client that made it, its id, its

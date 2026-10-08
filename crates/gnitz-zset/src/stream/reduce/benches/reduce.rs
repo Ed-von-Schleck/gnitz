@@ -1,7 +1,7 @@
 use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, AggFunc};
@@ -135,7 +135,7 @@ fn op_reduce_bench() {
     // Unsorted rows over a `grouped_schema`: every group column holds `grp` of
     // the row, a nullable one NULL on every 16th row.
     let scattered = |schema: &SchemaDescriptor, salt: u64, grp: &dyn Fn(u64) -> u64| {
-        let group = &schema.columns[1..schema.num_columns() - 1];
+        let group = &schema.columns()[1..schema.num_columns() - 1];
         let mut bb = BatchBuilder::new(schema);
         for i in 0..N {
             bb.begin_row(mix(i + salt * N) as u128, 1);
@@ -338,7 +338,7 @@ fn op_reduce_tiny_bench() {
     type Row = (u64, u64, u64, i64); // pk-or-a, grp-or-b, value seed, weight
     let build = |schema: &SchemaDescriptor, rows: &[Row]| {
         let compound = schema.pk_cols().len() == 2;
-        let string = schema.columns[2].type_code == TypeCode::String;
+        let string = schema.columns()[2].type_code == TypeCode::String;
         let mut bb = BatchBuilder::new(schema);
         for &(a, b, v, w) in rows {
             if compound {

@@ -4,7 +4,8 @@ use crate::test_support::{
     identity_circuit, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
 };
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
-use gnitz_zset::schema::{Placement, SchemaColumn, Slot};
+use gnitz_zset::algebra::{Placement, Slot};
+use gnitz_zset::schema::SchemaColumn;
 
 // ── The shapes a compile refuses ────────────────────────────────────────
 

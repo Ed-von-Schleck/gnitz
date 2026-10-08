@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
-use crate::schema::{index_spec_and_schema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::test_support::Rng;
 use crate::test_support::{le_cell, pk_only_schema};
 use gnitz_wire::{cmp_col_window, image_mask, key_image, widen_pk_be};
@@ -19,7 +19,7 @@ fn typed_cmp(s: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
     let mut off = 0;
     s.pk_columns()
         .map(|(_, c)| {
-            let r = off..off + c.size() as usize;
+            let r = off..off + c.size();
             off = r.end;
             cmp_col_window(&a[r.clone()], &[], &b[r], &[], c.type_code)
         })
@@ -50,21 +50,21 @@ fn opk_is_an_order_preserving_bijection() {
             let mut off = 0;
             s.pk_columns()
                 .map(|(_, c)| {
-                    off += c.size() as usize;
-                    le_cell(&le[off - c.size() as usize..off])
+                    off += c.size();
+                    le_cell(&le[off - c.size()..off])
                 })
                 .collect()
         };
         let (na, nb) = (natives(&a), natives(&b));
         let (oa, ob) = (s.opk_key_cols(&na), s.opk_key_cols(&nb));
         assert_eq!(
-            compare_pk_bytes(oa.pk_bytes(), ob.pk_bytes()),
+            oa.pk_bytes().cmp(ob.pk_bytes()),
             typed_cmp(&s, &a, &b),
             "{s:?}: {a:?} vs {b:?}"
         );
         let mut off = 0;
         for ((_, c), &native) in s.pk_columns().zip(&na) {
-            let cell = &oa.pk_bytes()[off..off + c.size() as usize];
+            let cell = &oa.pk_bytes()[off..off + c.size()];
             off += cell.len();
             assert_eq!(key_image(c.type_code, widen_pk_be(cell)), native, "{s:?}");
         }
@@ -88,7 +88,7 @@ fn opk_byte_primitives_agree_with_memcmp_at_every_width() {
         for _ in 0..16 {
             let a: Vec<u8> = (0..w).map(|_| rng.next_u64() as u8).collect();
             assert_eq!(pack_pk_be(&a), naive(&a), "w={w}");
-            assert_eq!(leading_u64(&a), (naive(&a[..w.min(8)]) >> 64) as u64, "w={w}");
+            assert_eq!(u64::from_opk(&a), (naive(&a[..w.min(8)]) >> 64) as u64, "w={w}");
             // Same width taxonomy as `widen_pk_be`, opposite alignment.
             if (1..=16).contains(&w) {
                 assert_eq!(pack_pk_be(&a), widen_pk_be(&a) << (8 * (16 - w)), "w={w}");
@@ -152,19 +152,6 @@ fn key_increment_and_decrement_are_inverse_steps() {
     }
 }
 
-/// A narrow key's image, right-aligned at the key's width, is the key.
-#[test]
-fn narrow_pk_opk_inverts_the_widening() {
-    let mut rng = Rng::new(0x0A11_6E00);
-    for _ in 0..2000 {
-        let bytes = rng.gen_u128().to_be_bytes();
-        for w in 1..=16 {
-            let opk = &bytes[..w];
-            assert_eq!(NarrowPkOpk::new(widen_pk_be(opk), w).bytes(), opk, "width {w}");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Index key spans
 // ---------------------------------------------------------------------------
@@ -177,21 +164,21 @@ fn narrow_pk_opk_inverts_the_widening() {
 fn index_schema_is_the_key_at_its_own_types_then_the_source_pk() {
     use TypeCode::{I128, I16, I32, I64, I8, U128, U32, U64};
     let src = SchemaDescriptor::new(&[col(U64), col(U32), col(U128)], &[0]);
-    let (spec, index) = index_spec_and_schema(&[1, 2], &src).unwrap();
+    let (spec, index) = spec_and_index_schema(&[1, 2], &src).unwrap();
     assert_eq!(index, pk_only_schema(&[U32, U128, U64]));
     assert_eq!(spec.span_schema(), pk_only_schema(&[U32, U128]));
     assert_eq!(spec.key_size(), 20);
     for t in [I8, I16, I32, I64, I128] {
         let src = SchemaDescriptor::new(&[col(U64), SchemaColumn::new(t, true)], &[0]);
-        let (spec, index) = index_spec_and_schema(&[1], &src).unwrap();
+        let (spec, index) = spec_and_index_schema(&[1], &src).unwrap();
         assert_eq!(index, pk_only_schema(&[t, U64]), "{t}");
         assert_eq!(spec.span_schema(), pk_only_schema(&[t]), "{t}");
     }
 
     let wide = SchemaDescriptor::new(&[col(U64); MAX_PK_COLUMNS + 1], &[0, 1]);
     let key: Vec<u32> = (2..=MAX_PK_COLUMNS as u32).collect();
-    assert!(index_spec_and_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
-    assert!(index_spec_and_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
+    assert!(spec_and_index_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
+    assert!(spec_and_index_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
 
     let mixed = SchemaDescriptor::new(&[col(U64), col(U32), col(TypeCode::F64), col(TypeCode::String)], &[0]);
     for (cols, why) in [
@@ -267,7 +254,9 @@ fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
     let stride = src.pk_stride();
 
     for cols in [[1u32, 2], [2, 1]] {
-        let (spec, idx) = crate::schema::index_spec_and_schema(&cols, &src).unwrap();
+        let (spec, idx) = KeySpec::new(&cols, &src)
+            .map(|spec| (spec, spec.index_schema(&src)))
+            .unwrap();
         // The width `split_entry` splits a stored entry at.
         assert_eq!(idx.pk_stride(), spec.key_size() + stride);
         for row in 0..b.len() {
@@ -326,4 +315,8 @@ fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
             prev = Some(seek.pk_bytes().to_vec());
         }
     }
+}
+
+fn spec_and_index_schema(cols: &[u32], source: &SchemaDescriptor) -> Result<(KeySpec, SchemaDescriptor), String> {
+    KeySpec::new(cols, source).map(|spec| (spec, spec.index_schema(source)))
 }

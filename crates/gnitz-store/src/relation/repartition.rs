@@ -12,8 +12,9 @@ use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
 use crate::storage::{flush_barrier, fsync_dir, link_store, retire_store, Cut, RecoverySource, Table};
 use gnitz_zset::algebra::ScatterPlan;
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
-use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a

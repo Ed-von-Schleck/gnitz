@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use crate::test_support::{cmp_const, fed_view, map_of, relation_fixture, RelationFixture, TID};
-use gnitz_expr::{CmpOp, LogicalProgram, SchemaFacts};
+use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};

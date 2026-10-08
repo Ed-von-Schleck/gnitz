@@ -541,7 +541,7 @@ impl PyClient {
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyAny>> {
-        let cols = PkColList::checked(&col_indices, schema.rust.columns.len()).map_err(|rule| {
+        let cols = PkColList::checked(&col_indices, schema.rust.columns().len()).map_err(|rule| {
             PyValueError::new_err(format!(
                 "seek_by_index: {}",
                 rule.for_role(gnitz_wire::PkListRole::ColumnList)
@@ -557,11 +557,11 @@ impl PyClient {
         let keys = col_indices
             .iter()
             .zip(key_vals.iter())
-            .map(|(&c, v)| py_key_image(&schema.rust.columns[c as usize], &v))
+            .map(|(&c, v)| py_key_image(&schema.rust.columns()[c as usize], &v))
             .collect::<PyResult<Vec<u128>>>()?;
         let (&last, eq) = keys.split_last().expect("at least one key value");
         let range = KeyRange::point(cols, eq, last);
-        if !range.is_exact(|c| schema.rust.columns[c as usize].is_nullable) {
+        if !range.is_exact(|c| schema.rust.columns()[c as usize].is_nullable) {
             return Err(PyValueError::new_err(
                 "seek_by_index: the key values stop short of a nullable column, whose NULL rows no walk reaches",
             ));

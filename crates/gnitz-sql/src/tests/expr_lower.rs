@@ -16,7 +16,7 @@ fn dec(scale: u8) -> ColType {
 fn lowered<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> LogicalProgram {
     let s = typed_schema(tys);
     let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    compile_bound_expr_to_program(&bound, &s.columns).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    compile_bound_expr_to_program(&bound, s.columns()).unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 /// `sql` lowered to its instructions. A register is its instruction's position.
@@ -28,7 +28,7 @@ fn instrs<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> Vec<L> {
 fn lower_rejected<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> String {
     let s = typed_schema(tys);
     let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    rejected(compile_bound_expr_to_program(&bound, &s.columns))
+    rejected(compile_bound_expr_to_program(&bound, s.columns()))
 }
 
 /// Assert `sql` evaluates to `want` on each of `rows`, in the register class its
@@ -37,7 +37,7 @@ fn lower_rejected<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> String {
 fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]], want: &[Cell]) {
     let s = typed_schema(tys);
     let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    let ty = bound.infer_ty(&s.columns[..]).tc;
+    let ty = bound.infer_ty(s.columns()).tc;
     let mut ev = compile_scalar_evaluator(&bound, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let out = ev.eval_all(&batch_of(&s, rows));
     let got: Vec<Cell> = match &out {
@@ -1088,7 +1088,7 @@ fn a_filter_program_drops_the_conjuncts_settled_true() {
     let and = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::And, b.clone());
     let not = |a: &BoundExpr| BoundExpr::Not(Box::new(a.clone()));
     let program = |conjuncts: &[&BoundExpr]| {
-        compile_filter_program(conjuncts.iter().copied(), &s.columns)
+        compile_filter_program(conjuncts.iter().copied(), s.columns())
             .expect("lowers")
             .map(|p| p.instrs().to_vec())
     };
@@ -1111,28 +1111,31 @@ fn a_filter_program_drops_the_conjuncts_settled_true() {
 #[test]
 fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
     let s = typed_schema(&[T::String]);
-    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], &s.columns));
+    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], s.columns()));
     assert!(
         m.contains("column \"c1\" is STRING; a condition must be BOOLEAN"),
         "{m}"
     );
     let s = typed_schema(&[T::I64]);
-    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], &s.columns));
+    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], s.columns()));
     assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
     // A conjunct its connectives settle true is dropped from the program and
     // refused all the same.
     let settled = BoundExpr::bin(BoundExpr::LitBool(true), BinOp::Or, BoundExpr::ColRef(1));
-    let m = rejected(compile_filter_program([&settled], &s.columns));
+    let m = rejected(compile_filter_program([&settled], s.columns()));
     assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
     // An operand refused in itself reports that refusal, not the type it fell back to.
-    let m = rejected(compile_filter_program([&bind_sql("c1 + 'x'", &s).unwrap()], &s.columns));
+    let m = rejected(compile_filter_program(
+        [&bind_sql("c1 + 'x'", &s).unwrap()],
+        s.columns(),
+    ));
     assert!(m.contains("is not supported on a string operand"), "{m}");
 }
 
 /// The rows of `batch` that pass every conjunct, through the wire blob a read ships.
 fn residual_rows(conjuncts: &[&BoundExpr], batch: &gnitz_core::ZSetBatch, schema: &Schema) -> Vec<usize> {
-    let blob = compile_wire_conjuncts(conjuncts.iter().copied(), &schema.columns).expect("residual must compile");
-    let mut filter = RowFilter::for_read(&blob, None, schema).expect("the blob resolves");
+    let blob = compile_wire_conjuncts(conjuncts.iter().copied(), schema.columns()).expect("residual must compile");
+    let mut filter = RowFilter::for_read(&blob, None, schema.layout()).expect("the blob resolves");
     let mut ranges = Vec::new();
     filter.ranges(batch, &mut ranges);
     ranges.into_iter().flat_map(|(s, e)| s..e).collect()
@@ -1169,7 +1172,7 @@ fn the_residual_keep_every_row_exits() {
     let schema = two_col(T::I64);
     let batch = batch_of(&schema, &[&[Int(7)]]);
     let (t, f) = (BoundExpr::LitBool(true), BoundExpr::LitBool(false));
-    assert!(compile_wire_conjuncts([&t], &schema.columns).unwrap().is_empty());
+    assert!(compile_wire_conjuncts([&t], schema.columns()).unwrap().is_empty());
     assert_eq!(residual_rows(&[], &batch, &schema), [0]);
     assert_eq!(residual_rows(&[&t], &batch, &schema), [0]);
     assert_eq!(residual_rows(&[&f], &batch, &schema), [0usize; 0]);

@@ -7,8 +7,6 @@
 //! delta run with the cursor's current trace row — and all write
 //! `[key, left payload…, right payload…]` over the SQL sides, keyed by the delta
 //! PK, or by `[left PK…, right PK…]` under `Cross`.
-
-use crate::schema::ColumnTable;
 use std::cmp::Ordering;
 
 use crate::repr::{
@@ -16,7 +14,7 @@ use crate::repr::{
     width_dispatch, Batch, ReadCursor,
 };
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
-use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
+use crate::schema::{DerivedSchema, SchemaDescriptor, MAX_PK_BYTES};
 
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
@@ -207,11 +205,7 @@ impl RangeProbe {
     fn new(trace: &SchemaDescriptor, rel: RangeRel, delta_is_right: bool) -> RangeProbe {
         // The key is `[eq slots…, range slot]`, in PK order: the equality prefix
         // is every key column but the last.
-        let eq_size = trace
-            .pk_columns()
-            .take(trace.pk_cols().len() - 1)
-            .map(|(_, c)| c.size() as usize)
-            .sum();
+        let eq_size = trace.pk_prefix_stride(trace.pk_cols().len() - 1);
         // `rel` relates left to right; the probe relates trace to delta.
         let rel = match delta_is_right {
             true => rel,
@@ -419,7 +413,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
         for (pi, col) in d_schema.payload_columns() {
             let slot = d_first + pi;
             width_dispatch!(
-                col.size() as usize,
+                col.size(),
                 copy_runs,
                 delta.col_data(pi),
                 w.col_mut(slot),

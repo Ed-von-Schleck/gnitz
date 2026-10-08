@@ -21,7 +21,7 @@ use crate::ir::{BoundExpr, RegClass};
 use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
+use gnitz_expr::{ExprResults, ScalarEval};
 use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, TypeCode};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
@@ -223,8 +223,8 @@ pub(super) fn bind_set_list(
             _ => None,
         }
         .ok_or_else(|| GnitzSqlError::Rejected(format!("{clause_name}: column must be a simple identifier")))?;
-        let ci = require_column(&schema.columns, name).map_err(|e| e.in_clause(clause_name))?;
-        if schema.is_pk_col(ci) {
+        let ci = require_column(schema.columns(), name).map_err(|e| e.in_clause(clause_name))?;
+        if schema.layout().is_pk_col(ci) {
             return Err(GnitzSqlError::Rejected(format!(
                 "cannot assign to primary key column in {clause_name}"
             )));
@@ -252,7 +252,7 @@ fn bind_set_rhs(
 ) -> Result<SetRhs, GnitzSqlError> {
     if clause == SetClause::DoUpdate {
         if let Some(col_name) = excluded_col(expr) {
-            let col_idx = require_column(&schema.columns, col_name).map_err(|e| e.in_clause("EXCLUDED"))?;
+            let col_idx = require_column(schema.columns(), col_name).map_err(|e| e.in_clause("EXCLUDED"))?;
             // Through the same classifier as a bare RHS, so `SET int_col =
             // EXCLUDED.str_col` is rejected here rather than per row.
             return classify_set_rhs(BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
@@ -283,7 +283,7 @@ fn excluded_col(e: &Expr) -> Option<&str> {
 /// read; a computed value's range and a NULL into a NOT NULL column are the
 /// verdicts [`apply_set`] takes per row.
 fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schema) -> Result<SetRhs, GnitzSqlError> {
-    let col = &schema.columns[target];
+    let col = &schema.columns()[target];
     let ty = col.ty;
     if expr.is_literal() {
         let (mut cell, mut spill) = (Vec::new(), Vec::new());
@@ -294,9 +294,9 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
             null: matches!(expr, BoundExpr::LitNull),
         });
     }
-    let src = expr.infer_ty(&schema.columns[..]);
+    let src = expr.infer_ty(schema.columns());
     if let BoundExpr::ColRef(c) = &expr {
-        if let (true, Some(slot)) = (src == ty, schema.payload_slot(*c)) {
+        if let (true, Some(slot)) = (src == ty, schema.layout().payload_slot(*c)) {
             return Ok(SetRhs::Copy { scope, src: slot });
         }
     }
@@ -353,12 +353,15 @@ pub(super) fn apply_set(
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let n = rows.len();
-    let rebuild = set.iter().any(|a| (schema.columns[a.ci].ty.tc).is_german_string());
+    let rebuild = set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string());
     let mut new = ZSetBatch::new(schema);
     let mut nulls = rows.nulls.clone();
     for a in set.iter_mut() {
-        let def = &schema.columns[a.ci];
-        let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column");
+        let def = &schema.columns()[a.ci];
+        let pi = schema
+            .layout()
+            .payload_slot(a.ci)
+            .expect("a SET target is a payload column");
         let tc = def.ty.tc;
         let scoped = |s: Scope| match s {
             Scope::Existing => &rows,

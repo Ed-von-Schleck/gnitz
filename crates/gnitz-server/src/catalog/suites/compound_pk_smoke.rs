@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_expr::ColumnTable;
 use gnitz_wire::TypeCode;
 
 #[test]

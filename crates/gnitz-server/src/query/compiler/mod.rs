@@ -5,18 +5,17 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use std::rc::Rc;
-
-use gnitz_expr::SchemaFacts;
 use rustc_hash::FxHashMap;
+use std::rc::Rc;
 
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
 use gnitz_wire::{AggDescriptor, NodeId};
 use gnitz_zset::algebra::MapPlan;
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::schema::{Placement, SchemaDescriptor};
+use gnitz_zset::schema::SchemaDescriptor;
 
 mod emit;
 mod hydration;

@@ -542,7 +542,7 @@ fn a_leftover_poll_does_not_shift_the_replies() {
     let abandoned = DeltaPollItem {
         view: 7.into(),
         from,
-        reply_layout: kv_schema(TypeCode::I64).layout_digest(),
+        reply_layout: kv_schema(TypeCode::I64).layout().layout_digest(),
         spec: &[],
     };
     drop(DeltaPoll::start(&mut client.session, &[abandoned]));

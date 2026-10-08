@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_expr::ColumnTable;
 use gnitz_wire::sys_rows::ColTabRow;
 use gnitz_wire::ColumnDef;
 use std::collections::HashMap;
@@ -284,7 +283,7 @@ fn test_edge_cases() {
         )
         .unwrap();
     let s15 = engine.registry.relation(tid15).map(Relation::schema).unwrap();
-    assert_eq!(s15.columns[0].type_code, TypeCode::U128);
+    assert_eq!(s15.columns()[0].type_code, TypeCode::U128);
     engine.drop_table("public.u128t").unwrap();
 
     // 18. schema_is_empty

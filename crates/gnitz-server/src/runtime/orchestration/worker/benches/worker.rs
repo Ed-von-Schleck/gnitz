@@ -2,7 +2,6 @@ use super::tests::{addressed, engine_with_table, frames, pk_keys, probe, push, t
 use super::*;
 use crate::runtime::sal::SalExcl;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view};
-use gnitz_expr::SchemaFacts;
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};

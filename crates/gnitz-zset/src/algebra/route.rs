@@ -2,7 +2,7 @@
 
 use gnitz_wire::{widen_pk_be, KeyRange, NARROW_PK_MAX_BYTES};
 
-use crate::schema::{key, ColumnTable, SchemaDescriptor};
+use crate::schema::{key, SchemaDescriptor};
 
 /// Map a 64-bit hash onto `0..num_workers` by multiply-shift.
 #[inline(always)]
@@ -61,11 +61,9 @@ impl Placement {
             "Placement::keyed: prefix {prefix_cols} of a {}-column PK",
             pk.len()
         );
-        let dist_stride = pk[..prefix_cols]
-            .iter()
-            .map(|&c| schema.columns[c as usize].size())
-            .sum();
-        Placement::Keyed { dist_stride }
+        Placement::Keyed {
+            dist_stride: schema.pk_prefix_stride(prefix_cols) as u8,
+        }
     }
 
     /// True iff worker `rank`'s copy is a counted one: every worker's for a
@@ -93,7 +91,7 @@ impl Placement {
         if !range.walks_pk(schema.pk_cols()) {
             return None;
         }
-        let Some((start, end)) = schema.pk_range_keys(range) else {
+        let Some((start, end)) = key::KeySpec::for_pk(schema).range_keys(schema.pk_stride(), range) else {
             return Some(0);
         };
         let Placement::Keyed { dist_stride } = self else {

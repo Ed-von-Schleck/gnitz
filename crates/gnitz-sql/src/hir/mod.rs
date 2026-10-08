@@ -677,7 +677,7 @@ impl RelExpr {
     pub(crate) fn get(ids: &ColIdGen, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
         let cols = desc
             .schema
-            .columns
+            .columns()
             .iter()
             .map(|c| HirCol::new(ids.next(), c.clone()))
             .collect();
@@ -757,7 +757,7 @@ impl RelExpr {
         match self {
             RelExpr::Unit => Some(Vec::new()),
             RelExpr::Get { desc, cols } if !desc.pk_repeats => {
-                Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
+                Some(desc.schema.pk_cols().iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),

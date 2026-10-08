@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::Circuit;
-use gnitz_zset::schema::{Placement, Slot};
+use gnitz_zset::algebra::{Placement, Slot};
 
 pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
     assert!(!circuit.nodes().is_empty(), "a decoded circuit has an output");

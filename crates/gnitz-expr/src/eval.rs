@@ -9,7 +9,7 @@ use gnitz_wire::KeyRange;
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
 use crate::program::{ColCopy, MapSinks, ReadAs};
 use crate::range::RangeMembership;
-use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, ResolvedProgram, SchemaFacts, Sink};
+use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, ResolvedProgram, SchemaDescriptor, Sink};
 
 /// One program's result for every row of a batch, in the shape its result
 /// register's class fixes.
@@ -35,7 +35,7 @@ pub(crate) struct Evaluator {
 /// against the schemas it will run on, which is what checks it against them.
 impl LogicalProgram {
     /// A filter predicate; its result must not be a string.
-    pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<RowFilter, ExprValidateErr> {
+    pub fn resolve_filter(self, schema: &SchemaDescriptor) -> Result<RowFilter, ExprValidateErr> {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
@@ -55,7 +55,7 @@ impl LogicalProgram {
     }
 
     /// A scalar expression, one value per row.
-    pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<ScalarEval, ExprValidateErr> {
+    pub fn resolve_scalar(self, schema: &SchemaDescriptor) -> Result<ScalarEval, ExprValidateErr> {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
@@ -76,8 +76,8 @@ impl LogicalProgram {
     /// exactly once.
     pub fn resolve_map(
         self,
-        in_schema: &dyn SchemaFacts,
-        out_schema: &dyn SchemaFacts,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
     ) -> Result<MapEval, ExprValidateErr> {
         let prog = self.resolve_program(in_schema, ReadAs::Value)?;
         let sinks = self.map_sinks(in_schema, out_schema)?;
@@ -153,7 +153,7 @@ impl RowFilter {
     pub fn for_read(
         predicate: &[u8],
         walk: Option<&KeyRange>,
-        schema: &dyn SchemaFacts,
+        schema: &SchemaDescriptor,
     ) -> Result<Self, ExprValidateErr> {
         let mut f = match predicate.is_empty() {
             true => RowFilter {

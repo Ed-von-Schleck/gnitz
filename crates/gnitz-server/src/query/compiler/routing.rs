@@ -6,9 +6,8 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::*;
-use gnitz_expr::ColumnTable;
 use gnitz_wire::{ClampKind, ReadBound};
-use gnitz_zset::schema::Placement;
+use gnitz_zset::algebra::Placement;
 
 /// How a batch reaches the workers that consume it.
 #[derive(Clone)]

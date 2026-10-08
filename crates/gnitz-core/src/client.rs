@@ -4,7 +4,6 @@ use crate::connection::{
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, RelName, Schema, ZSetBatch};
-use gnitz_expr::ColumnTable;
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
@@ -58,10 +57,9 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
 /// whose zero-instruction map fills no payload slot.
 pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
-    let reply = Schema {
-        columns: schema.hidden_key_columns().collect(),
-        pk_cols: (0..schema.pk_cols.len() as u32).collect(),
-    };
+    let pk: Vec<u32> = (0..schema.pk_cols().len() as u32).collect();
+    let reply = Schema::from_parts(schema.hidden_key_columns().collect(), &pk)
+        .expect("a schema's own PK columns are an admissible schema");
     let program = LogicalProgram::copy_cols(&[]).to_blob_bytes();
     let map = ComputeMap { program, out_cols: Vec::new() };
     (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
@@ -225,8 +223,7 @@ pub struct ViewBundle {
 impl ViewBundle {
     /// The chain's catalog rows at `+1`, its first member standing at `base`:
     /// each segment named by [`segment_name`] and owned by the user-named view,
-    /// which stands last under `view_name` and `props`. Every schema has passed
-    /// [`Schema::validate`].
+    /// which stands last under `view_name` and `props`.
     fn put_rows(&self, b: &mut DdlBundle, view_name: &str, props: ViewProps, schema_id: u64, base: u64) {
         let owner_vid = base + self.segments.len() as u64;
         for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
@@ -241,7 +238,7 @@ impl ViewBundle {
             };
 
             // A foreign key constrains a base table, not a view.
-            append_col_rows(b, vid, &pv.schema.columns, &[]);
+            append_col_rows(b, vid, pv.schema.columns(), &[]);
             let circuit = circuit.encode();
             b.put(&CircuitRow { view_id: vid, circuit: &circuit }, 1);
             let (capacity_bytes, delta_bytes) = props.row_words();
@@ -251,7 +248,7 @@ impl ViewBundle {
                     view_id: vid,
                     schema_id,
                     name: &name,
-                    pk_col_idx: PkColList::from_slice(&pv.schema.pk_cols).pack(),
+                    pk_col_idx: PkColList::from_slice(pv.schema.pk_cols()).pack(),
                     capacity_bytes,
                     delta_bytes,
                     owner_view_id,
@@ -1136,16 +1133,12 @@ impl GnitzClient {
             .iter()
             .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
             .collect::<Result<Vec<_>, String>>()?;
-        // `PkColList::from_slice` panics on a schema this refuses.
-        schema
-            .validate()
-            .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
-        let pk = PkColList::from_slice(&schema.pk_cols);
-        if !fks.is_empty() && fks.len() != schema.columns.len() {
+        let pk = PkColList::from_slice(schema.pk_cols());
+        if !fks.is_empty() && fks.len() != schema.columns().len() {
             return Err(ClientError::from(format!(
                 "create_table: {} foreign-key slots for {} columns",
                 fks.len(),
-                schema.columns.len()
+                schema.columns().len()
             )));
         }
 
@@ -1155,7 +1148,7 @@ impl GnitzClient {
         let new_tid = self.alloc_ids(1 + unique_indexes.len() as u64).await?;
 
         let mut b = DdlBundle::default();
-        append_col_rows(&mut b, new_tid, &schema.columns, fks);
+        append_col_rows(&mut b, new_tid, schema.columns(), fks);
         b.put(
             &TableTabRow {
                 table_id: new_tid,
@@ -1226,13 +1219,6 @@ impl GnitzClient {
             return Err(ClientError::from(format!(
                 "view chain has {n_views} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
             )));
-        }
-        // Before any allocation, so a bad schema leaves no residue and never
-        // reaches `PkColList::from_slice`, which panics on one.
-        for (k, pv) in bundle.segments.iter().chain([&bundle.view]).enumerate() {
-            pv.schema
-                .validate()
-                .map_err(|e| ClientError::from(format!("View '{view_name}' segment {k}: {e}")))?;
         }
         let n_segments = bundle.segments.len() as u64;
 
@@ -1387,7 +1373,7 @@ impl GnitzClient {
     /// `ALTER TABLE … ADD COLUMN`: `def` appended to `rel` after every physical
     /// column, dropped ones included.
     pub async fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
-        let (tid, col_idx) = (rel.tid, rel.schema.num_columns());
+        let (tid, col_idx) = (rel.tid, rel.schema.layout().num_columns());
 
         let mut b = DdlBundle::default();
         b.put(&ColTabRow::of(tid, col_idx as u64, def, None), 1);
@@ -1735,7 +1721,7 @@ impl TxnBuffer {
             ReadBound::Range(r) => Some(r),
             _ => None,
         };
-        RowFilter::for_read(&spec.predicate, walk, schema)
+        RowFilter::for_read(&spec.predicate, walk, schema.layout())
             .map_err(|e| ClientError::from(e.to_string()))?
             .ranges(&live, &mut ranges);
         if keys {

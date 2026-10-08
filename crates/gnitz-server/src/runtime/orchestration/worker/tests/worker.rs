@@ -7,7 +7,6 @@ use crate::test_support::{
     col_def, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     pk_only_schema, register_identity_view, scan_all, weighted_rows,
 };
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{PkColList, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
@@ -276,7 +275,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
                 id: tid,
                 kind: gnitz_store::relation::RelationKind::BaseTable,
                 schema,
-                placement: gnitz_zset::schema::Placement::full_pk(&schema),
+                placement: gnitz_zset::algebra::Placement::full_pk(&schema),
                 pk_repeats: false,
             })
             .unwrap();

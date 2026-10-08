@@ -11,7 +11,6 @@ use crate::ir::{BExpr, BoundExpr};
 use crate::project::{projection_program, ProjItem};
 use crate::tail::wire_keys;
 use gnitz_core::RelDescriptor;
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{ColumnDef, OrderKey};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -332,7 +331,7 @@ pub(crate) fn reply_rows(
         if twin.is_none() {
             // A hidden copy of a key column is the key riding hidden, under its own definition.
             let col = source.iter().position(|c| as_col(&it.expr) == Some(c.id));
-            if let Some(col) = col.filter(|&c| it.out.def.is_hidden && desc.schema.is_pk_col(c)) {
+            if let Some(col) = col.filter(|&c| it.out.def.is_hidden && desc.schema.layout().is_pk_col(c)) {
                 it.out.def = source[col].def.clone().hidden();
             }
             items.push(it);
@@ -354,7 +353,7 @@ impl AdhocRows {
     pub(crate) fn reply(self, keys: &[crate::tail::OrderKey<'_>]) -> Result<RowsReply, GnitzSqlError> {
         let AdhocRows { src, cols, proj, layout, placed } = self;
         let item_order = wire_keys(keys, cols.iter().map(|c| &c.def), placed)?;
-        let k = src.schema.pk_cols.len();
+        let k = src.schema.pk_cols().len();
         // The relation's payload columns, each copied in place at its own type: the reply's
         // regions are the relation's.
         let payload = proj[k..]
@@ -401,7 +400,7 @@ impl AdhocRows {
             pk_ordered: slots.len() <= k
                 && slots
                     .iter()
-                    .zip(&src.schema.pk_cols)
+                    .zip(src.schema.pk_cols())
                     .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize)),
             copied,
             program,

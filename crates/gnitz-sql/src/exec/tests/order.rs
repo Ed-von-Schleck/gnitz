@@ -135,7 +135,7 @@ fn comparator_sort(schema: &Schema, batch: &ZSetBatch, order: &[OrderKey], windo
     let keys = if order.is_empty() {
         Vec::new()
     } else {
-        order_locators(order, schema, cut)
+        order_locators(order, schema.layout(), cut)
     };
     let mut perm: Vec<usize> = (0..batch.len()).collect();
     perm.sort_by(|&a, &b| gnitz_expr::cmp_order_keys(&keys, batch, a, b));
@@ -243,7 +243,7 @@ fn a_ranked_sort_and_cut_is_the_comparator_sort_and_cut() {
                     .collect();
                 app.add_row_natives(&natives, (rng() % 3) as i64 + 1);
                 for c in (0..COLS as u32).filter(|c| !pk.contains(c)) {
-                    let null = s.columns[c as usize].is_nullable && rng() % 4 == 0;
+                    let null = s.columns()[c as usize].is_nullable && rng() % 4 == 0;
                     match c {
                         _ if null => app.null(),
                         0 => app.u64_val(id),

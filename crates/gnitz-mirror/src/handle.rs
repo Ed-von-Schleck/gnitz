@@ -1,7 +1,5 @@
 //! The store: what a host opens, and the `MirrorStore` surface a client drives
 //! it through.
-
-use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::append_own_regions;
@@ -13,8 +11,9 @@ use gnitz_store::relation::{
     lock_data_dir, DirLock, IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
 use gnitz_wire::{PkColList, ViewProps};
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
+use gnitz_zset::schema::SchemaDescriptor;
 
 use crate::guard::Guarded;
 use crate::record::{descriptor_of_block, index_lists, MirrorRecord};
@@ -352,7 +351,7 @@ impl Copies {
         // No copy holds a skeleton row, so no hydrator is needed.
         let batch = self
             .registry
-            .scan_spec(tid, spec, reply_schema.layout_digest(), None)
+            .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)
             .map_err(MirrorError::Engine)?;
         let regions = batch.wire_regions();
         let mut rows = ZSetBatch::new(reply_schema);

@@ -3,7 +3,7 @@
 //! grows it.
 
 use super::batch::Batch;
-use crate::schema::{SchemaDescriptor, SchemaFacts};
+use crate::schema::SchemaDescriptor;
 
 /// Row-by-row builder of a `Batch`, whose schema lives on the batch itself.
 pub struct BatchBuilder {
@@ -71,7 +71,7 @@ impl BatchBuilder {
     /// holds. That is the same native convention [`Self::begin_row_natives`] takes
     /// for PK columns.
     pub fn put_int(&mut self, val: u128) {
-        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        let col_size = self.schema().columns()[self.physical_col_idx()].size();
         debug_assert!(
             col_size == 16 || {
                 // The bytes about to be dropped must carry no information: all
@@ -114,7 +114,7 @@ impl BatchBuilder {
     /// width: an F32 column stores the `as f32` narrowing.
     #[cfg(test)]
     pub(crate) fn put_float(&mut self, val: f64) {
-        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        let col_size = self.schema().columns()[self.physical_col_idx()].size();
         match col_size {
             4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
             _ => self.batch.extend_col(self.curr_col, &val.to_le_bytes()),

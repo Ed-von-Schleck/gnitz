@@ -125,7 +125,7 @@ fn view(cat: &dyn Catalog, body: &str) -> PlannedChain {
 fn output_shape(chain: &PlannedChain) -> Vec<(String, bool, bool)> {
     final_view(chain)
         .schema
-        .columns
+        .columns()
         .iter()
         .map(|c| (c.name.clone(), c.is_hidden, c.is_nullable))
         .collect()

@@ -1,6 +1,7 @@
 use super::*;
+use crate::algebra::Placement;
 use crate::repr::BatchBuilder;
-use crate::schema::{ColumnTable, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
 use std::hint::black_box;
 

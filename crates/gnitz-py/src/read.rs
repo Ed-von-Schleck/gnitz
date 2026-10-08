@@ -14,7 +14,7 @@ use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType
 use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::decimal::format_decimal;
 use gnitz_wire::format_uuid;
 use gnitz_wire::{ColType, TypeCode};
@@ -305,13 +305,13 @@ pub(crate) fn present(
     include_hidden: bool,
     lsn: Option<u64>,
 ) -> PyResult<PyScanResult> {
-    let mut cols = Vec::with_capacity(schema.columns.len());
-    let mut names = Vec::with_capacity(schema.columns.len());
-    for (ci, c) in schema.columns.iter().enumerate() {
+    let mut cols = Vec::with_capacity(schema.columns().len());
+    let mut names = Vec::with_capacity(schema.columns().len());
+    for (ci, c) in schema.columns().iter().enumerate() {
         if c.is_hidden && !include_hidden {
             continue;
         }
-        cols.push((SchemaFacts::locate(schema.as_ref(), ci), c.ty));
+        cols.push((schema.layout().locate(ci), c.ty));
         names.push((c.name.as_str(), c.is_hidden));
     }
     let row_type = RowType::of(py, &names)?;

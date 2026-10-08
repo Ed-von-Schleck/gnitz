@@ -4,8 +4,8 @@ use crate::query::compiler::fixtures::*;
 use crate::test_support::{circuit_batch, circuit_cell_batch};
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{Circuit, KeyRange, PkColList, ReadBound};
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::Slot;
 
 const VIEW_ID: u64 = 1;
 
@@ -18,7 +18,7 @@ fn load(rows: Batch) -> Result<LoadedCircuit, String> {
             id: gnitz_wire::CIRCUIT_TAB,
             kind: RelationKind::SystemCatalog,
             schema: *SysFamily::Circuit.schema(),
-            placement: gnitz_zset::schema::Placement::Replicated,
+            placement: gnitz_zset::algebra::Placement::Replicated,
             pk_repeats: false,
         })
         .unwrap();

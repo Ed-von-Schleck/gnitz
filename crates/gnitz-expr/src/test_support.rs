@@ -1,6 +1,6 @@
-//! Owned-buffer stand-ins for a physical batch and schema. The real ones live in
-//! crates that depend on this one, and a stand-in holds the kernels to the
-//! [`BatchView`] / [`ColumnTable`] contracts alone.
+//! An owned-buffer stand-in for a physical batch. The real one lives in a crate
+//! that depends on this one, and a stand-in holds the kernels to the
+//! [`BatchView`] contract alone.
 
 use std::fmt::Debug;
 
@@ -9,8 +9,8 @@ use gnitz_wire::TypeCode;
 use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::{
-    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg,
-    RowFilter, ScalarEval, SchemaFacts, Sink,
+    BatchView, ColumnLocator, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
+    ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
 };
 use gnitz_wire::RowSource;
 
@@ -29,7 +29,7 @@ pub struct TestView {
 impl TestView {
     /// `rows` rows over `schema`: one payload column per slot, sized from its
     /// declared type, every PK column of row `r` holding `r + 1`, nothing NULL.
-    pub fn for_schema(schema: &TestSchema, rows: usize) -> Self {
+    pub fn for_schema(schema: &SchemaDescriptor, rows: usize) -> Self {
         let mut v = TestView {
             rows,
             pk_stride: schema.pk_stride(),
@@ -50,7 +50,7 @@ impl TestView {
 
     /// Write column `ci` of `row` from the low bytes of `native`, wherever the
     /// schema places the column.
-    pub fn set_native(&mut self, schema: &TestSchema, row: usize, ci: usize, native: u128) {
+    pub fn set_native(&mut self, schema: &SchemaDescriptor, row: usize, ci: usize, native: u128) {
         let loc = schema.locate(ci);
         match loc {
             ColumnLocator::Pk { byte_off, size, type_code } => {
@@ -159,45 +159,21 @@ impl MapTarget for TestView {
     }
 }
 
-/// A [`ColumnTable`] over a `(type_code, nullable)` column table and a PK list.
-/// Type codes are reported verbatim, undecodable ones included.
-pub struct TestSchema {
-    cols: Vec<(TypeCode, bool)>,
-    pk: Vec<u32>,
-}
-
-impl TestSchema {
-    pub fn new(cols: &[(TypeCode, bool)], pk: &[u32]) -> Self {
-        TestSchema { cols: cols.to_vec(), pk: pk.to_vec() }
-    }
-
-    /// As [`TestSchema::new`], with the PK at `pk_index` and every other column
-    /// of `col_types` a nullable payload.
-    pub fn with_pk_at(pk_index: usize, col_types: &[TypeCode]) -> Self {
-        let cols: Vec<(TypeCode, bool)> = col_types.iter().enumerate().map(|(i, &t)| (t, i != pk_index)).collect();
-        TestSchema::new(&cols, &[pk_index as u32])
-    }
-}
-
-impl ColumnTable for TestSchema {
-    fn pk_cols(&self) -> &[u32] {
-        &self.pk
-    }
-    fn num_columns(&self) -> usize {
-        self.cols.len()
-    }
-    fn col_type_code(&self, ci: usize) -> TypeCode {
-        self.cols[ci].0
-    }
-    fn col_nullable(&self, ci: usize) -> bool {
-        self.cols[ci].1
-    }
+/// A schema with its PK at `pk_index` and every other column of `col_types` a
+/// nullable payload.
+pub fn schema_with_pk_at(pk_index: usize, col_types: &[TypeCode]) -> SchemaDescriptor {
+    let cols: Vec<SchemaColumn> = col_types
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| SchemaColumn::new(t, i != pk_index))
+        .collect();
+    SchemaDescriptor::new(&cols, &[pk_index as u32])
 }
 
 /// An `n`-row view over `schema`'s German-string payload columns: slot `c` of
 /// `row` holds `cell(row, c)`, NULL when `null_pred(row, c)`. PKs are `1..=n`.
 pub fn make_string_view<S: AsRef<[u8]>>(
-    schema: &TestSchema,
+    schema: &SchemaDescriptor,
     n: usize,
     cell: impl Fn(usize, usize) -> S,
     null_pred: impl Fn(usize, usize) -> bool,
@@ -214,7 +190,7 @@ pub fn make_string_view<S: AsRef<[u8]>>(
 /// `row` holds `f(row, col)`, truncated to its cell, NULL when
 /// `null_pred(row, col)`. PKs are `1..=n`.
 pub fn make_n_col_view(
-    schema: &TestSchema,
+    schema: &SchemaDescriptor,
     n: usize,
     f: impl Fn(usize, usize) -> i64,
     null_pred: impl Fn(usize, usize) -> bool,
@@ -223,7 +199,7 @@ pub fn make_n_col_view(
 }
 
 fn make_view(
-    schema: &TestSchema,
+    schema: &SchemaDescriptor,
     n: usize,
     set: impl Fn(&mut TestView, usize, usize),
     null_pred: impl Fn(usize, usize) -> bool,
@@ -242,19 +218,19 @@ fn make_view(
 
 /// A `U64` PK plus `n` `I64` payload columns, all `nullable` or all not — the
 /// shape almost every kernel test wants.
-pub fn schema_pk_ints(n: usize, nullable: bool) -> TestSchema {
+pub fn schema_pk_ints(n: usize, nullable: bool) -> SchemaDescriptor {
     schema_pk_cols(TypeCode::I64, n, nullable)
 }
 
 /// A `U64` PK plus `n` `STRING` payload columns.
-pub fn schema_pk_strings(n: usize, nullable: bool) -> TestSchema {
+pub fn schema_pk_strings(n: usize, nullable: bool) -> SchemaDescriptor {
     schema_pk_cols(TypeCode::String, n, nullable)
 }
 
-fn schema_pk_cols(payload_tc: TypeCode, n: usize, nullable: bool) -> TestSchema {
-    let mut cols = vec![(TypeCode::U64, false)];
-    cols.extend(std::iter::repeat_n((payload_tc, nullable), n));
-    TestSchema::new(&cols, &[0])
+fn schema_pk_cols(payload_tc: TypeCode, n: usize, nullable: bool) -> SchemaDescriptor {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend(std::iter::repeat_n(SchemaColumn::new(payload_tc, nullable), n));
+    SchemaDescriptor::new(&cols, &[0])
 }
 
 /// `instrs` as a program whose one register sink is its last instruction.
@@ -266,7 +242,7 @@ fn result_prog(instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> Logica
 /// Build and resolve a scalar program; its result is its last instruction. A
 /// test program that fails validation is a bug in the test, so it unwraps here
 /// rather than at every site.
-pub fn scalar_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> ScalarEval {
+pub fn scalar_prog(schema: &SchemaDescriptor, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> ScalarEval {
     result_prog(instrs, const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
@@ -274,7 +250,7 @@ pub fn scalar_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings
 
 /// Build and resolve a filter program; its verdict is its last instruction.
 /// Same unwrap rule as [`scalar_prog`].
-pub fn filter_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> RowFilter {
+pub fn filter_prog(schema: &SchemaDescriptor, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> RowFilter {
     result_prog(instrs, const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
@@ -283,8 +259,8 @@ pub fn filter_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings
 /// Build and resolve a map program, checked against both the schema it reads
 /// and the one it writes. Same unwrap rule as [`scalar_prog`].
 pub fn map_prog(
-    in_schema: &TestSchema,
-    out_schema: &TestSchema,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     instrs: Vec<LogicalInstr>,
     sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,

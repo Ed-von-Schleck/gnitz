@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, u64_pk_schema};
 
 /// `packer`'s key for each of the first `n` rows of `src`, through `pack_rows`.
@@ -250,7 +250,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
         let in_schema = SchemaDescriptor::new(&cols, &[0]);
         let packer = ReindexPacker::new(&in_schema, key).unwrap();
         let out = packer.output_schema(&in_schema, keep).unwrap();
-        let types: Vec<TypeCode> = (0..out.num_columns()).map(|c| out.columns[c].type_code).collect();
+        let types: Vec<TypeCode> = (0..out.num_columns()).map(|c| out.columns()[c].type_code).collect();
         assert_eq!(types, want, "{payload:?} keyed on {key:?}");
         assert_eq!(out.pk_cols(), (0..key.len() as u32).collect::<Vec<_>>(), "{payload:?}");
         let slots: usize = key.iter().map(|&(_, t)| t.wire_stride()).sum();
@@ -303,7 +303,7 @@ fn test_reindex_packer_arity1_byte_identity() {
                 keys[row],
                 want.to_be_bytes(),
                 "{} row {row}: packed key is BE(content hash)",
-                schema.columns[1].type_code,
+                schema.columns()[1].type_code,
             );
         }
         // No two contents collide, the empty one included.
@@ -558,7 +558,9 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
         let src = b.finish();
         let mb = src.as_mem_batch();
         for indexed in [&[k][..], &[k, k + 1], &[k - 1, k]] {
-            let (spec, idx_schema) = crate::schema::index_spec_and_schema(indexed, &owner).unwrap();
+            let (spec, idx_schema) = crate::schema::KeySpec::new(indexed, &owner)
+                .map(|spec| (spec, spec.index_schema(&owner)))
+                .unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
             for row in 0..src.len() {
                 let mut e = [0u8; MAX_PK_BYTES];
@@ -625,7 +627,7 @@ fn a_nullable_group_key_packs_by_column_as_by_row() {
                 b.begin_row(row as u128, 1);
                 for (col, nullable) in cols[1..].iter().zip(nullable) {
                     let v = rng.gen_u128();
-                    let w = col.size() as usize;
+                    let w = col.size();
                     match nullable && rng.gen_range(4) == 0 {
                         true => b.put_null(),
                         false if w == 16 => b.put_int(v),

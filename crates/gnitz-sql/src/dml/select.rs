@@ -260,7 +260,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         }
     };
     let (bound, predicate) = bound_and_predicate(&desc.schema, &conjuncts, &desc.indexes)?;
-    let in_pk_order = walks_in_pk_order(&bound, &desc.schema.pk_cols);
+    let in_pk_order = walks_in_pk_order(&bound, desc.schema.pk_cols());
     let read = |sink| SpecRead {
         name,
         desc: Arc::clone(&desc),
@@ -280,7 +280,11 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
             let finish = FoldFinish::new(partial_schema, &agg.aggs, &having, finalize)?;
             // The finalize items follow the output's key.
             let out = finish.out_schema();
-            let order = wire_keys(&keys, &out.columns, order_cols.iter().map(|&at| out.pk_cols.len() + at))?;
+            let order = wire_keys(
+                &keys,
+                out.columns(),
+                order_cols.iter().map(|&at| out.pk_cols().len() + at),
+            )?;
             let sink = ReadSink { map: pre, kind: SinkKind::Fold(agg) };
             let case = ReadCase::Fold {
                 read: read(sink),

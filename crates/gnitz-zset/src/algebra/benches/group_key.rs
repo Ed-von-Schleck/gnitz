@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
 
 /// Instructions per row of [`GroupOutKey::ordinals`] over 262 144 unconsolidated
@@ -43,7 +43,7 @@ fn group_ordinals_bench() {
                 // The group in every grouped column, the row number in every other.
                 let cell = |c: usize| {
                     let v = if group_cols.contains(&(c as u32)) { g } else { i };
-                    (v & u64::MAX >> (64 - 8 * schema.columns[c].size())) as u128
+                    (v & u64::MAX >> (64 - 8 * schema.columns()[c].size())) as u128
                 };
                 let natives: Vec<u128> = (0..pk_cols).map(cell).collect();
                 bb.begin_row_natives(&natives, 1);

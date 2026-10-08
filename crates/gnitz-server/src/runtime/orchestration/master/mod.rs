@@ -26,8 +26,9 @@ use crate::runtime::sal::{
     Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter, WorkerSet,
 };
 use gnitz_wire::{BoundPeek, PkColList, WireFault};
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{Placement, SchemaDescriptor};
+use gnitz_zset::schema::SchemaDescriptor;
 
 pub(crate) use dispatch::WORKER_WATCH;
 pub(crate) use train::forward_scan;

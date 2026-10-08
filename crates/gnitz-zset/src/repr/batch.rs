@@ -11,7 +11,7 @@ use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_wire::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
 
@@ -1117,8 +1117,8 @@ impl Batch {
         self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row));
         let src_blob = source.blob();
         for pi in 0..self.schema.num_payload_cols() {
-            let col = self.schema.columns[self.schema.payload_col_idx(pi)];
-            let cell = source.get_col_ptr(row, pi, col.size() as usize);
+            let col = self.schema.columns()[self.schema.payload_col_idx(pi)];
+            let cell = source.get_col_ptr(row, pi, col.size());
             self.append_payload_cell(pi, col.type_code, cell, src_blob, blob_cache.as_deref_mut());
         }
         self.commit_row();

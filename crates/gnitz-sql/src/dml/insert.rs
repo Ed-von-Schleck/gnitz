@@ -23,7 +23,6 @@ use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, ScanReply, Schema, ZSetBatch};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
@@ -51,17 +50,17 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
         Some(ConflictTarget::Columns(cols)) => {
             let mut named: Vec<u32> = Vec::with_capacity(cols.len());
             for c in cols {
-                let ci = require_column(&schema.columns, c.value.as_str()).map_err(|e| e.in_clause("ON CONFLICT"))?;
+                let ci = require_column(schema.columns(), c.value.as_str()).map_err(|e| e.in_clause("ON CONFLICT"))?;
                 named.push(ci as u32);
             }
-            let mut pk = schema.pk_cols.clone();
+            let mut pk = schema.pk_cols().to_vec();
             named.sort_unstable();
             pk.sort_unstable();
             if named != pk {
                 return Err(GnitzSqlError::Rejected(format!(
                     "ON CONFLICT target must name exactly the primary key ({})",
                     pk.iter()
-                        .map(|&ci| schema.columns[ci as usize].name.as_str())
+                        .map(|&ci| schema.columns()[ci as usize].name.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
                 )));
@@ -82,7 +81,7 @@ fn value_slots(
     schema: &Schema,
     serial_ci: Option<usize>,
 ) -> Result<Vec<Option<usize>>, GnitzSqlError> {
-    let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns.len()];
+    let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns().len()];
     if columns.is_empty() {
         let unnamed = schema.visible_columns().filter(|&(ci, _)| Some(ci) != serial_ci);
         for (slot, (ci, _)) in unnamed.enumerate() {
@@ -93,7 +92,7 @@ fn value_slots(
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
             .ok_or_else(|| GnitzSqlError::Rejected("INSERT column list: column must be a simple identifier".into()))?;
-        let ci = require_column(&schema.columns, ident).map_err(|e| e.in_clause("INSERT column list"))?;
+        let ci = require_column(schema.columns(), ident).map_err(|e| e.in_clause("INSERT column list"))?;
         if Some(ci) == serial_ci {
             return Err(GnitzSqlError::Rejected(
                 "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
@@ -124,7 +123,7 @@ pub(crate) struct InsertPlan {
 
 /// The table's SERIAL column, whose keys the server assigns.
 fn serial_col(target: &RelDescriptor) -> Option<usize> {
-    target.schema.lone_pk_col().filter(|_| target.serial)
+    target.schema.layout().lone_pk_col().filter(|_| target.serial)
 }
 
 /// Reject every `Insert`-statement clause the INSERT planner does not consume. It reads only
@@ -269,13 +268,13 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
     let pk_slots: Vec<usize> = match serial_ci {
         Some(_) => Vec::new(),
         None => schema
-            .pk_cols
+            .pk_cols()
             .iter()
             .map(|&pi| {
                 slot_of[pi as usize].ok_or_else(|| {
                     GnitzSqlError::Rejected(format!(
                         "PK column '{}' missing from INSERT row",
-                        schema.columns[pi as usize].name
+                        schema.columns()[pi as usize].name
                     ))
                 })
             })
@@ -314,8 +313,8 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
         }
         if serial_ci.is_none() {
             let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-            for (k, (&pi, &slot)) in schema.pk_cols.iter().zip(&pk_slots).enumerate() {
-                let def = &schema.columns[pi as usize];
+            for (k, (&pi, &slot)) in schema.pk_cols().iter().zip(&pk_slots).enumerate() {
+                let def = &schema.columns()[pi as usize];
                 check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
                 natives[k] = native_value(&cells[slot], def)?;
             }
@@ -477,7 +476,7 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
 /// The keys of `n` SERIAL rows drawn from `base`, refused when the last exceeds
 /// the key column's type.
 fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColumn, GnitzSqlError> {
-    let tc = schema.columns[schema.pk_cols[0] as usize].ty.tc;
+    let tc = schema.columns()[schema.pk_cols()[0] as usize].ty.tc;
     let max = FixedInt::from_type_code(tc)
         .expect("`validate_serial_key` admits only a fixed int")
         .range()

@@ -40,7 +40,7 @@ pub(super) fn bound_and_predicate(
     let mut blocked = None;
     for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {
         let residual = residual(conjuncts, &consumed);
-        match compile_wire_conjuncts(residual.iter().copied(), &schema.columns) {
+        match compile_wire_conjuncts(residual.iter().copied(), schema.columns()) {
             Ok(predicate) => return Ok((bound, predicate)),
             // A conjunct the VM cannot carry; a later candidate may consume it.
             Err(e @ GnitzSqlError::Rejected(_)) => {
@@ -53,7 +53,7 @@ pub(super) fn bound_and_predicate(
     if let Some(e) = blocked {
         return Err(e);
     }
-    Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, &schema.columns)?))
+    Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, schema.columns())?))
 }
 
 /// Whether a worker reading under `bound` yields its rows in ascending PK order:

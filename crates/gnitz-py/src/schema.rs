@@ -117,14 +117,14 @@ impl PySchema {
     #[new]
     pub fn new(py: Python<'_>, columns: Vec<PyRef<'_, PyColumnDef>>, pk_indices: Vec<u32>) -> PyResult<Self> {
         let cols = columns.iter().map(|c| c.to_rust(py)).collect::<PyResult<_>>()?;
-        let rust = Schema::from_parts(cols, pk_indices).map_err(PyValueError::new_err)?;
+        let rust = Schema::from_parts(cols, &pk_indices).map_err(PyValueError::new_err)?;
         Ok(PySchema { rust: Arc::new(rust) })
     }
 
     #[getter]
     pub fn columns(&self, py: Python<'_>) -> Vec<PyColumnDef> {
         self.rust
-            .columns
+            .columns()
             .iter()
             .map(|c| PyColumnDef::from_rust(py, c))
             .collect()
@@ -132,14 +132,14 @@ impl PySchema {
 
     #[getter]
     pub fn pk_indices(&self) -> Vec<u32> {
-        self.rust.pk_cols.to_vec()
+        self.rust.pk_cols().to_vec()
     }
 
     pub fn __repr__(&self) -> String {
         format!(
             "Schema(pk_indices={:?}, ncols={})",
-            self.rust.pk_cols,
-            self.rust.columns.len()
+            self.rust.pk_cols(),
+            self.rust.columns().len()
         )
     }
 }

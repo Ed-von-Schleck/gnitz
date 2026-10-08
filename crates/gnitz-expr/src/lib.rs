@@ -20,9 +20,9 @@
 //! one), its resolution against a schema, and
 //! the morsel-oriented vectorized kernels that evaluate the resolved form — plus
 //! the two contracts they read through, [`ColumnLocator`] / [`gnitz_wire::RowSource`] /
-//! [`BatchView`] for *where a value physically sits* and [`ColumnTable`] /
-//! [`SchemaFacts`] for *what the schema says about it* — the column table an
-//! implementor writes, and everything derived from it.
+//! [`BatchView`] for *where a value physically sits* and [`SchemaDescriptor`]
+//! for *what the schema says about it* — the one descriptor the engine and the
+//! client both link.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
 //! `ExprOp`; the vocabulary, both tables and the blob framing that carries them
@@ -67,7 +67,7 @@ mod locator;
 pub mod place;
 mod program;
 mod range;
-mod schema_facts;
+mod schema;
 mod search;
 mod simd;
 mod view;
@@ -79,7 +79,7 @@ pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use program::*;
-pub use schema_facts::*;
+pub use schema::*;
 pub use view::*;
 
 #[cfg(test)]

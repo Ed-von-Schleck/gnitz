@@ -29,7 +29,6 @@ use crate::ir::BoundExpr;
 use crate::project::{compute_map, payload_program, ProjItem};
 pub(crate) use chain::{EmitPieces, ViewChain};
 use gnitz_core::{RelDescriptor, Schema, ViewBundle};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use std::collections::HashSet;
@@ -86,12 +85,12 @@ pub(crate) fn keyed_frame(
     row: impl IntoIterator<Item = u32>,
     tail: Vec<Slot>,
 ) -> Result<Frame, GnitzSqlError> {
-    let slots = input.schema.reduce_out_key(group).output_layout(group, row);
+    let slots = input.schema.layout().reduce_out_key(group).output_layout(group, row);
     let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
     let lead = slots.into_iter().map(|s| match s {
         ReduceOutSlot::SyntheticKey => (None, group_pk_def()),
         ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
-            (input.layout[c as usize], input.schema.columns[c as usize].clone())
+            (input.layout[c as usize], input.schema.columns()[c as usize].clone())
         }
     });
     Frame::new(lead.chain(tail), npk)
@@ -176,18 +175,22 @@ fn emit_projection(
     out: &Schema,
     input: &Schema,
 ) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
-    let k = input.pk_cols.len();
+    let k = input.pk_cols().len();
     // A payload slot naming a key column is a second copy of a value the key
     // region already carries; only the expression map can write one.
     let payload: Option<Vec<u32>> = items[k..]
         .iter()
-        .map(|i| i.passthrough_src().filter(|&c| !input.is_pk_col(c)).map(|c| c as u32))
+        .map(|i| {
+            i.passthrough_src()
+                .filter(|&c| !input.layout().is_pk_col(c))
+                .map(|c| c as u32)
+        })
         .collect();
     let Some(payload) = payload else {
         return Ok(cb.map_expr(node, compute_map(payload_program(items, out, input)?, out)));
     };
     let identity =
-        items.len() == input.columns.len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
+        items.len() == input.columns().len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
     Ok(if identity { node } else { cb.map(node, &payload) })
 }
 
@@ -219,7 +222,7 @@ pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result
     let schema = Arc::make_mut(&mut top.out.schema);
     for (slot, id) in top.out.layout.iter().enumerate() {
         if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
-            schema.columns[slot].name = c.def.name.clone();
+            schema.rename_column(slot, c.def.name.clone());
         }
     }
     let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
@@ -369,7 +372,7 @@ fn filter(
     preds: &[BoundExpr],
     schema: &Schema,
 ) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
-    match crate::expr_lower::compile_filter_program(preds, &schema.columns)? {
+    match crate::expr_lower::compile_filter_program(preds, schema.columns())? {
         Some(prog) => Ok(cb.filter(node, prog.to_blob_bytes())),
         None => Ok(node),
     }

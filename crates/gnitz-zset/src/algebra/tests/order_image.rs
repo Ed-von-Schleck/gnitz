@@ -3,7 +3,6 @@
 
 use super::{append_bytes_image, int16_image, wide_native_of_image, write_image_slot, WideKind};
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::SchemaFacts;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{pk_payload_schema, u64_pk_schema};
 

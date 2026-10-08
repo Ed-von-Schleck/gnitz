@@ -791,7 +791,7 @@ pub(crate) fn compile_wire_conjuncts<'a>(
 
 /// A scalar (non-predicate) expression as a resolved evaluator.
 pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<ScalarEval, GnitzSqlError> {
-    Ok(compile_bound_expr_to_program(expr, &schema.columns)?.resolve_scalar(schema)?)
+    Ok(compile_bound_expr_to_program(expr, schema.columns())?.resolve_scalar(schema.layout())?)
 }
 
 #[cfg(test)]

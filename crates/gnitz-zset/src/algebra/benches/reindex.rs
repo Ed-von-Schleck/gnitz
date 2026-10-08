@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{index_spec_and_schema, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
@@ -153,7 +153,9 @@ fn fold_key_bench() {
 fn index_entries_bench() {
     let counter = Counter::instructions();
     let measure = |label: &str, batch: &Batch, cols: &[u32]| {
-        let (spec, idx_schema) = index_spec_and_schema(cols, batch.schema()).unwrap();
+        let (spec, idx_schema) = crate::schema::KeySpec::new(cols, batch.schema())
+            .map(|spec| (spec, spec.index_schema(batch.schema())))
+            .unwrap();
         let mb = batch.as_mem_batch();
         let slot = spec.key_size().next_multiple_of(8);
         let mut spans = Vec::with_capacity(N * slot);

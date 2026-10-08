@@ -139,7 +139,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
-        let cs = col.size() as usize;
+        let cs = col.size();
         if col.type_code.is_german_string() {
             let src = batch.col_data(pi, 16).as_chunks::<16>().0;
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
@@ -225,7 +225,7 @@ pub(crate) fn scatter_unified_sources(
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
-        let cs = col.size() as usize;
+        let cs = col.size();
         if col.type_code.is_german_string() {
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
             for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(rows) {
@@ -262,7 +262,16 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
         let nbm_ptr = src.null_bmp.row_ptr(ri as usize);
         let wb = w.to_le_bytes();
         unsafe {
-            std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * pks), pks);
+            let d = pk_dst.add(dst_row * pks);
+            if PKS == 0 && (16..=32).contains(&pks) {
+                // Two overlapping 16-byte moves cover any width in 16..=32.
+                let head = (pk_ptr as *const [u8; 16]).read_unaligned();
+                let tail = (pk_ptr.add(pks - 16) as *const [u8; 16]).read_unaligned();
+                (d as *mut [u8; 16]).write_unaligned(head);
+                (d.add(pks - 16) as *mut [u8; 16]).write_unaligned(tail);
+            } else {
+                std::ptr::copy_nonoverlapping(pk_ptr, d, pks);
+            }
             std::ptr::copy_nonoverlapping(wb.as_ptr(), wt_dst.add(dst_row * FB), FB);
             let nbm = ((nbm_ptr as *const u64).read_unaligned() | src.null_pad_mask) & keep;
             (nbm_dst.add(dst_row * FB) as *mut u64).write_unaligned(nbm);
@@ -310,7 +319,7 @@ pub(crate) fn gather_rows(
                 }
             } else {
                 let dst = w.col_mut(pi);
-                width_dispatch!(col.size() as usize, gather_cells, sources, picks, pi, dst);
+                width_dispatch!(col.size(), gather_cells, sources, picks, pi, dst);
             }
         }
     })

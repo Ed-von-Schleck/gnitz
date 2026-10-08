@@ -214,9 +214,9 @@ fn the_read_index_is_built_on_read() {
 #[test]
 fn a_tid_refuses_a_second_layout() {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    let mut wide = kv_schema(TypeCode::I64);
-    wide.columns.push(ColumnDef::new("w", TypeCode::I64, false));
-    let wide = Arc::new(wide);
+    let mut wide_cols = s.columns().to_vec();
+    wide_cols.push(ColumnDef::new("w", TypeCode::I64, false));
+    let wide = Arc::new(Schema::from_parts(wide_cols, s.pk_cols()).unwrap());
     let wide_row = || {
         let mut b = ZSetBatch::new(&wide);
         BatchAppender::new(&mut b).add_row(2, 1).i64_val(20).i64_val(30);
@@ -242,13 +242,16 @@ fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::from_session(s);
     c.txn_begin().unwrap();
-    let signed = Arc::new(Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::I64, false),
-            ColumnDef::new("v", TypeCode::I64, false),
-        ],
-        pk_cols: vec![0],
-    });
+    let signed = Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("pk", TypeCode::I64, false),
+                ColumnDef::new("v", TypeCode::I64, false),
+            ],
+            &[0],
+        )
+        .unwrap(),
+    );
     let batch = kv_rows(&[(1, 10, 1)]);
     for push in [
         block_on(c.push(16, &signed, &batch, Update)),

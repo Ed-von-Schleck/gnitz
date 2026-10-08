@@ -146,7 +146,7 @@ fn a_text_table_past_one_frame_reads_back_whole() {
     let (schema, batch) = db.read("SELECT * FROM t");
     assert_eq!(batch.len(), ROWS as usize);
     let (id_ci, v_ci) = (col_idx(&schema, "id"), col_idx(&schema, "v"));
-    let s = SchemaFacts::locate(&*schema, col_idx(&schema, "s"));
+    let s = schema.layout().locate(col_idx(&schema, "s"));
     let mut seen = vec![false; ROWS as usize];
     for row in 0..batch.len() {
         let id = cell(&schema, &batch, id_ci, row) as u64;

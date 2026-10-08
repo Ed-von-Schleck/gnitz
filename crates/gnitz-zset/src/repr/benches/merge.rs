@@ -37,6 +37,20 @@ fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize)
     b.finish()
 }
 
+/// A U64 PK over a float, a U128 and a nullable column, each of which forces
+/// the `Generic` payload comparator.
+fn generic_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    )
+}
+
 /// `run_merge`'s compare loop alone — the emit materializes nothing — under a
 /// high duplicate-PK rate, over each payload comparator arm.
 #[test]
@@ -45,18 +59,8 @@ fn run_merge_dup_pk_bench() {
     const K: usize = 4;
     const N: usize = 200_000;
     const DUP: usize = 8;
-    // A float, a U128 and a nullable column each force the `Generic` arm.
-    let generic = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, false),
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
     let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
-    for (label, schema) in [("fixed_int", make_schema_u64_i64()), ("generic", generic)] {
+    for (label, schema) in [("fixed_int", make_schema_u64_i64()), ("generic", generic_schema())] {
         let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let merge = || {
@@ -71,6 +75,32 @@ fn run_merge_dup_pk_bench() {
             instr as f64 / (K * N) as f64,
             cyc as f64 / (K * N) as f64
         );
+    }
+}
+
+/// `in_consolidated_order` over a batch already in order, so the pass reads
+/// every row: PK groups of 1 never reach the payload order, wider groups read it
+/// once per row.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn in_consolidated_order_bench() {
+    const N: usize = 200_000;
+    let instructions = Counter::instructions();
+    for (label, schema) in [
+        ("fixed_int_1col", make_schema_u64_i64()),
+        ("fixed_int_2col", pk_u64_two_i64_schema()),
+        ("generic", generic_schema()),
+    ] {
+        for dup in [1usize, 8, 64] {
+            let batch = bench_sorted_batch(&schema, N, dup);
+            assert!(in_consolidated_order(&batch));
+            let (ordered, instr) = instructions.measure(|| in_consolidated_order(black_box(&batch)));
+            assert!(ordered);
+            println!(
+                "in_consolidated_order_bench {label:<14} dup={dup:<3} {:6.2} instr/row",
+                instr as f64 / N as f64
+            );
+        }
     }
 }
 

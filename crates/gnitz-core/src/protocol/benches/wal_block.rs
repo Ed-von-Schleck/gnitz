@@ -23,14 +23,15 @@ fn append_regions_bench() {
         } else {
             TypeCode::I64
         };
-        let schema = Schema {
-            columns: vec![
+        let schema = Schema::from_parts(
+            vec![
                 ColumnDef::new("k", TypeCode::U64, false),
                 ColumnDef::new("a", tc, false),
                 ColumnDef::new("b", tc, false),
             ],
-            pk_cols: vec![0],
-        };
+            &[0],
+        )
+        .unwrap();
         let mut batch = ZSetBatch::new(&schema);
         let mut rows = BatchAppender::new(&mut batch);
         for i in 0..ROWS {

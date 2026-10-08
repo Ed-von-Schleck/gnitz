@@ -5,7 +5,7 @@ use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{payload_str, payload_u64};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
@@ -28,7 +28,7 @@ pub(crate) fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
 
 /// A schema, held to the rules every decoded schema is.
 pub(crate) fn schema(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Schema {
-    Schema::from_parts(columns, pk_cols.to_vec()).expect("a valid test schema")
+    Schema::from_parts(columns, pk_cols).expect("a valid test schema")
 }
 
 /// A non-unique secondary index over `cols`.
@@ -204,7 +204,7 @@ pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
 /// Each row of `b` (in `schema`) as its payload cells and weight — what
 /// [`batch_of`] wrote, read back.
 pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
-    let locs = schema.payload_locators();
+    let locs = schema.layout().payload_locators();
     let cell = |r: usize, pi: usize, loc: &ColumnLocator| {
         let tc = loc.type_code();
         if loc.is_null(b, r) {

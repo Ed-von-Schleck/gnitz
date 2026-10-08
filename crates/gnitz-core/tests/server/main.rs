@@ -27,13 +27,14 @@ fn rel(schema: &str, name: &str) -> RelName {
 
 /// Non-nullable `columns`, the first one the PK.
 fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
-    Schema {
-        columns: columns
+    Schema::from_parts(
+        columns
             .iter()
             .map(|&(name, tc)| ColumnDef::new(name, tc, false))
             .collect(),
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
+    .unwrap()
 }
 
 /// `schema` created as table `t` in a fresh schema: `(schema name, tid, schema)`.
@@ -51,7 +52,7 @@ fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut app = BatchAppender::new(&mut batch);
     for pk in pks {
         let row = app.add_row(pk as u128, 1);
-        for j in 0..schema.columns.len() - 1 {
+        for j in 0..schema.columns().len() - 1 {
             row.i64_val(pk as i64 * 3 + j as i64);
         }
     }

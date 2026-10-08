@@ -19,7 +19,7 @@ use super::emit::emit_reduce_row;
 use super::shape::ReduceShape;
 use crate::algebra::group_key::{ground_pk, GroupNumbers, GroupOutKey, IdentityLoop};
 use crate::repr::{Batch, MemBatch};
-use crate::schema::{SchemaDescriptor, SchemaFacts};
+use crate::schema::SchemaDescriptor;
 
 /// The request-scoped fold state.
 pub(crate) struct AdhocFold {

@@ -6,7 +6,6 @@
 
 use std::borrow::Cow;
 
-use crate::schema::{ColumnTable, SchemaFacts};
 use gnitz_expr::RowFilter;
 
 use crate::repr::Batch;
@@ -40,7 +39,7 @@ pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Re
     }
     let cols: Vec<SchemaColumn> = (0..a.num_columns())
         .map(|c| {
-            let (ac, bc) = (a.columns[c], b.columns[c]);
+            let (ac, bc) = (a.columns()[c], b.columns()[c]);
             SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
         })
         .collect();

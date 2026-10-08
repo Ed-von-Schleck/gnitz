@@ -694,7 +694,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
 pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Result<BoundExpr, GnitzSqlError> {
     let ids = ColIdGen::new();
     let cols = schema
-        .columns
+        .columns()
         .iter()
         .map(|c| HirCol::new(ids.next(), c.clone()))
         .collect();

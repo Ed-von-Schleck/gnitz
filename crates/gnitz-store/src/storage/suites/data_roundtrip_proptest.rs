@@ -13,7 +13,7 @@ use gnitz_wire::MAX_PK_COLUMNS;
 
 use crate::storage::{flush_barrier, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::test_support::{self, arb_schema, row_key, zset_of};
-use gnitz_expr::{ColumnTable, SchemaFacts};
+
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -33,7 +33,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
     let pk_widths: Vec<usize> = schema
         .pk_cols()
         .iter()
-        .map(|&c| schema.columns[c as usize].size() as usize)
+        .map(|&c| schema.columns()[c as usize].size())
         .collect();
     // The leading PK columns are fixed once; only the trailing column varies
     // (= row ordinal). That keeps PKs distinct (the ordinal `< n ≤ 64 < 256 ≤
@@ -60,7 +60,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
             } else if col.type_code.is_german_string() {
                 batch.put_blob(&arb_string(&mut rng));
             } else {
-                batch.put_int(rng.gen_u128() & gnitz_wire::image_mask(col.size() as usize));
+                batch.put_int(rng.gen_u128() & gnitz_wire::image_mask(col.size()));
             }
         }
         batch.end_row();

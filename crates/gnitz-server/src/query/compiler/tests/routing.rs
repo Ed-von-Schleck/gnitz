@@ -2,8 +2,9 @@ use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots};
 use gnitz_wire::{Circuit, ComputeMap, JoinKind, KeyRange, NullKeys, PkColList, RangeRel, ReindexRole, TypeCode};
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{Placement, SchemaColumn, Slot};
+use gnitz_zset::schema::SchemaColumn;
 
 /// A registry for one worker of four: a view computed whole by one worker keeps
 /// no route.

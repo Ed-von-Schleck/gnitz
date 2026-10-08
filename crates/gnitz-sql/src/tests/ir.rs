@@ -116,7 +116,7 @@ fn each_node_types_as_the_value_it_computes() {
         ("SIGN(q)", t(I64)),
     ] {
         let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(bound.infer_ty(&s.columns[..]), want, "{sql}");
+        assert_eq!(bound.infer_ty(s.columns()), want, "{sql}");
     }
 }
 
@@ -217,7 +217,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
     let never_null = |sql: &str| {
         bind_sql(sql, &s)
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .never_null(&s.columns[..])
+            .never_null(s.columns())
     };
     for (shape, over_not_null) in [
         ("{x} + 1", true),

@@ -8,8 +8,9 @@ use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, 
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewProps};
+use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// A table under `dir` at a RAM tier of `ram_tier_bytes`, its shards unbounded.
 pub(crate) fn new_table(

@@ -7,7 +7,7 @@ use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::Batch;
 
 use crate::runtime::sal::{GroupData, MAX_WORKERS};
-use gnitz_zset::schema::Placement;
+use gnitz_zset::algebra::Placement;
 
 // Reuse the row lists across calls.
 thread_local! {

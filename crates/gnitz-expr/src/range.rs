@@ -4,7 +4,7 @@
 
 use gnitz_wire::{image_mask, KeyRange};
 
-use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaFacts};
+use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaDescriptor};
 
 /// A range walk over a column list, as a batch filter.
 pub(crate) struct RangeMembership {
@@ -18,7 +18,7 @@ pub(crate) struct RangeMembership {
 impl RangeMembership {
     /// The walk `range` names; `Err` when a column is out of range or its type has no
     /// key order.
-    pub(crate) fn new(range: &KeyRange, schema: &dyn SchemaFacts) -> Result<Self, ExprValidateErr> {
+    pub(crate) fn new(range: &KeyRange, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
         let bad = |e: String| ExprValidateErr::BadWalk(format!("range walk: {e}"));
         let cols = range.cols();
         let n = schema.num_columns();

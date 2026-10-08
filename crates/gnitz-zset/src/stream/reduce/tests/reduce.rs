@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, le_cell, TestTrace, FLOATS, STRS};
 use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind};
 
@@ -188,7 +188,7 @@ fn cmp_cells(tc: TypeCode, a: &[u8], b: &[u8]) -> Ordering {
 /// `agg` over one group's weighted rows, by its SQL definition.
 fn fold(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8>> {
     let col = agg.col_idx as usize;
-    let tc = schema().columns[col].type_code;
+    let tc = schema().columns()[col].type_code;
     let live = || rows.iter().filter_map(|(r, w)| r[col].as_deref().map(|c| (c, *w)));
     let i64_cell = |v: i64| Some(v.to_le_bytes().to_vec());
     match agg.agg_op {
@@ -485,10 +485,7 @@ fn the_output_is_the_key_the_group_columns_and_the_aggregates() {
         let s = *ReducePlan::from_wire(&schema(), group_cols, &aggs, false)
             .unwrap()
             .output_schema();
-        let cols: Vec<(TypeCode, bool)> = s.columns[..s.num_columns()]
-            .iter()
-            .map(|c| (c.type_code, c.nullable))
-            .collect();
+        let cols: Vec<(TypeCode, bool)> = s.columns().iter().map(|c| (c.type_code, c.nullable)).collect();
         (cols, s.pk_cols().to_vec())
     };
     let aggregates = |max_nullable| {

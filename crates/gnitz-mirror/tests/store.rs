@@ -528,13 +528,13 @@ fn a_damaged_copy_costs_that_copy_alone() {
             Damage::Record => {
                 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
                 let mut raw =
-                    RelationRegistry::new(&root(path(&dir)), gnitz_zset::schema::Slot::SOLO, Default::default());
+                    RelationRegistry::new(&root(path(&dir)), gnitz_zset::algebra::Slot::SOLO, Default::default());
                 raw.reopen_view(
                     RelationSpec {
                         id: TID,
                         kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
                         schema: make_schema_u64_i64(),
-                        placement: gnitz_zset::schema::Placement::Local,
+                        placement: gnitz_zset::algebra::Placement::Local,
                         pk_repeats: false,
                     },
                     FIRST_GENERATION,

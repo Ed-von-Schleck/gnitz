@@ -22,7 +22,7 @@ use super::scatter::with_routed;
 use super::train::drain_rows;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
-use gnitz_expr::{ColumnLocator, ColumnTable, SchemaFacts};
+use gnitz_expr::ColumnLocator;
 use gnitz_store::relation::Relation;
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::{PkBuf, PkColList, PkKeys, Probe, WireConflictMode, WireStatus, MAX_PK_BYTES};
@@ -135,6 +135,35 @@ enum Clash {
     Committed,
 }
 
+/// A PK rendered from its OPK bytes for an error message: the per-column native
+/// values in PK-list order, comma-separated. A calendar or decimal column
+/// renders as the integer it is stored as.
+fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8]) -> String {
+    use gnitz_wire::TypeCode;
+    let mut off = 0usize;
+    schema
+        .pk_columns()
+        .map(|(_, col)| {
+            let cell = &pk_bytes[off..off + col.size()];
+            off += cell.len();
+            let tc = col.type_code;
+            match gnitz_wire::FixedInt::from_type_code(tc) {
+                Some(fi) if fi.is_signed() => format!("{}", gnitz_wire::decode_opk_i64(cell, fi)),
+                Some(fi) => format!("{}", gnitz_wire::decode_opk_i64(cell, fi) as u64),
+                None => {
+                    let native = gnitz_wire::key_image(tc, gnitz_wire::widen_pk_be(cell));
+                    match tc {
+                        TypeCode::UUID => gnitz_wire::format_uuid(native),
+                        TypeCode::I128 => format!("{}", native as i128),
+                        _ => format!("{native}"),
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The PG-style PK-uniqueness rejection for the key `pk_bytes` of `schema`.
 fn pk_violation_err(
     cat: &CatalogEngine,
@@ -143,7 +172,7 @@ fn pk_violation_err(
     pk_bytes: &[u8],
     clash: Clash,
 ) -> WireFault {
-    let key_str = schema.format_pk_bytes(pk_bytes);
+    let key_str = format_pk_bytes(schema, pk_bytes);
     let (sn, tn) = cat.qualified_name_or_unknown(tid);
     let cols = cat.column_names(tid, schema.pk_cols());
     let what = match clash {

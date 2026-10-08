@@ -287,7 +287,7 @@ impl MappedShard {
         let col_regions = schema
             .payload_columns()
             .map(|(pi, col)| {
-                let width = col.size() as usize;
+                let width = col.size();
                 if pi >= file_npc {
                     debug_assert!(width <= ZERO_CELL.len());
                     return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
@@ -489,7 +489,7 @@ impl MappedShard {
             let heap_at = (!relocate).then(|| w.adopt_heap(blob));
             debug_assert!(heap_at.is_none_or(|base| base == 0), "a fresh writer's heap is empty");
             for (pi, col) in schema.payload_columns() {
-                self.decode_payload(pi, col.size() as usize, start, w.col_mut(pi));
+                self.decode_payload(pi, col.size(), start, w.col_mut(pi));
                 if col.type_code.is_german_string() {
                     w.rebase_string_col(pi, blob, heap_at);
                 }
@@ -552,7 +552,7 @@ impl ColumnarSource for MappedShard {
                 .map(|(region, (pi, col))| match region {
                     PayloadRegion::Mapped(cp) => *cp,
                     _ => {
-                        let w = col.size() as usize;
+                        let w = col.size();
                         // SAFETY: the decode writes every cell of `column`.
                         let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
                         self.decode_payload(pi, w, window.start, &mut column);

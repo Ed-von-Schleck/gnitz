@@ -6,7 +6,7 @@
 use crate::codec::literal::{place, Compared, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::Schema;
-use gnitz_expr::{CmpOp, SchemaFacts};
+use gnitz_expr::CmpOp;
 use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};
 use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
 use std::cmp::Reverse;
@@ -19,7 +19,7 @@ fn bound_col_vs_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Pla
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
-    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns[idx].ty);
+    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns()[idx].ty);
     match (left.as_ref(), right.as_ref()) {
         (BExpr::ColRef(idx), lit) => Some((*idx, placed(*idx, lit)?, *op)),
         (lit, BExpr::ColRef(idx)) => Some((*idx, placed(*idx, lit)?, op.converse())),
@@ -60,10 +60,10 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
             return None;
         };
         // Only a PK key set consumes a list; an index bound is one interval.
-        if !schema.is_pk_col(*col) {
+        if !schema.layout().is_pk_col(*col) {
             return None;
         }
-        let c = &schema.columns[*col];
+        let c = &schema.columns()[*col];
         image_max(c.ty.tc)?;
         // A NULL member never makes the conjunct true, and a placement other
         // than `At` names no row.
@@ -84,7 +84,7 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
     }
     let (col, p, op) = bound_col_vs_literal(conjunct, schema)?;
     let cmp = op.as_cmp().filter(|c| *c != CmpOp::Ne)?;
-    let tc = schema.columns[col].ty.tc;
+    let tc = schema.columns()[col].ty.tc;
     let max = image_max(tc)?;
     let admits = match p.compare(cmp) {
         Compared::Always(true) => 0..=max,
@@ -124,7 +124,7 @@ impl Folded {
 /// Every `Range` pin on `col` intersected. `None` when no such pin names `col`.
 fn fold(col: u32, terms: &[Term], schema: &Schema) -> Option<Folded> {
     let mut f = Folded {
-        admits: 0..=image_max(schema.columns[col as usize].ty.tc)?,
+        admits: 0..=image_max(schema.columns()[col as usize].ty.tc)?,
         consumed: Vec::new(),
     };
     for t in terms.iter().filter(|t| t.col as u32 == col) {
@@ -171,7 +171,7 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
     let pinned = eq.len();
     let (range, bounded_sides) = match next {
         Some((col, f)) => {
-            let max = image_max(schema.columns[col as usize].ty.tc)?;
+            let max = image_max(schema.columns()[col as usize].ty.tc)?;
             consumed.extend(f.consumed);
             let (&first, &last) = (f.admits.start(), f.admits.end());
             let sides = (first != 0) as u32 + (last != max) as u32;
@@ -183,7 +183,7 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
         }
     };
     range
-        .is_exact(|c| schema.columns[c as usize].is_nullable)
+        .is_exact(|c| schema.columns()[c as usize].is_nullable)
         .then_some(ListBound { range, consumed, pinned, bounded_sides })
 }
 
@@ -198,11 +198,11 @@ const MAX_CROSS_PRODUCT_KEYS: usize = 65_536;
 /// The PK keys the WHERE names: each PK column's point, else its first IN list,
 /// crossed into OPK keys.
 fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
-    let pk_count = schema.pk_cols.len();
+    let pk_count = schema.pk_cols().len();
     let mut points = [0u128; PK_LIST_MAX_COLS];
     let mut lists: [Option<&[u128]>; PK_LIST_MAX_COLS] = [None; PK_LIST_MAX_COLS];
     let mut consumed = Vec::new();
-    for (k, &col) in schema.pk_cols.iter().enumerate() {
+    for (k, &col) in schema.pk_cols().iter().enumerate() {
         if let Some(f) = fold(col, terms, schema) {
             if let Some(v) = f.point() {
                 points[k] = v;
@@ -231,7 +231,7 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
     }
     // Every list is in key order, so varying the last position fastest emits
     // strictly ascending tuples.
-    let stride = schema.pk_stride();
+    let stride = schema.layout().pk_stride();
     let mut bytes = Vec::with_capacity(n * stride);
     let mut at = [0usize; PK_LIST_MAX_COLS];
     let mut tuple = [0u128; PK_LIST_MAX_COLS];
@@ -239,8 +239,8 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
         for (k, s) in slices.iter().enumerate() {
             tuple[k] = s[at[k]];
         }
-        for (&c, &image) in schema.pk_cols.iter().zip(&tuple[..pk_count]) {
-            let width = schema.columns[c as usize].ty.tc.wire_stride();
+        for (&c, &image) in schema.pk_cols().iter().zip(&tuple[..pk_count]) {
+            let width = schema.columns()[c as usize].ty.tc.wire_stride();
             gnitz_wire::push_opk(&mut bytes, width, image, false);
         }
         for k in (0..pk_count).rev() {
@@ -310,8 +310,8 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
         ));
     }
     // A range pinning every PK column is the key set's one key.
-    let pk_range = bound_column_list(PkColList::from_slice(&schema.pk_cols), &terms, schema)
-        .filter(|b| b.pinned < schema.pk_cols.len());
+    let pk_range = bound_column_list(PkColList::from_slice(schema.pk_cols()), &terms, schema)
+        .filter(|b| b.pinned < schema.pk_cols().len());
     if let Some(b) = pk_range {
         let tier = if b.pinned > 0 {
             Tier::PinnedPkRange

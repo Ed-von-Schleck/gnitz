@@ -139,11 +139,11 @@ fn owner_hashes_the_distribution_prefix_alone() {
 /// Worker count the confinement checks route against; any count works.
 const NW: usize = 4;
 
-/// `pk_range_keys` is the band of exactly the keys a range admits, and
+/// The PK span's `range_keys` is the band of exactly the keys a range admits, and
 /// `confined_worker` names the band's worker iff every key in it shares the
 /// distribution prefix — worker 0 for an empty band.
 #[test]
-fn pk_range_keys_and_confinement_follow_key_membership() {
+fn pk_range_and_confinement_follow_key_membership() {
     let s = SchemaDescriptor::new(&[col(TypeCode::I8), col(TypeCode::U8)], &[0, 1]);
     let placed = [
         Placement::keyed(&s, 1),
@@ -166,7 +166,7 @@ fn pk_range_keys_and_confinement_follow_key_membership() {
 
     let key = |k: &PkBuf| u32::from(u16::from_be_bytes(k.pk_bytes().try_into().unwrap()));
     for r in &ranges {
-        let (lo, hi) = match s.pk_range_keys(r) {
+        let (lo, hi) = match crate::schema::KeySpec::for_pk(&s).range_keys(s.pk_stride(), r) {
             Some((start, end)) => (key(&start), end.as_ref().map_or(1 << 16, key)),
             None => (0, 0),
         };

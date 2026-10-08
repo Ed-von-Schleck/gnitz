@@ -1,7 +1,8 @@
 use super::*;
 use crate::algebra::group_key::GroupOutKey;
+use crate::algebra::{ground_owner, Placement};
 use crate::repr::BatchBuilder;
-use crate::schema::{ground_owner, Placement, SchemaColumn, TypeCode, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, TypeCode, MAX_PK_BYTES};
 use crate::test_support::{self_typed_slots, weighted_rows};
 
 /// PK `(U32, I32, U64, U64)` — 24 bytes, so the whole PK routes by the wide

@@ -1,5 +1,6 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
+use crate::schema::SchemaColumn;
 use crate::schema::TypeCode;
 use crate::test_support::Rng;
 use crate::test_support::{le_cell, opk_pk, random_schema, row_key};
@@ -28,7 +29,7 @@ fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Opti
         bb.put_null();
         return None;
     }
-    let w = col.size() as usize;
+    let w = col.size();
     let tc = col.type_code;
     Some(if tc.is_german_string() {
         let long = |c: u8| [&[b'x'; 20][..], &[c]].concat();
@@ -121,7 +122,7 @@ fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
         if s.payload_columns()
             .all(|(_, c)| !c.nullable && c.type_code.is_fixed_int())
         {
-            assert_eq!(s.payload_cmp, PayloadCmpKind::FixedIntNonnull, "{s:?}");
+            assert!(s.payload_is_fixed_int_nonnull(), "{s:?}");
         }
     }
 }

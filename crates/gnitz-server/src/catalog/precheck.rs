@@ -1,7 +1,5 @@
 //! Catalog precheck — the master's trust boundary against client-pushed
 //! system-table deltas.
-
-use gnitz_expr::SchemaFacts;
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow};

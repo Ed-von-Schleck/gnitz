@@ -18,7 +18,7 @@ fn plan(cat: &dyn Catalog, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
 /// What `UPDATE t SET <set>` writes for the rows `held` of `schema`, each read at
 /// weight 3.
 fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, GnitzSqlError> {
-    let cat = catalog(vec![("t", table(1, schema.columns.clone(), vec![0]))]);
+    let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut plan = plan(&cat, &format!("UPDATE t SET {set}"))?;
     let mut rows = batch_of(schema, held);
     rows.weights.fill(3);
@@ -112,7 +112,7 @@ fn a_uuid_column_is_copied() {
         .add_row(1, 1)
         .u128_val(0)
         .u128_val(u128::MAX - 7);
-    let cat = catalog(vec![("t", table(1, schema.columns.clone(), vec![0]))]);
+    let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut plan = plan(&cat, "UPDATE t SET c1 = c2").unwrap();
     let out = delta(plan.set.as_deref_mut(), rows, &schema).unwrap();
     assert_eq!(out.payload[0].bytes, (u128::MAX - 7).to_le_bytes());

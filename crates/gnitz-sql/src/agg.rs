@@ -107,7 +107,7 @@ pub(crate) fn group_pk_def() -> ColumnDef {
 /// hidden `_group_pk`. A FROM-less SELECT finalizes its constant row over it,
 /// through the same `FoldFinish` a global aggregate takes.
 pub(crate) fn ground_partial_schema() -> Schema {
-    Schema::from_parts(vec![group_pk_def()], vec![0]).expect("one hidden U128 key is a valid schema")
+    Schema::from_parts(vec![group_pk_def()], &[0]).expect("one hidden U128 key is a valid schema")
 }
 
 /// An aggregate's SELECT/HAVING value from its raw value and count ([`agg_ops`]).

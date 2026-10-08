@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig};
 use gnitz_wire::ViewProps;
-use gnitz_zset::schema::Slot;
+use gnitz_zset::algebra::Slot;
 
 /// What the emitter assembles, assembled by a test: the program, and the child
 /// stores its operators declare.
@@ -64,7 +64,7 @@ impl TestPlan {
                 id: VIEW_ID,
                 kind: RelationKind::View(ViewProps::Plain),
                 schema,
-                placement: gnitz_zset::schema::Placement::full_pk(&schema),
+                placement: gnitz_zset::algebra::Placement::full_pk(&schema),
                 pk_repeats: false,
             })
             .unwrap();

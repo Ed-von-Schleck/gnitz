@@ -5,7 +5,6 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
-use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -112,13 +111,13 @@ pub fn net_weight(engine: &CatalogEngine, id: u64) -> i64 {
 
 /// Column records for a view whose output is `schema`.
 pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
-    (0..schema.num_columns())
-        .map(|ci| {
-            let c = schema.column(ci).expect("in range");
-            CatalogColumn {
-                def: ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable),
-                fk: None,
-            }
+    schema
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(ci, c)| CatalogColumn {
+            def: ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable),
+            fk: None,
         })
         .collect()
 }
@@ -493,7 +492,7 @@ pub fn seek_by_index(
     let images: Vec<u128> = cols
         .iter()
         .zip(natives)
-        .map(|(&c, &v)| gnitz_wire::key_image(schema.columns[c as usize].type_code, v))
+        .map(|(&c, &v)| gnitz_wire::key_image(schema.columns()[c as usize].type_code, v))
         .collect();
     let (&last, eq) = images.split_last().expect("at least one key value");
     seek_by_index_range(

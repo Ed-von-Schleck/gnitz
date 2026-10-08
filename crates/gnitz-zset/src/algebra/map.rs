@@ -9,7 +9,7 @@ use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, DirectWriter};
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::{zip_cells, FixedInt};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
@@ -207,8 +207,7 @@ fn hashrow_output_schema(
     for &(c, t) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
         // top-N key kinds clear at this same boundary.
-        locate_key_col(in_schema, c, "hash-row map")?;
-        let src = in_schema.columns[c as usize];
+        let (src, _) = locate_key_col(in_schema, c, "hash-row map")?;
         b.push(SchemaColumn::new(t, src.nullable));
     }
     b.finish().map_err(|e| format!("hash-row map: output {e}"))

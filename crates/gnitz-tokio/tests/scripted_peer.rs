@@ -27,7 +27,7 @@ use tokio::runtime::Runtime;
 
 /// A key column and nothing else; the peer never checks a layout.
 fn schema() -> Arc<Schema> {
-    Arc::new(Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap())
+    Arc::new(Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], &[0]).unwrap())
 }
 
 /// `rows` keys at weight 1. A row is its key, its weight and its null word.

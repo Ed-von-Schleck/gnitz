@@ -5,7 +5,6 @@
 
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
-use gnitz_expr::ColumnTable;
 use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
 
@@ -103,7 +102,10 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
     let schema = entry.schema();
     let table = entry.table();
     if r.walks_pk(schema.pk_cols()) {
-        let cursor = table.range_cursor(schema.pk_range_keys(&r), cut);
+        let cursor = table.range_cursor(
+            gnitz_zset::schema::KeySpec::for_pk(&schema).range_keys(schema.pk_stride(), &r),
+            cut,
+        );
         return Ok((SourceCursor::Full(Box::new(cursor)), None));
     }
     // An index holds a pending row's entry from its ingest on, so it is walked

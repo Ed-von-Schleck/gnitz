@@ -2,9 +2,7 @@ use super::*;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::retraction_batch;
 use crate::test_support::{encode_wal_block, kv_schema};
-use gnitz_expr::{
-    BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, SchemaFacts, Sink,
-};
+use gnitz_expr::{BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, Sink};
 use gnitz_wire::{payload_str, payload_u64};
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
@@ -20,7 +18,11 @@ fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {
 /// `schema`'s payload regions holding `regions`, one per payload slot in slot
 /// order, each typed as its schema column.
 fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
-    assert_eq!(regions.len(), schema.num_payload_cols(), "one region per payload slot");
+    assert_eq!(
+        regions.len(),
+        schema.layout().num_payload_cols(),
+        "one region per payload slot"
+    );
     schema
         .payload_columns()
         .zip(regions)
@@ -33,7 +35,7 @@ fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
 }
 
 #[test]
-fn validate_enforces_full_rule_set() {
+fn from_parts_enforces_full_rule_set() {
     let cols = vec![
         ColumnDef::new("a", TypeCode::U64, false),    // 0: eligible, non-null
         ColumnDef::new("b", TypeCode::I32, false),    // 1: eligible, non-null
@@ -41,13 +43,10 @@ fn validate_enforces_full_rule_set() {
         ColumnDef::new("n", TypeCode::U64, true),     // 3: nullable
     ];
 
-    let schema = |pk: &[u32], columns: &[ColumnDef]| Schema {
-        columns: columns.to_vec(),
-        pk_cols: pk.to_vec(),
-    };
+    let schema = |pk: &[u32], columns: &[ColumnDef]| Schema::from_parts(columns.to_vec(), pk);
 
-    assert!(schema(&[0], &cols).validate().is_ok());
-    assert!(schema(&[0, 1], &cols).validate().is_ok());
+    assert!(schema(&[0], &cols).is_ok());
+    assert!(schema(&[0, 1], &cols).is_ok());
 
     // The rule set is `gnitz_wire::validate_pk_tuple`'s, tested there; these
     // pin what this caller hands it — its arity cap and each column's type and
@@ -60,29 +59,30 @@ fn validate_enforces_full_rule_set() {
             "primary key column 's' has type_code STRING; only fixed-width integer",
         ),
     ] {
-        let got = schema(pk, &cols).validate().unwrap_err();
+        let got = schema(pk, &cols).unwrap_err();
         assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");
     }
 
     // Column-count cap: the null bitmap is one u64, so > MAX_COLUMNS rejects.
-    let wide: Vec<ColumnDef> = (0..=MAX_COLUMNS)
+    let wide: Vec<ColumnDef> = (0..=gnitz_wire::MAX_COLUMNS)
         .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, i > 0))
         .collect();
-    let got = schema(&[0], &wide).validate().unwrap_err();
+    let got = schema(&[0], &wide).unwrap_err();
     assert!(got.contains("MAX_COLUMNS"), "{got}");
-    assert!(schema(&[0], &wide[..MAX_COLUMNS]).validate().is_ok());
+    assert!(schema(&[0], &wide[..gnitz_wire::MAX_COLUMNS]).is_ok());
 }
 
 /// `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
 fn validate_fixture() -> (Schema, ZSetBatch) {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("v", TypeCode::I64, false),
             ColumnDef::new("s", TypeCode::String, true),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     let mut b = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut b);
@@ -126,25 +126,27 @@ fn validate_refuses_each_malformed_batch() {
     for (other, want) in [
         (kv_schema(TypeCode::I64), "payload slot count"),
         (
-            Schema {
-                columns: vec![
+            Schema::from_parts(
+                vec![
                     ColumnDef::new("pk", TypeCode::U32, false),
                     ColumnDef::new("v", TypeCode::I64, false),
                     ColumnDef::new("s", TypeCode::String, true),
                 ],
-                pk_cols: vec![0],
-            },
+                &[0],
+            )
+            .unwrap(),
             "mismatched key column types: expected [U32], got [U64]",
         ),
         (
-            Schema {
-                columns: vec![
+            Schema::from_parts(
+                vec![
                     ColumnDef::new("pk", TypeCode::U64, false),
                     ColumnDef::new("v", TypeCode::F64, false),
                     ColumnDef::new("s", TypeCode::String, true),
                 ],
-                pk_cols: vec![0],
-            },
+                &[0],
+            )
+            .unwrap(),
             "type I64 != schema type F64",
         ),
     ] {
@@ -156,10 +158,7 @@ fn validate_refuses_each_malformed_batch() {
 #[test]
 #[should_panic(expected = "extend_from_owned: layout mismatch")]
 fn extend_from_owned_refuses_a_different_payload_count() {
-    let pk_only = Schema {
-        columns: vec![ColumnDef::new("pk", TypeCode::U64, false)],
-        pk_cols: vec![0],
-    };
+    let pk_only = Schema::from_parts(vec![ColumnDef::new("pk", TypeCode::U64, false)], &[0]).unwrap();
     ZSetBatch::new(&pk_only).extend_from_owned(ZSetBatch::new(&kv_schema(TypeCode::U64)));
 }
 
@@ -175,14 +174,8 @@ fn extend_from_owned_refuses_a_different_payload_type() {
 /// a stride and encode differently.
 #[test]
 fn a_key_of_another_sign_is_another_layout() {
-    let signed = Schema {
-        columns: vec![ColumnDef::new("pk", TypeCode::I64, false)],
-        pk_cols: vec![0],
-    };
-    let unsigned = Schema {
-        columns: vec![ColumnDef::new("pk", TypeCode::U64, false)],
-        pk_cols: vec![0],
-    };
+    let signed = Schema::from_parts(vec![ColumnDef::new("pk", TypeCode::I64, false)], &[0]).unwrap();
+    let unsigned = Schema::from_parts(vec![ColumnDef::new("pk", TypeCode::U64, false)], &[0]).unwrap();
     assert_eq!(
         ZSetBatch::new(&unsigned).layout_matches(&signed).unwrap_err(),
         "mismatched key column types: expected [I64], got [U64]"
@@ -214,14 +207,15 @@ fn a_compound_key_has_no_scalar_form() {
 /// shifts each moved German cell onto its body's new place in the arena.
 #[test]
 fn extend_from_owned_concatenates() {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("s", TypeCode::String, false),
             ColumnDef::new("b", TypeCode::Blob, false),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     // Each half spills a body of its own, so an unshifted cell reads the wrong one.
     let long = |base: u128| format!("spilled string number {base}");
     let build = |base: u128| {
@@ -250,8 +244,8 @@ fn extend_from_owned_concatenates() {
 /// cell. A second appender continues the batch the first one left.
 #[test]
 fn the_appender_writes_each_value_into_its_slot() {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("a", TypeCode::U64, false),
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("s", TypeCode::String, false),
@@ -260,8 +254,9 @@ fn the_appender_writes_each_value_into_its_slot() {
             ColumnDef::new("w", TypeCode::U128, false),
             ColumnDef::new("b", TypeCode::Blob, true),
         ],
-        pk_cols: vec![1],
-    };
+        &[1],
+    )
+    .unwrap();
     let spilled = "a string long enough to spill";
     let wide = (0xBEEF_u128 << 64) | 0xDEAD;
     let mut batch = ZSetBatch::new(&schema);
@@ -309,15 +304,16 @@ fn the_appender_writes_each_value_into_its_slot() {
 /// for a signed one, DATE as its I32 day count.
 #[test]
 fn int_val_writes_at_the_column_width() {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("n", TypeCode::I16, false),
             ColumnDef::new("d", TypeCode::Date, false),
             ColumnDef::new("u", TypeCode::U8, false),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch)
         .add_row(1, 1)
@@ -333,13 +329,14 @@ fn int_val_writes_at_the_column_width() {
 #[test]
 #[should_panic(expected = "256 is out of range for U8")]
 fn int_val_refuses_a_value_its_column_cannot_hold() {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("u", TypeCode::U8, false),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch).add_row(1, 1).int_val(256);
 }
@@ -379,14 +376,15 @@ fn a_wide_value_in_a_narrow_column_panics() {
 #[should_panic(expected = "BatchAppender: row got")]
 fn closing_an_under_pushed_row_trips_the_tripwire() {
     use gnitz_wire::sys_rows::SysRowSink;
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("s", TypeCode::String, true),
             ColumnDef::new("b", TypeCode::Blob, true),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     let mut a = BatchAppender::new(&mut batch);
     a.begin_row(&[1], 1);
@@ -406,14 +404,15 @@ const GATHER_VALS: [&str; 4] = [
 /// `(pk U64 | s STRING | n I64)` over `GATHER_VALS`: row `i` has pk `i`,
 /// weight `i + 1` and `n = 10 i`.
 fn string_batch() -> (Schema, ZSetBatch) {
-    let schema = Schema {
-        columns: vec![
+    let schema = Schema::from_parts(
+        vec![
             ColumnDef::new("pk", TypeCode::U64, false),
             ColumnDef::new("s", TypeCode::String, false),
             ColumnDef::new("n", TypeCode::I64, false),
         ],
-        pk_cols: vec![0],
-    };
+        &[0],
+    )
+    .unwrap();
     let mut b = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut b);
@@ -549,7 +548,7 @@ fn fixture_a_schema() -> Schema {
             ColumnDef::new("z", TypeCode::Blob, true),
             ColumnDef::new("w", TypeCode::U128, false),
         ],
-        vec![3, 0],
+        &[3, 0],
     )
     .expect("fixture A is a client-valid schema")
 }
@@ -588,7 +587,7 @@ fn fixture_b_schema() -> Schema {
             ColumnDef::new("k", TypeCode::U32, false),
             ColumnDef::new("v", TypeCode::I64, false),
         ],
-        vec![0],
+        &[0],
     )
     .expect("fixture B is a client-valid schema")
 }
@@ -611,7 +610,7 @@ fn fixture_b_batch() -> ZSetBatch {
 fn locate_addresses_the_pk_region_the_builder_hands_out() {
     let check = |schema: &Schema, batch: &ZSetBatch, want: &[(usize, &[u128])]| {
         for &(ci, vals) in want {
-            let loc = SchemaFacts::locate(schema, ci);
+            let loc = schema.layout().locate(ci);
             assert!(
                 matches!(loc, gnitz_expr::ColumnLocator::Pk { .. }),
                 "column {ci} is a PK column"
@@ -657,7 +656,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
             vec![Sink::Reg(Reg(2))],
             vec![],
         )
-        .resolve_scalar(&schema)
+        .resolve_scalar(schema.layout())
         .expect("program resolves against the client schema");
         let want: Vec<Option<i128>> = (0..3).map(|r| col[r].map(|v| i128::from(PK3[r] + v))).collect();
         assert_eq!(row_values(&mut ev, &batch), want, "ci3 + ci{ci}");
@@ -680,7 +679,7 @@ fn filter_over_the_region_path() {
         vec![Sink::Reg(Reg(2))],
         vec![],
     )
-    .resolve_filter(&schema)
+    .resolve_filter(schema.layout())
     .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -699,7 +698,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
         vec![Sink::Reg(Reg(0))],
         vec![],
     )
-    .resolve_scalar(&schema)
+    .resolve_scalar(schema.layout())
     .expect("string compare resolves against the client schema");
 
     // Row 0 spills both columns into the batch's one heap; row 2 nulls both.
@@ -723,10 +722,10 @@ fn batches_round_trip_through_a_wal_block() {
             ColumnDef::new("d", TypeCode::U128, false),
             ColumnDef::new("v", TypeCode::I64, false),
         ],
-        vec![0, 1, 2, 3],
+        &[0, 1, 2, 3],
     )
     .expect("the widest admissible client PK");
-    assert_eq!(wide.pk_stride(), gnitz_wire::PK_LIST_MAX_COLS * 16);
+    assert_eq!(wide.layout().pk_stride(), gnitz_wire::PK_LIST_MAX_COLS * 16);
     let mut wide_batch = ZSetBatch::new(&wide);
     wide_batch.pks.push_natives(&[u128::MAX, 1 << 64, 42, (1 << 64) + 7]);
     wide_batch.pks.push_natives(&[9, 8, 7, 6]);
@@ -762,16 +761,17 @@ fn batches_round_trip_through_a_wal_block() {
 /// (which is not column order here).
 #[test]
 fn schema_survives_the_block_roundtrip() {
-    let original = Schema {
-        columns: vec![
+    let original = Schema::from_parts(
+        vec![
             ColumnDef::new("id", TypeCode::U64, false).hidden(),
             ColumnDef::new("name", TypeCode::String, true),
             ColumnDef::new("score", TypeCode::F64, false),
             ColumnDef::new("tag", TypeCode::I32, true),
             ColumnDef::new("uuid", TypeCode::U128, false),
         ],
-        pk_cols: vec![4, 0],
-    };
+        &[4, 0],
+    )
+    .unwrap();
     assert_eq!(Schema::from_block(&original.to_block()).unwrap(), original);
 }
 
@@ -781,11 +781,9 @@ fn schema_survives_the_block_roundtrip() {
 #[test]
 fn a_pk_wider_than_the_client_codec_is_rejected() {
     let n = gnitz_wire::PK_LIST_MAX_COLS + 1;
-    let wide = Schema {
-        columns: (0..n).map(|_| ColumnDef::new("k", TypeCode::U64, false)).collect(),
-        pk_cols: (0..n as u32).collect(),
-    };
-    let block = wide.to_block();
+    let key = ColumnDef::new("k", TypeCode::U64, false);
+    let pk: Vec<u32> = (0..n as u32).collect();
+    let block = gnitz_wire::schema_block::encode((0..n).map(|_| key.block_col()), &pk);
     assert!(
         gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
         "the codec admits it"

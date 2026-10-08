@@ -338,12 +338,12 @@ crate graph rather than a convention: a host holding a mirrored view links
 |-------|------|
 | `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and the syscall idioms `std` lacks — independent leaves every other crate may name |
 | `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
-| `gnitz-expr` | The one expression evaluator, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
+| `gnitz-expr` | The one expression evaluator, the schema descriptor, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
 | `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
 | `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
-| `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators |
+| `gnitz-zset` | The Z-set kernel: the key and payload-order kernels, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
 | `gnitz-server` | The multi-process server binary, whose cargo package is `gnitz`: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |

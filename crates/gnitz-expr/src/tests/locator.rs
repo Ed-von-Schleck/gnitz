@@ -1,9 +1,11 @@
 //! Resolved-addressing reads, driven through a non-engine [`crate::BatchView`].
 
+use crate::SchemaColumn;
 use std::cmp::Ordering;
 
-use crate::test_support::{TestSchema, TestView};
-use crate::{cmp_order_keys, order_bits, order_locators, ColumnLocator, OrderLocator, RowRanking, SchemaFacts};
+use crate::test_support::TestView;
+use crate::SchemaDescriptor;
+use crate::{cmp_order_keys, order_bits, order_locators, ColumnLocator, OrderLocator, RowRanking};
 use gnitz_wire::{FixedInt, OrderKey, RowSource, ScalarKind, TypeCode};
 
 /// Every locator read of every key type, from a key column and from a payload
@@ -33,12 +35,12 @@ fn every_locator_read_agrees_with_the_values_encoding() {
     };
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let w = tc.wire_stride();
-        let schema = TestSchema::new(
+        let schema = SchemaDescriptor::new(
             &[
-                (TypeCode::U16, false), // key column 0
-                (tc, false),            // key column 1, at byte 2
-                (TypeCode::I64, true),  // payload slot 0
-                (tc, true),             // payload slot 1
+                SchemaColumn::new(TypeCode::U16, false), // key column 0
+                SchemaColumn::new(tc, false),            // key column 1, at byte 2
+                SchemaColumn::new(TypeCode::I64, true),  // payload slot 0
+                SchemaColumn::new(tc, true),             // payload slot 1
             ],
             &[0, 1],
         );
@@ -98,7 +100,10 @@ fn every_locator_read_agrees_with_the_values_encoding() {
 fn order_bits_reads_a_float_slot_as_its_image() {
     const FLOATS: [f64; 3] = [-1.5, 0.0, f64::NAN];
     for (kind, tc) in [(ScalarKind::F32, TypeCode::F32), (ScalarKind::F64, TypeCode::F64)] {
-        let schema = TestSchema::new(&[(TypeCode::U64, false), (tc, false)], &[0]);
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
+            &[0],
+        );
         let mut v = TestView::for_schema(&schema, FLOATS.len());
         let bits = |f: f64| match kind {
             ScalarKind::F32 => (f as f32).to_bits() as u64,
@@ -120,12 +125,12 @@ fn order_bits_reads_a_float_slot_as_its_image() {
 #[test]
 fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
     // `PRIMARY KEY (c3, c0)`.
-    let schema = TestSchema::new(
+    let schema = SchemaDescriptor::new(
         &[
-            (TypeCode::U32, false),
-            (TypeCode::String, true),
-            (TypeCode::F64, false),
-            (TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::String, true),
+            SchemaColumn::new(TypeCode::F64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[3, 0],
     );
@@ -163,7 +168,13 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 /// direction, and two NULLs tie.
 #[test]
 fn null_placement_ignores_the_direction() {
-    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]);
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
     let mut v = TestView::for_schema(&schema, 3);
     v.set_int(1, 0, 5);
     v.set_null(0, 0);
@@ -192,7 +203,7 @@ fn null_placement_ignores_the_direction() {
 /// value, where a NULL arm would call the rows tied.
 #[test]
 fn a_pk_key_never_takes_the_null_arm() {
-    let schema = TestSchema::new(&[(TypeCode::U64, false)], &[0]);
+    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     // Keys 1 and 2.
     let mut v = TestView::for_schema(&schema, 2);
     for row in 0..2 {
@@ -269,7 +280,14 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
     let mut rng = move || crate::test_support::xorshift(&mut st) as usize;
     for &tc in TypeCode::ALL {
         // `(key column 0, the leading key, a payload column)`, the leading key a payload column.
-        let schema = TestSchema::new(&[(TypeCode::U64, false), (tc, true), (TypeCode::I64, false)], &[0]);
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(tc, true),
+                SchemaColumn::new(TypeCode::I64, false),
+            ],
+            &[0],
+        );
         let mut v = TestView::for_schema(&schema, ROWS);
         for row in 0..ROWS {
             match tc.is_german_string() {
@@ -284,7 +302,14 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
         let mut cases = vec![(schema, v, 1u16)];
         if tc.is_pk_eligible() {
             // The leading key the first of two key columns, the second telling its ties apart.
-            let schema = TestSchema::new(&[(tc, false), (TypeCode::U16, false), (TypeCode::I64, true)], &[0, 1]);
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(tc, false),
+                    SchemaColumn::new(TypeCode::U16, false),
+                    SchemaColumn::new(TypeCode::I64, true),
+                ],
+                &[0, 1],
+            );
             let mut v = TestView::for_schema(&schema, ROWS);
             for row in 0..ROWS {
                 v.set_native(&schema, row, 0, PATTERNS[rng() % PATTERNS.len()]);

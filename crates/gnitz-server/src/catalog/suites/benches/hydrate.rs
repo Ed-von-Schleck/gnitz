@@ -6,7 +6,6 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-use gnitz_expr::{ColumnTable, SchemaFacts};
 use std::hint::black_box;
 use std::rc::Rc;
 

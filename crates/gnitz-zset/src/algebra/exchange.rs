@@ -1,12 +1,11 @@
 //! The scatter plan of a worker exchange: [`ScatterPlan`] and the per-row
 //! routing-key kernels.
 
+use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, Placement, Slot};
 use crate::algebra::group_key::{cell_image, for_cell_width, GroupKey, KeyCells};
 use crate::algebra::reindex::{FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
-use crate::schema::Slot;
-use crate::schema::{ground_owner, worker_for_key, worker_for_pk_bytes};
-use crate::schema::{Placement, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::zip_cells;
 
 /// A scatter key resolved against one schema: each row goes to the owner of the

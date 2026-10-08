@@ -8,7 +8,6 @@
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::SysRowSink;
 use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -117,7 +116,7 @@ fn read_line(read: &SpecRead, local: bool) -> String {
 fn access_line(bound: &ReadBound, schema: &Schema) -> String {
     match bound {
         ReadBound::None => "full scan".to_string(),
-        ReadBound::Range(r) if r.walks_pk(&schema.pk_cols) => "pk range walk".to_string(),
+        ReadBound::Range(r) if r.walks_pk(schema.pk_cols()) => "pk range walk".to_string(),
         ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
@@ -126,7 +125,7 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
                 .cols()
                 .as_slice()
                 .iter()
-                .map(|&c| schema.columns[c as usize].name.as_str())
+                .map(|&c| schema.columns()[c as usize].name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("index range on ({cols})")
@@ -137,14 +136,14 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
 /// Whether column `i` is a hidden **payload** column: one appended to order the
 /// reply. A hidden PK column carries the reply's key instead.
 fn is_hidden_payload(schema: &Schema, i: usize) -> bool {
-    schema.columns[i].is_hidden && !schema.is_pk_col(i)
+    schema.columns()[i].is_hidden && !schema.layout().is_pk_col(i)
 }
 
 /// How wide the reply is: its visible columns, the hidden ones appended to order it, and
 /// whether it ships no map.
 fn projection_line(schema: &Schema, unprojected: bool) -> String {
     let visible = schema.visible_columns().count();
-    let extra = (0..schema.columns.len())
+    let extra = (0..schema.columns().len())
         .filter(|&i| is_hidden_payload(schema, i))
         .count();
     let noun = if visible == 1 { "column" } else { "columns" };
@@ -170,7 +169,7 @@ fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_dis
     let cols = agg
         .group_cols
         .iter()
-        .map(|&c| reduce_schema.columns[c as usize].name.as_str())
+        .map(|&c| reduce_schema.columns()[c as usize].name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let ops = agg
@@ -184,7 +183,7 @@ fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_dis
                 AggFunc::Max => "MAX",
                 AggFunc::CountNonNull => "COUNT_NON_NULL",
             };
-            format!("{op}({})", reduce_schema.columns[s.col_idx as usize].name)
+            format!("{op}({})", reduce_schema.columns()[s.col_idx as usize].name)
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -219,7 +218,7 @@ fn plan_rows(lines: &[String]) -> SqlResult {
             ColumnDef::new("_line", TypeCode::U64, false).hidden(),
             ColumnDef::new("plan", TypeCode::String, false),
         ],
-        vec![0],
+        &[0],
     )
     .expect("the EXPLAIN reply schema is a valid two-column schema");
     let mut batch = ZSetBatch::new(&schema);
