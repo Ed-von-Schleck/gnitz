@@ -8,7 +8,6 @@ use crate::test_support::{
 };
 use gnitz_store::relation::Relation;
 use gnitz_wire::TypeCode;
-use gnitz_zset::schema::Slot;
 use std::collections::HashMap;
 
 pub(super) fn view_cols() -> Vec<CatalogColumn> {
@@ -196,66 +195,6 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     tick(&mut engine, base, delta);
     assert_eq!(held(&mut engine, once), times(&engine, base, &rows, 1));
     assert_eq!(net_weight(&engine, count), 1, "the count moved, its row count did not");
-}
-
-// ── A side's output relay ───────────────────────────────────────────────────
-
-/// Records the row count and whether the plan keeps rank 0's rows alone for
-/// every batch a relay sends, and relays it back.
-struct Recorder {
-    dag: DagEngine,
-    registry: RelationRegistry,
-    sent: Vec<(usize, bool)>,
-}
-
-impl DriveHost for Recorder {
-    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
-        (&mut self.dag, &mut self.registry)
-    }
-
-    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, _fold: bool) -> Batch {
-        let splits = plan.share(&batch, Slot::new(0, 2)).len() < batch.len();
-        self.sent.push((batch.len(), splits));
-        batch.into_owned()
-    }
-}
-
-/// A side whose output every worker holds whole never reaches the host: each
-/// rank keeps its own share, and the ranks' shares partition the output. A
-/// round and a broadcast reach it, the round with its plan.
-#[test]
-fn a_replica_sides_output_is_shared_without_a_round() {
-    let schema = crate::test_support::make_schema_u64_i64();
-    let rows: Vec<(u64, i64, i64)> = (1..=16).map(|k| (k, 1, k as i64 * 10)).collect();
-    let delta = make_batch(&schema, &rows);
-    let plan = std::rc::Rc::new(ScatterPlan::group(&schema, &[0]).unwrap());
-    let mut shares: Vec<u64> = Vec::new();
-    for rank in [0u32, 1] {
-        let mut host = Recorder {
-            dag: DagEngine::default(),
-            registry: RelationRegistry::new("", Slot::new(rank, 2), Default::default()),
-            sent: Vec::new(),
-        };
-        let share = relay(
-            &mut host,
-            99,
-            Cow::Borrowed(&delta),
-            Some(&Relay::Share(plan.clone())),
-            false,
-        );
-        shares.extend((0..share.len()).map(|i| share.get_pk(i) as u64));
-        relay(
-            &mut host,
-            99,
-            Cow::Borrowed(&delta),
-            Some(&Relay::Round(plan.clone())),
-            false,
-        );
-        relay(&mut host, 99, Cow::Borrowed(&delta), Some(&Relay::Broadcast), false);
-        assert_eq!(host.sent, [(16, true), (16, false)], "rank {rank}");
-    }
-    shares.sort_unstable();
-    assert_eq!(shares, (1..=16).collect::<Vec<u64>>());
 }
 
 // ── A LEFT JOIN's two re-keys ───────────────────────────────────────────────

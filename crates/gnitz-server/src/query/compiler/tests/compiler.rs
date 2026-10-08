@@ -3,77 +3,10 @@ use super::*;
 use crate::test_support::{
     identity_circuit, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
 };
-use gnitz_expr::SchemaFacts;
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
 use gnitz_zset::schema::{Placement, SchemaColumn, Slot};
 
 // ── The shapes a compile refuses ────────────────────────────────────────
-
-/// No planner path emits any of these; a circuit hand-built through `Circuit`
-/// can, so each is refused at compile by the guard named.
-#[test]
-fn a_circuit_no_plan_can_be_carved_from_is_rejected() {
-    let cases: [(Build, &str); 5] = [
-        // A node in two sides would open one scratch child twice, under two
-        // unsynchronized shard indexes.
-        (
-            |c: &mut Circuit| {
-                let a = scan(c, 10);
-                let (s1, s2) = (c.shard(a), c.shard(a));
-                c.union(s1, s2);
-            },
-            "exchange sides share a node",
-        ),
-        // A shard upstream of another lies in both ancestor sets.
-        (
-            |c: &mut Circuit| {
-                let a = scan(c, 10);
-                let s1 = c.shard(a);
-                let n = c.negate(s1);
-                c.shard(n);
-            },
-            "exchange sides share a node",
-        ),
-        // A delta is routed to the side scanning its source, so a scan in the post
-        // phase would receive nothing.
-        (
-            |c: &mut Circuit| {
-                let (a, b) = (scan(c, 10), scan(c, 11));
-                let s = c.shard(a);
-                c.union(s, b);
-            },
-            "an exchanged plan scans a relation outside every exchange side",
-        ),
-        // A post-phase node reading into a side, past its shard: the side's
-        // registers are another plan's.
-        (
-            |c: &mut Circuit| {
-                let a = scan(c, 10);
-                let n = c.negate(a);
-                let s = c.shard(n);
-                c.union(s, n);
-            },
-            "operand is produced outside this plan",
-        ),
-        // So is the delta a post-phase join would integrate.
-        (
-            |c: &mut Circuit| {
-                let a = scan(c, 10);
-                let n = c.negate(a);
-                let s = c.shard(n);
-                c.join(s, n, gnitz_wire::JoinKind::Equi, false);
-            },
-            "operand is produced outside this plan",
-        ),
-    ];
-    let schema = make_schema_u64_i64();
-    for (build, guard) in cases {
-        let mut c = Circuit::default();
-        build(&mut c);
-        let compiled = compile(c, &sources([(10, schema), (11, schema)]), &schema, false);
-        assert_eq!(rejection(compiled), guard);
-    }
-}
 
 /// The output must match the view schema's physical layout, not just its width.
 #[test]
@@ -157,29 +90,33 @@ fn a_side_relays_only_what_is_not_already_in_place() {
         shards.into_iter().reduce(|a, b| c.union(a, b)).unwrap();
         let registry = sources_at(Slot::new(0, of), (10..).zip(sides.iter().map(|s| s.0)));
         let (out, _) = compile(c, &registry, &view, false).expect("the fixture compiles");
-        out.sides.iter().map(|s| route(s.relay.as_ref())).collect::<Vec<_>>()
+        let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
+        let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
+        (rounds, shares)
     };
+    use crate::query::vm::Op;
     let negate = || Some(OpNode::Negate);
     assert_eq!(
         relays(4, &[(keyed, None)]),
-        [Route::Stays],
+        (0, 0),
         "a shard on the key its scan's rows are placed by"
     );
-    assert_eq!(relays(4, &[(keyed, negate())]), [Route::Round]);
+    assert_eq!(relays(4, &[(keyed, negate())]), (1, 0));
     assert_eq!(
         relays(4, &[(replicated, negate()), (keyed, negate())]),
-        [Route::Share, Route::Round],
+        (1, 1),
         "every worker computed the same rows of a replicated side"
     );
     assert_eq!(
         relays(4, &[(replicated, Some(OpNode::WorkerFilter)), (keyed, negate())]),
-        [Route::Round, Route::Round],
+        // The trim is a share of its own.
+        (2, 1),
         "a trimmed side emits a slice of the replica, not the replica"
     );
-    assert_eq!(relays(1, &[(keyed, negate())]), [Route::Stays], "one worker");
+    assert_eq!(relays(1, &[(keyed, negate())]), (0, 0), "one worker");
     assert_eq!(
         relays(4, &[(replicated, negate())]),
-        [Route::Stays],
+        (0, 0),
         "a view over replicated sources alone is computed whole on every worker"
     );
 }
@@ -246,7 +183,16 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     let replicated = keyed.placed(Placement::Replicated);
     let split = |circuit: Circuit, source: Source, of: u32| {
         let out = compile_global(circuit, source, Slot::new(0, of)).expect("the fixture compiles");
-        !out.sides[0].plan.vm.out_schema().same_layout(&source.schema)
+        out.vm
+            .ops()
+            .filter(|op| {
+                matches!(
+                    op,
+                    crate::query::vm::Op::Reduce { .. } | crate::query::vm::Op::TopN { .. }
+                )
+            })
+            .count()
+            == 2
     };
     for (why, op, source, of, want) in [
         ("a partitioned SUM", global_reduce(AggFunc::Sum), keyed, 4, true),
@@ -265,6 +211,26 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     ] {
         assert_eq!(split(global_circuit(&op, true), source, of), want, "{why}");
     }
+}
+
+/// A global aggregate's ground row is minted by the first epoch of any source,
+/// and a round runs only in the epochs of the sources that reach it — so a round
+/// behind the aggregate would drop the row minted in another source's epoch. A
+/// reduce that owes no ground row may sit behind one.
+#[test]
+fn an_exchange_behind_a_global_aggregate_is_rejected() {
+    let keyed = Source::from(make_schema_u64_i64());
+    let above = |exchanged: bool| {
+        let mut c = global_circuit(&global_reduce(AggFunc::Sum), exchanged);
+        let reduced = c.nodes().len() - 1;
+        c.shard(reduced);
+        compile_global(c, keyed, Slot::new(0, 4))
+    };
+    assert_eq!(rejection(above(true)), "an exchange behind a global aggregate");
+    assert!(
+        above(false).is_ok(),
+        "a reduce of each worker's slice owes no ground row"
+    );
 }
 
 /// An exchange places its rows by the key of the reduce or top-N reading it, so
@@ -298,7 +264,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
     let replicated = keyed.placed(Placement::Replicated);
     let op = global_reduce(AggFunc::Min);
     let seeds = |exchanged: bool, source: Source, slot: Slot| {
-        compile_global(global_circuit(&op, exchanged), source, slot).map(|out| out.post.vm.pending_ground_row)
+        compile_global(global_circuit(&op, exchanged), source, slot).map(|out| out.vm.pending_ground_row)
     };
     assert_eq!(seeds(true, keyed, Slot::SOLO), Ok(true), "one worker");
     assert_eq!(seeds(true, replicated, Slot::new(2, 4)), Ok(true), "a replicated view");
@@ -315,10 +281,12 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
         .map(|rank| {
             let slot = Slot::new(rank, 4);
             let out = compile_global(global_circuit(&op, true), keyed, slot).expect("the fixture compiles");
-            let Some(Relay::Round(relay)) = &out.sides[0].relay else {
-                panic!("a partitioned side takes a round");
-            };
-            (out.post.vm.pending_ground_row, !relay.share(&probe, slot).is_empty())
+            let round = out.vm.ops().find_map(|op| match op {
+                crate::query::vm::Op::Round { plan, .. } => Some(std::rc::Rc::clone(plan)),
+                _ => None,
+            });
+            let round = round.expect("a partitioned side takes a round");
+            (out.vm.pending_ground_row, !round.share(&probe, slot).is_empty())
         })
         .unzip();
     assert_eq!(seeded, receives);

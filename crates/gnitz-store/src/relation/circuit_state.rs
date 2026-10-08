@@ -8,10 +8,10 @@ use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// A `u16` index into one [`CircuitState`], minted only by
+/// An index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StateIdx(u16);
+pub struct StateIdx(usize);
 
 /// The children one compiled circuit declares, in [`StateIdx`] order.
 #[derive(Default)]
@@ -22,8 +22,7 @@ pub struct StateLayout {
 impl StateLayout {
     /// Declare one rederived child store named `child`.
     pub fn declare(&mut self, child: String, schema: SchemaDescriptor) -> StateIdx {
-        let idx =
-            StateIdx(u16::try_from(self.children.len()).expect("a circuit declares far fewer than 65536 children"));
+        let idx = StateIdx(self.children.len());
         self.children.push((child, schema));
         idx
     }
@@ -35,7 +34,7 @@ impl StateLayout {
 
     /// The schema of the child `idx` names.
     pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
-        &self.children[idx.0 as usize].1
+        &self.children[idx.0].1
     }
 }
 
@@ -90,10 +89,10 @@ impl CircuitState {
     }
 
     fn at(&self, idx: StateIdx) -> &Table {
-        &self.tables[idx.0 as usize]
+        &self.tables[idx.0]
     }
 
     fn at_mut(&mut self, idx: StateIdx) -> &mut Table {
-        &mut self.tables[idx.0 as usize]
+        &mut self.tables[idx.0]
     }
 }

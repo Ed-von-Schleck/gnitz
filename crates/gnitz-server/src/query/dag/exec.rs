@@ -1,5 +1,5 @@
-//! Epoch execution: the one pre → relay → post pipeline every compiled shape
-//! runs through, and the DAG evaluation driver.
+//! Epoch execution: a view's program run round by round, and the DAG
+//! evaluation driver.
 
 use super::*;
 
@@ -22,19 +22,6 @@ pub(crate) enum Drive {
     },
 }
 
-/// Hand `batch` to the workers that consume it.
-fn relay(host: &mut impl DriveHost, view_id: u64, batch: Cow<'_, Batch>, how: Option<&Relay>, fold: bool) -> Batch {
-    match how {
-        None => batch.into_owned(),
-        Some(Relay::Broadcast) => host.exchange(view_id, batch, &ScatterPlan::broadcast(), fold),
-        Some(Relay::Round(p)) => host.exchange(view_id, batch, p, fold),
-        Some(Relay::Share(p)) => {
-            let slot = host.parts().1.slot();
-            p.share(&batch, slot)
-        }
-    }
-}
-
 // ── Epoch execution ─────────────────────────────────────────────────────
 
 /// `view_id`'s plan, which its epoch compiled on entry, beside the stores an
@@ -46,103 +33,39 @@ fn plan_and_stores<'a>(
 ) -> (&'a mut CompileOutput, vm::Stores<'a>) {
     let (dag, registry) = host.parts();
     let ViewPlan { code, state } = dag.plan_mut(view_id).expect("compiled on the epoch's entry");
-    let stores = vm::Stores {
-        own: state,
-        registry,
-        view: view_id,
-        unfed,
-    };
+    let stores = vm::Stores { own: state, registry, unfed };
     (code, stores)
 }
 
-/// Run one view's epoch over `src_id`'s delta. `unfed`: the sources the view
-/// has been fed no row of.
+/// Run one view's epoch over `input`, `src_id`'s delta, which it may `take`.
+/// `unfed`: the sources the view has been fed no row of.
 fn run_view_epoch(
     host: &mut impl DriveHost,
     view_id: u64,
-    input: Cow<'_, Batch>,
+    input: &mut Batch,
+    take: bool,
     src_id: u64,
     unfed: &[u64],
 ) -> Result<Batch, String> {
-    let (route, fold) = {
+    let reg = {
         let (dag, registry) = host.parts();
-        let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
-        let code = &plan.code;
-        let route = meta.source_route(src_id).cloned();
-        let sub_plans = || code.sides.iter().map(|s| &s.plan).chain([&code.post]);
-        // With sides the post phase scans nothing, so this is the sides' answer alone.
-        let fold = sub_plans().any(|p| p.seed_folds(src_id));
-        // An empty delta into a plan that runs no exchange round and owes no
-        // ground row is an epoch every sub-plan would answer empty.
-        if input.is_empty()
-            && route.is_none()
-            && code.sides.iter().all(|s| s.relay.is_none())
-            && sub_plans().all(|p| !p.vm.pending_ground_row)
-        {
-            return Ok(Batch::empty_with_schema(code.post.vm.out_schema()));
+        let (_, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
+        let reg = plan.code.source_reg_map.get(&src_id).copied();
+        let reg = reg.expect("the dep map names only sources the view's circuit scans");
+        if input.is_empty() && plan.code.vm.idles_on_empty(reg) {
+            return Ok(Batch::empty_with_schema(plan.code.vm.out_schema()));
         }
-        (route, fold)
+        reg
     };
-    let input = relay(host, view_id, input, route.as_ref(), fold);
-    run_plan(host, view_id, input, src_id, unfed)
-}
-
-/// Run every side that scans `src_id` over its delta, then the post combine.
-fn run_plan(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    input: Batch,
-    src_id: u64,
-    unfed: &[u64],
-) -> Result<Batch, String> {
-    let (code, _) = plan_and_stores(host, view_id, unfed);
-    if code.sides.is_empty() {
-        let seed = sub_seed(&code.post, input, src_id);
-        return run_post(host, view_id, [seed], unfed);
-    }
-    // `a UNION a` scans the source on more than one side.
-    let scanning: Vec<usize> = (0..code.sides.len())
-        .filter(|&i| code.sides[i].plan.source_reg_map.contains_key(&src_id))
-        .collect();
-    let mut seeds = Vec::with_capacity(scanning.len());
-    if let Some((&last, rest)) = scanning.split_last() {
-        for &i in rest {
-            seeds.push(run_side(host, view_id, i, Batch::clone(&input), src_id, unfed)?);
-        }
-        seeds.push(run_side(host, view_id, last, input, src_id, unfed)?);
-    }
-    run_post(host, view_id, seeds, unfed)
-}
-
-/// The post phase over the seeds the sides produced.
-fn run_post(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    seeds: impl IntoIterator<Item = (vm::DeltaReg, Batch)>,
-    unfed: &[u64],
-) -> Result<Batch, String> {
-    let (code, mut stores) = plan_and_stores(host, view_id, unfed);
-    vm::execute_epoch(&mut code.post.vm, &mut stores, seeds)
-}
-
-/// Side `i`'s seed for the post phase: its relayed output.
-fn run_side(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    i: usize,
-    delta: Batch,
-    src_id: u64,
-    unfed: &[u64],
-) -> Result<(vm::DeltaReg, Batch), String> {
-    let (pre, seed_reg, how, fold) = {
+    let mut epoch = vm::Epoch::tick(reg, input, take);
+    let mut gathered = None;
+    loop {
         let (code, mut stores) = plan_and_stores(host, view_id, unfed);
-        let fold = code.post.vm.folds(code.sides[i].seed_reg);
-        let side = &mut code.sides[i];
-        let seed = sub_seed(&side.plan, delta, src_id);
-        let pre = vm::execute_epoch(&mut side.plan.vm, &mut stores, [seed])?;
-        (pre, side.seed_reg, side.relay.clone(), fold)
-    };
-    Ok((seed_reg, relay(host, view_id, Cow::Owned(pre), how.as_ref(), fold)))
+        match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered.take())? {
+            vm::Ran::Done(out) => return Ok(out),
+            vm::Ran::Round { plan, batch, fold } => gathered = Some(host.exchange(view_id, batch, &plan, fold)),
+        }
+    }
 }
 
 // ── DAG traversal driver ────────────────────────────────────────────────
@@ -219,20 +142,20 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>
     for step in schedule.iter() {
         let left = readers.get_mut(&step.producer).expect("counted above");
         *left -= 1;
-        // The last reader takes the batch; an earlier one borrows it, and copies
-        // it only when its view is unrouted, so at most two copies are live.
-        let input = match *left {
-            0 => outputs.remove(&step.producer).map(Cow::Owned),
-            _ => outputs.get(&step.producer).map(Cow::Borrowed),
-        }
-        .expect("the schedule runs every producer before the steps it feeds");
+        let last = *left == 0;
         let needed = readers.contains_key(&step.view);
-        let out = run_view_epoch(host, step.view, input, step.producer, &unfed)?;
+        // Lent to every reader, the last of which may take it.
+        let input = outputs.get_mut(&step.producer);
+        let input = input.expect("the schedule runs every producer before the steps it feeds");
+        let out = run_view_epoch(host, step.view, input, last, step.producer, &unfed)?;
+        if last {
+            outputs.remove(&step.producer);
+        }
         let (dag, registry) = host.parts();
         let echo = match round {
             // A tick's delta reaches its readers in this schedule, and no tick
             // runs while a chain is being built.
-            Some(_) if dag.passes_through(step.view) => needed.then(|| out.into_consolidated()),
+            Some(_) if dag.passes_through(step.view) => needed.then_some(out),
             _ => registry.ingest_at(step.view, out, round, needed)?,
         };
         // Kept even when empty, so a reader's exchange rounds run on every worker.
@@ -249,15 +172,6 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Option<Batch>
         }
     }
     Ok(())
-}
-
-/// The `(register, batch)` seeding a sub-plan with `source_id`'s delta.
-fn sub_seed(sub: &SubPlan, input: Batch, source_id: u64) -> (vm::DeltaReg, Batch) {
-    let reg = sub.source_reg_map.get(&source_id).copied();
-    (
-        reg.expect("the dep map names only sources the view's circuit scans"),
-        input,
-    )
 }
 
 // ---------------------------------------------------------------------------

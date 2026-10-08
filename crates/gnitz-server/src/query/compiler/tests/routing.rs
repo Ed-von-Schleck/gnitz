@@ -41,7 +41,7 @@ fn range() -> JoinKind {
 
 /// `d ⋈ I(d)`: the smallest circuit in which `d`'s source reaches a join.
 fn join_with_own_trace(c: &mut Circuit, d: NodeId, kind: JoinKind) -> NodeId {
-    c.join(d, d, kind, false)
+    c.join([d, d], [d, d], kind)
 }
 
 /// A reindex of `input` on `cols` of [`wide_schema`], stated as the route of the
@@ -258,7 +258,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
             false => keyed,
         }
     });
-    let joined = c.join_terms(deltas, deltas, kind);
+    let joined = c.join(deltas, deltas, kind);
     c.shard(joined);
     derive(c, &ext).expect("fixture routes")
 }
@@ -405,7 +405,7 @@ fn a_self_contained_view_keeps_no_route_and_still_validates_its_keys() {
     let joined = |key: &[gnitz_wire::ReindexSlot]| {
         let mut c = Circuit::default();
         let deltas = [7, 9].map(|source| scan_keyed(&mut c, source, key));
-        c.join_terms(deltas, deltas, JoinKind::Equi);
+        c.join(deltas, deltas, JoinKind::Equi);
         c
     };
     let base = Source::from(make_schema_u64_i64());
@@ -456,7 +456,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let key = self_typed_slots(&base, &[1]);
     let mut c = Circuit::default();
     let (a, b) = (scan_keyed(&mut c, 7, &key), scan_keyed(&mut c, 9, &key));
-    let joined = c.join(a, b, JoinKind::Equi, false);
+    let joined = c.join([a, b], [a, b], JoinKind::Equi);
     c.union(a, joined);
     let ext = sources([(7, Source::from(base).placed(Placement::Replicated)), (9, base.into())]);
     let meta = derive(c, &ext).unwrap();
@@ -477,7 +477,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
         let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a.schema, key_cols));
         let owned = c.worker_filter(keyed);
         let delta = scan_joined(&mut c, 9, &self_typed_slots(&b.schema, &[1]), kind);
-        c.join(delta, owned, kind, false);
+        c.join([delta, owned], [delta, owned], kind);
         derive(c, &sources([(7, a), (9, b)])).unwrap()
     };
     let routes = |meta: &ViewMeta| [7, 9].map(|tid| route(meta.source_route(tid)));
@@ -511,7 +511,7 @@ fn a_source_routes_by_the_one_key_it_states() {
     let source = scan(&mut c, 10);
     let delta = states_route(&mut c, source, &[2]);
     let again = states_route(&mut c, source, &[2]);
-    let joined = c.join(delta, again, JoinKind::Equi, false);
+    let joined = c.join([delta, again], [delta, again], JoinKind::Equi);
     let other = scan(&mut c, 20);
     c.union(joined, other);
     let meta = derive(c, &sources([(10, wide_schema()), (20, wide_schema())])).unwrap();
@@ -554,7 +554,7 @@ fn a_circuit_derive_cannot_route_is_rejected() {
             |c: &mut Circuit| {
                 let source = scan(c, 7);
                 let (a, b) = (states_route(c, source, &[1]), states_route(c, source, &[2]));
-                c.join(a, b, JoinKind::Equi, false);
+                c.join([a, b], [a, b], JoinKind::Equi);
             },
             "source 7 feeds several distinct scatter keys",
         ),

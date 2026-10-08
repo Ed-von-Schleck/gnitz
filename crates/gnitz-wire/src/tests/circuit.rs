@@ -13,18 +13,11 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::Filter => OpNode::Filter(vec![1, 2, 3, 4]),
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::JoinEqui => OpNode::Join {
-            kind: JoinKind::Equi,
-            delta_is_right: true,
-        },
+        Opcode::JoinEqui => OpNode::Join { kind: JoinKind::Equi },
         Opcode::JoinRange => OpNode::Join {
             kind: JoinKind::Range { rel: RangeRel::Le },
-            delta_is_right: true,
         },
-        Opcode::JoinCross => OpNode::Join {
-            kind: JoinKind::Cross,
-            delta_is_right: true,
-        },
+        Opcode::JoinCross => OpNode::Join { kind: JoinKind::Cross },
         // Every aggregate, at a distinct source column.
         Opcode::Reduce => OpNode::Reduce {
             group_cols: vec![2, 7],
@@ -168,19 +161,14 @@ fn every_op_node_variant_roundtrips() {
     // Every join kind on either side, and every relation the range kind can carry
     // — `Join`'s own sample can only be one of them. Same for the null-extend's
     // two placements.
-    for delta_is_right in [false, true] {
-        for kind in [JoinKind::Equi, JoinKind::Cross] {
-            nodes.push(OpNode::Join { kind, delta_is_right });
-        }
-        for &rel in RangeRel::ALL {
-            nodes.push(OpNode::Join {
-                kind: JoinKind::Range { rel },
-                delta_is_right,
-            });
-        }
+    nodes.push(OpNode::Join { kind: JoinKind::Cross });
+    for &rel in RangeRel::ALL {
+        nodes.push(OpNode::Join { kind: JoinKind::Range { rel } });
+    }
+    for nulls_first in [false, true] {
         nodes.push(OpNode::NullExtend {
             type_codes: vec![TypeCode::I64],
-            nulls_first: delta_is_right,
+            nulls_first,
         });
     }
     for node in nodes {
@@ -229,7 +217,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (10, 0xad83_9d1e_f903_5057));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (11, 0x8bd3_32cf_4500_a131));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -274,7 +262,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
         (poke(&aux, 11, 2), "boolean byte 2"),
         (poke(&hash_row, 7, 0), "unknown TypeCode 0"),
         (poke(&null_ext, 4, 200), "unknown TypeCode 200"),
-        // tag 0 | rel 1 | delta_is_right 2
+        // tag 0 | rel 1
         (
             poke(&sample(Opcode::JoinRange), 1, outside(RangeRel::from_wire)),
             "unknown RangeRel",

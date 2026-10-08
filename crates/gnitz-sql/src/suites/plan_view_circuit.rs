@@ -1,8 +1,8 @@
 //! The circuit shape a view body compiles to, read straight off the view planner.
 //!
 //! Each row pins only what CLAUDE.md §3 and the placement contracts require:
-//! segment count, where the exchanges sit and what reads them, the two join
-//! terms of the symmetric bilinear form, the reduce / clamp / null-fill /
+//! segment count, where the exchanges sit and what reads them, the bilinear
+//! joins, the reduce / clamp / null-fill /
 //! worker-filter / filter node counts. Projection lists, map counts, union
 //! counts and node numbering are free to change.
 
@@ -137,72 +137,72 @@ const SHAPES: &[Row] = &[
     // Linear: no exchange, one filter per WHERE.
     ("SELECT id, v FROM t", 1, &[], &[]),
     ("SELECT id, v * 2 AS d FROM t WHERE v > 5", 1, &[], &[(Filter, 1)]),
-    // Equi join: two join terms, no exchange; a null-fill against a non-unique
-    // side subtracts the preserved rows joined (two more terms) against the other
+    // Equi join: one join, no exchange; a null-fill against a non-unique
+    // side subtracts the preserved rows joined (one more join) against the other
     // side's distinct key set, then null-extends.
-    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2)]),
-    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a RIGHT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 6), (Distinct, 2), (NullExtend, 2)]),
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a RIGHT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 3), (Distinct, 2), (NullExtend, 2)]),
     // A null-fill against a side unique on the key subtracts without a clamp.
-    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.id", 1, &[], &[(EquiJoin, 2), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.id", 1, &[], &[(EquiJoin, 1), (NullExtend, 1)]),
     // A residual or WHERE is one filter; a nullable key is none, its re-key
     // dropping NULL-keyed rows itself.
-    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND a.v <> b.w", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND (a.v > 5 OR b.w < 3)", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k WHERE a.v > 5", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
-    ("SELECT n.id AS nid, b.w FROM n JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2)]),
-    ("SELECT a.id AS aid, n.v FROM a JOIN n ON a.k = n.k", 1, &[], &[(EquiJoin, 2)]),
-    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
-    ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND a.v <> b.w", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND (a.v > 5 OR b.w < 3)", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k WHERE a.v > 5", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
+    ("SELECT n.id AS nid, b.w FROM n JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 1)]),
+    ("SELECT a.id AS aid, n.v FROM a JOIN n ON a.k = n.k", 1, &[], &[(EquiJoin, 1)]),
+    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
     // A composite key mixing a NOT NULL and a nullable column.
-    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
     // An ON conjunct over the null-supplying side filters that input.
-    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
     // A filtered derived-table input fuses into the join, cutting no segment.
-    ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
-    // Band join: two range terms, one output exchange on the pair-PK, no worker filter.
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a RIGHT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 2), (PositivePart, 2), (NullExtend, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w WHERE a.id > 5", 1, &[PK], &[(RangeJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v < b.w AND a.id > b.id", 1, &[PK], &[(RangeJoin, 2), (Filter, 1)]),
+    ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
+    // Band join: one range join, one output exchange on the pair-PK, no worker filter.
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a RIGHT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 2), (NullExtend, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w WHERE a.id > 5", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v < b.w AND a.id > b.id", 1, &[PK], &[(RangeJoin, 1), (Filter, 1)]),
     // Pure range: broadcast trimmed by one worker filter per side; LEFT derives
     // its null-fill from a threshold reduce, so no clamp.
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 4), (Reduce, 1), (WorkerFilter, 2), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w AND a.id <> b.id", 1, &[PK], &[(RangeJoin, 2), (WorkerFilter, 2), (Filter, 1)]),
-    // Keyless (cross) join: two cross terms, one worker filter per side, the
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 2), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w AND a.id <> b.id", 1, &[PK], &[(RangeJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
+    // Keyless (cross) join: one cross join, one worker filter per side, the
     // pair-PK output shard; a residual — a constant `ON 1 = 1` included — or a
     // WHERE is one filter. A self product wraps the second copy in a segment,
     // and a third relation is one more keyless step over the cut product.
-    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a, b", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON 1 = 1", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v <> b.w", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a, b WHERE a.v <> b.w", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b WHERE a.v > 3", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT c.v AS cv, b.id AS bid FROM c CROSS JOIN b", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[PK], &[(CrossJoin, 2), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[PK, PK], &[(CrossJoin, 4), (WorkerFilter, 4)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a, b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON 1 = 1", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v <> b.w", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a, b WHERE a.v <> b.w", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b WHERE a.v > 3", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
+    ("SELECT c.v AS cv, b.id AS bid FROM c CROSS JOIN b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[PK, PK], &[(CrossJoin, 2), (WorkerFilter, 4)]),
     // Semi / anti / mark / IN: a join against B's key set, no exchange.
-    ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
-    ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
-    ("SELECT id FROM a WHERE k IN (SELECT k FROM b)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
-    ("SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
+    ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
+    ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
+    ("SELECT id FROM a WHERE k IN (SELECT k FROM b)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
+    ("SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
     // A B unique on the key already is a set.
-    ("SELECT id FROM a WHERE k IN (SELECT id FROM b)", 1, &[], &[(EquiJoin, 2)]),
+    ("SELECT id FROM a WHERE k IN (SELECT id FROM b)", 1, &[], &[(EquiJoin, 1)]),
     // Two marks: the lower one is cut, carrying its mark to the upper one, whose
     // matched branch folds the WHERE reading both to true.
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", 2, &[], &[(EquiJoin, 4), (Distinct, 2), (Filter, 1)]),
-    ("SELECT id FROM n WHERE EXISTS (SELECT 1 FROM m WHERE m.k = n.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
-    ("SELECT id FROM n WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = n.k AND b.w = n.id)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)", 1, &[PK], &[(RangeJoin, 2), (PositivePart, 1)]),
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", 2, &[], &[(EquiJoin, 2), (Distinct, 2), (Filter, 1)]),
+    ("SELECT id FROM n WHERE EXISTS (SELECT 1 FROM m WHERE m.k = n.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
+    ("SELECT id FROM n WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = n.k AND b.w = n.id)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1)]),
     // Pure range: A is owned before the join, so its output needs no exchange.
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
-    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1), (WorkerFilter, 1)]),
+    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1), (WorkerFilter, 1)]),
     // Reduce: an exchange on the group columns — for a global aggregate an empty
     // key, and a ground row.
     ("SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", 1, &[Some(&[1])], &[(Reduce, 1)]),
@@ -234,16 +234,16 @@ const SHAPES: &[Row] = &[
     // A view whose PK does not repeat is a set as a table is: a DISTINCT over its
     // key is the input, and a null-fill against it subtracts without a clamp.
     ("SELECT DISTINCT g, n FROM rv", 1, &[], &[]),
-    ("SELECT a.id AS aid, rv.n FROM a LEFT JOIN rv ON a.k = rv.g", 1, &[], &[(EquiJoin, 2), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, rv.n FROM a LEFT JOIN rv ON a.k = rv.g", 1, &[], &[(EquiJoin, 1), (NullExtend, 1)]),
     // A tree of directly nested set operations is one circuit, one exchange per
     // leaf; a UNION DISTINCT clamps once over all of its leaves.
     ("SELECT g FROM t UNION SELECT g FROM u UNION SELECT v FROM a", 1, &[PK, PK, PK], &[(Distinct, 1)]),
     ("SELECT g FROM t UNION ALL SELECT g FROM u INTERSECT SELECT v FROM a", 1, &[PK, PK, PK], &[(Distinct, 1), (PositivePart, 1)]),
     // Segments: a non-trivial CTE and a subquery cut; a derived table over one
     // relation, a computed group key and a projection over a join do not.
-    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[Some(&[1])], &[(EquiJoin, 2), (Reduce, 1), (NullExtend, 1)]),
-    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, Some(&[])], &[(RangeJoin, 2), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2)]),
-    ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[Some(&[1])], &[(EquiJoin, 2), (Reduce, 1)]),
+    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1), (NullExtend, 1)]),
+    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2)]),
+    ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),
     ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 2, &[], &[(Filter, 1)]),
     // A linear final over a grouped CTE: the segment's reduce keeps its exchange,
@@ -257,11 +257,11 @@ const SHAPES: &[Row] = &[
     ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[PK, PK], &[(Distinct, 1), (PositivePart, 1)]),
     // Window: a whole-partition frame joins the source to one reduce over it; a
     // cumulative frame folds over a band self-join first.
-    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 2), (Reduce, 1)]),
-    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 2), (Reduce, 1)]),
-    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 5, &[PK, Some(&[1, 2]), Some(&[2, 3])], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 5, &[PK, Some(&[1, 2]), Some(&[2, 3])], &[(EquiJoin, 1), (RangeJoin, 1), (Reduce, 2)]),
     // An order key a whole-partition frame drops is not computed.
-    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v + 1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 2), (Reduce, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v + 1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     // A QUALIFY bounding an unprojected ROW_NUMBER is a top-N per partition,
     // with no band join — cutting the outer side of whatever else the body
     // joins in; a projected one is the ranking desugar. The body's projection
@@ -269,8 +269,8 @@ const SHAPES: &[Row] = &[
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 1, &[Some(&[1])], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 1, &[Some(&[1])], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 1, &[Some(&[1])], &[(TopN, 1), (Filter, 1)]),
-    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[Some(&[1]), Some(&[2])], &[(TopN, 1), (EquiJoin, 2), (Reduce, 1)]),
-    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[PK, Some(&[1, 2, 0]), Some(&[2, 3, 4])], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2), (Filter, 2)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[Some(&[1]), Some(&[2])], &[(TopN, 1), (EquiJoin, 1), (Reduce, 1)]),
+    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[PK, Some(&[1, 2, 0]), Some(&[2, 3, 4])], &[(EquiJoin, 1), (RangeJoin, 1), (Reduce, 2), (Filter, 2)]),
 ];
 
 #[test]

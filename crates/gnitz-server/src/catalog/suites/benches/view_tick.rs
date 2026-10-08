@@ -377,3 +377,64 @@ fn join_view_tick_bench() {
         try_register_view(engine, two_term_join_circuit(t, u, TypeCode::U64), "v", &out, 0, 0).unwrap()
     });
 }
+
+/// Wide ticks through a chain segment into the next one: `t JOIN u ON t.k =
+/// u.k`, two rows of `u` a key, registered as a segment, under `SELECT k,
+/// SUM(t_id), COUNT(*) … GROUP BY k`. The segment stores nothing on a tick, its
+/// delta leaves the join unfolded, and the reduce reads it at raw weights.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn segment_view_tick_bench() {
+    const KEYS: u64 = 1_000;
+    let counter = perf::Counter::instructions();
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let mut engine = CatalogEngine::open(&temp_dir("segment_view_tick_bench"), 1).unwrap();
+    let t = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let u = engine.create_table("public.u", &cols, &[0]).unwrap();
+    let matches = rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]);
+    engine.registry.ingest(u, matches).unwrap();
+
+    // A segment is a view whose row names an owner, and only its owner's chain
+    // reads it; no tick of `t` reaches this owner.
+    let owner = register_identity_view(&mut engine, u, "owner", &cols);
+    let chained = |engine: &mut CatalogEngine, name: &str, circuit: Circuit, cols: &[CatalogColumn]| {
+        let vid = engine.allocate_ids(1).unwrap();
+        crate::test_support::write_circuit(engine, vid, circuit);
+        engine.write_column_records(vid, cols).unwrap();
+        let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
+        crate::test_support::push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
+        engine.submit(crate::catalog::SysFamily::View, bb.finish()).unwrap();
+        vid
+    };
+    let joined = [
+        col_def("k", TypeCode::U64),
+        col_def("t_id", TypeCode::U64),
+        col_def("u_id", TypeCode::U64),
+    ];
+    let segment = chained(
+        &mut engine,
+        "segment",
+        two_term_join_circuit(t, u, TypeCode::U64),
+        &joined,
+    );
+    let joined_schema = engine.registry.relation(segment).map(Relation::schema).unwrap();
+    let aggs = [
+        AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
+        AggDescriptor::COUNT_STAR,
+    ];
+    let reduced = *gnitz_zset::stream::ReducePlan::from_wire(&joined_schema, &[0], &aggs, false)
+        .unwrap()
+        .output_schema();
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(segment, ReadBound::None);
+    circuit.reduce_multi_local(scan, &[0], &aggs);
+    let view = chained(&mut engine, "reduced", circuit, &cols_of(&reduced));
+    backfill(&mut engine, segment);
+    backfill(&mut engine, view);
+
+    let ticks = wide_ticks(&mut engine, &counter, t, 0, false, |id| [scramble(id) % KEYS]);
+    assert_eq!(net_weight(&engine, segment), 0, "the segment stored no tick");
+    assert_eq!(net_weight(&engine, view) as u64, KEYS, "a group a key");
+    println!("segment into a reduce: {WIDE_TICK_ROWS}-row ticks {ticks:>6.1} instr/row");
+    discard(engine);
+}

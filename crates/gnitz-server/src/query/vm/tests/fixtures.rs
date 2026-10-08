@@ -46,7 +46,7 @@ impl TestPlan {
         let out_trace = self.table("reduce", out_schema);
         let index = plan.index_schema().map(|schema| self.table("avidx", *schema));
         let op = Op::Reduce {
-            out_trace: Some(out_trace),
+            out_trace: Integral::Own(out_trace),
             index,
             plan: Box::new(plan),
         };
@@ -95,15 +95,42 @@ impl TestVm {
         let stores = Stores {
             own: &mut self.state,
             registry: &self.registry,
-            view: VIEW_ID,
             unfed: &self.unfed,
         };
         (&mut self.vm, stores)
     }
 
-    pub(super) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Batch {
+    /// One tick's epoch over `seed`, taken, of a program that runs no round.
+    pub(super) fn epoch(&mut self, reg: DeltaReg, mut seed: Batch) -> Batch {
         let (vm, mut stores) = self.parts();
-        execute_epoch(vm, &mut stores, inputs).unwrap()
+        let mut epoch = Epoch::tick(reg, &mut seed, true);
+        match run(vm, &mut stores, &mut epoch, None).unwrap() {
+            Ran::Done(out) => out,
+            Ran::Round { .. } => panic!("the program stands at a round"),
+        }
+    }
+
+    /// One tick's epoch over the lent `seed`, each round it stands at answered by
+    /// `gather`, which is handed the round's rows and whether they were lent.
+    pub(super) fn epoch_with(
+        &mut self,
+        reg: DeltaReg,
+        seed: &mut Batch,
+        take: bool,
+        mut gather: impl FnMut(&Batch, bool) -> Batch,
+    ) -> Batch {
+        let (vm, mut stores) = self.parts();
+        let mut epoch = Epoch::tick(reg, seed, take);
+        let mut gathered = None;
+        loop {
+            match run(vm, &mut stores, &mut epoch, gathered.take()).unwrap() {
+                Ran::Done(out) => return out,
+                Ran::Round { batch, .. } => {
+                    let lent = matches!(batch, std::borrow::Cow::Borrowed(_));
+                    gathered = Some(gather(&batch, lent));
+                }
+            }
+        }
     }
 
     pub(super) fn replay(&mut self, reg: DeltaReg, seed: Batch) -> Batch {

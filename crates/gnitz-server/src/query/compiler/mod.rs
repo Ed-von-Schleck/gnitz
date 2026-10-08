@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
-use gnitz_wire::{AggDescriptor, NodeId, MAX_CIRCUIT_NODES};
+use gnitz_wire::{AggDescriptor, NodeId};
 use gnitz_zset::algebra::MapPlan;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};
@@ -35,10 +35,6 @@ pub(super) use hydration::Hydration;
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::load_circuit;
 pub(super) use routing::{Relay, ViewMeta};
-
-// Register and child-store ids are `u16`: a plan allocates a bounded number of
-// each per node.
-const _: () = assert!(3 * MAX_CIRCUIT_NODES < u16::MAX as usize);
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -86,12 +82,6 @@ impl LoadedCircuit {
             .map(|(nid, _)| nid)
     }
 
-    /// The node ids restricted to `keep`, in topological order. Every node list a
-    /// plan is built over is produced this way.
-    fn ordered_where(&self, keep: impl Fn(NodeId) -> bool) -> Vec<NodeId> {
-        (0..self.len()).filter(|&n| keep(n)).collect()
-    }
-
     /// Every node reading `nid`, in topological order.
     fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         (nid + 1..self.len()).filter(move |&n| self.inputs(n).contains(&nid))
@@ -131,52 +121,19 @@ fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> NodeId {
     from
 }
 
-// ---------------------------------------------------------------------------
-// Carve — the circuit split at its exchanges
-// ---------------------------------------------------------------------------
-
-/// One side of a [`Carve`]: an `ExchangeShard` and the nodes computing its input
-/// — the shard's ancestors — in topological order.
-struct CarvedSide {
-    shard: NodeId,
-    nodes: Vec<NodeId>,
-}
-
-/// The circuit split at its exchanges: one side per `ExchangeShard`, and the
-/// post phase — every node in no side, the shards excluded. For an
-/// exchange-free circuit `post` is the whole circuit.
-struct Carve {
-    sides: Vec<CarvedSide>,
-    post: Vec<NodeId>,
-}
-
 impl LoadedCircuit {
-    fn carve(&self) -> Result<Carve, String> {
-        let mut claimed = vec![false; self.len()];
-        let mut sides = Vec::new();
-        for shard in self.exchange_shards() {
-            let ancestors = self.ancestors_inclusive(shard);
-            // A node in two sides — a shared ancestor, or a shard upstream of
-            // another shard — would declare one scratch child twice.
-            if ancestors.iter().zip(&claimed).any(|(&a, &c)| a && c) {
-                return Err("exchange sides share a node".into());
-            }
-            for (c, &a) in claimed.iter_mut().zip(&ancestors) {
-                *c |= a;
-            }
-            let nodes = self.ordered_where(|n| n != shard && ancestors[n]);
-            sides.push(CarvedSide { shard, nodes });
-        }
-        let post = self.ordered_where(|n| !claimed[n]);
-        // A delta is routed to the side scanning its source, so a post-phase scan
-        // would receive nothing.
-        let post_scans = post
-            .iter()
-            .any(|&n| matches!(self.op(n), gnitz_wire::OpNode::ScanDelta { .. }));
-        if !sides.is_empty() && post_scans {
-            return Err("an exchanged plan scans a relation outside every exchange side".into());
-        }
-        Ok(Carve { sides, post })
+    /// `nid` is a reduce that owes a row over an empty input: one over no group
+    /// columns reading an `ExchangeShard`.
+    fn owes_ground_row(&self, nid: NodeId) -> bool {
+        use gnitz_wire::OpNode;
+        matches!(self.op(nid), OpNode::Reduce { group_cols, .. } if group_cols.is_empty())
+            && matches!(self.op(self.inputs(nid)[0]), OpNode::ExchangeShard)
+    }
+
+    /// Some node `nid` reads, directly or transitively, owes a ground row.
+    fn behind_ground_reduce(&self, nid: NodeId) -> bool {
+        let behind = self.ancestors_inclusive(self.inputs(nid)[0]);
+        (0..self.len()).any(|n| behind[n] && self.owes_ground_row(n))
     }
 
     /// The `Reduce` or `TopN` reading `shard`, and its group columns — the key the
@@ -200,129 +157,46 @@ impl LoadedCircuit {
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
-/// A compiled sub-pipeline: the VM and the sources whose delta seeds it. One
-/// per `build_plan` call — an exchange side, or the post-combine phase, which
-/// for an exchange-free circuit is the whole plan.
-pub(super) struct SubPlan {
-    pub(in crate::query) vm: Vm,
-    /// source table id → the input register its delta seeds.
-    pub(in crate::query) source_reg_map: FxHashMap<u64, DeltaReg>,
-}
-
-impl SubPlan {
-    /// `src`'s delta seeds a register here that folds it.
-    pub(in crate::query) fn seed_folds(&self, src: u64) -> bool {
-        self.source_reg_map.get(&src).is_some_and(|&r| self.vm.folds(r))
-    }
-}
-
-/// One exchanged side: a sub-plan whose output is relayed into `seed_reg` of the
-/// post phase.
-pub(super) struct Side {
-    pub(in crate::query) plan: SubPlan,
-    pub(in crate::query) seed_reg: DeltaReg,
-    /// How the output reaches the post phase; `None` when it stays where it is.
-    pub(in crate::query) relay: Option<Relay>,
-}
-
-/// Every relation the side scans is replicated and nothing trims its result, so
-/// each worker's output is a copy of the others'.
-fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
-    plan.source_reg_map
-        .keys()
-        .all(|tid| registry.relation(*tid).is_some_and(|r| r.placement().is_replicated()))
-        && !plan.vm.trims_per_worker()
-}
-
 /// Output from `compile_view`, consumed directly by DagEngine as the cached
-/// plan.
-///
-/// A source's routing lives once on the `ViewMeta` derived at the view's
-/// registration; each side carries the relay its own output takes.
+/// plan: the view's one program, exchanges included.
 pub(super) struct CompileOutput {
-    /// One per `ExchangeShard`, in circuit order, each relayed into `post`.
-    pub(in crate::query) sides: Vec<Side>,
-    /// The combine phase every side's relayed batch seeds — and, for a circuit
-    /// with no `ExchangeShard`, the whole plan.
-    pub(in crate::query) post: SubPlan,
+    pub(in crate::query) vm: Vm,
+    /// source table id → the register its delta seeds.
+    pub(in crate::query) source_reg_map: FxHashMap<u64, DeltaReg>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Hydration>,
 }
 
-/// Compile one view's already-loaded circuit under the routing `meta` derived
-/// from it: carve it at its exchanges, then `build_plan` each side and the post
-/// phase. Opens nothing: the returned layout declares every child store the
-/// plan's operators address.
+/// Compile view `view_id`'s already-loaded circuit under the routing `meta`
+/// derived from it. Opens nothing: the returned layout declares every child
+/// store the plan's operators address.
 pub(super) fn compile_view(
     loaded: &LoadedCircuit,
     registry: &RelationRegistry,
+    view_id: u64,
     view_schema: &SchemaDescriptor,
     meta: &ViewMeta,
     bounded: bool,
 ) -> Result<(CompileOutput, StateLayout), String> {
-    let carve = loaded.carve()?;
-    let mut layout = StateLayout::default();
-    let mut side_plans = Vec::with_capacity(carve.sides.len());
-    let mut seeds = Vec::with_capacity(carve.sides.len());
-    for side in &carve.sides {
-        let reader = loaded.keyed_reader(side.shard)?;
-        // A worker holding the whole input has nothing to pre-aggregate.
-        let out = match reader.filter(|(_, group)| group.is_empty() && !meta.self_contained) {
-            Some((consumer, _)) => PlanOut::Split { consumer },
-            None => PlanOut::Node(loaded.inputs(side.shard)[0]),
-        };
-        let Built { plan, partial, .. } = build_plan(loaded, &side.nodes, registry, &mut layout, meta, &[], out)?;
-        let schema = *plan.vm.out_schema();
-        let scatter = Rc::new(match reader {
-            Some((_, group)) => ScatterPlan::group(&schema, group)?,
-            None => ScatterPlan::native(Placement::full_pk(&schema)),
-        });
-        let stays = meta.self_contained
-            || (carve.sides.len() == 1 && routing::skips_output_exchange(loaded, side.shard, &scatter, registry));
-        let relay = match () {
-            _ if stays => None,
-            _ if emits_replica(&plan, registry) => Some(Relay::Share(scatter)),
-            _ => Some(Relay::Round(scatter)),
-        };
-        seeds.push(Seed {
-            shard: side.shard,
-            schema,
-            partials: partial,
-        });
-        side_plans.push((plan, relay));
+    let mut ctx = EmitCtx::new(loaded, registry, meta, (!bounded).then(|| (view_id, loaded.out())));
+    for (nid, op) in loaded.ops() {
+        let reg = emit_node(&mut ctx, nid, op)?;
+        ctx.regs.push(reg);
     }
-    let Built {
-        plan: post,
-        regs: post_regs,
-        integrals: post_integrals,
-        seed_regs,
-        ..
-    } = build_plan(
-        loaded,
-        &carve.post,
-        registry,
-        &mut layout,
-        meta,
-        &seeds,
-        match bounded {
-            true => PlanOut::Node(loaded.out()),
-            false => PlanOut::Store(loaded.out()),
-        },
-    )?;
+    let EmitCtx {
+        prog, layout, regs, integrals, sources, ..
+    } = ctx;
+    let vm = prog.finish(regs[loaded.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
-    if !post.vm.out_schema().same_region_types(view_schema) {
+    if !vm.out_schema().same_region_types(view_schema) {
         return Err("the circuit's output schema is not the view's".into());
     }
-    let sides = side_plans
-        .into_iter()
-        .zip(seed_regs)
-        .map(|((plan, relay), seed_reg)| Side { plan, seed_reg, relay })
-        .collect();
     let hydration = bounded
-        .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs, &post_integrals))
+        .then(|| derive_hydration(loaded, registry, view_schema, &vm, &regs, &integrals))
         .transpose()?;
-    Ok((CompileOutput { sides, post, hydration }, layout))
+    let source_reg_map = sources.into_iter().map(|(tid, (seed, _))| (tid, seed)).collect();
+    Ok((CompileOutput { vm, source_reg_map, hydration }, layout))
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::query::compiler::{self, CompileOutput, Relay, SubPlan, ViewMeta};
+use crate::query::compiler::{self, CompileOutput, ViewMeta};
 use crate::query::vm;
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
 use gnitz_zset::algebra::{self, ScatterPlan};
@@ -41,7 +41,7 @@ pub(crate) trait DriveHost {
 // DagEngine
 // ---------------------------------------------------------------------------
 
-/// One view's compiled plan and the operator state its sub-plans share.
+/// One view's compiled plan and the operator state it runs over.
 struct ViewPlan {
     code: CompileOutput,
     state: CircuitState,
@@ -100,7 +100,7 @@ impl DagEngine {
     fn passes_through(&self, id: u64) -> bool {
         self.views
             .get(&id)
-            .is_some_and(|v| v.owner != 0 && v.plan.as_ref().is_some_and(|p| !p.code.post.vm.reads_view_store()))
+            .is_some_and(|v| v.owner != 0 && v.plan.as_ref().is_some_and(|p| !p.code.vm.reads_view_store()))
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
@@ -183,7 +183,14 @@ fn compile(
     meta: &ViewMeta,
 ) -> Result<(CompileOutput, StateLayout), String> {
     let loaded = compiler::load_circuit(registry, view.id())?;
-    compiler::compile_view(&loaded, registry, &view.schema(), meta, view.kind().is_bounded())
+    compiler::compile_view(
+        &loaded,
+        registry,
+        view.id(),
+        &view.schema(),
+        meta,
+        view.kind().is_bounded(),
+    )
 }
 
 /// This view's metadata and its compiled plan, compiling and opening its

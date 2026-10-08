@@ -4,9 +4,11 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use gnitz_store::relation::{CircuitState, StateIdx};
+use std::rc::Rc;
+
+use gnitz_store::relation::{CircuitState, Cut, StateIdx};
 use gnitz_wire::ClampKind;
-use gnitz_zset::algebra::MapPlan;
+use gnitz_zset::algebra::{MapPlan, ScatterPlan};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::stream;
@@ -19,7 +21,7 @@ mod exec;
 mod fixtures;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{execute_epoch, replay_chunk, Stores};
+pub(in crate::query) use exec::{replay_chunk, run, Epoch, Ran, Stores};
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -29,12 +31,12 @@ pub(in crate::query) use exec::{execute_epoch, replay_chunk, Stores};
 /// a [`Vm`] has, a trace being named by its [`Integral`]. Minted only by
 /// [`ProgramBuilder`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::query) struct DeltaReg(u16);
+pub(in crate::query) struct DeltaReg(usize);
 
 impl DeltaReg {
     #[inline]
     fn at(self) -> usize {
-        self.0 as usize
+        self.0
     }
 }
 
@@ -64,32 +66,42 @@ pub(in crate::query) enum Op {
         hist: StateIdx,
         kind: ClampKind,
     },
-    /// The delta-trace inner join, equi, range and cross alike: the probe is
-    /// baked by the compiler from the wire's `JoinKind` and side flag, so neither
-    /// spelling reaches the instruction set.
+    /// One term of a join, delta against trace — equi, range and cross alike:
+    /// the plan is baked by the compiler from the wire's `JoinKind` and the
+    /// term's side, so neither reaches the instruction set.
     JoinDT {
         trace: Integral,
-        probe: stream::JoinProbe,
+        plan: Box<stream::JoinPlan>,
     },
-    WorkerFilter,
+    /// Keep the rows this worker owns under the plan: its share of a delta every
+    /// worker holds whole.
+    Share(Rc<ScatterPlan>),
+    /// One exchange round under the plan: every worker's delta in, this worker's
+    /// share of them all out. `seeds`: the seeded registers whose delta reaches
+    /// it. An epoch runs the round iff it seeds one of them, whatever the delta
+    /// holds, so every worker runs the same rounds.
+    Round {
+        plan: Rc<ScatterPlan>,
+        seeds: Box<[DeltaReg]>,
+    },
     /// Widen every row with NULL-filled payload columns — the LEFT JOIN
     /// null-fill's unmatched preserved rows — on the side `nulls_first` names.
     /// The column count is the difference between the two registers' schemas.
     NullExtend {
         nulls_first: bool,
     },
-    /// `out_trace`: the integral of the output register, or `None` where that
-    /// register is the view's output and so the view's own store is its integral.
+    /// `out_trace`: the integral of the output register — the view's own store
+    /// where that register is the view's output.
     /// `index`: the table the value index of its MIN/MAX aggregates lives in.
     Reduce {
-        out_trace: Option<StateIdx>,
+        out_trace: Integral,
         index: Option<StateIdx>,
         plan: Box<stream::ReducePlan>,
     },
     /// Per-group top-N: `index`, the ordered index of every input row, is
     /// populated with the delta before the walk. `out_trace` as [`Op::Reduce`]'s.
     TopN {
-        out_trace: Option<StateIdx>,
+        out_trace: Integral,
         index: StateIdx,
         plan: Box<stream::TopNPlan>,
     },
@@ -101,10 +113,10 @@ pub(in crate::query) enum Op {
 pub(in crate::query) enum Integral {
     /// A child store the circuit integrates a register into.
     Own(StateIdx),
-    /// The store of the relation the delta is scanned from, read as it stood
-    /// when the view last absorbed that relation: nothing is integrated, because
-    /// the relation's own ingest already holds every row a trace would.
-    Source(u64),
+    /// A relation's store, which its own ingest keeps: the table a delta is
+    /// scanned from, read as the view last absorbed it, or the view the plan
+    /// computes. Nothing is integrated.
+    Relation(u64, Cut),
 }
 
 /// What the VM's passes ask of one operator.
@@ -113,9 +125,9 @@ struct OpFacts {
     /// It reads its input at net weights, so the VM folds that register when it
     /// is written.
     consolidates_in: bool,
-    /// Its output depends on state it owns — its input's history, a value index,
-    /// an ordered index — so a replay past it would read that state against a
-    /// seed it never saw.
+    /// Its output depends on more than its operands — its input's history, a
+    /// value index, an ordered index, the other workers' rows — so a replay
+    /// past it would read that against a seed it never saw.
     stateful: bool,
     /// With every delta operand empty its kernel returns
     /// `empty_with_schema(out_reg)` and touches no trace.
@@ -129,7 +141,8 @@ fn facts(op: &Op) -> OpFacts {
         inert_on_empty: true,
     };
     match op {
-        Op::Filter(_) | Op::Map(_) | Op::Negate | Op::Union { .. } | Op::WorkerFilter | Op::NullExtend { .. } => linear,
+        Op::Filter(_) | Op::Map(_) | Op::Negate | Op::Union { .. } | Op::Share(_) | Op::NullExtend { .. } => linear,
+        Op::Round { .. } => OpFacts { stateful: true, ..linear },
         Op::WeightClamp { .. } => OpFacts {
             consolidates_in: true,
             stateful: true,
@@ -158,8 +171,9 @@ impl Instr {
             | Op::Map(_)
             | Op::Negate
             | Op::WeightClamp { hist: _, kind: _ }
-            | Op::JoinDT { trace: _, probe: _ }
-            | Op::WorkerFilter
+            | Op::JoinDT { trace: _, plan: _ }
+            | Op::Share(_)
+            | Op::Round { plan: _, seeds: _ }
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, index: _, plan: _ }
             | Op::TopN { out_trace: _, index: _, plan: _ } => None,
@@ -174,13 +188,17 @@ impl Instr {
     fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
         match &self.op {
             Op::WeightClamp { hist, .. } => Some((self.in_reg, *hist)),
-            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => out_trace.map(|trace| (self.out_reg, trace)),
+            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => match out_trace {
+                Integral::Own(trace) => Some((self.out_reg, *trace)),
+                Integral::Relation(..) => None,
+            },
             Op::Filter(_)
             | Op::Map(_)
             | Op::Negate
             | Op::Union { .. }
             | Op::JoinDT { .. }
-            | Op::WorkerFilter
+            | Op::Share(_)
+            | Op::Round { .. }
             | Op::NullExtend { .. } => None,
         }
     }
@@ -192,7 +210,7 @@ impl Instr {
 
 /// A compiled DBSP program and the registers it runs over. It owns every
 /// resource its instructions name except the stores: the view's own children
-/// ([`CircuitState`]) and the relations an [`Integral::Source`] reads.
+/// ([`CircuitState`]) and the relations an [`Integral::Relation`] reads.
 pub(in crate::query) struct Vm {
     instructions: Box<[Instr]>,
     /// Each tick's accumulation of a register into its trace. Run after the
@@ -227,6 +245,8 @@ struct Reg {
     fold: bool,
     /// Its last reader, which may take its batch.
     last_read: LastRead,
+    /// An epoch seeding it runs an exchange round.
+    feeds_round: bool,
 }
 
 /// Where a read-only replay enters a program: the register it seeds and the
@@ -248,15 +268,10 @@ impl Vm {
         self.schema_of(self.out_reg)
     }
 
-    /// A batch written to `reg` is folded.
-    pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {
-        self.regs[reg.at()].fold
-    }
-
-    /// How many instructions run an op `is` holds of.
+    /// Every instruction's op, in program order.
     #[cfg(test)]
-    pub(in crate::query) fn count_ops(&self, is: impl Fn(&Op) -> bool) -> usize {
-        self.instructions.iter().filter(|i| is(&i.op)).count()
+    pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.instructions.iter().map(|i| &i.op)
     }
 
     /// True iff a reduce or top-N reads the view's own store as its output trace.
@@ -264,15 +279,16 @@ impl Vm {
         self.instructions.iter().any(|i| {
             matches!(
                 i.op,
-                Op::Reduce { out_trace: None, .. } | Op::TopN { out_trace: None, .. }
+                Op::Reduce { out_trace: Integral::Relation(..), .. }
+                    | Op::TopN { out_trace: Integral::Relation(..), .. }
             )
         })
     }
 
-    /// True iff some instruction trims the delta to this worker's own rows, so
-    /// the result is a slice rather than a copy of what every worker computes.
-    pub(in crate::query) fn trims_per_worker(&self) -> bool {
-        self.instructions.iter().any(|i| matches!(i.op, Op::WorkerFilter))
+    /// An epoch seeding `reg` with an empty delta does nothing: it owes no ground
+    /// row and runs no exchange round.
+    pub(in crate::query) fn idles_on_empty(&self, reg: DeltaReg) -> bool {
+        !self.pending_ground_row && !self.regs[reg.at()].feeds_round
     }
 
     /// Enter a read-only replay at `reg`'s first reader. Refused where the seed

@@ -219,7 +219,7 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
         true => reindexed_on_col1(&mut circuit, source, tc),
         false => circuit.input_delta(source, gnitz_wire::ReadBound::None),
     });
-    circuit.join(ka, kb, gnitz_wire::JoinKind::Equi, false);
+    circuit.join([ka, kb], [ka, kb], gnitz_wire::JoinKind::Equi);
     circuit
 }
 
@@ -228,7 +228,7 @@ pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool;
 pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circuit {
     let mut circuit = Circuit::default();
     let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source, tc));
-    circuit.join_terms(deltas, deltas, gnitz_wire::JoinKind::Equi);
+    circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
     circuit
 }
 
@@ -254,10 +254,10 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
         true => c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep),
         false => ra,
     };
-    let inner = c.join_terms([ra, rb], [ra, rb], JoinKind::Equi);
+    let inner = c.join([ra, rb], [ra, rb], JoinKind::Equi);
     let keys = c.map(rb, &[]);
     let set = c.distinct(keys);
-    let matched = c.join_terms([ra, set], [ra, set], JoinKind::Equi);
+    let matched = c.join([ra, set], [ra, set], JoinKind::Equi);
     let nu = c.difference(all, matched);
     let filled = c.null_extend(nu, &[TypeCode::U64], false);
     c.union(filled, inner);

@@ -34,7 +34,7 @@ fn a_two_term_join_seeds_from_side_as_integral() {
         if semi {
             db = c.distinct(db);
         }
-        c.join_terms([da, db], [da, db], JoinKind::Equi);
+        c.join([da, db], [da, db], JoinKind::Equi);
         assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Trace { delta: da }), "semi: {semi}");
     }
 }
@@ -48,48 +48,20 @@ fn a_shape_outside_the_equation_is_refused() {
 
     refused(
         join_with([100, 200], |c, [da, db]| {
-            let ab = c.join(da, db, JoinKind::Equi, false);
-            let ba = c.join(db, db, JoinKind::Equi, true);
-            c.union(ab, ba)
+            let slice = c.worker_filter(db);
+            c.join([da, db], [da, slice], JoinKind::Equi)
         }),
-        "both terms probe the same integral",
+        "a delta joins another integral than the other delta's",
     );
     refused(
-        join_with([100, 200], |c, [da, db]| {
-            let ab = c.join(da, db, JoinKind::Equi, false);
-            let ba = c.join(da, da, JoinKind::Equi, true);
-            c.union(ab, ba)
-        }),
-        "the second term's delta is the first's",
-    );
-    refused(
-        join_with([100, 200], |c, [da, db]| {
-            let ab = c.join(da, db, JoinKind::Equi, false);
-            let ba = c.join(db, da, JoinKind::Equi, false);
-            c.union(ab, ba)
-        }),
-        "both terms write one side flag",
-    );
-    refused(
-        join_with([100, 200], |c, [da, _]| {
-            let dm = c.map(da, &[0]);
-            c.join_terms([da, dm], [da, dm], JoinKind::Equi)
-        }),
-        "the second delta is computed from the first",
-    );
-    refused(
-        join_with([100, 100], |c, deltas| c.join_terms(deltas, deltas, JoinKind::Equi)),
-        "both deltas read one relation",
-    );
-    refused(
-        join_with([100, 200], |c, deltas| c.join_terms(deltas, deltas, JoinKind::Cross)),
+        join_with([100, 200], |c, deltas| c.join(deltas, deltas, JoinKind::Cross)),
         "a non-equi kind",
     );
 
     let mut c = Circuit::default();
     let (a, b) = (scan(&mut c, 1), scan(&mut c, 2));
     c.union(a, b);
-    refused(loaded(c), "a union input that is not a join");
+    refused(loaded(c), "a union as the output");
 
     let mut c = Circuit::default();
     let a = scan(&mut c, 1);

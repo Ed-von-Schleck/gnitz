@@ -158,9 +158,10 @@ fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
     }
 }
 
-/// The worker filter keeps a rank's share by the whole PK.
+/// A relation's own whole-PK route shares as a group key over every PK column
+/// does.
 #[test]
-fn the_worker_filter_keeps_the_whole_pk_share() {
+fn the_native_whole_pk_route_shares_as_its_group_key_does() {
     let schema = schema();
     let b = batch(&schema);
     let whole_pk = ScatterPlan::group(&schema, &[0, 1, 2, 3]).unwrap();
@@ -168,7 +169,7 @@ fn the_worker_filter_keeps_the_whole_pk_share() {
         for rank in 0..nw {
             let slot = Slot::new(rank, nw);
             assert_eq!(
-                weighted_rows(&op_worker_filter(&b, slot)),
+                weighted_rows(&ScatterPlan::native(Placement::full_pk(&schema)).share(&b, slot)),
                 weighted_rows(&whole_pk.share(&b, slot)),
                 "rank {rank} of {nw}"
             );

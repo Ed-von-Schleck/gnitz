@@ -436,7 +436,7 @@ fn emit_cross(
     let int_b = cb.worker_filter(reindex_b);
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
     // so both terms already share one schema.
-    let inner = cb.join_terms([reindex_a, reindex_b], [int_a, int_b], JoinKind::Cross);
+    let inner = cb.join([reindex_a, reindex_b], [int_a, int_b], JoinKind::Cross);
     Ok(vec![(inner, None)]) // [pair-PK, A, B]
 }
 

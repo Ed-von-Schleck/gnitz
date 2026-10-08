@@ -9,13 +9,6 @@ use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{Placement, SchemaDescriptor};
 use gnitz_wire::zip_cells;
 
-/// Keep only the nonzero-weight rows `slot` owns: those whose PK `worker_for_pk_bytes`
-/// routes to it, the hash the equality scatter routes a join key by. A broadcast
-/// delta filtered here integrates into a trace partitioned like a scattered one.
-pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
-    ScatterPlan::native(Placement::full_pk(batch.schema())).share(batch, slot)
-}
-
 /// A scatter key resolved against one schema: each row goes to the owner of the
 /// PK its consumer gives it. Without a key every worker is sent every
 /// nonzero-weight row, as list 0.
@@ -45,6 +38,11 @@ impl ScatterPlan {
     /// Every nonzero-weight row to every worker.
     pub fn broadcast() -> Self {
         ScatterPlan(None)
+    }
+
+    /// Every worker is sent every row.
+    pub fn is_broadcast(&self) -> bool {
+        self.0.is_none()
     }
 
     /// True when this plan hashes exactly the bytes `placement` places rows by,

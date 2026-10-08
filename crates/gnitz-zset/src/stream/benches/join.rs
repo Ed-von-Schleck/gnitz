@@ -70,7 +70,7 @@ fn probe(counter: &Counter, plan: &JoinPlan, delta: &Batch, trace: &Batch, runs:
     // The first pass takes the pool's first allocations.
     let [_, (out, instructions)] = [(); 2].map(|()| {
         let mut open = opens(trace.cursor());
-        counter.measure(|| op_join_delta_trace(delta, &mut open, &plan.out_schema, &plan.probe))
+        counter.measure(|| op_join_delta_trace(delta, &mut open, plan))
     });
     (instructions as f64 / delta.count as f64, out.count)
 }

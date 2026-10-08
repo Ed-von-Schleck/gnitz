@@ -13,8 +13,6 @@ use gnitz_zset::schema::Placement;
 /// How a batch reaches the workers that consume it.
 #[derive(Clone)]
 pub(in crate::query) enum Relay {
-    /// Every worker needs the whole batch.
-    Broadcast,
     /// One exchange round, each row to the owner the plan names.
     Round(Rc<ScatterPlan>),
     /// Every worker already holds the batch whole and keeps its own share; no round.
@@ -89,7 +87,7 @@ impl ViewMeta {
                 // Every worker already holds the whole delta a broadcast would
                 // hand it.
                 true if replicated(tid) => continue,
-                true => Relay::Broadcast,
+                true => Relay::Round(Rc::new(ScatterPlan::broadcast())),
                 false => {
                     // Only a keyed relay can skip: a broadcast's matches spread
                     // over the whole other side.

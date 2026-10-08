@@ -31,7 +31,7 @@ fn join(
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
     // The VM hands the kernel a folded register; these fixtures build raw ones.
-    op_join_delta_trace(&delta.to_consolidated(), &mut opens(cursor), &p.out_schema, &p.probe)
+    op_join_delta_trace(&delta.to_consolidated(), &mut opens(cursor), &p)
 }
 
 // -----------------------------------------------------------------------
@@ -469,7 +469,7 @@ fn assert_matches_reference(
         ("three runs", TestTrace::dealt(trace, 3).cursor()),
     ];
     for (runs, ch) in cursors {
-        let out = op_join_delta_trace(delta, &mut opens(ch), &p.out_schema, &p.probe);
+        let out = op_join_delta_trace(delta, &mut opens(ch), &p);
         let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}, {runs}");
         assert_eq!(out.count, want_rows, "{at}: row count");
         assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
@@ -671,22 +671,12 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
 
         for delta_is_right in [false, true] {
             let stored = plan(JoinKind::Equi, delta_is_right, &delta_schema, &trace_schema);
-            let want = op_join_delta_trace(
-                &delta,
-                &mut opens(trace_cursor(trace.clone())),
-                &stored.out_schema,
-                &stored.probe,
-            );
+            let want = op_join_delta_trace(&delta, &mut opens(trace_cursor(trace.clone())), &stored);
             let over = JoinPlan::over_source(delta_is_right, &delta_schema, &source_schema, &map).unwrap();
             assert!(over.out_schema.same_layout(&stored.out_schema));
             assert!(!want.is_empty(), "premise: key {key:?} matches something");
             for runs in [1, 3] {
-                let got = op_join_delta_trace(
-                    &delta,
-                    &mut opens(TestTrace::dealt(&source, runs).cursor()),
-                    &over.out_schema,
-                    &over.probe,
-                );
+                let got = op_join_delta_trace(&delta, &mut opens(TestTrace::dealt(&source, runs).cursor()), &over);
                 assert_eq!(
                     zset_of(&got, &over.out_schema),
                     zset_of(&want, &stored.out_schema),

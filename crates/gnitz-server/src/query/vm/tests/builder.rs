@@ -24,7 +24,7 @@ fn an_integrate_takes_its_register_unless_it_is_the_output() {
 
     let input = [(1, 1, 10), (2, 3, 20)];
     let negated = [(1, -1, 10), (2, -3, 20)];
-    assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &input);
+    assert_rows(&vm.epoch(r0, make_batch_u128(&schema, &input)), &input);
     for (t, rows) in traces.into_iter().zip([&input, &negated, &input]) {
         assert_eq!(vm.trace(t), zset_of(&make_batch_u128(&schema, rows), &schema));
     }
@@ -53,7 +53,7 @@ fn only_the_last_reader_takes_a_register() {
         p.push(r0, schema, op);
         let out = p.push(r0, schema, Op::Negate);
         let mut vm = p.open(out);
-        assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
+        assert_rows(&vm.epoch(r0, make_batch_u128(&schema, &input)), &negated);
     }
 
     // A union reading the output register, which the epoch extracts after every
@@ -63,7 +63,7 @@ fn only_the_last_reader_takes_a_register() {
     let out = p.push(r0, schema, Op::Negate);
     p.push(out, schema, Op::Union { in_b: r0 });
     let mut vm = p.open(out);
-    assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
+    assert_rows(&vm.epoch(r0, make_batch_u128(&schema, &input)), &negated);
 }
 
 /// A register some instruction reads at net weights is folded when written — an
@@ -104,7 +104,7 @@ fn a_register_read_at_net_weights_is_folded_when_written() {
     let mut input = b.finish();
     input.certify_consolidated();
 
-    assert_rows(&vm.epoch([(r0, input)]), &[(1, 1, 100)]);
+    assert_rows(&vm.epoch(r0, input), &[(1, 1, 100)]);
     assert_eq!(
         vm.trace(hist),
         zset_of(&make_batch_u128(&narrow, &[(1, 2, 100)]), &narrow)

@@ -47,7 +47,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 10;
+pub(crate) const CIRCUIT_VERSION: u8 = 11;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -165,9 +165,8 @@ pub const fn agg_output_type(func: AggFunc, src_tc: TypeCode) -> Option<TypeCode
 
 wire_enum! {
     /// The range relation between the two **SQL sides** of a join:
-    /// `left_slot REL right_slot`, the ON clause's `a.x OP b.y` verbatim. Each
-    /// join instruction resolves it against its own `delta_is_right`. Wire values
-    /// are stable.
+    /// `left_slot REL right_slot`, the ON clause's `a.x OP b.y` verbatim. Wire
+    /// values are stable.
     pub enum RangeRel: u8 {
         Lt = 0,
         Le = 1,
@@ -357,11 +356,12 @@ pub enum OpNode {
         /// Aggregate specs `(func, source column)`. Carries a `Count`.
         agg: Vec<AggDescriptor>,
     },
-    /// `slot 0 ⋈ z⁻¹(I(slot 1))`, written `[key, left payload…, right payload…]`:
-    /// `delta_is_right` names the SQL side slot 0 carries.
+    /// The bilinear join of SQL sides A and B over slots `[ΔA, ΔB, iA, iB]`:
+    /// `ΔA ⋈ z⁻¹(I(iB)) + ΔB ⋈ z⁻¹(I(iA))`, written `[key, A payload…, B
+    /// payload…]`. A side's integrand is its delta, or the slice of it a worker
+    /// keeps.
     Join {
         kind: JoinKind,
-        delta_is_right: bool,
     },
     /// Co-locates its input by the key of what reads it — the group columns of a
     /// `Reduce` or `TopN` reader, else the input's own PK.
@@ -392,7 +392,8 @@ impl OpNode {
         match self {
             // The circuit's own input: fed by the source drive, not by a producer.
             OpNode::ScanDelta { .. } => 0,
-            OpNode::Union | OpNode::Join { .. } => 2,
+            OpNode::Join { .. } => 4,
+            OpNode::Union => 2,
             OpNode::Filter(_)
             | OpNode::Map(_)
             | OpNode::Negate
@@ -447,12 +448,11 @@ impl OpNode {
             OpNode::WeightClamp(ClampKind::Distinct) => w.put(&Opcode::Distinct),
             OpNode::WeightClamp(ClampKind::PositivePart) => w.put(&Opcode::PositivePart),
             OpNode::Reduce { group_cols, agg } => w.put(&Opcode::Reduce).list(group_cols).list(agg),
-            OpNode::Join { kind, delta_is_right } => match kind {
+            OpNode::Join { kind } => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
                 JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
                 JoinKind::Cross => w.put(&Opcode::JoinCross),
-            }
-            .bool(*delta_is_right),
+            },
             OpNode::ExchangeShard => w.put(&Opcode::ExchangeShard),
             OpNode::NullExtend { type_codes, nulls_first } => {
                 w.put(&Opcode::NullExtend).bool(*nulls_first).list(type_codes)
@@ -500,18 +500,9 @@ impl OpNode {
                 let agg = r.list("aggregate list", MAX_COLUMNS)?;
                 OpNode::Reduce { group_cols, agg }
             }
-            Opcode::JoinEqui => OpNode::Join {
-                kind: JoinKind::Equi,
-                delta_is_right: r.bool()?,
-            },
-            Opcode::JoinRange => OpNode::Join {
-                kind: JoinKind::Range { rel: r.get()? },
-                delta_is_right: r.bool()?,
-            },
-            Opcode::JoinCross => OpNode::Join {
-                kind: JoinKind::Cross,
-                delta_is_right: r.bool()?,
-            },
+            Opcode::JoinEqui => OpNode::Join { kind: JoinKind::Equi },
+            Opcode::JoinRange => OpNode::Join { kind: JoinKind::Range { rel: r.get()? } },
+            Opcode::JoinCross => OpNode::Join { kind: JoinKind::Cross },
             Opcode::ExchangeShard => OpNode::ExchangeShard,
             Opcode::NullExtend => {
                 let nulls_first = r.bool()?;
@@ -537,7 +528,7 @@ impl OpNode {
 pub type NodeId = usize;
 
 /// The most nodes one circuit may hold: the count [`Circuit::decode`] refuses
-/// past, and what bounds the engine's `u16` register and child-store ids.
+/// past.
 pub const MAX_CIRCUIT_NODES: usize = 16_384;
 
 const ARITY_MISMATCH: &str = "node's inputs do not match its operator's arity";
@@ -547,7 +538,7 @@ const EARLIER_NODE: &str = "a node's input is not an earlier node";
 pub struct Node {
     pub op: OpNode,
     /// Slot 0 first; a slot past `op.arity()` is unused and zero.
-    inputs: [NodeId; 2],
+    inputs: [NodeId; 4],
 }
 
 impl Node {
@@ -581,7 +572,7 @@ impl Circuit {
         if inputs.iter().any(|&p| p >= self.nodes.len()) {
             return Err(EARLIER_NODE.into());
         }
-        let mut slots = [0; 2];
+        let mut slots = [0; 4];
         slots[..inputs.len()].copy_from_slice(inputs);
         self.nodes.push(Node { op, inputs: slots });
         Ok(self.nodes.len() - 1)
@@ -608,7 +599,7 @@ impl Circuit {
             let mut circuit = Circuit::default();
             for _ in 0..r.count("nodes", MAX_CIRCUIT_NODES)? {
                 let op = OpNode::read(r)?;
-                let mut inputs = [0; 2];
+                let mut inputs = [0; 4];
                 let inputs = &mut inputs[..op.arity()];
                 for slot in inputs.iter_mut() {
                     *slot = r.u16()? as NodeId;
@@ -716,18 +707,10 @@ impl Circuit {
         self.add(OpNode::WeightClamp(ClampKind::PositivePart), &[diff])
     }
 
-    /// [`OpNode::Join`]: `delta` probes the integral of `integrand`, as it stood
-    /// before this epoch. `delta_is_right` names the SQL side the delta carries.
-    pub fn join(&mut self, delta: NodeId, integrand: NodeId, kind: JoinKind, delta_is_right: bool) -> NodeId {
-        self.add(OpNode::Join { kind, delta_is_right }, &[delta, integrand])
-    }
-
-    /// `ΔA ⋈ z⁻¹I(B) + ΔB ⋈ z⁻¹I(A)`, both terms in side order `[key, A, B]`:
-    /// `da` joins the integral of `ib`, `db` that of `ia`.
-    pub fn join_terms(&mut self, [da, db]: [NodeId; 2], [ia, ib]: [NodeId; 2], kind: JoinKind) -> NodeId {
-        let ab = self.join(da, ib, kind, false);
-        let ba = self.join(db, ia, kind, true);
-        self.union(ab, ba)
+    /// [`OpNode::Join`]: `da` joins the integral of `ib`, `db` that of `ia`, each
+    /// as it stood before this epoch.
+    pub fn join(&mut self, [da, db]: [NodeId; 2], [ia, ib]: [NodeId; 2], kind: JoinKind) -> NodeId {
+        self.add(OpNode::Join { kind }, &[da, db, ia, ib])
     }
 
     /// [`OpNode::WorkerFilter`].

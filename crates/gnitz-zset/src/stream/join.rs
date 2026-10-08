@@ -1,6 +1,6 @@
 //! The delta-trace inner join, equi, non-equi and keyless.
 //!
-//! One opcode over a compiler-baked [`JoinProbe`]: `Equi` co-groups the delta
+//! One opcode over a compiler-baked [`JoinPlan`]: `Equi` co-groups the delta
 //! against the trace on equal key, `Range` walks an ordered half-open span per
 //! delta equality group, `Cross` walks the whole trace once against the whole
 //! delta. All three name the same emission — the product of a contiguous
@@ -29,17 +29,12 @@ use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
 // The plan
 // ---------------------------------------------------------------------------
 
-/// One join instruction's compiler-baked artifact: how it probes its trace, and
-/// the schema it writes under.
+/// One join instruction's compiler-baked artifact: how it probes its trace,
+/// where each input's columns land in the output row, and the schema it writes
+/// under — baked by the compiler, which holds the two input schemas the kernel
+/// never sees.
 pub struct JoinPlan {
-    pub probe: JoinProbe,
-    pub out_schema: SchemaDescriptor,
-}
-
-/// How one join instruction probes its trace, and where each input's columns
-/// land in the output row — both baked by the compiler, which holds the two
-/// input schemas the kernel never sees.
-pub struct JoinProbe {
+    out_schema: SchemaDescriptor,
     walk: Walk,
     /// The first output payload slot the delta's columns fill.
     d_first: u16,
@@ -91,6 +86,11 @@ enum Walk {
 }
 
 impl JoinPlan {
+    /// The layout [`op_join_delta_trace`] writes under this plan.
+    pub fn out_schema(&self) -> &SchemaDescriptor {
+        &self.out_schema
+    }
+
     /// Resolve a wire join node against its two input schemas, or name the
     /// precondition the circuit violated. A circuit is client-supplied catalog
     /// data, so these are refusals rather than debug asserts.
@@ -184,15 +184,15 @@ impl JoinPlan {
             .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
             .collect();
         let t_nulls = NullPerm::new(&t_cols, walked.nullable_payload_slots());
-        let probe = JoinProbe {
+        Ok(JoinPlan {
+            out_schema,
             walk,
             d_first: d_slots.start,
             t_cols,
             t_nulls,
             trace_leads: delta_is_right,
             trace_ordered,
-        };
-        Ok(JoinPlan { probe, out_schema })
+        })
     }
 }
 
@@ -309,7 +309,7 @@ impl Pairing {
 }
 
 /// Join delta rows against the trace, writing `[key, left payload…, right
-/// payload…]` under the `out_schema` [`JoinPlan::from_wire`] derived above.
+/// payload…]` under [`JoinPlan::out_schema`].
 ///
 /// The walk only records which delta run meets which trace row; the output is
 /// then written one region at a time over that list. Emission is trace-major
@@ -321,12 +321,8 @@ impl Pairing {
 /// An equal-key walk claims its output consolidated where that order is the
 /// output's own: each delta run met one trace row, or the trace's rows arrived
 /// in output order and either lead the payload or met single delta rows.
-pub fn op_join_delta_trace(
-    delta: &Batch,
-    trace: OpenAt<'_>,
-    out_schema: &SchemaDescriptor,
-    probe: &JoinProbe,
-) -> Batch {
+pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) -> Batch {
+    let out_schema = &plan.out_schema;
     debug_assert!(delta.is_consolidated());
     let n = delta.count;
     if n == 0 {
@@ -334,7 +330,7 @@ pub fn op_join_delta_trace(
     }
     // Every trace row a walk can meet begins with a delta row's key under `Equi`,
     // with its equality prefix under `Range`, and with nothing under `Cross`.
-    let prefix = match probe.walk {
+    let prefix = match plan.walk {
         Walk::Equi => delta.schema().pk_stride(),
         Walk::Range(range) => range.eq_size,
         Walk::Cross { .. } => 0,
@@ -343,7 +339,7 @@ pub fn op_join_delta_trace(
     // Grown, not pre-sized: a walk can match nothing.
     let mut pairs: Vec<Pairing> = Vec::new();
     let mut rows = 0usize;
-    let mut ordered = matches!(probe.walk, Walk::Equi);
+    let mut ordered = matches!(plan.walk, Walk::Equi);
     let mut last_run = usize::MAX;
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         if rs == re {
@@ -351,7 +347,7 @@ pub fn op_join_delta_trace(
         }
         // A delta run's second trace row: its rows follow the first's.
         if ordered && rs == last_run {
-            ordered = probe.trace_ordered && (probe.trace_leads || re - rs == 1);
+            ordered = plan.trace_ordered && (plan.trace_leads || re - rs == 1);
         }
         last_run = rs;
         let (src, row) = c.current_position();
@@ -364,12 +360,12 @@ pub fn op_join_delta_trace(
         });
         rows += re - rs;
     };
-    match probe.walk {
+    match plan.walk {
         Walk::Equi => equi_merge_walk(delta, cursor, emit),
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
         Walk::Cross { .. } => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
-    let mut out = write_pairings(delta, cursor, out_schema, probe, &pairs, rows);
+    let mut out = write_pairings(delta, cursor, plan, &pairs, rows);
     if ordered && !out.is_empty() {
         out.certify_consolidated();
     }
@@ -378,14 +374,8 @@ pub fn op_join_delta_trace(
 
 /// The `rows` output rows `pairs` names, in list order, one region at a time,
 /// less any whose weight product is zero.
-fn write_pairings(
-    delta: &Batch,
-    cursor: &ReadCursor,
-    out_schema: &SchemaDescriptor,
-    probe: &JoinProbe,
-    pairs: &[Pairing],
-    rows: usize,
-) -> Batch {
+fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing], rows: usize) -> Batch {
+    let out_schema = &plan.out_schema;
     if rows == 0 {
         return Batch::empty_with_schema(out_schema);
     }
@@ -405,12 +395,12 @@ fn write_pairings(
         false => None,
     };
 
-    let d_first = probe.d_first as usize;
+    let d_first = plan.d_first as usize;
     let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
     let any_ghost = out.append_session(rows).write(rows, |w| {
         let mut any_ghost = false;
         let (pk, weights, nulls) = w.fixed_mut();
-        match probe.walk {
+        match plan.walk {
             // No key decides a match, so the pair `[left PK…, right PK…]` is minted
             // per row.
             Walk::Cross { pk_len, d_key, t_key } => {
@@ -426,7 +416,7 @@ fn write_pairings(
                     }
                 }
             }
-            // A keyed probe's output key is the delta's PK region verbatim.
+            // A keyed plan's output key is the delta's PK region verbatim.
             _ => width_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk_data(), pk, delta_runs(pairs)),
         }
         {
@@ -446,7 +436,7 @@ fn write_pairings(
             let mut dst = nulls.as_chunks_mut::<8>().0.iter_mut();
             for p in pairs {
                 let (t_src, t_row) = trace_row(p);
-                let t_bits = probe.t_nulls.apply(t_src.get_null_word(t_row));
+                let t_bits = plan.t_nulls.apply(t_src.get_null_word(t_row));
                 for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
                     *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
                 }
@@ -467,7 +457,7 @@ fn write_pairings(
             }
         }
 
-        for &ColCopy { src, slot, .. } in &probe.t_cols {
+        for &ColCopy { src, slot, .. } in &plan.t_cols {
             // Destructured once per column, so no pairing dispatches on the locator.
             match src {
                 ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {

@@ -55,7 +55,7 @@ impl EquiPrologue {
         let keys = cb.map(self.reindex[o], &[]);
         let mut deltas = self.reindex;
         deltas[o] = cb.distinct(keys);
-        cb.join_terms(deltas, deltas, JoinKind::Equi)
+        cb.join(deltas, deltas, JoinKind::Equi)
     }
 }
 
@@ -80,7 +80,7 @@ pub(super) fn equi_prologue(
         false => reindex_b,
     };
     let reindex = [reindex_a, b_delta];
-    let inner = cb.join_terms(reindex, reindex, JoinKind::Equi);
+    let inner = cb.join(reindex, reindex, JoinKind::Equi);
     Ok(EquiPrologue { all: [all_a, all_b], reindex, inner })
 }
 
@@ -208,7 +208,7 @@ impl RangePrologue<'_> {
             _ => self.reindex_b,
         };
         let kind = JoinKind::Range { rel: self.op };
-        cb.join_terms([reindex_a, self.reindex_b], [self.int_a, int_b], kind)
+        cb.join([reindex_a, self.reindex_b], [self.int_a, int_b], kind)
     }
 
     /// `(A_owned, matched)` for a pure range: A's owned slice and the rows of it
@@ -236,7 +236,7 @@ impl RangePrologue<'_> {
 
         // `m` carries no payload, so both terms are `[_join_pk × k, A]`.
         let deltas = [self.int_a, reindex_m];
-        let matched_raw = cb.join_terms(deltas, deltas, JoinKind::Range { rel: self.op });
+        let matched_raw = cb.join(deltas, deltas, JoinKind::Range { rel: self.op });
         let owned = self.owned_a.expect("a pure range with a ν over A owns A first");
         (owned, rekey_pinned(cb, matched_raw, self.k, &self.sides[..1]))
     }

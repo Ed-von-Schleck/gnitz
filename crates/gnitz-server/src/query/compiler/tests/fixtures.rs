@@ -19,6 +19,9 @@ pub(super) fn routing(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Re
     ViewMeta::derive(loaded, registry, &view).map(|(meta, _)| meta)
 }
 
+/// The id the compiled circuit's view goes by.
+pub(super) const VIEW: u64 = 99;
+
 /// `circuit` compiled into a view of schema `view`, under the routing derived
 /// from it.
 pub(super) fn compile(
@@ -29,21 +32,22 @@ pub(super) fn compile(
 ) -> Result<(CompileOutput, StateLayout), String> {
     let loaded = loaded(circuit);
     let (meta, _) = ViewMeta::derive(&loaded, registry, view)?;
-    compile_view(&loaded, registry, view, &meta, bounded)
+    compile_view(&loaded, registry, VIEW, view, &meta, bounded)
 }
 
-/// `loaded` emitted whole, exchange-free, into one plan that outputs `out`, and
-/// the children it declared.
-pub(super) fn whole(
-    loaded: &LoadedCircuit,
-    registry: &RelationRegistry,
-    meta: &ViewMeta,
-    out: PlanOut,
-) -> Result<(Built, StateLayout), String> {
-    let mut layout = StateLayout::default();
-    let all = loaded.ordered_where(|_| true);
-    let built = build_plan(loaded, &all, registry, &mut layout, meta, &[], out)?;
-    Ok((built, layout))
+/// `loaded` emitted whole; `store`: its output node's rows are the view store's.
+pub(super) fn whole<'a>(
+    loaded: &'a LoadedCircuit,
+    registry: &'a RelationRegistry,
+    meta: &'a ViewMeta,
+    store: bool,
+) -> Result<EmitCtx<'a>, String> {
+    let mut ctx = EmitCtx::new(loaded, registry, meta, store.then(|| (VIEW, loaded.out())));
+    for (nid, op) in loaded.ops() {
+        let reg = emit_node(&mut ctx, nid, op)?;
+        ctx.regs.push(reg);
+    }
+    Ok(ctx)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].
@@ -126,7 +130,7 @@ pub(super) enum Route {
 pub(super) fn route(relay: Option<&Relay>) -> Route {
     match relay {
         None => Route::Stays,
-        Some(Relay::Broadcast) => Route::Broadcast,
+        Some(Relay::Round(plan)) if plan.is_broadcast() => Route::Broadcast,
         Some(Relay::Round(_)) => Route::Round,
         Some(Relay::Share(_)) => Route::Share,
     }
