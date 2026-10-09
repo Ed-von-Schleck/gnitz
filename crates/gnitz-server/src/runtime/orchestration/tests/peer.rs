@@ -32,7 +32,7 @@ fn send_corks_what_fits_and_never_reorders() {
         let peer = Peer::new(&r, conn, None);
         peer.cork(&all[..pre]);
         let peer = r.block_on(async move {
-            peer.send(slot).await.expect("an open peer");
+            peer.send(SendBody::Slot(slot)).await.expect("an open peer");
             peer
         });
 
@@ -89,10 +89,14 @@ fn a_failed_send_finishes_the_peer() {
     drop(receiver);
 
     r.block_on(async move {
-        assert_eq!(peer.send(small).await, Ok(()), "a small slot is corked, not sent");
+        assert_eq!(
+            peer.send(SendBody::Slot(small)).await,
+            Ok(()),
+            "a small slot is corked, not sent"
+        );
         assert_eq!(peer.flush_egress().await, Err(PeerGone), "its flush fails");
         assert_eq!(peer.corked_len(), 0);
-        assert_eq!(peer.send(big).await, Err(PeerGone));
+        assert_eq!(peer.send(SendBody::Slot(big)).await, Err(PeerGone));
         assert_eq!(peer.flush_if_full().await, Err(PeerGone));
         assert_eq!(peer.flush_egress().await, Err(PeerGone));
         assert!(
@@ -143,51 +147,39 @@ fn next_request_ships_before_parking() {
     );
 }
 
-/// A queued train is shipped whole and in queue order behind what the cork
-/// already holds — a small one corked, a large one sent alone — and counted
-/// until the connection's next sync is answered.
+/// A shared body sent behind a non-empty cork joins it when it fits, and
+/// otherwise leaves alone behind a flush of what was corked.
 #[test]
-fn a_queued_train_is_shipped_whole_behind_the_reply() {
+fn a_shared_body_is_sent_behind_what_is_corked() {
     let (r, conn, receiver) = egress_pair(Limits::TEST, None);
     let peer = Rc::new(Peer::new(&r, conn, None));
-    let out = peer.outbox();
-    let large = COALESCE_MAX_BYTES / 2 + 1;
-    out.send(vec![0x10; 8], Rc::new(vec![0x11; 100]));
-    out.send(vec![0x20; 8], Rc::new(vec![0x21; large]));
-    assert_eq!(out.unsynced(), 116 + large);
+    let small = Rc::new(vec![0x11u8; 100]);
+    let large = Rc::new(vec![0x21u8; COALESCE_MAX_BYTES]);
 
     peer.cork(b"reply");
-    let shipping = Rc::clone(&peer);
-    let reader = receiver.try_clone().unwrap();
-    let wire = std::thread::spawn(move || {
-        let mut wire = vec![0u8; 121 + large];
-        (&reader).read_exact(&mut wire).expect("the reply and both trains");
-        wire
-    });
-    r.block_on(async move { shipping.ship_pushed().await.expect("an open peer") });
-    assert_eq!(
-        (out.unsynced(), peer.corked_len()),
-        (116 + large, 0),
-        "a ship is no sync"
-    );
-    out.synced();
-    assert_eq!(out.unsynced(), 0);
-    let want = [&b"reply"[..], &[0x10; 8], &[0x11; 100], &[0x20; 8], &vec![0x21; large]].concat();
-    assert!(
-        wire.join().unwrap() == want,
-        "the large train left behind what was corked"
-    );
-
-    // A small train waits in the cork for a flush.
-    out.send(vec![0x30; 8], Rc::new(vec![0x31; 100]));
-    let shipping = Rc::clone(&peer);
-    r.block_on(async move { shipping.ship_pushed().await.expect("an open peer") });
-    assert_eq!(peer.corked_len(), 108);
+    let sending = Rc::clone(&peer);
+    let body = Rc::clone(&small);
+    r.block_on(async move { sending.send(SendBody::Shared(body)).await.expect("an open peer") });
+    assert_eq!(peer.corked_len(), 105, "a body that fits is corked");
     assert!(
         read_nonblocking(&receiver, 1024).is_none(),
         "nothing leaves before a flush"
     );
-    r.block_on(async move { peer.flush_egress().await.expect("an open peer") });
-    let wire = read_nonblocking(&receiver, 1024).unwrap_or_default();
-    assert_eq!(wire, [&[0x30; 8][..], &[0x31; 100]].concat());
+
+    // The read above left the socket non-blocking.
+    receiver.set_nonblocking(false).expect("blocking");
+    let wire = std::thread::spawn(move || {
+        let reader = receiver;
+        let mut wire = vec![0u8; 105 + COALESCE_MAX_BYTES];
+        (&reader)
+            .read_exact(&mut wire)
+            .expect("the cork and the body behind it");
+        wire
+    });
+    let sending = Rc::clone(&peer);
+    let body = Rc::clone(&large);
+    r.block_on(async move { sending.send(SendBody::Shared(body)).await.expect("an open peer") });
+    assert_eq!(peer.corked_len(), 0, "a body that does not fit is not corked");
+    let want = [&b"reply"[..], &small, &large].concat();
+    assert!(wire.join().unwrap() == want, "the body left behind what was corked");
 }

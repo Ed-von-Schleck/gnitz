@@ -256,8 +256,8 @@ impl MasterDispatcher {
     /// another boot, from a dropped view, or polled under another spec is
     /// recognizably foreign. `spec` is the request's encoded bytes.
     pub(crate) fn delta_cursor_tag(&self, view_id: u64, spec: &[u8]) -> u64 {
-        // splitmix64's finalizer, a bijection on u64: two views of one boot
-        // never share a tag.
+        // splitmix64's finalizer, a bijection on u64: under one spec, two
+        // views of one boot never share a tag.
         let mut z = view_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

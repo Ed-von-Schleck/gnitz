@@ -4,7 +4,7 @@
 use super::*;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{
-    framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair, sync_answer,
+    framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair, sync_answer, Peer,
 };
 use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
@@ -542,7 +542,7 @@ fn an_abandoned_poll_queues_nothing() {
 
 /// A read of view 7's delta feed after `(tag 1, tick 4)`.
 fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
-    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[])
+    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[], None)
 }
 
 #[test]
@@ -638,10 +638,22 @@ fn cursor(tick: u64) -> DeltaCursor {
     DeltaCursor::from_pair(1, tick).unwrap()
 }
 
-/// Subscribe to view 40 from round 3 as subscription 5; that id. The request
-/// is a delta read, answered by view 40's train.
-fn subscribe(s: &mut Session) -> u64 {
-    s.subscribe(5, 40.into(), cursor(3), &schema_a(), &[]).unwrap();
+/// A read of view 40 that keeps it as subscription `id`.
+fn submit_kept_read(s: &mut Session, id: u64) -> Sent<(ScanReply, DeltaCursor)> {
+    s.submit_delta_read(40.into(), None, &schema_a(), &[], Some(id))
+}
+
+/// Subscribe to view 40 as subscription `id`: a kept read, answered here with
+/// no row and round 3.
+fn subscribe_as(s: &mut Session, peer: &Peer, id: u64) {
+    let sent = submit_kept_read(s, id);
+    peer.send(&delta_terminal(40, 3));
+    assert_eq!(await_reply(s, sent).unwrap().1, cursor(3));
+}
+
+/// [`subscribe_as`] subscription 5; that id.
+fn subscribe(s: &mut Session, peer: &Peer) -> u64 {
+    subscribe_as(s, peer, 5);
     5
 }
 
@@ -651,11 +663,10 @@ fn subscribe(s: &mut Session) -> u64 {
 #[test]
 fn a_pushed_train_between_replies_is_set_aside() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let first = s.submit(COMMIT);
     let second = s.submit(COMMIT);
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&reply_ctrl(0, 1)));
+    let mut bytes = framed(&reply_ctrl(0, 1));
     bytes.extend(pushed_train(40, sub, &[1, 2], 9));
     bytes.extend(pushed_train(40, sub + 1, &[3], 9));
     bytes.extend(pushed_train(40, sub, &[4], 11));
@@ -670,29 +681,29 @@ fn a_pushed_train_between_replies_is_set_aside() {
     assert!(s.take_pushed(sub + 1).is_err(), "nobody holds it");
 }
 
-/// What a subscription's own read brings is its first train, taken as a
-/// pushed one is.
+/// A kept read is answered as any delta read is, and its terminal leaves the
+/// session holding the subscription at the cursor it carries: a train pushed
+/// right behind the reply is the subscription's.
 #[test]
-fn a_subscriptions_read_is_its_first_train() {
+fn a_kept_reads_terminal_parks_its_cursor() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
-    assert_eq!(
-        s.take_pushed(sub).unwrap().1,
-        cursor(3),
-        "unanswered, it stands where it asked from"
-    );
-    let sent = s.submit(COMMIT);
+    let sent = submit_kept_read(&mut s, 5);
+    assert!(s.take_pushed(5).is_err(), "unanswered, nothing is held");
     let mut bytes = framed(&reply_rows(40, &batch_a(&[1, 2]), 0, true));
     bytes.extend(framed(&delta_terminal(40, 9)));
-    bytes.extend(pushed_train(40, sub, &[3], 11));
-    bytes.extend(framed(&reply_ctrl(0, 1)));
+    bytes.extend(pushed_train(40, 5, &[3], 11));
     peer.send_bytes(&bytes);
-    await_reply(&mut s, sent).unwrap();
-    let (blocks, next) = s.take_pushed(sub).unwrap();
+    let (reply, at) = await_reply(&mut s, sent).unwrap();
+    assert_eq!((reply.batch, at), (batch_a(&[1, 2]), cursor(9)));
+    let synced = s.submit_sync(&[5], Duration::ZERO);
+    assert_eq!(s.requests_sent(), 2, "the server holds one, so the sync is a request");
+    peer.send(&sync_answer(None));
+    await_reply(&mut s, synced).unwrap();
+    let (blocks, next) = s.take_pushed(5).unwrap();
     assert_eq!(
         (blocks.len(), next),
-        (2, cursor(11)),
-        "the read's rows, then what was pushed"
+        (1, cursor(11)),
+        "what was pushed, not the read's rows"
     );
 }
 
@@ -757,11 +768,7 @@ fn a_sync_of_no_subscription_is_no_request() {
 fn a_sync_names_what_is_held_and_ends_the_rest() {
     let (mut s, peer) = pair();
     for id in [5, 6] {
-        s.subscribe(id, 40.into(), cursor(3), &schema_a(), &[]).unwrap();
-    }
-    let mut script = Vec::new();
-    for _ in 0..2 {
-        script.extend(framed(&delta_terminal(40, 3)));
+        subscribe_as(&mut s, &peer, id);
     }
     for (held, named) in [(&[5, 6][..], &[5, 6][..]), (&[6, 9], &[6]), (&[], &[])] {
         let synced = s.submit_sync(held, Duration::ZERO);
@@ -773,8 +780,7 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
             }
         };
         assert_eq!(held_named(&request), named, "holding {held:?}");
-        script.extend(framed(&sync_answer(None)));
-        peer.send_bytes(&std::mem::take(&mut script));
+        peer.send(&sync_answer(None));
         await_reply(&mut s, synced).unwrap();
     }
     assert!(s.take_pushed(5).is_err() && s.take_pushed(6).is_err());
@@ -787,11 +793,9 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
 #[test]
 fn a_refused_sync_moves_no_subscription() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let synced = s.submit_sync(&[sub], Duration::ZERO);
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&sync_answer(Some("refused"))));
-    peer.send_bytes(&bytes);
+    peer.send(&sync_answer(Some("refused")));
     assert!(matches!(await_reply(&mut s, synced), Err(ClientError::Refused(_))));
     assert_eq!(s.take_pushed(sub).unwrap().1, cursor(3));
 }
@@ -802,12 +806,11 @@ fn a_refused_sync_moves_no_subscription() {
 #[test]
 fn a_request_behind_a_sync_is_answered_before_it() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let mut synced = s.submit_sync(&[sub], Duration::from_secs(60));
     let first = s.submit(COMMIT);
     let second = s.submit(COMMIT);
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&reply_ctrl(0, 1)));
+    let mut bytes = framed(&reply_ctrl(0, 1));
     bytes.extend(pushed_train(40, sub, &[1], 9));
     bytes.extend(framed(&reply_ctrl(0, 2)));
     peer.send_bytes(&bytes);
@@ -827,16 +830,35 @@ fn a_request_behind_a_sync_is_answered_before_it() {
 #[test]
 fn syncs_are_answered_in_order() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let held = s.submit_sync(&[sub], Duration::from_secs(60));
     let mut behind = s.submit_sync(&[sub], Duration::ZERO);
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&sync_answer(Some("refused"))));
-    peer.send_bytes(&bytes);
+    peer.send(&sync_answer(Some("refused")));
     assert!(matches!(await_reply(&mut s, held), Err(ClientError::Refused(_))));
     assert!(behind.try_take().is_none(), "one answer, one sync");
     peer.send(&sync_answer(None));
     await_reply(&mut s, behind).expect("the second answer is the second sync's");
+}
+
+/// The wait a SYNC_PUSHED request asks to be held for, in milliseconds.
+fn wait_asked(request: &[u8]) -> u64 {
+    let ctrl = peek_control_block(request).unwrap();
+    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    ctrl.hdr.arg0
+}
+
+/// A sync sent behind an unanswered one asks for no hold, whatever its caller
+/// asked for: the one ahead may be answered with trains whose reader is gone.
+#[test]
+fn a_sync_behind_an_unanswered_one_is_not_held() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s, &peer);
+    peer.recv();
+    let _first = s.submit_sync(&[sub], Duration::from_secs(60));
+    let _behind = s.submit_sync(&[sub], Duration::from_secs(60));
+    s.step(Interest::WRITE);
+    assert_eq!(wait_asked(&peer.recv()), 60_000);
+    assert_eq!(wait_asked(&peer.recv()), 0);
 }
 
 /// An answer to a sync nobody sent is a frame this session cannot place, and
@@ -844,10 +866,9 @@ fn syncs_are_answered_in_order() {
 #[test]
 fn a_sync_ends_with_its_session() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let synced = s.submit_sync(&[sub], Duration::from_secs(60));
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&sync_answer(None)));
+    let mut bytes = framed(&sync_answer(None));
     bytes.extend(framed(&sync_answer(None)));
     peer.send_bytes(&bytes);
     await_reply(&mut s, synced).expect("its own answer came first");
@@ -856,9 +877,8 @@ fn a_sync_ends_with_its_session() {
     }
 
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let synced = s.submit_sync(&[sub], Duration::from_secs(60));
-    peer.send(&delta_terminal(40, 3));
     drop(peer);
     assert!(matches!(
         await_reply(&mut s, synced),
@@ -866,27 +886,14 @@ fn a_sync_ends_with_its_session() {
     ));
 }
 
-/// A subscription a session at its cap refuses is no subscription: the
-/// refusal is returned, and the session holds nothing under the id.
-#[test]
-fn a_refused_subscribe_holds_nothing() {
-    let (mut s, _peer) = pair();
-    s.end(ClientError::Closed);
-    let refused = s.subscribe(5, 40.into(), cursor(3), &schema_a(), &[]);
-    assert!(matches!(refused, Err(ClientError::Closed)), "{refused:?}");
-    let gone = s.take_pushed(5).expect_err("nothing is held");
-    assert!(gone.to_string().contains("not held"), "{gone:?}");
-}
-
 /// A train that ends in a fault ends its subscription and nothing else: the
 /// request behind it is answered.
 #[test]
 fn a_pushed_fault_ends_its_subscription_and_no_request() {
     let (mut s, peer) = pair();
-    let sub = subscribe(&mut s);
+    let sub = subscribe(&mut s, &peer);
     let sent = s.submit(COMMIT);
-    let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(pushed_train(40, sub, &[1], 9));
+    let mut bytes = pushed_train(40, sub, &[1], 9);
     bytes.extend(framed(&pushed_marker(40, sub)));
     bytes.extend(framed(&reply_status(40, WireStatus::Error, "lagged")));
     bytes.extend(framed(&reply_ctrl(0, 3)));
@@ -898,23 +905,25 @@ fn a_pushed_fault_ends_its_subscription_and_no_request() {
     assert!(gone.to_string().contains("not held"), "{gone:?}");
 }
 
-/// A subscription whose read the server refuses — the request whole, or its
-/// view alone — is ended by the refusal, as by a fault train.
+/// A kept read the server refuses — the request whole, or its view alone —
+/// is a refused read and nothing else: the session holds nothing under the
+/// id, and has no subscription to sync.
 #[test]
-fn a_refused_subscription_is_ended_by_its_refusal() {
+fn a_refused_kept_read_parks_nothing() {
     for named in [0, 40] {
         let (mut s, peer) = pair();
-        let sub = subscribe(&mut s);
-        let sent = s.submit(COMMIT);
-        let mut bytes = framed(&reply_status(named, WireStatus::DeltaExpired, "refused"));
-        bytes.extend(framed(&reply_ctrl(0, 3)));
-        peer.send_bytes(&bytes);
-        assert_eq!(await_reply(&mut s, sent).unwrap(), 3);
-        let ended = s.take_pushed(sub);
+        let sent = submit_kept_read(&mut s, 5);
+        peer.send(&reply_status(named, WireStatus::DeltaExpired, "refused"));
+        let refused = await_reply(&mut s, sent);
         assert!(
-            matches!(&ended, Err(ClientError::Refused(f)) if f.status == WireStatus::DeltaExpired),
-            "naming {named}: {ended:?}"
+            matches!(&refused, Err(ClientError::Refused(f)) if f.status == WireStatus::DeltaExpired),
+            "naming {named}: {refused:?}"
         );
+        let gone = s.take_pushed(5).expect_err("nothing is held");
+        assert!(gone.to_string().contains("not held"), "naming {named}: {gone:?}");
+        let synced = s.submit_sync(&[5], Duration::ZERO);
+        await_reply(&mut s, synced).unwrap();
+        assert_eq!(s.requests_sent(), 1, "naming {named}: the read alone");
     }
 }
 

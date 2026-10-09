@@ -310,8 +310,7 @@ async def test_a_held_sync_leaves_an_async_client_free(client, server):
     vid, schema = client.resolve_table("f")
     tid, t_schema = client.resolve_table("t")
     async with aio.connect(server, schema=client.schema) as conn:
-        _, cursor = await conn.delta_bootstrap(vid, schema)
-        sub = await conn.subscribe(vid, schema, cursor)
+        sub, _, cursor = await conn.subscribe(vid, schema)
         held = asyncio.ensure_future(conn.sync(60))
         rows = await asyncio.wait_for(conn.scan(tid, t_schema), 20)
         assert not held.done(), "the scan left the sync held"
@@ -331,11 +330,9 @@ async def test_a_held_sync_follows_a_subscription_made_beside_it(client, server)
     mk_feed(client, "g", "SELECT id, w FROM u WHERE w > 0")
     (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
     async with aio.connect(server, schema=client.schema) as conn:
-        _, cursor = await conn.delta_bootstrap(fid, f_schema)
-        await conn.subscribe(fid, f_schema, cursor)
+        await conn.subscribe(fid, f_schema)
         held = asyncio.ensure_future(conn.sync(60))
-        _, cursor = await conn.delta_bootstrap(gid, g_schema)
-        late = await conn.subscribe(gid, g_schema, cursor)
+        late, _, _ = await conn.subscribe(gid, g_schema)
         assert not held.done(), "subscribing left the sync held"
         client.execute_sql("INSERT INTO u VALUES (1, 1, 5)")
         pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}
@@ -354,8 +351,7 @@ async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
         vid, schema = client.resolve_table("f")
         async with aio.connect(own_server.target) as conn:
             # The read ticks the seed, and the pace counts from that tick.
-            _, cursor = await conn.delta_bootstrap(vid, schema)
-            await conn.subscribe(vid, schema, cursor)
+            await conn.subscribe(vid, schema)
             held = asyncio.ensure_future(conn.sync(60))
             for i in range(2, 6):
                 await asyncio.wait_for(conn.execute_sql(f"INSERT INTO t VALUES ({i}, 100, 'w')"), 20)

@@ -819,7 +819,7 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let sent = self.session.submit_delta_read(view, from, reply_schema, spec);
+        let sent = self.session.submit_delta_read(view, from, reply_schema, spec, None);
         self.wait(sent)
     }
 

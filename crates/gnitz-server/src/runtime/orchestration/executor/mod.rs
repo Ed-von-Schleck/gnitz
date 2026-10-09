@@ -415,6 +415,7 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
 
     let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
     let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
+    let (feeds, asks) = Feeds::new();
     let shared = Rc::new(Shared {
         dispatcher,
         committer_tx,
@@ -424,7 +425,7 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
         last_tick_lsn: Cell::new(boot_seed),
         tick_rows: RefCell::new(FxHashMap::default()),
         sync_waiters: SyncWaiters::default(),
-        feeds: Feeds::default(),
+        feeds,
         push_queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),
         table_locks: RefCell::new(FxHashMap::default()),
         draining: Cell::new(false),
@@ -450,6 +451,7 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
         reactor.spawn(accept_loop(Rc::clone(&shared), listener));
     }
     reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
+    reactor.spawn(delta::pump(Rc::clone(&shared), asks));
 
     // `2` separates a dead worker from a failed boot's `1` and from
     // `gnitz_fatal_abort!`'s `134`.
@@ -512,16 +514,15 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
     }
 
     let mut subs = Subscriptions::default();
-    let out = peer.outbox();
     loop {
         // Ahead of the next request: a client that always has one ready is
         // still answered its sync.
-        if let Some(waiting) = subs.sync_wait(shared, &out) {
+        if let Some(waiting) = subs.sync_wait(shared) {
             let Ok(synced) = peer.until_request(waiting.as_mut()).await else {
                 break;
             };
             if let Some(synced) = synced {
-                subs.answer_sync(shared, peer, synced).await;
+                subs.answer_sync(peer, synced).await;
                 continue;
             }
         }
@@ -529,7 +530,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
         handle_message(peer, &mut subs, buf, shared).await;
         // Behind the reply, where a pushed train splits none. A client that
         // is gone is found out by the next request.
-        let _ = peer.ship_pushed().await;
+        let _ = subs.ship(peer).await;
     }
     subs.leave(&shared.feeds, |_| true);
 }
@@ -1025,18 +1026,6 @@ async fn fresh_read_lock(
     Ok(shared.catalog_rwlock.read().await)
 }
 
-/// A reply train's terminal frame. `arg0` is the read's watermark (see
-/// [`read_watermark`]), or a DELTA_POLL position's tick round, whose cursor tag
-/// rides `arg1`; `arg1` is `0` for every other read.
-fn terminal_scan_msg(target_id: u64, arg0: u64, arg1: u64) -> ipc::WireMsg<'static> {
-    ipc::WireMsg {
-        target_id,
-        arg0,
-        arg1,
-        ..Default::default()
-    }
-}
-
 /// The LSN at or below which every commit is reflected in a read of a `kind`
 /// relation. Called under the read's own SAL hold, so every zone at or below
 /// the SAL watermark precedes the read's group in the log. A view reflects its
@@ -1117,7 +1106,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
                 // This relation's train, all workers, before the next: within a
                 // cut each worker's ring order is request order.
                 forward_scan(peer, leases.next().expect("one lease per fanned scan")).await?;
-                send_msg(peer, terminal_scan_msg(target_id, s.lsn, 0));
+                send_ack(peer, target_id, s.lsn);
             }
         }
         // Carry no more than the budget into the next reply, and learn here
@@ -1164,7 +1153,8 @@ fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
 }
 
 /// A control-only ACK: the request's own `target_id`, and its one value — a
-/// write's LSN or an allocation's base id — in `arg0`.
+/// write's LSN, an allocation's base id, or the watermark of the read whose
+/// train it ends (see [`read_watermark`]) — in `arg0`.
 pub(super) fn send_ack(peer: &Peer, target_id: u64, value: u64) {
     send_msg(
         peer,

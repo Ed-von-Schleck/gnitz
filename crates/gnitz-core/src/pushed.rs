@@ -1,6 +1,6 @@
 //! A connection's sync, and the verbs of a reader that keeps its own copy:
-//! subscribe from a cursor a delta read handed out, then sync, which answers
-//! with the view's deltas since and advances every mirrored view.
+//! subscribe, then sync, which answers with the view's deltas since and
+//! advances every mirrored view.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,22 +32,24 @@ pub struct Synced {
 }
 
 impl GnitzClient {
-    /// Subscribe this connection to a view's delta feed from `cursor`, which a
-    /// delta read of the same view under the same `spec` handed out; the
-    /// subscription's id. [`Self::sync`] hands out its deltas since `cursor`,
-    /// in `reply_schema` and weights and all, or the server's refusal as its end.
-    pub fn subscribe(
+    /// A delta read of `view` after `from` — whole with none — that stays
+    /// subscribed from the cursor it answers with: the subscription's id, the
+    /// rows and that cursor.
+    pub async fn subscribe(
         &mut self,
         view: impl Into<Target>,
-        cursor: DeltaCursor,
+        from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-    ) -> Result<u64, ClientError> {
+    ) -> Result<(u64, ScanReply, DeltaCursor), ClientError> {
         let id = self.next_sub;
-        self.session.subscribe(id, view.into(), cursor, reply_schema, spec)?;
         self.next_sub += 1;
+        let sent = self
+            .session
+            .submit_delta_read(view.into(), from, reply_schema, spec, Some(id));
+        let (rows, cursor) = self.wait(sent).await?;
         self.readers.insert(id, Arc::clone(reply_schema));
-        Ok(id)
+        Ok((id, rows, cursor))
     }
 
     /// End subscription `id`: no sync reports it again. The next sync tells

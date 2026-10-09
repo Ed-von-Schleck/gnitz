@@ -5,9 +5,6 @@
 //! A cursor is a round of its own view, so the subscribers standing at one
 //! share one read. The copy's cursor stays the client's: a subscription can
 //! end at any point, and its client continues from that cursor by polling.
-//!
-//! A child of `executor`, reading that module's private items with no
-//! visibility widened.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -18,22 +15,18 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
-use super::{
-    all_ticked, encode_response_into, fresh_read_lock, send_fault, send_msg, target_kind, terminal_scan_msg, Access,
-    Shared,
-};
+use super::{all_ticked, encode_response_into, fresh_read_lock, send_fault, send_msg, target_kind, Access, Shared};
 use crate::runtime::master::forward_scan;
-use crate::runtime::peer::{Outbox, Peer};
-use crate::runtime::reactor::{oneshot, select2, ReadGuard, TrainLease};
+use crate::runtime::peer::Peer;
+use crate::runtime::reactor::{chan, oneshot, select2, PeerGone, ReadGuard, SendBody, TrainLease};
 use crate::runtime::wire as ipc;
 use gnitz_wire::control::{ControlHeader, Target};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
 use gnitz_wire::{WireFault, WireStatus};
 
-/// Views one DELTA_POLL reads at one SAL cut: the ceiling on the leases and
-/// reply trains a poll puts on the master at a time. A poll naming more is
-/// answered a slice at a time.
-const DELTA_POLL_CUT_VIEWS: usize = 64;
+/// Delta reads at one SAL cut: the ceiling on the leases and trains a
+/// DELTA_POLL or a pump pass puts on the master at a time.
+const DELTA_CUT_READS: usize = 64;
 
 /// The longest a SYNC_PUSHED is held, whatever wait it asks for.
 const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
@@ -105,7 +98,7 @@ pub(super) async fn handle_delta_poll(
     // the workers until its last train is taken, and that train is a view long.
     let slices = views
         .chunk_by(|a, b| a.from.is_some() && b.from.is_some())
-        .flat_map(|run| run.chunks(DELTA_POLL_CUT_VIEWS));
+        .flat_map(|run| run.chunks(DELTA_CUT_READS));
     for slice in slices {
         // ── Phase 1: classify under the catalog lock, dispatch one cut ─────
         let catalog = match first_lock.take() {
@@ -149,19 +142,17 @@ pub(super) async fn handle_delta_poll(
                     forward_scan(peer, &lease).await.map(|()| round)
                 }
             };
+            let tid = item.view.tid;
+            let tag = disp.delta_cursor_tag(tid, item.spec);
             if let Some(id) = kept.as_mut().and_then(Iterator::next) {
                 subs.leave(&shared.feeds, |kept| kept == id);
                 if let Ok(round) = result {
-                    subs.join(&shared.feeds, id, item, round, peer.outbox());
+                    subs.join(&shared.feeds, id, item, round, tag);
                 }
             }
-            let tid = item.view.tid;
             match result {
                 // Corked, not sent: the terminal joins whatever the forward corked.
-                Ok(round) => send_msg(
-                    peer,
-                    terminal_scan_msg(tid, round, disp.delta_cursor_tag(tid, item.spec)),
-                ),
+                Ok(round) => send_msg(peer, terminal(tid, round, tag)),
                 Err(fault) => send_fault(peer, tid, &fault),
             }
             // Carry no more than the budget into the next view, and learn here
@@ -172,6 +163,16 @@ pub(super) async fn handle_delta_poll(
         }
     }
     Ok(())
+}
+
+/// The frame that ends a delta train: the cursor to read `view` from next.
+fn terminal(view: u64, round: u64, tag: u64) -> ipc::WireMsg<'static> {
+    ipc::WireMsg {
+        target_id: view,
+        arg0: round,
+        arg1: tag,
+        ..Default::default()
+    }
 }
 
 /// The catalog read lock a sync of the views `ids` is answered under, every
@@ -231,17 +232,57 @@ struct Subscriber {
 }
 
 impl Subscriber {
-    /// Whether no round since this subscriber's cursor reached the view `tid`
-    /// it is fed.
-    fn caught_up(&self, shared: &Shared, tid: u64) -> bool {
-        let last = shared.disp().last_delta_round(tid);
+    /// Whether no round since this subscriber's cursor reached the view it is
+    /// fed, whose last round is `last`.
+    fn caught_up(&self, last: u64) -> bool {
         self.after_tick.get().is_some_and(|after| after >= last)
+    }
+}
+
+/// The pushed trains queued for one connection, which its own task ships
+/// between two replies.
+#[derive(Default)]
+struct Outbox {
+    trains: RefCell<Vec<Train>>,
+    unsynced: Cell<usize>,
+}
+
+/// One queued train: its opening frame, and the frames after it, which every
+/// connection sent the same ones shares.
+struct Train {
+    head: Vec<u8>,
+    body: Rc<Vec<u8>>,
+}
+
+impl Outbox {
+    /// Bytes queued since the connection's last SYNC_PUSHED was answered:
+    /// what its client may hold unread.
+    fn unsynced(&self) -> usize {
+        self.unsynced.get()
+    }
+
+    /// A SYNC_PUSHED was answered behind everything queued.
+    fn synced(&self) {
+        self.unsynced.set(0);
+    }
+
+    /// Whether every train queued has been shipped.
+    fn is_empty(&self) -> bool {
+        self.trains.borrow().is_empty()
+    }
+
+    /// Queue one train: its opening frame and the frames after it.
+    fn send(&self, head: Vec<u8>, body: Rc<Vec<u8>>) {
+        self.unsynced.set(self.unsynced.get() + head.len() + body.len());
+        self.trains.borrow_mut().push(Train { head, body });
     }
 }
 
 /// One [`FeedKey`]'s subscribers.
 struct Feed {
     key: FeedKey,
+    /// The cursor tag of every read of `key`.
+    tag: u64,
     members: RefCell<Vec<Rc<Subscriber>>>,
     /// A request waits for the pump to read it. The pump reads only such a
     /// feed: a round nobody asks for is read with the rounds after it, as a
@@ -249,18 +290,21 @@ struct Feed {
     asked: Cell<bool>,
 }
 
-/// The feeds with a subscriber, and the one task that reads for them.
-#[derive(Default)]
+/// The feeds with a subscriber, and the way to the one task that reads for
+/// them, [`pump`].
 pub(super) struct Feeds {
     live: RefCell<FxHashMap<FeedKey, Rc<Feed>>>,
-    /// The requests waiting for the pump's next pass.
-    syncing: RefCell<Vec<oneshot::Sender<()>>>,
-    /// Whether the pump runs: it is spawned by the first request to wait, and
-    /// ends once none does.
-    pumping: Cell<bool>,
+    /// The syncs waiting for the pump's next pass.
+    asked: chan::Sender<oneshot::Sender<()>>,
 }
 
 impl Feeds {
+    /// The feeds, and the requests [`pump`] is to be spawned on.
+    pub(super) fn new() -> (Feeds, chan::Receiver<oneshot::Sender<()>>) {
+        let (asked, asks) = chan::unbounded();
+        (Feeds { live: RefCell::default(), asked }, asks)
+    }
+
     /// `feed` lost a subscriber: forget it with its last.
     fn retire(&self, feed: &Rc<Feed>) {
         if !feed.members.borrow().is_empty() {
@@ -283,6 +327,8 @@ impl Feeds {
 #[derive(Default)]
 pub(super) struct Subscriptions {
     asked: Asked,
+    /// The trains queued for this connection.
+    out: Rc<Outbox>,
     /// The wait of the oldest sync, over `asked` as it was when the wait began.
     wait: Option<SyncWait>,
 }
@@ -307,13 +353,14 @@ impl Subscriptions {
         &mut self.asked
     }
 
-    /// Keep `item` as the subscription `id`, queued through `round` on `out`.
-    fn join(&mut self, feeds: &Feeds, id: u64, item: &DeltaPollItem, round: u64, out: Rc<Outbox>) {
+    /// Keep `item` as the subscription `id`, queued through `round`; `tag` is
+    /// the cursor tag of its reads.
+    fn join(&mut self, feeds: &Feeds, id: u64, item: &DeltaPollItem, round: u64, tag: u64) {
         let joined = Rc::new(Subscriber {
             id,
             after_tick: Cell::new(Some(round)),
             told: Cell::new(round),
-            out,
+            out: Rc::clone(&self.out),
         });
         let key = FeedKey {
             view: item.view,
@@ -323,6 +370,7 @@ impl Subscriptions {
         let feed = Rc::clone(feeds.live.borrow_mut().entry(key.clone()).or_insert_with(|| {
             Rc::new(Feed {
                 key,
+                tag,
                 members: RefCell::default(),
                 asked: Cell::new(false),
             })
@@ -334,16 +382,15 @@ impl Subscriptions {
     /// Send each subscription queued through rounds that left it no row where
     /// it stands, as a train of its terminal alone: its client's cursor passes
     /// those rounds too.
-    fn tell(&self, shared: &Shared, peer: &Peer) {
-        debug_assert!(peer.outbox().is_empty(), "a position is sent behind every train");
+    fn tell(&self, peer: &Peer) {
+        debug_assert!(self.out.is_empty(), "a position is sent behind every train");
         for (sub, feed) in &self.asked.held {
             let Some(after) = sub.after_tick.get() else { continue };
             if sub.told.replace(after) != after {
                 let tid = feed.key.view.tid;
-                let tag = shared.disp().delta_cursor_tag(tid, &feed.key.spec);
                 peer.cork_with(|out| {
                     out.extend_from_slice(&pushed_marker(tid, sub.id));
-                    encode_response_into(out, terminal_scan_msg(tid, after, tag));
+                    encode_response_into(out, terminal(tid, after, feed.tag));
                 });
             }
         }
@@ -371,7 +418,7 @@ impl Subscriptions {
 
     /// The [`sync_wait`] of the oldest unanswered sync, begun if none is
     /// under way.
-    pub(super) fn sync_wait(&mut self, shared: &Rc<Shared>, out: &Rc<Outbox>) -> Option<&mut SyncWait> {
+    pub(super) fn sync_wait(&mut self, shared: &Rc<Shared>) -> Option<&mut SyncWait> {
         if self.wait.is_none() {
             let Asked { held, syncs } = &mut self.asked;
             let deadline = match syncs.len() {
@@ -381,7 +428,7 @@ impl Subscriptions {
                 _ => syncs[0].clone().map(|_| Instant::now()),
             };
             held.retain(|(sub, _)| sub.after_tick.get().is_some());
-            let (shared, out, held) = (Rc::clone(shared), Rc::clone(out), held.clone());
+            let (shared, out, held) = (Rc::clone(shared), Rc::clone(&self.out), held.clone());
             self.wait = Some(Box::pin(async move { sync_wait(&shared, &out, deadline?, held).await }));
         }
         self.wait.as_mut()
@@ -389,15 +436,15 @@ impl Subscriptions {
 
     /// Answer the oldest sync, whose wait ended as `synced`: the trains
     /// queued, then the frame that ends it.
-    pub(super) async fn answer_sync(&mut self, shared: &Shared, peer: &Peer, synced: Result<(), WireFault>) {
+    pub(super) async fn answer_sync(&mut self, peer: &Peer, synced: Result<(), WireFault>) {
         self.asked_mut().syncs.pop_front();
-        if peer.ship_pushed().await.is_err() {
+        if self.ship(peer).await.is_err() {
             return;
         }
         let end = match &synced {
             Ok(()) => {
-                self.tell(shared, peer);
-                peer.outbox().synced();
+                self.tell(peer);
+                self.out.synced();
                 ipc::WireMsg::default()
             }
             Err(fault) => ipc::WireMsg::fault(fault),
@@ -407,6 +454,20 @@ impl Subscriptions {
             ..Default::default()
         };
         peer.cork_with(|out| encode_response_into(out, ipc::WireMsg { flags, ..end }));
+    }
+
+    /// Ship every queued train behind what is corked.
+    pub(super) async fn ship(&self, peer: &Peer) -> Result<(), PeerGone> {
+        loop {
+            let trains = self.out.trains.take();
+            if trains.is_empty() {
+                return Ok(());
+            }
+            for Train { head, body } in trains {
+                peer.cork(&head);
+                peer.send(SendBody::Shared(body)).await?;
+            }
+        }
     }
 }
 
@@ -464,7 +525,7 @@ async fn sync_wait(
     // by. Asked under the catalog lock.
     let caught_up = |(sub, feed): &(Rc<Subscriber>, Rc<Feed>)| {
         let view = feed.key.view;
-        target_kind(shared, view, Access::Read).is_ok() && sub.caught_up(shared, view.tid)
+        target_kind(shared, view, Access::Read).is_ok() && sub.caught_up(shared.disp().last_delta_round(view.tid))
     };
     loop {
         held.retain(|(sub, _)| sub.after_tick.get().is_some());
@@ -484,11 +545,7 @@ async fn sync_wait(
         }
         if asked {
             let (done, pumped) = oneshot::channel();
-            feeds.syncing.borrow_mut().push(done);
-            if !feeds.pumping.replace(true) {
-                let reactor = shared.disp().reactor().clone();
-                reactor.spawn(pump(Rc::clone(shared)));
-            }
+            feeds.asked.send(done);
             drop(catalog);
             pumped.await;
         } else {
@@ -500,53 +557,60 @@ async fn sync_wait(
     }
 }
 
-/// Read the feeds requests ask for, for as long as one waits. A pass answers
-/// the requests waiting when it starts: it reads each feed they asked for at
-/// one SAL cut, one read per distinct cursor behind among the feed's
-/// subscribers — in the steady state one read, however many they are — and
-/// queues each subscriber its train.
-async fn pump(shared: Rc<Shared>) {
+/// Read the feeds the syncs on `asks` ask for. A pass answers the syncs
+/// waiting when it starts: one read per distinct cursor behind among a feed's
+/// subscribers, each subscriber queued its train.
+pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::Sender<()>>) {
     let feeds = &shared.feeds;
     let disp = shared.disp();
     loop {
         // Taken together, so a pass reads every feed its requests asked for
         // and positions each after they asked.
-        let waiting = feeds.syncing.take();
-        if waiting.is_empty() {
-            feeds.pumping.set(false);
-            return;
+        let mut waiting = vec![asks.recv().await];
+        while let Some(done) = asks.try_recv() {
+            waiting.push(done);
         }
         let asked: Vec<Rc<Feed>> = {
             let live = feeds.live.borrow();
             live.values().filter(|feed| feed.asked.take()).cloned().collect()
         };
-        for slice in asked.chunks(DELTA_POLL_CUT_VIEWS) {
-            let catalog = shared.catalog_rwlock.read().await;
-            // Each distinct cursor that is behind. No await from here to the
-            // cut, so no round lands between a position and what is made of it.
-            let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
-            for feed in slice {
-                let view = feed.key.view;
-                if let Err(fault) = target_kind(&shared, view, Access::Read) {
-                    feeds.end(feed, &fault);
-                    continue;
-                }
-                let first = behind.len();
-                for m in feed.members.borrow().iter().filter(|m| !m.caught_up(&shared, view.tid)) {
-                    let cursor = m.after_tick.get().expect("a member is one its feed has not ended");
-                    if behind[first..].iter().all(|&(_, read)| read != cursor) {
-                        behind.push((feed, cursor));
-                    }
+        // Each distinct cursor that is behind, of the feeds still readable.
+        let mut first_lock = Some(shared.catalog_rwlock.read().await);
+        let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
+        for feed in &asked {
+            if let Err(fault) = target_kind(&shared, feed.key.view, Access::Read) {
+                feeds.end(feed, &fault);
+                continue;
+            }
+            let first = behind.len();
+            let last = disp.last_delta_round(feed.key.view.tid);
+            for m in feed.members.borrow().iter().filter(|m| !m.caught_up(last)) {
+                let cursor = m.after_tick.get().expect("a member is one its feed has not ended");
+                if behind[first..].iter().all(|&(_, read)| read != cursor) {
+                    behind.push((feed, cursor));
                 }
             }
-            if behind.is_empty() {
+        }
+        for slice in behind.chunks(DELTA_CUT_READS) {
+            let catalog = match first_lock.take() {
+                Some(g) => g,
+                None => shared.catalog_rwlock.read().await,
+            };
+            let mut reads = Vec::with_capacity(slice.len());
+            for &(feed, cursor) in slice {
+                match target_kind(&shared, feed.key.view, Access::Read) {
+                    Ok(_) => reads.push((feed, cursor)),
+                    Err(fault) => feeds.end(feed, &fault),
+                }
+            }
+            if reads.is_empty() {
                 continue;
             }
             // The round each read reaches.
-            let mut reached = Vec::with_capacity(behind.len());
+            let mut reached = Vec::with_capacity(reads.len());
             let leases = disp
                 .scan_cut(|cut| {
-                    for &(feed, cursor) in &behind {
+                    for &(feed, cursor) in &reads {
                         let FeedKey { view, layout, ref spec } = feed.key;
                         reached.push(cut.delta(view.tid, cursor, spec, layout)?);
                     }
@@ -556,13 +620,14 @@ async fn pump(shared: Rc<Shared>) {
             drop(catalog);
             match leases {
                 Ok(leases) => {
-                    for (((feed, cursor), round), lease) in behind.into_iter().zip(reached).zip(leases) {
+                    for (((feed, cursor), round), lease) in reads.into_iter().zip(reached).zip(leases) {
                         queue_train(&shared, feed, cursor, round, lease).await;
                     }
                 }
-                Err(fault) => behind.iter().for_each(|(feed, _)| feeds.end(feed, &fault)),
+                Err(fault) => reads.iter().for_each(|(feed, _)| feeds.end(feed, &fault)),
             }
         }
+        drop(first_lock);
         for done in waiting {
             done.send(());
         }
@@ -595,8 +660,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
         Ok(()) => {
             // Rounds that left the subscription no row are sent as no train.
             let rows = !body.is_empty();
-            let tag = shared.disp().delta_cursor_tag(tid, &feed.key.spec);
-            encode_response_into(&mut body, terminal_scan_msg(tid, round, tag));
+            encode_response_into(&mut body, terminal(tid, round, feed.tag));
             let body = Rc::new(body);
             for m in reading {
                 if rows && m.out.unsynced() + body.len() > cap {
@@ -615,3 +679,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     drop(members);
     shared.feeds.retire(feed);
 }
+
+#[cfg(test)]
+#[path = "tests/delta.rs"]
+mod tests;

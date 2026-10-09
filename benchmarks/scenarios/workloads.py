@@ -489,9 +489,8 @@ class Feed(Scenario):
             for t in range(subscribers):
                 conn = gnitz.connect(run.server.sock_path)
                 vid, schema, spec = conn.subscription(f"SELECT id, body FROM v_feed WHERE tenant = {t}")
-                rows, cursor = ph.timed("bootstrap", conn.delta_bootstrap, vid, schema, spec)
+                _, rows, _ = ph.timed("bootstrap", conn.subscribe, vid, schema, None, spec)
                 ph.rows += len(rows)
-                conn.subscribe(vid, schema, cursor, spec)
                 subs.append(conn)
 
         def delivered(synced):

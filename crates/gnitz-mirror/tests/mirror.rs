@@ -1147,10 +1147,14 @@ impl Reader {
         Reader { desc, whole, copy, cursor }
     }
 
-    fn subscribe(&self, client: &mut GnitzClient) -> u64 {
-        client
-            .subscribe(&*self.desc, self.cursor, &self.desc.schema, &self.whole)
-            .expect("subscribe")
+    /// Stay subscribed from the cursor: the read that does it is applied, as
+    /// a delta read from there would be.
+    fn subscribe(&mut self, client: &mut GnitzClient) -> u64 {
+        let from = Some(self.cursor);
+        let (sub, rows, cursor) =
+            block_on(client.subscribe(&*self.desc, from, &self.desc.schema, &self.whole)).expect("subscribe");
+        self.apply((rows, cursor));
+        sub
     }
 
     /// Add one delta to the copy, weights and all; its row count.
@@ -1396,10 +1400,10 @@ fn a_reconnect_ends_a_readers_subscription() {
     reader.assert_converged(&mut fx.direct, "after the reconnect");
 }
 
-/// A subscription the server refuses is reported once, by the next sync, as
-/// one that ended; the reader's cursor is untouched.
+/// A subscription the server refuses is a refused read and nothing else: no
+/// sync reports it, and the reader's cursor is untouched.
 #[test]
-fn a_refused_subscription_ends_at_the_next_sync() {
+fn a_refused_subscription_is_its_error_alone() {
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     let mut reader = Reader::bootstrap(&mut fx.direct);
@@ -1409,32 +1413,42 @@ fn a_refused_subscription_ends_at_the_next_sync() {
         ..reader.cursor
     };
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
-    let refused = fx
-        .direct
-        .subscribe(&*desc, foreign, &desc.schema, &whole)
-        .expect("the request is sent");
+    let refused = block_on(fx.direct.subscribe(&*desc, Some(foreign), &desc.schema, &whole));
+    let Err(ClientError::Refused(fault)) = refused else {
+        panic!("a foreign cursor is refused")
+    };
+    assert_eq!(fault.status, WireStatus::DeltaExpired);
 
     churn(&mut fx.direct, 100, 130);
-    let pushed = block_on(fx.direct.sync(Duration::ZERO)).expect("sync").pushed;
-    let subs: Vec<u64> = pushed.iter().map(|p| p.sub).collect();
-    assert_eq!(subs, [held, refused], "one entry each, in the order they were made");
-    for p in pushed {
-        match p.sub == held {
-            true => assert!(reader.apply(p.result.expect("held")) > 0),
-            false => {
-                let Err(ClientError::Refused(fault)) = p.result else {
-                    panic!("a foreign cursor is refused")
-                };
-                assert_eq!(fault.status, WireStatus::DeltaExpired);
-            }
-        }
-    }
-    reader.assert_converged(&mut fx.direct, "the held subscription");
-    assert_eq!(
-        reader.sync(&mut fx.direct, held, Duration::ZERO),
-        0,
-        "the refused one is gone"
+    assert!(
+        reader.sync(&mut fx.direct, held, Duration::ZERO) > 0,
+        "the one entry is the held subscription's"
     );
+    reader.assert_converged(&mut fx.direct, "the held subscription");
+}
+
+/// A reader that subscribes with no cursor is bootstrapped and subscribed by
+/// one request, and its copy follows the view from there.
+#[test]
+fn a_subscribe_with_no_cursor_is_one_request() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let before = fx.direct.requests_sent();
+    let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
+    let (sub, rows, cursor) = block_on(fx.direct.subscribe(&*desc, None, &desc.schema, &whole)).expect("subscribe");
+    assert_eq!(canonical(&(rows.schema, rows.batch)), reader.copy, "the view whole");
+    reader.cursor = cursor;
+    assert_eq!(reader.sync(&mut fx.direct, sub, Duration::ZERO), 0);
+    assert_eq!(
+        fx.direct.requests_sent() - before,
+        2,
+        "the read that subscribes, and the sync"
+    );
+
+    churn(&mut fx.direct, 100, 130);
+    assert!(reader.sync(&mut fx.direct, sub, Duration::ZERO) > 0);
+    reader.assert_converged(&mut fx.direct, "from a whole read");
 }
 
 /// A whole read over a view its spec keeps nothing of reports no row and is

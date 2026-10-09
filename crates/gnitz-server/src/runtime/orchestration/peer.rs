@@ -2,14 +2,15 @@
 //! [`ClientConn`], which also owns the connection's end; only sending dispatches
 //! on the transport.
 
-use std::cell::{Cell, RefCell};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::runtime::reactor::{select2, ClientConn, Either, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
-use crate::runtime::w2m::W2mSlot;
 use gnitz_zset::repr::PooledBuf;
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
@@ -26,47 +27,6 @@ pub struct Peer {
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
     egress: RefCell<Option<PooledBuf>>,
-    pushed: Rc<Outbox>,
-}
-
-/// The pushed trains queued for one connection by the tasks that produce them.
-/// The connection's own task ships them, whole and between replies, so a train
-/// splits no reply and nothing leaves for a client that is not reading one.
-#[derive(Default)]
-pub struct Outbox {
-    trains: RefCell<Vec<Train>>,
-    unsynced: Cell<usize>,
-}
-
-/// One queued train: its opening frame, and the frames after it, which every
-/// connection sent the same ones shares.
-struct Train {
-    head: Vec<u8>,
-    body: Rc<Vec<u8>>,
-}
-
-impl Outbox {
-    /// Bytes queued since the connection's last SYNC_PUSHED was answered:
-    /// what its client may hold unread.
-    pub fn unsynced(&self) -> usize {
-        self.unsynced.get()
-    }
-
-    /// A SYNC_PUSHED was answered behind everything queued.
-    pub fn synced(&self) {
-        self.unsynced.set(0);
-    }
-
-    /// Whether every train queued has been shipped.
-    pub fn is_empty(&self) -> bool {
-        self.trains.borrow().is_empty()
-    }
-
-    /// Queue one train: its opening frame and the frames after it.
-    pub fn send(&self, head: Vec<u8>, body: Rc<Vec<u8>>) {
-        self.unsynced.set(self.unsynced.get() + head.len() + body.len());
-        self.trains.borrow_mut().push(Train { head, body });
-    }
 }
 
 enum Transport {
@@ -91,35 +51,6 @@ impl Peer {
             conn,
             transport,
             egress: RefCell::new(None),
-            pushed: Rc::default(),
-        }
-    }
-
-    /// Where a task queues this connection's pushed trains.
-    pub fn outbox(&self) -> Rc<Outbox> {
-        Rc::clone(&self.pushed)
-    }
-
-    /// Ship every queued train behind what is corked, under [`Self::send`]'s
-    /// policy: one too large to join the cork goes out alone, uncopied. Called
-    /// only where no reply is half written. On `Ok` the queue was empty with no
-    /// await since.
-    pub async fn ship_pushed(&self) -> Result<(), PeerGone> {
-        loop {
-            let trains = self.pushed.trains.take();
-            if trains.is_empty() {
-                return Ok(());
-            }
-            for Train { head, body } in trains {
-                self.cork(&head);
-                if body.len() > COALESCE_MAX_BYTES / 2 {
-                    self.flush_egress().await?;
-                    self.send_raw(SendBody::Shared(body)).await?;
-                } else {
-                    self.cork(&body);
-                    self.flush_if_full().await?;
-                }
-            }
         }
     }
 
@@ -156,7 +87,7 @@ impl Peer {
     }
 
     /// Append `frame`'s bytes. See [`Self::cork_with`].
-    fn cork(&self, frame: &[u8]) {
+    pub fn cork(&self, frame: &[u8]) {
         self.cork_with(|acc| acc.extend_from_slice(frame));
     }
 
@@ -185,21 +116,20 @@ impl Peer {
         self.send_raw(SendBody::Pooled(buf)).await
     }
 
-    /// Send one worker frame behind whatever is corked. Corking copies it, releasing
-    /// its ring slot at once; a frame too large to join the cork goes out alone,
-    /// straight from that slot on AF_UNIX. A corked frame reports a gone peer at its
-    /// flush, not here.
-    pub async fn send(&self, slot: W2mSlot) -> Result<(), PeerGone> {
+    /// Send `body` behind whatever is corked: copied into the cork, or alone
+    /// and uncopied when it is too large to join it. A corked body reports a
+    /// gone peer at its flush, not here.
+    pub async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
         self.live()?;
-        let len = slot.frame_bytes().len();
+        let len = body.bytes().len();
         let corked = self.corked_len();
         if corked == 0 || corked + len > COALESCE_MAX_BYTES {
             self.flush_egress().await?;
             if len > COALESCE_MAX_BYTES / 2 {
-                return self.send_raw(SendBody::Slot(slot)).await;
+                return self.send_raw(body).await;
             }
         }
-        self.cork(slot.frame_bytes());
+        self.cork(body.bytes());
         Ok(())
     }
 
@@ -212,6 +142,8 @@ impl Peer {
     }
 
     async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
+        #[cfg(test)]
+        SENDS.with(|n| n.set(n.get() + 1));
         match &self.transport {
             Transport::Plain(r) => r.send_owned(&self.conn, body).await,
             Transport::Tls(t) => t.send(body).await,
@@ -221,6 +153,12 @@ impl Peer {
     pub fn close(&self) {
         self.conn.retire();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls of `send_raw` on this thread.
+    static SENDS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]

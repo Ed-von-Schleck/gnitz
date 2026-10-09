@@ -1082,18 +1082,28 @@ fn a_subscription_that_ended_is_continued_by_a_delta_read() {
     assert_eq!(log.take(), [Ev::Advance(7, 13)]);
 }
 
+/// Subscribe a reader to view 40 after `from`, its read answered with no row
+/// and `from` again; the subscription's id.
+fn subscribe_reader(client: &mut GnitzClient, peer: Peer, from: DeltaCursor, whole: &[u8]) -> (u64, Peer) {
+    let h = std::thread::spawn(move || {
+        let kept = peer.expect_kept("the reader's subscription");
+        peer.reply_watermark(40, from.tag, from.tick.get());
+        (peer, kept)
+    });
+    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let (sub, rows, at) = block_on(client.subscribe(Target::from(40), Some(from), &schema, whole)).expect("subscribe");
+    let (peer, kept) = h.join().unwrap();
+    assert_eq!((kept, rows.batch.len(), at), (vec![(40, sub)], 0, from));
+    (sub, peer)
+}
+
 #[test]
 fn one_sync_serves_a_reader_and_the_mirror() {
     let (mut client, peer, log, subs) = subscribed();
     let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
     let from = DeltaCursor::from_pair(TAG, 9).unwrap();
-    let sub = client
-        .subscribe(Target::from(40), from, &Arc::new(kv_schema(TypeCode::I64)), &whole)
-        .expect("the request is sent");
+    let (sub, peer) = subscribe_reader(&mut client, peer, from, &whole);
     let h = std::thread::spawn(move || {
-        let reader = peer.expect_kept("the reader's subscription");
-        assert_eq!(reader, [(40, sub)]);
-        peer.reply_watermark(40, TAG, 9);
         peer.expect_sync("the sync");
         peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
         peer.push_train(40, sub, &[(2, 20, 1)], Some(11));
@@ -1119,9 +1129,7 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
     let (mut client, peer, _log) = fixture(&[(7, "a", 4)]);
     let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
     let from = DeltaCursor::from_pair(TAG, 9).unwrap();
-    let sub = client
-        .subscribe(Target::from(40), from, &Arc::new(kv_schema(TypeCode::I64)), &whole)
-        .expect("the request is sent");
+    let (sub, peer) = subscribe_reader(&mut client, peer, from, &whole);
     let reading = Arc::new(AtomicBool::new(false));
     let watched = Arc::clone(&reading);
     client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
@@ -1136,8 +1144,6 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
     let sig = interrupt_self_until(Arc::clone(&stop));
 
     let h = std::thread::spawn(move || {
-        assert_eq!(peer.expect_kept("the reader's subscription"), [(40, sub)]);
-        peer.reply_watermark(40, TAG, 9);
         peer.expect_sync("the sync");
         peer.push_train(40, sub, &[(2, 20, 1)], Some(11));
         peer.send(&sync_answer(None));

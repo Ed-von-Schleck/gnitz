@@ -472,27 +472,30 @@ impl PyClient {
         )
     }
 
-    /// subscribe(view_id, schema, cursor, spec=None) -> int
+    /// subscribe(view_id, schema, cursor=None, spec=None) -> (int, ScanResult, (int, int))
     ///
-    /// Subscribe this connection to the view's delta feed from `cursor`, which
-    /// `delta_bootstrap` or `delta_poll` handed out under the same `spec`, and
-    /// return the subscription's id. `sync` then answers with the
-    /// deltas pushed for it. It ends with its connection.
-    #[pyo3(signature = (view_id, schema, cursor, spec = None))]
+    /// A delta read after `cursor` — whole with none — that stays subscribed
+    /// from the cursor it answers with. `sync` answers with the deltas since.
+    #[pyo3(signature = (view_id, schema, cursor = None, spec = None))]
     fn subscribe(
         slf: &Bound<'_, Self>,
         view_id: u64,
         schema: PySchema,
-        cursor: (u64, u64),
+        cursor: Option<(u64, u64)>,
         spec: Option<Vec<u8>>,
     ) -> PyResult<Py<PyAny>> {
-        let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
-            .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
+        let cursor = match cursor {
+            Some((tag, tick)) => Some(
+                DeltaCursor::from_pair(tag, tick)
+                    .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?,
+            ),
+            None => None,
+        };
         let spec = spec.unwrap_or_else(whole_view);
         Self::run(
             slf,
-            whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec)?),
-            |py, id| id.into_py_any(py),
+            whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec).await?),
+            |py, (id, rows, cursor)| (id, scan_result(py, rows)?, cursor.pair()).into_py_any(py),
         )
     }
 

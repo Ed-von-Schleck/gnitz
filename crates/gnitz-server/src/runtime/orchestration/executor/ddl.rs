@@ -7,10 +7,6 @@
 //! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs
 //! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
-//!
-//! A child of `executor`, so it reads that module's private items — `Shared` and
-//! its accessors included — with no visibility widened, and the DDL seams sit
-//! beside the code they perturb.
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};

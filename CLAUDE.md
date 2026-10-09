@@ -564,10 +564,11 @@ by polling from a client-held cursor as ordinary batches — **weights and all**
 so a row-set comparison of a feed tests nothing. The cursor lives on the client,
 and nothing retained survives a restart. A cursor names a round of its own view.
 
-A delta read carries every push acknowledged before it. A connection may also
-subscribe from a cursor and sync, which may ask to be held while it has nothing
-to report; a subscription can end at any point, and its reader continues from
-that cursor with a delta read. A sync covers every subscription of its
+A delta read carries every push acknowledged before it. A delta read may leave
+its connection subscribed from the cursor it answers with, and a sync may ask to
+be held while it has nothing to report; a subscription can end at any point, and
+its reader continues from that cursor with a delta read.
+A sync covers every subscription of its
 connection, and hands out a reader's deltas once. A held sync holds up no
 request of its connection.
 

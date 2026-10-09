@@ -164,7 +164,9 @@ wire_enum! {
     /// What a frame from the server answers ([`WireFlags::lane`]).
     #[derive(Default)]
     pub enum WireLane: u8 {
-        /// The connection's oldest unanswered request other than a sync.
+        /// The connection's oldest unanswered request other than a sync — or,
+        /// while a pushed train is open, that train: only its opening frame
+        /// names [`Self::PushedTrain`].
         #[default]
         Reply = 0,
         /// No request: it opens a train of the subscription `arg0`, the frames

@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::runtime::peer::Peer;
+use crate::runtime::reactor::SendBody;
 use gnitz_zset::repr::MemBatch;
 
 /// Hand `on_batch` the rows of every frame of `lease`, workers in ascending order,
@@ -24,7 +25,7 @@ pub(super) async fn drain_rows(
 /// worker fault, leaving the rest undrained.
 pub(crate) async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> {
     while let Some(f) = lease.next().await? {
-        if peer.send(f.slot).await.is_err() {
+        if peer.send(SendBody::Slot(f.slot)).await.is_err() {
             return Ok(());
         }
     }

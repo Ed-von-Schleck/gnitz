@@ -60,12 +60,26 @@ impl Counter {
         Self::open(PERF_COUNT_HW_BRANCH_MISSES)
     }
 
+    /// Instructions retired, user and kernel mode both.
+    pub fn instructions_all() -> Self {
+        Self::open_flags(PERF_COUNT_HW_INSTRUCTIONS, FLAG_DISABLED | FLAG_EXCLUDE_HV)
+    }
+
+    /// Core cycles, user and kernel mode both.
+    pub fn cycles_all() -> Self {
+        Self::open_flags(PERF_COUNT_HW_CPU_CYCLES, FLAG_DISABLED | FLAG_EXCLUDE_HV)
+    }
+
     fn open(config: u64) -> Self {
+        Self::open_flags(config, FLAG_DISABLED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV)
+    }
+
+    fn open_flags(config: u64, flags: u64) -> Self {
         let attr = PerfEventAttr {
             type_: PERF_TYPE_HARDWARE,
             size: std::mem::size_of::<PerfEventAttr>() as u32,
             config,
-            flags: FLAG_DISABLED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV,
+            flags,
             ..Default::default()
         };
         // pid 0 = this thread, cpu -1 = any, no group, no flags.

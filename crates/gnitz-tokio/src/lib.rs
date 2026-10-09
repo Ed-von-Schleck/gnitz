@@ -7,8 +7,9 @@ use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use gnitz_core::{promise, serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent};
+use gnitz_core::{promise, serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::mpsc;
 
@@ -147,6 +148,15 @@ impl AsyncClient {
             Box::pin(async move { f(client).detach().then(move |reply| to.fulfil(reply)) })
         }));
         sent
+    }
+
+    /// [`GnitzClient::sync`], leaving the client to the handle's other calls
+    /// while the server holds the reply.
+    pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
+        let sent = self.run(move |c| Box::pin(async move { c.begin_sync(wait) })).await??;
+        let reply = sent.await;
+        self.run(move |c| Box::pin(async move { c.finish_sync(reply).await }))
+            .await?
     }
 }
 

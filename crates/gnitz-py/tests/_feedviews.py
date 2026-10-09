@@ -74,9 +74,11 @@ class Subscriber:
         return self._apply(rows)
 
     def subscribe(self):
-        """Have the server push what `poll` would fetch. From here on the copy
-        moves by `sync` alone: a poll beside it would apply a round twice."""
-        self.sub = self.client.subscribe(self.vid, self.schema, self.cursor, self.spec)
+        """Poll, and have the server push what the next poll would fetch. From
+        here on the copy moves by `sync` alone: a poll beside it would apply a
+        round twice."""
+        self.sub, rows, self.cursor = self.client.subscribe(self.vid, self.schema, self.cursor, self.spec)
+        return self._apply(rows)
 
     def sync(self, wait=0.0):
         (pushed,) = self.client.sync(wait).pushed

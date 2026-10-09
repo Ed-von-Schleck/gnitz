@@ -60,6 +60,17 @@ fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
     batch
 }
 
+/// [`table`] with a fed view `v` of all of `t`, whose id follows the table's.
+fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
+    let (mut blocking, tid, schema, sn) = table(target);
+    let source = block_on(blocking.resolve_relation(&rel(&sn, "t"))).unwrap();
+    let fed = ViewProps::Fed {
+        delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
+    };
+    let vid = block_on(blocking.create_view(&rel(&sn, "v"), &source, fed)).unwrap();
+    (blocking, tid, vid, schema, sn)
+}
+
 /// How many rows a read returned, every one of them at weight 1. Every relation
 /// here is keyed uniquely, so a row counted twice is one row at weight 2.
 fn unit_rows(batch: &ZSetBatch) -> usize {
@@ -234,16 +245,7 @@ fn one_writev_per_burst() {
 #[test]
 fn a_shared_client_mirrors() {
     let srv = ServerHandle::start_n(4);
-    let (mut blocking, tid, schema, sn) = table(srv.sock_path());
-    let source = block_on(blocking.resolve_relation(&rel(&sn, "t"))).unwrap();
-    let vid = block_on(blocking.create_view(
-        &rel(&sn, "v"),
-        &source,
-        ViewProps::Fed {
-            delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
-        },
-    ))
-    .unwrap();
+    let (mut blocking, tid, vid, schema, sn) = fed_table(srv.sock_path());
     let mut push = |pks| {
         block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
     };
@@ -314,6 +316,103 @@ fn a_shared_client_mirrors() {
                 .unwrap()
                 .expect("the exit checkpoint");
         }
+        drop(client);
+        driver.await.unwrap();
+    });
+}
+
+// ── A held sync on the shared handle ──────────────────────────────────────
+
+/// Longer than anything here may take: a sync held this long fails its test.
+const HELD: Duration = Duration::from_secs(30);
+
+/// Subscribe `client` to the view `vid` whole; the subscription's id and how
+/// many rows the read brought.
+async fn subscribe(client: &AsyncClient, vid: u64, schema: &Arc<Schema>) -> (u64, usize) {
+    let schema = Arc::clone(schema);
+    let subscribed = client.run(move |c| {
+        Box::pin(async move {
+            let (sub, rows, _) = c.subscribe(vid, None, &schema, &all_rows().encode()).await?;
+            Ok::<_, ClientError>((sub, unit_rows(&rows.batch)))
+        })
+    });
+    subscribed.await.unwrap().expect("subscribe")
+}
+
+/// Poll `f` once, which makes the calls it starts with; whether it is pending.
+async fn started<F: Future + Unpin>(f: &mut F) -> bool {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *f).poll(cx).is_pending())).await
+}
+
+/// The rows a sync brought `sub`, the connection's one subscription.
+fn pushed_rows(synced: gnitz_core::Synced, sub: u64) -> usize {
+    let [pushed] = &synced.pushed[..] else {
+        panic!("one entry per subscription")
+    };
+    assert_eq!(pushed.sub, sub);
+    unit_rows(&pushed.result.as_ref().expect("the subscription is held").0.batch)
+}
+
+/// A sync held with nothing to report leaves the handle to its other calls: a
+/// scan made beside it is answered and leaves it held, and the push that then
+/// reaches the view ends it, with that push's rows.
+#[test]
+fn a_held_sync_leaves_the_shared_handle_free() {
+    let srv = ServerHandle::start_n(4);
+    let (mut blocking, tid, vid, schema, _) = fed_table(srv.sock_path());
+    let mut push = |pks| {
+        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+    };
+    push(0..50);
+
+    settled(&Runtime::new().unwrap(), async {
+        let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(srv.sock_path()).await.expect("connect"));
+        let driver = tokio::spawn(conn);
+        let (sub, seed) = subscribe(&client, vid, &schema).await;
+        assert_eq!(seed, 50);
+        assert_eq!(pushed_rows(client.sync(Duration::ZERO).await.unwrap(), sub), 0);
+
+        let mut held = Box::pin(client.sync(HELD));
+        assert!(started(&mut held).await);
+        let beside = scan(&client.clone(), tid, all_rows(), &schema).await.unwrap();
+        assert_eq!(unit_rows(&beside.batch), 50);
+        assert!(started(&mut held).await, "the scan left the sync held");
+
+        push(50..60);
+        assert_eq!(pushed_rows(held.await.unwrap(), sub), 10);
+        drop(client);
+        driver.await.unwrap();
+    });
+}
+
+/// A held sync that is dropped loses nothing: the next one is not held behind
+/// it, and brings what the dropped one's answer carried.
+#[test]
+fn a_dropped_held_sync_loses_nothing() {
+    let srv = ServerHandle::start_n(4);
+    let (mut blocking, tid, vid, schema, _) = fed_table(srv.sock_path());
+    let mut push = |pks| {
+        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+    };
+    push(0..50);
+
+    settled(&Runtime::new().unwrap(), async {
+        let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(srv.sock_path()).await.expect("connect"));
+        let driver = tokio::spawn(conn);
+        let (sub, _) = subscribe(&client, vid, &schema).await;
+        assert_eq!(pushed_rows(client.sync(Duration::ZERO).await.unwrap(), sub), 0);
+
+        let mut held = Box::pin(client.sync(HELD));
+        assert!(started(&mut held).await);
+        // Answered behind the sync's request, so the server holds that one.
+        scan(&client, tid, all_rows(), &schema).await.unwrap();
+        assert!(started(&mut held).await);
+        drop(held);
+
+        push(50..60);
+        let t0 = std::time::Instant::now();
+        assert_eq!(pushed_rows(client.sync(HELD).await.unwrap(), sub), 10);
+        assert!(t0.elapsed() < HELD / 2, "the dropped sync's answer held up no other");
         drop(client);
         driver.await.unwrap();
     });
