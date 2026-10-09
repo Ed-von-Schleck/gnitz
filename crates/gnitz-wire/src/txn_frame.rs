@@ -249,11 +249,34 @@ pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<u64>) -> Vec<
     encode_items_under(ClientVerb::DeltaPoll, keep.unwrap_or(0), &items)
 }
 
-/// The subscription id item 0 of the `DELTA_POLL` under `prologue` is kept
-/// as, the rest counting up, wrapping.
+/// The subscription id item `item` of a `DELTA_POLL` keeping from `first` is
+/// kept as.
+pub fn kept_as(first: u64, item: usize) -> u64 {
+    first.wrapping_add(item as u64)
+}
+
+/// The subscription id each item of the `DELTA_POLL` under `prologue` is kept
+/// as, in item order; `None` for a poll that keeps none.
 pub fn delta_poll_kept(prologue: &ControlHeader) -> Option<impl Iterator<Item = u64>> {
     let first = prologue.arg0;
-    (first != 0).then(|| (0u64..).map(move |i| first.wrapping_add(i)))
+    (first != 0).then(|| (0..).map(move |item| kept_as(first, item)))
+}
+
+/// A `SYNC_PUSHED` blob: the subscription ids its connection still holds.
+pub fn encode_held(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    ids.into_iter().flat_map(u64::to_le_bytes).collect()
+}
+
+/// The ids an [`encode_held`] blob names.
+pub fn decode_held(blob: &[u8]) -> Result<Vec<u64>, String> {
+    let (ids, rest) = blob.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(format!(
+            "SyncPushed: {} bytes of held ids are no whole number of them",
+            blob.len()
+        ));
+    }
+    Ok(ids.iter().map(|id| u64::from_le_bytes(*id)).collect())
 }
 
 /// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the

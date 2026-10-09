@@ -195,12 +195,15 @@ impl Peer {
         (first..).zip(items).map(|(id, item)| (item.view.tid, id)).collect()
     }
 
-    /// Read the next request, which must end subscription `sub`, and
-    /// acknowledge it.
-    fn expect_unsubscribe(&self, sub: u64) {
-        let (verb, hdr) = self.expect_verb("the unsubscribe");
-        assert_eq!((verb, hdr.arg0), (gnitz_wire::ClientVerb::Unsubscribe, sub));
-        self.send(&reply_ctrl(0, 0));
+    /// The subscription ids the next request, a SYNC_PUSHED, names as held,
+    /// in ascending order.
+    fn expect_sync_naming(&self, what: &str) -> Vec<u64> {
+        let frame = self.expect_frame(what);
+        let ctrl = peek_control_block(&frame).expect("a control header");
+        assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed, "{what}");
+        let mut held = gnitz_wire::txn_frame::decode_held(&frame[ctrl.blob]).expect("held ids");
+        held.sort_unstable();
+        held
     }
 
     /// One view's answer inside a poll: a control-only terminal frame naming the
@@ -486,7 +489,8 @@ fn copies_without_a_cursor_are_read_whole_in_the_one_request() {
 
 /// A block the store refuses fails the view it is of and nothing else: the
 /// rest of that view's train is dropped, the views behind it are read, and the
-/// subscription the request asked to keep for it is ended.
+/// subscription the request asked to keep for it is one the next sync does not
+/// name.
 #[test]
 fn a_refused_block_fails_its_view_and_no_other() {
     let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
@@ -500,21 +504,25 @@ fn a_refused_block_fails_its_view_and_no_other() {
         encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows)))
     };
     let h = std::thread::spawn(move || {
-        let mut refused = 0;
+        let mut kept = 0;
         for (tid, id) in peer.expect_kept("the poll") {
             if tid == 7 {
-                refused = id;
                 peer.send(&block(&[(1, 10, 1)]));
                 peer.send(&block(&[(2, 20, 1)]));
+            } else {
+                kept = id;
             }
             peer.reply_watermark(tid, TAG, 20);
         }
-        peer.expect_unsubscribe(refused);
+        (peer, kept)
     });
     let report = block_on(client.sync(Duration::ZERO))
         .map(|s| s.mirrored)
         .expect("a store refusal is the view's failure");
-    h.join().unwrap();
+    let (peer, kept) = h.join().unwrap();
+    drop(client.begin_sync(Duration::ZERO).expect("a sync is sent"));
+    client.session.step(crate::Interest::WRITE);
+    assert_eq!(peer.expect_sync_naming("the next sync"), [kept], "8's, and not 7's");
     let failed: Vec<u64> = report
         .iter()
         .filter(|o| matches!(o.result, PollResult::Failed(ClientError::Mirror(_))))
@@ -545,22 +553,18 @@ fn a_leftover_poll_does_not_shift_the_replies() {
         reply_layout: kv_schema(TypeCode::I64).layout().layout_digest(),
         spec: &[],
     };
-    drop(DeltaPoll::start(&mut client.session, &[abandoned]));
+    let first = client.next_sub;
+    client.next_sub += 1;
+    drop(DeltaPoll::start(&mut client.session, first, &[abandoned]));
 
     let h = std::thread::spawn(move || {
         let abandoned = peer.expect_kept("the abandoned poll");
         assert_eq!(abandoned.iter().map(|&(tid, _)| tid).collect::<Vec<_>>(), [7]);
-        let (verb, ended) = peer.expect_verb("the abandoned poll's subscription, ended");
-        assert_eq!(
-            (verb, ended.arg0),
-            (gnitz_wire::ClientVerb::Unsubscribe, abandoned[0].1)
-        );
         let ids = peer.expect_poll("the poll");
         // The abandoned train first, then one terminal per view, each at a round
         // derived from the view that asked — so a shifted reply lands visibly
         // wrong.
         peer.reply_watermark(7, TAG, 50);
-        peer.send(&reply_ctrl(0, 0));
         for &tid in &ids {
             peer.reply_watermark(tid, TAG, 100 + tid);
         }
@@ -650,23 +654,19 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
             }
         }
         // The registration lands on 8, whose copy is advanced from where the
-        // first round left it rather than re-read. The subscription the
-        // replaced registration held ends with it.
+        // first round left it rather than re-read, under a subscription of
+        // its own: the replaced registration's is nobody's.
         assert_eq!(peer.expect_request("the re-resolve"), 0);
         peer.reply_resolved(8);
-        peer.expect_unsubscribe(kept);
-        assert_eq!(peer.expect_poll("the next round"), vec![8]);
+        let next = peer.expect_kept("the next round");
+        assert!(matches!(next[..], [(8, id)] if id != kept), "{next:?}");
         peer.reply_watermark(8, TAG, 12);
     });
     let report = block_on(client.sync(Duration::ZERO))
         .map(|s| s.mirrored)
         .expect("the recovery lands on a live copy");
     h.join().unwrap();
-    assert_eq!(
-        client.requests_sent(),
-        4,
-        "the poll, the resolve, the replaced subscription's end, the next round"
-    );
+    assert_eq!(client.requests_sent(), 3, "the poll, the resolve, the next round");
 
     let events = log.take();
     assert!(
@@ -792,6 +792,8 @@ fn a_registration_the_store_lost_is_entered_again_by_the_next_poll() {
 #[test]
 fn an_interrupted_poll_reannounces_its_reseed() {
     let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
+    // As a view never read on this connection stands.
+    client.mirror.as_mut().unwrap().views.get_mut(&7).unwrap().confirmed = false;
     let watched = log.clone();
     client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
         if watched.saw(|e| matches!(e, Ev::Reseed(7, _))) {
@@ -851,6 +853,14 @@ fn an_interrupted_poll_reannounces_its_reseed() {
         results,
         [vec![(7, true), (8, false)], vec![(7, false), (8, false)]],
         "the owed reseed is announced once, on the next report that reaches a caller",
+    );
+    assert!(
+        client.cursor_of(7).is_some(),
+        "7 was read whole and advanced since: its copy answers"
+    );
+    assert!(
+        client.cursor_of(8).is_some(),
+        "8 was read and subscribed: its copy answers"
     );
 }
 
@@ -1146,10 +1156,10 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
 
     let h = std::thread::spawn(move || {
         // The abandoned read is answered, and the subscription it asked to
-        // keep is ended by the request behind it.
+        // keep is one the next sync does not name.
         peer.reply_watermark(7, TAG, 11);
-        peer.expect_unsubscribe(abandoned);
-        peer.expect_sync("the next sync");
+        let held = peer.expect_sync_naming("the next sync");
+        assert!(held == [sub] && sub != abandoned, "{held:?}");
         peer.send(&reply_ctrl(0, 0));
         assert_eq!(peer.expect_poll("the mirror's read"), vec![7]);
         peer.reply_watermark(7, TAG, 11);
@@ -1212,18 +1222,24 @@ fn a_sync_over_an_untaken_train_asks_for_no_hold() {
     assert_eq!(log.take(), [Ev::Advance(8, 15)]);
 }
 
-/// A view let go of ends its subscription, by the id it asked for it under.
+/// A view let go of ends its subscription: the next sync does not name it.
 #[test]
 fn a_forgotten_view_ends_its_subscription() {
     let (mut client, peer, _log, subs) = subscribed();
     let h = std::thread::spawn(move || {
-        peer.expect_sync("the poll");
+        let mut both: Vec<u64> = subs.values().copied().collect();
+        both.sort_unstable();
+        assert_eq!(peer.expect_sync_naming("the poll"), both);
         peer.send(&reply_ctrl(0, 0));
-        peer.expect_unsubscribe(subs[&7]);
+        assert_eq!(peer.expect_sync_naming("the poll after"), [subs[&8]]);
+        peer.send(&reply_ctrl(0, 0));
     });
     block_on(client.sync(Duration::ZERO))
         .map(|s| s.mirrored)
         .expect("both views advance");
     block_on(client.forget_view(7)).unwrap();
+    block_on(client.sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("the view kept advances");
     h.join().unwrap();
 }

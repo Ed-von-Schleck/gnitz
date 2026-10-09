@@ -42,8 +42,8 @@ fn concurrent_pushes_and_scans(target: &str) {
     let (mut pushes, mut scans) = (Vec::new(), Vec::new());
     for i in 0..n {
         let batch = rows(&schema, i * per..(i + 1) * per);
-        pushes.push(s.submit(push_req(tid, &schema, &batch)).unwrap());
-        scans.push(s.submit_scan(tid.into(), &all, &schema).unwrap());
+        pushes.push(s.submit(push_req(tid, &schema, &batch)));
+        scans.push(s.submit_scan(tid.into(), &all, &schema));
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n, "counted on enqueue");
     let (last, both_armed) = drive(&mut s, scans.pop().unwrap());
@@ -84,12 +84,12 @@ fn every_slot_up_to_the_cap_completes() {
     let all = ReadSpec::all_rows(ReadBound::None);
     let mut s = Session::connect(srv.sock_path()).unwrap();
     let scan = |s: &mut Session| s.submit_scan(tid.into(), &all, &schema);
-    let mut sent: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| scan(&mut s).unwrap()).collect();
-    assert!(scan(&mut s).is_err(), "at the cap");
+    let mut sent: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| scan(&mut s)).collect();
+    assert!(arrived(scan(&mut s)).is_err(), "at the cap");
     let (last, _) = drive(&mut s, sent.pop().unwrap());
     assert!(sent.into_iter().map(arrived).chain([last]).all(|r| r.is_ok()));
-    let below = scan(&mut s).expect("below the cap again");
-    drive(&mut s, below).0.unwrap();
+    let below = scan(&mut s);
+    drive(&mut s, below).0.expect("below the cap again");
 }
 
 // ── Syscalls per operation ────────────────────────────────────────────────

@@ -1038,7 +1038,8 @@ fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
     let sync = |wait: Duration| {
         let hdr = ControlHeader::naming(gnitz_wire::ClientVerb::SyncPushed, 0.into(), wait.as_millis() as u64);
         let mut frame = Vec::new();
-        append_frame(&mut frame, &hdr, &[], None, None);
+        // Naming the subscription below: a sync that names none holds none.
+        append_frame(&mut frame, &hdr, &gnitz_wire::txn_frame::encode_held([1]), None, None);
         frame
     };
 
@@ -1218,6 +1219,84 @@ fn a_sync_hands_a_reader_the_deltas_pushed_for_it() {
     let polled = block_on(fx.direct.delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
     assert!(reader.apply(polled) > 0);
     reader.assert_converged(&mut fx.direct, "after a delta read from the subscription's cursor");
+}
+
+/// A subscription a sync no longer names is ended at the server by that sync.
+/// The queue one connection is pushed through is its subscriptions' together,
+/// which is what shows it: a train two subscriptions cannot both be queued
+/// fits once one of them is gone.
+#[test]
+fn a_subscription_a_sync_does_not_name_is_ended_at_the_server() {
+    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_PUSH_QUEUE_BYTES", "4096")]);
+    churn(&mut fx.direct, 1, 20);
+    // One train of this many rows is more than half the queue and less than
+    // all of it.
+    let burst = |client: &mut GnitzClient, lo: i64| {
+        let rows: Vec<String> = (lo..lo + 24)
+            .map(|i| format!("({i}, {}, {}, {i}.5, 'body-{i:0>20}')", i % 7, i * 3))
+            .collect();
+        sql(client, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
+    };
+    let pushed = |client: &mut GnitzClient| -> Vec<(u64, Result<usize, String>)> {
+        let synced = block_on(client.sync(Duration::ZERO)).expect("sync");
+        let entry = |p: gnitz_core::Pushed| {
+            (
+                p.sub,
+                p.result.map(|(rows, _)| rows.batch.len()).map_err(|e| e.to_string()),
+            )
+        };
+        synced.pushed.into_iter().map(entry).collect()
+    };
+
+    // Two held: the second's train does not fit behind the first's.
+    let first = Reader::bootstrap(&mut fx.direct).subscribe(&mut fx.direct);
+    let second = Reader::bootstrap(&mut fx.direct).subscribe(&mut fx.direct);
+    assert!(pushed(&mut fx.direct).iter().all(|(_, rows)| *rows == Ok(0)));
+    burst(&mut fx.direct, 1000);
+    let both = pushed(&mut fx.direct);
+    assert!(
+        matches!(&both[..], [(a, Ok(rows)), (b, Err(lagged))] if (*a, *b) == (first, second) && *rows > 0 && lagged.contains("fell behind")),
+        "{both:?}"
+    );
+
+    // One let go of and one held: the sync that leaves the first out ends it,
+    // and the same train fits.
+    let third = Reader::bootstrap(&mut fx.direct).subscribe(&mut fx.direct);
+    fx.direct.unsubscribe(first);
+    assert_eq!(pushed(&mut fx.direct), [(third, Ok(0))]);
+    burst(&mut fx.direct, 2000);
+    let one = pushed(&mut fx.direct);
+    assert!(
+        matches!(&one[..], [(sub, Ok(rows))] if *sub == third && *rows > 0),
+        "{one:?}"
+    );
+}
+
+/// A reader's subscription ends with its connection: the first sync on the
+/// one that replaced it reports it ended, and a subscription made there has
+/// an id of its own and is pushed its deltas.
+#[test]
+fn a_replaced_connection_ends_a_readers_subscription_and_reuses_no_id() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let old = reader.subscribe(&mut fx.direct);
+    assert_eq!(reader.sync(&mut fx.direct, old, Duration::ZERO), 0);
+
+    let target = fx.server.sock_path().to_string();
+    block_on(fx.direct.reconnect(&target)).expect("reconnect");
+    let pushed = block_on(fx.direct.sync(Duration::ZERO)).expect("sync").pushed;
+    assert!(
+        matches!(&pushed[..], [p] if p.sub == old && p.result.is_err()),
+        "the old connection's subscription is reported ended, once"
+    );
+
+    let mut reader = Reader::bootstrap(&mut fx.direct);
+    let new = reader.subscribe(&mut fx.direct);
+    assert_ne!(new, old);
+    churn(&mut fx.direct, 100, 130);
+    assert!(reader.sync(&mut fx.direct, new, Duration::ZERO) > 0);
+    reader.assert_converged(&mut fx.direct, "on the new connection");
 }
 
 /// A waiting sync with nothing to report is held for its wait, and a commit

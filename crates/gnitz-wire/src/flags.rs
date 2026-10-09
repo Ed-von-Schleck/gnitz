@@ -46,13 +46,13 @@ wire_enum! {
         /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
-        /// End subscription `arg0`. An id this connection does not hold is
-        /// ACKed too.
-        Unsubscribe = 12,
         /// Answer once every subscription of this connection has been sent
         /// every push acknowledged before this request, the trains ahead of
         /// the ACK. While none of them was sent a row since the last one, the
         /// reply is held up to `arg0` milliseconds.
+        ///
+        /// The blob names the subscriptions the connection still holds
+        /// ([`crate::txn_frame::encode_held`]); every other one ends here.
         SyncPushed = 13,
     }
 }

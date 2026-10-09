@@ -147,7 +147,7 @@ pub(super) async fn handle_delta_poll(
                 }
             };
             if let Some(id) = kept.as_mut().and_then(Iterator::next) {
-                subs.leave(&shared.feeds, Some(id));
+                subs.leave(&shared.feeds, |kept| kept == id);
                 if let Ok(round) = result {
                     subs.join(&shared.feeds, id, item, round, peer.outbox());
                 }
@@ -327,9 +327,9 @@ impl Subscriptions {
         }
     }
 
-    /// Leave `id`'s feed; `None` for every one.
-    pub(super) fn leave(&mut self, feeds: &Feeds, id: Option<u64>) {
-        for (sub, feed) in self.0.extract_if(.., |(sub, _)| id.is_none_or(|id| id == sub.id)) {
+    /// Leave the feed of every subscription whose id `gone` names.
+    pub(super) fn leave(&mut self, feeds: &Feeds, gone: impl Fn(u64) -> bool) {
+        for (sub, feed) in self.0.extract_if(.., |(sub, _)| gone(sub.id)) {
             feed.members.borrow_mut().retain(|m| !Rc::ptr_eq(m, &sub));
             feeds.retire(&feed);
         }
@@ -378,15 +378,18 @@ fn lagged(view: u64) -> WireFault {
     format!("subscription to relation {view} fell behind what one connection is queued; poll from its cursor").into()
 }
 
-/// SYNC_PUSHED: bring every subscription of the connection up to the pushes
-/// acknowledged before this request, and hold the reply up to `wait_ms` while
-/// none of them has been sent anything since the last one.
+/// SYNC_PUSHED: end every subscription of the connection `held` does not
+/// name, bring the rest up to the pushes acknowledged before this request, and
+/// hold the reply up to `wait_ms` while none of them has been sent anything
+/// since the last one.
 pub(super) async fn handle_sync_pushed(
     shared: &Rc<Shared>,
     peer: &Peer,
     subs: &mut Subscriptions,
+    held: &[u64],
     wait_ms: u64,
 ) -> Result<(), WireFault> {
+    subs.leave(&shared.feeds, |id| !held.contains(&id));
     let deadline = Instant::now() + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT);
     let out = peer.outbox();
     let feeds = &shared.feeds;

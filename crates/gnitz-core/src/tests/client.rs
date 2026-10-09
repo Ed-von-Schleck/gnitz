@@ -409,6 +409,45 @@ impl Host for PendingHost {
     }
 }
 
+/// A host whose every wait fails.
+struct FailingHost;
+
+impl Host for FailingHost {
+    fn attach(&mut self, _: BorrowedFd<'_>) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn poll_io(
+        &mut self,
+        _: Interest,
+        _: &mut Context<'_>,
+        _: &mut dyn FnMut(Interest) -> bool,
+    ) -> Poll<Result<(), ClientError>> {
+        Poll::Ready(Err(std::io::Error::other("no reactor").into()))
+    }
+
+    fn spawn(&mut self, job: Job) {
+        job()
+    }
+}
+
+/// A wait that fails is the connection's end: the reply owed arrives as the
+/// failure, and so does every later request's.
+#[test]
+fn a_failed_wait_ends_the_session() {
+    let (s, _peer) = session_pair();
+    let mut c = GnitzClient::over(s, Box::new(FailingHost)).unwrap();
+    for _ in 0..2 {
+        let lost = block_on(c.alloc_id());
+        assert!(
+            matches!(&lost, Err(ClientError::Protocol(e)) if e.to_string().contains("no reactor")),
+            "{lost:?}"
+        );
+    }
+    assert!(c.session.is_closed());
+    assert_eq!(c.requests_sent(), 1, "the second was refused unsent");
+}
+
 /// Poll `fut` to completion, parking on `fd` whenever it pends, and count the
 /// polls it took.
 fn drive<F: Future>(fd: RawFd, fut: F) -> (F::Output, usize) {

@@ -492,9 +492,10 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
 }
 
 /// One message handled to completion before the next is received, so replies
-/// leave in request order — which is how clients correlate them (`gnitz.aio`
-/// gathers a mixed group onto one round-trip and rejects an out-of-order
-/// `target_id`). Spawning `handle_message` to overlap requests would break that.
+/// leave in request order — which is how a client correlates them: it answers
+/// its oldest request with each reply, and ends the connection on one naming
+/// another `target_id`. Spawning `handle_message` to overlap requests would
+/// break that.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
@@ -519,7 +520,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
         // is gone is found out by the next request.
         let _ = peer.ship_pushed().await;
     }
-    subs.leave(&shared.feeds, None);
+    subs.leave(&shared.feeds, |_| true);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,13 +715,11 @@ async fn dispatch_request(
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
 
-        ClientVerb::Unsubscribe => {
-            subs.leave(&shared.feeds, Some(ctrl.hdr.arg0));
-            send_ack(peer, target_id, 0);
-            Ok(())
+        ClientVerb::SyncPushed => {
+            let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
+                .map_err(|e| format!("decode error: {e}"))?;
+            handle_sync_pushed(shared, peer, subs, &held, ctrl.hdr.arg0).await
         }
-
-        ClientVerb::SyncPushed => handle_sync_pushed(shared, peer, subs, ctrl.hdr.arg0).await,
     }
 }
 

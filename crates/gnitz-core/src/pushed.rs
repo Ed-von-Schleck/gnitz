@@ -43,18 +43,18 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Result<u64, ClientError> {
-        let id = self.session.subscribe(view.into(), cursor, reply_schema, spec)?;
+        let id = self.next_sub;
+        self.session.subscribe(id, view.into(), cursor, reply_schema, spec)?;
+        self.next_sub += 1;
         self.readers.insert(id, Arc::clone(reply_schema));
         Ok(id)
     }
 
-    /// End subscription `id`. Nothing waits for the answer — a train of it
-    /// still on its way is dropped — and an id this client does not hold is
-    /// ignored.
+    /// End subscription `id`: no sync reports it again. The next sync tells
+    /// the server, and drops what was pushed for `id` until then. An id this
+    /// client does not hold is ignored.
     pub fn unsubscribe(&mut self, id: u64) {
-        if self.readers.remove(&id).is_some() {
-            self.session.unsubscribe([id]);
-        }
+        self.readers.remove(&id);
     }
 
     /// Bring every subscription of this connection, a reader's and a
@@ -76,7 +76,9 @@ impl GnitzClient {
     /// until the reply arrives, and a request made meanwhile ends the hold.
     pub fn begin_sync(&mut self, wait: Duration) -> Result<Sent<()>, ClientError> {
         let wait = self.mirror_hold(wait)?;
-        Ok(self.session.submit_sync(wait))
+        let mirrored = self.mirror.iter().flat_map(|m| m.views.values().filter_map(|v| v.sub));
+        let held: Vec<u64> = self.readers.keys().copied().chain(mirrored).collect();
+        Ok(self.session.submit_sync(&held, wait))
     }
 
     /// The second half of [`Self::sync`], given the reply to the first's
@@ -106,8 +108,6 @@ impl GnitzClient {
             pushed.push(Pushed { sub, result });
             held
         });
-        // The server may still hold one that ended here.
-        session.unsubscribe(pushed.iter().filter(|p| p.result.is_err()).map(|p| p.sub));
         pushed
     }
 }

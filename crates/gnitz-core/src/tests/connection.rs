@@ -8,7 +8,7 @@ use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
-fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<Sent<ScanReply>, ClientError> {
+fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanReply> {
     s.submit_scan(tid.into(), &ReadSpec::all_rows(ReadBound::None), schema)
 }
 
@@ -81,7 +81,7 @@ fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
 fn train_split_across_continuation_frames_completes_once() {
     let (mut s, peer) = pair();
     let schema = schema_a();
-    let mut sent = submit_scan(&mut s, 7, &schema).unwrap();
+    let mut sent = submit_scan(&mut s, 7, &schema);
     assert_eq!(s.interest(), Interest { read: true, write: true });
     s.step(Interest::WRITE);
     assert!(sent.try_take().is_none());
@@ -109,9 +109,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     let (sa, sb) = (schema_a(), schema_b());
     // Each train must decode under the schema paired with its relation — a
     // two-frame train for relation 2 included.
-    let mut sent = s
-        .submit_scan_multi(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))])
-        .unwrap();
+    let mut sent = s.submit_scan_multi(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]);
     s.step(Interest::WRITE);
     let req = peer.recv();
     let ctrl = peek_control_block(&req).unwrap();
@@ -142,7 +140,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
 fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
     let (mut s, peer) = pair();
     let sa = schema_a();
-    let sent = submit_scan(&mut s, 7, &sa).unwrap();
+    let sent = submit_scan(&mut s, 7, &sa);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&encode_frame(
@@ -168,13 +166,13 @@ fn a_status_frame_fails_its_slot_alone() {
     /// `sent`'s request refused `status` after `trains_before` of its trains.
     fn refused<T: std::fmt::Debug>(
         what: &str,
-        submit: impl FnOnce(&mut Session) -> Result<Sent<T>, ClientError>,
+        submit: impl FnOnce(&mut Session) -> Sent<T>,
         trains_before: u64,
         status: WireStatus,
     ) {
         let sa = schema_a();
         let (mut s, peer) = pair();
-        let sent = submit(&mut s).unwrap();
+        let sent = submit(&mut s);
         s.step(Interest::WRITE);
         peer.recv();
         for tid in 1..=trains_before {
@@ -189,7 +187,7 @@ fn a_status_frame_fails_its_slot_alone() {
         assert!(!s.is_closed(), "{what}");
         assert_eq!(s.interest(), Interest::NONE, "{what}: nothing left pending");
 
-        let sent = submit_scan(&mut s, 3, &sa).unwrap();
+        let sent = submit_scan(&mut s, 3, &sa);
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
@@ -206,8 +204,8 @@ fn a_status_frame_fails_its_slot_alone() {
     refused("a commit", |s| s.submit(COMMIT), 0, WireStatus::TxnConflict);
 }
 
-/// A request `submit` refuses opens no slot and queues nothing: the reply queue
-/// stays aligned with what the server was sent.
+/// A request `submit` refuses is answered with the refusal, opens no slot and
+/// queues nothing: the reply queue stays aligned with what the server was sent.
 #[test]
 fn a_refused_submit_leaves_the_session_as_it_was() {
     let (mut s, _peer) = pair();
@@ -226,7 +224,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         assert_eq!(s.interest(), Interest::NONE, "{what}");
         assert!(!s.is_closed(), "{what}");
     };
-    assert!(s.submit_scan_multi(Vec::new()).is_err());
+    assert!(matches!(s.submit_scan_multi(Vec::new()).try_take(), Some(Err(_))));
     untouched(&s, "an empty multi-read");
     for (what, req) in [
         ("a DDL family that is no system table", Request::DdlTxn(&ddl)),
@@ -249,7 +247,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
             },
         ),
     ] {
-        assert!(s.submit(req).is_err(), "{what}");
+        assert!(matches!(s.submit(req).try_take(), Some(Err(_))), "{what}");
         untouched(&s, what);
     }
 }
@@ -258,7 +256,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
 fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
     let (mut s, peer) = pair();
     let sa = schema_a();
-    let mut sent = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa).unwrap());
+    let mut sent = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa));
     s.step(Interest::WRITE);
     peer.recv();
     peer.recv();
@@ -281,14 +279,14 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
 fn replies_completed_before_a_fatal_frame_are_delivered() {
     let (mut s, peer) = pair();
     let (sa, rows) = (schema_a(), batch_a(&[1]));
-    let mut a = s.submit(COMMIT).unwrap();
+    let mut a = s.submit(COMMIT);
     let push = Request::Push {
         target: 5.into(),
         schema: &sa,
         batch: &rows,
         mode: WireConflictMode::Update,
     };
-    let mut b = s.submit(push).unwrap();
+    let mut b = s.submit(push);
     s.step(Interest::WRITE);
     peer.recv();
     peer.recv();
@@ -306,8 +304,8 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     assert!(s.is_closed());
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
-        submit_scan(&mut s, 1, &sa),
-        Err(ClientError::ConnectionLost(_))
+        submit_scan(&mut s, 1, &sa).try_take(),
+        Some(Err(ClientError::ConnectionLost(_)))
     ));
 }
 
@@ -316,12 +314,12 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
 #[test]
 fn a_reply_readable_behind_a_failed_flush_is_delivered() {
     let (mut s, peer) = pair();
-    let mut a = s.submit(COMMIT).unwrap();
+    let mut a = s.submit(COMMIT);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&reply_ctrl(0, 11));
     drop(peer);
-    let mut b = submit_scan(&mut s, 5, &schema_a()).unwrap();
+    let mut b = submit_scan(&mut s, 5, &schema_a());
     s.step(Interest::WRITE);
     let (a, b) = (a.try_take().unwrap(), b.try_take().unwrap());
     assert!(matches!(a, Ok(11)), "{a:?}");
@@ -334,7 +332,7 @@ fn a_reply_readable_behind_a_failed_flush_is_delivered() {
 #[test]
 fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
     let (mut s, peer) = pair();
-    let mut sent = submit_scan(&mut s, 5, &schema_a()).unwrap();
+    let mut sent = submit_scan(&mut s, 5, &schema_a());
     s.step(Interest::WRITE);
     // The request is on the wire and unread, so dropping the peer draws a
     // reset. A hangup folds into read readiness, so the waiting driver wakes.
@@ -358,14 +356,17 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
 fn end_abandons_every_pending_slot_and_refuses_further_work() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
-    let mut owed = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa).unwrap());
+    let mut owed = [1, 2].map(|tid| submit_scan(&mut s, tid, &sa));
     assert_eq!(s.interest(), Interest { read: true, write: true });
     s.end(ClientError::Closed);
     for sent in &mut owed {
         assert!(matches!(sent.try_take(), Some(Err(ClientError::Closed))));
     }
     assert_eq!(s.interest(), Interest::NONE);
-    assert!(matches!(submit_scan(&mut s, 3, &sa), Err(ClientError::Closed)));
+    assert!(matches!(
+        submit_scan(&mut s, 3, &sa).try_take(),
+        Some(Err(ClientError::Closed))
+    ));
 }
 
 /// The in-flight count bounds no memory on its own, so the byte cap is what
@@ -374,7 +375,7 @@ fn end_abandons_every_pending_slot_and_refuses_further_work() {
 fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
-    // About 1 MiB encoded, so the cap is some sixty pushes away.
+    // Large enough that a few dozen of them reach the cap.
     let b = batch_a(&(0..32_768).collect::<Vec<_>>());
     let push = |s: &mut Session| {
         let push = Request::Push {
@@ -383,20 +384,20 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
             batch: &b,
             mode: WireConflictMode::Update,
         };
-        s.submit(push).map(drop)
+        s.submit(push).try_take()
     };
     // An encoded push is a full copy of its batch, so the counter grows with
     // what was pushed, not with how many times.
-    push(&mut s).unwrap();
+    assert!(push(&mut s).is_none());
     let one = s.queued_bytes();
     assert!(one > b.len() * 32, "the frame carries the batch");
-    push(&mut s).unwrap();
+    assert!(push(&mut s).is_none());
     assert_eq!(s.queued_bytes(), 2 * one, "bytes, not submits");
 
     // The cap is checked before queueing, so the push that crosses it goes
     // through and it is the *next* submit that is refused.
     while !s.at_capacity() {
-        push(&mut s).unwrap();
+        assert!(push(&mut s).is_none());
     }
     let queued = s.queued_bytes();
     assert!(
@@ -404,7 +405,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
         "the last push was admitted under the cap"
     );
     let sent = s.requests_sent();
-    assert!(matches!(push(&mut s), Err(ClientError::Refused(_))));
+    assert!(matches!(push(&mut s), Some(Err(ClientError::Refused(_)))));
     assert_eq!(
         (s.queued_bytes(), s.requests_sent()),
         (queued, sent),
@@ -424,10 +425,13 @@ fn in_flight_cap_raises_rather_than_hanging() {
     let sa = schema_a();
     for _ in 0..MAX_IN_FLIGHT {
         assert!(!s.at_capacity());
-        submit_scan(&mut s, 1, &sa).unwrap();
+        assert!(submit_scan(&mut s, 1, &sa).try_take().is_none());
     }
     assert!(s.at_capacity());
-    assert!(matches!(submit_scan(&mut s, 1, &sa), Err(ClientError::Refused(_))));
+    assert!(matches!(
+        submit_scan(&mut s, 1, &sa).try_take(),
+        Some(Err(ClientError::Refused(_)))
+    ));
 }
 
 /// A DELTA_POLL item: `view` after `(tag 1, tick 4)`, replied as `schema_a`.
@@ -457,7 +461,7 @@ fn delta_terminal(view: u64, tick: u64) -> Vec<u8> {
 fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        s.submit_delta_poll(&[delta_item(7), delta_item(8), delta_item(9)]);
+        s.submit_delta_poll(1, &[delta_item(7), delta_item(8), delta_item(9)]);
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -497,9 +501,9 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
 #[test]
 fn an_abandoned_poll_queues_nothing() {
     let (mut s, peer) = pair();
-    s.submit_delta_poll(&[delta_item(7)]);
-    s.abandon_poll([]);
-    s.submit_delta_poll(&[delta_item(8)]);
+    s.submit_delta_poll(1, &[delta_item(7)]);
+    s.abandon_poll();
+    s.submit_delta_poll(2, &[delta_item(8)]);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {
@@ -525,7 +529,6 @@ fn an_abandoned_poll_queues_nothing() {
 /// A read of view 7's delta feed after `(tag 1, tick 4)`.
 fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
     s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[])
-        .unwrap()
 }
 
 #[test]
@@ -592,7 +595,7 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
         ),
     ] {
         let (mut s, peer) = pair();
-        let sent = s.submit_resolve("s.t").unwrap();
+        let sent = s.submit_resolve("s.t");
         s.step(Interest::WRITE);
         peer.recv();
         peer.send(&frame);
@@ -621,10 +624,11 @@ fn cursor(tick: u64) -> DeltaCursor {
     DeltaCursor::from_pair(1, tick).unwrap()
 }
 
-/// Subscribe to view 40 from round 3; the subscription's id. The request is
-/// a delta read, answered by view 40's train.
+/// Subscribe to view 40 from round 3 as subscription 5; that id. The request
+/// is a delta read, answered by view 40's train.
 fn subscribe(s: &mut Session) -> u64 {
-    s.subscribe(40.into(), cursor(3), &schema_a(), &[]).unwrap()
+    s.subscribe(5, 40.into(), cursor(3), &schema_a(), &[]).unwrap();
+    5
 }
 
 /// A pushed train between two replies is set aside whole for the subscription
@@ -634,8 +638,8 @@ fn subscribe(s: &mut Session) -> u64 {
 fn a_pushed_train_between_replies_is_set_aside() {
     let (mut s, peer) = pair();
     let sub = subscribe(&mut s);
-    let first = s.submit(COMMIT).unwrap();
-    let second = s.submit(COMMIT).unwrap();
+    let first = s.submit(COMMIT);
+    let second = s.submit(COMMIT);
     let mut bytes = framed(&delta_terminal(40, 3));
     bytes.extend(framed(&reply_ctrl(0, 1)));
     bytes.extend(pushed_train(40, sub, &[1, 2], 9));
@@ -663,7 +667,7 @@ fn a_subscriptions_read_is_its_first_train() {
         cursor(3),
         "unanswered, it stands where it asked from"
     );
-    let sent = s.submit(COMMIT).unwrap();
+    let sent = s.submit(COMMIT);
     let mut bytes = framed(&reply_rows(40, &batch_a(&[1, 2]), 0, true));
     bytes.extend(framed(&delta_terminal(40, 9)));
     bytes.extend(pushed_train(40, sub, &[3], 11));
@@ -678,24 +682,22 @@ fn a_subscriptions_read_is_its_first_train() {
     );
 }
 
-/// A kept poll whose reader went ends every subscription nobody took: the one
-/// already answered is held no more, and the one answered afterwards is never
-/// held, so neither can hold back a sync.
+/// A kept poll whose reader went sends nothing more. A subscription it was
+/// answered with stays the session's until a sync fails to name it, which is
+/// what tells the server; one answered afterwards is never held.
 #[test]
-fn an_abandoned_kept_poll_leaves_no_subscription() {
+fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     let (mut s, peer) = pair();
-    let first = s.submit_delta_poll(&[delta_item(7), delta_item(8)]);
-    assert_ne!(first, 0);
+    let first = 3;
+    s.submit_delta_poll(first, &[delta_item(7), delta_item(8)]);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&delta_terminal(7, 9));
     s.step(Interest::READ);
-    s.abandon_poll([first, first + 1]);
-    assert_eq!(s.requests_sent(), 3, "the poll, and an end for each subscription");
+    s.abandon_poll();
+    assert_eq!(s.requests_sent(), 1, "the poll alone");
     let mut bytes = framed(&delta_terminal(8, 9));
     bytes.extend(pushed_train(8, first + 1, &[1], 11));
-    bytes.extend(framed(&reply_ctrl(0, 0)));
-    bytes.extend(framed(&reply_ctrl(0, 0)));
     peer.send_bytes(&bytes);
     while !s.interest().is_empty() {
         s.step(Interest::from_revents(
@@ -703,31 +705,93 @@ fn an_abandoned_kept_poll_leaves_no_subscription() {
         ));
     }
     assert!(!s.is_closed());
-    for id in [first, first + 1] {
-        let gone = s.take_pushed(id).expect_err("nobody holds it");
-        assert!(gone.to_string().contains("not held"), "{gone:?}");
-    }
+    assert!(s.take_pushed(first).is_ok(), "answered before its reader went");
+    let gone = s.take_pushed(first + 1).expect_err("answered to nobody");
+    assert!(gone.to_string().contains("not held"), "{gone:?}");
+
+    let synced = s.submit_sync(&[], Duration::from_secs(60));
+    s.step(Interest::WRITE);
+    assert_eq!(held_named(&peer.recv()), [0u64; 0], "no owner named either");
+    peer.send(&reply_ctrl(0, 0));
+    await_reply(&mut s, synced).unwrap();
+    let gone = s.take_pushed(first).expect_err("nobody named it");
+    assert!(gone.to_string().contains("not held"), "{gone:?}");
     assert!(s.polled_out() && !s.polls.untaken());
+}
+
+/// The ids a SYNC_PUSHED request names.
+fn held_named(request: &[u8]) -> Vec<u64> {
+    let ctrl = peek_control_block(request).unwrap();
+    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    let mut held = txn_frame::decode_held(&request[ctrl.blob]).unwrap();
+    held.sort_unstable();
+    held
 }
 
 #[test]
 fn a_sync_of_no_subscription_is_no_request() {
     let (mut s, _peer) = pair();
-    let synced = s.submit_sync(Duration::from_secs(60));
+    let synced = s.submit_sync(&[], Duration::from_secs(60));
     assert_eq!(s.requests_sent(), 0);
     await_reply(&mut s, synced).unwrap();
+}
+
+/// A sync names the subscriptions its caller holds, and one left out is the
+/// session's no more. The server is told of the last one let go of by a sync
+/// naming none, after which a sync is no request again.
+#[test]
+fn a_sync_names_what_is_held_and_ends_the_rest() {
+    let (mut s, peer) = pair();
+    for id in [5, 6] {
+        s.subscribe(id, 40.into(), cursor(3), &schema_a(), &[]).unwrap();
+    }
+    let mut script = Vec::new();
+    for _ in 0..2 {
+        script.extend(framed(&delta_terminal(40, 3)));
+    }
+    for (held, named) in [(&[5, 6][..], &[5, 6][..]), (&[6, 9], &[6]), (&[], &[])] {
+        let synced = s.submit_sync(held, Duration::ZERO);
+        s.step(Interest::WRITE);
+        let request = loop {
+            let request = peer.recv();
+            if peek_control_block(&request).unwrap().hdr.flags.verb == gnitz_wire::ClientVerb::SyncPushed {
+                break request;
+            }
+        };
+        assert_eq!(held_named(&request), named, "holding {held:?}");
+        script.extend(framed(&reply_ctrl(0, 0)));
+        peer.send_bytes(&std::mem::take(&mut script));
+        await_reply(&mut s, synced).unwrap();
+    }
+    assert!(s.take_pushed(5).is_err() && s.take_pushed(6).is_err());
+    let sent = s.requests_sent();
+    let synced = s.submit_sync(&[], Duration::ZERO);
+    await_reply(&mut s, synced).unwrap();
+    assert_eq!(s.requests_sent(), sent, "the server holds none");
 }
 
 #[test]
 fn a_refused_sync_moves_no_subscription() {
     let (mut s, peer) = pair();
     let sub = subscribe(&mut s);
-    let synced = s.submit_sync(Duration::ZERO);
+    let synced = s.submit_sync(&[sub], Duration::ZERO);
     let mut bytes = framed(&delta_terminal(40, 3));
     bytes.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
     peer.send_bytes(&bytes);
     assert!(matches!(await_reply(&mut s, synced), Err(ClientError::Refused(_))));
     assert_eq!(s.take_pushed(sub).unwrap().1, cursor(3));
+}
+
+/// A subscription a session at its cap refuses is no subscription: the
+/// refusal is returned, and the session holds nothing under the id.
+#[test]
+fn a_refused_subscribe_holds_nothing() {
+    let (mut s, _peer) = pair();
+    s.end(ClientError::Closed);
+    let refused = s.subscribe(5, 40.into(), cursor(3), &schema_a(), &[]);
+    assert!(matches!(refused, Err(ClientError::Closed)), "{refused:?}");
+    let gone = s.take_pushed(5).expect_err("nothing is held");
+    assert!(gone.to_string().contains("not held"), "{gone:?}");
 }
 
 /// A train that ends in a fault ends its subscription and nothing else: the
@@ -736,7 +800,7 @@ fn a_refused_sync_moves_no_subscription() {
 fn a_pushed_fault_ends_its_subscription_and_no_request() {
     let (mut s, peer) = pair();
     let sub = subscribe(&mut s);
-    let sent = s.submit(COMMIT).unwrap();
+    let sent = s.submit(COMMIT);
     let mut bytes = framed(&delta_terminal(40, 3));
     bytes.extend(pushed_train(40, sub, &[1], 9));
     bytes.extend(framed(&pushed_marker(40, sub)));
@@ -757,7 +821,7 @@ fn a_refused_subscription_is_ended_by_its_refusal() {
     for named in [0, 40] {
         let (mut s, peer) = pair();
         let sub = subscribe(&mut s);
-        let sent = s.submit(COMMIT).unwrap();
+        let sent = s.submit(COMMIT);
         let mut bytes = framed(&reply_status(named, WireStatus::DeltaExpired, "refused"));
         bytes.extend(framed(&reply_ctrl(0, 3)));
         peer.send_bytes(&bytes);
@@ -770,22 +834,12 @@ fn a_refused_subscription_is_ended_by_its_refusal() {
     }
 }
 
-#[test]
-fn a_replacing_session_continues_the_ids() {
-    let (mut old, _peer) = pair();
-    let last = [subscribe(&mut old), subscribe(&mut old)][1];
-    let (fresh, _peer) = pair();
-    let mut fresh = fresh.replacing(&old);
-    assert_eq!(subscribe(&mut fresh), last + 1);
-    assert!(fresh.take_pushed(last).is_err(), "the old session's is not held here");
-}
-
 /// A frame of a pushed train naming another relation than the train opened
 /// for ends the session, as a misdirected reply frame does.
 #[test]
 fn a_pushed_train_naming_another_view_ends_the_session() {
     let (mut s, peer) = pair();
-    let sent = s.submit(COMMIT).unwrap();
+    let sent = s.submit(COMMIT);
     let mut bytes = framed(&pushed_marker(40, 5));
     bytes.extend(framed(&delta_terminal(41, 9)));
     peer.send_bytes(&bytes);

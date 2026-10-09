@@ -17,7 +17,7 @@ fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
 
 /// The refusal of `families` sent as one DDL bundle.
 fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
-    let sent = s.submit(Request::DdlTxn(families)).unwrap();
+    let sent = s.submit(Request::DdlTxn(families));
     drive(s, sent).0.unwrap_err().to_string()
 }
 

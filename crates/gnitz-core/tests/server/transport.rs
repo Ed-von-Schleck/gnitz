@@ -42,7 +42,7 @@ fn evicted_within(s: &mut Session, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if s.submit(Request::AllocIds(1)).is_err() || !write_out(s) {
+        if s.submit(Request::AllocIds(1)).try_take().is_some() || !write_out(s) {
             return true;
         }
     }
@@ -304,11 +304,11 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         let pushes: Vec<_> = (0..n_pushes)
             .map(|i| {
                 let batch = rows(&schema, i * per..(i + 1) * per);
-                s.submit(push_req(tid, &schema, &batch)).unwrap()
+                s.submit(push_req(tid, &schema, &batch))
             })
             .collect();
         let all = ReadSpec::all_rows(ReadBound::None);
-        let scan = s.submit_scan(tid.into(), &all, &schema).unwrap();
+        let scan = s.submit_scan(tid.into(), &all, &schema);
         assert!(write_out(&mut s), "the server keeps reading");
 
         let data = drive(&mut s, scan).0.expect("the scan behind the pushes");
@@ -337,7 +337,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
             let mut s = Session::connect(&target).unwrap();
             set_small_bufs(s.as_raw_fd());
             let all = ReadSpec::all_rows(ReadBound::None);
-            let _unread = s.submit_scan(tid.into(), &all, &schema).unwrap();
+            let _unread = s.submit_scan(tid.into(), &all, &schema);
             assert!(write_out(&mut s));
             // Never read. Allow a few deadlines of slack.
             assert!(evicted_within(&mut s, 8_000), "{target}: not evicted");
@@ -363,12 +363,12 @@ fn inbound_cap_breach_closes_stalled_connection() {
         let mut s = Session::connect(&target).unwrap();
         set_small_bufs(s.as_raw_fd());
         let all = ReadSpec::all_rows(ReadBound::None);
-        let _unread = s.submit_scan(tid.into(), &all, &schema).unwrap();
+        let _unread = s.submit_scan(tid.into(), &all, &schema);
 
         // ~140 MB of rows the table does not hold, ~1 MB a frame.
         let flood = rows(&schema, 200_000..225_000);
         let mut sent = 0;
-        while sent < 140 && s.submit(push_req(tid, &schema, &flood)).is_ok() && write_out(&mut s) {
+        while sent < 140 && s.submit(push_req(tid, &schema, &flood)).try_take().is_none() && write_out(&mut s) {
             sent += 1;
         }
         assert!(

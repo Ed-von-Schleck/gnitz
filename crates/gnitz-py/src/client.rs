@@ -498,7 +498,8 @@ impl PyClient {
 
     /// unsubscribe(sub) -> None
     ///
-    /// End a subscription. An id this client does not hold is ignored.
+    /// End a subscription: no `sync` reports it again, and the next one tells
+    /// the server. An id this client does not hold is ignored.
     fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
         Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
     }

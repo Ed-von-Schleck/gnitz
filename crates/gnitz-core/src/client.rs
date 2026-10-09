@@ -1,5 +1,5 @@
 use crate::connection::{
-    kept_as, promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
+    promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -20,15 +20,13 @@ use gnitz_wire::sys_rows::{
     CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, SysRow,
     TableTabRow, ViewTabRow,
 };
-use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
+use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_wire::{Circuit, ComputeMap, Cut, KeyRange, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
     PkColList, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
     TABLE_TAB, VIEW_TAB,
 };
-
-// --- Module-private helpers ---
 
 /// The absence a catalog lookup by name reports.
 pub fn not_found(noun: &'static str, name: &RelName) -> ClientError {
@@ -41,8 +39,7 @@ fn absent(text: String) -> ClientError {
 }
 
 /// Build the `-1` retraction batch for `pks`: the server's unique-PK rule
-/// retracts by PK alone, so the payload columns are inert filler. Built directly rather
-/// than through `BatchAppender`, which has no way to take a whole `PkColumn`.
+/// retracts by PK alone, so the payload columns are inert filler.
 pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
     let count = pks.len();
     ZSetBatch {
@@ -69,8 +66,6 @@ pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
 /// the conflict for the caller's own retry. Each attempt re-reads; there is no
 /// backoff.
 pub const RMW_MAX_ATTEMPTS: usize = 4;
-
-// --- GnitzClient ---
 
 /// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
 /// index name `DROP INDEX` matches.
@@ -376,9 +371,18 @@ fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -
         // awaited belongs to a session since replaced.
         return Poll::Ready(Err(ClientError::Closed));
     }
-    host.poll_io(want, cx, &mut |ready| {
+    let waited = ready!(host.poll_io(want, cx, &mut |ready| {
         session.step(ready);
         session.interest().write
+    }));
+    Poll::Ready(match waited {
+        // A wait that failed is the connection's end, which every reply owed
+        // arrives as; an interrupt leaves the session as it stood.
+        Err(e) if !matches!(e, ClientError::Interrupted(_)) => {
+            session.end(e);
+            Ok(())
+        }
+        waited => waited,
     })
 }
 
@@ -404,13 +408,7 @@ pub struct Pending<'a, T> {
     sent: Sent<T>,
 }
 
-impl<'a, T> Pending<'a, T> {
-    /// A refusal that sent nothing is the reply.
-    fn submitted(client: &'a mut GnitzClient, sent: Result<Sent<T>, ClientError>) -> Self {
-        let sent = sent.unwrap_or_else(|e| Sent::ready(Err(e)));
-        Pending { client, sent }
-    }
-
+impl<T> Pending<'_, T> {
     /// Let go of the client, keeping the reply.
     pub fn detach(self) -> Sent<T> {
         self.sent
@@ -462,7 +460,7 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
             }
             match poll_turn(session, &mut **host, cx) {
                 Poll::Ready(Ok(())) => {}
-                // The replies outstanding resolve as the host's failure.
+                // No call is waiting to hand an interrupt to.
                 Poll::Ready(Err(e)) => session.end(e),
                 Poll::Pending => return Poll::Pending,
             }
@@ -499,6 +497,11 @@ pub struct GnitzClient {
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     kept: HashMap<RelName, Arc<RelDescriptor>>,
+    /// The next subscription id this client asks for. One id names one
+    /// subscription for the client's whole life: a reader still holding an id
+    /// of a connection since replaced is told that one ended, never handed
+    /// another's trains.
+    pub(crate) next_sub: u64,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -553,6 +556,7 @@ impl GnitzClient {
             mirror: None,
             readers: Default::default(),
             kept: HashMap::new(),
+            next_sub: 1,
         })
     }
 
@@ -564,9 +568,9 @@ impl GnitzClient {
 
     // ── Waiting ────────────────────────────────────────────────────────────
 
-    pub(crate) fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
+    fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
         let sent = self.session.submit(req);
-        Pending::submitted(self, sent)
+        self.wait(sent)
     }
 
     /// Step this client's session until `sent` is answered. Replies arrive in
@@ -666,17 +670,16 @@ impl GnitzClient {
     ) -> Pending<'_, ScanReply> {
         let target = target.into();
         let sent = self.session.submit_scan(target, spec, reply_schema);
-        Pending::submitted(self, sent)
+        self.wait(sent)
     }
 
-    // ── The read seam ──────────────────────────────────────────────────────
+    // ── Reads, by the freshness asked for ──────────────────────────────────
     //
-    // `resolve` and `scan_spec` are the connection; `mirrored_desc` and
+    // `resolve` and `scan_spec` ask the server; `mirrored_desc` and
     // `scan_spec_local_first` below consult the copy first, and `kept_desc`
-    // the last RESOLVE's answer, so every call site
-    // declares which freshness it is asking for. **The gate is what the copy
-    // holds, never whether a store is attached**, so a client with one reads
-    // exactly like a client without for every relation the copy does not hold.
+    // the last RESOLVE's answer. **The gate is what the copy holds, never
+    // whether a store is attached**, so a client with one reads exactly like
+    // a client without for every relation the copy does not hold.
 
     /// The descriptor of the mirrored view `name`, while its copy answers
     /// reads. As stale as the copy.
@@ -748,9 +751,10 @@ impl GnitzClient {
             mirror,
             readers: _,
             kept,
+            next_sub: _,
         } = self;
         host.attach(fresh.as_fd())?;
-        *session = fresh.replacing(session);
+        *session = fresh;
         serial_cache.clear();
         kept.clear();
         if let Some(m) = mirror.as_deref_mut() {
@@ -806,7 +810,7 @@ impl GnitzClient {
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
         let sent = self.session.submit_delta_read(view, from, reply_schema, spec);
-        Pending::submitted(self, sent)
+        self.wait(sent)
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -815,7 +819,7 @@ impl GnitzClient {
     /// Each relation is replied in the layout of the schema paired with it.
     pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Pending<'_, Vec<ScanReply>> {
         let sent = self.session.submit_scan_multi(relations);
-        Pending::submitted(self, sent)
+        self.wait(sent)
     }
 
     /// Index `cols` of relation `owner_id`, in that order, under the catalog name
@@ -1425,7 +1429,7 @@ impl GnitzClient {
     /// no such relation exists; `Err` is a missing schema or a decode error.
     pub async fn resolve(&mut self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         let sent = self.session.submit_resolve(name.key());
-        let found = Pending::submitted(self, sent).await?;
+        let found = self.wait(sent).await?;
         match &found {
             Some(desc) => self.kept.insert(name.clone(), Arc::clone(desc)),
             None => self.kept.remove(name),
@@ -1476,34 +1480,32 @@ impl GnitzClient {
 
 /// A delta poll in flight: `items` in one request, handed out as each item's
 /// blocks and then its one end, the items in order. Dropping it drops what is
-/// left of its trains and ends each kept subscription [`Self::keep`] did not
-/// take.
+/// left of its trains. A subscription it kept is its caller's only once
+/// [`Self::kept`] is recorded where the next sync names it from.
 pub(crate) struct DeltaPoll<'s> {
     session: &'s mut Session,
     /// Ends handed out so far: the index of the item being answered.
     answered: usize,
-    /// The subscription id item 0 is kept as, the rest counting up.
+    items: usize,
+    /// The subscription id item 0 is kept as.
     first_id: u64,
-    /// Per item, whether its subscription is nobody's to end: it ended in a
-    /// fault, or its reader took it.
-    settled: Vec<bool>,
 }
 
 impl Drop for DeltaPoll<'_> {
     fn drop(&mut self) {
-        let unsettled = (self.first_id..).zip(&self.settled).filter(|(_, &settled)| !settled);
-        self.session.abandon_poll(unsettled.map(|(id, _)| id));
+        self.session.abandon_poll();
     }
 }
 
 impl<'s> DeltaPoll<'s> {
-    pub(crate) fn start(session: &'s mut Session, items: &[DeltaPollItem]) -> Self {
-        let first_id = session.submit_delta_poll(items);
+    /// Poll `items`, item `i` kept as the subscription `first_id + i`.
+    pub(crate) fn start(session: &'s mut Session, first_id: u64, items: &[DeltaPollItem]) -> Self {
+        session.submit_delta_poll(first_id, items);
         DeltaPoll {
             session,
             answered: 0,
+            items: items.len(),
             first_id,
-            settled: vec![false; items.len()],
         }
     }
 
@@ -1518,23 +1520,18 @@ impl<'s> DeltaPoll<'s> {
         loop {
             if let Some(next) = self.session.next_polled() {
                 let item = self.answered;
-                if let Polled::End(end) = &next {
-                    self.answered += 1;
-                    self.settled[item] = end.is_err();
-                }
+                self.answered += matches!(next, Polled::End(_)) as usize;
                 return Ok(Some((item, next)));
             }
-            if self.answered == self.settled.len() {
+            if self.answered == self.items {
                 return Ok(None);
             }
             poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
         }
     }
 
-    /// Take the subscription `item`, which ended with a cursor, is kept as:
-    /// its id, and from here its end is the caller's to ask for.
-    pub(crate) fn keep(&mut self, item: usize) -> u64 {
-        self.settled[item] = true;
+    /// The id of the subscription `item`, which ended with a cursor, is kept as.
+    pub(crate) fn kept(&self, item: usize) -> u64 {
         kept_as(self.first_id, item)
     }
 }
