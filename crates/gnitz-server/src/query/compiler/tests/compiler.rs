@@ -1,7 +1,7 @@
 use super::fixtures::*;
 use super::*;
 use crate::test_support::{
-    identity_circuit, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
+    identity_circuit, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
 };
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
@@ -90,7 +90,7 @@ fn a_side_relays_only_what_is_not_already_in_place() {
             .collect();
         shards.into_iter().reduce(|a, b| c.union(a, b)).unwrap();
         let registry = sources_at(Slot::new(0, of), (10..).zip(sides.iter().map(|s| s.0)));
-        let (out, _) = compile(c, &registry, &view, false).expect("the fixture compiles");
+        let out = compile(c, &registry, &view, false).expect("the fixture compiles");
         let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
         let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
         (rounds, shares)
@@ -156,9 +156,8 @@ fn global_circuit(op: &OpNode, exchanged: bool) -> Circuit {
 fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<CompileOutput, String> {
     let schema = source.schema;
     let view = circuit
-        .nodes()
-        .iter()
-        .find_map(|n| match &n.op {
+        .ops()
+        .find_map(|(_, op)| match op {
             OpNode::Reduce { agg, .. } => Some(
                 *gnitz_zset::stream::ReducePlan::from_wire(&schema, &[], agg, true)
                     .unwrap()
@@ -172,7 +171,7 @@ fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<Compil
             _ => None,
         })
         .expect("a global operator");
-    compile(circuit, &sources_at(slot, [(10, source)]), &view, false).map(|(out, _)| out)
+    compile(circuit, &sources_at(slot, [(10, source)]), &view, false)
 }
 
 /// A side ends in its global operator's partial — a layout of its own — exactly
@@ -217,8 +216,7 @@ fn an_exchange_behind_a_global_aggregate_is_rejected() {
     let keyed = Source::from(make_schema_u64_i64());
     let above = |exchanged: bool| {
         let mut c = global_circuit(&global_reduce(AggFunc::Sum), exchanged);
-        let reduced = c.nodes().len() - 1;
-        c.shard(reduced);
+        c.shard(c.out());
         compile_global(c, keyed, Slot::new(0, 4))
     };
     assert_eq!(rejection(above(true)), "an exchange behind a global aggregate");
@@ -249,41 +247,57 @@ fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
     }
 }
 
-/// A global aggregate's ground row is seeded once per copy of the result: on each
-/// worker holding the whole input, else on the one worker the empty-keyed shard
-/// sends every row to. With no exchange the reduce aggregates each worker's
-/// slice, and owes none.
+/// A global reduce behind an exchange owes a ground row, and its plan says so at
+/// every rank: which process mints it is the epoch's to say. With no exchange the
+/// reduce aggregates each worker's slice, and owes none.
 #[test]
 fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
+    use crate::query::vm::Op;
     let keyed = Source::from(make_schema_u64_i64());
     let replicated = keyed.placed(Placement::Replicated);
     let op = global_reduce(AggFunc::Min);
+    // Whether each reduce of the plan seeds the ground row, the last the circuit's.
     let seeds = |exchanged: bool, source: Source, slot: Slot| {
-        compile_global(global_circuit(&op, exchanged), source, slot).map(|out| out.vm.pending_ground_row)
+        let out = compile_global(global_circuit(&op, exchanged), source, slot).expect("the fixture compiles");
+        let reduces = out.vm.ops().filter_map(|op| match op {
+            Op::Reduce { plan, .. } => Some(plan.seeds_ground),
+            _ => None,
+        });
+        reduces.last().expect("a reduce")
     };
-    assert_eq!(seeds(true, keyed, Slot::SOLO), Ok(true), "one worker");
-    assert_eq!(seeds(true, replicated, Slot::new(2, 4)), Ok(true), "a replicated view");
-    for (source, slot) in [
-        (keyed, Slot::SOLO),
-        (keyed, Slot::new(0, 4)),
-        (replicated, Slot::new(2, 4)),
-    ] {
-        assert_eq!(seeds(false, source, slot), Ok(false), "no exchange, {slot:?}");
+    let slots = [Slot::SOLO].into_iter().chain((0..4).map(|rank| Slot::new(rank, 4)));
+    for slot in slots {
+        for source in [keyed, replicated] {
+            assert!(seeds(true, source, slot), "an exchange, {slot:?}");
+            assert!(!seeds(false, source, slot), "no exchange, {slot:?}");
+        }
     }
+}
 
-    let probe = make_batch(&keyed.schema, &[(1, 1, 1)]);
-    let (seeded, receives): (Vec<bool>, Vec<bool>) = (0..4)
-        .map(|rank| {
-            let slot = Slot::new(rank, 4);
-            let out = compile_global(global_circuit(&op, true), keyed, slot).expect("the fixture compiles");
-            let round = out.vm.ops().find_map(|op| match op {
-                crate::query::vm::Op::Round { plan, .. } => Some(std::rc::Rc::clone(plan)),
-                _ => None,
-            });
-            let round = round.expect("a partitioned side takes a round");
-            (out.vm.pending_ground_row, !round.share(&probe, slot).is_empty())
-        })
-        .unzip();
-    assert_eq!(seeded, receives);
-    assert_eq!(seeded.iter().filter(|&&s| s).count(), 1, "one owner");
+// ── Backfill bounds ─────────────────────────────────────────────────────
+
+/// A backfill bound survives per source scanned once; a source scanned twice
+/// shares one backfill cursor, so it keeps none even where one scan is bounded.
+#[test]
+fn a_source_scanned_once_keeps_its_backfill_bound() {
+    use gnitz_wire::{KeyRange, PkColList};
+    let schema = make_schema_u64_i64();
+    let bound = |col: u32| ReadBound::Range(KeyRange::point(PkColList::from_slice(&[col]), &[], 0));
+    let bounds_of = |scans: [(u64, ReadBound); 2]| {
+        let mut c = Circuit::default();
+        let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));
+        c.union(a, b);
+        let out = compile(c, &sources([(10, schema), (11, schema)]), &schema, false).expect("the fixture compiles");
+        scans.map(|(source, _)| out.sources[&source].1.clone())
+    };
+    assert_eq!(
+        bounds_of([(10, bound(1)), (11, ReadBound::None)]),
+        [bound(1), ReadBound::None],
+        "each source scanned once keeps its own"
+    );
+    assert_eq!(
+        bounds_of([(10, bound(1)), (10, ReadBound::None)]),
+        [ReadBound::None, ReadBound::None],
+        "a source scanned twice has none"
+    );
 }

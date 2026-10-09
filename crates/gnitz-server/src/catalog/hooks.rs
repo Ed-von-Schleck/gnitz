@@ -47,8 +47,9 @@ impl CatalogEngine {
         let schema = build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice())?;
         let placement = match rel.detail {
             RelDetail::View { owner, .. } => {
-                let placement = self.dag.register_view(&self.registry, rel.id, &schema, owner)?;
-                for &src in self.dag.sources_of(rel.id) {
+                let circuit = self.read_circuit(rel.id)?;
+                let chain = owner.unwrap_or(rel.id);
+                for src in circuit.sources() {
                     if SysFamily::from_id(src).is_some_and(SysFamily::master_only) {
                         return Err(format!(
                             "reads '{}', which holds no set a view can scan",
@@ -66,14 +67,15 @@ impl CatalogEngine {
                     // A segment keeps its rows only for the build of its chain, so only
                     // that chain may scan it — and a capacity-bounded view, which
                     // recomputes a key from the rows of what it scans, not at all.
-                    let chain = self.dag.chain_of(src);
-                    if chain != src && (chain != self.dag.chain_of(rel.id) || rel.kind.is_bounded()) {
+                    let holder = self.dag.chain_of(src);
+                    if holder != src && (holder != chain || rel.kind.is_bounded()) {
                         return Err(format!(
-                            "reads {src}, a segment of view {chain} that holds no rows for it"
+                            "reads {src}, a segment of view {holder} that holds no rows for it"
                         ));
                     }
                 }
-                placement
+                self.dag
+                    .register_view(&self.registry, rel.id, &schema, rel.kind.is_bounded(), owner, &circuit)?
             }
             RelDetail::Table {
                 distribution: TableDistribution::Replicated,

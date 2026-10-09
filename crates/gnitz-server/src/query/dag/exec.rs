@@ -5,22 +5,37 @@ use super::*;
 
 // ── Epoch execution ─────────────────────────────────────────────────────
 
-/// `view_id`'s program, which its epoch compiled on entry, beside the stores an
-/// epoch of it runs over.
+/// `view_id`'s program, beside the stores an epoch of it runs over, which its
+/// epoch opened on entry.
 fn plan_and_stores<'a>(
     host: &'a mut impl DriveHost,
     view_id: u64,
     unfed: &'a [u64],
 ) -> (&'a mut vm::Vm, vm::Stores<'a>) {
     let (dag, registry) = host.parts();
-    let ViewPlan { code, state } = dag.plan_mut(view_id).expect("compiled on the epoch's entry");
+    let view = dag.views.get_mut(&view_id).expect("registered on the epoch's entry");
+    let state = view.state.as_mut().expect("opened on the epoch's entry");
     let stores = vm::Stores { own: state, registry, unfed };
-    (&mut code.vm, stores)
+    (&mut view.code.vm, stores)
+}
+
+/// What an epoch of a backfill says of its view. A tick's says neither: every
+/// source has fed the view, and its backfill minted the ground row.
+#[derive(Clone, Copy)]
+struct Fill<'a> {
+    /// The epoch mints the row a global aggregate owes over an empty input.
+    ground: bool,
+    /// The sources the view has been fed no row of.
+    unfed: &'a [u64],
+}
+
+impl Fill<'_> {
+    const TICK: Self = Fill { ground: false, unfed: &[] };
 }
 
 /// Run one view's epoch over `input`, `src_id`'s delta, which it may `take`.
-/// `unfed`: the sources the view has been fed no row of. `drained`: what each
-/// round it runs passes to [`DriveHost::exchange`], and takes from it.
+/// `drained`: what each round it runs passes to [`DriveHost::exchange`], and
+/// takes from it.
 // Inlined: a call copies the output batch whole, once per step of a tick.
 #[inline(always)]
 fn run_view_epoch(
@@ -29,23 +44,23 @@ fn run_view_epoch(
     input: &mut Batch,
     take: bool,
     src_id: u64,
-    unfed: &[u64],
+    fill: Fill<'_>,
     drained: &mut bool,
 ) -> Result<Batch, String> {
     let reg = {
         let (dag, registry) = host.parts();
-        let plan = ensure_compiled(&mut dag.views, registry, view_id)?;
-        let reg = plan.code.source_reg_map.get(&src_id).copied();
-        let reg = reg.expect("the dep map names only sources the view's circuit scans");
-        if input.is_empty() && plan.code.vm.idles_on_empty(reg) {
-            return Ok(Batch::empty_with_schema(plan.code.vm.out_schema()));
+        let (code, _) = opened(&mut dag.views, registry, view_id)?;
+        let scan = code.sources.get(&src_id);
+        let reg = scan.expect("the dep map names only sources the view's circuit scans").0;
+        if input.is_empty() && !fill.ground && code.vm.idles_on_empty(reg) {
+            return Ok(Batch::empty_with_schema(code.vm.out_schema()));
         }
         reg
     };
-    let mut epoch = vm::Epoch::tick(reg, input, take);
+    let mut epoch = vm::Epoch::tick(reg, input, take, fill.ground);
     let mut gathered = None;
     loop {
-        let (vm, mut stores) = plan_and_stores(host, view_id, unfed);
+        let (vm, mut stores) = plan_and_stores(host, view_id, fill.unfed);
         match vm::run(vm, &mut stores, &mut epoch, gathered.take())? {
             vm::Ran::Done(out) => return Ok(out),
             vm::Ran::Round { plan, batch, fold } => {
@@ -68,9 +83,22 @@ impl DagEngine {
         let steps = self.dep.tick_steps(source_id);
         match self.rebuild.is_empty() {
             true => steps,
-            false => steps.iter().filter(|s| !self.awaits_rebuild(s.view)).copied().collect(),
+            false => meta::schedule(
+                steps
+                    .iter()
+                    .filter(|s| !self.awaits_rebuild(s.view))
+                    .map(|s| (s.view, s.producer))
+                    .collect(),
+            ),
         }
     }
+}
+
+/// Whether this process mints the row a global aggregate owes over an empty input: each
+/// process holding the view's whole input does, else the one worker the empty group's
+/// exchange sends every row to.
+fn mints_ground_row(slot: Slot, view: Placement) -> bool {
+    slot.of <= 1 || view.is_replicated() || slot.rank as usize == algebra::ground_owner(slot.of as usize)
 }
 
 /// Seal `source` and run its whole dependent closure over what the seal answers,
@@ -93,9 +121,13 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     dag.rebuild.remove(&view);
     let sources = dag.sources_of(view).to_vec();
     let chunk_rows = registry.scan_chunk_rows();
+    // Spent on the view's first epoch, whatever it seeds.
+    let mut ground = mints_ground_row(registry.slot(), registry.relation_or_err(view)?.placement());
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
-        let bound = dag.view_meta(view)?.source_bound(source);
+        let code = &dag.views.get(&view).ok_or_else(|| unregistered(view))?.code;
+        // `sources_of` names only relations the circuit scans.
+        let bound = code.sources[&source].1.clone();
         let (mut cursor, _unapplied) = registry.open_bound(source, bound, Cut::Sealed)?;
         let schema = registry.relation_or_err(source)?.schema();
         let unfed = &sources[at + 1..];
@@ -104,7 +136,9 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
             let mut drained = chunk.is_none();
             // Empty once drained, until every worker is: all run the same rounds.
             let mut input = chunk.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            let out = run_view_epoch(host, view, &mut input, true, source, unfed, &mut drained)?;
+            let fill = Fill { ground, unfed };
+            let out = run_view_epoch(host, view, &mut input, true, source, fill, &mut drained)?;
+            ground = false;
             host.parts().1.ingest_at(view, out, None, false)?;
             if drained {
                 break;
@@ -132,35 +166,27 @@ fn run_schedule(
     round: u64,
     delta: Batch,
 ) -> Result<(), String> {
-    // How many steps still read each producer's output. Sized for the schedule,
-    // as `outputs` is: growing either rehashes it once per doubling.
-    let mut readers: FxHashMap<u64, usize> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
-    for step in schedule.iter() {
-        *readers.entry(step.producer).or_default() += 1;
-    }
+    // Sized for the schedule: growing it rehashes it once per doubling.
     let mut outputs: FxHashMap<u64, Batch> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
     outputs.insert(source, delta);
-    for step in schedule.iter() {
-        let left = readers.get_mut(&step.producer).expect("counted above");
-        *left -= 1;
-        let last = *left == 0;
-        let needed = readers.contains_key(&step.view);
+    for &Step { view, producer, last, needed } in schedule {
         // Lent to every reader, the last of which may take it.
-        let input = outputs.get_mut(&step.producer);
+        let input = outputs.get_mut(&producer);
         let input = input.expect("the schedule runs every producer before the steps it feeds");
-        let out = run_view_epoch(host, step.view, input, last, step.producer, &[], &mut false)?;
+        let out = run_view_epoch(host, view, input, last, producer, Fill::TICK, &mut false)?;
         if last {
-            outputs.remove(&step.producer);
+            outputs.remove(&producer);
         }
         let (dag, registry) = host.parts();
-        let echo = match dag.passes_through(step.view) {
-            // A tick's delta reaches its readers in this schedule.
+        let echo = match out.is_empty() || dag.passes_through(view) {
+            // A tick's delta reaches its readers in this schedule, and an empty one
+            // changes no store.
             true => needed.then_some(out),
-            false => registry.ingest_at(step.view, out, Some(round), needed)?,
+            false => registry.ingest_at(view, out, Some(round), needed)?,
         };
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
-            let merged = match outputs.remove(&step.view) {
+            let merged = match outputs.remove(&view) {
                 Some(held) => {
                     // The held batch's schema: the union is certified under it.
                     let schema = *held.schema();
@@ -168,7 +194,7 @@ fn run_schedule(
                 }
                 None => out,
             };
-            outputs.insert(step.view, merged);
+            outputs.insert(view, merged);
         }
     }
     Ok(())

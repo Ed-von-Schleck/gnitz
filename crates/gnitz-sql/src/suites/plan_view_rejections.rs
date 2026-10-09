@@ -713,9 +713,8 @@ fn top_n_rules() {
     let chain = view(&cab, "SELECT c FROM cab ORDER BY c LIMIT 2");
     let orders: Vec<Vec<u16>> = final_view(&chain)
         .circuit
-        .nodes()
-        .iter()
-        .filter_map(|n| match &n.op {
+        .ops()
+        .filter_map(|(_, op)| match op {
             OpNode::TopN { order, .. } => Some(order.iter().map(|k| k.col).collect()),
             _ => None,
         })

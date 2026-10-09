@@ -111,7 +111,6 @@ impl ProgramBuilder {
         regs[out_reg.at()].last_read = LastRead::Nobody;
 
         Vm {
-            pending_ground_row: instructions.iter().any(|i| !i.facts.inert_on_empty),
             batches: regs.iter().map(|r| Batch::empty_with_schema(&r.schema)).collect(),
             instructions: instructions.into_boxed_slice(),
             integrates: integrates.into_boxed_slice(),

@@ -76,24 +76,23 @@ pub(in crate::query) struct Epoch<'e> {
     take: bool,
     /// The next instruction.
     pc: usize,
-    /// A tick's epoch: it spends the ground latch, does nothing where it would
-    /// idle, and integrates. A replay does none of the three.
+    /// A tick's epoch, which integrates. A replay does not.
     tick: bool,
-    /// This epoch spent the ground latch, so it mints the ground row an empty
-    /// delta owes.
+    /// The driver says this epoch mints the ground row an empty delta owes.
     ground: bool,
 }
 
 impl<'e> Epoch<'e> {
-    /// A tick's epoch over `seed`, the delta of the source seeding `reg`.
-    pub(in crate::query) fn tick(reg: DeltaReg, seed: &'e mut Batch, take: bool) -> Self {
+    /// A tick's epoch over `seed`, the delta of the source seeding `reg`, minting
+    /// the ground row iff `ground`.
+    pub(in crate::query) fn tick(reg: DeltaReg, seed: &'e mut Batch, take: bool, ground: bool) -> Self {
         Epoch {
             reg,
             seed,
             take,
             pc: 0,
             tick: true,
-            ground: false,
+            ground,
         }
     }
 }
@@ -122,23 +121,19 @@ pub(in crate::query) fn run<'f>(
 ) -> Result<Ran<'f>, String> {
     // The seed stands in its register while the program runs.
     std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
-    let runs = match gathered {
+    match gathered {
         None => begin(vm, epoch),
         Some(rows) => {
             let out_reg = vm.instructions[epoch.pc].out_reg;
             vm.batches[out_reg.at()] = rows;
             fold_written(&mut vm.batches, &vm.regs, out_reg);
             epoch.pc += 1;
-            true
         }
-    };
-    let ran = match runs {
-        true => run_instructions(vm, stores, epoch).and_then(|round| match round {
-            None if epoch.tick => run_integrates(vm, stores.own, epoch).map(|()| None),
-            round => Ok(round),
-        }),
-        false => Ok(None),
-    };
+    }
+    let ran = run_instructions(vm, stores, epoch).and_then(|round| match round {
+        None if epoch.tick => run_integrates(vm, stores.own, epoch).map(|()| None),
+        round => Ok(round),
+    });
     let pc = match ran {
         Ok(Some(pc)) => pc,
         Ok(None) => return Ok(Ran::Done(end(vm, epoch))),
@@ -191,8 +186,8 @@ pub(in crate::query) fn replay_chunk(
     }
 }
 
-/// Fold the seed where its register folds; whether the epoch runs at all.
-fn begin(vm: &mut Vm, epoch: &mut Epoch<'_>) -> bool {
+/// Fold the seed where its register folds.
+fn begin(vm: &mut Vm, epoch: &Epoch<'_>) {
     let seed = &vm.batches[epoch.reg.at()];
     // Rows under the wrong layout would scramble every downstream read
     // silently. An empty batch has no rows to misread, so it is exempt.
@@ -205,14 +200,6 @@ fn begin(vm: &mut Vm, epoch: &mut Epoch<'_>) -> bool {
         );
     }
     fold_written(&mut vm.batches, &vm.regs, epoch.reg);
-    if !epoch.tick {
-        return true;
-    }
-    let idles = vm.idles_on_empty(epoch.reg);
-    // Spent by any epoch that runs, not just an empty one: the ground reduce
-    // runs either way and leaves V₀ in its output trace.
-    epoch.ground = std::mem::take(&mut vm.pending_ground_row);
-    !(idles && vm.batches[epoch.reg.at()].is_empty())
 }
 
 /// Whether `reader` may take `reg`'s batch: it is the register's last reader,

@@ -1,5 +1,5 @@
-//! DagEngine: every registered view's routing metadata and the compiled plans
-//! of the views this process runs. Epoch execution lives in `exec`, per-key
+//! DagEngine: every registered view's compiled plan, and the operator state of
+//! the views this process runs. Epoch execution lives in `exec`, per-key
 //! hydration in `hydrate`, the dependency map in `meta`.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
@@ -11,11 +11,11 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::query::compiler::{self, CompileOutput, ViewMeta};
+use crate::query::compiler::{self, CompileOutput};
 use crate::query::vm;
-use gnitz_store::relation::{CircuitState, Cut, Relation, RelationRegistry, StateLayout};
+use gnitz_store::relation::{CircuitState, Cut, RelationRegistry};
 use gnitz_zset::algebra::Placement;
-use gnitz_zset::algebra::{self, ScatterPlan};
+use gnitz_zset::algebra::{self, ScatterPlan, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -48,16 +48,11 @@ pub(crate) trait DriveHost {
 // DagEngine
 // ---------------------------------------------------------------------------
 
-/// One view's compiled plan and the operator state it runs over.
-struct ViewPlan {
-    code: CompileOutput,
-    state: CircuitState,
-}
-
-/// One registered view: its routing metadata, and its plan once compiled.
+/// One registered view: its compiled plan, and the operator state the plan runs over.
 struct RegisteredView {
-    meta: ViewMeta,
-    plan: Option<ViewPlan>,
+    code: CompileOutput,
+    /// Opened by the first epoch this process runs of the view.
+    state: Option<CircuitState>,
     /// The user view whose chain holds this view: its owner, or itself.
     chain: u64,
 }
@@ -65,8 +60,7 @@ struct RegisteredView {
 #[derive(Default)]
 pub(crate) struct DagEngine {
     dep: DepMap,
-    /// Every registered view, from its registration to its drop. `plan` is `None`
-    /// until its first compile.
+    /// Every registered view, from its registration to its drop.
     views: FxHashMap<u64, RegisteredView>,
     /// Views the boot verdict rejected, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
@@ -75,25 +69,27 @@ pub(crate) struct DagEngine {
 impl DagEngine {
     // ── Registration ────────────────────────────────────────────────────
 
-    /// Derive `view_id`'s routing metadata and link it to its sources, both kept until
-    /// [`Self::forget`], and answer the placement its store registers under.
-    /// `owner`: the user view whose chain it is a segment of, `None` for a user view.
+    /// Compile `circuit` as `view_id`'s plan and link the view to its sources, both
+    /// kept until [`Self::forget`], and answer the placement its store registers
+    /// under. `owner`: the user view whose chain it is a segment of, `None` for a
+    /// user view.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
         view_id: u64,
         view: &SchemaDescriptor,
+        bounded: bool,
         owner: Option<u64>,
+        circuit: &gnitz_wire::Circuit,
     ) -> Result<Placement, String> {
-        let loaded = compiler::load_circuit(registry, view_id)?;
         // Tick scheduling and backfill take ascending id order as dependency order.
-        if let Some(src) = loaded.sources().find(|&s| s >= view_id) {
+        if let Some(src) = circuit.sources().find(|&s| s >= view_id) {
             return Err(format!("scans relation {src}, which is not older than it"));
         }
-        let (meta, placement) = ViewMeta::derive(&loaded, registry, view)?;
-        self.dep.link(view_id, loaded.sources());
+        let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
+        self.dep.link(view_id, circuit.sources());
         let chain = owner.unwrap_or(view_id);
-        self.views.insert(view_id, RegisteredView { meta, plan: None, chain });
+        self.views.insert(view_id, RegisteredView { code, state: None, chain });
         Ok(placement)
     }
 
@@ -102,7 +98,7 @@ impl DagEngine {
     fn passes_through(&self, id: u64) -> bool {
         self.views
             .get(&id)
-            .is_some_and(|v| v.chain != id && v.plan.as_ref().is_some_and(|p| !p.code.vm.reads_view_store()))
+            .is_some_and(|v| v.chain != id && !v.code.vm.reads_view_store())
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
@@ -134,34 +130,13 @@ impl DagEngine {
         std::mem::take(&mut self.rebuild)
     }
 
-    // ── Compilation ─────────────────────────────────────────────────────
+    // ── Operator state ──────────────────────────────────────────────────
 
-    /// The routing metadata derived when `view_id` registered. `Err` for an id
-    /// that is not a registered view.
-    fn view_meta(&self, view_id: u64) -> Result<&ViewMeta, String> {
-        self.views
-            .get(&view_id)
-            .map(|v| &v.meta)
-            .ok_or_else(|| unregistered(view_id))
-    }
-
-    /// Whether registered view `view_id`'s circuit compiles. Keeps and opens
-    /// nothing, so the master can ask before a DDL is durable.
-    pub(crate) fn preflight_compile(&self, registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
-        let meta = self.view_meta(view_id)?;
-        compile(registry, registry.relation_or_err(view_id)?, meta).map(drop)
-    }
-
-    /// `view_id`'s plan, if it is registered and compiled.
-    fn plan_mut(&mut self, view_id: u64) -> Option<&mut ViewPlan> {
-        self.views.get_mut(&view_id).and_then(|v| v.plan.as_mut())
-    }
-
-    /// Every compiled view's operator state, by view id.
+    /// Every opened view's operator state, by view id.
     pub(crate) fn ephemeral_states(&mut self) -> impl Iterator<Item = (u64, &mut CircuitState)> {
         self.views
             .iter_mut()
-            .filter_map(|(&id, v)| Some((id, &mut v.plan.as_mut()?.state)))
+            .filter_map(|(&id, v)| Some((id, v.state.as_mut()?)))
     }
 }
 
@@ -169,42 +144,18 @@ fn unregistered(view_id: u64) -> String {
     format!("view {view_id} is not registered")
 }
 
-/// Load and compile `view`'s circuit under the routing derived when it registered.
-/// Opens nothing.
-fn compile(
-    registry: &RelationRegistry,
-    view: &Relation,
-    meta: &ViewMeta,
-) -> Result<(CompileOutput, StateLayout), String> {
-    let loaded = compiler::load_circuit(registry, view.id())?;
-    compiler::compile_view(
-        &loaded,
-        registry,
-        view.id(),
-        &view.schema(),
-        meta,
-        view.kind().is_bounded(),
-    )
-}
-
-/// This view's compiled plan, compiling and opening its operator state on a
-/// miss.
-fn ensure_compiled<'a>(
+/// `view_id`'s plan and its operator state, opened on a miss.
+fn opened<'a>(
     views: &'a mut FxHashMap<u64, RegisteredView>,
     registry: &RelationRegistry,
     view_id: u64,
-) -> Result<&'a mut ViewPlan, String> {
-    let RegisteredView { meta, plan, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
-    if plan.is_none() {
-        let view = registry.relation_or_err(view_id)?;
-        let (code, layout) = compile(registry, view, meta)
-            .map_err(|e| format!("view_id={view_id} does not compile from its durable circuit: {e}"))?;
-        let state = CircuitState::open(registry, view_id, layout)
-            .map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?;
-        gnitz_debug!("dag: compiled view_id={}", view_id);
-        *plan = Some(ViewPlan { code, state });
+) -> Result<(&'a mut CompileOutput, &'a mut CircuitState), String> {
+    let RegisteredView { code, state, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
+    if state.is_none() {
+        let open = CircuitState::open(registry, view_id, &code.layout);
+        *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
     }
-    Ok(plan.as_mut().expect("filled above"))
+    Ok((code, state.as_mut().expect("opened above")))
 }
 
 #[cfg(test)]

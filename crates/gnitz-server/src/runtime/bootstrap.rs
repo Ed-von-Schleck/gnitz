@@ -359,8 +359,8 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, ready: AckLease, liv
 
     inject_recovery_panic("reset");
 
-    // Every scanned base, tail or none: the tick also compiles each kept view,
-    // and the boot checkpoint publishes no trace of an uncompiled one.
+    // Every scanned base, tail or none: the tick also opens each kept view's
+    // operator state, and the boot checkpoint publishes no trace of an unopened one.
     let scanned = {
         let cat = disp.cat();
         cat.dag.scanned_base_tables(&cat.registry)

@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots};
-use gnitz_wire::{Circuit, ComputeMap, JoinKind, KeyRange, NullKeys, PkColList, RangeRel, ReindexRole, TypeCode};
+use gnitz_wire::{Circuit, ComputeMap, JoinKind, NullKeys, RangeRel, ReindexRole, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
@@ -14,7 +14,7 @@ fn sources<S: Into<Source>>(rows: impl IntoIterator<Item = (u64, S)>) -> Relatio
 
 /// `derive`'s routing metadata, placed as a one-column-PK view.
 fn derive(c: Circuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
-    routing(&loaded(c), registry)
+    routing(&c, registry)
 }
 
 /// A U64 PK and five I64 payload columns: every key a fixture names is payload.
@@ -76,10 +76,8 @@ fn aux_reindex(c: &mut Circuit, input: NodeId, key: &[gnitz_wire::ReindexSlot]) 
 
 /// `relay` is keyed and splits rows by the join key over `cols` of `schema`: it
 /// sends every row of a probe whose columns all differ where that key does.
-fn assert_routes_by(relay: Option<&Relay>, schema: &SchemaDescriptor, cols: &[u32]) {
-    let Some(Relay::Round(got) | Relay::Share(got)) = relay else {
-        panic!("a keyed relay");
-    };
+fn assert_routes_by(relay: Option<&Rc<ScatterPlan>>, schema: &SchemaDescriptor, cols: &[u32]) {
+    let got = relay.expect("a keyed relay");
     let mut bb = BatchBuilder::new(schema);
     for i in 0..64u64 {
         bb.begin_row(i as u128, 1);
@@ -237,8 +235,10 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         let tip = mid(&mut c, source);
         let shard = c.shard(tip);
         let scatter = ScatterPlan::group(&at_shard, cols).expect(why);
+        let registry = sources([(7, schema), (8, schema)]);
+        let meta = derive(c.clone(), &registry).expect(why);
         assert_eq!(
-            skips_output_exchange(&loaded(c), shard, &scatter, &sources([(7, schema)])),
+            skips_output_exchange(&c, shard, &scatter, &meta, &registry),
             want,
             "{why}"
         );
@@ -270,7 +270,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
 /// share no key, so a partitioned source is broadcast.
 #[test]
 fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
-    use Route::{Broadcast, Round, Stays};
+    use Route::{Broadcast, Keyed, Stays};
     let base = Source::from(make_schema_u64_i64());
     let replicated = base.placed(Placement::Replicated);
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
@@ -301,9 +301,9 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
             &[1, 0],
             plain,
             [compound; 2],
-            [Round, Round],
+            [Keyed, Keyed],
         ),
-        ("a payload key", JoinKind::Equi, &[1], plain, [base; 2], [Round, Round]),
+        ("a payload key", JoinKind::Equi, &[1], plain, [base; 2], [Keyed, Keyed]),
         (
             "a replicated partner: the partitioned side joins its full local copy",
             JoinKind::Equi,
@@ -326,7 +326,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
             &[1],
             [false, true],
             [replicated, base],
-            [Stays, Round],
+            [Stays, Keyed],
         ),
         (
             "a replicated side clamps its whole copy on every worker",
@@ -350,7 +350,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
             &[0, 1],
             plain,
             [compound; 2],
-            [Round, Round],
+            [Keyed, Keyed],
         ),
         (
             "a band join beside a replicated partner",
@@ -428,7 +428,7 @@ fn a_self_contained_view_keeps_no_route_and_still_validates_its_keys() {
 
     let meta = derive(joined(&on_payload), &sources([(7, base), (9, base)])).unwrap();
     assert!(!meta.self_contained);
-    assert_eq!(routes(&meta), [Route::Round, Route::Round]);
+    assert_eq!(routes(&meta), [Route::Keyed, Route::Keyed]);
 }
 
 /// A source is routed by the slots it states: a range join's sides state its
@@ -463,7 +463,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let meta = derive(c, &ext).unwrap();
     assert_eq!(
         [7, 9].map(|tid| route(meta.source_route(tid))),
-        [Route::Share, Route::Round]
+        [Route::Keyed, Route::Keyed]
     );
 }
 
@@ -484,7 +484,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
     let routes = |meta: &ViewMeta| [7, 9].map(|tid| route(meta.source_route(tid)));
 
     let meta = trimmed(JoinKind::Equi, &[1], [base, replicated]);
-    assert_eq!(routes(&meta), [Route::Round, Route::Stays]);
+    assert_eq!(routes(&meta), [Route::Keyed, Route::Stays]);
     assert_routes_by(meta.source_route(7), &base.schema, &[1]);
 
     let meta = trimmed(range(), &[0], [base, base]);
@@ -497,7 +497,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
     let meta = trimmed(range(), &[0], [replicated, base]);
     assert_eq!(
         routes(&meta),
-        [Route::Share, Route::Broadcast],
+        [Route::Keyed, Route::Broadcast],
         "a replicated copy is kept by key where it stands"
     );
     assert_routes_by(meta.source_route(7), &replicated.schema, &[0]);
@@ -733,33 +733,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     for (why, build, [a, b], pk_arity, want) in cases {
         let mut c = Circuit::default();
         build(&mut c);
-        let (_, placement) = ViewMeta::derive(&loaded(c), &sources([(7, a), (9, b)]), &view(pk_arity)).unwrap();
+        let (_, placement) = ViewMeta::derive(&c, &sources([(7, a), (9, b)]), &view(pk_arity)).unwrap();
         assert_eq!(placement, want, "{why}");
     }
-}
-
-// ── Backfill bounds ─────────────────────────────────────────────────────
-
-/// A backfill bound survives per source scanned once; a source scanned twice
-/// shares one backfill cursor, so it keeps none even where one scan is bounded.
-#[test]
-fn a_source_scanned_once_keeps_its_backfill_bound() {
-    let bound = |col: u32| ReadBound::Range(KeyRange::point(PkColList::from_slice(&[col]), &[], 0));
-    let bounds_of = |scans: [(u64, ReadBound); 2]| {
-        let mut c = Circuit::default();
-        let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));
-        c.union(a, b);
-        let meta = derive(c, &sources([(10, wide_schema()), (11, wide_schema())])).unwrap();
-        scans.map(|(source, _)| meta.source_bound(source))
-    };
-    assert_eq!(
-        bounds_of([(10, bound(2)), (11, ReadBound::None)]),
-        [bound(2), ReadBound::None],
-        "each source scanned once keeps its own"
-    );
-    assert_eq!(
-        bounds_of([(10, bound(2)), (10, ReadBound::None)]),
-        [ReadBound::None, ReadBound::None],
-        "a source scanned twice has none"
-    );
 }

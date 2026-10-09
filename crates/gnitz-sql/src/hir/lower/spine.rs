@@ -37,9 +37,9 @@ pub(crate) enum Top {
     Slots,
 }
 
-/// Where an opened input's columns come from in the relation the master
-/// scatters: the source, the source column behind each surviving column, and the
-/// source PK, which the levels carry verbatim at the front of the key region.
+/// Where an opened input's columns come from in the scanned relation: the
+/// source, the source column behind each surviving column, and the source PK,
+/// which the levels carry verbatim at the front of the key region.
 pub(crate) struct SourceOrigin {
     pub(super) src: SegSource,
     /// Keyed by the id a column carries above the fused levels; a computed

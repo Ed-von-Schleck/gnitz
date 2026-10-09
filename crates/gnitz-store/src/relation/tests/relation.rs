@@ -319,14 +319,14 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     {
         let mut origin = solo(tmp.path());
         origin.register(spec).unwrap();
-        let mut state = CircuitState::open(&origin, 7, layout()).unwrap();
+        let mut state = CircuitState::open(&origin, 7, &layout()).unwrap();
         origin.checkpoint_ephemeral([(7, &mut state)], 0, |_| true).unwrap();
     }
     let reopen = || {
         let mut r = solo(tmp.path());
         r.reopen_view(spec, 0).map(|()| r)
     };
-    let trace = |r: &RelationRegistry| CircuitState::open(r, 7, layout()).map(drop);
+    let trace = |r: &RelationRegistry| CircuitState::open(r, 7, &layout()).map(drop);
     let worker = |resume: bool| {
         let mut master = RelationRegistry::master(base, 1, StoreConfig::default());
         master.register(spec).unwrap();

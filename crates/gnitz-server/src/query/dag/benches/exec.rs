@@ -10,6 +10,7 @@
 use super::tests::{delta_for, drive, engine_with_base, engine_with_views, tick_over, view_cols};
 use super::*;
 use crate::test_support::{net_weight, register_identity_view};
+use gnitz_store::relation::Relation;
 
 /// Timed ticks per cell of the closure, with one row and with none.
 const TICKS: u64 = 10_000;
@@ -28,7 +29,7 @@ fn drive_tick_bench() {
 
     let (mut engine, base, views) = engine_with_views("tick_bench_closure");
     let steps = engine.dag.tick_schedule(base).len() as u64;
-    // Compiles every plan outside the measurement.
+    // Opens every view's operator state outside the measurement.
     tick_over(&mut engine, base, None);
     let deltas: Vec<Batch> = (0..TICKS)
         .map(|i| delta_for(&engine, base, &[(i, 1, i as i64)]))

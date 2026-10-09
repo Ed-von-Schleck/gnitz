@@ -11,7 +11,7 @@ use gnitz_wire::AggFunc;
 /// The baked per-instruction circuit reduce plan.
 pub struct ReducePlan {
     pub(super) shape: ReduceShape,
-    /// This worker publishes the global-aggregate ground row.
+    /// The reduce owes the global-aggregate ground row: one row over an empty input.
     pub seeds_ground: bool,
     /// Position of the aggregate holding a group's net row count.
     pub(super) cardinality: usize,

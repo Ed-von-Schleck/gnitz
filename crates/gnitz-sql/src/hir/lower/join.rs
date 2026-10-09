@@ -179,7 +179,7 @@ pub(super) struct JoinSide {
 
 impl JoinSide {
     /// `key`, this side's reindex key in its own emitted layout, restated over
-    /// the relation the master scatters.
+    /// the scanned relation.
     pub(super) fn scatter_key(
         &self,
         key: &[gnitz_wire::ReindexSlot],

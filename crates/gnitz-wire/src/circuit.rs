@@ -613,6 +613,38 @@ impl Circuit {
         })
     }
 
+    /// The node whose rows are the circuit's. Panics on a circuit of no nodes, which
+    /// [`Self::decode`] refuses.
+    pub fn out(&self) -> NodeId {
+        self.nodes.len() - 1
+    }
+
+    pub fn op(&self, nid: NodeId) -> &OpNode {
+        &self.nodes[nid].op
+    }
+
+    /// `nid`'s producers, in slot order.
+    pub fn inputs(&self, nid: NodeId) -> &[NodeId] {
+        self.nodes[nid].inputs()
+    }
+
+    /// Every operator, in topological order.
+    pub fn ops(&self) -> impl Iterator<Item = (NodeId, &OpNode)> {
+        self.nodes.iter().map(|n| &n.op).enumerate()
+    }
+
+    /// Every node reading `nid`, in topological order.
+    pub fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        (nid + 1..self.nodes.len()).filter(move |&n| self.inputs(n).contains(&nid))
+    }
+
+    /// `nid` is a reduce that owes a row over an empty input: one over no group
+    /// columns reading an `ExchangeShard`.
+    pub fn owes_ground_row(&self, nid: NodeId) -> bool {
+        matches!(self.op(nid), OpNode::Reduce { group_cols, .. } if group_cols.is_empty())
+            && matches!(self.op(self.inputs(nid)[0]), OpNode::ExchangeShard)
+    }
+
     /// Every relation the circuit scans, once per scan.
     pub fn sources(&self) -> impl Iterator<Item = u64> + '_ {
         self.nodes.iter().filter_map(|n| match n.op {

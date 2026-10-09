@@ -36,7 +36,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
 
     if delta.count == 0 {
         // An empty source delivers only empty deltas, so the ground row is minted
-        // here, by a worker `seeds_ground` names, and only while no V₀ row is stored.
+        // here, by a reduce that owes one, and only while no V₀ row is stored.
         if plan.seeds_ground {
             let v0 = ground_pk();
             if !trace_out(v0.bytes(), v0.bytes()).seek_pk_group_ascending(v0.bytes()) {

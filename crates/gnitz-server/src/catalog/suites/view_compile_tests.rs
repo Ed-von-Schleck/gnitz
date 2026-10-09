@@ -1,13 +1,9 @@
-//! The master-side `CREATE VIEW` pre-flight compile, and the one-bundle
-//! replacement it protects.
+//! The compile a `CREATE VIEW` runs on the master, and the one-bundle replacement
+//! it protects.
 //!
-//! Without the pre-flight, a view whose circuit the engine cannot compile is
-//! still created, still resolvable, and returns no rows forever — the same
-//! observable as a correct view over a source matching nothing. The verdict is
-//! unreportable from the workers, where the first compile would otherwise
-//! happen: that is inside the backfill, after the DDL is durable and every
-//! worker has applied it. Compiling on the master inside the DDL is what makes
-//! it a client-visible error.
+//! A view's register hook compiles its circuit, and the master fires that hook
+//! inside the DDL, while the bundle is still undoable: a circuit the engine
+//! cannot compile is a client-visible error, and no view is created.
 
 use super::*;
 
@@ -41,21 +37,21 @@ fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [
     view_blocks([(vid, &filtered_circuit(base_tid, pred), &view_cols()[..])], views)
 }
 
-// ── The pre-flight verdict ──────────────────────────────────────────────────
+// ── The compile verdict ─────────────────────────────────────────────────────
 
 /// A circuit the engine cannot compile must come back as an error while the DDL
 /// is still undoable, and a compilable one must come back clean.
 #[test]
-fn test_preflight_compile_verdict() {
-    let dir = temp_dir("preflight_verdict");
+fn test_compile_verdict() {
+    let dir = temp_dir("view_compile_verdict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
     let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
-    let ok_vid = try_register_filtered_view(&mut engine, base_tid, "vok", &pred)
-        .expect("a well-formed circuit must pass the pre-flight");
+    let ok_vid =
+        try_register_filtered_view(&mut engine, base_tid, "vok", &pred).expect("a well-formed circuit compiles");
     assert!(engine.registry.has_id(ok_vid));
 
     // A predicate blob the expression decoder refuses — only a corrupt circuit
@@ -63,7 +59,7 @@ fn test_preflight_compile_verdict() {
     // decoder's own.
     let bad_vid = engine.next_id;
     let msg = try_register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF])
-        .expect_err("an undecodable predicate must fail the pre-flight");
+        .expect_err("an undecodable predicate fails the compile");
     assert!(
         msg.contains("expr blob"),
         "the rejection must be the decoder's, got: {msg}"
@@ -79,7 +75,7 @@ fn test_preflight_compile_verdict() {
 /// durable.
 #[test]
 fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
-    let dir = temp_dir("preflight_routing");
+    let dir = temp_dir("view_compile_routing");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
@@ -103,12 +99,13 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A view bundle whose circuit cell does not decode, and one whose circuit the
-/// register hook cannot route, are each refused at the view's row and undone:
-/// no view, no circuit row, and nothing depending on the source.
+/// A view bundle whose circuit cell does not decode, one whose circuit the
+/// register hook cannot route, and one holding no circuit row for its view are
+/// each refused at the view's row and undone: no view, no circuit row, and
+/// nothing depending on the source.
 #[test]
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
-    let dir = temp_dir("preflight_unusable_circuit");
+    let dir = temp_dir("view_compile_unusable_circuit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
@@ -121,10 +118,12 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
         let circuit = equi_join_circuit(base, other, TypeCode::I64, [false, true]);
         crate::test_support::circuit_batch(vid, &circuit)
     };
+    let absent = |_: u64| BatchBuilder::new(SysFamily::Circuit.schema()).finish();
     type Rows<'a> = &'a dyn Fn(u64) -> Batch;
-    let cases: [(Rows, &str); 2] = [
+    let cases: [(Rows, &str); 3] = [
         (&undecodable, "circuit: truncated"),
         (&unroutable, "feeds a join and states no scatter key"),
+        (&absent, "has no circuit row"),
     ];
     for (rows, want) in cases {
         let vid = engine.allocate_ids(1).unwrap();
@@ -154,7 +153,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
 /// refused bundle leaves neither view an edge.
 #[test]
 fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
-    let dir = temp_dir("preflight_bounded_in_bundle");
+    let dir = temp_dir("view_compile_bounded_in_bundle");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
@@ -194,7 +193,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
 /// collision; one it does not retire still is.
 #[test]
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
-    let dir = temp_dir("preflight_qname");
+    let dir = temp_dir("view_compile_qname");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
@@ -236,7 +235,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 /// rollback must restore the incumbent and retire the replacement.
 #[test]
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
-    let dir = temp_dir("preflight_rollback");
+    let dir = temp_dir("view_compile_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();

@@ -3,13 +3,38 @@
 use super::*;
 use std::collections::hash_map::Entry;
 
-/// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
-/// is the sort order, and sorting puts a view after every view it reads, because
-/// ids ascend along scan edges.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// One edge of a tick's schedule: `producer`'s output feeds `view`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Step {
     pub(super) view: u64,
     pub(super) producer: u64,
+    /// No later step reads `producer`'s output.
+    pub(super) last: bool,
+    /// A later step reads `view`'s output.
+    pub(super) needed: bool,
+}
+
+/// `edges`, each `(view, producer)`, as one schedule. Sorting puts a view after every
+/// view it reads, because ids ascend along scan edges.
+pub(super) fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
+    edges.sort_unstable();
+    let mut steps: Vec<Step> = edges
+        .into_iter()
+        .map(|(view, producer)| Step {
+            view,
+            producer,
+            last: false,
+            needed: false,
+        })
+        .collect();
+    let mut read: FxHashSet<u64> = FxHashSet::default();
+    for step in steps.iter_mut().rev() {
+        step.last = read.insert(step.producer);
+    }
+    for step in steps.iter_mut() {
+        step.needed = read.contains(&step.view);
+    }
+    steps.into()
 }
 
 /// The bidirectional view-dependency index, kept current by every view registration
@@ -58,14 +83,13 @@ impl DepMap {
             return Rc::clone(steps);
         }
         let producers = std::iter::once(source).chain(Self::closure(&self.forward, [source]));
-        let mut steps: Vec<Step> = producers
+        let edges = producers
             .flat_map(|producer| {
                 let views = self.forward.get(&producer).into_iter().flatten();
-                views.map(move |&view| Step { view, producer })
+                views.map(move |&view| (view, producer))
             })
             .collect();
-        steps.sort_unstable();
-        let steps: Rc<[Step]> = steps.into();
+        let steps = schedule(edges);
         self.tick_steps.insert(source, Rc::clone(&steps));
         steps
     }

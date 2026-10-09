@@ -20,7 +20,7 @@ mod source_cursor_tests;
 mod stream_tests;
 mod sys_retraction_tests;
 mod uuid_tests;
-mod view_preflight_tests;
+mod view_compile_tests;
 #[path = "benches/view_tick.rs"]
 mod view_tick_bench;
 mod wide_pk_validation;

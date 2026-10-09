@@ -69,7 +69,7 @@ impl TestPlan {
             })
             .unwrap();
         TestVm {
-            state: CircuitState::open(&registry, VIEW_ID, self.layout).unwrap(),
+            state: CircuitState::open(&registry, VIEW_ID, &self.layout).unwrap(),
             vm: self.prog.finish(out),
             registry,
             unfed: Vec::new(),
@@ -100,10 +100,11 @@ impl TestVm {
         (&mut self.vm, stores)
     }
 
-    /// One tick's epoch over `seed`, taken, of a program that runs no round.
-    pub(super) fn epoch(&mut self, reg: DeltaReg, mut seed: Batch) -> Batch {
+    /// One tick's epoch over `seed`, taken, of a program that runs no round,
+    /// minting the ground row iff `ground`.
+    pub(super) fn epoch(&mut self, reg: DeltaReg, mut seed: Batch, ground: bool) -> Batch {
         let (vm, mut stores) = self.parts();
-        let mut epoch = Epoch::tick(reg, &mut seed, true);
+        let mut epoch = Epoch::tick(reg, &mut seed, true, ground);
         match run(vm, &mut stores, &mut epoch, None).unwrap() {
             Ran::Done(out) => out,
             Ran::Round { .. } => panic!("the program stands at a round"),
@@ -120,7 +121,7 @@ impl TestVm {
         mut gather: impl FnMut(&Batch, bool) -> Batch,
     ) -> Batch {
         let (vm, mut stores) = self.parts();
-        let mut epoch = Epoch::tick(reg, seed, take);
+        let mut epoch = Epoch::tick(reg, seed, take, false);
         let mut gathered = None;
         loop {
             match run(vm, &mut stores, &mut epoch, gathered.take()).unwrap() {

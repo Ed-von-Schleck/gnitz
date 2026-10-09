@@ -455,8 +455,8 @@ fn push_refuses_an_arity_mismatch_and_a_forward_input() {
         "an input naming an earlier node is accepted"
     );
     assert_eq!(c.nodes().len(), 2, "a refused push appends nothing");
-    assert_eq!(c.nodes()[1].inputs(), [scan]);
-    assert_eq!(c.nodes()[0].inputs(), [] as [NodeId; 0]);
+    assert_eq!(c.inputs(1), [scan]);
+    assert_eq!(c.inputs(0), [] as [NodeId; 0]);
 
     // Slot 1 is filled solely by a binary operator.
     let reduce = OpNode::Reduce {
@@ -490,7 +490,7 @@ fn sources_are_the_scans_sources() {
 /// what a group-less one owes its ground row by.
 #[test]
 fn the_reduce_builders_differ_in_the_exchange() {
-    let exchanged = |c: &Circuit, id: NodeId| matches!(c.nodes()[c.nodes()[id].inputs()[0]].op, OpNode::ExchangeShard);
+    let exchanged = |c: &Circuit, id: NodeId| matches!(c.op(c.inputs(id)[0]), OpNode::ExchangeShard);
     let mut c = Circuit::default();
     let input = c.input_delta(7, crate::ReadBound::None);
     let aggs = [AggDescriptor::COUNT_STAR];

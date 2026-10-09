@@ -47,16 +47,16 @@ pub struct CircuitState {
 impl CircuitState {
     /// Open every child `layout` declares, in registered view `view_id`'s
     /// directory at this registry's rank.
-    pub fn open(reg: &RelationRegistry, view_id: u64, layout: StateLayout) -> Result<Self, String> {
+    pub fn open(reg: &RelationRegistry, view_id: u64, layout: &StateLayout) -> Result<Self, String> {
         let view = reg.relation_or_err(view_id)?;
         // The traces resume from the generation the output they feed resumed from.
         let recovery = RecoverySource::Rederive { resume_at: view.table().loaded_mark() };
         let tables = layout
             .children
-            .into_iter()
+            .iter()
             .map(|(child, schema)| {
                 // Unbounded: a bounded view's hydration reads these traces back.
-                reg.open_child_as(view_id, ChildKind::Scratch(&child), schema, recovery, None)
+                reg.open_child_as(view_id, ChildKind::Scratch(child), *schema, recovery, None)
             })
             .collect::<Result<_, _>>()?;
         Ok(CircuitState { tables })

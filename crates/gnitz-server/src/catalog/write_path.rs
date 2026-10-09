@@ -116,11 +116,10 @@ impl CatalogEngine {
             .try_for_each(|g| self.apply_family(g.family, g.batch.negated(), false))
     }
 
-    /// The cross-family guards, each family through [`Self::submit`], then a
-    /// compile of every view the bundle creates. A bundle that creates is applied
-    /// in [`SysFamily::ALL`] order, so every register hook finds the families it
-    /// reads applied; one that only drops in the reverse, so a dependent is
-    /// retired first. On `Err`, `zone` holds what was applied.
+    /// The cross-family guards, then each family through [`Self::submit`]. A bundle
+    /// that creates is applied in [`SysFamily::ALL`] order, so every register hook
+    /// finds the families it reads applied; one that only drops in the reverse, so
+    /// a dependent is retired first. On `Err`, `zone` holds what was applied.
     fn apply_families(
         &mut self,
         families: [Option<Batch>; SysFamily::COUNT],
@@ -141,11 +140,6 @@ impl CatalogEngine {
         }
         for (family, batch) in ordered {
             self.submit(family, batch, zone)?;
-        }
-        // On the master, while the bundle is still undoable: a worker's compile verdict
-        // comes after the DDL is durable.
-        for &vid in &new_views {
-            self.dag.preflight_compile(&self.registry, vid)?;
         }
         Ok(())
     }

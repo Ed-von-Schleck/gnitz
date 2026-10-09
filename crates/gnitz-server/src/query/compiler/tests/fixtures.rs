@@ -1,53 +1,30 @@
 //! Compiler test fixtures: the relation registry a circuit compiles against and
 //! the few helpers every test file shares. A child of `compiler`, so it reaches
-//! `LoadedCircuit`'s private items.
+//! its private items.
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::Circuit;
 use gnitz_zset::algebra::{Placement, Slot};
 
-pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
-    assert!(!circuit.nodes().is_empty(), "a decoded circuit has an output");
-    LoadedCircuit(circuit)
-}
-
-/// `loaded`'s routing. A view's schema decides only which key its placement
+/// `circuit`'s routing. A view's schema decides only which key its placement
 /// names, which no route reads.
-pub(super) fn routing(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
+pub(super) fn routing(circuit: &Circuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
     let view = crate::test_support::make_schema_u64_i64();
-    ViewMeta::derive(loaded, registry, &view).map(|(meta, _)| meta)
+    ViewMeta::derive(circuit, registry, &view).map(|(meta, _)| meta)
 }
 
 /// The id the compiled circuit's view goes by.
 pub(super) const VIEW: u64 = 99;
 
-/// `circuit` compiled into a view of schema `view`, under the routing derived
-/// from it.
+/// `circuit` compiled into a view of schema `view`.
 pub(super) fn compile(
     circuit: Circuit,
     registry: &RelationRegistry,
     view: &SchemaDescriptor,
     bounded: bool,
-) -> Result<(CompileOutput, StateLayout), String> {
-    let loaded = loaded(circuit);
-    let (meta, _) = ViewMeta::derive(&loaded, registry, view)?;
-    compile_view(&loaded, registry, VIEW, view, &meta, bounded)
-}
-
-/// `loaded` emitted whole; `store`: its output node's rows are the view store's.
-pub(super) fn whole<'a>(
-    loaded: &'a LoadedCircuit,
-    registry: &'a RelationRegistry,
-    meta: &'a ViewMeta,
-    store: bool,
-) -> Result<EmitCtx<'a>, String> {
-    let mut ctx = EmitCtx::new(loaded, registry, meta, store.then_some(VIEW));
-    for (nid, op) in loaded.ops() {
-        let reg = emit_node(&mut ctx, nid, op)?;
-        ctx.regs.push(reg);
-    }
-    Ok(ctx)
+) -> Result<CompileOutput, String> {
+    compile_view(&circuit, registry, VIEW, view, bounded).map(|(out, _)| out)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].
@@ -117,21 +94,19 @@ pub(super) fn sources<S: Into<Source>>(rows: impl IntoIterator<Item = (u64, S)>)
     sources_at(Slot::SOLO, rows)
 }
 
-/// A [`Relay`] without its key, `Stays` for none: the routing decision a test
-/// compares.
+/// A source's route without its key, `Stays` for none: the routing decision a
+/// test compares.
 #[derive(Debug, PartialEq)]
 pub(super) enum Route {
     Stays,
     Broadcast,
-    Round,
-    Share,
+    Keyed,
 }
 
-pub(super) fn route(relay: Option<&Relay>) -> Route {
-    match relay {
+pub(super) fn route(plan: Option<&Rc<ScatterPlan>>) -> Route {
+    match plan {
         None => Route::Stays,
-        Some(Relay::Round(plan)) if plan.is_broadcast() => Route::Broadcast,
-        Some(Relay::Round(_)) => Route::Round,
-        Some(Relay::Share(_)) => Route::Share,
+        Some(plan) if plan.is_broadcast() => Route::Broadcast,
+        Some(_) => Route::Keyed,
     }
 }

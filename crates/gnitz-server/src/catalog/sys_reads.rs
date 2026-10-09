@@ -62,6 +62,14 @@ impl CatalogEngine {
         self.sys_relation(family).live_row_at(&sys_key(id)).1
     }
 
+    /// View `id`'s circuit, decoded from its `circuits` row.
+    pub(in crate::catalog) fn read_circuit(&self, id: u64) -> Result<gnitz_wire::Circuit, String> {
+        let row = self.live_sys_row(SysFamily::Circuit, id).ok_or("has no circuit row")?;
+        let (src, ri) = row.source();
+        let Ok(stored) = gnitz_wire::sys_rows::CircuitRow::read(src, ri);
+        gnitz_wire::Circuit::decode(stored.circuit)
+    }
+
     /// Visit every live row of `family` whose leading key column is `leading`: the
     /// row itself for a single-column key, the owner's whole band for a pair.
     pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: u64, f: impl FnMut(&ReadCursor)) {

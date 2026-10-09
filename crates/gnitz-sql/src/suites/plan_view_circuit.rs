@@ -55,14 +55,14 @@ impl Node {
         TopN,
     ];
 
-    fn matches(self, circuit: &Circuit, node: &gnitz_wire::Node) -> bool {
-        let op = &node.op;
+    fn matches(self, circuit: &Circuit, nid: gnitz_wire::NodeId) -> bool {
+        let op = circuit.op(nid);
         match self {
             EquiJoin => matches!(op, OpNode::Join { kind: JoinKind::Equi, .. }),
             RangeJoin => matches!(op, OpNode::Join { kind: JoinKind::Range { .. }, .. }),
             CrossJoin => matches!(op, OpNode::Join { kind: JoinKind::Cross, .. }),
             Reduce => matches!(op, OpNode::Reduce { .. }),
-            GlobalGround => owes_ground(circuit, node),
+            GlobalGround => circuit.owes_ground_row(nid),
             Distinct => matches!(op, OpNode::WeightClamp(ClampKind::Distinct)),
             PositivePart => matches!(op, OpNode::WeightClamp(ClampKind::PositivePart)),
             WorkerFilter => matches!(op, OpNode::WorkerFilter),
@@ -87,21 +87,13 @@ fn cat() -> TestCatalog {
     cat
 }
 
-/// A reduce over no group columns behind an exchange: the one that owes a row
-/// over an empty input.
-fn owes_ground(circuit: &Circuit, node: &gnitz_wire::Node) -> bool {
-    matches!(&node.op, OpNode::Reduce { group_cols, .. } if group_cols.is_empty())
-        && matches!(circuit.nodes()[node.inputs()[0]].op, OpNode::ExchangeShard)
-}
-
 /// How many nodes of every segment are a `kind`.
 fn total(chain: &PlannedChain, kind: Node) -> usize {
     all_views(chain)
         .map(|pv| {
             pv.circuit
-                .nodes()
-                .iter()
-                .filter(|n| kind.matches(&pv.circuit, n))
+                .ops()
+                .filter(|&(nid, _)| kind.matches(&pv.circuit, nid))
                 .count()
         })
         .sum()
@@ -112,19 +104,15 @@ fn total(chain: &PlannedChain, kind: Node) -> usize {
 fn exchanges(chain: &PlannedChain) -> Vec<Option<Vec<u32>>> {
     let mut out: Vec<Option<Vec<u32>>> = all_views(chain)
         .flat_map(|pv| {
-            let nodes = pv.circuit.nodes();
-            (0..nodes.len())
-                .filter(|&at| matches!(nodes[at].op, OpNode::ExchangeShard))
-                .map(|at| {
-                    nodes
-                        .iter()
-                        .filter(|n| n.inputs().contains(&at))
-                        .find_map(|n| match &n.op {
-                            OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => {
-                                Some(group_cols.clone())
-                            }
-                            _ => None,
-                        })
+            let circuit = &pv.circuit;
+            circuit
+                .ops()
+                .filter(|(_, op)| matches!(op, OpNode::ExchangeShard))
+                .map(move |(at, _)| {
+                    circuit.readers(at).find_map(|n| match circuit.op(n) {
+                        OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => Some(group_cols.clone()),
+                        _ => None,
+                    })
                 })
         })
         .collect();
@@ -378,7 +366,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
     for &(cat, body, want) in rows {
         let chain = view(cat, body);
         let bounds: Vec<String> = all_views(&chain)
-            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
+            .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
             .filter_map(|op| match op {
                 OpNode::ScanDelta { bound, .. } => match bound {
                     ReadBound::None => None,
@@ -412,12 +400,12 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     // carries a user aggregate.
     let chain = view(&cat, BODY);
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = all_views(&chain)
-        .flat_map(|pv| pv.circuit.nodes().iter().map(|n| (&pv.circuit, n)))
-        .filter_map(|(circuit, node)| match &node.op {
+        .flat_map(|pv| pv.circuit.ops().map(|(nid, op)| (&pv.circuit, nid, op)))
+        .filter_map(|(circuit, nid, op)| match op {
             OpNode::Reduce { group_cols, agg } => Some((
                 group_cols.as_slice().to_vec(),
                 agg.iter().map(|d| d.agg_op).collect(),
-                owes_ground(circuit, node),
+                circuit.owes_ground_row(nid),
             )),
             _ => None,
         })
@@ -478,7 +466,7 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
     ] {
         let chain = view(&cat, body);
         let groups: Vec<&[u32]> = all_views(&chain)
-            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
+            .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
             .filter_map(|op| match op {
                 OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => Some(group_cols.as_slice()),
                 _ => None,
@@ -493,22 +481,21 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
 /// circuit order: each re-key walked back to the scan it reads.
 fn scatter_keys(chain: &PlannedChain) -> Vec<(u64, Vec<u32>)> {
     use gnitz_wire::{MapKind, ReindexRole};
-    let nodes = final_view(chain).circuit.nodes();
-    nodes
-        .iter()
-        .filter_map(|node| {
+    let circuit = &final_view(chain).circuit;
+    circuit
+        .ops()
+        .filter_map(|(mut at, op)| {
             let OpNode::Map(MapKind::Reindex {
                 role: ReindexRole::ScatterKey { source_cols },
                 ..
-            }) = &node.op
+            }) = op
             else {
                 return None;
             };
-            let mut at = node;
             loop {
-                match at.op {
-                    OpNode::ScanDelta { source, .. } => return Some((source, source_cols.clone())),
-                    _ => at = &nodes[at.inputs()[0]],
+                match circuit.op(at) {
+                    OpNode::ScanDelta { source, .. } => return Some((*source, source_cols.clone())),
+                    _ => at = circuit.inputs(at)[0],
                 }
             }
         })

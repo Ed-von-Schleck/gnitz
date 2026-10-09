@@ -8,11 +8,10 @@ use gnitz_wire::{Circuit, JoinKind};
 fn plan(build: Build) -> Result<Vm, String> {
     let mut c = Circuit::default();
     build(&mut c);
-    let loaded = loaded(c);
     let schema = make_schema_u64_i64();
     let registry = sources([(10, schema), (11, schema)]);
-    let meta = routing(&loaded, &registry)?;
-    whole(&loaded, &registry, &meta, false).map(|ctx| ctx.prog.finish(ctx.regs[loaded.out()]))
+    let meta = routing(&c, &registry)?;
+    EmitCtx::emit(&c, &registry, &meta, None).map(|ctx| ctx.prog.finish(ctx.regs[c.out()]))
 }
 
 /// A join's two terms each read the other side as it stood before the epoch, so
@@ -120,9 +119,8 @@ fn trace_and_children(
     let (registry, _dir) = two_tables(slot, wide);
     let mut c = Circuit::default();
     let integrand = build(&mut c);
-    let loaded = loaded(c);
-    let meta = routing(&loaded, &registry).unwrap();
-    let ctx = whole(&loaded, &registry, &meta, false).unwrap();
+    let meta = routing(&c, &registry).unwrap();
+    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
     (
         ctx.integrals[integrand].expect("a join probes the integrand"),
         ctx.layout.names().map(str::to_string).collect(),
@@ -261,11 +259,10 @@ fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
         let (registry, _dir) = two_tables(Slot::SOLO, table);
         let mut c = Circuit::default();
         build(&mut c);
-        let loaded = loaded(c);
-        let meta = routing(&loaded, &registry).unwrap();
-        let ctx = whole(&loaded, &registry, &meta, false).unwrap();
-        let view = ctx.prog.schema_of(ctx.regs[loaded.out()]);
-        let (out, _) = compile_view(&loaded, &registry, VIEW, &view, &meta, true).unwrap();
+        let meta = routing(&c, &registry).unwrap();
+        let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
+        let view = ctx.prog.schema_of(ctx.regs[c.out()]);
+        let out = compile(c, &registry, &view, true).unwrap();
         out.hydration.expect("a bounded view").seed
     };
     assert_eq!(
@@ -290,12 +287,11 @@ fn left_join_plan(key: u32) -> (Vm, Vec<String>, NodeId) {
     let a = SchemaDescriptor::new(&[nn, nn, nullable], &[0]);
     let b = SchemaDescriptor::new(&[nn, nn, nn], &[0]);
     let (c, ra) = crate::test_support::left_join_circuit(10, 11, key);
-    let loaded = loaded(c);
     let registry = sources([(10, a), (11, b)]);
-    let meta = routing(&loaded, &registry).unwrap();
-    let ctx = whole(&loaded, &registry, &meta, false).unwrap();
+    let meta = routing(&c, &registry).unwrap();
+    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
     let names = ctx.layout.names().map(str::to_string).collect();
-    (ctx.prog.finish(ctx.regs[loaded.out()]), names, ra)
+    (ctx.prog.finish(ctx.regs[c.out()]), names, ra)
 }
 
 /// A join names the node whose integral it probes, so the two joins reading the
@@ -326,10 +322,9 @@ fn children_of(tip: fn(&mut Circuit, NodeId) -> NodeId, store: bool) -> Vec<Stri
     let mut c = Circuit::default();
     let a = scan(&mut c, 10);
     tip(&mut c, a);
-    let loaded = loaded(c);
     let registry = sources([(10, make_schema_u64_i64())]);
-    let meta = routing(&loaded, &registry).unwrap();
-    let ctx = whole(&loaded, &registry, &meta, store).unwrap();
+    let meta = routing(&c, &registry).unwrap();
+    let ctx = EmitCtx::emit(&c, &registry, &meta, store.then_some(VIEW)).unwrap();
     ctx.layout.names().map(str::to_string).collect()
 }
 
@@ -359,4 +354,60 @@ fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
     assert_eq!(children_of(top, true), ["topnidx_1"]);
     assert_eq!(children_of(top, false), ["topnidx_1"]);
     assert_eq!(children_of(negated, true), ["reduce_1"]);
+}
+
+// ── A routed source's relay ───────────────────────────────────────────────
+
+/// The relays of a plan over sources 7 and 9, beside three other workers:
+/// `(rounds, shares)`.
+fn relays(sources: [Source; 2], build: Build) -> (usize, usize) {
+    use gnitz_zset::algebra::Slot;
+    let mut c = Circuit::default();
+    build(&mut c);
+    let registry = sources_at(Slot::new(0, 4), [(7, sources[0]), (9, sources[1])]);
+    let meta = routing(&c, &registry).unwrap();
+    let vm = EmitCtx::emit(&c, &registry, &meta, None)
+        .map(|ctx| ctx.prog.finish(ctx.regs[c.out()]))
+        .unwrap();
+    let rounds = vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
+    let shares = vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
+    (rounds, shares)
+}
+
+/// A routed source's delta is relayed by a round, and kept by share where the
+/// source is replicated: every worker already holds that delta whole.
+#[test]
+fn a_routed_source_is_shared_where_replicated_and_relayed_by_a_round_otherwise() {
+    use crate::test_support::{scan_keyed, self_typed_slots};
+    use gnitz_zset::algebra::Placement;
+    let keyed = Source::from(make_schema_u64_i64());
+    let replicated = keyed.placed(Placement::Replicated);
+    // `7 ⋈ 9` on a payload column, 7's re-key also read beside the join: read
+    // there a replicated delta counts once per worker, so neither source skips.
+    let build: Build = |c| {
+        let key = self_typed_slots(&make_schema_u64_i64(), &[1]);
+        let (a, b) = (scan_keyed(c, 7, &key), scan_keyed(c, 9, &key));
+        c.negate(a);
+        c.join([a, b], [a, b], JoinKind::Equi);
+    };
+    assert_eq!(relays([replicated, keyed], build), (1, 1));
+    assert_eq!(relays([keyed, keyed], build), (2, 0));
+}
+
+/// The output exchange moves nothing behind a scan placed by the shard key — but
+/// not behind one a join's relay has moved off its source's owner: each source's
+/// relay runs, and so does the exchange.
+#[test]
+fn the_output_exchange_runs_behind_a_relayed_scan() {
+    use crate::test_support::{scan_keyed, self_typed_slots};
+    use gnitz_wire::AggDescriptor;
+    let keyed = Source::from(make_schema_u64_i64());
+    let build: Build = |c| {
+        let key = self_typed_slots(&make_schema_u64_i64(), &[1]);
+        let deltas = [7, 9].map(|source| scan_keyed(c, source, &key));
+        c.join(deltas, deltas, JoinKind::Equi);
+        // `scan_keyed` pushed 7's scan first.
+        c.reduce_multi(0, &[0], &[AggDescriptor::COUNT_STAR]);
+    };
+    assert_eq!(relays([keyed, keyed], build), (3, 0));
 }

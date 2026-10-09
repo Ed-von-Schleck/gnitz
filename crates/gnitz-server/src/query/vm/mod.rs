@@ -150,7 +150,8 @@ fn facts(op: &Op) -> OpFacts {
         Op::Reduce { plan, .. } => OpFacts {
             consolidates_in: !plan.is_exact_linear(),
             stateful: true,
-            // A global-ground reduce mints V₀ from an empty delta.
+            // A global-ground reduce mints V₀ from an empty delta, in the epoch
+            // that says so.
             inert_on_empty: !plan.seeds_ground,
         },
         Op::TopN { .. } => OpFacts { stateful: true, ..linear },
@@ -221,10 +222,6 @@ pub(in crate::query) struct Vm {
     batches: Box<[Batch]>,
     /// The register the epoch's output is extracted from.
     out_reg: DeltaReg,
-    /// No epoch has been dispatched yet and some instruction is not inert on an
-    /// empty delta (a global-ground `Reduce` this worker owns) — the one reason
-    /// an all-empty epoch is worth dispatching.
-    pub(in crate::query) pending_ground_row: bool,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -280,10 +277,10 @@ impl Vm {
             .any(|i| matches!(i.op, Op::Reduce { out_trace: Integral::Relation(..), .. }))
     }
 
-    /// An epoch seeding `reg` with an empty delta does nothing: it owes no ground
-    /// row and runs no exchange round.
+    /// An epoch seeding `reg` with an empty delta, and minting no ground row, does
+    /// nothing: it runs no exchange round.
     pub(in crate::query) fn idles_on_empty(&self, reg: DeltaReg) -> bool {
-        !self.pending_ground_row && !self.regs[reg.at()].feeds_round
+        !self.regs[reg.at()].feeds_round
     }
 
     /// Enter a read-only replay at `reg`'s first reader. Refused where the seed

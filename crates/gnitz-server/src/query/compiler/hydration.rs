@@ -25,19 +25,19 @@ enum SeedAt {
     Trace { delta: NodeId },
 }
 
-fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
+fn seed_node(circuit: &Circuit) -> Result<SeedAt, String> {
     use gnitz_wire::OpNode;
     // A replay runs on one worker, and so no exchange round.
-    if loaded.exchange_shards().next().is_some() {
+    if exchange_shards(circuit).next().is_some() {
         return Err(UNSUPPORTED.into());
     }
-    let origin = row_local_origin(loaded, loaded.out());
-    match loaded.op(origin) {
+    let origin = row_local_origin(circuit, circuit.out());
+    match circuit.op(origin) {
         OpNode::ScanDelta { source, .. } => return Ok(SeedAt::Scan { node: origin, source: *source }),
         OpNode::Join { kind: gnitz_wire::JoinKind::Equi } => {}
         _ => return Err(UNSUPPORTED.into()),
     }
-    let &[da, db, ia, ib] = loaded.inputs(origin) else {
+    let &[da, db, ia, ib] = circuit.inputs(origin) else {
         unreachable!("a join is wired on four inputs")
     };
     // Seeding `da` alone replays `I(da) ⋈ I(db)`, which is the maintained view
@@ -50,7 +50,7 @@ fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
 
 /// Resolve the seed against the plan the emitter produced for it.
 pub(super) fn derive_hydration(
-    loaded: &LoadedCircuit,
+    circuit: &Circuit,
     registry: &RelationRegistry,
     view_schema: &SchemaDescriptor,
     vm: &Vm,
@@ -58,7 +58,7 @@ pub(super) fn derive_hydration(
     integrals: &[Option<Integral>],
 ) -> Result<Hydration, String> {
     let reg = |n: NodeId| regs[n];
-    let (in_node, seed, keyed) = match seed_node(loaded)? {
+    let (in_node, seed, keyed) = match seed_node(circuit)? {
         SeedAt::Scan { node, source } => {
             if registry
                 .relation(source)
@@ -81,7 +81,7 @@ pub(super) fn derive_hydration(
                 Integral::Own(_) => delta,
                 // The relation's own rows enter where its delta does, and are
                 // re-keyed by `delta`, the reindex whose integral the store is.
-                Integral::Relation(..) => loaded.inputs(delta)[0],
+                Integral::Relation(..) => circuit.inputs(delta)[0],
             };
             (in_node, seed, delta)
         }

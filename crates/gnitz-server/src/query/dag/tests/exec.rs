@@ -108,31 +108,44 @@ pub(super) fn tick_over(engine: &mut CatalogEngine, source: u64, delta: impl Int
 
 /// The schedule names one step per dependency edge out of the source's forward
 /// closure, ordered by view id — so a producer always precedes the steps it
-/// feeds — and leaves out the views awaiting a rebuild.
+/// feeds — and leaves out the views awaiting a rebuild. Each step says whether
+/// it is its producer's last reader and whether a later one reads its view, of
+/// the steps the schedule runs.
 #[test]
 fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
-    let step = |view, producer| Step { view, producer };
+    let edges = |dag: &mut DagEngine| -> Vec<(u64, u64)> {
+        dag.tick_schedule(1).iter().map(|s| (s.view, s.producer)).collect()
+    };
     let mut dag = DagEngine::default();
     for (view, sources) in [(2, &[1][..]), (3, &[1]), (4, &[2, 3]), (5, &[4]), (7, &[6])] {
         dag.dep.link(view, sources.iter().copied());
     }
 
-    let every = [step(2, 1), step(3, 1), step(4, 2), step(4, 3), step(5, 4)];
-    assert_eq!(*dag.tick_schedule(1), every);
+    let every = [(2, 1), (3, 1), (4, 2), (4, 3), (5, 4)];
+    assert_eq!(edges(&mut dag), every);
+    let flags = |dag: &mut DagEngine| -> Vec<(bool, bool)> {
+        dag.tick_schedule(1).iter().map(|s| (s.last, s.needed)).collect()
+    };
+    assert_eq!(
+        flags(&mut dag),
+        [(false, true), (true, true), (true, true), (true, true), (true, false)],
+        "(last, needed) of each"
+    );
 
     // A rebuild set is closed under dependents.
     dag.set_rebuild([2, 4, 5].into_iter().collect());
-    assert_eq!(*dag.tick_schedule(1), [step(3, 1)]);
+    assert_eq!(edges(&mut dag), [(3, 1)]);
+    assert_eq!(flags(&mut dag), [(true, false)], "of the steps it runs");
     dag.rebuild.remove(&2);
-    assert_eq!(*dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
+    assert_eq!(edges(&mut dag), [(2, 1), (3, 1)]);
 
     // A view linked or dropped after a schedule was read moves that schedule.
     dag.take_rebuild();
     dag.dep.link(8, [5].into_iter());
-    assert_eq!(dag.tick_schedule(1)[..5], every);
-    assert_eq!(dag.tick_schedule(1)[5..], [step(8, 5)]);
+    assert_eq!(edges(&mut dag)[..5], every);
+    assert_eq!(edges(&mut dag)[5..], [(8, 5)]);
     dag.dep.unlink(4);
-    assert_eq!(*dag.tick_schedule(1), [step(2, 1), step(3, 1)]);
+    assert_eq!(edges(&mut dag), [(2, 1), (3, 1)]);
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────
@@ -253,7 +266,7 @@ fn a_backfill_opens_the_bound_its_view_recorded() {
     let whole = try_register_view(&mut engine, identity(ReadBound::None), "whole", &view_cols(), 0, 0).unwrap();
     // What `backfill` opens for `view`'s one source.
     let open = |engine: &CatalogEngine, view: u64| {
-        let bound = engine.dag.view_meta(view).unwrap().source_bound(base);
+        let bound = engine.dag.views[&view].code.sources[&base].1.clone();
         engine.registry.open_bound(base, bound, Cut::Sealed).unwrap().0
     };
 
@@ -267,8 +280,8 @@ fn a_backfill_opens_the_bound_its_view_recorded() {
     assert!(matches!(open(&engine, bounded), SourceCursor::Full(_)));
 }
 
-/// A tick that brings this process no row still mints the ground row a global
-/// aggregate owes, once; past that it lands nothing, in that view or any other.
+/// A view's backfill mints the ground row a global aggregate owes; a tick that
+/// brings this process no row lands nothing, in that view or any other.
 #[test]
 fn an_empty_tick_lands_only_an_owed_ground_row() {
     let (mut engine, base) = engine_with_base("empty_tick");
@@ -283,6 +296,10 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     circuit.reduce_multi(scan, &[], &aggs);
     let count = try_register_view(&mut engine, circuit, "count", &cols_of(&counted), 0, 0).unwrap();
 
+    tick_over(&mut engine, base, None);
+    assert_eq!(net_weight(&engine, count), 0, "no tick mints the ground row");
+    backfill(&mut LocalDrive(&mut engine), count).unwrap();
+    assert_eq!(net_weight(&engine, count), 1, "the ground row");
     for round in 1..=2 {
         tick_over(&mut engine, base, None);
         assert_eq!(net_weight(&engine, count), 1, "round {round}: the ground row, once");
@@ -294,6 +311,30 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     tick_over(&mut engine, base, delta);
     assert_eq!(held(&mut engine, once), times(&engine, base, &rows, 1));
     assert_eq!(net_weight(&engine, count), 1, "the count moved, its row count did not");
+}
+
+/// The ground row is minted once per copy of the result: on each process holding
+/// the view's whole input, else on the one worker the empty group's exchange
+/// sends every row to.
+#[test]
+fn the_ground_row_is_minted_where_the_whole_input_arrives() {
+    let schema = crate::test_support::make_schema_u64_i64();
+    let keyed = Placement::full_pk(&schema);
+    let probe = make_batch(&schema, &[(1, 1, 1)]);
+    let group = ScatterPlan::group(&schema, &[]).unwrap();
+    let (mints, receives): (Vec<bool>, Vec<bool>) = (0..4)
+        .map(|rank| {
+            let slot = Slot::new(rank, 4);
+            assert!(
+                mints_ground_row(slot, Placement::Replicated),
+                "a replicated view, {slot:?}"
+            );
+            (mints_ground_row(slot, keyed), !group.share(&probe, slot).is_empty())
+        })
+        .unzip();
+    assert_eq!(mints, receives);
+    assert_eq!(mints.iter().filter(|&&m| m).count(), 1, "one owner");
+    assert!(mints_ground_row(Slot::SOLO, keyed), "one worker");
 }
 
 // ── A LEFT JOIN's two re-keys ───────────────────────────────────────────────

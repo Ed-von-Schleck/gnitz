@@ -186,3 +186,28 @@ def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_serve
     assert bag(conn.scan(*v), *cols) == {
         (7, 256, 100000, 256, 9223372036854775809, 1.5, 4.0, 1.5, 4.0): 1}
     conn.close()
+
+
+def test_a_global_count_keeps_its_one_row_through_restarts_and_an_emptied_table(own_server):
+    """A global aggregate holds one row over an empty input. After a restart every
+    worker runs the plan the master compiled before it forked, and exactly one of
+    them owns that row: emptying the table must leave `n = 0` once — not no row,
+    and not one per worker — and a second restart must bring the same row back."""
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        conn.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(f"({k}, {k})" for k in range(24)))
+        conn.execute_sql("CREATE VIEW c AS SELECT COUNT(*) AS n FROM t")
+        assert bag(scanned(conn, "c"), "n") == {(24,): 1}
+
+    own_server.restart()
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "c"), "n") == {(24,): 1}, "post-restart"
+        conn.execute_sql("DELETE FROM t WHERE pk >= 0")
+        assert bag(scanned(conn, "c"), "n") == {(0,): 1}, "emptied"
+
+    own_server.restart()
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "c"), "n") == {(0,): 1}, "second restart"
