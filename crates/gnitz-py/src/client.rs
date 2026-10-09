@@ -510,11 +510,18 @@ impl PyClient {
     /// order: an atomic multi-table transaction is never observed torn across it.
     /// `pairs` is a list of `(table_id, schema)`.
     fn scan_many(slf: &Bound<'_, Self>, pairs: Vec<(u64, PySchema)>) -> PyResult<Py<PyAny>> {
-        let relations = pairs.into_iter().map(|(tid, s)| (tid, s.rust)).collect();
-        Self::run(slf, single!(|c| c.scan_many(relations)), |py, replies| {
-            let results: PyResult<Vec<_>> = replies.into_iter().map(|reply| scan_result(py, reply)).collect();
-            results?.into_py_any(py)
-        })
+        let spec = ReadSpec::all_rows(ReadBound::None);
+        Self::run(
+            slf,
+            single!(|c| {
+                let scans: Vec<_> = pairs.iter().map(|(tid, s)| ((*tid).into(), &spec, &s.rust)).collect();
+                c.scan_many(&scans)
+            }),
+            |py, replies| {
+                let results: PyResult<Vec<_>> = replies.into_iter().map(|reply| scan_result(py, reply)).collect();
+                results?.into_py_any(py)
+            },
+        )
     }
 
     /// seek(table_id, schema, pk) -> ScanResult.

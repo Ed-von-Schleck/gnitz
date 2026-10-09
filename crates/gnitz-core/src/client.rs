@@ -38,6 +38,15 @@ fn absent(text: String) -> ClientError {
     ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
 }
 
+/// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
+/// `schema_name` (already canonical).
+fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Result<usize, ClientError> {
+    schemas
+        .live_rows()
+        .find(|&i| payload_bytes(schemas, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
+        .ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
+}
+
 /// Build the `-1` retraction batch for `pks`: the server's unique-PK rule
 /// retracts by PK alone, so the payload columns are inert filler.
 pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
@@ -813,12 +822,10 @@ impl GnitzClient {
         self.wait(sent)
     }
 
-    /// Consistent snapshot of N relations at one server-side SAL cut, returned
-    /// in request order. An atomic multi-table `txn_commit` is never observed torn
-    /// across the result set.
-    /// Each relation is replied in the layout of the schema paired with it.
-    pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Pending<'_, Vec<ScanReply>> {
-        let sent = self.session.submit_scan_multi(relations);
+    /// N [`Self::scan_spec`]s as one request, answered in request order: no
+    /// commit is in some of the replies and not in others.
+    pub fn scan_many(&mut self, scans: &[(Target, &ReadSpec, &Arc<Schema>)]) -> Pending<'_, Vec<ScanReply>> {
+        let sent = self.session.submit_scan_multi(scans);
         self.wait(sent)
     }
 
@@ -1089,29 +1096,20 @@ impl GnitzClient {
         Ok(schema_id)
     }
 
-    /// Drop a schema and every table and view it contains — PostgreSQL
-    /// `DROP SCHEMA … CASCADE` semantics — as **one** atomic DDL bundle, so a
-    /// schema of any size costs one `fdatasync` and one worker broadcast.
-    ///
-    /// All-negative, which is what makes the engine apply it VIEW → TABLE →
-    /// SCHEMA: each view is retired before the tables it reads, and the schema row
-    /// last, by which time its member-count guard sees an empty schema.
-    ///
-    /// Atomic in both directions: an external dependent (a cross-schema FK child
-    /// or view-on-view) or a rename landing between the scans and the push fails
-    /// the whole bundle and drops nothing.
+    /// `DROP SCHEMA … CASCADE`: the schema and every table and view in it, as
+    /// one DDL bundle. A relation outside the schema that depends on one inside
+    /// fails the bundle, and nothing is dropped.
     pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = gnitz_wire::canonical_identifier(name)?;
-        let (schemas, at) = self.lookup_schema(&name).await?;
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let [schemas, views, tables] = self
+            .sys_cut([(SCHEMA_TAB, &all), (VIEW_TAB, &all), (TABLE_TAB, &all)])
+            .await?;
+        let at = schema_row(&schemas, &name)?;
         let schema_id = schemas.pks.get(at) as u64;
 
-        // Hidden segments need no separate pass: each is an ordinary VIEW_TAB row
-        // carrying this `schema_id`, so the whole matching set is already complete
-        // — and the engine's co-drop carve-out admits it, every dependent being in
-        // the same drop set.
         let mut b = DdlBundle::default();
-        for family in [VIEW_TAB, TABLE_TAB] {
-            let scanned = self.sys_rows(family, ReadBound::None).await?;
+        for (family, scanned) in [(VIEW_TAB, views), (TABLE_TAB, tables)] {
             for i in scanned.live_rows() {
                 if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
                     b.batch(family).copy_row_at(&scanned, i, -1);
@@ -1238,13 +1236,9 @@ impl GnitzClient {
                     Cut::before(base as u128),
                     Cut::after(vid as u128),
                 )));
-                // One round trip: every family's read is sent before the first is awaited.
-                let reads = [VIEW_TAB, COL_TAB, CIRCUIT_TAB]
-                    .map(|family| (family, self.scan_spec(family, &members, sys_schema(family)).detach()));
-                let mut standing = DdlBundle::default();
-                for (family, read) in reads {
-                    standing.0.push((family, self.wait(read).await?.batch));
-                }
+                let families = [VIEW_TAB, COL_TAB, CIRCUIT_TAB];
+                let rows = self.sys_cut(families.map(|family| (family, &members))).await?;
+                let standing = DdlBundle(families.into_iter().zip(rows).collect());
                 let views = &standing.0[0].1;
                 let i = views
                     .live_rows()
@@ -1443,11 +1437,17 @@ impl GnitzClient {
     /// batch and the row's index in it.
     async fn lookup_schema(&mut self, schema_name: &str) -> Result<(ZSetBatch, usize), ClientError> {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
-        let i = batch
-            .live_rows()
-            .find(|&i| payload_bytes(&batch, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
-            .ok_or_else(|| absent(format!("schema '{schema_name}' not found")))?;
+        let i = schema_row(&batch, schema_name)?;
         Ok((batch, i))
+    }
+
+    /// System families' rows, each under its spec, with no DDL between them.
+    async fn sys_cut<const N: usize>(&mut self, reads: [(u64, &ReadSpec); N]) -> Result<[ZSetBatch; N], ClientError> {
+        let scans = reads.map(|(family, spec)| (Target::from(family), spec, sys_schema(family)));
+        let mut replies = self.scan_many(&scans).await?.into_iter();
+        Ok(std::array::from_fn(|_| {
+            replies.next().expect("one reply per scan").batch
+        }))
     }
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;

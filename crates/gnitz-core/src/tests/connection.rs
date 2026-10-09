@@ -107,19 +107,31 @@ fn train_split_across_continuation_frames_completes_once() {
 fn scan_multi_decodes_each_train_under_its_own_relation() {
     let (mut s, peer) = pair();
     let (sa, sb) = (schema_a(), schema_b());
-    // Each train must decode under the schema paired with its relation — a
-    // two-frame train for relation 2 included.
-    let mut sent = s.submit_scan_multi(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]);
+    let (all, keys) = (
+        ReadSpec::all_rows(ReadBound::None),
+        ReadSpec::all_rows(ReadBound::PkSet(gnitz_wire::PkKeys::from_sorted(
+            8,
+            7u64.to_be_bytes().to_vec(),
+        ))),
+    );
+    let mut sent = s.submit_scan_multi(&[(Target::from(1), &all, &sa), (Target { tid: 2, token: 9 }, &keys, &sb)]);
     s.step(Interest::WRITE);
     let req = peer.recv();
     let ctrl = peek_control_block(&req).unwrap();
     let items = gnitz_wire::txn_frame::decode_scan_multi(&req[ctrl.body]).unwrap();
-    let layouts: Vec<(u64, u64)> = items.iter().map(|i| (i.target.tid, i.reply_layout)).collect();
+    let named: Vec<(Target, u64, Vec<u8>)> = items
+        .iter()
+        .map(|i| (i.target, i.reply_layout, i.spec.to_vec()))
+        .collect();
     assert_eq!(
-        layouts,
-        [(1, sa.layout().layout_digest()), (2, sb.layout().layout_digest())],
-        "each item names its reply layout"
+        named,
+        [
+            (Target::from(1), sa.layout().layout_digest(), all.encode()),
+            (Target { tid: 2, token: 9 }, sb.layout().layout_digest(), keys.encode()),
+        ],
+        "each item names its target and token, its reply layout and its spec"
     );
+    // Relation 2's train is two frames.
     peer.send(&reply_rows(1, &batch_a(&[10, 11]), 0, false));
     s.step(Interest::READ);
     assert!(sent.try_take().is_none(), "one of two trains");
@@ -194,10 +206,10 @@ fn a_status_frame_fails_its_slot_alone() {
         let r = await_reply(&mut s, sent).unwrap();
         assert_eq!(r.lsn, Some(42), "{what}: the next request completes normally");
     }
-    let three = (1..=3).map(|tid| (tid, Arc::clone(&sa))).collect();
+    let all = ReadSpec::all_rows(ReadBound::None);
     refused(
         "the second of three trains",
-        |s| s.submit_scan_multi(three),
+        |s| s.submit_scan_multi(&[1, 2, 3].map(|tid| (Target::from(tid), &all, &sa))),
         1,
         WireStatus::Error,
     );
@@ -224,7 +236,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
         assert_eq!(s.interest(), Interest::NONE, "{what}");
         assert!(!s.is_closed(), "{what}");
     };
-    assert!(matches!(s.submit_scan_multi(Vec::new()).try_take(), Some(Err(_))));
+    assert!(matches!(s.submit_scan_multi(&[]).try_take(), Some(Err(_))));
     untouched(&s, "an empty multi-read");
     for (what, req) in [
         ("a DDL family that is no system table", Request::DdlTxn(&ddl)),

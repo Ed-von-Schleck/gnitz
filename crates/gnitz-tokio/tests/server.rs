@@ -134,7 +134,7 @@ fn pipelined_verbs() {
             let mut replaced = ZSetBatch::new(&schema);
             BatchAppender::new(&mut replaced).add_row(7, 1).i64_val(-1);
             let key = PkColumn::from_natives(&schema, [7]);
-            let relations = vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))];
+            let (all, reply) = (ReadSpec::all_rows(ReadBound::None), Arc::clone(&schema));
             let resolve = |name: &'static str| {
                 let sn = sn.clone();
                 client.run(move |c| Box::pin(async move { c.resolve(&rel(&sn, name)).await }))
@@ -142,7 +142,7 @@ fn pipelined_verbs() {
             let (_, one, many, found, missing) = tokio::join!(
                 push(&client, tid, &schema, replaced),
                 scan(&client, tid, ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
-                client.send(move |c| c.scan_many(relations)),
+                client.send(move |c| c.scan_many(&[(tid.into(), &all, &reply), (empty.into(), &all, &reply)])),
                 resolve("t"),
                 resolve("nope"),
             );

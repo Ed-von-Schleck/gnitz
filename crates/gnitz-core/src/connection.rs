@@ -545,25 +545,31 @@ impl Session {
         sent
     }
 
-    /// SCAN_MULTI: every row of N relations at one cut, each replied in the
-    /// layout of the schema paired with it, in request order.
-    pub fn submit_scan_multi(&mut self, rels: Vec<(u64, Arc<Schema>)>) -> Sent<Vec<ScanReply>> {
-        if rels.is_empty() {
+    /// SCAN_MULTI: N [`Self::submit_scan`]s as one request, replied in order.
+    pub fn submit_scan_multi(
+        &mut self,
+        scans: &[(Target, &gnitz_wire::ReadSpec, &Arc<Schema>)],
+    ) -> Sent<Vec<ScanReply>> {
+        if scans.is_empty() {
             return Sent::ready(Err(ClientError::from("a multi-read names no relation".to_string())));
         }
-        let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
-        let items: Vec<txn_frame::ScanItem> = rels
+        let specs: Vec<Vec<u8>> = scans.iter().map(|(_, spec, _)| spec.encode()).collect();
+        let items: Vec<txn_frame::ScanItem> = scans
             .iter()
-            .map(|(tid, schema)| txn_frame::ScanItem {
-                target: Target::from(*tid),
+            .zip(&specs)
+            .map(|(&(target, _, schema), spec)| txn_frame::ScanItem {
+                target,
                 reply_layout: schema.layout().layout_digest(),
-                spec: &spec,
+                spec,
             })
             .collect();
         let (to, sent) = promise();
         let slot = Slot::Multi {
-            replies: Vec::with_capacity(rels.len()),
-            rels,
+            replies: Vec::with_capacity(scans.len()),
+            rels: scans
+                .iter()
+                .map(|&(target, _, schema)| (target.tid, Arc::clone(schema)))
+                .collect(),
             data: None,
             to,
         };

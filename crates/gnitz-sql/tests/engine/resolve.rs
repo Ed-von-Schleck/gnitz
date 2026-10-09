@@ -204,13 +204,13 @@ fn a_statement_resolves_each_relation_once() {
         ("ALTER TABLE t RENAME TO u", 3, "resolve, seek, push"),
         (
             "ALTER VIEW v AS SELECT id FROM u",
-            7,
-            "two resolves, one read per catalog family, alloc, push",
+            5,
+            "two resolves, one read of the catalog, alloc, push",
         ),
         (
             "CREATE OR REPLACE VIEW v AS SELECT id, x FROM u",
-            7,
-            "two resolves, one read per catalog family, alloc, push",
+            5,
+            "two resolves, one read of the catalog, alloc, push",
         ),
         (
             "SELECT * FROM u",
@@ -219,8 +219,8 @@ fn a_statement_resolves_each_relation_once() {
         ),
         (
             "CREATE OR REPLACE VIEW v AS SELECT id, x FROM u",
-            5,
-            "two resolves, one read per catalog family: the definition stands",
+            3,
+            "two resolves, one read of the catalog: the definition stands",
         ),
         (
             "SELECT * FROM u",
@@ -242,10 +242,8 @@ fn a_statement_resolves_each_relation_once() {
     );
 }
 
-/// `DROP SCHEMA` is one bundle whatever the member count: the SCHEMA_TAB probe,
-/// one VIEW_TAB scan, one TABLE_TAB scan and one push.
 #[test]
-fn drop_schema_is_four_requests_whatever_the_member_count() {
+fn drop_schema_is_one_read_and_one_push_whatever_the_member_count() {
     let mut db = Db::boot(1);
     for i in 0..4 {
         db.exec(&format!(
@@ -254,7 +252,7 @@ fn drop_schema_is_four_requests_whatever_the_member_count() {
     }
     let before = db.client.requests_sent();
     block_on(db.client.drop_schema(&db.sn)).unwrap();
-    assert_eq!(db.client.requests_sent() - before, 4);
+    assert_eq!(db.client.requests_sent() - before, 2);
     block_on(db.client.create_schema(&db.sn)).unwrap();
     assert!(!db.exists("m0") && !db.exists("vw0"));
 }

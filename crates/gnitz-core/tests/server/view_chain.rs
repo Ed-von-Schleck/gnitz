@@ -192,6 +192,18 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 }
 
 #[test]
+fn a_schema_drop_retires_a_chain_with_its_segments() {
+    let srv = ServerHandle::start_n(4);
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let (sn, base_tid, schema) = make_base(&mut client);
+    block_on(client.create_view_chain(&rel(&sn, "f"), chain(base_tid, &schema), ViewProps::default(), None)).unwrap();
+    assert_eq!(live_views(&mut client).len(), 3);
+
+    block_on(client.drop_schema(&sn)).unwrap();
+    assert_eq!(live_views(&mut client), []);
+}
+
+#[test]
 fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
@@ -203,12 +215,13 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let vid = block_on(client.create_view_chain(&rel(&sn, "f"), bundle, ViewProps::default(), None)).unwrap();
 
     let view_tab = gnitz_core::sys_schema(VIEW_TAB);
-    let relations = vec![
-        (base_tid, Arc::clone(&schema)),
-        (VIEW_TAB, Arc::clone(view_tab)),
-        (vid, Arc::clone(&schema)),
+    let all = ReadSpec::all_rows(ReadBound::None);
+    let scans = [
+        (base_tid.into(), &all, &schema),
+        (VIEW_TAB.into(), &all, view_tab),
+        (vid.into(), &all, &schema),
     ];
-    let replies = block_on(client.scan_many(relations)).unwrap();
+    let replies = block_on(client.scan_many(&scans)).unwrap();
     let base = weighted_rows(&base_rows(&schema));
     assert_eq!(weighted_rows(&replies[0].batch), base, "the table");
     let views = &replies[1].batch;
