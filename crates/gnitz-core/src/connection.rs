@@ -1,11 +1,9 @@
 //! The protocol session: a sans-io connection state machine. Nothing in it
 //! waits; whoever drives [`Session::step`] does.
 //!
-//! Replies leave the server in request order, so only the head of the pending
-//! queue is ever being answered: every frame that arrives is the head slot's
-//! until its last train terminates — but for a pushed train, which opens with
-//! a frame marked as one, arrives whole between two replies and is set aside
-//! for whoever holds the subscription it is of.
+//! A frame is of what its [`WireLane`] names. Replies arrive in request order,
+//! each the head slot's until its last train terminates; a pushed train and
+//! the answer to a sync arrive whole between two replies.
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
@@ -26,7 +24,7 @@ use crate::{
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame::{self, kept_as};
 use gnitz_wire::CONNECT_TIMEOUT;
-use gnitz_wire::{ClientVerb, WireConflictMode};
+use gnitz_wire::{ClientVerb, WireConflictMode, WireLane};
 use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
 
 /// Requests one connection may hold in flight; `submit` raises past it. A bound
@@ -198,7 +196,7 @@ impl Request<'_> {
 }
 
 /// One request in flight: how its reply decodes, the reply read so far, and
-/// where it goes. A slot is answered only while it heads the queue, so its
+/// where it goes. A slot is answered only while it heads its queue, so its
 /// state is the one train in progress, and it goes when the slot does.
 enum Slot {
     /// A control-only ACK naming `tid`, its value in `arg0`.
@@ -242,7 +240,7 @@ enum Slot {
         /// The train in progress, when a [`Taker::Holder`] takes it.
         blocks: Vec<RawBlock>,
     },
-    /// A SYNC_PUSHED.
+    /// A SYNC_PUSHED, queued among the syncs.
     Sync { to: Promise<()> },
 }
 
@@ -461,6 +459,8 @@ pub struct Session {
     polls: Polls,
     /// The pushed train being read.
     pushed: Option<Slot>,
+    /// The syncs sent and not yet answered, oldest first.
+    syncing: VecDeque<Slot>,
 }
 
 impl Session {
@@ -483,6 +483,7 @@ impl Session {
             unread: false,
             polls: Polls::default(),
             pushed: None,
+            syncing: VecDeque::new(),
         }
     }
 
@@ -638,9 +639,8 @@ impl Session {
     }
 
     /// SYNC_PUSHED: bring the subscriptions `held` names up to date, held up
-    /// to `wait` while none has anything new. Every other subscription of this
-    /// connection ends with it, here and at the server: one is let go of by
-    /// leaving it out.
+    /// to `wait` while none has anything new, and end every other one of this
+    /// connection.
     pub(crate) fn submit_sync(&mut self, held: &[u64], wait: Duration) -> Sent<()> {
         self.polls.subs.retain(|id, _| held.contains(id));
         if !self.polls.server_holds {
@@ -710,7 +710,7 @@ impl Session {
             // never disagree; only the message re-derives which cap was hit.
             self.at_capacity().then(|| {
                 let queued = self.queued_bytes();
-                ClientError::from(if self.pending.len() >= MAX_IN_FLIGHT {
+                ClientError::from(if self.in_flight() >= MAX_IN_FLIGHT {
                     format!("connection has {MAX_IN_FLIGHT} requests in flight")
                 } else {
                     format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
@@ -723,8 +723,16 @@ impl Session {
         }
         self.transport.enqueue(frame);
         self.submitted += 1;
-        self.pending.push_back(slot);
+        match slot {
+            Slot::Sync { .. } => self.syncing.push_back(slot),
+            _ => self.pending.push_back(slot),
+        }
         true
+    }
+
+    /// Requests sent and not yet answered.
+    fn in_flight(&self) -> usize {
+        self.pending.len() + self.syncing.len()
     }
 
     /// Do the I/O `ready` allows — one read, then one flush; every reply it
@@ -758,8 +766,15 @@ impl Session {
         if self.ended.is_some() {
             return;
         }
-        let Session { transport, pending, polls, pushed, .. } = self;
-        match transport.read(|buf| feed(pending, pushed, buf, polls)) {
+        let Session {
+            transport,
+            pending,
+            polls,
+            pushed,
+            syncing,
+            ..
+        } = self;
+        match transport.read(|buf| feed(pending, pushed, syncing, buf, polls)) {
             Ok(more) => self.unread = more,
             Err(e) => self.end(ClientError::ConnectionLost(e)),
         }
@@ -798,17 +813,17 @@ impl Session {
     /// it is, which is what turns a cap into back-pressure rather than an error.
     /// Each cap implies its own interest bit, so gating on it loses no wakeup.
     pub fn at_capacity(&self) -> bool {
-        self.pending.len() >= MAX_IN_FLIGHT || self.queued_bytes() >= MAX_QUEUED_BYTES
+        self.in_flight() >= MAX_IN_FLIGHT || self.queued_bytes() >= MAX_QUEUED_BYTES
     }
 
-    /// `READ` while any slot is outstanding; `WRITE` while bytes remain queued
+    /// `READ` while any request is unanswered; `WRITE` while bytes remain queued
     /// or rustls has ciphertext to ship. Nothing once the session has ended.
     pub fn interest(&self) -> Interest {
         if self.ended.is_some() {
             return Interest::NONE;
         }
         Interest {
-            read: !self.pending.is_empty(),
+            read: self.in_flight() > 0,
             write: self.transport.wants_write(),
         }
     }
@@ -818,15 +833,15 @@ impl Session {
         self.ended.is_some()
     }
 
-    /// Fail every pending slot with `why` and refuse further work. The shutdown
+    /// Fail every unanswered request with `why` and refuse further work. The shutdown
     /// shows the server EOF now rather than when the session drops.
     pub(crate) fn end(&mut self, why: ClientError) {
         if self.ended.is_some() {
             return;
         }
         self.transport.close();
-        let Session { pending, polls, .. } = self;
-        for mut slot in pending.drain(..) {
+        let Session { pending, syncing, polls, .. } = self;
+        for mut slot in pending.drain(..).chain(syncing.drain(..)) {
             slot.fail(why.clone(), polls);
         }
         self.ended = Some(why);
@@ -839,38 +854,42 @@ fn wait_ms(wait: Duration) -> u64 {
     u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
-/// Feed one frame to the slot it is of — the pushed train it opens or the one
-/// open, else the head — whose reply arrives if that completes it.
+/// Feed one frame to the slot it is of, whose reply arrives if that completes it.
 fn feed(
     pending: &mut VecDeque<Slot>,
     pushed: &mut Option<Slot>,
+    syncing: &mut VecDeque<Slot>,
     buf: Cow<'_, [u8]>,
     polls: &mut Polls,
 ) -> Result<(), ProtocolError> {
     let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
-    if ctrl.hdr.flags.pushed {
-        let train = Slot::DeltaPoll {
-            views: vec![ctrl.hdr.target_id],
-            at: 0,
-            poll: None,
-            first: ctrl.hdr.arg0,
-            blocks: Vec::new(),
-        };
-        return match pushed.replace(train) {
-            None => Ok(()),
-            Some(_) => Err(ProtocolError::DecodeError(
-                "a pushed train opened inside another".into(),
-            )),
-        };
-    }
     let in_train = pushed.is_some();
-    let Some(slot) = pushed.as_mut().or(pending.front_mut()) else {
+    let queue = match ctrl.hdr.flags.lane {
+        WireLane::Reply => pending,
+        _ if in_train => {
+            return Err(ProtocolError::DecodeError(
+                "a pushed train split by a frame that is not of it".into(),
+            ))
+        }
+        WireLane::PushedTrain => {
+            *pushed = Some(Slot::DeltaPoll {
+                views: vec![ctrl.hdr.target_id],
+                at: 0,
+                poll: None,
+                first: ctrl.hdr.arg0,
+                blocks: Vec::new(),
+            });
+            return Ok(());
+        }
+        WireLane::SyncAnswer => syncing,
+    };
+    let Some(slot) = pushed.as_mut().or(queue.front_mut()) else {
         return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
     };
     if slot.feed(ctrl, buf, polls)? {
         match in_train {
             true => *pushed = None,
-            false => drop(pending.pop_front()),
+            false => drop(queue.pop_front()),
         }
     }
     Ok(())

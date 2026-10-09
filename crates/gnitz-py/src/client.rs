@@ -664,7 +664,8 @@ impl PyClient {
     ///
     /// Bring every subscription of this connection up to every push
     /// acknowledged before the call. With nothing to report, the server holds
-    /// the reply for up to `wait` seconds.
+    /// the reply for up to `wait` seconds. On an event loop the client's other
+    /// calls are answered meanwhile, and leave the sync held.
     ///
     /// A subscription that ended and a view that failed carry the exception
     /// in their entry's `error`. The call raises only for a poisoned store or
@@ -674,7 +675,7 @@ impl PyClient {
         let wait = sync_wait(wait)?;
         let convert = |py: Python<'_>, synced: Synced| PySynced::new(py, synced)?.into_py_any(py);
         // On an event loop the client is free while the server holds the
-        // sync's one request.
+        // sync: its answer has no place among the replies.
         if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
             return handle.submit_then(
                 slf.py(),

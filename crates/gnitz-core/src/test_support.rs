@@ -156,13 +156,25 @@ pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
         target_id: view,
         arg0: sub,
         flags: gnitz_wire::WireFlags {
-            pushed: true,
-            continuation: true,
+            lane: gnitz_wire::WireLane::PushedTrain,
             ..Default::default()
         },
         ..Default::default()
     };
     crate::encode_frame(hdr, &[], None, None)
+}
+
+/// The frame that answers the oldest sync: with `refusal`, a fault refusing it.
+pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
+    let hdr = gnitz_wire::control::ControlHeader {
+        status: refusal.map_or(WireStatus::Ok, |_| WireStatus::Error),
+        flags: gnitz_wire::WireFlags {
+            lane: gnitz_wire::WireLane::SyncAnswer,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    crate::encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None, None)
 }
 
 /// A fault frame naming `tid`, with `text` as its body.

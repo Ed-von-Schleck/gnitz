@@ -73,7 +73,8 @@ impl GnitzClient {
     }
 
     /// The first half of [`Self::sync`]: its request, sent. The client is free
-    /// until the reply arrives, and a request made meanwhile ends the hold.
+    /// until the answer arrives: a request made meanwhile is answered while the
+    /// server holds the sync, and leaves it held.
     pub fn begin_sync(&mut self, wait: Duration) -> Result<Sent<()>, ClientError> {
         let wait = self.mirror_hold(wait)?;
         let mirrored = self.mirror.iter().flat_map(|m| m.views.values().filter_map(|v| v.sub));

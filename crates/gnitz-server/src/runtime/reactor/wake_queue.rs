@@ -48,11 +48,16 @@ impl<T> WakeQueue<T> {
     /// Park the awaiter until [`Self::poll`] would not: a value is queued or
     /// the stream has ended. Takes nothing.
     pub(super) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<()> {
-        if self.closed || !self.queue.is_empty() {
+        if self.is_ready() {
             return Poll::Ready(());
         }
         self.waker = Some(cx.waker().clone());
         Poll::Pending
+    }
+
+    /// Whether [`Self::poll`] would not park.
+    pub(super) fn is_ready(&self) -> bool {
+        self.closed || !self.queue.is_empty()
     }
 
     fn wake(&mut self) {

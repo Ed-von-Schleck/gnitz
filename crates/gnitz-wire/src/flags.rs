@@ -23,7 +23,7 @@ wire_enum! {
         /// A prologue `arg0` other than `0` keeps item `i`, once answered with
         /// a terminal, as the connection's subscription `arg0 + i` from that
         /// terminal's cursor. The rounds reaching it afterwards are sent as
-        /// pushed trains ([`WireFlags::pushed`]); a fault ends it.
+        /// pushed trains ([`WireLane::PushedTrain`]); a fault ends it.
         DeltaPoll = 4,
         /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
         /// name in the blob; the reply's `arg0` is its descriptor token.
@@ -46,13 +46,9 @@ wire_enum! {
         /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
-        /// Answer once every subscription of this connection has been sent
-        /// every push acknowledged before this request, the trains ahead of
-        /// the ACK. While none of them was sent a row since the last one, the
-        /// reply is held up to `arg0` milliseconds.
-        ///
-        /// The blob names the subscriptions the connection still holds
-        /// ([`crate::txn_frame::encode_held`]); every other one ends here.
+        /// Send every subscription the blob names ([`crate::txn_frame::encode_held`])
+        /// the pushes acknowledged before this request, and end the others. The
+        /// [`WireLane::SyncAnswer`] is held up to `arg0` ms while none was sent a row.
         SyncPushed = 13,
     }
 }
@@ -80,17 +76,15 @@ pub struct WireFlags {
     pub scan_last: bool,
     /// Bits 36-37: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
-    /// Bit 38: this frame opens a pushed train — one no request is answered
-    /// by — of the subscription `arg0`. The train is the frames after it, to
-    /// the first without `continuation`: a delta read's terminal, or a fault.
-    pub pushed: bool,
+    /// Bits 38-39.
+    pub lane: WireLane,
 }
 
 pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
 pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
 
-/// Bits 16-31 and 39-63: no field.
-const RESERVED_BITS: u64 = !crate::low_bits_mask(39) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
+/// Bits 16-31 and 40-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(40) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
@@ -102,7 +96,7 @@ impl WireFlags {
             continuation: true,
             scan_last: last,
             probe_mode: WireProbeMode::Pk,
-            pushed: false,
+            lane: WireLane::Reply,
         }
     }
 
@@ -112,7 +106,7 @@ impl WireFlags {
             | (self.continuation as u64) << 34
             | (self.scan_last as u64) << 35
             | (self.probe_mode as u64) << 36
-            | (self.pushed as u64) << 38
+            | (self.lane as u64) << 38
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -128,7 +122,7 @@ impl WireFlags {
             continuation: bit(34),
             scan_last: bit(35),
             probe_mode: WireProbeMode::from_wire(((w >> 36) & 3) as u8).ok_or("flags: unknown probe mode")?,
-            pushed: bit(38),
+            lane: WireLane::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown lane")?,
         })
     }
 }
@@ -163,6 +157,21 @@ wire_enum! {
         PkColumn = 1,
         Index = 2,
         IndexAll = 3,
+    }
+}
+
+wire_enum! {
+    /// What a frame from the server answers ([`WireFlags::lane`]).
+    #[derive(Default)]
+    pub enum WireLane: u8 {
+        /// The connection's oldest unanswered request other than a sync.
+        #[default]
+        Reply = 0,
+        /// No request: it opens a train of the subscription `arg0`, the frames
+        /// after it to the first without `continuation`.
+        PushedTrain = 1,
+        /// The connection's oldest unanswered SYNC_PUSHED, whole in this frame.
+        SyncAnswer = 2,
     }
 }
 

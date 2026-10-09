@@ -3,10 +3,11 @@
 //! on the transport.
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::runtime::reactor::{ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{select2, ClientConn, Either, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
 use gnitz_zset::repr::PooledBuf;
@@ -133,13 +134,16 @@ impl Peer {
         self.conn.recv().await
     }
 
-    /// Resolves once the client has sent its next request or is gone, taking
-    /// nothing. Ships what is corked first, as [`Self::next_request`] does
-    /// before it parks.
-    pub async fn next_request_ready(&self) {
-        if self.flush_egress().await.is_ok() {
-            self.conn.readable().await
+    /// What `waited` resolves to, or `None` once [`Self::next_request`] would
+    /// not park. What is corked ships first, so `waited` is raced with no send.
+    pub async fn until_request<T>(&self, waited: impl Future<Output = T>) -> Result<Option<T>, PeerGone> {
+        if !self.conn.is_readable() {
+            self.flush_egress().await?;
         }
+        Ok(match select2(waited, self.conn.readable()).await {
+            Either::A(done) => Some(done),
+            Either::B(()) => None,
+        })
     }
 
     /// Append a reply written by `write`, to leave with whatever is corked

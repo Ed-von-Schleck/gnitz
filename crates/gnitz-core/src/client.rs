@@ -583,7 +583,8 @@ impl GnitzClient {
     }
 
     /// Step this client's session until `sent` is answered. Replies arrive in
-    /// request order, so every reply detached before it is answered by then.
+    /// request order, so every reply detached before it is answered by then;
+    /// a sync's answer is no reply, and arrives in the order of syncs alone.
     pub fn wait<T>(&mut self, sent: Sent<T>) -> Pending<'_, T> {
         Pending { client: self, sent }
     }

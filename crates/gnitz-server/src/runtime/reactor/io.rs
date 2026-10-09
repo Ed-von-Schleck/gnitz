@@ -268,6 +268,11 @@ impl ClientConn {
         std::future::poll_fn(|cx| self.q.borrow_mut().frames.poll_ready(cx)).await
     }
 
+    /// Whether [`Self::readable`] would resolve at once.
+    pub(crate) fn is_readable(&self) -> bool {
+        self.q.borrow().frames.is_ready()
+    }
+
     /// The next already-deframed frame without parking. `None` means nothing is
     /// queued right now, not that the peer is gone.
     pub(crate) fn try_recv(&self) -> Option<RecvBuf> {

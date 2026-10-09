@@ -302,8 +302,8 @@ def test_a_waiting_sync_is_held_until_a_commit_reaches_the_view(client, server):
 @pytest.mark.asyncio
 async def test_a_held_sync_leaves_an_async_client_free(client, server):
     """A sync held with nothing to report does not hold its client: a scan
-    submitted beside it is answered, and the server ends the sync for it, with
-    no rows and the cursor the subscription stood at."""
+    submitted beside it is answered and leaves it held, and the commit that
+    then reaches the view ends it, with that commit's delta."""
     base_tables(client)
     mk_feed(client, "f", LINEAR)
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
@@ -312,13 +312,58 @@ async def test_a_held_sync_leaves_an_async_client_free(client, server):
     async with aio.connect(server, schema=client.schema) as conn:
         _, cursor = await conn.delta_bootstrap(vid, schema)
         sub = await conn.subscribe(vid, schema, cursor)
-        t0 = time.monotonic()
-        synced, rows = await asyncio.gather(conn.sync(30), conn.scan(tid, t_schema))
-        (pushed,) = synced.pushed
-        assert time.monotonic() - t0 < 10, "the scan released the sync, not the wait"
+        held = asyncio.ensure_future(conn.sync(60))
+        rows = await asyncio.wait_for(conn.scan(tid, t_schema), 20)
+        assert not held.done(), "the scan left the sync held"
+        client.execute_sql("INSERT INTO t VALUES (2, 200, 'late')")
+        (pushed,) = (await asyncio.wait_for(held, 20)).pushed
     assert len(rows) == 1
-    assert (pushed.sub, pushed.error, len(pushed.rows)) == (sub, None, 0)
-    assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] >= cursor[1]
+    assert (pushed.sub, pushed.error, len(pushed.rows)) == (sub, None, 1)
+    assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
+
+
+@pytest.mark.asyncio
+async def test_a_held_sync_follows_a_subscription_made_beside_it(client, server):
+    """A subscription made while a sync is held is one that sync waits for: a
+    commit reaching its view alone ends the hold, with that commit's delta."""
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    mk_feed(client, "g", "SELECT id, w FROM u WHERE w > 0")
+    (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
+    async with aio.connect(server, schema=client.schema) as conn:
+        _, cursor = await conn.delta_bootstrap(fid, f_schema)
+        await conn.subscribe(fid, f_schema, cursor)
+        held = asyncio.ensure_future(conn.sync(60))
+        _, cursor = await conn.delta_bootstrap(gid, g_schema)
+        late = await conn.subscribe(gid, g_schema, cursor)
+        assert not held.done(), "subscribing left the sync held"
+        client.execute_sql("INSERT INTO u VALUES (1, 1, 5)")
+        pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}
+    assert (pushed[late].error, len(pushed[late].rows)) == (None, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
+    """The writes behind a held sync are answered while it waits for a tick,
+    which at the pace set here is ten minutes away."""
+    own_server.start(extra_env={"GNITZ_PATIENT_TICK_GAP_MS": "600000"})
+    with gnitz.connect(own_server.target) as client:
+        base_tables(client)
+        mk_feed(client, "f", LINEAR)
+        client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+        vid, schema = client.resolve_table("f")
+        async with aio.connect(own_server.target) as conn:
+            # The read ticks the seed, and the pace counts from that tick.
+            _, cursor = await conn.delta_bootstrap(vid, schema)
+            await conn.subscribe(vid, schema, cursor)
+            held = asyncio.ensure_future(conn.sync(60))
+            for i in range(2, 6):
+                await asyncio.wait_for(conn.execute_sql(f"INSERT INTO t VALUES ({i}, 100, 'w')"), 20)
+            assert not held.done(), "no tick has taken the writes"
+            # A read of the view ticks at once: no follower asked for it.
+            assert len(rows(client, "SELECT * FROM f")) == 5
+            (pushed,) = (await asyncio.wait_for(held, 20)).pushed
+    assert (pushed.error, len(pushed.rows)) == (None, 4)
 
 
 # ── refused cursors ──────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
-use self::delta::{handle_delta_poll, handle_sync_pushed, Feeds, Subscriptions};
+use self::delta::{handle_delta_poll, Feeds, Subscriptions};
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingWrite};
@@ -43,11 +43,6 @@ use gnitz_wire::{ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
-
-/// The least time between a tick and one only waiting syncs ask for: such a
-/// sync is re-issued the moment it is answered, so unpaced it would tick per
-/// commit.
-const PATIENT_TICK_GAP: Duration = Duration::from_millis(10);
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
 /// would.
@@ -103,7 +98,7 @@ enum TickTrigger {
     /// success would serve stale rows under `WireStatus::Ok`.
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
-        /// Asked for by a waiting sync: held to [`PATIENT_TICK_GAP`] unless a
+        /// Asked for by a waiting sync: held to [`Shared::patient_tick_gap`] unless a
         /// trigger that is not joins the batch.
         patient: bool,
     },
@@ -217,6 +212,10 @@ pub struct Shared {
     /// included (`GNITZ_HELLO_TIMEOUT_MS`). The default outlasts the client's own
     /// `CONNECT_TIMEOUT`, so only a client that has already given up is reaped.
     hello_timeout: Duration,
+    /// The least time between a tick and one only waiting syncs ask for
+    /// (`GNITZ_PATIENT_TICK_GAP_MS`): such a sync is re-issued the moment it is
+    /// answered, so unpaced it would tick per commit.
+    patient_tick_gap: Duration,
 }
 
 /// The table locks one task holds.
@@ -436,6 +435,7 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
             "GNITZ_HELLO_TIMEOUT_MS",
             (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
         )),
+        patient_tick_gap: Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10)),
     });
 
     // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
@@ -491,11 +491,9 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
     peer.close();
 }
 
-/// One message handled to completion before the next is received, so replies
-/// leave in request order — which is how a client correlates them: it answers
-/// its oldest request with each reply, and ends the connection on one naming
-/// another `target_id`. Spawning `handle_message` to overlap requests would
-/// break that.
+/// One message is handled to completion before the next is received, so
+/// replies leave in request order, which is how a client pairs each with its
+/// request. A sync's answer is no reply, and leaves between two.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
@@ -514,7 +512,20 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
     }
 
     let mut subs = Subscriptions::default();
-    while let Some(buf) = peer.next_request().await {
+    let out = peer.outbox();
+    loop {
+        // Ahead of the next request: a client that always has one ready is
+        // still answered its sync.
+        if let Some(waiting) = subs.sync_wait(shared, &out) {
+            let Ok(synced) = peer.until_request(waiting.as_mut()).await else {
+                break;
+            };
+            if let Some(synced) = synced {
+                subs.answer_sync(shared, peer, synced).await;
+                continue;
+            }
+        }
+        let Some(buf) = peer.next_request().await else { break };
         handle_message(peer, &mut subs, buf, shared).await;
         // Behind the reply, where a pushed train splits none. A client that
         // is gone is found out by the next request.
@@ -584,7 +595,7 @@ async fn serve_until_signalled(shared: &Shared) {
 /// Coalescing is the *sender's* job — the committer sends `Auto` only once a tid
 /// crosses `TICK_COALESCE_ROWS`, and `Drain` senders are parked on the answer —
 /// so this loop delays no tick to gather more. The one tick it holds back is
-/// one only patient drains ask for, to [`PATIENT_TICK_GAP`] after the last.
+/// one only patient drains ask for, to [`Shared::patient_tick_gap`] after the last.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     // The batch's `Drain` repliers.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
@@ -632,7 +643,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
             }
             lease.acks().await;
         }
-        patient_from = Instant::now() + PATIENT_TICK_GAP;
+        patient_from = Instant::now() + shared.patient_tick_gap;
     }
 }
 
@@ -716,9 +727,11 @@ async fn dispatch_request(
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
 
         ClientVerb::SyncPushed => {
+            // Refused or not, it is answered as a sync is: out of the order of replies.
             let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
-                .map_err(|e| format!("decode error: {e}"))?;
-            handle_sync_pushed(shared, peer, subs, &held, ctrl.hdr.arg0).await
+                .map_err(|e| WireFault::from(format!("decode error: {e}")));
+            subs.ask_sync(&shared.feeds, held, ctrl.hdr.arg0);
+            Ok(())
         }
     }
 }

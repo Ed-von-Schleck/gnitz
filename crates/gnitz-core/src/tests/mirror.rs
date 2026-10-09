@@ -12,7 +12,9 @@ use super::*;
 use crate::block_on;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{interrupt_self_until, kv_schema, rel, reply_ctrl, reply_status, session_pair, Peer};
+use crate::test_support::{
+    interrupt_self_until, kv_schema, rel, reply_ctrl, reply_status, session_pair, sync_answer, Peer,
+};
 use crate::BlockingHost;
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
@@ -831,11 +833,11 @@ fn an_interrupted_poll_reannounces_its_reseed() {
                                       // 7's whole read left it subscribed, so the first poll is a sync and
                                       // 8's delta read; after it both are subscribed, and the next is a sync.
         peer.expect_sync("the first poll");
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         assert_eq!(peer.expect_poll("a poll"), vec![8]);
         peer.reply_watermark(8, TAG, 21);
         peer.expect_sync("the second poll");
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
     });
     let mut results = Vec::new();
     for _ in 0..2 {
@@ -1011,7 +1013,7 @@ fn a_subscribed_copy_is_advanced_by_what_was_pushed() {
         peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
         peer.push_train(7, subs[&7], &[(1, 10, -1)], Some(12));
         peer.push_train(8, subs[&8], &[], Some(12));
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
     });
     let before = client.requests_sent();
     let mut report: Vec<(u64, u64)> = block_on(client.sync(Duration::ZERO))
@@ -1042,7 +1044,7 @@ fn a_train_behind_another_reply_waits_for_its_poll() {
         peer.send(&reply_ctrl(0, 4242));
         peer.push_train(8, subs[&8], &[(2, 20, 1)], Some(15));
         peer.expect_sync("the poll");
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
     });
     assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
     assert!(log.take().is_empty(), "a copy moves only in a poll");
@@ -1062,7 +1064,7 @@ fn a_subscription_that_ended_is_continued_by_a_delta_read() {
     let h = std::thread::spawn(move || {
         peer.expect_sync("the poll");
         peer.push_train(7, subs[&7], &[], None);
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         let again = peer.expect_kept("the delta read");
         assert!(matches!(again[..], [(7, id)] if id != 0 && id != subs[&7]), "{again:?}");
         peer.reply_watermark(7, TAG, 13);
@@ -1095,7 +1097,7 @@ fn one_sync_serves_a_reader_and_the_mirror() {
         peer.expect_sync("the sync");
         peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
         peer.push_train(40, sub, &[(2, 20, 1)], Some(11));
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
     });
     let before = client.requests_sent();
     let synced = block_on(client.sync(Duration::ZERO)).expect("one sync");
@@ -1138,7 +1140,7 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
         peer.reply_watermark(40, TAG, 9);
         peer.expect_sync("the sync");
         peer.push_train(40, sub, &[(2, 20, 1)], Some(11));
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         // The mirror's read is never answered, so the call parks and is
         // interrupted.
         let read = peer.expect_kept("the mirror's read");
@@ -1160,7 +1162,7 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
         peer.reply_watermark(7, TAG, 11);
         let held = peer.expect_sync_naming("the next sync");
         assert!(held == [sub] && sub != abandoned, "{held:?}");
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         assert_eq!(peer.expect_poll("the mirror's read"), vec![7]);
         peer.reply_watermark(7, TAG, 11);
     });
@@ -1186,7 +1188,7 @@ fn a_view_that_keeps_failing_does_not_end_the_hold() {
         }
         let (verb, hdr) = peer.expect_verb("the second sync");
         assert_eq!(verb, gnitz_wire::ClientVerb::SyncPushed);
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         assert_eq!(peer.expect_poll("the retry"), vec![8]);
         peer.send(&reply_status(8, WireStatus::Error, "gone"));
         hdr.arg0
@@ -1212,7 +1214,7 @@ fn a_sync_over_an_untaken_train_asks_for_no_hold() {
         peer.push_train(8, subs[&8], &[(2, 20, 1)], Some(15));
         peer.send(&reply_ctrl(0, 4242));
         let (_, hdr) = peer.expect_verb("the sync");
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         hdr.arg0
     });
     assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
@@ -1230,9 +1232,9 @@ fn a_forgotten_view_ends_its_subscription() {
         let mut both: Vec<u64> = subs.values().copied().collect();
         both.sort_unstable();
         assert_eq!(peer.expect_sync_naming("the poll"), both);
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
         assert_eq!(peer.expect_sync_naming("the poll after"), [subs[&8]]);
-        peer.send(&reply_ctrl(0, 0));
+        peer.send(&sync_answer(None));
     });
     block_on(client.sync(Duration::ZERO))
         .map(|s| s.mirrored)

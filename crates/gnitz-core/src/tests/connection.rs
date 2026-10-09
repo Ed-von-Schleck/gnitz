@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair};
+use crate::test_support::{
+    framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair, sync_answer,
+};
 use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
 
@@ -724,7 +726,7 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     let synced = s.submit_sync(&[], Duration::from_secs(60));
     s.step(Interest::WRITE);
     assert_eq!(held_named(&peer.recv()), [0u64; 0], "no owner named either");
-    peer.send(&reply_ctrl(0, 0));
+    peer.send(&sync_answer(None));
     await_reply(&mut s, synced).unwrap();
     let gone = s.take_pushed(first).expect_err("nobody named it");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
@@ -771,7 +773,7 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
             }
         };
         assert_eq!(held_named(&request), named, "holding {held:?}");
-        script.extend(framed(&reply_ctrl(0, 0)));
+        script.extend(framed(&sync_answer(None)));
         peer.send_bytes(&std::mem::take(&mut script));
         await_reply(&mut s, synced).unwrap();
     }
@@ -788,10 +790,80 @@ fn a_refused_sync_moves_no_subscription() {
     let sub = subscribe(&mut s);
     let synced = s.submit_sync(&[sub], Duration::ZERO);
     let mut bytes = framed(&delta_terminal(40, 3));
-    bytes.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
+    bytes.extend(framed(&sync_answer(Some("refused"))));
     peer.send_bytes(&bytes);
     assert!(matches!(await_reply(&mut s, synced), Err(ClientError::Refused(_))));
     assert_eq!(s.take_pushed(sub).unwrap().1, cursor(3));
+}
+
+/// A sync holds no place among the replies: the requests submitted behind it
+/// are answered while it is unanswered, and a train pushed meanwhile is its
+/// subscription's when the answer comes.
+#[test]
+fn a_request_behind_a_sync_is_answered_before_it() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s);
+    let mut synced = s.submit_sync(&[sub], Duration::from_secs(60));
+    let first = s.submit(COMMIT);
+    let second = s.submit(COMMIT);
+    let mut bytes = framed(&delta_terminal(40, 3));
+    bytes.extend(framed(&reply_ctrl(0, 1)));
+    bytes.extend(pushed_train(40, sub, &[1], 9));
+    bytes.extend(framed(&reply_ctrl(0, 2)));
+    peer.send_bytes(&bytes);
+    assert_eq!(await_reply(&mut s, first).unwrap(), 1);
+    assert_eq!(await_reply(&mut s, second).unwrap(), 2);
+    assert!(synced.try_take().is_none(), "no reply answers a sync");
+    assert!(s.interest().read, "the sync is still owed its answer");
+
+    peer.send(&sync_answer(None));
+    await_reply(&mut s, synced).unwrap();
+    let (blocks, next) = s.take_pushed(sub).unwrap();
+    assert_eq!((blocks.len(), next), (1, cursor(9)));
+    assert!(s.interest().is_empty());
+}
+
+/// Syncs are answered in the order they were submitted, each by one answer.
+#[test]
+fn syncs_are_answered_in_order() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s);
+    let held = s.submit_sync(&[sub], Duration::from_secs(60));
+    let mut behind = s.submit_sync(&[sub], Duration::ZERO);
+    let mut bytes = framed(&delta_terminal(40, 3));
+    bytes.extend(framed(&sync_answer(Some("refused"))));
+    peer.send_bytes(&bytes);
+    assert!(matches!(await_reply(&mut s, held), Err(ClientError::Refused(_))));
+    assert!(behind.try_take().is_none(), "one answer, one sync");
+    peer.send(&sync_answer(None));
+    await_reply(&mut s, behind).expect("the second answer is the second sync's");
+}
+
+/// An answer to a sync nobody sent is a frame this session cannot place, and
+/// a session that ends fails the syncs it had not been answered.
+#[test]
+fn a_sync_ends_with_its_session() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s);
+    let synced = s.submit_sync(&[sub], Duration::from_secs(60));
+    let mut bytes = framed(&delta_terminal(40, 3));
+    bytes.extend(framed(&sync_answer(None)));
+    bytes.extend(framed(&sync_answer(None)));
+    peer.send_bytes(&bytes);
+    await_reply(&mut s, synced).expect("its own answer came first");
+    while !s.is_closed() {
+        s.step(Interest::READ);
+    }
+
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s);
+    let synced = s.submit_sync(&[sub], Duration::from_secs(60));
+    peer.send(&delta_terminal(40, 3));
+    drop(peer);
+    assert!(matches!(
+        await_reply(&mut s, synced),
+        Err(ClientError::ConnectionLost(_))
+    ));
 }
 
 /// A subscription a session at its cap refuses is no subscription: the

@@ -378,18 +378,23 @@ def test_a_mirror_is_not_read_your_own_writes(client, mirror):
 @pytest.mark.asyncio
 async def test_a_held_poll_leaves_an_async_client_free(client, server, mirror_dir):
     """A poll held with nothing to report does not hold its client: a scan
-    submitted beside it is answered, and the server ends the poll for it."""
+    submitted beside it is answered and leaves it held, and the commit that
+    then reaches the view ends it, already in the copy."""
     _fed_view(client)
     churn(client, 1, 30)
     tid, t_schema = client.resolve_table("t")
     async with aio.connect(server, schema=client.schema) as m:
         await m.mirror_at(mirror_dir)
-        await m.mirror_view("f")
+        vid = (await m.mirror_view("f")).view_id
         await m.sync()
-        t0 = time.monotonic()
-        synced, scanned = await asyncio.gather(m.sync(wait=30), m.scan(tid, t_schema))
-        assert time.monotonic() - t0 < 10, "the scan released the poll, not the wait"
+        before = await m.cursor(vid)
+        held = asyncio.ensure_future(m.sync(wait=60))
+        scanned = await asyncio.wait_for(m.scan(tid, t_schema), 20)
+        assert not held.done(), "the scan left the poll held"
+        client.execute_sql("INSERT INTO t VALUES (9001, 200, 'late')")
+        synced = await asyncio.wait_for(held, 20)
         assert [r.error for r in synced.mirrored] == [None]
+        assert (await m.cursor(vid))[1] > before[1], "the commit is in the copy"
         assert len(scanned) > 0
         await m.close_mirror()
 

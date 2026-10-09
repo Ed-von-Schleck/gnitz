@@ -10,18 +10,21 @@
 //! visibility widened.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
 use super::{
-    all_ticked, encode_response_into, fresh_read_lock, send_ack, send_fault, send_msg, target_kind, terminal_scan_msg,
-    Access, Shared,
+    all_ticked, encode_response_into, fresh_read_lock, send_fault, send_msg, target_kind, terminal_scan_msg, Access,
+    Shared,
 };
 use crate::runtime::master::forward_scan;
 use crate::runtime::peer::{Outbox, Peer};
-use crate::runtime::reactor::{oneshot, select2, Either, ReadGuard, TrainLease};
+use crate::runtime::reactor::{oneshot, select2, ReadGuard, TrainLease};
 use crate::runtime::wire as ipc;
 use gnitz_wire::control::{ControlHeader, Target};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
@@ -172,36 +175,34 @@ pub(super) async fn handle_delta_poll(
 }
 
 /// The catalog read lock a sync of the views `ids` is answered under, every
-/// commit reaching one of them ticked. A `quiet` request is first held until a
-/// relation one of them reads changes, `wait` passes, or the client sends its
-/// next request or goes; `true` while it may be held again.
+/// commit reaching one of them ticked. A `quiet` sync is first held until a
+/// relation one of them reads changes or `until` comes.
 async fn hold_lock(
     shared: &Rc<Shared>,
-    peer: &Peer,
     ids: &[u64],
-    wait: Duration,
+    until: Instant,
     quiet: impl FnOnce() -> bool,
-) -> Result<(ReadGuard, bool), WireFault> {
+) -> Result<ReadGuard, WireFault> {
     let ids = || ids.iter().copied();
+    let wait = until.saturating_duration_since(Instant::now());
     let waiting = !wait.is_zero();
     let g = fresh_read_lock(shared, ids(), waiting).await?;
     if !waiting {
-        return Ok((g, false));
+        return Ok(g);
     }
     // No await from the test to the park, so no commit is acknowledged between
     // them. The drain above was one: a commit it did not take is un-ticked here.
     let mut watched = shared.cat().dag.source_closure(ids());
     if !(all_ticked(shared, &watched) && quiet()) {
-        return Ok((g, true));
+        return Ok(g);
     }
     // A commit or a drop reaches a view through the view or anything it reads.
     watched.extend(ids());
     let mut parked = shared.sync_waiters.park(watched);
     drop(g);
-    let released = select2(shared.disp().reactor().sleep(wait), peer.next_request_ready());
-    let woken = matches!(select2(&mut parked.woken, released).await, Either::A(_));
+    select2(&mut parked.woken, shared.disp().reactor().sleep(wait)).await;
     drop(parked);
-    Ok((fresh_read_lock(shared, ids(), true).await?, woken))
+    fresh_read_lock(shared, ids(), true).await
 }
 
 // ---------------------------------------------------------------------------
@@ -278,13 +279,34 @@ impl Feeds {
     }
 }
 
-/// The subscriptions one connection holds, each with its feed. An entry
-/// outlives a subscription its feed ended, until the connection's next
-/// SYNC_PUSHED.
+/// One connection's side of the pushed feeds.
 #[derive(Default)]
-pub(super) struct Subscriptions(Vec<(Rc<Subscriber>, Rc<Feed>)>);
+pub(super) struct Subscriptions {
+    asked: Asked,
+    /// The wait of the oldest sync, over `asked` as it was when the wait began.
+    wait: Option<SyncWait>,
+}
+
+/// What a connection asked for and still has.
+#[derive(Default)]
+struct Asked {
+    /// Its subscriptions, each with its feed. An entry outlives a subscription
+    /// its feed ended, until a sync next waits.
+    held: Vec<(Rc<Subscriber>, Rc<Feed>)>,
+    /// Its unanswered syncs, oldest first: until when each may be held, or
+    /// what refused it.
+    syncs: VecDeque<Result<Instant, WireFault>>,
+}
+
+type SyncWait = Pin<Box<dyn Future<Output = Result<(), WireFault>>>>;
 
 impl Subscriptions {
+    /// `asked`, to change it: the wait begins again.
+    fn asked_mut(&mut self) -> &mut Asked {
+        self.wait = None;
+        &mut self.asked
+    }
+
     /// Keep `item` as the subscription `id`, queued through `round` on `out`.
     fn join(&mut self, feeds: &Feeds, id: u64, item: &DeltaPollItem, round: u64, out: Rc<Outbox>) {
         let joined = Rc::new(Subscriber {
@@ -306,7 +328,7 @@ impl Subscriptions {
             })
         }));
         feed.members.borrow_mut().push(Rc::clone(&joined));
-        self.0.push((joined, feed));
+        self.asked_mut().held.push((joined, feed));
     }
 
     /// Send each subscription queued through rounds that left it no row where
@@ -314,7 +336,7 @@ impl Subscriptions {
     /// those rounds too.
     fn tell(&self, shared: &Shared, peer: &Peer) {
         debug_assert!(peer.outbox().is_empty(), "a position is sent behind every train");
-        for (sub, feed) in &self.0 {
+        for (sub, feed) in &self.asked.held {
             let Some(after) = sub.after_tick.get() else { continue };
             if sub.told.replace(after) != after {
                 let tid = feed.key.view.tid;
@@ -329,27 +351,77 @@ impl Subscriptions {
 
     /// Leave the feed of every subscription whose id `gone` names.
     pub(super) fn leave(&mut self, feeds: &Feeds, gone: impl Fn(u64) -> bool) {
-        for (sub, feed) in self.0.extract_if(.., |(sub, _)| gone(sub.id)) {
+        for (sub, feed) in self.asked_mut().held.extract_if(.., |(sub, _)| gone(sub.id)) {
             feed.members.borrow_mut().retain(|m| !Rc::ptr_eq(m, &sub));
             feeds.retire(&feed);
         }
+    }
+
+    /// SYNC_PUSHED: end every subscription `held` does not name, and owe the
+    /// connection a sync held up to `wait_ms`. An undecodable `held` is what
+    /// that sync is refused with.
+    pub(super) fn ask_sync(&mut self, feeds: &Feeds, held: Result<Vec<u64>, WireFault>, wait_ms: u64) {
+        if let Ok(held) = &held {
+            self.leave(feeds, |id| !held.contains(&id));
+        }
+        self.asked_mut()
+            .syncs
+            .push_back(held.map(|_| Instant::now() + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT)));
+    }
+
+    /// The [`sync_wait`] of the oldest unanswered sync, begun if none is
+    /// under way.
+    pub(super) fn sync_wait(&mut self, shared: &Rc<Shared>, out: &Rc<Outbox>) -> Option<&mut SyncWait> {
+        if self.wait.is_none() {
+            let Asked { held, syncs } = &mut self.asked;
+            let deadline = match syncs.len() {
+                0 => return None,
+                1 => syncs[0].clone(),
+                // Answered in the order asked, so held no longer.
+                _ => syncs[0].clone().map(|_| Instant::now()),
+            };
+            held.retain(|(sub, _)| sub.after_tick.get().is_some());
+            let (shared, out, held) = (Rc::clone(shared), Rc::clone(out), held.clone());
+            self.wait = Some(Box::pin(async move { sync_wait(&shared, &out, deadline?, held).await }));
+        }
+        self.wait.as_mut()
+    }
+
+    /// Answer the oldest sync, whose wait ended as `synced`: the trains
+    /// queued, then the frame that ends it.
+    pub(super) async fn answer_sync(&mut self, shared: &Shared, peer: &Peer, synced: Result<(), WireFault>) {
+        self.asked_mut().syncs.pop_front();
+        if peer.ship_pushed().await.is_err() {
+            return;
+        }
+        let end = match &synced {
+            Ok(()) => {
+                self.tell(shared, peer);
+                peer.outbox().synced();
+                ipc::WireMsg::default()
+            }
+            Err(fault) => ipc::WireMsg::fault(fault),
+        };
+        let flags = gnitz_wire::WireFlags {
+            lane: gnitz_wire::WireLane::SyncAnswer,
+            ..Default::default()
+        };
+        peer.cork_with(|out| encode_response_into(out, ipc::WireMsg { flags, ..end }));
     }
 }
 
 /// The frame that opens a pushed train of subscription `id`.
 fn pushed_marker(view: u64, id: u64) -> Vec<u8> {
     let mut out = Vec::new();
-    let flags = gnitz_wire::WireFlags {
-        pushed: true,
-        continuation: true,
-        ..Default::default()
-    };
     encode_response_into(
         &mut out,
         ipc::WireMsg {
             target_id: view,
             arg0: id,
-            flags,
+            flags: gnitz_wire::WireFlags {
+                lane: gnitz_wire::WireLane::PushedTrain,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -378,20 +450,15 @@ fn lagged(view: u64) -> WireFault {
     format!("subscription to relation {view} fell behind what one connection is queued; poll from its cursor").into()
 }
 
-/// SYNC_PUSHED: end every subscription of the connection `held` does not
-/// name, bring the rest up to the pushes acknowledged before this request, and
-/// hold the reply up to `wait_ms` while none of them has been sent anything
-/// since the last one.
-pub(super) async fn handle_sync_pushed(
+/// Wait until a sync of `held` can be answered: each subscription is queued
+/// every round acknowledged before it, and one was queued something since the
+/// last sync or `deadline` has passed.
+async fn sync_wait(
     shared: &Rc<Shared>,
-    peer: &Peer,
-    subs: &mut Subscriptions,
-    held: &[u64],
-    wait_ms: u64,
+    out: &Outbox,
+    deadline: Instant,
+    mut held: Vec<(Rc<Subscriber>, Rc<Feed>)>,
 ) -> Result<(), WireFault> {
-    subs.leave(&shared.feeds, |id| !held.contains(&id));
-    let deadline = Instant::now() + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT);
-    let out = peer.outbox();
     let feeds = &shared.feeds;
     // Whether a subscription has been queued every round its view was reached
     // by. Asked under the catalog lock.
@@ -400,22 +467,16 @@ pub(super) async fn handle_sync_pushed(
         target_kind(shared, view, Access::Read).is_ok() && sub.caught_up(shared, view.tid)
     };
     loop {
-        // A subscription its feed ended is gone here too.
-        subs.0.retain(|(sub, _)| sub.after_tick.get().is_some());
-        let ids: Vec<u64> = subs.0.iter().map(|(_, feed)| feed.key.view.tid).collect();
+        held.retain(|(sub, _)| sub.after_tick.get().is_some());
+        let ids: Vec<u64> = held.iter().map(|(_, feed)| feed.key.view.tid).collect();
         // With no subscription there is nothing to hold for.
-        let left = match ids.is_empty() {
-            true => Duration::ZERO,
-            false => deadline.saturating_duration_since(Instant::now()),
-        };
-        let quiet = || out.unsynced() == 0 && subs.0.iter().all(caught_up);
-        let (catalog, may_hold) = hold_lock(shared, peer, &ids, left, quiet).await?;
-        // Every commit acknowledged before this request is ticked here, so a
-        // subscription that is caught up waits for no pump: the steady state
-        // of a poll. One its feed ended while the lock was awaited has its
-        // fault train queued.
+        let until = if ids.is_empty() { Instant::now() } else { deadline };
+        let quiet = || out.unsynced() == 0 && held.iter().all(caught_up);
+        let catalog = hold_lock(shared, &ids, until, quiet).await?;
+        // Every commit acknowledged before the sync is ticked here, so only a
+        // subscription behind asks for a pump.
         let mut asked = false;
-        for joined in subs.0.iter().filter(|(sub, _)| sub.after_tick.get().is_some()) {
+        for joined in held.iter().filter(|(sub, _)| sub.after_tick.get().is_some()) {
             if !caught_up(joined) {
                 joined.1.asked.set(true);
                 asked = true;
@@ -433,17 +494,10 @@ pub(super) async fn handle_sync_pushed(
         } else {
             drop(catalog);
         }
-        if peer.ship_pushed().await.is_err() {
+        if out.unsynced() > 0 || Instant::now() >= until {
             return Ok(());
         }
-        if out.unsynced() > 0 || !may_hold {
-            break;
-        }
     }
-    subs.tell(shared, peer);
-    send_ack(peer, 0, 0);
-    out.synced();
-    Ok(())
 }
 
 /// Read the feeds requests ask for, for as long as one waits. A pass answers

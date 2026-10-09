@@ -1013,10 +1013,11 @@ fn a_round_of_another_view_moves_no_cursor() {
     );
 }
 
-/// The next request a connection sends ends its waiting sync, and both are
-/// answered in order; a request ahead of one is not held with it.
+/// A waiting sync holds up no request of its connection: one sent behind it
+/// is answered while it waits. The next sync ends its hold, and the two are
+/// answered in the order they were sent, outside the order of replies.
 #[test]
-fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
+fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
     use gnitz_wire::control::{append_frame, ControlHeader};
     use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
     use std::io::{Read, Write};
@@ -1055,47 +1056,39 @@ fn a_waiting_sync_is_answered_when_its_connection_sends_the_next_request() {
         raw.read_exact(&mut payload).unwrap();
         payload
     };
-    let answered = |raw: &mut std::os::unix::net::UnixStream, which: &str| {
+    let next_is_sync = |raw: &mut std::os::unix::net::UnixStream, which: &str| {
         let reply = recv(raw);
         let ctrl = gnitz_wire::control::peek_control_block(&reply).expect("a control header");
         assert!(ctrl.fault(&reply).is_none(), "{which} is answered, not refused");
-        assert!(!ctrl.hdr.flags.pushed, "{which}: a quiet view is sent no train");
+        match ctrl.hdr.flags.lane {
+            gnitz_wire::WireLane::Reply => false,
+            gnitz_wire::WireLane::SyncAnswer => true,
+            gnitz_wire::WireLane::PushedTrain => panic!("{which}: a quiet view is sent no train"),
+        }
     };
     send(&mut raw, &gnitz_wire::HELLO);
     assert_eq!(recv(&mut raw), gnitz_wire::HELLO);
     send(&mut raw, &encode_delta_poll(&[item], Some(1)));
-    answered(&mut raw, "the subscribing read");
+    assert!(!next_is_sync(&mut raw, "the subscribing read"));
 
     let t0 = std::time::Instant::now();
     send(&mut raw, &sync(HELD));
-    send(&mut raw, &sync(Duration::ZERO));
-    answered(&mut raw, "the waiting sync");
-    answered(&mut raw, "the request behind it");
-    assert!(t0.elapsed() < RELEASED, "the second request released the first");
-
-    // A request ahead of a waiting sync, read in with it, is answered before
-    // the sync is held.
-    let mut both = Vec::new();
-    for wait in [Duration::ZERO, HELD] {
-        let payload = sync(wait);
-        both.extend_from_slice(&gnitz_wire::frame_len_prefix(payload.len()));
-        both.extend_from_slice(&payload);
-    }
-    let t0 = std::time::Instant::now();
-    raw.write_all(&both).unwrap();
-    recv(&mut raw);
+    send(&mut raw, &encode_delta_poll(&[item], None));
     assert!(
-        t0.elapsed() < RELEASED,
-        "the reply ahead of the sync did not wait with it"
+        !next_is_sync(&mut raw, "the read behind the sync"),
+        "the sync is still held"
     );
+    assert!(t0.elapsed() < RELEASED, "the read did not wait with the sync");
+
     send(&mut raw, &sync(Duration::ZERO));
-    recv(&mut raw);
-    recv(&mut raw);
+    assert!(next_is_sync(&mut raw, "the waiting sync"));
+    assert!(next_is_sync(&mut raw, "the sync behind it"));
+    assert!(t0.elapsed() < RELEASED, "the second sync ended the hold of the first");
 }
 
 /// A poll taken in its two halves leaves the client free while the server
-/// holds its request: a request made meanwhile is answered and ends the hold,
-/// and the second half then reports every view.
+/// holds its request: a request made meanwhile is answered and leaves it
+/// held, a commit ends the hold, and the second half then reports every view.
 #[test]
 fn a_held_poll_leaves_its_client_free() {
     let mut fx = Fixture::start();
@@ -1104,10 +1097,16 @@ fn a_held_poll_leaves_its_client_free() {
     fx.drain();
 
     let t0 = std::time::Instant::now();
-    let synced = fx.mirror().begin_sync(HELD).expect("the first half");
+    let mut synced = fx.mirror().begin_sync(HELD).expect("the first half");
     block_on(fx.mirror().resolve_relation(&rel("s", "t"))).expect("a request beside the held poll");
+    assert!(
+        t0.elapsed() < RELEASED,
+        "the request beside it did not wait with the poll"
+    );
+    assert!(synced.try_take().is_none(), "the request beside it left the poll held");
+    sql(&mut fx.direct, "s", "INSERT INTO t VALUES (3999, 1, 5, 0.5, 'held')");
     let synced = block_on(fx.mirror().wait(synced));
-    assert!(t0.elapsed() < RELEASED, "the request beside it released the poll");
+    assert!(t0.elapsed() < RELEASED, "the commit released the poll");
     let report = block_on(fx.mirror().finish_sync(synced))
         .expect("the second half")
         .mirrored;
