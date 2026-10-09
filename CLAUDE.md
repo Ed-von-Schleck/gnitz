@@ -643,27 +643,48 @@ once the new one is durable, so a crash at any point leaves one complete set.
 ## Benchmarking
 
 ```bash
-make bench                          # quick mode, 1 worker
-make bench-full                     # full mode, 4 workers
-make bench WORKERS=4 STAT=1         # knobs: WORKERS, CLIENTS, FULL=1, PERF=1, STAT=1
+make bench                              # every scenario, 4 workers
+make bench SCENARIO=join,fanout         # knobs: SCENARIO, FAMILY, REGIME, ROWS, WORKERS, LABEL
+make bench-compare A=<dir> B=<dir>      # what moved between two results directories
+make bench-profile SCENARIO=join        # the same scenario, explained: flamegraphs, syscalls, syncs, mallocs
 ```
 
-`STAT=1` adds the server's own user-space instructions and cycles per measured
-row. Compare two builds on those: rows per second moves by more than most
-changes do.
+`make help` lists the rest. Results land in the gitignored `benchmarks/results/`,
+one directory per run.
 
-`make help` lists the rest. Results land in the gitignored `benchmarks/results/`;
-`benchmarks/report.py` turns them into report tables.
+A **scenario** is one fresh server taken through **phases** — load, a graceful
+stop and boot, deltas the server's own ticks pace, small writes each read back at
+once, rewrites and deletes, a kill and recovery, every view created a second
+time. A phase is the unit every number is taken over, and it ends with every
+view drained: a push is acknowledged before its tick, so the time of a push alone
+is not the cost of maintaining a view.
 
-`make bench-disk` measures bytes instead of time: each scenario loads one shape
-of data under the views that stress it, lets the shutdown checkpoint put every
-resumable store on disk, and prints `gnitz-server --disk-usage <data_dir>` — the
-data directory by relation, store, LSM level and shard region — beside the same
-shards summed by region class, the rows a store holds that cancel, and the bytes
-the workers wrote to get there. That flag reads the files alone, so it also
-answers for any other data directory, a live server's included.
+**The numbers of record are counts** — instructions, syscalls, syncs, bytes
+written, shard bytes — taken per process group (client, master, workers). Two
+runs of the same code agree on them to a fraction of a percent on any machine;
+on durations they do not, so a duration decides nothing a count can decide.
+`bench-compare` knows each metric's noise and prints only what moved past it.
 
-Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
+**Every scenario checks its own answer**: each maintained view is held against a
+second view of the same body created after the fact — a pure backfill — weights
+included. A benchmark that computed the wrong rows reports no numbers.
+
+A **profile layer** explains a number and is never the run of record: it perturbs
+what it observes, so each layer has a run of its own. The layers need a kernel
+that lets an unprivileged `perf` see the whole machine, a readable tracefs, and
+`bpftrace` under `sudo -n`; a layer this machine cannot deliver is refused before
+anything runs.
+
+The same scenarios are read for their bytes: `make bench-disk` takes the ones
+that vary the shape of the data through each of its storage regimes and prints,
+per store, `gnitz-server --disk-usage <data_dir>` — the data directory by
+relation, store, LSM level and shard region — beside the same shards summed by
+region class and the rows a store holds that cancel. That flag reads the files alone,
+so it also answers for any other data directory, a live server's included.
+
+Workflow: `make bench LABEL=before` → change → `make bench LABEL=after` →
+`make bench-compare`; where a number moved and the reason is not obvious,
+`make bench-profile` on that scenario.
 
 ### Rust micro-benchmarks
 

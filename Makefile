@@ -7,19 +7,19 @@ SHELL         := bash
 .DEFAULT_GOAL := help
 
 # Knobs — override on the command line, e.g.
-#   make bench WORKERS=4 PERF=1
+#   make bench SCENARIO=join,fanout REGIME=compacted
 #   make test T=some_test_name
 #   make e2e WORKERS=1 K='joins and not slow'
-WORKERS    ?= 1                              # e2e overrides this to 4 (see below)
-CLIENTS    ?= 1
-FULL       ?=
-PERF       ?=
-STAT       ?=                                # bench: count the server's instructions and cycles per benchmark
-PERF_DWARF ?=
-ROWS       ?=                                # bench-disk: rows loaded per scenario
-RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES of its compacted regime
-SCENARIO   ?=                                # bench-disk: comma-separated scenario names
-REGIME     ?=                                # bench-disk: l0, compacted, checkpointed or all
+WORKERS    ?= 1                              # e2e and the benchmarks override this to 4 (see below)
+ROWS       ?=                                # bench: rows a scenario loads
+SCENARIO   ?=                                # bench: comma-separated scenario names
+FAMILY     ?=                                # bench: comma-separated scenario families
+REGIME     ?=                                # bench: comma-separated regimes (l0, compacted, checkpointed), or every
+RAM_TIER   ?=                                # bench: GNITZ_RAM_TIER_BYTES of the server
+PROFILE    ?=                                # bench-profile: comma-separated layers (default: all of them)
+LABEL      ?=                                # bench: a label in the results directory's name
+A          ?=                                # bench-compare: the results directory before (default: the second latest)
+B          ?=                                # bench-compare: the results directory after (default: the latest)
 T          ?=                                # cargo test name filter
 K          ?=                                # pytest -k expression
 
@@ -36,8 +36,8 @@ TARGET_CPU ?= x86-64-v3
         server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
         e2e-checked e2e-debug release-test \
         clean distclean \
-        bench-rust bench bench-disk bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
-        bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
+        bench-rust bench bench-full bench-disk bench-profile bench-compare bench-report bench-native \
+        profiling-server pyext-profiling
 
 all: test
 
@@ -151,7 +151,7 @@ distclean: clean ## clean + cargo target cache + post-mortem logs
 	@rm -f tmp/*.log
 
 # ---------------------------------------------------------------------------
-# Benchmarks — the in-process Rust microbenchmarks and the SQL-level suite
+# Benchmarks — the in-process Rust microbenchmarks and the whole-program suite
 # ---------------------------------------------------------------------------
 
 # The in-process microbenchmarks `make bench` cannot isolate. A green run says
@@ -170,40 +170,37 @@ bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs 
 		$(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1
 
-bench: release-server pyext-release ## Run the SQL benchmark suite
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py \
-		$(if $(FULL),--full) \
-		--workers=$(WORKERS) --clients=$(CLIENTS) \
-		$(if $(K),-k '$(K)') \
-		$(if $(PERF),--perf) $(if $(PERF)$(STAT),--perf-stat) \
-		$(if $(PERF_DWARF),--perf-dwarf)
+# One scenario is one fresh server taken through phases; a run writes a
+# directory under benchmarks/results/ and prints every phase as one line. The
+# numbers of record are counts — instructions, syscalls, syncs, bytes — so two
+# runs of the same code agree to a fraction of a percent on any machine.
+# Held in a variable: a comma in a function's argument would split it.
+DISK_FAMILIES := shape,mutation,policy,join
+BENCH = cd crates/gnitz-py && uv run python ../../benchmarks/bench.py
+BENCH_RUN = $(BENCH) run --workers=$(WORKERS) \
+		$(if $(ROWS),--rows=$(ROWS)) $(if $(SCENARIO),--scenario=$(SCENARIO)) $(if $(FAMILY),--family=$(FAMILY)) \
+		$(if $(RAM_TIER),--env=GNITZ_RAM_TIER_BYTES=$(RAM_TIER)) $(if $(LABEL),--label=$(LABEL))
 
-# Bytes, not time: a run prints what the data directory holds once the final
-# checkpoint has put every store on disk.
+bench: WORKERS = 4
+bench: release-server pyext-release ## Whole-program benchmark: every scenario, 4 workers (knobs: SCENARIO, FAMILY, REGIME, ROWS, WORKERS, LABEL)
+	$(BENCH_RUN) $(if $(REGIME),--regime=$(REGIME))
+
+bench-full: WORKERS = 1,4
+bench-full: release-server pyext-release ## Every scenario under each of its storage regimes, at 1 and at 4 workers
+	$(BENCH_RUN) --regime=$(or $(REGIME),every)
+
+# Bytes, not time: the same scenarios, read for what the data directory holds
+# once a checkpoint has put every store on disk.
 bench-disk: WORKERS = 4
-bench-disk: release-server pyext-release ## Disk footprint by scenario and LSM regime (knobs: WORKERS, ROWS, RAM_TIER, SCENARIO, REGIME)
-	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release \
-		uv run python ../../benchmarks/disk.py --workers=$(WORKERS) \
-		$(if $(ROWS),--rows=$(ROWS)) $(if $(RAM_TIER),--ram-tier-bytes=$(RAM_TIER)) \
-		$(if $(SCENARIO),--scenario=$(SCENARIO)) $(if $(REGIME),--regime=$(REGIME))
+bench-disk: release-server pyext-release ## Disk footprint by store and region, of the scenarios read for their bytes, under each regime
+	$(BENCH_RUN) --regime=$(or $(REGIME),every) $(if $(SCENARIO)$(FAMILY),,--family=$(DISK_FAMILIES))
+	$(BENCH) report --disk
 
-bench-full: WORKERS = 4
-bench-full: FULL    = 1
-bench-full: bench ## Full benchmark mode, 4 workers
+bench-compare: ## What moved between two results directories (A=<before> B=<after>; the two latest by default)
+	$(BENCH) compare $(if $(A)$(B),$(abspath $(A)) $(abspath $(B)))
 
-bench-features: release-server pyext-release ## Full features tier (per-feature maintenance cost), 4 workers
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 -k features
-
-bench-txn: release-server pyext-release ## Full transaction/HTAP/serving tiers, 4 workers
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 -k "txn or htap or serving"
-
-bench-sweep: release-server pyext-release ## Sweep workers×clients over {1,2,4}
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=1,2,4 --clients=1,2,4
-
-bench-perf: WORKERS = 4
-bench-perf: FULL    = 1
-bench-perf: PERF    = 1
-bench-perf: bench ## Full + perf record + perf stat
+bench-report: ## Print the latest results (SCENARIO= prints those phase by phase, with their profile)
+	$(BENCH) report $(if $(SCENARIO),--scenario=$(SCENARIO))
 
 # Builds for THIS machine only — the binary may SIGILL anywhere else, and its
 # numbers are not comparable with a default-built run. For answering "what does
@@ -214,35 +211,25 @@ bench-perf: bench ## Full + perf record + perf stat
 # either of them having to know about RUSTFLAGS. Setting it in the environment
 # is also what overrides crates/.cargo/config.toml.
 bench-native: export RUSTFLAGS = -C target-cpu=native
-bench-native: WORKERS = 4
-bench-native: FULL    = 1
-bench-native: bench ## Full benchmark built for the host CPU (non-portable binary)
+bench-native: bench ## The benchmark built for the host CPU (non-portable binary)
 
-bench-perf-dwarf: WORKERS = 4
-bench-perf-dwarf: FULL       = 1
-bench-perf-dwarf: PERF_DWARF = 1
-bench-perf-dwarf: bench ## Full + perf with DWARF call graphs
+# A profile reads its stacks off frame pointers and names an inlined function
+# from debug info, so both builds carry both. They go to a target directory of
+# their own: changed RUSTFLAGS would otherwise recompile the release build too.
+PROFILING = CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-frame-pointers=yes"
 
-profiling-server: ## Build frame-pointer release server -> ./gnitz-server-profiling (accurate perf call graphs)
-	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-frame-pointers=yes" CARGO_TARGET_DIR=target/profiling \
-		cargo build --release -p gnitz
+profiling-server: ## Build the release server with frame pointers and debug info -> ./gnitz-server-profiling
+	cd crates && $(PROFILING) CARGO_TARGET_DIR=target/profiling cargo build --release -p gnitz
 	cp crates/target/profiling/release/gnitz-server gnitz-server-profiling
 
-bench-profile: profiling-server pyext-release ## Profile incremental view maintenance under perf (frame pointers, W=4)
-	cd crates/gnitz-py && GNITZ_SERVER_BIN=$(abspath gnitz-server-profiling) \
-		uv run python ../../benchmarks/run.py --full --workers=4 --perf -k view_maintenance
-	cd crates/gnitz-py && uv run python ../../benchmarks/report.py
+pyext-profiling: ## Build & install the Python extension with frame pointers and debug info
+	cd crates/gnitz-py && $(PROFILING) CARGO_TARGET_DIR=$(abspath crates/target/profiling) uv run maturin develop --release
 
-profiling-server-dwarf: ## Build release server with DWARF unwind tables + line info -> ./gnitz-server-profiling-dwarf
-	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-unwind-tables=yes -C debuginfo=1" CARGO_TARGET_DIR=target/profiling-dwarf \
-		cargo build --release -p gnitz
-	cp crates/target/profiling-dwarf/release/gnitz-server gnitz-server-profiling-dwarf
-
-# The flagship profiling command: sweep over the {1,4}×{1,4} worker×client
-# corner combinations under perf DWARF call-graph recording + perf stat. Uses the
-# DWARF-capable server build (.eh_frame unwind tables), and writes a per-combo
-# perf.data + flamegraph plus a combined report.
-bench-sweep-dwarf: profiling-server-dwarf pyext-release ## Full sweep workers×clients {1,4} under perf DWARF profiling + report
-	cd crates/gnitz-py && GNITZ_SERVER_BIN=$(abspath gnitz-server-profiling-dwarf) \
-		uv run python ../../benchmarks/run.py --full --workers=1,4 --clients=1,4 --perf-dwarf --perf-stat
-	cd crates/gnitz-py && uv run python ../../benchmarks/report.py --all
+# Each layer has a run of its own beside the unprofiled one, since a layer
+# distorts what the others would see. More rows than `make bench` loads, so a
+# phase lasts long enough to be sampled.
+bench-profile: WORKERS = 4
+bench-profile: ROWS := $(or $(ROWS),1000000)
+bench-profile: profiling-server pyext-profiling ## Profile scenarios: flamegraphs on and off CPU, syscalls, ring ops, syncs, mallocs (knobs: SCENARIO, PROFILE, ROWS)
+	$(BENCH_RUN) $(if $(REGIME),--regime=$(REGIME)) --server=$(abspath gnitz-server-profiling) \
+		--profile=$(or $(PROFILE),all)

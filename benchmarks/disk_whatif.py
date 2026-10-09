@@ -1,13 +1,13 @@
-"""What a kept `bench-disk` data directory would weigh under other encodings.
+"""What a kept benchmark data directory would weigh under other encodings.
 
-Reads the directories `disk.py --keep` left behind and re-encodes each shard
+Reads the directories `bench.py run --keep` left behind and re-encodes each shard
 region's real bytes under candidate encodings, so an idea is priced on the bytes
 it would act on. Every candidate is sized as the image its region would hold;
 alignment padding is not re-derived. Region types are inferred from the bytes:
 a 16-byte raw payload column whose every cell reads as a German string against
 the shard's heap is a string column.
 
-    uv run --with numpy python ../../benchmarks/disk_whatif.py ../../tmp/bench_disk_*
+    uv run --with numpy python ../../benchmarks/disk_whatif.py ../../tmp/bench_*
 """
 
 from __future__ import annotations
@@ -21,8 +21,7 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
-from helpers.shards import read_shards  # noqa: E402
+from harness.shards import read_shards  # noqa: E402
 
 FIRST_USER = 16
 BLOCK = 4096          # bytes per independently compressed heap block
@@ -270,7 +269,7 @@ def main():
         for name, saved in sorted(acc.items(), key=lambda kv: -kv[1]):
             if name != "current" and saved:
                 print(f"  {saved:>12} {100 * saved / acc['current']:>5.1f}%  {name}")
-    out = REPO_ROOT / "benchmarks/results/disk/whatif.json"
+    out = REPO_ROOT / "benchmarks/results/whatif.json"
     out.write_text(json.dumps(table, indent=1))
     print(f"\nresults: {out}")
 
