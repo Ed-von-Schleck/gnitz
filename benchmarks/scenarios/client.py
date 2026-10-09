@@ -6,13 +6,14 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
 from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch, aio
+
+from harness.run import time_pushes
 
 from .base import Scenario
 
@@ -159,15 +160,9 @@ def _spin(stop):
         x = (x * 3 + 1) & 0xFFFF
 
 
-async def _push_loop(target, tid, schema, n):
-    ms = []
+async def _push_loop(target, ops):
     async with aio.connect(target) as conn:
-        for i in range(n):
-            b = ZSetBatch(schema).extend([dict(pk=i, val=i)])
-            t = time.perf_counter()
-            await conn.push(tid, b)
-            ms.append((time.perf_counter() - t) * 1e3)
-    return ms
+        return await time_pushes(conn, ops)
 
 
 @dataclass
@@ -179,15 +174,15 @@ class Async(Scenario):
     def run(self, run):
         n = max(run.rows // 100, 1000)
         run.ddl("CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
-        t = run.tables["t"]
         for name, busy in (("idle", False), ("beside_a_busy_thread", True)):
             stop = threading.Event()
             spinner = threading.Thread(target=_spin, args=(stop,), daemon=True) if busy else None
+            ops = run.ops("t", (dict(pk=i, val=i) for i in range(n)), 1)
             with run.phase(name) as ph:
                 if spinner:
                     spinner.start()
                 try:
-                    ph.add("push", asyncio.run(_push_loop(run.server.sock_path, t.tid, t.schema, n)), rows=n)
+                    ph.add("push", asyncio.run(_push_loop(run.server.sock_path, ops)), rows=n)
                 finally:
                     stop.set()
                     if spinner:

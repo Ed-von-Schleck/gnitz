@@ -99,6 +99,17 @@ def time_calls(fn, n):
     return out
 
 
+async def time_pushes(conn, ops):
+    """Each of `ops` pushed on the `gnitz.aio` connection `conn` and awaited;
+    each push's milliseconds."""
+    out = []
+    for op in ops:
+        t = time.perf_counter()
+        await conn.push(op.table.tid, op.batch)
+        out.append((time.perf_counter() - t) * 1e3)
+    return out
+
+
 class Phase:
     """`boots` is a phase a boot runs in: no process of the server exists when
     it opens, so its groups are the server's, with their totals since they

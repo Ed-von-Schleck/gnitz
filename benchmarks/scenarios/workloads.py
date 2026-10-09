@@ -4,14 +4,16 @@ writers, replicated placement, and views pushed out to subscribers."""
 
 from __future__ import annotations
 
+import asyncio
 import random
 import tempfile
 import time
 from dataclasses import dataclass
 
 import gnitz
+from gnitz import aio
 
-from harness.run import time_calls
+from harness.run import time_calls, time_pushes
 
 from .base import INGEST_BATCH, LOAD_BATCH, Fact, Scenario, Shape, Zipf, scatter
 from .relational import FLOAT, NATIONS, SHIPMODES
@@ -531,6 +533,59 @@ class Feed(Scenario):
         mirror.close()
 
 
+async def _write_followed(target, ops, rows, store, beside):
+    """`ops` pushed on one connection while a held sync follows the mirrored
+    `v_kinds`, on that connection or with `beside` on one of its own: each
+    push's milliseconds and the syncs answered, once the copy counts `rows`."""
+    async with aio.connect(target) as conn:
+        follower = aio.connect(target) if beside else conn
+        await follower.mirror_at(store)
+        vid = (await follower.mirror_view("v_kinds")).view_id
+        _, copy = await follower.resolve_table("v_kinds")
+        syncs = 0
+
+        async def follow():
+            nonlocal syncs
+            while True:
+                await follower.sync(30.0)
+                syncs += 1
+        following = asyncio.ensure_future(follow())
+        ms = await time_pushes(conn, ops)
+
+        async def caught_up():
+            while sum(r.n for r in await follower.scan(vid, copy)) < rows:
+                await asyncio.sleep(0.002)
+        await asyncio.wait_for(caught_up(), 60)
+        following.cancel()
+        await asyncio.gather(following, return_exceptions=True)
+        await follower.close_mirror()
+        if beside:
+            await follower.aclose()
+    return ms, syncs
+
+
+@dataclass
+class Follow(Scenario):
+    """A writer that follows a view: awaited one-row pushes on a connection
+    that keeps a mirror of an aggregate view current with a held sync, and the
+    same pushes with the follower on a connection of its own."""
+
+    def run(self, run):
+        n = max(run.rows // 100, 1000)
+        run.ddl("CREATE TABLE w (pk BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL)",
+                "CREATE VIEW v_kinds WITH (delta = '16 MB') AS SELECT kind, COUNT(*) AS n FROM w GROUP BY kind")
+        lo = 0
+        for name, beside in (("on_the_writing_connection", False), ("on_its_own_connection", True)):
+            store = tempfile.mkdtemp(dir=run.tmp, prefix="mirror_")
+            ops = run.ops("w", (dict(pk=k, kind=k % 16) for k in range(lo, lo + n)), 1)
+            with run.phase(name) as ph:
+                ms, syncs = asyncio.run(_write_followed(run.server.sock_path, ops, lo + n, store, beside))
+                ph.add("push", ms, rows=n)
+                ph.extra["syncs_answered"] = syncs
+                ph.extra["unpaced"] = True      # a follower's ticks keep to the clock
+            lo += n
+
+
 # ---------------------------------------------------------------------------
 # TPC-H as views
 # ---------------------------------------------------------------------------
@@ -613,4 +668,6 @@ SCENARIOS = [
                                           "backfill and maintenance of a UNION ALL view over each"),
     Feed("feed", "distribution", "eight subscribers that each keep one tenant's rows of a filter view, and a "
                                  "mirror that follows an aggregate view and a filtered alias as a local store"),
+    Follow("follow", "distribution", "awaited one-row pushes on a connection that follows a mirrored view with a "
+                                     "held sync, and the same with the follower on a connection of its own"),
 ]
