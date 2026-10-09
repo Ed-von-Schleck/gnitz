@@ -165,7 +165,9 @@ distclean: clean ## clean + cargo target cache + post-mortem logs
 bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs one)
 	mkdir -p tmp
 	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) TMPDIR=$(abspath tmp) \
-		cargo test --release --workspace --exclude gnitz-py --tests $(or $(T),_bench) \
+		cargo test --release --workspace --exclude gnitz-py --tests \
+		--features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration \
+		$(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1
 
 bench: release-server pyext-release ## Run the SQL benchmark suite

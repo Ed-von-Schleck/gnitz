@@ -20,7 +20,6 @@ use super::{park_until, request_barrier, send_ack, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily, ZoneError};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::master::UniqueFilter;
-use crate::runtime::orchestration::guard_panic_async;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::WriteGuard;
 use crate::runtime::wire as ipc;
@@ -162,13 +161,9 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
     if families[SysFamily::Circuit.index()].is_some() {
-        let mut unticked = Vec::new();
-        shared.drain_live_tick_rows_into(&mut unticked);
-        let ticked = guard_panic_async("DDL", shared.disp().drain_tick(&unticked)).await;
-        if ticked.is_err() {
-            shared.requeue_tick_tids(&unticked);
+        if let Some(lease) = shared.emit_pending_tick().await? {
+            lease.acks().await;
         }
-        ticked?;
     }
     let (zone_lsn, held_above, synced) = {
         let mut excl = shared.disp().sal().lock().await;
@@ -203,23 +198,15 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
     // is durable), so abort — restart's boot rebuild refills it.
-    guard_panic_async(
-        "view-backfill",
-        shared.disp().backfill_views_in_dep_order(&new_view_ids),
-    )
-    .await
-    .unwrap_or_else(|e| {
-        gnitz_fatal_abort!(
-            "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
-            e
-        );
-    });
+    if let Err(e) = shared.disp().backfill_views_in_dep_order(&new_view_ids).await {
+        gnitz_fatal_abort!("live CREATE VIEW backfill failed after the CREATE was made durable: {e}");
+    }
 
     // After the backfill: a new view has read the sealed families, and these
     // rows reach the views that already scanned them.
-    guard_panic_async("catalog-tick", shared.disp().drain_tick(&held_above))
-        .await
-        .unwrap_or_else(|e| gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {}", e));
+    if let Err(e) = shared.disp().drain_tick(&held_above).await {
+        gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}");
+    }
     for &family in &held_above {
         shared.sync_waiters.wake(family);
     }

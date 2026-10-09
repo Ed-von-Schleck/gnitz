@@ -13,7 +13,7 @@ use crate::catalog::{CatalogEngine, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
 
 use crate::runtime::affinity;
-use crate::runtime::executor::ServerExecutor;
+use crate::runtime::executor;
 use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
@@ -470,7 +470,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     })?;
 
     let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
-    Ok(ServerExecutor::run(dispatcher, data_dir, listeners))
+    Ok(executor::run(dispatcher, data_dir, listeners))
 }
 
 #[cfg(test)]

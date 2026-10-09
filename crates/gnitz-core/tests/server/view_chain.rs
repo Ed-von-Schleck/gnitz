@@ -190,3 +190,32 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         "got: {err}"
     );
 }
+
+#[test]
+fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
+    let srv = ServerHandle::start_n(4);
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let (sn, base_tid, schema) = make_base(&mut client);
+    let bundle = ViewBundle {
+        segments: Vec::new(),
+        view: segment(base_tid, &schema),
+    };
+    let vid = block_on(client.create_view_chain(&rel(&sn, "f"), bundle, ViewProps::default(), None)).unwrap();
+
+    let view_tab = gnitz_core::sys_schema(VIEW_TAB);
+    let relations = vec![
+        (base_tid, Arc::clone(&schema)),
+        (VIEW_TAB, Arc::clone(view_tab)),
+        (vid, Arc::clone(&schema)),
+    ];
+    let replies = block_on(client.scan_many(relations)).unwrap();
+    let base = weighted_rows(&base_rows(&schema));
+    assert_eq!(weighted_rows(&replies[0].batch), base, "the table");
+    let views = &replies[1].batch;
+    let listed: Vec<u64> = (0..views.len())
+        .filter(|&i| views.weights[i] > 0)
+        .map(|i| views.pks.get(i) as u64)
+        .collect();
+    assert_eq!(listed, [vid], "the family lists the one view");
+    assert_eq!(weighted_rows(&replies[2].batch), base, "the view");
+}

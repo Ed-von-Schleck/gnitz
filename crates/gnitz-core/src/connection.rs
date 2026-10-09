@@ -541,11 +541,13 @@ impl Session {
         if rels.is_empty() {
             return Err(ClientError::from("a multi-read names no relation".to_string()));
         }
-        let items: Vec<txn_frame::ScanMultiItem> = rels
+        let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
+        let items: Vec<txn_frame::ScanItem> = rels
             .iter()
-            .map(|(tid, schema)| txn_frame::ScanMultiItem {
-                tid: *tid,
+            .map(|(tid, schema)| txn_frame::ScanItem {
+                target: Target::from(*tid),
                 reply_layout: schema.layout().layout_digest(),
+                spec: &spec,
             })
             .collect();
         let (to, sent) = promise();

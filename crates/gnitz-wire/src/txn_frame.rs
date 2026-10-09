@@ -9,7 +9,7 @@
 //! |--------------|----------------------------------------------------------|---------------------------|
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
 //! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | schema record, data block |
-//! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest                | none                      |
+//! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest; `arg1` = descriptor token | blob = `ReadSpec` |
 //! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = descriptor token | blob = cursor tag, after_tick, `ReadSpec` |
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
@@ -85,7 +85,7 @@ pub(crate) const fn item_shape(verb: ClientVerb) -> Option<ItemShape> {
     let (blob, schema, data, cap) = match verb {
         ClientVerb::DdlTxn => (false, false, true, usize::MAX),
         ClientVerb::PushTxn => (false, true, true, usize::MAX),
-        ClientVerb::ScanMulti => (false, false, false, SCAN_MULTI_MAX_RELATIONS),
+        ClientVerb::ScanMulti => (true, false, false, SCAN_MULTI_MAX_RELATIONS),
         ClientVerb::DeltaPoll => (true, false, false, usize::MAX),
         _ => return None,
     };
@@ -142,25 +142,25 @@ pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], Decoded
     Ok(out)
 }
 
-/// One SCAN_MULTI item: every row of `tid`, replied in the layout whose digest
-/// is `reply_layout`.
+/// One scan: the encoded `ReadSpec` `spec` over `target`, replied in the layout
+/// whose digest is `reply_layout`. A `SCAN_MULTI` item, and what a `SCAN_SPEC`
+/// request's header and blob spell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanMultiItem {
-    pub tid: u64,
+pub struct ScanItem<'a> {
+    /// The relation, and the token of the RESOLVE answer this read was built from.
+    pub target: Target,
     pub reply_layout: u64,
+    /// The worker's decode is the trust boundary.
+    pub spec: &'a [u8],
 }
 
 /// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
-pub fn encode_scan_multi(relations: &[ScanMultiItem]) -> Vec<u8> {
-    let items: Vec<FrameItem> = relations
+pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
+    let items: Vec<FrameItem> = scans
         .iter()
-        .map(|r| FrameItem {
-            hdr: ControlHeader {
-                target_id: r.tid,
-                arg0: r.reply_layout,
-                ..Default::default()
-            },
-            blob: &[],
+        .map(|s| FrameItem {
+            hdr: ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout),
+            blob: s.spec,
             schema: None,
             data: None,
         })
@@ -169,12 +169,13 @@ pub fn encode_scan_multi(relations: &[ScanMultiItem]) -> Vec<u8> {
 }
 
 /// Decode a `SCAN_MULTI` frame body into its items, in request order.
-pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanMultiItem>, String> {
+pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanItem<'_>>, String> {
     Ok(decode_items(body, ClientVerb::ScanMulti)?
         .into_iter()
-        .map(|(_, c)| ScanMultiItem {
-            tid: c.hdr.target_id,
+        .map(|(item, c)| ScanItem {
+            target: c.hdr.target(),
             reply_layout: c.hdr.arg0,
+            spec: &item[c.blob],
         })
         .collect())
 }

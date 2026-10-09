@@ -2,11 +2,11 @@
 own sources' ticks.
 
 Every read verb that answers "what is current" asks whether the target's
-transitive source closure committed at or below the last completed tick's
+transitive source closure committed at or below the last emitted tick's
 watermark, and drains when it did not. A tick fires when a push crosses the
 row-coalesce threshold or when a read drains, so a small push sits pending until
-the read that needs it; and the watermark moves only after a tick's worker ACKs,
-so a tick still in flight reads as un-absorbed.
+the read that needs it; and a read written behind a tick still in flight is
+answered by each worker only once its drive has ended.
 """
 
 import gnitz
@@ -90,7 +90,7 @@ def test_a_read_waits_for_its_own_in_flight_tick(client):
 def test_an_unrelated_pending_tick_does_not_gate_the_read(client):
     """A read of a clean `v1` must not tick `t2`, which `v1` does not depend on.
 
-    Asserted on the watermark a scan reports, which only a completed tick moves:
+    Asserted on the watermark a scan reports, which only a tick moves:
     had the read drained, it would jump past `t2`'s commit."""
     for sql in (_TABLE.format("t1"), _TABLE.format("t2"),
                 "CREATE VIEW v1 AS SELECT pk, val FROM t1 WHERE val >= 0",

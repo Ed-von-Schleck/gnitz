@@ -116,7 +116,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     let req = peer.recv();
     let ctrl = peek_control_block(&req).unwrap();
     let items = gnitz_wire::txn_frame::decode_scan_multi(&req[ctrl.body]).unwrap();
-    let layouts: Vec<(u64, u64)> = items.iter().map(|i| (i.tid, i.reply_layout)).collect();
+    let layouts: Vec<(u64, u64)> = items.iter().map(|i| (i.target.tid, i.reply_layout)).collect();
     assert_eq!(
         layouts,
         [(1, sa.layout().layout_digest()), (2, sb.layout().layout_digest())],

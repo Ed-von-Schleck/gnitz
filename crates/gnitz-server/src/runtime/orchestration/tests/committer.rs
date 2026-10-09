@@ -11,19 +11,13 @@ fn batch_of(rows: usize) -> Batch {
 }
 
 fn push_of(rows: usize) -> CommitRequest {
-    let (done, _rx) = oneshot::channel();
-    CommitRequest::Push(PendingPush {
-        tid: 7,
-        batch: batch_of(rows),
-        recoverable: true,
-        done,
-    })
+    write_of(&[rows])
 }
 
-/// A transaction of one family per entry of `family_rows`.
-fn txn_of(family_rows: &[usize]) -> CommitRequest {
+/// A write of one family per entry of `family_rows`.
+fn write_of(family_rows: &[usize]) -> CommitRequest {
     let (done, _rx) = oneshot::channel();
-    CommitRequest::Txn(PendingTxn {
+    CommitRequest::Write(PendingWrite {
         families: family_rows
             .iter()
             .enumerate()
@@ -43,7 +37,7 @@ fn barrier_of(kind: BarrierKind) -> CommitRequest {
 }
 
 /// A batch drains what is queued until the row cap — tested before each receive,
-/// so the request that crosses it is admitted whole, and a transaction counts
+/// so the request that crosses it is admitted whole, and a write counts
 /// every family's rows — or until a barrier, wherever it lands.
 #[test]
 fn a_batch_ends_at_the_row_cap_or_a_barrier() {
@@ -51,15 +45,15 @@ fn a_batch_ends_at_the_row_cap_or_a_barrier() {
     // One family alone stays under the cap; two cross it.
     let half = MAX_PENDING_ROWS / 2 + 1;
     let cases = [
-        // (queued, (pushes, txns, barrier, left behind))
-        (vec![push_of(1), CommitRequest::Reclaim, push_of(1)], (2, 0, None, 0)),
+        // (queued, (writes, barrier, left behind))
+        (vec![push_of(1), CommitRequest::Reclaim, push_of(1)], (2, None, 0)),
         (
             vec![push_of(MAX_PENDING_ROWS - 1), push_of(2), push_of(1)],
-            (2, 0, None, 1),
+            (2, None, 1),
         ),
-        (vec![txn_of(&[half, half]), push_of(1)], (0, 1, None, 1)),
-        (vec![push_of(1), barrier_of(Ddl), push_of(1)], (1, 0, Some(Ddl), 1)),
-        (vec![barrier_of(Shutdown), push_of(1)], (0, 0, Some(Shutdown), 1)),
+        (vec![write_of(&[half, half]), push_of(1)], (1, None, 1)),
+        (vec![push_of(1), barrier_of(Ddl), push_of(1)], (1, Some(Ddl), 1)),
+        (vec![barrier_of(Shutdown), push_of(1)], (0, Some(Shutdown), 1)),
     ];
     for (i, (queued, want)) in cases.into_iter().enumerate() {
         let (tx, mut rx) = chan::unbounded();
@@ -69,7 +63,7 @@ fn a_batch_ends_at_the_row_cap_or_a_barrier() {
         let first = rx.try_recv().expect("queued");
         let b = drain_ready_batch(&mut rx, first);
         let left = std::iter::from_fn(|| rx.try_recv()).count();
-        let got = (b.pushes.len(), b.txns.len(), b.barrier.map(|(k, _)| k), left);
+        let got = (b.writes.len(), b.barrier.map(|(k, _)| k), left);
         assert_eq!(got, want, "case {i}");
     }
 }

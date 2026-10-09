@@ -114,8 +114,8 @@ def _srv(tmp_path_factory, _sock_path):
 
 def _session_target(srv, tmp_path_factory, user):
     """Connect target of the session server, restarting it on a fresh catalog if
-    it has died — a prior test triggered a panic that escaped guard_panic, or an
-    OOM/signal killed the process.
+    it has died — a prior test triggered a panic, or an OOM/signal killed the
+    process.
 
     Without the restart, one server death cascades into hundreds of ERROR
     entries for unrelated tests. With it, only the test that caused the death

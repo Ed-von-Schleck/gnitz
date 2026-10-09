@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use super::{
-    all_ticked, encode_response_into, finish_scan_fanout, fresh_read_lock, send_ack, target_kind, terminal_scan_msg,
+    all_ticked, encode_response_into, fresh_read_lock, send_ack, send_fault, send_msg, target_kind, terminal_scan_msg,
     Access, Shared,
 };
 use crate::runtime::master::forward_scan;
@@ -55,7 +55,7 @@ enum PollPosition {
 /// Where a poll of `item` stands.
 fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
     let tid = item.view.tid;
-    let kind = match target_kind(shared, item.view, Access::UserRead) {
+    let kind = match target_kind(shared, item.view, Access::Read) {
         Ok(kind) => kind,
         Err(fault) => return PollPosition::Fault(fault),
     };
@@ -152,8 +152,15 @@ pub(super) async fn handle_delta_poll(
                     subs.join(&shared.feeds, id, item, round, peer.outbox());
                 }
             }
-            let tag = disp.delta_cursor_tag(item.view.tid, item.spec);
-            finish_scan_fanout(peer, item.view.tid, tag, result);
+            let tid = item.view.tid;
+            match result {
+                // Corked, not sent: the terminal joins whatever the forward corked.
+                Ok(round) => send_msg(
+                    peer,
+                    terminal_scan_msg(tid, round, disp.delta_cursor_tag(tid, item.spec)),
+                ),
+                Err(fault) => send_fault(peer, tid, &fault),
+            }
             // Carry no more than the budget into the next view, and learn here
             // rather than at the end if the client is gone.
             if peer.flush_if_full().await.is_err() {
@@ -387,7 +394,7 @@ pub(super) async fn handle_sync_pushed(
     // by. Asked under the catalog lock.
     let caught_up = |(sub, feed): &(Rc<Subscriber>, Rc<Feed>)| {
         let view = feed.key.view;
-        target_kind(shared, view, Access::UserRead).is_ok() && sub.caught_up(shared, view.tid)
+        target_kind(shared, view, Access::Read).is_ok() && sub.caught_up(shared, view.tid)
     };
     loop {
         // A subscription its feed ended is gone here too.
@@ -463,7 +470,7 @@ async fn pump(shared: Rc<Shared>) {
             let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
             for feed in slice {
                 let view = feed.key.view;
-                if let Err(fault) = target_kind(&shared, view, Access::UserRead) {
+                if let Err(fault) = target_kind(&shared, view, Access::Read) {
                     feeds.end(feed, &fault);
                     continue;
                 }

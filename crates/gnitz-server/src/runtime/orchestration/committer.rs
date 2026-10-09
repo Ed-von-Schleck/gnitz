@@ -24,12 +24,11 @@
 //!   catalog mutation, and by graceful shutdown (see `BarrierKind`).
 
 use super::executor::{request_drain, Shared};
-use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::reactor::{chan, oneshot, AckLease};
-use crate::runtime::sal::SalScope;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
+use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -38,15 +37,9 @@ use std::rc::Rc;
 const MAX_PENDING_ROWS: usize = 100_000;
 
 /// One request to the committer.
-#[allow(clippy::large_enum_variant)]
 pub enum CommitRequest {
-    /// Buffer one batch for group commit.
-    Push(PendingPush),
-    /// An atomic user-table transaction: N families emitted as N `Push`
-    /// groups inside one zone, with a single `done` for the
-    /// whole bundle. Validated and lock-guarded by the executor before it
-    /// reaches here.
-    Txn(PendingTxn),
+    /// Commit one write.
+    Write(PendingWrite),
     /// Drain any in-flight batch and signal via `done`. `kind` decides whether
     /// the batch runs a checkpoint sequence (see `BarrierKind`).
     Barrier {
@@ -57,11 +50,10 @@ pub enum CommitRequest {
     Reclaim,
 }
 
-/// One buffered atomic transaction awaiting commit: its families in frame order
-/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle, or the error that
-/// rolled it back. Every family is `recoverable` — the executor
-/// refuses a stream target — so a transaction always opens a zone.
-pub struct PendingTxn {
+/// One write awaiting commit, all-or-nothing: each family is one `Push` group,
+/// in frame order, and `done` resolves `Ok(zone_lsn)` or the error that rolled
+/// the whole write back.
+pub struct PendingWrite {
     pub families: Vec<TxnFamily>,
     pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
@@ -78,19 +70,6 @@ pub enum BarrierKind {
     /// skips the ephemeral round rather than aborting, precisely because Shutdown
     /// runs here.
     Shutdown,
-}
-
-/// One buffered single push awaiting commit. `done` resolves to `Ok(zone_lsn)` or
-/// `Err(error_message)`.
-pub struct PendingPush {
-    pub tid: u64,
-    pub batch: Batch,
-    /// Whether these rows are something a restart must recover, i.e. whether this
-    /// group may join the zone the commit and fdatasync close. False only for a
-    /// stream. Decided by the executor, which has already resolved the target's kind,
-    /// so the committer never asks the catalog what a relation *is*.
-    pub recoverable: bool,
-    pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
 /// The committer task loop. Never returns.
@@ -114,9 +93,9 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
             run_checkpoint_sequence(&shared).await;
         }
 
-        let PendingBatch { pushes, txns, barrier } = batch;
-        if !pushes.is_empty() || !txns.is_empty() {
-            commit_pushes(&shared, pushes, txns).await;
+        let PendingBatch { writes, barrier } = batch;
+        if !writes.is_empty() {
+            commit_writes(&shared, writes).await;
         }
 
         if let Some((_, b)) = barrier {
@@ -130,12 +109,10 @@ fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
     matches!(batch.barrier, Some((BarrierKind::Shutdown, _))) || shared.disp().sal().needs_checkpoint()
 }
 
-/// One committer batch: the single pushes to group-commit and the atomic
-/// transactions to commit.
+/// One committer batch: the writes to commit together.
 #[derive(Default)]
 struct PendingBatch {
-    pushes: Vec<PendingPush>,
-    txns: Vec<PendingTxn>,
+    writes: Vec<PendingWrite>,
     /// The barrier that ended this batch, if one did: signalled once the batch —
     /// and any checkpoint sequence — has committed.
     barrier: Option<(BarrierKind, oneshot::Sender<()>)>,
@@ -155,15 +132,11 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     let mut next = Some(first);
     while let Some(req) = next {
         match req {
-            CommitRequest::Push(p) => {
-                row_count += p.batch.len();
-                b.pushes.push(p);
-            }
-            // A transaction is one indivisible entry — its whole family set rides
-            // this batch; its row count is the sum of every family's rows.
-            CommitRequest::Txn(t) => {
-                row_count += t.families.iter().map(|f| f.batch.len()).sum::<usize>();
-                b.txns.push(t);
+            // A write is one indivisible entry: its whole family set rides this
+            // batch, and counts every family's rows.
+            CommitRequest::Write(w) => {
+                row_count += w.families.iter().map(|f| f.batch.len()).sum::<usize>();
+                b.writes.push(w);
             }
             CommitRequest::Barrier { kind, done } => {
                 b.barrier = Some((kind, done));
@@ -214,39 +187,26 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
         .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 }
 
-/// One single-tid SAL group: a merged run of single pushes, or one transaction
-/// family.
-struct GroupInfo {
-    tid: u64,
-    /// See `PendingPush::recoverable`. A merged run is homogeneous in
-    /// `tid`, so one flag per group is exact.
-    recoverable: bool,
-    /// The ACKs of the workers the group was written to; `Some` once it is laid out.
-    lease: Option<AckLease>,
-    merged: Batch,
-}
-
 /// One client-visible commit unit, all-or-nothing: the SAL groups it emits and
 /// the clients waiting on their shared verdict.
 struct CommitUnit {
-    /// One group for a merged single-push run; one per family, in frame order,
-    /// for a transaction.
-    groups: Vec<GroupInfo>,
-    /// The coalesced clients of a merged run, or a transaction's one client.
+    /// One group each, in frame order. A run of one-family writes to one table
+    /// is one unit of one family, their batches merged.
+    families: Vec<TxnFamily>,
+    /// The coalesced clients of a merged run, or a write's one client.
     dones: Vec<oneshot::Sender<Result<u64, WireFault>>>,
-    /// Why none of `groups` committed.
+    /// Why none of `families` committed.
     failed: Option<WireFault>,
 }
 
 impl CommitUnit {
-    /// This unit's groups if it has not failed: what the SAL admitted, and past
-    /// Phase C what every worker also took. The one spelling: a group awaited
-    /// that no worker was sent would park forever.
-    fn live(&self) -> &[GroupInfo] {
+    /// This unit's families if it has not failed: what the SAL admitted, and
+    /// past Phase C what every worker also took.
+    fn live(&self) -> &[TxnFamily] {
         if self.failed.is_some() {
             &[]
         } else {
-            &self.groups
+            &self.families
         }
     }
 
@@ -258,146 +218,117 @@ impl CommitUnit {
     }
 }
 
-/// Commit one batch of pushes. Emits every group's SAL writes, queues their tids
+/// Whether no table is written by two of `units`.
+fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
+    let mut seen = FxHashSet::default();
+    units.iter().all(|unit| {
+        let mut tids: Vec<u64> = unit.families.iter().map(|f| f.tid).collect();
+        tids.sort_unstable();
+        tids.dedup();
+        tids.into_iter().all(|tid| seen.insert(tid))
+    })
+}
+
+/// Commit one batch of writes. Emits every group's SAL writes, queues their tids
 /// for the tick and submits the fsync SQE under one SAL hold, THEN awaits worker
 /// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the update of the
 /// master's caches of committed rows happen after fsync.
-async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: Vec<PendingTxn>) {
-    // Sort by tid so runs are homogeneous. Stable: arrival order within a run is
-    // what makes intra-batch last-insert-wins mean last *inserted*.
-    pushes.sort_by_key(|p| p.tid);
-
-    let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
+async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
+    // One-family writes in tid runs. Stable: arrival order within a run is what
+    // makes intra-batch last-insert-wins mean last *inserted*.
+    writes.sort_by_key(|w| (w.families.len() != 1, w.families[0].tid));
 
     // ------------------------------------------------------------------
-    // Phase A (no lock): build merged batches.
-    // Transaction units come FIRST (transactions-first emission), each family its
-    // own group in frame order; then the merged single-push units.
+    // Phase A (no lock): one unit per write, a run of one-family writes to one
+    // table merged into one.
     // ------------------------------------------------------------------
-    for PendingTxn { families, done } in txns {
-        units.push(CommitUnit {
-            groups: families
-                .into_iter()
-                .map(|fam| GroupInfo {
-                    tid: fam.tid,
-                    recoverable: true,
-                    lease: None,
-                    merged: fam.batch,
-                })
-                .collect(),
-            dones: vec![done],
-            failed: None,
-        });
-    }
-
-    // Single-push runs: walk the sorted pushes, draining each maximal tid run
-    // into one merged group.
-    let mut remaining = pushes.into_iter().peekable();
-    while let Some(first) = remaining.next() {
-        let (tid, recoverable) = (first.tid, first.recoverable);
-        // Split the run into its two independent halves as it is drained: the
-        // batches the merge consumes, and the `done` senders the unit resolves.
-        // The run's first batch is held apart, so the dominant single-push case
-        // allocates no `Vec` and enters no `catch_unwind` frame.
-        let head = first.batch;
-        let mut tail: Vec<Batch> = Vec::new();
-        let mut dones = vec![first.done];
-        while remaining.peek().is_some_and(|p| p.tid == tid) {
-            let p = remaining.next().unwrap();
-            tail.push(p.batch);
-            dones.push(p.done);
+    let mut units: Vec<CommitUnit> = Vec::with_capacity(writes.len());
+    let mut remaining = writes.into_iter().peekable();
+    while let Some(PendingWrite { mut families, done }) = remaining.next() {
+        let mut dones = vec![done];
+        if let [head] = &mut families[..] {
+            // The run's batches behind its first. A single push ships the
+            // client's batch as it stands, so the dominant case builds no `Vec`.
+            let mut tail: Vec<Batch> = Vec::new();
+            while let Some(next) = remaining.next_if(|w| matches!(&w.families[..], [f] if f.tid == head.tid)) {
+                tail.extend(next.families.into_iter().map(|f| f.batch));
+                dones.push(next.done);
+            }
+            if !tail.is_empty() {
+                head.batch = Batch::concat(
+                    head.batch.schema(),
+                    std::iter::once(&head.batch).chain(&tail).map(Batch::as_mem_batch),
+                );
+            }
         }
-
-        // A single push ships the client's batch as it stands; a coalesced run
-        // concatenates into one. The concat reads client-supplied batches, so it
-        // is guarded.
-        // A failed concat leaves a failed unit with no group to lay out.
-        let merged = if tail.is_empty() {
-            Ok(head)
-        } else {
-            guard_panic("commit_merge", || {
-                Ok::<_, String>(Batch::concat(
-                    head.schema(),
-                    std::iter::once(&head).chain(tail.iter()).map(Batch::as_mem_batch),
-                ))
-            })
-        };
-        units.push(match merged {
-            Ok(merged) => CommitUnit {
-                groups: vec![GroupInfo { tid, recoverable, lease: None, merged }],
-                dones,
-                failed: None,
-            },
-            Err(panic_msg) => CommitUnit {
-                groups: Vec::new(),
-                dones,
-                failed: Some(WireFault::from(panic_msg)),
-            },
-        });
+        units.push(CommitUnit { families, dones, failed: None });
     }
+    debug_assert!(
+        write_disjoint_tables(&units),
+        "two units of one batch write one table, so the sort reordered them"
+    );
 
     // ------------------------------------------------------------------
     // Phase B (under the SAL writer): emit SAL groups, queue their tids for the
     // tick, submit fsync SQE. The batch's recoverable groups form one zone.
     // ------------------------------------------------------------------
-    let (zone_lsn, synced) = {
+    let (zone_lsn, synced, leases) = {
         let disp = shared.disp();
         let mut excl = disp.sal().lock().await;
 
         // Nothing laid out inside the scope is visible until it commits, so a
-        // transaction that runs out of SAL space part-way can take its earlier
+        // write that runs out of SAL space part-way can take its earlier
         // families back. Every write, the commit and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
         let scope = excl.begin("commit");
         let zone_lsn = scope.lsn();
 
-        // Emit every unit into the zone, in unit order (transactions first). The
-        // first recoverable group the scope admits opens the zone.
-        //
-        // A unit is all-or-nothing: a family that does not fit rolls the bundle
+        // The ACKs of every group laid out and kept, in unit order.
+        let mut leases: Vec<AckLease> = Vec::with_capacity(units.len());
+        // A unit is all-or-nothing: a family that does not fit rolls the unit
         // back to where it started, and the families before it were never
-        // published. A single-push unit has one group, so the same rule refuses
-        // that push alone.
-        for unit in units.iter_mut().filter(|u| u.failed.is_none()) {
-            let savepoint = scope.savepoint();
+        // published.
+        for unit in &mut units {
+            let (savepoint, kept) = (scope.savepoint(), leases.len());
             unit.failed = unit
-                .groups
-                .iter_mut()
-                .find_map(|g| match lay_out_group(shared, &scope, g) {
+                .families
+                .iter()
+                .find_map(|f| match disp.write_commit_group(&scope, f.tid, &f.batch) {
                     Ok(lease) => {
-                        g.lease = Some(lease);
+                        leases.push(lease);
                         None
                     }
                     Err(e) => Some(e),
                 });
             if unit.failed.is_some() {
                 scope.roll_back(savepoint);
+                leases.truncate(kept);
             }
         }
 
         let synced = scope.commit().then(|| excl.sync(disp.reactor(), "committer"));
-        // Queued in the block that laid the groups out, so a tick whose snapshot
-        // of the SAL watermark covers `zone_lsn` also takes these tids — what
-        // `all_ticked` relies on. The tick's group follows these in the log,
-        // and the auto-tick it may fire overlaps the ACKs and the fsync.
-        shared.note_commit_rows(units.iter().flat_map(|u| u.live()).map(|g| (g.tid, g.merged.len())));
-        (zone_lsn, synced)
+        // The auto-tick this may fire overlaps the ACKs and the fsync.
+        shared.note_commit_rows(
+            &excl,
+            units.iter().flat_map(|u| u.live()).map(|f| (f.tid, f.batch.len())),
+        );
+        (zone_lsn, synced, leases)
     };
 
     // ------------------------------------------------------------------
-    // Phase C (no lock): await push ACKs, per live group in unit order. Replies
-    // for later groups wait in their routes meanwhile.
+    // Phase C (no lock): await push ACKs, per group in unit order. Replies for
+    // later groups wait in their routes meanwhile.
     // The master's caches of committed rows are NOT updated here: they hold
     // only what is durable, so that runs after Phase D's fsync.
     // ------------------------------------------------------------------
-    for g in units.iter().flat_map(|u| u.live()) {
-        g.lease.as_ref().expect("a live group was laid out").acks().await;
+    for lease in &leases {
+        lease.acks().await;
     }
 
     // ------------------------------------------------------------------
     // Phase D (no lock): await fsync CQE. Client response is held until after
     // fsync so the client sees only durable data. A batch of nothing but stream
-    // groups opened no zone, so has no fsync to await. Pushes batched together
+    // groups opened no zone, so has no fsync to await. Writes batched together
     // share one zone LSN.
     // ------------------------------------------------------------------
     if let Some(synced) = synced {
@@ -406,23 +337,14 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
 
     // The master's caches of committed rows follow, now that fsync confirms
     // durability and before any writer is answered.
-    for g in units.iter().flat_map(|u| u.live()) {
-        shared.disp().committed(g.tid, &g.merged);
+    for f in units.iter().flat_map(|u| u.live()) {
+        shared.disp().committed(f.tid, &f.batch);
     }
 
     // Send responses: every client of a unit gets the unit's verdict.
     for unit in units {
         unit.resolve(zone_lsn);
     }
-}
-
-/// Lay one group out in `scope`, inside its zone when the group is
-/// `recoverable`, and answer the lease its workers ACK on. `guard_panic` covers
-/// the encode of a client-supplied batch.
-fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result<AckLease, WireFault> {
-    guard_panic("commit_write", || {
-        shared.disp().write_commit_group(scope, g.tid, &g.merged, g.recoverable)
-    })
 }
 
 #[cfg(test)]

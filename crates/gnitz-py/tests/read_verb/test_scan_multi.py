@@ -171,21 +171,27 @@ def test_every_refusal_leaves_the_server_serving(client):
     t = client.create_table("t", KV)
     client.push(t, _batch([(1, 1)]))
 
-    for why, rels in [
-        # A repeated tid is legal, so the count alone is what this one crosses.
-        ("too many items", _kvs(t) * 1000),
-        # A fan-out read has no form for a system relation — refused server-side.
-        ("system catalog family", [(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))]),
-    ]:
-        with pytest.raises(gnitz.GnitzRefusedError, match=why):
-            client.scan_many(rels)
-        assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, f"unhealthy after {why}"
+    # A repeated tid is legal, so the count alone is what this one crosses.
+    with pytest.raises(gnitz.GnitzRefusedError, match="too many items"):
+        client.scan_many(_kvs(t) * 1000)
+    assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after too many items"
 
     # An unknown user tid resolves to no table, and the refusal names it.
     missing = gnitz.FIRST_USER_TABLE_ID + 987654
     with pytest.raises(gnitz.GnitzNotFoundError, match=str(missing)):
         client.scan_many(_kvs(t, missing))
     assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
+
+
+def test_a_system_family_is_read_beside_user_relations(client):
+    """A family is read off the master's own copy, a table off its workers: one
+    request answers both, each as its own scan does."""
+    t = client.create_table("t", KV)
+    client.push(t, _batch([(1, 1)]))
+    tables = gnitz.sys_schema(gnitz.TABLE_TAB)
+    first, family, last = client.scan_many([(t, KV), (gnitz.TABLE_TAB, tables), (t, KV)])
+    assert bag(first) == bag(last) == {(1, 1): 1}
+    assert bag(family) == bag(client.scan(gnitz.TABLE_TAB, tables))
 
 
 def test_a_repeated_tid_is_answered_at_each_position(client):

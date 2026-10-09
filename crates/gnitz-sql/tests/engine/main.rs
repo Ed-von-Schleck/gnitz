@@ -12,6 +12,9 @@ mod placement;
 mod resolve;
 mod views;
 
+#[path = "benches/read_after_write.rs"]
+mod read_after_write_bench;
+
 use gnitz_core::block_on;
 use std::rc::Rc;
 use std::sync::Arc;

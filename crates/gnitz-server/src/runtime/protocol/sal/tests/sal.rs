@@ -613,12 +613,12 @@ fn every_header_field_round_trips() {
         .write_slots(
             head(FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER, 0x0A0B_0C0D),
             &[8, 0, 24],
-            |_, b| b.fill(0),
+            |b| b.fill(0),
         )
         .expect("group fits");
     let shared = log
         .writer
-        .write_slots(head(FLAG_SHARED, 0), &[40], |_, b| b.fill(0))
+        .write_slots(head(FLAG_SHARED, 0), &[40], |b| b.fill(0))
         .expect("group fits");
     log.writer.publish_range(per_worker, log.cursor());
     assert!(first < per_worker && per_worker < shared);

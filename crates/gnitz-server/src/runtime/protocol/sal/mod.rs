@@ -913,12 +913,7 @@ impl SalWriter {
     /// not fit is refused with [`WireStatus::SalFull`] and leaves the log
     /// untouched; the refusal reaches clients verbatim, so the cursor goes to the
     /// operator log instead. A zone member (`lsn != 0`) checksums every payload.
-    fn write_slots(
-        &self,
-        head: GroupHead,
-        sizes: &[usize],
-        mut fill: impl FnMut(usize, &mut [u8]),
-    ) -> Result<u64, WireFault> {
+    fn write_slots(&self, head: GroupHead, sizes: &[usize], mut fill: impl FnMut(&mut [u8])) -> Result<u64, WireFault> {
         let epoch = self.epoch.get();
         assert!(
             epoch >= 1,
@@ -986,7 +981,7 @@ impl SalWriter {
             // SAFETY: `off + sz <= total - PREFIX_BYTES - hdr_size`, inside the mapped
             // span, and the spans are disjoint.
             let slot = unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size + off), sz) };
-            fill(i, &mut *slot);
+            fill(&mut *slot);
             if head.lsn != 0 {
                 let at = OFF_DIRECTORY + i * DIR_ENTRY_BYTES + DIR_CHECKSUM_AT;
                 write_u64_le(hdr, at, gnitz_wire::checksum(slot));
@@ -1080,7 +1075,7 @@ impl SalWriter {
             targets: set,
         };
         let mut workers = set.iter();
-        let base = self.write_slots(head, &sizes[..n], |_, slot| {
+        let base = self.write_slots(head, &sizes[..n], |slot| {
             let w = if shared {
                 0
             } else {

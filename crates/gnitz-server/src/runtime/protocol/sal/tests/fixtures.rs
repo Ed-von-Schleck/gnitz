@@ -105,7 +105,7 @@ impl TestLog {
             targets: written().fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
         };
         let mut bytes = written().map(|(_, p)| *p);
-        let base = self.writer.write_slots(head, &sizes, |_, slot| {
+        let base = self.writer.write_slots(head, &sizes, |slot| {
             slot.copy_from_slice(bytes.next().expect("one payload per size"))
         })?;
         self.writer.publish(base);

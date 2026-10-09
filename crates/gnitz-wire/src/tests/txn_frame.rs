@@ -2,8 +2,12 @@ use super::*;
 use crate::control::CTRL_HEADER_SIZE;
 use crate::WireConflictMode;
 
-fn rel(tid: u64, reply_layout: u64) -> ScanMultiItem {
-    ScanMultiItem { tid, reply_layout }
+fn rel(tid: u64, reply_layout: u64) -> ScanItem<'static> {
+    ScanItem {
+        target: Target { tid, token: tid ^ 0x5A5A },
+        reply_layout,
+        spec: if tid.is_multiple_of(2) { b"spec" } else { b"" },
+    }
 }
 
 fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem<'static> {

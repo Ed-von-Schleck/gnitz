@@ -123,22 +123,12 @@ def test_a_restamp_owed_by_a_failed_drain_keeps_later_pushes_across_a_crash(own_
         assert bag(scanned(conn, "f"), "pk", "v") == {r: 1 for r in rows if r[0] % 2 == 0}
 
 
-def test_a_failed_tick_reports_and_requeues(own_server):
-    """The same rule one rung up: a *view tick* that fails to emit must report,
-    not serve.
+def test_a_failed_tick_reports_and_stays_pending(own_server):
+    """A view tick that fails to emit fails the read waiting on it, and the next
+    read ticks the same delta.
 
-    `drain_tick_rows_into` empties `tick_tids` BEFORE the tick runs, so a tick
-    that fails to emit used to strand its tids: no later Auto re-queued them, only
-    a fresh push to that exact tid did, and the drain the reader was waiting on
-    signalled success anyway — so the read returned OK over a stale view,
-    permanently. The emit failure needs a seam; a real one takes a full SAL.
-
-    The read that waited on the failed tick must error rather than serve the
-    stale view, and the next read — which ticks the re-queued tid before it is
-    served — must be correct.
-
-    The seam fails the first *replied* tick emission. The CREATE's own
-    view-seeding drain writes a silent tick group and so cannot spend it."""
+    The emit failure needs a seam; a real one takes a full SAL. The CREATE VIEW
+    has nothing pending, emits no tick and so cannot spend it."""
     client = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_TICK_EMIT_ERROR": "1"}).target)
     client.execute_sql(
         "CREATE TABLE tickfault (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
@@ -151,8 +141,6 @@ def test_a_failed_tick_reports_and_requeues(own_server):
     with pytest.raises(gnitz.GnitzRefusedError):
         client.scan(vid, schema)
 
-    # The seam is spent and the tid was re-queued, so this read ticks it. A view
-    # read is served only once its source closure is at the last completed tick's
-    # watermark, so one read is the whole claim — polling for convergence would
-    # also pass on a view that converges and then diverges again.
+    # One read is the whole claim: polling for convergence would also pass on a
+    # view that converges and then diverges again.
     assert bag(client.scan(vid, schema), "pk", "val") == {(1, 10): 1, (2, 20): 1}

@@ -331,28 +331,27 @@ impl MasterDispatcher {
 
     /// Lay one push batch out as a SAL group inside `scope`, written to the
     /// workers that own its rows, and answer the lease those workers ACK on.
-    /// `recoverable` puts it inside the zone; a stream's rows ride outside. The
-    /// committer commits the scope and awaits the ACKs.
+    /// A base table's rows go inside the zone; a stream's, which no restart
+    /// recovers, ride outside.
     pub(crate) fn write_commit_group(
         &self,
         scope: &SalScope,
         target_id: u64,
         batch: &Batch,
-        recoverable: bool,
     ) -> Result<AckLease, WireFault> {
-        if recoverable {
-            self.unflushed_pushes.set(true);
-        }
         let cat = self.cat();
         let record = cat
             .schema_record(target_id)
             .expect("a wire target is registered under the catalog lock");
-        let placement = cat
+        let rel = cat
             .registry
             .relation(target_id)
-            .expect("a push target is registered under the catalog lock")
-            .placement();
-        with_routed(batch, placement, self.num_workers(), |data| {
+            .expect("a push target is registered under the catalog lock");
+        let recoverable = rel.kind().is_base_table();
+        if recoverable {
+            self.unflushed_pushes.set(true);
+        }
+        with_routed(batch, rel.placement(), self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());
             scope.write(

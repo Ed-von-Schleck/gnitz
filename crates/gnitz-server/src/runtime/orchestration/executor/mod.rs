@@ -3,7 +3,7 @@
 //! catalog-zone write path is the child `ddl`; the delta feed's readers are
 //! the child `delta`.
 //!
-//! The master owns one `Reactor`: `ServerExecutor::run` spawns its tasks on it
+//! The master owns one `Reactor`: [`run`] spawns its tasks on it
 //! and races the signal loop against a worker's death.
 //!
 //! A request handler rejects by returning `Err`, and the router sends it: no
@@ -23,23 +23,23 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::guard_panic;
 use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
 use self::delta::{handle_delta_poll, handle_sync_pushed, Feeds, Subscriptions};
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
-use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
+use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingWrite};
 use crate::runtime::listen::ClientListener;
 use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, Read};
+use crate::runtime::reactor::{chan, oneshot, select2, AckLease, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
+use crate::runtime::sal::{DirectGroup, Read, SalExcl};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::control::{DecodedControl, Target};
-use gnitz_wire::{ReadBound, ReadSpec, WireFault, WireStatus};
+use gnitz_wire::txn_frame::ScanItem;
+use gnitz_wire::{ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -181,8 +181,9 @@ pub struct Shared {
     /// [`Shared::note_commit_rows`], so every trigger this process sends is minted
     /// in one place.
     tick_tx: chan::Sender<TickTrigger>,
-    /// The SAL watermark the last completed tick snapshotted: every commit at or
-    /// below it is reflected in every view.
+    /// The SAL watermark the last emitted tick snapshotted: every commit at or
+    /// below it is reflected in every view, as a read written to the SAL from
+    /// now on sees it.
     last_tick_lsn: Cell<u64>,
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
@@ -199,9 +200,8 @@ pub struct Shared {
     /// guard; a push that reads no committed state takes the read guard, so
     /// same-table pushes reach the committer concurrently and share one fsync.
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
-    /// Set true by the signal loop before it sends the final Shutdown barrier.
-    /// Read only by [`Shared::commit`], which is what makes the test and the send
-    /// one step.
+    /// Set by the signal loop before it sends the final Shutdown barrier. Read
+    /// only by [`Shared::submit`].
     draining: Cell<bool>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`. A missing entry reads as `boot_seed`.
@@ -285,28 +285,40 @@ impl Shared {
         }
     }
 
-    /// Commit `req` unless a graceful shutdown has begun, await its verdict under
-    /// the caller's catalog read guard, and on success raise each of `tids`' commit
-    /// LSN to it. No await separates the test from the send: a request that saw a
-    /// live server is queued ahead of the signal loop's Shutdown barrier.
-    async fn commit(
-        &self,
-        _catalog: &ReadGuard,
-        held: &HeldTables,
-        tids: impl IntoIterator<Item = u64>,
-        req: impl FnOnce(oneshot::Sender<Result<u64, WireFault>>) -> CommitRequest,
-    ) -> Result<u64, WireFault> {
-        let tids: Vec<u64> = tids.into_iter().collect();
-        assert!(
-            tids.iter().all(|&t| held.holds(t)),
-            "a commit bumps only tables whose lock it holds"
-        );
+    /// Queue `families` for commit as one write, or refuse it once a graceful
+    /// shutdown has begun: a write is ahead of the Shutdown barrier or refused.
+    fn submit(&self, families: Vec<TxnFamily>) -> Result<oneshot::Receiver<Result<u64, WireFault>>, WireFault> {
         if self.draining.get() {
             return Err("server shutting down".to_string().into());
         }
         let (done, rx) = oneshot::channel();
-        self.committer_tx.send(req(done));
-        let lsn = rx.await?;
+        self.committer_tx
+            .send(CommitRequest::Write(PendingWrite { families, done }));
+        Ok(rx)
+    }
+
+    /// Validate `families` as one bundle, commit it with the families its
+    /// deletes cascade to as one write, and raise each written table's commit
+    /// LSN to the write's.
+    async fn commit(
+        &self,
+        _catalog: &ReadGuard,
+        held: &HeldTables,
+        mut families: Vec<TxnFamily>,
+    ) -> Result<u64, WireFault> {
+        debug_assert!(
+            families
+                .iter()
+                .all(|f| held.holds_exclusive(f.tid) || !self.cat().push_reads_committed_state(f.tid, f.mode)),
+            "a write whose validation reads committed state holds its table exclusively"
+        );
+        self.disp().validate_txn_distributed(&mut families).await?;
+        let tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
+        assert!(
+            tids.iter().all(|&t| held.holds(t)),
+            "a commit bumps only tables whose lock it holds"
+        );
+        let lsn = self.submit(families)?.await?;
         let mut map = self.table_commit_lsn.borrow_mut();
         for tid in tids {
             // Pushes sharing a read guard resume from the await in any order.
@@ -348,14 +360,15 @@ impl Shared {
         self.sync_waiters.wake(id);
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
+        self.tick_rows.borrow_mut().remove(&id);
         self.disp().forget_relation(id);
     }
 
     /// Credit `rows` against each tid's pending-tick count and fire the auto-tick
     /// if any tid now stands at or above the coalesce threshold. Below it a push
     /// only accumulates, and nothing ticks until a read or a delta poll asks for
-    /// a drain.
-    pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (u64, usize)>) {
+    /// a drain. `_laid_out` is the SAL hold the rows' groups were written under.
+    pub(super) fn note_commit_rows(&self, _laid_out: &SalExcl<'_>, rows: impl Iterator<Item = (u64, usize)>) {
         let crossed = {
             let mut pending = self.tick_rows.borrow_mut();
             let dag = &self.cat().dag;
@@ -369,100 +382,88 @@ impl Shared {
         }
     }
 
-    /// Drain the pending tids into `out`, dropping any a DDL has since dropped —
-    /// a tid no longer in the catalog must not be ticked. Retains `out`'s
-    /// capacity, so the caller's scratch buffer is reused across ticks instead of
-    /// allocating a fresh `Vec` per drain.
-    ///
-    /// The liveness filter is part of the drain rather than a separate step at
-    /// each call site: both callers need it, and a third that forgot it would tick
-    /// a dropped relation.
-    fn drain_live_tick_rows_into(&self, out: &mut Vec<u64>) {
-        out.clear();
-        let mut rows = self.tick_rows.borrow_mut();
-        out.extend(
-            rows.drain()
-                .map(|(tid, _)| tid)
-                .filter(|&tid| self.cat().registry.has_id(tid)),
-        );
-    }
-
-    /// Put `tids` back after a tick failed to emit them, so their deltas are
-    /// ticked again instead of stranded. Their true row counts are gone; 1
-    /// understates the coalesce threshold, so the committer fires no `Auto` off
-    /// them alone and a repeatedly-refused emit (a full SAL) is retried only
-    /// when the next push or read asks for a tick. A tid a mid-tick push
-    /// already re-queued keeps that push's real count.
-    fn requeue_tick_tids(&self, tids: &[u64]) {
-        let mut rows = self.tick_rows.borrow_mut();
-        for &tid in tids {
-            rows.entry(tid).or_insert(1);
+    /// Tick every table with a pending delta as one Tick group, and answer the
+    /// lease its workers ACK on; `None` when nothing was pending. A refused emit
+    /// leaves every delta pending.
+    async fn emit_pending_tick(&self) -> Result<Option<AckLease>, WireFault> {
+        if self.tick_rows.borrow().is_empty() {
+            self.last_tick_lsn.set(self.disp().sal().watermark());
+            return Ok(None);
         }
+        // The hold `note_commit_rows` is called under, so the tids and the
+        // watermark read here are of the same commits.
+        let excl = self.disp().sal().lock().await;
+        if TICK_EMIT_ERROR.take_once() {
+            return Err("injected tick emit error".to_string().into());
+        }
+        let tids: Vec<u64> = self.tick_rows.borrow().keys().copied().collect();
+        let lease = self.disp().emit_tick(&excl, &tids)?;
+        self.tick_rows.borrow_mut().clear();
+        self.last_tick_lsn.set(self.disp().sal().watermark());
+        Ok(Some(lease))
     }
 }
 
 // ---------------------------------------------------------------------------
-// ServerExecutor entry point
+// Entry point
 // ---------------------------------------------------------------------------
 
-pub struct ServerExecutor;
+/// Serve `listeners` until a shutdown signal or a worker's death; the process's
+/// exit code.
+pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>) -> i32 {
+    let reactor = dispatcher.reactor().clone();
+    let boot_seed = dispatcher.sal().watermark();
 
-impl ServerExecutor {
-    pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>) -> i32 {
-        let reactor = dispatcher.reactor().clone();
-        let boot_seed = dispatcher.sal().watermark();
+    let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
+    let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
+    let shared = Rc::new(Shared {
+        dispatcher,
+        committer_tx,
+        catalog_rwlock: AsyncRwLock::default(),
+        tick_gate: AsyncRwLock::default(),
+        tick_tx,
+        last_tick_lsn: Cell::new(boot_seed),
+        tick_rows: RefCell::new(FxHashMap::default()),
+        sync_waiters: SyncWaiters::default(),
+        feeds: Feeds::default(),
+        push_queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),
+        table_locks: RefCell::new(FxHashMap::default()),
+        draining: Cell::new(false),
+        table_commit_lsn: RefCell::new(FxHashMap::default()),
+        boot_seed,
+        data_dir: data_dir.to_string(),
+        hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
+            "GNITZ_HELLO_TIMEOUT_MS",
+            (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
+        )),
+    });
 
-        let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
-        let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
-        let shared = Rc::new(Shared {
-            dispatcher,
-            committer_tx,
-            catalog_rwlock: AsyncRwLock::default(),
-            tick_gate: AsyncRwLock::default(),
-            tick_tx,
-            last_tick_lsn: Cell::new(boot_seed),
-            tick_rows: RefCell::new(FxHashMap::default()),
-            sync_waiters: SyncWaiters::default(),
-            feeds: Feeds::default(),
-            push_queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),
-            table_locks: RefCell::new(FxHashMap::default()),
-            draining: Cell::new(false),
-            table_commit_lsn: RefCell::new(FxHashMap::default()),
-            boot_seed,
-            data_dir: data_dir.to_string(),
-            hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
-                "GNITZ_HELLO_TIMEOUT_MS",
-                (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
-            )),
-        });
+    // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
+    // before exiting.
+    install_shutdown_signal_handlers();
+    // Past the last env knob the boot reads, so one it refuses stops the
+    // server before it reports ready.
+    gnitz_note!("GnitzDB ready");
 
-        // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
-        // before exiting.
-        install_shutdown_signal_handlers();
-        // Past the last env knob the boot reads, so one it refuses stops the
-        // server before it reports ready.
-        gnitz_note!("GnitzDB ready");
-
-        reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
-        for listener in listeners {
-            reactor.spawn(accept_loop(Rc::clone(&shared), listener));
-        }
-        reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
-
-        // `2` separates a dead worker from a failed boot's `1` and from
-        // `gnitz_fatal_abort!`'s `134`.
-        reactor.block_on(async move {
-            match select2(serve_until_signalled(&shared), shared.disp().worker_death()).await {
-                Either::A(()) => 0,
-                Either::B(crashed) => {
-                    let data_dir = &shared.data_dir;
-                    gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
-                    shared.disp().kill_workers();
-                    2
-                }
-            }
-        })
+    reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
+    for listener in listeners {
+        reactor.spawn(accept_loop(Rc::clone(&shared), listener));
     }
+    reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
+
+    // `2` separates a dead worker from a failed boot's `1` and from
+    // `gnitz_fatal_abort!`'s `134`.
+    reactor.block_on(async move {
+        match select2(serve_until_signalled(&shared), shared.disp().worker_death()).await {
+            Either::A(()) => 0,
+            Either::B(crashed) => {
+                let data_dir = &shared.data_dir;
+                gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
+                shared.disp().kill_workers();
+                2
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -583,15 +584,9 @@ async fn serve_until_signalled(shared: &Shared) {
 /// crosses `TICK_COALESCE_ROWS`, and `Drain` senders are parked on the answer —
 /// so this loop delays no tick to gather more. The one tick it holds back is
 /// one only patient drains ask for, to [`PATIENT_TICK_GAP`] after the last.
-///
-/// A failure in one trigger fails only that trigger; SAL emission is further
-/// guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
-    // The batch's `Drain` repliers, held across the tick they are waiting on.
+    // The batch's `Drain` repliers.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
-    // Reused across every tick; `drain_live_tick_rows_into` clears it before
-    // refilling so capacity is retained.
-    let mut tids_scratch: Vec<u64> = Vec::new();
     let mut patient_from = Instant::now();
     loop {
         let mut all_patient = true;
@@ -620,61 +615,24 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         }
 
         let _ticking = shared.tick_gate.read().await;
-        shared.drain_live_tick_rows_into(&mut tids_scratch);
-
-        // Run the tick. Errors are reported in logs AND handed to every Drain
-        // trigger's `done`: the waiting reader's view is stale, so reporting
-        // success would serve stale rows under `WireStatus::Ok`.
-        let tick_result = run_tick(&shared, &tids_scratch).await;
-        if let Err(e) = &tick_result {
+        let emitted = shared.emit_pending_tick().await;
+        if let Err(e) = &emitted {
             gnitz_warn!("tick error: {}", e);
         }
+        // At the emit, not its ACKs: a waiting reader's scan follows the tick's
+        // group in the SAL.
+        let verdict = emitted.as_ref().map(|_| ()).map_err(WireFault::clone);
         for done in dones.drain(..) {
-            done.send(tick_result.clone());
+            done.send(verdict.clone());
+        }
+        if let Ok(Some(lease)) = emitted {
+            if TICK_HOLD_FOR_DDL.take_once() {
+                hold_tick_for_ddl(&shared).await;
+            }
+            lease.acks().await;
         }
         patient_from = Instant::now() + PATIENT_TICK_GAP;
     }
-}
-
-/// Emit one Tick group for every `tid` and await the per-worker ACKs.
-async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
-    // Snapshot in the same step as the caller's drain of `tick_rows`: the
-    // committer queues a commit's tids as it lays the commit out, so every
-    // commit at or below the snapshot was drained by this tick or an earlier
-    // one. A later snapshot could cover a commit this tick never took.
-    let snapshot_lsn = shared.disp().sal().watermark();
-    if tids.is_empty() {
-        // Nothing pending: an earlier completed tick already took every commit
-        // at or below the snapshot. The watermark still advances, so a drain a
-        // reader waits on brings `last_tick_lsn` up to the moment it ran.
-        shared.last_tick_lsn.set(snapshot_lsn);
-        return Ok(());
-    }
-
-    let emit = {
-        let excl = shared.disp().sal().lock().await;
-        guard_panic("tick", || {
-            if TICK_EMIT_ERROR.take_once() {
-                return Err("injected tick emit error".into());
-            }
-            shared.disp().emit_tick(&excl, tids)
-        })
-    };
-    // A refused write publishes nothing, so no worker took any tid's delta.
-    let lease = match emit {
-        Ok(lease) => lease,
-        Err(e) => {
-            shared.requeue_tick_tids(tids);
-            return Err(e);
-        }
-    };
-
-    if TICK_HOLD_FOR_DDL.take_once() {
-        hold_tick_for_ddl(shared).await;
-    }
-    lease.acks().await;
-    shared.last_tick_lsn.set(snapshot_lsn);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +672,11 @@ async fn dispatch_request(
         // decodes its items from the frame's body.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
-        ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &data[ctrl.body]).await,
+        ClientVerb::ScanMulti => {
+            let scans =
+                gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(|e| format!("decode error: {e}"))?;
+            handle_scan(shared, peer, &scans).await
+        }
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
 
         // `target_id` is the sequence key (= the owning table's id).
@@ -734,13 +696,17 @@ async fn dispatch_request(
         }
 
         ClientVerb::ScanSpec => {
-            let (target, reply_layout) = (ctrl.hdr.target(), ctrl.hdr.arg0);
-            handle_scan_spec(shared, peer, target, &data[ctrl.blob.clone()], reply_layout).await
+            let scan = ScanItem {
+                target: ctrl.hdr.target(),
+                reply_layout: ctrl.hdr.arg0,
+                spec: &data[ctrl.blob.clone()],
+            };
+            handle_scan(shared, peer, &[scan]).await
         }
 
-        // A plain read guard, not `read_lock`: a resolve answers catalog shape,
+        // A plain read guard, not `fresh_read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick
-        // drain `read_lock` waits for buys nothing here.
+        // drain that one waits for buys nothing here.
         ClientVerb::Resolve => {
             let _g = shared.catalog_rwlock.read().await;
             build_resolve_reply(shared, peer, &data[ctrl.blob.clone()])
@@ -822,28 +788,17 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
 
     shared.cat().recheck_record(target_id, &seen)?;
 
-    // A push that reads no committed state cannot be invalidated by a concurrent
-    // one, so it shares its table's lock and reaches the committer alongside
-    // other pushes to the same table, which fold into one SAL zone and one
-    // fsync. Every other push is a one-family transaction: it takes its whole
-    // write lock set exclusively and commits whatever its deletes cascade to.
-    let zone_lsn = if shared.cat().push_reads_committed_state(target_id, mode) {
-        let locks = shared.cat().write_lock_set(target_id, !batch.all_weights_positive());
-        let held = shared.lock_tables_exclusive(locks).await;
-        let families = vec![TxnFamily { tid: target_id, mode, batch }];
-        commit_validated(shared, &catalog, &held, families).await?
+    // See `Shared::table_locks`. The exclusive set covers the tables this
+    // push's deletes cascade to.
+    let families = vec![TxnFamily { tid: target_id, mode, batch }];
+    let held = if shared.cat().push_reads_committed_state(target_id, mode) {
+        let deletes = !families[0].batch.all_weights_positive();
+        let locks = shared.cat().write_lock_set(target_id, deletes);
+        shared.lock_tables_exclusive(locks).await
     } else {
-        let held = shared.lock_table_shared(target_id).await;
-        let push = |done| {
-            CommitRequest::Push(PendingPush {
-                tid: target_id,
-                batch,
-                recoverable: !is_stream,
-                done,
-            })
-        };
-        shared.commit(&catalog, &held, [target_id], push).await?
+        shared.lock_table_shared(target_id).await
     };
+    let zone_lsn = shared.commit(&catalog, &held, families).await?;
     // A stream replies `0`: its push is not durable, and an ACK reports an LSN
     // only for a write a restart must recover. Keyed on the target rather than on
     // whether this batch happened to open a zone, so a stream push the committer
@@ -851,23 +806,6 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     let reply_lsn = if is_stream { 0 } else { zone_lsn };
     send_ack(peer, target_id, reply_lsn);
     Ok(())
-}
-
-/// Validate `families` as one bundle and commit it, with the families its
-/// deletes cascade to, as one zone. `held` is its tables' whole write lock sets.
-async fn commit_validated(
-    shared: &Rc<Shared>,
-    catalog: &ReadGuard,
-    held: &HeldTables,
-    mut families: Vec<TxnFamily>,
-) -> Result<u64, WireFault> {
-    shared.disp().validate_txn_distributed(&mut families).await?;
-    let tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
-    shared
-        .commit(catalog, held, tids, |done| {
-            CommitRequest::Txn(PendingTxn { families, done })
-        })
-        .await
 }
 
 /// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
@@ -913,7 +851,7 @@ async fn handle_push_txn(
     }
 
     // 4. Distributed bundle validation, and the commit.
-    let lsn = commit_validated(shared, &catalog, &held, families).await?;
+    let lsn = shared.commit(&catalog, &held, families).await?;
     send_ack(peer, 0, lsn);
     Ok(())
 }
@@ -963,12 +901,9 @@ fn not_found(tid: u64) -> WireFault {
 enum Access {
     /// Any read, a system catalog family included.
     Read,
-    /// A read with only a worker fan-out realization, which a system catalog
-    /// family has no form of: a family is read off the master's own copy.
-    UserRead,
     Write,
     /// A write inside a `PUSH_TXN`. Refusing a stream keeps every family
-    /// `recoverable`, so a transaction always opens a zone.
+    /// inside the zone, so a transaction always opens one.
     TxnWrite,
 }
 
@@ -994,11 +929,8 @@ fn target_kind(shared: &Shared, target: Target, access: Access) -> Result<Relati
         return Err(not_found(target_id));
     };
     match access {
-        Access::Read | Access::UserRead if kind == RelationKind::Stream => {
+        Access::Read if kind == RelationKind::Stream => {
             Err(format!("table {target_id} is a stream: a stream holds no rows and cannot be read").into())
-        }
-        Access::UserRead if kind == RelationKind::SystemCatalog => {
-            Err(format!("table {target_id} is a system catalog family: this read has only a fan-out form").into())
         }
         Access::Write | Access::TxnWrite if !kind.is_ingestion_point() => {
             Err(format!("table {target_id} is not writable: pushes must target a base table or a stream").into())
@@ -1048,13 +980,8 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Re
 }
 
 /// True when every relation of `sources` committed at or below the last
-/// completed tick's watermark, so no un-ticked commit reaches a view whose
-/// source closure they are.
-///
-/// Sound because the committer queues a commit's tids in `tick_rows` in the
-/// step that lays the commit out (see `run_tick`'s snapshot); a *missing* map
-/// entry is the `boot_seed` argument. Erring towards false is harmless (one
-/// extra drain).
+/// emitted tick's watermark, so no un-ticked commit reaches a view whose
+/// source closure they are. Erring towards false costs one extra drain.
 fn all_ticked(shared: &Shared, sources: &FxHashSet<u64>) -> bool {
     let ticked = shared.last_tick_lsn.get();
     sources.iter().all(|&s| shared.commit_lsn_of(s) <= ticked)
@@ -1086,20 +1013,6 @@ async fn fresh_read_lock(
     Ok(shared.catalog_rwlock.read().await)
 }
 
-/// [`fresh_read_lock`] for one target, with its kind resolved from the same
-/// probe that validated it: each single-target read verb passes the `Access`
-/// its realization can serve and routes on the returned kind, rather than
-/// re-deciding the system/user split from the id.
-async fn read_lock(
-    shared: &Rc<Shared>,
-    target: Target,
-    access: Access,
-) -> Result<(ReadGuard, RelationKind), WireFault> {
-    let g = fresh_read_lock(shared, [target.tid], false).await?;
-    let kind = target_kind(shared, target, access)?;
-    Ok((g, kind))
-}
-
 /// A reply train's terminal frame. `arg0` is the read's watermark (see
 /// [`read_watermark`]), or a DELTA_POLL position's tick round, whose cursor tag
 /// rides `arg1`; `arg1` is `0` for every other read.
@@ -1123,145 +1036,80 @@ fn read_watermark(shared: &Shared, kind: RelationKind) -> u64 {
     }
 }
 
-/// One scan-shaped fan-out of a `kind` relation: the cut under `guard`, then the
-/// reply train without it — a slow client's egress must not hold the catalog
-/// read lock. Answers the read's watermark, sampled inside the cut.
-async fn fan_out_scan(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    guard: ReadGuard,
+/// One scan of [`handle_scan`], resolved under the catalog guard.
+struct Scanned {
     kind: RelationKind,
-    read: Read<'_>,
-) -> Result<u64, WireFault> {
-    let mut lsn = 0;
-    let mut leases = shared
-        .disp()
-        .scan_cut(|cut| {
-            lsn = read_watermark(shared, kind);
-            cut.read(DirectGroup::new(read))
-        })
-        .await?;
-    drop(guard);
-    forward_scan(peer, &leases.pop().expect("one read, one lease")).await?;
-    Ok(lsn)
-}
-
-/// Finish one scan-shaped fan-out: the terminal frame carrying the `Ok`'s `arg0`
-/// (the read's watermark, or a delta read's round) and `arg1`, or the fault.
-fn finish_scan_fanout(peer: &Peer, target_id: u64, arg1: u64, result: Result<u64, WireFault>) {
-    match result {
-        // Corked, not sent: the terminal joins whatever the forward corked.
-        Ok(arg0) => send_msg(peer, terminal_scan_msg(target_id, arg0, arg1)),
-        Err(f) => send_fault(peer, target_id, &f),
-    }
-}
-
-/// SCAN_SPEC: one relation, replied in the client's layout `reply_layout`.
-async fn handle_scan_spec(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    target: Target,
-    blob: &[u8],
-    reply_layout: u64,
-) -> Result<(), WireFault> {
-    let target_id = target.tid;
-    let (g, kind) = read_lock(shared, target, Access::Read).await?;
-    if kind == RelationKind::SystemCatalog {
-        let spec = ReadSpec::decode(blob).map_err(|e| format!("decode error: {e}"))?;
-        let rows = guard_panic("read", || {
-            shared.cat().registry.scan_spec(target_id, spec, reply_layout, None)
-        })?;
-        send_msg(
-            peer,
-            ipc::WireMsg {
-                target_id,
-                arg0: read_watermark(shared, kind),
-                data: rows.wire_whole(),
-                ..Default::default()
-            },
-        );
-        return Ok(());
-    }
-    let read = Read::ScanSpec {
-        tid: target_id,
-        reply_layout,
-        spec: blob.into(),
-    };
-    let result = fan_out_scan(shared, peer, g, kind, read).await;
-    finish_scan_fanout(peer, target_id, 0, result);
-    Ok(())
-}
-
-/// One relation's Phase-1 capture for `handle_scan_multi`, carried to the
-/// deferred Phase-2 emit.
-struct ScanMultiRelPlan {
-    tid: u64,
-    reply_layout: u64,
-    kind: RelationKind,
-    /// The read's watermark, sampled inside the cut.
+    /// A system catalog family's rows, read off the master's own copy; `None`
+    /// for a scan that takes the next lease of the cut.
+    local: Option<Rc<Batch>>,
+    /// The read's watermark; a fanned scan's is sampled inside the cut.
     lsn: u64,
 }
 
-/// SCAN_MULTI: snapshot N relations at one SAL cut and stream N reply trains in
-/// request order. The read-side completion of the atomic multi-table write
-/// story: an atomic commit is either wholly before the cut (visible in every
-/// train) or wholly after (visible in none), never torn across the result set.
-///
-/// Every scan's lease lives in the `dispatches` vec and drops on return, so an
-/// early return removes every route and discards undrained frames at the ring
-/// boundary.
-async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
-    // ── Phase 0: decode; tid legality is Phase 1's, under the catalog lock ──
-    let relations = gnitz_wire::txn_frame::decode_scan_multi(body).map_err(|e| format!("decode error: {e}"))?;
-
-    // Phase 1 resolves every tid's kind under this guard, so a DDL during the
+/// SCAN_SPEC and SCAN_MULTI: one reply per scan, in request order. The scans
+/// its workers answer share one SAL cut, so an atomic commit is in all of
+/// their replies or in none.
+async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
+    // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
-    let cat = fresh_read_lock(shared, relations.iter().map(|r| r.tid), false).await?;
-
-    // ── Phase 1: catalog lock — resolve shapes + schemas, dispatch one cut ──
-    // One catalog snapshot for every relation, one SAL cut for every group.
-    let (dispatches, plans) = {
-        let _cat = cat;
-        let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
-        for r in &relations {
-            let kind = target_kind(shared, r.tid.into(), Access::UserRead)?;
-            plans.push(ScanMultiRelPlan {
-                tid: r.tid,
-                reply_layout: r.reply_layout,
-                kind,
-                lsn: 0,
-            });
-        }
-        let spec = ReadSpec::all_rows(ReadBound::None).encode();
-        let disp = shared.disp();
-        let dispatches = disp
-            .scan_cut(|cut| {
-                for plan in &mut plans {
-                    plan.lsn = read_watermark(shared, plan.kind);
-                    cut.read(DirectGroup::new(Read::ScanSpec {
-                        tid: plan.tid,
-                        reply_layout: plan.reply_layout,
-                        spec: spec.as_slice().into(),
-                    }))?;
-                }
-                Ok(())
-            })
-            .await?;
-        // Release the catalog read lock here: Phase 2 touches no catalog state
-        // (the snapshot is worker-frozen), so holding it across the whole bulk
-        // read would needlessly block DDL.
-        (dispatches, plans)
+    let catalog = fresh_read_lock(shared, scans.iter().map(|s| s.target.tid), false).await?;
+    let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
+    for scan in scans {
+        let kind = target_kind(shared, scan.target, Access::Read)?;
+        let (local, lsn) = match kind {
+            RelationKind::SystemCatalog => {
+                let spec = ReadSpec::decode(scan.spec).map_err(|e| format!("decode error: {e}"))?;
+                let registry = &shared.cat().registry;
+                let rows = registry.scan_spec(scan.target.tid, spec, scan.reply_layout, None)?;
+                (Some(rows), read_watermark(shared, kind))
+            }
+            _ => (None, 0),
+        };
+        scanned.push(Scanned { kind, local, lsn });
+    }
+    let leases = if scanned.iter().all(|s| s.local.is_some()) {
+        Vec::new()
+    } else {
+        let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
+        let cut = shared.disp().scan_cut(|cut| {
+            for (scan, s) in fanned {
+                s.lsn = read_watermark(shared, s.kind);
+                cut.read(DirectGroup::new(Read::ScanSpec {
+                    tid: scan.target.tid,
+                    reply_layout: scan.reply_layout,
+                    spec: scan.spec.into(),
+                }))?;
+            }
+            Ok(())
+        });
+        cut.await?
     };
+    // The replies read no catalog state, and a slow client's egress must not
+    // hold the catalog read lock.
+    drop(catalog);
 
-    // ── Phase 2: sequential per-relation drain (no locks; holds all leases) ──
-    for (plan, d) in plans.iter().zip(&dispatches) {
-        // Drain this relation's train (all workers, ascending) before the next —
-        // within a cut each worker's ring order is request order.
-        forward_scan(peer, d).await?;
-        // Terminal frame for this relation (tid + its watermark).
-        send_msg(peer, terminal_scan_msg(plan.tid, plan.lsn, 0));
-        // This relation's reply is complete: carry no more than the budget into
-        // the next, and learn here rather than at the end if the client is gone.
+    let mut leases = leases.iter();
+    for (scan, s) in scans.iter().zip(&scanned) {
+        let target_id = scan.target.tid;
+        match &s.local {
+            Some(rows) => send_msg(
+                peer,
+                ipc::WireMsg {
+                    target_id,
+                    arg0: s.lsn,
+                    data: rows.wire_whole(),
+                    ..Default::default()
+                },
+            ),
+            None => {
+                // This relation's train, all workers, before the next: within a
+                // cut each worker's ring order is request order.
+                forward_scan(peer, leases.next().expect("one lease per fanned scan")).await?;
+                send_msg(peer, terminal_scan_msg(target_id, s.lsn, 0));
+            }
+        }
+        // Carry no more than the budget into the next reply, and learn here
+        // rather than at the end if the client is gone.
         if peer.flush_if_full().await.is_err() {
             return Ok(());
         }

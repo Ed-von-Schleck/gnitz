@@ -192,18 +192,10 @@ impl<'d> ScanCut<'d> {
 
 impl MasterDispatcher {
     /// Bring every cache derived from `tid`'s committed rows up to a `batch` of
-    /// it that is now durable. A panic costs the table those caches, which its
-    /// next constrained write builds again; the write itself stands.
+    /// it that is now durable.
     pub(crate) fn committed(&self, tid: u64, batch: &Batch) {
-        if let Err(e) = super::guard_panic("cache_ingest", || {
-            self.unique_filter_ingest_batch(tid, batch);
-            self.fk_presence_ingest_batch(tid, batch);
-            Ok::<_, String>(())
-        }) {
-            self.unique_filter_invalidate_table(tid);
-            self.fk_presence_invalidate_table(tid);
-            gnitz_warn!("{}", e);
-        }
+        self.unique_filter_ingest_batch(tid, batch);
+        self.fk_presence_ingest_batch(tid, batch);
     }
 
     /// Drop everything held for a dropped relation. Ids are never reused, so
