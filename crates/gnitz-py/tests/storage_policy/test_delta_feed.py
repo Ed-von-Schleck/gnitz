@@ -362,6 +362,23 @@ async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
     assert (pushed.error, len(pushed.rows)) == (None, 4)
 
 
+def test_a_sync_is_held_for_a_tick_no_longer_than_its_wait(own_server):
+    """A sync that finds a commit no tick has taken is answered with it once
+    its own wait ends, at a pace that puts the next tick ten minutes away."""
+    own_server.start(extra_env={"GNITZ_PATIENT_TICK_GAP_MS": "600000"})
+    with gnitz.connect(own_server.target) as client, gnitz.connect(own_server.target) as reader:
+        base_tables(client)
+        mk_feed(client, "f", LINEAR)
+        client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+        # The read ticks the seed, and the pace counts from that tick.
+        reader.subscribe(*client.resolve_table("f"))
+        client.execute_sql("INSERT INTO t VALUES (2, 200, 'late')")
+        began = time.monotonic()
+        (pushed,) = reader.sync(0.2).pushed
+        assert time.monotonic() - began < 60
+    assert (pushed.error, len(pushed.rows)) == (None, 1)
+
+
 # ── refused cursors ──────────────────────────────────────────────────────────
 
 

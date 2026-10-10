@@ -92,22 +92,18 @@ enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
     /// coalesce threshold.  Tids come from `tick_rows`.
     Auto,
-    /// Explicit drain requested by a read or by the checkpoint: tick whatever is
-    /// pending — even nothing — and report the tick's verdict on `done`. A reader
-    /// that waited on a failed tick must be told: its view is stale, and reporting
-    /// success would serve stale rows under `WireStatus::Ok`.
+    /// Asked for by a read or by the checkpoint: tick whatever is pending —
+    /// even nothing — by `by`, and report the tick's verdict on `done`.
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
-        /// Asked for by a waiting sync: held to [`Shared::patient_tick_gap`] unless a
-        /// trigger that is not joins the batch.
-        patient: bool,
+        by: Instant,
     },
 }
 
-/// Ask the tick loop to tick everything pending and report the tick's verdict.
-pub(super) fn request_drain(shared: &Shared, patient: bool) -> oneshot::Receiver<Result<(), WireFault>> {
+/// Send the tick loop a [`TickTrigger::Drain`] due `by`; the receiver is its verdict.
+pub(super) fn request_drain(shared: &Shared, by: Instant) -> oneshot::Receiver<Result<(), WireFault>> {
     let (done, rx) = oneshot::channel();
-    shared.tick_tx.send(TickTrigger::Drain { done, patient });
+    shared.tick_tx.send(TickTrigger::Drain { done, by });
     rx
 }
 
@@ -212,8 +208,8 @@ pub struct Shared {
     /// included (`GNITZ_HELLO_TIMEOUT_MS`). The default outlasts the client's own
     /// `CONNECT_TIMEOUT`, so only a client that has already given up is reaped.
     hello_timeout: Duration,
-    /// The least time between a tick and one only waiting syncs ask for
-    /// (`GNITZ_PATIENT_TICK_GAP_MS`): such a sync is re-issued the moment it is
+    /// How long after a tick the next one waits for a trigger to fall due
+    /// (`GNITZ_PATIENT_TICK_GAP_MS`): a held sync is re-issued the moment it is
     /// answered, so unpaced it would tick per commit.
     patient_tick_gap: Duration,
 }
@@ -590,33 +586,29 @@ async fn serve_until_signalled(shared: &Shared) {
 // Tick loop (event-driven)
 // ---------------------------------------------------------------------------
 
-/// Drive ticks from a channel of `TickTrigger`s: take every trigger already
-/// queued, then issue one batched tick for the union of pending tids.
-///
-/// Coalescing is the *sender's* job — the committer sends `Auto` only once a tid
-/// crosses `TICK_COALESCE_ROWS`, and `Drain` senders are parked on the answer —
-/// so this loop delays no tick to gather more. The one tick it holds back is
-/// one only patient drains ask for, to [`Shared::patient_tick_gap`] after the last.
+/// One tick of everything pending per batch of `TickTrigger`s. A batch is
+/// ticked once its first trigger is due, or [`Shared::patient_tick_gap`] after
+/// the last tick where that is sooner.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     // The batch's `Drain` repliers.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     let mut patient_from = Instant::now();
     loop {
-        let mut all_patient = true;
+        let mut due = patient_from;
         let mut trigger = rx.recv().await;
         loop {
             match trigger {
-                TickTrigger::Auto => all_patient = false,
-                TickTrigger::Drain { done, patient } => {
-                    all_patient &= patient;
+                TickTrigger::Auto => due = Instant::now(),
+                TickTrigger::Drain { done, by } => {
+                    due = due.min(by);
                     dones.push(done);
                 }
             }
             trigger = match rx.try_recv() {
                 Some(t) => t,
                 None => {
-                    let hold = patient_from.saturating_duration_since(Instant::now());
-                    if !all_patient || hold.is_zero() {
+                    let hold = due.saturating_duration_since(Instant::now());
+                    if hold.is_zero() {
                         break;
                     }
                     match select2(rx.recv(), shared.disp().reactor().sleep(hold)).await {
@@ -1015,14 +1007,14 @@ fn all_ticked(shared: &Shared, sources: &FxHashSet<u64>) -> bool {
 async fn fresh_read_lock(
     shared: &Rc<Shared>,
     targets: impl IntoIterator<Item = u64>,
-    patient: bool,
+    drain_by: Instant,
 ) -> Result<ReadGuard, WireFault> {
     let g = shared.catalog_rwlock.read().await;
     if all_ticked(shared, &shared.cat().dag.source_closure(targets)) {
         return Ok(g);
     }
     drop(g);
-    request_drain(shared, patient).await?;
+    request_drain(shared, drain_by).await?;
     Ok(shared.catalog_rwlock.read().await)
 }
 
@@ -1053,7 +1045,7 @@ struct Scanned {
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
     // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
-    let catalog = fresh_read_lock(shared, scans.iter().map(|s| s.target.tid), false).await?;
+    let catalog = fresh_read_lock(shared, scans.iter().map(|s| s.target.tid), Instant::now()).await?;
     let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
     for scan in scans {
         let kind = target_kind(shared, scan.target, Access::Read)?;

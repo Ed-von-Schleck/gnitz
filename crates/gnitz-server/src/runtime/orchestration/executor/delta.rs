@@ -91,7 +91,7 @@ pub(super) async fn handle_delta_poll(
     let disp = shared.disp();
     let mut kept = delta_poll_kept(prologue);
     // The poll drained once, for this lock; a later slice takes the lock alone.
-    let mut first_lock = Some(fresh_read_lock(shared, views.iter().map(|v| v.view.tid), false).await?);
+    let mut first_lock = Some(fresh_read_lock(shared, views.iter().map(|v| v.view.tid), Instant::now()).await?);
 
     // One slice at a time: one catalog lock and — for however many of its views
     // moved — one broadcast. A view read whole is a slice of its own: a cut holds
@@ -187,7 +187,7 @@ async fn hold_lock(
     let ids = || ids.iter().copied();
     let wait = until.saturating_duration_since(Instant::now());
     let waiting = !wait.is_zero();
-    let g = fresh_read_lock(shared, ids(), waiting).await?;
+    let g = fresh_read_lock(shared, ids(), until).await?;
     if !waiting {
         return Ok(g);
     }
@@ -203,7 +203,7 @@ async fn hold_lock(
     drop(g);
     select2(&mut parked.woken, shared.disp().reactor().sleep(wait)).await;
     drop(parked);
-    fresh_read_lock(shared, ids(), true).await
+    fresh_read_lock(shared, ids(), until).await
 }
 
 // ---------------------------------------------------------------------------
