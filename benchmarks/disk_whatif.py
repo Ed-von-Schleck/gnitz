@@ -98,6 +98,20 @@ def pk_candidates(data, rows):
         widths = [max((b - a for a, b in zip(ints[i:i + 127], ints[i + 1:i + 128])), default=0).bit_length()
                   for i in range(0, rows, 128)]
     out["delta_bits_128"] = sum(w + 1 + packed(127, b) for b in widths)
+    # Frame of reference per 8-byte key word and per 512-row block: a base and a width per word.
+    at = np.arange(0, rows, 512)
+    n = np.diff(np.append(at, rows))
+    span_bits = np.frompyfunc(lambda s: int(s).bit_length(), 1, 1)
+    by_bytes = by_bits = 0
+    for lo in range(0, w, 8):
+        word = np.zeros((rows, 8), dtype=np.uint8)
+        word[:, 8 - min(8, w - lo):] = cells[:, lo:lo + 8]
+        v = word.view(">u8").ravel().astype(np.uint64)
+        bits = span_bits(np.maximum.reduceat(v, at) - np.minimum.reduceat(v, at)).astype(np.int64)
+        by_bytes += int((9 + n * ((bits + 7) // 8)).sum())
+        by_bits += int((9 + (n * bits + 7) // 8).sum())
+    out["word_for_bytes_512"] = by_bytes
+    out["word_for_bits_512"] = by_bits
     return out
 
 
