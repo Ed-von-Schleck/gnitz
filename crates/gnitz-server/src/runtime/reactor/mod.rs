@@ -30,8 +30,7 @@ mod sync;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::{
-    client_pair, egress_pair, framed, make_reactor_over, poll_until, reactor_with_rings, read_nonblocking, ring_slot,
-    spawn_drain,
+    client_pair, egress_pair, framed, poll_until, reactor_with_rings, read_nonblocking, ring_slot, spawn_drain,
 };
 mod uring;
 mod wake_queue;
