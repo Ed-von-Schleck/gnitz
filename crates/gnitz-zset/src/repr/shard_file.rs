@@ -24,7 +24,9 @@ fn is_constant(region: &[u8], width: usize) -> bool {
 }
 
 /// A region of `width`-byte elements as it is written: its one element where
-/// they are all the same, else what `pack` makes of it, else the region itself.
+/// they are all the same, else what `pack` makes of it where that leaves the
+/// region fewer aligned bytes, else the region itself. A win that vanishes after
+/// alignment saves no disk and still costs a decode.
 fn encode_region(
     src: &[u8],
     width: usize,
@@ -33,31 +35,17 @@ fn encode_region(
     if is_constant(src, width) {
         return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
-    match pack() {
+    match pack().filter(|(_, image)| region_start(image.len()) < region_start(src.len())) {
         Some((encoding, image)) => (encoding, Cow::Owned(image)),
         None => (Encoding::Raw, Cow::Borrowed(src)),
     }
-}
-
-/// The FoR image of `src`, where it leaves the region fewer aligned bytes: a
-/// win that vanishes after alignment saves no disk and still costs a decode.
-fn framed(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
-    for_encode(src, fi).filter(|image| region_start(image.len()) < region_start(src.len()))
-}
-
-/// The packed image of a PK region of `raw`'s fields, where it leaves the
-/// region fewer aligned bytes.
-fn pack_key(src: &[u8], raw: &KeyLayout) -> Option<(Encoding, Vec<u8>)> {
-    key_encode(src, raw)
-        .filter(|image| region_start(image.len()) < region_start(src.len()))
-        .map(|image| (Encoding::Key, image))
 }
 
 /// The packed image of a weight or null region, whose words are `word`s.
 fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
     two_value_encode(src)
         .map(|image| (Encoding::TwoValue, image))
-        .or_else(|| framed(src, word).map(|image| (Encoding::For, image)))
+        .or_else(|| for_encode(src, word).map(|image| (Encoding::For, image)))
 }
 
 /// The packed image of `col`, payload column `pi` and no string's, under the
@@ -67,7 +55,10 @@ fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
 fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) -> Option<(Encoding, Vec<u8>)> {
     let n = nulls.len() / FIXED_REGION_BYTES;
     let width = col.size();
-    let framed = col.fixed_int().and_then(|fi| framed(src, fi));
+    let framed = col
+        .fixed_int()
+        .and_then(|fi| for_encode(src, fi))
+        .filter(|image| region_start(image.len()) < region_start(src.len()));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
     let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
     // A column under half NULL has more cells than half the region holds.
@@ -147,6 +138,12 @@ fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> 
 /// at the first value past which the lengths are the smaller.
 fn pack_string_column<'a>(cells: &'a [[u8; 16]], src_heap: &'a [u8], heap: &mut Vec<u8>) -> (Encoding, Vec<u8>) {
     let content = |cell: &'a [u8; 16]| german_string_content(cell, src_heap);
+    if is_constant(cells.as_flattened(), 16) {
+        return (
+            Encoding::Constant,
+            relocate_german_string_vec(&cells[0], src_heap, heap, None).to_vec(),
+        );
+    }
     let (at, raw) = (heap.len(), region_start(cells.len() * 16));
     let (mut span, mut short, mut long) = ((usize::MAX, 0), 0, 0);
     for len in cells.iter().map(|cell| content(cell).len()) {
@@ -250,7 +247,7 @@ impl Batch {
         let nulls = regions[REG_NULL_BMP];
         let mut images: Vec<(Encoding, Cow<[u8]>)> = Vec::with_capacity(regions.len() + 1);
         images.push(encode_region(regions[REG_PK], schema.pk_stride(), || {
-            pack_key(regions[REG_PK], &KeyLayout::of(schema))
+            key_encode(regions[REG_PK], schema).map(|image| (Encoding::Key, image))
         }));
         images.push(encode_region(regions[REG_WEIGHT], FIXED_REGION_BYTES, || {
             pack_words(regions[REG_WEIGHT], FixedInt::I64)

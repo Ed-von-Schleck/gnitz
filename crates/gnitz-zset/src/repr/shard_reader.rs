@@ -118,7 +118,7 @@ impl KeyRegion {
         if span.encoding != Encoding::Key {
             return direct_region(data, span, count, schema.pk_stride()).map(KeyRegion::Mapped);
         }
-        let image = KeyImage::parse(span.bytes(data), count, &KeyLayout::of(schema)).ok_or(Corrupt("region size"))?;
+        let image = KeyImage::parse(span.bytes(data), count, schema).ok_or(Corrupt("region size"))?;
         Ok(KeyRegion::Packed(Box::new(PackedKey {
             image,
             blocks: DecodedBlocks::new(count),

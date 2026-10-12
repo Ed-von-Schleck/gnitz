@@ -451,6 +451,34 @@ fn shapes() -> Vec<Shape> {
             reader: nullable_string,
             encodings: vec![(REG_PAYLOAD_START, Seq)],
         },
+        // Eight weights and their image both take one 64-byte block.
+        Shape {
+            label: "two weights that pack to no fewer blocks",
+            written: build(u64_i64, 8, |b, i| {
+                b.begin_row(i as u128, if i % 2 == 0 { 1 } else { -1 });
+                b.put_int(i as u128 * 0x0123_4567_89AB_CDEF);
+            }),
+            reader: u64_i64,
+            encodings: vec![(REG_WEIGHT, Raw)],
+        },
+        Shape {
+            label: "a NULL string in every row",
+            written: build(nullable_string, 40, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_null();
+            }),
+            reader: nullable_string,
+            encodings: vec![(REG_PAYLOAD_START, Constant)],
+        },
+        Shape {
+            label: "one inline string in every row",
+            written: build(string, 40, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string("active");
+            }),
+            reader: string,
+            encodings: vec![(REG_PAYLOAD_START, Constant)],
+        },
         Shape {
             label: "one long string in every row",
             written: build(string, 9, |b, i| {

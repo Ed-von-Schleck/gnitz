@@ -143,6 +143,27 @@ fn shard_read_bench() {
             }),
         ),
         (
+            "one nullable column, all NULL",
+            build(nullable_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_null();
+            }),
+        ),
+        (
+            "one column, one inline value",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string("active");
+            }),
+        ),
+        (
+            "one column, one 60-byte value",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(0, 60));
+            }),
+        ),
+        (
             "one column, 60-byte values drawn from N/2",
             build(one_string, N, |b, i| {
                 b.begin_row(i as u128 + 1, 1);

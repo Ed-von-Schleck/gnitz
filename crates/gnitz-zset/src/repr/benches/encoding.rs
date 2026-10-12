@@ -83,17 +83,62 @@ fn key_bench() {
         ("a u128 of 80 bits", vec![U128], |i, _| {
             (i as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C) >> 8
         }),
+        (
+            "(i32 of 50, i32 of 1000, i32 of 7, i64 seconds)",
+            vec![I32, I32, I32, I64],
+            |i, c| {
+                [
+                    (i % 50) as u128,
+                    (i as u128 * 31) % 1000,
+                    (i % 7) as u128,
+                    1_760_000_000 + (i as u128 * 7919) % 86_400,
+                ][c]
+            },
+        ),
+        (
+            "(u128 of 50, u128 of 1000, u128 seconds)",
+            vec![U128, U128, U128],
+            |i, c| {
+                [
+                    (i % 50) as u128,
+                    (i as u128 * 31) % 1000,
+                    1_760_000_000 + (i as u128 * 7919) % 86_400,
+                ][c]
+            },
+        ),
+        ("five u128", vec![U128, U128, U128, U128, U128], |i, c| {
+            [
+                (i % 9) as u128,
+                (i % 50) as u128,
+                (i as u128 * 31) % 1000,
+                (i % 7) as u128,
+                1_760_000_000 + (i as u128 * 7919) % 86_400,
+            ][c]
+        }),
+        (
+            "(i16 of 9, i32 of 50, i32 of 1000, i32 of 7, i64 seconds)",
+            vec![I16, I32, I32, I32, I64],
+            |i, c| {
+                [
+                    (i % 9) as u128,
+                    (i % 50) as u128,
+                    (i as u128 * 31) % 1000,
+                    (i % 7) as u128,
+                    1_760_000_000 + (i as u128 * 7919) % 86_400,
+                ][c]
+            },
+        ),
     ];
     let instructions = Counter::instructions();
     for (label, types, value) in shapes {
         let (schema, raw) = key_region(&types, N, value);
-        let (fields, stride) = (KeyLayout::of(&schema), schema.pk_stride());
+        let stride = schema.pk_stride();
         let ((image, _), encode) = instructions.measure(|| {
-            let image = key_encode(black_box(&raw), &fields).expect("region must pack");
+            let image = key_encode(black_box(&raw), &schema).expect("region must pack");
             let len = image.len();
             (image, len)
         });
-        let key = KeyImage::parse(&image, N, &fields).expect("the encoder's image parses");
+        let key = KeyImage::parse(&image, N, &schema).expect("the encoder's image parses");
         let mut decoded = vec![0u8; raw.len()];
         let ((), decode) = instructions.measure(|| black_box(&key).decode(0, black_box(&mut decoded)));
         assert!(decoded == raw);
@@ -123,7 +168,7 @@ fn key_bench() {
         });
         assert_eq!(in_image, in_region);
         println!(
-            "key_bench {label:<38} {stride:>2} -> {:>2} bytes a row; per row: encode {:5.1}, decode {:5.1}; \
+            "key_bench {label:<58} {stride:>2} -> {:>2} bytes a row; per row: encode {:5.1}, decode {:5.1}; \
              per seek: {:6.1} in the image, {:6.1} in the region",
             key.stride,
             encode as f64 / N as f64,

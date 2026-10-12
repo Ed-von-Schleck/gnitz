@@ -576,6 +576,8 @@ fn key_probes(fields: &KeyLayout, key: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
 fn key_roundtrips_and_seeks_as_the_region_it_packs() {
     use TypeCode::*;
     type Value = fn(usize, usize) -> u128;
+    // A few values per column, whatever the columns.
+    const SMALL: Value = |i, c| ((i * [3, 5, 7, 11, 13][c]) % [50, 7, 1000, 9, 300][c]) as u128;
     // Each case's packed row width at 1500 rows, or `None` where the encoder declines.
     let cases: Vec<(&str, Vec<TypeCode>, Value, Option<usize>)> = vec![
         ("a narrow u64", vec![U64], |i, _| 1000 + (i as u128 * 7) % 5000, Some(2)),
@@ -623,6 +625,12 @@ fn key_roundtrips_and_seeks_as_the_region_it_packs() {
             },
             Some(3),
         ),
+        ("four fields", vec![U32, U32, U16, U64], SMALL, Some(3)),
+        ("six fields", vec![U128, U128, U128], SMALL, Some(3)),
+        ("seven fields", vec![U128, U128, U128, U8], SMALL, Some(3)),
+        ("eight fields", vec![U128, U128, U128, U128], SMALL, Some(3)),
+        ("nine fields", vec![U128, U128, U128, U128, U16], SMALL, Some(4)),
+        ("ten fields", vec![U128, U128, U128, U128, U128], SMALL, Some(4)),
         ("a full-width u64", vec![U64], |i, _| mix(i as u64) as u128, None),
         (
             "three full-width u64: a row past one u128",
@@ -637,21 +645,21 @@ fn key_roundtrips_and_seeks_as_the_region_it_packs() {
         for n in [2, DECODE_BLOCK_ROWS + 1, 1500] {
             let (schema, raw) = key_region(&types, n, value);
             let (fields, stride) = (KeyLayout::of(&schema), schema.pk_stride());
-            let Some(image) = key_encode(&raw, &fields) else {
+            let Some(image) = key_encode(&raw, &schema) else {
                 assert!(n < 1500 || packed_stride.is_none(), "{label}: declined at {n} rows");
                 continue;
             };
             assert!(image.len() < raw.len(), "{label}: no larger than the region");
-            let key = KeyImage::parse(&image, n, &fields).expect("the encoder's image parses");
+            let key = KeyImage::parse(&image, n, &schema).expect("the encoder's image parses");
             if n == 1500 {
                 assert_eq!(Some(key.stride), packed_stride, "{label}: packed row width");
             }
             assert!(
-                KeyImage::parse(&image, n + 1, &fields).is_none(),
+                KeyImage::parse(&image, n + 1, &schema).is_none(),
                 "{label}: another row count"
             );
             assert!(
-                KeyImage::parse(&image, n - 1, &fields).is_none(),
+                KeyImage::parse(&image, n - 1, &schema).is_none(),
                 "{label}: another row count"
             );
 
@@ -695,7 +703,7 @@ fn key_parse_refuses_widths_its_fields_do_not_hold() {
         [(i % 9) as u128, i as u128][c]
     });
     let fields = KeyLayout::of(&schema);
-    let image = key_encode(&raw, &fields).unwrap();
+    let image = key_encode(&raw, &schema).unwrap();
     let bits_at = fields.fields().len() * 8;
     assert_eq!(image[bits_at..bits_at + 2], [4, 9], "the fields' bit widths");
     // Widths their fields hold at the row's size parse, as any body bytes do;
@@ -709,15 +717,15 @@ fn key_parse_refuses_widths_its_fields_do_not_hold() {
     ] {
         let mut image = image.clone();
         image[bits_at..bits_at + 2].copy_from_slice(&forged);
-        let parsed = KeyImage::parse(&image, 300, &fields);
+        let parsed = KeyImage::parse(&image, 300, &schema);
         assert_eq!(parsed.is_some(), parses, "bit widths {forged:?}");
     }
     assert!(
-        KeyImage::parse(&image[..bits_at], 300, &fields).is_none(),
+        KeyImage::parse(&image[..bits_at], 300, &schema).is_none(),
         "shorter than its header"
     );
     assert!(
-        KeyImage::parse(&image, 300, &KeyLayout::of(&pk_only_schema(&[TypeCode::U64]))).is_none(),
+        KeyImage::parse(&image, 300, &pk_only_schema(&[TypeCode::U64])).is_none(),
         "another PK's fields"
     );
 }
@@ -727,10 +735,9 @@ fn a_key_minimum_past_its_field_wraps() {
     let (schema, raw) = key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
         [(i % 9) as u128, i as u128][c]
     });
-    let fields = KeyLayout::of(&schema);
-    let mut image = key_encode(&raw, &fields).unwrap();
+    let mut image = key_encode(&raw, &schema).unwrap();
     image[..16].fill(0xFF);
-    let key = KeyImage::parse(&image, 300, &fields).unwrap();
+    let key = KeyImage::parse(&image, 300, &schema).unwrap();
     let mut decoded = vec![0u8; raw.len()];
     key.decode(0, &mut decoded);
     // Row 0 held each field's minimum, now all ones: every field reads one less than it was.
@@ -738,4 +745,26 @@ fn a_key_minimum_past_its_field_wraps() {
     let field = |rows: &[u8]| gnitz_wire::widen_pk_be(&rows[299 * 10 + 2..]);
     assert_eq!(field(&decoded), field(&raw) - 1);
     assert_eq!(key.seek(&raw[..10], None), 0, "below every forged minimum");
+}
+
+/// Key shapes whose fields end at their row's end, at a few rows: the wide loads
+/// and stores of the last rows are the ones that could leave the region. Small
+/// enough to run under Miri.
+#[test]
+fn key_roundtrips_at_a_few_rows() {
+    use TypeCode::*;
+    for types in [vec![U32, I16, U8], vec![U64, U16], vec![U8, U8], vec![U128, U8]] {
+        for n in [2usize, 3, 9, 20] {
+            let (schema, raw) = key_region(&types, n, |i, c| (i * (c + 3) % 5) as u128);
+            let Some(image) = key_encode(&raw, &schema) else {
+                continue;
+            };
+            let key = KeyImage::parse(&image, n, &schema).unwrap();
+            let mut decoded = vec![0u8; raw.len()];
+            key.decode(0, &mut decoded);
+            assert!(decoded == raw, "{types:?} at {n} rows");
+            let stride = schema.pk_stride();
+            assert_eq!(key.seek(&raw[..stride], None), 0, "{types:?} at {n} rows");
+        }
+    }
 }

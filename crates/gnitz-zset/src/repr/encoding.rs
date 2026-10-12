@@ -141,7 +141,7 @@ const fn for_cell_at(row: usize, bw: usize) -> usize {
     FOR_CELLS_AT + row * bw
 }
 
-pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
+const fn for_image_len(count: usize, bw: usize) -> usize {
     for_cell_at(count, bw) + FOR_SLACK
 }
 
@@ -226,23 +226,42 @@ impl<'a> ForImage<'a> {
     }
 
     fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8]) {
-        let ForImage { image, reference, mask, bw } = *self;
+        match self.bw {
+            1 => self.decode_framed::<W, 1>(first_row, out),
+            2 => self.decode_framed::<W, 2>(first_row, out),
+            3 => self.decode_framed::<W, 3>(first_row, out),
+            4 => self.decode_framed::<W, 4>(first_row, out),
+            5 => self.decode_framed::<W, 5>(first_row, out),
+            6 => self.decode_framed::<W, 6>(first_row, out),
+            7 => self.decode_framed::<W, 7>(first_row, out),
+            _ => unreachable!("a framed offset is 1 to 7 bytes"),
+        }
+    }
+
+    /// [`decode_cells`](Self::decode_cells) at the constant offset width `BW`.
+    #[inline(always)]
+    fn decode_framed<const W: usize, const BW: usize>(&self, first_row: usize, out: &mut [u8]) {
         let cells = out.as_chunks_mut::<W>().0;
         let Some(last) = cells.len().checked_sub(1) else {
             return;
         };
-        assert!(for_cell_at(first_row + last, bw) + size_of::<u64>() <= image.len());
+        // The rows' offsets, the last one a whole u64.
+        let offsets = &self.image[for_cell_at(first_row, BW)..for_cell_at(first_row + last, BW) + size_of::<u64>()];
         for (i, cell) in cells.iter_mut().enumerate() {
-            // SAFETY: row `first_row + i` is at most `first_row + last`, whose load the assert bounds.
-            let packed = unsafe {
-                image
-                    .as_ptr()
-                    .add(for_cell_at(first_row + i, bw))
-                    .cast::<u64>()
-                    .read_unaligned()
+            let at = &offsets[i * BW..];
+            // An offset the width of an integer loads as one; any other, as the low bytes of a u64.
+            let packed = if BW.is_power_of_two() {
+                let mut exact = [0u8; 8];
+                exact[..BW].copy_from_slice(at.first_chunk::<BW>().unwrap());
+                u64::from_le_bytes(exact)
+            } else {
+                u64::from_le_bytes(*at.first_chunk().unwrap()) & gnitz_wire::low_bits_mask(8 * BW)
             };
-            let v = (u64::from_le(packed) & mask).wrapping_add(reference);
-            *cell = *v.to_le_bytes().first_chunk::<W>().unwrap();
+            *cell = *packed
+                .wrapping_add(self.reference)
+                .to_le_bytes()
+                .first_chunk::<W>()
+                .unwrap();
         }
     }
 }
@@ -498,7 +517,7 @@ macro_rules! key_word_dispatch {
 /// The fields a PK row reads as, in order: a column of up to eight bytes is
 /// one, a 16-byte column its two halves.
 #[derive(Clone, Copy)]
-pub(crate) struct KeyLayout {
+struct KeyLayout {
     fields: [KeyField; KEY_MAX_FIELDS],
     n: usize,
     /// Bytes per raw row.
@@ -507,7 +526,7 @@ pub(crate) struct KeyLayout {
 
 impl KeyLayout {
     /// The fields of `schema`'s PK region, with no place in a packed row yet.
-    pub(crate) fn of(schema: &SchemaDescriptor) -> Self {
+    fn of(schema: &SchemaDescriptor) -> Self {
         let mut layout = KeyLayout {
             fields: [KeyField::default(); KEY_MAX_FIELDS],
             n: 0,
@@ -555,12 +574,15 @@ impl KeyLayout {
     }
 }
 
-/// Run `$body` with `$set` the fields of `$layout` for a row loop to run over:
-/// an array by value up to four, whose constant count unrolls the loop and
-/// whose fields stay in registers across the loop's stores, a slice past it.
+// The arms of `key_fields_dispatch!` are the field counts a key can have.
+const _: () = assert!(KEY_MAX_FIELDS == 10);
+
+/// Run `$body` with `$set` the fields of `$layout` by value, an array of
+/// their count: the constant count unrolls a row loop over them, and the
+/// fields stay in registers across the loop's stores.
 macro_rules! key_fields_dispatch {
     ($layout:expr, |$set:ident| $body:expr) => {
-        key_fields_dispatch!(@arms $layout, $set, $body, 1 2 3 4)
+        key_fields_dispatch!(@arms $layout, $set, $body, 1 2 3 4 5 6 7 8 9 10)
     };
     (@arms $layout:expr, $set:ident, $body:expr, $($c:literal)*) => {
         match $layout.n {
@@ -568,56 +590,61 @@ macro_rules! key_fields_dispatch {
                 let $set: [KeyField; $c] = *$layout.fields.first_chunk().unwrap();
                 $body
             })*
-            _ => {
-                let $set: &[KeyField] = $layout.fields();
-                $body
-            }
+            _ => unreachable!("a key reads as 1 to {KEY_MAX_FIELDS} fields"),
         }
     };
 }
 
-/// The Key image of a PK region of `raw`'s fields; or `None` unless a packed
-/// row fits and the image is smaller than the region.
-pub(crate) fn key_encode(src: &[u8], raw: &KeyLayout) -> Option<Vec<u8>> {
-    let (count, n) = (raw.n, src.len() / raw.raw_stride);
+/// The Key image of `src`, the PK region of `schema` in key order; or `None`
+/// unless a packed row fits and the image is smaller than the region.
+pub(crate) fn key_encode(src: &[u8], schema: &SchemaDescriptor) -> Option<Vec<u8>> {
+    let raw = KeyLayout::of(schema);
+    debug_assert!(src.chunks_exact(raw.raw_stride).is_sorted());
+    let (fields, rows) = (raw.n, src.len() / raw.raw_stride);
     let spans = key_fields_dispatch!(raw, |set| key_spans(set, raw.raw_stride, src));
     let bits = |f: usize| u64::BITS - (spans[f].1 - spans[f].0).leading_zeros();
     let (stride, layout) = raw.packed(bits, |f| spans[f].0)?;
-    let len = key_image_len(n, count, stride);
+    let len = key_image_len(rows, fields, stride);
     if len >= src.len() {
         return None;
     }
     let mut image = vec![0u8; len];
-    for f in 0..count {
+    for f in 0..fields {
         write_u64_le(&mut image, f * 8, spans[f].0);
-        image[count * 8 + f] = bits(f) as u8;
+        image[fields * 8 + f] = bits(f) as u8;
     }
-    let rows = &mut image[key_rows_at(count)..];
+    let packed = &mut image[key_rows_at(fields)..];
     key_word_dispatch!(stride, |W| key_fields_dispatch!(layout, |set| {
-        key_pack::<W>(set, stride, layout.raw_stride, src, rows)
+        key_pack::<W, _>(set, stride, layout.raw_stride, src, packed)
     }));
     Some(image)
 }
 
 /// Each of `fields`' least and greatest value over the rows of `raw_stride`
 /// bytes of `src`.
-#[inline(always)]
-fn key_spans(fields: impl AsRef<[KeyField]> + Copy, raw_stride: usize, src: &[u8]) -> [(u64, u64); KEY_MAX_FIELDS] {
-    let fields = fields.as_ref();
+#[inline(never)]
+fn key_spans<const N: usize>(fields: [KeyField; N], raw_stride: usize, src: &[u8]) -> [(u64, u64); KEY_MAX_FIELDS] {
     let mut spans = [(u64::MAX, 0u64); KEY_MAX_FIELDS];
-    let (wide, tail) = src.split_at(wide_rows(src.len(), raw_stride) * raw_stride);
-    for row in wide.chunks_exact(raw_stride) {
-        for (span, field) in spans.iter_mut().zip(fields) {
-            // SAFETY: a field starts inside its row, a wide one.
-            let v = unsafe { field.load_wide(row.as_ptr()) };
-            *span = (span.0.min(v), span.1.max(v));
+    // The rows are in key order, so the leading field's span is its first and last row's.
+    let (first, last) = (&src[..raw_stride], &src[src.len() - raw_stride..]);
+    // SAFETY: a field lies inside its row.
+    spans[0] = unsafe { (fields[0].load(first.as_ptr()), fields[0].load(last.as_ptr())) };
+    let (rest, fields) = (&mut spans[1..], &fields[1..]);
+    let (n, wide) = (src.len() / raw_stride, wide_rows(src.len(), raw_stride));
+    let src = src.as_ptr();
+    // SAFETY: `src` holds `n` rows, a field inside each and the first `wide` wide.
+    unsafe {
+        for i in 0..wide {
+            for (span, field) in rest.iter_mut().zip(fields) {
+                let v = field.load_wide(src.add(i * raw_stride));
+                *span = (span.0.min(v), span.1.max(v));
+            }
         }
-    }
-    for row in tail.chunks_exact(raw_stride) {
-        for (span, field) in spans.iter_mut().zip(fields) {
-            // SAFETY: a field lies inside its row.
-            let v = unsafe { field.load(row.as_ptr()) };
-            *span = (span.0.min(v), span.1.max(v));
+        for i in wide..n {
+            for (span, field) in rest.iter_mut().zip(fields) {
+                let v = field.load(src.add(i * raw_stride));
+                *span = (span.0.min(v), span.1.max(v));
+            }
         }
     }
     spans
@@ -625,15 +652,14 @@ fn key_spans(fields: impl AsRef<[KeyField]> + Copy, raw_stride: usize, src: &[u8
 
 /// The rows of `raw_stride` bytes of `src` packed to `dst` as rows of `stride`
 /// bytes.
-#[inline(always)]
-fn key_pack<W: KeyWord>(
-    fields: impl AsRef<[KeyField]> + Copy,
+#[inline(never)]
+fn key_pack<W: KeyWord, const N: usize>(
+    fields: [KeyField; N],
     stride: usize,
     raw_stride: usize,
     src: &[u8],
     dst: &mut [u8],
 ) {
-    let fields = fields.as_ref();
     let (n, wide) = (src.len() / raw_stride, wide_rows(src.len(), raw_stride));
     assert!(n * stride + KEY_SLACK <= dst.len());
     let (src, dst) = (src.as_ptr(), dst.as_mut_ptr());
@@ -670,9 +696,10 @@ pub(crate) struct KeyImage<'a> {
 }
 
 impl<'a> KeyImage<'a> {
-    /// `image` as the key of `count` rows of `raw`'s fields, or `None` unless
+    /// `image` as the key of `count` rows of `schema`'s PK, or `None` unless
     /// its bit widths fit their fields and give exactly that size.
-    pub(crate) fn parse(image: &'a [u8], count: usize, raw: &KeyLayout) -> Option<Self> {
+    pub(crate) fn parse(image: &'a [u8], count: usize, schema: &SchemaDescriptor) -> Option<Self> {
+        let raw = KeyLayout::of(schema);
         let n = raw.n;
         let (header, rows) = image.split_at_checked(key_rows_at(n))?;
         let (stride, layout) = raw.packed(|f| header[n * 8 + f] as u32, |f| read_u64_le(header, f * 8))?;
@@ -689,7 +716,7 @@ impl<'a> KeyImage<'a> {
     pub(crate) fn decode(&self, first_row: usize, out: &mut [u8]) {
         let (layout, src) = (&self.layout, &self.rows[first_row * self.stride..]);
         key_word_dispatch!(self.stride, |W| key_fields_dispatch!(layout, |set| {
-            key_unpack::<W>(set, self.stride, layout.raw_stride, src, out)
+            key_unpack::<W, _>(set, self.stride, layout.raw_stride, src, out)
         }))
     }
 
@@ -769,15 +796,14 @@ impl<'a> KeyImage<'a> {
 
 /// The packed rows of `stride` bytes of `src` decoded to `out`, `out.len() /
 /// raw_stride` of them.
-#[inline(always)]
-fn key_unpack<W: KeyWord>(
-    fields: impl AsRef<[KeyField]> + Copy,
+#[inline(never)]
+fn key_unpack<W: KeyWord, const N: usize>(
+    fields: [KeyField; N],
     stride: usize,
     raw_stride: usize,
     src: &[u8],
     out: &mut [u8],
 ) {
-    let fields = fields.as_ref();
     assert!(out.len() / raw_stride * stride + KEY_SLACK <= src.len());
     // SAFETY: the assert leaves each packed row a whole word to load.
     let word = |i: usize| unsafe { W::load(src.as_ptr().add(i * stride)) };
@@ -787,7 +813,7 @@ fn key_unpack<W: KeyWord>(
     let dst = out.as_mut_ptr();
     for i in 0..whole {
         let word = word(i);
-        for field in fields {
+        for field in &fields {
             let v = word.field(field).wrapping_add(field.min);
             // SAFETY: the field's eight bytes end inside `out`, by `whole`.
             unsafe {
@@ -799,7 +825,7 @@ fn key_unpack<W: KeyWord>(
     }
     for (i, row) in out.chunks_exact_mut(raw_stride).enumerate().skip(whole) {
         let word = word(i);
-        for field in fields {
+        for field in &fields {
             let v = word.field(field).wrapping_add(field.min);
             row[field.at..field.at + field.width].copy_from_slice(&field.leading(v).to_be_bytes()[..field.width]);
         }
