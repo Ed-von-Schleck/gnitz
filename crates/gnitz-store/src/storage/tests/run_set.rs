@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::{arb_fold_case, fold_batch, fold_schemas, zset_of, zset_sum};
-use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::BatchBuilder;
 use proptest::prelude::*;
 
@@ -37,8 +36,8 @@ proptest! {
             let want = zset_sum(&pushed, &s);
             for key in want.keys().map(|k| &k.0) {
                 let mut sum = 0;
-                set.find_pk_bytes(key, probe_key(key), |run, start| {
-                    sum += (start..pk_group_end(&**run, start)).map(|r| run.get_weight(r)).sum::<i64>();
+                set.find_pk_bytes(key, probe_key(key), |run, rows| {
+                    sum += rows.map(|r| run.get_weight(r)).sum::<i64>();
                 });
                 let want_sum: i64 = want.iter().filter(|(k, _)| &k.0 == key).map(|(_, w)| w).sum();
                 prop_assert_eq!(sum, want_sum);

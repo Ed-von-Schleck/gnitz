@@ -86,14 +86,12 @@ impl ReadCursor {
         // `position` is already past the committed row.
         let start = self.current_row;
         let row_count = (self.states[i].count - start).min(max_rows);
-        let src = &self.sources[i];
-        let batch = if src.is_skeleton() {
-            for r in start..start + row_count {
-                skeletons.push(src.get_pk_bytes(r), src.get_weight(r));
+        let batch = match &self.sources[i] {
+            Run::Shard(shard) if shard.is_skeleton() => {
+                skeletons.extend(shard, start..start + row_count);
+                Batch::empty_with_schema(&self.schema)
             }
-            Batch::empty_with_schema(&self.schema)
-        } else {
-            src.slice_to_owned_batch(start, row_count, &self.schema)
+            src => src.slice_to_owned_batch(start, row_count, &self.schema),
         };
         self.states[i].position = start + row_count;
         self.advance_single(i);

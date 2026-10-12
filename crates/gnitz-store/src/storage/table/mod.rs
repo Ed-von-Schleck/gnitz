@@ -13,6 +13,7 @@
 use std::cell::Cell;
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::rc::Rc;
 
 use gnitz_wire::PkKeys;
@@ -21,7 +22,6 @@ use super::manifest::Manifest;
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
 use gnitz_wire::PkBuf;
-use gnitz_zset::repr::pk_group_end;
 use gnitz_zset::repr::Batch;
 #[cfg(test)]
 use gnitz_zset::repr::MappedShard;
@@ -491,19 +491,17 @@ impl Table {
     /// puts `live_row_at`'s live row ahead of the retracted history it would
     /// otherwise scan past.
     fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(&Run, usize)) {
-        let mut visit = |run: Run, start: usize| {
-            for row in start..pk_group_end(&run, start) {
+        let mut visit = |run: Run, rows: Range<usize>| {
+            for row in rows {
                 f(&run, row);
             }
         };
         let fingerprint = probe_key(key);
         for set in self.ram_tiers(Cut::Now) {
-            set.find_pk_bytes(key, fingerprint, |batch, start| {
-                visit(Run::Mem(Rc::clone(batch)), start)
-            });
+            set.find_pk_bytes(key, fingerprint, |batch, rows| visit(Run::Mem(Rc::clone(batch)), rows));
         }
-        self.shard_index.find_pk_bytes(key, fingerprint, |shard, start| {
-            visit(Run::Shard(Rc::clone(shard)), start)
+        self.shard_index.find_pk_bytes(key, fingerprint, |shard, rows| {
+            visit(Run::Shard(Rc::clone(shard)), rows)
         });
     }
 

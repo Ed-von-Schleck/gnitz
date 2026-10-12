@@ -18,7 +18,7 @@ MAGIC = 0x31305F5A54494E47
 HEADER_SIZE = 64
 DIR_ENTRY_SIZE = 16
 ALIGNMENT = 64
-ENCODINGS = ["raw", "constant", "two-value", "for", "dict", "seq", "sparse"]
+ENCODINGS = ["raw", "constant", "two-value", "for", "dict", "seq", "sparse", "key"]
 
 _SLOT = re.compile(r"^(?:(.*)_)?w\d+of\d+$")
 

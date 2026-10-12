@@ -66,14 +66,16 @@ pub fn merge_guard(
             std::mem::replace(start, end)..end
         })
         .collect();
+    // The merge compares every key of a window and the scatter copies it.
+    let shards: Vec<_> = shards.iter().zip(&windows).map(|(s, w)| s.window(w.clone())).collect();
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(windows.iter().map(Range::len).sum());
-    run_merge_in(shards, &out_schema, windows.iter().cloned(), |src, row, w| {
+    run_merge_in(&shards, &out_schema, windows.iter().cloned(), |src, row, w| {
         survivors.push((src as u32, row as u32, w));
     });
     if survivors.is_empty() {
         return None;
     }
-    let set = UnifiedSet::of(shards, &out_schema, windows);
+    let set = UnifiedSet::of(&shards, &out_schema, windows);
     Some((skeleton, set.materialize(&survivors, set.src_rows())))
 }
 

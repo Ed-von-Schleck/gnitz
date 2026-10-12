@@ -1,7 +1,9 @@
-//! The OPK lower-bound search every sorted PK region seeks through, stateless
-//! and galloping, plus the equal-PK group bracket. `Batch`, `MappedShard` and
-//! the `Run` that is either all seek through the `(count, stride, ColPtr)`
-//! entry points here; a seek by (PK, payload) gallops through [`gallop_by`].
+//! The lower-bound search every sorted PK region seeks through, stateless and
+//! galloping, plus the equal-PK group bracket: [`lower_bound_by`] and
+//! [`gallop_by`] under the `(count, stride, ColPtr)` entry points here for an
+//! OPK region, under a packed key's image and under a seek by (PK, payload).
+
+use std::ops::Range;
 
 use super::merge::ColPtr;
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
@@ -10,7 +12,7 @@ use gnitz_wire::RowSource;
 /// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
 /// probe, where `lt(i)` reports row `i < probe`.
 #[inline]
-fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> usize {
+pub(crate) fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> usize {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if lt(mid) {
@@ -75,6 +77,25 @@ pub(crate) unsafe fn seek_advance_to(count: usize, stride: usize, pk: ColPtr, ke
     pk_width_dispatch!(stride, |K| {
         let p = K::from_opk(key);
         gallop_by(count, hint, |i| K::from_opk(pk.row(i, stride)) < p)
+    })
+}
+
+/// The rows of `pk` whose OPK bytes are `key`: none, at its lower bound, where
+/// no row holds it.
+///
+/// # Safety
+/// As [`seek_lower_bound`].
+#[inline]
+pub(crate) unsafe fn seek_pk_rows(count: usize, stride: usize, pk: ColPtr, key: &[u8]) -> Range<usize> {
+    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
+    pk_width_dispatch!(stride, |K| {
+        let p = K::from_opk(key);
+        let lo = lower_bound_by(0, count, |i| K::from_opk(pk.row(i, stride)) < p);
+        let mut hi = lo;
+        while hi < count && K::from_opk(pk.row(hi, stride)) == p {
+            hi += 1;
+        }
+        lo..hi
     })
 }
 

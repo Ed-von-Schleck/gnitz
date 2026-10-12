@@ -2,14 +2,15 @@
 //! policy, compaction ([`index`]), and the shard set a manifest publishes.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 
 use super::manifest::{self, ManifestEntry, ShardSet};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{guard_slot, pk_group_end, MappedShard};
-use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range};
+use gnitz_zset::repr::{guard_slot, MappedShard};
+use gnitz_zset::schema::key::pk_in_range;
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod index;
@@ -131,32 +132,26 @@ impl ShardEntry {
     /// Open the shard drawn at `seq` in the store at `dir`.
     pub(crate) fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
         let shard = Rc::new(MappedShard::open(&manifest::shard_path(dir, seq), schema)?);
-        let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
-        let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.row_count() - 1));
+        let (pk_min, pk_max) = (shard.pk_at(0), shard.pk_at(shard.row_count() - 1));
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
     }
 
     /// The first row above `key`, or the row count when there is none.
     fn first_row_above(&self, key: &PkBuf) -> usize {
-        let row = self.shard.find_lower_bound_bytes(key.pk_bytes());
-        match row < self.shard.row_count() && pk_bytes_eq(self.shard.get_pk_bytes(row), key.pk_bytes()) {
-            true => pk_group_end(&*self.shard, row),
-            false => row,
-        }
+        self.shard.pk_rows(key.pk_bytes()).end
     }
 
-    /// The row this shard's matches of OPK `key` (exactly `pk_stride` wide) start
-    /// at. `filter_key` is `probe_key(key)` — the caller hoists it because it is
+    /// This shard's rows of OPK `key` (exactly `pk_stride` wide), where it has
+    /// any. `filter_key` is `probe_key(key)` — the caller hoists it because it is
     /// the same value for every shard in one sweep.
-    fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<usize> {
+    fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<Range<usize>> {
         if !pk_in_range(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key) {
             return None;
         }
         if !self.shard.shard_filter_may_contain(filter_key) {
             return None;
         }
-        let idx = self.shard.find_lower_bound_bytes(key);
-        (idx < self.shard.row_count() && pk_bytes_eq(self.shard.get_pk_bytes(idx), key)).then_some(idx)
+        Some(self.shard.pk_rows(key)).filter(|rows| !rows.is_empty())
     }
 }
 
@@ -236,11 +231,7 @@ fn fold_destinations<'a>(key: PkBuf, entries: impl Iterator<Item = &'a ShardEntr
         let rows: usize = entries.clone().map(|e| e.shard.row_count()).sum();
         let step = (rows / SPLIT_SAMPLES).max(1);
         let mut sample: Vec<PkBuf> = entries
-            .flat_map(|e| {
-                (0..e.shard.row_count())
-                    .step_by(step)
-                    .map(|r| PkBuf::from_bytes(e.shard.get_pk_bytes(r)))
-            })
+            .flat_map(|e| (0..e.shard.row_count()).step_by(step).map(|r| e.shard.pk_at(r)))
             .collect();
         sample.sort_unstable();
         sample.dedup();

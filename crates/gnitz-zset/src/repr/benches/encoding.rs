@@ -1,5 +1,9 @@
-use super::tests::pack;
+use super::tests::{key_region, pack};
 use super::*;
+use crate::repr::merge::ColPtr;
+use crate::repr::seek::seek_lower_bound;
+use crate::schema::TypeCode;
+use crate::test_support::Rng;
 use gnitz_wire::FixedInt;
 
 /// Instructions per value to decode a framed region in bulk, at each cell
@@ -33,5 +37,99 @@ fn for_decode_bench() {
                 raw.len() as f64 / image.len() as f64
             );
         }
+    }
+}
+
+/// A PK region as its Key image, by key shape: the packed row's bytes, and
+/// instructions per row to encode and to bulk-decode it and per seek, in the
+/// image and in the region, at keys the region holds and keys one off them.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn key_bench() {
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    use TypeCode::*;
+    const N: usize = 1 << 20;
+    const PROBES: usize = 200_000;
+    type Value = fn(usize, usize) -> u128;
+    let shapes: Vec<(&str, Vec<TypeCode>, Value)> = vec![
+        ("a serial i64", vec![I64], |i, _| 4 * i as u128),
+        ("a time-ordered i64 id", vec![I64], |i, _| {
+            ((1_760_000_000_000 + i as u128 * 2471) << 22) | ((i as u128 * 977) % 4096)
+        }),
+        ("(i64 of 10k, serial i64)", vec![I64, I64], |i, c| {
+            [(i as u128 * 7919) % 10_000, i as u128][c]
+        }),
+        ("(i64 of 10k, time-ordered i64 id)", vec![I64, I64], |i, c| {
+            [
+                (i as u128 * 7919) % 10_000,
+                (1_760_000_000_000 + i as u128 * 2471) << 22,
+            ][c]
+        }),
+        ("(i32 of 50, i32 of 1000, i64 seconds)", vec![I32, I32, I64], |i, c| {
+            [
+                (i % 50) as u128,
+                (i as u128 * 31) % 1000,
+                1_760_000_000 + (i as u128 * 7919) % 86_400,
+            ][c]
+        }),
+        ("(i64 of 2k, i64 seconds, serial i64)", vec![I64, I64, I64], |i, c| {
+            [
+                (i as u128 * 7919) % 2000,
+                1_760_000_000 + (i as u128 * 31) % 2_592_000,
+                i as u128,
+            ][c]
+        }),
+        ("a u128 of 80 bits", vec![U128], |i, _| {
+            (i as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C) >> 8
+        }),
+    ];
+    let instructions = Counter::instructions();
+    for (label, types, value) in shapes {
+        let (schema, raw) = key_region(&types, N, value);
+        let (fields, stride) = (KeyLayout::of(&schema), schema.pk_stride());
+        let ((image, _), encode) = instructions.measure(|| {
+            let image = key_encode(black_box(&raw), &fields).expect("region must pack");
+            let len = image.len();
+            (image, len)
+        });
+        let key = KeyImage::parse(&image, N, &fields).expect("the encoder's image parses");
+        let mut decoded = vec![0u8; raw.len()];
+        let ((), decode) = instructions.measure(|| black_box(&key).decode(0, black_box(&mut decoded)));
+        assert!(decoded == raw);
+
+        let mut rng = Rng::new(0x004B_4559);
+        let probes: Vec<Vec<u8>> = (0..PROBES)
+            .map(|i| {
+                let row = rng.gen_range(N as u64) as usize;
+                let mut probe = raw[row * stride..][..stride].to_vec();
+                probe[stride - 1] ^= (i % 2) as u8;
+                probe
+            })
+            .collect();
+        let pk = ColPtr { base: raw.as_ptr(), stride };
+        let (in_region, region) = instructions.measure(|| {
+            // SAFETY: `raw` holds `N` rows of `stride` bytes.
+            probes
+                .iter()
+                .map(|p| unsafe { seek_lower_bound(N, stride, pk, black_box(p)) })
+                .sum::<usize>()
+        });
+        let (in_image, packed) = instructions.measure(|| {
+            probes
+                .iter()
+                .map(|p| black_box(&key).seek(black_box(p), None))
+                .sum::<usize>()
+        });
+        assert_eq!(in_image, in_region);
+        println!(
+            "key_bench {label:<38} {stride:>2} -> {:>2} bytes a row; per row: encode {:5.1}, decode {:5.1}; \
+             per seek: {:6.1} in the image, {:6.1} in the region",
+            key.stride,
+            encode as f64 / N as f64,
+            decode as f64 / N as f64,
+            packed as f64 / PROBES as f64,
+            region as f64 / PROBES as f64,
+        );
     }
 }

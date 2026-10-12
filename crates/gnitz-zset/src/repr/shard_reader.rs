@@ -19,6 +19,7 @@ use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::read_u64_le;
+use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 
 use StorageError::Corrupt;
@@ -54,13 +55,19 @@ enum PackedImage {
     Sparse(SparseImage<'static>),
 }
 
-/// The blocks of a column that per-row reads have decoded, one per
-/// `DECODE_BLOCK_ROWS` rows.
+/// The blocks of a column or of a packed key that per-row reads have decoded,
+/// one per `DECODE_BLOCK_ROWS` rows.
 pub(crate) struct DecodedBlocks(Box<[OnceCell<Box<[u8]>>]>);
 
 impl DecodedBlocks {
     fn new(rows: usize) -> Self {
         DecodedBlocks((0..rows.div_ceil(DECODE_BLOCK_ROWS)).map(|_| OnceCell::new()).collect())
+    }
+
+    /// How many blocks per-row reads have decoded.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.0.iter().filter(|b| b.get().is_some()).count()
     }
 
     /// The leading `size` bytes of row `row`'s `width`-byte cell of a column of
@@ -86,6 +93,55 @@ impl DecodedBlocks {
             }),
         };
         &cells[(row % DECODE_BLOCK_ROWS) * width..][..size]
+    }
+}
+
+/// The PK region.
+pub(crate) enum KeyRegion {
+    /// Readable in place: a Raw (stride = `pk_stride`) or Constant (stride 0)
+    /// region of the mapping.
+    Mapped(ColPtr),
+    Packed(Box<PackedKey>),
+}
+
+/// An [`Encoding::Key`] region of the mapping. A seek searches the image in
+/// place; a per-row read decodes the block it lands in and keeps it, and a bulk
+/// read decodes its own window and keeps nothing.
+pub(crate) struct PackedKey {
+    image: KeyImage<'static>,
+    blocks: DecodedBlocks,
+}
+
+impl KeyRegion {
+    /// The region `span` holds for `count` rows of `schema`'s PK.
+    fn bind(data: &'static [u8], span: &Span, count: usize, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
+        if span.encoding != Encoding::Key {
+            return direct_region(data, span, count, schema.pk_stride()).map(KeyRegion::Mapped);
+        }
+        let image = KeyImage::parse(span.bytes(data), count, &KeyLayout::of(schema)).ok_or(Corrupt("region size"))?;
+        Ok(KeyRegion::Packed(Box::new(PackedKey {
+            image,
+            blocks: DecodedBlocks::new(count),
+        })))
+    }
+
+    /// Rows `start..` as they stand in a batch, `dst.len() / stride` rows of
+    /// the shard.
+    fn decode(&self, start: usize, stride: usize, dst: &mut [u8]) {
+        match self {
+            // SAFETY: the region holds a key for every row of the shard.
+            KeyRegion::Mapped(cp) => unsafe { cp.copy_rows(start, stride, dst) },
+            KeyRegion::Packed(key) => key.image.decode(start, dst),
+        }
+    }
+
+    /// The keys as a column readable at `rows`, decoded into `decoded` where
+    /// they are packed.
+    fn window(&self, rows: &Range<usize>, stride: usize, decoded: &mut DecodedColumns) -> ColPtr {
+        match self {
+            KeyRegion::Mapped(cp) => *cp,
+            KeyRegion::Packed(key) => decoded.column(rows, stride, |keys| key.image.decode(rows.start, keys)),
+        }
     }
 }
 
@@ -138,7 +194,7 @@ pub struct MappedShard {
     mmap: Rc<Mmap>,
     header: ShardHeader,
     schema: SchemaDescriptor,
-    pk: ColPtr,
+    pk: KeyRegion,
     weight: WordRegion,
     null_bmp: WordRegion,
     /// Non-PK column regions indexed by payload position, always one per payload
@@ -267,7 +323,7 @@ impl MappedShard {
         let (file_npc, count) = (header.file_npc, header.row_count);
         let spans = region_spans(data, file_npc)?;
 
-        let pk = direct_region(data, &spans[REG_PK], count, schema.pk_stride())?;
+        let pk = KeyRegion::bind(data, &spans[REG_PK], count, schema)?;
         let weight = WordRegion::bind(data, &spans[REG_WEIGHT], count)?;
         let mut null_bmp = WordRegion::bind(data, &spans[REG_NULL_BMP], count)?;
         let narrowed_nulls = (file_npc > schema.num_payload_cols()).then(|| {
@@ -412,11 +468,27 @@ impl MappedShard {
         p.blocks.cell(row, size, (self.header.row_count, p.width), decode)
     }
 
+    /// Row `row`'s key of `key`, `stride` bytes.
+    #[inline]
+    fn packed_key<'a>(&'a self, key: &'a PackedKey, row: usize, stride: usize) -> &'a [u8] {
+        let decode = |first, out: &mut [u8]| key.image.decode(first, out);
+        key.blocks.cell(row, stride, (self.header.row_count, stride), decode)
+    }
+
+    /// How many blocks of a packed key per-row reads have decoded.
+    #[cfg(test)]
+    fn decoded_key_blocks(&self) -> usize {
+        match &self.pk {
+            KeyRegion::Packed(key) => key.blocks.held(),
+            KeyRegion::Mapped(_) => 0,
+        }
+    }
+
     /// How many blocks of payload column `pi` per-row reads have decoded.
     #[cfg(test)]
     fn decoded_blocks(&self, pi: usize) -> usize {
         match &self.col_regions[pi] {
-            PayloadRegion::Packed(p) => p.blocks.0.iter().filter(|b| b.get().is_some()).count(),
+            PayloadRegion::Packed(p) => p.blocks.held(),
             PayloadRegion::Mapped(_) | PayloadRegion::Dict(_) => 0,
         }
     }
@@ -432,14 +504,56 @@ impl MappedShard {
             .is_none_or(|region| shard_filter::may_contain(region, probe_key))
     }
 
-    /// [`seek_lower_bound`](super::seek::seek_lower_bound) over this shard's PKs.
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        unsafe { super::seek::seek_lower_bound(self.header.row_count, self.schema.pk_stride(), self.pk, key) }
+    /// Row `row`'s key by value, decoded alone where the key is packed.
+    pub fn pk_at(&self, row: usize) -> PkBuf {
+        assert!(row < self.header.row_count);
+        let mut pk = PkBuf::zeroed(self.schema.pk_stride());
+        self.pk.decode(row, self.schema.pk_stride(), pk.pk_bytes_mut());
+        pk
     }
 
-    /// [`seek_advance_to`](super::seek::seek_advance_to) over this shard's PKs.
+    /// The keys of `rows`, appended to `dst`.
+    pub(crate) fn append_pks(&self, rows: Range<usize>, dst: &mut Vec<u8>) {
+        assert!(rows.end <= self.header.row_count);
+        let (stride, at) = (self.schema.pk_stride(), dst.len());
+        dst.resize(at + rows.len() * stride, 0);
+        self.pk.decode(rows.start, stride, &mut dst[at..]);
+    }
+
+    /// The rows whose PK is the OPK `key`, exactly `pk_stride` bytes: none, at
+    /// its lower bound, where the shard holds no such row.
+    pub fn pk_rows(&self, key: &[u8]) -> Range<usize> {
+        let (count, stride) = (self.header.row_count, self.schema.pk_stride());
+        match &self.pk {
+            // SAFETY: the region holds a key for every row of the shard.
+            KeyRegion::Mapped(cp) => unsafe { super::seek::seek_pk_rows(count, stride, *cp, key) },
+            KeyRegion::Packed(packed) => packed.image.rows_of(key),
+        }
+    }
+
+    /// The first row whose PK is at or after the OPK `key`, galloping from
+    /// `hint` where there is one.
+    #[inline]
+    fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
+        let (count, stride) = (self.header.row_count, self.schema.pk_stride());
+        match (&self.pk, hint) {
+            // SAFETY: the region holds a key for every row of the shard.
+            (KeyRegion::Mapped(cp), None) => unsafe { super::seek::seek_lower_bound(count, stride, *cp, key) },
+            (KeyRegion::Mapped(cp), Some(hint)) => unsafe {
+                super::seek::seek_advance_to(count, stride, *cp, key, hint)
+            },
+            (KeyRegion::Packed(packed), hint) => packed.image.seek(key, hint),
+        }
+    }
+
+    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride` bytes.
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+        self.seek(key, None)
+    }
+
+    /// [`find_lower_bound_bytes`](Self::find_lower_bound_bytes), galloping from `hint`.
     pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        unsafe { super::seek::seek_advance_to(self.header.row_count, self.schema.pk_stride(), self.pk, key, hint) }
+        self.seek(key, Some(hint))
     }
 
     /// Copy a contiguous slice of rows into a batch under the schema this handle
@@ -475,8 +589,7 @@ impl MappedShard {
         };
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
             let (pk, weight, null_bmp) = w.fixed_mut();
-            // SAFETY: the assert above keeps the slice inside the shard.
-            unsafe { self.pk.copy_rows(start, schema.pk_stride(), pk) };
+            self.pk.decode(start, schema.pk_stride(), pk);
             self.weight.decode(start, weight);
             self.null_bmp.decode(start, null_bmp);
             if self.null_pad_mask != 0 {
@@ -505,7 +618,12 @@ impl RowSource for MappedShard {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         debug_assert!(row < self.header.row_count);
-        unsafe { self.pk.row(row, self.schema.pk_stride()) }
+        let stride = self.schema.pk_stride();
+        match &self.pk {
+            // SAFETY: the region holds a key for every row of the shard.
+            KeyRegion::Mapped(cp) => unsafe { cp.row(row, stride) },
+            KeyRegion::Packed(key) => self.packed_key(key, row, stride),
+        }
     }
 
     #[inline(always)]
@@ -535,9 +653,20 @@ impl RowSource for MappedShard {
     }
 }
 
-impl ColumnarSource for MappedShard {
-    fn to_unified(
+impl MappedShard {
+    /// This shard at `rows`, their keys decoded once.
+    pub(crate) fn window(&self, rows: Range<usize>) -> ShardWindow<'_> {
+        debug_assert!(rows.end <= self.header.row_count);
+        let mut decoded = DecodedColumns::default();
+        let pk = self.pk.window(&rows, self.schema.pk_stride(), &mut decoded);
+        ShardWindow { shard: self, rows, pk, _decoded: decoded }
+    }
+
+    /// [`ColumnarSource::to_unified`] over `pk`, a column of this shard's keys
+    /// readable at `window`.
+    fn unified(
         &self,
+        pk: ColPtr,
         schema: &SchemaDescriptor,
         cols: &mut Vec<ColPtr>,
         window: Range<usize>,
@@ -551,39 +680,36 @@ impl ColumnarSource for MappedShard {
                 .zip(self.schema.payload_columns())
                 .map(|(region, (pi, col))| match region {
                     PayloadRegion::Mapped(cp) => *cp,
-                    _ => {
-                        let w = col.size();
-                        // SAFETY: the decode writes every cell of `column`.
-                        let mut column = unsafe { PooledBuf::uninit(window.len() * w) };
-                        self.decode_payload(pi, w, window.start, &mut column);
-                        // Rebased so that row `window.start` reads the column's first cell.
-                        ColPtr {
-                            base: decoded.hold(column).wrapping_sub(window.start * w),
-                            stride: w,
-                        }
-                    }
+                    _ => decoded.column(&window, col.size(), |column| {
+                        self.decode_payload(pi, col.size(), window.start, column)
+                    }),
                 }),
         );
         let null_bmp = match &self.null_bmp {
             WordRegion::Mapped(cp) => *cp,
-            packed => {
-                // SAFETY: the decode writes every word of `words`.
-                let mut words = unsafe { PooledBuf::uninit(window.len() * FIXED_REGION_BYTES) };
-                packed.decode(window.start, &mut words);
-                ColPtr {
-                    base: decoded.hold(words).wrapping_sub(window.start * FIXED_REGION_BYTES),
-                    stride: FIXED_REGION_BYTES,
-                }
-            }
+            packed => decoded.column(&window, FIXED_REGION_BYTES, |words| packed.decode(window.start, words)),
         };
         UnifiedSource {
-            pk: self.pk,
+            pk,
             null_bmp,
             null_pad_mask: self.null_pad_mask,
             cols_off,
             blob: self.blob(),
             heap_at: None,
         }
+    }
+}
+
+impl ColumnarSource for MappedShard {
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
+        let pk = self.pk.window(&window, schema.pk_stride(), decoded);
+        self.unified(pk, schema, cols, window, decoded)
     }
 
     #[inline(always)]
@@ -595,6 +721,69 @@ impl ColumnarSource for MappedShard {
     #[inline(always)]
     fn is_skeleton(&self) -> bool {
         MappedShard::is_skeleton(self)
+    }
+}
+
+/// A shard at the rows of one window, their keys decoded once for the merge
+/// that compares them and the scatter that copies them.
+pub(crate) struct ShardWindow<'a> {
+    shard: &'a MappedShard,
+    rows: Range<usize>,
+    /// The keys, readable at `rows`.
+    pk: ColPtr,
+    /// What `pk` reads, where the keys are decoded.
+    _decoded: DecodedColumns,
+}
+
+impl RowSource for ShardWindow<'_> {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        debug_assert!(self.rows.contains(&row), "a key outside the window");
+        // SAFETY: `pk` holds a key for every row of `rows`.
+        unsafe { self.pk.row(row, self.shard.schema.pk_stride()) }
+    }
+
+    #[inline(always)]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.shard.get_null_word(row)
+    }
+
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        self.shard.get_col_ptr(row, payload_col, col_size)
+    }
+
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        self.shard.blob
+    }
+
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.shard.header.row_count
+    }
+}
+
+impl ColumnarSource for ShardWindow<'_> {
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
+        debug_assert!(self.rows.start <= window.start && window.end <= self.rows.end);
+        self.shard.unified(self.pk, schema, cols, window, decoded)
+    }
+
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        ColumnarSource::get_weight(self.shard, row)
+    }
+
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        self.shard.is_skeleton()
     }
 }
 

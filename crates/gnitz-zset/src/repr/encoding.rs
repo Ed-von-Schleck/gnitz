@@ -6,8 +6,12 @@
 //! them: a code, a length or a rank that points outside its image reads the
 //! last entry, the empty string or zero.
 
+use std::ops::Range;
+
+use super::seek::{gallop_by, lower_bound_by};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
-    read_u32_le, read_u64_le, write_u32_le, write_u64_le, FixedInt, ScalarKind, GERMAN_INLINE_OFF,
+    read_u32_le, read_u64_le, write_u32_le, write_u64_le, FixedInt, ScalarKind, GERMAN_INLINE_OFF, MAX_PK_COLUMNS,
     SHORT_STRING_THRESHOLD,
 };
 
@@ -29,6 +33,8 @@ gnitz_wire::wire_enum! {
         Seq = 5,
         /// Sparse: a nullable payload column, not a string's, as its non-NULL cells.
         Sparse = 6,
+        /// Key: a PK region as a narrower key of the same order.
+        Key = 7,
     }
 }
 
@@ -43,6 +49,7 @@ impl Encoding {
             Encoding::Dict => "dict",
             Encoding::Seq => "seq",
             Encoding::Sparse => "sparse",
+            Encoding::Key => "key",
         }
     }
 }
@@ -347,10 +354,462 @@ impl<'a> DictImage<'a> {
     }
 }
 
-/// Rows per block of a packed payload column: what a per-row read decodes and
-/// keeps, sized so that a block of an I64 column is one page, and the spacing of
-/// the entry points a Seq or Sparse image holds, so that a block decodes from
-/// one.
+/// The most fields a key reads as.
+const KEY_MAX_FIELDS: usize = 2 * MAX_PK_COLUMNS;
+
+// A Key image: each field's minimum (u64 LE); each field's bit width (u8), the
+// widths zero-padded to eight bytes; a packed row per row; `KEY_SLACK` zeroes.
+// A packed row is each field's `value − minimum` at its bit width, the first
+// field leading, big-endian and zero-padded to whole bytes: it orders as its row.
+const KEY_ROW_MAX: usize = size_of::<u128>();
+/// The bytes behind the packed rows that let the last one be read and written
+/// as a whole [`KeyWord`].
+const KEY_SLACK: usize = KEY_ROW_MAX - 1;
+
+const fn key_rows_at(fields: usize) -> usize {
+    fields * 8 + fields.next_multiple_of(8)
+}
+
+const fn key_image_len(count: usize, fields: usize, stride: usize) -> usize {
+    key_rows_at(fields) + count * stride + KEY_SLACK
+}
+
+/// One field of a key: a big-endian unsigned integer of a raw row.
+#[derive(Clone, Copy, Default)]
+struct KeyField {
+    /// Where the field starts in a raw row, and its bytes there.
+    at: usize,
+    width: usize,
+    min: u64,
+    /// The bits of `value − min` in a packed row.
+    mask: u64,
+    /// How far they lie above the low end of the row's [`KeyWord`].
+    shift: u32,
+}
+
+impl KeyField {
+    /// This field of the raw row at `row`.
+    ///
+    /// # Safety
+    /// The field's bytes are readable at `row`.
+    #[inline(always)]
+    unsafe fn load(&self, row: *const u8) -> u64 {
+        let at = row.add(self.at);
+        match self.width {
+            8 => u64::from_be(at.cast::<u64>().read_unaligned()),
+            4 => u32::from_be(at.cast::<u32>().read_unaligned()) as u64,
+            2 => u16::from_be(at.cast::<u16>().read_unaligned()) as u64,
+            _ => *at as u64,
+        }
+    }
+
+    /// [`load`](Self::load) as one eight-byte read, whatever the field's width.
+    ///
+    /// # Safety
+    /// Eight bytes are readable at the field's start in `row`.
+    #[inline(always)]
+    unsafe fn load_wide(&self, row: *const u8) -> u64 {
+        u64::from_be(row.add(self.at).cast::<u64>().read_unaligned()) >> (u64::BITS as usize - 8 * self.width)
+    }
+
+    /// `value` left-aligned in a u64, so that its big-endian bytes lead with
+    /// the field's.
+    #[inline(always)]
+    fn leading(&self, value: u64) -> u64 {
+        value << (u64::BITS as usize - 8 * self.width)
+    }
+}
+
+/// How many rows of `stride` bytes at the front of `len` bytes an eight-byte
+/// read or write starting anywhere in them stays inside `len`.
+fn wide_rows(len: usize, stride: usize) -> usize {
+    len.saturating_sub(size_of::<u64>() - 1) / stride
+}
+
+/// A packed row loaded left-aligned as an unsigned integer, the bytes of the
+/// rows after it below its own: a `u64` where the row fits one, which keeps a
+/// search's compare and a decode's shifts in one register.
+trait KeyWord: Copy + Ord + Default {
+    const BITS: u32;
+    /// The row at `at`.
+    ///
+    /// # Safety
+    /// `size_of::<Self>()` bytes are readable at `at`.
+    unsafe fn load(at: *const u8) -> Self;
+    /// `self` to `at`, a row with zeroes below it.
+    ///
+    /// # Safety
+    /// `size_of::<Self>()` bytes are writable at `at`.
+    unsafe fn store(self, at: *mut u8);
+    fn field(self, field: &KeyField) -> u64;
+    fn with(self, field: &KeyField, offset: u64) -> Self;
+    /// The word's leading `stride` bytes, a row's own, over zeroes.
+    fn row(self, stride: usize) -> Self;
+    /// `self` counted up by one at bit `bit`, where the word holds that.
+    fn above(self, bit: u32) -> Option<Self>;
+}
+
+macro_rules! impl_key_word {
+    ($($word:ty)*) => {$(
+        impl KeyWord for $word {
+            const BITS: u32 = <$word>::BITS;
+            #[inline(always)]
+            unsafe fn load(at: *const u8) -> $word {
+                <$word>::from_be(at.cast::<$word>().read_unaligned())
+            }
+            #[inline(always)]
+            unsafe fn store(self, at: *mut u8) {
+                at.cast::<$word>().write_unaligned(self.to_be())
+            }
+            #[inline(always)]
+            fn field(self, field: &KeyField) -> u64 {
+                (self >> field.shift) as u64 & field.mask
+            }
+            #[inline(always)]
+            fn with(self, field: &KeyField, offset: u64) -> $word {
+                self | (offset as $word) << field.shift
+            }
+            #[inline(always)]
+            fn row(self, stride: usize) -> $word {
+                self & (<$word>::MAX << (<$word>::BITS as usize - 8 * stride))
+            }
+            #[inline(always)]
+            fn above(self, bit: u32) -> Option<$word> {
+                self.checked_add((1 as $word).checked_shl(bit)?)
+            }
+        }
+    )*};
+}
+impl_key_word!(u64 u128);
+
+/// Run `$body` with `$w` the [`KeyWord`] a packed row of `$stride` bytes loads as.
+macro_rules! key_word_dispatch {
+    ($stride:expr, |$w:ident| $body:expr) => {
+        if $stride <= size_of::<u64>() {
+            type $w = u64;
+            $body
+        } else {
+            type $w = u128;
+            $body
+        }
+    };
+}
+
+/// The fields a PK row reads as, in order: a column of up to eight bytes is
+/// one, a 16-byte column its two halves.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyLayout {
+    fields: [KeyField; KEY_MAX_FIELDS],
+    n: usize,
+    /// Bytes per raw row.
+    raw_stride: usize,
+}
+
+impl KeyLayout {
+    /// The fields of `schema`'s PK region, with no place in a packed row yet.
+    pub(crate) fn of(schema: &SchemaDescriptor) -> Self {
+        let mut layout = KeyLayout {
+            fields: [KeyField::default(); KEY_MAX_FIELDS],
+            n: 0,
+            raw_stride: 0,
+        };
+        for (_, col) in schema.pk_columns() {
+            let halves: &[usize] = if col.size() == 16 { &[8, 8] } else { &[col.size()] };
+            for &width in halves {
+                assert!(matches!(width, 1 | 2 | 4 | 8), "a PK column is 1, 2, 4, 8 or 16 bytes");
+                let field = &mut layout.fields[layout.n];
+                (field.at, field.width) = (layout.raw_stride, width);
+                layout.n += 1;
+                layout.raw_stride += width;
+            }
+        }
+        layout
+    }
+
+    fn fields(&self) -> &[KeyField] {
+        &self.fields[..self.n]
+    }
+
+    /// The bytes of a packed row and these fields placed in it, at `bits` and
+    /// `min` per field; `None` unless each width fits its field and the row is
+    /// 1 to [`KEY_ROW_MAX`] bytes.
+    fn packed(mut self, bits: impl Fn(usize) -> u32, min: impl Fn(usize) -> u64) -> Option<(usize, Self)> {
+        let total: u32 = (0..self.n).map(&bits).sum();
+        let stride = (total as usize).div_ceil(8);
+        if !(1..=KEY_ROW_MAX).contains(&stride) {
+            return None;
+        }
+        let word = key_word_dispatch!(stride, |W| W::BITS);
+        let mut shift = word;
+        for (f, field) in self.fields[..self.n].iter_mut().enumerate() {
+            if bits(f) > 8 * field.width as u32 {
+                return None;
+            }
+            shift -= bits(f);
+            (field.min, field.mask) = (min(f), gnitz_wire::low_bits_mask(bits(f) as usize));
+            // A leading field of no bits lies at the word's width, which no
+            // shift reaches; it reads zero from anywhere.
+            field.shift = shift.min(word - 1);
+        }
+        Some((stride, self))
+    }
+}
+
+/// Run `$body` with `$set` the fields of `$layout` for a row loop to run over:
+/// an array by value up to four, whose constant count unrolls the loop and
+/// whose fields stay in registers across the loop's stores, a slice past it.
+macro_rules! key_fields_dispatch {
+    ($layout:expr, |$set:ident| $body:expr) => {
+        key_fields_dispatch!(@arms $layout, $set, $body, 1 2 3 4)
+    };
+    (@arms $layout:expr, $set:ident, $body:expr, $($c:literal)*) => {
+        match $layout.n {
+            $($c => {
+                let $set: [KeyField; $c] = *$layout.fields.first_chunk().unwrap();
+                $body
+            })*
+            _ => {
+                let $set: &[KeyField] = $layout.fields();
+                $body
+            }
+        }
+    };
+}
+
+/// The Key image of a PK region of `raw`'s fields; or `None` unless a packed
+/// row fits and the image is smaller than the region.
+pub(crate) fn key_encode(src: &[u8], raw: &KeyLayout) -> Option<Vec<u8>> {
+    let (count, n) = (raw.n, src.len() / raw.raw_stride);
+    let spans = key_fields_dispatch!(raw, |set| key_spans(set, raw.raw_stride, src));
+    let bits = |f: usize| u64::BITS - (spans[f].1 - spans[f].0).leading_zeros();
+    let (stride, layout) = raw.packed(bits, |f| spans[f].0)?;
+    let len = key_image_len(n, count, stride);
+    if len >= src.len() {
+        return None;
+    }
+    let mut image = vec![0u8; len];
+    for f in 0..count {
+        write_u64_le(&mut image, f * 8, spans[f].0);
+        image[count * 8 + f] = bits(f) as u8;
+    }
+    let rows = &mut image[key_rows_at(count)..];
+    key_word_dispatch!(stride, |W| key_fields_dispatch!(layout, |set| {
+        key_pack::<W>(set, stride, layout.raw_stride, src, rows)
+    }));
+    Some(image)
+}
+
+/// Each of `fields`' least and greatest value over the rows of `raw_stride`
+/// bytes of `src`.
+#[inline(always)]
+fn key_spans(fields: impl AsRef<[KeyField]> + Copy, raw_stride: usize, src: &[u8]) -> [(u64, u64); KEY_MAX_FIELDS] {
+    let fields = fields.as_ref();
+    let mut spans = [(u64::MAX, 0u64); KEY_MAX_FIELDS];
+    let (wide, tail) = src.split_at(wide_rows(src.len(), raw_stride) * raw_stride);
+    for row in wide.chunks_exact(raw_stride) {
+        for (span, field) in spans.iter_mut().zip(fields) {
+            // SAFETY: a field starts inside its row, a wide one.
+            let v = unsafe { field.load_wide(row.as_ptr()) };
+            *span = (span.0.min(v), span.1.max(v));
+        }
+    }
+    for row in tail.chunks_exact(raw_stride) {
+        for (span, field) in spans.iter_mut().zip(fields) {
+            // SAFETY: a field lies inside its row.
+            let v = unsafe { field.load(row.as_ptr()) };
+            *span = (span.0.min(v), span.1.max(v));
+        }
+    }
+    spans
+}
+
+/// The rows of `raw_stride` bytes of `src` packed to `dst` as rows of `stride`
+/// bytes.
+#[inline(always)]
+fn key_pack<W: KeyWord>(
+    fields: impl AsRef<[KeyField]> + Copy,
+    stride: usize,
+    raw_stride: usize,
+    src: &[u8],
+    dst: &mut [u8],
+) {
+    let fields = fields.as_ref();
+    let (n, wide) = (src.len() / raw_stride, wide_rows(src.len(), raw_stride));
+    assert!(n * stride + KEY_SLACK <= dst.len());
+    let (src, dst) = (src.as_ptr(), dst.as_mut_ptr());
+    // SAFETY: `src` holds `n` rows, a field inside each and the first `wide`
+    // wide; the assert leaves each packed row a whole word, whose excess the
+    // next row overwrites.
+    unsafe {
+        for i in 0..wide {
+            let row = src.add(i * raw_stride);
+            let word = fields.iter().fold(W::default(), |word, field| {
+                word.with(field, field.load_wide(row) - field.min)
+            });
+            word.store(dst.add(i * stride));
+        }
+        for i in wide..n {
+            let row = src.add(i * raw_stride);
+            let word = fields.iter().fold(W::default(), |word, field| {
+                word.with(field, field.load(row) - field.min)
+            });
+            word.store(dst.add(i * stride));
+        }
+    }
+}
+
+/// A Key image taken apart.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyImage<'a> {
+    /// The packed rows and their slack.
+    rows: &'a [u8],
+    count: usize,
+    /// Bytes per packed row.
+    stride: usize,
+    layout: KeyLayout,
+}
+
+impl<'a> KeyImage<'a> {
+    /// `image` as the key of `count` rows of `raw`'s fields, or `None` unless
+    /// its bit widths fit their fields and give exactly that size.
+    pub(crate) fn parse(image: &'a [u8], count: usize, raw: &KeyLayout) -> Option<Self> {
+        let n = raw.n;
+        let (header, rows) = image.split_at_checked(key_rows_at(n))?;
+        let (stride, layout) = raw.packed(|f| header[n * 8 + f] as u32, |f| read_u64_le(header, f * 8))?;
+        (rows.len() == count.checked_mul(stride)?.checked_add(KEY_SLACK)?).then_some(KeyImage {
+            rows,
+            count,
+            stride,
+            layout,
+        })
+    }
+
+    /// Decode rows `first_row..` back to their raw rows, `out.len() / raw
+    /// stride` rows. A sum past its field's width wraps.
+    pub(crate) fn decode(&self, first_row: usize, out: &mut [u8]) {
+        let (layout, src) = (&self.layout, &self.rows[first_row * self.stride..]);
+        key_word_dispatch!(self.stride, |W| key_fields_dispatch!(layout, |set| {
+            key_unpack::<W>(set, self.stride, layout.raw_stride, src, out)
+        }))
+    }
+
+    /// Row `row`'s word.
+    #[inline(always)]
+    fn word<W: KeyWord>(&self, row: usize) -> W {
+        debug_assert!(row < self.count);
+        // SAFETY: `parse` found `count` packed rows and the slack behind them.
+        unsafe { W::load(self.rows.as_ptr().add(row * self.stride)) }
+    }
+
+    /// The packed key that the rows at or after the raw key `key` are at or
+    /// after, and whether it is `key` itself, which alone a row can equal;
+    /// `None` where every row sorts before `key`.
+    #[inline(always)]
+    fn probe<W: KeyWord>(&self, key: &[u8]) -> Option<(W, bool)> {
+        assert_eq!(
+            key.len(),
+            self.layout.raw_stride,
+            "seek probe width must equal pk_stride"
+        );
+        let mut packed = W::default();
+        // The bit that counts the fields so far up by one.
+        let mut carry = W::BITS;
+        for field in self.layout.fields() {
+            // SAFETY: the fields lie inside a raw row, which the assert makes `key`.
+            let v = unsafe { field.load(key.as_ptr()) };
+            if v < field.min {
+                // Below every row that shares the fields so far: their first.
+                return Some((packed, false));
+            }
+            let offset = v - field.min;
+            if offset > field.mask {
+                // Above every row that shares them: the first row past those.
+                return Some((packed.above(carry)?, false));
+            }
+            packed = packed.with(field, offset);
+            carry -= field.mask.count_ones();
+        }
+        Some((packed, true))
+    }
+
+    /// The first row that sorts at or after the raw key `key`, galloping from
+    /// `hint` where there is one.
+    #[inline]
+    pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
+        key_word_dispatch!(self.stride, |W| {
+            let Some((probe, _)) = self.probe::<W>(key) else {
+                return self.count;
+            };
+            // A row's word runs into the rows after it, where the probe is zero.
+            let lt = |row: usize| self.word::<W>(row) < probe;
+            match hint {
+                Some(hint) => gallop_by(self.count, hint, lt),
+                None => lower_bound_by(0, self.count, lt),
+            }
+        })
+    }
+
+    /// The rows whose key is the raw key `key`: none, at its lower bound, where
+    /// no row holds it.
+    #[inline]
+    pub(crate) fn rows_of(&self, key: &[u8]) -> Range<usize> {
+        key_word_dispatch!(self.stride, |W| {
+            let Some((probe, exact)) = self.probe::<W>(key) else {
+                return self.count..self.count;
+            };
+            let lo = lower_bound_by(0, self.count, |row| self.word::<W>(row) < probe);
+            let mut hi = lo;
+            while exact && hi < self.count && self.word::<W>(hi).row(self.stride) == probe {
+                hi += 1;
+            }
+            lo..hi
+        })
+    }
+}
+
+/// The packed rows of `stride` bytes of `src` decoded to `out`, `out.len() /
+/// raw_stride` of them.
+#[inline(always)]
+fn key_unpack<W: KeyWord>(
+    fields: impl AsRef<[KeyField]> + Copy,
+    stride: usize,
+    raw_stride: usize,
+    src: &[u8],
+    out: &mut [u8],
+) {
+    let fields = fields.as_ref();
+    assert!(out.len() / raw_stride * stride + KEY_SLACK <= src.len());
+    // SAFETY: the assert leaves each packed row a whole word to load.
+    let word = |i: usize| unsafe { W::load(src.as_ptr().add(i * stride)) };
+    // A whole u64 per field while the row's last one stays inside `out`: the
+    // field or the row after it overwrites the excess.
+    let whole = wide_rows(out.len(), raw_stride);
+    let dst = out.as_mut_ptr();
+    for i in 0..whole {
+        let word = word(i);
+        for field in fields {
+            let v = word.field(field).wrapping_add(field.min);
+            // SAFETY: the field's eight bytes end inside `out`, by `whole`.
+            unsafe {
+                dst.add(i * raw_stride + field.at)
+                    .cast::<u64>()
+                    .write_unaligned(field.leading(v).to_be())
+            };
+        }
+    }
+    for (i, row) in out.chunks_exact_mut(raw_stride).enumerate().skip(whole) {
+        let word = word(i);
+        for field in fields {
+            let v = word.field(field).wrapping_add(field.min);
+            row[field.at..field.at + field.width].copy_from_slice(&field.leading(v).to_be_bytes()[..field.width]);
+        }
+    }
+}
+
+/// Rows per block of a packed payload column or key: what a per-row read
+/// decodes and keeps, sized so that a block of an I64 column is one page, and
+/// the spacing of the entry points a Seq or Sparse image holds, so that a block
+/// decodes from one.
 pub(crate) const DECODE_BLOCK_ROWS: usize = 512;
 
 // A Seq image: a string column as its lengths alone, its content lying in row

@@ -330,7 +330,9 @@ fn run_set_probe_bench() {
                 instructions.measure(|| {
                     let mut found = 0u64;
                     for (key, fingerprint) in &keys {
-                        set.find_pk_bytes(key, *fingerprint, |run, start| found += run.get_weight(start) as u64);
+                        set.find_pk_bytes(key, *fingerprint, |run, rows| {
+                            found += run.get_weight(rows.start) as u64
+                        });
                     }
                     found
                 })

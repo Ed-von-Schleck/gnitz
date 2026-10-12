@@ -898,6 +898,13 @@ impl Batch {
         unsafe { super::seek::seek_lower_bound(self.count, cp.stride, cp, key) }
     }
 
+    /// The rows whose PK is the OPK `key`, exactly `pk_stride` bytes: none, at
+    /// its lower bound, where the batch, which is in key order, holds no such row.
+    pub fn pk_rows(&self, key: &[u8]) -> Range<usize> {
+        let cp = self.pk_col_ptr();
+        unsafe { super::seek::seek_pk_rows(self.count, cp.stride, cp, key) }
+    }
+
     /// Galloping forward lower bound seeded at `hint` (the caller's live
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
     /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the join's

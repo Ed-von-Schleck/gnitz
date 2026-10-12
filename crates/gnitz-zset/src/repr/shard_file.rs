@@ -45,6 +45,14 @@ fn framed(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
     for_encode(src, fi).filter(|image| region_start(image.len()) < region_start(src.len()))
 }
 
+/// The packed image of a PK region of `raw`'s fields, where it leaves the
+/// region fewer aligned bytes.
+fn pack_key(src: &[u8], raw: &KeyLayout) -> Option<(Encoding, Vec<u8>)> {
+    key_encode(src, raw)
+        .filter(|image| region_start(image.len()) < region_start(src.len()))
+        .map(|image| (Encoding::Key, image))
+}
+
 /// The packed image of a weight or null region, whose words are `word`s.
 fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
     two_value_encode(src)
@@ -241,7 +249,9 @@ impl Batch {
             .map(|f| shard_filter::serialize(&f));
         let nulls = regions[REG_NULL_BMP];
         let mut images: Vec<(Encoding, Cow<[u8]>)> = Vec::with_capacity(regions.len() + 1);
-        images.push(encode_region(regions[REG_PK], schema.pk_stride(), || None));
+        images.push(encode_region(regions[REG_PK], schema.pk_stride(), || {
+            pack_key(regions[REG_PK], &KeyLayout::of(schema))
+        }));
         images.push(encode_region(regions[REG_WEIGHT], FIXED_REGION_BYTES, || {
             pack_words(regions[REG_WEIGHT], FixedInt::I64)
         }));

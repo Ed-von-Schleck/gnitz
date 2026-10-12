@@ -1,5 +1,6 @@
 use super::*;
-use crate::test_support::Rng;
+use crate::schema::{SchemaDescriptor, TypeCode};
+use crate::test_support::{mix, opk_pk, pk_only_schema, Rng};
 use gnitz_wire::FixedInt;
 
 /// Pack signed/unsigned values into a raw `fi.width()`-byte-per-cell LE
@@ -523,4 +524,218 @@ fn a_sparse_row_past_the_last_value_reads_zero() {
         sparse_decode(&sparse, DECODE_BLOCK_ROWS, 8, &mut out[..88 * 8], is_null);
         assert_eq!(out[..88 * 8], vec![0u8; 88 * 8]);
     }
+}
+
+/// A sorted PK region under `types`: row `i`'s column `c` holds `value(i, c)`.
+pub(super) fn key_region(
+    types: &[TypeCode],
+    rows: usize,
+    value: impl Fn(usize, usize) -> u128,
+) -> (SchemaDescriptor, Vec<u8>) {
+    let schema = pk_only_schema(types);
+    let mut keys: Vec<Vec<u8>> = (0..rows)
+        .map(|i| {
+            let natives: Vec<u128> = (0..types.len()).map(|c| value(i, c)).collect();
+            opk_pk(&schema, &natives)
+        })
+        .collect();
+    keys.sort();
+    (schema, keys.concat())
+}
+
+/// The first row of `raw` at or after `key`.
+fn raw_lower_bound(raw: &[u8], stride: usize, key: &[u8]) -> usize {
+    let rows = raw.chunks_exact(stride);
+    let n = rows.len();
+    rows.into_iter().position(|row| row >= key).unwrap_or(n)
+}
+
+/// `key` and, per field, `key` with that field a step below and above itself,
+/// at its least and its greatest, and at random.
+fn key_probes(fields: &KeyLayout, key: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
+    let mut probes = vec![key.to_vec()];
+    for &KeyField { at, width: w, .. } in fields.fields() {
+        let field = gnitz_wire::widen_pk_be(&key[at..at + w]) as u64;
+        for v in [
+            field.wrapping_sub(1),
+            field.wrapping_add(1),
+            0,
+            u64::MAX,
+            rng.next_u64(),
+        ] {
+            let mut probe = key.to_vec();
+            probe[at..at + w].copy_from_slice(&v.to_be_bytes()[8 - w..]);
+            probes.push(probe);
+        }
+    }
+    probes.push((0..key.len()).map(|_| rng.next_u64() as u8).collect());
+    probes
+}
+
+#[test]
+fn key_roundtrips_and_seeks_as_the_region_it_packs() {
+    use TypeCode::*;
+    type Value = fn(usize, usize) -> u128;
+    // Each case's packed row width at 1500 rows, or `None` where the encoder declines.
+    let cases: Vec<(&str, Vec<TypeCode>, Value, Option<usize>)> = vec![
+        ("a narrow u64", vec![U64], |i, _| 1000 + (i as u128 * 7) % 5000, Some(2)),
+        (
+            "an i64 across zero",
+            vec![I64],
+            |i, _| (i as i128 % 600 - 300) as u128,
+            Some(2),
+        ),
+        (
+            "u32, i16, u8",
+            vec![U32, I16, U8],
+            |i, c| [(i % 1000) as u128, (i as i128 % 100 - 50) as u128, (i % 4) as u128][c],
+            Some(3),
+        ),
+        (
+            "two u64 of forty bits: a row past one u64",
+            vec![U64, U64],
+            |i, c| (mix(i as u64) >> (24 - c)) as u128 | 1 << 39,
+            Some(10),
+        ),
+        (
+            "a u128 around the u64 boundary",
+            vec![U128],
+            |i, _| (1u128 << 64) - 700 + i as u128,
+            Some(9),
+        ),
+        (
+            "a constant leading column",
+            vec![U64, U64],
+            |i, c| [7, (i as u128 * 31) % 100_000][c],
+            Some(2),
+        ),
+        (
+            "five fields",
+            vec![U8, U16, U32, U64, I64],
+            |i, c| {
+                [
+                    (i % 3) as u128,
+                    (i % 50) as u128,
+                    (i % 7) as u128,
+                    9,
+                    (i as i128 - 750) as u128,
+                ][c]
+            },
+            Some(3),
+        ),
+        ("a full-width u64", vec![U64], |i, _| mix(i as u64) as u128, None),
+        (
+            "three full-width u64: a row past one u128",
+            vec![U64, U64, U64],
+            |i, c| mix(i as u64 + c as u64) as u128,
+            None,
+        ),
+        ("one key", vec![U64, I32], |_, c| [5, 6][c], None),
+    ];
+    let mut rng = Rng::new(0x004B_4559);
+    for (label, types, value, packed_stride) in cases {
+        for n in [2, DECODE_BLOCK_ROWS + 1, 1500] {
+            let (schema, raw) = key_region(&types, n, value);
+            let (fields, stride) = (KeyLayout::of(&schema), schema.pk_stride());
+            let Some(image) = key_encode(&raw, &fields) else {
+                assert!(n < 1500 || packed_stride.is_none(), "{label}: declined at {n} rows");
+                continue;
+            };
+            assert!(image.len() < raw.len(), "{label}: no larger than the region");
+            let key = KeyImage::parse(&image, n, &fields).expect("the encoder's image parses");
+            if n == 1500 {
+                assert_eq!(Some(key.stride), packed_stride, "{label}: packed row width");
+            }
+            assert!(
+                KeyImage::parse(&image, n + 1, &fields).is_none(),
+                "{label}: another row count"
+            );
+            assert!(
+                KeyImage::parse(&image, n - 1, &fields).is_none(),
+                "{label}: another row count"
+            );
+
+            let mut decoded = vec![0u8; raw.len()];
+            key.decode(0, &mut decoded);
+            assert!(decoded == raw, "{label}: byte-exact roundtrip at {n} rows");
+            let window = n / 3..n - n / 4;
+            let mut decoded = vec![0u8; window.len() * stride];
+            key.decode(window.start, &mut decoded);
+            assert!(
+                decoded == raw[window.start * stride..window.end * stride],
+                "{label}: a window decodes alone"
+            );
+            key.decode(n, &mut []);
+
+            for row in (0..n).step_by(n / 60 + 1).chain([n - 1]) {
+                for probe in key_probes(&fields, &raw[row * stride..][..stride], &mut rng) {
+                    let want = raw_lower_bound(&raw, stride, &probe);
+                    assert_eq!(key.seek(&probe, None), want, "{label}: lower bound of {probe:02x?}");
+                    let held = raw.chunks_exact(stride).filter(|row| *row == probe).count();
+                    assert_eq!(key.rows_of(&probe), want..want + held, "{label}: rows of {probe:02x?}");
+                    for hint in [
+                        0,
+                        want,
+                        want.saturating_sub(3),
+                        (want + 5).min(n),
+                        n,
+                        rng.gen_range(n as u64 + 1) as usize,
+                    ] {
+                        assert_eq!(key.seek(&probe, Some(hint)), want, "{label}: {probe:02x?} from {hint}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn key_parse_refuses_widths_its_fields_do_not_hold() {
+    let (schema, raw) = key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
+        [(i % 9) as u128, i as u128][c]
+    });
+    let fields = KeyLayout::of(&schema);
+    let image = key_encode(&raw, &fields).unwrap();
+    let bits_at = fields.fields().len() * 8;
+    assert_eq!(image[bits_at..bits_at + 2], [4, 9], "the fields' bit widths");
+    // Widths their fields hold at the row's size parse, as any body bytes do;
+    // a width past its field or another row size does not.
+    for (forged, parses) in [
+        ([16, 0], true),
+        ([0, 13], true),
+        ([17, 0], false),
+        ([4, 65], false),
+        ([4, 17], false),
+    ] {
+        let mut image = image.clone();
+        image[bits_at..bits_at + 2].copy_from_slice(&forged);
+        let parsed = KeyImage::parse(&image, 300, &fields);
+        assert_eq!(parsed.is_some(), parses, "bit widths {forged:?}");
+    }
+    assert!(
+        KeyImage::parse(&image[..bits_at], 300, &fields).is_none(),
+        "shorter than its header"
+    );
+    assert!(
+        KeyImage::parse(&image, 300, &KeyLayout::of(&pk_only_schema(&[TypeCode::U64]))).is_none(),
+        "another PK's fields"
+    );
+}
+
+#[test]
+fn a_key_minimum_past_its_field_wraps() {
+    let (schema, raw) = key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
+        [(i % 9) as u128, i as u128][c]
+    });
+    let fields = KeyLayout::of(&schema);
+    let mut image = key_encode(&raw, &fields).unwrap();
+    image[..16].fill(0xFF);
+    let key = KeyImage::parse(&image, 300, &fields).unwrap();
+    let mut decoded = vec![0u8; raw.len()];
+    key.decode(0, &mut decoded);
+    // Row 0 held each field's minimum, now all ones: every field reads one less than it was.
+    assert_eq!(decoded[..10], [0xFF; 10]);
+    let field = |rows: &[u8]| gnitz_wire::widen_pk_be(&rows[299 * 10 + 2..]);
+    assert_eq!(field(&decoded), field(&raw) - 1);
+    assert_eq!(key.seek(&raw[..10], None), 0, "below every forged minimum");
 }

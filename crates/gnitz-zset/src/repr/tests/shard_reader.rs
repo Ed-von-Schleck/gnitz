@@ -156,6 +156,8 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     }
     for r in 0..n {
         let key = want.get_pk_bytes(r);
+        assert_eq!(shard.pk_at(r).pk_bytes(), key, "{label}: key by value, row {r}");
+        assert_eq!(shard.pk_rows(key), want.pk_rows(key), "{label}: rows of row {r}'s key");
         assert!(
             shard.shard_filter_may_contain(crate::schema::key::probe_key(key)),
             "{label}: PK filter false negative on row {r}"
@@ -197,7 +199,7 @@ pub(super) fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut
 }
 
 fn shapes() -> Vec<Shape> {
-    use Encoding::{Constant, Dict, For, Raw, Seq, Sparse, TwoValue};
+    use Encoding::{Constant, Dict, For, Key, Raw, Seq, Sparse, TwoValue};
     let u64_i64 = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
@@ -220,6 +222,15 @@ fn shapes() -> Vec<Shape> {
     );
     let u128_i64 = make_schema_u128_i64();
     let all_pk = pk_only_schema(&[TypeCode::U64; 3]);
+    let compound = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I16, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I8, false),
+        ],
+        &[0, 1, 3],
+    );
     let string = make_schema_pk_u64_payload_string();
     let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
     let str_col = SchemaColumn::new(TypeCode::String, false);
@@ -259,7 +270,7 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: nullable_i64,
             encodings: vec![
-                (REG_PK, Raw),
+                (REG_PK, Key),
                 (REG_WEIGHT, For),
                 (REG_NULL_BMP, TwoValue),
                 (REG_PAYLOAD_START, Raw),
@@ -504,10 +515,44 @@ fn shapes() -> Vec<Shape> {
             reader: u128_i64,
             encodings: vec![(REG_PK, Raw)],
         },
+        // Each half of the key is a field, and a packed row is past one u64.
+        Shape {
+            label: "u128 pk packed across decode blocks",
+            written: build(u128_i64, DECODE_BLOCK_ROWS + 90, |b, i| {
+                b.begin_row((1u128 << 64) - 300 + i as u128, 1);
+                b.put_int(i as u128);
+            }),
+            reader: u128_i64,
+            encodings: vec![(REG_PK, Key)],
+        },
+        // The first column is one value: a field of no bits.
         Shape {
             label: "3xu64 all-pk",
             written: build(all_pk, 9, |b, i| {
                 b.begin_row_natives(&[1, (i / 4) as u128, (i * 7) as u128], 1)
+            }),
+            reader: all_pk,
+            encodings: vec![(REG_PK, Key)],
+        },
+        // Signed columns of three widths, a PK several rows share, and a last
+        // decode block of one row.
+        Shape {
+            label: "compound signed pk across decode blocks",
+            written: build(compound, 2 * DECODE_BLOCK_ROWS + 1, |b, i| {
+                let (i, lo) = (i as i128, DECODE_BLOCK_ROWS as i128);
+                b.begin_row_natives(&[(i / 400 - 1) as u128, (i / 3 - lo) as u128, 0x80], 1 + i as i64 % 2);
+                b.put_int(i as u128 % 3);
+            }),
+            reader: compound,
+            encodings: vec![(REG_PK, Key)],
+        },
+        // Three columns whose spans a packed row does not hold.
+        Shape {
+            label: "3xu64 pk too wide to pack",
+            written: build(all_pk, 200, |b, i| {
+                let spread =
+                    |c: u64| ((i as u64 * 3 + c).wrapping_mul(0x9E37_79B9_7F4A_7C15) | i as u64 >> 1 << 60) as u128;
+                b.begin_row_natives(&[(i as u128) << 56, spread(1), spread(2)], 1)
             }),
             reader: all_pk,
             encodings: vec![(REG_PK, Raw)],
@@ -695,6 +740,32 @@ fn a_slice_and_a_materialize_decode_no_block() {
     let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
     std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, rows.len()));
     assert_eq!(shard.decoded_blocks(0), 0);
+}
+
+/// A per-row read of a packed key decodes the block it lands in, once; a
+/// seek, a key by value and a bulk read decode none.
+#[test]
+fn a_key_read_decodes_one_block_and_keeps_its_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = packed_three_blocks(dir.path());
+    assert!(matches!(shard.pk, KeyRegion::Packed(_)));
+    let (n, row) = (shard.row_count(), DECODE_BLOCK_ROWS + 3);
+    let key = (row as u64).to_be_bytes();
+
+    assert_eq!(shard.find_lower_bound_bytes(&key), row);
+    assert_eq!(shard.advance_to(&key, 3), row);
+    assert_eq!(shard.pk_at(row).pk_bytes(), key);
+    assert_eq!(shard.pk_rows(&key), row..row + 1);
+    std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
+    assert_eq!(shard.decoded_key_blocks(), 0);
+
+    let first = shard.get_pk_bytes(row);
+    assert_eq!(first, key);
+    assert_eq!(shard.get_pk_bytes(row).as_ptr(), first.as_ptr());
+    assert_eq!(shard.decoded_key_blocks(), 1);
+    // The last block is a partial one.
+    assert_eq!(shard.get_pk_bytes(n - 1), (n as u64 - 1).to_be_bytes());
+    assert_eq!(shard.decoded_key_blocks(), 2);
 }
 
 // -----------------------------------------------------------------------
@@ -1066,8 +1137,8 @@ fn every_body_region_and_its_padding_is_inside_the_body_checksum() {
 }
 
 /// A directory size a byte off what the row count and encoding determine is
-/// refused, for every fixed region of every shape. A size that pushes the
-/// regions after it past the end of the file is refused there first.
+/// refused, for every fixed region of every shape. A size that moves where the
+/// regions after it start is refused there first.
 #[test]
 fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -1080,7 +1151,12 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
                 let forged = sz.checked_add_signed(delta).unwrap();
                 let got = open_patched_restamped(&path, schema, &base, |d| patch_entry(d, region, |e| e.size = forged));
                 assert!(
-                    matches!(got, Err(StorageError::Corrupt("region size" | "region past the end"))),
+                    matches!(
+                        got,
+                        Err(StorageError::Corrupt(
+                            "region size" | "region past the end" | "directory does not span the file"
+                        ))
+                    ),
                     "{}: region {region} ({enc:?}) size {sz}{delta:+}: {:?}",
                     s.label,
                     got.err(),

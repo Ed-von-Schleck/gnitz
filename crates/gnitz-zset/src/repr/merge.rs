@@ -555,19 +555,18 @@ impl MergeOrder {
         }
     }
 
-    /// Keyed past the prefix every row of `sources` shares, so that keys of
-    /// small values in wide columns do not all tie. A source is sorted, so what
-    /// its first and last rows share, all of its rows share. Never coarsened:
-    /// a compaction that writes skeleton rows merges under the PK-only schema
-    /// instead (`compact::merge_guard`).
-    fn past_shared_prefix<S: ColumnarSource>(sources: &[S], stride: usize) -> Self {
+    /// Keyed past the prefix every row `cursors` walk of `sources` shares —
+    /// what each walk's first and last rows share, a source being sorted — so
+    /// that keys of small values in wide columns do not all tie.
+    fn past_shared_prefix<S: ColumnarSource>(sources: &[S], cursors: &[PosCursor], stride: usize) -> Self {
         if stride <= NARROW_PK_MAX_BYTES {
             return Self::leading(stride, false);
         }
         let mut bounds = sources
             .iter()
-            .filter(|s| s.row_count() > 0)
-            .flat_map(|s| [s.get_pk_bytes(0), s.get_pk_bytes(s.row_count() - 1)]);
+            .zip(cursors)
+            .filter(|(_, c)| c.is_valid())
+            .flat_map(|(s, c)| [s.get_pk_bytes(c.position), s.get_pk_bytes(c.count - 1)]);
         let first = bounds.next().unwrap_or(&[]);
         let shared = |pk: &[u8]| first.iter().zip(pk).take_while(|(a, b)| a == b).count();
         let at = bounds.map(shared).min().unwrap_or(0);
@@ -690,7 +689,11 @@ fn run_merge_body<S, P>(
     S: ColumnarSource,
     P: PayloadOrder,
 {
-    let order = MergeOrder::past_shared_prefix(sources, schema.pk_stride());
+    debug_assert!(
+        schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
+        "a skeleton row merges under the PK-only schema: this order is never coarsened"
+    );
+    let order = MergeOrder::past_shared_prefix(sources, cursors, schema.pk_stride());
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| {

@@ -5,7 +5,7 @@ use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{pk_group_end, Batch, BatchBuilder};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::path::Path;
@@ -150,7 +150,7 @@ fn fat_batch(base: u64, n: u64, width: usize) -> Batch {
 }
 
 /// Rows in a shard the guard rebalance neither splits nor merges.
-const STABLE_ROWS: u64 = 2800;
+const STABLE_ROWS: u64 = 4000;
 
 fn assert_stable(len: u64) {
     assert!(
@@ -196,10 +196,8 @@ fn assert_weighs(idx: &ShardIndex, weight: i64, keys: impl IntoIterator<Item = P
     for k in keys {
         let key = k.pk_bytes();
         let mut sum = 0;
-        idx.find_pk_bytes(key, probe_key(key), |shard, start| {
-            sum += (start..pk_group_end(&**shard, start))
-                .map(|r| shard.get_weight(r))
-                .sum::<i64>();
+        idx.find_pk_bytes(key, probe_key(key), |shard, rows| {
+            sum += rows.map(|r| shard.get_weight(r)).sum::<i64>();
         });
         assert_eq!(sum, weight, "key {key:?} through the guard partition");
     }
@@ -499,7 +497,7 @@ fn a_corrupt_input_body_fails_the_compaction() {
 
 /// A run above every key L1 holds folds into one fresh guard and stays that
 /// guard's one shard, although it outweighs the spills it was written from: a
-/// frame spanned one spill in each of them and spans the run in it.
+/// key packed to the span of one spill in each of them and packs to the run's in it.
 #[test]
 fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
     const SPILL: u64 = 14_000;
@@ -509,7 +507,7 @@ fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
     for run in 0..3u64 {
         for spill in run * 5..run * 5 + 5 {
             let pks: Vec<u64> = (spill * SPILL..(spill + 1) * SPILL).collect();
-            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
             idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
         }
         let spilled = idx.levels[L0].bytes();
@@ -520,7 +518,7 @@ fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
             assert_eq!(guards.len(), guards_before + 1, "run {run}");
             let folded = guards.last().unwrap();
             assert_eq!(folded.entries.len(), 1, "run {run}");
-            assert!(folded.bytes() > spilled, "premise: the fold's frame is the wider");
+            assert!(folded.bytes() > spilled, "premise: the fold's key is the wider");
         }
         guards_before = guards.len();
     }
@@ -652,7 +650,7 @@ fn open_removes_exactly_the_unreferenced_files() {
 
 /// Rows enough to put one dense shard over `MIN_GUARD_BYTES` — the guard
 /// target an unbounded store that has folded nothing yet carries.
-const OVER_TARGET_ROWS: u64 = 5000;
+const OVER_TARGET_ROWS: u64 = 8000;
 
 /// Guard 0 owns the key line below its own key, so a quantile down there is
 /// how that tail becomes addressable — the one place a split mints a key
@@ -887,7 +885,7 @@ fn a_first_dehydration_never_splits() {
 fn a_dehydrated_guard_over_target_splits_and_stays_skeleton() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
-    let rows = 8_000u64;
+    let rows = 30_000u64;
     seed_guard(&mut idx, TERMINAL, gk(1), &dense_batch(1, rows), 1);
     idx.dehydrate_guard(0).unwrap();
 
@@ -921,7 +919,7 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
     let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
     // Eight rows per key: dehydration folds each key to one `(PK, Σweight)`
     // row, which is the order-of-magnitude shrink the merge pass exists for.
-    let keys = 2_500u64;
+    let keys = 4_000u64;
     let pks: Vec<u64> = (1..=keys).flat_map(|k| std::iter::repeat_n(k, 8)).collect();
     let vals: Vec<i64> = (0..pks.len() as u64).map(ramp).collect();
     seed_guard(&mut idx, TERMINAL, gk(1), &test_batch(&pks, &vals), 1);
@@ -1438,8 +1436,9 @@ fn a_vertical_over_target_writes_its_parts_directly() {
     let target = idx.guard_target_bytes(TERMINAL);
     let terminal = &idx.levels[TERMINAL].guards;
     assert!(terminal.len() > 1 && terminal.iter().all(|g| g.bytes() <= target));
-    assert_weighs(&idx, 1, (1..2000).chain(2801..4800).step_by(13).map(gk));
-    assert_weighs(&idx, 2, (2000..=2800).step_by(13).map(gk));
+    let once = (1..2000).chain(STABLE_ROWS + 1..2000 + STABLE_ROWS);
+    assert_weighs(&idx, 1, once.step_by(13).map(gk));
+    assert_weighs(&idx, 2, (2000..=STABLE_ROWS).step_by(13).map(gk));
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,10 +1559,8 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     }
     for pk in m.seen.iter() {
         let mut sum = 0;
-        idx.find_pk_bytes(pk, probe_key(pk), |shard, start| {
-            sum += (start..pk_group_end(&**shard, start))
-                .map(|r| shard.get_weight(r))
-                .sum::<i64>();
+        idx.find_pk_bytes(pk, probe_key(pk), |shard, rows| {
+            sum += rows.map(|r| shard.get_weight(r)).sum::<i64>();
         });
         assert_eq!(sum, per_pk.get(pk).copied().unwrap_or(0), "{what}: key {pk:?} by probe");
     }
@@ -1719,7 +1716,7 @@ fn tier_folds_keep_the_zset() {
     use gnitz_zset::repr::merge_guard;
     use std::collections::BTreeMap;
     const KEYS: u64 = 400_000;
-    for budget in [None, Some(4 << 20)] {
+    for budget in [None, Some(3 << 20)] {
         let tmp = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = open(tmp.path(), schema, budget);
@@ -1727,7 +1724,7 @@ fn tier_folds_keep_the_zset() {
         let mut version = vec![0u64; KEYS as usize];
         let mut model: BTreeMap<(u64, i64), i64> = BTreeMap::new();
         cstats::reset();
-        for _ in 0..200 {
+        for _ in 0..260 {
             let mut rows = Vec::new();
             for _ in 0..2048 {
                 // Half the keys are hit often, so retractions land in every tier.

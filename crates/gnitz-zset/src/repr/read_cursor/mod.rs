@@ -10,6 +10,7 @@ use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::MemBatch;
 use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
 use crate::repr::seek::gallop_by;
+use crate::repr::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
@@ -37,6 +38,14 @@ impl SkeletonKeys {
         self.keys.extend_from_slice(pk);
         if cfg!(debug_assertions) {
             self.coarse.push(weight);
+        }
+    }
+
+    /// Every row of `rows` of `shard`, a skeleton one.
+    fn extend(&mut self, shard: &MappedShard, rows: Range<usize>) {
+        shard.append_pks(rows.clone(), &mut self.keys);
+        if cfg!(debug_assertions) {
+            self.coarse.extend(rows.map(|r| ColumnarSource::get_weight(shard, r)));
         }
     }
 

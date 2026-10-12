@@ -269,23 +269,28 @@ impl ShardIndex {
         self.capacity.is_some() && self.levels[TERMINAL].guards.iter().any(LevelGuard::dehydrated)
     }
 
-    /// Visit each shard holding OPK `key`, with the row its matches start at;
+    /// Visit each shard holding OPK `key`, with its rows of that key;
     /// `filter_key` is `key`'s `probe_key`. Each level routes by the whole key
     /// against its guard partition.
-    pub(crate) fn find_pk_bytes(&self, key: &[u8], filter_key: u64, mut visitor: impl FnMut(&Rc<MappedShard>, usize)) {
+    pub(crate) fn find_pk_bytes(
+        &self,
+        key: &[u8],
+        filter_key: u64,
+        mut visitor: impl FnMut(&Rc<MappedShard>, Range<usize>),
+    ) {
         for level in &self.levels {
             let Some(guard) = level.guards.get(level.slot(key)) else {
                 continue;
             };
             for e in &guard.entries {
-                if let Some(row) = e.probe_pk_bytes(key, filter_key) {
-                    visitor(&e.shard, row);
+                if let Some(rows) = e.probe_pk_bytes(key, filter_key) {
+                    visitor(&e.shard, rows);
                 }
             }
         }
         for e in &self.pending {
-            if let Some(row) = e.probe_pk_bytes(key, filter_key) {
-                visitor(&e.shard, row);
+            if let Some(rows) = e.probe_pk_bytes(key, filter_key) {
+                visitor(&e.shard, rows);
             }
         }
     }
@@ -359,10 +364,10 @@ impl ShardIndex {
     fn install(&mut self, run: Running) {
         let Running { fold, shards, opened, .. } = run;
         if fold.kind == CompactionKind::L0Fold {
-            // A run that lands in one guard is one shard, and can outweigh the
-            // shards it was spilled as: a frame spans the whole run where it
-            // spanned one spill. Unobserved, every such guard would be over
-            // target as written and be rewritten at once to be cut in two.
+            // A run that lands in one guard is one shard whose encodings span
+            // the whole run, and can outweigh the spills it was written from.
+            // Unobserved, every such guard would be over target as written and
+            // be rewritten at once to be cut in two.
             let largest = opened.iter().map(|(_, e)| e.shard.file_len()).max();
             self.l0_run_bytes = self.l0_run_bytes.max(largest.unwrap_or(0));
         }
@@ -591,7 +596,7 @@ impl ShardIndex {
             rows += n;
             if first < n {
                 above += n - first;
-                let key = PkBuf::from_bytes(e.shard.get_pk_bytes(first));
+                let key = e.shard.pk_at(first);
                 fence = Some(fence.map_or(key, |f| f.min(key)));
             }
         }

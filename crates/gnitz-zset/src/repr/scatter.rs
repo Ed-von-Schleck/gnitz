@@ -361,15 +361,22 @@ fn gather_cells<const N: usize>(
     }
 }
 
-/// The columns a [`UnifiedSet`]'s sources decoded to be viewed, freed with the set.
+/// The columns a source decoded to be viewed at a window of its rows, freed
+/// with the [`UnifiedSet`] or the window that views them.
+#[derive(Default)]
 pub(crate) struct DecodedColumns(Vec<PooledBuf>);
 
 impl DecodedColumns {
-    /// Hold `column` for the set's lifetime; its first byte's address.
-    pub(crate) fn hold(&mut self, column: PooledBuf) -> *const u8 {
-        let base = column.as_ptr();
+    /// A column of `width`-byte cells readable at `window`, which `decode`
+    /// writes whole given the window's bytes.
+    pub(crate) fn column(&mut self, window: &Range<usize>, width: usize, decode: impl FnOnce(&mut [u8])) -> ColPtr {
+        // SAFETY: `decode` writes every cell of `column`.
+        let mut column = unsafe { PooledBuf::uninit(window.len() * width) };
+        decode(&mut column);
+        // Rebased so that row `window.start` reads the column's first cell.
+        let base = column.as_ptr().wrapping_sub(window.start * width);
         self.0.push(column);
-        base
+        ColPtr { base, stride: width }
     }
 }
 
@@ -397,7 +404,7 @@ impl<'a> UnifiedSet<'a> {
         windows: impl IntoIterator<Item = Range<usize>>,
     ) -> Self {
         let mut cols = Vec::with_capacity(sources.len() * schema.num_payload_cols());
-        let mut decoded = DecodedColumns(Vec::new());
+        let mut decoded = DecodedColumns::default();
         #[cfg(debug_assertions)]
         let (windows, each) = {
             let windows: Vec<Range<usize>> = windows.into_iter().collect();

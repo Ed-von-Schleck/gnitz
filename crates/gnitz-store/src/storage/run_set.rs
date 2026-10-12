@@ -1,12 +1,13 @@
 //! `RunSet` — a set of in-heap sorted runs with a PK bloom and a fold trigger.
 
 use std::cell::OnceCell;
+use std::ops::Range;
 use std::rc::Rc;
 
 use super::bloom::BloomFilter;
 use gnitz_wire::PkBuf;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
-use gnitz_zset::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key};
+use gnitz_zset::schema::key::{pk_in_range, pk_ranges_overlap, probe_key};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a
@@ -78,9 +79,14 @@ impl RunSet {
         })
     }
 
-    /// Visit each run holding `key`, newest first, with the row its matches start
-    /// at; `fingerprint` is `key`'s [`probe_key`].
-    pub(super) fn find_pk_bytes(&self, key: &[u8], fingerprint: u64, mut visitor: impl FnMut(&Rc<Batch>, usize)) {
+    /// Visit each run holding `key`, newest first, with its rows of that key;
+    /// `fingerprint` is `key`'s [`probe_key`].
+    pub(super) fn find_pk_bytes(
+        &self,
+        key: &[u8],
+        fingerprint: u64,
+        mut visitor: impl FnMut(&Rc<Batch>, Range<usize>),
+    ) {
         if !self.may_contain(fingerprint) {
             return;
         }
@@ -88,9 +94,9 @@ impl RunSet {
             if !pk_in_range(pk_min(run), pk_max(run), key) {
                 continue;
             }
-            let start = run.find_lower_bound_bytes(key);
-            if start < run.len() && pk_bytes_eq(run.get_pk_bytes(start), key) {
-                visitor(run, start);
+            let rows = run.pk_rows(key);
+            if !rows.is_empty() {
+                visitor(run, rows);
             }
         }
     }
