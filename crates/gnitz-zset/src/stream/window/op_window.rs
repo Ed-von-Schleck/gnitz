@@ -3,10 +3,10 @@
 
 use crate::algebra::AggValues;
 use crate::repr::Batch;
-use crate::stream::order_index::{with_row, At, OrderedEpoch, Walk};
+use crate::stream::order_index::{with_row, At, OrderedEpoch, OrderedPlan, Walk};
 use crate::stream::OpenAt;
 
-use super::plan::WindowPlan;
+use super::plan::Window;
 
 /// The group's contents before the epoch, and after it.
 const OLD: usize = 0;
@@ -29,13 +29,13 @@ struct Running {
 
 impl Running {
     /// Whether the two contents give a row the same aggregates.
-    fn same_aggs(&self, plan: &WindowPlan) -> bool {
+    fn same_aggs(&self, plan: &Window) -> bool {
         let same = |(k, agg)| self.aggs.same(k, agg, OLD, NEW);
         plan.aggs.iter().enumerate().all(same)
     }
 
     /// Whether the two contents give a row the same ranks.
-    fn same_ranks(&self, plan: &WindowPlan) -> bool {
+    fn same_ranks(&self, plan: &Window) -> bool {
         (plan.rank.is_none() || self.rows[OLD] == self.rows[NEW])
             && (plan.dense_rank.is_none() || self.groups[OLD] == self.groups[NEW])
     }
@@ -43,10 +43,10 @@ impl Running {
     /// Fold the stored rows before the next entry's peers. The two contents
     /// amount to the same on entry and hold the same such rows, so each is folded
     /// once, and none is emitted.
-    fn fold_to_entry(&mut self, plan: &WindowPlan, walk: &mut Walk<'_>) {
+    fn fold_to_entry(&mut self, plan: &Window, walk: &mut Walk<'_>) {
         let mut last: Option<At> = None;
-        while let Some(row) = walk.stored_before_entry() {
-            let (at, weight) = (walk.at(&row), row.new);
+        while let Some(row) = walk.next_stored_before_entry() {
+            let (at, weight) = (row.at, row.new);
             // A row at a non-positive weight is not in the group.
             if weight > 0 {
                 if plan.dense_rank.is_some() {
@@ -58,7 +58,6 @@ impl Running {
                 });
                 self.rows[NEW] = self.rows[NEW].wrapping_add(weight);
             }
-            walk.advance(&row);
         }
         for (k, agg) in plan.aggs.iter().enumerate() {
             self.aggs.copy(k, agg, NEW, OLD);
@@ -71,7 +70,7 @@ impl Running {
     fn emit(
         &self,
         out: &mut Batch,
-        plan: &WindowPlan,
+        plan: &Window,
         walk: &Walk<'_>,
         out_pk: &[u8],
         (at, weight): (At, i64),
@@ -99,9 +98,14 @@ impl Running {
 /// new contents and every row of it emitted at its new values less its old ones,
 /// until the two contents amount to the same again. δ_out holds each element
 /// once, in the order of the walk.
-pub fn op_window(delta: &Batch, history: OpenAt<'_>, plan: &WindowPlan) -> OrderedEpoch {
+pub(in crate::stream) fn op_window(
+    delta: &Batch,
+    history: OpenAt<'_>,
+    plan: &OrderedPlan,
+    window: &Window,
+) -> OrderedEpoch {
     let mut running = Running {
-        aggs: AggValues::new(&plan.aggs, 2),
+        aggs: AggValues::new(&window.aggs, 2),
         rows: [0; 2],
         groups: [0; 2],
     };
@@ -110,19 +114,14 @@ pub fn op_window(delta: &Batch, history: OpenAt<'_>, plan: &WindowPlan) -> Order
         running.aggs.clear();
         (running.rows, running.groups) = ([0; 2], [0; 2]);
         while walk.pending() {
-            running.fold_to_entry(plan, walk);
+            running.fold_to_entry(window, walk);
             loop {
                 // The next peer group in index order.
                 peers.clear();
-                while let Some(row) = walk.peek() {
-                    let at = walk.at(&row);
-                    if peers.first().is_some_and(|first| !walk.peers(first.at, at)) {
-                        break;
-                    }
+                while let Some(row) = walk.next_peer(peers.first().map(|first| first.at)) {
                     // A row at a non-positive weight is not in the group.
                     let weight = [row.old.max(0), row.new.max(0)];
-                    peers.push(Peer { at, weight });
-                    walk.advance(&row);
+                    peers.push(Peer { at: row.at, weight });
                 }
                 if peers.is_empty() {
                     return;
@@ -134,28 +133,32 @@ pub fn op_window(delta: &Batch, history: OpenAt<'_>, plan: &WindowPlan) -> Order
                         let w = peer.weight[side];
                         if w > 0 {
                             weight[side] = weight[side].wrapping_add(w);
-                            with_row!(walk, peer.at, |src, row| for (k, agg) in plan.aggs.iter().enumerate() {
-                                running.aggs.step(k, agg, side, src, row, w);
-                            });
+                            with_row!(
+                                walk,
+                                peer.at,
+                                |src, row| for (k, agg) in window.aggs.iter().enumerate() {
+                                    running.aggs.step(k, agg, side, src, row, w);
+                                }
+                            );
                         }
                     }
                 }
                 // An aggregate folds this peer group; a rank counts up to it.
-                let same_aggs = running.same_aggs(plan);
-                let same = same_aggs && running.same_ranks(plan);
+                let same_aggs = running.same_aggs(window);
+                let same = same_aggs && running.same_ranks(window);
                 for peer in &peers {
                     let [old, new] = peer.weight;
                     if same {
                         if new != old {
-                            running.emit(out, plan, walk, out_pk, (peer.at, new - old), NEW);
+                            running.emit(out, window, walk, out_pk, (peer.at, new - old), NEW);
                         }
                         continue;
                     }
                     if old > 0 {
-                        running.emit(out, plan, walk, out_pk, (peer.at, -old), OLD);
+                        running.emit(out, window, walk, out_pk, (peer.at, -old), OLD);
                     }
                     if new > 0 {
-                        running.emit(out, plan, walk, out_pk, (peer.at, new), NEW);
+                        running.emit(out, window, walk, out_pk, (peer.at, new), NEW);
                     }
                 }
                 for side in [OLD, NEW] {
@@ -163,11 +166,11 @@ pub fn op_window(delta: &Batch, history: OpenAt<'_>, plan: &WindowPlan) -> Order
                     running.groups[side] += (weight[side] > 0) as i64;
                 }
                 // Every later row has the values it had, until the next entry.
-                if same_aggs && running.same_ranks(plan) {
+                if same_aggs && running.same_ranks(window) {
                     break;
                 }
             }
         }
     };
-    plan.index.epoch(delta, &plan.key, history, &plan.output_schema, group)
+    plan.index.epoch(delta, history, &plan.output_schema, group)
 }

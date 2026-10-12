@@ -238,10 +238,10 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
             let plan = match ctx.reads_partials(nid) {
-                true => gnitz_zset::stream::TopNPlan::combine(&in_schema, order, *limit, *offset)?,
-                false => gnitz_zset::stream::TopNPlan::from_wire(&in_schema, group_cols, order, *limit, *offset)?,
+                true => gnitz_zset::stream::OrderedPlan::top_n_combine(&in_schema, order, *limit, *offset)?,
+                false => gnitz_zset::stream::OrderedPlan::top_n(&in_schema, group_cols, order, *limit, *offset)?,
             };
-            Ok(push_topn(ctx, nid, in_reg, plan))
+            Ok(push_ordered(ctx, nid, in_reg, "topnidx", plan))
         }
 
         gnitz_wire::OpNode::Window {
@@ -253,18 +253,9 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
         } => {
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
-            let plan = Box::new(gnitz_zset::stream::WindowPlan::from_wire(
-                &in_schema,
-                group_cols,
-                order,
-                aggs,
-                *rank,
-                *dense_rank,
-            )?);
-            let out_schema = *plan.output_schema();
-            // The ordered index of every input row — the operator's whole history.
-            let index = ctx.declare_child("windowidx", nid, *plan.index_schema());
-            Ok(ctx.prog.push(in_reg, out_schema, Op::Window { index, plan }))
+            let plan =
+                gnitz_zset::stream::OrderedPlan::window(&in_schema, group_cols, order, aggs, *rank, *dense_rank)?;
+            Ok(push_ordered(ctx, nid, in_reg, "windowidx", plan))
         }
 
         gnitz_wire::OpNode::Join { kind } => {
@@ -422,13 +413,19 @@ fn push_reduce(
     ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan })
 }
 
-/// Declare `plan`'s index, and push the top-N over `in_reg`.
-fn push_topn(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: gnitz_zset::stream::TopNPlan) -> DeltaReg {
+/// Declare `plan`'s index — every input row in order, the operator's whole
+/// history — as a `kind` child, and push the operator over `in_reg`.
+fn push_ordered(
+    ctx: &mut EmitCtx,
+    nid: NodeId,
+    in_reg: DeltaReg,
+    kind: &'static str,
+    plan: gnitz_zset::stream::OrderedPlan,
+) -> DeltaReg {
     let out_schema = *plan.output_schema();
-    // The ordered index of every input row — the operator's whole history.
-    let index = ctx.declare_child("topnidx", nid, *plan.index_schema());
+    let index = ctx.declare_child(kind, nid, *plan.index_schema());
     let plan = Box::new(plan);
-    ctx.prog.push(in_reg, out_schema, Op::TopN { index, plan })
+    ctx.prog.push(in_reg, out_schema, Op::Ordered { index, plan })
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce
@@ -442,8 +439,8 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
         gnitz_wire::OpNode::Reduce { agg, .. } => gnitz_zset::stream::ReducePlan::partial(&in_schema, agg)?
             .map(|plan| push_reduce(ctx, shard, PARTIAL, in_reg, plan)),
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
-            let plan = gnitz_zset::stream::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
-            Some(push_topn(ctx, shard, in_reg, plan))
+            let plan = gnitz_zset::stream::OrderedPlan::top_n_partial(&in_schema, order, *limit, *offset)?;
+            Some(push_ordered(ctx, shard, in_reg, "topnidx", plan))
         }
         gnitz_wire::OpNode::Window { .. } => None,
         _ => unreachable!("`keyed_reader` names only a Reduce, a TopN or a Window"),

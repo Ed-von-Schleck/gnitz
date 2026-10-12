@@ -47,8 +47,6 @@ pub(super) struct AviBake {
     key_packer: ReindexPacker,
     pub(super) schema: SchemaDescriptor,
     aggs: Vec<AviAgg>,
-    /// Width of the value slot, shared by every ordinal.
-    value_bytes: usize,
 }
 
 impl AviBake {
@@ -74,12 +72,7 @@ impl AviBake {
         }
         let schema = b.finish().map_err(|e| format!("min/max index: {e}"))?;
         debug_assert!(!has_payload || schema.payload_slot(schema.num_columns() - 1) == Some(IMAGE_SLOT));
-        Ok(Some(AviBake {
-            schema,
-            key_packer,
-            aggs,
-            value_bytes: suffix[1].size(),
-        }))
+        Ok(Some(AviBake { schema, key_packer, aggs }))
     }
 
     /// `group ‖ ordinal` over a buffer the group key is already packed into.
@@ -142,8 +135,8 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
     let n = delta.count;
     let stride = bake.key_packer.out_stride;
-    let value = stride + ORDINAL_BYTES..stride + ORDINAL_BYTES + bake.value_bytes;
-    let width = value.end;
+    let width = bake.schema.pk_stride();
+    let value = stride + ORDINAL_BYTES..width;
     let has_payload = bake.schema.num_payload_cols() != 0;
     let mut out = Batch::with_capacity(&bake.schema, (n * bake.aggs.len()).max(1));
     // A string ordinal's images, back to back, and each one's end.

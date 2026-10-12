@@ -6,31 +6,12 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::Batch;
-use crate::schema::SchemaDescriptor;
-use crate::stream::order_index::tests::{arb_keys, arb_row, batch, cells, schema, Cells, Harness, Ordered, Row};
-use crate::stream::order_index::{OrderIndex, OrderedEpoch};
-use crate::stream::OpenAt;
-use crate::test_support::{arb_ticks, assert_folds, delta_to};
+use crate::stream::order_index::tests::{arb_keys, arb_row, batch, cells, schema, Cells, Harness, Row};
+use crate::test_support::{arb_ticks, delta_to};
 use gnitz_expr::{cmp_order_keys, order_locators};
 use gnitz_wire::OrderKey;
 
-use super::op_topn::op_topn;
-use super::plan::TopNPlan;
-
-impl Ordered for TopNPlan {
-    fn index(&self) -> &OrderIndex {
-        &self.index
-    }
-    fn output(&self) -> &SchemaDescriptor {
-        &self.output_schema
-    }
-    fn epoch(&self, delta: &Batch, history: OpenAt<'_>) -> OrderedEpoch {
-        op_topn(delta, history, self)
-    }
-    fn check(out: &Batch) {
-        assert_folds(std::slice::from_ref(out), out, "op_topn's delta");
-    }
-}
+use crate::stream::order_index::OrderedPlan;
 
 /// Weight slots `offset .. offset + limit` of each group of `model`, in the
 /// read path's order: `keys`, then the identity tie-break an ad-hoc `ORDER BY`
@@ -86,7 +67,7 @@ proptest! {
         ticks in arb_ticks(arb_row()),
     ) {
         let group_cols: &[u32] = [&[][..], &[0], &[1], &[2], &[1, 3]][gi];
-        let plan = TopNPlan::from_wire(&schema(), group_cols, &keys, limit, offset).unwrap();
+        let plan = OrderedPlan::top_n(&schema(), group_cols, &keys, limit, offset).unwrap();
         let mut h = Harness::new(plan, group_cols);
         let mut model = BTreeMap::new();
         for targets in &ticks {
@@ -104,10 +85,10 @@ proptest! {
         offset in arb_bound(),
         ticks in arb_ticks(arb_row()),
     ) {
-        let partial = || Harness::new(TopNPlan::partial(&schema(), &keys, limit, offset).unwrap(), &[]);
+        let partial = || Harness::new(OrderedPlan::top_n_partial(&schema(), &keys, limit, offset).unwrap(), &[]);
         let mut workers = [partial(), partial()];
         let partials = workers[0].plan.output_schema;
-        let mut combine = Harness::new(TopNPlan::combine(&partials, &keys, limit, offset).unwrap(), &[]);
+        let mut combine = Harness::new(OrderedPlan::top_n_combine(&partials, &keys, limit, offset).unwrap(), &[]);
         let mut model = BTreeMap::new();
         for targets in &ticks {
             let delta = delta_to(&mut model, targets);
@@ -142,7 +123,7 @@ fn a_nullable_key_places_nulls_by_nulls_first_in_either_direction() {
         (true, true, [1, 5]),
     ] {
         let key = OrderKey { col: 2, desc, nulls_first };
-        let mut h = Harness::new(TopNPlan::from_wire(&schema(), &[1], &[key], 1, 0).unwrap(), &[1]);
+        let mut h = Harness::new(OrderedPlan::top_n(&schema(), &[1], &[key], 1, 0).unwrap(), &[1]);
         h.tick(&batch(&rows));
         let ids: Vec<Vec<u8>> = h.state().into_keys().map(|(row, _)| row[0].clone().unwrap()).collect();
         let want: Vec<Vec<u8>> = want.iter().map(|id: &u64| id.to_le_bytes().to_vec()).collect();
@@ -156,7 +137,7 @@ fn a_nullable_key_places_nulls_by_nulls_first_in_either_direction() {
 #[test]
 fn a_fixed_width_key_sits_whole_in_the_index_pk() {
     let key = OrderKey { col: 1, desc: false, nulls_first: false };
-    let plan = TopNPlan::from_wire(&schema(), &[], &[key], 1, 0).unwrap();
+    let plan = OrderedPlan::top_n(&schema(), &[], &[key], 1, 0).unwrap();
     assert_eq!(plan.index.schema.pk_stride(), 8, "no group, no rank, the whole image");
     assert_eq!(
         plan.index.schema.num_payload_cols(),
@@ -175,9 +156,9 @@ fn a_fixed_width_key_sits_whole_in_the_index_pk() {
 fn from_wire_rejects_what_it_cannot_run() {
     let s = schema();
     let order = [OrderKey { col: 2, desc: false, nulls_first: false }];
-    let err = |r: Result<TopNPlan, String>| r.err().expect("refused");
-    assert!(err(TopNPlan::from_wire(&s, &[], &order, 0, 0)).contains("zero limit"));
-    assert!(err(TopNPlan::from_wire(&s, &[], &[], 1, 0)).contains("no order keys"));
+    let err = |r: Result<OrderedPlan, String>| r.err().expect("refused");
+    assert!(err(OrderedPlan::top_n(&s, &[], &order, 0, 0)).contains("zero limit"));
+    assert!(err(OrderedPlan::top_n(&s, &[], &[], 1, 0)).contains("no order keys"));
     let oob = [OrderKey { col: 9, ..order[0] }];
-    assert!(err(TopNPlan::from_wire(&s, &[], &oob, 1, 0)).contains("order column"));
+    assert!(err(OrderedPlan::top_n(&s, &[], &oob, 1, 0)).contains("order column"));
 }

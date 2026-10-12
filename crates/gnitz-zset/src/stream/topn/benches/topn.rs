@@ -1,9 +1,9 @@
 use std::ops::Range;
 
-use super::plan::TopNPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::stream::order_index::tests::Harness;
+use crate::stream::order_index::OrderedPlan;
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::OrderKey;
@@ -12,7 +12,7 @@ const N: u64 = 1 << 16;
 
 /// Three bulk epochs — `first` into an empty index, `second` beside it, and the
 /// retraction of `first` — in instructions per delta row.
-fn bulk_epochs(h: &mut Harness<TopNPlan>, counter: &Counter, first: &Batch, second: &Batch) -> [f64; 3] {
+fn bulk_epochs(h: &mut Harness, counter: &Counter, first: &Batch, second: &Batch) -> [f64; 3] {
     let retraction = first.clone().negated().into_consolidated();
     [first, second, &retraction].map(|d| h.measure(counter, d) as f64 / d.count as f64)
 }
@@ -95,7 +95,7 @@ fn op_topn_bench() {
             }
             b.finish().into_consolidated()
         };
-        let plan = TopNPlan::from_wire(&schema, &group_cols, &[asc(cols.len() as u16 - 1)], 10, 0).unwrap();
+        let plan = OrderedPlan::top_n(&schema, &group_cols, &[asc(cols.len() as u16 - 1)], 10, 0).unwrap();
         let mut h = Harness::new(plan, &[]);
         let (d1, d2) = (make(1), make(2));
         let index = &h.plan.index;
@@ -153,7 +153,7 @@ fn op_topn_window_bench() {
         let group = |i: u64| mix(i) % groups;
         // Bulk keys stand in the upper half of the key space.
         let bulk = |i: u64| (mix(i) >> 2) | (1 << 62);
-        let plan = TopNPlan::from_wire(&window_schema(), &[1], &by_key(false), limit, offset).unwrap();
+        let plan = OrderedPlan::top_n(&window_schema(), &[1], &by_key(false), limit, offset).unwrap();
         let mut h = Harness::new(plan, &[]);
         let [e1, e2, e3] = bulk_epochs(
             &mut h,
@@ -186,7 +186,7 @@ fn op_topn_window_ordered_bench() {
     let counter = Counter::instructions();
     for (groups, limit) in [(1u64, 10u64), (1, 100_000), (16, 10)] {
         let group = |i: u64| i * groups / (4 * N);
-        let plan = TopNPlan::from_wire(&window_schema(), &[1], &by_key(false), limit, 0).unwrap();
+        let plan = OrderedPlan::top_n(&window_schema(), &[1], &by_key(false), limit, 0).unwrap();
         let [e1, e2, e3] = bulk_epochs(
             &mut Harness::new(plan, &[]),
             &counter,
@@ -207,7 +207,7 @@ fn op_topn_window_ordered_bench() {
 fn op_topn_window_descending_bench() {
     let counter = Counter::instructions();
     for limit in [10u64, 1000] {
-        let plan = TopNPlan::partial(&window_schema(), &by_key(true), limit, 0).unwrap();
+        let plan = OrderedPlan::top_n_partial(&window_schema(), &by_key(true), limit, 0).unwrap();
         let [e1, e2, e3] = bulk_epochs(
             &mut Harness::new(plan, &[]),
             &counter,

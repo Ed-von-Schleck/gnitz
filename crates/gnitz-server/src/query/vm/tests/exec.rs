@@ -473,12 +473,12 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
 fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let schema = make_schema_u128_i64();
     let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
-    let plan = stream::TopNPlan::from_wire(&schema, &[], &order, 1, 0).unwrap();
+    let plan = stream::OrderedPlan::top_n(&schema, &[], &order, 1, 0).unwrap();
     let out_schema = *plan.output_schema();
     let mut p = TestPlan::default();
     let index_table = p.table("topnidx", *plan.index_schema());
     let r0 = p.seed(schema);
-    let out = p.push(r0, out_schema, Op::TopN { index: index_table, plan: Box::new(plan) });
+    let out = p.push(r0, out_schema, Op::Ordered { index: index_table, plan: Box::new(plan) });
     let mut vm = p.open(out);
 
     // The output row carries the input row whole: its PK, then its value.

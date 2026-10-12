@@ -320,19 +320,11 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 stream::op_reduce(delta, &mut open_out, history, plan)
             }
 
-            Op::TopN { index, plan } => {
+            Op::Ordered { index, plan } => {
                 let delta = &batches[in_reg.at()];
-                let epoch = stream::op_topn(delta, &mut stores.open(Trace::Child(*index)), plan);
+                let epoch = plan.epoch(delta, &mut stores.open(Trace::Child(*index)));
                 let res = stores.own.ingest(*index, epoch.index_entries);
-                res.map_err(|e| ingest_err("topn index", *index, e))?;
-                epoch.out
-            }
-
-            Op::Window { index, plan } => {
-                let delta = &batches[in_reg.at()];
-                let epoch = stream::op_window(delta, &mut stores.open(Trace::Child(*index)), plan);
-                let res = stores.own.ingest(*index, epoch.index_entries);
-                res.map_err(|e| ingest_err("window index", *index, e))?;
+                res.map_err(|e| ingest_err("order index", *index, e))?;
                 epoch.out
             }
         };

@@ -1,29 +1,20 @@
-//! `TopNPlan` — everything `op_topn` needs that is a pure function of
+//! The top-N's plans: everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::OrderKey;
 
-use crate::algebra::GroupOutKey;
-use crate::stream::order_index::OrderIndex;
+use crate::stream::order_index::{OrderIndex, OrderedKind, OrderedPlan};
 
-/// The baked per-instruction top-N plan.
-pub struct TopNPlan {
-    /// The group key region a reduce over the same group set would have, then
-    /// every input column not in that region, in input schema order.
-    pub(super) output_schema: SchemaDescriptor,
-    /// How a row's group is found and keyed in the output.
-    pub(super) key: GroupOutKey,
-    /// Weight slots to skip, then to keep, per group. `limit ≥ 1`.
+/// The weight slots a top-N skips, then keeps, per group. `limit ≥ 1`.
+pub(in crate::stream) struct TopN {
     pub(super) offset: u64,
     pub(super) limit: u64,
-    /// The ordered index of every input row this operator is maintained through.
-    pub(super) index: OrderIndex,
 }
 
-impl TopNPlan {
-    /// `Err` for a shape an untrusted producer can name and the operator cannot
-    /// execute.
-    pub fn from_wire(
+impl OrderedPlan {
+    /// A top-N. `Err` for a shape an untrusted producer can name and the
+    /// operator cannot execute.
+    pub fn top_n(
         input_schema: &SchemaDescriptor,
         group_cols: &[u32],
         order: &[OrderKey],
@@ -33,35 +24,34 @@ impl TopNPlan {
         if limit == 0 {
             return Err("top-n: a zero limit selects nothing".to_string());
         }
-        let (index, key, row) = OrderIndex::new(input_schema, group_cols, order, [])?;
+        let (index, row) = OrderIndex::new(input_schema, group_cols, order, [])?;
         let output_schema = row.finish().map_err(|e| format!("top-n: output {e}"))?;
-        Ok(TopNPlan { output_schema, key, offset, limit, index })
-    }
-
-    /// The layout `op_topn` emits under this plan.
-    pub fn output_schema(&self) -> &SchemaDescriptor {
-        &self.output_schema
-    }
-
-    /// The layout of the ordered index the operator is maintained through.
-    pub fn index_schema(&self) -> &SchemaDescriptor {
-        &self.index.schema
+        Ok(OrderedPlan {
+            index,
+            output_schema,
+            kind: OrderedKind::TopN(TopN { offset, limit }),
+        })
     }
 
     /// One worker's window of a global top-N: its first `limit + offset` slots,
     /// which hold every global slot.
-    pub fn partial(
+    pub fn top_n_partial(
         input_schema: &SchemaDescriptor,
         order: &[OrderKey],
         limit: u64,
         offset: u64,
     ) -> Result<Self, String> {
-        Self::from_wire(input_schema, &[], order, limit.saturating_add(offset), 0)
+        Self::top_n(input_schema, &[], order, limit.saturating_add(offset), 0)
     }
 
-    /// The global window over relayed [`Self::partial`] outputs, grouped on their
-    /// key.
-    pub fn combine(partials: &SchemaDescriptor, order: &[OrderKey], limit: u64, offset: u64) -> Result<Self, String> {
+    /// The global window over relayed [`Self::top_n_partial`] outputs, grouped on
+    /// their key.
+    pub fn top_n_combine(
+        partials: &SchemaDescriptor,
+        order: &[OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Self, String> {
         // A partial's key, then the input's columns in order.
         let key = partials.pk_cols();
         let shifted: Vec<OrderKey> = order
@@ -71,7 +61,7 @@ impl TopNPlan {
                 ..*k
             })
             .collect();
-        let plan = Self::from_wire(partials, key, &shifted, limit, offset)?;
+        let plan = Self::top_n(partials, key, &shifted, limit, offset)?;
         debug_assert_eq!(plan.output_schema, *partials);
         Ok(plan)
     }

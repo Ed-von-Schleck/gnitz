@@ -1,21 +1,14 @@
-//! `WindowPlan` — everything `op_window` needs that is a pure function of
+//! The window's plan: everything `op_window` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
 
-use crate::algebra::{Agg, GroupOutKey, ReduceShape};
-use crate::stream::order_index::OrderIndex;
+use crate::algebra::{resolve_aggs, Agg};
+use crate::stream::order_index::{OrderIndex, OrderedKind, OrderedPlan};
 
-/// The baked per-instruction window plan.
-pub struct WindowPlan {
-    /// The group key region a reduce over the same group set would have, every
-    /// input column not in that region, in input schema order, then the values:
-    /// the rank, the dense rank, the aggregates.
-    pub(super) output_schema: SchemaDescriptor,
-    /// How a row's group is found and keyed in the output.
-    pub(super) key: GroupOutKey,
-    /// The ordered index of every input row this operator is maintained through.
-    pub(super) index: OrderIndex,
+/// The values a window adds behind its input's columns: the rank, the dense
+/// rank, the aggregates.
+pub(in crate::stream) struct Window {
     /// The payload slot of each rank the output has.
     pub(super) rank: Option<usize>,
     pub(super) dense_rank: Option<usize>,
@@ -23,10 +16,10 @@ pub struct WindowPlan {
     pub(super) aggs: Vec<Agg>,
 }
 
-impl WindowPlan {
-    /// `Err` for a shape an untrusted producer can name and the operator cannot
-    /// execute.
-    pub fn from_wire(
+impl OrderedPlan {
+    /// A window. `Err` for a shape an untrusted producer can name and the
+    /// operator cannot execute.
+    pub fn window(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         order: &[OrderKey],
@@ -40,9 +33,9 @@ impl WindowPlan {
         // A COUNT(*) reads no column.
         let reads = |d: &&AggDescriptor| d.agg_op != AggFunc::Count;
         let read = aggs.iter().filter(reads).map(|d| d.col_idx);
-        let (index, key, mut out) = OrderIndex::new(input, group_cols, order, read)?;
+        let (index, mut out) = OrderIndex::new(input, group_cols, order, read)?;
 
-        let mut slot = key.carried().len();
+        let mut slot = index.row.len();
         let mut value = |has: bool| {
             has.then(|| {
                 out.push(SchemaColumn::new(TypeCode::I64, false));
@@ -63,24 +56,11 @@ impl WindowPlan {
             })
             .collect();
         // A row's own frame holds the row, so no value is taken over no rows.
-        let ReduceShape { output_schema, key, aggs } = ReduceShape::new(&index.schema, key, out, &over_index, false)?;
-        Ok(WindowPlan {
-            output_schema,
-            key,
+        let (output_schema, aggs) = resolve_aggs(&index.schema, out, &over_index, false)?;
+        Ok(OrderedPlan {
             index,
-            rank,
-            dense_rank,
-            aggs,
+            output_schema,
+            kind: OrderedKind::Window(Window { rank, dense_rank, aggs }),
         })
-    }
-
-    /// The layout `op_window` emits under this plan.
-    pub fn output_schema(&self) -> &SchemaDescriptor {
-        &self.output_schema
-    }
-
-    /// The layout of the ordered index the operator is maintained through.
-    pub fn index_schema(&self) -> &SchemaDescriptor {
-        &self.index.schema
     }
 }

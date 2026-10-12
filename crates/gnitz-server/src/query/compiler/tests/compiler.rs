@@ -174,12 +174,12 @@ fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<Compil
                     .output_schema(),
             ),
             OpNode::TopN { order, limit, offset, .. } => Some(
-                *gnitz_zset::stream::TopNPlan::from_wire(&schema, &[], order, *limit, *offset)
+                *gnitz_zset::stream::OrderedPlan::top_n(&schema, &[], order, *limit, *offset)
                     .unwrap()
                     .output_schema(),
             ),
             OpNode::Window { order, aggs, rank, dense_rank, .. } => Some(
-                *gnitz_zset::stream::WindowPlan::from_wire(&schema, &[], order, aggs, *rank, *dense_rank)
+                *gnitz_zset::stream::OrderedPlan::window(&schema, &[], order, aggs, *rank, *dense_rank)
                     .unwrap()
                     .output_schema(),
             ),
@@ -203,9 +203,7 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
             .filter(|op| {
                 matches!(
                     op,
-                    crate::query::vm::Op::Reduce { .. }
-                        | crate::query::vm::Op::TopN { .. }
-                        | crate::query::vm::Op::Window { .. }
+                    crate::query::vm::Op::Reduce { .. } | crate::query::vm::Op::Ordered { .. }
                 )
             })
             .count()

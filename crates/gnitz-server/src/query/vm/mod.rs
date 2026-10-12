@@ -98,15 +98,11 @@ pub(in crate::query) enum Op {
         index: Option<StateIdx>,
         plan: Box<stream::ReducePlan>,
     },
-    /// Per-group top-N over `index`, the ordered index of every input row.
-    TopN {
+    /// A top-N or a window: per group, over `index`, the ordered index of every
+    /// input row.
+    Ordered {
         index: StateIdx,
-        plan: Box<stream::TopNPlan>,
-    },
-    /// Per-group running values over `index`, the ordered index of every input row.
-    Window {
-        index: StateIdx,
-        plan: Box<stream::WindowPlan>,
+        plan: Box<stream::OrderedPlan>,
     },
 }
 
@@ -159,7 +155,7 @@ fn facts(op: &Op) -> OpFacts {
             // that says so.
             inert_on_empty: !plan.seeds_ground,
         },
-        Op::TopN { .. } | Op::Window { .. } => OpFacts { stateful: true, ..linear },
+        Op::Ordered { .. } => OpFacts { stateful: true, ..linear },
     }
 }
 
@@ -180,8 +176,7 @@ impl Instr {
             | Op::Round { plan: _, seeds: _ }
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, index: _, plan: _ }
-            | Op::TopN { index: _, plan: _ }
-            | Op::Window { index: _, plan: _ } => None,
+            | Op::Ordered { index: _, plan: _ } => None,
         };
         [Some(self.in_reg), second]
     }
@@ -205,8 +200,7 @@ impl Instr {
             | Op::Share(_)
             | Op::Round { .. }
             | Op::NullExtend { .. }
-            | Op::TopN { .. }
-            | Op::Window { .. } => None,
+            | Op::Ordered { .. } => None,
         }
     }
 }

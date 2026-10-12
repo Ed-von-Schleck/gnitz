@@ -6,29 +6,12 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
-use crate::repr::Batch;
-use crate::schema::SchemaDescriptor;
-use crate::stream::order_index::tests::{arb_keys, arb_row, batch, cells, schema, Cells, Harness, Ordered, Row};
-use crate::stream::order_index::{OrderIndex, OrderedEpoch};
-use crate::stream::OpenAt;
+use crate::stream::order_index::tests::{arb_keys, arb_row, batch, cells, schema, Cells, Harness, Row};
 use crate::test_support::{arb_ticks, delta_to};
 use gnitz_expr::{cmp_order_keys, order_locators};
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
 
-use super::op_window::op_window;
-use super::plan::WindowPlan;
-
-impl Ordered for WindowPlan {
-    fn index(&self) -> &OrderIndex {
-        &self.index
-    }
-    fn output(&self) -> &SchemaDescriptor {
-        &self.output_schema
-    }
-    fn epoch(&self, delta: &Batch, history: OpenAt<'_>) -> OrderedEpoch {
-        op_window(delta, history, self)
-    }
-}
+use crate::stream::order_index::OrderedPlan;
 
 fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
     AggDescriptor { agg_op, col_idx }
@@ -124,7 +107,7 @@ proptest! {
         ticks in arb_ticks(arb_row()),
     ) {
         let group_cols: &[u32] = [&[][..], &[1], &[0], &[1, 0]][gi];
-        let plan = WindowPlan::from_wire(&schema(), group_cols, &keys, &aggs(), true, true).unwrap();
+        let plan = OrderedPlan::window(&schema(), group_cols, &keys, &aggs(), true, true).unwrap();
         let mut h = Harness::new(plan, group_cols);
         let mut model = BTreeMap::new();
         for targets in &ticks {
@@ -139,7 +122,7 @@ proptest! {
 #[test]
 fn a_row_moves_the_rows_behind_it_and_no_others() {
     let key = OrderKey { col: 2, desc: false, nulls_first: false };
-    let plan = WindowPlan::from_wire(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 2)], false, false).unwrap();
+    let plan = OrderedPlan::window(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 2)], false, false).unwrap();
     let mut h = Harness::new(plan, &[1]);
     let row = |id, val| ((id, 7, Some(val), None, 0), 1);
     h.tick(&batch(&[row(1, 10), row(2, 20), row(3, 30)]));
@@ -160,7 +143,7 @@ fn a_row_moves_the_rows_behind_it_and_no_others() {
 #[test]
 fn a_float_sum_is_a_function_of_the_group() {
     let key = OrderKey { col: 0, desc: false, nulls_first: false };
-    let plan = WindowPlan::from_wire(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 4)], false, false).unwrap();
+    let plan = OrderedPlan::window(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 4)], false, false).unwrap();
     let mut h = Harness::new(plan, &[1]);
     let row = |id: u64, f: f64| ((id, 0, None, None, f.to_bits()), 1);
     h.tick(&batch(&[row(2, 0.1), row(3, 0.2), row(4, 1e17)]));
@@ -176,10 +159,10 @@ fn a_float_sum_is_a_function_of_the_group() {
 fn from_wire_rejects_what_it_cannot_run() {
     let s = schema();
     let order = [OrderKey { col: 2, desc: false, nulls_first: false }];
-    let err = |r: Result<WindowPlan, String>| r.err().expect("refused");
-    assert!(err(WindowPlan::from_wire(&s, &[], &order, &[], false, false)).contains("no value columns"));
-    assert!(err(WindowPlan::from_wire(&s, &[], &[], &[], true, false)).contains("no order keys"));
+    let err = |r: Result<OrderedPlan, String>| r.err().expect("refused");
+    assert!(err(OrderedPlan::window(&s, &[], &order, &[], false, false)).contains("no value columns"));
+    assert!(err(OrderedPlan::window(&s, &[], &[], &[], true, false)).contains("no order keys"));
     let sum = |col| [agg(AggFunc::Sum, col)];
-    assert!(err(WindowPlan::from_wire(&s, &[], &order, &sum(9), false, false)).contains("carried column"));
-    assert!(err(WindowPlan::from_wire(&s, &[], &order, &sum(3), false, false)).contains("not defined over"));
+    assert!(err(OrderedPlan::window(&s, &[], &order, &sum(9), false, false)).contains("carried column"));
+    assert!(err(OrderedPlan::window(&s, &[], &order, &sum(3), false, false)).contains("not defined over"));
 }

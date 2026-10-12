@@ -231,13 +231,17 @@ pub(crate) fn arb_pk_type() -> impl Strategy<Value = TypeCode> {
 
 /// Strings that are prefixes of one another, one escaping `0x00`, and two that
 /// share more leading bytes than an index key's lead slot holds.
-pub(crate) const STRS: [&str; 6] = [
+pub(crate) const STRS: [&str; 10] = [
     "",
     "a",
     "ab",
     "\0b",
     "shared-lead-slot-prefix-x",
     "shared-lead-slot-prefix-y",
+    "a\0",
+    "a\0\0",
+    "a\0b-a-string-past-the-inline-cell-with-a-zero",
+    "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
 ];
 
 /// Floats `total_cmp` tells apart though `==` does not, and the ones it places

@@ -19,5 +19,5 @@ mod bench;
 #[path = "tests/topn.rs"]
 mod tests;
 
-pub use op_topn::op_topn;
-pub use plan::TopNPlan;
+pub(in crate::stream) use op_topn::op_topn;
+pub(in crate::stream) use plan::TopN;

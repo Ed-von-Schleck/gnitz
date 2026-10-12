@@ -345,7 +345,7 @@ fn topn_view_tick_bench() {
         let scan = circuit.input_delta(t, ReadBound::None);
         circuit.top_n(scan, &group, &order, 3, 0);
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::TopNPlan::from_wire(&schema, &group, &order, 3, 0)
+        let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, &group, &order, 3, 0)
             .unwrap()
             .output_schema();
         try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()
@@ -373,7 +373,7 @@ fn topn_bulk_view_tick_bench() {
         let scan = circuit.input_delta(t, ReadBound::None);
         circuit.top_n(scan, &group, &order, limit, 0);
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::TopNPlan::from_wire(&schema, &group, &order, limit, 0)
+        let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, &group, &order, limit, 0)
             .unwrap()
             .output_schema();
         let v = try_register_view(&mut engine, circuit, "v", &cols_of(&out), 0, 0).unwrap();
@@ -385,6 +385,44 @@ fn topn_bulk_view_tick_bench() {
              instr/row (view holds {held} -> {})",
             fill as f64 / ROWS as f64,
             net_weight(&engine, v),
+        );
+        discard(engine);
+    }
+}
+
+/// Window views under bulk deltas: a rank and a running sum of `v` per `k` in
+/// `v` order — the backfill of `ROWS` rows and the wide ticks, every later row
+/// behind its group, which re-emits nothing, or in front of it, which re-emits
+/// the group.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn window_bulk_view_tick_bench() {
+    let counter = perf::Counter::instructions();
+    for (label, groups, in_front) in [
+        ("16 a group, behind", ROWS / 16, false),
+        ("256 a group, behind", ROWS / 256, false),
+        ("16 a group, in front", ROWS / 16, true),
+        ("256 a group, in front", ROWS / 256, true),
+    ] {
+        let cells = move |id: u64| [scramble(id) % groups, if in_front { 2 * ROWS - id } else { id }];
+        let name = format!("window_bulk_{}", label.replace([' ', ','], "_"));
+        let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
+        let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
+        let aggs = [AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum }];
+        let mut circuit = Circuit::default();
+        let scan = circuit.input_delta(t, ReadBound::None);
+        circuit.window(scan, &[1], &order, &aggs, (true, false));
+        let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
+        let out = *gnitz_zset::stream::OrderedPlan::window(&schema, &[1], &order, &aggs, true, false)
+            .unwrap()
+            .output_schema();
+        let v = try_register_view(&mut engine, circuit, "v", &cols_of(&out), 0, 0).unwrap();
+        let ((), fill) = counter.measure(|| backfill(&mut engine, v));
+        let ticks = wide_ticks(&mut engine, &counter, t, ROWS, false, cells);
+        println!(
+            "window bulk view, {label:<21}: backfill {:>8.1} instr/row, {WIDE_TICK_ROWS}-row ticks {ticks:>8.1} \
+             instr/row",
+            fill as f64 / ROWS as f64,
         );
         discard(engine);
     }

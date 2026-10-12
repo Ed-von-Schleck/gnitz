@@ -2195,7 +2195,7 @@ impl NullPerm {
     /// Derive the null words of `out` rows `[dst_base, dst_base + n)` from
     /// source rows `[src_start, src_start + n)`, one u64 per row. The whole
     /// window is written: the destination may be an uninitialized tail.
-    pub(crate) fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
+    pub fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
         let dst = &mut out[dst_base * 8..(dst_base + n) * 8];
         let src = in_null_bmp[src_start * 8..(src_start + n) * 8].as_chunks::<8>().0;
         let word = |w: &[u8; 8]| u64::from_le_bytes(*w);

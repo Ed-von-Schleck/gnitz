@@ -17,10 +17,10 @@ use gnitz_wire::{zip_cells, FixedInt};
 /// below, so they are one value rather than three positional `usize`s a caller
 /// can transpose.
 #[derive(Clone, Copy)]
-struct RowWindow {
-    src: usize,
-    dst: usize,
-    n: usize,
+pub(crate) struct RowWindow {
+    pub(crate) src: usize,
+    pub(crate) dst: usize,
+    pub(crate) n: usize,
 }
 
 /// Average survivor-run length below which a map that computes, or that copies
@@ -51,10 +51,33 @@ enum PkSource {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The input's German-string payload slots `copies` read.
+pub(crate) fn copied_string_slots(copies: &[ColCopy]) -> u64 {
+    copies.iter().fold(0, |slots, c| match c.src {
+        ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => slots | 1 << slot,
+        _ => slots,
+    })
+}
+
+/// Rebase the string columns [`copy_column`] wrote for `copies`, their cells
+/// read from `src_blob`, onto the heap [`Batch::carry_heap`] left at `heap_at`.
+pub(crate) fn rebase_copied_strings(
+    copies: &[ColCopy],
+    output: &mut DirectWriter<'_>,
+    src_blob: &[u8],
+    heap_at: Option<usize>,
+) {
+    for c in copies {
+        if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
+            output.rebase_string_col(c.slot, src_blob, heap_at);
+        }
+    }
+}
+
 /// Copy a single column from `in_batch` to `output` over `w`, a German-string
 /// cell verbatim: the caller rebases the column. The source is read at its own
 /// type's width and sign/zero-extended into a wider (promoted) destination slot.
-fn copy_column(
+pub(crate) fn copy_column(
     in_batch: &Batch,
     output: &mut DirectWriter<'_>,
     &ColCopy {
@@ -279,10 +302,7 @@ impl MapPlan {
         pk_source: PkSource,
     ) -> Result<Self, ExprValidateErr> {
         let ev = logical.resolve_map(in_schema, out_schema)?;
-        let copied_string_slots = ev.copies().iter().fold(0u64, |slots, c| match c.src {
-            ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => slots | 1u64 << slot,
-            _ => slots,
-        });
+        let copied_string_slots = copied_string_slots(ev.copies());
 
         Ok(MapPlan {
             ev,
@@ -378,11 +398,7 @@ impl MapPlan {
                 self.map_rows_into(src, out, w);
                 dst += w.n;
             }
-            for c in self.ev.copies() {
-                if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
-                    out.rebase_string_col(c.slot, src.blob(), heap_at);
-                }
-            }
+            rebase_copied_strings(self.ev.copies(), out, src.blob(), heap_at);
             // The one source that keys on the finished output row.
             if let PkSource::HashRow(fold) = &self.pk_source {
                 reindex_hash_row(out, fold);

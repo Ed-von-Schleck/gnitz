@@ -20,5 +20,5 @@ mod bench;
 #[path = "tests/window.rs"]
 mod tests;
 
-pub use op_window::op_window;
-pub use plan::WindowPlan;
+pub(in crate::stream) use op_window::op_window;
+pub(in crate::stream) use plan::Window;

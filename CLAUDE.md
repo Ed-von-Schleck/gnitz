@@ -242,7 +242,8 @@ null-fills, and band EXISTS/IN are the only `positive_part` users.
 back through a cursor that merges the in-memory and on-disk tiers on the fly,
 summing weights of matching (PK, payload) entries and dropping ghosts — so every
 tier depends on §2's sort invariant. An operator reading a trace sees
-`z⁻¹(I(X))`, the integral *before* the current delta.
+`z⁻¹(I(X))`, the integral *before* the current delta — but for a reduce's value
+index, read with the epoch's entries in it.
 
 **A trace is not always a store of its own.** A join side that is a base table
 re-keyed onto leading columns of its own PK reads the table's store — **as the

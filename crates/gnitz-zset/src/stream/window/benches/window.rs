@@ -1,9 +1,9 @@
 use std::ops::Range;
 
-use super::plan::WindowPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::stream::order_index::tests::Harness;
+use crate::stream::order_index::OrderedPlan;
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
@@ -48,7 +48,7 @@ fn op_window_bench() {
         let group = |i: u64| mix(i) % groups;
         // Bulk keys stand in the middle of the key space.
         let bulk = |i: u64| (mix(i) >> 2) | (1 << 61);
-        let plan = WindowPlan::from_wire(&schema(), &[1], &order, &sum, true, false).unwrap();
+        let plan = OrderedPlan::window(&schema(), &[1], &order, &sum, true, false).unwrap();
         let mut h = Harness::new(plan, &[]);
         let empty = h.measure(&counter, &rows(0..N, group, bulk)) as f64 / N as f64;
         let mut ones = |key: &dyn Fn(u64) -> u64, base: u64| {
