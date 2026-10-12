@@ -140,6 +140,16 @@ fn global_topn() -> OpNode {
     }
 }
 
+fn global_window() -> OpNode {
+    OpNode::Window {
+        group_cols: vec![],
+        order: vec![gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false }],
+        aggs: vec![],
+        rank: true,
+        dense_rank: false,
+    }
+}
+
 /// `ScanDelta(10) → [ExchangeShard] → op`.
 fn global_circuit(op: &OpNode, exchanged: bool) -> Circuit {
     let mut c = Circuit::default();
@@ -168,6 +178,11 @@ fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<Compil
                     .unwrap()
                     .output_schema(),
             ),
+            OpNode::Window { order, aggs, rank, dense_rank, .. } => Some(
+                *gnitz_zset::stream::WindowPlan::from_wire(&schema, &[], order, aggs, *rank, *dense_rank)
+                    .unwrap()
+                    .output_schema(),
+            ),
             _ => None,
         })
         .expect("a global operator");
@@ -188,7 +203,9 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
             .filter(|op| {
                 matches!(
                     op,
-                    crate::query::vm::Op::Reduce { .. } | crate::query::vm::Op::TopN { .. }
+                    crate::query::vm::Op::Reduce { .. }
+                        | crate::query::vm::Op::TopN { .. }
+                        | crate::query::vm::Op::Window { .. }
                 )
             })
             .count()
@@ -202,6 +219,8 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
         ("a replicated source", global_reduce(AggFunc::Sum), replicated, 4, false),
         ("a replicated source", global_topn(), replicated, 4, false),
         ("a partitioned MIN", global_reduce(AggFunc::Min), keyed, 4, true),
+        // A row's rank reads every row before it: no worker's rows stand for the rest.
+        ("a partitioned window", global_window(), keyed, 4, false),
     ] {
         assert_eq!(split(global_circuit(&op, true), source, of), want, "{why}");
     }
@@ -226,12 +245,12 @@ fn an_exchange_behind_a_global_aggregate_is_rejected() {
     );
 }
 
-/// An exchange places its rows by the key of the reduce or top-N reading it, so
-/// a second reader would be handed rows placed by a key that is not its own.
+/// An exchange places its rows by the key of the reduce, top-N or window reading
+/// it, so a second reader would be handed rows placed by a key that is not its own.
 #[test]
 fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
     let keyed = Source::from(make_schema_u64_i64());
-    for op in [global_reduce(AggFunc::Sum), global_topn()] {
+    for op in [global_reduce(AggFunc::Sum), global_topn(), global_window()] {
         let mut shared = Circuit::default();
         let a = scan(&mut shared, 10);
         let shard = shared.shard(a);
@@ -240,7 +259,7 @@ fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
         for of in [1, 4] {
             assert_eq!(
                 rejection(compile_global(shared.clone(), keyed, Slot::new(0, of))),
-                "an exchange in front of a reduce or top-N has another reader",
+                "an exchange in front of a reduce, top-N or window has another reader",
                 "{op:?} of {of}"
             );
         }

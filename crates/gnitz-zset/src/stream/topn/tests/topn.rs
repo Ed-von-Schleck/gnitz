@@ -5,118 +5,30 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
-use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, TestTrace, FLOATS, STRS};
+use crate::repr::Batch;
+use crate::schema::SchemaDescriptor;
+use crate::stream::order_index::tests::{arb_keys, arb_row, batch, cells, schema, Cells, Harness, Ordered, Row};
+use crate::stream::order_index::{OrderIndex, OrderedEpoch};
+use crate::stream::OpenAt;
+use crate::test_support::{arb_ticks, assert_folds, delta_to};
 use gnitz_expr::{cmp_order_keys, order_locators};
-use gnitz_wire::{OrderKey, ReduceOutSlot};
+use gnitz_wire::OrderKey;
 
-use super::op_topn::{op_topn, TopNEpoch};
+use super::op_topn::op_topn;
 use super::plan::TopNPlan;
 
-/// `[U64 id (pk), I64 grp, I64 val NULL, STRING s NULL, F64 f]`.
-fn schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::String, true),
-            SchemaColumn::new(TypeCode::F64, false),
-        ],
-        &[0],
-    )
-}
-
-/// `(id, grp, val, s, f)`, `f` as its `f64` bits.
-type Row = (u64, i64, Option<i64>, Option<&'static str>, u64);
-/// A row as one native cell per input column, `None` for NULL.
-type Cells = Vec<Option<Vec<u8>>>;
-
-fn cells(&(id, grp, val, s, f): &Row) -> Cells {
-    vec![
-        Some(id.to_le_bytes().to_vec()),
-        Some(grp.to_le_bytes().to_vec()),
-        val.map(|v| v.to_le_bytes().to_vec()),
-        s.map(|s| s.as_bytes().to_vec()),
-        Some(f.to_le_bytes().to_vec()),
-    ]
-}
-
-fn batch(rows: &[(Row, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(&schema());
-    for &((id, grp, val, s, f), w) in rows {
-        b.begin_row(id as u128, w);
-        b.put_int(grp as u128);
-        b.put_opt_int(val.map(|v| v as u128));
-        match s {
-            Some(s) => b.put_string(s),
-            None => b.put_null(),
-        }
-        b.put_u64(f);
-        b.end_row();
+impl Ordered for TopNPlan {
+    fn index(&self) -> &OrderIndex {
+        &self.index
     }
-    b.finish()
-}
-
-/// The operator with its index, driven the way the VM drives it.
-pub(super) struct Harness {
-    pub(super) plan: TopNPlan,
-    pub(super) index: TestTrace,
-    /// The integral of the output, which only the test reads.
-    out: TestTrace,
-    /// Output column → the input column it holds; `None` for a synthetic key.
-    layout: Vec<Option<usize>>,
-}
-
-impl Harness {
-    pub(super) fn new(plan: TopNPlan, group_cols: &[u32]) -> Self {
-        let index = TestTrace::new(plan.index.schema);
-        let out = TestTrace::new(plan.output_schema);
-        let layout = schema()
-            .reduce_out_key(group_cols)
-            .output_layout(group_cols, 0..5)
-            .into_iter()
-            .map(|s| match s {
-                ReduceOutSlot::SyntheticKey => None,
-                ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => Some(c as usize),
-            })
-            .collect();
-        Harness { plan, index, out, layout }
+    fn output(&self) -> &SchemaDescriptor {
+        &self.output_schema
     }
-
-    /// One epoch: run, add the returned entries to the index, integrate the
-    /// output. Returns the raw delta.
-    fn tick(&mut self, delta: &Batch) -> Batch {
-        let index = &self.index;
-        let TopNEpoch { out, index_entries: entries } =
-            op_topn(delta, &mut |first, last| index.cursor_within(first, last), &self.plan);
-        assert_folds(
-            &[self.plan.index.batch(delta, self.plan.key.carried())],
-            &entries,
-            "op_topn's index entries",
-        );
-        self.index.ingest(entries);
-        assert_folds(std::slice::from_ref(&out), &out, "op_topn's delta");
-        self.out.ingest(out.clone());
-        out
+    fn epoch(&self, delta: &Batch, history: OpenAt<'_>) -> OrderedEpoch {
+        op_topn(delta, history, self)
     }
-
-    /// The maintained output, each row read back as the input row it carries.
-    fn state(&self) -> BTreeMap<Cells, i64> {
-        let b = self.out.cursor().materialize();
-        let mb = b.as_mem_batch();
-        let out = self.plan.output_schema;
-        (0..b.count)
-            .map(|r| {
-                let mut row = vec![None; 5];
-                for (oc, ic) in self.layout.iter().enumerate() {
-                    let Some(ic) = *ic else { continue };
-                    row[ic] = cell(&mb, out.locate(oc), r);
-                }
-                (row, b.get_weight(r))
-            })
-            .collect()
+    fn check(out: &Batch) {
+        assert_folds(std::slice::from_ref(out), out, "op_topn's delta");
     }
 }
 
@@ -129,7 +41,7 @@ fn window(
     keys: &[OrderKey],
     limit: u64,
     offset: u64,
-) -> BTreeMap<Cells, i64> {
+) -> BTreeMap<(Cells, Cells), i64> {
     // One entry per weight slot.
     let slots: Vec<(Row, i64)> = model
         .iter()
@@ -149,31 +61,10 @@ fn window(
     let mut want = BTreeMap::new();
     for rows in groups.into_values() {
         for row in rows.into_iter().skip(offset as usize).take(limit as usize) {
-            *want.entry(row).or_insert(0) += 1;
+            *want.entry((row, Vec::new())).or_insert(0) += 1;
         }
     }
     want
-}
-
-fn arb_row() -> impl Strategy<Value = Row> {
-    (
-        0u64..4,
-        0i64..2,
-        prop::option::of(prop_oneof![Just(i64::MIN), -1i64..=1]),
-        prop::option::of(prop::sample::select(&STRS[..])),
-        prop::sample::select(&FLOATS[..]).prop_map(f64::to_bits),
-    )
-}
-
-fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
-    prop::collection::vec(
-        (0u16..5, any::<bool>(), any::<bool>()).prop_map(|(col, desc, nulls_first)| OrderKey {
-            col,
-            desc,
-            nulls_first,
-        }),
-        1..=3,
-    )
 }
 
 fn arb_bound() -> impl Strategy<Value = u64> {
@@ -253,7 +144,7 @@ fn a_nullable_key_places_nulls_by_nulls_first_in_either_direction() {
         let key = OrderKey { col: 2, desc, nulls_first };
         let mut h = Harness::new(TopNPlan::from_wire(&schema(), &[1], &[key], 1, 0).unwrap(), &[1]);
         h.tick(&batch(&rows));
-        let ids: Vec<Vec<u8>> = h.state().into_keys().map(|row| row[0].clone().unwrap()).collect();
+        let ids: Vec<Vec<u8>> = h.state().into_keys().map(|(row, _)| row[0].clone().unwrap()).collect();
         let want: Vec<Vec<u8>> = want.iter().map(|id: &u64| id.to_le_bytes().to_vec()).collect();
         assert_eq!(ids, want, "desc={desc} nulls_first={nulls_first}");
     }
@@ -272,10 +163,10 @@ fn a_fixed_width_key_sits_whole_in_the_index_pk() {
         plan.output_schema.num_payload_cols(),
         "the carried columns alone"
     );
-    let idx = plan.index.batch(
-        &batch(&[((1, 0x100, None, None, 0), 1), ((2, 0x101, None, None, 0), 1)]),
-        plan.key.carried(),
-    );
+    let idx = plan.index.batch(&batch(&[
+        ((1, 0x100, None, None, 0), 1),
+        ((2, 0x101, None, None, 0), 1),
+    ]));
     let mb = idx.as_mem_batch();
     assert_ne!(mb.get_pk_bytes(0), mb.get_pk_bytes(1));
 }

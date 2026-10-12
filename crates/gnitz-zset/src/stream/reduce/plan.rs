@@ -67,7 +67,8 @@ impl ReducePlan {
             "the ground row carries no group columns"
         );
         let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
-        let shape = ReduceShape::new(input, key, prefix, aggs)?;
+        let empty = key.is_global();
+        let shape = ReduceShape::new(input, key, prefix, aggs, empty)?;
         let avi = AviBake::new(input, group_cols, &shape.aggs)?;
         let empty_group = AggValues::new(&shape.aggs, 1);
         Ok(ReducePlan {

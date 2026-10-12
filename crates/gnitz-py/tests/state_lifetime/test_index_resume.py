@@ -171,3 +171,27 @@ def test_the_ordered_index_of_a_top_n_view_survives_a_restart(own_server):
         assert bag(scanned(conn, "top2"), "id") == {(2,): 1, (3,): 1}
         conn.execute_sql("DELETE FROM scores WHERE id = 2")
         assert bag(scanned(conn, "top2"), "id") == {(3,): 1, (1,): 1}
+
+
+@pytest.mark.parametrize("graceful", [True, False], ids=["stop", "kill"])
+def test_the_ordered_index_of_a_window_view_survives_a_restart(own_server, graceful):
+    """A window's index of every input row is its whole history: after a restart
+    a new row still ranks behind the rows written before it, and a retraction
+    still moves the rows behind the one that left."""
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(
+            "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, score BIGINT NOT NULL); "
+            "CREATE VIEW ranked AS SELECT id, RANK() OVER w AS r, SUM(score) OVER w AS s FROM scores "
+            "WINDOW w AS (PARTITION BY grp ORDER BY score)")
+        insert(conn, "scores", [(1, 0, 10), (2, 0, 30), (3, 0, 20), (4, 1, 5)])
+        assert bag(scanned(conn, "ranked")) == {(1, 1, 10): 1, (2, 3, 60): 1, (3, 2, 30): 1, (4, 1, 5): 1}
+
+    own_server.restart(graceful=graceful)
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "ranked")) == {(1, 1, 10): 1, (2, 3, 60): 1, (3, 2, 30): 1, (4, 1, 5): 1}
+        insert(conn, "scores", [(5, 0, 25)])
+        assert bag(scanned(conn, "ranked")) == {
+            (1, 1, 10): 1, (2, 4, 85): 1, (3, 2, 30): 1, (4, 1, 5): 1, (5, 3, 55): 1}
+        conn.execute_sql("DELETE FROM scores WHERE id = 1")
+        assert bag(scanned(conn, "ranked")) == {(2, 3, 75): 1, (3, 1, 20): 1, (4, 1, 5): 1, (5, 2, 45): 1}

@@ -550,12 +550,15 @@ such a view.
 
 ## Window functions
 
-A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) desugars in the planner into
-operators that exist without it, and is legal only in a view body. A QUALIFY bounding a
-`ROW_NUMBER` nothing else reads cuts each partition with a top-N. Every other window is
-keyed on its partition and order keys by joins: they carry the join-key rules and must
-be provably NOT NULL, and `ROW_NUMBER` there is numbered over the ORDER BY extended by
-the input's unique key, so the input must be a set with one.
+A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) is legal only in a view body, and
+the planner realizes it by its specification. A QUALIFY bounding a `ROW_NUMBER` nothing
+else reads cuts each partition with a top-N. Every other window with an ORDER BY is an
+operator over its partition kept in order: its partition is a group key, its order takes
+any type and honours the written NULL placement, and a changed row reads the rows of its
+partition before it and re-emits those at or after it. A window over its whole partition
+is a join onto a reduce: its partition carries the join-key rules and must be provably
+NOT NULL. `ROW_NUMBER` outside the cut is numbered over the ORDER BY extended by the
+input's unique key, so the input must be a set with one.
 
 ## Delta feeds
 

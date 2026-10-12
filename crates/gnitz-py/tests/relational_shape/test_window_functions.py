@@ -1,14 +1,15 @@
 """Window functions: `f(...) OVER (PARTITION BY ... ORDER BY ...)`, QUALIFY and
 a named WINDOW clause.
 
-A window call is not an operator — the planner desugars it into ordinary joins
-and reduces over the body's own relation, so what each view states is which
-frame that desugar produces. Every view is checked against its frame computed
-from the rows the test wrote, on weights: the band self-join plus GROUP BY
-behind an ordered window is exactly where a weight bug would hide.
+An ordered window is an operator walking each partition in order; one over its
+whole partition is a join of the body to a reduce over it. What each view states
+is which frame it reads: every view is checked against its frame computed from
+the rows the test wrote, on weights — a row whose value moves is retracted and
+re-emitted, which is exactly where a weight bug would hide.
 
-Run with GNITZ_WORKERS=4 — the desugared joins exchange.
+Run with GNITZ_WORKERS=4 — a window's partitions and its joins exchange.
 """
+import functools
 from collections import Counter
 
 import gnitz
@@ -74,7 +75,7 @@ _VIEWS = [
     "ranks AS SELECT id, k, a, RANK() OVER (PARTITION BY k ORDER BY a) AS r, "
     "DENSE_RANK() OVER (PARTITION BY k ORDER BY a DESC) AS d, "
     "ROW_NUMBER() OVER (PARTITION BY k ORDER BY a DESC) AS rn, RANK() OVER (ORDER BY a DESC, ts) AS g FROM ev",
-    # A projected RANK in QUALIFY filters the desugar's value; the top-N recognizer
+    # A projected RANK in QUALIFY filters the window's value; the top-N recognizer
     # reads only an unprojected ROW_NUMBER.
     "top_rank AS SELECT id, k, RANK() OVER (PARTITION BY k ORDER BY a DESC) AS r FROM ev QUALIFY r <= 2",
     "running AS SELECT id, k, ts, SUM(a) OVER (PARTITION BY k ORDER BY ts) AS running, "
@@ -90,9 +91,9 @@ _VIEWS = [
     # The WHERE runs first; one named window serves both calls; both keys are computed.
     "named AS SELECT id, k % 2 AS parity, a, SUM(a) OVER w AS s, RANK() OVER w AS r FROM ev WHERE a > 1 "
     "WINDOW w AS (PARTITION BY k % 2 ORDER BY a * 2 DESC)",
-    # COUNT(*) and COUNT(a) over a NOT NULL `a` are one column of the peer-group
-    # reduce, which also carries AVG's and RANK's counts; ROW_NUMBER counts the peer
-    # groups of its own specification, each one row, beside an aggregate over it.
+    # COUNT(*) and COUNT(a) over a NOT NULL `a` are one column of the window, which
+    # AVG reads too; ROW_NUMBER ranks under its own specification's order, the row
+    # key included, beside an aggregate over it.
     "shared AS SELECT id, COUNT(*) OVER w AS c, COUNT(a) OVER w AS ca, AVG(a) OVER w AS av, SUM(b) OVER w AS sb, "
     "RANK() OVER w AS r, ROW_NUMBER() OVER w AS rn, COUNT(*) OVER (PARTITION BY k ORDER BY a, id) AS cid "
     "FROM ev WINDOW w AS (PARTITION BY k ORDER BY a)",
@@ -283,3 +284,140 @@ def test_row_number_reads_the_row_key_off_the_registered_view(client):
         "CREATE VIEW rn_pv AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM pv")
     client.execute_sql("INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 2, 20)")
     assert bag(scanned(client, "rn_pv"), "a", "rn") == {(10, 1): 1, (20, 2): 1, (30, 3): 1}
+
+
+def _keyed(rows, partition, order):
+    """Each partition of `rows` as its peer groups in `order`, a list of
+    `(column, descending, nulls_first)`: rows equal on every key are peers."""
+    def cmp(x, y):
+        for col, desc, nulls_first in order:
+            a, b = x[col], y[col]
+            if (a is None) != (b is None):
+                return -1 if (a is None) == nulls_first else 1
+            if a is not None and a != b:
+                return (-1 if a < b else 1) * (-1 if desc else 1)
+        return 0
+    for part in _partitions(rows, partition):
+        groups = []
+        for r in sorted(part, key=functools.cmp_to_key(cmp)):
+            if groups and cmp(groups[-1][0], r) == 0:
+                groups[-1].append(r)
+            else:
+                groups.append([r])
+        yield groups
+
+
+def _values(rows, partition, order, arg=None):
+    """`{id: (rank, dense rank, running sum of arg, running count)}`, each row at
+    its own multiplicity `w`."""
+    out = {}
+    for groups in _keyed(rows, partition, order):
+        before = total = count = 0
+        for dense, peers in enumerate(groups, 1):
+            for r in peers:
+                count += r.get("w", 1)
+                if arg and r[arg] is not None:
+                    total += r[arg] * r.get("w", 1)
+            for r in peers:
+                out[r["id"]] = (before + 1, dense, total, count)
+            before = count
+    return out
+
+
+def test_a_window_takes_an_ordered_indexs_keys(client):
+    """An ordered window keys an index, not a join: its order may be NULL, a
+    string or a float, placed where the ORDER BY says, and its partition may be
+    NULL — one partition. An aggregate may read its own partition column."""
+    client.execute_sql(
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, p BIGINT, o BIGINT, "
+        "s TEXT, f DOUBLE NOT NULL, a BIGINT NOT NULL); "
+        "CREATE VIEW nf AS SELECT id, RANK() OVER w AS r, DENSE_RANK() OVER w AS d, SUM(a) OVER w AS t "
+        "FROM n WINDOW w AS (PARTITION BY k ORDER BY o NULLS FIRST); "
+        "CREATE VIEW nl AS SELECT id, RANK() OVER w AS r, COUNT(*) OVER w AS c "
+        "FROM n WINDOW w AS (PARTITION BY k ORDER BY o DESC NULLS LAST); "
+        "CREATE VIEW st AS SELECT id, RANK() OVER (ORDER BY s DESC NULLS LAST, a) AS r, "
+        "SUM(a) OVER (PARTITION BY k ORDER BY s NULLS FIRST) AS t FROM n; "
+        "CREATE VIEW fl AS SELECT id, DENSE_RANK() OVER (PARTITION BY k ORDER BY f DESC) AS d FROM n; "
+        "CREATE VIEW np AS SELECT id, SUM(a) OVER (PARTITION BY p ORDER BY a DESC) AS t, "
+        "RANK() OVER (PARTITION BY p ORDER BY a DESC) AS r FROM n; "
+        "CREATE VIEW own AS SELECT id, SUM(k) OVER w AS t, MAX(k) OVER w AS m, COUNT(*) OVER w AS c "
+        "FROM n WINDOW w AS (PARTITION BY k ORDER BY a)")
+
+    cols = ("k", "p", "o", "s", "f", "a")
+    rows = {}
+
+    def write(sql, changes):
+        client.execute_sql(sql)
+        for i, r in changes.items():
+            if r is None:
+                del rows[i]
+            else:
+                rows[i] = dict(zip(("id", *cols), (i, *r)))
+        state = list(rows.values())
+
+        def check(view, names, want):
+            assert bag(scanned(client, view), "id", *names) == dict(sorted(Counter(want).items(), key=repr)), (sql, view)
+
+        v = _values(state, ["k"], [("o", False, True)], "a")
+        check("nf", ("r", "d", "t"), [(i, v[i][0], v[i][1], v[i][2]) for i in rows])
+        v = _values(state, ["k"], [("o", True, False)])
+        check("nl", ("r", "c"), [(i, v[i][0], v[i][3]) for i in rows])
+        r = _values(state, [], [("s", True, False), ("a", False, False)])
+        t = _values(state, ["k"], [("s", False, True)], "a")
+        check("st", ("r", "t"), [(i, r[i][0], t[i][2]) for i in rows])
+        v = _values(state, ["k"], [("f", True, False)])
+        check("fl", ("d",), [(i, v[i][1]) for i in rows])
+        v = _values(state, ["p"], [("a", True, False)], "a")
+        check("np", ("t", "r"), [(i, v[i][2], v[i][0]) for i in rows])
+        v = _values(state, ["k"], [("a", False, False)], "k")
+        check("own", ("t", "m", "c"), [(i, v[i][2], x["k"], v[i][3]) for i, x in rows.items()])
+
+    write("INSERT INTO n VALUES (1, 1, 1, 5, 'b', 1.5, 10), (2, 1, NULL, NULL, NULL, 2.5, 20), "
+          "(3, 1, 1, 7, 'a', 1.5, 30), (4, 2, NULL, 3, 'b', 0.5, 40), (5, 2, NULL, NULL, 'c', 0.25, 50), "
+          "(6, 2, 2, 3, NULL, 9.0, 60), (7, 3, 2, NULL, '', -1.0, 70)",
+          {1: (1, 1, 5, "b", 1.5, 10), 2: (1, None, None, None, 2.5, 20), 3: (1, 1, 7, "a", 1.5, 30),
+           4: (2, None, 3, "b", 0.5, 40), 5: (2, None, None, "c", 0.25, 50), 6: (2, 2, 3, None, 9.0, 60),
+           7: (3, 2, None, "", -1.0, 70)})
+    # A NULL key gains a value, and a value becomes NULL.
+    write("UPDATE n SET o = 6, s = 'bb' WHERE id = 2", {2: (1, None, 6, "bb", 2.5, 20)})
+    write("UPDATE n SET o = NULL, p = NULL WHERE id = 3", {3: (1, None, None, "a", 1.5, 30)})
+    # A second NULL peer, then the first one goes.
+    write("INSERT INTO n VALUES (8, 1, 1, NULL, NULL, 2.5, 5)", {8: (1, 1, None, None, 2.5, 5)})
+    write("DELETE FROM n WHERE id = 3", {3: None})
+    write("UPDATE n SET k = 2, f = 0.5 WHERE id = 1", {1: (2, 1, 5, "b", 0.5, 10)})
+    write("DELETE FROM n WHERE id = 4", {4: None})
+    write("DELETE FROM n WHERE id = 5", {5: None})
+
+
+def test_a_window_over_a_bag_weighs_every_copy(client):
+    """Over a body whose rows repeat, a row's copies are peers: each counts
+    toward the ranks behind it and folds into every aggregate at its
+    multiplicity, and the row is emitted at that multiplicity."""
+    client.execute_sql(
+        "CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL); "
+        "CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL); "
+        "CREATE VIEW both AS SELECT k, a FROM x UNION ALL SELECT k, a FROM y; "
+        "CREATE VIEW w AS SELECT k, a, RANK() OVER o AS r, DENSE_RANK() OVER o AS d, SUM(a) OVER o AS t, "
+        "COUNT(*) OVER o AS c FROM both WINDOW o AS (PARTITION BY k ORDER BY a)")
+    held = {"x": {}, "y": {}}
+
+    def write(table, sql, changes):
+        client.execute_sql(sql)
+        for i, r in changes.items():
+            if r is None:
+                del held[table][i]
+            else:
+                held[table][i] = r
+        copies = Counter(r for t in held.values() for r in t.values())
+        state = [dict(id=(k, a), k=k, a=a, w=w) for (k, a), w in copies.items()]
+        v = _values(state, ["k"], [("a", False, False)], "a")
+        want = {(k, a, *v[k, a]): w for (k, a), w in copies.items()}
+        assert bag(scanned(client, "w"), "k", "a", "r", "d", "t", "c") == dict(sorted(want.items(), key=repr)), sql
+
+    write("x", "INSERT INTO x VALUES (1, 1, 10), (2, 1, 10), (3, 1, 20), (4, 2, 5)",
+          {1: (1, 10), 2: (1, 10), 3: (1, 20), 4: (2, 5)})
+    write("y", "INSERT INTO y VALUES (1, 1, 10), (2, 1, 30), (3, 2, 5)", {1: (1, 10), 2: (1, 30), 3: (2, 5)})
+    write("x", "DELETE FROM x WHERE id = 2", {2: None})
+    write("y", "UPDATE y SET a = 20 WHERE id = 1", {1: (1, 20)})
+    write("x", "DELETE FROM x WHERE id = 1", {1: None})
+    write("y", "DELETE FROM y WHERE id = 3", {3: None})

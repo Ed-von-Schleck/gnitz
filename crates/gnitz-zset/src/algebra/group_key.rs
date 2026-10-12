@@ -201,7 +201,7 @@ pub(crate) fn ground_pk() -> NarrowPkOpk {
 }
 
 /// How an operator keyed like a reduce (the reduce itself, the ad-hoc fold, the
-/// top-N) groups its input and keys its output. A group is its output PK.
+/// top-N, the window) groups its input and keys its output. A group is its output PK.
 pub(crate) struct GroupOutKey {
     key: GroupKey,
     /// The output PK is a hidden `_group_pk`, which the key is widened to.

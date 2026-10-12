@@ -5,6 +5,7 @@
 //!   - `join`   — the bilinear operator, equi, range and cross, over one probe
 //!   - `reduce` — the incremental aggregate and its combined value index (`avi`)
 //!   - `topn`   — per-group top-N over an ordered index of every input row
+//!   - `window` — per-partition running values over the same ordered index
 //!
 //! These are the operators whose incremental form is not the operator itself:
 //! each consults an integral. Only a circuit dispatches to them, and each builds
@@ -17,8 +18,10 @@
 
 mod clamp;
 mod join;
+mod order_index;
 mod reduce;
 mod topn;
+mod window;
 
 use crate::repr::ReadCursor;
 
@@ -32,5 +35,7 @@ pub type OpenAt<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> ReadCursor;
 
 pub use clamp::op_weight_clamp;
 pub use join::{op_join_delta_trace, JoinPlan};
+pub use order_index::OrderedEpoch;
 pub use reduce::{op_reduce, ReducePlan};
-pub use topn::{op_topn, TopNEpoch, TopNPlan};
+pub use topn::{op_topn, TopNPlan};
+pub use window::{op_window, WindowPlan};

@@ -73,8 +73,8 @@ fn a_window_call_types_and_names_like_the_aggregate_it_is() {
             ],
         ),
         // A windowed MIN/MAX selects a row, so a TEXT argument survives the
-        // desugar's join and reduce at its source type: the join-key rules bind
-        // the partition and order keys, not the aggregate's own argument.
+        // desugar at its source type: a key's rules bind the partition, not the
+        // aggregate's own argument.
         (
             "SELECT id, MIN(s) OVER () AS m FROM t",
             vec![c("id", i, false), c("m", TypeCode::String, false)],
@@ -134,8 +134,8 @@ fn every_supported_window_shape_lowers() {
         // Named windows, one defined in terms of another.
         "SELECT id, RANK() OVER w AS r, SUM(a) OVER w AS s FROM t WINDOW w AS (PARTITION BY k ORDER BY a)",
         "SELECT id, RANK() OVER w2 AS r FROM t WINDOW w AS (PARTITION BY k ORDER BY a), w2 AS w",
-        // A division by a non-zero literal is never NULL; a string is fine as a
-        // hash key and as a residual key, a 128-bit value as the first ORDER BY key.
+        // A computed key, a string as a partition and as an order key, a 128-bit
+        // order key.
         "SELECT id, RANK() OVER (ORDER BY a / 2) FROM t",
         "SELECT id, COUNT(*) OVER (PARTITION BY s) FROM t",
         "SELECT id, RANK() OVER (ORDER BY a, s) FROM t",
@@ -165,6 +165,19 @@ fn every_supported_window_shape_lowers() {
         "SELECT id, RANK() OVER (PARTITION BY k ORDER BY k) AS r, SUM(a) OVER (PARTITION BY k ORDER BY k) AS s FROM t",
         "SELECT id, RANK() OVER (ORDER BY a, a) AS r, SUM(a) OVER (ORDER BY a, a) AS s FROM t",
         "SELECT id, SUM(a) OVER (PARTITION BY k, k) AS s FROM t",
+        // An ordered window's keys are an index's: a nullable, string or float order
+        // key, a 128-bit one in any position, and a nullable partition.
+        "SELECT id, RANK() OVER (ORDER BY b) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY b DESC NULLS LAST, s) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY f) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY s) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY a / k) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY a, big) FROM x",
+        "SELECT id, SUM(a) OVER (PARTITION BY b ORDER BY a) FROM t",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM t QUALIFY rn = 1",
+        "SELECT big, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM wk QUALIFY rn = 1",
+        // An aggregate over its own partition column.
+        "SELECT id, SUM(k) OVER (PARTITION BY k ORDER BY a) AS s, MAX(k) OVER (PARTITION BY k ORDER BY a) AS m FROM t",
         // A window call in ORDER BY alone, and one that is also an item.
         "SELECT id FROM t ORDER BY RANK() OVER (ORDER BY a) LIMIT 3",
         "SELECT id, RANK() OVER (ORDER BY a) AS r FROM t ORDER BY RANK() OVER (ORDER BY a) LIMIT 3",
@@ -212,15 +225,6 @@ fn a_bounded_row_number_takes_a_top_ns_keys() {
             "SELECT id FROM st QUALIFY ROW_NUMBER() OVER (PARTITION BY k) = 1",
             "ROW_NUMBER needs an input with a unique row key",
         ),
-        // A selected number is a value, which the join-keyed shape computes.
-        (
-            "SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM t QUALIFY rn = 1",
-            "window ORDER BY: the key must be provably NOT NULL",
-        ),
-        (
-            "SELECT big, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM wk QUALIFY rn = 1",
-            "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
-        ),
     ] {
         assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), needle);
     }
@@ -252,24 +256,8 @@ fn every_unsupported_window_names_its_clause() {
             "window PARTITION BY: a float-valued expression",
         ),
         (
-            "SELECT id, RANK() OVER (ORDER BY b) FROM t",
-            "window ORDER BY: the key must be provably NOT NULL",
-        ),
-        (
-            "SELECT id, RANK() OVER (ORDER BY f) FROM t",
-            "window ORDER BY: a float-valued expression",
-        ),
-        (
-            "SELECT id, RANK() OVER (ORDER BY s) FROM t",
-            "a string cannot be the first ORDER BY key",
-        ),
-        (
-            "SELECT id, RANK() OVER (ORDER BY a / k) FROM t",
-            "window ORDER BY: the key must be provably NOT NULL",
-        ),
-        (
-            "SELECT id, RANK() OVER (ORDER BY a, big) FROM x",
-            "window ORDER BY: a 128-bit key can only be the first",
+            "SELECT id, RANK() OVER (PARTITION BY f ORDER BY a) FROM t",
+            "window PARTITION BY: a float-valued expression",
         ),
         // Frames and functions outside the supported set.
         (
@@ -415,16 +403,9 @@ fn row_number_reads_the_row_key_off_the_relation() {
     for name in ["sv", "jv", "tv2", "uv"] {
         assert_rejects(name, over(name), "unique row key");
     }
-    // `tv1` and `dv` keep their unique key, a hidden 128-bit column no later
-    // ORDER BY key can compare.
-    assert_rejects(
-        "dv",
-        over("dv"),
-        "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
-    );
-    assert_rejects(
-        "tv1",
-        over("tv1"),
-        "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
-    );
+    // `tv1` and `dv` keep their unique key, a hidden 128-bit column the order
+    // extends by.
+    for name in ["dv", "tv1"] {
+        over(name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
 }

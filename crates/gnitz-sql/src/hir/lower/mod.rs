@@ -15,11 +15,11 @@ mod chain;
 pub(crate) mod fold;
 mod join;
 mod joincore;
+mod ordered;
 pub(crate) mod read;
 mod reduce;
 mod setop;
 mod spine;
-mod topn;
 
 use super::physical::{self, Frame, Rename, Slot};
 use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
@@ -244,31 +244,24 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
             match source.as_ref() {
                 RelExpr::Join { .. } => join::lower_join_view(chain, items, fpreds, source),
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, items, fpreds, source),
-                RelExpr::TopN { .. } => {
-                    let above = topn::Above { alias: None, preds: fpreds, items };
-                    topn::lower_topn(chain, source, Some(above))
-                }
-                // An alias nothing else reads: a window's cut under its outer read.
-                RelExpr::Alias { input: cut, cols }
-                    if matches!(cut.as_ref(), RelExpr::TopN { .. }) && Rc::strong_count(cut) == 1 =>
-                {
-                    let above = topn::Above { alias: Some(cols), preds: fpreds, items };
-                    topn::lower_topn(chain, cut, Some(above))
+                RelExpr::TopN { .. } | RelExpr::Window { .. } => {
+                    let above = Demand { items, where_preds: fpreds };
+                    ordered::lower_ordered(chain, source, Some(above))
                 }
                 _ => spine::lower_linear(chain, rel, items),
             }
         }
         RelExpr::Distinct { input } => setop::lower_distinct(chain, input),
         RelExpr::SetOp { out, .. } => setop::lower_setop(chain, rel, out),
-        RelExpr::TopN { .. } => topn::lower_topn(chain, rel, None),
+        RelExpr::TopN { .. } | RelExpr::Window { .. } => ordered::lower_ordered(chain, rel, None),
         _ => Err(GnitzSqlError::Internal(
             "HIR lowering has no body arm for this node".into(),
         )),
     }
 }
 
-/// `Project?(Filter?(Join | Reduce | TopN))`: what a join, reduce or top-N shell
-/// lowers as one body.
+/// `Project?(Filter?(Join | Reduce | TopN | Window))`: what a join, reduce, top-N
+/// or window shell lowers as one body.
 fn lowered_whole(rel: &RelExpr) -> bool {
     let rel = match rel {
         RelExpr::Project { input, .. } => input.as_ref(),
@@ -280,7 +273,7 @@ fn lowered_whole(rel: &RelExpr) -> bool {
     };
     matches!(
         rel,
-        RelExpr::Join { .. } | RelExpr::Reduce { .. } | RelExpr::TopN { .. }
+        RelExpr::Join { .. } | RelExpr::Reduce { .. } | RelExpr::TopN { .. } | RelExpr::Window { .. }
     )
 }
 
@@ -355,7 +348,9 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
                 RelExpr::project(Rc::clone(input), narrowed)
             }
         }
-        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::TopN { .. } => Rc::clone(subtree),
+        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::TopN { .. } | RelExpr::Window { .. } => {
+            Rc::clone(subtree)
+        }
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
             let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));

@@ -38,7 +38,7 @@ fn assert_kernels_match(b: &Batch, ci: u32) {
     ] {
         let aggs = [AggDescriptor { col_idx: ci, agg_op }];
         let (key, prefix) = GroupOutKey::new(schema, &[0], [0]).unwrap();
-        let aggs = ReduceShape::new(schema, key, prefix, &aggs).unwrap().aggs;
+        let aggs = ReduceShape::new(schema, key, prefix, &aggs, false).unwrap().aggs;
         let agg = &aggs[0];
         let ranges = [(0, 0), (0, 1), (3, 40), (40, 41), (41, N)];
         let step = |vals: &mut AggValues, g: usize, row: usize| {

@@ -15,8 +15,8 @@ mod join;
 mod subquery;
 
 use super::{
-    as_col, col_by_id, ColId, ColIdGen, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, SetOpKind, SubqueryKind,
-    SubqueryRef, TopNKey,
+    as_col, col_by_id, ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind,
+    SubqueryKind, SubqueryRef,
 };
 use crate::ast_util::{
     alias_column_names, body_is_grouped, expand_wildcard_item, extract_table_name_and_alias, has_visible_column,
@@ -227,7 +227,7 @@ impl<'a> QueryTail<'a> {
         let order = key_slots(&self.keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
             .into_iter()
             .zip(&self.keys)
-            .map(|(at, key)| TopNKey {
+            .map(|(at, key)| OrderCol {
                 col: cols[at].id,
                 desc: key.desc,
                 nulls_first: key.nulls_first,

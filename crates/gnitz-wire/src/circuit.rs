@@ -42,12 +42,15 @@ wire_enum! {
         /// Per-group top-N: the rows filling the first `limit` weight slots past
         /// `offset` of each group in ORDER BY order.
         TopN = 19,
+        /// Per-group running values: every row of a group, widened by its
+        /// values over the rows at or before it in ORDER BY order.
+        Window = 20,
     }
 }
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 11;
+pub(crate) const CIRCUIT_VERSION: u8 = 12;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -364,7 +367,7 @@ pub enum OpNode {
         kind: JoinKind,
     },
     /// Co-locates its input by the key of what reads it — the group columns of a
-    /// `Reduce` or `TopN` reader, else the input's own PK.
+    /// `Reduce`, `TopN` or `Window` reader, else the input's own PK.
     ExchangeShard,
     /// Widen every row with NULL columns of `type_codes`, ahead of the input's
     /// payload under `nulls_first` and behind it otherwise — the side order an
@@ -384,9 +387,43 @@ pub enum OpNode {
         limit: u64,
         offset: u64,
     },
+    /// Per-group running values: every row of each `group_cols` value at its own
+    /// weight, widened by its values over the rows of the group at or before its
+    /// peers in `order` — the rows equal to it on every order key. The values are
+    /// `rank`, one more than the weight of the rows before the row's peers; then
+    /// `dense_rank`, the number of peer groups up to and including the row's;
+    /// then each of `aggs` over those rows, the peers included. Keyed like a
+    /// `Reduce` over the same group set.
+    Window {
+        group_cols: Vec<u32>,
+        order: Vec<crate::OrderKey>,
+        aggs: Vec<AggDescriptor>,
+        rank: bool,
+        dense_rank: bool,
+    },
 }
 
 impl OpNode {
+    /// The columns of its input this operator groups by, for one that groups:
+    /// the key an [`OpNode::ExchangeShard`] in front of it co-locates by.
+    pub fn group_cols(&self) -> Option<&[u32]> {
+        match self {
+            OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } | OpNode::Window { group_cols, .. } => {
+                Some(group_cols)
+            }
+            OpNode::ScanDelta { .. }
+            | OpNode::Filter(_)
+            | OpNode::Map(_)
+            | OpNode::Negate
+            | OpNode::Union
+            | OpNode::WeightClamp(_)
+            | OpNode::Join { .. }
+            | OpNode::ExchangeShard
+            | OpNode::NullExtend { .. }
+            | OpNode::WorkerFilter => None,
+        }
+    }
+
     /// How many input slots this operator is wired on.
     pub const fn arity(&self) -> usize {
         match self {
@@ -402,7 +439,8 @@ impl OpNode {
             | OpNode::ExchangeShard
             | OpNode::NullExtend { .. }
             | OpNode::WorkerFilter
-            | OpNode::TopN { .. } => 1,
+            | OpNode::TopN { .. }
+            | OpNode::Window { .. } => 1,
         }
     }
 
@@ -464,6 +502,19 @@ impl OpNode {
                 .u64(*offset)
                 .list(group_cols)
                 .list(order),
+            OpNode::Window {
+                group_cols,
+                order,
+                aggs,
+                rank,
+                dense_rank,
+            } => w
+                .put(&Opcode::Window)
+                .bool(*rank)
+                .bool(*dense_rank)
+                .list(group_cols)
+                .list(order)
+                .list(aggs),
         };
     }
 
@@ -516,6 +567,19 @@ impl OpNode {
                 let group_cols = cols(r)?;
                 let order = r.list("order keys", crate::MAX_ORDER_KEYS)?;
                 OpNode::TopN { group_cols, order, limit, offset }
+            }
+            Opcode::Window => {
+                let (rank, dense_rank) = (r.bool()?, r.bool()?);
+                let group_cols = cols(r)?;
+                let order = r.list("order keys", crate::MAX_ORDER_KEYS)?;
+                let aggs = r.list("aggregates", MAX_COLUMNS)?;
+                OpNode::Window {
+                    group_cols,
+                    order,
+                    aggs,
+                    rank,
+                    dense_rank,
+                }
             }
         })
     }
@@ -786,6 +850,26 @@ impl Circuit {
             order: order.to_vec(),
             limit,
             offset,
+        };
+        self.add(op, &[sharded])
+    }
+
+    /// [`OpNode::Window`] behind an [`OpNode::ExchangeShard`] on its group columns.
+    pub fn window(
+        &mut self,
+        input: NodeId,
+        group_cols: &[u32],
+        order: &[crate::OrderKey],
+        aggs: &[AggDescriptor],
+        (rank, dense_rank): (bool, bool),
+    ) -> NodeId {
+        let sharded = self.shard(input);
+        let op = OpNode::Window {
+            group_cols: group_cols.to_vec(),
+            order: order.to_vec(),
+            aggs: aggs.to_vec(),
+            rank,
+            dense_rank,
         };
         self.add(op, &[sharded])
     }

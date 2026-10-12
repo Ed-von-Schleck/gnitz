@@ -136,6 +136,7 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
         RelExpr::Distinct { .. } => Err(derivation("DISTINCT CTE")),
         RelExpr::SetOp { .. } => Err(derivation("set operation")),
         RelExpr::TopN { .. } => Err(GnitzSqlError::Internal("an ad-hoc read bound a top-N".into())),
+        RelExpr::Window { .. } => Err(GnitzSqlError::Internal("an ad-hoc read bound a window".into())),
     }
 }
 

@@ -1,59 +1,49 @@
 //! Window functions (`f(…) OVER (PARTITION BY … ORDER BY …)`), desugared at
-//! bind into the join / reduce / top-N HIR the rest of the pipeline already
-//! lowers. No operator is added.
+//! bind into the window / join / reduce / top-N HIR the rest of the pipeline
+//! lowers.
 //!
 //! Let `W` be the relation the SELECT list projects (the FROM/WHERE tree, or
 //! the grouped relation) narrowed to one column per distinct expression a window
-//! operand, the SELECT list or QUALIFY reads. The body is one pipeline over it:
+//! operand, the SELECT list or QUALIFY reads. Every call belongs to a
+//! specification — its partition columns `P` and its order `O` — and the body is
+//! one pipeline over `W`:
 //!
-//! 1. **The cut.** A `ROW_NUMBER` bounded by a QUALIFY conjunct (`<= n`, `< n`,
-//!    `= n`) and read by nothing else is a per-partition top-N of `W`, which
-//!    replaces `W` as the outer side below. Its partition is a reduce group key,
-//!    so it takes any key but a float; its order takes any type and honours the
-//!    written NULL placement.
-//! 2. **The value relations.** Every other call belongs to a specification — its
-//!    partition columns `P` and its order `O` — and each specification is one
-//!    relation keyed on `(P, O)`, inner-joined onto the outer side:
-//!    * no order (no ORDER BY, or an aggregate under an `UNBOUNDED PRECEDING AND
-//!      UNBOUNDED FOLLOWING` frame): `γ_P(W)`, each aggregate per partition;
-//!    * an order (the default `RANGE … CURRENT ROW` frame): `G = γ_{P,O}(W)`
-//!      carries each aggregate per peer group, and `R = γ_{P,O}(G g1 ⋈ G g2 ON
-//!      g1.P = g2.P ∧ g2.O ≤ g1.O)` folds every peer group up to and including
-//!      the current one. `RANK` is `1 + Σ_{≤} cnt − own cnt`, `DENSE_RANK` the
-//!      number of peer groups folded, and every aggregate the fold of its
-//!      per-group value (AVG as `Σ sum / Σ count`). The `≤` band join matches
-//!      every group with itself, so the fold is never empty and needs no
-//!      null-fill; a multi-column order keys the band on its first column and
-//!      refines it lexicographically in the residual.
-//! 3. QUALIFY's remaining conjuncts filter the join, and the SELECT list projects it.
-//!
-//! Every value relation is computed over the whole of `W` and matches each outer
-//! row exactly once, so cutting the outer side commutes with the joins.
+//! 1. **The running values.** A specification with an order (the default `RANGE
+//!    … CURRENT ROW` frame) is one [`RelExpr::Window`] over the rows so far: every
+//!    row, widened by each aggregate folded up to and including the row's peers,
+//!    and by its rank among them. `ROW_NUMBER` is the rank under an order the
+//!    input's unique key makes total. Its partition is a reduce group key, so it
+//!    takes any key but a float; its order takes any type and honours the written
+//!    NULL placement.
+//! 2. **The cut.** A `ROW_NUMBER` bounded by a QUALIFY conjunct (`<= n`, `< n`,
+//!    `= n`) and read by nothing else is a per-partition top-N of those rows,
+//!    under the rules of a window's keys.
+//! 3. **The partition values.** A specification with no order (no ORDER BY, or an
+//!    aggregate under an `UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` frame) is
+//!    `γ_P(W)`, each aggregate per partition, inner-joined onto the rows on `P`.
+//!    It is computed over the whole of `W` and matches each row exactly once, so
+//!    the cut commutes with the join. `P` is a join key here, and carries a
+//!    join key's rules: no float, and provably NOT NULL (an inner join drops a
+//!    NULL key).
+//! 4. QUALIFY's remaining conjuncts filter the result, and the SELECT list projects it.
 //!
 //! A frame is read for an aggregate only: a ranking function ignores it.
 //!
-//! `ROW_NUMBER` orders by its ORDER BY extended by the input's unique key. In a
-//! value relation it is the count of peer groups at or before the current one,
-//! which numbers rows only where each peer group is one row at weight 1 — so the
-//! input must be a set with a unique key. The cut needs neither: over a bag each
-//! copy of a row fills its own weight slot.
+//! `ROW_NUMBER` numbers rows only where each peer group is one row at weight 1,
+//! so outside the cut its input must be a set with a unique key. The cut needs
+//! neither: over a bag each copy of a row fills its own weight slot.
 //!
-//! A specification's keys are join keys, and carry rules of their own: no float,
-//! provably NOT NULL (an inner join drops a NULL key), no string in the band
-//! slot, and no 128-bit key after the first order key.
-//!
-//! The desugar is purely logical: `W` and `G` are shared subtrees read through
-//! aliases, and the lowering's cut memo and collision rule decide what is read
-//! in place and what is cut once to a hidden segment.
+//! The desugar is purely logical: `W` is a shared subtree read through aliases,
+//! and the lowering's cut memo and collision rule decide what is read in place
+//! and what is cut once to a hidden segment.
 //!
 //! Cost under incremental maintenance: a changed row re-emits the rows of its
 //! partition at or after it (the whole partition for an unordered
-//! specification), and an ordered specification stores the band join's output
-//! under its fold — one row per ordered pair of peer groups of a partition.
+//! specification). An ordered specification also reads the rows of the
+//! partition before the changed one, and keeps one index entry per row of `W`.
 
 use super::bind::{bind_projection, place_order_keys, ItemLeaf};
-use super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr};
-use super::{TopNKey, Value};
+use super::{as_col, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr};
 use crate::agg::{agg_func_from_name, AggFunc};
 use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, AggArg, CallSurface, PlainCall};
 use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, LeafBinder};
@@ -72,8 +62,7 @@ use std::rc::Rc;
 
 /// A view body's SELECT list over the relation `rel` builds, with the item each
 /// ORDER BY key sorts on. Window calls in the list, in the ORDER BY keys and in
-/// QUALIFY are found by binding them; a body holding one is desugared into joins
-/// and reduces. `leaf` is the body's own item leaf; `ctx` names the surface.
+/// QUALIFY are found by binding them; a body holding one is desugared. `leaf` is the body's own item leaf; `ctx` names the surface.
 pub(crate) fn bind_view_select_list<L: ItemLeaf>(
     ids: &ColIdGen,
     select: &Select,
@@ -124,13 +113,14 @@ enum WinFunc {
     RowNumber,
 }
 
-/// One window call as written, its operands columns of `W`, and the column its
-/// value is read through. `order` is empty for a whole-partition window.
+/// One window call, its operands columns of `W`, and the column its value is
+/// read through. `order` is as written until the desugar makes it the call's
+/// effective order; it is empty for a whole-partition window.
 struct Call {
     func: WinFunc,
     arg: Option<ColId>,
     partition: Vec<ColId>,
-    order: Vec<TopNKey>,
+    order: Vec<OrderCol>,
     out: HirCol,
 }
 
@@ -247,7 +237,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     }
 
     /// Bind one `f(…) OVER (…)` call and hand back the placeholder column its
-    /// value stands in for until the desugar joins it in. Two calls equal in
+    /// value stands in for until the desugar computes it. Two calls equal in
     /// function, argument and specification share one.
     fn bind_window_call(&self, f: &Function) -> Result<HirCol, GnitzSqlError> {
         let over = f.over.as_ref().expect("bind_window_call receives a windowed call");
@@ -299,9 +289,9 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 partition_cols.push(col);
             }
         }
-        let order: Vec<TopNKey> = order
+        let order: Vec<OrderCol> = order
             .iter()
-            .map(|(e, desc, nulls_first)| TopNKey {
+            .map(|(e, desc, nulls_first)| OrderCol {
                 col: st.hoist(self.ids, self.inner, e),
                 desc: *desc,
                 nulls_first: *nulls_first,
@@ -379,7 +369,7 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
         self.inner.bind_aggregate(func, arg)
     }
     /// The one context that admits a window call: it binds to the placeholder
-    /// column its value stands in for until the desugar joins it in.
+    /// column its value stands in for until the desugar computes it.
     fn bind_window(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         Ok(BExpr::ColRef(self.bind_window_call(f)?.id))
     }
@@ -454,13 +444,13 @@ fn frame_is_whole(frame: Option<&WindowFrame>) -> Result<bool, GnitzSqlError> {
 /// A call's order as its plan keys on it: the written keys — a ROW_NUMBER's
 /// extended by `key`, the input's unique key, which makes the order total over a
 /// set — less any key the partition or an earlier key already fixes.
-fn effective_order(call: &Call, key: Option<&[ColId]>) -> Vec<TopNKey> {
+fn effective_order(call: &Call, key: Option<&[ColId]>) -> Vec<OrderCol> {
     let tiebreak = key
         .filter(|_| call.func == WinFunc::RowNumber)
         .into_iter()
         .flatten()
-        .map(|&col| TopNKey { col, desc: false, nulls_first: false });
-    let mut order: Vec<TopNKey> = Vec::new();
+        .map(|&col| OrderCol { col, desc: false, nulls_first: false });
+    let mut order: Vec<OrderCol> = Vec::new();
     for k in call.order.iter().copied().chain(tiebreak) {
         if !call.partition.contains(&k.col) && !order.iter().any(|o| o.col == k.col) {
             order.push(k);
@@ -496,14 +486,9 @@ fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<(u64, u64)> {
 /// The body's top-N cut: a ROW_NUMBER with an order, bounded by one QUALIFY
 /// conjunct and read by nothing else — its index in `calls`, that conjunct's in
 /// `qualify`, and the slots `offset .. offset + limit` the bound keeps.
-fn top_n_cut(
-    calls: &[Call],
-    orders: &[Vec<TopNKey>],
-    items: &[ProjEntry],
-    qualify: &[HirExpr],
-) -> Option<(usize, usize, u64, u64)> {
+fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option<(usize, usize, u64, u64)> {
     calls.iter().enumerate().find_map(|(ci, call)| {
-        if call.func != WinFunc::RowNumber || orders[ci].is_empty() {
+        if call.func != WinFunc::RowNumber || call.order.is_empty() {
             return None;
         }
         let rn = call.out.id;
@@ -522,56 +507,12 @@ fn top_n_cut(
     })
 }
 
-/// Where an ORDER BY key lands in the band join: the one range slot (the first
-/// key), the lexicographic residual (every later key), or an equality (hash)
-/// key.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum KeySlot {
-    Hash,
-    Band,
-    Residual,
-}
-
-/// The join-key rules a value relation's partition / order key must satisfy,
-/// stated with the clause named, rather than surfacing later as a rejection of a
-/// join the user never wrote.
-fn check_key(def: &ColumnDef, role: &str, slot: KeySlot) -> Result<(), GnitzSqlError> {
-    let tc = def.ty.tc;
-    reject_float_key(tc, None, role)?;
-    if slot == KeySlot::Band && tc.is_german_string() {
-        return Err(GnitzSqlError::Rejected(format!(
-            "{role}: a string cannot be the first ORDER BY key; its content hash is not \
-             order-preserving, so it cannot bound the band join the window folds over"
-        )));
-    }
-    if slot == KeySlot::Residual && tc.is_wide_int() {
-        return Err(GnitzSqlError::Rejected(format!(
-            "{role}: a 128-bit key can only be the first ORDER BY key; a later key is \
-             compared in an expression, which a 128-bit value cannot enter"
-        )));
-    }
-    if def.is_nullable {
-        return Err(GnitzSqlError::Rejected(format!(
-            "{role}: the key must be provably NOT NULL (a NOT NULL column, or an expression over \
-             NOT NULL columns) — the window is keyed on it, and a NULL key neither groups nor matches"
-        )));
-    }
-    Ok(())
-}
-
-/// One window specification of the desugar: its keys as `W` columns, each order
-/// key with whether it descends, and the calls it serves.
+/// One window specification of the desugar: its keys as `W` columns, and the
+/// calls it serves. `order` is empty for a whole-partition specification.
 struct Spec {
     partition: Vec<ColId>,
-    order: Vec<(ColId, bool)>,
+    order: Vec<OrderCol>,
     calls: Vec<Call>,
-}
-
-impl Spec {
-    /// The partition columns, then the order columns.
-    fn keys(&self) -> impl Iterator<Item = ColId> + '_ {
-        self.partition.iter().copied().chain(self.order.iter().map(|&(c, _)| c))
-    }
 }
 
 /// A fresh read of a relation: the alias, its columns, and its column for each
@@ -599,9 +540,10 @@ impl Read {
     }
 }
 
-/// Rewrite a windowed body: cut `W` by the QUALIFY-bounded ROW_NUMBER if there is
-/// one, join every remaining specification's value relation onto the outer read,
-/// filter by what is left of QUALIFY and project the SELECT list.
+/// Rewrite a windowed body: widen `W` by every ordered specification's running
+/// values, cut it by the QUALIFY-bounded ROW_NUMBER if there is one, join every
+/// unordered specification's value relation onto an outer read of that, filter
+/// by what is left of QUALIFY and project the SELECT list.
 fn desugar<L: ItemLeaf>(
     ids: &ColIdGen,
     input: Rc<RelExpr>,
@@ -619,23 +561,33 @@ fn desugar<L: ItemLeaf>(
     } else {
         None
     };
-    let mut orders: Vec<Vec<TopNKey>> = calls.iter().map(|c| effective_order(c, key.as_deref())).collect();
-
-    let cut = match top_n_cut(&calls, &orders, &items, &qualify) {
-        Some((ci, qi, offset, limit)) => {
-            let (call, order) = (calls.remove(ci), orders.remove(ci));
-            qualify.remove(qi);
-            // A top-N's partition is a reduce group key: GROUP BY's rule.
-            for &p in &call.partition {
-                reject_float_key(def_of(&win.w, p).ty.tc, None, "window PARTITION BY")?;
+    for call in &mut calls {
+        call.order = effective_order(call, key.as_deref());
+        for &p in &call.partition {
+            let def = def_of(&win.w, p);
+            // A partition is a reduce group key: GROUP BY's rule.
+            reject_float_key(def.ty.tc, None, "window PARTITION BY")?;
+            // Stated with the clause named, rather than surfacing later as a
+            // rejection of a join the user never wrote.
+            if call.order.is_empty() && def.is_nullable {
+                return Err(GnitzSqlError::Rejected(
+                    "window PARTITION BY: the key must be provably NOT NULL (a NOT NULL column, or an \
+                     expression over NOT NULL columns) — a window over its whole partition is joined on \
+                     it, and a NULL key neither groups nor matches"
+                        .into(),
+                ));
             }
-            Some((call.partition, order, limit, offset))
         }
-        None => None,
-    };
+    }
+
+    let cut = top_n_cut(&calls, &items, &qualify).map(|(ci, qi, offset, limit)| {
+        qualify.remove(qi);
+        let call = calls.remove(ci);
+        (call.partition, call.order, limit, offset)
+    });
 
     let mut specs: Vec<Spec> = Vec::new();
-    for (call, order) in calls.into_iter().zip(orders) {
+    for call in calls {
         if call.func == WinFunc::RowNumber && key.is_none() {
             return Err(GnitzSqlError::Rejected(
                 "ROW_NUMBER needs an input with a unique row key (a table, or a grouped or DISTINCT \
@@ -645,27 +597,14 @@ fn desugar<L: ItemLeaf>(
                     .into(),
             ));
         }
-        for &p in &call.partition {
-            check_key(def_of(&win.w, p), "window PARTITION BY", KeySlot::Hash)?;
-        }
-        for (i, k) in order.iter().enumerate() {
-            let role = if call.order.iter().any(|written| written.col == k.col) {
-                "window ORDER BY"
-            } else {
-                "ROW_NUMBER's tiebreak (the input's row key)"
-            };
-            let slot = if i == 0 { KeySlot::Band } else { KeySlot::Residual };
-            check_key(def_of(&win.w, k.col), role, slot)?;
-        }
-        let order: Vec<(ColId, bool)> = order.iter().map(|k| (k.col, k.desc)).collect();
         match specs
             .iter_mut()
-            .find(|s| s.partition == call.partition && s.order == order)
+            .find(|s| s.partition == call.partition && s.order == call.order)
         {
             Some(spec) => spec.calls.push(call),
             None => specs.push(Spec {
                 partition: call.partition.clone(),
-                order,
+                order: call.order.clone(),
                 calls: vec![call],
             }),
         }
@@ -685,213 +624,129 @@ fn desugar<L: ItemLeaf>(
 
     // W: the narrowing projection every read of the input aliases.
     let w = leaf.project(input, win.w)?;
-    let base = match cut {
-        Some((partition, order, limit, offset)) => RelExpr::top_n(Rc::clone(&w), partition, order, limit, offset),
-        None => Rc::clone(&w),
-    };
-    // Every specification's value relation, joined onto the outer read. An
-    // unordered specification with no partition key is a keyless (cross) join
-    // against the one global row.
-    let outer = Read::of(ids, &base);
-    let mut cur = Rc::clone(&outer.rel);
-    for spec in &specs {
-        let (rel, keys) = spec_relation(ids, &w, spec)?;
-        let on = spec
-            .keys()
-            .zip(keys)
-            .map(|(k, r)| BExpr::bin(outer.col(k), BinOp::Eq, BExpr::ColRef(r)))
-            .collect();
-        cur = RelExpr::join(cur, rel, JoinType::Inner, on)?;
+    // A call's value is an expression over columns its specification adds.
+    let mut values: HashMap<ColId, HirExpr> = HashMap::new();
+    // The rows: W under every ordered specification's values, then the cut. Every
+    // later node carries the columns a window adds.
+    let mut rows = Rc::clone(&w);
+    for spec in specs.iter().filter(|s| !s.order.is_empty()) {
+        rows = running_values(ids, rows, spec, &mut values)?;
+    }
+    if let Some((partition, order, limit, offset)) = cut {
+        rows = RelExpr::top_n(rows, partition, order, limit, offset);
+    }
+    // Every unordered specification's `γ_P(W)`, joined onto an outer read of the
+    // rows. One with no partition key is a keyless (cross) join against the one
+    // global row.
+    let mut unordered = specs.iter().filter(|s| s.order.is_empty()).peekable();
+    let outer = unordered.peek().is_some().then(|| Read::of(ids, &rows));
+    if let Some(outer) = &outer {
+        rows = Rc::clone(&outer.rel);
+        for spec in unordered {
+            let (rel, keys) = partition_values(ids, &w, spec, &mut values)?;
+            let on = spec
+                .partition
+                .iter()
+                .zip(keys)
+                .map(|(&k, r)| BExpr::bin(outer.col(k), BinOp::Eq, BExpr::ColRef(r)))
+                .collect();
+            rows = RelExpr::join(rows, rel, JoinType::Inner, on)?;
+        }
     }
 
-    // A `W` reference reads the outer side; a placeholder is the id its value
-    // column was minted under, so it already names a column of the join.
-    let to_outer = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(outer.at.get(id).copied().unwrap_or(*id)));
-    let qualify = qualify.iter().map(to_outer).collect();
+    // A placeholder reads its value; a column of the rows reads the outer side,
+    // where there is one.
+    let rewrite = |e: &HirExpr| {
+        let valued = e.rebuild(&mut |id| values.get(id).cloned().unwrap_or(BExpr::ColRef(*id)));
+        match &outer {
+            Some(outer) => valued.rebuild(&mut |id| BExpr::ColRef(outer.at.get(id).copied().unwrap_or(*id))),
+            None => valued,
+        }
+    };
+    let qualify = qualify.iter().map(rewrite).collect();
     let items = items
         .into_iter()
-        .map(|it| ProjEntry { expr: to_outer(&it.expr), out: it.out })
+        .map(|it| ProjEntry { expr: rewrite(&it.expr), out: it.out })
         .collect();
-    Ok(RelExpr::project(RelExpr::filter(cur, qualify)?, items))
+    Ok(RelExpr::project(RelExpr::filter(rows, qualify)?, items))
 }
 
-/// A reduce's aggregate list, with each aggregate's index handed back so a value
-/// can address it.
-struct Aggs<'a> {
-    env: &'a [HirCol],
-    ids: &'a ColIdGen,
+/// The value of aggregate `(func, arg)` over a relation of columns `env`,
+/// listed in `aggs` with the aggregates of the same reduce or window.
+fn agg_value(
+    ids: &ColIdGen,
+    env: &[HirCol],
     is_global: bool,
-    list: Vec<HirAgg>,
+    aggs: &mut Vec<HirAgg>,
+    func: AggFunc,
+    arg: Option<ColId>,
+) -> Result<HirExpr, GnitzSqlError> {
+    let agg = HirAgg::new(ids, func, arg.map_or(AggArg::Star, AggArg::All), env, is_global, aggs)?;
+    let value = agg.as_value().0;
+    aggs.push(agg);
+    Ok(value)
 }
 
-impl Aggs<'_> {
-    fn slot(&mut self, func: AggFunc, arg: Option<ColId>) -> Result<usize, GnitzSqlError> {
-        let arg = arg.map_or(AggArg::Star, AggArg::All);
-        let agg = HirAgg::new(self.ids, func, arg, self.env, self.is_global, &self.list)?;
-        // `HirAgg::new` shares physical columns, so `COUNT(x)` over a NOT NULL `x` is
-        // the `COUNT(*)` already listed.
-        let same = |a: &HirAgg| {
-            a.func == func
-                && a.out.col.id == agg.out.col.id
-                && a.companion.as_ref().map(|c| c.col.id) == agg.companion.as_ref().map(|c| c.col.id)
-        };
-        Ok(match self.list.iter().position(same) {
-            Some(i) => i,
-            None => {
-                self.list.push(agg);
-                self.list.len() - 1
-            }
-        })
-    }
-
-    /// Aggregate `(func, arg)`, registered on first sight, as a value column.
-    fn value(&mut self, func: AggFunc, arg: Option<ColId>) -> Result<Value, GnitzSqlError> {
-        let slot = self.slot(func, arg)?;
-        Ok(self.list[slot].as_value())
-    }
-}
-
-/// `rel`'s `keys` passed through, then each value as the column of its id.
-fn present(rel: Rc<RelExpr>, keys: &[ColId], values: Vec<(ColId, Value)>) -> Rc<RelExpr> {
-    let cols = rel.cols();
-    let mut items = RelExpr::passthrough_items(keys.iter().map(|&k| hircol_of(&cols, k).clone()));
-    items.extend(values.into_iter().map(|(id, (expr, ty, nullable))| ProjEntry {
-        expr,
-        out: HirCol::new(id, ColumnDef::typed("_win", ty, nullable)),
-    }));
-    RelExpr::project(rel, items)
-}
-
-/// One specification's value relation — keyed on the specification's keys, one
-/// column per call under the call's placeholder id — and its key columns in
-/// `spec.keys()` order.
-fn spec_relation(ids: &ColIdGen, w: &Rc<RelExpr>, spec: &Spec) -> Result<(Rc<RelExpr>, Vec<ColId>), GnitzSqlError> {
-    let wf = Read::of(ids, w);
-    let keys: Vec<ColId> = spec.keys().map(|k| wf.at[&k]).collect();
-    let arg = |c: &Call| c.arg.map(|a| wf.at[&a]);
-    let mut g_aggs = Aggs {
-        env: &wf.cols,
-        ids,
-        is_global: keys.is_empty(),
-        list: Vec::new(),
+/// `rows` under an ordered specification's running values, and each of its
+/// calls' values into `values` under the call's placeholder id.
+fn running_values(
+    ids: &ColIdGen,
+    rows: Rc<RelExpr>,
+    spec: &Spec,
+    values: &mut HashMap<ColId, HirExpr>,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let cols = rows.cols();
+    let mut aggs = Vec::new();
+    let (mut rank, mut dense_rank) = (None, None);
+    let number = |col: &mut Option<HirCol>| {
+        let def = || ColumnDef::typed("_win", ColType::of(TypeCode::I64), false);
+        BExpr::ColRef(col.get_or_insert_with(|| HirCol::new(ids.next(), def())).id)
     };
-
-    if spec.order.is_empty() {
-        let mut values = Vec::with_capacity(spec.calls.len());
-        for c in &spec.calls {
-            values.push((
-                c.out.id,
-                match c.func {
-                    WinFunc::Agg(func) => g_aggs.value(func, arg(c))?,
-                    // Nothing orders the partition, so every row of it is first.
-                    _ => (BExpr::LitInt(1), ColType::of(TypeCode::I64), false),
-                },
-            ));
-        }
-        let g = RelExpr::reduce(Rc::clone(&wf.rel), keys.clone(), HirAgg::physical(&g_aggs.list));
-        return Ok((present(g, &keys, values), keys));
-    }
-
-    // G: one row per peer group, carrying what each call folds. Over a set and a
-    // total order every peer group is one row, so a ROW_NUMBER, like a DENSE_RANK,
-    // counts groups and reads nothing of one.
-    let mut carried: Vec<Vec<usize>> = Vec::with_capacity(spec.calls.len());
     for c in &spec.calls {
-        carried.push(match c.func {
-            WinFunc::Agg(AggFunc::Avg) => {
-                vec![g_aggs.slot(AggFunc::Sum, arg(c))?, g_aggs.slot(AggFunc::Count, arg(c))?]
+        let value = match c.func {
+            // A row's own frame holds the row, so no aggregate is one over no rows.
+            WinFunc::Agg(func) => agg_value(ids, &cols, false, &mut aggs, func, c.arg)?,
+            // The order is total over a set, so a row is its own peer group.
+            WinFunc::Rank | WinFunc::RowNumber => number(&mut rank),
+            WinFunc::DenseRank => number(&mut dense_rank),
+        };
+        values.insert(c.out.id, value);
+    }
+    let (partition, order) = (spec.partition.clone(), spec.order.clone());
+    Ok(RelExpr::window(
+        rows,
+        partition,
+        order,
+        HirAgg::physical(&aggs),
+        rank,
+        dense_rank,
+    ))
+}
+
+/// An unordered specification's `γ_P(W)` and its key columns in partition order,
+/// and each of its calls' values into `values` under the call's placeholder id.
+fn partition_values(
+    ids: &ColIdGen,
+    w: &Rc<RelExpr>,
+    spec: &Spec,
+    values: &mut HashMap<ColId, HirExpr>,
+) -> Result<(Rc<RelExpr>, Vec<ColId>), GnitzSqlError> {
+    let wf = Read::of(ids, w);
+    let keys: Vec<ColId> = spec.partition.iter().map(|k| wf.at[k]).collect();
+    let mut aggs = Vec::new();
+    for c in &spec.calls {
+        let value = match c.func {
+            WinFunc::Agg(func) => {
+                let arg = c.arg.map(|a| wf.at[&a]);
+                agg_value(ids, &wf.cols, keys.is_empty(), &mut aggs, func, arg)?
             }
-            WinFunc::Agg(func) => vec![g_aggs.slot(func, arg(c))?],
-            WinFunc::Rank => vec![g_aggs.slot(AggFunc::Count, None)?],
-            WinFunc::DenseRank | WinFunc::RowNumber => vec![],
-        });
+            // Nothing orders the partition, so every row of it is first.
+            _ => BExpr::LitInt(1),
+        };
+        values.insert(c.out.id, value);
     }
-    let g_cols: Vec<ColId> = g_aggs.list.iter().map(|_| ids.next()).collect();
-    let g = present(
-        RelExpr::reduce(Rc::clone(&wf.rel), keys.clone(), HirAgg::physical(&g_aggs.list)),
-        &keys,
-        g_cols
-            .iter()
-            .copied()
-            .zip(g_aggs.list.iter().map(HirAgg::as_value))
-            .collect(),
-    );
-
-    // The band self-join: g1 is the current peer group, g2 every group of its
-    // partition at or before it under each key's own direction.
-    let (g1, g2) = (Read::of(ids, &g), Read::of(ids, &g));
-    let cmp = |k: ColId, op: BinOp| BExpr::bin(g2.col(k), op, g1.col(k));
-    let weak = |desc: bool| if desc { BinOp::Ge } else { BinOp::Le };
-    let strict = |desc: bool| if desc { BinOp::Gt } else { BinOp::Lt };
-    let np = spec.partition.len();
-    let dirs = || keys[np..].iter().copied().zip(spec.order.iter().map(|&(_, desc)| desc));
-    let mut on: Vec<HirExpr> = keys[..np].iter().map(|&k| cmp(k, BinOp::Eq)).collect();
-    let (k0, desc0) = dirs().next().expect("an ordered specification has an order key");
-    on.push(cmp(k0, weak(desc0)));
-    if spec.order.len() > 1 {
-        // `g2.O ≤lex g1.O`, which the range slot above bounds on its first key.
-        let lex = dirs().rev().fold(None, |rest: Option<HirExpr>, (k, desc)| {
-            Some(match rest {
-                None => cmp(k, weak(desc)),
-                Some(rest) => {
-                    let tie = BExpr::bin(cmp(k, BinOp::Eq), BinOp::And, rest);
-                    BExpr::bin(cmp(k, strict(desc)), BinOp::Or, tie)
-                }
-            })
-        });
-        on.extend(lex);
-    }
-    let band = RelExpr::join(Rc::clone(&g1.rel), Rc::clone(&g2.rel), JoinType::Inner, on)?;
-    let band_cols = band.cols();
-
-    // R: g2's carried values folded over the band, keyed by g1's group.
-    let mut r_keys: Vec<ColId> = keys.iter().map(|k| g1.at[k]).collect();
-    let mut r_aggs = Aggs {
-        env: &band_cols,
-        ids,
-        is_global: false,
-        list: Vec::new(),
-    };
-    let mut values = Vec::with_capacity(spec.calls.len());
-    for (c, slots) in spec.calls.iter().zip(&carried) {
-        let of_g2 = |slot: usize| Some(g2.at[&g_cols[slot]]);
-        values.push((
-            c.out.id,
-            match c.func {
-                WinFunc::Agg(AggFunc::Avg) => {
-                    let (sum, _, nullable) = r_aggs.value(AggFunc::Sum, of_g2(slots[0]))?;
-                    let (cnt, _, _) = r_aggs.value(AggFunc::Sum, of_g2(slots[1]))?;
-                    (
-                        crate::agg::finalize_agg_bexpr(sum, Some(cnt), AggFunc::Avg),
-                        ColType::of(TypeCode::F64),
-                        nullable,
-                    )
-                }
-                WinFunc::Agg(func @ (AggFunc::Min | AggFunc::Max)) => r_aggs.value(func, of_g2(slots[0]))?,
-                WinFunc::Agg(_) => r_aggs.value(AggFunc::Sum, of_g2(slots[0]))?,
-                // Rows before the current group: the fold less the group's own count,
-                // which is a column of g1 and so a group key of R.
-                WinFunc::Rank => {
-                    let own = g1.at[&g_cols[slots[0]]];
-                    if !r_keys.contains(&own) {
-                        r_keys.push(own);
-                    }
-                    let (folded, _, _) = r_aggs.value(AggFunc::Sum, of_g2(slots[0]))?;
-                    let before = BExpr::bin(folded, BinOp::Sub, BExpr::ColRef(own));
-                    (
-                        BExpr::bin(before, BinOp::Add, BExpr::LitInt(1)),
-                        ColType::of(TypeCode::I64),
-                        false,
-                    )
-                }
-                // The band holds one row per group at or before the current one.
-                WinFunc::DenseRank | WinFunc::RowNumber => r_aggs.value(AggFunc::Count, None)?,
-            },
-        ));
-    }
-    let r = RelExpr::reduce(band, r_keys.clone(), HirAgg::physical(&r_aggs.list));
-    let keys = r_keys[..keys.len()].to_vec();
-    Ok((present(r, &keys, values), keys))
+    let reduce = RelExpr::reduce(Rc::clone(&wf.rel), keys.clone(), HirAgg::physical(&aggs));
+    Ok((reduce, keys))
 }
 
 #[cfg(test)]

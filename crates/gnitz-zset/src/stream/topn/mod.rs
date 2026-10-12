@@ -8,7 +8,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-mod index;
 mod op_topn;
 mod plan;
 
@@ -20,5 +19,5 @@ mod bench;
 #[path = "tests/topn.rs"]
 mod tests;
 
-pub use op_topn::{op_topn, TopNEpoch};
+pub use op_topn::op_topn;
 pub use plan::TopNPlan;

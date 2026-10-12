@@ -588,6 +588,48 @@ impl AggValues {
         }
     }
 
+    /// What `rows`' row at `weight` does to group `g` of aggregate `k`. An extreme
+    /// takes a positive weight only.
+    #[inline]
+    pub(crate) fn step(&mut self, k: usize, agg: &Agg, g: usize, rows: &impl RowSource, row: usize, weight: i64) {
+        self.apply(k, g, (agg.kind, agg.src), rows, row, weight);
+    }
+
+    /// Empty every group.
+    pub(crate) fn clear(&mut self) {
+        self.acc.fill(0);
+        self.has.fill(false);
+    }
+
+    /// Give group `to` the value group `from` holds of aggregate `k`.
+    pub(crate) fn copy(&mut self, k: usize, agg: &Agg, from: usize, to: usize) {
+        let (from, to) = (self.at(k, from), self.at(k, to));
+        self.acc[to] = self.acc[from];
+        if let StepKind::Extreme { kind, .. } = agg.kind {
+            self.has[to] = self.has[from];
+            if matches!(kind, ImageKind::Wide(_)) && self.has[from] {
+                let value = self.wide(from).to_vec();
+                self.store_wide(to, &value);
+            }
+        }
+    }
+
+    /// Whether groups `a` and `b` hold the same value of aggregate `k`.
+    pub(crate) fn same(&self, k: usize, agg: &Agg, a: usize, b: usize) -> bool {
+        let (a, b) = (self.at(k, a), self.at(k, b));
+        match agg.kind {
+            StepKind::Extreme { kind, .. } => {
+                self.has[a] == self.has[b]
+                    && (!self.has[a]
+                        || match kind {
+                            ImageKind::Scalar(_) => self.acc[a] == self.acc[b],
+                            ImageKind::Wide(_) => self.wide(a) == self.wide(b),
+                        })
+            }
+            _ => self.acc[a] == self.acc[b],
+        }
+    }
+
     /// Fold into group `g` aggregate `k`'s value from a previously-emitted
     /// output row.
     pub(crate) fn fold_stored(&mut self, k: usize, agg: &Agg, g: usize, out_row: &impl RowSource, row: usize) {

@@ -3,8 +3,8 @@
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::OrderKey;
 
-use super::index::TopNIndex;
 use crate::algebra::GroupOutKey;
+use crate::stream::order_index::OrderIndex;
 
 /// The baked per-instruction top-N plan.
 pub struct TopNPlan {
@@ -17,7 +17,7 @@ pub struct TopNPlan {
     pub(super) offset: u64,
     pub(super) limit: u64,
     /// The ordered index of every input row this operator is maintained through.
-    pub(super) index: TopNIndex,
+    pub(super) index: OrderIndex,
 }
 
 impl TopNPlan {
@@ -33,9 +33,8 @@ impl TopNPlan {
         if limit == 0 {
             return Err("top-n: a zero limit selects nothing".to_string());
         }
-        let (key, prefix) = GroupOutKey::new(input_schema, group_cols, 0..input_schema.num_columns() as u32)?;
-        let output_schema = prefix.finish().map_err(|e| format!("top-n: output {e}"))?;
-        let index = TopNIndex::new(input_schema, group_cols, order, &output_schema)?;
+        let (index, key, row) = OrderIndex::new(input_schema, group_cols, order, [])?;
+        let output_schema = row.finish().map_err(|e| format!("top-n: output {e}"))?;
         Ok(TopNPlan { output_schema, key, offset, limit, index })
     }
 

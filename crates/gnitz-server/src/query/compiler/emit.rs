@@ -244,6 +244,29 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(push_topn(ctx, nid, in_reg, plan))
         }
 
+        gnitz_wire::OpNode::Window {
+            group_cols,
+            order,
+            aggs,
+            rank,
+            dense_rank,
+        } => {
+            let in_reg = ctx.unary_delta_in(nid);
+            let in_schema = ctx.prog.schema_of(in_reg);
+            let plan = Box::new(gnitz_zset::stream::WindowPlan::from_wire(
+                &in_schema,
+                group_cols,
+                order,
+                aggs,
+                *rank,
+                *dense_rank,
+            )?);
+            let out_schema = *plan.output_schema();
+            // The ordered index of every input row — the operator's whole history.
+            let index = ctx.declare_child("windowidx", nid, *plan.index_schema());
+            Ok(ctx.prog.push(in_reg, out_schema, Op::Window { index, plan }))
+        }
+
         gnitz_wire::OpNode::Join { kind } => {
             let &[da, db, ia, ib] = ctx.circuit.inputs(nid) else {
                 unreachable!("a join is wired on four inputs")
@@ -409,7 +432,8 @@ fn push_topn(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: gnitz_zset:
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce
-/// whose partials do not combine. Its children are the shard's.
+/// whose partials do not combine and for a window, whose every row reads the
+/// rows before it. Its children are the shard's.
 fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>, String> {
     let shard = ctx.circuit.inputs(consumer)[0];
     let in_reg = ctx.unary_delta_in(shard);
@@ -421,7 +445,8 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
             let plan = gnitz_zset::stream::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
             Some(push_topn(ctx, shard, in_reg, plan))
         }
-        _ => unreachable!("`keyed_reader` names only a Reduce or a TopN"),
+        gnitz_wire::OpNode::Window { .. } => None,
+        _ => unreachable!("`keyed_reader` names only a Reduce, a TopN or a Window"),
     })
 }
 

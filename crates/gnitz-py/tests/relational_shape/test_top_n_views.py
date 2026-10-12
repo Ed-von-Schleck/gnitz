@@ -116,7 +116,7 @@ def test_qualify_cuts_each_partition(client):
     """`rn <= n`, `n > rn` and `rn = 1` are bounds the recognizer reads, so each
     takes the top rows of each partition, and a partition emptied loses its rows
     while a new one gains them. A *projected* `rn` is a value the top-N operator
-    cannot supply, so the join-keyed desugar answers instead, and selects the same
+    cannot supply, so the window operator answers instead, and selects the same
     rows because both order by the written keys and then the unique key. A
     partition key naming the whole PK in another order is one row per PK, and the
     operator must shard by the PK's own order to find them."""
@@ -194,7 +194,7 @@ def test_a_cut_takes_any_slot_and_sits_beside_other_windows(client):
 def test_a_cut_takes_null_keys(client):
     """A top-N's partition is a group key and its order any column, so both may
     be NULL: the NULL partition is one partition, and NULLs sort where the ORDER BY
-    says — which a join-keyed window, refusing a nullable key, never had to honour."""
+    says."""
     client.execute_sql(
         "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, p BIGINT, o BIGINT); "
         "CREATE VIEW nf AS SELECT id FROM n QUALIFY ROW_NUMBER() OVER (PARTITION BY p ORDER BY o NULLS FIRST) <= 2; "

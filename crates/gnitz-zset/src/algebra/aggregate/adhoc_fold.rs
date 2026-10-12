@@ -44,7 +44,8 @@ impl AdhocFold {
         let (key, prefix) =
             GroupOutKey::new(src_schema, &agg.group_cols, agg.group_cols.iter().copied()).map_err(refuse)?;
         let mut groups = Batch::empty_with_schema(&prefix.finish().map_err(refuse)?);
-        let shape = ReduceShape::new(src_schema, key, prefix, &agg.aggs).map_err(refuse)?;
+        let empty = key.is_global();
+        let shape = ReduceShape::new(src_schema, key, prefix, &agg.aggs, empty).map_err(refuse)?;
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
             groups.push_key_row(ground_pk().bytes(), 1);

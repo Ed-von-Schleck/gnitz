@@ -84,18 +84,16 @@ fn behind_ground_reduce(circuit: &Circuit, nid: NodeId) -> bool {
     (0..circuit.nodes().len()).any(|n| behind[n] && circuit.owes_ground_row(n))
 }
 
-/// The `Reduce` or `TopN` reading `shard`, and its group columns — the key the
-/// exchange co-locates by. `None` where no reader is one: the rows are placed by
-/// their own PK.
+/// The reader of `shard` that groups its input, and its group columns — the key
+/// the exchange co-locates by. `None` where no reader is one: the rows are placed
+/// by their own PK.
 fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Result<Option<(NodeId, &[u32])>, String> {
-    use gnitz_wire::OpNode::{Reduce, TopN};
-    let keyed = circuit.readers(shard).find_map(|n| match circuit.op(n) {
-        Reduce { group_cols, .. } | TopN { group_cols, .. } => Some((n, group_cols.as_slice())),
-        _ => None,
-    });
+    let keyed = circuit
+        .readers(shard)
+        .find_map(|n| Some((n, circuit.op(n).group_cols()?)));
     // A second reader would be handed rows placed by a key that is not its own.
     if keyed.is_some() && circuit.readers(shard).nth(1).is_some() {
-        return Err("an exchange in front of a reduce or top-N has another reader".into());
+        return Err("an exchange in front of a reduce, top-N or window has another reader".into());
     }
     Ok(keyed)
 }

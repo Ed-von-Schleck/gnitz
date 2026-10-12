@@ -37,6 +37,7 @@ enum Node {
     NullExtend,
     Filter,
     TopN,
+    Window,
 }
 use Node::*;
 
@@ -53,6 +54,7 @@ impl Node {
         NullExtend,
         Filter,
         TopN,
+        Window,
     ];
 
     fn matches(self, circuit: &Circuit, nid: gnitz_wire::NodeId) -> bool {
@@ -69,6 +71,7 @@ impl Node {
             NullExtend => matches!(op, OpNode::NullExtend { .. }),
             Filter => matches!(op, OpNode::Filter(_)),
             TopN => matches!(op, OpNode::TopN { .. }),
+            Window => matches!(op, OpNode::Window { .. }),
         }
     }
 }
@@ -99,8 +102,8 @@ fn total(chain: &PlannedChain, kind: Node) -> usize {
         .sum()
 }
 
-/// Every exchange of every segment, by the group columns of the reduce or top-N
-/// reading it.
+/// Every exchange of every segment, by the group columns of the reduce, top-N
+/// or window reading it.
 fn exchanges(chain: &PlannedChain) -> Vec<Option<Vec<u32>>> {
     let mut out: Vec<Option<Vec<u32>>> = all_views(chain)
         .flat_map(|pv| {
@@ -109,10 +112,9 @@ fn exchanges(chain: &PlannedChain) -> Vec<Option<Vec<u32>>> {
                 .ops()
                 .filter(|(_, op)| matches!(op, OpNode::ExchangeShard))
                 .map(move |(at, _)| {
-                    circuit.readers(at).find_map(|n| match circuit.op(n) {
-                        OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => Some(group_cols.clone()),
-                        _ => None,
-                    })
+                    circuit
+                        .readers(at)
+                        .find_map(|n| circuit.op(n).group_cols().map(<[u32]>::to_vec))
                 })
         })
         .collect();
@@ -244,21 +246,28 @@ const SHAPES: &[Row] = &[
     ("SELECT DISTINCT g + 1 AS g1, v FROM t", 1, &[PK], &[(Distinct, 1)]),
     ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[PK, PK], &[(Distinct, 1), (PositivePart, 1)]),
     // Window: a whole-partition frame joins the source to one reduce over it; a
-    // cumulative frame folds over a band self-join first.
+    // cumulative frame is one window over the source.
     ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
-    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 5, &[PK, Some(&[1, 2]), Some(&[2, 3])], &[(EquiJoin, 1), (RangeJoin, 1), (Reduce, 2)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 1, &[Some(&[2])], &[(Window, 1)]),
+    ("SELECT id, SUM(v) OVER (ORDER BY v) AS s, RANK() OVER (ORDER BY v) AS r FROM t", 1, &[Some(&[])], &[(Window, 1)]),
+    // One window per specification, each over the last one's rows; a
+    // whole-partition frame beside them joins its reduce onto those rows.
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s, RANK() OVER (ORDER BY id) AS r FROM t", 2, &[Some(&[]), Some(&[2])], &[(Window, 2)]),
+    ("SELECT id, RANK() OVER (PARTITION BY g ORDER BY v) AS r, SUM(v) OVER (PARTITION BY g) AS s FROM t", 3, &[Some(&[1]), Some(&[1])], &[(EquiJoin, 1), (Reduce, 1), (Window, 1)]),
     // An order key a whole-partition frame drops is not computed.
     ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v + 1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     // A QUALIFY bounding an unprojected ROW_NUMBER is a top-N per partition,
-    // with no band join — cutting the outer side of whatever else the body
-    // joins in; a projected one is the ranking desugar. The body's projection
-    // and filter run in the top-N's own circuit.
+    // cutting the outer side of whatever else the body joins in; a projected
+    // one is a window's rank. The body's projection and filter run in the
+    // top-N's own circuit, as a window's do in its.
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 1, &[Some(&[1])], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 1, &[Some(&[1])], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 1, &[Some(&[1])], &[(TopN, 1), (Filter, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[Some(&[1]), Some(&[2])], &[(TopN, 1), (EquiJoin, 1), (Reduce, 1)]),
-    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[PK, Some(&[1, 2, 0]), Some(&[2, 3, 4])], &[(EquiJoin, 1), (RangeJoin, 1), (Reduce, 2), (Filter, 2)]),
+    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 1, &[Some(&[1])], &[(Window, 1), (Filter, 1)]),
+    // A cut beside a running value cuts the window's rows.
+    ("SELECT id, RANK() OVER (PARTITION BY g ORDER BY v) AS r FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) <= 2", 2, &[Some(&[0]), Some(&[1])], &[(TopN, 1), (Window, 1)]),
 ];
 
 #[test]
@@ -467,10 +476,7 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
         let chain = view(&cat, body);
         let groups: Vec<&[u32]> = all_views(&chain)
             .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
-            .filter_map(|op| match op {
-                OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } => Some(group_cols.as_slice()),
-                _ => None,
-            })
+            .filter_map(|op| op.group_cols())
             .collect();
         assert!(!groups.is_empty(), "{body}: no reduce or top-N");
         assert!(groups.iter().all(|g| *g == want), "{body}: {groups:?}");

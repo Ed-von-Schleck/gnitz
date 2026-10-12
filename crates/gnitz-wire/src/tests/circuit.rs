@@ -69,6 +69,13 @@ fn sample(op: Opcode) -> OpNode {
             limit: 10,
             offset: 5,
         },
+        Opcode::Window => OpNode::Window {
+            group_cols: vec![1, 4],
+            order: vec![crate::OrderKey { col: 3, desc: true, nulls_first: true }],
+            aggs: vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Max }],
+            rank: true,
+            dense_rank: false,
+        },
     }
 }
 
@@ -217,7 +224,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (11, 0x8bd3_32cf_4500_a131));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (12, 0x6651_e52e_9fc9_50d2));
 }
 
 /// Every framing guard, against the forgery that trips it.

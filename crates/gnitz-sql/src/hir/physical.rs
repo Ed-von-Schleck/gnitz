@@ -67,7 +67,7 @@ impl Frame {
         ids.into_iter().map(|id| self.slot(id)).collect()
     }
 
-    /// The group list to send a reduce or top-N grouped by `ids`' slots: SQL's
+    /// The group list to send a reduce, top-N or window grouped by `ids`' slots: SQL's
     /// GROUP BY is unordered, so a permutation of leading PK columns is sent in PK
     /// order.
     pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {

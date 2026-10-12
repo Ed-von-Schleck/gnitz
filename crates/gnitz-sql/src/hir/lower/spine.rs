@@ -29,7 +29,7 @@ enum Level<'a> {
 }
 
 /// What the consumer needs of the top projection: its exact columns (a view's
-/// output, a top-N carrying every input column), or only a slot per column it
+/// output, a top-N or window carrying every input column), or only a slot per column it
 /// reads (a reduce, a content hash).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Top {

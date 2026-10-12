@@ -302,16 +302,30 @@ pub(crate) enum RelExpr {
     TopN {
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
-        order: Vec<TopNKey>,
+        order: Vec<OrderCol>,
         limit: u64,
         offset: u64,
     },
+    /// Per-partition running values: every row of `input`, widened by its values
+    /// over the rows of its `partition` value at or before its peers — the rows
+    /// equal to it on every key of `order`. Its output is `input`'s columns, then
+    /// `rank` — one more than the number of rows before the row's peers — then
+    /// `dense_rank` — the number of peer groups up to and including the row's —
+    /// then each of `aggs` over those rows, the peers included.
+    Window {
+        input: Rc<RelExpr>,
+        partition: Vec<ColId>,
+        order: Vec<OrderCol>,
+        aggs: AggCols,
+        rank: Option<HirCol>,
+        dense_rank: Option<HirCol>,
+    },
 }
 
-/// One ORDER BY key of a [`RelExpr::TopN`]: a column of its input, its
-/// direction, and where NULLs go.
+/// One ORDER BY key of a [`RelExpr::TopN`] or [`RelExpr::Window`]: a column of
+/// its input, its direction, and where NULLs go.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TopNKey {
+pub(crate) struct OrderCol {
     pub col: ColId,
     pub desc: bool,
     pub nulls_first: bool,
@@ -721,12 +735,33 @@ impl RelExpr {
     pub(crate) fn top_n(
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
-        order: Vec<TopNKey>,
+        order: Vec<OrderCol>,
         limit: u64,
         offset: u64,
     ) -> Rc<RelExpr> {
         debug_assert!(limit >= 1, "a top-N selects at least one slot");
         Rc::new(RelExpr::TopN { input, partition, order, limit, offset })
+    }
+
+    /// The running values of `input` over `partition` in `order`. Every key
+    /// names an input column, `order` is not empty, and there is a value.
+    pub(crate) fn window(
+        input: Rc<RelExpr>,
+        partition: Vec<ColId>,
+        order: Vec<OrderCol>,
+        aggs: AggCols,
+        rank: Option<HirCol>,
+        dense_rank: Option<HirCol>,
+    ) -> Rc<RelExpr> {
+        debug_assert!(!order.is_empty() && (!aggs.is_empty() || rank.is_some() || dense_rank.is_some()));
+        Rc::new(RelExpr::Window {
+            input,
+            partition,
+            order,
+            aggs,
+            rank,
+            dense_rank,
+        })
     }
 
     /// A fresh read of `input`: every column under a newly minted id.
@@ -762,8 +797,9 @@ impl RelExpr {
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             RelExpr::SetOp { all: false, out, .. } => Some(out.iter().map(|c| c.id).collect()),
-            // A subset of its input's rows under its input's identities.
-            RelExpr::TopN { input, .. } => input.unique_key(),
+            // Rows of its input — a subset of them, or each once — under its
+            // input's identities.
+            RelExpr::TopN { input, .. } | RelExpr::Window { input, .. } => input.unique_key(),
             RelExpr::Join { left, right, kind, on } => match kind {
                 // One output row per left row.
                 k if k.is_decorrelated() => left.unique_key(),
@@ -875,6 +911,12 @@ impl RelExpr {
                 cols
             }
             RelExpr::Distinct { input } | RelExpr::TopN { input, .. } => input.cols(),
+            RelExpr::Window { input, aggs, rank, dense_rank, .. } => {
+                let mut cols = input.cols();
+                cols.extend(rank.iter().chain(dense_rank).cloned());
+                cols.extend(aggs.iter().map(|c| c.col.clone()));
+                cols
+            }
             RelExpr::Alias { cols, .. } => cols.clone(),
             RelExpr::SetOp { out, .. } => out.clone(),
         }

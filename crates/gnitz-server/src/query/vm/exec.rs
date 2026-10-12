@@ -327,6 +327,14 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 res.map_err(|e| ingest_err("topn index", *index, e))?;
                 epoch.out
             }
+
+            Op::Window { index, plan } => {
+                let delta = &batches[in_reg.at()];
+                let epoch = stream::op_window(delta, &mut stores.open(Trace::Child(*index)), plan);
+                let res = stores.own.ingest(*index, epoch.index_entries);
+                res.map_err(|e| ingest_err("window index", *index, e))?;
+                epoch.out
+            }
         };
         batches[out_reg.at()] = out;
 
