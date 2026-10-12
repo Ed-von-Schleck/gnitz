@@ -8,84 +8,212 @@ use std::time::{Duration, Instant};
 
 // -- ring layout ---------------------------------------------------------
 
-/// Consume one message and release its space, as the master does when it
-/// drops the slot.
-unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
-    let slot = recv.try_read_slot(0)?;
-    let bytes = &slot.frame[gnitz_wire::FRAME_LEN_PREFIX_BYTES..];
-    drop(slot);
-    Some(bytes)
+/// The address a message published into an empty ring is read at.
+fn data_head(writer: &W2mWriter) -> *const u8 {
+    unsafe { writer.wc.base.add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) }
 }
 
 /// A published message is read in place, and its slot's frame bytes are the
 /// client framing as they stand: the `u32` LE length, then the payload.
 #[test]
 fn a_published_message_is_read_in_place_as_a_client_frame() {
-    unsafe {
-        let (mut writer, recv) = make_ring(128, 4, 8);
-        let payload: Vec<u8> = (0..128).collect();
-        assert!(writer.try_publish(5, payload.len(), |slot| slot.copy_from_slice(&payload)));
+    let (mut writer, recv) = make_ring(128, 4, 8);
+    let payload: Vec<u8> = (0..128).collect();
+    assert!(writer.try_publish(5, payload.len(), |slot| slot.copy_from_slice(&payload)));
 
-        let slot = recv.try_read_slot(0).expect("message must be visible");
-        assert_eq!(slot.internal_req_id, 5);
-        assert_eq!(slot.frame_bytes(), [128u32.to_le_bytes().as_slice(), &payload].concat());
-        assert_eq!(
-            slot.bytes().as_ptr(),
-            writer.wc.base.add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) as *const u8,
-            "the payload must be mmap-resident — a train frame's rows are read in place"
-        );
-        drop(slot);
-        assert!(consume_one(&recv).is_none(), "ring must now read empty");
-    }
+    let slot = recv.try_read_slot(0).expect("message must be visible");
+    assert_eq!(slot.internal_req_id, 5);
+    assert_eq!(slot.frame_bytes(), [128u32.to_le_bytes().as_slice(), &payload].concat());
+    assert_eq!(
+        slot.bytes().as_ptr(),
+        data_head(&writer),
+        "the payload must be mmap-resident — a train frame's rows are read in place"
+    );
+    drop(slot);
+    assert!(recv.try_read_slot(0).is_none(), "ring must now read empty");
 }
 
 /// The ring's message size: over zero slack, a run of them ends exactly on
 /// the ring's physical end.
 const MSG: usize = 256;
 
+/// A ring its reader has emptied starts over at its head, wherever the write
+/// position had got to, and at no cost in virtual bytes.
+#[test]
+fn an_empty_ring_starts_over_at_its_head() {
+    let (mut writer, recv) = make_ring(MSG, 8, 8);
+    for round in 0..3u8 {
+        // Two a round: the second one is published into a ring that holds the first.
+        for i in 0..2 {
+            assert!(writer.try_publish(0, MSG, |slot| slot.fill(round * 2 + i)));
+        }
+        let first = recv.try_read_slot(0).expect("the first message");
+        assert_eq!(
+            first.bytes().as_ptr(),
+            data_head(&writer),
+            "round {round} starts at the head"
+        );
+        let second = recv.try_read_slot(0).expect("the second message");
+        assert_eq!(second.bytes().as_ptr(), unsafe {
+            data_head(&writer).add(slot_stride(MSG) as usize)
+        });
+        assert!(first.bytes().iter().all(|&b| b == round * 2));
+        assert!(second.bytes().iter().all(|&b| b == round * 2 + 1));
+    }
+    assert_eq!(recv.write_cursor(0), 6 * slot_stride(MSG), "a rewind publishes no byte");
+    assert_eq!(recv.release_cursor(0), recv.write_cursor(0));
+}
+
+/// The origin names a rewound message's offset before the write cursor shows
+/// the message: a reader that sees the one has the other.
+#[test]
+fn a_rewind_moves_the_origin_before_it_publishes() {
+    let (mut writer, recv) = make_ring(MSG, 8, 8);
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(1)));
+    assert!(recv.try_read_slot(0).is_some());
+    let at = recv.write_cursor(0);
+    assert_eq!(recv.header(0).origin.load(Ordering::Acquire), 0);
+    assert!(writer.try_publish(0, MSG, |slot| {
+        assert_eq!(
+            recv.header(0).origin.load(Ordering::Acquire),
+            at,
+            "the origin moves first"
+        );
+        assert_eq!(recv.write_cursor(0), at, "and the message is not yet published");
+        slot.fill(2);
+    }));
+    assert_eq!(
+        recv.try_read_slot(0).expect("slot").bytes().as_ptr(),
+        data_head(&writer)
+    );
+}
+
+/// A ring that still holds a slot does not start over: the slot's bytes are the
+/// master's until it is released, however far behind the reader it is.
+#[test]
+fn a_held_slot_keeps_the_ring_from_starting_over() {
+    let (mut writer, recv) = make_ring(MSG, 8, 8);
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(1)));
+    let held = recv.try_read_slot(0).expect("the held message");
+    for tag in 2..=4u8 {
+        assert!(writer.try_publish(0, MSG, |slot| slot.fill(tag)));
+        let next = recv.try_read_slot(0).expect("the next message");
+        assert_ne!(
+            next.bytes().as_ptr(),
+            data_head(&writer),
+            "message {tag} overwrote a held slot"
+        );
+        assert!(next.bytes().iter().all(|&b| b == tag));
+    }
+    assert!(held.bytes().iter().all(|&b| b == 1));
+    drop(held);
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(5)));
+    assert_eq!(
+        recv.try_read_slot(0).expect("slot").bytes().as_ptr(),
+        data_head(&writer)
+    );
+}
+
+/// A message as large as the ring is refused while the ring holds anything, and
+/// placed once it is empty, wherever the write position stands.
+#[test]
+fn a_message_filling_the_ring_is_placed_once_the_ring_is_empty() {
+    let (mut writer, recv) = make_ring(MSG, 4, 0);
+    let whole = (writer.wc.dcap() - RING_PREFIX_BYTES) as usize;
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(1)));
+    assert!(
+        !writer.try_publish(0, whole, |slot| slot.fill(2)),
+        "the ring holds a message"
+    );
+    assert!(recv.try_read_slot(0).is_some());
+    assert!(
+        writer.try_publish(0, whole, |slot| slot.fill(2)),
+        "an empty ring holds any message it can"
+    );
+    let got = recv.try_read_slot(0).expect("the whole-ring message");
+    assert_eq!(got.bytes().len(), whole);
+    assert!(got.bytes().iter().all(|&b| b == 2));
+}
+
+/// A message the tail is too short for is read at the head, and the tail it
+/// skipped counts as published.
+#[test]
+fn a_message_short_of_the_tail_is_read_at_the_head_past_it() {
+    let (mut writer, recv) = make_ring(MSG, 4, 8);
+    let read = || recv.try_read_slot(0).expect("the next message");
+    for tag in 1..=3u8 {
+        assert!(writer.try_publish(0, MSG, |slot| slot.fill(tag)));
+    }
+    // Never empty: each publish finds the message before it unread.
+    drop((read(), read()));
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(4)));
+    drop(read());
+    assert!(writer.try_publish(0, MSG, |slot| slot.fill(5)));
+    assert_eq!(recv.write_cursor(0), 5 * slot_stride(MSG) + 8);
+
+    assert!(read().bytes().iter().all(|&b| b == 4));
+    let wrapped = read();
+    assert_eq!(wrapped.bytes().as_ptr(), data_head(&writer));
+    assert!(wrapped.bytes().iter().all(|&b| b == 5));
+    assert_eq!(recv.read_cursor(0), recv.write_cursor(0));
+}
+
 #[derive(Clone, Debug)]
-enum RingOp {
+enum SlotOp {
     Publish(usize),
-    Consume,
+    Read,
+    Release(usize),
 }
 
 proptest! {
-    /// Every consumed message is the oldest unread one, intact, and only a ring
-    /// holding unread messages refuses a publish.
+    /// Slots are read in publish order and released in any order. A message
+    /// stays intact for as long as its slot is held; an empty ring refuses
+    /// nothing, and its next message is at the head.
     #[test]
-    fn a_ring_delivers_every_message_in_order_across_wraps(
+    fn a_ring_keeps_every_unreleased_message_intact(
         slack in prop::sample::select(vec![0u64, 8, 16, 24]),
         ops in prop::collection::vec(
             prop_oneof![
-                2 => prop_oneof![Just(MSG), 1..=MSG + 44].prop_map(RingOp::Publish),
-                1 => Just(RingOp::Consume),
+                3 => prop_oneof![Just(MSG), 1..=3 * MSG].prop_map(SlotOp::Publish),
+                3 => Just(SlotOp::Read),
+                2 => (0usize..8).prop_map(SlotOp::Release),
             ],
-            1..80,
+            1..160,
         ),
     ) {
-        let (mut writer, recv) = make_ring(MSG, 4, slack);
-        let mut unread: VecDeque<(u8, usize)> = VecDeque::new();
+        let (mut writer, recv) = make_ring(MSG, 6, slack);
+        let mut unread: VecDeque<(u8, usize, bool)> = VecDeque::new();
+        let mut held: Vec<(W2mSlot, u8, usize)> = Vec::new();
         for (tag, op) in ops.into_iter().enumerate() {
             let tag = tag as u8;
             match op {
-                RingOp::Publish(len) => {
+                SlotOp::Publish(len) => {
+                    let empty = unread.is_empty() && held.is_empty();
                     if writer.try_publish(0, len, |slot| slot.fill(tag)) {
-                        unread.push_back((tag, len));
+                        unread.push_back((tag, len, empty));
                     } else {
-                        prop_assert!(!unread.is_empty(), "an empty ring refused a {len}-byte publish");
+                        prop_assert!(!empty, "an empty ring refused a {}-byte publish", len);
                     }
                 }
-                RingOp::Consume => {
-                    let got = unsafe { consume_one(&recv) };
-                    match unread.pop_front() {
-                        None => prop_assert!(got.is_none()),
-                        Some((tag, len)) => {
-                            let got = got.expect("an unread message is visible");
-                            prop_assert_eq!(got.len(), len);
-                            prop_assert!(got.iter().all(|&b| b == tag), "message {} overwritten", tag);
+                SlotOp::Read => match (recv.try_read_slot(0), unread.pop_front()) {
+                    (None, None) => {}
+                    (Some(slot), Some((tag, len, at_head))) => {
+                        if at_head {
+                            prop_assert_eq!(slot.bytes().as_ptr(), data_head(&writer));
                         }
+                        held.push((slot, tag, len));
+                    }
+                    (got, want) => prop_assert!(false, "read {:?}, expected {:?}", got.is_some(), want),
+                },
+                SlotOp::Release(i) => {
+                    if !held.is_empty() {
+                        held.swap_remove(i % held.len());
                     }
                 }
+            }
+            for (slot, tag, len) in &held {
+                prop_assert_eq!(slot.bytes().len(), *len);
+                prop_assert!(slot.bytes().iter().all(|b| b == tag), "held message {} overwritten", tag);
             }
         }
     }
@@ -209,7 +337,7 @@ fn arm_waitv_arms_only_while_every_ring_is_quiet() {
 // -- concurrent publish/drain --------------------------------------------
 
 /// A writer thread's frames arrive once each, in publish order, blob intact,
-/// across many wraps of a ring a few frames long.
+/// from a ring a few frames long that the reader races.
 #[test]
 fn concurrent_publishes_drain_in_order() {
     for (ring_frames, n, pad) in [(8, 2_000u32, &[][..]), (4, 500, &[b'x'; 4000][..])] {

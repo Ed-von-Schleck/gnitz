@@ -127,7 +127,7 @@ fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
 }
 
 /// A forked child floods a shared W2M ring while the parent drains through the
-/// `FUTEX_WAITV` park: a lost wake runs into the timeout, a torn wrap loses an id.
+/// `FUTEX_WAITV` park: a lost wake runs into the timeout, a torn frame loses an id.
 #[test]
 fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     const N_MESSAGES: u32 = 500;
