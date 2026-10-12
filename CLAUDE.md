@@ -4,14 +4,11 @@ Never check or confirm that compilation warnings or Clippy errors/warnings are c
 
 Use `semble search` (the semble MCP server is installed) to find code by describing what it does or naming a symbol/identifier instead of grep. There are other useful semble commands as well. Prefer it over grep + read every time. Use `semble clear all` to clear a stale index.
 
-gnitz is **pre-alpha** and not used in production anywhere because it has not been released, so there are **never** any compatibility concerns and there should **never** be legacy code remaining.
+gnitz is **pre-alpha** and not used in production anywhere.
 
 **Plans (`plans/`):**
 - Never cite a plan path/filename in code, tests, or comments.
 - Not ground truth: validate against source/tests/git; only edit the plan named for the task.
-- Validate the problem, not just the design: a claimed cost must state the input size that
-  can actually occur (trace the producer — a `MAX_` cap is a trust boundary, not a reachable
-  range) and the largest instance present in the tree.
 - Authoring: state one committed design — no history, no optional/either-or, no "follow-on/future-work" (fold in, spin out a new plan, or drop); include validated snippets; never cross-link plans (state needed facts inline); out-of-scope bugs get their own plan. When a plan is written, all decisions need to be made - no "gates" in plans are allowed.
 - Don't write memories about a specific plan (they're transient).
 
@@ -102,7 +99,7 @@ and consolidation.
 consolidation. **Negation** is `(-A)(x) = -A(x)`.
 
 **Consolidation** groups duplicate (PK, payload) entries, sums their weights, and
-drops elements whose net weight is zero ("ghost elimination").
+drops elements whose net weight is zero.
 
 > **Consolidation is the only operation that merges duplicate rows and sums
 > weights.** (In Z-Set algebra filter/projection/join also change element count —
@@ -118,12 +115,6 @@ position.
 > **Every merge and consolidation path must sort by (PK, payload), never by PK
 > alone.** PK-only ordering interleaves rows that share a PK but differ in
 > payload, so weights accumulate against the wrong element.
-
-> **Every batch entering an N-way merge must already be sorted by (PK, payload).**
-> A merge reads each input linearly; an unsorted input makes the heap deliver
-> duplicates non-adjacently and the accumulator produces *wrong weights
-> silently* — a release build checks nothing; only debug and checked builds
-> verify a batch's layout.
 
 ## 3. DBSP: Incremental Computation on Z-Sets
 
