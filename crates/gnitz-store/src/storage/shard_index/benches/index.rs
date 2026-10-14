@@ -219,7 +219,7 @@ fn compaction_amplification_bench() {
         (
             "scattered, dehydrating",
             scattered,
-            Some(40 << 20),
+            Some(24 << 20),
             true,
             false,
             400,
@@ -229,7 +229,7 @@ fn compaction_amplification_bench() {
         (
             "scattered, at the skeleton floor",
             scattered,
-            Some(16 << 20),
+            Some(8 << 20),
             false,
             false,
             400,

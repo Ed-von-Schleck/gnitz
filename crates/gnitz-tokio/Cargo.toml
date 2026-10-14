@@ -17,7 +17,7 @@ integration = []
 gnitz-core.workspace = true
 # `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
 # `spawn_blocking`, and `sync` the mpsc the handle and driver share.
-tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
+tokio = { version = "1.53.3", default-features = false, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]
 gnitz-wire.workspace = true

@@ -34,7 +34,9 @@ impl Host for TokioHost {
         // Registered before the old registration drops, so a socket the
         // reactor refuses leaves this host on the old one. That one is still
         // open here, so the two are different fds.
-        self.fd = Some(AsyncFd::new(fd.as_raw_fd())?);
+        // SAFETY: the socket stays open until the next `attach` or this host's
+        // drop, which each drop this registration first.
+        self.fd = Some(unsafe { AsyncFd::register(fd.as_raw_fd()) }?);
         Ok(())
     }
 
