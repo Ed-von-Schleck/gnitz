@@ -82,6 +82,7 @@ impl Table {
     /// Fold the memtable into the RAM tier, spilling the tier to an unsynced
     /// shard unless its net state leaves it room.
     pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
+        self.rejudge_live_floors();
         self.fold_memtable_into_ram_tier();
         if self.held_in_ram || !self.ram_tier.is_full() {
             return Ok(());
@@ -104,6 +105,7 @@ impl Table {
     /// it, unless it is the one in place; `None` when that one is also synced.
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
+        self.rejudge_live_floors();
         self.fold_memtable_into_ram_tier();
         self.spill_ram_tier()?;
         // Rows above the cut go to a shard of their own, which no compaction

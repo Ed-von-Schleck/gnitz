@@ -227,6 +227,114 @@ fn a_cursor_between_empty_prefixes_reads_the_whole_store() {
     }
 }
 
+/// The OPK of `pk` under [`make_schema_u64_i64`].
+fn key(pk: u64) -> Vec<u8> {
+    pk.to_be_bytes().to_vec()
+}
+
+/// A store whose keys 1..=64 are inserted and retracted in two runs, and whose
+/// one live row is key 100.
+fn store_cancelled_under_100(dir: &Path) -> Table {
+    let mut t = new_table(
+        dir,
+        make_schema_u64_i64(),
+        RecoverySource::SalReplay,
+        DEFAULT_RAM_TIER_BYTES,
+    );
+    let cancelled: Vec<(u64, i64, i64)> = (1..=64).map(|pk| (pk, 1, 0)).collect();
+    t.ingest(rows(&[cancelled.as_slice(), &[(100, 1, 0)]].concat()))
+        .unwrap();
+    t.fold_to_ram().unwrap();
+    t.ingest(rows(
+        &cancelled.iter().map(|&(pk, _, v)| (pk, -1, v)).collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    t
+}
+
+fn floor(t: &Table, cut: Cut) -> Option<Vec<u8>> {
+    t.live_floor(cut).get().at.map(|k| k.pk_bytes().to_vec())
+}
+
+fn scan(t: &Table, cut: Cut) -> HashMap<RowKey, i64> {
+    zset_of(&t.open_cursor(cut).materialize(), &make_schema_u64_i64())
+}
+
+fn live(pks: &[u64]) -> HashMap<RowKey, i64> {
+    zset_of(
+        &rows(&pks.iter().map(|&pk| (pk, 1, 0)).collect::<Vec<_>>()),
+        &make_schema_u64_i64(),
+    )
+}
+
+#[test]
+fn an_open_keeps_the_first_live_key_as_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = store_cancelled_under_100(dir.path());
+    for cut in [Cut::Now, Cut::Sealed] {
+        assert_eq!(floor(&t, cut), None, "{cut:?}");
+        assert_eq!(scan(&t, cut), live(&[100]), "{cut:?}");
+        assert_eq!(floor(&t, cut), Some(key(100)), "{cut:?}");
+    }
+    let band = |lo, hi| {
+        let band = Some((PkBuf::from_bytes(&key(lo)), Some(PkBuf::from_bytes(&key(hi)))));
+        zset_of(&t.range_cursor(band, Cut::Now).materialize(), &make_schema_u64_i64())
+    };
+    assert_eq!(band(0, 100), live(&[]));
+    assert_eq!(band(0, 101), live(&[100]));
+}
+
+#[test]
+fn a_pending_row_lowers_the_floor_its_cuts_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = store_cancelled_under_100(dir.path());
+    scan(&t, Cut::Now);
+    scan(&t, Cut::Sealed);
+    t.ingest_pending(rows(&[(50, 1, 0)]));
+    assert_eq!(floor(&t, Cut::Now), Some(key(50)));
+    assert_eq!(floor(&t, Cut::Sealed), Some(key(100)));
+    assert_eq!(scan(&t, Cut::Now), live(&[50, 100]));
+    assert_eq!(scan(&t, Cut::Sealed), live(&[100]));
+    t.seal().unwrap();
+    assert_eq!(floor(&t, Cut::Sealed), Some(key(50)));
+    assert_eq!(scan(&t, Cut::Sealed), live(&[50, 100]));
+}
+
+#[test]
+fn a_floor_with_nothing_under_it_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = store_cancelled_under_100(dir.path());
+    scan(&t, Cut::Now);
+    t.ingest(rows(&[(0, 1, 0)])).unwrap();
+    assert_eq!(floor(&t, Cut::Now), Some(key(0)));
+    assert_eq!(scan(&t, Cut::Now), live(&[0, 100]));
+    assert_eq!(floor(&t, Cut::Now), None);
+}
+
+#[test]
+fn a_fold_under_the_floor_drops_it_at_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = store_cancelled_under_100(dir.path());
+    scan(&t, Cut::Now);
+    t.fold_to_ram().unwrap();
+    assert_eq!(t.ram_tier.row_count(), 1, "premise: the fold cancelled the pairs");
+    assert_eq!(floor(&t, Cut::Now), Some(key(100)));
+    scan(&t, Cut::Now);
+    assert_eq!(floor(&t, Cut::Now), None);
+}
+
+#[test]
+fn a_store_of_cancelled_rows_floors_at_the_top_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = store_cancelled_under_100(dir.path());
+    t.ingest(rows(&[(100, -1, 0)])).unwrap();
+    assert_eq!(scan(&t, Cut::Now), live(&[]));
+    let top = PkBuf::max(make_schema_u64_i64().pk_stride());
+    assert_eq!(floor(&t, Cut::Now), Some(top.pk_bytes().to_vec()));
+    t.clear();
+    assert_eq!(floor(&t, Cut::Now), None);
+}
+
 /// An ingest past the memtable's budget folds it into the RAM tier on its own.
 #[test]
 fn a_memtable_over_budget_folds_into_the_ram_tier() {

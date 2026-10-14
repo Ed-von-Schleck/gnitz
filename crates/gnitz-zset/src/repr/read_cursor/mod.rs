@@ -354,6 +354,13 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
+    /// Whether the rows under this cursor's position outnumber its sources: a
+    /// row walked costs more than one source's seek.
+    #[inline]
+    pub fn passed_more_than_a_seek(&self) -> bool {
+        self.states.iter().map(|s| s.position).sum::<usize>() > self.sources.len()
+    }
+
     /// Whether the current row came out of a capacity-bounded view's skeleton
     /// shard — a (PK, coarse weight) pair whose payload columns do not exist on
     /// disk. Its caller must hydrate that key from the view's own traces or source
@@ -743,6 +750,18 @@ pub fn from_runs_in_band(
     end: Option<&[u8]>,
 ) -> ReadCursor {
     build(runs, schema, cap, |c| c.seek_range_bytes(start, end))
+}
+
+/// [`from_runs`] positioned on the first live row at or above `key`, each
+/// source galloping from its first row: cheaper than [`from_runs_in_band`]'s
+/// binary search where `key` lies near the bottom of every run.
+pub fn from_runs_at(
+    runs: impl IntoIterator<Item = Run>,
+    schema: SchemaDescriptor,
+    cap: usize,
+    key: &[u8],
+) -> ReadCursor {
+    build(runs, schema, cap, |c| c.reposition_to(key))
 }
 
 #[inline]

@@ -9,6 +9,10 @@
 //! [`Cut`], and [`Table::seal`] moves the cut past it. A barrier that comes
 //! first writes the pending rows to shards the disk tier holds apart, which a
 //! reader at the cut leaves out.
+//!
+//! A row and its retraction stay stored until a fold merges their runs. An open
+//! starts at its cut's [`LiveFloor`] rather than walking the cancelled pairs
+//! under it.
 
 use std::cell::Cell;
 use std::fs;
@@ -26,7 +30,7 @@ use gnitz_zset::repr::Batch;
 #[cfg(test)]
 use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_in_band, PkSetGather, ReadCursor};
+use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
 use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -84,6 +88,15 @@ pub enum Cut {
     Sealed,
 }
 
+/// A key under which no row nets nonzero at one cut. Every ingest lowers it,
+/// and the first open after the rows move judges whether it repays a seek.
+#[derive(Clone, Copy, Default)]
+struct LiveFloor {
+    /// `None` where unknown, or where it skips too few rows to repay a seek.
+    at: Option<PkBuf>,
+    judged: bool,
+}
+
 pub(crate) struct Table {
     /// Runs ingested above the cut, folded among themselves only: [`Self::seal`]
     /// moves them into `memtable` as one run.
@@ -116,6 +129,9 @@ pub(crate) struct Table {
 
     /// Last `full_scan` result, held until the row set moves.
     cached_full_scan: Cell<Option<Rc<Batch>>>,
+
+    /// Per cut, as [`Self::live_floor`] picks it.
+    live_floor: [Cell<LiveFloor>; 2],
 
     /// The bytes of the manifest in place: the one this open read, or the one
     /// this process's last barrier renamed. `None` for a store that has none,
@@ -189,6 +205,7 @@ impl Table {
             upkeep_overdraft: 0,
             live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
+            live_floor: Default::default(),
             manifest_in_place,
             manifest_synced: false,
         })
@@ -217,7 +234,7 @@ impl Table {
 
     /// See [`ShardIndex::append_terminal_run`].
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        self.cached_full_scan.set(None);
+        self.admit(run, &[Cut::Now, Cut::Sealed]);
         self.shard_index.append_terminal_run(run)
     }
 
@@ -262,7 +279,7 @@ impl Table {
         if run.is_empty() {
             return Ok(());
         }
-        self.cached_full_scan.set(None);
+        self.admit(&run, &[Cut::Now, Cut::Sealed]);
         let ingested = run.total_bytes();
         self.memtable.push_run(run, &self.shard_index.schema);
         if self.memtable.is_full() {
@@ -275,6 +292,7 @@ impl Table {
     /// publishes the empty store.
     pub(crate) fn clear(&mut self) {
         self.cached_full_scan.set(None);
+        self.live_floor = Default::default();
         self.pending.clear();
         self.memtable.clear();
         self.ram_tier.clear();
@@ -288,7 +306,7 @@ impl Table {
         if batch.is_empty() {
             return;
         }
-        self.cached_full_scan.set(None);
+        self.admit(&batch, &[Cut::Now]);
         self.pending.push(batch, &self.shard_index.schema);
     }
 
@@ -324,6 +342,9 @@ impl Table {
             }
         };
         self.shard_index.seal_pending();
+        // The cut now reads every ingest.
+        self.live_floor(Cut::Sealed).set(self.live_floor(Cut::Now).get());
+        self.rejudge_live_floors();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -354,6 +375,7 @@ impl Table {
         if self.held_in_ram {
             return Ok(());
         }
+        self.rejudge_live_floors();
         self.shard_index.maintain(u64::MAX).map(drop)
     }
 
@@ -395,8 +417,58 @@ impl Table {
 
     /// Open a read-only cursor over the rows `cut` reads.
     pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
+        let floor = self.live_floor(cut);
+        let LiveFloor { at, judged } = floor.get();
+        if judged {
+            return self.cursor_from(at, cut);
+        }
+        let cursor = self.cursor_from(at, cut);
+        let at = cursor.passed_more_than_a_seek().then(|| match cursor.valid {
+            true => PkBuf::from_bytes(cursor.current_pk_bytes()),
+            false => PkBuf::max(self.shard_index.schema.pk_stride()),
+        });
+        floor.set(LiveFloor { at, judged: true });
+        cursor
+    }
+
+    /// A cursor over the rows `cut` reads, on its first live row at or above
+    /// `floor`.
+    fn cursor_from(&self, floor: Option<PkBuf>, cut: Cut) -> ReadCursor {
+        let schema = self.shard_index.schema;
         let cap = self.mem_run_count() + self.shard_index.shard_count();
-        from_runs(self.runs(cut), self.shard_index.schema, cap)
+        match floor {
+            Some(at) => from_runs_at(self.runs(cut), schema, cap, at.pk_bytes()),
+            None => from_runs(self.runs(cut), schema, cap),
+        }
+    }
+
+    fn live_floor(&self, cut: Cut) -> &Cell<LiveFloor> {
+        &self.live_floor[cut as usize]
+    }
+
+    /// A fold leaves each floor valid, but can cancel the rows it skips.
+    fn rejudge_live_floors(&mut self) {
+        for floor in &mut self.live_floor {
+            floor.get_mut().judged = false;
+        }
+    }
+
+    /// `rows`, a non-empty run, enter what each of `cuts` reads.
+    fn admit(&mut self, rows: &Batch, cuts: &[Cut]) {
+        debug_assert!(
+            !rows.is_empty() && rows.is_consolidated(),
+            "a run's least key is its first"
+        );
+        self.cached_full_scan.set(None);
+        let least = rows.get_pk_bytes(0);
+        for &cut in cuts {
+            let floor = self.live_floor[cut as usize].get_mut();
+            floor.judged = false;
+            match &mut floor.at {
+                Some(at) if least < at.pk_bytes() => *at = PkBuf::from_bytes(least),
+                _ => {}
+            }
+        }
     }
 
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
@@ -418,9 +490,18 @@ impl Table {
     /// hold a key of it; `None` opens empty.
     pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> ReadCursor {
         let schema = self.shard_index.schema;
-        let Some((start, end)) = range else {
+        let Some((mut start, end)) = range else {
             return empty_cursor(schema);
         };
+        match self.live_floor(cut).get().at {
+            Some(at) if at > start => {
+                if end.is_some_and(|end| end <= at) {
+                    return empty_cursor(schema);
+                }
+                start = at;
+            }
+            _ => {}
+        }
         let stride = schema.pk_stride();
         let hi = end.unwrap_or_else(|| PkBuf::max(stride));
         debug_assert!(

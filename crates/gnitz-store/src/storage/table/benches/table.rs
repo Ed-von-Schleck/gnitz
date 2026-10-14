@@ -394,3 +394,48 @@ fn barrier_seal_bench() {
         );
     }
 }
+
+/// Instructions per repeated `Table::open_cursor` of a store whose lowest keys
+/// are inserted and retracted in different runs.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn open_cursor_bench() {
+    const HELD: u64 = 8192;
+    const RUNS: u64 = 13;
+    const OPENS: u64 = 10_000;
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = Counter::instructions();
+    for cancelled in [0u64, 8, 32, 64, 4096] {
+        let rederive = RecoverySource::Rederive { resume_at: None };
+        let mut t = new_table(
+            dir.path().join(cancelled.to_string()),
+            schema,
+            rederive,
+            DEFAULT_RAM_TIER_BYTES,
+        );
+        let held: Vec<_> = (0..HELD).map(|k| (k, 1, k as i64)).collect();
+        t.ingest(make_batch(&schema, &held)).unwrap();
+        t.fold_to_ram().unwrap();
+        if cancelled > 0 {
+            let retracted: Vec<_> = (0..cancelled).map(|k| (k, -1, k as i64)).collect();
+            t.ingest(make_batch(&schema, &retracted)).unwrap();
+        }
+        for r in 0..RUNS {
+            let rows: Vec<_> = (0..64).map(|i| (HELD + r * 64 + i, 1, 0)).collect();
+            t.ingest(make_batch(&schema, &rows)).unwrap();
+        }
+        let first = t.open_cursor(Cut::Now);
+        assert_eq!(first.current_pk_bytes(), cancelled.to_be_bytes(), "the first live row");
+        drop(first);
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..OPENS {
+                std::hint::black_box(t.open_cursor(Cut::Now));
+            }
+        });
+        println!(
+            "open_cursor_bench {cancelled:>5} cancelled keys {:9.1} instr/open",
+            instructions as f64 / OPENS as f64
+        );
+    }
+}
