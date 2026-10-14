@@ -331,14 +331,13 @@ fn stamp_digest(hdr: &mut [u8]) {
 
 const SAL_MMAP_SIZE: usize = 1 << 30;
 
-/// The page at the head of `wal.sal` holding the anchor: the walk epoch, and the
-/// ring offset a completed `fdatasync` covers. At the head, so it does not move
+/// The page holding the anchor, at the head of `wal.sal` so it does not move
 /// when `GNITZ_SAL_BYTES` does.
 const ANCHOR_BYTES: usize = 4096;
 
 const _: () = assert!(
     SAL_MMAP_SIZE as u64 <= 1 << 32,
-    "the anchor and a group header's BASE pack a ring offset into 32 bits"
+    "a zone LSN and a group header's BASE pack a ring offset into 32 bits"
 );
 
 /// The epoch after `epoch`: what a checkpoint moves the writer and every reader
@@ -379,10 +378,8 @@ const _: () = assert!(
 );
 
 /// `SAL_MMAP_SIZE`, or `GNITZ_SAL_BYTES` clamped into
-/// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it. The
-/// override exists because each server `fallocate`s its whole SAL at startup, so
-/// dozens of test servers sharing a tmpfs would exhaust it. Called once, by
-/// [`SalLog::open`].
+/// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it — for
+/// test servers sharing a tmpfs, since each `fallocate`s its whole SAL.
 fn sal_mmap_size() -> usize {
     let asked = gnitz_foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
     let size = asked.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE);
@@ -423,8 +420,7 @@ impl SalMessageKind {
     }
 }
 
-/// `(epoch << 32) | low`: `low` = [`PRESENT`] for a prefix, the synced offset
-/// for the anchor.
+/// `(epoch << 32) | low`.
 #[inline]
 const fn epoch_word(epoch: u32, low: u64) -> u64 {
     (epoch as u64) << 32 | low
@@ -440,8 +436,13 @@ const fn word_epoch(word: u64) -> u32 {
     (word >> 32) as u32
 }
 
-/// The prefix word at `offset` as an atomic, for the Acquire/Release pair that
-/// publishes a group across processes.
+/// The anchor of `epoch`: its complement in the low half, so no flipped bit
+/// verifies.
+const fn anchor_word(epoch: u32) -> u64 {
+    epoch_word(epoch, !epoch as u64)
+}
+
+/// The word at `offset` as an atomic: a publication prefix, or the anchor.
 ///
 /// # Safety
 /// `offset + PREFIX_BYTES` must lie within the mapping.
@@ -558,13 +559,11 @@ fn decode_sal_frame(
 
 /// What the bytes at an offset are.
 enum SalStep {
-    /// Nothing published here, the group's own stride runs past this mapping
-    /// (the log was written under a larger `GNITZ_SAL_BYTES`), or a verified
-    /// header stamped with another epoch — the ring's leftovers. Either way, the
-    /// end of the log.
+    /// Nothing published here, or a verified header stamped with another epoch —
+    /// the ring's leftovers. Either way, the end of the log.
     Absent,
-    /// A published header at this offset that fails its digest, or does not
-    /// decode.
+    /// A published header at this offset that fails its digest, does not decode,
+    /// or sizes a group the mapping cannot hold.
     Corrupt,
     Group(SalMessage),
 }
@@ -593,10 +592,6 @@ impl EpochGate {
     }
 }
 
-/// The anchor's bytes: the [`epoch_word`] in force, that word's checksum, and a
-/// spare word — the one in force before the last write began.
-const ANCHOR_RECORD: usize = 24;
-
 /// Ask btrfs to overwrite the file in place (`FS_NOCOW_FL`): a copy-on-write
 /// rewrite needs new blocks, so the reservation alone would not keep a store
 /// from failing for want of space. Btrfs honours the flag on an empty file
@@ -611,19 +606,6 @@ fn set_nocow(fd: libc::c_int) {
             libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &flags);
         }
     }
-}
-
-/// The stores of an anchor write from the word `in_force` to `word`, as
-/// `(byte offset, value)` in the order they are made. A kill between any two
-/// leaves a record [`SalLog::anchor_word`] resolves to one of the two words: the
-/// spare takes the word in force before the front word is touched, and the
-/// checksum moves to the new word last.
-fn anchor_stores(in_force: u64, word: u64) -> [(usize, u64); 3] {
-    [
-        (16, in_force),
-        (0, word),
-        (8, gnitz_wire::checksum(&word.to_le_bytes())),
-    ]
 }
 
 /// The opened SAL: its mapping and the file behind it.
@@ -661,14 +643,15 @@ impl SalLog {
         Ok(log)
     }
 
-    /// Map `len` bytes of `file` shared and writable. The file is extended to
-    /// `len` first, since a store past its end raises `SIGBUS`, and its blocks
-    /// are reserved, so a store cannot fail for want of disk space. A file
-    /// already longer keeps its length and contents.
+    /// Map `file` shared and writable: `len` bytes, or all of a longer file —
+    /// one written under a larger `GNITZ_SAL_BYTES`.
     fn map(file: &'static File, len: usize) -> io::Result<SalLog> {
+        let len = len.max(file.metadata()?.len().min(SAL_MMAP_SIZE as u64) as usize);
         assert!(len > ANCHOR_BYTES, "the SAL holds a ring behind its anchor page");
         let fd = file.as_raw_fd();
         set_nocow(fd);
+        // A store past the file's end raises `SIGBUS`, and one into an
+        // unreserved block can fail for want of space.
         posix_io::retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) })?;
         // SAFETY: a fresh mapping of a file at least `len` bytes long.
         let ptr = unsafe {
@@ -692,28 +675,18 @@ impl SalLog {
         })
     }
 
-    fn anchor_record(&self) -> *mut [u8; ANCHOR_RECORD] {
-        self.ring.wrapping_sub(ANCHOR_BYTES).cast()
-    }
-
-    /// The anchor word in force: the front word if the checksum verifies it, else
-    /// the spare. A zero word verifies against a zero checksum — the fresh file.
-    fn anchor_word(&self) -> Option<u64> {
+    fn anchor_atomic(&self) -> &'static AtomicU64 {
         // SAFETY: the anchor page is mapped ahead of the ring.
-        let a = unsafe { &*self.anchor_record() };
-        let sum = read_u64_le(a, 8);
-        [0, 16].into_iter().map(|at| read_u64_le(a, at)).find(|&w| match w {
-            0 => sum == 0,
-            w => gnitz_wire::checksum(&w.to_le_bytes()) == sum,
-        })
+        unsafe { prefix_atomic(self.ring.wrapping_sub(ANCHOR_BYTES), 0) }
     }
 
-    /// The walk epoch, and the ring offset a completed `fdatasync` covers.
-    fn anchor(&self) -> Result<(u32, u64), String> {
-        let word = self
-            .anchor_word()
-            .ok_or("SAL anchor fails its checksum: the head of wal.sal is damaged")?;
-        Ok((word_epoch(word), word & u64::from(u32::MAX)))
+    /// The walk epoch.
+    fn anchor(&self) -> Result<u32, String> {
+        match self.anchor_atomic().load(Ordering::Relaxed) {
+            0 => Ok(0), // The fresh file.
+            w if w == anchor_word(word_epoch(w)) => Ok(word_epoch(w)),
+            _ => Err("SAL anchor fails its check: the head of wal.sal is damaged".into()),
+        }
     }
 
     /// The publication prefix word at `base`, or 0 when nothing was published
@@ -784,7 +757,7 @@ impl SalLog {
         let dir = &hdr[OFF_DIRECTORY..OFF_DIRECTORY + payloads * DIR_ENTRY_BYTES];
         let end = cursor as usize + group_total_size(payloads, dir_sizes(dir));
         if end > m {
-            return SalStep::Absent;
+            return SalStep::Corrupt;
         }
 
         // SAFETY: bounded directly above; the payloads run from the header's end
@@ -848,8 +821,6 @@ pub(crate) struct SalWriter {
     log: SalLog,
     write_cursor: Cell<u64>,
     epoch: Cell<u32>,
-    /// The anchored synced offset of the live epoch.
-    synced: Cell<u64>,
     /// The LSN of the latest scope that published anything; see
     /// [`Self::watermark`].
     watermark: Cell<u64>,
@@ -884,7 +855,6 @@ impl SalWriter {
             log,
             write_cursor: Cell::new(0),
             epoch: Cell::new(0),
-            synced: Cell::new(0),
             watermark: Cell::new(0),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
@@ -1101,36 +1071,19 @@ impl SalWriter {
         debug_assert!(epoch >= 1, "the first live SAL epoch is 1");
         self.write_cursor.set(0);
         self.epoch.set(epoch);
-        self.synced.set(0);
         self.refused_transient.set(false);
         // Emptied only once the new epoch is durable: a kill before that must
         // leave the old epoch's tail whole.
-        self.write_anchor(epoch, 0);
+        self.write_anchor(epoch);
         if let Err(e) = self.log.file.sync_data() {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");
         }
         unsafe { write_end_prefix(self.log.ring, 0) };
     }
 
-    /// Anchor `synced` in `epoch`.
-    fn write_anchor(&self, epoch: u32, synced: u64) {
-        let in_force = self.log.anchor_word().expect("the anchor verified at boot");
-        let record = self.log.anchor_record().cast::<u8>();
-        for (at, value) in anchor_stores(in_force, epoch_word(epoch, synced)) {
-            // SAFETY: the anchor page is mapped ahead of the ring, and only this
-            // writer writes it. Volatile, so the stores reach the mapping in
-            // this order.
-            unsafe { record.add(at).cast::<[u8; 8]>().write_volatile(value.to_le_bytes()) };
-        }
-    }
-
-    /// Raise the anchored offset to `through`, unless the log was rewound out of
-    /// `epoch` since.
-    fn mark_synced(&self, epoch: u32, through: u64) {
-        if self.epoch.get() == epoch && through > self.synced.get() {
-            self.synced.set(through);
-            self.write_anchor(epoch, through);
-        }
+    /// Anchor `epoch` as the one the walk reads.
+    fn write_anchor(&self, epoch: u32) {
+        self.log.anchor_atomic().store(anchor_word(epoch), Ordering::Relaxed);
     }
 
     pub(crate) fn epoch(&self) -> u32 {
@@ -1168,7 +1121,7 @@ impl<'a> SalExcl<'a> {
     /// Open a publication scope at the log's next zone LSN: groups laid out in
     /// it are invisible until [`SalScope::commit`], and an uncommitted drop
     /// discards the span. `tag` names the scope for [`ZONE_PANIC`]. `&mut`, so
-    /// no scope overlaps another, a rewind or a [`Self::sync`].
+    /// no scope overlaps another or a rewind.
     pub(crate) fn begin(&mut self, tag: &'static str) -> SalScope<'_> {
         let w = self.writer;
         SalScope {
@@ -1181,18 +1134,15 @@ impl<'a> SalExcl<'a> {
         }
     }
 
-    /// `fdatasync` the log, fatal on failure; once done, anchor the cursor at
-    /// submission as synced. No scope is open, so every byte below it is published.
-    pub(crate) fn sync(&self, reactor: &Reactor, op: &'static str) -> impl Future<Output = ()> + 'a {
-        let w = self.writer;
-        let (epoch, through) = (w.epoch.get(), w.write_cursor.get());
-        let done = reactor.fsync(w.log.file.as_fd());
+    /// `fdatasync` the log, fatal on failure: every group published before the
+    /// call is durable once it resolves.
+    pub(crate) fn sync(&self, reactor: &Reactor, op: &'static str) -> impl Future<Output = ()> {
+        let done = reactor.fsync(self.writer.log.file.as_fd());
         async move {
             let rc = done.await;
             if rc < 0 {
                 gnitz_fatal_abort!("SAL fdatasync ({op}) failed rc={rc}");
             }
-            w.mark_synced(epoch, through);
         }
     }
 

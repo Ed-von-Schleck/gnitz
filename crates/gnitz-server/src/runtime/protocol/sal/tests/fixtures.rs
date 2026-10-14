@@ -52,7 +52,7 @@ impl TestLog {
 
     /// The anchor page's first byte, the start of the whole file.
     pub(crate) fn anchor_ptr(&self) -> *mut u8 {
-        self.writer.log.anchor_record().cast()
+        self.writer.log.ring.wrapping_sub(ANCHOR_BYTES)
     }
 
     pub(crate) fn log(&self) -> SalLog {
@@ -71,11 +71,6 @@ impl TestLog {
     /// Place the write cursor by hand.
     pub(crate) fn seek(&self, cursor: u64) {
         self.writer.write_cursor.set(cursor);
-    }
-
-    /// Anchor `offset` as covered by a completed `fdatasync` in the live epoch.
-    pub(crate) fn synced_through(&self, offset: u64) {
-        self.writer.mark_synced(self.writer.epoch(), offset);
     }
 
     /// Append one group sending worker `w` the bytes `payloads[w]` verbatim, an
@@ -129,9 +124,8 @@ impl TestLog {
         (lsn, bases)
     }
 
-    /// One committed, synced zone of `DdlSync` groups, as a DDL's broadcasts
-    /// write it. Returns its LSN.
-    pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) -> u64 {
+    /// One committed zone of `DdlSync` groups, as a DDL's broadcasts write it.
+    pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) {
         let records: Vec<Vec<u8>> = groups
             .iter()
             .map(|(family, _)| encode_schema_block(family.schema()))
@@ -141,9 +135,7 @@ impl TestLog {
             .zip(groups)
             .map(|(record, &(family, batch))| DirectGroup::ddl_sync(family.id(), record, batch))
             .collect();
-        let (lsn, _) = self.commit_zone(&groups);
-        self.synced_through(self.cursor());
-        lsn
+        self.commit_zone(&groups);
     }
 
     /// The header of the group at `base`, sized by its own payload count.
@@ -165,7 +157,7 @@ impl TestLog {
 
 /// The group published at `base`, walked at the anchor's epoch.
 pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
-    let epoch = log.anchor().expect("the anchor verifies").0;
+    let epoch = log.anchor().expect("the anchor verifies");
     match log.read_at(base, EpochGate::Walk(epoch)) {
         SalStep::Group(msg) => msg,
         _ => panic!("a group is published at offset {base}"),

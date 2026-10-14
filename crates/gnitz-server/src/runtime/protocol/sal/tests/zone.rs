@@ -1,6 +1,6 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_RECORD, PREFIX_BYTES};
+use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, PREFIX_BYTES};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
@@ -10,32 +10,17 @@ const NW: usize = 4;
 const TID: u64 = 16;
 
 /// The zone LSNs a quiescent log commits, in log order.
-fn committed(log: SalLog) -> Result<Vec<u64>, String> {
-    let mut lsns: Vec<u64> = CommittedTail::read(log)?.groups().map(|m| m.lsn).collect();
+fn committed(log: SalLog) -> Vec<u64> {
+    let tail = CommittedTail::read(log).expect("the anchor verifies");
+    let mut lsns: Vec<u64> = tail.groups().map(|m| m.lsn).collect();
     lsns.dedup();
-    Ok(lsns)
+    lsns
 }
 
 /// The `(lsn, target_id)` of each group the walk reads from 0.
 fn walk(log: SalLog) -> Vec<(u64, u64)> {
-    let epoch = log.anchor().expect("the anchor verifies").0;
+    let epoch = log.anchor().expect("the anchor verifies");
     log.walk(epoch).map(|m| (m.lsn, m.target_id)).collect()
-}
-
-/// Unsynced, damage at `stop` commits exactly `before`; once the log is
-/// synced, it fails the boot naming `stop`.
-fn truncates_then_fails(case: &str, log: &TestLog, before: &[u64], stop: u64) {
-    assert_eq!(
-        committed(log.log()).unwrap(),
-        before,
-        "{case}: unsynced, the zones before the stop"
-    );
-    log.synced_through(log.cursor());
-    let err = committed(log.log()).expect_err("damage below the anchored offset is a hole");
-    assert!(
-        err.contains(&format!("offset={stop},")),
-        "{case}: the error names the stop: {err}"
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -54,16 +39,12 @@ fn a_closing_members_prefix_is_not_single_bit_zeroable() {
     let view = log.log();
     let clean = walk(view);
     assert_eq!(clean.len(), 2, "the zone's one member, a tick");
-    assert_eq!(committed(view).unwrap(), vec![lsn]);
+    assert_eq!(committed(view), vec![lsn]);
 
     let prefix = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(bases[0] as usize), PREFIX_BYTES) };
     sweep_bit_flips(prefix, 0..PREFIX_BYTES, |byte, bit, _| {
         assert_eq!(walk(view), clean, "prefix byte {byte} bit {bit} changed the walk");
-        assert_eq!(
-            committed(view).unwrap(),
-            vec![lsn],
-            "prefix byte {byte} bit {bit} lost the zone"
-        );
+        assert_eq!(committed(view), vec![lsn], "prefix byte {byte} bit {bit} lost the zone");
     });
 }
 
@@ -75,34 +56,27 @@ fn a_closing_members_prefix_is_not_single_bit_zeroable() {
 #[test]
 fn a_fresh_file_anchors_epoch_0() {
     let log = TestLog::new(SIZE, 1, 1);
-    unsafe { std::ptr::write_bytes(log.anchor_ptr(), 0, ANCHOR_RECORD) };
+    unsafe { std::ptr::write_bytes(log.anchor_ptr(), 0, PREFIX_BYTES) };
     let view = log.log();
-    assert_eq!(view.anchor(), Ok((0, 0)));
+    assert_eq!(view.anchor(), Ok(0));
     let tail = CommittedTail::read(view).unwrap();
     assert_eq!((tail.live_epoch(), tail.groups().count()), (1, 0));
 }
 
-/// A flipped bit of the anchor word or of its checksum fails the boot; the
-/// spare word behind them is read only when the front word does not verify.
+/// Any flipped bit of the anchor fails the boot.
 #[test]
 fn a_flipped_anchor_bit_fails_the_boot() {
     let log = TestLog::new(SIZE, 1, 3);
-    log.zone(&[11]);
-    log.synced_through(log.cursor());
     let view = log.log();
-    let clean = (3, log.cursor());
-    assert_eq!(view.anchor(), Ok(clean));
+    assert_eq!(view.anchor(), Ok(3));
 
-    let anchor = unsafe { &mut *view.anchor_record() };
-    sweep_bit_flips(anchor, 0..16, |byte, bit, _| {
+    let anchor = unsafe { std::slice::from_raw_parts_mut(log.anchor_ptr(), PREFIX_BYTES) };
+    sweep_bit_flips(anchor, 0..PREFIX_BYTES, |byte, bit, _| {
         let err = CommittedTail::read(view).err();
         assert!(
             err.is_some_and(|e| e.contains("SAL anchor")),
             "anchor byte {byte} bit {bit} must fail the read"
         );
-    });
-    sweep_bit_flips(anchor, 16..ANCHOR_RECORD, |byte, bit, _| {
-        assert_eq!(view.anchor(), Ok(clean), "spare byte {byte} bit {bit}");
     });
 }
 
@@ -114,35 +88,31 @@ fn the_next_epochs_anchor_over_the_old_ring_is_an_empty_tail() {
     let log = TestLog::new(SIZE, 1, 1);
     log.zone(&[11]);
     log.zone(&[21]);
-    log.synced_through(log.cursor());
-    assert_eq!(committed(log.log()).unwrap().len(), 2);
+    assert_eq!(committed(log.log()).len(), 2);
 
-    log.writer.write_anchor(2, 0);
-    let tail = CommittedTail::read(log.log()).expect("an empty tail, not a hole");
+    log.writer.write_anchor(2);
+    let tail = CommittedTail::read(log.log()).expect("an empty tail");
     assert_eq!((tail.live_epoch(), tail.groups().count()), (3, 0));
 }
 
 /// A checkpoint reset durably anchors the next epoch at cursor 0: the old
-/// epoch's groups are leftovers, an fdatasync completing after it covered the
-/// abandoned epoch only, and the next group lands at 0.
+/// epoch's groups are leftovers, and the next group lands at 0.
 #[test]
 fn a_checkpoint_reset_durably_moves_the_anchor_epoch() {
     let log = TestLog::new(SIZE, 1, 1);
     log.zone(&[11]);
     log.zone(&[21]);
-    let (epoch, through) = (log.writer.epoch(), log.cursor());
     log.excl().checkpoint_reset();
-    log.writer.mark_synced(epoch, through);
 
     let view = log.log();
-    assert_eq!(view.anchor(), Ok((2, 0)), "the new epoch, nothing synced");
+    assert_eq!(view.anchor(), Ok(2), "the new epoch");
     assert_eq!(log.cursor(), 0);
     assert_eq!(walk(view), []);
-    assert!(committed(view).unwrap().is_empty());
+    assert!(committed(view).is_empty());
 
     let (lsn, bases) = log.zone(&[31]);
     assert_eq!(bases, [0]);
-    assert_eq!(committed(view).unwrap(), [lsn]);
+    assert_eq!(committed(view), [lsn]);
 }
 
 /// A previous epoch's leftover past the new frontier ends the log.
@@ -164,26 +134,25 @@ fn a_previous_epochs_leftover_ends_the_walk() {
 // The prefix rule: the walk stops at the first defect
 // -----------------------------------------------------------------------
 
-/// Every defect ends the committed set at the zone before it, and fails the
-/// boot once it lies below the synced offset. Each row builds a log, damages
-/// it, and returns the zones before the stop and the stop.
+/// Every defect ends the committed set at the zone before it. Each row builds
+/// a log, damages it, and returns the zones before the stop.
 #[test]
-fn a_defect_truncates_unsynced_and_fails_synced() {
-    type Row = fn(&mut TestLog) -> (Vec<u64>, u64);
+fn a_defect_ends_the_committed_set_at_the_zone_before_it() {
+    type Row = fn(&mut TestLog) -> Vec<u64>;
     // Damage to member `i` of the middle one of three three-member zones.
-    fn middle_zone_member(log: &mut TestLog, i: usize) -> (Vec<u64>, u64) {
+    fn middle_zone_member(log: &mut TestLog, i: usize) -> Vec<u64> {
         let (first, _) = log.zone(&[11, 12, 13]);
         let (_, second) = log.zone(&[21, 22, 23]);
         log.zone(&[31, 32, 33]);
         log.damage_header(second[i]);
-        (vec![first], second[i])
+        vec![first]
     }
     let rows: [(&str, Row); 8] = [
         ("the last zone's closing member", |log| {
             let (first, _) = log.zone(&[11, 12]);
             let (_, last) = log.zone(&[21, 22]);
             log.damage_header(last[1]);
-            (vec![first], last[1])
+            vec![first]
         }),
         ("a zone's first member", |log| middle_zone_member(log, 0)),
         ("a zone's middle member", |log| middle_zone_member(log, 1)),
@@ -194,68 +163,49 @@ fn a_defect_truncates_unsynced_and_fails_synced() {
             log.zone(&[21]);
             log.zone(&[31]);
             log.damage_header(tick);
-            (vec![first], tick)
+            vec![first]
         }),
         ("the stream groups a stream-only commit batch writes", |log| {
             let stream = log.write(41, 0, SalMessageKind::Push, &[&[0u8; 64]]);
             log.zone(&[11]);
             log.damage_header(stream);
-            (vec![], stream)
+            vec![]
         }),
         ("a member of another zone while one is open", |log| {
             let (first, _) = log.zone(&[11]);
             log.open_member();
-            let (_, third) = log.zone(&[31]);
-            (vec![first], third[0])
+            log.zone(&[31]);
+            vec![first]
         }),
         ("a torn slot in the first member of the last zone", |log| {
             let (first, _) = log.push_zone(&[TID]);
             let (_, last) = log.push_zone(&[TID, TID + 1]);
             log.damage_slot(last[0], 0);
-            (vec![first], last[0])
+            vec![first]
         }),
     ];
     for (case, build) in rows {
         let mut log = TestLog::new(SIZE, NW, 1);
-        let (before, stop) = build(&mut log);
-        truncates_then_fails(case, &log, &before, stop);
+        let before = build(&mut log);
+        assert_eq!(committed(log.log()), before, "{case}: the zones before the stop");
     }
 }
 
-/// An unclosed tail zone past the synced offset costs nothing, torn or not.
+/// An unclosed tail zone costs nothing, torn or not.
 #[test]
 fn an_unclosed_tail_zone_costs_nothing() {
     let mut log = TestLog::new(SIZE, 1, 1);
     let (first, _) = log.zone(&[11]);
     let (second, _) = log.zone(&[21]);
-    log.synced_through(log.cursor());
     let torn = log.open_member();
-    assert_eq!(committed(log.log()).unwrap(), [first, second]);
+    assert_eq!(committed(log.log()), [first, second]);
 
     log.damage_header(torn);
     assert_eq!(
-        committed(log.log()).unwrap(),
+        committed(log.log()),
         [first, second],
         "every committed zone before the torn header must survive"
     );
-}
-
-/// A log read under a smaller `GNITZ_SAL_BYTES` than it was written under.
-#[test]
-fn a_stop_past_the_mapping_below_synced_fails() {
-    let log = TestLog::new(SIZE, 1, 1);
-    let (first, _) = log.zone(&[11]);
-    let (_, second) = log.zone(&[21]);
-    // A mapping that ends inside the second zone's group.
-    let shrunk = || SalLog {
-        ring_len: second[0] as usize + 64,
-        ..log.log()
-    };
-    assert_eq!(committed(shrunk()).unwrap(), [first]);
-
-    log.synced_through(log.cursor());
-    let err = committed(shrunk()).expect_err("fsynced groups past the new bound");
-    assert!(err.contains(&format!("offset={},", second[0])), "{err}");
 }
 
 /// Rot in any worker's payload demotes the zone.
@@ -265,7 +215,7 @@ fn the_demotion_is_global_across_slots() {
         let log = TestLog::new(SIZE, NW, 1);
         let (_, bases) = log.push_zone(&[TID]);
         log.damage_slot(bases[0], victim);
-        truncates_then_fails(&format!("slot {victim}"), &log, &[], bases[0]);
+        assert_eq!(committed(log.log()), [], "slot {victim}");
     }
 }
 

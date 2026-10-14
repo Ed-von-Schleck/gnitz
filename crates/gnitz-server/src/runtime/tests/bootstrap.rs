@@ -142,7 +142,6 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
             };
             log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
         });
-        log.synced_through(log.cursor());
 
         let tail = CommittedTail::read(log.log()).unwrap();
         let group = tail.groups().next().expect("the push is committed");
@@ -194,7 +193,6 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
             log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
         });
     }
-    log.synced_through(log.cursor());
     recover_from_sal(CommittedTail::read(log.log()).unwrap(), slot, &mut engine).unwrap();
 
     for tid in [kept, rejected] {

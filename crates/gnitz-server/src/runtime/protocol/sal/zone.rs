@@ -1,6 +1,5 @@
 //! Which zones a boot replays: every zone closed before the recovery walk's
-//! first defect, unless that defect lies below the anchored `synced` offset —
-//! a hole in the durable log, which fails the boot.
+//! first defect.
 
 use super::{next_epoch, SalLog, SalMessage, SalMessageKind};
 
@@ -16,8 +15,8 @@ pub(crate) struct CommittedTail {
 impl CommittedTail {
     /// Walk `log` from 0 at its anchored epoch to the first defect.
     pub(crate) fn read(log: SalLog) -> Result<Self, String> {
-        let (epoch, synced) = log.anchor()?;
-        let (mut at, mut end, mut open) = (0u64, 0u64, None);
+        let epoch = log.anchor()?;
+        let (mut end, mut open) = (0u64, None);
         for msg in log.walk(epoch) {
             if msg.lsn != 0 {
                 if !msg.intact() || open.is_some_and(|zone| zone != msg.lsn) {
@@ -28,13 +27,6 @@ impl CommittedTail {
                     end = msg.end;
                 }
             }
-            at = msg.end;
-        }
-        if at < synced {
-            return Err(format!(
-                "SAL replay: the log breaks at offset={at}, below offset={synced} that a \
-                 completed fdatasync covered — a hole in the durable log, not a torn tail"
-            ));
         }
         Ok(CommittedTail { log, epoch, end })
     }

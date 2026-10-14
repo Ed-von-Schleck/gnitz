@@ -1,9 +1,9 @@
 use super::fixtures::{group_at, TestLog};
 use super::{
-    anchor_stores, decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, DirectGroup,
-    EpochGate, GroupData, GroupHead, GroupTargets, Read, SalLog, SalMessageKind, SalReader, SalRequest, SalStep,
-    WorkerSet, ANCHOR_BYTES, ANCHOR_RECORD, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END,
-    HDR_PREFIX, KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
+    decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, DirectGroup, EpochGate,
+    GroupData, GroupHead, GroupTargets, Read, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, WorkerSet,
+    ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX, KNOWN_FLAGS,
+    MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::test_rings;
@@ -556,26 +556,24 @@ fn a_header_only_verifies_at_the_offset_it_was_published_at() {
     );
 }
 
-/// The probe bounds each header read by the mapping before making it. Views
-/// that end one byte short of the fixed part and of the directory sit over a
-/// digest-valid header, which a read past the view would verify and then find
-/// the stride overrunning — `Absent` — so `Corrupt` is the bound's own verdict.
+/// A view that cannot hold the whole group reads it as corrupt, wherever the
+/// view ends.
 #[test]
 fn a_probe_never_reads_past_the_end_of_the_mapping() {
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 8]]);
+    let base = log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 8]]);
+    let end = group_at(log.log(), base).end as usize;
     let read_in = |len: usize| SalLog { ring_len: len, ..log.log() }.read_at(0, EpochGate::Walk(1));
 
     let header = PREFIX_BYTES + group_header_size(1);
-    assert!(
-        matches!(read_in(PREFIX_BYTES + HDR_PREFIX - 1), SalStep::Corrupt),
-        "the fixed part"
-    );
-    assert!(matches!(read_in(header - 1), SalStep::Corrupt), "the directory");
-    assert!(
-        matches!(read_in(header), SalStep::Absent),
-        "the whole header, not the payload"
-    );
+    for (view, len) in [
+        ("the fixed part", PREFIX_BYTES + HDR_PREFIX - 1),
+        ("the directory", header - 1),
+        ("the payload", end - 1),
+    ] {
+        assert!(matches!(read_in(len), SalStep::Corrupt), "{view}");
+    }
+    assert!(matches!(read_in(end), SalStep::Group(_)), "the whole group");
 }
 
 // ---------------------------------------------------------------------------
@@ -711,57 +709,6 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
         matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
         "a worker addressed past the group's width must read as corruption"
     );
-}
-
-// ---------------------------------------------------------------------------
-// The anchor: a kill can follow any of a write's stores.
-// ---------------------------------------------------------------------------
-
-/// An anchor write started from each state a kill can leave resolves, after each
-/// of its stores, to the word in force before it or to the new one — and to the
-/// new one once all are made.
-#[test]
-fn an_anchor_write_resolves_to_the_old_word_or_the_new_after_every_store() {
-    let sum = |w: u64| gnitz_wire::checksum(&w.to_le_bytes());
-    let (older, old, new, stale) = (
-        epoch_word(6, 0),
-        epoch_word(7, 4096),
-        epoch_word(7, 8192),
-        epoch_word(9, 64),
-    );
-    // `[front, checksum, spare]`.
-    let starts: [(&str, [u64; 3]); 5] = [
-        ("the fresh file", [0, 0, 0]),
-        ("the front verifies, the spare fresh", [old, sum(old), 0]),
-        ("the front verifies, the spare older", [old, sum(old), older]),
-        ("the front verifies, the spare stale", [old, sum(old), stale]),
-        ("the front stale, the spare verifies", [stale, sum(old), old]),
-    ];
-    for (case, start) in starts {
-        let log = TestLog::new(1 << 20, 1, 1);
-        let record = log.log().anchor_record();
-        let store = |at: usize, w: u64| unsafe { gnitz_wire::write_u64_le(&mut *record, at, w) };
-        let lay = || start.into_iter().enumerate().for_each(|(i, w)| store(i * 8, w));
-
-        lay();
-        let in_force = log.log().anchor_word().unwrap_or_else(|| panic!("{case}: resolves"));
-        assert_eq!(in_force, if start == [0; 3] { 0 } else { old }, "{case}");
-        for (n, (at, value)) in anchor_stores(in_force, new).into_iter().enumerate() {
-            store(at, value);
-            let got = log.log().anchor_word();
-            assert!(
-                got == Some(in_force) || got == Some(new),
-                "{case}: after store {n} the anchor reads {got:x?}"
-            );
-        }
-        assert_eq!(log.log().anchor_word(), Some(new), "{case}: every store made");
-        let done: [u8; ANCHOR_RECORD] = unsafe { *record };
-
-        // The writer makes exactly those stores.
-        lay();
-        log.writer.write_anchor(7, 8192);
-        assert_eq!(unsafe { *record }, done, "{case}: the writer's own stores");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,7 +994,7 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema_or_its_record() {
 
 /// The file reaches `len` before the mapping exists, so the store lands on a
 /// real page instead of raising SIGBUS; a remap keeps what the file holds, and a
-/// smaller one does not shrink it.
+/// smaller one neither shrinks it nor maps less of it.
 #[test]
 fn mapping_extends_the_file_and_never_shrinks_it() {
     let file: &'static File = Box::leak(Box::new(tempfile::tempfile().unwrap()));
@@ -1057,5 +1004,6 @@ fn mapping_extends_the_file_and_never_shrinks_it() {
     unsafe { log.ring.add(4096).write(42) };
     let log = SalLog::map(file, ANCHOR_BYTES + 4097).unwrap();
     assert_eq!(len(), (ANCHOR_BYTES + 8192) as u64);
+    assert_eq!(log.ring_len, 8192, "the whole file is mapped");
     assert_eq!(unsafe { log.ring.add(4096).read() }, 42);
 }
