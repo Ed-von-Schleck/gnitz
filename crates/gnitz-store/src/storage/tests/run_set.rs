@@ -11,9 +11,10 @@ proptest! {
     fn a_run_set_holds_the_zset_of_its_pushes(
         (si, rows) in arb_fold_case(),
         steps in prop::collection::vec((0usize..10, 0u8..8), 1..40),
+        cancelling in any::<bool>(),
     ) {
         let s = fold_schemas()[si];
-        let mut set = RunSet::new(1 << 20);
+        let mut set = if cancelling { RunSet::cancelling(1 << 20) } else { RunSet::new(1 << 20) };
         let mut pushed: Vec<Batch> = Vec::new();
         let mut rows = rows.iter().cycle();
         for (n, action) in steps {
@@ -58,17 +59,40 @@ proptest! {
     }
 }
 
+fn keyed_run(schema: &SchemaDescriptor, keys: std::ops::Range<u64>, w: i64, v: i64) -> Batch {
+    let rows: Vec<_> = keys.map(|k| (k, w, v)).collect();
+    crate::test_support::make_batch_raw(schema, &rows).into_consolidated()
+}
+
+/// Only a run cancelling rows of the one before it merges.
+#[test]
+fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
+    let schema = crate::test_support::make_schema_u64_i64();
+    let mut set = RunSet::cancelling(usize::MAX);
+    set.push(keyed_run(&schema, 0..100, 1, 0), &schema);
+    set.push(keyed_run(&schema, 100..200, 1, 0), &schema);
+    assert_eq!(set.len(), 2, "an insert-only run stays apart");
+
+    let mut update = keyed_run(&schema, 100..160, -1, 0);
+    update = update.merged_consolidated(&keyed_run(&schema, 100..160, 1, 1), &schema);
+    set.push(update, &schema);
+    assert_eq!(set.len(), 2, "the update cancelled into the run before it");
+    assert_eq!(set.row_count(), 200, "its retractions and their rows are gone");
+
+    set.push(keyed_run(&schema, 0..50, -1, 0), &schema);
+    assert_eq!(set.len(), 3, "retractions of an older run's rows stay apart");
+    set.fold(&schema);
+    assert_eq!(set.row_count(), 150);
+}
+
 /// A probed set keeps its filter through a fold that cancels a few rows, drops
 /// it at one that cancels most of what went in, and answers its probes alike.
 #[test]
 fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
-    use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk};
+    use crate::test_support::{make_schema_u64_i64, opk_pk};
     let schema = make_schema_u64_i64();
     let mut set = RunSet::new(0);
-    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
-        let rows: Vec<_> = keys.map(|k| (k, w, 7)).collect();
-        set.push(make_batch_raw(&schema, &rows).into_consolidated(), &schema);
-    };
+    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| set.push(keyed_run(&schema, keys, w, 7), &schema);
     let holds = |set: &RunSet, k: u64| {
         let key = opk_pk(&schema, &[k as u128]);
         let mut found = false;

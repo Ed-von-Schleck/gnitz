@@ -180,7 +180,7 @@ impl Table {
             // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
-            ram_tier: RunSet::new(ram_tier_bytes),
+            ram_tier: RunSet::cancelling(ram_tier_bytes),
             shard_index: ShardIndex::open(dir, schema, capacity, skip_pk_filter, &shards)?,
             rederived,
             loaded_mark,

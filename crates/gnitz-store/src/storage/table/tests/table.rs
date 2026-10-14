@@ -481,10 +481,12 @@ fn a_tier_folded_to_just_under_its_ceiling_spills() {
             .unwrap();
         t.fold_to_ram().unwrap();
         assert_eq!(t.all_shard_arcs().len(), 0, "{held}: under the ceiling");
-        // Updates of a quarter of the ceiling's rows: each a retraction and an insert.
-        let updates = (0..CEILING_ROWS / 4).flat_map(|k| [(k, -1, 0), (k, 1, 1)]);
-        t.ingest(rows(&updates.collect::<Vec<_>>())).unwrap();
-        t.fold_to_ram().unwrap();
+        // Updates of a quarter of the ceiling's rows, in pushes too small to merge.
+        for half in [0..CEILING_ROWS / 8, CEILING_ROWS / 8..CEILING_ROWS / 4] {
+            let updates = half.flat_map(|k| [(k, -1, 0), (k, 1, 1)]);
+            t.ingest(rows(&updates.collect::<Vec<_>>())).unwrap();
+            t.fold_to_ram().unwrap();
+        }
         assert_eq!(!t.all_shard_arcs().is_empty(), spills, "{held} rows held");
         assert_eq!(t.full_scan().len() as u64, held);
     }

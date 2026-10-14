@@ -227,7 +227,7 @@ fn run_set_tier_bench() {
                 (spills, folded) = (0, 0);
                 let mut instructions = 0;
                 let mut memtable = RunSet::new(MEMTABLE_BYTES);
-                let mut tier = RunSet::new(DEFAULT_RAM_TIER_BYTES);
+                let mut tier = RunSet::cancelling(DEFAULT_RAM_TIER_BYTES);
                 for drain in 0..DRAINS {
                     let mut moved: Vec<(u64, i64)> = (drain * per_run..(drain + 1) * per_run)
                         .map(|seq| rows(seq, hot))

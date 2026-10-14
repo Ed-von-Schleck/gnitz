@@ -11,6 +11,7 @@ use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
+use crate::schema::payload_order::compare_rows;
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_wire::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
@@ -903,6 +904,14 @@ impl Batch {
     pub fn pk_rows(&self, key: &[u8]) -> Range<usize> {
         let cp = self.pk_col_ptr();
         unsafe { super::seek::seek_pk_rows(self.count, cp.stride, cp, key) }
+    }
+
+    /// Whether this batch holds the element of `src`'s row `row`, at any weight.
+    pub fn holds_element_of(&self, src: &Batch, row: usize, schema: &SchemaDescriptor) -> bool {
+        let rows = self.pk_rows(src.get_pk_bytes(row));
+        let cmp = |i| compare_rows(schema, self, i, src, row);
+        let at = super::seek::lower_bound_by(rows.start, rows.end, |i| cmp(i).is_lt());
+        at < rows.end && cmp(at).is_eq()
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live

@@ -14,6 +14,13 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// cursor merges and a PK probe walks.
 const FOLD_THRESHOLD: usize = 16;
 
+/// A [cancelling](RunSet::cancelling) set merges a run into one at most this
+/// many times its size.
+const CANCEL_MERGE_RATIO: usize = 2;
+
+/// Retractions a [cancelling](RunSet::cancelling) set looks up per push.
+const CANCEL_SAMPLE: usize = 16;
+
 /// The share of its budget a set must have free not to be
 /// [crowded](RunSet::is_crowded): one part in this many.
 const ROOM_SHARE: usize = 16;
@@ -37,6 +44,8 @@ pub(super) struct RunSet {
     /// into the next tier, or spill to a shard — is `Table`'s policy.
     budget: usize,
     bytes: usize,
+    /// See [`Self::cancelling`].
+    merges_cancelling: bool,
 }
 
 impl RunSet {
@@ -46,6 +55,16 @@ impl RunSet {
             bloom: OnceCell::new(),
             budget,
             bytes: 0,
+            merges_cancelling: false,
+        }
+    }
+
+    /// A set that merges each pushed run into the one before it while that run
+    /// is not much larger and holds most of the pushed run's retractions.
+    pub(super) fn cancelling(budget: usize) -> Self {
+        RunSet {
+            merges_cancelling: true,
+            ..Self::new(budget)
         }
     }
 
@@ -67,6 +86,16 @@ impl RunSet {
         }
         self.bytes += run.total_bytes();
         self.runs.push(run);
+        while let [.., older, newer] = &self.runs[..] {
+            if !self.merges_cancelling
+                || older.len() > CANCEL_MERGE_RATIO * newer.len()
+                || !retractions_cancel(older, newer, schema)
+            {
+                break;
+            }
+            let merged = older.merged_consolidated(newer, schema);
+            self.replace_from(self.runs.len() - 2, merged);
+        }
         if self.runs.len() >= FOLD_THRESHOLD {
             self.fold(schema);
         }
@@ -162,28 +191,25 @@ impl RunSet {
             let dominant = self.runs.remove(big);
             match &self.runs[..] {
                 [one] => dominant.merged_consolidated(one, schema),
-                _ => dominant.merged_consolidated(&self.consolidate_all(schema), schema),
+                rest => dominant.merged_consolidated(&consolidate_all(rest, schema), schema),
             }
         } else {
-            self.consolidate_all(schema)
+            consolidate_all(&self.runs, schema)
         };
-        self.runs.clear();
-        // A cancelled row's key stays in the filter as a false positive.
-        if self.bloom.get().is_some_and(|b| b.stale(merged.len())) {
-            self.bloom.take();
-        }
-        self.bytes = 0;
-        if !merged.is_empty() {
-            let run = Rc::new(merged.trimmed());
-            self.bytes = run.total_bytes();
-            self.runs.push(run);
-        }
+        self.replace_from(0, merged);
     }
 
-    /// Every run folded N-way into one consolidated batch.
-    fn consolidate_all(&self, schema: &SchemaDescriptor) -> Batch {
-        let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
-        merge_consolidated(&views, schema)
+    /// Replace the runs from `start` on with `merged`, their consolidated sum.
+    fn replace_from(&mut self, start: usize, merged: Batch) {
+        self.runs.truncate(start);
+        if !merged.is_empty() {
+            self.runs.push(Rc::new(merged.trimmed()));
+        }
+        self.bytes = self.runs.iter().map(|r| r.total_bytes()).sum();
+        // A cancelled row's key stays in the filter as a false positive.
+        if self.bloom.get().is_some_and(|b| b.stale(self.row_count())) {
+            self.bloom.take();
+        }
     }
 
     /// Fold to a single run and hand it to `write`, emptying the set once that
@@ -243,6 +269,32 @@ impl RunSet {
             bloom
         })
     }
+}
+
+/// `runs` folded N-way into one consolidated batch.
+fn consolidate_all(runs: &[Rc<Batch>], schema: &SchemaDescriptor) -> Batch {
+    let views: Vec<MemBatch> = runs.iter().map(|r| r.as_mem_batch()).collect();
+    merge_consolidated(&views, schema)
+}
+
+/// Whether `older` holds most sampled retractions of `newer`: the first
+/// retraction of each of [`CANCEL_SAMPLE`] equal stretches of its rows.
+fn retractions_cancel(older: &Batch, newer: &Batch, schema: &SchemaDescriptor) -> bool {
+    // The count vectorises, so an insert-only run costs one cheap pass, where
+    // the sampling below would read each of its weights one at a time.
+    if newer.retracted_rows().count() == 0 {
+        return false;
+    }
+    let n = newer.len();
+    let (mut sampled, mut held) = (0, 0);
+    for s in 0..CANCEL_SAMPLE {
+        let stretch = s * n / CANCEL_SAMPLE..(s + 1) * n / CANCEL_SAMPLE;
+        if let Some(row) = stretch.into_iter().find(|&i| newer.get_weight(i) < 0) {
+            sampled += 1;
+            held += usize::from(older.holds_element_of(newer, row, schema));
+        }
+    }
+    2 * held >= sampled
 }
 
 /// Insert every row's PK into `bloom`, keyed by [`probe_key`].

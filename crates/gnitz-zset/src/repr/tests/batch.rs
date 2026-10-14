@@ -760,3 +760,33 @@ fn key_ranges_are_the_rows_a_key_set_lists() {
         assert_eq!(got, want, "n={n}");
     }
 }
+
+#[test]
+fn holds_element_of_matches_pk_and_payload() {
+    let schema = make_schema_u64_i64();
+    let mut rows: Vec<(u64, i64, i64)> = (0..50).map(|v| (7, 1, 2 * v)).collect();
+    rows.extend([(3, 1, 10), (9, -2, 4)]);
+    let held = make_batch_raw(&schema, &rows).into_consolidated();
+    let probes = make_batch_raw(
+        &schema,
+        &[(3, -1, 10), (3, 1, 11), (7, -1, 48), (7, -1, 49), (8, 1, 0), (9, 1, 4)],
+    )
+    .into_consolidated();
+    let got: Vec<(u128, i64, bool)> = (0..probes.len())
+        .map(|i| {
+            let v = i64::from_le_bytes(probes.get_col_ptr(i, 0, 8).try_into().unwrap());
+            (probes.get_pk(i), v, held.holds_element_of(&probes, i, &schema))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (3, 10, true),
+            (3, 11, false),
+            (7, 48, true),
+            (7, 49, false),
+            (8, 0, false),
+            (9, 4, true)
+        ]
+    );
+}
