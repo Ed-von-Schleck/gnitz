@@ -38,6 +38,8 @@ pub struct ServerHandle {
     /// mTLS client cert/key PEM paths (minted by `start_mtls`), for
     /// [`Self::mtls_target`]. `None` for non-mTLS servers.
     mtls_client: Option<(PathBuf, PathBuf)>,
+    /// The token that file held at boot, until `start_tls_with_token` hands it out.
+    first_token: Option<String>,
 }
 
 impl ServerHandle {
@@ -57,7 +59,7 @@ impl ServerHandle {
     /// [`Self::start_n`] with extra environment variables on the server
     /// process alone.
     pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
-        Self::start_inner(workers, extra_env, None, false)
+        Self::start_inner(workers, extra_env, None, Auth::None)
     }
 
     /// Start with a TLS listener on an ephemeral loopback port, reached through
@@ -68,24 +70,69 @@ impl ServerHandle {
 
     /// [`Self::start_tls`] with extra server-side environment variables.
     pub fn start_tls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
-        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), false)
+        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), Auth::None)
     }
 
     /// [`Self::start_tls`] on the IPv6 loopback (`[::1]:0`) — exercises
-    /// bracketed-target parsing and the dev cert's `::1` IP SAN.
+    /// bracketed-target parsing and the minted cert's `::1` IP SAN.
     pub fn start_tls_v6(workers: usize) -> Self {
-        Self::start_inner(workers, &[], Some("[::1]:0"), false)
+        Self::start_inner(workers, &[], Some("[::1]:0"), Auth::None)
     }
 
     /// [`Self::start_tls`] requiring mTLS against a freshly minted client CA,
     /// whose signed leaf [`Self::mtls_target`] presents.
     pub fn start_mtls(workers: usize) -> Self {
-        Self::start_inner(workers, &[], Some("127.0.0.1:0"), true)
+        Self::start_inner(workers, &[], Some("127.0.0.1:0"), Auth::ClientCa)
+    }
+
+    /// [`Self::start_tls`] requiring an access token, and the one its token
+    /// file holds at boot.
+    pub fn start_tls_with_token(workers: usize) -> (Self, String) {
+        let mut srv = Self::start_inner(workers, &[], Some("127.0.0.1:0"), Auth::Token);
+        let token = srv.first_token.take().expect("a token server mints its first token");
+        (srv, token)
+    }
+
+    /// Mint a token into this server's token file with `--new-token`; the
+    /// server holds it after [`Self::sighup`].
+    pub fn new_token(&self, name: &str) -> String {
+        mint_token(&self.paths.bin, self.token_file(), name)
+    }
+
+    /// The token file a [`Self::start_tls_with_token`] server reads.
+    pub fn token_file(&self) -> &Path {
+        self.args
+            .iter()
+            .find_map(|a| a.strip_prefix("--auth-tokens="))
+            .map(Path::new)
+            .expect("token_file requires a start_tls_with_token server")
+    }
+
+    /// Send the master SIGHUP, which reloads the TLS listener, and wait until
+    /// its log reports the reload's outcome. Returns that line.
+    pub fn sighup(&mut self) -> String {
+        let offset = fs::metadata(&self.paths.stderr_path)
+            .expect("stderr log metadata")
+            .len();
+        let status = Command::new("kill")
+            .args(["-HUP", &self.process.id().to_string()])
+            .status()
+            .expect("kill -HUP");
+        assert!(status.success(), "kill -HUP failed");
+        await_log(&mut self.process, &self.paths.stderr_path, offset, |log| {
+            log.lines().find(|l| l.contains("SIGHUP:")).map(str::to_string)
+        })
+        .unwrap_or_else(|e| panic!("the server never reported the reload: {e}"))
+    }
+
+    /// Whether the server is still running; a worker's death stops the master too.
+    pub fn is_alive(&mut self) -> bool {
+        self.process.try_wait().expect("try_wait").is_none()
     }
 
     /// A missing binary panics rather than skips: a suite passing without a
     /// server tests nothing.
-    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Self {
+    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, auth: Auth) -> Self {
         let bin = env::var("GNITZ_SERVER_BIN")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
         assert!(
@@ -104,16 +151,24 @@ impl ServerHandle {
         };
         let env: Vec<(String, String)> = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
-        // Build the TLS argv. mTLS additionally mints a client CA + a
-        // CA-signed leaf into the tmpdir and enables `--tls-client-ca`.
+        // Build the TLS argv, minting what the client authentication needs.
         let mut args: Vec<String> = Vec::new();
         let mut mtls_client: Option<(PathBuf, PathBuf)> = None;
+        let mut first_token = None;
         if let Some(addr) = tls_listen {
             args.push(format!("--tls-listen={addr}"));
-            if mtls {
-                let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(tmpdir.path());
-                args.push(format!("--tls-client-ca={}", ca.display()));
-                mtls_client = Some((leaf_cert, leaf_key));
+            match auth {
+                Auth::None => {}
+                Auth::ClientCa => {
+                    let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(tmpdir.path());
+                    args.push(format!("--tls-client-ca={}", ca.display()));
+                    mtls_client = Some((leaf_cert, leaf_key));
+                }
+                Auth::Token => {
+                    let file = tmpdir.path().join("tokens");
+                    first_token = Some(mint_token(&paths.bin, &file, "first"));
+                    args.push(format!("--auth-tokens={}", file.display()));
+                }
             }
         }
 
@@ -133,6 +188,7 @@ impl ServerHandle {
             args,
             env,
             mtls_client,
+            first_token,
         }
     }
 
@@ -151,15 +207,15 @@ impl ServerHandle {
             .to_string()
     }
 
-    /// `tls://IP:PORT?ca=<data_dir>/tls_dev_cert.pem` for the bound listener —
-    /// verifies the server's minted dev certificate.
+    /// `tls://IP:PORT?ca=<data_dir>/tls_cert.pem` for the bound listener —
+    /// verifies the server's minted certificate.
     pub fn tls_target(&self) -> String {
         format!("tls://{}?ca={}", self.tls_endpoint(), self.tls_ca_path().display())
     }
 
-    /// Path of the server's minted dev certificate (public PEM).
+    /// Path of the server's minted certificate.
     pub fn tls_ca_path(&self) -> PathBuf {
-        self.paths.data_dir.join("tls_dev_cert.pem")
+        self.paths.data_dir.join("tls_cert.pem")
     }
 
     /// The minted client leaf `(cert_pem, key_pem)` paths for a
@@ -181,6 +237,18 @@ impl ServerHandle {
         format!("{}&cert={}&key={}", self.tls_target(), cert.display(), key.display())
     }
 
+    /// [`Self::tls_target`] presenting `token`, which a fresh file in the
+    /// server's tmpdir holds.
+    pub fn token_target(&self, token: &str) -> String {
+        let dir = self.tmpdir.as_ref().expect("a running server's tmpdir").path();
+        let path = (0..)
+            .map(|i| dir.join(format!("client_token_{i}")))
+            .find(|p| !p.exists())
+            .expect("an unused name");
+        fs::write(&path, format!("{token}\n")).expect("write the client's token file");
+        format!("{}&token_file={}", self.tls_target(), path.display())
+    }
+
     /// Kill the server and respawn it on the same data dir and socket path,
     /// with every flag and environment variable of the first boot. A TLS server
     /// rebinds the port it had.
@@ -200,6 +268,32 @@ impl ServerHandle {
             // ServerHandle::Drop preserves the tmpdir during the unwind.
             .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
     }
+}
+
+/// How a TLS listener authenticates its clients, beyond what a loopback bind needs.
+#[derive(Clone, Copy)]
+enum Auth {
+    None,
+    /// `--tls-client-ca`: a client certificate a minted CA signed.
+    ClientCa,
+    /// `--auth-tokens`: an access token.
+    Token,
+}
+
+/// Run `bin --new-token file name`, returning the token it prints.
+fn mint_token(bin: &str, file: &Path, name: &str) -> String {
+    let out = Command::new(bin)
+        .arg("--new-token")
+        .arg(file)
+        .arg(name)
+        .output()
+        .expect("run --new-token");
+    assert!(
+        out.status.success(),
+        "--new-token failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("a UTF-8 token").trim().to_string()
 }
 
 /// Mint a self-signed client CA and a leaf certificate signed by it, writing
@@ -236,14 +330,11 @@ fn spawn_and_wait_ready(
     extra_env: &[(String, String)],
     args: &[String],
 ) -> Result<Child, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
     // Appended on restart so the first boot's stderr survives for post-mortem;
     // this boot's marker is looked for past what is already there.
-    let mut stderr_file = fs::OpenOptions::new()
+    let stderr_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .read(true)
         .open(&paths.stderr_path)
         .expect("failed to open server stderr log file");
     let offset = stderr_file.metadata().expect("stderr log metadata").len();
@@ -269,25 +360,47 @@ fn spawn_and_wait_ready(
     cmd.args(args);
     let mut proc = cmd.spawn().expect("failed to spawn server");
 
+    await_log(&mut proc, &paths.stderr_path, offset, |log| {
+        log.contains(READY_MARKER).then_some(())
+    })
+    .map_err(|e| {
+        proc.kill().ok();
+        proc.wait().ok();
+        format!("server did not log {READY_MARKER:?}: {e}")
+    })?;
+    Ok(proc)
+}
+
+/// Poll the log at `path` past `offset` until `found` finds what it looks for
+/// there; `Err` carries the stderr tail of `proc` exiting or of a timeout.
+fn await_log<T>(
+    proc: &mut Child,
+    path: &Path,
+    offset: u64,
+    mut found: impl FnMut(&str) -> Option<T>,
+) -> Result<T, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).expect("open server stderr log");
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut logged = Vec::new();
     loop {
         if let Ok(Some(status)) = proc.try_wait() {
-            let tail = read_stderr_tail(&paths.stderr_path);
-            return Err(format!("server exited early ({status})\nstderr tail:\n{tail}"));
+            return Err(format!(
+                "server exited ({status})\nstderr tail:\n{}",
+                read_stderr_tail(path)
+            ));
         }
         logged.clear();
-        stderr_file.seek(SeekFrom::Start(offset)).expect("seek stderr log");
-        stderr_file.read_to_end(&mut logged).expect("read stderr log");
-        if String::from_utf8_lossy(&logged).contains(READY_MARKER) {
-            return Ok(proc);
+        file.seek(SeekFrom::Start(offset)).expect("seek stderr log");
+        file.read_to_end(&mut logged).expect("read stderr log");
+        if let Some(t) = found(&String::from_utf8_lossy(&logged)) {
+            return Ok(t);
         }
         if Instant::now() >= deadline {
-            proc.kill().ok();
-            proc.wait().ok();
-            let tail = read_stderr_tail(&paths.stderr_path);
             return Err(format!(
-                "server did not log {READY_MARKER:?} within {STARTUP_TIMEOUT:?}\nstderr tail:\n{tail}"
+                "nothing within {STARTUP_TIMEOUT:?}\nstderr tail:\n{}",
+                read_stderr_tail(path)
             ));
         }
         thread::sleep(POLL_INTERVAL);

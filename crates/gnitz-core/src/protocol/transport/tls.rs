@@ -25,6 +25,8 @@ struct Target {
     ca: Option<String>,
     /// `cert=PATH&key=PATH`: the client's chain and key, for mTLS.
     client_auth: Option<(String, String)>,
+    /// `token_file=PATH`: the file holding the access token the handshake sends.
+    token_file: Option<String>,
 }
 
 fn bad_target(msg: impl std::fmt::Display) -> io::Error {
@@ -32,21 +34,23 @@ fn bad_target(msg: impl std::fmt::Display) -> io::Error {
 }
 
 /// Parse `HOST:PORT[?QUERY]`, the target after `tls://`. `QUERY` is
-/// `&`-separated `ca=PATH`, `cert=PATH` and `key=PATH`, each at most once.
+/// `&`-separated `ca=PATH`, `cert=PATH`, `key=PATH` and `token_file=PATH`, each
+/// at most once.
 fn parse_target(rest: &str) -> io::Result<Target> {
     let (hostport, query) = match rest.split_once('?') {
         Some((hp, q)) => (hp, Some(q)),
         None => (rest, None),
     };
-    let (mut ca, mut cert, mut key) = (None, None, None);
+    let (mut ca, mut cert, mut key, mut token_file) = (None, None, None, None);
     for elem in query.into_iter().flat_map(|q| q.split('&')) {
         let (slot, path) = match elem.split_once('=') {
             Some(("ca", p)) => (&mut ca, p),
             Some(("cert", p)) => (&mut cert, p),
             Some(("key", p)) => (&mut key, p),
+            Some(("token_file", p)) => (&mut token_file, p),
             _ => {
                 return Err(bad_target(format!(
-                    "param {elem:?} not recognised (expected `ca=`, `cert=` or `key=`)"
+                    "param {elem:?} not recognised (expected `ca=`, `cert=`, `key=` or `token_file=`)"
                 )))
             }
         };
@@ -90,7 +94,34 @@ fn parse_target(rest: &str) -> io::Result<Target> {
         port,
         ca,
         client_auth,
+        token_file,
     })
+}
+
+pub(super) const TOKEN_ENV: &str = "GNITZ_TOKEN";
+
+/// The access token `target` sends: its `token_file=`'s contents, else
+/// [`TOKEN_ENV`]'s, else none.
+fn token(target: &Target) -> io::Result<Vec<u8>> {
+    let (token, from) = match &target.token_file {
+        Some(path) => (std::fs::read(path).map_err(|e| bad_file(path, e))?, path.as_str()),
+        None => match std::env::var_os(TOKEN_ENV) {
+            Some(v) => (v.into_encoded_bytes(), TOKEN_ENV),
+            None => return Ok(Vec::new()),
+        },
+    };
+    let token = token.trim_ascii();
+    if token.len() > gnitz_wire::MAX_TOKEN_BYTES {
+        return Err(bad_file(
+            from,
+            format!(
+                "the access token is {} bytes, past the {}-byte limit",
+                token.len(),
+                gnitz_wire::MAX_TOKEN_BYTES
+            ),
+        ));
+    }
+    Ok(token.to_vec())
 }
 
 fn bad_file(path: &str, e: impl std::fmt::Display) -> io::Error {
@@ -98,7 +129,7 @@ fn bad_file(path: &str, e: impl std::fmt::Display) -> io::Error {
 }
 
 /// The `ClientConfig` for one connection, built on every connect so a replaced
-/// `ca=`/`cert=`/`key=` file (the server's dev cert is re-minted each boot) is read afresh.
+/// `ca=`/`cert=`/`key=` file is read afresh.
 fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
     let roots = match &target.ca {
         None => RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
@@ -141,10 +172,11 @@ fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
 const SEND_BUFFER_BYTES: usize = 1 << 20;
 
 /// The TCP connect to `rest` (the target after the `tls://` prefix), no later
-/// than `until`. No TLS handshake is run.
-pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<ClientTransport, ProtocolError> {
+/// than `until`, and the access token its HELLO sends. No TLS handshake is run.
+pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<(ClientTransport, Vec<u8>), ProtocolError> {
     let target = parse_target(rest)?;
     let cfg = build_client_config(&target)?;
+    let token = token(&target)?;
     let server_name = ServerName::try_from(target.host.clone())
         .map_err(|e| bad_target(format!("server name {:?}: {e}", target.host)))?;
 
@@ -174,7 +206,10 @@ pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<ClientTransport,
     let mut conn = ClientConnection::new(cfg, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tls: {e}")))?;
     conn.set_buffer_limit(Some(SEND_BUFFER_BYTES));
-    Ok(ClientTransport::new(Inner::Tls(Box::new(TlsInner { conn, sock }))))
+    Ok((
+        ClientTransport::new(Inner::Tls(Box::new(TlsInner { conn, sock }))),
+        token,
+    ))
 }
 
 /// The TLS arm's state: the rustls connection and the socket beneath it.

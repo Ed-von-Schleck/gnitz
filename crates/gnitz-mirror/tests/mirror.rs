@@ -1067,7 +1067,10 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         }
     };
     send(&mut raw, &gnitz_wire::HELLO);
-    assert_eq!(recv(&mut raw), gnitz_wire::HELLO);
+    assert_eq!(
+        recv(&mut raw),
+        gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted)
+    );
     send(&mut raw, &encode_delta_poll(&[item], Some(1)));
     assert!(!next_is_sync(&mut raw, "the subscribing read"));
 

@@ -40,6 +40,13 @@ fn every_refusal_names_what_it_refuses() {
         ("--tls-key=k.pem /data /sock", None, "--tls-listen"),
         ("--tls-client-ca=ca.pem /data /sock", None, "--tls-listen"),
         ("--allow-unauthenticated /data /sock", None, "--tls-listen"),
+        ("--auth-tokens=t /data /sock", None, "--tls-listen"),
+        ("--tls-name=db /data /sock", None, "--tls-listen"),
+        (
+            "--tls-listen=127.0.0.1:0 --tls-name=a,,b /data /sock",
+            None,
+            "empty name",
+        ),
     ] {
         let e = parse(line, env_level)
             .err()
@@ -83,6 +90,13 @@ fn the_tls_flags_are_collected_wherever_they_stand() {
     let tls = parse("--tls-listen=[::1]:7 /data /sock", None).unwrap().tls.unwrap();
     assert_eq!(tls.listen, "[::1]:7".parse().unwrap());
     assert!(tls.cert_key.is_none() && tls.client_ca.is_none() && !tls.allow_unauthenticated);
+    assert!(tls.names.is_empty() && tls.auth_tokens.is_none());
+
+    let line = "--tls-name=db.internal,10.0.0.5 /data --tls-listen=127.0.0.1:0 --tls-name=db2 --auth-tokens=tok \
+                /sock";
+    let tls = parse(line, None).unwrap().tls.unwrap();
+    assert_eq!(tls.names, ["db.internal", "10.0.0.5", "db2"]);
+    assert_eq!(tls.auth_tokens.as_deref(), Some("tok"));
 
     let line = "/data --tls-listen=127.0.0.1:0 --tls-cert=c.pem --tls-key=k.pem \
                 --tls-client-ca=ca.pem --allow-unauthenticated /sock";

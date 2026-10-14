@@ -44,9 +44,9 @@ def test_a_public_bind_without_client_authentication_is_refused(own_server):
     assert "--allow-unauthenticated" in _refused(own_server, "--tls-listen=0.0.0.0:0")
 
 
-def test_one_public_address_is_refused_the_dev_certificate(own_server):
+def test_one_public_address_needs_a_certificate_naming_it(own_server):
     out = _refused(own_server, "--tls-listen=192.0.2.1:0", "--allow-unauthenticated")
-    assert "--tls-cert" in out
+    assert "--tls-cert" in out and "--tls-name" in out
 
 
 def test_an_unreadable_pem_file_is_refused(own_server):

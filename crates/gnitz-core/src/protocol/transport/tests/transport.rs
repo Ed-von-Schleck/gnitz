@@ -54,54 +54,77 @@ fn queue_survives_chunked_and_partial_writes() {
     assert_eq!(reader.join().unwrap(), expected);
 }
 
-/// A peer answering `reply` to the client's HELLO, which it reads first.
-fn hello_against(reply: &[u8]) -> Result<(), ClientError> {
+/// A peer answering `reply` to the client's HELLO, which carries `token`.
+fn hello_against(token: &[u8], reply: &[u8]) -> Result<(), ClientError> {
     let (mut t, peer) = transport_pair();
     peer.send_bytes(reply);
-    let r = t.hello(Instant::now() + gnitz_wire::CONNECT_TIMEOUT);
-    assert_eq!(peer.recv(), gnitz_wire::HELLO);
+    let r = t.hello(token, Instant::now() + gnitz_wire::CONNECT_TIMEOUT);
+    assert_eq!(peer.recv(), gnitz_wire::client_hello(token));
     r
 }
 
-/// The HELLO of another protocol version.
+/// The server's HELLO carrying `status`, framed.
+fn server_hello(status: gnitz_wire::AuthStatus) -> Vec<u8> {
+    framed(&gnitz_wire::server_hello(status))
+}
+
+/// The HELLO a server of another protocol version refuses ours with.
 fn other_version_hello() -> Vec<u8> {
     let mut other = gnitz_wire::HELLO;
     other[4] ^= 1;
-    other.to_vec()
+    framed(&other)
 }
 
 #[track_caller]
-fn assert_version_refusal(r: Result<(), ClientError>) {
+fn assert_refusal(r: Result<(), ClientError>, names: &str) {
     match r {
-        Err(ClientError::Refused(f)) => assert!(f.text.contains("version mismatch"), "{}", f.text),
-        r => panic!("expected a version refusal, got {r:?}"),
+        Err(ClientError::Refused(f)) => assert!(f.text.contains(names), "{}", f.text),
+        r => panic!("expected a refusal naming {names:?}, got {r:?}"),
     }
 }
 
 #[test]
 fn hello_checks_the_server_hello() {
-    hello_against(&framed(&gnitz_wire::HELLO)).unwrap();
-    assert_version_refusal(hello_against(&framed(&other_version_hello())));
+    hello_against(b"", &server_hello(gnitz_wire::AuthStatus::Accepted)).unwrap();
+    assert_refusal(hello_against(b"", &other_version_hello()), "version mismatch");
     assert!(matches!(
-        hello_against(&framed(b"GNTX\0\0\0\0")),
+        hello_against(b"", &framed(b"GNTX\0\0\0\0\0")),
+        Err(ClientError::Protocol(ProtocolError::DecodeError(_)))
+    ));
+}
+
+#[test]
+fn hello_sends_the_token_and_reports_the_verdict() {
+    hello_against(b"gnitz_ab", &server_hello(gnitz_wire::AuthStatus::Accepted)).unwrap();
+    assert_refusal(
+        hello_against(b"", &server_hello(gnitz_wire::AuthStatus::Refused)),
+        "requires an access token",
+    );
+    assert_refusal(
+        hello_against(b"gnitz_ab", &server_hello(gnitz_wire::AuthStatus::Refused)),
+        "does not recognise",
+    );
+    let not_a_verdict = framed(&[&gnitz_wire::HELLO[..], b"\x09"].concat());
+    assert!(matches!(
+        hello_against(b"", &not_a_verdict),
         Err(ClientError::Protocol(ProtocolError::DecodeError(_)))
     ));
 }
 
 #[test]
 fn hello_refuses_anything_behind_the_server_hello() {
-    let mut two = framed(&gnitz_wire::HELLO);
+    let mut two = server_hello(gnitz_wire::AuthStatus::Accepted);
     two.extend(framed(b"early"));
-    let r = hello_against(&two);
+    let r = hello_against(b"", &two);
     assert!(
         matches!(&r, Err(ClientError::Protocol(ProtocolError::DecodeError(m))) if m.contains("behind the server's HELLO")),
         "{r:?}"
     );
 
     // A framing error behind a good HELLO is the failure reported.
-    let mut torn = framed(&gnitz_wire::HELLO);
+    let mut torn = server_hello(gnitz_wire::AuthStatus::Accepted);
     torn.extend(0u32.to_le_bytes());
-    let r = hello_against(&torn);
+    let r = hello_against(b"", &torn);
     assert!(
         matches!(&r, Err(ClientError::Protocol(ProtocolError::DecodeError(m))) if m.contains("zero-length")),
         "{r:?}"
@@ -109,11 +132,19 @@ fn hello_refuses_anything_behind_the_server_hello() {
 }
 
 #[test]
-fn hello_reports_another_version_from_a_peer_that_then_closes() {
-    let (mut t, peer) = transport_pair();
-    peer.send(&other_version_hello());
-    peer.0.shutdown(std::net::Shutdown::Write).unwrap();
-    assert_version_refusal(t.hello(Instant::now() + gnitz_wire::CONNECT_TIMEOUT));
+fn hello_reports_a_refusal_from_a_peer_that_then_closes() {
+    for (reply, names) in [
+        (other_version_hello(), "version mismatch"),
+        (server_hello(gnitz_wire::AuthStatus::Refused), "does not recognise"),
+    ] {
+        let (mut t, peer) = transport_pair();
+        peer.send_bytes(&reply);
+        peer.0.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_refusal(
+            t.hello(b"gnitz_ab", Instant::now() + gnitz_wire::CONNECT_TIMEOUT),
+            names,
+        );
+    }
 }
 
 #[test]
@@ -121,7 +152,7 @@ fn a_silent_peer_fails_the_hello_at_the_deadline() {
     let (mut t, _peer) = transport_pair();
     let d = Duration::from_millis(50);
     let t0 = Instant::now();
-    let r = t.hello(t0 + d);
+    let r = t.hello(b"", t0 + d);
     assert!(
         matches!(&r, Err(ClientError::Protocol(ProtocolError::IoError(e))) if e.kind() == ErrorKind::TimedOut),
         "{r:?}"

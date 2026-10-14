@@ -43,6 +43,7 @@ gnitz-server — GnitzDB database server
 Usage:
   gnitz-server [OPTIONS] <data_dir> <socket_path>
   gnitz-server --disk-usage <data_dir>
+  gnitz-server --new-token <token_file> <name>
 
 Arguments:
   <data_dir>      Path to the database data directory (created if absent)
@@ -54,28 +55,44 @@ Options:
   --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
                        address (port 0 = ephemeral). The bound address is
                        written to <data_dir>/tls_endpoint. A NON-LOOPBACK bind
-                       REQUIRES --tls-client-ca or --allow-unauthenticated.
-                       A loopback bind is turnkey.
-  --tls-cert=PEM       Server certificate chain (requires --tls-key and
-                       --tls-listen). Without cert+key a self-signed dev
-                       certificate for localhost/127.0.0.1/::1 is minted and
-                       its public PEM written to <data_dir>/tls_dev_cert.pem;
-                       a bind to one non-loopback address therefore REQUIRES
-                       cert+key.
+                       REQUIRES --auth-tokens, --tls-client-ca or
+                       --allow-unauthenticated. A loopback bind is turnkey.
+  --tls-cert=PEM       Server certificate chain, e.g. Let's Encrypt's
+                       fullchain.pem (requires --tls-key and --tls-listen).
+                       Without cert+key a self-signed certificate for
+                       localhost, 127.0.0.1, ::1 and every --tls-name is
+                       minted into <data_dir>/tls_cert.pem (its key into
+                       tls_key.pem, owner-only) and kept across boots: a client
+                       trusts it with ca=<copy of tls_cert.pem>. Delete both
+                       files to mint a new one. A bind to one non-loopback
+                       address REQUIRES cert+key or --tls-name.
   --tls-key=PEM        Server private key (see --tls-cert)
+  --tls-name=NAME[,NAME...]
+                       DNS names or IP addresses the minted certificate covers
+                       beside loopback: the names clients dial. A kept
+                       certificate that does not cover them refuses the boot.
+  --auth-tokens=FILE   Require an access token on every TLS connection, loopback
+                       included: one of those whose SHA-256 FILE holds, one
+                       `<name> <sha256-hex>` line each. Mint one with
+                       --new-token. The AF_UNIX socket asks for none: it is
+                       gated by filesystem permissions.
   --tls-client-ca=PEM  Enable REQUIRED mTLS: clients must present an X.509
                        certificate chaining to this CA (chain) to complete the
                        handshake. Use a DEDICATED client-auth CA — any leaf the
                        CA signs authenticates (a leaf with no extended-key-usage
                        extension authenticates too). No CRL/OCSP: revoke by rotating the CA,
-                       which invalidates all clients at once.
+                       which invalidates all clients at once. Combined with
+                       --auth-tokens, a client needs both.
   --allow-unauthenticated
                        Escape hatch: permit a non-loopback bind with NO client
                        authentication — anyone who can reach the port gets full
-                       DDL/DML/scan access. Prefer --tls-client-ca. Note: even a
-                       loopback bind trusts every local UID (like the always-on
-                       AF_UNIX socket), gated only by network reachability and
-                       filesystem permissions.
+                       DDL/DML/scan access. Prefer --auth-tokens. Note: without
+                       --auth-tokens a loopback bind trusts every local UID (like
+                       the always-on AF_UNIX socket), gated only by network
+                       reachability and filesystem permissions.
+  --new-token          Start no server: mint an access token named <name>,
+                       append its SHA-256 to <token_file> (created owner-only if
+                       absent) and print the token, which is kept nowhere else.
   --disk-usage         Start no server: print what <data_dir> holds on disk, by
                        relation id, store and LSM level, with each shard
                        region's share and the shards two stores hold byte for
@@ -85,6 +102,13 @@ Options:
 
 Every option is --flag=VALUE: a space-separated value is not accepted, and an
 unrecognised argument is an error.
+
+Signals:
+  SIGTERM, SIGINT  Checkpoint and stop.
+  SIGHUP           Reload the TLS listener: its certificate and key (a renewal),
+                   its client CA and its token file (a revocation), for the
+                   connections accepted from then on. A reload that fails keeps
+                   what is served and logs why.
 
 Environment:
   A variable that is set to a value it cannot be read as stops the server;
@@ -147,7 +171,8 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
         None => Level::Quiet,
     };
     let mut workers = 1;
-    let (mut tls_listen, mut cert, mut key, mut client_ca) = (None, None, None, None);
+    let (mut tls_listen, mut cert, mut key, mut client_ca, mut auth_tokens) = (None, None, None, None, None);
+    let mut names: Vec<String> = Vec::new();
     let mut allow_unauthenticated = false;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
@@ -166,6 +191,15 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             key = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-client-ca=") {
             client_ca = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--tls-name=") {
+            for name in val.split(',') {
+                if name.is_empty() {
+                    return Err(format!("--tls-name={val}: an empty name"));
+                }
+                names.push(name.to_string());
+            }
+        } else if let Some(val) = arg.strip_prefix("--auth-tokens=") {
+            auth_tokens = Some(val.to_string());
         } else if arg == "--allow-unauthenticated" {
             allow_unauthenticated = true;
         } else if arg.starts_with('-') {
@@ -185,13 +219,21 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
                 (Some(c), Some(k)) => Some((c, k)),
                 _ => return Err("--tls-cert and --tls-key must be given together".to_string()),
             },
+            names,
             client_ca,
+            auth_tokens,
             allow_unauthenticated,
         }),
-        None if cert.is_some() || key.is_some() || client_ca.is_some() || allow_unauthenticated => {
-            return Err(
-                "--tls-cert, --tls-key, --tls-client-ca and --allow-unauthenticated require --tls-listen".to_string(),
-            );
+        None if cert.is_some()
+            || key.is_some()
+            || client_ca.is_some()
+            || auth_tokens.is_some()
+            || !names.is_empty()
+            || allow_unauthenticated =>
+        {
+            return Err("--tls-cert, --tls-key, --tls-name, --tls-client-ca, --auth-tokens and \
+                        --allow-unauthenticated require --tls-listen"
+                .to_string());
         }
         None => None,
     };
@@ -222,17 +264,26 @@ fn main() {
         print!("{HELP_TEXT}");
         process::exit(0);
     }
-    if let [flag, data_dir] = &args[..] {
-        if flag == "--disk-usage" {
-            match gnitz_store::relation::disk_usage(data_dir) {
-                Ok(usage) => print!("{usage}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    process::exit(1);
-                }
-            }
-            process::exit(0);
+    // The commands that start no server.
+    let one_shot = match &args[..] {
+        [flag, data_dir] if flag == "--disk-usage" => {
+            Some(gnitz_store::relation::disk_usage(data_dir).map(|usage| print!("{usage}")))
         }
+        [flag, token_file, name] if flag == "--new-token" => Some(runtime::mint_token(token_file, name).map(|token| {
+            println!("{token}");
+            eprintln!(
+                "Minted access token {name:?} into {token_file}. It is shown once and kept nowhere: \
+                 store it where its client reads it. Revoke it by deleting its line, then SIGHUP the server."
+            );
+        })),
+        _ => None,
+    };
+    if let Some(done) = one_shot {
+        if let Err(e) = done {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+        process::exit(0);
     }
     let env_level = env::var("GNITZ_LOG_LEVEL").ok();
     let refuse = |e: String| -> ! {

@@ -1,66 +1,49 @@
 //! The client listeners: the AF_UNIX socket every server has and the TCP socket
-//! `--tls-listen` adds, and the files that describe the TCP one to its clients.
+//! `--tls-listen` adds, and the file that tells clients where the TCP one bound.
 
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
+use std::rc::Rc;
 
-use crate::runtime::tls::TlsConfig;
+use crate::runtime::tls::TlsListener;
 
-/// `<data_dir>/<name>` files a TLS listener is described by: the bound `IP:PORT`,
-/// and the public PEM of a minted dev certificate.
+/// `<data_dir>/<name>` file holding the TLS listener's bound `IP:PORT`.
 const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
-const TLS_DEV_CERT_FILE: &str = "tls_dev_cert.pem";
 
-/// A bound, listening socket, and the rustls config its connections are
-/// served under (`None`: the AF_UNIX socket, served in plaintext).
+/// A bound, listening socket, and what its connections are served under
+/// (`None`: the AF_UNIX socket, served in plaintext and asked for no token).
 pub(crate) struct ClientListener {
     pub fd: OwnedFd,
-    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub tls: Option<Rc<TlsListener>>,
 }
 
-/// Remove an earlier boot's TLS files. Called with the data-directory lock held,
-/// so the files it removes belong to no live server; from here until
-/// [`bind_listeners`] writes them, their absence is the truth.
+/// Remove an earlier boot's endpoint file. Called with the data-directory lock
+/// held, so the file belongs to no live server; from here until
+/// [`bind_listeners`] writes it, its absence is the truth.
 pub(crate) fn clear_published(data_dir: &str) -> Result<(), String> {
-    for name in [TLS_ENDPOINT_FILE, TLS_DEV_CERT_FILE] {
-        let path = format!("{data_dir}/{name}");
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(format!("failed to remove {path}: {e}"));
-            }
-            _ => {}
-        }
+    let path = format!("{data_dir}/{TLS_ENDPOINT_FILE}");
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("failed to remove {path}: {e}")),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-/// Bind every listener, then publish the TLS files. Called after the fork, so no
-/// worker inherits a listening fd. The TCP socket binds first, so a boot that fails
-/// the TCP bind never exposed the AF_UNIX socket. The files are written only once
-/// both binds succeeded, the endpoint last.
+/// Bind every listener, the AF_UNIX socket last, then publish the endpoint.
+/// Called after the fork, so no worker inherits a listening fd.
 pub(crate) fn bind_listeners(
     data_dir: &str,
     socket_path: &str,
-    tls: Option<TlsConfig>,
+    tls: Option<TlsListener>,
 ) -> Result<Vec<ClientListener>, String> {
     let tcp = tls
-        .map(|t| bind_tcp(t.listen).map(|(fd, bound)| (fd, bound, t)))
+        .map(|tls| bind_tcp(tls.listen()).map(|(fd, bound)| (fd, bound, tls)))
         .transpose()?;
     let mut listeners = vec![ClientListener { fd: bind_unix(socket_path)?, tls: None }];
-    if let Some((fd, bound, t)) = tcp {
-        if let Some(pem) = t.dev_pem {
-            let path = format!("{data_dir}/{TLS_DEV_CERT_FILE}");
-            std::fs::write(&path, pem).map_err(|e| format!("failed to publish {path}: {e}"))?;
-            gnitz_info!(
-                "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
-                 public PEM at {path}"
-            );
-        }
+    if let Some((fd, bound, tls)) = tcp {
         let path = format!("{data_dir}/{TLS_ENDPOINT_FILE}");
         std::fs::write(&path, format!("{bound}\n")).map_err(|e| format!("failed to publish {path}: {e}"))?;
-        gnitz_info!("Listening on tls://{}", bound);
-        listeners.push(ClientListener { fd, tls: Some(t.cfg) });
+        gnitz_note!("Listening on tls://{bound}: {}", tls.describe());
+        listeners.push(ClientListener { fd, tls: Some(Rc::new(tls)) });
     }
     Ok(listeners)
 }

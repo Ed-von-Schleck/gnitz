@@ -21,7 +21,7 @@ use crate::runtime::park::{WorkerPark, WorkerParks};
 use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
-use crate::runtime::tls::TlsConfig;
+use crate::runtime::tls::{TlsArgs, TlsListener};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Residency, StoreConfig};
@@ -187,7 +187,7 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: 
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> i32 {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> i32 {
     match run_server(data_dir, socket_path, num_workers, tls) {
         Ok(rc) => rc,
         Err(e) => {
@@ -264,6 +264,11 @@ fn run_worker_child(
     // Die immediately if the master exits for any reason: a worker parks on the
     // SAL with no timeout, so this is its only notice.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    // A reload and a stop are the master's: a Ctrl-C or a `pkill` reaching the
+    // whole group must not kill a worker ahead of the master's checkpoint.
+    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
     // Re-check: parent may have died in the fork→prctl window.
     if unsafe { libc::getppid() } != master_pid {
         unsafe { libc::_exit(0) };
@@ -410,7 +415,8 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> Result<i32, String> {
+fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> Result<i32, String> {
+    executor::install_reload_handler();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
     // held by its mapping, and an fsync batch opens a bounded chunk.
@@ -425,6 +431,9 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     let mut opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
         .map_err(|e| format!("failed to open catalog: {e}"))?;
     listen::clear_published(data_dir)?;
+    // Ahead of recovery, so an identity that cannot be read or minted refuses
+    // the boot before it costs one.
+    let tls = tls.map(|args| TlsListener::open(args, data_dir)).transpose()?;
 
     gnitz_note!("Starting {num_workers} workers");
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::tls::TlsArgs;
+use crate::runtime::tls::{TlsArgs, TlsListener, TLS_CERT_FILE};
 
 /// The AF_UNIX bind replaces only a stale socket: a regular file at the path
 /// and a socket a live server answers on each refuse the boot, untouched.
@@ -23,21 +23,20 @@ fn bind_unix_replaces_only_a_stale_socket() {
     bind_unix(path_str).expect("a stale socket is replaced");
 }
 
-/// `bind_listeners` publishes the bound endpoint and the dev PEM after the
-/// AF_UNIX listener, every accepted TLS socket inherits the listening socket's
-/// options, and `clear_published` removes both files, tolerating their absence.
+/// Every accepted TLS socket inherits the listening socket's options, and
+/// `clear_published` tolerates an absent endpoint.
 #[test]
-fn bind_listeners_publishes_the_tls_files_and_accepted_sockets_inherit_the_options() {
+fn bind_listeners_publishes_the_endpoint_and_accepted_sockets_inherit_the_options() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap();
     let sock = dir.path().join("s.sock");
-    let tls = TlsArgs::on("127.0.0.1:0").resolve().unwrap();
+    let tls = TlsListener::open(TlsArgs::on("127.0.0.1:0").resolve().unwrap(), data_dir).unwrap();
     let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls)).expect("bind");
 
     let endpoint = std::fs::read_to_string(dir.path().join(TLS_ENDPOINT_FILE)).unwrap();
     let addr: SocketAddr = endpoint.trim().parse().expect("a connectable address");
     assert_ne!(addr.port(), 0);
-    let pem = std::fs::read_to_string(dir.path().join(TLS_DEV_CERT_FILE)).unwrap();
+    let pem = std::fs::read_to_string(dir.path().join(TLS_CERT_FILE)).unwrap();
     assert!(pem.contains("BEGIN CERTIFICATE"));
 
     assert_eq!(listeners.len(), 2);
@@ -62,25 +61,21 @@ fn bind_listeners_publishes_the_tls_files_and_accepted_sockets_inherit_the_optio
 
     clear_published(data_dir).unwrap();
     clear_published(data_dir).unwrap();
-    for name in [TLS_ENDPOINT_FILE, TLS_DEV_CERT_FILE] {
-        assert!(!dir.path().join(name).exists(), "{name} is removed");
-    }
+    assert!(!dir.path().join(TLS_ENDPOINT_FILE).exists(), "the endpoint is removed");
+    assert!(dir.path().join(TLS_CERT_FILE).exists(), "the identity is kept");
 }
 
 /// The TCP socket binds first, so a boot that fails it exposes neither the
-/// AF_UNIX socket nor a TLS file.
+/// AF_UNIX socket nor the endpoint.
 #[test]
 fn a_failed_tcp_bind_exposes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("s.sock");
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-    let tls = TlsArgs::on(&taken.local_addr().unwrap().to_string()).resolve().unwrap();
+    let args = TlsArgs::on(&taken.local_addr().unwrap().to_string()).resolve().unwrap();
+    let tls = TlsListener::open(args, dir.path().to_str().unwrap()).unwrap();
     assert!(bind_listeners(dir.path().to_str().unwrap(), sock.to_str().unwrap(), Some(tls)).is_err());
-    for path in [
-        sock,
-        dir.path().join(TLS_ENDPOINT_FILE),
-        dir.path().join(TLS_DEV_CERT_FILE),
-    ] {
+    for path in [sock, dir.path().join(TLS_ENDPOINT_FILE)] {
         assert!(!path.exists(), "{}", path.display());
     }
 }

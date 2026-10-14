@@ -60,6 +60,19 @@ fn inbound_frames_are_refused_at_the_header() {
     assert_refused(usize::MAX, &oversize, "a prefix past the frame ceiling");
 }
 
+#[test]
+fn a_connection_admits_full_frames_only_once_admitted() {
+    let past_handshake = framed(&[0x5A; gnitz_wire::HANDSHAKE_FRAME_MAX + 1]);
+    assert_refused(usize::MAX, &past_handshake, "a frame past the handshake's");
+
+    let r = capped_reactor(usize::MAX);
+    let (conn, partner) = admitted(&r);
+    (&partner).write_all(&past_handshake).expect("write");
+    let c = Rc::clone(&conn);
+    let got = r.block_on(async move { c.recv().await.expect("an admitted frame").as_slice().len() });
+    assert_eq!(got, gnitz_wire::HANDSHAKE_FRAME_MAX + 1);
+}
+
 /// In-flight (partial, un-completed) payloads are accounted, and a second
 /// connection whose first frame would breach the full cap is refused — the
 /// many-connection uncounted-in-flight OOM vector.
@@ -67,7 +80,7 @@ fn inbound_frames_are_refused_at_the_header() {
 fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     // Exactly one 10_000-byte in-flight buffer fits.
     let r = capped_reactor(10_000);
-    let (conn1, partner1) = registered(&r);
+    let (conn1, partner1) = admitted(&r);
 
     // Header claims 10_000 bytes but only 100 are delivered: the buffer
     // is malloc'd and counted at header-parse time, yet no frame completes.
@@ -103,7 +116,7 @@ fn inbound_cap_accounting_balances_on_consume() {
     // One recv deframes a whole round and charges every frame in it, so the peak
     // is a round rather than a frame — and the cap below admits one.
     let r = capped_reactor(15_000);
-    let (conn, partner) = registered(&r);
+    let (conn, partner) = admitted(&r);
 
     let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
     for _round in 0..2 {

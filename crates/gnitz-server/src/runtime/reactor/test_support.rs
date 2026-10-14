@@ -122,6 +122,13 @@ pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     (conn, partner)
 }
 
+/// [`registered`], past its handshake: admitting frames up to the payload ceiling.
+pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
+    let (conn, partner) = registered(r);
+    conn.admit_full_frames();
+    (conn, partner)
+}
+
 /// A reactor built with `limits`, and a [`client_pair`] on it. `sndbuf` shrinks
 /// both socket buffers.
 pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Reactor, Rc<ClientConn>, UnixStream) {

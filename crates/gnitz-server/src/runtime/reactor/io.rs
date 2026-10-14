@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
-use gnitz_wire::{Deframer, FrameLenError};
+use gnitz_wire::{Deframer, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
 
 use super::sync::chan;
 use super::wake_queue::WakeQueue;
@@ -102,7 +102,7 @@ pub(crate) enum RecvEnd {
     PeerClosed,
     /// The recv itself failed (`-ECONNRESET`, `-EBADF`, …).
     Socket,
-    /// A declared frame payload above `MAX_FRAME_PAYLOAD`.
+    /// A declared frame payload above the connection's frame ceiling.
     Oversize,
     /// The declared frame's `want` bytes would push the inbound budget past its cap.
     CapBreach { want: usize },
@@ -117,7 +117,7 @@ impl std::fmt::Display for RecvEnd {
         match self {
             RecvEnd::PeerClosed => f.write_str("the peer closed"),
             RecvEnd::Socket => f.write_str("the recv failed"),
-            RecvEnd::Oversize => f.write_str("a frame over the payload ceiling"),
+            RecvEnd::Oversize => f.write_str("a frame over the frame ceiling"),
             RecvEnd::CapBreach { want } => write!(f, "a {want}-byte frame would pass the inbound cap"),
             RecvEnd::Alloc { len } => write!(f, "a {len}-byte frame could not be allocated"),
             RecvEnd::Protocol => f.write_str("a framing violation"),
@@ -145,6 +145,9 @@ pub(crate) struct RecvQueue {
     /// deadlocks once the kernel socket buffer fills.
     frames: WakeQueue<RecvBuf>,
     budget: Rc<Budget>,
+    /// The largest payload admitted: [`HANDSHAKE_FRAME_MAX`] until the
+    /// handshake admits the client, then [`MAX_FRAME_PAYLOAD`].
+    max_frame: usize,
 }
 
 impl RecvQueue {
@@ -153,13 +156,17 @@ impl RecvQueue {
             deframer: Deframer::default(),
             frames: WakeQueue::default(),
             budget,
+            max_frame: HANDSHAKE_FRAME_MAX,
         }
     }
 
     /// Deframe `src`, queueing every frame it completes.
     pub(crate) fn feed(&mut self, mut src: &[u8]) -> Result<(), RecvEnd> {
-        let budget = &self.budget;
+        let (budget, max_frame) = (&self.budget, self.max_frame);
         while let Some((buf, charge)) = self.deframer.feed(&mut src, |len| {
+            if len > max_frame {
+                return Err(RecvEnd::Oversize);
+            }
             let want = frame_weight(len);
             budget.charge(want).ok_or(RecvEnd::CapBreach { want })
         })? {
@@ -169,6 +176,12 @@ impl RecvQueue {
             });
         }
         Ok(())
+    }
+
+    /// Admit frames up to [`MAX_FRAME_PAYLOAD`]: the handshake admitted the
+    /// client, which until then sends no frame past [`HANDSHAKE_FRAME_MAX`].
+    pub(crate) fn admit_full_frames(&mut self) {
+        self.max_frame = MAX_FRAME_PAYLOAD;
     }
 
     /// Take a completed frame without parking.
@@ -204,6 +217,19 @@ impl ClientConn {
 
     pub(super) fn fd(&self) -> i32 {
         self.fd.as_raw_fd()
+    }
+
+    /// See [`RecvQueue::admit_full_frames`].
+    pub(crate) fn admit_full_frames(&self) {
+        self.q.borrow_mut().admit_full_frames();
+    }
+
+    /// The address of the TCP peer; `None` for an AF_UNIX peer.
+    pub(crate) fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: borrowed for one getpeername, never closed: the fd is the connection's.
+        let sock = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(self.fd()) });
+        sock.peer_addr().ok()
     }
 
     /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which

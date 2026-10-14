@@ -54,6 +54,16 @@ impl Peer {
         }
     }
 
+    /// See [`ClientConn::admit_full_frames`].
+    pub fn admit_full_frames(&self) {
+        self.conn.admit_full_frames();
+    }
+
+    /// The client's TCP address; `None` on the AF_UNIX socket.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.conn.peer_addr()
+    }
+
     /// The next request, shipping what is corked before parking on the client.
     /// `None` once the client is gone or has sent its last request.
     pub async fn next_request(&self) -> Option<RecvBuf> {
@@ -84,6 +94,15 @@ impl Peer {
         let mut e = self.egress.borrow_mut();
         let acc = e.get_or_insert_with(|| PooledBuf::with_capacity(COALESCE_MAX_BYTES));
         write(&mut acc.0);
+    }
+
+    /// Append `payload` framed: its length prefix, then its bytes. See
+    /// [`Self::cork_with`].
+    pub fn cork_frame(&self, payload: &[u8]) {
+        self.cork_with(|acc| {
+            acc.extend_from_slice(&gnitz_wire::frame_len_prefix(payload.len()));
+            acc.extend_from_slice(payload);
+        });
     }
 
     /// Append `frame`'s bytes. See [`Self::cork_with`].

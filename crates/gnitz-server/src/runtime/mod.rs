@@ -35,7 +35,7 @@ use protocol::{mesh, park, sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;
 pub(crate) use sal::MAX_WORKERS;
-pub(crate) use tls::TlsArgs;
+pub(crate) use tls::{mint_token, TlsArgs};
 
 #[cfg(test)]
 mod test_support;

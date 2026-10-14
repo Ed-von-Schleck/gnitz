@@ -31,10 +31,10 @@ fn handshake(sock: TcpStream, cfg: Arc<rustls::ServerConfig>) -> ServerEnd {
     end
 }
 
-/// Answer the client's HELLO.
+/// Answer the client's HELLO, which carries no token.
 fn hello(mut end: ServerEnd) -> ServerEnd {
     assert_eq!(read_frame(&mut end), gnitz_wire::HELLO);
-    write_frame(&mut end, &gnitz_wire::HELLO);
+    write_frame(&mut end, &gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted));
     end
 }
 
@@ -92,9 +92,8 @@ pub(in crate::protocol::transport) fn pair(rcvbuf: Option<libc::c_int>) -> (Clie
     (t, lb.join())
 }
 
-/// The client profile: TLS 1.3 alone, and early data off, so that once a
-/// future auth layer gives a session DML authority, replayable early data
-/// cannot become replayable DML. gnitz-server's TLS config tests assert the
+/// The client profile: TLS 1.3 alone, and early data off, so that the access
+/// token the handshake sends never rides replayable early data. gnitz-server's TLS config tests assert the
 /// server-side half.
 #[test]
 fn client_config_profile() {
@@ -260,16 +259,26 @@ fn close_notify_with_bytes_behind_it_surfaces_eof() {
 
 #[test]
 fn parse_target_accepts_all_forms() {
-    type Parsed<'a> = (&'a str, u16, Option<&'a str>, Option<(&'a str, &'a str)>);
-    let cases: [(&str, Parsed); 4] = [
-        ("db.example.com:5433", ("db.example.com", 5433, None, None)),
+    type Parsed<'a> = (
+        &'a str,
+        u16,
+        Option<&'a str>,
+        Option<(&'a str, &'a str)>,
+        Option<&'a str>,
+    );
+    let cases: [(&str, Parsed); 5] = [
+        ("db.example.com:5433", ("db.example.com", 5433, None, None, None)),
         (
             "[::1]:65535?ca=/some/dir/cert.pem",
-            ("::1", 65535, Some("/some/dir/cert.pem"), None),
+            ("::1", 65535, Some("/some/dir/cert.pem"), None, None),
         ),
-        ("h:5?cert=/c&key=/k", ("h", 5, None, Some(("/c", "/k")))),
+        ("h:5?cert=/c&key=/k", ("h", 5, None, Some(("/c", "/k")), None)),
         // A `PATH` may contain `=`, taken literally to the next `&`.
-        ("h:5?ca=/x&cert=/p=q&key=/k", ("h", 5, Some("/x"), Some(("/p=q", "/k")))),
+        (
+            "h:5?ca=/x&cert=/p=q&key=/k",
+            ("h", 5, Some("/x"), Some(("/p=q", "/k")), None),
+        ),
+        ("h:5?token_file=/t&ca=/x", ("h", 5, Some("/x"), None, Some("/t"))),
     ];
     for (input, want) in cases {
         let t = parse_target(input).unwrap();
@@ -278,6 +287,7 @@ fn parse_target_accepts_all_forms() {
             t.port,
             t.ca.as_deref(),
             t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            t.token_file.as_deref(),
         );
         assert_eq!(got, want, "{input:?}");
     }
@@ -286,27 +296,74 @@ fn parse_target_accepts_all_forms() {
 #[test]
 fn parse_target_rejects_malformed() {
     for bad in [
-        "",                      // empty
-        "hostonly",              // no port
-        ":443",                  // empty host
-        "h:0x1f",                // non-numeric port
-        "h:99999",               // port out of u16 range
-        "h:443?",                // empty query (bare trailing `?`)
-        "h:443?ca=",             // empty CA path
-        "h:443?key=",            // empty key path
-        "h:443?CA=/x",           // params are case-sensitive
-        "[::1]443",              // missing `:` after bracket
-        "[::1:443",              // unterminated bracket
-        "h:443?cert=/c",         // cert without key
-        "h:443?key=/k",          // key without cert
-        "h:443?cert=/c&cert=/d", // duplicate cert
-        "h:443?ca=/x&ca=/y",     // duplicate ca
-        "h:443?ca=/x&",          // trailing `&` (empty element)
-        "h:443?&ca=/x",          // leading `&` (empty element)
+        "",                                  // empty
+        "hostonly",                          // no port
+        ":443",                              // empty host
+        "h:0x1f",                            // non-numeric port
+        "h:99999",                           // port out of u16 range
+        "h:443?",                            // empty query (bare trailing `?`)
+        "h:443?ca=",                         // empty CA path
+        "h:443?key=",                        // empty key path
+        "h:443?CA=/x",                       // params are case-sensitive
+        "[::1]443",                          // missing `:` after bracket
+        "[::1:443",                          // unterminated bracket
+        "h:443?cert=/c",                     // cert without key
+        "h:443?key=/k",                      // key without cert
+        "h:443?cert=/c&cert=/d",             // duplicate cert
+        "h:443?ca=/x&ca=/y",                 // duplicate ca
+        "h:443?ca=/x&",                      // trailing `&` (empty element)
+        "h:443?&ca=/x",                      // leading `&` (empty element)
+        "h:443?token_file=",                 // empty token path
+        "h:443?token_file=/a&token_file=/b", // duplicate token file
+        "h:443?token=gnitz_x",               // a token is never written into the target
     ] {
         assert!(
             parse_target(bad).is_err(),
             "{bad:?} must be rejected by the target parser"
         );
     }
+}
+
+/// A `token_file=` is read whole, its surrounding whitespace dropped; a missing
+/// one or one past the token limit is refused naming the file.
+#[test]
+fn a_token_file_is_read_trimmed_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str, body: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path.display().to_string()
+    };
+    let ok = file("ok", b"  gnitz_0123\n");
+    let target = parse_target(&format!("h:1?token_file={ok}")).unwrap();
+    assert_eq!(token(&target).unwrap(), b"gnitz_0123");
+
+    let long = file("long", &[b'x'; gnitz_wire::MAX_TOKEN_BYTES + 1]);
+    for path in [long, "/nonexistent/token".to_string()] {
+        let e = token(&parse_target(&format!("h:1?token_file={path}")).unwrap()).unwrap_err();
+        assert!(e.to_string().contains(&path), "{e}");
+    }
+}
+
+/// A token the server answers `Unrecognised` fails the connect with that
+/// verdict, and the token rides the client's HELLO verbatim.
+#[test]
+fn a_refused_token_fails_the_connect() {
+    let lb = Loopback::serve(None, |sock, cfg| {
+        let mut end = handshake(sock, cfg);
+        let hello = read_frame(&mut end);
+        write_frame(&mut end, &gnitz_wire::server_hello(gnitz_wire::AuthStatus::Refused));
+        end.conn.send_close_notify();
+        end.flush().unwrap();
+        hello
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("token");
+    std::fs::write(&path, "gnitz_feed\n").unwrap();
+    let target = format!("{}&token_file={}", lb.target, path.display());
+    match ClientTransport::connect(&target, Instant::now() + CONNECT_TIMEOUT) {
+        Err(ClientError::Refused(f)) => assert!(f.text.contains("does not recognise"), "{}", f.text),
+        r => panic!("expected the token refused, got {:?}", r.err()),
+    }
+    assert_eq!(lb.join(), gnitz_wire::client_hello(b"gnitz_feed"));
 }

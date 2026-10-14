@@ -1,6 +1,7 @@
 //! The transports against a real server: TLS on a `--tls-listen` listener
-//! (self-signed dev cert, ephemeral port) beside the AF_UNIX socket, and what
-//! the server does to a connection that stalls, floods or never says HELLO.
+//! (minted self-signed cert, ephemeral port) beside the AF_UNIX socket, the
+//! access tokens it asks for and reloads, and what the server does to a
+//! connection that stalls, floods or never says HELLO.
 
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
@@ -67,11 +68,11 @@ fn with_watchdog(secs: u64, f: impl FnOnce() + Send + 'static) {
 fn ca_pin_connects_and_bad_verifications_fail() {
     let srv = ServerHandle::start_tls(1);
 
-    // ?ca=dev cert: full verification against the minted self-signed cert.
+    // ?ca=<minted cert>: full verification against the minted self-signed cert.
     let mut pinned = GnitzClient::connect(&srv.tls_target()).expect("ca-pinned connect");
     block_on(pinned.alloc_id()).unwrap();
 
-    // Default webpki roots must REJECT the self-signed dev cert.
+    // Default webpki roots must REJECT the self-signed minted cert.
     let err = GnitzClient::connect(&format!("tls://{}", srv.tls_endpoint()))
         .err()
         .expect("webpki roots must reject");
@@ -80,7 +81,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
         "expected a certificate error, got: {err}"
     );
 
-    // Wrong CA: a *different* server's dev cert must not verify this one.
+    // Wrong CA: a *different* server's minted cert must not verify this one.
     let other = ServerHandle::start_tls(1);
     let wrong_ca = format!("tls://{}?ca={}", srv.tls_endpoint(), other.tls_ca_path().display());
     assert!(
@@ -90,7 +91,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
 
     // ALPN mismatch: a raw rustls client offering only http/1.1 must fail
     // the handshake (the server pins a non-empty ALPN list). The client
-    // verifies for real against the dev cert — no skip-verifier — so the
+    // verifies for real against the minted cert — no skip-verifier — so the
     // ALPN mismatch is the only possible failure cause.
     let addr = srv.tls_endpoint();
     let mut roots = rustls::RootCertStore::empty();
@@ -123,7 +124,7 @@ fn ipv6_loopback_connect_and_ca_verify() {
     let srv = ServerHandle::start_tls_v6(1);
     let target = srv.tls_target();
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
-    // Full verification against the dev cert's ::1 IP SAN.
+    // Full verification against the minted cert's ::1 IP SAN.
     let mut client = GnitzClient::connect(&target).expect("ca-pinned tls over [::1]");
     block_on(client.alloc_id()).unwrap();
 }
@@ -173,6 +174,86 @@ fn a_wire_version_mismatch_is_answered_with_the_servers_hello_then_closed() {
     sock.read_to_end(&mut reply).unwrap();
     let want = [&gnitz_wire::frame_len_prefix(hello.len())[..], &gnitz_wire::HELLO].concat();
     assert_eq!(reply, want);
+}
+
+#[track_caller]
+fn assert_refused(target: &str, names: &str) {
+    match GnitzClient::connect(target) {
+        Err(ClientError::Refused(f)) => assert!(f.text.contains(names), "{}", f.text),
+        Err(e) => panic!("expected a refusal naming {names:?}, got {e}"),
+        Ok(_) => panic!("expected a refusal naming {names:?}, got a connection"),
+    }
+}
+
+#[test]
+fn a_token_server_admits_only_a_held_token() {
+    let (srv, token) = ServerHandle::start_tls_with_token(4);
+    assert_refused(&srv.tls_target(), "requires an access token");
+    let mut wrong = token.clone();
+    wrong.replace_range(wrong.len() - 1.., if token.ends_with('0') { "1" } else { "0" });
+    assert_refused(&srv.token_target(&wrong), "does not recognise");
+
+    let (mut client, _, tid, schema) = client_with_table(&srv.token_target(&token));
+    let pushed = rows(&schema, 0..300);
+    block_on(client.push(tid, &schema, &pushed, WireConflictMode::Update)).unwrap();
+    let mut local = GnitzClient::connect(srv.sock_path()).expect("the AF_UNIX socket asks for no token");
+    assert_eq!(
+        weighted_rows(&scan_all(&mut local, tid, &schema)),
+        weighted_rows(&pushed)
+    );
+}
+
+#[test]
+fn a_sighup_reloads_the_token_file() {
+    let (mut srv, first) = ServerHandle::start_tls_with_token(4);
+    let (mut held, _, tid, schema) = client_with_table(&srv.token_target(&first));
+
+    let second = srv.new_token("second");
+    let second_target = srv.token_target(&second);
+    assert_refused(&second_target, "does not recognise");
+    let line = srv.sighup();
+    assert!(line.contains("reloaded") && line.contains("2 access tokens"), "{line}");
+    GnitzClient::connect(&second_target).expect("a token minted before the reload");
+
+    let file = srv.token_file().to_path_buf();
+    let kept: String = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("first "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&file, kept).unwrap();
+    srv.sighup();
+    assert_refused(&srv.token_target(&first), "does not recognise");
+    let pushed = rows(&schema, 0..200);
+    block_on(held.push(tid, &schema, &pushed, WireConflictMode::Update)).expect("a held connection stays");
+    assert_eq!(
+        weighted_rows(&scan_all(&mut held, tid, &schema)),
+        weighted_rows(&pushed)
+    );
+
+    std::fs::write(&file, "not a token line\n").unwrap();
+    let line = srv.sighup();
+    assert!(line.contains("failed") && line.contains("line 1"), "{line}");
+    GnitzClient::connect(&second_target).expect("a failed reload keeps the last good token file");
+    assert!(srv.is_alive(), "no process died of a SIGHUP");
+}
+
+/// A first frame past the largest HELLO is refused at its header: an admitted
+/// one would be awaited until the handshake deadline.
+#[test]
+fn a_frame_past_the_handshake_cap_ends_the_connection() {
+    let srv = ServerHandle::start_with_env(1, &[("GNITZ_HELLO_TIMEOUT_MS", "30000")]);
+    let mut sock = UnixStream::connect(srv.sock_path()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let t0 = Instant::now();
+    sock.write_all(&gnitz_wire::frame_len_prefix(gnitz_wire::HANDSHAKE_FRAME_MAX + 1))
+        .unwrap();
+    let mut rest = Vec::new();
+    sock.read_to_end(&mut rest)
+        .expect("the server closes, not the read timeout");
+    assert!(rest.is_empty(), "no HELLO: {rest:?}");
+    assert!(t0.elapsed() < Duration::from_secs(5), "closed after {:?}", t0.elapsed());
 }
 
 const HELLO_DEADLINE: Duration = Duration::from_millis(500);

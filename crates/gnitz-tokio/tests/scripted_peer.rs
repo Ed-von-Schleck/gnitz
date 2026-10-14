@@ -66,7 +66,7 @@ fn accept(listener: &UnixListener) -> UnixStream {
     let (mut s, _) = listener.accept().expect("accept");
     s.set_read_timeout(Some(PATIENCE)).unwrap();
     read_frame(&mut s);
-    write_frame(&mut s, &gnitz_wire::HELLO);
+    write_frame(&mut s, &gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted));
     s
 }
 

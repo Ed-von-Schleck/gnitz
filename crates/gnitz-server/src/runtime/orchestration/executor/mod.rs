@@ -35,6 +35,7 @@ use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AckLease, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
 use crate::runtime::sal::{DirectGroup, Read, SalExcl};
+use crate::runtime::tls::{Served, TlsListener};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::control::{DecodedControl, Target};
@@ -437,11 +438,13 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
 
     // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
     // before exiting.
-    install_shutdown_signal_handlers();
+    install_handler(libc::SIGTERM, handle_shutdown_signal);
+    install_handler(libc::SIGINT, handle_shutdown_signal);
     // Past the last env knob the boot reads, so one it refuses stops the
     // server before it reports ready.
     gnitz_note!("GnitzDB ready");
 
+    let tls = listeners.iter().find_map(|l| l.tls.clone());
     reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
     for listener in listeners {
         reactor.spawn(accept_loop(Rc::clone(&shared), listener));
@@ -452,7 +455,12 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
     // `2` separates a dead worker from a failed boot's `1` and from
     // `gnitz_fatal_abort!`'s `134`.
     reactor.block_on(async move {
-        match select2(serve_until_signalled(&shared), shared.disp().worker_death()).await {
+        match select2(
+            serve_until_signalled(&shared, tls.as_deref()),
+            shared.disp().worker_death(),
+        )
+        .await
+        {
             Either::A(()) => 0,
             Either::B(crashed) => {
                 let data_dir = &shared.data_dir;
@@ -477,13 +485,14 @@ async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
         let Some(conn) = reactor.client_conn(reactor.accept(fd.as_fd()).await) else {
             continue;
         };
-        let peer = Peer::new(&reactor, conn, tls.as_ref());
-        reactor.spawn(connection_loop(peer, Rc::clone(&shared)));
+        let served = tls.as_ref().map(|t| t.current());
+        let peer = Peer::new(&reactor, conn, served.as_ref().map(|s| &s.cfg));
+        reactor.spawn(connection_loop(peer, Rc::clone(&shared), served));
     }
 }
 
-async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
-    serve_connection(&peer, &shared).await;
+async fn connection_loop(peer: Peer, shared: Rc<Shared>, served: Option<Rc<Served>>) {
+    serve_connection(&peer, &shared, served).await;
     // The one exit: ship what is corked, a refusal included, then retire the fd.
     let _ = peer.flush_egress().await;
     peer.close();
@@ -494,19 +503,11 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
 /// request. A sync's answer is no reply, and leaves between two.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
-async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
+async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, served: Option<Rc<Served>>) {
     let deadline = shared.disp().reactor().sleep(shared.hello_timeout);
-    let hello = match select2(peer.next_request(), deadline).await {
-        Either::A(hello) => hello,
-        Either::B(()) => None,
-    };
-    let Some(hello) = hello else { return };
-    peer.cork_with(|out| {
-        out.extend_from_slice(&gnitz_wire::frame_len_prefix(gnitz_wire::HELLO.len()));
-        out.extend_from_slice(&gnitz_wire::HELLO);
-    });
-    if gnitz_wire::check_hello(hello.as_slice()).is_err() {
-        return;
+    match select2(handshake(peer, served), deadline).await {
+        Either::A(true) => peer.admit_full_frames(),
+        Either::A(false) | Either::B(()) => return,
     }
 
     let mut subs = Subscriptions::default();
@@ -531,8 +532,45 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
     subs.leave(&shared.feeds, |_| true);
 }
 
+/// Answer the client's HELLO, its verdict on the access token it carries; true
+/// once the client is admitted.
+async fn handshake(peer: &Peer, served: Option<Rc<Served>>) -> bool {
+    let Some(hello) = peer.next_request().await else {
+        return false;
+    };
+    let Ok(token) = gnitz_wire::read_client_hello(hello.as_slice()) else {
+        // Bare, so a client of another version reports the mismatch.
+        peer.cork_frame(&gnitz_wire::HELLO);
+        return false;
+    };
+    let admitted = match served.as_deref().and_then(|s| s.tokens.as_ref()) {
+        None => true,
+        Some(tokens) => match tokens.check(token) {
+            Some(name) => {
+                gnitz_debug!("a connection authenticated with access token {name:?}");
+                true
+            }
+            None => {
+                gnitz_info!(
+                    "refused the connection from {}: it holds no access token the server does",
+                    peer.peer_addr()
+                        .map_or_else(|| "a client".to_string(), |a| a.to_string())
+                );
+                false
+            }
+        },
+    };
+    peer.cork_frame(&gnitz_wire::server_hello(if admitted {
+        gnitz_wire::AuthStatus::Accepted
+    } else {
+        gnitz_wire::AuthStatus::Refused
+    }));
+    admitted
+}
+
 // ---------------------------------------------------------------------------
-// Signal loop: graceful shutdown (SIGTERM / SIGINT) and SAL reclaim
+// Signal loop: graceful shutdown (SIGTERM / SIGINT), TLS reload (SIGHUP) and
+// SAL reclaim
 // ---------------------------------------------------------------------------
 
 /// Set by the SIGTERM/SIGINT handler; polled by the signal loop. A plain
@@ -544,24 +582,50 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Install async-signal-safe handlers for SIGTERM and SIGINT. The handler only
-/// flips `SHUTDOWN_REQUESTED`; the signal loop's timer picks it up.
-fn install_shutdown_signal_handlers() {
+/// Set by the SIGHUP handler; polled and cleared by the signal loop.
+static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn handle_reload_signal(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install the async-signal-safe `handler` for `sig`. A handler only flips its
+/// flag; the signal loop's timer picks it up.
+fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
+        sa.sa_sigaction = handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_RESTART;
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Catch SIGHUP, so the signal loop reloads the TLS listener.
+pub(crate) fn install_reload_handler() {
+    install_handler(libc::SIGHUP, handle_reload_signal);
+}
+
+fn reload_tls(tls: Option<&TlsListener>) {
+    let Some(tls) = tls else {
+        gnitz_note!("SIGHUP: no TLS listener, nothing to reload");
+        return;
+    };
+    match tls.reload() {
+        Ok(()) => gnitz_note!("SIGHUP: reloaded the TLS listener: {}", tls.describe()),
+        Err(e) => gnitz_error!("SIGHUP: the TLS reload failed, the previous setup is still served: {e}"),
     }
 }
 
 /// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
 /// Then stop admitting pushes, run one final checkpoint, and stop the workers.
-async fn serve_until_signalled(shared: &Shared) {
+async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
     loop {
         shared.disp().reactor().sleep(WORKER_WATCH).await;
+
+        if RELOAD_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            reload_tls(tls);
+        }
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");

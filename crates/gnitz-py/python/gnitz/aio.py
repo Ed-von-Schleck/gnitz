@@ -8,7 +8,9 @@
 
 The target may also be ``tls://HOST:PORT[?QUERY]``, ``QUERY`` being
 ``&``-separated ``ca=PATH`` (PEM roots, default webpki), ``cert=PATH`` and
-``key=PATH`` (mTLS).
+``key=PATH`` (mTLS), and ``token_file=PATH`` (the access token a server run
+with ``--auth-tokens`` asks for; without it the ``GNITZ_TOKEN`` environment
+variable is sent).
 
 A verb submits when called and returns its future; calls run in the order they
 were made, one at a time. A verb that is one request — ``push``, ``delete``,

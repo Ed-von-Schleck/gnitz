@@ -132,19 +132,20 @@ def kill_group(proc):
     proc.wait()
 
 
-def await_ready(proc, read_log, timeout):
-    """Block until `proc` logs the readiness marker, raising with the log tail if
-    it exits first. `read_log` returns this boot's output so far."""
+def await_log(proc, read_log, marker, timeout):
+    """Block until `proc` logs `marker` and return the line holding it, raising
+    with the log tail if it exits first. `read_log` returns the output so far."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(
-                f"server exited rc={proc.returncode} before becoming ready\n"
+                f"server exited rc={proc.returncode} before logging {marker!r}\n"
                 f"{read_log()[-4096:]}")
-        if _READY_MARKER in read_log():
-            return
+        line = next((l for l in read_log().splitlines() if marker in l), None)
+        if line is not None:
+            return line
         time.sleep(_READY_POLL_S)
-    raise TimeoutError(f"server did not start (never reported ready)\n{read_log()[-4096:]}")
+    raise TimeoutError(f"server never logged {marker!r}\n{read_log()[-4096:]}")
 
 
 def is_debug_build():
@@ -250,6 +251,8 @@ class ServerProc:
         # Configuration of this server on every boot; `start(extra_env=...)` is
         # for one boot only.
         self.extra_env = {}
+        # Arguments of this server on every boot, behind the ones every server gets.
+        self.extra_args = []
         self.log_path = log_path or data_dir.rstrip("/") + ".log"
         self.proc = None
         self.tls_target = None
@@ -284,7 +287,7 @@ class ServerProc:
         try:
             return subprocess.Popen(
                 [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}",
-                 "--tls-listen=127.0.0.1:0", *extra_args],
+                 "--tls-listen=127.0.0.1:0", *self.extra_args, *extra_args],
                 stdout=log, stderr=log, env=env,
                 start_new_session=True, preexec_fn=preexec,
             )
@@ -302,13 +305,13 @@ class ServerProc:
             self.workers = workers
         self.proc = self._popen(extra_env)
         try:
-            await_ready(self.proc, self.log_text, timeout)
+            await_log(self.proc, self.log_text, _READY_MARKER, timeout)
         except TimeoutError as e:
             self.stop()
             raise RuntimeError(str(e)) from None
         with open(os.path.join(self.data_dir, "tls_endpoint")) as f:
             port = f.read().strip().rsplit(":", 1)[1]
-        self.tls_target = f"tls://127.0.0.1:{port}?ca={self.data_dir}/tls_dev_cert.pem"
+        self.tls_target = f"tls://127.0.0.1:{port}?ca={self.data_dir}/tls_cert.pem"
         return self
 
     def start_expecting_exit(self, *, workers=None, extra_env=None, extra_args=(), timeout=20.0):
@@ -406,6 +409,13 @@ class ServerProc:
 
     def log_tail(self, max_bytes=4096):
         return self.log_text()[-max_bytes:]
+
+    def sighup(self, timeout=10.0):
+        """SIGHUP the master, which reloads its TLS listener, and return the line
+        it logs the reload's outcome on."""
+        seen = len(self.log_text())
+        os.kill(self.proc.pid, signal.SIGHUP)
+        return await_log(self.proc, lambda: self.log_text()[seen:], "SIGHUP:", timeout)
 
     def worker_pids(self):
         """`{worker index: pid}` of the running master's children: each worker's

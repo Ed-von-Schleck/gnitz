@@ -11,7 +11,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-use gnitz_wire::{Deframer, FrameLenError, HelloError};
+use gnitz_wire::{AuthStatus, Deframer, FrameLenError, HelloError};
 
 use super::error::ProtocolError;
 use crate::ClientError;
@@ -156,11 +156,11 @@ impl ClientTransport {
     /// Connect to a `tls://` target, or else to an AF_UNIX socket path, and
     /// exchange HELLOs, all no later than `until`.
     pub fn connect(target: &str, until: Instant) -> Result<Self, ClientError> {
-        let mut t = match target.strip_prefix("tls://") {
+        let (mut t, token) = match target.strip_prefix("tls://") {
             Some(rest) => tls::connect_tls(rest, until)?,
-            None => ClientTransport::unix(UnixStream::connect(target)?)?,
+            None => (ClientTransport::unix(UnixStream::connect(target)?)?, Vec::new()),
         };
-        t.hello(until)?;
+        t.hello(&token, until)?;
         Ok(t)
     }
 
@@ -177,10 +177,11 @@ impl ClientTransport {
         self.inner.as_fd().as_raw_fd()
     }
 
-    /// Exchange HELLOs, no later than `until`. On TLS this is also where the
-    /// handshake completes and certificate failures surface.
-    fn hello(&mut self, until: Instant) -> Result<(), ClientError> {
-        self.enqueue(gnitz_wire::HELLO.to_vec());
+    /// Exchange HELLOs, ours carrying `token`, no later than `until`. On TLS
+    /// this is also where the handshake completes and certificate failures
+    /// surface.
+    fn hello(&mut self, token: &[u8], until: Instant) -> Result<(), ClientError> {
+        self.enqueue(gnitz_wire::client_hello(token));
         loop {
             // Every round: a read queues the TLS handshake's next flight.
             self.flush()?;
@@ -206,12 +207,24 @@ impl ClientTransport {
                 [reply] => reply,
                 _ => return Err(ProtocolError::DecodeError("a frame behind the server's HELLO".into()).into()),
             };
-            // Ahead of `read`'s own failure: a server refusing the version
-            // answers, then hangs up.
-            gnitz_wire::check_hello(reply).map_err(|e| match e {
-                HelloError::Malformed => ClientError::from(ProtocolError::DecodeError(e.to_string())),
-                HelloError::Version { .. } => ClientError::from(e.to_string()),
-            })?;
+            // Ahead of `read`'s own failure: a server refusing the version or
+            // the token answers, then hangs up.
+            match gnitz_wire::read_server_hello(reply) {
+                Ok(AuthStatus::Accepted) => {}
+                Ok(AuthStatus::Refused) if token.is_empty() => {
+                    return Err(ClientError::from(format!(
+                        "authentication failed: the server requires an access token (`token_file=` or {})",
+                        tls::TOKEN_ENV
+                    )))
+                }
+                Ok(AuthStatus::Refused) => {
+                    return Err(ClientError::from(
+                        "authentication failed: the server does not recognise the access token".to_string(),
+                    ))
+                }
+                Err(e @ HelloError::Malformed) => return Err(ProtocolError::DecodeError(e.to_string()).into()),
+                Err(e @ HelloError::Version { .. }) => return Err(ClientError::from(e.to_string())),
+            }
             read?;
             return Ok(());
         }
