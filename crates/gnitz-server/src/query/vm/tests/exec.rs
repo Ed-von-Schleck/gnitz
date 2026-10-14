@@ -131,7 +131,7 @@ fn a_distinct_emits_only_the_positive_boundary_crossings_of_its_history() {
         r0,
         schema,
         Op::WeightClamp {
-            hist,
+            hist: ClampHistory::Own(hist),
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
@@ -538,7 +538,7 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
         r0,
         schema,
         Op::WeightClamp {
-            hist,
+            hist: ClampHistory::Own(hist),
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
@@ -559,7 +559,7 @@ fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
         b,
         schema,
         Op::WeightClamp {
-            hist,
+            hist: ClampHistory::Own(hist),
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
@@ -683,7 +683,7 @@ fn a_lent_seed_comes_back_folded_and_whole() {
     let hist = p.table("hist", schema);
     let r0 = p.seed(schema);
     let kind = gnitz_wire::ClampKind::Distinct;
-    let out = p.push(r0, schema, Op::WeightClamp { hist, kind });
+    let out = p.push(r0, schema, Op::WeightClamp { hist: ClampHistory::Own(hist), kind });
     let mut vm = p.open(out);
 
     let mut seed = make_batch_u128_raw(&schema, &[(2, 1, 20), (1, 1, 10), (2, 1, 20)]);
@@ -709,7 +709,11 @@ fn a_broadcast_sends_folded_what_its_reader_reads_folded() {
         let r0 = p.seed(schema);
         let gathered = p.round(r0, plan);
         let kind = gnitz_wire::ClampKind::Distinct;
-        let out = p.push(gathered, schema, Op::WeightClamp { hist, kind });
+        let out = p.push(
+            gathered,
+            schema,
+            Op::WeightClamp { hist: ClampHistory::Own(hist), kind },
+        );
         let mut vm = p.open(out);
 
         let mut seed = make_batch_u128_raw(&schema, &[(2, 1, 20), (1, 1, 10), (2, 1, 20)]);

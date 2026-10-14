@@ -231,8 +231,8 @@ at weight −1, the new at +1.
 
 *Set operations* (UNION/INTERSECT/EXCEPT, DISTINCT and ALL) are **join-free**:
 each is a linear combination of `{union, negate}` plus the weight-clamp primitive
-(`distinct = clamp[0,1]`, `positive_part = clamp[0,i64::MAX]`) over
-content-hashed leaves — EXCEPT DISTINCT = `positive_part(distinct(A) −
+(`distinct = clamp[0,1]`, `positive_part = clamp[0,i64::MAX]`) over leaves
+keyed by their element — EXCEPT DISTINCT = `positive_part(distinct(A) −
 B)`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) − B)`. There is **no anti-join operator**: these, the band outer-join
 null-fills, and band EXISTS/IN are the only `positive_part` users.
 
@@ -243,11 +243,13 @@ back through a cursor that merges the in-memory and on-disk tiers on the fly,
 summing weights of matching (PK, payload) entries and dropping ghosts — so every
 tier depends on §2's sort invariant. An operator reading a trace sees
 `z⁻¹(I(X))`, the integral *before* the current delta — but for a reduce's value
-index, read with the epoch's entries in it.
+index and a clamp reading base tables' stores, read with the epoch's entries in
+it.
 
 **A trace is not always a store of its own.** A join side that is a base table
 re-keyed onto leading columns of its own PK reads the table's store — **as the
-view last absorbed it** — instead of keeping a copy. A reduce whose output is
+view last absorbed it** — instead of keeping a copy, and so does a clamp over
+base tables' rows under their own PK. A reduce whose output is
 the view's reads the view's own store, unless that view is
 capacity-bounded.
 

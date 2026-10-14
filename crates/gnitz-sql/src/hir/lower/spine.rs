@@ -148,6 +148,10 @@ pub(crate) fn open<'a>(
 }
 
 impl Spine<'_> {
+    pub(crate) fn source(&self) -> &SegSource {
+        &self.seg.src
+    }
+
     pub(crate) fn tid(&self) -> u64 {
         self.seg.src.tid()
     }

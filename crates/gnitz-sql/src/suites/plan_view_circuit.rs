@@ -582,3 +582,58 @@ fn the_side_that_alone_outputs_its_unmatched_rows_is_scanned_second() {
         assert_eq!(scanned, want, "`{body}`");
     }
 }
+
+/// A set operation whose every leaf is a base table outputting its whole PK at
+/// the same positions and types is keyed by that PK, unless the result is a set
+/// the PK alone would not keep unique.
+#[test]
+fn a_set_op_over_whole_base_table_keys_is_keyed_by_them() {
+    let cat = cat();
+    let hashes = |chain: &PlannedChain| {
+        all_views(chain).any(|pv| {
+            pv.circuit
+                .ops()
+                .any(|(_, op)| matches!(op, OpNode::Map(gnitz_wire::MapKind::HashRow { .. })))
+        })
+    };
+    // (body, key columns of the view with no hidden key, PK repeats)
+    #[rustfmt::skip]
+    let keyed: &[(&str, &[u32], bool)] = &[
+        ("SELECT * FROM t EXCEPT SELECT * FROM u", &[0], false),
+        ("SELECT id, g FROM t INTERSECT ALL SELECT id, g FROM u", &[0], false),
+        ("SELECT * FROM t EXCEPT ALL SELECT * FROM u", &[0], false),
+        ("SELECT * FROM t UNION ALL SELECT * FROM u", &[0], true),
+        // The key need not lead the SELECT list; a filter keeps the source's rows.
+        ("SELECT g, id FROM t INTERSECT SELECT g, id FROM u WHERE v > 1", &[1], false),
+        ("SELECT * FROM t WHERE v > 1 EXCEPT ALL SELECT * FROM t WHERE v < 9", &[0], false),
+        ("SELECT * FROM c EXCEPT SELECT * FROM c WHERE v > 3", &[0, 1], false),
+        ("SELECT * FROM t EXCEPT SELECT * FROM u EXCEPT SELECT * FROM t WHERE g = 2", &[0], false),
+        // A second copy of a key column is a payload column.
+        ("SELECT id, id AS j FROM t EXCEPT SELECT id, id AS j FROM u", &[0], false),
+    ];
+    for &(body, pk, repeats) in keyed {
+        let chain = view(&cat, body);
+        let v = final_view(&chain);
+        assert!(!hashes(&chain), "`{body}` hashes");
+        assert!(v.schema.columns().iter().all(|c| !c.is_hidden), "`{body}`");
+        assert_eq!(v.schema.pk_cols(), pk, "`{body}`");
+        assert_eq!(v.pk_repeats, repeats, "`{body}`");
+    }
+    for body in [
+        // Two elements under one source key would leave the result's key repeating.
+        "SELECT * FROM t UNION SELECT * FROM u",
+        // No leaf outputs its PK, or not all of it, or not at one position.
+        "SELECT g FROM t EXCEPT SELECT g FROM u",
+        "SELECT a, v FROM c EXCEPT SELECT a, v FROM c WHERE v > 3",
+        "SELECT id, g FROM t EXCEPT SELECT g, id FROM u",
+        // A widened column.
+        "SELECT id, i32c FROM ty EXCEPT SELECT id, v FROM t",
+        // A leaf over a view, a bounded view or a system table.
+        "SELECT * FROM t EXCEPT SELECT * FROM tv",
+        "SELECT * FROM t INTERSECT SELECT * FROM sys",
+    ] {
+        let chain = view(&cat, body);
+        assert!(hashes(&chain), "`{body}` keyed by its source PK");
+        assert!(!final_view(&chain).pk_repeats || body.contains("UNION ALL"), "`{body}`");
+    }
+}

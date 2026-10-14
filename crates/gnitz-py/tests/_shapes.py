@@ -111,6 +111,21 @@ _FT = [(i, i % 4, (100 if i <= 18 else 5000)) for i in range(1, 25)]
 _GT = "CREATE TABLE gt (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)"
 
 
+# `kb` overlaps `ka`, agreeing on a third of the shared ids; `kc` and `kd` repeat
+# them under a compound key, and `kr` is a replicated part of `ka`.
+_KA0 = [(i, i % 7) for i in range(30)]
+_KA = [(i, 3 if i == 4 else v) for i, v in _KA0]
+_KB0 = [(i, i % 7 if i % 3 == 0 else 100 + i) for i in range(10, 40)]
+_KB = [r for r in _KB0 if r[0] != 12]
+_KC = [(i % 6, i, v) for i, v in _KA]
+_KD = [(i % 6, i, v) for i, v in _KB]
+_KR = [r for r in _KA if r[0] % 2 == 0]
+
+
+def _bag(rows, keep=lambda *r: True, order=None):
+    return Counter(tuple(r[i] for i in order) if order else tuple(r) for r in rows if keep(*r))
+
+
 def _ks(keep):
     return Counter((k,) for _, k, _ in _A if keep(k))
 
@@ -288,6 +303,31 @@ SHAPES = {
         **{f"split_{n}": (f"SELECT k FROM a WHERE k > 0 {op} SELECT k FROM a WHERE k < 3", ("k",),
                           setop(op, _ks(lambda k: k > 0), _ks(lambda k: k < 3)))
            for n, op in ONE_SOURCE_OPS.items()}}),
+    # Sides that output their base table's whole PK, keyed by it.
+    "source_keyed_set_ops": (
+        "; ".join(f"CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL){w}"
+                  for t, w in (("ka", ""), ("kb", ""), ("kr", " WITH (replicated = true)"))) + "; "
+        "CREATE TABLE kc (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b)) "
+        "CLUSTER BY a; "
+        "CREATE TABLE kd (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b))",
+        f"INSERT INTO ka VALUES {values(_KA0)}; INSERT INTO kb VALUES {values(_KB0)}; "
+        f"INSERT INTO kc VALUES {values(_KC)}; INSERT INTO kd VALUES {values(_KD)}; "
+        f"INSERT INTO kr VALUES {values(_KR)}; "
+        "UPDATE ka SET val = 3 WHERE id = 4; DELETE FROM kb WHERE id = 12",
+        {**{f"k_{n}": (f"SELECT * FROM ka {op} SELECT * FROM kb", ("id", "val"), setop(op, _bag(_KA), _bag(_KB)))
+            for n, op in ONE_SOURCE_OPS.items()},
+         "k_filtered": ("SELECT id, val FROM ka WHERE val > 1 EXCEPT SELECT id, val FROM kb WHERE val < 6",
+                        ("id", "val"), setop("EXCEPT", _bag(_KA, lambda i, v: v > 1), _bag(_KB, lambda i, v: v < 6))),
+         "k_reordered": ("SELECT val, id FROM ka INTERSECT SELECT val, id FROM kb", ("val", "id"),
+                         setop("INTERSECT", _bag(_KA, order=(1, 0)), _bag(_KB, order=(1, 0)))),
+         "k_chain": ("SELECT * FROM ka EXCEPT SELECT * FROM kb EXCEPT SELECT * FROM kr", ("id", "val"),
+                     setop("EXCEPT", Counter(setop("EXCEPT", _bag(_KA), _bag(_KB))), _bag(_KR))),
+         "k_self": ("SELECT * FROM ka WHERE val > 2 EXCEPT ALL SELECT * FROM ka WHERE val < 5", ("id", "val"),
+                    setop("EXCEPT ALL", _bag(_KA, lambda i, v: v > 2), _bag(_KA, lambda i, v: v < 5))),
+         "k_prefix": ("SELECT * FROM kc INTERSECT SELECT * FROM kd", ("a", "b", "v"),
+                      setop("INTERSECT", _bag(_KC), _bag(_KD))),
+         "k_replicated": ("SELECT * FROM ka EXCEPT SELECT * FROM kr", ("id", "val"),
+                          setop("EXCEPT", _bag(_KA), _bag(_KR)))}),
     "grouped_set_op_side": _ab({"v": (
         "SELECT k AS x, COUNT(*) AS n FROM a GROUP BY k UNION ALL SELECT id, bv FROM b",
         ("x", "n"), {(k, 6): 1 for k in range(5)} | {(j, bv): 1 for j, bv in _B})}),

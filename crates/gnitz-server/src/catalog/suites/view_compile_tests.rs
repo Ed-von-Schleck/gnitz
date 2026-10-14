@@ -278,3 +278,78 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `a EXCEPT ALL b` over leaves keyed by their own PK equals its definition,
+/// weights included, after a backfill and after each write to either side.
+#[test]
+fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
+    use std::collections::BTreeMap;
+    let dir = temp_dir("clamp_over_source_stores");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
+    let [a, b] = ["public.a", "public.b"].map(|name| engine.create_table(name, &cols, &[0]).unwrap());
+    // `b` agrees with `a` on ids 5..10 but 7.
+    let mut held: [BTreeMap<u64, u64>; 2] = [
+        (0..10).map(|id| (id, id)).collect(),
+        (5..15).map(|id| (id, if id == 7 { 70 } else { id })).collect(),
+    ];
+    for (tid, rows_of) in [(a, &held[0]), (b, &held[1])] {
+        let batch = rows(&engine, tid, 1, rows_of.keys().copied(), |id| [rows_of[&id]]);
+        engine.registry.ingest(tid, batch).unwrap();
+    }
+
+    let mut circuit = Circuit::default();
+    let [da, db] = [a, b].map(|s| {
+        let leaf = circuit.input_delta(s, gnitz_wire::ReadBound::None);
+        circuit.shard(leaf)
+    });
+    circuit.positive_diff(da, db);
+    let vid = try_register_view(&mut engine, circuit, "v", &cols, 0, 0).unwrap();
+    backfill(&mut engine, vid);
+
+    let check = |engine: &mut CatalogEngine, held: &[BTreeMap<u64, u64>; 2], step: &str| {
+        let out = read_rows(engine, vid, gnitz_wire::ReadBound::None);
+        let mut got: Vec<(u64, u64, i64)> = (0..out.len())
+            .map(|i| (out.get_pk(i) as u64, payload_u64(&*out, i, 0), out.get_weight(i)))
+            .collect();
+        got.sort();
+        let want: Vec<(u64, u64, i64)> = held[0]
+            .iter()
+            .filter(|&(id, val)| held[1].get(id) != Some(val))
+            .map(|(&id, &val)| (id, val, 1))
+            .collect();
+        assert_eq!(got, want, "{step}");
+    };
+    check(&mut engine, &held, "backfill");
+
+    // (side, id, Some(val) to write, None to delete)
+    let steps: &[(usize, u64, Option<u64>)] = &[
+        (0, 20, Some(20)), // a-only: enters
+        (1, 20, Some(20)), // matched: leaves
+        (0, 3, Some(99)),  // an update: one element out, one in
+        (1, 6, None),      // the match goes: a's row enters
+        (1, 3, Some(99)),  // matches a's new row: it leaves
+        (0, 7, Some(70)),  // onto b's row: leaves
+        (0, 7, None),      // gone from a
+        (1, 7, None),      // and from b: nothing to enter
+        (0, 7, Some(7)),   // back in a: enters
+    ];
+    for &(side, id, write) in steps {
+        let tid = [a, b][side];
+        let batch = match write {
+            Some(val) => {
+                held[side].insert(id, val);
+                rows(&engine, tid, 1, [id], |_| [val])
+            }
+            None => {
+                let val = held[side].remove(&id).expect("a held row");
+                rows(&engine, tid, -1, [id], |_| [val])
+            }
+        };
+        engine.ingest_unticked(tid, batch).unwrap();
+        seal_and_tick(&mut engine, tid);
+        check(&mut engine, &held, &format!("side {side} id {id} {write:?}"));
+    }
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -2,16 +2,14 @@
 `MINUS`, and SELECT DISTINCT.
 
 A set op is join-free — a linear combination of `{union, negate}` and the
-weight-clamp primitive over content-hashed leaves — so what it computes is a
-weight, never a row set. An `ALL` branch overlap legitimately carries weight 2,
+weight-clamp primitive over leaves keyed by their element — so what it computes
+is a weight, never a row set. An `ALL` branch overlap legitimately carries weight 2,
 and a tuple that should net to 0 surviving at weight 1 is invisible to a row
 count, so every assertion here is a weighted bag.
 
 Leaves over one source, however many, are driven by one push in one epoch.
 
-Run with GNITZ_WORKERS=4: each side is repartitioned by its content hash, so
-both branches of a tuple land on one worker only if the hash is a pure function
-of the logical value.
+Run with GNITZ_WORKERS=4: both branches of a tuple must land on one worker.
 """
 from collections import Counter
 

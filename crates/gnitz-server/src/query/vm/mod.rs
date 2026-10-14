@@ -62,8 +62,7 @@ pub(in crate::query) enum Op {
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
     /// (PK, payload), emit `clamp(w_new) − clamp(w_old)` at `kind`'s bounds.
     WeightClamp {
-        /// The history trace `I(in)`, which `finish` integrates.
-        hist: StateIdx,
+        hist: ClampHistory,
         kind: ClampKind,
     },
     /// One term of a join, delta against trace — equi, range and cross alike:
@@ -104,6 +103,24 @@ pub(in crate::query) enum Op {
         index: StateIdx,
         plan: Box<stream::OrderedPlan>,
     },
+}
+
+/// Where a clamp reads `I(in)`, its input's history.
+pub(in crate::query) enum ClampHistory {
+    /// A child store `finish` integrates the input into.
+    Own(StateIdx),
+    /// The stores of the base tables the input is a signed sum of. Nothing is
+    /// integrated.
+    Sources(Box<[HistoryTerm]>),
+}
+
+/// One base table's term of a [`ClampHistory::Sources`].
+pub(in crate::query) struct HistoryTerm {
+    pub(in crate::query) relation: u64,
+    /// The filters and maps, by position, that turn a row of the relation into
+    /// one of the clamp's input.
+    pub(in crate::query) steps: Box<[usize]>,
+    pub(in crate::query) negated: bool,
 }
 
 /// The integral of a delta, as its readers find it: a join's probe, and a
@@ -187,7 +204,8 @@ impl Instr {
     /// opcode must say whether it owns one.
     fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
         match &self.op {
-            Op::WeightClamp { hist, .. } => Some((self.in_reg, *hist)),
+            Op::WeightClamp { hist: ClampHistory::Own(trace), .. } => Some((self.in_reg, *trace)),
+            Op::WeightClamp { hist: ClampHistory::Sources(_), .. } => None,
             Op::Reduce { out_trace, .. } => match out_trace {
                 Integral::Own(trace) => Some((self.out_reg, *trace)),
                 Integral::Relation(..) => None,

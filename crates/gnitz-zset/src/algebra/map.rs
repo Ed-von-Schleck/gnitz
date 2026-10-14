@@ -334,10 +334,16 @@ impl MapPlan {
         Some(self.ev.copies().iter().map(|c| c.src).collect())
     }
 
+    /// True iff this map copies its input's PK region verbatim, and so keeps
+    /// every row under its own key.
+    pub fn inherits_pk(&self) -> bool {
+        matches!(self.pk_source, PkSource::Inherit)
+    }
+
     /// True iff running this map would reproduce its input batch. A compiler
     /// elides such a node entirely and lets its consumers read the input.
     pub fn is_identity(&self) -> bool {
-        matches!(self.pk_source, PkSource::Inherit) && self.ev.is_identity()
+        self.inherits_pk() && self.ev.is_identity()
     }
 
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's

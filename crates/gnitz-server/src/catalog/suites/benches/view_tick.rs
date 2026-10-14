@@ -429,7 +429,8 @@ fn window_bulk_view_tick_bench() {
 }
 
 /// `SELECT DISTINCT * FROM t`: every tick moves one row across the positive
-/// boundary, found by a point lookup into the integral.
+/// boundary, found by a point lookup into `t`'s store, which is the distinct's
+/// history.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn distinct_view_tick_bench() {

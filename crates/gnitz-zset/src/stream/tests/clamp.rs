@@ -1,6 +1,7 @@
 use super::*;
-use crate::test_support::{make_batch, make_schema_u64_i64, opens, trace_cursor, weighted_rows};
+use crate::test_support::{create_read_cursor, make_batch, make_schema_u64_i64, opens, trace_cursor, weighted_rows};
 use gnitz_wire::ClampKind::{Distinct, PositivePart};
+use std::rc::Rc;
 
 /// `(pk, weight, payload)` fixture rows, pre-sorted by `(pk, payload)`.
 pub(super) type ClampRow = (u64, i64, i64);
@@ -63,12 +64,25 @@ fn weight_clamp_emits_each_elements_transition() {
     for (delta, trace) in cases {
         for kind in [Distinct, PositivePart] {
             let ch = trace_cursor(make_batch(&schema, trace));
-            let out = op_weight_clamp(&make_batch(&schema, delta), &mut opens(ch), kind);
+            let out = op_weight_clamp(&make_batch(&schema, delta), &mut opens(ch), false, kind);
             assert!(out.is_consolidated());
             assert_eq!(
                 weighted_rows(&out),
                 weighted_rows(&make_batch(&schema, &reference(kind, delta, trace))),
                 "{kind:?}: delta={delta:?} trace={trace:?}"
+            );
+            // The same history with the delta already absorbed.
+            let after = [trace, delta].map(|rows| Rc::new(make_batch(&schema, rows)));
+            let absorbed = op_weight_clamp(
+                &make_batch(&schema, delta),
+                &mut opens(create_read_cursor(&after, &[], schema)),
+                true,
+                kind,
+            );
+            assert_eq!(
+                weighted_rows(&absorbed),
+                weighted_rows(&out),
+                "{kind:?} absorbed: delta={delta:?} trace={trace:?}"
             );
         }
     }
@@ -83,6 +97,7 @@ fn weight_clamp_of_an_empty_delta_opens_nothing() {
         let out = op_weight_clamp(
             &Batch::empty_with_schema(&schema),
             &mut |_, _| panic!("an empty delta opened its history"),
+            false,
             kind,
         );
         assert!(out.is_empty());

@@ -74,39 +74,23 @@ struct Wide {
 /// Relation 10 as `wide` has it and table 11 `(k | w)`, registered for worker
 /// `slot` under a fresh directory.
 fn two_tables(slot: gnitz_zset::algebra::Slot, wide: Wide) -> (RelationRegistry, tempfile::TempDir) {
-    use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-    use gnitz_wire::TypeCode;
+    use gnitz_store::relation::RelationKind;
     use gnitz_zset::algebra::Placement;
     use gnitz_zset::schema::SchemaColumn;
-    let col = SchemaColumn::new(TypeCode::U64, false);
-    let (kind_of_10, placement, replicated_partner) = (wide.kind, wide.placement, wide.replicated_partner);
-    let wide = SchemaDescriptor::new(&[SchemaColumn::new(wide.a, false), col, col], &[0, 1]);
-    let narrow = make_schema_u64_i64();
-    let dir = tempfile::tempdir().unwrap();
-    let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), slot, StoreConfig::default());
-    for (id, kind, schema, placement) in [
-        (10, kind_of_10, wide, placement(&wide)),
-        (
-            11,
-            RelationKind::BaseTable,
-            narrow,
-            match replicated_partner {
-                true => Placement::Replicated,
-                false => Placement::full_pk(&narrow),
-            },
-        ),
-    ] {
-        registry
-            .register(RelationSpec {
-                id,
-                kind,
-                schema,
-                placement,
-                pk_repeats: false,
-            })
-            .unwrap();
-    }
-    (registry, dir)
+    let col = SchemaColumn::new(gnitz_wire::TypeCode::U64, false);
+    let schema = SchemaDescriptor::new(&[SchemaColumn::new(wide.a, false), col, col], &[0, 1]);
+    let partner = Source::from(make_schema_u64_i64());
+    let partner = match wide.replicated_partner {
+        true => partner.placed(Placement::Replicated),
+        false => partner,
+    };
+    tables_at(
+        slot,
+        [
+            (10, wide.kind, Source::from(schema).placed((wide.placement)(&schema))),
+            (11, RelationKind::BaseTable, partner),
+        ],
+    )
 }
 
 /// The integral of the node `build` answers and every child declared, as its
@@ -410,4 +394,107 @@ fn the_output_exchange_runs_behind_a_relayed_scan() {
         c.reduce_multi(0, &[0], &[AggDescriptor::COUNT_STAR]);
     };
     assert_eq!(relays([keyed, keyed], build), (3, 0));
+}
+
+// ── A clamp whose history is its sources' stores ──────────────────────────
+
+/// One table of a set operation: its kind, and its placement from its schema.
+type Side = (
+    gnitz_store::relation::RelationKind,
+    fn(&SchemaDescriptor) -> gnitz_zset::algebra::Placement,
+);
+
+/// The children `build`'s circuit declares, compiled on worker `slot` over
+/// tables 10 and 11, each `(a, b | v)` keyed `(a, b)`, of the kind and placement
+/// `sides` gives.
+fn set_op_children(slot: gnitz_zset::algebra::Slot, sides: [Side; 2], build: Build) -> Vec<String> {
+    use gnitz_zset::schema::SchemaColumn;
+    let col = SchemaColumn::new(gnitz_wire::TypeCode::U64, false);
+    let schema = SchemaDescriptor::new(&[col, col, col], &[0, 1]);
+    let tables = [10, 11]
+        .into_iter()
+        .zip(sides)
+        .map(|(id, (kind, placement))| (id, kind, Source::from(schema).placed(placement(&schema))));
+    let (registry, _dir) = tables_at(slot, tables);
+    let mut c = Circuit::default();
+    build(&mut c);
+    let meta = routing(&c, &registry).unwrap();
+    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
+    ctx.layout.names().map(str::to_string).collect()
+}
+
+/// `10 EXCEPT ALL 11` over leaves keyed by their own PK, each behind an exchange
+/// on it.
+fn keyed_except(c: &mut Circuit) {
+    let [a, b] = [10, 11].map(|s| {
+        let leaf = scan(c, s);
+        c.shard(leaf)
+    });
+    c.positive_diff(a, b);
+}
+
+/// A clamp declares no history of its own exactly where each term of its input
+/// is a base table's rows on the worker that stores them.
+#[test]
+fn a_clamp_reads_its_sources_where_they_hold_its_history() {
+    use gnitz_store::relation::RelationKind::{BaseTable, Stream};
+    use gnitz_zset::algebra::{Placement, Slot};
+    let reads_sources = |children: &[String]| !children.iter().any(|n| n.starts_with("hist_"));
+    let table: Side = (BaseTable, Placement::full_pk);
+    let third = Slot::new(2, 4);
+
+    assert!(
+        reads_sources(&set_op_children(Slot::SOLO, [table; 2], keyed_except)),
+        "one worker"
+    );
+    assert!(
+        reads_sources(&set_op_children(third, [table; 2], keyed_except)),
+        "an exchange that moves nothing"
+    );
+    let replicated: Side = (BaseTable, |_| Placement::Replicated);
+    assert!(
+        reads_sources(&set_op_children(third, [replicated, table], keyed_except)),
+        "a replicated side's share"
+    );
+    assert!(
+        reads_sources(&set_op_children(third, [table; 2], |c| {
+            let a = scan(c, 10);
+            let a = c.filter(
+                a,
+                crate::test_support::cmp_const(gnitz_expr::CmpOp::Lt, 2, 100).to_blob_bytes(),
+            );
+            let a = c.map(a, &[2]);
+            let b = scan(c, 11);
+            c.positive_diff(a, b);
+        })),
+        "a filter and a projection on the way"
+    );
+
+    let by_prefix: Side = (BaseTable, |s| Placement::keyed(s, 1));
+    assert!(
+        !reads_sources(&set_op_children(third, [by_prefix, table], keyed_except)),
+        "an exchange that moves a side placed by its PK prefix"
+    );
+    let stream: Side = (Stream, Placement::full_pk);
+    assert!(
+        !reads_sources(&set_op_children(Slot::SOLO, [stream, table], keyed_except)),
+        "a stream holds no rows"
+    );
+    assert!(
+        !reads_sources(&set_op_children(Slot::SOLO, [table; 2], |c| {
+            let [a, b] = [10, 11].map(|s| {
+                let leaf = scan(c, s);
+                c.map_hash_row(leaf, &[(0, gnitz_wire::TypeCode::U64), (2, gnitz_wire::TypeCode::U64)])
+            });
+            c.positive_diff(a, b);
+        })),
+        "a re-key onto a content hash"
+    );
+    // The outer clamp of a chain reads the inner one's output, which no store holds.
+    let chain = set_op_children(Slot::SOLO, [table; 2], |c| {
+        let [a, b] = [10, 11].map(|s| scan(c, s));
+        let inner = c.positive_diff(a, b);
+        c.distinct(inner);
+    });
+    assert_eq!(chain.iter().filter(|n| n.starts_with("hist_")).count(), 1, "{chain:?}");
 }

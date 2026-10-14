@@ -33,7 +33,7 @@ use gnitz_store::relation::{
     SecondaryIndex, StoreConfig,
 };
 use gnitz_wire::payload_u64;
-use gnitz_wire::{PkColList, TypeCode, PK_LIST_PACKED_FLAG};
+use gnitz_wire::{Circuit, NullKeys, PkColList, ReindexRole, TypeCode, PK_LIST_PACKED_FLAG};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -191,9 +191,16 @@ fn published_children(dir: &str, id: u64) -> Vec<String> {
     names
 }
 
-/// A backfilled `DISTINCT` view over `source`: an output store and one trace.
+/// A backfilled `DISTINCT` view over `source` re-keyed onto its column 0: an
+/// output store and one trace.
 fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
-    let vid = try_register_view(engine, distinct_circuit(source), name, cols, 0, 0).unwrap();
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
+    let keep: Vec<u32> = (1..cols.len() as u32).collect();
+    let key = [(0, cols[0].def.ty.tc)];
+    let rekeyed = circuit.map_reindex(scan, &key, &keep, ReindexRole::Auxiliary, NullKeys::Keep);
+    circuit.distinct(rekeyed);
+    let vid = try_register_view(engine, circuit, name, cols, 0, 0).unwrap();
     backfill(engine, vid);
     vid
 }

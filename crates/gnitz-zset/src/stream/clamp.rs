@@ -15,8 +15,9 @@ fn cap(kind: ClampKind) -> i64 {
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
 /// clamp(w_old, 0, cap)` against its weight `w_old` in the history `hist` opens —
-/// the lift of a per-element weight clamp to its delta.
-pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, kind: ClampKind) -> Batch {
+/// the lift of a per-element weight clamp to its delta. `hist_holds_delta`: what
+/// `hist` opens has absorbed `delta` already, so it holds `w_old + Δw`.
+pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, kind: ClampKind) -> Batch {
     debug_assert!(delta.is_consolidated());
     if delta.is_empty() {
         return Batch::empty_with_schema(delta.schema());
@@ -27,8 +28,13 @@ pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, kind: ClampKind) -> Batc
     let mut rows: Vec<(u32, u32, i64)> = Vec::new();
     // Every row emitting its own weight — an insert-only tick — is the delta itself.
     let mut identity = true;
-    cursor.for_each_mem_row_weight(&mb, |i, w_old| {
+    cursor.for_each_mem_row_weight(&mb, |i, w_hist| {
         let dw = mb.get_weight(i);
+        let w_old = if hist_holds_delta {
+            w_hist.wrapping_sub(dw)
+        } else {
+            w_hist
+        };
         let out_w = w_old.wrapping_add(dw).clamp(0, cap) - w_old.clamp(0, cap);
         identity &= out_w == dw;
         if out_w != 0 {

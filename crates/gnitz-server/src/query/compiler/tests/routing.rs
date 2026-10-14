@@ -238,7 +238,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         let registry = sources([(7, schema), (8, schema)]);
         let meta = derive(c.clone(), &registry).expect(why);
         assert_eq!(
-            skips_output_exchange(&c, shard, &scatter, &meta, &registry),
+            exchange_moves_nothing(&c, shard, &scatter, &meta, &registry),
             want,
             "{why}"
         );

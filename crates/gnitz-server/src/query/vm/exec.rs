@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use super::*;
 use gnitz_store::relation::{Cut, Relation, RelationRegistry};
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::{empty_cursor, Batch, PkSetGather, ReadCursor, StorageError};
+use gnitz_zset::repr::{empty_cursor, from_runs, Batch, PkSetGather, ReadCursor, Run, StorageError};
 use gnitz_zset::{algebra, stream};
 
 /// The stores an epoch reads and writes: the view's own children, and the
@@ -52,11 +52,44 @@ impl Stores<'_> {
         }
     }
 
+    /// What `terms`' stores hold at `delta`'s keys, `delta` included, one run per
+    /// term through its `steps`.
+    fn source_state(
+        &self,
+        delta: &Batch,
+        terms: &[HistoryTerm],
+        instructions: &mut [Instr],
+    ) -> Result<Vec<Run>, String> {
+        let stride = delta.schema().pk_stride();
+        let keys = PkKeys::from_keys(stride, (0..delta.len()).map(|row| delta.get_pk_bytes(row)));
+        let mut runs = Vec::with_capacity(terms.len());
+        for term in terms {
+            let mut gather = self.gather(Integral::Relation(term.relation, Cut::Sealed), keys.clone())?;
+            let Some(mut rows) = gather.drain_chunk(usize::MAX) else {
+                continue;
+            };
+            for &pc in term.steps.iter() {
+                rows = match &mut instructions[pc].op {
+                    Op::Filter(pred) => algebra::op_filter(&rows, pred).unwrap_or(rows),
+                    // A map may reorder the payload a run sorts by.
+                    Op::Map(plan) => plan.evaluate_map_batch(&rows).into_consolidated(),
+                    _ => unreachable!("a history step is a filter or a map"),
+                };
+            }
+            if term.negated {
+                rows = rows.negated();
+            }
+            runs.push(Run::Mem(Rc::new(rows)));
+        }
+        Ok(runs)
+    }
+
     /// Every live row of `keys` in `integral`.
     pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys) -> Result<PkSetGather, String> {
-        Ok(match integral {
-            Integral::Own(trace) => self.own.gather(trace, keys),
-            Integral::Relation(id, cut) => self.registry.relation_or_err(id)?.gather(keys, cut),
+        Ok(match self.trace(integral)? {
+            Trace::Child(idx) => self.own.gather(idx, keys),
+            Trace::Relation(relation, cut) => relation.gather(keys, cut),
+            Trace::Unfed(relation) => PkSetGather::over(empty_cursor(relation.schema()), keys),
         })
     }
 }
@@ -234,7 +267,9 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
 
     gnitz_debug!("vm: dispatch out_reg={} instrs={}", out_reg.0, instructions.len());
 
-    for (pc, instr) in instructions.iter_mut().enumerate().skip(epoch.pc) {
+    for pc in epoch.pc..instructions.len() {
+        let (before, rest) = instructions.split_at_mut(pc);
+        let instr = &mut rest[0];
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
         let takes = |r: DeltaReg| takes(regs, epoch, r, LastRead::Instr(pc));
 
@@ -282,8 +317,19 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 )
             }
 
-            Op::WeightClamp { hist, kind } => {
-                stream::op_weight_clamp(&batches[in_reg.at()], &mut stores.open(Trace::Child(*hist)), *kind)
+            Op::WeightClamp { hist: ClampHistory::Own(hist), kind } => stream::op_weight_clamp(
+                &batches[in_reg.at()],
+                &mut stores.open(Trace::Child(*hist)),
+                false,
+                *kind,
+            ),
+
+            Op::WeightClamp { hist: ClampHistory::Sources(terms), kind } => {
+                let delta = &batches[in_reg.at()];
+                let runs = stores.source_state(delta, terms, before)?;
+                let schema = regs[in_reg.at()].schema;
+                let mut open = |_: &[u8], _: &[u8]| from_runs(runs.iter().cloned(), schema, runs.len());
+                stream::op_weight_clamp(delta, &mut open, true, *kind)
             }
 
             Op::JoinDT { trace, plan } => {

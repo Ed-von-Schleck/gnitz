@@ -248,11 +248,9 @@ fn scanned_row_locally(circuit: &Circuit, from: NodeId) -> Option<u64> {
     }
 }
 
-/// True when the view's output `ExchangeShard` at `enid` moves nothing:
-/// `scatter`, the plan over the shard's input, hashes the bytes the scan behind
-/// it placed its rows by. The row-local walk back to that scan carries the PK
-/// region through, so a prefix of the input's PK is that prefix of the scan's.
-pub(super) fn skips_output_exchange(
+/// True when the `ExchangeShard` at `enid` moves nothing: `scatter`, the plan
+/// over the shard's input, hashes the bytes the scan behind it placed its rows by.
+pub(super) fn exchange_moves_nothing(
     circuit: &Circuit,
     enid: NodeId,
     scatter: &ScatterPlan,

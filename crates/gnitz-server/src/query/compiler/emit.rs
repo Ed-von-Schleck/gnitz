@@ -8,7 +8,7 @@
 //! read them.
 
 use super::*;
-use crate::query::vm::{Op, ProgramBuilder};
+use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
 use gnitz_store::relation::Cut;
 use gnitz_store::relation::StateLayout;
 use gnitz_zset::stream::JoinPlan;
@@ -126,6 +126,19 @@ impl<'a> EmitCtx<'a> {
         })
     }
 
+    /// `source`'s store where it holds, on this worker, the integral of the delta
+    /// its scan reads: a base table's, with no round moving that delta. A view's
+    /// store has absorbed, within one drive, a delta its reader is yet to be fed.
+    fn integral_store(&self, source: u64) -> Option<&'a Relation> {
+        let registry: &'a RelationRegistry = self.registry;
+        let relation = registry.relation(source).filter(|r| r.kind().is_base_table())?;
+        let moved = matches!(
+            self.prog.writer(self.sources.get(&source)?.reg),
+            Some((_, Op::Round { .. }, _))
+        );
+        (!moved).then_some(relation)
+    }
+
     /// The base table whose store is already the integral of `of`, and `of`'s re-key
     /// over that table's rows.
     fn source_rekey(&self, of: NodeId) -> Option<(&'a Relation, MapPlan)> {
@@ -136,24 +149,54 @@ impl<'a> EmitCtx<'a> {
         let OpNode::ScanDelta { source, .. } = self.circuit.op(self.circuit.inputs(of)[0]) else {
             return None;
         };
-        let registry: &'a RelationRegistry = self.registry;
-        let relation = registry.relation(*source)?;
-        // A view's store has absorbed, within one drive, a delta its reader is yet to be fed.
-        if !relation.kind().is_base_table() {
-            return None;
-        }
+        let relation = self.integral_store(*source)?;
         let rekey = MapPlan::from_wire(&relation.schema(), mk).ok()?;
         // The table's rows then sort by the integral's key first.
         rekey.rekeys_onto_pk_prefix()?;
-        // A trace holds the delta where it lands, which is where the table holds it
-        // only if no relay moves it.
-        let unmoved = relation.placement().is_replicated() || self.meta.source_route(*source).is_none();
         // An equal-key probe alone walks rows keyed wider than its delta.
         let probes_are_equi = self.circuit.readers(of).all(|n| match self.circuit.op(n) {
             OpNode::Join { kind } if self.circuit.inputs(n)[2..].contains(&of) => *kind == JoinKind::Equi,
             _ => true,
         });
-        (unmoved && probes_are_equi).then_some((relation, rekey))
+        probes_are_equi.then_some((relation, rekey))
+    }
+
+    /// The terms of a clamp's input `reg` where it is a signed sum of base tables'
+    /// rows whose stores hold its history.
+    fn source_history(&self, reg: DeltaReg) -> Option<Box<[HistoryTerm]>> {
+        let mut terms = Vec::new();
+        let mut operands = vec![(reg, false)];
+        while let Some((reg, negated)) = operands.pop() {
+            match self.prog.writer(reg) {
+                Some((_, Op::Union { in_b }, in_a)) => operands.extend([(in_a, negated), (*in_b, negated)]),
+                Some((_, Op::Negate, input)) => operands.push((input, !negated)),
+                _ => terms.push(self.history_term(reg, negated)?),
+            }
+        }
+        Some(terms.into())
+    }
+
+    /// The scan whose rows reach `reg` under their own keys, and the instructions
+    /// on the way, where the scanned table's store holds their history.
+    fn history_term(&self, mut reg: DeltaReg, negated: bool) -> Option<HistoryTerm> {
+        let mut steps = Vec::new();
+        let relation = loop {
+            if let Some((&source, _)) = self.sources.iter().find(|(_, scan)| scan.reg == reg) {
+                break source;
+            }
+            let (pc, op, input) = self.prog.writer(reg)?;
+            match op {
+                Op::Filter(_) => steps.push(pc),
+                Op::Map(plan) if plan.inherits_pk() => steps.push(pc),
+                // A share keeps or drops whole elements.
+                Op::Share(_) => {}
+                _ => return None,
+            }
+            reg = input;
+        };
+        self.integral_store(relation)?;
+        steps.reverse();
+        Some(HistoryTerm { relation, steps: steps.into(), negated })
     }
 
     /// The child integrating `of`'s register, declared and scheduled the first time
@@ -228,7 +271,10 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
         gnitz_wire::OpNode::WeightClamp(kind) => {
             let in_reg = ctx.unary_delta_in(nid);
             let schema = ctx.prog.schema_of(in_reg);
-            let hist = ctx.declare_child("hist", nid, schema);
+            let hist = match ctx.source_history(in_reg) {
+                Some(terms) => ClampHistory::Sources(terms),
+                None => ClampHistory::Own(ctx.declare_child("hist", nid, schema)),
+            };
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
 
@@ -293,9 +339,8 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
                 Some((_, group)) => ScatterPlan::group(&schema, group)?,
                 None => ScatterPlan::native(Placement::full_pk(&schema)),
             });
-            let alone = exchange_shards(ctx.circuit).nth(1).is_none();
             let stays = ctx.meta.self_contained
-                || (alone && routing::skips_output_exchange(ctx.circuit, nid, &scatter, ctx.meta, ctx.registry));
+                || routing::exchange_moves_nothing(ctx.circuit, nid, &scatter, ctx.meta, ctx.registry);
             Ok(match () {
                 _ if stays => reg,
                 _ if ctx.feeds_replica(nid) => ctx.share(reg, scatter),

@@ -44,6 +44,14 @@ impl ProgramBuilder {
         out_reg
     }
 
+    /// The instruction writing `reg`, with its position and its first operand;
+    /// `None` for a seeded register.
+    pub(in crate::query) fn writer(&self, reg: DeltaReg) -> Option<(usize, &Op, DeltaReg)> {
+        let pc = self.instructions.iter().position(|i| i.out_reg == reg)?;
+        let instr = &self.instructions[pc];
+        Some((pc, &instr.op, instr.in_reg))
+    }
+
     /// Some seeded register's delta reaches both `a` and `b`.
     pub(in crate::query) fn share_a_seed(&self, a: DeltaReg, b: DeltaReg) -> bool {
         self.reach[a.at()].iter().any(|seed| self.reach[b.at()].contains(seed))

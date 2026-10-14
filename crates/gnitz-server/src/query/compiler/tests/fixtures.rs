@@ -71,22 +71,42 @@ impl Source {
     }
 }
 
-/// A registry for worker `slot` holding only `rows`, each registered as a stream —
-/// a storeless kind, so a compile finds its schemas without opening a store.
-pub(super) fn sources_at<S: Into<Source>>(slot: Slot, rows: impl IntoIterator<Item = (u64, S)>) -> RelationRegistry {
-    let mut registry = RelationRegistry::new("", slot, StoreConfig::default());
-    for (id, source) in rows {
+/// A registry for worker `slot` over `dir` holding only `rows`, each of its kind.
+fn registry_of<S: Into<Source>>(
+    dir: &str,
+    slot: Slot,
+    rows: impl IntoIterator<Item = (u64, RelationKind, S)>,
+) -> RelationRegistry {
+    let mut registry = RelationRegistry::new(dir, slot, StoreConfig::default());
+    for (id, kind, source) in rows {
         let Source { schema, placement } = source.into();
         let spec = RelationSpec {
             id,
-            kind: RelationKind::Stream,
+            kind,
             schema,
             placement,
             pk_repeats: false,
         };
-        registry.register(spec).expect("a stream registers without a store");
+        registry.register(spec).expect("a relation registers");
     }
     registry
+}
+
+/// A registry for worker `slot` holding only `rows`, each registered as a stream —
+/// a storeless kind, so a compile finds its schemas without opening a store.
+pub(super) fn sources_at<S: Into<Source>>(slot: Slot, rows: impl IntoIterator<Item = (u64, S)>) -> RelationRegistry {
+    registry_of("", slot, rows.into_iter().map(|(id, s)| (id, RelationKind::Stream, s)))
+}
+
+/// A registry for worker `slot` under a fresh directory holding only `rows`, each
+/// of its kind, with a store where the kind has one.
+pub(super) fn tables_at<S: Into<Source>>(
+    slot: Slot,
+    rows: impl IntoIterator<Item = (u64, RelationKind, S)>,
+) -> (RelationRegistry, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry_of(dir.path().to_str().unwrap(), slot, rows);
+    (registry, dir)
 }
 
 /// [`sources_at`] the one worker of a single-worker process.
