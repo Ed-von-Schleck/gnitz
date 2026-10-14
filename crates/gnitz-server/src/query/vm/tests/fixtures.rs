@@ -1,81 +1,29 @@
 //! VM test fixtures: a plan assembled by hand, and the child stores its
-//! operators read and write. A child of `vm`, so both `builder`'s and `exec`'s
-//! tests reach it.
+//! operators read and write. A child of `vm`, so `exec`'s tests reach it.
 
 use super::*;
-use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig};
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_wire::ViewProps;
 use gnitz_zset::algebra::Slot;
 
-/// What the emitter assembles, assembled by a test: the program, and the child
-/// stores its operators declare.
-#[derive(Default)]
-pub(super) struct TestPlan {
-    prog: ProgramBuilder,
-    layout: StateLayout,
-}
-
-impl std::ops::Deref for TestPlan {
-    type Target = ProgramBuilder;
-
-    fn deref(&self) -> &ProgramBuilder {
-        &self.prog
-    }
-}
-
-impl std::ops::DerefMut for TestPlan {
-    fn deref_mut(&mut self) -> &mut ProgramBuilder {
-        &mut self.prog
-    }
-}
-
-/// The view a [`TestPlan`]'s children are opened under.
+/// The view a test program's children are opened under.
 const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 
-impl TestPlan {
-    /// One child store, declared the way a compile declares one.
-    pub(super) fn table(&mut self, name: &str, schema: SchemaDescriptor) -> StateIdx {
-        self.layout.declare(name.to_string(), schema)
-    }
-
-    /// Push `plan`'s reduce over `in_reg`, declaring its output trace and, for a
-    /// MIN/MAX, its value index — as the emitter does. Returns the output
-    /// register and trace.
-    pub(super) fn reduce(&mut self, in_reg: DeltaReg, plan: stream::ReducePlan) -> (DeltaReg, StateIdx) {
-        let out_schema = *plan.output_schema();
-        let out_trace = self.table("reduce", out_schema);
-        let index = plan.index_schema().map(|schema| self.table("avidx", *schema));
-        let op = Op::Reduce {
-            out_trace: Integral::Own(out_trace),
-            index,
-            plan: Box::new(plan),
-        };
-        (self.prog.push(in_reg, out_schema, op), out_trace)
-    }
-
-    /// Finish the program with output `out`, opening every declared child store
-    /// in a fresh directory as the DAG opens a compiled view's.
-    pub(super) fn open(self, out: DeltaReg) -> TestVm {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
-        let schema = crate::test_support::make_schema_u128_i64();
-        registry
-            .register(RelationSpec {
-                id: VIEW_ID,
-                kind: RelationKind::View(ViewProps::Plain),
-                schema,
-                placement: gnitz_zset::algebra::Placement::full_pk(&schema),
-                pk_repeats: false,
-            })
-            .unwrap();
-        TestVm {
-            state: CircuitState::open(&registry, VIEW_ID, &self.layout).unwrap(),
-            vm: self.prog.finish(out),
-            registry,
-            unfed: Vec::new(),
-            _dir: dir,
-        }
-    }
+/// Push `plan`'s reduce over `in_reg`, declaring its output trace and, for a
+/// MIN/MAX, its value index, and integrating its output — as the emitter does.
+/// Returns the output register and trace.
+pub(super) fn reduce(p: &mut ProgramBuilder, in_reg: DeltaReg, plan: stream::ReducePlan) -> (DeltaReg, StateIdx) {
+    let out_schema = *plan.output_schema();
+    let out_trace = p.declare("reduce".into(), out_schema);
+    let index = plan.index_schema().map(|schema| p.declare("avidx".into(), *schema));
+    let op = Op::Reduce {
+        out_trace: Integral::Own(out_trace),
+        index,
+        plan: Box::new(plan),
+    };
+    let out = p.push(in_reg, out_schema, op);
+    p.integrate(out, out_trace);
+    (out, out_trace)
 }
 
 /// A built program, the operator state it runs over, and what that state lives
@@ -90,6 +38,31 @@ pub(super) struct TestVm {
 }
 
 impl TestVm {
+    /// Finish `p` with output `out`, opening every child store it declares in a
+    /// fresh directory as the DAG opens a compiled view's.
+    pub(super) fn open(p: ProgramBuilder, out: DeltaReg) -> TestVm {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
+        let schema = crate::test_support::make_schema_u128_i64();
+        registry
+            .register(RelationSpec {
+                id: VIEW_ID,
+                kind: RelationKind::View(ViewProps::Plain),
+                schema,
+                placement: gnitz_zset::algebra::Placement::full_pk(&schema),
+                pk_repeats: false,
+            })
+            .unwrap();
+        let vm = p.finish(out);
+        TestVm {
+            state: CircuitState::open(&registry, VIEW_ID, vm.layout()).unwrap(),
+            vm,
+            registry,
+            unfed: Vec::new(),
+            _dir: dir,
+        }
+    }
+
     /// The program, beside the stores an epoch of it runs over.
     fn parts(&mut self) -> (&mut Vm, Stores<'_>) {
         let stores = Stores {
@@ -100,11 +73,17 @@ impl TestVm {
         (&mut self.vm, stores)
     }
 
-    /// One tick's epoch over `seed`, taken, of a program that runs no round,
-    /// minting the ground row iff `ground`.
-    pub(super) fn epoch(&mut self, reg: DeltaReg, mut seed: Batch, ground: bool) -> Batch {
+    /// The ground rows the program's global aggregates owe, each minted in an
+    /// epoch of its own.
+    pub(super) fn ground(&mut self) -> Batch {
         let (vm, mut stores) = self.parts();
-        let mut epoch = Epoch::tick(reg, &mut seed, true, ground);
+        mint_ground_rows(vm, &mut stores).unwrap()
+    }
+
+    /// One tick's epoch over `seed`, taken, of a program that runs no round.
+    pub(super) fn epoch(&mut self, reg: DeltaReg, mut seed: Batch) -> Batch {
+        let (vm, mut stores) = self.parts();
+        let mut epoch = Epoch::tick(reg, &mut seed, true);
         match run(vm, &mut stores, &mut epoch, None).unwrap() {
             Ran::Done(out) => out,
             Ran::Round { .. } => panic!("the program stands at a round"),
@@ -121,7 +100,7 @@ impl TestVm {
         mut gather: impl FnMut(&Batch, bool) -> Batch,
     ) -> Batch {
         let (vm, mut stores) = self.parts();
-        let mut epoch = Epoch::tick(reg, seed, take, false);
+        let mut epoch = Epoch::tick(reg, seed, take);
         let mut gathered = None;
         loop {
             match run(vm, &mut stores, &mut epoch, gathered.take()).unwrap() {

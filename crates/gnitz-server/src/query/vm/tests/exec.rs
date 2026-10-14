@@ -41,14 +41,14 @@ fn int_rows(b: &Batch) -> Vec<(Vec<Option<i128>>, i64)> {
 #[test]
 fn a_filter_feeds_the_negate_only_its_passing_rows() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
     let kept = p.push(r0, schema, filter_gt(&schema, 1, 0));
     let out = p.push(kept, schema, Op::Negate);
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, -5), (3, 1, 20)]);
-    assert_rows(&vm.epoch(r0, input, false), &[(1, -1, 10), (3, -1, 20)]);
+    assert_rows(&vm.epoch(r0, input), &[(1, -1, 10), (3, -1, 20)]);
 }
 
 /// `A + B`, the second operand a filter of the first: both non-empty, the
@@ -57,11 +57,11 @@ fn a_filter_feeds_the_negate_only_its_passing_rows() {
 #[test]
 fn a_union_sums_its_operands_in_every_epoch() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let a = p.seed(schema);
     let b = p.push(a, schema, filter_gt(&schema, 1, 15));
     let out = p.push(a, schema, Op::Union { in_b: b });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     type Rows = &'static [(u128, i64, i64)];
     let cases: [(Rows, Rows); 3] = [
@@ -73,7 +73,7 @@ fn a_union_sums_its_operands_in_every_epoch() {
         (&[], &[]),
     ];
     for (rows, want) in cases {
-        assert_rows(&vm.epoch(a, make_batch_u128(&schema, rows), false), want);
+        assert_rows(&vm.epoch(a, make_batch_u128(&schema, rows)), want);
     }
 }
 
@@ -87,13 +87,13 @@ fn a_union_passes_an_operand_through_under_its_merged_schema() {
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
     let merged = algebra::union_nullability_merge(&not_null, &nullable).unwrap();
 
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let a = p.seed(not_null);
     let none = p.push(a, nullable, filter_gt(&not_null, 1, 0));
     let out = p.push(a, merged, Op::Union { in_b: none });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
-    let got = vm.epoch(a, make_batch_u128(&not_null, &[(1, 1, -3)]), false);
+    let got = vm.epoch(a, make_batch_u128(&not_null, &[(1, 1, -3)]));
     assert_eq!(*got.schema(), merged);
     assert_rows(&got, &[(1, 1, -3)]);
 }
@@ -104,18 +104,14 @@ fn a_union_passes_an_operand_through_under_its_merged_schema() {
 #[test]
 fn a_self_union_doubles_every_weight() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
     let out = p.push(r0, schema, Op::Union { in_b: r0 });
-    let mut vm = p.open(out);
-    let got = vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]), false);
+    let mut vm = TestVm::open(p, out);
+    let got = vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]));
     assert_rows(&got, &[(1, 2, 10), (2, 6, 20)]);
 
-    let got = vm.epoch(
-        r0,
-        make_batch_u128(&schema, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]),
-        false,
-    );
+    let got = vm.epoch(r0, make_batch_u128(&schema, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]));
     assert!(!got.has_ghost());
     assert!(got.is_consolidated());
     assert_rows(&got, &[(1, i64::MIN, 10), (2, i64::MAX, 20)]);
@@ -124,9 +120,10 @@ fn a_self_union_doubles_every_weight() {
 #[test]
 fn a_distinct_emits_only_the_positive_boundary_crossings_of_its_history() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
-    let hist = p.table("hist", schema);
+    let mut p = ProgramBuilder::default();
+    let hist = p.declare("hist".into(), schema);
     let r0 = p.seed(schema);
+    p.integrate(r0, hist);
     let out = p.push(
         r0,
         schema,
@@ -135,11 +132,11 @@ fn a_distinct_emits_only_the_positive_boundary_crossings_of_its_history() {
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     // 0 → 3 crosses in, 3 → 2 stays, 2 → 0 crosses out.
     for (w, want) in [(3, 1), (-1, 0), (-2, -1)] {
-        let got = vm.epoch(r0, make_batch_u128(&schema, &[(1, w, 42)]), false);
+        let got = vm.epoch(r0, make_batch_u128(&schema, &[(1, w, 42)]));
         let want: &[_] = if want == 0 { &[] } else { &[(1, want, 42)] };
         assert_rows(&got, want);
     }
@@ -147,10 +144,10 @@ fn a_distinct_emits_only_the_positive_boundary_crossings_of_its_history() {
 
 // ── The empty-epoch skip ─────────────────────────────────────────────────
 
-/// A value-indexed global reduce: its V₀ row is minted by the empty epoch the
-/// driver says mints it, which opens no value index, and an empty epoch after it
-/// skips the pass. A raw delta is folded before both the kernel and the index, and a
-/// retracted minimum is replaced by the next one the index holds.
+/// A value-indexed global reduce: its V₀ row is minted in an epoch of its own,
+/// which opens no value index, and an empty epoch after it skips the pass. A raw
+/// delta is folded before both the kernel and the index, and a retracted minimum
+/// is replaced by the next one the index holds.
 #[test]
 fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
     let schema = make_schema_u128_i64();
@@ -159,15 +156,15 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
         AggDescriptor::COUNT_STAR,
     ];
     let plan = stream::ReducePlan::from_wire(&schema, &[], &aggs, true).unwrap();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
-    let (out, trace) = p.reduce(r0, plan);
-    let mut vm = p.open(out);
+    let (out, trace) = reduce(&mut p, r0, plan);
+    let mut vm = TestVm::open(p, out);
 
-    let ground = int_rows(&vm.epoch(r0, Batch::empty_with_schema(&schema), true));
+    let ground = int_rows(&vm.ground());
     assert_eq!(ground, vec![(vec![None, Some(0)], 1)], "the ground row");
-    let mut epoch = |rows: &[(u128, i64, i64)]| int_rows(&vm.epoch(r0, make_batch_u128_raw(&schema, rows), false));
-    assert!(epoch(&[]).is_empty(), "a second empty epoch has nothing left to mint");
+    let mut epoch = |rows: &[(u128, i64, i64)]| int_rows(&vm.epoch(r0, make_batch_u128_raw(&schema, rows)));
+    assert!(epoch(&[]).is_empty(), "an empty epoch mints nothing");
     assert_eq!(
         epoch(&[(1, 1, 10), (3, 1, 7), (2, 1, 5), (3, -1, 7)]),
         vec![(vec![None, Some(0)], -1), (vec![Some(5), Some(2)], 1)],
@@ -179,29 +176,42 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
     assert_eq!(int_rows(&vm.held(trace)), vec![(vec![Some(10), Some(1)], 1)]);
 }
 
-/// An epoch ends with every register free, one nothing reads included; and
-/// without a ground row an empty epoch produces nothing.
+/// The ground row is minted behind its reduce: it flows on through what reads
+/// the reduce's output, and lands in the reduce's own trace.
+#[test]
+fn a_minted_ground_row_reaches_the_reduces_readers_and_its_trace() {
+    let schema = make_schema_u128_i64();
+    let plan = stream::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], true).unwrap();
+    let mut p = ProgramBuilder::default();
+    let r0 = p.seed(schema);
+    let (reduced, trace) = reduce(&mut p, r0, plan);
+    let out = p.push(reduced, p.schema_of(reduced), Op::Negate);
+    let mut vm = TestVm::open(p, out);
+
+    assert_eq!(int_rows(&vm.ground()), vec![(vec![Some(0)], -1)], "−V₀ downstream");
+    assert_eq!(int_rows(&vm.held(trace)), vec![(vec![Some(0)], 1)], "V₀ in the trace");
+}
+
+/// An epoch ends with every register free, one nothing reads included; and an
+/// empty epoch produces nothing.
 #[test]
 fn an_epoch_leaves_every_register_free() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
     let out = p.push(r0, schema, Op::Share(own_rows(&schema)));
     // Written and never read, so no reader frees it.
     let dead = p.push(r0, schema, Op::Negate);
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
-    assert_rows(
-        &vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10)]), false),
-        &[(1, 1, 10)],
-    );
+    assert_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10)])), &[(1, 1, 10)]);
     assert!(
         vm.batches.iter().all(|b| b.is_empty()),
         "register {} included",
         dead.at()
     );
 
-    assert!(vm.epoch(r0, Batch::empty_with_schema(&schema), false).is_empty());
+    assert!(vm.epoch(r0, Batch::empty_with_schema(&schema)).is_empty());
 }
 
 // ── The two-term DBSP join, end to end ────────────────────────────────────
@@ -222,8 +232,8 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
     for kind in [gnitz_wire::JoinKind::Equi, gnitz_wire::JoinKind::Cross] {
         let plan = |right: bool| stream::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
         let out_schema = *plan(false).out_schema();
-        let mut p = TestPlan::default();
-        let (trace_a, trace_b) = (p.table("ta", schema), p.table("tb", schema));
+        let mut p = ProgramBuilder::default();
+        let (trace_a, trace_b) = (p.declare("ta".into(), schema), p.declare("tb".into(), schema));
         let (a, b) = (p.seed(schema), p.seed(schema));
         let ab = p.push(
             a,
@@ -244,20 +254,16 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
         let out = p.push(ab, out_schema, Op::Union { in_b: ba });
         p.integrate(a, trace_a);
         p.integrate(b, trace_b);
-        let mut vm = p.open(out);
+        let mut vm = TestVm::open(p, out);
 
         for rows in a_epochs {
-            let got = vm.epoch(a, make_batch_u128_raw(&schema, rows), false);
+            let got = vm.epoch(a, make_batch_u128_raw(&schema, rows));
             assert!(got.is_empty(), "{kind:?}: nothing to join against yet");
         }
         // Bilinear, so the product of the raw batches denotes the product of the
         // Z-sets they denote.
         let (want, _) = join_reference(kind, false, &schema, &schema, &a_rows, &b_rows);
-        assert_eq!(
-            zset_of(&vm.epoch(b, b_rows.clone(), false), &out_schema),
-            want,
-            "{kind:?}"
-        );
+        assert_eq!(zset_of(&vm.epoch(b, b_rows.clone()), &out_schema), want, "{kind:?}");
     }
 }
 
@@ -268,8 +274,8 @@ fn join_against_an_integral(
     schema: SchemaDescriptor,
 ) -> (TestVm, DeltaReg, DeltaReg, SchemaDescriptor) {
     let plan = stream::JoinPlan::from_wire(kind, true, &schema, &schema).unwrap();
-    let mut p = TestPlan::default();
-    let trace = p.table("t", schema);
+    let mut p = ProgramBuilder::default();
+    let trace = p.declare("t".into(), schema);
     let (t, d) = (p.seed(schema), p.seed(schema));
     let out_schema = *plan.out_schema();
     let out = p.push(
@@ -281,7 +287,7 @@ fn join_against_an_integral(
         },
     );
     p.integrate(t, trace);
-    (p.open(out), t, d, out_schema)
+    (TestVm::open(p, out), t, d, out_schema)
 }
 
 /// A band join reads its trace between the delta's least and greatest equality
@@ -322,11 +328,11 @@ fn a_band_join_emits_the_spans_of_the_groups_its_delta_names() {
         let kind = gnitz_wire::JoinKind::Range { rel };
         let (mut vm, t, d, out_schema) = join_against_an_integral(kind, schema);
         for rows in t_epochs {
-            assert!(vm.epoch(t, batch(rows), false).is_empty());
+            assert!(vm.epoch(t, batch(rows)).is_empty());
         }
         let (want, want_rows) = join_reference(kind, true, &schema, &schema, &delta, &trace);
         assert!(want_rows > 0, "premise: {rel:?} matches something");
-        let got = vm.epoch(d, delta.clone(), false);
+        let got = vm.epoch(d, delta.clone());
         assert_eq!(got.len(), want_rows, "{rel:?}: row count");
         assert_eq!(zset_of(&got, &out_schema), want, "{rel:?}");
     }
@@ -347,11 +353,11 @@ fn a_cross_join_pairs_every_row_of_a_trace_integrated_across_epochs() {
 
     let (mut vm, t, d, out_schema) = join_against_an_integral(gnitz_wire::JoinKind::Cross, schema);
     for rows in t_epochs {
-        assert!(vm.epoch(t, make_batch_u128_raw(&schema, rows), false).is_empty());
+        assert!(vm.epoch(t, make_batch_u128_raw(&schema, rows)).is_empty());
     }
     let (want, want_rows) = join_reference(gnitz_wire::JoinKind::Cross, true, &schema, &schema, &delta, &trace);
     assert_eq!(want_rows, 8);
-    let got = vm.epoch(d, delta, false);
+    let got = vm.epoch(d, delta);
     assert_eq!(got.len(), want_rows, "row count");
     assert_eq!(zset_of(&got, &out_schema), want);
 }
@@ -375,14 +381,14 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
     let rekey = MapPlan::from_wire(&schema, &rekey).unwrap();
     let over = stream::JoinPlan::over_source(false, &schema, &schema, &rekey).unwrap();
     let out_schema = *over.out_schema();
-    let mut p = TestPlan::default();
-    let trace_a = p.table("ta", schema);
+    let mut p = ProgramBuilder::default();
+    let trace_a = p.declare("ta".into(), schema);
     let (a, b) = (p.seed(schema), p.seed(schema));
     let ab = p.push(
         a,
         out_schema,
         Op::JoinDT {
-            trace: Integral::Relation(TABLE, gnitz_store::relation::Cut::Sealed),
+            trace: Integral::Relation(TABLE),
             plan: Box::new(over),
         },
     );
@@ -396,7 +402,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
     );
     let out = p.push(ab, out_schema, Op::Union { in_b: ba });
     p.integrate(a, trace_a);
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
     vm.registry
         .register(RelationSpec {
             id: TABLE,
@@ -437,7 +443,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
             write(&mut vm, table_rows);
         }
         let a_delta = make_batch_u128_raw(&schema, a_rows);
-        let ticked = vm.epoch(a, a_delta.clone(), false);
+        let ticked = vm.epoch(a, a_delta.clone());
         let (want, _) = join_reference(
             gnitz_wire::JoinKind::Equi,
             false,
@@ -450,7 +456,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
         absorb(ticked);
         a_all.append_batch(&a_delta);
         if let Some(delta) = vm.registry.seal(TABLE).unwrap() {
-            absorb(vm.epoch(b, delta, false));
+            absorb(vm.epoch(b, delta));
         }
     }
     let table_now = vm.registry.relation(TABLE).unwrap().cursor().materialize();
@@ -460,9 +466,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
 
     // A source the program has been fed nothing of reads empty, whatever it holds.
     vm.unfed = vec![TABLE];
-    assert!(vm
-        .epoch(a, make_batch_u128_raw(&schema, &[(1, 1, 12)]), false)
-        .is_empty());
+    assert!(vm.epoch(a, make_batch_u128_raw(&schema, &[(1, 1, 12)])).is_empty());
 }
 
 // ── Integrates run after the range, and a replay runs none ───────────────
@@ -475,18 +479,18 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
     let plan = stream::OrderedPlan::top_n(&schema, &[], &order, 1, 0).unwrap();
     let out_schema = *plan.output_schema();
-    let mut p = TestPlan::default();
-    let index_table = p.table("topnidx", *plan.index_schema());
+    let mut p = ProgramBuilder::default();
+    let index_table = p.declare("topnidx".into(), *plan.index_schema());
     let r0 = p.seed(schema);
     let out = p.push(r0, out_schema, Op::Ordered { index: index_table, plan: Box::new(plan) });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     // The output row carries the input row whole: its PK, then its value.
-    let first = vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10)]), false);
+    let first = vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10)]));
     assert_eq!(int_rows(&first), vec![(vec![Some(1), Some(10)], 1)]);
     // A strictly greater value displaces the top row entirely.
     assert_eq!(
-        int_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(2, 1, 99)]), false)),
+        int_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(2, 1, 99)]))),
         vec![(vec![Some(1), Some(10)], -1), (vec![Some(2), Some(99)], 1)],
     );
 }
@@ -498,16 +502,16 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
 #[test]
 fn a_replay_runs_from_its_entry_and_leaves_every_trace_as_it_found_it() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
-    let trace = p.table("trace", schema);
+    let mut p = ProgramBuilder::default();
+    let trace = p.declare("trace".into(), schema);
     let r0 = p.seed(schema);
     let mid = p.push(r0, schema, Op::Negate);
     let out = p.push(mid, schema, Op::Share(own_rows(&schema)));
     p.integrate(out, trace);
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let rows = [(1, 1, 10), (2, 1, 20)];
-    vm.epoch(r0, make_batch_u128(&schema, &rows), false);
+    vm.epoch(r0, make_batch_u128(&schema, &rows));
     let before = vm.trace(trace);
 
     assert_rows(&vm.replay(mid, make_batch_u128(&schema, &rows)), &rows);
@@ -521,19 +525,20 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
     let schema = make_schema_u128_i64();
 
     let plan = stream::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
-    let (reduced, _) = p.reduce(r0, plan);
+    let (reduced, _) = reduce(&mut p, r0, plan);
     let reduced_schema = p.schema_of(reduced);
     let out = p.push(reduced, reduced_schema, Op::Share(own_rows(&reduced_schema)));
-    let vm = p.open(out);
+    let vm = TestVm::open(p, out);
     assert!(vm.replay_entry(r0).is_err(), "the reduce reads the seed");
     assert!(vm.replay_entry(reduced).is_ok());
 
     // A clamp reads its input's history, which the seed never entered.
-    let mut p = TestPlan::default();
-    let hist = p.table("hist", schema);
+    let mut p = ProgramBuilder::default();
+    let hist = p.declare("hist".into(), schema);
     let r0 = p.seed(schema);
+    p.integrate(r0, hist);
     let out = p.push(
         r0,
         schema,
@@ -542,7 +547,10 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    assert!(p.open(out).replay_entry(r0).is_err(), "the clamp reads the seed");
+    assert!(
+        TestVm::open(p, out).replay_entry(r0).is_err(),
+        "the clamp reads the seed"
+    );
 }
 
 /// A stateful operator the seed does not reach sits on an empty register for
@@ -551,9 +559,10 @@ fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
 #[test]
 fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
-    let hist = p.table("hist", schema);
+    let mut p = ProgramBuilder::default();
+    let hist = p.declare("hist".into(), schema);
     let (a, b) = (p.seed(schema), p.seed(schema));
+    p.integrate(b, hist);
     let negated = p.push(a, schema, Op::Negate);
     let clamped = p.push(
         b,
@@ -564,10 +573,10 @@ fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
         },
     );
     let out = p.push(negated, schema, Op::Union { in_b: clamped });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
     assert!(vm.replay_entry(b).is_err(), "the clamp reads this seed");
 
-    vm.epoch(b, make_batch_u128(&schema, &[(1, 1, 10)]), false);
+    vm.epoch(b, make_batch_u128(&schema, &[(1, 1, 10)]));
     let before = vm.trace(hist);
     let replayed = vm.replay(a, make_batch_u128(&schema, &[(2, 1, 20)]));
     assert_rows(&replayed, &[(2, -1, 20)]);
@@ -581,12 +590,12 @@ fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
 #[test]
 fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
     let negated = p.push(r0, schema, Op::Negate);
     let gathered = p.round(negated, own_rows(&schema));
     let out = p.push(gathered, schema, Op::Negate);
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let mut seed = make_batch_u128(&schema, &[(1, 1, 10)]);
     let mut sent = Vec::new();
@@ -606,13 +615,13 @@ fn a_round_leaves_its_operand_to_a_later_reader() {
     let pk = SchemaColumn::new(TypeCode::U128, false);
     let not_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(not_null);
     // Negate hands its input's label through; the register says `nullable`.
     let negated = p.push(r0, nullable, Op::Negate);
     let gathered = p.round(negated, own_rows(&nullable));
     let out = p.push(gathered, nullable, Op::Union { in_b: negated });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let mut seed = make_batch_u128(&not_null, &[(1, 1, 10)]);
     let mut sent = Vec::new();
@@ -629,10 +638,10 @@ fn a_round_leaves_its_operand_to_a_later_reader() {
 #[test]
 fn a_round_over_the_seed_lends_or_takes_it_as_the_caller_does() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
     let out = p.round(r0, own_rows(&schema));
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let rows = [(1, 1, 10), (2, 1, 20)];
     for take in [false, true] {
@@ -654,11 +663,11 @@ fn a_round_over_the_seed_lends_or_takes_it_as_the_caller_does() {
 #[test]
 fn a_round_runs_by_what_its_epoch_seeds_not_by_what_the_seed_holds() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let (a, b) = (p.seed(schema), p.seed(schema));
     let relayed = p.round(a, own_rows(&schema));
     let out = p.push(relayed, schema, Op::Union { in_b: b });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
     assert!(!vm.idles_on_empty(a) && vm.idles_on_empty(b));
 
     let mut rounds = 0;
@@ -679,12 +688,13 @@ fn a_round_runs_by_what_its_epoch_seeds_not_by_what_the_seed_holds() {
 #[test]
 fn a_lent_seed_comes_back_folded_and_whole() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
-    let hist = p.table("hist", schema);
+    let mut p = ProgramBuilder::default();
+    let hist = p.declare("hist".into(), schema);
     let r0 = p.seed(schema);
+    p.integrate(r0, hist);
     let kind = gnitz_wire::ClampKind::Distinct;
     let out = p.push(r0, schema, Op::WeightClamp { hist: ClampHistory::Own(hist), kind });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
 
     let mut seed = make_batch_u128_raw(&schema, &[(2, 1, 20), (1, 1, 10), (2, 1, 20)]);
     assert!(!seed.is_consolidated());
@@ -704,17 +714,18 @@ fn a_broadcast_sends_folded_what_its_reader_reads_folded() {
         (std::rc::Rc::new(algebra::ScatterPlan::broadcast()), true),
         (own_rows(&schema), false),
     ] {
-        let mut p = TestPlan::default();
-        let hist = p.table("hist", schema);
+        let mut p = ProgramBuilder::default();
+        let hist = p.declare("hist".into(), schema);
         let r0 = p.seed(schema);
         let gathered = p.round(r0, plan);
+        p.integrate(gathered, hist);
         let kind = gnitz_wire::ClampKind::Distinct;
         let out = p.push(
             gathered,
             schema,
             Op::WeightClamp { hist: ClampHistory::Own(hist), kind },
         );
-        let mut vm = p.open(out);
+        let mut vm = TestVm::open(p, out);
 
         let mut seed = make_batch_u128_raw(&schema, &[(2, 1, 20), (1, 1, 10), (2, 1, 20)]);
         let mut folded = Vec::new();
@@ -732,11 +743,11 @@ fn a_broadcast_sends_folded_what_its_reader_reads_folded() {
 #[test]
 fn replay_entry_refuses_a_seed_that_reaches_a_round() {
     let schema = make_schema_u128_i64();
-    let mut p = TestPlan::default();
+    let mut p = ProgramBuilder::default();
     let (a, b) = (p.seed(schema), p.seed(schema));
     let relayed = p.round(a, own_rows(&schema));
     let out = p.push(relayed, schema, Op::Union { in_b: b });
-    let mut vm = p.open(out);
+    let mut vm = TestVm::open(p, out);
     assert!(vm.replay_entry(a).is_err());
     assert_rows(&vm.replay(b, make_batch_u128(&schema, &[(3, 1, 30)])), &[(3, 1, 30)]);
 }

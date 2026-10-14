@@ -9,7 +9,6 @@ use crate::schema::SchemaDescriptor;
 use super::avi::AviBake;
 use super::plan::ReducePlan;
 use crate::algebra::emit_reduce_row;
-use crate::algebra::ground_pk;
 use crate::algebra::{AggValues, GroupOrdinals, RangeGroups};
 use crate::stream::OpenAt;
 
@@ -35,16 +34,6 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
     if delta.count == 0 {
-        // An empty source delivers only empty deltas, so the ground row is minted
-        // here, by a reduce that owes one, and only while no V₀ row is stored.
-        if plan.seeds_ground {
-            let v0 = ground_pk();
-            if !trace_out(v0.bytes(), v0.bytes()).seek_pk_group_ascending(v0.bytes()) {
-                let mut out = Batch::with_capacity(output_schema, 1);
-                emit_reduce_row(&mut out, None, v0.bytes(), &shape.aggs, &plan.empty_group, 0);
-                return out;
-            }
-        }
         return Batch::empty_with_schema(output_schema);
     }
 
@@ -193,16 +182,9 @@ impl<'a> GroupEmit<'a> {
         if cardinality > 0 {
             let group = Some((self.delta, first, shape.key.carried()));
             emit_reduce_row(&mut self.out, group, out_pk_bytes, &shape.aggs, vals, g);
-        } else if self.plan.seeds_ground {
+        } else if let Some(v0) = &self.plan.ground {
             // An emptied global aggregate still publishes one row.
-            emit_reduce_row(
-                &mut self.out,
-                None,
-                out_pk_bytes,
-                &shape.aggs,
-                &self.plan.empty_group,
-                0,
-            );
+            self.out.append_batch(v0);
         }
         consolidate_group(&mut self.out, &shape.output_schema, mark);
     }

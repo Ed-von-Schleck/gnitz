@@ -224,10 +224,10 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     }
 }
 
-/// A global aggregate's ground row is minted by the first epoch of any source,
-/// and a round runs only in the epochs of the sources that reach it — so a round
-/// behind the aggregate would drop the row minted in another source's epoch. A
-/// reduce that owes no ground row may sit behind one.
+/// A global aggregate's ground row is minted in an epoch of its own on one
+/// worker, entered behind the reduce — so a round behind the aggregate would wait
+/// on workers that never run it. A reduce that owes no ground row may sit behind
+/// one.
 #[test]
 fn an_exchange_behind_a_global_aggregate_is_rejected() {
     let keyed = Source::from(make_schema_u64_i64());
@@ -265,7 +265,7 @@ fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
 }
 
 /// A global reduce behind an exchange owes a ground row, and its plan says so at
-/// every rank: which process mints it is the epoch's to say. With no exchange the
+/// every rank: which process mints it is the backfill's to say. With no exchange the
 /// reduce aggregates each worker's slice, and owes none.
 #[test]
 fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
@@ -277,7 +277,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
     let seeds = |exchanged: bool, source: Source, slot: Slot| {
         let out = compile_global(global_circuit(&op, exchanged), source, slot).expect("the fixture compiles");
         let reduces = out.vm.ops().filter_map(|op| match op {
-            Op::Reduce { plan, .. } => Some(plan.seeds_ground),
+            Op::Reduce { plan, .. } => Some(plan.ground_row().is_some()),
             _ => None,
         });
         reduces.last().expect("a reduce")

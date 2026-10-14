@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use gnitz_store::relation::{CircuitState, Cut, StateIdx};
+use gnitz_store::relation::{CircuitState, StateIdx, StateLayout};
 use gnitz_wire::ClampKind;
 use gnitz_zset::algebra::{MapPlan, ScatterPlan};
 use gnitz_zset::repr::Batch;
@@ -21,7 +21,7 @@ mod exec;
 mod fixtures;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{replay_chunk, run, Epoch, Ran, Stores};
+pub(in crate::query) use exec::{mint_ground_rows, replay_chunk, run, Epoch, Ran, Stores};
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -46,8 +46,6 @@ struct Instr {
     in_reg: DeltaReg,
     out_reg: DeltaReg,
     op: Op,
-    /// `op`'s, classified once when the instruction is pushed.
-    facts: OpFacts,
 }
 
 /// The operators, each boxing whatever the emitter baked for it.
@@ -107,7 +105,7 @@ pub(in crate::query) enum Op {
 
 /// Where a clamp reads `I(in)`, its input's history.
 pub(in crate::query) enum ClampHistory {
-    /// A child store `finish` integrates the input into.
+    /// A child store the input is integrated into.
     Own(StateIdx),
     /// The stores of the base tables the input is a signed sum of. Nothing is
     /// integrated.
@@ -129,10 +127,10 @@ pub(in crate::query) struct HistoryTerm {
 pub(in crate::query) enum Integral {
     /// A child store the circuit integrates a register into.
     Own(StateIdx),
-    /// A relation's store, which its own ingest keeps: the table a delta is
-    /// scanned from, read as the view last absorbed it, or the view the plan
-    /// computes. Nothing is integrated.
-    Relation(u64, Cut),
+    /// A relation's store as of its last seal, which its own ingest keeps: the
+    /// table a delta is scanned from, read as the view last absorbed it, or the
+    /// view the plan computes. Nothing is integrated.
+    Relation(u64),
 }
 
 /// What the VM's passes ask of one operator.
@@ -145,32 +143,18 @@ struct OpFacts {
     /// value index, an ordered index, the other workers' rows — so a replay
     /// past it would read that against a seed it never saw.
     stateful: bool,
-    /// With every delta operand empty its kernel returns
-    /// `empty_with_schema(out_reg)` and touches no trace.
-    inert_on_empty: bool,
 }
 
 fn facts(op: &Op) -> OpFacts {
-    let linear = OpFacts {
-        consolidates_in: false,
-        stateful: false,
-        inert_on_empty: true,
-    };
+    let linear = OpFacts { consolidates_in: false, stateful: false };
     match op {
         Op::Filter(_) | Op::Map(_) | Op::Negate | Op::Union { .. } | Op::Share(_) | Op::NullExtend { .. } => linear,
         Op::Round { .. } => OpFacts { stateful: true, ..linear },
-        Op::WeightClamp { .. } => OpFacts {
-            consolidates_in: true,
-            stateful: true,
-            ..linear
-        },
+        Op::WeightClamp { .. } => OpFacts { consolidates_in: true, stateful: true },
         Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
         Op::Reduce { plan, .. } => OpFacts {
             consolidates_in: !plan.is_exact_linear(),
             stateful: true,
-            // A global-ground reduce mints V₀ from an empty delta, in the epoch
-            // that says so.
-            inert_on_empty: !plan.seeds_ground,
         },
         Op::Ordered { .. } => OpFacts { stateful: true, ..linear },
     }
@@ -197,30 +181,6 @@ impl Instr {
         };
         [Some(self.in_reg), second]
     }
-
-    /// The trace this instruction's op owns as the integral of one of its own
-    /// registers — the clamp's input history, a reduce's output — which
-    /// `finish` schedules as an integrate. No `_` arm, as in [`Self::reads`]: a new
-    /// opcode must say whether it owns one.
-    fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
-        match &self.op {
-            Op::WeightClamp { hist: ClampHistory::Own(trace), .. } => Some((self.in_reg, *trace)),
-            Op::WeightClamp { hist: ClampHistory::Sources(_), .. } => None,
-            Op::Reduce { out_trace, .. } => match out_trace {
-                Integral::Own(trace) => Some((self.out_reg, *trace)),
-                Integral::Relation(..) => None,
-            },
-            Op::Filter(_)
-            | Op::Map(_)
-            | Op::Negate
-            | Op::Union { .. }
-            | Op::JoinDT { .. }
-            | Op::Share(_)
-            | Op::Round { .. }
-            | Op::NullExtend { .. }
-            | Op::Ordered { .. } => None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +188,8 @@ impl Instr {
 // ---------------------------------------------------------------------------
 
 /// A compiled DBSP program and the registers it runs over. It owns every
-/// resource its instructions name except the stores: the view's own children
+/// resource its instructions name, and the layout of the child stores they
+/// address; the stores themselves are the caller's: the view's own children
 /// ([`CircuitState`]) and the relations an [`Integral::Relation`] reads.
 pub(in crate::query) struct Vm {
     instructions: Box<[Instr]>,
@@ -241,6 +202,8 @@ pub(in crate::query) struct Vm {
     batches: Box<[Batch]>,
     /// The register the epoch's output is extracted from.
     out_reg: DeltaReg,
+    /// The child stores the instructions and integrates address.
+    layout: StateLayout,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -283,6 +246,12 @@ impl Vm {
         self.schema_of(self.out_reg)
     }
 
+    /// The child stores this program addresses, to be opened as its
+    /// [`CircuitState`].
+    pub(in crate::query) fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
     /// Every instruction's op, in program order.
     #[cfg(test)]
     pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> {
@@ -296,16 +265,14 @@ impl Vm {
             .any(|i| matches!(i.op, Op::Reduce { out_trace: Integral::Relation(..), .. }))
     }
 
-    /// An epoch seeding `reg` with an empty delta, and minting no ground row, does
-    /// nothing: it runs no exchange round.
+    /// An epoch seeding `reg` with an empty delta does nothing: it runs no
+    /// exchange round.
     pub(in crate::query) fn idles_on_empty(&self, reg: DeltaReg) -> bool {
         !self.regs[reg.at()].feeds_round
     }
 
     /// Enter a read-only replay at `reg`'s first reader. Refused where the seed
-    /// would reach a stateful operator, or where one runs without it: every
-    /// other register is empty in a replay, so an operator the seed does not
-    /// reach is skipped exactly when it is inert on an empty delta.
+    /// would reach a stateful operator.
     pub(in crate::query) fn replay_entry(&self, reg: DeltaReg) -> Result<ReplayEntry, String> {
         let pc = self
             .instructions
@@ -316,7 +283,7 @@ impl Vm {
         seeded[reg.at()] = true;
         for instr in &self.instructions[pc..] {
             let reads_seed = instr.reads().into_iter().flatten().any(|r| seeded[r.at()]);
-            if instr.facts.stateful && (reads_seed || !instr.facts.inert_on_empty) {
+            if facts(&instr.op).stateful && reads_seed {
                 return Err("replay: the seed reaches a stateful operator".into());
             }
             seeded[instr.out_reg.at()] |= reads_seed;

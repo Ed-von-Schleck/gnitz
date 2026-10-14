@@ -141,6 +141,14 @@ impl Harness {
         out
     }
 
+    /// The epoch of its own a global aggregate's ground row is minted in: the
+    /// row lands in the output's trace.
+    fn ground(&mut self) {
+        if let Some(v0) = self.plan.ground_row().cloned() {
+            self.trace_out.ingest(v0);
+        }
+    }
+
     fn state(&self, group_cols: &[u32]) -> BTreeMap<Cells, i64> {
         output_rows(&self.trace_out.cursor().materialize(), group_cols)
     }
@@ -314,7 +322,7 @@ proptest! {
         let ground = seeds && group_cols.is_empty();
         let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, ground).unwrap());
         let mut model = BTreeMap::new();
-        h.tick(batch(&[]));
+        h.ground();
         prop_assert_eq!(h.state(group_cols), aggregates(&model, group_cols, &aggs, ground));
         for targets in &ticks {
             let delta = batch(&delta_to(&mut model, targets));
@@ -339,7 +347,7 @@ proptest! {
         let partials = *workers[0].plan.output_schema();
         let mut combine = Harness::new(ReducePlan::combine(&partials, &aggs, true).unwrap());
         let mut model = BTreeMap::new();
-        combine.tick(Batch::empty_with_schema(&partials));
+        combine.ground();
         prop_assert_eq!(combine.state(&[]), aggregates(&model, &[], &aggs, true));
         for targets in &ticks {
             let delta = delta_to(&mut model, targets);

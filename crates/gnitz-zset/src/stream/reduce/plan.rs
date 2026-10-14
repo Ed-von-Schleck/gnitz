@@ -2,7 +2,7 @@
 //! `ReduceShape` the ad-hoc fold shares.
 
 use super::avi::{avi_batch, AviBake};
-use crate::algebra::{Agg, AggValues, GroupOutKey, ReduceShape};
+use crate::algebra::{emit_reduce_row, ground_pk, Agg, AggValues, GroupOutKey, ReduceShape};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::AggDescriptor;
@@ -11,14 +11,13 @@ use gnitz_wire::AggFunc;
 /// The baked per-instruction circuit reduce plan.
 pub struct ReducePlan {
     pub(super) shape: ReduceShape,
-    /// The reduce owes the global-aggregate ground row: one row over an empty input.
-    pub seeds_ground: bool,
+    /// The row a global aggregate publishes over an empty input; `None` for a
+    /// reduce that owes none.
+    pub(super) ground: Option<Batch>,
     /// Position of the aggregate holding a group's net row count.
     pub(super) cardinality: usize,
     /// The value index the non-linear aggregates read their history from.
     pub(super) avi: Option<AviBake>,
-    /// One group no row has stepped: the ground row's values.
-    pub(super) empty_group: AggValues,
 }
 
 impl ReducePlan {
@@ -70,14 +69,19 @@ impl ReducePlan {
         let empty = key.is_global();
         let shape = ReduceShape::new(input, key, prefix, aggs, empty)?;
         let avi = AviBake::new(input, group_cols, &shape.aggs)?;
-        let empty_group = AggValues::new(&shape.aggs, 1);
-        Ok(ReducePlan {
-            shape,
-            seeds_ground,
-            cardinality,
-            avi,
-            empty_group,
-        })
+        let ground = seeds_ground.then(|| {
+            let mut v0 = Batch::with_capacity(&shape.output_schema, 1);
+            let values = AggValues::new(&shape.aggs, 1);
+            emit_reduce_row(&mut v0, None, ground_pk().bytes(), &shape.aggs, &values, 0);
+            v0
+        });
+        Ok(ReducePlan { shape, ground, cardinality, avi })
+    }
+
+    /// The row a global aggregate publishes over an empty input; `None` for a
+    /// reduce that owes none.
+    pub fn ground_row(&self) -> Option<&Batch> {
+        self.ground.as_ref()
     }
 
     /// The layout `op_reduce` emits under this plan.

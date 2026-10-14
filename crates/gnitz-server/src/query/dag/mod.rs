@@ -152,7 +152,7 @@ fn opened<'a>(
 ) -> Result<(&'a mut CompileOutput, &'a mut CircuitState), String> {
     let RegisteredView { code, state, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
     if state.is_none() {
-        let open = CircuitState::open(registry, view_id, &code.layout);
+        let open = CircuitState::open(registry, view_id, code.vm.layout());
         *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
     }
     Ok((code, state.as_mut().expect("opened above")))

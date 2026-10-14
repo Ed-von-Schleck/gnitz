@@ -423,8 +423,7 @@ fn op_reduce_tiny_bench() {
             );
         }
     }
-    // The ground row: an empty delta over an empty trace, and the delete of the
-    // last row of a global aggregate.
+    // The delete of the last row of a global aggregate, which emits its ground row.
     for (label, aggs) in [("ground sum", &[Sum][..]), ("ground min", &[Min][..])] {
         let col_idx = 2;
         let aggs: Vec<AggDescriptor> = aggs
@@ -432,20 +431,7 @@ fn op_reduce_tiny_bench() {
             .map(|&agg_op| AggDescriptor { col_idx, agg_op })
             .chain([AggDescriptor::COUNT_STAR])
             .collect();
-        let mk = || Harness::new(ReducePlan::from_wire(&keyed_i, &[], &aggs, true).unwrap());
-        let h = mk();
-        let empty = Batch::empty_with_schema(&keyed_i);
-        let ((), instructions) = counter.measure(|| {
-            for _ in 0..ITERS {
-                std::hint::black_box(h.reduce(&empty));
-            }
-        });
-        println!(
-            "op_reduce_tiny_bench {label:<20} {:<19} {:>6} instr/call",
-            "empty delta",
-            instructions / ITERS
-        );
-        let mut h = mk();
+        let mut h = Harness::new(ReducePlan::from_wire(&keyed_i, &[], &aggs, true).unwrap());
         let one = h.fold(build(&keyed_i, &[(1, 1, 1, 1)]));
         epoch(&counter, &mut h, &one);
         let del = h.fold(build(&keyed_i, &[(1, 1, 1, -1)]));

@@ -23,7 +23,7 @@ pub(in crate::query) struct Stores<'a> {
 enum Trace<'a> {
     /// One of the view's own children.
     Child(StateIdx),
-    Relation(&'a Relation, Cut),
+    Relation(&'a Relation),
     /// A source the view has been fed no row of.
     Unfed(&'a Relation),
 }
@@ -33,11 +33,11 @@ impl Stores<'_> {
     fn trace(&self, integral: Integral) -> Result<Trace<'_>, String> {
         Ok(match integral {
             Integral::Own(idx) => Trace::Child(idx),
-            Integral::Relation(id, cut) => {
+            Integral::Relation(id) => {
                 let relation = self.registry.relation_or_err(id)?;
                 match self.unfed.contains(&id) {
                     true => Trace::Unfed(relation),
-                    false => Trace::Relation(relation, cut),
+                    false => Trace::Relation(relation),
                 }
             }
         })
@@ -47,7 +47,7 @@ impl Stores<'_> {
     fn open<'s>(&'s self, store: Trace<'s>) -> impl FnMut(&[u8], &[u8]) -> ReadCursor + 's {
         move |first: &[u8], last: &[u8]| match store {
             Trace::Child(idx) => self.own.cursor_between(idx, first, last),
-            Trace::Relation(relation, cut) => relation.cursor_between(first, last, cut),
+            Trace::Relation(relation) => relation.cursor_between(first, last, Cut::Sealed),
             Trace::Unfed(relation) => empty_cursor(relation.schema()),
         }
     }
@@ -64,7 +64,7 @@ impl Stores<'_> {
         let keys = PkKeys::from_keys(stride, (0..delta.len()).map(|row| delta.get_pk_bytes(row)));
         let mut runs = Vec::with_capacity(terms.len());
         for term in terms {
-            let mut gather = self.gather(Integral::Relation(term.relation, Cut::Sealed), keys.clone())?;
+            let mut gather = self.gather(Integral::Relation(term.relation), keys.clone())?;
             let Some(mut rows) = gather.drain_chunk(usize::MAX) else {
                 continue;
             };
@@ -88,7 +88,7 @@ impl Stores<'_> {
     pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys) -> Result<PkSetGather, String> {
         Ok(match self.trace(integral)? {
             Trace::Child(idx) => self.own.gather(idx, keys),
-            Trace::Relation(relation, cut) => relation.gather(keys, cut),
+            Trace::Relation(relation) => relation.gather(keys, Cut::Sealed),
             Trace::Unfed(relation) => PkSetGather::over(empty_cursor(relation.schema()), keys),
         })
     }
@@ -111,22 +111,12 @@ pub(in crate::query) struct Epoch<'e> {
     pc: usize,
     /// A tick's epoch, which integrates. A replay does not.
     tick: bool,
-    /// The driver says this epoch mints the ground row an empty delta owes.
-    ground: bool,
 }
 
 impl<'e> Epoch<'e> {
-    /// A tick's epoch over `seed`, the delta of the source seeding `reg`, minting
-    /// the ground row iff `ground`.
-    pub(in crate::query) fn tick(reg: DeltaReg, seed: &'e mut Batch, take: bool, ground: bool) -> Self {
-        Epoch {
-            reg,
-            seed,
-            take,
-            pc: 0,
-            tick: true,
-            ground,
-        }
+    /// A tick's epoch over `seed`, the delta of the source seeding `reg`.
+    pub(in crate::query) fn tick(reg: DeltaReg, seed: &'e mut Batch, take: bool) -> Self {
+        Epoch { reg, seed, take, pc: 0, tick: true }
     }
 }
 
@@ -183,19 +173,17 @@ pub(in crate::query) fn run<'f>(
     let fold = vm.regs[instr.out_reg.at()].fold;
     let take = takes(&vm.regs, epoch, in_reg, LastRead::Instr(pc));
     epoch.pc = pc;
-    if in_reg == epoch.reg {
-        std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
-        return Ok(Ran::Round {
-            plan,
-            batch: operand(epoch.seed, take),
-            fold,
-        });
-    }
-    // The label every worker sends its rows under.
-    let mut batch = operand(&mut vm.batches[in_reg.at()], take).into_owned();
-    batch.set_schema(&vm.regs[in_reg.at()].schema);
     std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
-    Ok(Ran::Round { plan, batch: Cow::Owned(batch), fold })
+    let batch = match in_reg == epoch.reg {
+        true => operand(epoch.seed, take),
+        false => {
+            // The label every worker sends its rows under.
+            let mut batch = operand(&mut vm.batches[in_reg.at()], take).into_owned();
+            batch.set_schema(&vm.regs[in_reg.at()].schema);
+            Cow::Owned(batch)
+        }
+    };
+    Ok(Ran::Round { plan, batch, fold })
 }
 
 /// One chunk of a capacity-bounded view's hydration replay.
@@ -205,17 +193,40 @@ pub(in crate::query) fn replay_chunk(
     entry: ReplayEntry,
     mut seed: Batch,
 ) -> Result<Batch, String> {
-    let mut epoch = Epoch {
-        reg: entry.reg,
-        seed: &mut seed,
-        take: true,
-        pc: entry.pc,
-        tick: false,
-        ground: false,
-    };
+    run_through(vm, stores, entry.reg, entry.pc, false, &mut seed)
+}
+
+/// Mint the row each global aggregate owes over an empty input, each in an
+/// epoch of its own entered behind its reduce, and answer what they produced.
+pub(in crate::query) fn mint_ground_rows(vm: &mut Vm, stores: &mut Stores<'_>) -> Result<Batch, String> {
+    let mut minted = Batch::empty_with_schema(vm.out_schema());
+    for pc in 0..vm.instructions.len() {
+        let instr = &vm.instructions[pc];
+        let Op::Reduce { plan, .. } = &instr.op else { continue };
+        let Some(mut row) = plan.ground_row().cloned() else {
+            continue;
+        };
+        let reg = instr.out_reg;
+        minted.append_batch(&run_through(vm, stores, reg, pc + 1, true, &mut row)?);
+    }
+    Ok(minted)
+}
+
+/// Run `seed`, taken, from `reg` and instruction `pc` to the program's end,
+/// integrating iff `tick`. No round stands past `pc`: `replay_entry` refuses a
+/// seed that reaches one, and the compiler puts none behind a global aggregate.
+fn run_through(
+    vm: &mut Vm,
+    stores: &mut Stores<'_>,
+    reg: DeltaReg,
+    pc: usize,
+    tick: bool,
+    seed: &mut Batch,
+) -> Result<Batch, String> {
+    let mut epoch = Epoch { reg, seed, take: true, pc, tick };
     match run(vm, stores, &mut epoch, None)? {
         Ran::Done(out) => Ok(out),
-        Ran::Round { .. } => unreachable!("`replay_entry` refuses a seed that reaches a round"),
+        Ran::Round { .. } => unreachable!("no round stands past the entry"),
     }
 }
 
@@ -281,11 +292,10 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 false => continue,
             },
 
-            // The kernel would return exactly this, so the dispatch is saved:
-            // past the epoch that minted it, the ground row is in its trace.
-            _ if all_empty && (instr.facts.inert_on_empty || !epoch.ground) => {
-                Batch::empty_with_schema(&regs[out_reg.at()].schema)
-            }
+            // The kernel would return an empty batch, and the out register is
+            // already one: every run leaves every register empty, and an empty
+            // register's label is never read.
+            _ if all_empty => continue,
 
             Op::Filter(pred) => algebra::op_filter(&batches[in_reg.at()], pred)
                 .unwrap_or_else(|| operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned()),
@@ -345,15 +355,9 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
 
             Op::Reduce { out_trace, index, plan } => {
                 let delta = &batches[in_reg.at()];
-                // An empty delta touches no group; only a ground-seeding
-                // reduce reaches here with one.
-                let entries = match delta.is_empty() {
-                    true => None,
-                    false => index.zip(plan.index_batch(delta)),
-                };
                 // Ingested before the index is opened, so a prefix seek over
                 // it sees the rows this epoch wrote.
-                if let Some((idx, entries)) = entries {
+                if let Some((idx, entries)) = index.zip(plan.index_batch(delta)) {
                     let res = stores.own.ingest(idx, entries);
                     res.map_err(|e| ingest_err("avi", idx, e))?;
                 }

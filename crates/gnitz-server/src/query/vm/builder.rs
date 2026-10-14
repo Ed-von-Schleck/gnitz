@@ -11,12 +11,13 @@ use super::*;
 #[derive(Default)]
 pub(in crate::query) struct ProgramBuilder {
     instructions: Vec<Instr>,
-    /// The traces the circuit itself integrates; each op's own integral is
-    /// added by [`Self::finish`].
+    /// The traces the circuit itself integrates.
     integrates: Vec<(DeltaReg, StateIdx)>,
     schemas: Vec<SchemaDescriptor>,
     /// Per register, the seeded registers whose delta reaches it.
     reach: Vec<Vec<DeltaReg>>,
+    /// The child stores the program addresses.
+    layout: StateLayout,
 }
 
 impl ProgramBuilder {
@@ -31,8 +32,7 @@ impl ProgramBuilder {
     /// Push `op` over `in_reg`, writing a fresh register of `out_schema`.
     pub(in crate::query) fn push(&mut self, in_reg: DeltaReg, out_schema: SchemaDescriptor, op: Op) -> DeltaReg {
         let out_reg = self.seed(out_schema);
-        let facts = facts(&op);
-        let instr = Instr { in_reg, out_reg, op, facts };
+        let instr = Instr { in_reg, out_reg, op };
         let mut reach: Vec<DeltaReg> = Vec::new();
         for seed in instr.reads().into_iter().flatten().flat_map(|r| &self.reach[r.at()]) {
             if !reach.contains(seed) {
@@ -68,6 +68,11 @@ impl ProgramBuilder {
         self.integrates.push((reg, trace));
     }
 
+    /// Declare a child store of `schema` the program addresses as `name`.
+    pub(in crate::query) fn declare(&mut self, name: String, schema: SchemaDescriptor) -> StateIdx {
+        self.layout.declare(name, schema)
+    }
+
     /// The schema register `reg` is labelled with.
     pub(in crate::query) fn schema_of(&self, reg: DeltaReg) -> SchemaDescriptor {
         self.schemas[reg.at()]
@@ -76,9 +81,12 @@ impl ProgramBuilder {
     /// The runnable plan, whose epoch output is extracted from `out_reg`.
     pub(in crate::query) fn finish(self, out_reg: DeltaReg) -> Vm {
         let ProgramBuilder {
-            instructions, mut integrates, schemas, ..
+            instructions,
+            integrates,
+            schemas,
+            layout,
+            ..
         } = self;
-        integrates.extend(instructions.iter().filter_map(Instr::own_integral));
 
         // Over the emitted instructions, which already name the register an
         // elided node's readers read.
@@ -96,7 +104,7 @@ impl ProgramBuilder {
             for reg in instr.reads().into_iter().flatten() {
                 regs[reg.at()].last_read = LastRead::Instr(pc);
             }
-            regs[instr.in_reg.at()].fold |= instr.facts.consolidates_in;
+            regs[instr.in_reg.at()].fold |= facts(&instr.op).consolidates_in;
         }
         // A broadcast hands every worker every row, so the fold its gathering
         // register owes is the sender's: one sort, not one per worker. A keyed
@@ -124,10 +132,7 @@ impl ProgramBuilder {
             integrates: integrates.into_boxed_slice(),
             regs: regs.into_boxed_slice(),
             out_reg,
+            layout,
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/builder.rs"]
-mod tests;

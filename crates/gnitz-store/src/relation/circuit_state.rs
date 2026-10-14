@@ -31,11 +31,6 @@ impl StateLayout {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.children.iter().map(|(name, _)| name.as_str())
     }
-
-    /// The schema of the child `idx` names.
-    pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
-        &self.children[idx.0].1
-    }
 }
 
 /// The rederived operator state of one compiled circuit: the stores its stateful

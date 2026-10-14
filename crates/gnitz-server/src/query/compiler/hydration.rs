@@ -69,11 +69,7 @@ pub(super) fn derive_hydration(
                         .into(),
                 );
             }
-            (
-                node,
-                Integral::Relation(source, gnitz_store::relation::Cut::Sealed),
-                node,
-            )
+            (node, Integral::Relation(source), node)
         }
         SeedAt::Trace { delta } => {
             let seed = integrals[delta].expect("the join declared its integrand's integral");
@@ -81,7 +77,7 @@ pub(super) fn derive_hydration(
                 Integral::Own(_) => delta,
                 // The relation's own rows enter where its delta does, and are
                 // re-keyed by `delta`, the reindex whose integral the store is.
-                Integral::Relation(..) => circuit.inputs(delta)[0],
+                Integral::Relation(_) => circuit.inputs(delta)[0],
             };
             (in_node, seed, delta)
         }

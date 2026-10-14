@@ -9,8 +9,6 @@
 
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
-use gnitz_store::relation::Cut;
-use gnitz_store::relation::StateLayout;
 use gnitz_zset::stream::JoinPlan;
 
 // ---------------------------------------------------------------------------
@@ -25,8 +23,6 @@ pub(super) struct EmitCtx<'a> {
     meta: &'a ViewMeta,
     /// Answers each source's schema and placement.
     registry: &'a RelationRegistry,
-    /// Every child the view's operators declare, in one index space.
-    pub(super) layout: StateLayout,
     pub(super) prog: ProgramBuilder,
     /// The register of every node emitted so far, by node id.
     pub(super) regs: Vec<DeltaReg>,
@@ -46,6 +42,8 @@ pub(super) struct EmitCtx<'a> {
 pub(super) struct Scan {
     pub(super) seed: DeltaReg,
     reg: DeltaReg,
+    /// An exchange round moves the delta between the seed and `reg`.
+    relayed: bool,
     pub(super) bound: ReadBound,
 }
 
@@ -53,7 +51,7 @@ impl<'a> EmitCtx<'a> {
     /// Declare one child store of the view's operator state, named after `kind`
     /// and the node. The returned [`StateIdx`] is the only way to reach it.
     fn declare_child(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> StateIdx {
-        self.layout.declare(format!("{kind}_{nid}"), schema)
+        self.prog.declare(format!("{kind}_{nid}"), schema)
     }
 
     /// `circuit` emitted whole under the routing `meta` derived from it.
@@ -69,7 +67,6 @@ impl<'a> EmitCtx<'a> {
             circuit,
             meta,
             registry,
-            layout: StateLayout::default(),
             prog: ProgramBuilder::default(),
             regs: Vec::with_capacity(nodes),
             partials: vec![false; nodes],
@@ -88,7 +85,7 @@ impl<'a> EmitCtx<'a> {
     /// holds the node's rows, else a child declared under `kind`.
     fn out_trace(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> Integral {
         match self.store_out {
-            Some(view) if self.circuit.out() == nid => Integral::Relation(view, Cut::Now),
+            Some(view) if self.circuit.out() == nid => Integral::Relation(view),
             _ => Integral::Own(self.declare_child(kind, nid, schema)),
         }
     }
@@ -132,11 +129,7 @@ impl<'a> EmitCtx<'a> {
     fn integral_store(&self, source: u64) -> Option<&'a Relation> {
         let registry: &'a RelationRegistry = self.registry;
         let relation = registry.relation(source).filter(|r| r.kind().is_base_table())?;
-        let moved = matches!(
-            self.prog.writer(self.sources.get(&source)?.reg),
-            Some((_, Op::Round { .. }, _))
-        );
-        (!moved).then_some(relation)
+        (!self.sources.get(&source)?.relayed).then_some(relation)
     }
 
     /// The base table whose store is already the integral of `of`, and `of`'s re-key
@@ -205,7 +198,13 @@ impl<'a> EmitCtx<'a> {
         if let Some(Integral::Own(trace)) = self.integrals[of] {
             return trace;
         }
-        let trace = self.declare_child("int", of, self.prog.schema_of(reg));
+        self.integrated_child("int", of, reg)
+    }
+
+    /// A child store of `reg`'s schema, declared under `kind` and node `nid`, that
+    /// `reg` is integrated into.
+    fn integrated_child(&mut self, kind: &str, nid: NodeId, reg: DeltaReg) -> StateIdx {
+        let trace = self.declare_child(kind, nid, self.prog.schema_of(reg));
         self.prog.integrate(reg, trace);
         trace
     }
@@ -231,13 +230,14 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
                 return Ok(scan.reg);
             }
             let seed = ctx.prog.seed(relation.schema());
-            let reg = match ctx.meta.source_route(*tid) {
+            let (reg, relayed) = match ctx.meta.source_route(*tid) {
                 // Every worker already holds a replicated delta whole.
-                Some(plan) if relation.placement().is_replicated() => ctx.share(seed, Rc::clone(plan)),
-                Some(plan) => ctx.prog.round(seed, Rc::clone(plan)),
-                None => seed,
+                Some(plan) if relation.placement().is_replicated() => (ctx.share(seed, Rc::clone(plan)), false),
+                Some(plan) => (ctx.prog.round(seed, Rc::clone(plan)), true),
+                None => (seed, false),
             };
-            ctx.sources.insert(*tid, Scan { seed, reg, bound: bound.clone() });
+            let bound = bound.clone();
+            ctx.sources.insert(*tid, Scan { seed, reg, relayed, bound });
             Ok(reg)
         }
 
@@ -273,7 +273,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             let schema = ctx.prog.schema_of(in_reg);
             let hist = match ctx.source_history(in_reg) {
                 Some(terms) => ClampHistory::Sources(terms),
-                None => ClampHistory::Own(ctx.declare_child("hist", nid, schema)),
+                None => ClampHistory::Own(ctx.integrated_child("hist", nid, in_reg)),
             };
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
@@ -321,8 +321,9 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
         }
 
         gnitz_wire::OpNode::ExchangeShard => {
-            // A ground row is minted by the first epoch, whatever it seeds, and
-            // a round runs only in the epochs of the sources that reach it.
+            // The ground row is minted in an epoch of its own on one worker,
+            // entered behind the reduce: a round behind it would wait on workers
+            // that never run it.
             if behind_ground_reduce(ctx.circuit, nid) {
                 return Err("an exchange behind a global aggregate".into());
             }
@@ -385,12 +386,12 @@ fn emit_join_term(
     // One constructor owns every kind's guards and its output layout.
     let (trace, plan) = match ctx.source_rekey(integrand) {
         Some((relation, rekey)) => (
-            Integral::Relation(relation.id(), Cut::Sealed),
+            Integral::Relation(relation.id()),
             JoinPlan::over_source(delta_is_right, &delta_schema, &relation.schema(), &rekey)?,
         ),
         None => {
             let trace = ctx.own_integral(integrand, integrand_reg);
-            let plan = JoinPlan::from_wire(kind, delta_is_right, &delta_schema, ctx.layout.schema_of(trace))?;
+            let plan = JoinPlan::from_wire(kind, delta_is_right, &delta_schema, &ctx.prog.schema_of(integrand_reg))?;
             (Integral::Own(trace), plan)
         }
     };
@@ -425,7 +426,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<
 fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group_cols: &[u32], agg: &[AggDescriptor]) -> Result<DeltaReg, String> {
     let in_reg = ctx.unary_delta_in(nid);
     let in_schema = ctx.prog.schema_of(in_reg);
-    // Whether it mints one is the epoch's to say.
+    // Minted by the view's backfill, in an epoch of its own.
     let seeds_ground = ctx.circuit.owes_ground_row(nid);
     let plan = match ctx.reads_partials(nid) {
         true => gnitz_zset::stream::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
@@ -455,7 +456,11 @@ fn push_reduce(
         .index_schema()
         .map(|schema| ctx.declare_child(index_kind, nid, *schema));
     let plan = Box::new(plan);
-    ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan })
+    let out = ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan });
+    if let Integral::Own(trace) = out_trace {
+        ctx.prog.integrate(out, trace);
+    }
+    out
 }
 
 /// Declare `plan`'s index — every input row in order, the operator's whole

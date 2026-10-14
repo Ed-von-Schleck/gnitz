@@ -65,7 +65,7 @@ impl RelationRegistry {
     pub fn open_bound(&self, id: u64, bound: ReadBound, cut: Cut) -> Result<(SourceCursor, Option<KeyRange>), String> {
         let entry = self.relation_or_err(id)?;
         // A stream holds no rows, but a backfill over one still feeds an empty
-        // epoch: that is what mints a global aggregate's ground row.
+        // epoch: that keeps every worker's exchange rounds in step.
         if entry.kind() == RelationKind::Stream {
             let empty = empty_cursor(entry.schema());
             return Ok((SourceCursor::Full(Box::new(empty)), None));

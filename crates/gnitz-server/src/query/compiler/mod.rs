@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
-use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
+use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
 use gnitz_wire::{AggDescriptor, Circuit, NodeId, ReadBound};
 use gnitz_zset::algebra::MapPlan;
 use gnitz_zset::algebra::Placement;
@@ -106,8 +106,6 @@ fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Result<Option<(NodeId, &[u3
 /// program, exchanges included.
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
-    /// Every child store the plan's operators address.
-    pub(in crate::query) layout: StateLayout,
     /// source id → the register its delta seeds, and the bound its backfill scan
     /// narrows by.
     pub(in crate::query) sources: FxHashMap<u64, (DeltaReg, ReadBound)>,
@@ -125,9 +123,8 @@ pub(super) fn compile_view(
     bounded: bool,
 ) -> Result<(CompileOutput, Placement), String> {
     let (meta, placement) = ViewMeta::derive(circuit, registry, view_schema)?;
-    let EmitCtx {
-        prog, layout, regs, integrals, sources, ..
-    } = EmitCtx::emit(circuit, registry, &meta, (!bounded).then_some(view_id))?;
+    let EmitCtx { prog, regs, integrals, sources, .. } =
+        EmitCtx::emit(circuit, registry, &meta, (!bounded).then_some(view_id))?;
     let vm = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
@@ -141,7 +138,7 @@ pub(super) fn compile_view(
         .into_iter()
         .map(|(tid, scan)| (tid, (scan.seed, scan.bound)))
         .collect();
-    let output = CompileOutput { vm, layout, sources, hydration };
+    let output = CompileOutput { vm, sources, hydration };
     Ok((output, placement))
 }
 

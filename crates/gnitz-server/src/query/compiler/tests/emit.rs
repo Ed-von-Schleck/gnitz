@@ -105,10 +105,9 @@ fn trace_and_children(
     let integrand = build(&mut c);
     let meta = routing(&c, &registry).unwrap();
     let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    (
-        ctx.integrals[integrand].expect("a join probes the integrand"),
-        ctx.layout.names().map(str::to_string).collect(),
-    )
+    let integral = ctx.integrals[integrand].expect("a join probes the integrand");
+    let vm = ctx.prog.finish(ctx.regs[c.out()]);
+    (integral, vm.layout().names().map(str::to_string).collect())
 }
 
 fn trace_of(slot: gnitz_zset::algebra::Slot, wide: Wide, build: fn(&mut Circuit) -> NodeId) -> Integral {
@@ -152,7 +151,7 @@ fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
     use gnitz_store::relation::RelationKind::{BaseTable, Stream};
     use gnitz_wire::TypeCode::{U128, U32, U64, UUID};
     use gnitz_zset::algebra::{Placement, Slot};
-    let is_source = |t: Integral| t == Integral::Relation(10, gnitz_store::relation::Cut::Sealed);
+    let is_source = |t: Integral| t == Integral::Relation(10);
     let table = Wide {
         kind: BaseTable,
         placement: Placement::full_pk,
@@ -251,7 +250,7 @@ fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
     };
     assert_eq!(
         seed(|c| rekeyed_join(c, &A, id, JoinKind::Equi)),
-        Integral::Relation(10, gnitz_store::relation::Cut::Sealed)
+        Integral::Relation(10)
     );
     assert!(matches!(
         seed(|c| rekeyed_join(c, &A, |c, n| c.distinct(n), JoinKind::Equi)),
@@ -274,8 +273,9 @@ fn left_join_plan(key: u32) -> (Vm, Vec<String>, NodeId) {
     let registry = sources([(10, a), (11, b)]);
     let meta = routing(&c, &registry).unwrap();
     let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    let names = ctx.layout.names().map(str::to_string).collect();
-    (ctx.prog.finish(ctx.regs[c.out()]), names, ra)
+    let vm = ctx.prog.finish(ctx.regs[c.out()]);
+    let names = vm.layout().names().map(str::to_string).collect();
+    (vm, names, ra)
 }
 
 /// A join names the node whose integral it probes, so the two joins reading the
@@ -309,7 +309,8 @@ fn children_of(tip: fn(&mut Circuit, NodeId) -> NodeId, store: bool) -> Vec<Stri
     let registry = sources([(10, make_schema_u64_i64())]);
     let meta = routing(&c, &registry).unwrap();
     let ctx = EmitCtx::emit(&c, &registry, &meta, store.then_some(VIEW)).unwrap();
-    ctx.layout.names().map(str::to_string).collect()
+    let vm = ctx.prog.finish(ctx.regs[c.out()]);
+    vm.layout().names().map(str::to_string).collect()
 }
 
 /// A reduce that is the view's output declares no output trace where the view's
@@ -420,7 +421,8 @@ fn set_op_children(slot: gnitz_zset::algebra::Slot, sides: [Side; 2], build: Bui
     build(&mut c);
     let meta = routing(&c, &registry).unwrap();
     let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    ctx.layout.names().map(str::to_string).collect()
+    let vm = ctx.prog.finish(ctx.regs[c.out()]);
+    vm.layout().names().map(str::to_string).collect()
 }
 
 /// `10 EXCEPT ALL 11` over leaves keyed by their own PK, each behind an exchange
