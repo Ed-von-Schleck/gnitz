@@ -72,6 +72,10 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
 /// A payload row order. Generic over both sources, so one selected order serves
 /// every source pairing a merge seat puts under it.
 pub(crate) trait PayloadOrder: Copy {
+    /// Whether the order is [`FixedIntNonnull`]'s: each column's cells read as
+    /// an order-preserving integer.
+    const FIXED_INT: bool;
+
     fn compare<A: RowSource, B: RowSource>(
         self,
         schema: &SchemaDescriptor,
@@ -90,6 +94,8 @@ pub(crate) struct FixedIntNonnull;
 pub(crate) struct Generic;
 
 impl PayloadOrder for FixedIntNonnull {
+    const FIXED_INT: bool = true;
+
     /// Each column read as an order-preserving u64: zero-extend, then flip the
     /// sign bit for signed columns. Same order as [`compare_rows`], with no
     /// null-bitmap read and no per-column type dispatch.
@@ -120,6 +126,8 @@ impl PayloadOrder for FixedIntNonnull {
 }
 
 impl PayloadOrder for Generic {
+    const FIXED_INT: bool = false;
+
     #[inline]
     fn compare<A: RowSource, B: RowSource>(self, s: &SchemaDescriptor, a: &A, ra: usize, b: &B, rb: usize) -> Ordering {
         compare_rows(s, a, ra, b, rb)

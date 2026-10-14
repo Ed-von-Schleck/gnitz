@@ -325,3 +325,51 @@ fn wide_pk_merges_fold_to_the_sum_of_their_sources() {
         }
     }
 }
+
+/// `into_consolidated` folds a batch of fixed-width integer payloads to its
+/// Z-set, whether the payload fits one 128-bit sort key or spans several — over
+/// signed and unsigned columns at their extremes, and over PKs that arrive in
+/// order and out of it.
+#[test]
+fn consolidation_folds_fixed_int_payloads_of_every_width() {
+    use crate::schema::SchemaColumn;
+    use crate::test_support::Rng;
+    use TypeCode::{I16, I32, I64, I8, U16, U64, U8};
+    let mut rng = Rng::new(13);
+    for payload in [
+        &[I64][..],
+        &[U8, I16, I32],
+        &[I64, I64],
+        &[I64, I64, I8],
+        &[I32, U64, I64],
+        &[U16; 9],
+        &[I8, U64, U64, I32],
+    ] {
+        let mut cols = vec![SchemaColumn::new(U64, false)];
+        cols.extend(payload.iter().map(|&t| SchemaColumn::new(t, false)));
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        for grouped in [false, true] {
+            let mut pks: Vec<u64> = (0..600).map(|_| rng.gen_range(5)).collect();
+            if grouped {
+                pks.sort();
+            }
+            let mut b = crate::repr::BatchBuilder::new(&schema);
+            for pk in pks {
+                b.begin_row(pk as u128, [-1, 1, 2][rng.gen_range(3) as usize]);
+                // Either type's extremes and the values next to its zero.
+                for (_, col) in schema.payload_columns() {
+                    let top = 1u128 << (col.size() * 8 - 1);
+                    b.put_int([0, 1, top - 1, top, 2 * top - 1][rng.gen_range(5) as usize]);
+                }
+                b.end_row();
+            }
+            let batch = b.finish();
+            let got = batch.clone().into_consolidated();
+            assert_folds(
+                std::slice::from_ref(&batch),
+                &got,
+                &format!("{payload:?}, grouped {grouped}"),
+            );
+        }
+    }
+}

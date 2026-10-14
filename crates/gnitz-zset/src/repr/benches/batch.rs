@@ -61,6 +61,89 @@ fn consolidate_bench() {
     }
 }
 
+/// `into_consolidated` over the rows a window emits into a view keyed by its
+/// partition: PKs in order, each with a run of rows whose payload stands out
+/// of order — a retraction and an insertion per row, a few hundred rows a run.
+/// Two payload columns fit one 128-bit payload sort key; three span two.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn consolidate_runs_bench() {
+    const N: u64 = 1 << 17;
+    let counter = Counter::instructions();
+    for payload_cols in [2usize, 3] {
+        let mut cols = vec![SchemaColumn::new(TypeCode::I64, false); 1 + payload_cols];
+        cols[0] = SchemaColumn::new(TypeCode::U64, false);
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        for per_pk in [32u64, 256] {
+            let [_, (out, instructions)] = [(); 2].map(|()| {
+                let mut b = BatchBuilder::new(&schema);
+                for i in 0..N / 2 {
+                    let (pk, id) = (i / (per_pk / 2), mix(i) >> 16);
+                    for (w, value) in [(-1, i % per_pk), (1, i % per_pk + 1)] {
+                        b.begin_row(pk as u128, w);
+                        b.put_int(id as u128);
+                        for _ in 1..payload_cols {
+                            b.put_int(value as u128);
+                        }
+                        b.end_row();
+                    }
+                }
+                let batch = b.finish();
+                counter.measure(|| black_box(batch).into_consolidated())
+            });
+            assert_eq!(out.count as u64, N);
+            println!(
+                "into_consolidated, {payload_cols} payload columns, {per_pk:>3} rows per PK {:>7.1} instr/row",
+                instructions as f64 / N as f64
+            );
+        }
+    }
+}
+
+/// `into_consolidated` per batch over many small batches, as single-row writes
+/// and small ticks hand it: rows of distinct PKs out of order, and an update —
+/// a row retracted and its successor inserted under one PK — per PK. What a
+/// call costs before any row does.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn consolidate_small_bench() {
+    const BATCHES: u64 = 2_000;
+    let counter = Counter::instructions();
+    let schema = make_schema_u64_i64();
+    for (label, rows, per_pk) in [
+        ("rows", 2u64, 1u64),
+        ("rows", 8, 1),
+        ("rows", 64, 1),
+        ("updates", 2, 2),
+        ("updates", 8, 2),
+    ] {
+        let batches: Vec<Batch> = (0..BATCHES)
+            .map(|k| {
+                let rows: Vec<(u64, i64, i64)> = (0..rows)
+                    .map(|i| {
+                        (
+                            mix(k * 100 + i / per_pk) >> 8,
+                            [1, -1][(i % per_pk) as usize],
+                            -(i as i64),
+                        )
+                    })
+                    .collect();
+                make_batch_raw(&schema, &rows)
+            })
+            .collect();
+        let ((), instructions) = counter.measure(|| {
+            for batch in batches {
+                black_box(black_box(batch).into_consolidated());
+            }
+        });
+        println!(
+            "into_consolidated, {:>2} {label:<7} a batch {:>9.1} instr/batch",
+            rows / per_pk,
+            instructions as f64 / BATCHES as f64
+        );
+    }
+}
+
 /// Retired instructions of `append_batch` over a string-bearing source: a 64-row
 /// batch of 40-byte strings appended 10⁴ times into one growing destination.
 #[test]

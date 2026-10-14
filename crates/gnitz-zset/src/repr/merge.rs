@@ -1114,8 +1114,9 @@ impl ArgEntry for PackedEntry {
     }
 }
 
-/// The argsort half of [`consolidate_groups`]: the sort key carries the whole
-/// OPK image, so a key tie goes straight to the payload order.
+/// The argsort half of [`consolidate_groups`]: the entries sorted by PK alone —
+/// a batch whose PKs already stand in order sorts in one pass — and each run of
+/// a PK sorted by its payload as [`fold_runs`] folds it.
 #[inline]
 fn consolidate_groups_inner<P: PayloadOrder>(
     n: usize,
@@ -1129,14 +1130,8 @@ fn consolidate_groups_inner<P: PayloadOrder>(
         let mut entries: Vec<PackedEntry> = (0..n as u32)
             .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
             .collect();
-        // By PK, then row index; the payload order then applies within each PK.
         entries.sort_unstable();
-        if schema.num_payload_cols() > 0 {
-            for run in entries.chunk_by_mut(|a, b| a.same_pk(*b)).filter(|r| r.len() > 1) {
-                run.sort_unstable_by(|a, b| payload.compare(schema, batch, a.idx(), batch, b.idx()));
-            }
-        }
-        return drain_groups(&entries, batch, schema, payload, out);
+        return fold_runs(&mut entries, batch, schema, payload, out);
     }
     pk_width_dispatch!(stride, |K| {
         let mut entries: Vec<SortEntry<K>> = (0..n as u32)
@@ -1145,41 +1140,141 @@ fn consolidate_groups_inner<P: PayloadOrder>(
                 idx: i,
             })
             .collect();
-        entries.sort_unstable_by(|a, b| {
-            let (x, y) = (a.idx as usize, b.idx as usize);
-            Ord::cmp(&a.key, &b.key).then_with(|| payload.compare(schema, batch, x, batch, y))
-        });
-        drain_groups(&entries, batch, schema, payload, out);
+        entries.sort_unstable_by(|a, b| Ord::cmp(&a.key, &b.key));
+        fold_runs(&mut entries, batch, schema, payload, out);
     })
 }
 
-/// The fold half of [`consolidate_groups`]: walk the sorted entries and push one
-/// survivor per (PK, payload) group whose weights do not cancel.
+/// The fold half of [`consolidate_groups`]: over entries sorted by PK, sort each
+/// run of a PK by its payload and push one survivor per (PK, payload) group whose
+/// weights do not cancel.
 #[inline]
-fn drain_groups<E: ArgEntry, P: PayloadOrder>(
-    entries: &[E],
+fn fold_runs<E: ArgEntry, P: PayloadOrder>(
+    entries: &mut [E],
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     payload: P,
     out: &mut Vec<(u32, u32, i64)>,
 ) {
-    let mut pending = entries[0];
-    let mut pending_weight = batch.get_weight(pending.idx());
-
-    for &cur in &entries[1..] {
-        let (pi, ci) = (pending.idx(), cur.idx());
-        if pending.same_pk(cur) && payload.compare(schema, batch, pi, batch, ci).is_eq() {
-            pending_weight += batch.get_weight(ci);
-        } else {
-            if pending_weight != 0 {
-                out.push((0, pi as u32, pending_weight));
+    let weights = batch.weight().as_chunks::<8>().0;
+    // The run in hand's payload keys and rows, in a buffer every run reuses.
+    let mut keyed = Vec::new();
+    for run in entries.chunk_by_mut(|a, b| a.same_pk(*b)) {
+        match run {
+            [one] => {
+                let weight = i64::from_le_bytes(weights[one.idx()]);
+                if weight != 0 {
+                    out.push((0, one.idx() as u32, weight));
+                }
             }
-            pending = cur;
-            pending_weight = batch.get_weight(ci);
+            run => fold_run(run, batch, schema, payload, weights, &mut keyed, out),
         }
     }
-    if pending_weight != 0 {
-        out.push((0, pending.idx() as u32, pending_weight));
+}
+
+/// Sort `run`, the rows of one PK, by its payload and fold it. Out of line, so
+/// the loop over a batch of distinct PKs stays tight.
+#[inline(never)]
+fn fold_run<E: ArgEntry, P: PayloadOrder>(
+    run: &mut [E],
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    payload: P,
+    weights: &[[u8; 8]],
+    keyed: &mut Vec<(u128, u32)>,
+    out: &mut Vec<(u32, u32, i64)>,
+) {
+    let cmp = |a: usize, b: usize| payload.compare(schema, batch, a, batch, b);
+    if let [a, b] = run {
+        let (a, b) = (a.idx(), b.idx());
+        let weight = |i: usize| i64::from_le_bytes(weights[i]);
+        let mut push = |i: usize, w: i64| {
+            if w != 0 {
+                out.push((0, i as u32, w));
+            }
+        };
+        match cmp(a, b) {
+            Ordering::Equal => push(a, weight(a) + weight(b)),
+            Ordering::Less => (push(a, weight(a)), push(b, weight(b))).0,
+            Ordering::Greater => (push(b, weight(b)), push(a, weight(a))).0,
+        }
+        return;
+    }
+    if P::FIXED_INT {
+        keyed.clear();
+        keyed.extend(run.iter().map(|e| (0, e.idx() as u32)));
+        fold_keyed(batch, schema, 0, keyed, weights, out);
+    } else {
+        run.sort_unstable_by(|a, b| cmp(a.idx(), b.idx()));
+        fold_sorted(run, |e| e.idx(), |a, b| cmp(a.idx(), b.idx()).is_eq(), weights, out);
+    }
+}
+
+/// Sort `keyed`, rows that tie on every fixed-int, non-null payload column
+/// before `from`, by the rest of the payload, and fold them. The columns from
+/// `from` that fit 128 bits are packed into each row's key from the high bits
+/// down, each order-preserving, and the rows sorted by it; rows still tied on it
+/// are sorted the same way by the columns after.
+fn fold_keyed(
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    from: usize,
+    keyed: &mut [(u128, u32)],
+    weights: &[[u8; 8]],
+    out: &mut Vec<(u32, u32, i64)>,
+) {
+    /// Shift each key left past the column and put the column's bits in.
+    #[inline(always)]
+    fn put<const W: usize>(keyed: &mut [(u128, u32)], cells: &[u8], flip: u64) {
+        for (key, row) in keyed.iter_mut() {
+            let mut v = [0u8; 8];
+            v[..W].copy_from_slice(&cells[*row as usize * W..][..W]);
+            *key = (*key << (W * 8)) | (u64::from_le_bytes(v) ^ flip) as u128;
+        }
+    }
+    // The rows tie on the key the columns before `from` made, so whatever of it
+    // these columns do not shift out is a prefix every row shares.
+    let (mut room, mut next) = (u128::BITS as usize, from);
+    for (pc, col) in schema.payload_columns().skip(from) {
+        let cs = col.size();
+        let Some(left) = room.checked_sub(cs * 8) else { break };
+        (room, next) = (left, next + 1);
+        let (cells, flip) = (batch.col_data(pc, cs), (col.is_signed() as u64) << (cs * 8 - 1));
+        match cs {
+            1 => put::<1>(keyed, cells, flip),
+            2 => put::<2>(keyed, cells, flip),
+            4 => put::<4>(keyed, cells, flip),
+            8 => put::<8>(keyed, cells, flip),
+            w => unreachable!("a fixed-int column of {w} bytes"),
+        }
+    }
+    keyed.sort_unstable_by_key(|e| e.0);
+    if next == schema.num_payload_cols() {
+        return fold_sorted(keyed, |e| e.1 as usize, |a, b| a.0 == b.0, weights, out);
+    }
+    for tie in keyed.chunk_by_mut(|a, b| a.0 == b.0) {
+        match tie {
+            [_] => fold_sorted(tie, |e| e.1 as usize, |_, _| true, weights, out),
+            tie => fold_keyed(batch, schema, next, tie, weights, out),
+        }
+    }
+}
+
+/// Push one survivor per group of adjacent `same` rows of `sorted` whose weights
+/// do not cancel: the group's first row, at the group's summed weight.
+#[inline(always)]
+fn fold_sorted<T>(
+    sorted: &[T],
+    idx: impl Fn(&T) -> usize,
+    same: impl Fn(&T, &T) -> bool,
+    weights: &[[u8; 8]],
+    out: &mut Vec<(u32, u32, i64)>,
+) {
+    for group in sorted.chunk_by(same) {
+        let weight: i64 = group.iter().map(|e| i64::from_le_bytes(weights[idx(e)])).sum();
+        if weight != 0 {
+            out.push((0, idx(&group[0]) as u32, weight));
+        }
     }
 }
 
