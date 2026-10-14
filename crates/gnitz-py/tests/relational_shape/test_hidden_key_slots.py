@@ -1,7 +1,7 @@
 """Hidden key slots: a view's visible schema is exactly what its SELECT projects.
 
 Every emitter that fabricates a synthetic key (`_join_pk`, `_pair_pk`, `_set_pk`,
-`_distinct_pk`, `_group_pk`) marks that column hidden, and so is a simple view's
+`_group_pk`) marks that column hidden, and so is a simple view's
 auto-prepended unprojected source PK. A hidden column is physical — it still
 keys, routes, sorts and consolidates the view — but is excluded from wildcard
 expansion, name resolution and client rows.

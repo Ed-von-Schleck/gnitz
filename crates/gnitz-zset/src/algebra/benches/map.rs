@@ -67,7 +67,7 @@ fn map_ranges_bench() {
         whole(&name, reindex(&schema, NullKeys::Drop), &batch);
     }
 
-    // --- Hash-row maps, `[U128 hash PK, payload...]`: the set-op / DISTINCT leaf.
+    // --- Hash-row maps, `[U128 hash PK, payload...]`: a hashed set-op / DISTINCT leaf.
     // Fixed-width shapes on both sides of the fold's stack arm, and a
     // heap-backed string beside an integer.
     whole("hash_row[i64x2]", hash_row(&two, &[I64, I64]), &two_batch);

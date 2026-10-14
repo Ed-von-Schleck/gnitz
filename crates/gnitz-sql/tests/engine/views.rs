@@ -432,6 +432,7 @@ fn bounded_view_eligibility_is_the_engines() {
         "SELECT tid, SUM(w) AS s FROM u GROUP BY tid",
         "SELECT id, v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
         "SELECT DISTINCT v FROM t",
+        "SELECT d.v FROM (SELECT DISTINCT v FROM t) d",
         "SELECT id, v FROM t UNION ALL SELECT id, w FROM u",
         "SELECT t.id, u.w FROM t LEFT JOIN u ON t.id = u.tid",
         "SELECT t.id, u.w FROM t RIGHT JOIN u ON t.id = u.tid",
@@ -444,7 +445,7 @@ fn bounded_view_eligibility_is_the_engines() {
     }
     // A body the planner splits into a chain never reaches the engine's rule.
     db.refuses(
-        &bounded("SELECT d.v FROM (SELECT DISTINCT v FROM t) d"),
+        &bounded("SELECT v FROM t UNION ALL SELECT tid FROM u GROUP BY tid"),
         Rejected,
         "more than one view",
     );

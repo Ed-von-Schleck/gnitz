@@ -31,7 +31,8 @@ fn set_op_common_type_admits_what_a_column_copy_widens() {
 
 /// `unique_key` reads a relation's `pk_repeats` flag and carries the key through
 /// the nodes that keep a set a set: a top-N, and a join matching each row of the
-/// keyed side at most once. An ALL set operation has none.
+/// keyed side at most once, and an EXCEPT or INTERSECT over a set operand. A
+/// UNION ALL has none.
 #[test]
 fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
     use crate::test_support::{col, schema};
@@ -55,9 +56,22 @@ fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
     assert_eq!(set.unique_key(), Some(vec![set_id]));
     assert_eq!(bag.unique_key(), None);
 
-    let union = |all| RelExpr::set_op(&ids, SetOpKind::Union, all, Rc::clone(&set), Rc::clone(&other)).unwrap();
-    assert_eq!(union(true).unique_key(), None);
-    assert_eq!(union(false).unique_key().map(|k| k.len()), Some(2));
+    let set_op = |op, all, left: &Rc<RelExpr>, right: &Rc<RelExpr>| {
+        RelExpr::set_op(&ids, op, all, Rc::clone(left), Rc::clone(right)).unwrap()
+    };
+    let out_ids = |rel: &Rc<RelExpr>| rel.cols().iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(set_op(SetOpKind::Union, true, &set, &other).unique_key(), None);
+    let union = set_op(SetOpKind::Union, false, &set, &other);
+    assert!(matches!(union.as_ref(), RelExpr::Distinct { .. }));
+    assert_eq!(union.unique_key().map(|k| k.len()), Some(2));
+    // An ALL operation keeps a set operand's key, under its own ids.
+    let except_all = set_op(SetOpKind::Except, true, &set, &bag);
+    assert_eq!(except_all.unique_key(), Some(vec![id_of(&except_all, 0)]));
+    let intersect_all = set_op(SetOpKind::Intersect, true, &bag, &other);
+    assert_eq!(intersect_all.unique_key(), Some(vec![id_of(&intersect_all, 0)]));
+    // A DISTINCT EXCEPT over a bag clamps it: every column is the key.
+    let except = set_op(SetOpKind::Except, false, &bag, &set);
+    assert_eq!(except.unique_key(), Some(out_ids(&except)));
 
     let top = |rel: &Rc<RelExpr>| RelExpr::top_n(Rc::clone(rel), Vec::new(), Vec::new(), 2, 0);
     assert_eq!(top(&set).unique_key(), Some(vec![set_id]));

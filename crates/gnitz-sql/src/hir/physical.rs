@@ -16,6 +16,13 @@ use std::sync::Arc;
 /// A frame slot: the identity that names it, if any, and its column.
 pub(crate) type Slot = (Option<ColId>, ColumnDef);
 
+impl HirCol {
+    /// This column as a slot its identity names.
+    pub(crate) fn slot(&self) -> Slot {
+        (Some(self.id), self.def.clone())
+    }
+}
+
 /// A relation's physical addressing: the `ColId` at each slot and the schema
 /// typing those slots. A reference resolves to a position in `layout` and is
 /// typed against `schema` at that position, so the two travel as one value.

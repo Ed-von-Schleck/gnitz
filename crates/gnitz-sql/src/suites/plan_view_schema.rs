@@ -263,14 +263,10 @@ fn wildcard_modifiers_rewrite_the_expansion() {
         ),
         (
             "SELECT * EXCEPT (d) FROM da UNION SELECT * EXCEPT (d) FROM db",
-            sh(&[("_set_pk", true, false), ("id", false, false), ("g", false, false)]),
-            &[0],
+            sh(&[("id", false, false), ("g", false, false)]),
+            &[0, 1],
         ),
-        (
-            "SELECT DISTINCT y FROM sa",
-            sh(&[("_distinct_pk", true, false), ("y", false, false)]),
-            &[0],
-        ),
+        ("SELECT DISTINCT y FROM sa", sh(&[("y", false, false)]), &[0]),
     ];
     for (body, shape, pk_cols) in rows {
         let chain = view(&cat, body);
@@ -493,9 +489,9 @@ fn a_reference_binds_to_the_cte_before_the_catalog_and_never_to_a_sibling() {
 
 // ── set operations ───────────────────────────────────────────────────────────
 
-/// A set-op view keys on the hashed row under a hidden `_set_pk`; its column
-/// is nullable when the operator's tuple algebra admits a NULL from either
-/// side (UNION), only from the left (EXCEPT), or from both (INTERSECT).
+/// A set-op column is nullable when the operator's tuple algebra admits a NULL
+/// from either side (UNION), only from the left (EXCEPT), or from both
+/// (INTERSECT); a nullable one is keyed by the row's hash under `_set_pk`.
 #[test]
 fn a_set_op_column_is_nullable_by_the_operators_algebra() {
     let i = TypeCode::I64;
@@ -512,11 +508,11 @@ fn a_set_op_column_is_nullable_by_the_operators_algebra() {
     ];
     for (body, nullable) in rows {
         let chain = view(&cat, body);
-        assert_eq!(
-            output_shape(&chain),
-            sh(&[("_set_pk", true, false), ("v", false, *nullable)]),
-            "{body}"
-        );
+        let shape = match nullable {
+            true => sh(&[("_set_pk", true, false), ("v", false, true)]),
+            false => sh(&[("v", false, false)]),
+        };
+        assert_eq!(output_shape(&chain), shape, "{body}");
         assert_eq!(pk(&chain), [0], "{body}");
     }
 }
@@ -927,12 +923,16 @@ fn a_join_view_is_keyed_on_its_join_key() {
             &[0, 1],
             &[i, i, i, i],
         ),
-        // A bag-valued preserved side: the UNION ALL view's `_set_pk` is its PK.
+        // A bag-valued preserved side: the UNION ALL view's columns are its PK.
         (
             "SELECT uv.k AS a, bb.id AS b FROM uv LEFT JOIN bb ON uv.k = bb.k AND uv.lo <= bb.t",
-            [pair_pks(), sh(&[("a", false, false), ("b", false, true)])].concat(),
-            &[0, 1],
-            &[TypeCode::U128, i, i, i],
+            [
+                pair_pks(),
+                sh(&[("_pair_pk_2", true, false), ("a", false, false), ("b", false, true)]),
+            ]
+            .concat(),
+            &[0, 1, 2],
+            &[i, i, i, i, i],
         ),
     ];
     for (body, shape, pk_cols, tcs) in rows {

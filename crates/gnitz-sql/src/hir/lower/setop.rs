@@ -1,137 +1,173 @@
 //! The set-operation and DISTINCT shell: each leaf, opened through the spine, is
-//! keyed by its element's identity and combined by weight arithmetic. A base
-//! table's PK is that identity, so a leaf carrying one keeps it; any other is
-//! keyed by a hash of its row.
+//! keyed by its element's identity and combined by weight arithmetic.
 
-use super::super::{ColId, HirCol, RelExpr, SetOpKind};
-use super::spine::{open, Spine, Top};
-use super::{EmitPieces, SegSource, ViewChain};
+use super::super::physical::Frame;
+use super::super::{HirCol, RelExpr, SetOpKind};
+use super::spine::{open, Top};
+use super::{emit_filter, project_front, Demand, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
-use crate::hir::physical::Frame;
-use gnitz_wire::{Circuit, ColumnDef, NodeId, ReadBound, ReindexSlot, RelClass, TypeCode};
+use gnitz_wire::{
+    Circuit, ColumnDef, NodeId, NullKeys, ReadBound, ReindexRole, ReindexSlot, TypeCode, NARROW_PK_MAX_BYTES,
+};
 use std::rc::Rc;
 
-/// Lower a `SetOp` body: its tree of directly nested set operations is one
-/// circuit over its leaves, each opened once.
+/// A leaf emitted into the circuit: its columns, its node, and the frame that
+/// node's rows are addressed by.
+struct Leaf {
+    cols: Vec<HirCol>,
+    node: NodeId,
+    frame: Frame,
+}
+
+/// What every leaf is keyed by.
+enum ElementKey {
+    /// The PK every leaf carries: each leaf's columns in `order`, the first `npk` the key.
+    Carried { order: Vec<usize>, npk: usize },
+    /// Every column, as this frame keys them.
+    Natural(Frame),
+    /// A hash of every column.
+    Hash,
+}
+
+/// Lower a `Distinct` or `SetOp` body — with `above`, the `Project(Filter?(…))`
+/// over it: its tree of directly nested clamps and set operations is one circuit
+/// over its leaves, each opened and emitted once.
 pub(super) fn lower_setop(
     chain: &mut ViewChain,
     rel: &Rc<RelExpr>,
-    out: &[HirCol],
+    above: Option<Demand<'_>>,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    // The leaves, in the order `combine` emits them.
-    let mut sides: Vec<&Rc<RelExpr>> = Vec::new();
-    combine(&mut Circuit::default(), rel, &mut |cb, side| {
-        sides.push(side);
-        Ok(cb.input_delta(0, ReadBound::None))
-    })?;
-    let spines = sides
-        .iter()
-        .map(|side| open(chain, side, &side.cols().iter().map(|c| c.id).collect()))
-        .collect::<Result<Vec<_>, _>>()?;
-    // An ALL root can hold an element at weight above 1; any other clamps to a set.
-    let bag = matches!(rel.as_ref(), RelExpr::SetOp { all: true, .. });
-    let unique = unique_on_key(rel);
-    // A content hash keys a set by its elements; a source key does only where it stays unique.
-    let key = source_key(&sides, &spines, out).filter(|_| bag || unique);
-
+    let out = rel.cols();
+    let unique = rel.unique_key();
     let mut cb = Circuit::default();
-    let mut spines = spines.into_iter();
-    let mut leaf = |cb: &mut Circuit, side: &Rc<RelExpr>| {
-        let spine = spines.next().expect("one spine per leaf, opened in `combine` order");
-        match &key {
-            Some(key) => keyed_side(cb, spine, side, key),
-            None => hashed_side(cb, spine, side, out),
-        }
+    // The leaves, in the order `combine` reads them, which is scan order.
+    let mut leaves: Vec<Leaf> = Vec::new();
+    combine(&mut Circuit::default(), rel, false, &mut |dry, side| {
+        let cols = side.cols();
+        let spine = open(chain, side, &cols.iter().map(|c| c.id).collect())?;
+        let (node, frame) = spine.emit(&mut cb, Top::Slots)?;
+        leaves.push(Leaf { cols, node, frame });
+        Ok(dry.input_delta(0, ReadBound::None))
+    })?;
+    // A set's key covers its unique key, so its PK repeats only where it is a bag.
+    let covers = |key: &Vec<usize>| {
+        unique
+            .as_ref()
+            .is_none_or(|u| u.iter().all(|id| key.iter().any(|&p| out[p].id == *id)))
     };
-    combine(&mut cb, rel, &mut leaf)?;
-    match key {
-        Some(key) => keyed_pieces(cb, out, &key, !unique),
-        None => hashed_pieces(cb, "_set_pk", out, bag),
-    }
-}
+    let key = match carried_key(&leaves, &out).filter(covers) {
+        Some(key) => ElementKey::Carried {
+            npk: key.len(),
+            order: key
+                .iter()
+                .copied()
+                .chain((0..out.len()).filter(|p| !key.contains(p)))
+                .collect(),
+        },
+        None => natural_frame(&out).map_or(ElementKey::Hash, ElementKey::Natural),
+    };
 
-/// `rel` as weight arithmetic over its leaves, each emitted by `leaf`.
-fn combine<'r>(
-    cb: &mut Circuit,
-    rel: &'r Rc<RelExpr>,
-    leaf: &mut impl FnMut(&mut Circuit, &'r Rc<RelExpr>) -> Result<NodeId, GnitzSqlError>,
-) -> Result<NodeId, GnitzSqlError> {
-    let RelExpr::SetOp { op, all, left, right, .. } = rel.as_ref() else {
-        return leaf(cb, rel);
-    };
-    if *op == SetOpKind::Union {
-        let mut operands = Vec::new();
-        union_operands(rel, !all, &mut operands);
-        let mut sum = combine(cb, operands[0], leaf)?;
-        for operand in &operands[1..] {
-            let term = combine(cb, operand, leaf)?;
-            sum = cb.union(sum, term);
+    let mut next = leaves.iter();
+    let root = combine(&mut cb, rel, false, &mut |cb, _| {
+        let leaf = next.next().expect("one leaf per `combine` read, in the same order");
+        if let ElementKey::Carried { order, .. } = &key {
+            let items = RelExpr::passthrough_items(order.iter().map(|&p| leaf.cols[p].clone()));
+            let (node, _) = project_front(cb, leaf.node, &items, &leaf.frame)?;
+            return Ok(cb.shard(node));
         }
-        return Ok(if *all { sum } else { cb.distinct(sum) });
-    }
-    // A backfill feeds the sources in scan order, and the first is combined with
-    // nothing: the operand that outputs its rows on its own goes second.
-    let b = combine(cb, right, leaf)?;
-    let a = combine(cb, left, leaf)?;
-    let is_set = |r: &RelExpr| r.unique_key().is_some();
-    // B ≥ 0, so positive_part(A − B) and min(A, B) are sets once A is; min also
-    // once B is.
-    let result_is_set = is_set(left) || (*op == SetOpKind::Intersect && is_set(right));
-    let a = if *all || result_is_set { a } else { cb.distinct(a) };
-    let except = cb.positive_diff(a, b);
-    Ok(if *op == SetOpKind::Except {
-        except
-    } else {
-        // min(A, B) = A − positive_part(A − B)
-        cb.difference(a, except)
+        let slots: Vec<ReindexSlot> = leaf
+            .frame
+            .slots(leaf.cols.iter().map(|c| c.id))?
+            .into_iter()
+            .zip(&out)
+            .map(|(s, o)| (s as u32, o.def.ty.tc))
+            .collect();
+        Ok(match key {
+            // A leaf row NULL where `out` is NOT NULL is of no element of the result.
+            ElementKey::Natural(_) => {
+                let node = cb.map_reindex(leaf.node, &slots, &[], ReindexRole::Auxiliary, NullKeys::Drop);
+                cb.shard(node)
+            }
+            _ => cb.map_hash_row(leaf.node, &slots),
+        })
+    })?;
+
+    let frame = match key {
+        ElementKey::Carried { order, npk } => Frame::new(order.iter().map(|&p| out[p].slot()), npk)?,
+        ElementKey::Natural(frame) => frame,
+        ElementKey::Hash => Frame::keyed(
+            vec![ColumnDef::new("_set_pk", TypeCode::U128, false).hidden()],
+            out.iter().map(HirCol::slot),
+        )?,
+    };
+    let frame = match above {
+        Some(above) => {
+            let filtered = emit_filter(&mut cb, root, above.where_preds, &frame)?;
+            project_front(&mut cb, filtered, above.items, &frame)?.1
+        }
+        None => frame,
+    };
+    Ok(EmitPieces {
+        circuit: cb,
+        out: frame,
+        pk_repeats: unique.is_none(),
     })
 }
 
-/// The operands of the union `rel`, through every union nested directly under
-/// it that its own clamp also covers: under a DISTINCT that is every one of
-/// them, since `distinct(distinct(x) + y) = distinct(x + y)` over weights ≥ 0.
-fn union_operands<'a>(rel: &'a Rc<RelExpr>, distinct: bool, operands: &mut Vec<&'a Rc<RelExpr>>) {
+/// `rel` as weight arithmetic over its leaves, each emitted by `leaf` — up to each
+/// weight's sign where `sign`, whose reader reads only whether it is positive.
+fn combine<'r>(
+    cb: &mut Circuit,
+    rel: &'r Rc<RelExpr>,
+    sign: bool,
+    leaf: &mut impl FnMut(&mut Circuit, &'r Rc<RelExpr>) -> Result<NodeId, GnitzSqlError>,
+) -> Result<NodeId, GnitzSqlError> {
     match rel.as_ref() {
-        RelExpr::SetOp {
-            op: SetOpKind::Union, all, left, right, ..
-        } if *all || distinct => {
-            union_operands(left, distinct, operands);
-            union_operands(right, distinct, operands);
+        RelExpr::Distinct { input } => {
+            let x = combine(cb, input, true, leaf)?;
+            Ok(if sign { x } else { cb.distinct(x) })
         }
-        _ => operands.push(rel),
+        // A sum of weights ≥ 0 is positive where an operand is.
+        RelExpr::SetOp { op: SetOpKind::Union, left, right, .. } => {
+            let a = combine(cb, left, sign, leaf)?;
+            let b = combine(cb, right, sign, leaf)?;
+            Ok(cb.union(a, b))
+        }
+        RelExpr::SetOp { op, left, right, .. } => {
+            let intersect = *op == SetOpKind::Intersect;
+            // Beside an exact set, positive_part(A − B) reads only B's sign and
+            // min(A, B) only the other operand's; min is positive where both are.
+            let b_sign = left.unique_key().is_some() || (intersect && sign);
+            let a_sign = intersect && (sign || (right.unique_key().is_some() && !b_sign));
+            // A backfill feeds the sources in scan order, the first against nothing:
+            // the operand that outputs its rows on its own goes second.
+            let b = combine(cb, right, b_sign, leaf)?;
+            let a = combine(cb, left, a_sign, leaf)?;
+            let except = cb.positive_diff(a, b);
+            // min(A, B) = A − positive_part(A − B)
+            Ok(if intersect { cb.difference(a, except) } else { except })
+        }
+        _ => leaf(cb, rel),
     }
 }
 
-/// Lower a `SELECT DISTINCT` body: dedup over its input's content hash.
-pub(super) fn lower_distinct(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
-    let cols = input.cols();
-    let spine = open(chain, input, &cols.iter().map(|c| c.id).collect())?;
-    let mut cb = Circuit::default();
-    let side = hashed_side(&mut cb, spine, input, &cols)?;
-    cb.distinct(side);
-    hashed_pieces(cb, "_distinct_pk", &cols, false)
-}
-
-/// The positions of `out` holding every leaf's source PK, in PK order, where each
-/// leaf is a base table read in place at `out`'s column types.
-fn source_key(sides: &[&Rc<RelExpr>], spines: &[Spine<'_>], out: &[HirCol]) -> Option<Vec<usize>> {
+/// The positions in its columns of each leaf's PK slots, where every leaf names
+/// them all, at the same positions and at `out`'s column types.
+fn carried_key(leaves: &[Leaf], out: &[HirCol]) -> Option<Vec<usize>> {
     let mut key: Option<Vec<usize>> = None;
-    for (side, spine) in sides.iter().zip(spines) {
-        let SegSource::Catalog(desc) = spine.source() else {
-            return None;
-        };
-        if desc.class != RelClass::Table {
+    for leaf in leaves {
+        if leaf.cols.iter().zip(out).any(|(c, o)| c.def.ty != o.def.ty) {
             return None;
         }
-        let cols = side.cols();
-        if cols.iter().zip(out).any(|(c, o)| c.def.ty != o.def.ty) {
-            return None;
-        }
-        // Read in place, a leaf's unique key is its source PK.
-        let at = side
-            .unique_key()?
+        let at = leaf
+            .frame
+            .schema
+            .pk_cols()
             .iter()
-            .map(|k| cols.iter().position(|c| c.id == *k))
+            .map(|&s| {
+                let id = leaf.frame.layout[s as usize]?;
+                leaf.cols.iter().position(|c| c.id == id)
+            })
             .collect::<Option<Vec<usize>>>()?;
         match &key {
             Some(seen) if *seen != at => return None,
@@ -141,77 +177,12 @@ fn source_key(sides: &[&Rc<RelExpr>], spines: &[Spine<'_>], out: &[HirCol]) -> O
     key
 }
 
-/// `side` keyed by its source PK, its other columns behind it in output order,
-/// then exchanged on that key.
-fn keyed_side(cb: &mut Circuit, spine: Spine<'_>, side: &Rc<RelExpr>, key: &[usize]) -> Result<NodeId, GnitzSqlError> {
-    // The output projection pins the source PK to the front.
-    let (node, frame) = spine.emit(cb, Top::Output)?;
-    let slots = frame.slots(side.cols().iter().map(|c| c.id))?;
-    if key
-        .iter()
-        .map(|&p| slots[p] as u32)
-        .ne(frame.schema.pk_cols().iter().copied())
-    {
-        return Err(GnitzSqlError::Internal(
-            "a source-keyed set-op leaf does not carry its source PK".into(),
-        ));
-    }
-    Ok(cb.shard(node))
-}
-
-/// The circuit and its frame over source-keyed leaves: `out`'s key columns, then
-/// the rest in output order.
-fn keyed_pieces(cb: Circuit, out: &[HirCol], key: &[usize], pk_repeats: bool) -> Result<EmitPieces, GnitzSqlError> {
-    let slot = |c: &HirCol| (Some(c.id), c.def.clone());
-    let payload = (0..out.len()).filter(|p| !key.contains(p)).map(|p| slot(&out[p]));
-    Ok(EmitPieces {
-        circuit: cb,
-        out: Frame::new(key.iter().map(|&p| slot(&out[p])).chain(payload), key.len())?,
-        pk_repeats,
-    })
-}
-
-/// Whether `rel`'s result holds each key of its leaves' unique keys once.
-fn unique_on_key(rel: &RelExpr) -> bool {
-    match rel {
-        RelExpr::SetOp { op: SetOpKind::Union, .. } => false,
-        RelExpr::SetOp { op: SetOpKind::Except, left, .. } => unique_on_key(left),
-        RelExpr::SetOp {
-            op: SetOpKind::Intersect, left, right, ..
-        } => unique_on_key(left) || unique_on_key(right),
-        leaf => leaf.unique_key().is_some(),
-    }
-}
-
-/// `side` keyed by a hash of its columns, each widened to its positional `out`
-/// column's type, then exchanged on that hash.
-fn hashed_side(
-    cb: &mut Circuit,
-    spine: Spine<'_>,
-    side: &Rc<RelExpr>,
-    out: &[HirCol],
-) -> Result<NodeId, GnitzSqlError> {
-    let ids: Vec<ColId> = side.cols().iter().map(|c| c.id).collect();
-    let (node, frame) = spine.emit(cb, Top::Slots)?;
-    let key: Vec<ReindexSlot> = frame
-        .slots(ids.iter().copied())?
-        .into_iter()
-        .zip(out)
-        .map(|(s, o)| (s as u32, o.def.ty.tc))
-        .collect();
-    Ok(cb.map_hash_row(node, &key))
-}
-
-/// The circuit and its frame: the hidden U128 content-hash PK, then `cols`. A
-/// content hash identifies its own element, so the PK repeats only where an
-/// element's weight can exceed 1 — `bag`.
-fn hashed_pieces(cb: Circuit, pk_name: &str, cols: &[HirCol], bag: bool) -> Result<EmitPieces, GnitzSqlError> {
-    Ok(EmitPieces {
-        circuit: cb,
-        out: Frame::keyed(
-            vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
-            cols.iter().map(|c| (Some(c.id), c.def.clone())),
-        )?,
-        pk_repeats: bag,
-    })
+/// `out` keyed by all of its columns, where they can be its own key.
+fn natural_frame(out: &[HirCol]) -> Option<Frame> {
+    let frame = Frame::new(out.iter().map(HirCol::slot), out.len()).ok()?;
+    // The reindex packs each column at its own type.
+    let packs = out.iter().all(|c| c.def.ty.tc.packs_at(c.def.ty.tc));
+    // A wider key leaves every key kernel's narrow path.
+    let narrow = frame.schema.layout().pk_stride() <= NARROW_PK_MAX_BYTES;
+    (packs && narrow).then_some(frame)
 }

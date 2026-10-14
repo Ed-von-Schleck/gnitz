@@ -130,9 +130,9 @@ _SET_OP_PAIRS = [
 
 @pytest.mark.parametrize("lt,rt,shared,left_only,right_only", _SET_OP_PAIRS,
                          ids=[f"{a}={b}".replace(" ", "").lower() for a, b, *_ in _SET_OP_PAIRS])
-def test_a_set_op_widens_both_branches_to_one_content_key(
+def test_a_set_op_widens_both_branches_to_one_element_key(
         client, lt, rt, shared, left_only, right_only):
-    """A set op hashes each branch's row as its content key, so the narrower side
+    """A set op keys each branch's row by its element, so the narrower side
     widens to the common type first: the shared value coalesces under UNION, is
     the INTERSECT and cancels under EXCEPT, while a value only one type holds
     stays distinct. The NULLs on both sides coalesce with each other and never
@@ -158,6 +158,26 @@ def test_a_set_op_widens_both_branches_to_one_content_key(
     # `shared` stays in t2 under tag 2, which the pair identity does not match.
     client.execute_sql("DELETE FROM t2 WHERE pk = 1")
     expect([(None, 1)])
+
+
+@pytest.mark.parametrize("lt,rt,shared,left_only,right_only", _SET_OP_PAIRS,
+                         ids=[f"{a}={b}".replace(" ", "").lower() for a, b, *_ in _SET_OP_PAIRS])
+def test_a_not_null_branch_widens_into_its_columns_as_the_key(
+        client, lt, rt, shared, left_only, right_only):
+    """NOT NULL integer branches key the set op by their columns themselves: the
+    narrower side still widens to the common type before it is keyed."""
+    client.execute_sql(
+        f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL); "
+        f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL); "
+        "CREATE VIEW vu AS SELECT val FROM t1 UNION SELECT val FROM t2; "
+        "CREATE VIEW vi AS SELECT val FROM t1 INTERSECT SELECT val FROM t2; "
+        "CREATE VIEW ve AS SELECT val FROM t1 EXCEPT SELECT val FROM t2; "
+        f"INSERT INTO t2 VALUES (1, {shared}), (2, {right_only}), (3, {shared}); "
+        f"INSERT INTO t1 VALUES (1, {shared}), (2, {left_only}), (3, 0)")
+    assert bag(scanned(client, "vu"), "val") == dict.fromkeys(
+        [(shared,), (left_only,), (right_only,), (0,)], 1)
+    assert bag(scanned(client, "vi"), "val") == {(shared,): 1}
+    assert bag(scanned(client, "ve"), "val") == {(left_only,): 1, (0,): 1}
 
 
 def test_a_narrow_key_column_sign_extends_into_a_wider_branch(client):

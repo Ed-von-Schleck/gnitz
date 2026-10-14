@@ -2,7 +2,7 @@
 //! order. Their input opens through the spine, so a projection over a relation
 //! read in place is not stored a second time beside the operator's index.
 
-use super::super::{ColId, RelExpr};
+use super::super::{ColId, HirCol, RelExpr};
 use super::spine::{open, Top};
 use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, Demand, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
@@ -60,7 +60,7 @@ pub(super) fn lower_ordered(
         RelExpr::Window { aggs, rank, dense_rank, .. } => {
             let aggs = resolve_reduce_specs(partition, aggs, &frame)?;
             let ranks = [rank, dense_rank].into_iter().flatten();
-            let tail = ranks.map(|c| (Some(c.id), c.def.clone())).chain(aggs.cols).collect();
+            let tail = ranks.map(HirCol::slot).chain(aggs.cols).collect();
             let has = (rank.is_some(), dense_rank.is_some());
             (cb.window(node, &group, &keys, &aggs.specs, has), tail, true)
         }

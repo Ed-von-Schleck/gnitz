@@ -248,11 +248,14 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
                     let above = Demand { items, where_preds: fpreds };
                     ordered::lower_ordered(chain, source, Some(above))
                 }
+                RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => {
+                    let above = Demand { items, where_preds: fpreds };
+                    setop::lower_setop(chain, source, Some(above))
+                }
                 _ => spine::lower_linear(chain, rel, items),
             }
         }
-        RelExpr::Distinct { input } => setop::lower_distinct(chain, input),
-        RelExpr::SetOp { out, .. } => setop::lower_setop(chain, rel, out),
+        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => setop::lower_setop(chain, rel, None),
         RelExpr::TopN { .. } | RelExpr::Window { .. } => ordered::lower_ordered(chain, rel, None),
         _ => Err(GnitzSqlError::Internal(
             "HIR lowering has no body arm for this node".into(),
@@ -260,8 +263,8 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
     }
 }
 
-/// `Project?(Filter?(Join | Reduce | TopN | Window))`: what a join, reduce, top-N
-/// or window shell lowers as one body.
+/// `Project?(Filter?(Join | Reduce | TopN | Window | Distinct | SetOp))`: what a
+/// shell lowers as one body.
 fn lowered_whole(rel: &RelExpr) -> bool {
     let rel = match rel {
         RelExpr::Project { input, .. } => input.as_ref(),
@@ -273,7 +276,12 @@ fn lowered_whole(rel: &RelExpr) -> bool {
     };
     matches!(
         rel,
-        RelExpr::Join { .. } | RelExpr::Reduce { .. } | RelExpr::TopN { .. } | RelExpr::Window { .. }
+        RelExpr::Join { .. }
+            | RelExpr::Reduce { .. }
+            | RelExpr::TopN { .. }
+            | RelExpr::Window { .. }
+            | RelExpr::Distinct { .. }
+            | RelExpr::SetOp { .. }
     )
 }
 
@@ -329,15 +337,10 @@ pub(crate) fn cut_segment(
     Ok(seg)
 }
 
-/// A subtree as a complete, lowerable body: `Project`/`Distinct`/`SetOp` already
-/// are one; anything else is wrapped in an identity `Project` over its live cols.
-///
-/// A cut `Project` narrows its own items to the live set — the one pruning gap the
-/// lowering-time demand did not already close (its parent's demand reaches the
-/// identity-`Project` wrap below and the shell-built child-demand, but never a cut
-/// `Project` segment's own entries). `Distinct`/`SetOp` stay full-column: their
-/// content-hash identity spans every projected column (`π(distinct(X)) ≠
-/// distinct(π(X))`), so narrowing would change the dedup/match classes.
+/// `subtree` as a complete, lowerable body pruned to `live`: a `Project` keeps its
+/// live items, a clamp, set operation, top-N or window stays whole
+/// (`π(distinct(X)) ≠ distinct(π(X))`), and anything else is wrapped in a
+/// projection of its live columns.
 fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
     match subtree.as_ref() {
         RelExpr::Project { input, items } => {

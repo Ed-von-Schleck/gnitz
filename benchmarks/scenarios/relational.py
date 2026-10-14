@@ -248,7 +248,7 @@ SCENARIOS = [
         measures, unverified={"v_net_sum": FLOAT}),
     Shape(
         "operators", "relational",
-        "a DISTINCT and an EXCEPT, whose leaves are keyed on a hash of the row, and a per-group top-N",
+        "a DISTINCT and an EXCEPT, whose leaves are keyed on their columns, and a per-group top-N",
         BYTES,
         ["CREATE TABLE visits (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, page INT NOT NULL, "
          "day INT NOT NULL, ms INT NOT NULL)",

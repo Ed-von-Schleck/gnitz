@@ -134,3 +134,27 @@ def test_a_distinct_tuple_lives_exactly_while_a_row_carries_it(client):
     ]:
         client.execute_sql(sql)
         assert bag(scanned(client, "v"), "a", "b") == dict.fromkeys(want, 1), sql
+
+
+def test_a_uuid_element_is_keyed_by_its_hash(client):
+    """A UUID column packs as no key of its own, so a set op or DISTINCT over one
+    keys its leaves by a hash of the row; both still weigh each UUID at 1 while
+    a row of either side carries it."""
+    p, q, r = (f"00000000-0000-0000-0000-{n:012x}" for n in (1, 2, 0xffffffffffff))
+    client.execute_sql(
+        "CREATE TABLE x (pk BIGINT NOT NULL PRIMARY KEY, u UUID NOT NULL); "
+        "CREATE TABLE y (pk BIGINT NOT NULL PRIMARY KEY, u UUID NOT NULL); "
+        "CREATE VIEW vu AS SELECT u FROM x UNION SELECT u FROM y; "
+        "CREATE VIEW vd AS SELECT DISTINCT u FROM x")
+
+    for sql, union, distinct in [
+        (f"INSERT INTO x VALUES (1, '{p}'), (2, '{p}'), (3, '{q}')", {p, q}, {p, q}),
+        (f"INSERT INTO y VALUES (1, '{q}'), (2, '{r}')", {p, q, r}, {p, q}),
+        ("DELETE FROM x WHERE pk = 1", {p, q, r}, {p, q}),
+        ("DELETE FROM x WHERE pk IN (2, 3)", {q, r}, set()),
+        ("DELETE FROM y WHERE pk = 1", {r}, set()),
+        (f"UPDATE y SET u = '{p}' WHERE pk = 2", {p}, set()),
+    ]:
+        client.execute_sql(sql)
+        assert bag(scanned(client, "vu"), "u") == {(u,): 1 for u in union}, sql
+        assert bag(scanned(client, "vd"), "u") == {(u,): 1 for u in distinct}, sql

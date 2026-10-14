@@ -43,7 +43,7 @@ pub(crate) fn reject_float_key(tc: TypeCode, name: Option<&str>, role: &str) -> 
     )))
 }
 
-/// [`reject_float_key`] over every column of one hashed row identity.
+/// [`reject_float_key`] over every column of one element's identity.
 pub(crate) fn reject_float_keys<'a>(
     cols: impl IntoIterator<Item = &'a ColumnDef>,
     role: &str,

@@ -72,8 +72,8 @@ _VIEWS = {
                                                            if a > 10 and i in u and u[i][1] < 100)),
     "read_count": ("SELECT COUNT(*) AS n FROM (SELECT a FROM t WHERE b > 0) d",
                    ("n",), lambda t, u: {(sum(b > 0 for _, b in t.values()),): 1}),
-    # An inner set op is a segment the outer re-hashes on its own identity, in a
-    # chain and across quantifiers; a leaf's identity may be computed.
+    # Nested set ops, in a chain and across quantifiers; a leaf's identity may be
+    # computed.
     "set_op_chain": ("SELECT a FROM t UNION SELECT a FROM u UNION SELECT b FROM t",
                      ("a",), lambda t, u: _set(_t_a(t) + _t_a(u) + [b for _, b in t.values()])),
     "set_op_mixed": ("(SELECT a FROM t UNION ALL SELECT a FROM u) INTERSECT SELECT b FROM t",

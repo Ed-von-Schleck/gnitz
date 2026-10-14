@@ -1650,9 +1650,10 @@ const SHAPE_VIEWS: &[(&str, &str, &[&str])] = &[
         &["SELECT id FROM v_except WHERE id > 30"],
     ),
     (
+        // A TEXT column is keyed by its hash, so this keys by `_set_pk`.
         "v_distinct",
-        "SELECT DISTINCT v FROM t",
-        &["SELECT v FROM v_distinct WHERE v > 100"],
+        "SELECT DISTINCT body FROM t",
+        &["SELECT body FROM v_distinct WHERE body > 'body-00000000000000000040'"],
     ),
     (
         // An id `u` covers appears in both arms, so its element carries weight

@@ -264,9 +264,8 @@ pub(crate) enum RelExpr {
         group_cols: Vec<ColId>,
         aggs: AggCols,
     },
-    /// SELECT DISTINCT — and the set a DISTINCT aggregate reduces over: dedup over
-    /// every one of the input's columns, hidden ones included, via a synthetic
-    /// content-hash key.
+    /// Every weight of `input` clamped to `[0, 1]`, its element identified by all
+    /// its columns, hidden ones included.
     Distinct {
         input: Rc<RelExpr>,
     },
@@ -283,12 +282,12 @@ pub(crate) enum RelExpr {
         input: Rc<RelExpr>,
         cols: Vec<HirCol>,
     },
-    /// A set operation (UNION / INTERSECT / EXCEPT, ALL or distinct). `out[i]` is
-    /// the promoted common type of each side's `i`-th column, under the
-    /// per-operator output nullability.
+    /// A set operation over weights: UNION sums them, EXCEPT is
+    /// `positive_part(A − B)`, INTERSECT is `min(A, B)`. `out[i]` is the promoted
+    /// common type of each side's `i`-th column, under the per-operator output
+    /// nullability.
     SetOp {
         op: SetOpKind,
-        all: bool,
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
         out: Vec<HirCol>,
@@ -670,6 +669,13 @@ impl JoinClass {
     }
 }
 
+/// `key`, a set of `from`'s columns, as the columns at the same positions of `to`.
+fn rename_key(key: Vec<ColId>, from: &[HirCol], to: &[HirCol]) -> Option<Vec<ColId>> {
+    key.iter()
+        .map(|k| from.iter().position(|c| c.id == *k).map(|p| to[p].id))
+        .collect()
+}
+
 /// The type a set-op column pair shares: its own where the two agree, else one a
 /// column copy widens both into. `None` where there is neither.
 fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
@@ -781,10 +787,8 @@ impl RelExpr {
         Rc::new(RelExpr::Alias { input, cols })
     }
 
-    /// Columns no two live rows share a value of, each row at weight 1: a relation
-    /// whose PK does not repeat, a reduce's group columns, every column of a DISTINCT
-    /// or a deduplicating set operation — through filters, pass-through projections,
-    /// aliases, a top-N, and a join matching each row of one side at most once.
+    /// Columns no two live rows share a value of, each row at weight 1; `None` where
+    /// the relation may be a bag.
     pub(crate) fn unique_key(&self) -> Option<Vec<ColId>> {
         if let Some(mapped) = self.key_through(RelExpr::unique_key) {
             return mapped;
@@ -796,7 +800,15 @@ impl RelExpr {
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
-            RelExpr::SetOp { all: false, out, .. } => Some(out.iter().map(|c| c.id).collect()),
+            // positive_part(A − B) ≤ A and min(A, B) ≤ A, B; a widened key stays a key.
+            RelExpr::SetOp { op, left, right, out } => {
+                let kept = |side: &RelExpr| rename_key(side.unique_key()?, &side.cols(), out);
+                match op {
+                    SetOpKind::Union => None,
+                    SetOpKind::Except => kept(left),
+                    SetOpKind::Intersect => kept(left).or_else(|| kept(right)),
+                }
+            }
             // Rows of its input — a subset of them, or each once — under its
             // input's identities.
             RelExpr::TopN { input, .. } | RelExpr::Window { input, .. } => input.unique_key(),
@@ -821,23 +833,15 @@ impl RelExpr {
                     .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
                     .collect()
             }),
-            RelExpr::Alias { input, cols } => {
-                let in_cols = input.cols();
-                key(input).and_then(|k| {
-                    k.iter()
-                        .map(|k| in_cols.iter().position(|c| c.id == *k).map(|p| cols[p].id))
-                        .collect()
-                })
-            }
+            RelExpr::Alias { input, cols } => key(input).and_then(|k| rename_key(k, &input.cols(), cols)),
             _ => return None,
         })
     }
 
-    /// A set operation. Pairs the two sides' output columns positionally,
-    /// promoting each pair to its common type ([`set_op_common_type`]) and stamping
-    /// the per-operator output nullability (Union `l||r`, Intersect `l&&r`, Except
-    /// `l`). Rejects an arity or type mismatch, and a float output column — the
-    /// content hash identifying a set-op row cannot carry one.
+    /// A set operation, its sides' columns paired positionally at their common type
+    /// ([`set_op_common_type`]) under the per-operator output nullability (Union
+    /// `l||r`, Intersect `l&&r`, Except `l`). A float column is refused: SQL
+    /// equality, which identifies an element, is not a float's byte equality.
     pub(crate) fn set_op(
         ids: &ColIdGen,
         op: SetOpKind,
@@ -875,7 +879,19 @@ impl RelExpr {
             out.push(HirCol::new(ids.next(), def));
         }
         crate::rules::reject_float_keys(out.iter().map(|c| &c.def), "set operation")?;
-        Ok(Rc::new(RelExpr::SetOp { op, all, left, right, out }))
+        let set_op = |left, right| Rc::new(RelExpr::SetOp { op, left, right, out });
+        Ok(match op {
+            _ if all => set_op(left, right),
+            SetOpKind::Union => Rc::new(RelExpr::Distinct { input: set_op(left, right) }),
+            SetOpKind::Except => set_op(RelExpr::distinct(left, "set operation")?, right),
+            SetOpKind::Intersect => {
+                let left = match right.unique_key() {
+                    Some(_) => left,
+                    None => RelExpr::distinct(left, "set operation")?,
+                };
+                set_op(left, right)
+            }
+        })
     }
 
     /// The node's output columns.

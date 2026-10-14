@@ -701,6 +701,10 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("WITH c AS (SELECT id FROM st) SELECT id FROM c", "is a stream"),
         ("SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5", "128-bit"),
         ("WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x", "(DISTINCT CTE)"),
+        (
+            "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT v FROM x",
+            "(set operation)",
+        ),
         ("SELECT v AS x, w AS x FROM t", "duplicate column name 'x'"),
         ("SELECT DISTINCT v AS x, w AS x FROM t", "duplicate column name 'x'"),
         ("SELECT id, v, v FROM t", "duplicate column name 'v'"),

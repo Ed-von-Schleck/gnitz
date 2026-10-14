@@ -482,8 +482,8 @@ fn set_op_and_distinct_rules() {
     view(&cat, "SELECT id FROM ty UNION SELECT id FROM w");
     view(&cat, "SELECT DISTINCT g FROM t");
     view(&cat, "(SELECT g FROM t WHERE g > 0) UNION SELECT g FROM t");
-    // A grouped or DISTINCT set-op side becomes a hidden segment, so its clauses
-    // are consumed there rather than refused.
+    // A grouped set-op side becomes a hidden segment, so its clauses are
+    // consumed there rather than refused.
     view(&cat, "SELECT DISTINCT v FROM t UNION ALL SELECT g FROM u GROUP BY g");
     rejects(
         &cat,

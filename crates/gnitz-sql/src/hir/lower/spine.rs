@@ -30,7 +30,7 @@ enum Level<'a> {
 
 /// What the consumer needs of the top projection: its exact columns (a view's
 /// output, a top-N or window carrying every input column), or only a slot per column it
-/// reads (a reduce, a content hash).
+/// reads (a reduce, a set operation's leaves).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Top {
     Output,
@@ -148,10 +148,6 @@ pub(crate) fn open<'a>(
 }
 
 impl Spine<'_> {
-    pub(crate) fn source(&self) -> &SegSource {
-        &self.seg.src
-    }
-
     pub(crate) fn tid(&self) -> u64 {
         self.seg.src.tid()
     }
