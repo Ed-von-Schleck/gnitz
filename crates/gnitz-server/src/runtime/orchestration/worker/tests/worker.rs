@@ -1,7 +1,8 @@
 use super::*;
 use crate::catalog::{CatalogColumn, SysFamily};
+use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, WorkerSet};
+use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     col_def, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
@@ -64,14 +65,10 @@ pub(super) fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
     (engine, tid)
 }
 
-/// `request` answered on `request_id`; `later`: as a later member of its cut.
-pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32, later: bool) -> DirectGroup<'a> {
+/// `request` answered on `request_id`.
+pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32) -> DirectGroup<'a> {
     DirectGroup {
-        targets: GroupTargets {
-            request_id,
-            in_request_order: later,
-            ..GroupTargets::UNADDRESSED
-        },
+        targets: GroupTargets { request_id, ..GroupTargets::UNADDRESSED },
         ..DirectGroup::new(request)
     }
 }
@@ -97,11 +94,11 @@ pub(super) fn pk_keys(ids: &[u64]) -> (Vec<u8>, Batch) {
 }
 
 /// A PK probe of `tid` at `keys`.
-pub(super) fn probe<'a>(tid: u64, keys: &'a (Vec<u8>, Batch), request_id: u32, later: bool) -> DirectGroup<'a> {
+pub(super) fn probe<'a>(tid: u64, keys: &'a (Vec<u8>, Batch), request_id: u32) -> DirectGroup<'a> {
     DirectGroup {
         schema: Some(&keys.0),
         data: GroupData::Same(keys.1.wire_whole()),
-        ..addressed(Read::HasPk { tid, probe: Probe::Pk }, request_id, later)
+        ..addressed(Read::HasPk { tid, probe: Probe::Pk }, request_id)
     }
 }
 
@@ -233,14 +230,14 @@ fn in_wait_dispositions() {
     // A control-only push carries no rows, so it ACKs without reaching the
     // store. `Flush` goes last: the reader leaves the epoch on stepping past it.
     let groups = [
-        addressed(scan(vid, &schema), 1, false),
-        addressed(delta, 2, false),
-        addressed(scan(tid, &schema), 3, false),
-        addressed(spans, 4, false),
-        addressed(Read::HasPk { tid, probe: Probe::Pk }, 5, false),
-        addressed(Apply::Push { tid }, 6, false),
+        addressed(scan(vid, &schema), 1),
+        addressed(delta, 2),
+        addressed(scan(tid, &schema), 3),
+        addressed(spans, 4),
+        addressed(Read::HasPk { tid, probe: Probe::Pk }, 5),
+        addressed(Apply::Push { tid }, 6),
         ddl,
-        addressed(Apply::Flush, 7, false),
+        addressed(Apply::Flush, 7),
     ];
     for group in &groups {
         sal.excl().write(group).expect("group fits");
@@ -290,7 +287,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
         first_round: 7,
         tids: vec![500, 501].into(),
     };
-    sal.excl().write(&addressed(tick, 9, false)).expect("group fits");
+    sal.excl().write(&addressed(tick, 9)).expect("group fits");
     wp.drain_sal();
 
     for tid in [500, 501] {
@@ -312,9 +309,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    sal.excl()
-        .write(&addressed(scan(tid, &schema), 1, false))
-        .expect("group fits");
+    sal.excl().write(&addressed(scan(tid, &schema), 1)).expect("group fits");
     sal.excl().write(&push(tid, &record, &row, 2)).expect("group fits");
     drain_in_wait(&mut wp);
 
@@ -339,9 +334,8 @@ fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
 
     {
         let excl = sal.excl();
-        excl.write(&addressed(scan(vid, &schema), 1, false))
-            .expect("group fits");
-        excl.write(&addressed(scan(tid, &schema), 2, true)).expect("group fits");
+        excl.write(&addressed(scan(vid, &schema), 1)).expect("group fits");
+        excl.write(&addressed(scan(tid, &schema), 2)).expect("group fits");
     }
     drain_in_wait(&mut wp);
     assert_eq!(owed(&wp), [("parked", 1), ("train", 2)]);
@@ -374,11 +368,11 @@ fn a_burst_passes_what_another_cut_owes() {
             .into(),
     };
     let keys = pk_keys(&[1]);
-    sal.excl().write(&addressed(delta, 1, false)).expect("group fits");
+    sal.excl().write(&addressed(delta, 1)).expect("group fits");
     {
         let excl = sal.excl();
-        excl.write(&probe(tid, &keys, 2, false)).expect("group fits");
-        excl.write(&probe(tid, &keys, 3, true)).expect("group fits");
+        excl.write(&probe(tid, &keys, 2)).expect("group fits");
+        excl.write(&probe(tid, &keys, 3)).expect("group fits");
     }
     drain_in_wait(&mut wp);
 
@@ -399,7 +393,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     let (mut wp, sal, rx) = test_worker(&mut engine);
     for request_id in [1, 2] {
         sal.excl()
-            .write(&addressed(scan(tid, &schema), request_id, false))
+            .write(&addressed(scan(tid, &schema), request_id))
             .expect("group fits");
     }
 

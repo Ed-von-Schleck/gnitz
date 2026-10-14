@@ -66,12 +66,12 @@ fn a_read_reaches_the_owners_its_bound_names() {
         ),
     ];
     for (case, schema, placement, blob, want) in &cases {
-        let r = route_read(schema, *placement, blob.as_deref(), NW);
+        let r = route_read(schema, *placement, blob.as_deref().unwrap_or_default(), NW);
         assert_eq!(&r.set, want, "{case}");
         assert!(r.per_worker.is_none(), "{case}: every worker is sent the whole bound");
     }
 
-    let spread = route_read(&schema, keyed, Some(&set(&[0, b])), NW);
+    let spread = route_read(&schema, keyed, &set(&[0, b]), NW);
     assert_eq!(spread.set, WorkerSet::one(owner(0)).with(owner(b)));
     let own_keys = (0..NW)
         .map(|w| match w {

@@ -18,11 +18,10 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::park::WorkerParks;
-use crate::runtime::sal::MAX_WORKERS;
+use crate::runtime::park::{WorkerParks, MAX_WORKERS};
 use gnitz_foundation::posix_io;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
@@ -66,33 +65,14 @@ pub(crate) fn outbox_bytes() -> usize {
 /// Zeroed. A memfd, so [`Mesh::trim`] can return pages by file offset.
 pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result<Vec<Mesh>> {
     let nw = parks.len();
-    assert!(nw <= MAX_WORKERS, "{nw} workers");
     let len = HEADER_BYTES + 2 * nw * outbox_bytes;
-    // SAFETY: the name is a NUL-terminated literal.
-    let fd = unsafe { libc::memfd_create(c"gnitz-mesh".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor nothing else owns. Leaked with the mapping.
-    let file: &'static File = Box::leak(Box::new(unsafe { File::from_raw_fd(fd) }));
+    // Leaked with the mapping.
+    let file: &'static File = Box::leak(Box::new(posix_io::memfd(c"gnitz-mesh")?));
     file.set_len(len as u64)?;
-    // SAFETY: a fresh mapping of the whole `len`-byte file.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error());
-    }
+    let base = posix_io::map_shared(Some(file.as_fd()), len)?;
     Ok((0..nw)
         .map(|rank| Mesh {
-            base: base.cast(),
+            base,
             file,
             rank,
             outbox_bytes,

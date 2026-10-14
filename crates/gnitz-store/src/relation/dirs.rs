@@ -7,10 +7,11 @@ use std::fs::{self, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::PkColList;
 
 use super::RelationRegistry;
-use crate::storage::{fsync_dir, manifest_path, read_at, read_intact, retire_store};
+use crate::storage::{manifest_path, read_at, read_intact, retire_store};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::StorageError;
 

@@ -8,7 +8,8 @@ use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
-use crate::runtime::sal::{GroupTargets, SalMessageKind, WorkerSet};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::{GroupTargets, SalMessageKind};
 
 /// The request id every worker's boot verdict answers on.
 pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
@@ -164,11 +165,7 @@ impl AckLease {
 
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
-        GroupTargets {
-            set: self.workers,
-            request_id: self.id,
-            in_request_order: false,
-        }
+        GroupTargets { set: self.workers, request_id: self.id }
     }
 
     /// Resolves once every worker of the set has ACKed. A worker that cannot
@@ -244,12 +241,8 @@ impl TrainLease {
     }
 
     /// The targets of the group this lease's workers answer.
-    pub(crate) fn targets(&self, in_request_order: bool) -> GroupTargets {
-        GroupTargets {
-            set: self.workers,
-            request_id: self.id,
-            in_request_order,
-        }
+    pub(crate) fn targets(&self) -> GroupTargets {
+        GroupTargets { set: self.workers, request_id: self.id }
     }
 
     /// Worker `w`'s next frame that carries rows, `None` once its train has ended;

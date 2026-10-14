@@ -18,7 +18,7 @@ fn park_wake_bench() {
     for (advance, publish) in [("bump", false), ("publish", true)] {
         let park = word(WorkerParks::create(1).unwrap(), 0);
         // The child's voluntary context switches, written before it exits.
-        let sleeps = map_anon_shared(4096).unwrap().cast::<i64>();
+        let sleeps = posix_io::map_shared(None, 4096).unwrap().cast::<i64>();
         let child = || {
             let before = voluntary_ctx_switches();
             let mut seen = 0;

@@ -1,8 +1,8 @@
 use super::*;
 use crate::catalog::{CatalogColumn, SysFamily};
 use crate::runtime::master::scatter::with_routed;
-use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::{DirectGroup, GroupTargets};
+use crate::runtime::sal::fixtures::{holders_of, TestLog};
+use crate::runtime::sal::DirectGroup;
 use crate::test_support::{
     circuit_batch, col_def, col_tab_batch, identity_circuit, make_batch, push_view_tab_row, sum_weights,
     table_tab_batch,
@@ -136,17 +136,13 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
         let placement = engine.registry.relation(tid).unwrap().placement();
         let record = engine.schema_record(tid).expect("a registered table");
         with_routed(&rows, placement, written_at, |data| {
-            let targets = GroupTargets {
-                set: data.holders(),
-                ..GroupTargets::UNADDRESSED
-            };
-            log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
+            log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
         });
 
         let tail = CommittedTail::read(log.log()).unwrap();
         let group = tail.groups().next().expect("the push is committed");
         assert_eq!(
-            (group.width() as usize, group.payloads().count()),
+            (group.head.width() as usize, group.payloads().count()),
             (written_at, 1),
             "one payload, written for {written_at} worker(s)"
         );
@@ -186,11 +182,7 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
         let placement = engine.registry.relation(tid).unwrap().placement();
         let record = engine.schema_record(tid).expect("a registered table");
         with_routed(&rows, placement, slot.of as usize, |data| {
-            let targets = GroupTargets {
-                set: data.holders(),
-                ..GroupTargets::UNADDRESSED
-            };
-            log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
+            log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
         });
     }
     recover_from_sal(CommittedTail::read(log.log()).unwrap(), slot, &mut engine).unwrap();

@@ -18,12 +18,12 @@ impl CommittedTail {
         let epoch = log.anchor()?;
         let (mut end, mut open) = (0u64, None);
         for msg in log.walk(epoch) {
-            if msg.lsn != 0 {
-                if !msg.intact() || open.is_some_and(|zone| zone != msg.lsn) {
+            if msg.head.lsn != 0 {
+                if !msg.intact() || open.is_some_and(|zone| zone != msg.head.lsn) {
                     break;
                 }
-                open = (!msg.zone_end).then_some(msg.lsn);
-                if msg.zone_end {
+                open = (!msg.head.zone_end()).then_some(msg.head.lsn);
+                if msg.head.zone_end() {
                     end = msg.end;
                 }
             }
@@ -34,7 +34,12 @@ impl CommittedTail {
     /// Whether a push committed since the last base round: this boot's replay
     /// moves a base store.
     pub(crate) fn holds_pushes(self) -> bool {
-        self.groups().any(|m| m.kind == SalMessageKind::Push)
+        self.groups().any(|m| m.head.kind == SalMessageKind::Push)
+    }
+
+    /// The log the tail was read from.
+    pub(crate) fn log(self) -> SalLog {
+        self.log
     }
 
     /// The epoch this boot writes and drains at: one above the tail's.
@@ -47,7 +52,7 @@ impl CommittedTail {
         self.log
             .walk(self.epoch)
             .take_while(move |m| m.end <= self.end)
-            .filter(|m| m.lsn != 0)
+            .filter(|m| m.head.lsn != 0)
     }
 }
 

@@ -51,3 +51,25 @@ fn a_parked_worker_wakes_on_a_forked_masters_wake() {
     });
     unsafe { assert_child_exited_ok(pid) };
 }
+
+/// Membership, the launched-worker bound and rank, at a small worker count and
+/// at the full word.
+#[test]
+fn a_worker_set_bounds_to_the_launched_workers() {
+    let s = WorkerSet::one(1).with(3).with(6);
+    assert_eq!(s.len(), 3);
+    assert!(s.contains(3) && !s.contains(2));
+    assert_eq!(s.without(3), WorkerSet::one(1).with(6));
+    assert_eq!(s.within(4), WorkerSet::one(1).with(3));
+    assert_eq!(s.iter().collect::<Vec<_>>(), vec![1, 3, 6]);
+    assert_eq!([1, 3, 6].map(|w| s.rank(w)), [0, 1, 2]);
+
+    assert_eq!(WorkerSet::ALL.within(4).len(), 4);
+    assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
+    assert_eq!(WorkerSet::EMPTY.len(), 0);
+    assert_eq!(WorkerSet::ALL.rank(MAX_WORKERS - 1), MAX_WORKERS - 1);
+    assert_eq!(WorkerSet::EMPTY.rank(7), 0);
+
+    assert_eq!(WorkerSet::one(1).union(WorkerSet::one(3)), WorkerSet::one(1).with(3));
+    assert_eq!(s.union(WorkerSet::EMPTY), s);
+}

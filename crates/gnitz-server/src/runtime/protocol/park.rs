@@ -4,6 +4,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use gnitz_foundation::posix_io;
+use gnitz_wire::{low_bits_mask, BitIter};
 use io_uring::types::FutexWaitV;
 
 // ---------------------------------------------------------------------------
@@ -92,28 +94,6 @@ fn futex_failed(site: &str, errno: i32) -> ! {
     gnitz_fatal_abort!("{}: futex failed: errno={}", site, errno);
 }
 
-/// An anonymous read-write mapping shared with every `fork()`ed child, zeroed.
-/// `MAP_NORESERVE`: its pages are charged as they are touched, so under
-/// heuristic overcommit a mapping sized far above its occupancy is not refused
-/// for its size.
-pub(super) fn map_anon_shared(size: usize) -> std::io::Result<*mut u8> {
-    // SAFETY: a fresh mapping at an address the kernel picks.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(ptr.cast())
-}
-
 // ---------------------------------------------------------------------------
 // Park
 // ---------------------------------------------------------------------------
@@ -191,6 +171,62 @@ impl Park {
 }
 
 // ---------------------------------------------------------------------------
+// WorkerSet
+// ---------------------------------------------------------------------------
+
+/// The most workers a cluster runs: [`WorkerSet`] holds one bit per worker.
+pub(crate) const MAX_WORKERS: usize = 64;
+
+/// A subset of the workers. `ALL` is unbounded; every other set holds only
+/// launched workers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorkerSet(pub(super) u64);
+
+const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
+
+impl WorkerSet {
+    pub(crate) const EMPTY: Self = WorkerSet(0);
+    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
+
+    pub(crate) const fn one(w: usize) -> Self {
+        WorkerSet(1 << w)
+    }
+
+    pub(crate) const fn with(self, w: usize) -> Self {
+        WorkerSet(self.0 | 1 << w)
+    }
+
+    pub(crate) const fn without(self, w: usize) -> Self {
+        WorkerSet(self.0 & !(1 << w))
+    }
+
+    pub(crate) const fn within(self, nw: usize) -> Self {
+        WorkerSet(self.0 & low_bits_mask(nw))
+    }
+
+    pub(crate) const fn contains(self, w: usize) -> bool {
+        self.0 >> w & 1 == 1
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        WorkerSet(self.0 | other.0)
+    }
+
+    /// How many members of the set are below `w`: `w`'s position among them.
+    pub(crate) const fn rank(self, w: usize) -> usize {
+        (self.0 & low_bits_mask(w)).count_ones() as usize
+    }
+
+    pub(crate) fn iter(self) -> BitIter {
+        BitIter(self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WorkerParks
 // ---------------------------------------------------------------------------
 
@@ -205,7 +241,8 @@ pub(crate) struct WorkerParks(&'static [Line]);
 
 impl WorkerParks {
     pub(crate) fn create(nw: usize) -> std::io::Result<Self> {
-        let base = map_anon_shared((nw * size_of::<Line>()).max(1))?;
+        assert!(nw <= MAX_WORKERS, "{nw} workers: a WorkerSet holds at most MAX_WORKERS");
+        let base = posix_io::map_shared(None, (nw * size_of::<Line>()).max(1))?;
         // SAFETY: a fresh page-aligned shared mapping of at least `nw` lines, never
         // unmapped; zeroed is a `Park` nobody sleeps on.
         Ok(WorkerParks(unsafe { std::slice::from_raw_parts(base.cast(), nw) }))

@@ -34,7 +34,7 @@ use orchestration::{committer, executor, master, peer, worker};
 use protocol::{mesh, park, sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;
-pub(crate) use sal::MAX_WORKERS;
+pub(crate) use park::MAX_WORKERS;
 pub(crate) use tls::{mint_token, TlsArgs};
 
 #[cfg(test)]

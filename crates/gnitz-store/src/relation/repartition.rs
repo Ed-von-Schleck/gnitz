@@ -10,7 +10,8 @@ use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
-use crate::storage::{flush_barrier, fsync_dir, link_store, retire_store, Cut, RecoverySource, Table};
+use crate::storage::{flush_barrier, link_store, retire_store, Cut, RecoverySource, Table};
+use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{from_runs, Batch, StorageError};

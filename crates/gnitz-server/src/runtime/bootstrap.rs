@@ -38,7 +38,7 @@ use gnitz_zset::algebra::Slot;
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
     let mine = |msg: &SalMessage| {
-        msg.kind == SalMessageKind::DdlSync && floors.get(&msg.target_id).is_some_and(|&f| msg.lsn > f)
+        msg.head.kind == SalMessageKind::DdlSync && floors.get(&msg.head.target_id).is_some_and(|&f| msg.head.lsn > f)
     };
 
     let mut replayed: u32 = 0;
@@ -47,17 +47,17 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
         let Some(data) = msg.payloads().next() else {
             return Err(format!(
                 "SAL replay: DdlSync group at offset={} (lsn={}) carries no payload",
-                msg.base, msg.lsn
+                msg.base, msg.head.lsn
             ));
         };
         let Some(batch) = msg.rows(data, |_, _| None)? else {
             continue;
         };
         // Master-validated rows that already carry a drop's children.
-        catalog.stage(msg.target_id, msg.lsn, batch).map_err(|e| {
+        catalog.stage(msg.head.target_id, msg.head.lsn, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
-                msg.target_id, msg.lsn
+                msg.head.target_id, msg.head.lsn
             )
         })?;
         replayed += 1;
@@ -93,8 +93,8 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
-    for msg in tail.groups().filter(|m| m.kind == SalMessageKind::Push) {
-        let tid = msg.target_id;
+    for msg in tail.groups().filter(|m| m.head.kind == SalMessageKind::Push) {
+        let tid = msg.head.target_id;
         // A table dropped later in the tail has no relation, and nothing to
         // recover into.
         let Some(relation) = catalog.registry.relation(tid) else {
@@ -105,9 +105,9 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
         let (schema, placement) = (relation.schema(), relation.placement());
         // Written for another width, so no payload is this rank's share: every one
         // is re-cut for the launched topology.
-        let reslice = msg.width() != slot.of;
+        let reslice = msg.head.width() != slot.of;
         if reslice {
-            resliced_from = Some(msg.width());
+            resliced_from = Some(msg.head.width());
         }
         let own = (!reslice).then(|| msg.slot(slot.rank)).flatten();
         let all = reslice.then(|| msg.payloads()).into_iter().flatten();
@@ -134,7 +134,7 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
             catalog.ingest_unticked(tid, owned).map_err(|e| {
                 format!(
                     "SAL replay apply failed (table_id={}, lsn={}): {e}",
-                    msg.target_id, msg.lsn
+                    msg.head.target_id, msg.head.lsn
                 )
             })?;
             applied = true;
@@ -199,7 +199,6 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Opt
 
 /// One worker's share of the IPC: the SAL it reads, and its own ends.
 struct WorkerIpc {
-    sal: SalLog,
     tail: CommittedTail,
     w2m_writer: W2mWriter,
     park: WorkerPark,
@@ -212,7 +211,6 @@ struct WorkerIpc {
 /// Nothing here is reclaimed on error: the only response to a failed boot is to
 /// exit the process, which returns all of it to the kernel.
 struct SharedIpc {
-    sal: SalLog,
     /// The committed tail every recovery replays, and the epoch the next writer
     /// epoch starts above. Read once with the mapping, before the fork.
     tail: CommittedTail,
@@ -227,8 +225,7 @@ struct SharedIpc {
 /// Open and map the SAL, the workers' parks, one W2M ring per worker, and the
 /// exchange mesh.
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
-    let sal = SalLog::open(data_dir)?;
-    let tail = CommittedTail::read(sal)?;
+    let tail = CommittedTail::read(SalLog::open(data_dir)?)?;
     let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
     let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
@@ -238,14 +235,13 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         .zip(meshes)
         .enumerate()
         .map(|(w, (w2m_writer, mesh))| WorkerIpc {
-            sal,
             tail,
             w2m_writer,
             park: parks.park(w),
             mesh,
         })
         .collect();
-    Ok(SharedIpc { sal, tail, workers, receiver, parks })
+    Ok(SharedIpc { tail, workers, receiver, parks })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -298,7 +294,7 @@ fn run_worker_child(
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
-    let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
+    let sal_reader = SalReader::new(ipc.tail.log(), slot.rank, ipc.tail.live_epoch());
     // The id the master leases before it collects.
     ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
     WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.park, ipc.mesh).run()
@@ -448,7 +444,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     master_pre_fork_recovery(catalog, ipc.tail)?;
 
-    let SharedIpc { sal, tail, workers, receiver, parks } = ipc;
+    let SharedIpc { tail, workers, receiver, parks } = ipc;
     let worker_pids = fork_workers(catalog, data_dir, workers, pinning.as_ref())?;
 
     // --- Parent process ---
@@ -457,7 +453,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
-        SalWriter::new(sal, parks),
+        SalWriter::new(tail.log(), parks),
         reactor,
     ));
 

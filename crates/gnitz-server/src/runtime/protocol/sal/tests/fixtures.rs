@@ -2,10 +2,8 @@
 //! production writer, plus the reader every assertion goes through.
 //!
 //! A child of `sal`, so it reaches `write_slots` and the cursor directly: the
-//! raw writes below forge what no scope writes — arbitrary LSNs and flags, an
-//! open zone — and every other group goes through [`SalExcl`].
-
-use std::os::fd::FromRawFd;
+//! raw writes below forge what no scope writes — arbitrary LSNs, an open zone —
+//! and every other group goes through [`SalExcl`].
 
 use super::*;
 use crate::catalog::SysFamily;
@@ -16,18 +14,14 @@ use gnitz_zset::schema::encode_schema_block;
 /// `parks`. Unrewound, as a boot's writer is before [`SalExcl::boot_rewind`].
 pub(crate) fn test_writer(size: usize, parks: WorkerParks) -> SalWriter {
     let len = ANCHOR_BYTES + size;
-    let fd = unsafe { libc::memfd_create(c"test_sal".as_ptr(), libc::MFD_CLOEXEC) };
-    assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
-    // SAFETY: a descriptor nothing else owns. Leaked: open and mapped for the rest of the process.
-    let file: &'static File = Box::leak(Box::new(unsafe { File::from_raw_fd(fd) }));
+    // Leaked: open and mapped for the rest of the process.
+    let file: &'static File = Box::leak(Box::new(posix_io::memfd(c"test_sal").expect("memfd")));
     SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks)
 }
 
 /// A SAL over its own file.
 pub(crate) struct TestLog {
     pub(crate) writer: SalWriter,
-    /// The parks the writer's wakes land on.
-    parks: WorkerParks,
 }
 
 impl TestLog {
@@ -37,12 +31,12 @@ impl TestLog {
         let parks = WorkerParks::create(workers).expect("map the parks");
         let writer = test_writer(size, parks);
         writer.rewind(epoch);
-        TestLog { writer, parks }
+        TestLog { writer }
     }
 
-    /// Every worker's park.
+    /// Every worker's park: where the writer's wakes land.
     pub(crate) fn parks(&self) -> WorkerParks {
-        self.parks
+        self.writer.parks
     }
 
     /// The ring's first byte — offset 0 of every group base.
@@ -76,17 +70,15 @@ impl TestLog {
     /// Append one group sending worker `w` the bytes `payloads[w]` verbatim, an
     /// empty one being a worker the group does not address; returns its base.
     pub(super) fn write(&self, target: u64, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
-        self.try_write(target, lsn, kind, 0, payloads).expect("group fits")
+        self.try_write(target, lsn, kind, payloads).expect("group fits")
     }
 
-    /// [`Self::write`] with the flag byte given and the writer's verdict
-    /// reported.
+    /// [`Self::write`] with the writer's verdict reported.
     pub(super) fn try_write(
         &self,
         target: u64,
         lsn: u64,
         kind: SalMessageKind,
-        flags: u8,
         payloads: &[&[u8]],
     ) -> Result<u64, WireFault> {
         let written = || payloads.iter().enumerate().filter(|(_, p)| !p.is_empty());
@@ -94,7 +86,8 @@ impl TestLog {
         let head = GroupHead {
             lsn,
             kind,
-            flags,
+            flags: 0,
+            width: self.writer.parks.len() as u8,
             request_id: 0,
             target_id: target,
             targets: written().fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
@@ -143,9 +136,8 @@ impl TestLog {
         let at = base as usize + PREFIX_BYTES;
         // SAFETY: a test only asks for a header it wrote, so both reads are mapped.
         unsafe {
-            let fixed = std::slice::from_raw_parts(self.ptr().add(at), HDR_PREFIX);
-            let payloads = payload_count(fixed[OFF_FLAGS], WorkerSet(read_u64_le(fixed, OFF_TARGETS)));
-            std::slice::from_raw_parts_mut(self.ptr().add(at), group_header_size(payloads))
+            let fixed = &*(self.ptr().add(at) as *const [u8; HDR_PREFIX]);
+            std::slice::from_raw_parts_mut(self.ptr().add(at), header_len(fixed))
         }
     }
 
@@ -161,5 +153,13 @@ pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
     match log.read_at(base, EpochGate::Walk(epoch)) {
         SalStep::Group(msg) => msg,
         _ => panic!("a group is published at offset {base}"),
+    }
+}
+
+/// The targets of a push of `data` nothing answers: the workers that hold its rows.
+pub(crate) fn holders_of(data: &GroupData) -> GroupTargets {
+    GroupTargets {
+        set: data.holders(),
+        ..GroupTargets::UNADDRESSED
     }
 }

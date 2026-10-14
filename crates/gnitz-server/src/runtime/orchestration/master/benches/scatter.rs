@@ -1,6 +1,5 @@
-use super::tests::holders_of;
 use super::*;
-use crate::runtime::sal::fixtures::TestLog;
+use crate::runtime::sal::fixtures::{holders_of, TestLog};
 use crate::runtime::sal::DirectGroup;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::Counter;
@@ -73,6 +72,7 @@ fn push_group_layout_bench() {
                     match data {
                         GroupData::Same(_) => None,
                         GroupData::Each(each) => Some(each.iter().flatten().count()),
+                        GroupData::Blobs(_) => unreachable!("a push is routed by its rows"),
                     }
                 });
                 scope.commit();

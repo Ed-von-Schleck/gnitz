@@ -39,7 +39,6 @@ impl MasterDispatcher {
             unique_filters: RefCell::new(FxHashMap::default()),
             fk_presence: RefCell::new(FxHashMap::default()),
             fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
-            unflushed_pushes: Cell::new(false),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
             boot_nonce: boot_nonce(),
@@ -88,10 +87,12 @@ impl MasterDispatcher {
         }
     }
 
-    /// Write `group` to every worker on a fresh ACK lease.
+    /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
+    /// caller may await the ACKs under this hold.
     fn write_acked(&self, excl: &SalExcl<'_>, group: DirectGroup<'_>) -> Result<AckLease, WireFault> {
         let lease = self.reactor.lease_acks(WorkerSet::ALL);
         excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
+        excl.wake();
         Ok(lease)
     }
 
@@ -101,7 +102,7 @@ impl MasterDispatcher {
 
     /// A checkpoint's first half: the round that flushes base and system tables.
     ///
-    /// When a recoverable push group was written since the last one, the round
+    /// When a push to a base table was published since the last one, the round
     /// moves the base stores past what the checkpointed views integrate, so a
     /// generation bump goes ahead of it: every checkpointed view and index is
     /// invalid until the next ephemeral round restamps it. Otherwise the round
@@ -109,7 +110,7 @@ impl MasterDispatcher {
     /// republishes only the stores whose manifests changed.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
-        if self.unflushed_pushes.replace(false) {
+        if self.sal.holds_pushes() {
             self.cat_mut().advance_durable_generation()?;
         }
         self.flush_round(&mut excl, Apply::Flush).await
@@ -120,7 +121,7 @@ impl MasterDispatcher {
     pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
         debug_assert!(
-            !self.unflushed_pushes.get(),
+            !self.sal.holds_pushes(),
             "an ephemeral round's reset would discard pushes no base round flushed"
         );
         let generation = self.cat().durable_generation();
@@ -130,8 +131,6 @@ impl MasterDispatcher {
     /// Write `round`'s group, wait for every worker's ACK, finalize.
     async fn flush_round(&self, excl: &mut SalExcl<'_>, round: Apply<'_>) -> Result<(), WireFault> {
         let lease = self.write_acked(excl, DirectGroup::new(round))?;
-        // `excl` is held through the ACKs, so its drop would wake too late.
-        excl.wake();
         lease.acks().await;
         self.checkpoint_post_ack(excl)
     }
@@ -150,7 +149,6 @@ impl MasterDispatcher {
             return Ok(());
         }
         let group = DirectGroup::new(Apply::Backfill { views: ordered.into() });
-        // Two statements: the `SalExcl`'s drop is the wake.
         let lease = self.write_acked(&self.sal.lock().await, group)?;
         lease.acks().await;
         Ok(())
@@ -348,9 +346,6 @@ impl MasterDispatcher {
             .relation(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
-        if recoverable {
-            self.unflushed_pushes.set(true);
-        }
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());

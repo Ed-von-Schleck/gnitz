@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 
+use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::PkBuf;
 use gnitz_wire::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
@@ -201,11 +202,6 @@ pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
 /// The intact manifest in `dir` iff it carries `generation`.
 pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, StorageError> {
     Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
-}
-
-/// `fsync` `dir`, making its entries durable.
-pub(crate) fn fsync_dir(dir: &str) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
 }
 
 /// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest. Does NOT

@@ -57,16 +57,6 @@ pub(crate) enum SalRequest<'a> {
     Shutdown,
 }
 
-impl Read<'_> {
-    /// The relation it reads.
-    pub(crate) fn target(&self) -> u64 {
-        match *self {
-            Read::HasPk { tid, .. } | Read::KeySpans { tid, .. } | Read::ScanSpec { tid, .. } => tid,
-            Read::Delta { view, .. } => view,
-        }
-    }
-}
-
 impl SalRequest<'_> {
     pub(crate) fn kind(&self) -> SalMessageKind {
         match self {

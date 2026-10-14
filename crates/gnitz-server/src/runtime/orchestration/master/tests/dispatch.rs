@@ -2,7 +2,8 @@ use std::rc::Rc;
 
 use super::super::fixtures::test_dispatcher;
 use crate::catalog::CatalogEngine;
-use crate::runtime::sal::{Apply, DirectGroup};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{WireFault, WireStatus};
@@ -209,7 +210,23 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     };
 
     assert_eq!(checkpoint(&disp), gen, "no push since the last base round");
-    disp.unflushed_pushes.set(true);
+    {
+        let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
+        let scope = excl.begin("test");
+        // No rows, so no schema block is framed, and addressed to no worker, so
+        // no ACK is owed.
+        let push = DirectGroup::push(
+            1,
+            &[],
+            GroupData::Same(None),
+            GroupTargets {
+                set: WorkerSet::EMPTY,
+                ..GroupTargets::UNADDRESSED
+            },
+        );
+        scope.write(&push, true).unwrap();
+        assert!(scope.commit(), "the push is a zone member");
+    }
     assert_eq!(checkpoint(&disp), gen + 1);
     assert_eq!(checkpoint(&disp), gen + 1, "the base round took the push with it");
 

@@ -1,6 +1,7 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{DirectGroup, GroupTargets, WorkerSet};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::fixtures::{group_at, holders_of, TestLog};
+use crate::runtime::sal::DirectGroup;
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
@@ -10,14 +11,6 @@ use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::schema::encode_schema_block;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
-
-/// The targets of a push of `data` nothing answers: the workers that hold its rows.
-pub(super) fn holders_of(data: &GroupData) -> GroupTargets {
-    GroupTargets {
-        set: data.holders(),
-        ..GroupTargets::UNADDRESSED
-    }
-}
 
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
 /// `placement`, handing `inspect` the layout the scatter picked.
@@ -134,7 +127,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
             let owners = (0..batch.len())
                 .map(|row| placement.owner(batch.get_pk_bytes(row), nw).expect("a keyed placement"))
                 .fold(WorkerSet::EMPTY, WorkerSet::with);
-            assert_eq!(msg.targets, owners, "{case}: the owners alone are addressed");
+            assert_eq!(msg.head.targets, owners, "{case}: the owners alone are addressed");
             assert_eq!(msg.payloads().count(), owners.len(), "{case}: one payload each");
             for (w, s) in &sent {
                 for row in 0..s.len() {

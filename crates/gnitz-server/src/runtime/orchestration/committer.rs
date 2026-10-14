@@ -87,9 +87,7 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // a latency tax.
         let batch = drain_ready_batch(&mut rx, first);
 
-        // Before this batch's groups, never after: workers bump their
-        // expected_epoch on Flush, so a group written behind one in the same
-        // epoch is silently skipped.
+        // Before this batch's groups: the checkpoint makes room for them.
         if checkpoint_warranted(&shared, &batch) {
             run_checkpoint_sequence(&shared).await;
         }

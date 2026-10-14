@@ -33,9 +33,9 @@ fn arm(
     engine.registry.ingest(tid, batch).unwrap();
     let record = engine.schema_record(tid).expect("a registered table");
     let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
-    let excl = sal.excl();
+    // Independent client requests: each under a hold of its own.
     for id in 1..=requests {
-        request(&excl, tid, &record, id).expect("group fits");
+        request(&sal.excl(), tid, &record, id).expect("group fits");
     }
     let ((), instructions) = Counter::instructions().measure(|| loop {
         wp.drain_sal();
@@ -75,7 +75,7 @@ fn worker_request_bench() {
     let n = REQUESTS as usize;
     let bare = |_: &mut CatalogEngine, _: u64| ();
 
-    let ack = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid }, id, false));
+    let ack = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid }, id));
     arm("ack", 0, bare, REQUESTS, ack, n, 0);
 
     let one_row = |excl: &SalExcl, tid, record: &[u8], id: u32| {
@@ -84,8 +84,7 @@ fn worker_request_bench() {
     };
     arm("push", 0, bare, REQUESTS, one_row, n, REQUESTS as u64);
 
-    let has_pk =
-        |excl: &SalExcl, tid, _: &[u8], id: u32| excl.write(&probe(tid, &pk_keys(&[id as u64 % HELD]), id, false));
+    let has_pk = |excl: &SalExcl, tid, _: &[u8], id: u32| excl.write(&probe(tid, &pk_keys(&[id as u64 % HELD]), id));
     arm("has_pk", HELD, bare, REQUESTS, has_pk, n, HELD);
 
     let scan = |excl: &SalExcl, tid, _: &[u8], id: u32| {
@@ -97,7 +96,7 @@ fn worker_request_bench() {
                 .encode()
                 .into(),
         };
-        excl.write(&addressed(read, id, false))
+        excl.write(&addressed(read, id))
     };
     arm("scan_spec", HELD, bare, REQUESTS, scan, n, HELD);
 
@@ -109,7 +108,7 @@ fn worker_request_bench() {
             first_round: id as u64 + 1,
             tids: vec![tid].into(),
         };
-        excl.write(&addressed(tick, id, false))
+        excl.write(&addressed(tick, id))
     };
     arm("tick", 0, viewed, REQUESTS, tick, n, 0);
 
@@ -120,7 +119,7 @@ fn worker_request_bench() {
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_index(tid, claim, cols).unwrap();
     };
-    let spans = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols }, id, false));
+    let spans = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols }, id));
     let held = (CHUNKS * CHUNK_ROWS) as u64;
     // A frame per chunk, then the train's end.
     arm("spans_sort", held, chunked, 1, spans, CHUNKS + 1, held);

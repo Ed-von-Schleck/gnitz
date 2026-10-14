@@ -26,8 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use super::park::{futex_waitv_entry, map_anon_shared, Park};
+use super::park::{futex_waitv_entry, Park};
 use crate::runtime::wire::WireMsg;
+use gnitz_foundation::posix_io;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 // ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ const W2M_REGION_SIZE: usize =
 // `arm_waitv` builds a `futex_waitv` word list of `num_workers` entries. The
 // kernel's `FUTEX_WAITV_MAX` is 128; past it the wait fails with EINVAL. Make a
 // `MAX_WORKERS` bump that outgrows it a build error.
-const _: () = assert!(super::sal::MAX_WORKERS <= 128);
+const _: () = assert!(super::park::MAX_WORKERS <= 128);
 
 const _: () = assert!(
     2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
@@ -231,7 +232,7 @@ fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)>
             "W2M capacity={capacity} must stay under 2^32: a cursor advances by at most the ring's \
              capacity, and only under 2^32 does an advance always move the low half a futex compares",
         );
-        let base = map_anon_shared(capacity)?;
+        let base = posix_io::map_shared(None, capacity)?;
         // Before the first touch. Shared anonymous memory is shmem-backed, so the
         // hint is the kernel's to honour under `shmem_enabled=advise`.
         // SAFETY: the `capacity` bytes just mapped.

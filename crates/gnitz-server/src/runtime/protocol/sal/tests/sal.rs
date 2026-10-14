@@ -11,7 +11,7 @@ use crate::runtime::wire::WireMsg;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
-use gnitz_wire::control::{peek_control_block, ControlHeader, CTRL_HEADER_SIZE};
+use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -52,7 +52,10 @@ fn a_per_worker_group_gives_each_addressed_worker_its_own_bytes() {
         assert_eq!(groups[1].base, groups[0].end, "width {width}: the stride");
         assert_eq!(groups[1].end, log.cursor(), "width {width}: the writer's advance");
         for (g, header) in groups.iter().zip([(7, 9), (8, 0)]) {
-            assert_eq!((g.target_id, g.lsn, g.width() as usize), (header.0, header.1, width));
+            assert_eq!(
+                (g.head.target_id, g.head.lsn, g.head.width() as usize),
+                (header.0, header.1, width)
+            );
             assert_eq!(
                 g.payloads().count(),
                 width.div_ceil(2),
@@ -97,7 +100,7 @@ fn a_shared_group_gives_every_addressed_worker_the_same_bytes() {
         let msg = group_at(log.log(), base);
         let payloads: Vec<_> = msg.payloads().collect();
         assert_eq!(payloads.len(), 1, "one directory entry");
-        assert_eq!(msg.width(), 4);
+        assert_eq!(msg.head.width(), 4);
         for (w, addressed) in addressed.into_iter().enumerate() {
             assert_eq!(msg.slot(w as u32), addressed.then_some(payloads[0]), "worker {w}");
         }
@@ -119,7 +122,7 @@ fn a_group_that_does_not_fit_is_refused_sal_full() {
     let refuse = |payload: usize| {
         let before = log.cursor();
         let err = log
-            .try_write(0, 0, SalMessageKind::ScanSpec, 0, &[&vec![0; payload]])
+            .try_write(0, 0, SalMessageKind::ScanSpec, &[&vec![0; payload]])
             .expect_err("the group must be refused");
         assert_eq!(err.status, WireStatus::SalFull);
         assert_eq!(log.cursor(), before, "the log is untouched");
@@ -132,7 +135,7 @@ fn a_group_that_does_not_fit_is_refused_sal_full() {
     refuse(8);
     assert!(log.writer.needs_checkpoint(), "a checkpoint admits it");
 
-    log.try_write(0, 0, SalMessageKind::Flush, 0, &[&[0u8; CTRL_HEADER_SIZE]])
+    log.try_write(0, 0, SalMessageKind::Flush, &[&[0u8; CTRL_HEADER_SIZE]])
         .expect("a checkpoint round must still fit");
 
     log.excl().checkpoint_reset();
@@ -187,7 +190,7 @@ fn a_scope_publishes_its_zone_at_commit() {
         .iter()
         .map(|&base| {
             let m = group_at(log.log(), base);
-            (m.target_id, m.lsn, m.zone_end)
+            (m.head.target_id, m.head.lsn, m.head.zone_end())
         })
         .collect();
     assert_eq!(
@@ -213,7 +216,10 @@ fn a_rolled_back_group_is_taken_back_and_the_rest_commits() {
     assert_eq!(log.cursor(), taken_back, "the cursor is restored");
     assert!(scope.commit(), "the zone before the savepoint closes");
 
-    assert!(group_at(log.log(), 0).zone_end, "the member left is the closing one");
+    assert!(
+        group_at(log.log(), 0).head.zone_end(),
+        "the member left is the closing one"
+    );
     assert!(matches!(
         log.log().read_at(taken_back, EpochGate::Live(1)),
         SalStep::Absent
@@ -249,7 +255,7 @@ fn zone_lsns_rise_with_the_log_and_the_watermark_follows_the_commits() {
     stream.write(&to(1), false).expect("group fits");
     assert!(!stream.commit(), "an unzoned group closes no zone");
     assert_eq!(log.writer.watermark(), first);
-    assert_eq!(group_at(log.log(), 0).target_id, 1, "but it is published");
+    assert_eq!(group_at(log.log(), 0).head.target_id, 1, "but it is published");
 
     let zoned = excl.begin("test");
     let second = zoned.lsn();
@@ -275,7 +281,7 @@ fn a_reader_leaves_its_epoch_on_stepping_past_a_flush() {
         let kind = SalRequest::from(round.clone()).kind();
         let log = TestLog::new(1 << 20, 2, 1);
         let reader = SalReader::new(log.log(), 0, 1);
-        let read = || reader.next().map(|(m, _)| (m.kind, m.target_id));
+        let read = || reader.next().map(|(m, _)| (m.head.kind, m.head.target_id));
         let mut excl = log.excl();
         excl.write(&to(1)).expect("group fits");
         excl.write(&DirectGroup::new(round)).expect("group fits");
@@ -351,28 +357,6 @@ fn sal_cross_process_checkpoint() {
     unsafe { assert_child_exited_ok(pid) };
 }
 
-/// Membership, the launched-worker bound and rank, at a small worker count and
-/// at the full word.
-#[test]
-fn a_worker_set_bounds_to_the_launched_workers() {
-    let s = WorkerSet::one(1).with(3).with(6);
-    assert_eq!(s.len(), 3);
-    assert!(s.contains(3) && !s.contains(2));
-    assert_eq!(s.without(3), WorkerSet::one(1).with(6));
-    assert_eq!(s.within(4), WorkerSet::one(1).with(3));
-    assert_eq!(s.iter().collect::<Vec<_>>(), vec![1, 3, 6]);
-    assert_eq!([1, 3, 6].map(|w| s.rank(w)), [0, 1, 2]);
-
-    assert_eq!(WorkerSet::ALL.within(4).len(), 4);
-    assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
-    assert_eq!(WorkerSet::EMPTY.len(), 0);
-    assert_eq!(WorkerSet::ALL.rank(MAX_WORKERS - 1), MAX_WORKERS - 1);
-    assert_eq!(WorkerSet::EMPTY.rank(7), 0);
-
-    assert_eq!(WorkerSet::one(1).union(WorkerSet::one(3)), WorkerSet::one(1).with(3));
-    assert_eq!(s.union(WorkerSet::EMPTY), s);
-}
-
 /// A group written to 2 of 4 workers is read by those two alone, both answering
 /// on the one request id.
 #[test]
@@ -382,21 +366,23 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
         targets: GroupTargets {
             set: WorkerSet::one(1).with(3),
             request_id: 40,
-            in_request_order: true,
         },
         ..DirectGroup::new(scan(0, &[]))
     };
-    let excl = log.excl();
-    excl.write(&group).expect("group fits");
-    excl.write(&DirectGroup::new(scan(0, &[]))).expect("group fits");
+    log.excl().write(&group).expect("group fits");
+    log.excl().write(&DirectGroup::new(scan(0, &[]))).expect("group fits");
 
     for w in 0..4u32 {
         let reader = SalReader::new(log.log(), w, 1);
-        let mut read = std::iter::from_fn(|| reader.next().map(|(m, _)| (m.request_id, m.in_request_order)));
+        let mut read = std::iter::from_fn(|| {
+            reader
+                .next()
+                .map(|(m, _)| (m.head.request_id, m.head.in_request_order()))
+        });
         if w == 1 || w == 3 {
             assert_eq!(
                 read.next(),
-                Some((40, true)),
+                Some((40, false)),
                 "worker {w} reads the group written to it"
             );
         }
@@ -410,20 +396,21 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
 #[test]
 fn every_worker_numbers_a_cut_alike() {
     let log = TestLog::new(1 << 20, 2, 1);
-    let member = |set, request_id, in_request_order| DirectGroup {
-        targets: GroupTargets { set, request_id, in_request_order },
+    let member = |set, request_id| DirectGroup {
+        targets: GroupTargets { set, request_id },
         ..DirectGroup::new(scan(0, &[]))
     };
-    let excl = log.excl();
     // One cut whose first member addresses worker 0 alone, then a cut of one.
-    excl.write(&member(WorkerSet::one(0), 1, false)).expect("group fits");
-    excl.write(&member(WorkerSet::ALL, 2, true)).expect("group fits");
-    excl.write(&member(WorkerSet::ALL, 3, true)).expect("group fits");
-    excl.write(&member(WorkerSet::ALL, 4, false)).expect("group fits");
+    let excl = log.excl();
+    excl.write(&member(WorkerSet::one(0), 1)).expect("group fits");
+    excl.write(&member(WorkerSet::ALL, 2)).expect("group fits");
+    excl.write(&member(WorkerSet::ALL, 3)).expect("group fits");
+    drop(excl);
+    log.excl().write(&member(WorkerSet::ALL, 4)).expect("group fits");
 
     let cuts = |w| {
         let reader = SalReader::new(log.log(), w, 1);
-        std::iter::from_fn(|| reader.next().map(|(m, _)| (m.request_id, reader.cut()))).collect::<Vec<_>>()
+        std::iter::from_fn(|| reader.next().map(|(m, _)| (m.head.request_id, reader.cut.get()))).collect::<Vec<_>>()
     };
     assert_eq!(cuts(0), [(1, 1), (2, 1), (3, 1), (4, 2)]);
     assert_eq!(cuts(1), [(2, 1), (3, 1), (4, 2)]);
@@ -436,11 +423,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     let log = TestLog::new(1 << 20, 4, 1);
     let seqs = || (0..4).map(|w| log.parks().wake_seq(w)).collect::<Vec<_>>();
     let leased = |set| DirectGroup {
-        targets: GroupTargets {
-            set,
-            request_id: 1,
-            in_request_order: false,
-        },
+        targets: GroupTargets { set, request_id: 1 },
         ..DirectGroup::new(scan(0, &[]))
     };
 
@@ -487,24 +470,24 @@ fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
     );
 }
 
-/// A group carrying per-worker extras sends each worker its own blob in place
+/// A group carrying per-worker blobs sends each worker its own blob in place
 /// of the request's.
 #[test]
-fn a_group_with_per_worker_extras_sends_each_worker_its_own_blob() {
+fn a_group_with_per_worker_blobs_sends_each_worker_its_own_blob() {
     let log = TestLog::new(1 << 20, 3, 1);
-    let extras: Vec<Vec<u8>> = vec![vec![1; 40], Vec::new(), vec![3; 400]];
+    let blobs: Vec<Vec<u8>> = vec![vec![1; 40], Vec::new(), vec![3; 400]];
     let group = DirectGroup {
-        extras: Some(&extras),
+        data: GroupData::Blobs(&blobs),
         ..DirectGroup::new(scan(16, &[9; 7]))
     };
     log.excl().write(&group).expect("group fits");
 
     let msg = group_at(log.log(), 0);
-    assert_eq!(msg.payloads().count(), extras.len(), "one payload per worker");
-    for (w, extra) in extras.iter().enumerate() {
+    assert_eq!(msg.payloads().count(), blobs.len(), "one payload per worker");
+    for (w, blob) in blobs.iter().enumerate() {
         let slot = msg.slot(w as u32).expect("every worker is written");
         let control = peek_control_block(slot).expect("a payload decodes");
-        assert_eq!(slot[control.blob], **extra, "worker {w}");
+        assert_eq!(slot[control.blob], **blob, "worker {w}");
     }
 }
 
@@ -602,6 +585,7 @@ fn every_header_field_round_trips() {
         lsn: 0x0102_0304_0506_0708,
         kind: SalMessageKind::Backfill,
         flags,
+        width: 5,
         request_id,
         target_id: 0xABCD_1234,
         targets,
@@ -622,22 +606,33 @@ fn every_header_field_round_trips() {
     assert!(first < per_worker && per_worker < shared);
 
     let msg = group_at(log.log(), per_worker);
-    assert_eq!(msg.lsn, 0x0102_0304_0506_0708);
-    assert_eq!(msg.kind, SalMessageKind::Backfill);
-    assert!(msg.zone_end && msg.in_request_order && !msg.shared);
-    assert_eq!(msg.request_id, 0x0A0B_0C0D);
-    assert_eq!(msg.target_id, 0xABCD_1234);
+    assert_eq!(msg.head.lsn, 0x0102_0304_0506_0708);
+    assert_eq!(msg.head.kind, SalMessageKind::Backfill);
+    assert!(msg.head.zone_end() && msg.head.in_request_order() && !msg.head.shared());
+    assert_eq!(msg.head.request_id, 0x0A0B_0C0D);
+    assert_eq!(msg.head.target_id, 0xABCD_1234);
     assert_eq!((msg.base, msg.end), (per_worker, shared));
-    assert_eq!((msg.width(), msg.targets), (5, targets));
+    assert_eq!((msg.head.width(), msg.head.targets), (5, targets));
     assert_eq!(
         msg.payloads().map(<[u8]>::len).collect::<Vec<_>>(),
         vec![8, 0, 24],
         "every directory entry, the empty payload included"
     );
+    assert!(msg.intact(), "a zone member's payload checksum verifies");
+    let payload_at = per_worker as usize + PREFIX_BYTES + group_header_size(3);
+    // SAFETY: the first payload byte of the group laid out above.
+    unsafe { *log.ptr().add(payload_at) ^= 1 };
+    assert!(
+        !group_at(log.log(), per_worker).intact(),
+        "a flipped payload byte fails it"
+    );
 
     let msg = group_at(log.log(), shared);
-    assert!(msg.shared && !msg.zone_end && !msg.in_request_order);
-    assert_eq!((msg.width(), msg.targets, msg.request_id), (5, targets, 0));
+    assert!(msg.head.shared() && !msg.head.zone_end() && !msg.head.in_request_order());
+    assert_eq!(
+        (msg.head.width(), msg.head.targets, msg.head.request_id),
+        (5, targets, 0)
+    );
     assert_eq!(msg.payloads().map(<[u8]>::len).collect::<Vec<_>>(), vec![40]);
     assert!(
         matches!(log.log().read_at(shared, EpochGate::Live(u32::MAX)), SalStep::Group(_)),
@@ -656,7 +651,11 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
     let view = log.log();
 
     restamp_header(&mut log, |hdr| hdr[OFF_KIND] = SalMessageKind::Tick.as_wire());
-    assert_eq!(group_at(view, 0).kind, SalMessageKind::Tick, "the re-stamp verifies");
+    assert_eq!(
+        group_at(view, 0).head.kind,
+        SalMessageKind::Tick,
+        "the re-stamp verifies"
+    );
 
     let unknown = (0..=u8::MAX)
         .find(|&b| SalMessageKind::from_wire(b).is_none())
@@ -671,7 +670,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
         hdr[OFF_KIND] = SalMessageKind::ScanSpec.as_wire();
         hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER;
     });
-    assert!(group_at(view, 0).zone_end, "both known flags verify");
+    assert!(group_at(view, 0).head.zone_end(), "both known flags verify");
 
     restamp_header(&mut log, |hdr| gnitz_wire::write_u64_le(hdr, OFF_LSN, 0));
     assert!(
@@ -689,7 +688,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
     );
 
     restamp_header(&mut log, |hdr| hdr[OFF_FLAGS] = 0);
-    assert_eq!(group_at(view, 0).width(), 1, "the re-stamp verifies");
+    assert_eq!(group_at(view, 0).head.width(), 1, "the re-stamp verifies");
     restamp_header(&mut log, |hdr| hdr[OFF_WIDTH] = MAX_WORKERS as u8 + 1);
     assert!(
         matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
@@ -701,7 +700,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
         hdr[OFF_WIDTH] = 1;
         hdr[OFF_FLAGS] = FLAG_SHARED;
     });
-    assert!(group_at(view, 0).shared, "the re-stamp verifies");
+    assert!(group_at(view, 0).head.shared(), "the re-stamp verifies");
     restamp_header(&mut log, |hdr| {
         gnitz_wire::write_u64_le(hdr, OFF_TARGETS, 0b11);
     });
@@ -712,25 +711,21 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
 }
 
 // ---------------------------------------------------------------------------
-// The live drain's response to the two verdicts the digest can produce: a
-// leftover parks, damage aborts.
+// The live drain's response to what the gates reject: a leftover parks, damage
+// aborts.
 // ---------------------------------------------------------------------------
 
 /// The prefix gate compares an unauthenticated copy of the epoch, so a leftover
 /// whose prefix epoch flipped up to the current one passes it with an entirely
-/// intact older header. Only the header's own epoch rejects it — and it must
-/// park, not abort: this is a leftover, not damage.
+/// intact older header. A prefix the master published carries its header's
+/// epoch, so the mismatch is damage.
 #[test]
-fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
+fn the_live_gate_reads_a_raised_prefix_epoch_over_an_older_header_as_corrupt() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(7, 11, SalMessageKind::ScanSpec, &[&[0u8; 32]]);
     // Raise only the prefix's epoch copy: 1 -> 2, header untouched.
     unsafe { prefix_atomic(log.ptr(), 0).store(epoch_word(2, PRESENT), Ordering::Relaxed) };
-    let reader = SalReader::new(log.log(), 0, 2);
-    assert!(
-        reader.next().is_none(),
-        "a previous epoch's group must park, whatever its prefix claims"
-    );
+    assert!(matches!(log.log().read_at(0, EpochGate::Live(2)), SalStep::Corrupt));
 }
 
 /// A digest mismatch under a passing epoch gate can only be corruption, and the
@@ -910,14 +905,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
         let wire = msg.encode_to_vec();
         let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         let rows = sal_rows(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
-        let hdr = ControlHeader {
-            status: msg.status,
-            target_id: msg.target_id,
-            flags: msg.flags,
-            arg0: msg.arg0,
-            arg1: msg.arg1,
-        };
-        assert_eq!(control.hdr, hdr, "shape {shape}");
+        assert_eq!(control.hdr, msg.header(), "shape {shape}");
         assert_eq!(&wire[control.blob], msg.blob, "shape {shape}");
         assert_eq!(control.schema.map(|r| &wire[r]), msg.schema_block, "shape {shape}");
         match (sent, rows) {

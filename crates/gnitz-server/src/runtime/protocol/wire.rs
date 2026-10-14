@@ -1,6 +1,6 @@
 //! Wire protocol: IPC message codec, encode/decode.
 
-use gnitz_wire::control::DecodedControl;
+use gnitz_wire::control::{ControlHeader, DecodedControl};
 use gnitz_wire::{WireFault, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -70,17 +70,22 @@ impl<'a> WireMsg<'a> {
             + self.data.map_or(0, |d| d.byte_size())
     }
 
+    /// The control header this frame carries.
+    pub(crate) fn header(&self) -> ControlHeader {
+        ControlHeader {
+            status: self.status,
+            target_id: self.target_id,
+            flags: self.flags,
+            arg0: self.arg0,
+            arg1: self.arg1,
+        }
+    }
+
     /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
     pub fn encode(&self, out: &mut [u8]) {
         let mut pos = gnitz_wire::control::encode_frame_head(
             out,
-            &gnitz_wire::control::ControlHeader {
-                status: self.status,
-                target_id: self.target_id,
-                flags: self.flags,
-                arg0: self.arg0,
-                arg1: self.arg1,
-            },
+            &self.header(),
             self.blob,
             self.schema_block,
             self.data.is_some(),

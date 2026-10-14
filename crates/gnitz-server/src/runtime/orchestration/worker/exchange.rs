@@ -54,7 +54,7 @@ impl WorkerProcess<'_> {
             // reach it.
             SalRequest::Read(read) => {
                 let registry = &self.catalog.registry;
-                match registry.relation(read.target()).is_some_and(|r| r.kind().is_view()) {
+                match registry.relation(route.target_id).is_some_and(|r| r.kind().is_view()) {
                     true => self.replies.push_back(Owed::Parked(route, read, rows)),
                     false => {
                         let answer = answer(self.catalog, &read, rows.as_deref());

@@ -12,7 +12,7 @@ const TID: u64 = 16;
 /// The zone LSNs a quiescent log commits, in log order.
 fn committed(log: SalLog) -> Vec<u64> {
     let tail = CommittedTail::read(log).expect("the anchor verifies");
-    let mut lsns: Vec<u64> = tail.groups().map(|m| m.lsn).collect();
+    let mut lsns: Vec<u64> = tail.groups().map(|m| m.head.lsn).collect();
     lsns.dedup();
     lsns
 }
@@ -20,7 +20,7 @@ fn committed(log: SalLog) -> Vec<u64> {
 /// The `(lsn, target_id)` of each group the walk reads from 0.
 fn walk(log: SalLog) -> Vec<(u64, u64)> {
     let epoch = log.anchor().expect("the anchor verifies");
-    log.walk(epoch).map(|m| (m.lsn, m.target_id)).collect()
+    log.walk(epoch).map(|m| (m.head.lsn, m.head.target_id)).collect()
 }
 
 // -----------------------------------------------------------------------
@@ -244,7 +244,7 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     let members: Vec<(u64, u64)> = CommittedTail::read(log.log())
         .unwrap()
         .groups()
-        .map(|m| (m.lsn, m.target_id))
+        .map(|m| (m.head.lsn, m.head.target_id))
         .collect();
     assert_eq!(
         members,

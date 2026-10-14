@@ -21,10 +21,9 @@ use std::cell::{Cell, RefCell};
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
-use crate::runtime::sal::{
-    Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter, WorkerSet,
-};
+use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter};
 use gnitz_wire::{BoundPeek, PkColList, WireFault};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
@@ -54,9 +53,6 @@ pub struct MasterDispatcher {
     /// Keys one presence cache holds before it is dropped whole.
     /// `GNITZ_FK_PRESENCE_KEYS` lowers it, so tests reach it on small tables.
     fk_presence_cap: usize,
-
-    /// A recoverable push group was written since the last base round.
-    unflushed_pushes: Cell<bool>,
 
     /// The last tick round allocated, one per tid a tick group carries. Starts at 1, which is
     /// never emitted, so `after_tick = 0` names no round.
@@ -89,10 +85,10 @@ struct ReadRoute {
 
 /// Which workers answer a read, bounded by `blob`, of a relation with `schema`
 /// placed by `placement`, and what each is sent.
-fn route_read(schema: &SchemaDescriptor, placement: Placement, blob: Option<&[u8]>, nw: usize) -> ReadRoute {
+fn route_read(schema: &SchemaDescriptor, placement: Placement, blob: &[u8], nw: usize) -> ReadRoute {
     let whole = |set| ReadRoute { set, per_worker: None };
     let owner = |k: &[u8]| placement.owner(k, nw).expect("a key-routed placement owns every key");
-    match (placement, blob.and_then(gnitz_wire::peek_bound)) {
+    match (placement, gnitz_wire::peek_bound(blob)) {
         (Placement::Replicated, _) => whole(WorkerSet::one(Placement::REPLICA_OWNER as usize)),
         (_, Some(BoundPeek::Range(r))) => whole(
             placement
@@ -122,7 +118,8 @@ fn route_read(schema: &SchemaDescriptor, placement: Placement, blob: Option<&[u8
     }
 }
 
-/// Scan-shaped requests being written under one SAL hold.
+/// Scan-shaped requests written under one SAL hold: one cut, whose replies each
+/// worker sends in request order.
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
@@ -134,11 +131,7 @@ impl<'d> ScanCut<'d> {
     pub(crate) fn push(&mut self, set: WorkerSet, group: DirectGroup<'_>) -> Result<(), WireFault> {
         let lease = self.disp.reactor.lease_train(set, group.request.kind());
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
-        self.excl.write(&DirectGroup {
-            // Only a later scan of a cut has a train of the cut to stay behind.
-            targets: lease.targets(!self.scans.is_empty()),
-            ..group
-        })?;
+        self.excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
         self.scans.push(lease);
         Ok(())
     }
@@ -164,29 +157,24 @@ impl<'d> ScanCut<'d> {
     /// `group`, a read, written to the workers its target and bound reach, each
     /// sent its own key set when the bound splits one.
     pub(crate) fn read(&mut self, group: DirectGroup<'_>) -> Result<(), WireFault> {
-        let SalRequest::Read(read) = &group.request else {
-            unreachable!("a cut routes reads; {:?} is none", group.request)
-        };
-        let bound = match read {
-            Read::ScanSpec { spec, .. } | Read::Delta { spec, .. } => Some(&spec[..]),
-            _ => None,
-        };
-        let tid = read.target();
+        assert!(
+            matches!(group.request, SalRequest::Read(_)),
+            "a cut routes reads; {:?} is none",
+            group.request
+        );
+        let head = group.request.template();
         let (schema, placement) = self
             .disp
             .cat()
             .registry
-            .relation(tid)
+            .relation(head.target_id)
             .map(|rel| (rel.schema(), rel.placement()))
-            .unwrap_or_else(|| panic!("master: no relation for target_id={tid}"));
-        let route = route_read(&schema, placement, bound, self.disp.num_workers());
-        self.push(
-            route.set,
-            DirectGroup {
-                extras: route.per_worker.as_deref(),
-                ..group
-            },
-        )
+            .unwrap_or_else(|| panic!("master: no relation for target_id={}", head.target_id));
+        let route = route_read(&schema, placement, head.blob, self.disp.num_workers());
+        // Only a rowless read is split by key set: its blobs replace nothing.
+        debug_assert!(route.per_worker.is_none() || matches!(group.data, GroupData::Same(None)));
+        let data = route.per_worker.as_deref().map_or(group.data, GroupData::Blobs);
+        self.push(route.set, DirectGroup { data, ..group })
     }
 }
 

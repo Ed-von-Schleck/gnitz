@@ -48,25 +48,6 @@ fn every_request() -> Vec<SalRequest<'static>> {
     ]
 }
 
-fn head_of(msg: &WireMsg<'_>) -> ControlHeader {
-    ControlHeader {
-        status: msg.status,
-        target_id: msg.target_id,
-        flags: msg.flags,
-        arg0: msg.arg0,
-        arg1: msg.arg1,
-    }
-}
-
-#[test]
-fn every_request_decodes_from_its_own_template() {
-    for request in every_request() {
-        let template = request.template();
-        let decoded = SalRequest::decode(request.kind(), &head_of(&template), template.blob);
-        assert_eq!(decoded.as_ref(), Ok(&request));
-    }
-}
-
 /// The head a worker decodes is the one `lay_out` wrote: every request through
 /// a written group, the two that carry rows through their own constructors.
 #[test]
@@ -90,10 +71,10 @@ fn every_request_decodes_from_its_written_group() {
             .next()
             .expect("the group addresses the worker");
         let control = peek_control_block(slot).expect("a control block");
-        let decoded = SalRequest::decode(msg.kind, &control.hdr, &slot[control.blob.clone()]);
+        let decoded = SalRequest::decode(msg.head.kind, &control.hdr, &slot[control.blob.clone()]);
         assert_eq!(decoded.as_ref(), Ok(&group.request));
-        assert_eq!(msg.kind, group.request.kind());
-        assert_eq!(msg.target_id, group.request.template().target_id);
+        assert_eq!(msg.head.kind, group.request.kind());
+        assert_eq!(msg.head.target_id, group.request.template().target_id);
         assert_eq!(control.data.is_some(), group.schema.is_some(), "{:?}", group.request);
     }
 }

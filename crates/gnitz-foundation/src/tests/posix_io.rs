@@ -29,3 +29,14 @@ fn set_sockopt_int_reports_a_refused_option() {
     let err = set_sockopt_int(-1, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EBADF));
 }
+
+#[test]
+fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
+    let root = tempfile::tempdir().unwrap();
+    fsync_dir(root.path().to_str().unwrap()).unwrap();
+    let missing = root.path().join("absent");
+    assert_eq!(
+        fsync_dir(missing.to_str().unwrap()).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}

@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use super::test_support::*;
 use super::*;
-use crate::runtime::sal::{SalMessageKind, WorkerSet};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::SalMessageKind;
 use crate::runtime::test_support::fork_child;
 
 /// An ACK drained before anything awaits it is kept for the awaiter, and `acks`
