@@ -1,7 +1,7 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
 use crate::codec::{decode_all, Writer};
-use crate::{PkColList, PkListRole, ViewProps};
+use crate::{PkColList, PkListRole, ViewBudget};
 
 wire_enum! {
     /// What a relation is, as the client sees it.
@@ -37,12 +37,12 @@ impl RelClass {
     }
 }
 
-impl From<ViewProps> for RelClass {
-    fn from(props: ViewProps) -> RelClass {
+impl From<ViewBudget> for RelClass {
+    fn from(props: ViewBudget) -> RelClass {
         match props {
-            ViewProps::Plain => RelClass::View,
-            ViewProps::Bounded { .. } => RelClass::BoundedView,
-            ViewProps::Fed { .. } => RelClass::FedView,
+            ViewBudget::Plain => RelClass::View,
+            ViewBudget::Bounded { .. } => RelClass::BoundedView,
+            ViewBudget::Fed { .. } => RelClass::FedView,
         }
     }
 }

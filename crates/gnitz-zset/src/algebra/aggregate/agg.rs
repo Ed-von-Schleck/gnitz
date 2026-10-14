@@ -460,8 +460,8 @@ impl AggValues {
                         let v = wide_native(&loc, kind, rows, row, &mut scratch);
                         let wins = if max { Ordering::Greater } else { Ordering::Less };
                         let at = self.at(k, g);
-                        if !self.has[at] || kind.cmp_native(v, self.wide(at)) == wins {
-                            self.store_wide(at, v);
+                        if !self.has[at] || kind.cmp_native(&v, self.wide(at)) == wins {
+                            self.store_wide(at, &v);
                         }
                     }
                 }

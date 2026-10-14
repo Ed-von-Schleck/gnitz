@@ -29,6 +29,8 @@ pub trait BatchView: RowSource {
     /// region pays one call to obtain both, matching the single `col_data` call
     /// its payload counterpart makes.
     fn pk_region(&self) -> (&[u8], usize);
+    /// The heap in full: a batch holds its long values verbatim.
+    fn blob(&self) -> &[u8];
 }
 
 /// The batch a map writes its computed columns into.

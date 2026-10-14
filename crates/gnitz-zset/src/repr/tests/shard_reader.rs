@@ -1,5 +1,6 @@
 use super::super::batch::{Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::batch_builder::BatchBuilder;
+use super::super::codebook::Codebook;
 use super::super::merge::ColumnarSource;
 use super::super::scatter::UnifiedSet;
 use super::super::shard_file::ShardWriteOpts;
@@ -7,16 +8,22 @@ use super::*;
 use crate::repr::error::StorageError;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema,
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema, prose,
     sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, write_u64_le};
 
-/// Write `batch` through the production writer to `dir/name`.
+/// Write `batch` through the production writer to `dir/name`, its heap coded
+/// under a codebook trained on it where that pays.
 pub(super) fn write(dir: &std::path::Path, name: &str, batch: &Batch) -> String {
     let path = dir.join(name).to_str().unwrap().to_owned();
-    batch.write_as_shard(&path, ShardWriteOpts::default()).unwrap();
+    let codebook = Codebook::for_batch(None, batch);
+    let opts = ShardWriteOpts {
+        codebook: codebook.as_deref(),
+        ..Default::default()
+    };
+    batch.write_as_shard(&path, opts).unwrap();
     path
 }
 
@@ -135,7 +142,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     for relocate in [false, true] {
         for w in [0..n, 0..0, mid.clone()] {
             // A whole heap charged dead bounds any slice's.
-            let carried = (!relocate).then(|| shard.blob().len());
+            let carried = shard.heap().plain().filter(|_| !relocate).map(<[u8]>::len);
             let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried);
             assert_eq!(
                 rows_of(&b.as_mem_batch(), schema),
@@ -199,7 +206,7 @@ pub(super) fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut
 }
 
 fn shapes() -> Vec<Shape> {
-    use Encoding::{Constant, Dict, For, Key, Raw, Seq, Sparse, TwoValue};
+    use Encoding::{Constant, Dict, For, Key, Raw, Seq, Sparse, Symbols, TwoValue};
     let u64_i64 = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
@@ -235,6 +242,11 @@ fn shapes() -> Vec<Shape> {
     let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
     let str_col = SchemaColumn::new(TypeCode::String, false);
     let two_strings = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), str_col, str_col], &[0]);
+    let three_strings = SchemaDescriptor::new(
+        &[SchemaColumn::new(TypeCode::U64, false), str_col, str_col, str_col],
+        &[0],
+    );
+    let heap_of = |schema: &SchemaDescriptor| REG_PAYLOAD_START + schema.num_payload_cols();
     let for_i64 = |b: &mut BatchBuilder, i: usize| {
         b.begin_row(i as u128, 1);
         b.put_int((1_000_000 + (i % 300) as i64) as u128);
@@ -533,6 +545,49 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: two_strings,
             encodings: vec![(REG_PAYLOAD_START, Dict), (REG_PAYLOAD_START + 1, Seq)],
+        },
+        Shape {
+            label: "a coded heap under a column of distinct values",
+            written: build(string, 2 * DECODE_BLOCK_ROWS + 7, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&prose(i));
+            }),
+            reader: string,
+            encodings: vec![(REG_PAYLOAD_START, Seq), (heap_of(&string), Symbols)],
+        },
+        // A dictionary's, a constant's and a sequence's values share one coded heap.
+        Shape {
+            label: "a coded heap under three images",
+            written: build(three_strings, DECODE_BLOCK_ROWS + 300, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&prose(i % 40));
+                b.put_string(&prose(1_000_000));
+                b.put_string(&prose(i));
+            }),
+            reader: three_strings,
+            encodings: vec![
+                (REG_PAYLOAD_START, Dict),
+                (REG_PAYLOAD_START + 1, Constant),
+                (REG_PAYLOAD_START + 2, Seq),
+                (heap_of(&three_strings), Symbols),
+            ],
+        },
+        // Random letters: no table codes them to three quarters of their bytes.
+        Shape {
+            label: "an incompressible heap stays plain",
+            written: {
+                let mut rng = crate::test_support::Rng::new(7);
+                build(string, 600, |b, i| {
+                    b.begin_row(i as u128, 1);
+                    b.put_string(
+                        &(0..40)
+                            .map(|_| (b'a' + (rng.next_u64() % 26) as u8) as char)
+                            .collect::<String>(),
+                    );
+                })
+            },
+            reader: string,
+            encodings: vec![(REG_PAYLOAD_START, Seq), (heap_of(&string), Raw)],
         },
         Shape {
             label: "u128 pk across the u64 boundary",
@@ -845,7 +900,7 @@ fn shard_wider_than_reader_schema_opens() {
         .unwrap();
     assert!((0..3).all(|row| rebound.get_null_word(row) == 0));
     // The blob region came from the *file's* index, not the reader's.
-    assert!(shard.blob().is_empty());
+    assert_eq!(shard.heap().plain_len(), 0);
 }
 
 /// An all-PK table widened by `ADD COLUMN` has a skeleton's region shape, and
@@ -885,6 +940,8 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
         (blob, Encoding::Dict as u8),
         (blob, Encoding::Constant as u8),
         (filter, Encoding::Constant as u8),
+        (filter, Encoding::Symbols as u8),
+        (REG_PAYLOAD_START, Encoding::Symbols as u8),
     ];
     for &(region, enc) in cases {
         let opened = open_patched_restamped(&path, &schema, &base, |data| {
@@ -896,6 +953,54 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
             "encoding {enc:#x} on region {region} must be rejected",
         );
     }
+}
+
+/// A coded heap's table is body bytes the open parses: a table its image cannot
+/// hold, or one no decode may read, refuses the open. A plain heap read as a
+/// coded one is one of these.
+#[test]
+fn a_symbol_table_its_image_cannot_hold_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_pk_u64_payload_string();
+    let batch = build(schema, 400, |b, i| {
+        b.begin_row(i as u128, 1);
+        b.put_string(&prose(i));
+    });
+    let path = write(dir.path(), "coded.db", &batch);
+    let base = std::fs::read(&path).unwrap();
+    let blob = num_regions(schema.num_payload_cols()) - 1;
+    let heap = &spans_of(&base)[blob];
+    assert_eq!(heap.encoding, Encoding::Symbols, "premise: the heap is coded");
+    let (count, n) = (
+        heap.off + SYMBOLS_COUNT_AT,
+        gnitz_wire::read_u64_le(&base, heap.off + SYMBOLS_COUNT_AT),
+    );
+    let first_len = heap.off + SYMBOLS_AT + n as usize * 8;
+    // (label, offset, bytes written there)
+    let cases: [(&str, usize, &[u8]); 4] = [
+        ("more symbols than codes", count, &256u64.to_le_bytes()),
+        ("more symbols than the image", count, &u64::MAX.to_le_bytes()),
+        ("an empty symbol", first_len, &[0]),
+        ("a symbol past eight bytes", first_len, &[9]),
+    ];
+    for (label, at, bytes) in cases {
+        let opened = open_patched(&path, &schema, &base, |d| {
+            d[at..at + bytes.len()].copy_from_slice(bytes)
+        });
+        assert_eq!(opened.err(), Some(StorageError::Corrupt("region size")), "{label}");
+    }
+    let plain = small_shard(dir.path(), 8, 1);
+    let plain_base = std::fs::read(&plain).unwrap();
+    let u64_i64 = make_schema_u64_i64();
+    let plain_blob = num_regions(u64_i64.num_payload_cols()) - 1;
+    let opened = open_patched_restamped(&plain, &u64_i64, &plain_base, |data| {
+        patch_entry(data, plain_blob, |e| e.encoding = Encoding::Symbols as u8);
+    });
+    assert_eq!(
+        opened.err(),
+        Some(StorageError::Corrupt("region size")),
+        "an empty heap read as coded"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -917,8 +1022,8 @@ fn slice_relocates_only_its_own_strings() {
         b.put_string(&wide_string(i, W));
     });
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
-    assert_eq!(shard.blob().len(), N * W);
-    let string = |b: &Batch, i: usize| gnitz_wire::payload_str(b, i, 0).unwrap().to_owned();
+    assert_eq!(shard.heap().plain().map(<[u8]>::len), Some(N * W));
+    let string = |b: &Batch, i: usize| gnitz_wire::payload_str(b, i, 0).unwrap().into_owned();
 
     let one = shard.slice_to_owned_batch(37, 1);
     assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
@@ -934,7 +1039,11 @@ fn slice_relocates_only_its_own_strings() {
         "at the cut the whole region is copied, the rows left out charged dead"
     );
     let full = shard.slice_to_owned_batch(0, N);
-    assert_eq!(full.blob.as_slice(), shard.blob(), "whole shard: verbatim");
+    assert_eq!(
+        Some(full.blob.as_slice()),
+        shard.heap().plain(),
+        "whole shard: verbatim"
+    );
 
     for i in 0..CUT - 1 {
         assert_eq!(string(&under, i), wide_string(i, W), "relocated row {i}");
@@ -953,7 +1062,11 @@ fn a_relocating_slice_copies_a_shared_span_once() {
         b.put_string(&wide_string(i % 2, 40));
     });
     let shard = MappedShard::open(&write(dir.path(), "shared.db", &batch), &schema).unwrap();
-    assert_eq!(shard.blob().len(), 2 * 40, "premise: rows 0 and 2 share one span");
+    assert_eq!(
+        shard.heap().plain().map(<[u8]>::len),
+        Some(2 * 40),
+        "premise: rows 0 and 2 share one span"
+    );
     let slice = shard.slice_to_owned_batch_with(0, 3, None);
     assert_eq!(slice.blob.len(), 2 * 40);
     for i in 0..3 {

@@ -14,7 +14,7 @@ use super::writer::DirectWriter;
 use crate::schema::payload_order::compare_rows;
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_wire::RowSource;
-use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
+use gnitz_wire::{read_i64_le, read_u64_le, Heap, TypeCode};
 
 // ── Region indices ──────────────────────────────────────────────────────────
 //
@@ -735,6 +735,12 @@ impl Batch {
     /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
     /// eliminated, §2).
     pub(crate) fn debug_verify_consolidated(&self) {
+        self.debug_verify_consolidated_over(self);
+    }
+
+    /// [`debug_verify_consolidated`](Self::debug_verify_consolidated) of this
+    /// batch's rows as `rows` reads them, over a heap other than its own.
+    pub(crate) fn debug_verify_consolidated_over(&self, rows: &impl RowSource) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -745,7 +751,7 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
-                let ord = crate::schema::payload_order::compare_full_rows(&self.schema, self, i, self, i + 1);
+                let ord = crate::schema::payload_order::compare_full_rows(&self.schema, rows, i, rows, i + 1);
                 debug_assert_eq!(
                     ord,
                     std::cmp::Ordering::Less,
@@ -818,7 +824,7 @@ impl Batch {
             for (pi, col) in in_schema.payload_columns() {
                 w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
                 if col.type_code.is_german_string() {
-                    w.rebase_string_col(first_slot + pi, &self.blob, heap_at);
+                    w.rebase_string_col(first_slot + pi, Heap::Plain(&self.blob), heap_at);
                 }
             }
             rest(w);
@@ -1131,28 +1137,28 @@ impl Batch {
             return;
         }
         self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row));
-        let src_blob = source.blob();
+        let src_heap = source.heap();
         for pi in 0..self.schema.num_payload_cols() {
             let col = self.schema.columns()[self.schema.payload_col_idx(pi)];
             let cell = source.get_col_ptr(row, pi, col.size());
-            self.append_payload_cell(pi, col.type_code, cell, src_blob, blob_cache.as_deref_mut());
+            self.append_payload_cell(pi, col.type_code, cell, src_heap, blob_cache.as_deref_mut());
         }
         self.commit_row();
     }
 
     /// Append `cell` into output slot `out_pi`, relocating a STRING/BLOB struct
-    /// into `self.blob` against `src_blob`.
+    /// into `self.blob` out of `src_heap`.
     #[inline(always)]
     fn append_payload_cell(
         &mut self,
         out_pi: usize,
         type_code: TypeCode,
         cell: &[u8],
-        src_blob: &[u8],
+        src_heap: Heap<'_>,
         blob_cache: Option<&mut BlobCache>,
     ) {
         if type_code.is_german_string() {
-            let dest = relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
+            let dest = relocate_german_string_vec(cell, src_heap, &mut self.blob, blob_cache);
             self.extend_col(out_pi, &dest);
         } else {
             self.extend_col(out_pi, cell);
@@ -1181,7 +1187,7 @@ impl Batch {
                         continue;
                     }
                     let cell = src.get_col_ptr(row, slot as usize, size as usize);
-                    self.append_payload_cell(out_pi, type_code, cell, src.blob(), None);
+                    self.append_payload_cell(out_pi, type_code, cell, src.heap(), None);
                 }
             }
         }
@@ -1353,8 +1359,8 @@ impl RowSource for Batch {
         Batch::get_col_ptr(self, row, payload_col, col_size)
     }
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        Batch::blob(self)
+    fn heap(&self) -> Heap<'_> {
+        Heap::Plain(Batch::blob(self))
     }
     #[inline(always)]
     fn row_count(&self) -> usize {

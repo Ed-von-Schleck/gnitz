@@ -10,7 +10,7 @@ use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
     lock_data_dir, DirLock, IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
-use gnitz_wire::{PkColList, ViewProps};
+use gnitz_wire::{PkColList, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -166,10 +166,11 @@ impl Copies {
     ) -> Result<(), String> {
         let spec = RelationSpec {
             id: tid,
-            kind: RelationKind::View(ViewProps::Plain),
+            kind: RelationKind::View(ViewBudget::Plain),
             schema,
             placement: Placement::Local,
             pk_repeats: rec.pk_repeats,
+            compress: false,
         };
         match resume {
             Some(generation) => self.registry.reopen_view(spec, generation)?,

@@ -47,3 +47,12 @@ def test_a_transaction_writing_a_stream_is_refused_whole(conn):
             txn.push(t_tid, gnitz.ZSetBatch(t_schema).extend([{"id": 1, "kind": 1}]))
             txn.push(s_tid, gnitz.ZSetBatch(s_schema).extend([{"id": 2, "kind": 2, "amount": 2}]))
     assert bag(conn.scan(t_tid, t_schema)) == {}, "the table's write must be refused with it"
+
+
+def test_a_stream_cannot_be_compressed(module_client):
+    """A stream holds no rows, so it has no store to compress."""
+    with pytest.raises(gnitz.GnitzError, match="cannot be compressed"):
+        module_client.execute_sql(
+            "CREATE TABLE sc (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, body TEXT NOT NULL) "
+            "WITH (stream = true, compress = true)"
+        )

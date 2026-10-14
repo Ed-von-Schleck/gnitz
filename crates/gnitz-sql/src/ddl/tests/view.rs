@@ -31,15 +31,23 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
 #[test]
 fn each_budget_decodes_to_its_view_class() {
     assert_eq!(
-        options_of("WITH (capacity = '1 MB')").unwrap(),
-        ViewProps::Bounded {
+        options_of("WITH (capacity = '1 MB')").unwrap().budget,
+        ViewBudget::Bounded {
             capacity_bytes: NonZeroU64::new(1 << 20).unwrap()
         }
     );
     assert_eq!(
-        options_of("WITH (delta = '2 KB')").unwrap(),
-        ViewProps::Fed {
+        options_of("WITH (delta = '2 KB')").unwrap().budget,
+        ViewBudget::Fed {
             delta_bytes: NonZeroU64::new(2 << 10).unwrap()
         }
     );
+}
+
+#[test]
+fn compress_is_a_boolean_beside_any_budget() {
+    let props = options_of("WITH (capacity = '1 MB', compress = true)").unwrap();
+    assert!(props.compress && matches!(props.budget, ViewBudget::Bounded { .. }));
+    assert!(!options_of("WITH (delta = '2 KB')").unwrap().compress);
+    assert!(options_of("WITH (compress = 1)").is_err(), "not a boolean");
 }

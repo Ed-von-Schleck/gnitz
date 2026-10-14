@@ -123,6 +123,8 @@ fn rewrite_targets(
     ram_tier_bytes: usize,
     chunk_rows: usize,
 ) -> Result<(), StorageError> {
+    // The relay writes its copy's heaps plain: a compressed relation's store
+    // codes them as its compactions rewrite them.
     let open = |of: u32| {
         cluster_children(of)
             .map(|c| {
@@ -132,6 +134,7 @@ fn rewrite_targets(
                     RecoverySource::SalReplay,
                     ram_tier_bytes,
                     None,
+                    false,
                 )
             })
             .collect::<Result<Vec<Table>, _>>()

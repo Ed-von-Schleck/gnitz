@@ -18,7 +18,7 @@ MAGIC = 0x31305F5A54494E47
 HEADER_SIZE = 64
 DIR_ENTRY_SIZE = 16
 ALIGNMENT = 64
-ENCODINGS = ["raw", "constant", "two-value", "for", "dict", "seq", "sparse", "key"]
+ENCODINGS = ["raw", "constant", "two-value", "for", "dict", "seq", "sparse", "key", "symbols"]
 
 _SLOT = re.compile(r"^(?:(.*)_)?w\d+of\d+$")
 
@@ -83,6 +83,55 @@ def read_shards(data_dir, min_relation=0):
         if relation >= min_relation:
             out.append(read_shard(path, relation, store))
     return out
+
+
+class Heap:
+    """A shard's string heap, read value by value: its values verbatim, or each
+    coded under the symbol table of a `symbols` region (FSST: a code stands for
+    its symbol's bytes, the escape code for the byte after it)."""
+
+    ESCAPE = 255
+
+    def __init__(self, region):
+        image = region.data
+        self.coded = region.encoding == "symbols"
+        if not self.coded:
+            self.data = image
+            return
+        # The decoded bytes, the trained ratio, the symbol count; then the
+        # symbols, eight bytes each, and their lengths.
+        _plain_len, _trained, n = struct.unpack_from("<3Q", image, 0)
+        at = 24
+        lens = image[at + 8 * n:at + 9 * n]
+        self.symbols = [image[at + 8 * c:at + 8 * c + lens[c]] for c in range(n)]
+        self.data = image[at + 9 * n:]
+
+    def value(self, at, n):
+        """The value of `n` bytes stored from `at`, with where the next one
+        starts; None where the heap does not hold it. A coded value is its code
+        count (LEB128), then its codes."""
+        if not self.coded:
+            return (self.data[at:at + n], at + n) if at + n <= len(self.data) else None
+        count, shift, i = 0, 0, at
+        while True:
+            if i >= len(self.data):
+                return None
+            byte = self.data[i]
+            i += 1
+            count |= (byte & 0x7F) << shift
+            if byte < 0x80:
+                break
+            shift += 7
+        if i + count > len(self.data):
+            return None
+        out = bytearray()
+        codes = iter(self.data[i:i + count])
+        for c in codes:
+            if c == self.ESCAPE:
+                out += bytes([next(codes, 0)])
+            else:
+                out += self.symbols[c] if c < len(self.symbols) else b"\0"
+        return bytes(out[:n]).ljust(n, b"\0"), i + count
 
 
 def region_class(region):

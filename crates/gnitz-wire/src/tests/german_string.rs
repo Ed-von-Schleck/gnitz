@@ -143,7 +143,10 @@ fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
     write_u64_le(&mut b, 8, 900);
     let blob = vec![0u8; 4];
     assert_eq!(german_string_content(&a, &blob), &[] as &[u8]);
-    assert_eq!(compare_german_strings(&a, &blob, &b, &blob), Ordering::Equal);
+    assert_eq!(
+        compare_german_strings(&a, Heap::Plain(&blob), &b, Heap::Plain(&blob)),
+        Ordering::Equal
+    );
     // And the boundary predicate rejects both, so they never get this far
     // on a real ingest path.
     assert!(!german_string_cell_ok(&a, &blob));
@@ -167,7 +170,7 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
         german_string_content(&dirty, &blob)
     );
     assert_ne!(
-        compare_german_strings(&clean, &blob, &dirty, &blob),
+        compare_german_strings(&clean, Heap::Plain(&blob), &dirty, Heap::Plain(&blob)),
         Ordering::Equal,
         "the pad is compare-visible — that is exactly what cell_ok must reject"
     );
@@ -182,7 +185,7 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     // The tail word is compared under the content's mask, so this pad is not
     // compare-visible: the cells order as their contents do.
     assert_eq!(
-        compare_german_strings(&clean_suffix, &blob, &dirty_suffix, &blob),
+        compare_german_strings(&clean_suffix, Heap::Plain(&blob), &dirty_suffix, Heap::Plain(&blob)),
         Ordering::Equal
     );
 
@@ -233,12 +236,13 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
         for (i, di) in data.iter().enumerate() {
             for (j, dj) in data.iter().enumerate() {
                 assert_eq!(
-                    compare_german_strings(&x.0[i], &x.1, &y.0[j], &y.1),
+                    compare_german_strings(&x.0[i], Heap::Plain(&x.1), &y.0[j], Heap::Plain(&y.1)),
                     di.cmp(dj),
                     "compare mismatch for {di:?} vs {dj:?}",
                 );
                 // The lead decides only what the contents decide the same way.
-                let lead = german_string_lead(&x.0[i], &x.1).cmp(&german_string_lead(&y.0[j], &y.1));
+                let lead =
+                    german_string_lead(&x.0[i], Heap::Plain(&x.1)).cmp(&german_string_lead(&y.0[j], Heap::Plain(&y.1)));
                 assert!(
                     lead == Ordering::Equal || lead == di.cmp(dj),
                     "lead of {di:?} vs {dj:?}"

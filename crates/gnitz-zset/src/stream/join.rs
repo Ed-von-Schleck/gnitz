@@ -20,7 +20,7 @@ use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
 use gnitz_wire::RowSource;
-use gnitz_wire::{null_word_at, JoinKind, PkBuf, RangeRel, TypeCode};
+use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, TypeCode};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -420,7 +420,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                 delta_runs(pairs)
             );
             if col.type_code.is_german_string() {
-                w.rebase_string_col(slot, delta.blob(), heap_at);
+                w.rebase_string_col(slot, Heap::Plain(delta.blob()), heap_at);
             }
         }
 
@@ -435,7 +435,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                         let (t_src, t_row) = trace_row(p);
                         let cell = relocate_german_string_vec(
                             t_src.get_col_ptr(t_row, pi as usize, 16),
-                            t_src.blob(),
+                            t_src.heap(),
                             dst_blob,
                             cache.as_deref_mut(),
                         );

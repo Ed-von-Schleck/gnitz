@@ -65,7 +65,7 @@ fn opk_codec_over_every_pk_type() {
             for (j, b) in les.iter().enumerate() {
                 assert_eq!(
                     opk.cmp(&keys[j]),
-                    cmp_col_window(&le[..sz], &[], &b[..sz], &[], tc),
+                    cmp_col_window(&le[..sz], &b[..sz], tc),
                     "tc={tc}: pattern {i} vs {j}"
                 );
             }

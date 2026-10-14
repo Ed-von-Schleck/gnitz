@@ -67,7 +67,7 @@ impl CatalogEngine {
         let row = self.live_sys_row(SysFamily::Circuit, id).ok_or("has no circuit row")?;
         let (src, ri) = row.source();
         let Ok(stored) = gnitz_wire::sys_rows::CircuitRow::read(src, ri);
-        gnitz_wire::Circuit::decode(stored.circuit)
+        gnitz_wire::Circuit::decode(&stored.circuit)
     }
 
     /// Visit every live row of `family` whose leading key column is `leading`: the
@@ -146,7 +146,7 @@ impl CatalogEngine {
         let row = self.live_sys_row(SysFamily::Schema, sid)?;
         let (src, ri) = row.source();
         let stored = SchemaTabRow::read(src, ri).expect("a stored schema name passed the precheck");
-        Some(stored.name.to_owned())
+        Some(stored.name.into_owned())
     }
 
     /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
@@ -163,7 +163,7 @@ impl CatalogEngine {
         let schema = self.schema_name(sid).unwrap_or_else(|| "?".into());
         let name =
             payload_str(src, ri, gnitz_wire::RELTAB_PAY_NAME).expect("a stored relation name passed the precheck");
-        (schema, name.to_owned())
+        (schema, name.into_owned())
     }
 
     /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.

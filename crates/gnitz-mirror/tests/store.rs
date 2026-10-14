@@ -532,10 +532,11 @@ fn a_damaged_copy_costs_that_copy_alone() {
                 raw.reopen_view(
                     RelationSpec {
                         id: TID,
-                        kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
+                        kind: RelationKind::View(gnitz_wire::ViewBudget::Plain),
                         schema: make_schema_u64_i64(),
                         placement: gnitz_zset::algebra::Placement::Local,
                         pk_repeats: false,
+                        compress: false,
                     },
                     FIRST_GENERATION,
                 )

@@ -6,13 +6,14 @@
 //! CatalogEngine dependency.
 
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::sys_rows::{
     ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow, ViewTabRow,
 };
-use gnitz_wire::{ColumnDef, TableDistribution, ViewProps, MAX_COLUMNS};
+use gnitz_wire::{ColumnDef, TableDistribution, ViewBudget, ViewProps, MAX_COLUMNS};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -52,10 +53,12 @@ use gnitz_wire::{bool_word, PkListRole};
 pub(super) struct RelRow<'a> {
     pub(super) id: u64,
     pub(super) schema_id: u64,
-    pub(super) name: &'a str,
+    pub(super) name: Cow<'a, str>,
     pub(super) pk: PkColList,
     pub(super) kind: RelationKind,
     pub(super) detail: RelDetail,
+    /// `WITH (compress = true)`: its rows' store codes its heaps.
+    pub(super) compress: bool,
 }
 
 pub(super) enum RelDetail {
@@ -112,17 +115,17 @@ fn rel_violated(noun: &str, name: &str, id: u64, e: String) -> String {
 fn rel_from_table_row(r: TableTabRow<'_>) -> Result<RelRow<'_>, String> {
     let (id, name) = (r.table_id, r.name);
     let props = gnitz_wire::TableProps::from_flags(r.flags)
-        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), name, id, e))?;
+        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), &name, id, e))?;
     let kind = if props.stream {
         RelationKind::Stream
     } else {
         RelationKind::BaseTable
     };
     let pk = PkColList::unpack(r.pk_col_idx)
-        .map_err(|rule| rel_violated(kind.noun(), name, id, rule.for_role(PkListRole::PrimaryKey)))?;
+        .map_err(|rule| rel_violated(kind.noun(), &name, id, rule.for_role(PkListRole::PrimaryKey)))?;
     props
         .validate(pk.as_slice().len())
-        .map_err(|e| rel_violated(kind.noun(), name, id, e))?;
+        .map_err(|e| rel_violated(kind.noun(), &name, id, e))?;
     Ok(RelRow {
         id,
         schema_id: r.schema_id,
@@ -133,20 +136,22 @@ fn rel_from_table_row(r: TableTabRow<'_>) -> Result<RelRow<'_>, String> {
             distribution: props.distribution,
             serial: props.serial,
         },
+        compress: props.compress,
     })
 }
 
 fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
     let (id, name, noun) = (r.view_id, r.name, SysFamily::View.row_noun());
     let pk = PkColList::unpack(r.pk_col_idx)
-        .map_err(|rule| rel_violated(noun, name, id, rule.for_role(PkListRole::PrimaryKey)))?;
-    let props =
-        ViewProps::from_row(r.capacity_bytes, r.delta_bytes).map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
-    let pk_repeats = bool_word(r.pk_repeats).map_err(|e| rel_violated(noun, name, id, format!("pk_repeats: {e}")))?;
+        .map_err(|rule| rel_violated(noun, &name, id, rule.for_role(PkListRole::PrimaryKey)))?;
+    let budget =
+        ViewBudget::from_row(r.capacity_bytes, r.delta_bytes).map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
+    let pk_repeats = bool_word(r.pk_repeats).map_err(|e| rel_violated(noun, &name, id, format!("pk_repeats: {e}")))?;
+    let compress = bool_word(r.compress).map_err(|e| rel_violated(noun, &name, id, format!("compress: {e}")))?;
     let owner = (r.owner_view_id != 0).then_some(r.owner_view_id);
     // A chain segment is a relation the planner mints, never one an option
     // clause may name.
-    if props != ViewProps::Plain && owner.is_some() {
+    if (ViewProps { budget, compress }) != ViewProps::default() && owner.is_some() {
         return Err(format!(
             "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
         ));
@@ -156,8 +161,9 @@ fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
         schema_id: r.schema_id,
         name,
         pk,
-        kind: RelationKind::View(props),
+        kind: RelationKind::View(budget),
         detail: RelDetail::View { owner, pk_repeats },
+        compress,
     })
 }
 
@@ -455,7 +461,7 @@ impl SysFamily {
                     (SYSTEM_SCHEMA_ID, gnitz_wire::SYSTEM_SCHEMA),
                     (PUBLIC_SCHEMA_ID, "public"),
                 ] {
-                    SchemaTabRow { schema_id, name }.write(bb, 1);
+                    SchemaTabRow { schema_id, name: name.into() }.write(bb, 1);
                 }
             }
             SysFamily::Table => {
@@ -463,7 +469,7 @@ impl SysFamily {
                     let row = TableTabRow {
                         table_id: family.id(),
                         schema_id: SYSTEM_SCHEMA_ID,
-                        name: family.name(),
+                        name: family.name().into(),
                         pk_col_idx: PkColList::from_slice(family.wire().pk_cols).pack(),
                         flags: gnitz_wire::TableProps::default().pack(),
                     };

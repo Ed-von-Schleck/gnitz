@@ -276,8 +276,8 @@ fn cmp_col_window_orders_every_fixed_width_type() {
         (F32, 1.5f32.to_le_bytes().to_vec(), 2.5f32.to_le_bytes().to_vec(), Less),
     ];
     for (tc, a, b, want) in cases {
-        assert_eq!(cmp_col_window(a, &[], b, &[], *tc), *want, "{tc}");
-        assert_eq!(cmp_col_window(b, &[], a, &[], *tc), want.reverse(), "{tc} reversed");
+        assert_eq!(cmp_col_window(a, b, *tc), *want, "{tc}");
+        assert_eq!(cmp_col_window(b, a, *tc), want.reverse(), "{tc} reversed");
     }
 }
 
@@ -405,7 +405,7 @@ fn a_floats_order_image_is_the_total_order() {
             for &b in &bits {
                 assert_eq!(
                     image.cmp(&kind.order_image(b)),
-                    cmp_col_window(&a.to_le_bytes()[..w], &[], &b.to_le_bytes()[..w], &[], tc),
+                    cmp_col_window(&a.to_le_bytes()[..w], &b.to_le_bytes()[..w], tc),
                     "{kind:?}: {a:#x} vs {b:#x}"
                 );
             }

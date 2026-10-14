@@ -110,7 +110,7 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
                 "row {row}: NULL string"
             ),
             false => assert_eq!(
-                (payload_bytes(&out, dst, 2), bit(2)),
+                (&*payload_bytes(&out, dst, 2), bit(2)),
                 (text(row).to_uppercase().as_bytes(), false),
                 "row {row}"
             ),

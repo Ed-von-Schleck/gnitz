@@ -17,7 +17,7 @@ fn relocation_rebuilds_each_cell_canonically() {
     let mut dst_blob = Vec::new();
     for (src, want) in cases {
         assert_eq!(
-            relocate_german_string_vec(&src, &[0; 4], &mut dst_blob, None),
+            relocate_german_string_vec(&src, Heap::Plain(&[0; 4]), &mut dst_blob, None),
             want,
             "{src:02x?}"
         );
@@ -32,8 +32,8 @@ fn a_cached_relocation_copies_a_span_once() {
     let cell = gnitz_wire::encode_german_string(b"hello world test dat", &mut src_blob);
     let mut dst_blob = Vec::new();
     let mut cache = BlobCache::new(0);
-    let first = relocate_german_string_vec(&cell, &src_blob, &mut dst_blob, Some(&mut cache));
-    let second = relocate_german_string_vec(&cell, &src_blob, &mut dst_blob, Some(&mut cache));
+    let first = relocate_german_string_vec(&cell, Heap::Plain(&src_blob), &mut dst_blob, Some(&mut cache));
+    let second = relocate_german_string_vec(&cell, Heap::Plain(&src_blob), &mut dst_blob, Some(&mut cache));
     assert_eq!((dst_blob, first), (src_blob, second));
 }
 
@@ -49,7 +49,7 @@ fn a_session_takes_a_map_of_its_own_size() {
     let mut dst_blob = Vec::new();
     let mut large = BlobCache::new(SPANS);
     for cell in &cells {
-        relocate_german_string_vec(cell, &src_blob, &mut dst_blob, Some(&mut large));
+        relocate_german_string_vec(cell, Heap::Plain(&src_blob), &mut dst_blob, Some(&mut large));
     }
     drop(large);
     let mut again = BlobCache::new(SPANS);
@@ -57,7 +57,7 @@ fn a_session_takes_a_map_of_its_own_size() {
     drop(again);
 
     let mut small = BlobCache::new(1);
-    relocate_german_string_vec(&cells[0], &src_blob, &mut dst_blob, Some(&mut small));
+    relocate_german_string_vec(&cells[0], Heap::Plain(&src_blob), &mut dst_blob, Some(&mut small));
     assert!(small.map().capacity() <= 8, "{}", small.map().capacity());
 }
 

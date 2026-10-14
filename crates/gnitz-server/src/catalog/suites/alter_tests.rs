@@ -13,7 +13,7 @@ fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch
     let minus = engine.retract_under(SysFamily::Table, &[tid]);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     let row = TableTabRow {
-        name: new_name,
+        name: new_name.into(),
         ..TableTabRow::read(&minus, 0).unwrap()
     };
     row.write(&mut bb, 1);

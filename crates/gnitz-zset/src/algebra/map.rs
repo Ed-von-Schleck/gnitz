@@ -69,7 +69,7 @@ pub(crate) fn rebase_copied_strings(
 ) {
     for c in copies {
         if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
-            output.rebase_string_col(c.slot, src_blob, heap_at);
+            output.rebase_string_col(c.slot, gnitz_wire::Heap::Plain(src_blob), heap_at);
         }
     }
 }

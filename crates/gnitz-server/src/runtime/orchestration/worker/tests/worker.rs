@@ -274,6 +274,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
                 schema,
                 placement: gnitz_zset::algebra::Placement::full_pk(&schema),
                 pk_repeats: false,
+                compress: false,
             })
             .unwrap();
         engine

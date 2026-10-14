@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-from harness.shards import read_shards  # noqa: E402
+from harness.shards import Heap, read_shards  # noqa: E402
 
 FIRST_USER = 16
 BLOCK = 4096          # bytes per independently compressed heap block
@@ -130,10 +130,10 @@ def string_cells(data, rows, heap):
                 return None
             out.append(cell[4:4 + n])
         else:
-            off = int.from_bytes(cell[8:], "little")
-            if off + n > len(heap) or heap[off:off + 4] != cell[4:8]:
+            value = heap.value(int.from_bytes(cell[8:], "little"), n)
+            if value is None or value[0][:4] != cell[4:8]:
                 return None
-            out.append(heap[off:off + n])
+            out.append(value[0])
     return out
 
 
@@ -152,8 +152,8 @@ def seq_cells(data, rows, heap):
     heap_at, out = int.from_bytes(data[8:16], "little"), []
     for n in map(int, lens):
         if n > 12:
-            out.append(heap[heap_at:heap_at + n])
-            heap_at += n
+            value, heap_at = heap.value(heap_at, n) or (b"", heap_at + n)
+            out.append(value)
         else:
             out.append(data[pool_at:pool_at + n])
             pool_at += n
@@ -172,7 +172,7 @@ def price_shard(shard, acc):
     """Add `shard`'s current bytes and each idea's saving to `acc`."""
     rows = shard.rows
     regions = {r.role: r for r in shard.regions}
-    heap = regions["blob"].data
+    heap = Heap(regions["blob"])
     acc["current"] += shard.size
     acc["overhead (header, directory, padding)"] += shard.overhead
     acc["filter"] += len(regions["filter"].data)
@@ -244,17 +244,20 @@ def price_shard(shard, acc):
                 distinct = len(np.unique(v))
                 acc["wide int: dictionary"] += n - min(n, 16 * distinct + packed(rows, bits_for(distinct)))
 
-    if heap:
-        acc["heap bytes"] += len(heap)
-        whole = len(zstd.compress(heap, level=3))
-        acc["heap: zstd-3 whole"] += len(heap) - whole
-        acc[f"heap: zstd-3 in {BLOCK}-byte blocks"] += len(heap) - min(block_zstd(heap), len(heap))
+    # Each candidate is priced on the values themselves and saves against the
+    # heap's stored bytes, which a coded heap already shrank.
+    stored = len(regions["blob"].data)
+    plain = b"".join(dict.fromkeys(long_contents)) if heap.coded else heap.data
+    if plain:
+        acc["heap bytes"] += stored
+        acc["heap: zstd-3 whole"] += stored - min(len(zstd.compress(plain, level=3)), stored)
+        acc[f"heap: zstd-3 in {BLOCK}-byte blocks"] += stored - min(block_zstd(plain), stored)
         sample = long_contents[:: max(len(long_contents) // 2000, 1)]
         if len(sample) >= 16:
             try:
                 d = zstd.train_dict(sample, 16 << 10)
                 per_value = sum(len(zstd.compress(c, level=3, zstd_dict=d)) for c in long_contents[::7]) * 7
-                acc["heap: zstd-3 per value, 16 KiB trained dict"] += len(heap) - min(per_value + len(d.dict_content), len(heap))
+                acc["heap: zstd-3 per value, 16 KiB trained dict"] += stored - min(per_value + len(d.dict_content), stored)
             except zstd.ZstdError:
                 pass
 

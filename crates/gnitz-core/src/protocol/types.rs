@@ -904,8 +904,8 @@ impl gnitz_wire::RowSource for ZSetBatch {
     }
 
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        &self.blob
+    fn heap(&self) -> gnitz_wire::Heap<'_> {
+        gnitz_wire::Heap::Plain(&self.blob)
     }
 
     #[inline(always)]
@@ -934,6 +934,11 @@ impl gnitz_expr::BatchView for ZSetBatch {
     #[inline(always)]
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pks.buf, self.pks.stride as usize)
+    }
+
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        &self.blob
     }
 }
 

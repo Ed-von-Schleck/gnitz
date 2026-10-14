@@ -1,5 +1,7 @@
 //! Catalog precheck — the master's trust boundary against client-pushed
 //! system-table deltas.
+use std::borrow::Cow;
+
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow};
@@ -245,20 +247,20 @@ impl CatalogEngine {
     fn claim_qname<'a>(
         &self,
         sid: u64,
-        name: &'a str,
+        name: Cow<'a, str>,
         self_id: u64,
         net_dead: &IdSet,
-        claimed: &mut FxHashSet<(u64, &'a str)>,
+        claimed: &mut FxHashSet<(u64, Cow<'a, str>)>,
     ) -> Result<Option<u64>, String> {
         let schema_name = self
             .schema_name(sid)
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
-        let incumbent = self.relation_id(sid, name).filter(|&existing| existing != self_id);
+        let incumbent = self.relation_id(sid, &name).filter(|&existing| existing != self_id);
         let displaced = incumbent.filter(|&e| net_dead.contains(e));
-        if incumbent != displaced || !claimed.insert((sid, name)) {
+        if incumbent != displaced || !claimed.insert((sid, name.clone())) {
             return Err(format!(
                 "Table or view already exists: {}",
-                gnitz_wire::qualified_key(&schema_name, name)
+                gnitz_wire::qualified_key(&schema_name, &name)
             ));
         }
         Ok(displaced)
@@ -548,14 +550,14 @@ impl CatalogEngine {
         // Two `+1` rows under one name both miss the live schemas and both apply:
         // the name would resolve to the second, leaving the first id live and
         // unreachable.
-        let mut claimed: FxHashSet<&str> = FxHashSet::default();
+        let mut claimed: FxHashSet<Cow<'_, str>> = FxHashSet::default();
         for i in batch.live_rows() {
             let name = SchemaTabRow::read(batch, i).map_err(|e| format!("Schema: {e}"))?.name;
             // The full identifier rule, leading-`_` included. Nothing synthesizes
             // a schema name, so the reserved `_` prefix applies with no carve-out.
-            validate_user_identifier(name)?;
-            reject_unstorable_name(name, "schema")?;
-            if self.schema_id(name).is_some() || !claimed.insert(name) {
+            validate_user_identifier(&name)?;
+            reject_unstorable_name(&name, "schema")?;
+            if self.schema_id(&name).is_some() || !claimed.insert(name.clone()) {
                 return Err(format!("Schema already exists: {name}"));
             }
         }
@@ -582,7 +584,7 @@ impl CatalogEngine {
         sigs: &[PkSignature],
         net_dead: &IdSet,
     ) -> Result<(), String> {
-        let mut claimed: FxHashSet<(u64, &str)> = FxHashSet::default();
+        let mut claimed: FxHashSet<(u64, Cow<'_, str>)> = FxHashSet::default();
         let creates = IdSet::new(
             sigs.iter()
                 .filter(|s| s.pos.is_some() && s.neg.is_none())
@@ -618,9 +620,9 @@ impl CatalogEngine {
                     return Err(format!("{rel}: a chain segment's name starts with '_'"));
                 }
                 RelDetail::View { owner: Some(_), .. } => {}
-                _ => validate_user_identifier(rel.name)?,
+                _ => validate_user_identifier(&rel.name)?,
             }
-            reject_unstorable_name(rel.name, rel.kind.noun())?;
+            reject_unstorable_name(&rel.name, rel.kind.noun())?;
             // An FK probes its parent's store on every write of the child, which only
             // a base table's ingest runs; a stream push must stay a pure append.
             if !rel.kind.is_base_table() {
@@ -653,7 +655,7 @@ impl CatalogEngine {
                 }
                 RelDetail::View { .. } => {}
             }
-            let displaced = self.claim_qname(rel.schema_id, rel.name, rel.id, net_dead, &mut claimed)?;
+            let displaced = self.claim_qname(rel.schema_id, rel.name.clone(), rel.id, net_dead, &mut claimed)?;
             // The drop cascade would take the outgoing relation's indexes with it.
             let owns_index = |old: u64| {
                 let named = |c: &IndexClaim| matches!(c, IndexClaim::Index { .. });
@@ -739,7 +741,7 @@ impl CatalogEngine {
         // indexes are scanned, and a `+1` on one already failed the net bound, so
         // any hit is a different index.
         let live = self.sys_relation(SysFamily::Index).full_scan();
-        let mut taken: FxHashSet<&[u8]> = (0..live.len())
+        let mut taken: FxHashSet<Cow<'_, [u8]>> = (0..live.len())
             .map(|i| payload_bytes(&*live, i, IdxTabSlot::name as usize))
             .collect();
         let noun = SysFamily::Index.row_noun();
@@ -747,10 +749,10 @@ impl CatalogEngine {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             let (owner_id, cols, unique) = r.parts().map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
-            validate_user_identifier(index_name)?;
-            reject_unstorable_name(index_name, noun)?;
+            validate_user_identifier(&index_name)?;
+            reject_unstorable_name(&index_name, noun)?;
             self.validate_index_create(owner_id, cols.as_slice(), unique)?;
-            if !taken.insert(index_name.as_bytes()) {
+            if !taken.insert(Cow::Owned(index_name.as_bytes().to_vec())) {
                 return Err(format!("Index already exists: {index_name}"));
             }
         }

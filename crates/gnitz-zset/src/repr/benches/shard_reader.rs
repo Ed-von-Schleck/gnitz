@@ -1,4 +1,5 @@
 use super::super::batch::Batch;
+use super::super::codebook::Codebook;
 use super::super::scatter::UnifiedSet;
 use super::super::shard_file::ShardWriteOpts;
 use super::super::string_heap::should_relocate_blob;
@@ -11,6 +12,7 @@ use crate::test_support::{
 };
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
+use std::rc::Rc;
 
 /// The measurement `RELOCATE_CELL_COST_BYTES` is set from: cycles of a
 /// whole-heap memcpy against per-cell relocation on the *same* slice, swept over
@@ -24,7 +26,7 @@ fn slice_blob_relocate_bench() {
     let schema = make_schema_pk_u64_payload_string();
     let cycles = Counter::cycles();
     let arm = |shard: &MappedShard, rc: usize, relocate: bool| {
-        let carried = (!relocate).then(|| shard.blob().len());
+        let carried = (!relocate).then(|| shard.heap().plain().expect("a plain heap").len());
         let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried)));
         // The first slice faults in the cold mmap pages.
         slice();
@@ -32,9 +34,15 @@ fn slice_blob_relocate_bench() {
     };
 
     for w in [16usize, 40, 256, 1024] {
+        // Random letters: a heap no symbol table shrinks, so the shard's is plain.
+        let mut rng = Rng::new(w as u64);
         let batch = build(schema, N, |b, i| {
             b.begin_row(i as u128 + 1, 1);
-            b.put_string(&wide_string(i, w));
+            b.put_string(
+                &(0..w)
+                    .map(|_| (b'a' + (rng.next_u64() % 26) as u8) as char)
+                    .collect::<String>(),
+            );
         });
         let shard = MappedShard::open(&write(dir.path(), &format!("bench_{w}.db"), &batch), &schema).unwrap();
         for pct in [
@@ -42,7 +50,7 @@ fn slice_blob_relocate_bench() {
         ] {
             let rc = (N * pct / 100).max(1);
             let (reloc, copy) = (arm(&shard, rc, true), arm(&shard, rc, false));
-            let picks = match should_relocate_blob(shard.blob().len(), shard.row_count(), rc) {
+            let picks = match should_relocate_blob(shard.heap().plain_len(), shard.row_count(), rc) {
                 true => "relocate",
                 false => "memcpy  ",
             };
@@ -61,7 +69,8 @@ fn slice_blob_relocate_bench() {
 /// accessor on a fresh handle and again once its blocks are decoded, to read
 /// every weight and null word, and to materialize it through a `UnifiedSet` as a
 /// compaction does. The regions' stored sizes and encodings name what each
-/// shape packed to.
+/// shape packed to. A shape whose heap a symbol table codes is measured twice:
+/// plain, and coded under a codebook trained on it beforehand.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_read_bench() {
@@ -224,10 +233,23 @@ fn shard_read_bench() {
 
     let instructions = Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
-    for (si, (label, batch)) in shapes.iter().enumerate() {
+    let coded = shapes.iter().filter_map(|(label, batch)| {
+        let codebook = Codebook::for_batch(None, batch)?;
+        Some((format!("{label}, its heap coded"), batch, Some(codebook)))
+    });
+    let measured: Vec<(String, &Batch, Option<Rc<Codebook>>)> = shapes
+        .iter()
+        .map(|(label, batch)| (label.to_string(), batch, None))
+        .chain(coded)
+        .collect();
+    for (si, (label, batch, codebook)) in measured.iter().enumerate() {
         let schema = *batch.schema();
-        let name = format!("{si}.db");
-        let (path, write_i) = instructions.measure(|| write(dir.path(), &name, batch));
+        let path = dir.path().join(format!("{si}.db")).to_str().unwrap().to_owned();
+        let opts = ShardWriteOpts {
+            codebook: codebook.as_deref(),
+            ..Default::default()
+        };
+        let ((), write_i) = instructions.measure(|| batch.write_as_shard(&path, opts).unwrap());
         let regions: Vec<String> = ShardDirectory::read(&path)
             .unwrap()
             .regions

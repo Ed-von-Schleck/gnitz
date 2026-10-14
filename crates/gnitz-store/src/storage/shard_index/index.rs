@@ -17,7 +17,7 @@ use gnitz_wire::RowSource;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ShardWriteOpts;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{merge_guard, MappedShard};
+use gnitz_zset::repr::{merge_guard, Codebook, MappedShard};
 use gnitz_zset::schema::key::pk_ranges_overlap;
 
 /// One fold the tree owes: the shards it merges and where the merge goes.
@@ -64,22 +64,43 @@ impl ShardIndex {
             .chain(&mut self.pending)
     }
 
-    /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
-    /// defaults to that seq.
-    fn write_shard(&mut self, batch: &Batch, skeleton: bool, newest: Option<u64>) -> Result<ShardEntry, StorageError> {
+    /// Write `run`, a run spilled into the store, as an unpublished shard named
+    /// by a fresh seq, its heap coded under [`Self::codebook_for`] it.
+    fn write_shard(&mut self, run: &Batch) -> Result<ShardEntry, StorageError> {
+        let codebook = self.codebook_for(run);
+        self.write_with(None, |path, opts| {
+            run.write_as_shard(path, ShardWriteOpts { codebook: codebook.as_deref(), ..opts })
+        })
+    }
+
+    /// Write a shard named by a fresh seq through `write`, handed its path and
+    /// the store's options, and open it. `newest` defaults to that seq.
+    fn write_with(
+        &mut self,
+        newest: Option<u64>,
+        write: impl FnOnce(&str, ShardWriteOpts<'_>) -> Result<(), StorageError>,
+    ) -> Result<ShardEntry, StorageError> {
         self.shard_seq += 1;
         let seq = self.shard_seq;
         let path = manifest::shard_path(&self.output_dir, seq);
-        batch
-            .write_as_shard(
-                &path,
-                ShardWriteOpts {
-                    skeleton,
-                    skip_pk_filter: self.skip_pk_filter,
-                },
-            )
+        let opts = ShardWriteOpts {
+            skip_pk_filter: self.skip_pk_filter,
+            ..Default::default()
+        };
+        write(&path, opts)
             .and_then(|()| ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq)))
             .inspect_err(|_| self.unlink_shard(seq))
+    }
+
+    /// The codebook `run` is coded under, adopted as the store's own: none in a
+    /// store that codes no heap, or for a run too small to code.
+    fn codebook_for(&mut self, run: &Batch) -> Option<Rc<Codebook>> {
+        if !self.compress {
+            return None;
+        }
+        let codebook = Codebook::for_batch(self.codebook.as_ref(), run)?;
+        self.codebook = Some(Rc::clone(&codebook));
+        Some(codebook)
     }
 
     /// Unlink the shard drawn at `seq`, best-effort.
@@ -89,7 +110,7 @@ impl ShardIndex {
 
     /// Append `run` to L0 as one unpublished shard: the spill.
     pub(crate) fn append_l0_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        let entry = self.write_shard(run, false, None)?;
+        let entry = self.write_shard(run)?;
         let whole = PkBuf::zeroed(self.schema.pk_stride());
         self.levels[L0].get_or_create_guard(whole).entries.push(entry);
         self.owed = true;
@@ -99,7 +120,7 @@ impl ShardIndex {
     /// Write `run`, rows above the store's cut, as one unpublished shard outside
     /// every level.
     pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        let entry = self.write_shard(run, false, None)?;
+        let entry = self.write_shard(run)?;
         self.pending.push(entry);
         Ok(())
     }
@@ -193,7 +214,7 @@ impl ShardIndex {
         );
         self.abandon_fold();
         self.owed = true;
-        let entry = self.write_shard(run, false, None)?;
+        let entry = self.write_shard(run)?;
         self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
         self.levels[TERMINAL]
             .guards
@@ -333,15 +354,36 @@ impl ShardIndex {
         let before: usize = run.starts.iter().sum();
         let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
         let schema = self.schema;
-        let merged = merge_guard(&inputs, &run.fold.keys, run.next, &mut run.starts, dehydrate, &schema);
+        let codebook = self.codebook.clone();
+        let merged = merge_guard(
+            &inputs,
+            &run.fold.keys,
+            run.next,
+            &mut run.starts,
+            dehydrate,
+            &schema,
+            codebook.as_deref(),
+        );
         // Row share stands in for byte share.
         let (rows, bytes): (usize, u64) = inputs
             .iter()
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
         let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
         *read += (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
-        if let Some((skeleton, batch)) = merged {
-            match self.write_shard(&batch, skeleton, Some(run.newest)) {
+        if let Some((skeleton, merged)) = merged {
+            // A store that has coded no heap yet codes the run under one of its own.
+            let fresh = merged.plain().filter(|_| !skeleton).and_then(|b| self.codebook_for(b));
+            let written = self.write_with(Some(run.newest), |path, opts| {
+                merged.write_as_shard(
+                    path,
+                    ShardWriteOpts {
+                        skeleton,
+                        codebook: fresh.as_deref(),
+                        ..opts
+                    },
+                )
+            });
+            match written {
                 Ok(entry) => run.opened.push((run.fold.keys[run.next], entry)),
                 Err(e) => {
                     self.running = Some(run);

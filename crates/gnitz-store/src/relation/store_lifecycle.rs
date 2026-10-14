@@ -46,6 +46,7 @@ impl RelationRegistry {
                 schema: e.schema(),
                 placement: e.placement(),
                 pk_repeats: e.pk_repeats(),
+                compress: e.compress(),
             };
             let (store, feed) = self.build_relation_store(spec, resume_at)?;
             let index_stores = e
@@ -58,6 +59,7 @@ impl RelationRegistry {
                         ix.schema(),
                         RecoverySource::Rederive { resume_at },
                         None,
+                        false,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;

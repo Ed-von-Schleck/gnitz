@@ -234,7 +234,9 @@ fn extend_from_owned_concatenates() {
     let pks: Vec<u128> = (0..acc.len()).map(|r| acc.pks.get(r)).collect();
     assert_eq!(pks, [1, 2, 10, 11]);
     assert_eq!(acc.weights, [1, -1, 1, -1]);
-    let strs: Vec<&str> = (0..acc.len()).map(|r| payload_str(&acc, r, 0).unwrap()).collect();
+    let strs: Vec<String> = (0..acc.len())
+        .map(|r| payload_str(&acc, r, 0).unwrap().into_owned())
+        .collect();
     assert_eq!(strs, [long(1).as_str(), "short", long(10).as_str(), "short"]);
     acc.validate(&schema).unwrap();
 }
@@ -432,7 +434,7 @@ fn rows(b: &ZSetBatch) -> Vec<Row> {
             (
                 b.pks.get(r),
                 b.weights[r],
-                payload_str(b, r, 0).unwrap().to_owned(),
+                payload_str(b, r, 0).unwrap().into_owned(),
                 payload_u64(b, r, 1),
             )
         })

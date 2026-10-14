@@ -1,6 +1,7 @@
 //! Order images: the byte strings whose plain lexicographic order *is* a
 //! column's typed order, the keys of the indexes that walk a column in order.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
@@ -41,7 +42,7 @@ impl WideKind {
     #[inline(always)]
     pub(crate) fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
-            Self::Fixed(tc) => cmp_col_window(a, &[], b, &[], tc),
+            Self::Fixed(tc) => cmp_col_window(a, b, tc),
             Self::Bytes => a.cmp(b),
         }
     }
@@ -82,7 +83,7 @@ impl ImageCol {
         match *kind {
             ImageKind::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, *invert, src, row).to_be_bytes()),
             ImageKind::Wide(WideKind::Fixed(_)) => out.extend_from_slice(&int16_image(loc, *invert, src, row)),
-            ImageKind::Wide(WideKind::Bytes) => append_bytes_image(*invert, loc.content(src, row), out),
+            ImageKind::Wide(WideKind::Bytes) => append_bytes_image(*invert, &loc.content(src, row), out),
         }
     }
 
@@ -104,7 +105,7 @@ impl ImageCol {
             ImageKind::Wide(WideKind::Fixed(_)) => slot.copy_from_slice(&int16_image(loc, *invert, src, row)),
             ImageKind::Wide(WideKind::Bytes) => {
                 let at = whole.len();
-                append_bytes_image(*invert, loc.content(src, row), whole);
+                append_bytes_image(*invert, &loc.content(src, row), whole);
                 write_image_slot(slot, &whole[at..]);
             }
         }
@@ -129,10 +130,10 @@ pub(crate) fn wide_native<'a>(
     mb: &'a impl RowSource,
     row: usize,
     scratch: &'a mut [u8; 16],
-) -> &'a [u8] {
+) -> Cow<'a, [u8]> {
     match kind {
         WideKind::Bytes => loc.content(mb, row),
-        WideKind::Fixed(_) => loc.native_le_bytes(mb, row, scratch),
+        WideKind::Fixed(_) => Cow::Borrowed(loc.native_le_bytes(mb, row, scratch)),
     }
 }
 

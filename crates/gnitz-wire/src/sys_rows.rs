@@ -50,7 +50,7 @@ macro_rules! sys_row {
         };
 
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct $Row $(<$lt>)? {
             $(pub $k: u64,)+
             $($(#[$pmeta])* pub $p: sys_row!(@ty $tc),)+
@@ -89,16 +89,16 @@ macro_rules! sys_row {
         }
     };
     (@ty U64) => { u64 };
-    (@ty String) => { &'a str };
-    (@ty Blob) => { &'a [u8] };
+    (@ty String) => { std::borrow::Cow<'a, str> };
+    (@ty Blob) => { std::borrow::Cow<'a, [u8]> };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, U64) => { crate::payload_u64($s, $r, $pi) };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Blob) => { crate::payload_bytes($s, $r, $pi) };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, String) => {
         crate::payload_str($s, $r, $pi).map_err(|_| format!("{} is not UTF-8", stringify!($p)))?
     };
     (@put $s:ident, $v:expr, U64) => { $s.put_u64($v) };
-    (@put $s:ident, $v:expr, String) => { $s.put_string($v) };
-    (@put $s:ident, $v:expr, Blob) => { $s.put_bytes($v) };
+    (@put $s:ident, $v:expr, String) => { $s.put_string(&$v) };
+    (@put $s:ident, $v:expr, Blob) => { $s.put_bytes(&$v) };
 }
 
 sys_row! {
@@ -131,10 +131,10 @@ sys_row! {
         name: String,
         /// [`crate::PkColList::pack`].
         pk_col_idx: U64,
-        /// [`crate::ViewProps::row_words`]: `WITH (capacity = …)` in bytes, `0`
+        /// [`crate::ViewBudget::row_words`]: `WITH (capacity = …)` in bytes, `0`
         /// absent.
         capacity_bytes: U64,
-        /// [`crate::ViewProps::row_words`]: `WITH (delta = …)` in bytes, `0` absent.
+        /// [`crate::ViewBudget::row_words`]: `WITH (delta = …)` in bytes, `0` absent.
         delta_bytes: U64,
         /// The user view this row is an internal chain segment of; `0` is a user
         /// view. A column, so the precheck can validate it against a forger.
@@ -144,6 +144,8 @@ sys_row! {
         /// identifies no single row. The planner that compiled the view states
         /// it; the engine stores it verbatim.
         pk_repeats: U64,
+        /// A boolean ([`crate::bool_word`]): [`crate::ViewProps::compress`].
+        compress: U64,
     }
 }
 
@@ -231,7 +233,7 @@ impl<'a> ColTabRow<'a> {
         ColTabRow {
             owner_id,
             col_idx,
-            name: &col.name,
+            name: col.name.as_str().into(),
             type_code: col.ty.tc.as_wire() as u64,
             is_nullable: col.is_nullable as u64,
             fk_table_id,
@@ -271,7 +273,7 @@ impl<'a> ColTabRow<'a> {
             (table_id, col) => Some(FkRef { table_id, col, on_delete }),
         };
         let def = crate::ColumnDef {
-            name: self.name.to_owned(),
+            name: self.name.to_string(),
             ty,
             is_nullable: flag("is_nullable", self.is_nullable)?,
             is_hidden: flag("is_hidden", self.is_hidden)?,

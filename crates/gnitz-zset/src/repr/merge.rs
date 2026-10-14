@@ -24,6 +24,7 @@ use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::BatchView;
 use gnitz_wire::read_u64_le;
+use gnitz_wire::Heap;
 use gnitz_wire::RowSource;
 use gnitz_wire::NARROW_PK_MAX_BYTES;
 
@@ -93,8 +94,8 @@ pub(crate) struct UnifiedSource<'a> {
     /// line because a by-value `[ColPtr; MAX_COLUMNS]` would be zeroed per source
     /// per call, whatever the schema's real column count.
     pub cols_off: usize,
-    pub blob: &'a [u8],
-    /// Where `blob` already lies in the scatter's destination heap, when carried
+    pub heap: Heap<'a>,
+    /// Where `heap` already lies in the scatter's destination heap, when carried
     /// whole; `None` relocates each cell.
     pub heap_at: Option<usize>,
 }
@@ -125,7 +126,7 @@ pub(crate) fn mem_batch_to_unified<'a>(
         },
         null_pad_mask: 0,
         cols_off,
-        blob: mb.blob,
+        heap: Heap::Plain(mb.blob),
         heap_at: None,
     }
 }
@@ -268,8 +269,8 @@ impl<'a> RowSource for MemBatch<'a> {
         MemBatch::get_col_ptr(self, row, payload_col, col_size)
     }
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.blob
+    fn heap(&self) -> Heap<'_> {
+        Heap::Plain(self.blob)
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
@@ -292,6 +293,10 @@ impl<'a> BatchView for MemBatch<'a> {
     #[inline(always)]
     fn pk_region(&self) -> (&[u8], usize) {
         (MemBatch::pk(self), self.pk_stride())
+    }
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        self.blob
     }
 }
 
@@ -882,7 +887,7 @@ impl<'w> MergeSink<'w> {
         for pi in gnitz_wire::BitIter(self.string_slots) {
             let cells = &mut self.regions[REG_PAYLOAD_START + pi].dst[at * 16..(at + n) * 16];
             let (blob, heap_at) = (self.srcs[side].blob, self.heap_at[side]);
-            rebase_string_cells(cells, blob, self.blob, heap_at, self.cache.as_deref_mut());
+            rebase_string_cells(cells, Heap::Plain(blob), self.blob, heap_at, self.cache.as_deref_mut());
         }
         self.rows += n;
     }

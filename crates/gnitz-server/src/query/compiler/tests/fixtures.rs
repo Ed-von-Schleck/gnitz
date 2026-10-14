@@ -86,6 +86,7 @@ fn registry_of<S: Into<Source>>(
             schema,
             placement,
             pk_repeats: false,
+            compress: false,
         };
         registry.register(spec).expect("a relation registers");
     }

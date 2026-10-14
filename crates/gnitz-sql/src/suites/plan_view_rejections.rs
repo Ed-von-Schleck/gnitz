@@ -109,9 +109,9 @@ fn cat() -> TestCatalog {
         cat.insert(&in_sn(name), desc);
     }
     let jv = view(&cat, "SELECT * FROM t JOIN u ON t.v = u.v");
-    register(&cat, "jv", 47, jv.props.into(), final_view(&jv));
+    register(&cat, "jv", 47, jv.props.budget.into(), final_view(&jv));
     let ju = view(&cat, "SELECT * FROM t JOIN c ON t.v = c.v");
-    register(&cat, "ju", 48, ju.props.into(), final_view(&ju));
+    register(&cat, "ju", 48, ju.props.budget.into(), final_view(&ju));
     cat
 }
 
@@ -728,7 +728,7 @@ fn ambiguous_and_hidden_column_rules() {
     // A merged name is one column, so a third step can pair with it.
     view(&cat, "SELECT t.id AS x FROM t JOIN u USING (v) JOIN a USING (v)");
     let sv = view(&cat, "SELECT v FROM t");
-    register(&cat, "sv", 50, sv.props.into(), final_view(&sv));
+    register(&cat, "sv", 50, sv.props.budget.into(), final_view(&sv));
     rejects(
         &cat,
         &[

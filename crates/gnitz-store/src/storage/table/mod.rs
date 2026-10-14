@@ -157,6 +157,7 @@ impl Table {
         recovery_source: RecoverySource,
         ram_tier_bytes: usize,
         capacity: Option<u64>,
+        compress: bool,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
@@ -197,7 +198,7 @@ impl Table {
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
-            shard_index: ShardIndex::open(dir, schema, capacity, skip_pk_filter, &shards)?,
+            shard_index: ShardIndex::open(dir, schema, capacity, skip_pk_filter, compress, &shards)?,
             rederived,
             loaded_mark,
             caller_record,

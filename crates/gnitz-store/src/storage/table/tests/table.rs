@@ -384,7 +384,14 @@ fn a_damaged_manifest_fails_a_replayed_open_and_rebuilds_a_rederived_one() {
             drop(t);
             damage(Path::new(&manifest_path(dir.path().to_str().unwrap())));
 
-            let opened = Table::new(dir.path().to_str().unwrap(), schema, rs, DEFAULT_RAM_TIER_BYTES, None);
+            let opened = Table::new(
+                dir.path().to_str().unwrap(),
+                schema,
+                rs,
+                DEFAULT_RAM_TIER_BYTES,
+                None,
+                false,
+            );
             match (rs, name) {
                 (RecoverySource::Rederive { .. }, "unreadable") => {
                     assert_eq!(opened.err(), Some(StorageError::Io(libc::EISDIR)))
@@ -675,4 +682,75 @@ fn a_seal_that_enters_shards_into_l0_compacts_it() {
         assert_eq!(zset_of(&delta, &schema), want, "overflow={overflow}: the delta");
         assert_eq!(zset_of(&t.full_scan(), &schema), want, "overflow={overflow}: the rows");
     }
+}
+
+/// Row `i`'s sentence: words of a short list, so that a symbol table codes a
+/// heap of them to a fraction of its bytes, and unique to `i`.
+fn sentence(i: u64) -> String {
+    const WORDS: [&str; 8] = [
+        "the", "river", "carried", "every", "lantern", "toward", "the", "harbour",
+    ];
+    let mut s = format!("{i} ");
+    for k in 0..8 + i % 7 {
+        s.push_str(WORDS[((i * 3 + k * 5) % 8) as usize]);
+        s.push(' ');
+    }
+    s
+}
+
+/// A compressing store codes the heaps of the shards it spills and compacts
+/// under one table, which a reopen takes up again, and serves its rows as
+/// given.
+#[test]
+fn a_compressing_store_codes_its_shards_under_one_table() {
+    use gnitz_zset::repr::Codebook;
+    let dir = tempfile::tempdir().unwrap();
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let open = || {
+        Table::new(
+            dir.path().to_str().unwrap(),
+            schema,
+            RecoverySource::SalReplay,
+            1 << 20,
+            None,
+            true,
+        )
+        .unwrap()
+    };
+    let batch = |keys: std::ops::Range<u64>| {
+        let values: Vec<String> = keys.clone().map(sentence).collect();
+        let rows: Vec<(u64, i64, &[u8])> = keys.zip(&values).map(|(k, v)| (k, 1, v.as_bytes())).collect();
+        crate::test_support::make_string_batch(&rows)
+    };
+    let digests = |t: &Table| -> Vec<Option<u64>> {
+        let shards = t.all_shard_arcs();
+        shards
+            .iter()
+            .map(|s| Codebook::of_shard(s).map(|b| b.digest()))
+            .collect()
+    };
+    let mut t = open();
+    let mut pushed = Vec::new();
+    for round in 0..=L0_COMPACT_THRESHOLD as u64 {
+        pushed.push(batch(round * 400..(round + 1) * 400));
+        t.ingest(pushed.last().unwrap().clone()).unwrap();
+        flush_barrier([&mut t], round).unwrap();
+    }
+    t.settle().unwrap();
+    assert_eq!(t.level_shape().0, 0, "the spills folded out of L0");
+    let tables = digests(&t);
+    assert!(tables.iter().all(|d| d.is_some() && *d == tables[0]), "{tables:?}");
+    assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
+    drop(t);
+
+    let mut t = open();
+    pushed.push(batch(10_000..10_400));
+    t.ingest(pushed.last().unwrap().clone()).unwrap();
+    flush_barrier([&mut t], 99).unwrap();
+    let reopened = digests(&t);
+    assert!(
+        reopened.iter().all(|d| *d == tables[0]),
+        "the reopen codes under the table it found"
+    );
+    assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
 }

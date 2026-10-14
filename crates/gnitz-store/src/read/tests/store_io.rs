@@ -181,7 +181,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 fn a_views_index_walk_follows_its_deltas() {
     let schema = make_schema_u64_i64();
     let rows: Vec<_> = (0..NBASE).map(|id| (id, 1, id as i64 * 10)).collect();
-    let view = RelationKind::View(gnitz_wire::ViewProps::Plain);
+    let view = RelationKind::View(gnitz_wire::ViewBudget::Plain);
     let mut r = relation_fixture(view, schema, &[1], [make_batch_raw(&schema, &rows)]);
     // 51 leaves the range, 90 enters it at weight 2.
     let delta = [(51, -1, 510), (51, 1, 9000), (90, -1, 900), (90, 2, 555)];
@@ -208,7 +208,7 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
         .into_iter()
         .chain((2..64).map(|pk| (pk, 1, 1000)))
         .collect();
-    let view = RelationKind::View(gnitz_wire::ViewProps::Plain);
+    let view = RelationKind::View(gnitz_wire::ViewBudget::Plain);
     let r = relation_fixture(view, schema, &[1], [make_batch_raw(&schema, &rows)]);
     let (mut cur, _) = r.open_bound(TID, val_range(5, 6), At::Now).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));

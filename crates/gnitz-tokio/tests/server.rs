@@ -18,7 +18,9 @@ use gnitz_core::{
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use gnitz_tokio::AsyncClient;
-use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
+use gnitz_wire::{
+    read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewBudget, ViewProps, WireConflictMode,
+};
 use support::settled;
 use tokio::runtime::Runtime;
 
@@ -64,8 +66,11 @@ fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
 fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
     let (mut blocking, tid, schema, sn) = table(target);
     let source = block_on(blocking.resolve_relation(&rel(&sn, "t"))).unwrap();
-    let fed = ViewProps::Fed {
-        delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
+    let fed = ViewProps {
+        budget: ViewBudget::Fed {
+            delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
+        },
+        compress: false,
     };
     let vid = block_on(blocking.create_view(&rel(&sn, "v"), &source, fed)).unwrap();
     (blocking, tid, vid, schema, sn)

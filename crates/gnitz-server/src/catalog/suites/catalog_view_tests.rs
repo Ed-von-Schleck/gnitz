@@ -143,7 +143,7 @@ fn the_system_schema_takes_no_relation() {
     TableTabRow {
         table_id: tid,
         schema_id: SYSTEM_SCHEMA_ID,
-        name: "mine",
+        name: "mine".into(),
         pk_col_idx,
         flags: gnitz_wire::TableProps::default().pack(),
     }
@@ -158,12 +158,13 @@ fn the_system_schema_takes_no_relation() {
     ViewTabRow {
         view_id: vid,
         schema_id: SYSTEM_SCHEMA_ID,
-        name: "mine",
+        name: "mine".into(),
         pk_col_idx,
         capacity_bytes: 0,
         delta_bytes: 0,
         owner_view_id: 0,
         pk_repeats: 0,
+        compress: 0,
     }
     .write(&mut view, 1);
     let family_cols = SysFamily::Table.column_defs();

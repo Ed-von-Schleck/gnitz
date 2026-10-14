@@ -1,6 +1,8 @@
 //! German string codec: 16-byte inline/blob string representation.
 
-use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
+use std::borrow::Cow;
+
+use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, Heap, HeapValue};
 
 /// Threshold for inline German String storage (bytes).
 pub const SHORT_STRING_THRESHOLD: usize = 12;
@@ -143,6 +145,26 @@ fn relocate_long(cell: &[u8; 16], src_blob: &[u8], place: impl FnOnce(&[u8]) -> 
     out
 }
 
+/// [`relocate_german_string_with`] over any heap: a long cell points at the
+/// offset `place` returns for its value. A long cell `heap` does not hold
+/// becomes the empty string, as [`german_string_bytes`] reads it.
+#[inline]
+pub fn relocate_german_value_with(
+    cell: &[u8; 16],
+    heap: Heap<'_>,
+    place: impl FnOnce(HeapValue<'_>) -> usize,
+) -> [u8; 16] {
+    if let Some(short) = canonical_short_cell(cell) {
+        return short;
+    }
+    let Some(value) = german_string_value(cell, heap) else {
+        return [0; 16];
+    };
+    let mut out = *cell;
+    write_u64_le(&mut out, 8, place(value) as u64);
+    out
+}
+
 /// [`relocate_german_string_with`] appending the content to `dst_blob`.
 #[inline]
 pub fn relocate_german_string(cell: &[u8; 16], src_blob: &[u8], dst_blob: &mut Vec<u8>) -> [u8; 16] {
@@ -160,8 +182,9 @@ pub fn german_string_short_ascii(cell: &[u8; 16]) -> bool {
     german_string_inline(cell).is_some() && u128::from_le_bytes(*cell) & u128::from_le_bytes([0x80; 16]) == 0
 }
 
-/// The content of cell `s`, with a long cell that overruns `blob` read as empty
-/// — the one degrading accessor, so every path degrades alike.
+/// The content of cell `s` over the plain heap `blob`, with a long cell that
+/// overruns `blob` read as empty — the one degrading accessor, so every path
+/// degrades alike.
 #[inline]
 pub fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
     match german_string_inline(s) {
@@ -173,21 +196,56 @@ pub fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
     }
 }
 
+/// A long cell's value in `heap`; `None` for a short cell or one `heap` does
+/// not hold.
+#[inline(always)]
+pub fn german_string_value<'a>(cell: &[u8], heap: Heap<'a>) -> Option<HeapValue<'a>> {
+    let None = german_string_inline(cell) else {
+        return None;
+    };
+    heap.value(read_u64_le(cell, 8), read_u32_le(cell, 0) as usize)
+}
+
+/// The content of cell `s` over `heap`: borrowed where it lies inline or in a
+/// plain heap, decoded from a coded one. A long cell `heap` does not hold reads
+/// as empty, as [`german_string_content`] reads one.
+#[inline]
+pub fn german_string_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [u8]> {
+    match heap {
+        Heap::Plain(blob) => Cow::Borrowed(german_string_content(s, blob)),
+        Heap::Coded(_) => decoded_bytes(s, heap),
+    }
+}
+
+/// [`german_string_bytes`] over a coded heap.
+#[inline(never)]
+fn decoded_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [u8]> {
+    match german_string_inline(s) {
+        Some(inline) => Cow::Borrowed(inline),
+        None => german_string_value(s, heap).map_or(Cow::Borrowed(&[]), HeapValue::bytes),
+    }
+}
+
 /// A cell's first 8 content bytes, zero-padded, big-endian: an integer whose order never
 /// contradicts [`compare_german_strings`].
 #[inline(always)]
-pub fn german_string_lead(cell: &[u8], blob: &[u8]) -> u64 {
-    let content = german_string_content(cell, blob);
-    let mut lead = [0u8; 8];
-    let n = content.len().min(8);
-    lead[..n].copy_from_slice(&content[..n]);
+pub fn german_string_lead(cell: &[u8], heap: Heap<'_>) -> u64 {
+    let lead = match german_string_inline(cell) {
+        Some(inline) => {
+            let mut lead = [0u8; 8];
+            let n = inline.len().min(8);
+            lead[..n].copy_from_slice(&inline[..n]);
+            lead
+        }
+        None => german_string_value(cell, heap).map_or([0; 8], HeapValue::lead),
+    };
     u64::from_be_bytes(lead)
 }
 
 /// Byte-lexicographic order over two German string cells — the order
 /// `compare_rows`, every merge heap and every compaction sorts by.
 #[inline(always)]
-pub fn compare_german_strings(a: &[u8; 16], blob_a: &[u8], b: &[u8; 16], blob_b: &[u8]) -> std::cmp::Ordering {
+pub fn compare_german_strings(a: &[u8; 16], heap_a: Heap<'_>, b: &[u8; 16], heap_b: Heap<'_>) -> std::cmp::Ordering {
     // A canonical cell zero-pads its inline bytes, so each 4- and 8-byte word
     // orders as the content under it does.
     let pfx_a = u32::from_be_bytes(a[4..8].try_into().unwrap());
@@ -197,7 +255,7 @@ pub fn compare_german_strings(a: &[u8; 16], blob_a: &[u8], b: &[u8; 16], blob_b:
     }
     let (la, lb) = (read_u32_le(a, 0), read_u32_le(b, 0));
     // Nested, not one `&&`: joined, the long path re-tests `a`'s length.
-    let content_a = if la as usize <= SHORT_STRING_THRESHOLD {
+    let inline_a = if la as usize <= SHORT_STRING_THRESHOLD {
         if lb as usize <= SHORT_STRING_THRESHOLD {
             // Both inline: the rest of the content is bytes 8..16, masked to the
             // content so a stray pad byte orders as the content arm would read it;
@@ -207,12 +265,36 @@ pub fn compare_german_strings(a: &[u8; 16], blob_a: &[u8], b: &[u8; 16], blob_b:
             };
             return tail(a, la).cmp(&tail(b, lb)).then(la.cmp(&lb));
         }
-        &a[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + la as usize]
+        Some(&a[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + la as usize])
     } else {
-        german_string_content(a, blob_a)
+        None
     };
-    // Vectorised memcmp with the length tiebreak `[u8]::cmp` already applies.
-    content_a.cmp(german_string_content(b, blob_b))
+    match (heap_a, heap_b) {
+        // Vectorised memcmp with the length tiebreak `[u8]::cmp` already applies.
+        (Heap::Plain(blob_a), Heap::Plain(blob_b)) => inline_a
+            .unwrap_or_else(|| german_string_content(a, blob_a))
+            .cmp(german_string_content(b, blob_b)),
+        _ => compare_decoded(a, heap_a, b, heap_b),
+    }
+}
+
+/// [`compare_german_strings`] of two cells that tie on their prefix, one of
+/// them over a coded heap. Two values coded under one table are equal exactly
+/// when their codes are, so equal ones are told apart without a decode; two
+/// long values that differ in their first eight bytes are ordered by those.
+#[inline(never)]
+fn compare_decoded(a: &[u8; 16], heap_a: Heap<'_>, b: &[u8; 16], heap_b: Heap<'_>) -> std::cmp::Ordering {
+    if let (Some(va), Some(vb)) = (german_string_value(a, heap_a), german_string_value(b, heap_b)) {
+        let same_table = va.table_digest().is_some() && va.table_digest() == vb.table_digest();
+        if same_table && va.len() == vb.len() && va.stored() == vb.stored() {
+            return std::cmp::Ordering::Equal;
+        }
+        let lead = va.lead().cmp(&vb.lead());
+        if lead.is_ne() {
+            return lead;
+        }
+    }
+    german_string_bytes(a, heap_a).cmp(&german_string_bytes(b, heap_b))
 }
 
 #[cfg(test)]

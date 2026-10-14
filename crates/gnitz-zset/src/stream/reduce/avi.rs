@@ -17,6 +17,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use gnitz_wire::payload_bytes;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
+use std::borrow::Cow;
 use std::ops::ControlFlow;
 
 // ---------------------------------------------------------------------------
@@ -113,12 +114,12 @@ impl AviBake {
                 continue;
             }
             let image = if a.image.fits_slot() {
-                &cur.current_pk_bytes()[prefix_len..]
+                Cow::Borrowed(&cur.current_pk_bytes()[prefix_len..])
             } else {
                 let (src, row) = cur.current_row_source();
                 payload_bytes(src, row, IMAGE_SLOT)
             };
-            vals.seed_from_index(k, &aggs[k], g, image);
+            vals.seed_from_index(k, &aggs[k], g, &image);
         }
     }
 }

@@ -12,7 +12,7 @@ variable is. A file that varies two coordinates is two files.
     mutation_pattern   what writes occur and how they are grouped
     schema_lifetime    the schema changing mid-scenario: DDL, ALTER, create-order
     distribution       worker count, partitioning, replication, exchange
-    storage_policy     a relation's WITH (...): capacity, delta, stream
+    storage_policy     a relation's WITH (...): capacity, delta, stream, compress
     state_lifetime     the process boundary crossed: restart, crash, checkpoint,
                        SAL reclaim
     interleaving       timing between operations that would otherwise be serial

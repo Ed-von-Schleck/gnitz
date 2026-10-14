@@ -20,6 +20,7 @@ rustc-hash.workspace = true
 libc.workspace = true
 # The UTF-8 check on a pushed block's STRING cells.
 simdutf8 = "0.1"
+fsst-rs = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

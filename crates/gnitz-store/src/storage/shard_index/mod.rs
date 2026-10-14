@@ -9,7 +9,7 @@ use super::manifest::{self, ManifestEntry, ShardSet};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{guard_slot, MappedShard};
+use gnitz_zset::repr::{guard_slot, Codebook, MappedShard};
 use gnitz_zset::schema::key::pk_in_range;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -316,6 +316,13 @@ pub(super) struct ShardIndex {
     capacity: Option<u64>,
     /// Passed to every shard write.
     skip_pk_filter: bool,
+    /// `WITH (compress = true)`: the store codes its shards' heaps under a
+    /// symbol table where that pays.
+    compress: bool,
+    /// The table a compressing store codes under: the one its newest coded
+    /// shard was written under, until a spill its codes drift from trains
+    /// another.
+    codebook: Option<Rc<Codebook>>,
     /// What the in-place guard folds so far cancelled per retraction they read.
     cancel_yield: CancelYield,
     /// Whether the tree may owe a fold; see [`Self::owed`].
@@ -368,6 +375,7 @@ impl ShardIndex {
         schema: SchemaDescriptor,
         capacity: Option<u64>,
         skip_pk_filter: bool,
+        compress: bool,
         shards: &ShardSet,
     ) -> Result<Self, StorageError> {
         let mut idx = ShardIndex {
@@ -381,6 +389,8 @@ impl ShardIndex {
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
             capacity,
             skip_pk_filter,
+            compress,
+            codebook: None,
             cancel_yield: CancelYield::FRESH,
             // A reopened tree is asked once whether it owes anything.
             owed: !shards.entries.is_empty(),
@@ -396,6 +406,13 @@ impl ShardIndex {
             level.get_or_create_guard(e.guard_key).entries.push(entry);
         }
         idx.shard_seq = idx.all_entries().map(|e| e.seq).max().unwrap_or(0);
+        if compress {
+            let newest_coded = idx
+                .all_entries()
+                .filter(|e| e.shard.heap_is_coded())
+                .max_by_key(|e| e.seq);
+            idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
+        }
         idx.published_through = idx.shard_seq;
         let live: HashSet<u64> = idx.all_entries().map(|e| e.seq).collect();
         manifest::remove_stale_files(output_dir, |seq| live.contains(&seq))?;

@@ -11,7 +11,7 @@ use gnitz_wire::{PkColList, ViewProps, SCHEMA_TAB, SEQ_TAB};
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
     let s = sys_schema(SCHEMA_TAB);
     let mut b = ZSetBatch::new(s);
-    SchemaTabRow { schema_id, name }.write(&mut BatchAppender::new(&mut b), 1);
+    SchemaTabRow { schema_id, name: name.into() }.write(&mut BatchAppender::new(&mut b), 1);
     b
 }
 

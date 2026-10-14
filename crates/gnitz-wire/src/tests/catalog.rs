@@ -118,24 +118,36 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
     for distribution in dists {
         for stream in [false, true] {
             for serial in [false, true] {
-                let p = TableProps { stream, serial, distribution };
-                assert_eq!(TableProps::from_flags(p.pack()), Ok(p));
+                for compress in [false, true] {
+                    let p = TableProps { stream, serial, distribution, compress };
+                    assert_eq!(TableProps::from_flags(p.pack()), Ok(p));
+                }
             }
         }
     }
 
-    let t = |stream, serial, distribution| TableProps { stream, serial, distribution }.pack();
+    let t = |stream, serial, distribution| {
+        TableProps {
+            stream,
+            serial,
+            distribution,
+            compress: false,
+        }
+        .pack()
+    };
     assert_eq!(TableProps::default().pack(), 0);
     assert_eq!(t(false, false, TableDistribution::Replicated), 0b001);
     assert_eq!(t(true, false, TableDistribution::default()), 0b010);
     assert_eq!(t(false, true, TableDistribution::default()), 0b100);
+    let compressed = TableProps { compress: true, ..TableProps::default() };
+    assert_eq!(compressed.pack(), 0b1000);
     assert_eq!(t(false, false, TableDistribution::Keyed { prefix_len: 2 }), 2 << 8);
 
     for bit in 0..64u32 {
         let w = 1u64 << bit;
         assert_eq!(
             TableProps::from_flags(w).is_ok(),
-            bit <= 2 || (8..16).contains(&bit),
+            bit <= 3 || (8..16).contains(&bit),
             "table bit {bit}"
         );
     }

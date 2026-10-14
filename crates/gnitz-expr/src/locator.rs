@@ -100,8 +100,8 @@ impl ColumnLocator {
     /// A STRING/BLOB column's content in `row`, resolved through the source's
     /// heap.
     #[inline(always)]
-    pub fn content<'b>(&self, mb: &'b impl RowSource, row: usize) -> &'b [u8] {
-        gnitz_wire::german_string_content(self.bytes(mb, row), mb.blob())
+    pub fn content<'b>(&self, mb: &'b impl RowSource, row: usize) -> std::borrow::Cow<'b, [u8]> {
+        gnitz_wire::german_string_bytes(self.bytes(mb, row), mb.heap())
     }
 
     /// Native little-endian value bytes of the column in `row`; a PK column is
@@ -140,8 +140,17 @@ impl ColumnLocator {
     pub fn cmp_non_null<A: RowSource, B: RowSource>(&self, a: &A, ra: usize, b: &B, rb: usize) -> Ordering {
         match *self {
             ColumnLocator::Pk { .. } => self.bytes(a, ra).cmp(self.bytes(b, rb)),
+            ColumnLocator::Payload { type_code, .. } if type_code.is_german_string() => {
+                let cell = |s: &[u8]| -> [u8; 16] { s.try_into().unwrap() };
+                gnitz_wire::compare_german_strings(
+                    &cell(self.bytes(a, ra)),
+                    a.heap(),
+                    &cell(self.bytes(b, rb)),
+                    b.heap(),
+                )
+            }
             ColumnLocator::Payload { type_code, .. } => {
-                gnitz_wire::cmp_col_window(self.bytes(a, ra), a.blob(), self.bytes(b, rb), b.blob(), type_code)
+                gnitz_wire::cmp_col_window(self.bytes(a, ra), self.bytes(b, rb), type_code)
             }
         }
     }
@@ -302,7 +311,7 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: impl Iterator<Item
         }),
         Some(kind) => fill(key, src, rows, out, |r| order_bits(&loc, src, r, kind)),
         None if tc.is_german_string() => fill(key, src, rows, out, |r| {
-            gnitz_wire::german_string_lead(loc.bytes(src, r), src.blob())
+            gnitz_wire::german_string_lead(loc.bytes(src, r), src.heap())
         }),
         // A 16-byte integer's high half.
         None => fill(key, src, rows, out, |r| (loc.opk_image(src, r) >> 64) as u64),

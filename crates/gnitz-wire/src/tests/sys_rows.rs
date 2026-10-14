@@ -68,23 +68,24 @@ fn a_row_writes_one_value_of_its_columns_type_per_payload_column() {
             assert!(fits, "{}.{}: {val:?}", f.name, col.name);
         }
     }
-    check(&SchemaTabRow { schema_id: 3, name: "public" });
+    check(&SchemaTabRow { schema_id: 3, name: "public".into() });
     check(&TableTabRow {
         table_id: 16,
         schema_id: 3,
-        name: "t",
+        name: "t".into(),
         pk_col_idx: 1,
         flags: 0,
     });
     check(&ViewTabRow {
         view_id: 20,
         schema_id: 4,
-        name: "v",
+        name: "v".into(),
         pk_col_idx: 1,
         capacity_bytes: 0,
         delta_bytes: 1 << 20,
         owner_view_id: 21,
         pk_repeats: 1,
+        compress: 1,
     });
     let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
     check(&ColTabRow::of(16, 2, &col, None));
@@ -92,11 +93,11 @@ fn a_row_writes_one_value_of_its_columns_type_per_payload_column() {
         index_id: 100,
         owner_id: 16,
         source_col_idx: 1,
-        name: "idx_t_b",
+        name: "idx_t_b".into(),
         is_unique: 1,
     });
     check(&SeqTabRow { seq_id: 1, next_val: 17 });
-    check(&CircuitRow { view_id: 7, circuit: b"\x01" });
+    check(&CircuitRow { view_id: 7, circuit: b"\x01"[..].into() });
 }
 
 /// The first key column is the family's leading id, in key order.
@@ -148,16 +149,22 @@ fn a_column_row_refuses_forged_words() {
     let sound = ColTabRow::of(16, 0, &col, None);
     assert!(sound.column().is_ok());
     for (r, expect) in [
-        (ColTabRow { type_code: 0x104, ..sound }, "type_code"),
-        (ColTabRow { type_code: 99, ..sound }, "invalid column type 99"),
-        (ColTabRow { is_nullable: 2, ..sound }, "is_nullable"),
-        (ColTabRow { is_hidden: 2, ..sound }, "is_hidden"),
-        (ColTabRow { fk_col_idx: 1 << 32, ..sound }, "fk_col_idx"),
-        (ColTabRow { fk_col_idx: 3, ..sound }, "FK column 3 with no FK table"),
-        (ColTabRow { fk_on_delete: 2, ..sound }, "fk_on_delete"),
-        (ColTabRow { fk_on_delete: 1, ..sound }, "an FK action with no FK table"),
-        (ColTabRow { scale: 256, ..sound }, "scale"),
-        (ColTabRow { scale: 3, ..sound }, "invalid column type"),
+        (ColTabRow { type_code: 0x104, ..sound.clone() }, "type_code"),
+        (ColTabRow { type_code: 99, ..sound.clone() }, "invalid column type 99"),
+        (ColTabRow { is_nullable: 2, ..sound.clone() }, "is_nullable"),
+        (ColTabRow { is_hidden: 2, ..sound.clone() }, "is_hidden"),
+        (ColTabRow { fk_col_idx: 1 << 32, ..sound.clone() }, "fk_col_idx"),
+        (
+            ColTabRow { fk_col_idx: 3, ..sound.clone() },
+            "FK column 3 with no FK table",
+        ),
+        (ColTabRow { fk_on_delete: 2, ..sound.clone() }, "fk_on_delete"),
+        (
+            ColTabRow { fk_on_delete: 1, ..sound.clone() },
+            "an FK action with no FK table",
+        ),
+        (ColTabRow { scale: 256, ..sound.clone() }, "scale"),
+        (ColTabRow { scale: 3, ..sound.clone() }, "invalid column type"),
     ] {
         let err = r.column().unwrap_err();
         assert!(err.contains(expect), "{expect}: {err}");

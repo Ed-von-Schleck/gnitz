@@ -11,12 +11,14 @@ use std::ops::Range;
 
 use super::batch::{range_rows, write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
+use super::codebook::Codebook;
 use super::merge::{ColPtr, ColumnarSource, MemBatch, UnifiedSource};
 use super::string_heap::{
-    carried_dead, prorated_blob_cap, rebase_string_cell, relocate_german_string_vec, row_long_bytes,
+    carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocate_german_string_vec, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
+use gnitz_wire::Heap;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -106,7 +108,7 @@ pub(crate) fn copy_ranges(
         }
     }
     for pi in gnitz_wire::BitIter(schema.string_payload_slots()) {
-        writer.rebase_string_col(pi, src.blob, heap_at);
+        writer.rebase_string_col(pi, Heap::Plain(src.blob), heap_at);
     }
 }
 
@@ -144,7 +146,8 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
             let src = batch.col_data(pi, 16).as_chunks::<16>().0;
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
             for (cell, &idx) in cells.as_chunks_mut::<16>().0.iter_mut().zip(indices) {
-                *cell = relocate_german_string_vec(&src[idx as usize], batch.blob, blob, cache.as_deref_mut());
+                *cell =
+                    relocate_german_string_vec(&src[idx as usize], Heap::Plain(batch.blob), blob, cache.as_deref_mut());
             }
         } else {
             let src_col = batch.col_data(pi, cs);
@@ -203,6 +206,7 @@ pub(crate) fn scatter_unified_sources(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
+    codebook: Option<&Codebook>,
     writer: &mut DirectWriter<'_>,
 ) {
     assert_eq!(
@@ -228,11 +232,25 @@ pub(crate) fn scatter_unified_sources(
         let cs = col.size();
         if col.type_code.is_german_string() {
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
-            for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(rows) {
-                let src = unsafe { sources.get_unchecked(si as usize) };
-                let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                cell.copy_from_slice(&src_struct[..16]);
-                rebase_string_cell(cell, src.blob, blob, src.heap_at, cache.as_deref_mut());
+            let picked = cells
+                .as_chunks_mut::<16>()
+                .0
+                .iter_mut()
+                .zip(rows)
+                .map(|(cell, &(si, ri, _))| {
+                    let src = unsafe { sources.get_unchecked(si as usize) };
+                    let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
+                    cell.copy_from_slice(&src_struct[..16]);
+                    (cell, src)
+                });
+            // Matched once, so the per-cell loop tests for no codebook.
+            match codebook {
+                None => picked.for_each(|(cell, src)| {
+                    rebase_string_cell(cell, src.heap, blob, src.heap_at, cache.as_deref_mut())
+                }),
+                Some(book) => {
+                    picked.for_each(|(cell, src)| recode_string_cell(cell, src.heap, blob, book, cache.as_deref_mut()))
+                }
             }
         } else {
             width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));
@@ -315,7 +333,7 @@ pub(crate) fn gather_rows(
                 let (cells, blob, _) = w.string_col_mut(pi);
                 for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
                     let s = &sources[si as usize];
-                    *cell = relocate_german_string_vec(s.get_col_ptr(ri as usize, pi, 16), s.blob(), blob, None);
+                    *cell = relocate_german_string_vec(s.get_col_ptr(ri as usize, pi, 16), s.heap(), blob, None);
                 }
             } else {
                 let dst = w.col_mut(pi);
@@ -422,7 +440,7 @@ impl<'a> UnifiedSet<'a> {
             sources: views,
             cols,
             schema: *schema,
-            src_blob: sources.iter().map(|s| s.blob().len()).sum(),
+            src_blob: sources.iter().map(|s| s.heap().plain_len()).sum(),
             src_rows: sources.iter().map(|s| s.row_count()).sum(),
             _decoded: decoded,
             #[cfg(debug_assertions)]
@@ -445,6 +463,17 @@ impl<'a> UnifiedSet<'a> {
     /// `of_rows` is the row count of the whole output `rows` is a share of; it
     /// sizes the heap reserved.
     pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], of_rows: usize) -> Batch {
+        self.materialize_under(rows, of_rows, None)
+    }
+
+    /// [`materialize`](Self::materialize) into a heap coded under `codebook`
+    /// where one is given; see [`Codebook::append`].
+    pub(crate) fn materialize_under(
+        &self,
+        rows: &[(u32, u32, i64)],
+        of_rows: usize,
+        codebook: Option<&Codebook>,
+    ) -> Batch {
         #[cfg(debug_assertions)]
         for &(si, ri, _) in rows {
             debug_assert!(
@@ -459,7 +488,7 @@ impl<'a> UnifiedSet<'a> {
             0
         };
         write_to_batch(&self.schema, rows.len(), blob_cap, |writer| {
-            scatter_unified_sources(&self.sources, &self.cols, rows, writer);
+            scatter_unified_sources(&self.sources, &self.cols, rows, codebook, writer);
         })
     }
 }
@@ -512,7 +541,7 @@ pub(crate) fn materialize_carrying(
                 debug_assert_eq!(base, at, "carried heaps land in source order");
             }
         }
-        scatter_unified_sources(&set.sources, &set.cols, rows, writer);
+        scatter_unified_sources(&set.sources, &set.cols, rows, None, writer);
     });
     out.charge_dead(dead);
     out

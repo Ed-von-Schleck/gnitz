@@ -479,6 +479,8 @@ const TABLE_FLAG_STREAM: u64 = 1 << 1;
 /// Bit 2: the table's single PK column is **SERIAL** — INSERT draws it from the
 /// table's sequence.
 const TABLE_FLAG_SERIAL: u64 = 1 << 2;
+/// Bit 3: the table's store **compresses** its heaps — `WITH (compress = true)`.
+const TABLE_FLAG_COMPRESS: u64 = 1 << 3;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`;
 /// `0` there is the default, the full PK.
 const TABLE_FLAG_DIST_SHIFT: u32 = 8;
@@ -486,8 +488,11 @@ const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte.
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 /// Every bit a `TABLE_TAB.flags` word may carry.
-const TABLE_FLAGS_DEFINED: u64 =
-    TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | TABLE_FLAG_SERIAL | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
+const TABLE_FLAGS_DEFINED: u64 = TABLE_FLAG_REPLICATED
+    | TABLE_FLAG_STREAM
+    | TABLE_FLAG_SERIAL
+    | TABLE_FLAG_COMPRESS
+    | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
 /// A catalog column holding a boolean: `0` or `1`, any other word refused.
 pub fn bool_word(w: u64) -> Result<bool, String> {
@@ -526,6 +531,9 @@ pub struct TableProps {
     /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
     /// prefix; the SQL planner validates it against the PK before packing.
     pub distribution: TableDistribution,
+    /// The table's store codes its shards' heaps under a symbol table where
+    /// that pays.
+    pub compress: bool,
 }
 
 impl TableProps {
@@ -536,7 +544,10 @@ impl TableProps {
             TableDistribution::Keyed { prefix_len } => (prefix_len as u64) << TABLE_FLAG_DIST_SHIFT,
             TableDistribution::Replicated => TABLE_FLAG_REPLICATED,
         };
-        dist | if self.stream { TABLE_FLAG_STREAM } else { 0 } | if self.serial { TABLE_FLAG_SERIAL } else { 0 }
+        let bit = |set: bool, flag: u64| if set { flag } else { 0 };
+        dist | bit(self.stream, TABLE_FLAG_STREAM)
+            | bit(self.serial, TABLE_FLAG_SERIAL)
+            | bit(self.compress, TABLE_FLAG_COMPRESS)
     }
 
     /// Decode a persisted `TABLE_TAB.flags` u64, refusing a bit outside the
@@ -557,6 +568,7 @@ impl TableProps {
             stream: flags & TABLE_FLAG_STREAM != 0,
             serial: flags & TABLE_FLAG_SERIAL != 0,
             distribution,
+            compress: flags & TABLE_FLAG_COMPRESS != 0,
         })
     }
 
@@ -569,6 +581,9 @@ impl TableProps {
                     "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
                 ));
             }
+        }
+        if self.compress && self.stream {
+            return Err("a stream cannot be compressed: it holds no rows".to_string());
         }
         if self.serial && self.stream {
             return Err("a stream cannot be SERIAL: it holds no rows to seed the generator from".to_string());
@@ -600,7 +615,15 @@ pub fn replicated_with_prefix(prefix_len: u8) -> String {
 
 /// The `WITH (…)` options of one user-named view.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub enum ViewProps {
+pub struct ViewProps {
+    pub budget: ViewBudget,
+    /// `WITH (compress = …)`: the view's output store codes its heaps.
+    pub compress: bool,
+}
+
+/// The byte budget a view's `WITH (…)` names, if any.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum ViewBudget {
     #[default]
     Plain,
     /// `WITH (capacity = …)`: the view's output store is bounded, dehydrating past it.
@@ -609,16 +632,16 @@ pub enum ViewProps {
     Fed { delta_bytes: NonZeroU64 },
 }
 
-impl ViewProps {
+impl ViewBudget {
     /// The props two optional budgets name.
     pub fn from_budgets(
         capacity_bytes: Option<NonZeroU64>,
         delta_bytes: Option<NonZeroU64>,
-    ) -> Result<ViewProps, String> {
+    ) -> Result<ViewBudget, String> {
         match (capacity_bytes, delta_bytes) {
-            (None, None) => Ok(ViewProps::Plain),
-            (Some(capacity_bytes), None) => Ok(ViewProps::Bounded { capacity_bytes }),
-            (None, Some(delta_bytes)) => Ok(ViewProps::Fed { delta_bytes }),
+            (None, None) => Ok(ViewBudget::Plain),
+            (Some(capacity_bytes), None) => Ok(ViewBudget::Bounded { capacity_bytes }),
+            (None, Some(delta_bytes)) => Ok(ViewBudget::Fed { delta_bytes }),
             (Some(_), Some(_)) => Err("a capacity-bounded view cannot carry a delta feed: its bootstrap read \
                                        hydrates from the source relation's live store, which no tick round governs"
                 .to_string()),
@@ -626,7 +649,7 @@ impl ViewProps {
     }
 
     /// Decode the `(capacity, delta)` `VIEW_TAB` words, where `0` is absent.
-    pub fn from_row(capacity: u64, delta: u64) -> Result<ViewProps, String> {
+    pub fn from_row(capacity: u64, delta: u64) -> Result<ViewBudget, String> {
         Self::from_budgets(NonZeroU64::new(capacity), NonZeroU64::new(delta))
     }
 
@@ -637,14 +660,14 @@ impl ViewProps {
 
     pub fn capacity_bytes(self) -> Option<u64> {
         match self {
-            ViewProps::Bounded { capacity_bytes } => Some(capacity_bytes.get()),
+            ViewBudget::Bounded { capacity_bytes } => Some(capacity_bytes.get()),
             _ => None,
         }
     }
 
     pub fn delta_bytes(self) -> Option<u64> {
         match self {
-            ViewProps::Fed { delta_bytes } => Some(delta_bytes.get()),
+            ViewBudget::Fed { delta_bytes } => Some(delta_bytes.get()),
             _ => None,
         }
     }

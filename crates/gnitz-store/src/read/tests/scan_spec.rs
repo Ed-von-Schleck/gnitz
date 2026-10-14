@@ -8,7 +8,7 @@ use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{payload_is_null, payload_str, payload_u64};
 use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
-use gnitz_wire::{PkKeys, ReadBound, SinkKind, ViewProps};
+use gnitz_wire::{PkKeys, ReadBound, SinkKind, ViewBudget};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::repr::SourceCursor;
 use gnitz_zset::schema::SchemaColumn;
@@ -18,7 +18,7 @@ use gnitz_zset::schema::SchemaColumn;
 /// may repeat and a weight above 1 is admitted verbatim.
 fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
     let schema = make_schema_u64_i64();
-    let kind = RelationKind::View(ViewProps::Plain);
+    let kind = RelationKind::View(ViewBudget::Plain);
     relation_fixture(kind, schema, &[], [make_batch_raw(&schema, rows)])
 }
 
@@ -205,7 +205,7 @@ fn a_fold_counts_the_survivors_of_every_chunk() {
 fn a_malformed_request_is_refused() {
     let col = |tc| SchemaColumn::new(tc, false);
     let schema = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::F64)], &[0]);
-    let kind = RelationKind::View(ViewProps::Plain);
+    let kind = RelationKind::View(ViewBudget::Plain);
     let r = relation_fixture(kind, schema, &[], []);
     let walk = |c: u32| {
         let r = KeyRange::new(PkColList::from_slice(&[c]), &[], Cut::before(0), Cut::after(9));
@@ -472,7 +472,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
     let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let nv = (!payload_is_null(&*got, row, 2)).then(|| payload_u64(&*got, row, 2) as i64);
-            let s = payload_str(&*got, row, 0).unwrap().to_owned();
+            let s = payload_str(&*got, row, 0).unwrap().into_owned();
             (got.get_pk(row) as u64, s, payload_u64(&*got, row, 1), nv)
         })
         .collect();
@@ -538,7 +538,7 @@ fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64
     let schema = make_schema_u64_i64();
     let rows =
         |ids: std::ops::Range<u64>| make_batch_raw(&schema, &ids.map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
-    let kind = RelationKind::View(ViewProps::Bounded {
+    let kind = RelationKind::View(ViewBudget::Bounded {
         capacity_bytes: std::num::NonZeroU64::MIN,
     });
     let mut registry = relation_fixture(kind, schema, &[], [rows(on_disk)]);

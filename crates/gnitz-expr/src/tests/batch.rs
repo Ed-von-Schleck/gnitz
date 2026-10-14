@@ -1,6 +1,6 @@
 use crate::SchemaColumn;
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
-use gnitz_wire::{FixedInt, TypeCode};
+use gnitz_wire::{FixedInt, Heap, TypeCode};
 
 use super::{decode_f64, encode_f64, eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MORSEL};
 use crate::eval::Resolved;
@@ -1016,7 +1016,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         );
         let want = |op: CmpOp, row: usize| {
             let (i, j) = (row / len, row % len);
-            let ord = gnitz_wire::compare_german_strings(&cells[i], &blob, &cells[j], &blob);
+            let ord = gnitz_wire::compare_german_strings(&cells[i], Heap::Plain(&blob), &cells[j], Heap::Plain(&blob));
             (!null(row, 0) && !null(row, 1)).then(|| cmp_want(op, ord))
         };
         let run = |instrs: Vec<LogicalInstr>, consts| int_rows(&mut scalar_prog(&schema, instrs, consts), &view);
@@ -1050,7 +1050,12 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                     let want = (!null(row, 0)).then(|| {
                         cmp_want(
                             op,
-                            gnitz_wire::compare_german_strings(&cells[row / len], &blob, &cells[j], &blob),
+                            gnitz_wire::compare_german_strings(
+                                &cells[row / len],
+                                Heap::Plain(&blob),
+                                &cells[j],
+                                Heap::Plain(&blob),
+                            ),
                         )
                     });
                     assert_eq!(got[row], want, "nullable={nullable} StrColConst {op:?} row {row}");

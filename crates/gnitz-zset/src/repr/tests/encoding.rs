@@ -247,10 +247,20 @@ fn seq_values(rows: usize, spread: usize) -> Vec<Vec<u8>> {
 }
 
 /// `values` as a Seq image over `heap`.
-fn seq_image(values: &[Vec<u8>], heap: &mut Vec<u8>) -> Vec<u8> {
+fn seq_image(values: &[Vec<u8>], heap: &mut HeapWriter) -> Vec<u8> {
     let lens = values.iter().map(Vec::len);
     let span = (lens.clone().min().unwrap(), lens.max().unwrap());
-    seq_encode(values.len(), span, values.iter().map(Vec::as_slice), heap)
+    let mut src = Vec::new();
+    let cells: Vec<[u8; 16]> = values
+        .iter()
+        .map(|v| gnitz_wire::encode_german_string(v, &mut src))
+        .collect();
+    seq_encode(&cells, span, Heap::Plain(&src), heap)
+}
+
+/// `bytes` appended to `heap` as one value.
+pub(super) fn push_bytes(heap: &mut HeapWriter, bytes: &[u8]) {
+    heap.push(Heap::Plain(bytes).value(0, bytes.len()).unwrap());
 }
 
 #[test]
@@ -265,8 +275,10 @@ fn seq_roundtrips_at_every_length_width() {
     ] {
         let values = seq_values(rows, spread);
         // The heap a second column packs behind a first.
-        let mut heap = vec![0xEE; 77];
+        let mut heap = HeapWriter::plain();
+        push_bytes(&mut heap, &[0xEE; 77]);
         let image = seq_image(&values, &mut heap);
+        let heap = heap.finish().1;
         let lens = values.iter().map(Vec::len);
         let span = (lens.clone().min().unwrap(), lens.clone().max().unwrap());
         let (short, long): (Vec<usize>, Vec<usize>) = lens.partition(|&len| len <= SHORT_STRING_THRESHOLD);
@@ -298,7 +310,7 @@ fn seq_roundtrips_at_every_length_width() {
             2..2,
         ] {
             let mut out = vec![0xAAu8; window.len() * 16];
-            seq.decode(&heap, window.start, &mut out);
+            seq.decode(Heap::Plain(&heap), window.start, &mut out);
             for (cell, want) in out.as_chunks::<16>().0.iter().zip(&values[window.clone()]) {
                 assert!(gnitz_wire::german_string_cell_ok(cell, &heap), "{bw}: a canonical cell");
                 assert_eq!(
@@ -314,7 +326,7 @@ fn seq_roundtrips_at_every_length_width() {
 #[test]
 fn seq_parse_refuses_a_size_its_header_does_not_give() {
     let values = seq_values(DECODE_BLOCK_ROWS + 3, 30);
-    let image = seq_image(&values, &mut Vec::new());
+    let image = seq_image(&values, &mut HeapWriter::plain());
     assert!(SeqImage::parse(&image, values.len()).is_some());
     for rows in [values.len() - 1, values.len() + 1, DECODE_BLOCK_ROWS] {
         assert!(SeqImage::parse(&image, rows).is_none(), "{rows} rows");
@@ -333,17 +345,18 @@ fn seq_parse_refuses_a_size_its_header_does_not_give() {
 #[test]
 fn a_seq_value_past_its_heap_or_pool_reads_empty() {
     let values = seq_values(40, 30);
-    let mut heap = Vec::new();
+    let mut heap = HeapWriter::plain();
     let image = seq_image(&values, &mut heap);
+    let heap = heap.finish().1;
     let mut forged = image.clone();
     forged[SEQ_BLOCKS_AT..SEQ_BLOCKS_AT + SEQ_BLOCK_ENTRY].fill(0xFF);
     let seq = SeqImage::parse(&forged, values.len()).unwrap();
     let mut out = vec![0xAAu8; values.len() * 16];
-    seq.decode(&heap, 0, &mut out);
+    seq.decode(Heap::Plain(&heap), 0, &mut out);
     assert_eq!(out, vec![0u8; out.len()]);
     // A heap shorter than the lengths name.
     let seq = SeqImage::parse(&image, values.len()).unwrap();
-    seq.decode(&heap[..heap.len() / 2], 0, &mut out);
+    seq.decode(Heap::Plain(&heap[..heap.len() / 2]), 0, &mut out);
     for (cell, want) in out.as_chunks::<16>().0.iter().zip(&values) {
         let got = gnitz_wire::german_string_content(cell, &heap);
         assert!(got == want.as_slice() || got.is_empty());

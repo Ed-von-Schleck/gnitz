@@ -13,7 +13,7 @@ use std::hint::black_box;
 use crate::relation::RelationKind;
 use crate::test_support::{relation_fixture, RelationFixture, TID};
 use gnitz_foundation::perf::{Counter, Resident};
-use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewProps, WireStatus};
+use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewBudget, WireStatus};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -136,10 +136,10 @@ fn delta_capture_bench() {
                 let row_bytes = round(&schema(strings), strings, 0, 64).total_bytes() as u64 / 64;
                 let rounds = (2 * (ram_tier + budget) / row_bytes).div_ceil(per_round);
                 let rows = rounds * per_round;
-                let fed = RelationKind::View(ViewProps::Fed {
+                let fed = RelationKind::View(ViewBudget::Fed {
                     delta_bytes: std::num::NonZeroU64::new(budget).unwrap(),
                 });
-                for (kind, kind_name) in [(RelationKind::View(ViewProps::Plain), "plain"), (fed, "fed")] {
+                for (kind, kind_name) in [(RelationKind::View(ViewBudget::Plain), "plain"), (fed, "fed")] {
                     if !only("GNITZ_CAPTURE_KIND", kind_name) {
                         continue;
                     }
@@ -174,7 +174,7 @@ fn delta_capture_bench() {
 fn delta_idle_bench() {
     for budget_mib in env_list("GNITZ_CAPTURE_BUDGETS_MIB", &[4, 64, 256]) {
         let resident = Resident::baseline().expect("run under GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072");
-        let fed = RelationKind::View(ViewProps::Fed {
+        let fed = RelationKind::View(ViewBudget::Fed {
             delta_bytes: std::num::NonZeroU64::new(budget_mib << 20).unwrap(),
         });
         let mut r = relation_fixture(fed, schema(false), &[], []);

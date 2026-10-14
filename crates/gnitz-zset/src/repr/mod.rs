@@ -31,6 +31,7 @@ mod batch;
 mod batch_builder;
 mod batch_pool;
 mod batch_wire;
+mod codebook;
 mod compact;
 mod encoding;
 mod error;
@@ -53,7 +54,8 @@ pub use batch::Batch;
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
 pub use batch_wire::WireRows;
-pub use compact::{guard_slot, merge_guard};
+pub use codebook::Codebook;
+pub use compact::{guard_slot, merge_guard, GuardRun};
 pub use error::StorageError;
 pub use merge::{merge_consolidated, MemBatch};
 pub use read_cursor::{

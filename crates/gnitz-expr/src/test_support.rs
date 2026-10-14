@@ -12,7 +12,7 @@ use crate::{
     BatchView, ColumnLocator, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
     ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
 };
-use gnitz_wire::RowSource;
+use gnitz_wire::{Heap, RowSource};
 
 /// A [`BatchView`] and [`MapTarget`] over owned buffers, laid out region-wise
 /// like the physical batch.
@@ -127,8 +127,8 @@ impl RowSource for TestView {
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         &self.cols[payload_col][row * col_size..row * col_size + col_size]
     }
-    fn blob(&self) -> &[u8] {
-        &self.blob
+    fn heap(&self) -> Heap<'_> {
+        Heap::Plain(&self.blob)
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
@@ -147,6 +147,9 @@ impl BatchView for TestView {
     }
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pk, self.pk_stride)
+    }
+    fn blob(&self) -> &[u8] {
+        &self.blob
     }
 }
 

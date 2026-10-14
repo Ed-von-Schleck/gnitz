@@ -377,16 +377,14 @@ impl core::fmt::Display for ColType {
     }
 }
 
-/// Compare two equal-width column windows of type `tc`: German strings
-/// (STRING/BLOB) by content through their backing blob arenas, every
-/// fixed-width type by its value — unsigned magnitude, signed two's complement,
-/// or `total_cmp` for a float. The blob slices back each side's heap payload,
-/// and are ignored for non-string columns.
+/// Compare two equal-width windows of the fixed-width type `tc` by value —
+/// unsigned magnitude, signed two's complement, or `total_cmp` for a float. A
+/// STRING/BLOB window orders through its heap: [`crate::compare_german_strings`].
 ///
 /// In `gnitz-wire` because the client-side comparators are held to the same
 /// order as the engine's.
 #[inline(always)]
-pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> Ordering {
+pub fn cmp_col_window(a: &[u8], b: &[u8], tc: TypeCode) -> Ordering {
     // Deliberately not `debug_assert_eq!`: that takes both lengths by reference
     // and spills them, on a per-row path.
     debug_assert!(a.len() == b.len(), "cmp_col_window: windows must be equal length");
@@ -408,7 +406,7 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
         T::I128 => i128::from_le_bytes(arr(a)).cmp(&i128::from_le_bytes(arr(b))),
         T::F32 => f32::from_le_bytes(arr(a)).total_cmp(&f32::from_le_bytes(arr(b))),
         T::F64 => f64::from_le_bytes(arr(a)).total_cmp(&f64::from_le_bytes(arr(b))),
-        T::String | T::Blob => crate::compare_german_strings(&arr(a), a_blob, &arr(b), b_blob),
+        T::String | T::Blob => unreachable!("cmp_col_window: a string window orders through its heap"),
     }
 }
 

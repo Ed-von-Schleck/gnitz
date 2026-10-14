@@ -316,6 +316,7 @@ fn child_registry(
             schema,
             placement,
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
     registry

@@ -410,6 +410,7 @@ fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
             schema,
             placement: gnitz_zset::algebra::Placement::full_pk(&schema),
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
 

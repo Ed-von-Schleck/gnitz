@@ -131,7 +131,11 @@ pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColu
 pub fn circuit_batch(vid: u64, circuit: &Circuit) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
     let circuit = circuit.encode();
-    CircuitRow { view_id: vid, circuit: &circuit }.write(&mut bb, 1);
+    CircuitRow {
+        view_id: vid,
+        circuit: circuit.as_slice().into(),
+    }
+    .write(&mut bb, 1);
     bb.finish()
 }
 
@@ -366,7 +370,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
         let row = TableTabRow {
             table_id,
             schema_id: PUBLIC_SCHEMA_ID,
-            name,
+            name: name.into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
             flags: gnitz_wire::TableProps::default().pack(),
         };
@@ -379,7 +383,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
-        SchemaTabRow { schema_id, name }.write(&mut bb, weight);
+        SchemaTabRow { schema_id, name: name.into() }.write(&mut bb, weight);
     }
     bb.finish()
 }
@@ -398,7 +402,7 @@ pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_
         index_id,
         owner_id,
         source_col_idx: gnitz_wire::PkColList::from_slice(cols).pack(),
-        name,
+        name: name.into(),
         is_unique: is_unique as u64,
     }
     .write(&mut bb, weight);
@@ -406,7 +410,7 @@ pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_
 }
 
 /// Append one raw VIEW_TAB row with PK list `[0]`, word by word, so a test can forge
-/// budget words no `ViewProps` holds (`0` = off; `owner_view_id` `0` = a user view).
+/// budget words no `ViewBudget` holds (`0` = off; `owner_view_id` `0` = a user view).
 pub fn push_view_tab_row(
     bb: &mut BatchBuilder,
     weight: i64,
@@ -425,6 +429,7 @@ pub fn push_view_tab_row(
     sink.put_u64(delta_bytes);
     sink.put_u64(owner_view_id);
     sink.put_u64(0); // pk_repeats
+    sink.put_u64(0); // compress
     sink.end_row();
 }
 

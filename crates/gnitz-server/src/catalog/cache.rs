@@ -151,7 +151,7 @@ impl CatalogEngine {
         for i in batch.retracted_rows() {
             let (sid, name) = key(i);
             if let Entry::Occupied(mut names) = by_schema.entry(sid) {
-                names.get_mut().remove(name);
+                names.get_mut().remove(&*name);
                 if names.get().is_empty() {
                     names.remove();
                 }

@@ -6,7 +6,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{payload_str, payload_u64};
+use gnitz_wire::{payload_u64, RowSource};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
 use std::cell::RefCell;
@@ -210,7 +210,10 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
         if loc.is_null(b, r) {
             Cell::Null
         } else if tc.is_german_string() {
-            Cell::Str(payload_str(b, r, pi).unwrap())
+            let cell = b.get_col_ptr(r, pi, 16);
+            Cell::Str(
+                std::str::from_utf8(gnitz_wire::german_string_content(cell, gnitz_expr::BatchView::blob(b))).unwrap(),
+            )
         } else if tc == TypeCode::F64 {
             Cell::F64(f64::from_bits(payload_u64(b, r, pi)))
         } else {

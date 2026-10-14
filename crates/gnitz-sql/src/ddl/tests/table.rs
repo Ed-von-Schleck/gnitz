@@ -18,7 +18,12 @@ fn with_options_carry_replicated_and_stream_independently() {
         ("WITH (stream = true, replicated = false)", true, keyed),
         ("WITH (stream = true, replicated = true)", true, repl),
     ] {
-        let want = TableProps { stream, distribution, serial: false };
+        let want = TableProps {
+            stream,
+            distribution,
+            serial: false,
+            compress: false,
+        };
         assert_eq!(parse_table_options(&table_options_of(with)).unwrap(), want, "{with}");
     }
     let e = parse_table_options(&table_options_of("WITH (stream = 1)")).unwrap_err();

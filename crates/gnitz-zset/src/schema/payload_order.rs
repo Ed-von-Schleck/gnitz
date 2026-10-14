@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use super::SchemaDescriptor;
 use gnitz_wire::RowSource;
-use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
+use gnitz_wire::{cmp_col_window, compare_german_strings, null_word_get, read_unsigned_exact};
 
 /// Compare two rows in the full (PK, payload) order.
 pub(crate) fn compare_full_rows<A: RowSource, B: RowSource>(
@@ -35,9 +35,6 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
 ) -> Ordering {
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
-    // Both blob arenas are loop-invariant, and only the German-string arm of
-    // `cmp_col_window` reads them, so they are hoisted out of the column loop.
-    let (blob_a, blob_b) = (src_a.blob(), src_b.blob());
 
     for (payload_col, col) in schema.payload_columns() {
         let null_a = null_word_get(null_word_a, payload_col);
@@ -53,13 +50,14 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
         }
 
         let cs = col.size();
-        let ord = cmp_col_window(
+        let (a, b) = (
             src_a.get_col_ptr(row_a, payload_col, cs),
-            blob_a,
             src_b.get_col_ptr(row_b, payload_col, cs),
-            blob_b,
-            col.type_code,
         );
+        let ord = match col.type_code.is_german_string() {
+            true => compare_german_strings(a.try_into().unwrap(), src_a.heap(), b.try_into().unwrap(), src_b.heap()),
+            false => cmp_col_window(a, b, col.type_code),
+        };
 
         if ord != Ordering::Equal {
             return ord;

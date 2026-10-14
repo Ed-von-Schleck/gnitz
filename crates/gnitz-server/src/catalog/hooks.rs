@@ -103,6 +103,7 @@ impl CatalogEngine {
             schema,
             placement,
             pk_repeats: rel.pk_repeats(),
+            compress: rel.compress,
         })?;
         self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.serial());
         // Derived, not stored: every process builds the same FK indexes from the same

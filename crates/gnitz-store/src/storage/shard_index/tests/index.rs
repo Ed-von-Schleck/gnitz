@@ -79,7 +79,7 @@ impl ShardIndex {
 fn open(dir: &Path, schema: SchemaDescriptor, budget: Option<u64>) -> ShardIndex {
     let dir = dir.to_str().unwrap();
     let shards = manifest::read(dir).unwrap().map(|m| m.shards).unwrap_or_default();
-    ShardIndex::open(dir, schema, budget, false, &shards).unwrap()
+    ShardIndex::open(dir, schema, budget, false, false, &shards).unwrap()
 }
 
 /// An unbounded store at `dir`, reloaded from its manifest if it has one.
@@ -162,7 +162,9 @@ fn assert_stable(len: u64) {
 /// Write `batch` as a published entry of `level_idx`'s guard `key`, creating it,
 /// stamped `stamp`.
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
-    let entry = idx.write_shard(batch, false, Some(stamp)).unwrap();
+    let entry = idx
+        .write_with(Some(stamp), |path, opts| batch.write_as_shard(path, opts))
+        .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.mark_published();
 }
@@ -1771,7 +1773,8 @@ fn tier_folds_keep_the_zset() {
             let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();
             idx.verify_shards().unwrap();
             let mut starts = vec![0; inputs.len()];
-            if let Some((_, batch)) = merge_guard(&inputs, &[gk(0)], 0, &mut starts, false, &schema) {
+            if let Some((_, run)) = merge_guard(&inputs, &[gk(0)], 0, &mut starts, false, &schema, None) {
+                let batch = run.plain().unwrap();
                 for row in 0..batch.len() {
                     let k = u64::from_be_bytes(batch.get_pk_bytes(row).try_into().unwrap());
                     *per_key.entry(k).or_default() += batch.get_weight(row);

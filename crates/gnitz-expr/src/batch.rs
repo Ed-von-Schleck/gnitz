@@ -16,7 +16,7 @@ use crate::simd::{self, LanePred, Level};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_content, german_string_heap, german_string_inline, low_bits_mask,
-    null_word_get, FixedInt,
+    null_word_get, FixedInt, Heap,
 };
 
 /// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
@@ -1373,7 +1373,12 @@ fn eval_str_cmp<A: Cells, B: Cells>(
     fill_null_bits_mask(scratch, dst, mo, a.null_bit | b.null_bit);
     let rd = &mut scratch.regs[dst as usize].lanes[..mo.m];
     for (i, r) in rd.iter_mut().enumerate() {
-        *r = pred(compare_german_strings(a.cells.cell(i), a.blob, b.cells.cell(i), b.blob)) as i64;
+        *r = pred(compare_german_strings(
+            a.cells.cell(i),
+            Heap::Plain(a.blob),
+            b.cells.cell(i),
+            Heap::Plain(b.blob),
+        )) as i64;
     }
     maybe_pack_bool_bits(scratch, mo, dst);
 }

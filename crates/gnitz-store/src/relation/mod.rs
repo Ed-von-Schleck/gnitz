@@ -11,7 +11,7 @@ use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};
-use gnitz_wire::{PkColList, PkKeys, ViewProps};
+use gnitz_wire::{PkColList, PkKeys, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
 
@@ -145,7 +145,7 @@ pub enum RelationKind {
     ///
     /// Not necessarily *rebuilt* from its sources: a mirror registers its fed
     /// copies under this kind too.
-    View(ViewProps),
+    View(ViewBudget),
     /// Ingestion point: storeless, append-only. Pushed rows exist
     /// only as the deltas they produce; nothing is retained, so there is nothing
     /// to recover and no store to read.
@@ -192,9 +192,11 @@ impl RelationKind {
     /// Whether this kind of relation may carry a secondary index.
     fn admits_index(self) -> bool {
         match self {
-            RelationKind::BaseTable | RelationKind::View(ViewProps::Plain | ViewProps::Fed { .. }) => true,
+            RelationKind::BaseTable | RelationKind::View(ViewBudget::Plain | ViewBudget::Fed { .. }) => true,
             // A bounded view's sweep drops the payload an entry is projected from.
-            RelationKind::View(ViewProps::Bounded { .. }) | RelationKind::Stream | RelationKind::SystemCatalog => false,
+            RelationKind::View(ViewBudget::Bounded { .. }) | RelationKind::Stream | RelationKind::SystemCatalog => {
+                false
+            }
         }
     }
 
@@ -202,14 +204,14 @@ impl RelationKind {
     /// its store.
     #[inline]
     pub fn has_delta_feed(self) -> bool {
-        matches!(self, RelationKind::View(ViewProps::Fed { .. }))
+        matches!(self, RelationKind::View(ViewBudget::Fed { .. }))
     }
 
     /// Whether a capacity bounds this relation's registered shard bytes, so its
     /// sweep may leave skeleton rows behind.
     #[inline]
     pub fn is_bounded(self) -> bool {
-        matches!(self, RelationKind::View(ViewProps::Bounded { .. }))
+        matches!(self, RelationKind::View(ViewBudget::Bounded { .. }))
     }
 }
 
@@ -258,6 +260,7 @@ pub struct Relation {
     kind: RelationKind,
     placement: Placement,
     pk_repeats: bool,
+    compress: bool,
 }
 
 impl Relation {
@@ -289,6 +292,11 @@ impl Relation {
     /// Whether two of its rows may share a PK.
     pub fn pk_repeats(&self) -> bool {
         self.pk_repeats
+    }
+
+    /// Whether its rows' store codes its heaps.
+    pub fn compress(&self) -> bool {
+        self.compress
     }
 
     /// The unique secondary indexes a write must still check: one covering the
@@ -371,6 +379,9 @@ pub struct RelationSpec {
     /// Whether two of its rows may share a PK. `false` is a promise the index
     /// gather relies on, so a host that cannot vouch for it passes `true`.
     pub pk_repeats: bool,
+    /// `WITH (compress = true)`: its rows' store codes its shards' heaps under
+    /// a symbol table where that pays.
+    pub compress: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +535,7 @@ impl RelationRegistry {
                 index_schema,
                 RecoverySource::Rederive { resume_at },
                 None,
+                false,
             )?));
             if !ix.resumed() {
                 let owner_store = &self.tables[&owner].store;

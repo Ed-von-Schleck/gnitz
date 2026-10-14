@@ -5,6 +5,7 @@ use super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, 
 use super::merge::MemBatch;
 use super::string_heap::{rebase_string_cells, BlobCache};
 use crate::schema::SchemaDescriptor;
+use gnitz_wire::Heap;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
 /// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed
@@ -157,11 +158,11 @@ impl<'a> DirectWriter<'a> {
     }
 
     /// Rebase string column `pi`, whose cells were copied verbatim from a source
-    /// whose heap is `src_blob`; see [`rebase_string_cells`].
+    /// whose heap is `src`; see [`rebase_string_cells`].
     #[inline]
-    pub(crate) fn rebase_string_col(&mut self, pi: usize, src_blob: &[u8], heap_at: Option<usize>) {
+    pub(crate) fn rebase_string_col(&mut self, pi: usize, src: Heap<'_>, heap_at: Option<usize>) {
         let (cells, blob, cache) = self.string_col_mut(pi);
-        rebase_string_cells(cells, src_blob, blob, heap_at, cache);
+        rebase_string_cells(cells, src, blob, heap_at, cache);
     }
 
     /// Carry a source heap whole onto the end of this writer's heap. Returns the

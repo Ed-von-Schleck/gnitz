@@ -166,8 +166,8 @@ pub trait RowSource {
     fn get_null_word(&self, row: usize) -> u64;
     /// `col_size` bytes of payload column `payload_col` (native LE) in `row`.
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
-    /// The variable-length string/blob heap the German-string cells point into.
-    fn blob(&self) -> &[u8];
+    /// The heap the German-string cells' long values lie in.
+    fn heap(&self) -> crate::Heap<'_>;
     /// Rows in this source. The bound every whole-source walk reads — the
     /// evaluator's `RowFilter::ranges`, the engine's N-way merge
     /// — so that a caller can never drive a view past its own end with a count it
@@ -191,8 +191,8 @@ impl<T: RowSource + ?Sized> RowSource for &T {
         (**self).get_col_ptr(row, payload_col, col_size)
     }
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        (**self).blob()
+    fn heap(&self) -> crate::Heap<'_> {
+        (**self).heap()
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
@@ -208,13 +208,21 @@ pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
 /// One row's STRING or BLOB payload slot `pi`, resolved through the source's
 /// heap.
 #[inline(always)]
-pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
-    crate::german_string_content(src.get_col_ptr(row, pi, 16), src.blob())
+pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> std::borrow::Cow<'_, [u8]> {
+    crate::german_string_bytes(src.get_col_ptr(row, pi, 16), src.heap())
 }
 
-/// [`payload_bytes`] as a `&str`; an error when the cell is not UTF-8.
-pub fn payload_str<S: RowSource>(src: &S, row: usize, pi: usize) -> Result<&str, std::str::Utf8Error> {
-    std::str::from_utf8(payload_bytes(src, row, pi))
+/// [`payload_bytes`] as a string; an error when the cell is not UTF-8.
+pub fn payload_str<S: RowSource>(
+    src: &S,
+    row: usize,
+    pi: usize,
+) -> Result<std::borrow::Cow<'_, str>, std::str::Utf8Error> {
+    use std::borrow::Cow;
+    match payload_bytes(src, row, pi) {
+        Cow::Borrowed(bytes) => std::str::from_utf8(bytes).map(Cow::Borrowed),
+        Cow::Owned(bytes) => String::from_utf8(bytes).map(Cow::Owned).map_err(|e| e.utf8_error()),
+    }
 }
 
 /// Whether one row's payload slot `pi` is NULL.

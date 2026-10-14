@@ -25,7 +25,14 @@ impl RelationRegistry {
     }
 
     fn enter(&mut self, spec: RelationSpec, (store, feed): (Store, Option<Feed>)) {
-        let RelationSpec { id, kind, placement, pk_repeats, .. } = spec;
+        let RelationSpec {
+            id,
+            kind,
+            placement,
+            pk_repeats,
+            compress,
+            ..
+        } = spec;
         let prev = self.tables.insert(
             id,
             Relation {
@@ -37,6 +44,7 @@ impl RelationRegistry {
                 kind,
                 placement,
                 pk_repeats,
+                compress,
             },
         );
         debug_assert!(prev.is_none(), "relation {id} registered twice");
@@ -49,7 +57,9 @@ impl RelationRegistry {
         spec: RelationSpec,
         resume_at: Option<u64>,
     ) -> Result<(Store, Option<Feed>), String> {
-        let RelationSpec { id, kind, schema, placement, .. } = spec;
+        let RelationSpec {
+            id, kind, schema, placement, compress, ..
+        } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
         let (recovery, capacity, feed) = match kind {
             RelationKind::Stream => return absent(),
@@ -58,7 +68,7 @@ impl RelationRegistry {
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
                 let ram_tier_bytes = self.config.ram_tier_bytes;
-                let table = Table::new(&dir, schema, RecoverySource::SalReplay, ram_tier_bytes, None)
+                let table = Table::new(&dir, schema, RecoverySource::SalReplay, ram_tier_bytes, None, false)
                     .map_err(|e| format!("open store '{dir}': {e}"))?;
                 return Ok((Store::Held(Box::new(table)), None));
             }
@@ -91,7 +101,7 @@ impl RelationRegistry {
                 )
             }
         };
-        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, capacity)?;
+        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, capacity, compress)?;
         // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.
         let feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
         Ok((Store::Held(Box::new(rows)), feed))
@@ -105,8 +115,9 @@ impl RelationRegistry {
         schema: SchemaDescriptor,
         recovery: RecoverySource,
         capacity: Option<u64>,
+        compress: bool,
     ) -> Result<Table, String> {
-        let table = self.open_child(id, kind, schema, recovery, capacity)?;
+        let table = self.open_child(id, kind, schema, recovery, capacity, compress)?;
         // A resume that found no manifest at its generation.
         if matches!(recovery, RecoverySource::Rederive { resume_at: Some(_) }) && table.loaded_mark().is_none() {
             return Err(format!(
@@ -124,9 +135,10 @@ impl RelationRegistry {
         schema: SchemaDescriptor,
         recovery: RecoverySource,
         capacity: Option<u64>,
+        compress: bool,
     ) -> Result<Table, String> {
         let dir = self.child_dir(id, kind);
-        Table::new(&dir, schema, recovery, self.config.ram_tier_bytes, capacity)
+        Table::new(&dir, schema, recovery, self.config.ram_tier_bytes, capacity, compress)
             .map_err(|e| format!("open store '{dir}': {e}"))
     }
 }

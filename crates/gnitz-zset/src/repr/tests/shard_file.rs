@@ -2,12 +2,13 @@ use super::*;
 use crate::repr::{BatchBuilder, MappedShard};
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch};
+use gnitz_wire::Heap;
 
 /// Any change to the written bytes, the writer's own or a dependency's, needs a
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (29, 7727684566177143943);
+    const PINNED: (u64, u64) = (30, 5542345507825367142);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let schema = SchemaDescriptor::new(
         &[
@@ -18,6 +19,7 @@ fn shard_bytes_are_pinned() {
             SchemaColumn::new(TypeCode::String, false),
             SchemaColumn::new(TypeCode::I64, true),
             int,
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -34,13 +36,22 @@ fn shard_bytes_are_pinned() {
         // One row in eight holds a value: the others' cells are left out.
         b.put_opt_int((i % 8 == 0).then_some((1 << 40) + i as u128));
         b.put_int(7);
+        // Words a symbol table codes: the heap the strings share is coded.
+        b.put_string(&format!(
+            "row {i} of the golden shard: {}",
+            "words a table codes ".repeat(10)
+        ));
         b.end_row();
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("golden.db");
-    b.finish()
-        .write_as_shard(path.to_str().unwrap(), ShardWriteOpts::default())
-        .unwrap();
+    let batch = b.finish();
+    let codebook = Codebook::for_batch(None, &batch);
+    let opts = ShardWriteOpts {
+        codebook: codebook.as_deref(),
+        ..Default::default()
+    };
+    batch.write_as_shard(path.to_str().unwrap(), opts).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
 
     let spans = spans_of(&bytes);
@@ -48,7 +59,7 @@ fn shard_bytes_are_pinned() {
     use Encoding::*;
     assert_eq!(
         encodings,
-        [Key, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Raw, Raw],
+        [Key, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Seq, Symbols, Raw],
         "the batch covers every encoding"
     );
     assert!(spans.last().unwrap().size > 0, "and a PK filter");
@@ -97,7 +108,11 @@ fn a_shard_drops_its_runs_dead_heap() {
 
     let dir = tempfile::tempdir().unwrap();
     let shard = map_shard(&dir.path().join("s.db"), &run);
-    assert_eq!(shard.blob().len(), y.len(), "only the referenced span reaches disk");
+    assert_eq!(
+        shard.heap().plain_len(),
+        y.len(),
+        "only the referenced span reaches disk"
+    );
     assert_eq!(read_strings(&shard.slice_to_owned_batch(0, 1)), [y.to_vec()]);
 }
 
@@ -115,7 +130,7 @@ fn written_strings(rows: &[(u64, i64, &[u8])]) -> (usize, Encoding) {
     for (row, &(_, _, want)) in rows.iter().enumerate() {
         assert_eq!(gnitz_wire::payload_bytes(&shard, row, 0), want, "row {row}");
     }
-    (shard.blob().len(), spans_of(&image)[REG_PAYLOAD_START].encoding)
+    (shard.heap().plain_len(), spans_of(&image)[REG_PAYLOAD_START].encoding)
 }
 
 /// A long value several rows hold reaches the heap once, whichever image the
@@ -147,7 +162,7 @@ fn a_packed_shard_drops_its_runs_dead_heap() {
 
     let dir = tempfile::tempdir().unwrap();
     let shard = map_shard(&dir.path().join("s.db"), &run);
-    assert_eq!(shard.blob().len(), y.len());
+    assert_eq!(shard.heap().plain_len(), y.len());
     assert_eq!(shard.row_count(), 3);
 }
 
@@ -168,8 +183,9 @@ fn each_value_twice(values: usize, width: usize) -> (Vec<[u8; 16]>, Vec<u8>) {
 fn more_values_than_a_dictionary_holds_stay_raw_over_a_shared_heap() {
     let values = DICT_MAX_ENTRIES + 1;
     let (cells, src_heap) = each_value_twice(values, 40);
-    let mut heap = Vec::new();
-    let (encoding, image) = pack_string_column(&cells, &src_heap, &mut heap);
+    let mut heap = HeapWriter::plain();
+    let (encoding, image) = pack_string_column(&cells, Heap::Plain(&src_heap), &mut heap);
+    let heap = heap.finish().1;
     assert_eq!(encoding, Encoding::Raw);
     assert_eq!(heap.len() * 2, src_heap.len(), "each value once");
     let packed = image.as_chunks::<16>().0;
@@ -189,8 +205,10 @@ fn more_values_than_a_dictionary_holds_stay_raw_over_a_shared_heap() {
 #[test]
 fn more_short_values_than_a_dictionary_holds_are_their_lengths() {
     let (cells, src_heap) = each_value_twice(DICT_MAX_ENTRIES + 1, 20);
-    let mut heap = vec![0u8; 5];
-    let (encoding, image) = pack_string_column(&cells, &src_heap, &mut heap);
+    let mut heap = HeapWriter::plain();
+    heap.push(Heap::Plain(&[0; 5]).value(0, 5).unwrap());
+    let (encoding, image) = pack_string_column(&cells, Heap::Plain(&src_heap), &mut heap);
+    let heap = heap.finish().1;
     assert_eq!(encoding, Encoding::Seq);
     assert_eq!(
         heap.len() - 5,
@@ -200,7 +218,7 @@ fn more_short_values_than_a_dictionary_holds_are_their_lengths() {
     let mut packed = vec![0u8; cells.len() * 16];
     SeqImage::parse(&image, cells.len())
         .unwrap()
-        .decode(&heap, 0, &mut packed);
+        .decode(Heap::Plain(&heap), 0, &mut packed);
     for (i, (cell, src)) in packed.as_chunks::<16>().0.iter().zip(&cells).enumerate() {
         assert_eq!(
             gnitz_wire::german_string_content(cell, &heap),

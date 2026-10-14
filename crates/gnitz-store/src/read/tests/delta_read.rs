@@ -8,7 +8,7 @@ use crate::test_support::{
     relation_fixture_with, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::{Cut, KeyRange, PkColList, PkKeys, ReadSink, TypeCode, ViewProps};
+use gnitz_wire::{Cut, KeyRange, PkColList, PkKeys, ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -409,10 +409,11 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
 
     r.register(RelationSpec {
         id: TID + 1,
-        kind: RelationKind::View(ViewProps::Plain),
+        kind: RelationKind::View(ViewBudget::Plain),
         schema,
         placement: Placement::full_pk(&schema),
         pk_repeats: false,
+        compress: false,
     })
     .unwrap();
     for (id, after_tick, layout) in [(TID, 0, own ^ 1), (TID, 3, own ^ 1), (TID + 1, 0, own)] {

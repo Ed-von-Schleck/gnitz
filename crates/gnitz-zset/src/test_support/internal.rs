@@ -10,7 +10,9 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::repr::{from_runs, from_runs_in_band, Batch, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts};
+use crate::repr::{
+    from_runs, from_runs_in_band, Batch, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
+};
 use crate::schema::key::{key_range_between_cuts, KeyCut};
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
@@ -200,6 +202,38 @@ pub(crate) fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
     (0..batch.len())
         .map(|row| gnitz_wire::payload_bytes(batch, row, 0).to_vec())
         .collect()
+}
+
+/// Row `i`'s sentence: words of a short list, so that a symbol table codes a
+/// heap of them to a fraction of its bytes, and unique to `i`.
+pub(crate) fn prose(i: usize) -> String {
+    const WORDS: [&str; 12] = [
+        "the", "river", "under", "morning", "light", "carried", "every", "lantern", "toward", "harbour", "while",
+        "sailors",
+    ];
+    let mut s = format!("{i} ");
+    for k in 0..6 + i % 9 {
+        s.push_str(WORDS[(i * 7 + k * 5) % WORDS.len()]);
+        s.push(' ');
+    }
+    s
+}
+
+/// Write `batch` to `path` as a shard whose heap is coded under `codebook`,
+/// and map it.
+pub(crate) fn map_coded_shard(path: &Path, batch: &Batch, codebook: &Codebook) -> Rc<MappedShard> {
+    let path = path.to_str().unwrap();
+    let opts = ShardWriteOpts {
+        codebook: Some(codebook),
+        ..Default::default()
+    };
+    batch.write_as_shard(path, opts).unwrap();
+    let shard = MappedShard::open(path, batch.schema()).unwrap();
+    assert!(
+        shard.heap_is_coded(),
+        "premise: the heap codes to less than three quarters"
+    );
+    Rc::new(shard)
 }
 
 /// U64 pk + a single BLOB payload column.

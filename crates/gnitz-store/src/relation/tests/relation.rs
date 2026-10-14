@@ -17,6 +17,7 @@ fn table(id: u64, schema: SchemaDescriptor) -> RelationSpec {
         schema,
         placement: Placement::full_pk(&schema),
         pk_repeats: false,
+        compress: false,
     }
 }
 
@@ -24,10 +25,11 @@ fn view(id: u64) -> RelationSpec {
     let schema = pk_only_schema(&[TypeCode::U64]);
     RelationSpec {
         id,
-        kind: RelationKind::View(ViewProps::Plain),
+        kind: RelationKind::View(ViewBudget::Plain),
         schema,
         placement: Placement::full_pk(&schema),
         pk_repeats: false,
+        compress: false,
     }
 }
 
@@ -81,10 +83,10 @@ fn only_a_store_naming_one_row_per_key_admits_an_index() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     let schema = make_schema_u64_i64();
-    let plain = RelationKind::View(ViewProps::Plain);
+    let plain = RelationKind::View(ViewBudget::Plain);
     let mb = std::num::NonZeroU64::new(1 << 20).unwrap();
-    let fed = RelationKind::View(ViewProps::Fed { delta_bytes: mb });
-    let bounded = RelationKind::View(ViewProps::Bounded { capacity_bytes: mb });
+    let fed = RelationKind::View(ViewBudget::Fed { delta_bytes: mb });
+    let bounded = RelationKind::View(ViewBudget::Bounded { capacity_bytes: mb });
     let owners = [
         (RelationKind::BaseTable, false, Ok(true)),
         (plain, false, Ok(false)),
@@ -273,7 +275,7 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let spec = RelationSpec {
-        kind: RelationKind::View(ViewProps::Plain),
+        kind: RelationKind::View(ViewBudget::Plain),
         ..table(9, schema)
     };
     let cols = PkColList::from_slice(&[1]);

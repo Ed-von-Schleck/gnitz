@@ -161,7 +161,7 @@ fn a_view_over_a_compound_pk_view_keeps_its_pk() {
     )]);
     let v1 = view(&cat, "SELECT b, c, a FROM base");
     assert_eq!(pk(&v1), [2, 0]);
-    register(&cat, "v1", 40, v1.props.into(), final_view(&v1));
+    register(&cat, "v1", 40, v1.props.budget.into(), final_view(&v1));
     let v2 = view(&cat, "SELECT a, b FROM v1");
     assert_eq!(output_shape(&v2), sh(&[("a", false, false), ("b", false, false)]));
     assert_eq!(pk(&v2), [0, 1]);
@@ -816,7 +816,7 @@ fn a_join_view_is_keyed_on_its_join_key() {
         ("pq", table(48, vec![col("id", i), col("p", i), col("q", i)], vec![0])),
     ]);
     let uv = view(&cat, "SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2");
-    register(&cat, "uv", 60, uv.props.into(), final_view(&uv));
+    register(&cat, "uv", 60, uv.props.budget.into(), final_view(&uv));
     let on = (0..PK_LIST_MAX_COLS)
         .map(|k| format!("ka.c{k} = kb.c{k}"))
         .collect::<Vec<_>>()
@@ -1029,6 +1029,6 @@ fn a_collision_segment_keeps_only_its_live_columns() {
 fn a_registered_bounded_view_carries_its_class() {
     let cat = base();
     let bounded = plan(&cat, "CREATE VIEW v WITH (capacity = '1 MB') AS SELECT id, v FROM t").unwrap();
-    register(&cat, "bnd", 60, bounded.props.into(), final_view(&bounded));
+    register(&cat, "bnd", 60, bounded.props.budget.into(), final_view(&bounded));
     assert_eq!(cat.probe(&in_sn("bnd")).unwrap().unwrap().class, RelClass::BoundedView);
 }

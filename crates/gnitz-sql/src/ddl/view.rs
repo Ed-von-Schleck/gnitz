@@ -1,7 +1,7 @@
 //! CREATE / ALTER VIEW: decode the statement's own clauses and options, compile
 //! the body (`hir::bind_and_lower`) into a view bundle, and commit it atomically.
 
-use super::guard::kv_options;
+use super::guard::{bool_option, kv_options};
 use crate::ast_util::extract_object_name;
 use crate::bind::{bind_constant, Catalog};
 use crate::error::{reject_if, GnitzSqlError};
@@ -11,7 +11,7 @@ use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelName, ViewBundle};
-use gnitz_wire::ViewProps;
+use gnitz_wire::{ViewBudget, ViewProps};
 use std::num::NonZeroU64;
 
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query};
@@ -21,12 +21,16 @@ const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1
 
 /// Decode the `WITH (...)` clause of a `CREATE VIEW`.
 fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
-    let [capacity, delta] = kv_options(options, "CREATE VIEW", ["capacity", "delta"])?;
-    ViewProps::from_budgets(
+    let [capacity, delta, compress] = kv_options(options, "CREATE VIEW", ["capacity", "delta", "compress"])?;
+    let budget = ViewBudget::from_budgets(
         capacity.map(|v| size_option("capacity", v)).transpose()?,
         delta.map(|v| size_option("delta", v)).transpose()?,
     )
-    .map_err(|e| GnitzSqlError::Rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))
+    .map_err(|e| GnitzSqlError::Rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))?;
+    Ok(ViewProps {
+        budget,
+        compress: bool_option("compress", compress)?,
+    })
 }
 
 /// The byte count of one size-valued `CREATE VIEW` option.
@@ -182,7 +186,7 @@ pub(crate) fn plan_alter_view(
         stmt: "ALTER VIEW",
         replacing: Some(old_vid),
     };
-    let props = ViewProps::Plain;
+    let props = ViewProps::default();
     let bundle = plan_segments(cat, view, query, columns.iter(), props)?;
     Ok(PlannedChain {
         name: named,
@@ -202,7 +206,7 @@ fn plan_segments<'a>(
     props: ViewProps,
 ) -> Result<ViewBundle, GnitzSqlError> {
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
-    let bounded = matches!(props, ViewProps::Bounded { .. });
+    let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
     crate::hir::bind_and_lower(cat, query, view, bounded, aliases)
 }
 

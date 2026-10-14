@@ -19,6 +19,7 @@ use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::read_u64_le;
+use gnitz_wire::Heap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 
@@ -203,7 +204,10 @@ pub struct MappedShard {
     /// The null bits of `schema`'s payload columns past the file's own, OR'd
     /// into every null word read: a column the file predates reads NULL.
     null_pad_mask: u64,
+    /// The heap region.
     blob: &'static [u8],
+    /// `blob` taken apart, where it holds its values coded under a table.
+    coded: Option<SymbolsImage<'static>>,
     /// The PK filter region, or `None` when the file carries none.
     shard_filter: Option<&'static [u8]>,
     /// The words `null_bmp` points into when the file is wider than `schema`:
@@ -382,7 +386,12 @@ impl MappedShard {
         let [.., blob, filter] = spans.as_slice() else {
             unreachable!("region_spans yields every region plus the filter")
         };
-        if blob.encoding != Encoding::Raw || filter.encoding != Encoding::Raw {
+        let coded = match blob.encoding {
+            Encoding::Raw => None,
+            Encoding::Symbols => Some(SymbolsImage::parse(blob.bytes(data)).ok_or(Corrupt("region size"))?),
+            _ => return Err(Corrupt("encoding")),
+        };
+        if filter.encoding != Encoding::Raw {
             return Err(Corrupt("encoding"));
         }
         let shard_filter = match filter.size {
@@ -406,6 +415,7 @@ impl MappedShard {
             col_regions,
             null_pad_mask,
             blob: blob.bytes(data),
+            coded,
             shard_filter,
             mmap,
         })
@@ -448,7 +458,7 @@ impl MappedShard {
     fn decode_packed(&self, p: &PackedRegion, pi: usize, first: usize, out: &mut [u8]) {
         match &p.image {
             PackedImage::For(frame) => frame.decode(first, p.width, out),
-            PackedImage::Seq(seq) => seq.decode(self.blob, first, out),
+            PackedImage::Seq(seq) => seq.decode(self.heap(), first, out),
             PackedImage::Sparse(sparse) => {
                 // From the block's first row on: the decode counts the values before `first`.
                 let from = first - first % DECODE_BLOCK_ROWS;
@@ -491,6 +501,16 @@ impl MappedShard {
             PayloadRegion::Packed(p) => p.blocks.held(),
             PayloadRegion::Mapped(_) | PayloadRegion::Dict(_) => 0,
         }
+    }
+
+    /// Whether the heap holds its values coded under a symbol table.
+    pub fn heap_is_coded(&self) -> bool {
+        self.coded.is_some()
+    }
+
+    /// The heap region, where it is coded.
+    pub(crate) fn coded_heap(&self) -> Option<&SymbolsImage<'static>> {
+        self.coded.as_ref()
     }
 
     /// Whether this shard carries a PK filter.
@@ -559,12 +579,15 @@ impl MappedShard {
     /// Copy a contiguous slice of rows into a batch under the schema this handle
     /// is bound to, the blob arm picked by [`carried_dead`]. A shard holds no dead
     /// bytes of its own; a carried heap charges the long bytes of the rows outside
-    /// the slice.
+    /// the slice. A coded heap is never carried: its values are decoded into the
+    /// batch's own.
     #[inline]
     pub fn slice_to_owned_batch(&self, start: usize, row_count: usize) -> Batch {
         let n = self.header.row_count;
-        let carried = carried_dead(self.blob().len(), 0, n, row_count, || {
-            long_bytes_outside(self, self.schema.string_payload_slots(), &[(start, start + row_count)])
+        let carried = self.heap().plain().and_then(|blob| {
+            carried_dead(blob.len(), 0, n, row_count, || {
+                long_bytes_outside(self, self.schema.string_payload_slots(), &[(start, start + row_count)])
+            })
         });
         self.slice_to_owned_batch_with(start, row_count, carried)
     }
@@ -580,12 +603,12 @@ impl MappedShard {
         assert!(start + row_count <= self.header.row_count, "slice out of range");
 
         let schema = &self.schema;
-        let blob = self.blob;
+        let heap = self.heap();
         let relocate = carried.is_none();
         let blob_cap = if relocate {
-            prorated_blob_cap(blob.len(), self.header.row_count, row_count)
+            prorated_blob_cap(heap.plain_len(), self.header.row_count, row_count)
         } else {
-            blob.len()
+            heap.plain_len()
         };
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
             let (pk, weight, null_bmp) = w.fixed_mut();
@@ -599,12 +622,12 @@ impl MappedShard {
             }
             // A carried heap lands first in the fresh one, so its cells stand as
             // the shard holds them.
-            let heap_at = (!relocate).then(|| w.adopt_heap(blob));
+            let heap_at = (!relocate).then(|| w.adopt_heap(heap.plain().expect("only a plain heap is carried")));
             debug_assert!(heap_at.is_none_or(|base| base == 0), "a fresh writer's heap is empty");
             for (pi, col) in schema.payload_columns() {
                 self.decode_payload(pi, col.size(), start, w.col_mut(pi));
                 if col.type_code.is_german_string() {
-                    w.rebase_string_col(pi, blob, heap_at);
+                    w.rebase_string_col(pi, heap, heap_at);
                 }
             }
         });
@@ -643,8 +666,11 @@ impl RowSource for MappedShard {
     }
 
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.blob
+    fn heap(&self) -> Heap<'_> {
+        match &self.coded {
+            None => Heap::Plain(self.blob),
+            Some(image) => image.heap(),
+        }
     }
 
     #[inline(always)]
@@ -694,7 +720,7 @@ impl MappedShard {
             null_bmp,
             null_pad_mask: self.null_pad_mask,
             cols_off,
-            blob: self.blob(),
+            heap: self.heap(),
             heap_at: None,
         }
     }
@@ -754,8 +780,8 @@ impl RowSource for ShardWindow<'_> {
     }
 
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.shard.blob
+    fn heap(&self) -> Heap<'_> {
+        self.shard.heap()
     }
 
     #[inline(always)]

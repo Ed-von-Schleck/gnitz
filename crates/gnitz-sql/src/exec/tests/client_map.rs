@@ -76,12 +76,12 @@ fn a_computed_string_spills_beside_a_copied_one() {
     )
     .apply(b);
 
-    assert_eq!(payload_str(&out, 0, 0).unwrap().to_owned(), LONG);
+    assert_eq!(payload_str(&out, 0, 0).unwrap().into_owned(), LONG);
     assert!(payload_is_null(&out, 1, 0));
     assert_eq!(
         [
-            payload_str(&out, 0, 1).unwrap().to_owned(),
-            payload_str(&out, 1, 1).unwrap().to_owned()
+            payload_str(&out, 0, 1).unwrap().into_owned(),
+            payload_str(&out, 1, 1).unwrap().into_owned()
         ],
         [FALLBACK, FALLBACK]
     );

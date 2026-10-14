@@ -645,7 +645,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
     cat.insert(&in_sn("l"), l);
     cat.insert(&in_sn("r"), r);
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
-    register(&cat, "jv", 32, jv.props.into(), final_view(&jv));
+    register(&cat, "jv", 32, jv.props.budget.into(), final_view(&jv));
     let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
     cat.insert(&in_sn("st"), st);
 

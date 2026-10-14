@@ -26,8 +26,12 @@ fn route(
     let mut starts = vec![0usize; inputs.len()];
     (0..guards.len())
         .filter_map(|g| {
-            let (skeleton, batch) = merge_guard(&inputs, guards, g, &mut starts, dehydrate, schema)?;
-            Some((guards[g], skeleton, batch))
+            let (skeleton, run) = merge_guard(&inputs, guards, g, &mut starts, dehydrate, schema, None)?;
+            Some((
+                guards[g],
+                skeleton,
+                run.plain().expect("a merge given no codebook is plain").clone(),
+            ))
         })
         .collect()
 }
@@ -201,4 +205,86 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
         })
         .collect();
     assert_eq!(rows, [(true, vec![(1, 3)]), (true, vec![(5, 1), (9, 1)])]);
+}
+
+/// Each row of `src` as `(pk, weight, value)`, its weight `weight`'s.
+fn string_rows(src: &impl RowSource, weight: impl Fn(usize) -> i64) -> Vec<(u64, i64, Vec<u8>)> {
+    (0..src.row_count())
+        .map(|r| {
+            let pk = u64::from_be_bytes(src.get_pk_bytes(r).try_into().unwrap());
+            (pk, weight(r), gnitz_wire::payload_bytes(src, r, 0).into_owned())
+        })
+        .collect()
+}
+
+/// The bytes `src`'s heap stores for row `row`'s long value.
+fn stored(src: &impl RowSource, row: usize) -> Vec<u8> {
+    let cell = src.get_col_ptr(row, 0, 16);
+    gnitz_wire::german_string_value(cell, src.heap())
+        .unwrap()
+        .stored()
+        .to_vec()
+}
+
+/// A merge given a codebook writes its run coded under it: a value read from a
+/// shard of that table keeps its codes, one of another table's or of a plain
+/// shard is coded, and a retraction cancels the row it retracts, coded under one
+/// table or under two — the rows are the plain merge's, weights and all.
+#[test]
+fn a_coded_merge_keeps_the_codes_of_its_own_table() {
+    use crate::test_support::{make_string_batch, map_coded_shard, prose};
+    let dir = tempfile::tempdir().unwrap();
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let values: Vec<String> = (0..1000).map(prose).collect();
+    let rows = |pks: std::ops::RangeInclusive<u64>, w: i64| -> Batch {
+        let rows: Vec<(u64, i64, &[u8])> = pks.map(|pk| (pk, w, values[pk as usize].as_bytes())).collect();
+        make_string_batch(&rows)
+    };
+    let own = rows(1..=300, 1);
+    let book = Codebook::for_batch(None, &own).unwrap();
+    let theirs = rows(301..=600, 1);
+    let other = Codebook::for_batch(None, &theirs).unwrap();
+    assert_ne!(other.table().digest(), book.table().digest(), "premise: two tables");
+    // Retractions of `own`'s first rows under its table, of `theirs`' under
+    // none, and rows of no table yet.
+    let late = rows(1..=50, -1).merged_consolidated(&rows(601..=900, 1), &schema);
+    let retracted = rows(301..=320, -1);
+    let shards = [
+        map_coded_shard(&dir.path().join("own.db"), &own, &book),
+        map_coded_shard(&dir.path().join("theirs.db"), &theirs, &other),
+        map_coded_shard(&dir.path().join("late.db"), &late, &book),
+        crate::test_support::map_shard(&dir.path().join("retracted.db"), &retracted),
+    ];
+    let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
+    let guards = [PkBuf::zeroed(schema.pk_stride())];
+
+    let (_, plain) = merge_guard(&inputs, &guards, 0, &mut [0; 4], false, &schema, None).unwrap();
+    let (_, coded) = merge_guard(&inputs, &guards, 0, &mut [0; 4], false, &schema, Some(&book)).unwrap();
+    let plain = plain.plain().unwrap();
+    let want = string_rows(plain, |r| plain.get_weight(r));
+    assert_eq!(want.len(), 250 + 280 + 300);
+    let cancelled = |pk: u64| pk <= 50 || (301..=320).contains(&pk);
+    assert!(
+        want.iter().all(|&(pk, w, _)| !cancelled(pk) && w == 1),
+        "the retractions cancelled"
+    );
+    assert_eq!(string_rows(&coded, |r| coded.batch.get_weight(r)), want);
+
+    // Run rows 0..250 are `own`'s rows 50..300 and keep their codes; run row 250
+    // is `theirs`' row 20, coded anew under the merge's table.
+    for (run_row, own_row) in (0..250).zip(50..300) {
+        assert_eq!(
+            stored(&coded, run_row),
+            stored(&*shards[0], own_row),
+            "own row {own_row}"
+        );
+    }
+    let mut recoded = Vec::new();
+    book.encode_into(values[321].as_bytes(), &mut recoded);
+    assert_eq!(stored(&coded, 250), recoded);
+    assert_ne!(
+        stored(&*shards[1], 20),
+        recoded,
+        "premise: the other table codes it otherwise"
+    );
 }

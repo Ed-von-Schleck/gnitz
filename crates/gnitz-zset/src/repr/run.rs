@@ -17,7 +17,7 @@ use crate::repr::scatter::DecodedColumns;
 use crate::repr::shard_reader::MappedShard;
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::RowSource;
+use gnitz_wire::{Heap, RowSource};
 
 #[derive(Clone)]
 pub enum Run {
@@ -143,10 +143,10 @@ impl RowSource for Run {
         }
     }
     #[inline(always)]
-    fn blob(&self) -> &[u8] {
+    fn heap(&self) -> Heap<'_> {
         match self {
-            Run::Mem(b) => b.blob(),
-            Run::Shard(s) => s.blob(),
+            Run::Mem(b) => RowSource::heap(&**b),
+            Run::Shard(s) => s.heap(),
         }
     }
     #[inline(always)]

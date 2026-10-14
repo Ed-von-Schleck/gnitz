@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewProps};
+use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -19,7 +19,15 @@ pub(crate) fn new_table(
     recovery: RecoverySource,
     ram_tier_bytes: usize,
 ) -> Table {
-    Table::new(dir.as_ref().to_str().unwrap(), schema, recovery, ram_tier_bytes, None).unwrap()
+    Table::new(
+        dir.as_ref().to_str().unwrap(),
+        schema,
+        recovery,
+        ram_tier_bytes,
+        None,
+        false,
+    )
+    .unwrap()
 }
 
 /// A rederived table under `dir` at the default budgets — nothing a test puts
@@ -69,7 +77,7 @@ impl std::ops::DerefMut for RelationFixture {
 
 /// A fed view, its feed retaining `delta_bytes`.
 pub(crate) fn fed_view(delta_bytes: u64) -> RelationKind {
-    RelationKind::View(ViewProps::Fed {
+    RelationKind::View(ViewBudget::Fed {
         delta_bytes: NonZeroU64::new(delta_bytes).unwrap(),
     })
 }
@@ -102,6 +110,7 @@ pub(crate) fn relation_fixture_with(
             schema,
             placement: Placement::full_pk(&schema),
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
     for (id, &col) in (TID + 1..).zip(indexed) {

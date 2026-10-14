@@ -3,7 +3,7 @@
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_wire::ViewProps;
+use gnitz_wire::ViewBudget;
 use gnitz_zset::algebra::Slot;
 
 /// The view a test program's children are opened under.
@@ -47,10 +47,11 @@ impl TestVm {
         registry
             .register(RelationSpec {
                 id: VIEW_ID,
-                kind: RelationKind::View(ViewProps::Plain),
+                kind: RelationKind::View(ViewBudget::Plain),
                 schema,
                 placement: gnitz_zset::algebra::Placement::full_pk(&schema),
                 pk_repeats: false,
+                compress: false,
             })
             .unwrap();
         let vm = p.finish(out);

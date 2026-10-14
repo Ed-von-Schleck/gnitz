@@ -155,7 +155,7 @@ impl CatalogEngine {
         let row = TableTabRow {
             table_id: tid,
             schema_id: sid,
-            name: table_name,
+            name: table_name.into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols).pack(),
             flags: props.pack(),
         };
@@ -255,7 +255,7 @@ impl CatalogEngine {
         let row = TableTabRow {
             table_id: tid,
             schema_id,
-            name,
+            name: name.into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(pk).pack(),
             flags: gnitz_wire::TableProps::default().pack(),
         };

@@ -5,14 +5,14 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::codebook::Codebook;
 use super::encoding::*;
 use super::layout::*;
 use super::shard_filter;
-use super::string_heap::relocate_german_string_vec;
 use crate::repr::error::StorageError;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaColumn;
-use gnitz_wire::{german_string_content, read_u64_le, write_u64_le, FixedInt};
+use gnitz_wire::{read_u64_le, write_u64_le, FixedInt, Heap, RowSource};
 use rustc_hash::{FxHashMap, FxHashSet};
 use xorf::BinaryFuse8;
 
@@ -136,17 +136,13 @@ fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> 
 /// one cell for a column of one value. A column whose sample repeats no value
 /// is priced without the pass that tells its values apart, and the pass stops
 /// at the first value past which the lengths are the smaller.
-fn pack_string_column<'a>(cells: &'a [[u8; 16]], src_heap: &'a [u8], heap: &mut Vec<u8>) -> (Encoding, Vec<u8>) {
-    let content = |cell: &'a [u8; 16]| german_string_content(cell, src_heap);
+fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapWriter<'_>) -> (Encoding, Vec<u8>) {
     if is_constant(cells.as_flattened(), 16) {
-        return (
-            Encoding::Constant,
-            relocate_german_string_vec(&cells[0], src_heap, heap, None).to_vec(),
-        );
+        return (Encoding::Constant, heap.place(&cells[0], src).to_vec());
     }
-    let (at, raw) = (heap.len(), region_start(cells.len() * 16));
+    let (at, raw) = (heap.mark(), region_start(cells.len() * 16));
     let (mut span, mut short, mut long) = ((usize::MAX, 0), 0, 0);
-    for len in cells.iter().map(|cell| content(cell).len()) {
+    for len in cells.iter().map(|cell| stored_value(cell, src).0) {
         span = (span.0.min(len), span.1.max(len));
         *if len > gnitz_wire::SHORT_STRING_THRESHOLD {
             &mut long
@@ -166,16 +162,17 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src_heap: &'a [u8], heap: &mut 
             (raw + shared <= seq).then_some(Encoding::Raw)
         }
     };
-    if raw + long <= seq || sample_repeats(cells.len(), |row| content(&cells[row])) {
-        let mut index: FxHashMap<Content<'_>, u32> = FxHashMap::default();
+    if raw + long <= seq || sample_repeats(cells.len(), |row| stored_value(&cells[row], src).1) {
+        let mut index: FxHashMap<(usize, Content<'_>), u32> = FxHashMap::default();
         let mut entries: Vec<[u8; 16]> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(cells.len());
         for cell in cells {
             let next = entries.len() as u32;
-            let id = *index.entry(Content(content(cell))).or_insert(next);
+            let (len, bytes) = stored_value(cell, src);
+            let id = *index.entry((len, Content(bytes))).or_insert(next);
             if id == next {
-                entries.push(relocate_german_string_vec(cell, src_heap, heap, None));
-                if next > 0 && sharing(entries.len(), heap.len() - at).is_none() {
+                entries.push(heap.place(cell, src));
+                if next > 0 && sharing(entries.len(), heap.plain_len() - at.1).is_none() {
                     break;
                 }
             }
@@ -184,16 +181,13 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src_heap: &'a [u8], heap: &mut 
         if entries.len() == 1 {
             return (Encoding::Constant, entries[0].to_vec());
         }
-        match sharing(entries.len(), heap.len() - at) {
+        match sharing(entries.len(), heap.plain_len() - at.1) {
             Some(Encoding::Dict) => return (Encoding::Dict, dict_encode(&entries, &ids)),
             Some(_) => return (Encoding::Raw, ids.iter().flat_map(|&id| entries[id as usize]).collect()),
             None => heap.truncate(at),
         }
     }
-    (
-        Encoding::Seq,
-        seq_encode(cells.len(), span, cells.iter().map(content), heap),
-    )
+    (Encoding::Seq, seq_encode(cells, span, src, heap))
 }
 
 fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<BinaryFuse8> {
@@ -217,23 +211,40 @@ fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<B
 
 /// Per-call policy for [`Batch::write_as_shard`].
 #[derive(Clone, Copy, Default)]
-pub struct ShardWriteOpts {
+pub struct ShardWriteOpts<'a> {
     /// Stamp [`SHARD_FLAG_SKELETON`].
     pub skeleton: bool,
     /// Write no PK filter — named for what it turns off, so `Default` builds one.
     pub skip_pk_filter: bool,
+    /// Code the heap under this codebook, unless that leaves it more than three
+    /// quarters of its bytes.
+    pub codebook: Option<&'a Codebook>,
 }
 
 impl Batch {
     /// Write this batch as a new, unsynced shard at `path`; `Err` if `path` exists.
-    pub fn write_as_shard(&self, path: &str, opts: ShardWriteOpts) -> Result<(), StorageError> {
+    pub fn write_as_shard(&self, path: &str, opts: ShardWriteOpts<'_>) -> Result<(), StorageError> {
+        self.write_shard_over(self, path, opts)
+    }
+
+    /// [`write_as_shard`](Self::write_as_shard) of this batch's rows as `rows`
+    /// reads them: over the heap its blob holds.
+    pub(crate) fn write_shard_over(
+        &self,
+        rows: &impl RowSource,
+        path: &str,
+        opts: ShardWriteOpts<'_>,
+    ) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
         assert!(n > 0, "every writer skips an empty output");
-        self.debug_verify_dead_heap();
+        let src = rows.heap();
+        if src.plain().is_some() {
+            self.debug_verify_dead_heap();
+        }
+        self.debug_verify_consolidated_over(rows);
         let regions = self.wire_regions();
         let npc = schema.num_payload_cols();
-        self.debug_verify_consolidated();
         // A skeleton weight sums a per-key time prefix of a positive integral.
         debug_assert!(
             !opts.skeleton || (npc == 0 && (0..n).all(|row| self.get_weight(row) > 0)),
@@ -255,18 +266,34 @@ impl Batch {
         images.push(encode_region(nulls, FIXED_REGION_BYTES, || {
             pack_words(nulls, FixedInt::U64)
         }));
-        // The string columns share a heap that holds no dead byte.
-        let (mb, mut heap) = (self.as_mem_batch(), Vec::new());
-        for (pi, col) in schema.payload_columns() {
+        // The string columns share a heap that holds no dead byte, packed again
+        // into a plain one where coding it saved too little.
+        let pack_strings = |heap: &mut HeapWriter| -> Vec<Option<(Encoding, Vec<u8>)>> {
+            schema
+                .payload_columns()
+                .map(|(pi, col)| {
+                    let cells = regions[REG_PAYLOAD_START + pi].as_chunks::<16>().0;
+                    col.type_code
+                        .is_german_string()
+                        .then(|| pack_string_column(cells, src, heap))
+                })
+                .collect()
+        };
+        let mut heap = opts.codebook.map_or_else(HeapWriter::plain, HeapWriter::coded);
+        let mut strings = pack_strings(&mut heap);
+        if heap.coding_lost() {
+            heap = HeapWriter::plain();
+            strings = pack_strings(&mut heap);
+        }
+        for ((pi, col), string) in schema.payload_columns().zip(strings) {
             let src = regions[REG_PAYLOAD_START + pi];
-            images.push(if col.type_code.is_german_string() {
-                let (encoding, image) = pack_string_column(src.as_chunks::<16>().0, mb.blob, &mut heap);
-                (encoding, Cow::Owned(image))
-            } else {
-                encode_region(src, col.size(), || pack_fixed_column(col, pi, src, nulls))
+            images.push(match string {
+                Some((encoding, image)) => (encoding, Cow::Owned(image)),
+                None => encode_region(src, col.size(), || pack_fixed_column(col, pi, src, nulls)),
             });
         }
-        images.push((Encoding::Raw, Cow::Owned(heap)));
+        let (encoding, heap) = heap.finish();
+        images.push((encoding, Cow::Owned(heap)));
         images.push((Encoding::Raw, Cow::Borrowed(filter.as_deref().unwrap_or(&[]))));
 
         static PAD: [u8; ALIGNMENT] = [0; ALIGNMENT];

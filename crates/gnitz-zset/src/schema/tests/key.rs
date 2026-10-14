@@ -21,7 +21,7 @@ fn typed_cmp(s: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
         .map(|(_, c)| {
             let r = off..off + c.size();
             off = r.end;
-            cmp_col_window(&a[r.clone()], &[], &b[r], &[], c.type_code)
+            cmp_col_window(&a[r.clone()], &b[r], c.type_code)
         })
         .find(|o| o.is_ne())
         .unwrap_or(Ordering::Equal)

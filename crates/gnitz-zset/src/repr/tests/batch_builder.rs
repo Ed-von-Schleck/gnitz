@@ -137,7 +137,7 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
     assert_eq!(batch.get_col_ptr(0, 7, 8), &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 8, 8), &(-99999i64).to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 9, 8), &(-2.25f64).to_le_bytes());
-    assert_eq!(gnitz_wire::payload_bytes(&batch, 0, 10), b"hello world!");
+    assert_eq!(*gnitz_wire::payload_bytes(&batch, 0, 10), b"hello world!"[..]);
     let got = i128::from_le_bytes(batch.get_col_ptr(0, 11, 16).try_into().unwrap());
     assert_eq!(got, i128_val, "a 16-byte payload round-trips at its full width");
 }

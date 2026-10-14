@@ -105,7 +105,7 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
         let row = TableTabRow {
             table_id: 40,
             schema_id: PUBLIC_SCHEMA_ID,
-            name: "events",
+            name: "events".into(),
             pk_col_idx: PkColList::from_slice(&[0]).pack(),
             flags: gnitz_wire::TableProps { stream, ..Default::default() }.pack(),
         };
@@ -135,7 +135,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
 
     let r = SchemaTabRow {
         schema_id: 7,
-        name: "a_long_schema_name_past_twelve",
+        name: "a_long_schema_name_past_twelve".into(),
     };
     assert_eq!(
         SchemaTabRow::read(&sys_batch(SysFamily::Schema, |bb| r.write(bb, 1)), 0),
@@ -145,7 +145,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
     let r = TableTabRow {
         table_id: 9,
         schema_id: 2,
-        name: "t",
+        name: "t".into(),
         pk_col_idx: 0x31,
         flags: 5,
     };
@@ -157,12 +157,13 @@ fn every_system_family_reads_back_the_row_it_wrote() {
     let r = ViewTabRow {
         view_id: 11,
         schema_id: 2,
-        name: "v",
+        name: "v".into(),
         pk_col_idx: 1,
         capacity_bytes: 4 << 20,
         delta_bytes: 32 << 20,
         owner_view_id: 10,
         pk_repeats: 1,
+        compress: 0,
     };
     assert_eq!(
         ViewTabRow::read(&sys_batch(SysFamily::View, |bb| r.write(bb, 1)), 0),
@@ -173,7 +174,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
     let r = ColTabRow {
         owner_id: 16,
         col_idx: 3,
-        name: "c",
+        name: "c".into(),
         type_code: 8,
         is_nullable: 1,
         fk_table_id: 12,
@@ -191,7 +192,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
         index_id: 70,
         owner_id: 16,
         source_col_idx: 0x21,
-        name: "i",
+        name: "i".into(),
         is_unique: 1,
     };
     assert_eq!(
@@ -207,7 +208,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
 
     // A circuit past the inline 12 bytes, and an empty one.
     for circuit in [&b"a circuit cell past twelve bytes"[..], b""] {
-        let r = CircuitRow { view_id: 0x1122, circuit };
+        let r = CircuitRow { view_id: 0x1122, circuit: circuit.into() };
         assert_eq!(
             CircuitRow::read(&sys_batch(SysFamily::Circuit, |bb| r.write(bb, 1)), 0),
             Ok(r)

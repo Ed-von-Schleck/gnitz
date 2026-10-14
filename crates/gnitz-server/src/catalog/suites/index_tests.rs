@@ -1845,6 +1845,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             schema,
             placement: Placement::full_pk(&schema),
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
     engine

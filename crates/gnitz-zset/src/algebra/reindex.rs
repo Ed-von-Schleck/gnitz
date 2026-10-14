@@ -54,7 +54,7 @@ fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word:
         ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
             let content = gnitz_wire::payload_bytes(src, row, slot as usize);
             buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
-            buf.extend_from_slice(content);
+            buf.extend_from_slice(&content);
         }
         _ => buf.extend_from_slice(&loc.opk_image(src, row).to_le_bytes()),
     }
@@ -398,7 +398,7 @@ impl ReindexPacker {
                     cell.fill(0);
                 }
                 ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
-                    let h = gnitz_wire::checksum_128(gnitz_wire::payload_bytes(batch, row, slot as usize));
+                    let h = gnitz_wire::checksum_128(&gnitz_wire::payload_bytes(batch, row, slot as usize));
                     cell.copy_from_slice(&h.to_be_bytes());
                 }
                 _ => {

@@ -244,19 +244,26 @@ impl ViewBundle {
             // A foreign key constrains a base table, not a view.
             append_col_rows(b, vid, pv.schema.columns(), &[]);
             let circuit = circuit.encode();
-            b.put(&CircuitRow { view_id: vid, circuit: &circuit }, 1);
-            let (capacity_bytes, delta_bytes) = props.row_words();
+            b.put(
+                &CircuitRow {
+                    view_id: vid,
+                    circuit: circuit.as_slice().into(),
+                },
+                1,
+            );
+            let (capacity_bytes, delta_bytes) = props.budget.row_words();
             // The VIEW_TAB register hook triggers server-side compilation.
             b.put(
                 &ViewTabRow {
                     view_id: vid,
                     schema_id,
-                    name: &name,
+                    name: name.as_str().into(),
                     pk_col_idx: PkColList::from_slice(pv.schema.pk_cols()).pack(),
                     capacity_bytes,
                     delta_bytes,
                     owner_view_id,
                     pk_repeats: pv.pk_repeats as u64,
+                    compress: props.compress as u64,
                 },
                 1,
             );
@@ -847,7 +854,7 @@ impl GnitzClient {
                 index_id,
                 owner_id,
                 source_col_idx: cols.pack(),
-                name: &index_name,
+                name: index_name.as_str().into(),
                 is_unique: is_unique as u64,
             },
             1,
@@ -1068,7 +1075,7 @@ impl GnitzClient {
                     view.renamed(
                         payload_str(b, j, RELTAB_PAY_NAME)
                             .ok()
-                            .and_then(|new| view.name.sibling(new).ok())
+                            .and_then(|new| view.name.sibling(&new).ok())
                             .expect("a bundle this client built names its views"),
                     ),
                 ),
@@ -1092,7 +1099,7 @@ impl GnitzClient {
         let name = gnitz_wire::canonical_identifier(name)?;
         let schema_id = self.alloc_id().await?;
         let mut b = DdlBundle::default();
-        b.put(&SchemaTabRow { schema_id, name: &name }, 1);
+        b.put(&SchemaTabRow { schema_id, name: name.as_str().into() }, 1);
         self.commit_ddl(b).await?;
         Ok(schema_id)
     }
@@ -1156,7 +1163,7 @@ impl GnitzClient {
             &TableTabRow {
                 table_id: new_tid,
                 schema_id,
-                name: table.name(),
+                name: table.name().into(),
                 pk_col_idx: pk.pack(),
                 flags: props.pack(),
             },
@@ -1168,7 +1175,7 @@ impl GnitzClient {
                     index_id: new_tid + 1 + k as u64,
                     owner_id: new_tid,
                     source_col_idx: spec.cols.pack(),
-                    name: &index_names[k],
+                    name: index_names[k].as_str().into(),
                     is_unique: 1,
                 },
                 1,
@@ -1743,11 +1750,19 @@ fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
         .live_rows()
         .map(|i| {
             let r = IdxTabRow::read(batch, i).map_err(|e| ProtocolError::DecodeError(format!("index row {i}: {e}")))?;
-            let name = r.name.to_owned();
+            let name = r.name.clone();
             let (owner, cols, is_unique) = r
                 .parts()
                 .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
-            Ok((i, IndexRow { owner, name, cols, is_unique }))
+            Ok((
+                i,
+                IndexRow {
+                    owner,
+                    name: name.into_owned(),
+                    cols,
+                    is_unique,
+                },
+            ))
         })
         .collect()
 }

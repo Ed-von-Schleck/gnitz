@@ -6,6 +6,17 @@
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use gnitz_wire::sys_rows::FkAction;
 
+/// The boolean a `WITH (key = …)` entry names; `false` where it is absent.
+pub(super) fn bool_option(key: &str, value: Option<&sqlparser::ast::Expr>) -> Result<bool, GnitzSqlError> {
+    match value.map(crate::bind::bind_constant) {
+        None => Ok(false),
+        Some(Ok(crate::ir::BExpr::LitBool(b))) => Ok(b),
+        Some(_) => Err(GnitzSqlError::Rejected(format!(
+            "WITH ({key} = …) expects a boolean (true/false)"
+        ))),
+    }
+}
+
 /// The values of a `CREATE` statement's `WITH (key = value, …)` clause, one slot per
 /// entry of `keys`. Any other option form, unknown key or repeated key is rejected.
 pub(super) fn kv_options<'a, const N: usize>(

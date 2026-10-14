@@ -42,7 +42,9 @@ fn both_kernels_gather_rows_at_every_pk_width() {
             mem_batch_to_unified(&mb1, &schema, &mut cols),
         ];
         let rows: &[(u32, u32, i64)] = &[(1, 0, 5), (0, 1, -1), (0, 0, 3)];
-        let unified = write_to_batch(&schema, 3, 0, |w| scatter_unified_sources(&sources, &cols, rows, w));
+        let unified = write_to_batch(&schema, 3, 0, |w| {
+            scatter_unified_sources(&sources, &cols, rows, None, w)
+        });
         let want = [(&k[3], 5, 40), (&k[1], -1, 20), (&k[0], 3, 10)];
         assert_eq!(
             rows_of(&unified),

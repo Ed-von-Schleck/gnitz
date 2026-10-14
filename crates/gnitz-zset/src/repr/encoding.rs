@@ -8,11 +8,12 @@
 
 use std::ops::Range;
 
+use super::codebook::Codebook;
 use super::seek::{gallop_by, lower_bound_by};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
-    read_u32_le, read_u64_le, write_u32_le, write_u64_le, FixedInt, ScalarKind, GERMAN_INLINE_OFF, MAX_PK_COLUMNS,
-    SHORT_STRING_THRESHOLD,
+    read_u32_le, read_u64_le, write_u32_le, write_u64_le, CodedHeap, FixedInt, Heap, HeapValue, ScalarKind,
+    SymbolTable, GERMAN_INLINE_OFF, MAX_PK_COLUMNS, MAX_SYMBOLS, MAX_SYMBOL_LEN, SHORT_STRING_THRESHOLD,
 };
 
 gnitz_wire::wire_enum! {
@@ -35,6 +36,8 @@ gnitz_wire::wire_enum! {
         Sparse = 6,
         /// Key: a PK region as a narrower key of the same order.
         Key = 7,
+        /// Symbols: the heap as its values coded under a symbol table (FSST).
+        Symbols = 8,
     }
 }
 
@@ -50,6 +53,7 @@ impl Encoding {
             Encoding::Seq => "seq",
             Encoding::Sparse => "sparse",
             Encoding::Key => "key",
+            Encoding::Symbols => "symbols",
         }
     }
 }
@@ -870,30 +874,45 @@ pub(crate) const fn seq_image_len(count: usize, (min, max): (usize, usize), pool
     seq_lens_at(count) + for_image_len(count, seq_bw(min, max)) + pool + SEQ_POOL_SLACK
 }
 
-/// The Seq image of a column of `count` rows whose contents `content` yields in
-/// row order, their lengths spanning `min..=max`. The long ones are appended to
-/// `heap`.
-pub(crate) fn seq_encode<'a>(
-    count: usize,
+/// What a string cell holds over `src`, as two equal values hold it alike: its
+/// length, and its bytes as the heap stores them — the value, or its codes under
+/// the heap's one table. A long value `src` does not hold reads as the empty
+/// string.
+#[inline]
+pub(crate) fn stored_value<'a>(cell: &'a [u8; 16], src: Heap<'a>) -> (usize, &'a [u8]) {
+    match gnitz_wire::german_string_inline(cell) {
+        Some(inline) => (inline.len(), inline),
+        None => gnitz_wire::german_string_value(cell, src).map_or((0, &[]), |v| (v.len(), v.stored())),
+    }
+}
+
+/// The Seq image of `cells`, a column of German-string cells over `src` whose
+/// lengths span `min..=max`. The long values are appended to `heap`.
+pub(crate) fn seq_encode(
+    cells: &[[u8; 16]],
     (min, max): (usize, usize),
-    content: impl Iterator<Item = &'a [u8]> + Clone,
-    heap: &mut Vec<u8>,
+    src: Heap<'_>,
+    heap: &mut HeapWriter<'_>,
 ) -> Vec<u8> {
+    let count = cells.len();
     let mut image = vec![0u8; seq_lens_at(count)];
-    let lens = content.clone().map(|c| c.len() as u64);
+    let lens = cells.iter().map(|c| stored_value(c, src).0 as u64);
     image.extend_from_slice(&for_image(count, lens, min as u64, seq_bw(min, max)));
     let pool_at = image.len();
-    for (row, c) in content.enumerate() {
+    for (row, cell) in cells.iter().enumerate() {
         if row % DECODE_BLOCK_ROWS == 0 {
             let entry = SEQ_BLOCKS_AT + row / DECODE_BLOCK_ROWS * SEQ_BLOCK_ENTRY;
             let pooled = image.len() - pool_at;
-            write_u64_le(&mut image, entry, heap.len() as u64);
+            write_u64_le(&mut image, entry, heap.next_at() as u64);
             write_u64_le(&mut image, entry + 8, pooled as u64);
         }
-        if c.len() > SHORT_STRING_THRESHOLD {
-            heap.extend_from_slice(c);
-        } else {
-            image.extend_from_slice(c);
+        match gnitz_wire::german_string_inline(cell) {
+            Some(inline) => image.extend_from_slice(inline),
+            None => {
+                if let Some(value) = gnitz_wire::german_string_value(cell, src) {
+                    heap.push(value);
+                }
+            }
         }
     }
     let pooled = image.len() - pool_at;
@@ -928,7 +947,29 @@ impl<'a> SeqImage<'a> {
     /// Decode rows `first_row..` to their cells over `heap`, `out.len() / 16`
     /// rows. A value the lengths place past the heap or the pool reads as the
     /// empty string.
-    pub(crate) fn decode(&self, heap: &[u8], first_row: usize, out: &mut [u8]) {
+    pub(crate) fn decode(&self, heap: Heap<'_>, first_row: usize, out: &mut [u8]) {
+        match heap {
+            // A plain heap holds each value's bytes back to back.
+            Heap::Plain(blob) => self.decode_over(first_row, out, |at, len| {
+                let value = blob.get(at..).filter(|rest| rest.len() >= len);
+                (
+                    value.and_then(|v| v.first_chunk::<4>()).copied(),
+                    at.saturating_add(len),
+                )
+            }),
+            Heap::Coded(_) => self.decode_over(first_row, out, |at, len| {
+                let value = heap.value(at as u64, len);
+                let prefix = value.map(|v| v.lead()[..4].try_into().unwrap());
+                (prefix, value.map_or(usize::MAX, HeapValue::end))
+            }),
+        }
+    }
+
+    /// [`decode`](Self::decode) over a heap `long` reads: the prefix of the
+    /// value of `len` bytes stored from `at`, if the heap holds it, and where
+    /// the next one starts.
+    #[inline(always)]
+    fn decode_over(&self, first_row: usize, out: &mut [u8], long: impl Fn(usize, usize) -> (Option<[u8; 4]>, usize)) {
         let cells = out.as_chunks_mut::<16>().0;
         if cells.is_empty() {
             return;
@@ -942,21 +983,23 @@ impl<'a> SeqImage<'a> {
         let step = |at: &mut usize, len: usize| std::mem::replace(at, at.saturating_add(len));
         for row in block * DECODE_BLOCK_ROWS..first_row {
             match len(row) {
-                long if long > SHORT_STRING_THRESHOLD => step(&mut heap_at, long),
-                short => step(&mut pool_at, short),
-            };
+                n if n > SHORT_STRING_THRESHOLD => heap_at = long(heap_at, n).1,
+                short => {
+                    step(&mut pool_at, short);
+                }
+            }
         }
         for (i, cell) in cells.iter_mut().enumerate() {
             let len = len(first_row + i);
             let mut image = [0u8; 16];
             if len > SHORT_STRING_THRESHOLD {
-                let at = step(&mut heap_at, len);
-                let value = heap.get(at..).filter(|rest| rest.len() >= len);
-                if let Some(prefix) = value.and_then(|v| v.first_chunk::<4>()) {
+                let (prefix, next) = long(heap_at, len);
+                if let Some(prefix) = prefix {
                     image[..4].copy_from_slice(&(len as u32).to_le_bytes());
-                    image[4..8].copy_from_slice(prefix);
-                    image[8..].copy_from_slice(&(at as u64).to_le_bytes());
+                    image[4..8].copy_from_slice(&prefix);
+                    image[8..].copy_from_slice(&(heap_at as u64).to_le_bytes());
                 }
+                heap_at = next;
             } else if let Some(value) = pool
                 .get(step(&mut pool_at, len)..)
                 .and_then(|v| v.first_chunk::<SEQ_POOL_SLACK>())
@@ -968,6 +1011,153 @@ impl<'a> SeqImage<'a> {
             }
             *cell = image;
         }
+    }
+}
+
+// A Symbols image: a heap as its values coded under a symbol table. The bytes
+// the values decode to (u64 LE); how the table coded its training values, in
+// sixteenths of their bytes (u64 LE); the symbol count (u64 LE); each symbol,
+// eight bytes; each symbol's length, a byte; the values, each where a cell names
+// it, as its code count (LEB128) and its codes.
+const SYMBOLS_PLAIN_LEN_AT: usize = 0;
+const SYMBOLS_TRAINED_AT: usize = 8;
+pub(crate) const SYMBOLS_COUNT_AT: usize = 16;
+pub(crate) const SYMBOLS_AT: usize = 24;
+
+/// The bytes a Symbols image of `n` symbols takes before its codes.
+pub(crate) const fn symbols_head_len(n: usize) -> usize {
+    SYMBOLS_AT + n * (MAX_SYMBOL_LEN + 1)
+}
+
+/// The heap a shard's string columns are packed into, as the writer fills it:
+/// each long value verbatim, or coded under a codebook.
+pub(crate) struct HeapWriter<'a> {
+    /// The heap image's bytes: the values, or the coded image's head and codes.
+    bytes: Vec<u8>,
+    /// Where the codes start in `bytes`, and the codebook they are coded under.
+    coded: Option<(usize, &'a Codebook)>,
+    /// The bytes the values appended take decoded.
+    plain_len: usize,
+}
+
+impl<'a> HeapWriter<'a> {
+    /// A heap holding each value verbatim.
+    pub(crate) fn plain() -> Self {
+        HeapWriter {
+            bytes: Vec::new(),
+            coded: None,
+            plain_len: 0,
+        }
+    }
+
+    /// A heap holding each value coded under `book`.
+    pub(crate) fn coded(book: &'a Codebook) -> Self {
+        let symbols: Vec<_> = book.table().symbols().collect();
+        let mut bytes = vec![0u8; symbols_head_len(0) + symbols.len() * MAX_SYMBOL_LEN];
+        write_u64_le(&mut bytes, SYMBOLS_TRAINED_AT, book.trained_sixteenths() as u64);
+        write_u64_le(&mut bytes, SYMBOLS_COUNT_AT, symbols.len() as u64);
+        for (i, (symbol, _)) in symbols.iter().enumerate() {
+            bytes[SYMBOLS_AT + i * MAX_SYMBOL_LEN..][..MAX_SYMBOL_LEN].copy_from_slice(*symbol);
+        }
+        bytes.extend(symbols.iter().map(|&(_, len)| len));
+        HeapWriter {
+            coded: Some((bytes.len(), book)),
+            bytes,
+            plain_len: 0,
+        }
+    }
+
+    /// Where the next value appended starts, as its cell names it.
+    pub(crate) fn next_at(&self) -> usize {
+        self.bytes.len() - self.coded.map_or(0, |(codes_at, _)| codes_at)
+    }
+
+    /// Append `value`; where it starts, as its cell names it. See
+    /// [`Codebook::append`] for a coded heap.
+    pub(crate) fn push(&mut self, value: HeapValue<'_>) -> usize {
+        let at = self.next_at();
+        self.plain_len += value.len();
+        match self.coded {
+            None => value.append_to(&mut self.bytes),
+            Some((_, book)) => book.append(value, &mut self.bytes),
+        }
+        at
+    }
+
+    /// `cell`, a cell over the heap `src`, with its long value appended.
+    #[inline]
+    pub(crate) fn place(&mut self, cell: &[u8; 16], src: Heap<'_>) -> [u8; 16] {
+        gnitz_wire::relocate_german_value_with(cell, src, |value| self.push(value))
+    }
+
+    /// The bytes the values appended take decoded.
+    pub(crate) fn plain_len(&self) -> usize {
+        self.plain_len
+    }
+
+    /// The point [`truncate`](Self::truncate) returns the heap to.
+    pub(crate) fn mark(&self) -> (usize, usize) {
+        (self.bytes.len(), self.plain_len)
+    }
+
+    /// Drop every value appended since `mark`.
+    pub(crate) fn truncate(&mut self, (bytes, plain_len): (usize, usize)) {
+        self.bytes.truncate(bytes);
+        self.plain_len = plain_len;
+    }
+
+    /// Whether the heap is coded and its image, table included, holds more than
+    /// three quarters of the bytes its values take: a saving that small does
+    /// not pay for decoding every value read.
+    pub(crate) fn coding_lost(&self) -> bool {
+        self.coded.is_some() && self.bytes.len() > self.plain_len / 4 * 3
+    }
+
+    /// The heap's region: its encoding and image.
+    pub(crate) fn finish(mut self) -> (Encoding, Vec<u8>) {
+        match self.coded {
+            None => (Encoding::Raw, self.bytes),
+            Some(_) => {
+                write_u64_le(&mut self.bytes, SYMBOLS_PLAIN_LEN_AT, self.plain_len as u64);
+                (Encoding::Symbols, self.bytes)
+            }
+        }
+    }
+}
+
+/// A Symbols image taken apart.
+pub(crate) struct SymbolsImage<'a> {
+    pub(crate) table: Box<SymbolTable>,
+    /// How the table coded its training values, in sixteenths of their bytes.
+    pub(crate) trained_sixteenths: usize,
+    pub(crate) codes: &'a [u8],
+    pub(crate) plain_len: usize,
+}
+
+impl<'a> SymbolsImage<'a> {
+    /// `image` as a Symbols image, or `None` unless its head and table fit it
+    /// and the table is one [`SymbolTable::new`] takes.
+    pub(crate) fn parse(image: &'a [u8]) -> Option<Self> {
+        let head = image.get(..SYMBOLS_AT)?;
+        let word = |at| usize::try_from(read_u64_le(head, at)).ok();
+        let n = word(SYMBOLS_COUNT_AT).filter(|&n| n <= MAX_SYMBOLS)?;
+        let (symbols, rest) = image[SYMBOLS_AT..].split_at_checked(n * MAX_SYMBOL_LEN)?;
+        let (lens, codes) = rest.split_at_checked(n)?;
+        Some(SymbolsImage {
+            table: SymbolTable::new(symbols.as_chunks().0, lens)?,
+            trained_sixteenths: word(SYMBOLS_TRAINED_AT)?,
+            codes,
+            plain_len: word(SYMBOLS_PLAIN_LEN_AT)?,
+        })
+    }
+
+    /// The heap the image holds.
+    pub(crate) fn heap(&self) -> Heap<'_> {
+        Heap::Coded(CodedHeap {
+            table: &self.table,
+            codes: self.codes,
+            plain_len: self.plain_len,
+        })
     }
 }
 

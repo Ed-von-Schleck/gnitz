@@ -405,7 +405,7 @@ impl OrderIndex {
         a.get_pk_bytes(a_row).cmp(b.get_pk_bytes(b_row)).then_with(|| {
             self.images
                 .iter()
-                .map(|loc| loc.content(a, a_row).cmp(loc.content(b, b_row)))
+                .map(|loc| loc.content(a, a_row).cmp(&loc.content(b, b_row)))
                 .find(|ord| ord.is_ne())
                 .unwrap_or(Ordering::Equal)
         })

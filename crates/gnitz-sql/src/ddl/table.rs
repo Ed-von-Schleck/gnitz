@@ -2,13 +2,12 @@
 //! and CREATE INDEX.
 
 use super::guard::{
-    fk_on_delete, kv_options, reject_index_type_and_options, reject_unhonored_column_options,
+    bool_option, fk_on_delete, kv_options, reject_index_type_and_options, reject_unhonored_column_options,
     reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
 };
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{bind_constant, require_column, Catalog};
+use crate::bind::{require_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use crate::ir::BExpr;
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
@@ -17,7 +16,7 @@ use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
 use sqlparser::ast::{
-    ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
+    ColumnOption, CreateTableOptions, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, WrappedCollection,
 };
 use std::collections::HashSet;
@@ -247,22 +246,17 @@ fn resolve_fk_target(
 /// The boolean properties of `CREATE TABLE … WITH (…)`. A `Keyed` distribution's
 /// prefix is left at its default; the CLUSTER BY phase fills it.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
-    let [replicated, stream] = kv_options(table_options, "CREATE TABLE", ["replicated", "stream"])?;
-    let flag = |key: &str, value: Option<&Expr>| match value.map(bind_constant) {
-        None => Ok(false),
-        Some(Ok(BExpr::LitBool(b))) => Ok(b),
-        Some(_) => Err(GnitzSqlError::Rejected(format!(
-            "WITH ({key} = …) expects a boolean (true/false)"
-        ))),
-    };
-    let distribution = match flag("replicated", replicated)? {
+    let [replicated, stream, compress] =
+        kv_options(table_options, "CREATE TABLE", ["replicated", "stream", "compress"])?;
+    let distribution = match bool_option("replicated", replicated)? {
         true => TableDistribution::Replicated,
         false => TableDistribution::default(),
     };
     Ok(TableProps {
-        stream: flag("stream", stream)?,
+        stream: bool_option("stream", stream)?,
         serial: false,
         distribution,
+        compress: bool_option("compress", compress)?,
     })
 }
 

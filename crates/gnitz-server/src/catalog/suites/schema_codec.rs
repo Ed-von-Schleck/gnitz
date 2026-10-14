@@ -108,7 +108,7 @@ fn ddl_txn_roundtrip_client_to_server() {
         let row = TableTabRow {
             table_id: tid,
             schema_id: 3,
-            name: "t",
+            name: "t".into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
             flags: gnitz_wire::TableProps::default().pack(),
         };
@@ -122,7 +122,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             index_id: idx_id,
             owner_id: owner,
             source_col_idx: gnitz_wire::PkColList::from_slice(&[1]).pack(),
-            name: "idx_t_b",
+            name: "idx_t_b".into(),
             is_unique: 1,
         };
         row.write(&mut BatchAppender::new(&mut b), 1);
@@ -181,7 +181,11 @@ fn ddl_txn_roundtrip_client_to_server() {
         let mut b = ZSetBatch::new(s);
         let identity = crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None);
         let circuit = identity.encode();
-        CircuitRow { view_id: vid, circuit: &circuit }.write(&mut BatchAppender::new(&mut b), 1);
+        CircuitRow {
+            view_id: vid,
+            circuit: circuit.as_slice().into(),
+        }
+        .write(&mut BatchAppender::new(&mut b), 1);
         b
     };
     let view = {
@@ -190,12 +194,13 @@ fn ddl_txn_roundtrip_client_to_server() {
         let row = ViewTabRow {
             view_id: vid,
             schema_id: 3,
-            name: "v",
+            name: "v".into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
             capacity_bytes: 0,
             delta_bytes: 0,
             owner_view_id: 0,
             pk_repeats: 0,
+            compress: 0,
         };
         row.write(&mut BatchAppender::new(&mut b), 1);
         b

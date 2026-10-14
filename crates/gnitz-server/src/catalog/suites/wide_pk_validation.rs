@@ -39,6 +39,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
             schema,
             placement: Placement::full_pk(&schema),
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
     engine
@@ -112,6 +113,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             schema: parent_schema,
             placement: Placement::full_pk(&parent_schema),
             pk_repeats: false,
+            compress: false,
         })
         .unwrap();
     engine.registry.ingest(parent_tid, pb).unwrap();

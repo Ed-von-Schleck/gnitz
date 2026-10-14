@@ -272,6 +272,15 @@ SCENARIOS = [
                                    ("slowest", "user_id", "user_id, MAX(ms) AS slowest")))],
         click_twins, rewrites=0, deletes=0),
     Shape(
+        "compressed", "policy",
+        "strings_prose's paragraphs in a table and a filter view both compressed, each read back against "
+        "a plain twin",
+        BYTES,
+        ["CREATE TABLE passages (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, body TEXT NOT NULL) "
+         "WITH (compress = true)",
+         "CREATE VIEW v_kind0 WITH (compress = true) AS SELECT id, body FROM passages WHERE kind = 0"],
+        strings_prose, fixed_rows=70_000),
+    Shape(
         "bounded", "policy",
         "a filter view held under a capacity a sixth of what it would take, beside its unbounded twin",
         BYTES,

@@ -44,7 +44,15 @@ fn for_compaction_bench() {
             instructions.measure(|| {
                 let mut starts = vec![0usize; inputs.len()];
                 for g in 0..guard_keys.len() {
-                    black_box(merge_guard(&inputs, &guard_keys, g, &mut starts, skeleton, &schema));
+                    black_box(merge_guard(
+                        &inputs,
+                        &guard_keys,
+                        g,
+                        &mut starts,
+                        skeleton,
+                        &schema,
+                        None,
+                    ));
                 }
             })
         });
@@ -115,7 +123,8 @@ fn distinct_compaction_bench() {
             }
             let mut starts = vec![0usize; inputs.len()];
             let ((), whole) = instructions.measure(|| {
-                let (_, batch) = merge_guard(&inputs, &guard_keys, 0, &mut starts, false, &schema).unwrap();
+                let (_, run) = merge_guard(&inputs, &guard_keys, 0, &mut starts, false, &schema, None).unwrap();
+                let batch = run.plain().unwrap();
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);
             });
