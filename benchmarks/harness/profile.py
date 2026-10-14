@@ -488,7 +488,8 @@ class Layers:
             if (g := self.groups.get(pid)) and phase in names:
                 frames = [symbols.name(self.maps.get(pid, []), a) for a in stack]
                 # The innermost engine function below the allocator.
-                site = next((f for f in frames if engine_layer(f)), frames[1] if len(frames) > 1 else frames[0])
+                site = next((f for f in frames if engine_layer(f)), frames[1] if len(frames) > 1 else
+                            frames[0] if frames else "[no stack]")
                 sites[(phase, g)][site] += n
         for (phase, g), (n, nbytes, freed) in sorted(totals.items()):
             name = names[phase]
