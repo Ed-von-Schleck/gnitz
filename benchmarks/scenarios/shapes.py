@@ -4,10 +4,12 @@ of its store."""
 
 from __future__ import annotations
 
+import itertools
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+from . import corpus
 from .base import BYTES, WORDS, Fact, Shape, scatter
 
 
@@ -35,6 +37,16 @@ def strings_unique(n, rng):
             tag=f"t{k:x}",                                               # inline
         )
     return [], {"docs": Fact(row)}
+
+
+def strings_prose(n, rng):
+    """Every payload draws the next paragraph of the corpus in a shuffled order,
+    so no paragraph is drawn twice; a draw past the corpus's end fails the run."""
+    paras = corpus.paragraphs()
+    rng.shuffle(paras)
+    draws = itertools.count()
+    return [], {"passages": Fact(lambda k: dict(
+        id=k + 1, kind=rng.randrange(4), body=paras[next(draws)]))}
 
 
 def ints(n, rng):
@@ -153,6 +165,15 @@ SCENARIOS = [
          "path TEXT NOT NULL, title TEXT NOT NULL, tag TEXT NOT NULL)",
          "CREATE VIEW v_kind0 AS SELECT id, token, path, title FROM docs WHERE kind = 0"],
         strings_unique),
+    Shape(
+        "strings_prose", "shape",
+        "a TEXT column of real prose — paragraphs of public-domain books in five languages, none loaded "
+        "twice — under a filter view",
+        BYTES,
+        ["CREATE TABLE passages (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, body TEXT NOT NULL)",
+         "CREATE VIEW v_kind0 AS SELECT id, body FROM passages WHERE kind = 0"],
+        # As many as keep every payload its phases draw within the corpus.
+        strings_prose, fixed_rows=70_000),
     Shape(
         "ints", "shape",
         "integer and float columns of every range — a near-monotone timestamp, small domains, 60 random "
