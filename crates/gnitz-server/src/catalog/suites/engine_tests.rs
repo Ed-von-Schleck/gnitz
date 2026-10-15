@@ -562,7 +562,7 @@ fn test_dependent_view_restricts_fire_from_registered_views() {
     register_identity_view(&mut engine, tid, "v", &cols);
 
     let err = engine.drop_table("public.t").unwrap_err();
-    assert!(err.contains("View dependency"), "DROP TABLE RESTRICT: {err}");
+    assert!(err.contains("dependent views (public.v)"), "DROP TABLE RESTRICT: {err}");
 
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
     let mut nullable = cols[1].clone();

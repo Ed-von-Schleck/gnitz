@@ -10,10 +10,9 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::sys_rows::{
-    ColTabRow, ColTabSlot, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow, ViewTabRow,
-};
-use gnitz_wire::{ColumnDef, TableDistribution, ViewBudget, ViewProps, MAX_COLUMNS};
+pub(crate) use gnitz_wire::sys_rows::CatalogColumn;
+use gnitz_wire::sys_rows::{ColTabSlot, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewParts, ViewTabRow};
+use gnitz_wire::{ColumnDef, TableProps, MAX_COLUMNS};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -37,7 +36,6 @@ pub(super) const FIRST_ALLOCATED_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 // PK list encoding lives in gnitz-wire so the client and engine cannot drift on
 // the on-disk format.
 pub(super) use gnitz_wire::PkColList;
-use gnitz_wire::{bool_word, PkListRole};
 
 // ---------------------------------------------------------------------------
 // Per-family row-view decoders — the one reading of each family's *full row
@@ -55,42 +53,50 @@ pub(super) struct RelRow<'a> {
     pub(super) schema_id: u64,
     pub(super) name: Cow<'a, str>,
     pub(super) pk: PkColList,
-    pub(super) kind: RelationKind,
     pub(super) detail: RelDetail,
-    /// `WITH (compress = true)`: its rows' store codes its heaps.
-    pub(super) compress: bool,
 }
 
 pub(super) enum RelDetail {
-    Table {
-        distribution: TableDistribution,
-        serial: bool,
-    },
-    /// `owner` is the user view this row is a chain segment of; `None` for a user
-    /// view.
-    View { owner: Option<u64>, pk_repeats: bool },
+    Table(TableProps),
+    View(ViewParts),
 }
 
 impl RelRow<'_> {
+    pub(super) fn kind(&self) -> RelationKind {
+        match self.detail {
+            RelDetail::Table(TableProps { stream: true, .. }) => RelationKind::Stream,
+            RelDetail::Table(_) => RelationKind::BaseTable,
+            RelDetail::View(v) => RelationKind::View(v.props.budget),
+        }
+    }
+
     /// Whether two of the relation's rows may share a PK.
     pub(super) fn pk_repeats(&self) -> bool {
         match self.detail {
             // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-            RelDetail::Table { .. } => self.kind == RelationKind::Stream,
-            RelDetail::View { pk_repeats, .. } => pk_repeats,
+            RelDetail::Table(t) => t.stream,
+            RelDetail::View(v) => v.pk_repeats,
         }
     }
 
-    /// [`gnitz_wire::TableProps::serial`].
+    /// [`TableProps::serial`].
     pub(super) fn serial(&self) -> bool {
-        matches!(self.detail, RelDetail::Table { serial: true, .. })
+        matches!(self.detail, RelDetail::Table(TableProps { serial: true, .. }))
+    }
+
+    /// `WITH (compress = true)`: its rows' store codes its heaps.
+    pub(super) fn compress(&self) -> bool {
+        match self.detail {
+            RelDetail::Table(t) => t.compress,
+            RelDetail::View(v) => v.props.compress,
+        }
     }
 }
 
 /// `table 'orders' (id=17)` — the subject of a registration or precheck message.
 impl std::fmt::Display for RelRow<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} '{}' (id={})", self.kind.noun(), self.name, self.id)
+        write!(f, "{} '{}' (id={})", self.kind().noun(), self.name, self.id)
     }
 }
 
@@ -113,78 +119,29 @@ fn rel_violated(noun: &str, name: &str, id: u64, e: String) -> String {
 }
 
 fn rel_from_table_row(r: TableTabRow<'_>) -> Result<RelRow<'_>, String> {
-    let (id, name) = (r.table_id, r.name);
-    let props = gnitz_wire::TableProps::from_flags(r.flags)
-        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), &name, id, e))?;
-    let kind = if props.stream {
-        RelationKind::Stream
-    } else {
-        RelationKind::BaseTable
-    };
-    let pk = PkColList::unpack(r.pk_col_idx)
-        .map_err(|rule| rel_violated(kind.noun(), &name, id, rule.for_role(PkListRole::PrimaryKey)))?;
-    props
-        .validate(pk.as_slice().len())
-        .map_err(|e| rel_violated(kind.noun(), &name, id, e))?;
+    let (pk, props) = r
+        .parts()
+        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), &r.name, r.table_id, e))?;
     Ok(RelRow {
-        id,
+        id: r.table_id,
         schema_id: r.schema_id,
-        name,
+        name: r.name,
         pk,
-        kind,
-        detail: RelDetail::Table {
-            distribution: props.distribution,
-            serial: props.serial,
-        },
-        compress: props.compress,
+        detail: RelDetail::Table(props),
     })
 }
 
 fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
-    let (id, name, noun) = (r.view_id, r.name, SysFamily::View.row_noun());
-    let pk = PkColList::unpack(r.pk_col_idx)
-        .map_err(|rule| rel_violated(noun, &name, id, rule.for_role(PkListRole::PrimaryKey)))?;
-    let budget =
-        ViewBudget::from_row(r.capacity_bytes, r.delta_bytes).map_err(|e| format!("{noun} '{name}' (id={id}): {e}"))?;
-    let pk_repeats = bool_word(r.pk_repeats).map_err(|e| rel_violated(noun, &name, id, format!("pk_repeats: {e}")))?;
-    let compress = bool_word(r.compress).map_err(|e| rel_violated(noun, &name, id, format!("compress: {e}")))?;
-    let owner = (r.owner_view_id != 0).then_some(r.owner_view_id);
-    // A chain segment is a relation the planner mints, never one an option
-    // clause may name.
-    if (ViewProps { budget, compress }) != ViewProps::default() && owner.is_some() {
-        return Err(format!(
-            "catalog invariant violated: internal segment '{name}' (id={id}) carries a WITH option"
-        ));
-    }
+    let (pk, parts) = r
+        .parts()
+        .map_err(|e| rel_violated(SysFamily::View.row_noun(), &r.name, r.view_id, e))?;
     Ok(RelRow {
-        id,
+        id: r.view_id,
         schema_id: r.schema_id,
-        name,
+        name: r.name,
         pk,
-        kind: RelationKind::View(budget),
-        detail: RelDetail::View { owner, pk_repeats },
-        compress,
+        detail: RelDetail::View(parts),
     })
-}
-
-/// A catalog column: the logical column plus its FK, already resolved.
-#[derive(Clone, Debug)]
-pub(crate) struct CatalogColumn {
-    pub(crate) def: ColumnDef,
-    pub(crate) fk: Option<FkRef>,
-}
-
-impl CatalogColumn {
-    /// The column COL_TAB row `r` describes — [`Self::write_col_tab_row`]'s inverse.
-    pub(super) fn from_row(r: &ColTabRow<'_>) -> Result<Self, String> {
-        let (def, fk) = r.column()?;
-        Ok(CatalogColumn { def, fk })
-    }
-
-    /// Write this column as COL_TAB row `(owner_id, col_idx)`.
-    pub(crate) fn write_col_tab_row(&self, sink: &mut impl SysRowSink, owner_id: u64, col_idx: usize, weight: i64) {
-        ColTabRow::of(owner_id, col_idx as u64, &self.def, self.fk).write(sink, weight);
-    }
 }
 
 /// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.

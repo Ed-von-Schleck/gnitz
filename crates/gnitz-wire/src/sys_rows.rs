@@ -222,6 +222,21 @@ pub struct FkRef {
     pub on_delete: FkAction,
 }
 
+/// A catalog column: the logical column plus its FK, already resolved — what a
+/// `COL_TAB` row states, as [`ColTabRow::column`] reads it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogColumn {
+    pub def: crate::ColumnDef,
+    pub fk: Option<FkRef>,
+}
+
+impl CatalogColumn {
+    /// Write this column as `COL_TAB` row `(owner_id, col_idx)`.
+    pub fn write_col_tab_row(&self, sink: &mut (impl SysRowSink + ?Sized), owner_id: u64, col_idx: usize, weight: i64) {
+        ColTabRow::of(owner_id, col_idx as u64, &self.def, self.fk).write(sink, weight);
+    }
+}
+
 impl<'a> ColTabRow<'a> {
     /// Column `col_idx` of `owner_id` as `col` declares it, referencing `fk` —
     /// the **resolved** parent column: a client's deferred self-reference is
@@ -248,7 +263,7 @@ impl<'a> ColTabRow<'a> {
     /// [`Self::of`]'s inverse. Every word must fit the width it is stored at and
     /// decode to a value `of` could emit: an overflowing one would leave a stored
     /// row no client can reproduce, and so no later `-1` can retract.
-    pub fn column(&self) -> Result<(crate::ColumnDef, Option<FkRef>), String> {
+    pub fn column(&self) -> Result<CatalogColumn, String> {
         let word = |field: &str, w: u64, max: u64| {
             if w > max {
                 return Err(format!(
@@ -278,7 +293,47 @@ impl<'a> ColTabRow<'a> {
             is_nullable: flag("is_nullable", self.is_nullable)?,
             is_hidden: flag("is_hidden", self.is_hidden)?,
         };
-        Ok((def, fk))
+        Ok(CatalogColumn { def, fk })
+    }
+}
+
+impl TableTabRow<'_> {
+    /// The row's `(pk, props)` — the one decoding of `pk_col_idx` and `flags`,
+    /// held to the rules the flags word cannot encode against that key.
+    pub fn parts(&self) -> Result<(crate::PkColList, crate::TableProps), String> {
+        let props = crate::TableProps::from_flags(self.flags)?;
+        let pk =
+            crate::PkColList::unpack(self.pk_col_idx).map_err(|rule| rule.for_role(crate::PkListRole::PrimaryKey))?;
+        props.validate(pk.as_slice().len())?;
+        Ok((pk, props))
+    }
+}
+
+/// What a `VIEW_TAB` row states about its view beyond its name and key, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewParts {
+    pub props: crate::ViewProps,
+    /// The user view this row is a chain segment of; `None` for a user view.
+    pub owner: Option<u64>,
+    /// [`ViewTabRow::pk_repeats`].
+    pub pk_repeats: bool,
+}
+
+impl ViewTabRow<'_> {
+    /// The row's `(pk, parts)` — the one decoding of its words, held to the rule
+    /// that a chain segment, which the planner mints, carries no `WITH` option.
+    pub fn parts(&self) -> Result<(crate::PkColList, ViewParts), String> {
+        let pk =
+            crate::PkColList::unpack(self.pk_col_idx).map_err(|rule| rule.for_role(crate::PkListRole::PrimaryKey))?;
+        let budget = crate::ViewBudget::from_row(self.capacity_bytes, self.delta_bytes)?;
+        let compress = crate::bool_word(self.compress).map_err(|e| format!("compress: {e}"))?;
+        let pk_repeats = crate::bool_word(self.pk_repeats).map_err(|e| format!("pk_repeats: {e}"))?;
+        let props = crate::ViewProps { budget, compress };
+        let owner = (self.owner_view_id != 0).then_some(self.owner_view_id);
+        if owner.is_some() && props != crate::ViewProps::default() {
+            return Err("is a chain segment carrying a WITH option".to_string());
+        }
+        Ok((pk, ViewParts { props, owner, pk_repeats }))
     }
 }
 

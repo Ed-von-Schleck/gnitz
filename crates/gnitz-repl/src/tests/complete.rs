@@ -1,19 +1,24 @@
 use super::*;
-use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, ViewBudget};
+use gnitz_core::RelProps;
+use gnitz_wire::sys_rows::CatalogColumn;
+use gnitz_wire::{ColType, ColumnDef, PkColList, TableProps, TypeCode};
 
-fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> Relation {
-    Relation {
+fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
+    CatalogRelation {
         id,
         schema: schema.into(),
         name: name.into(),
-        class: RelClass::Table,
-        budget: ViewBudget::Plain,
+        props: RelProps::Table(TableProps::default()),
         columns: cols
             .iter()
-            .map(|c| ColumnDef::typed(c.to_string(), ColType::of(TypeCode::I64), true))
+            .map(|c| CatalogColumn {
+                def: ColumnDef::typed(c.to_string(), ColType::of(TypeCode::I64), true),
+                fk: None,
+            })
             .collect(),
-        pk: vec![],
+        pk: PkColList::from_slice(&[0]),
         indexes: vec![],
+        reads: vec![],
     }
 }
 

@@ -9,7 +9,8 @@ use gnitz_sql::sqlparser::tokenizer::Token;
 use nu_ansi_term::{Color, Style};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
-use crate::catalog::{Catalog, Relation};
+use gnitz_core::{Catalog, CatalogRelation};
+
 use crate::lex::lex_prefix;
 use crate::meta::{self, ArgKind, MetaLine};
 
@@ -359,7 +360,7 @@ fn relation_candidates(ctx: &Context, word: &str) -> Vec<Candidate> {
             .map(|r| Candidate {
                 kind: Kind::Relation,
                 value: format!("{qual}.{}", r.name),
-                description: r.class.describe().to_string(),
+                description: r.class().describe().to_string(),
             })
             .collect();
     }
@@ -373,7 +374,7 @@ fn relation_candidates(ctx: &Context, word: &str) -> Vec<Candidate> {
                 true => r.name.clone(),
                 false => r.qualified(),
             },
-            description: r.class.describe().to_string(),
+            description: r.class().describe().to_string(),
         })
         .collect();
     out.extend(ctx.catalog.schemas.iter().map(|s| Candidate {
@@ -399,7 +400,7 @@ fn keyword(kw: &str, word: &str) -> Candidate {
 
 /// The relations a statement names after FROM, JOIN, INTO or UPDATE, keyed by
 /// the name it is read under there: its alias, else its own name.
-fn referenced<'a>(ctx: &'a Context, line: &str) -> HashMap<String, &'a Relation> {
+fn referenced<'a>(ctx: &'a Context, line: &str) -> HashMap<String, &'a CatalogRelation> {
     let (lexemes, _) = lex_prefix(line);
     let words: Vec<&Token> = lexemes.iter().filter(|l| !l.is_trivia()).map(|l| &l.token).collect();
     let mut out = HashMap::new();
@@ -437,16 +438,20 @@ fn referenced<'a>(ctx: &'a Context, line: &str) -> HashMap<String, &'a Relation>
     out
 }
 
-fn column_candidates<'a>(rel: &'a Relation, qualifier: Option<&str>) -> impl Iterator<Item = Candidate> + 'a {
+fn column_candidates<'a>(rel: &'a CatalogRelation, qualifier: Option<&str>) -> impl Iterator<Item = Candidate> + 'a {
     let qualifier = qualifier.map(str::to_string);
-    rel.columns.iter().filter(|c| !c.is_hidden).map(move |c| Candidate {
-        kind: Kind::Column,
-        value: match &qualifier {
-            Some(q) => format!("{q}.{}", c.name),
-            None => c.name.clone(),
-        },
-        description: format!("{} · {}", gnitz_sql::sql_type_name(c.ty), rel.name),
-    })
+    rel.columns
+        .iter()
+        .map(|c| &c.def)
+        .filter(|c| !c.is_hidden)
+        .map(move |c| Candidate {
+            kind: Kind::Column,
+            value: match &qualifier {
+                Some(q) => format!("{q}.{}", c.name),
+                None => c.name.clone(),
+            },
+            description: format!("{} · {}", gnitz_sql::sql_type_name(c.ty), rel.name),
+        })
 }
 
 fn sql_candidates(ctx: &Context, line: &str, start: usize, word: &str) -> (Vec<Candidate>, usize) {

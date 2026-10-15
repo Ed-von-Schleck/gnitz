@@ -4,8 +4,8 @@ use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow};
-use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter};
+use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow, ViewParts};
+use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, TableProps};
 use gnitz_wire::{payload_bytes, RowSource};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
@@ -319,7 +319,7 @@ impl CatalogEngine {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
-            let decode = |r| ColTabRow::read(batch, r).and_then(|r| CatalogColumn::from_row(&r));
+            let decode = |r| ColTabRow::read(batch, r).and_then(|r| r.column());
             let old = sig.neg.map(decode).transpose()?;
             let new = sig.pos.map(decode).transpose()?;
 
@@ -389,7 +389,7 @@ impl CatalogEngine {
                             ));
                         }
                     }
-                    self.reject_if_dependent_views(owner_id, op)?;
+                    self.reject_if_dependent_views(owner_id, op, &IdSet::default())?;
                 }
                 None => self.precheck_column_append(new, owner_id, col_idx, &owner_schema)?,
             }
@@ -397,20 +397,27 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Reject a column transition on `owner_id` while any view scans it: a
-    /// compiled circuit's `ScanDelta` register schema is baked from the base
-    /// descriptor and its operator traces hold re-keyed base rows at the old
-    /// shape.
-    fn reject_if_dependent_views(&self, owner_id: u64, op: &str) -> Result<(), String> {
-        // Name the table and one blocking view: the recovery is to drop that
-        // view, which a bare id leaves the author to go and look up.
-        let blockers = self.dag.dependents_of(owner_id);
+    /// Reject `op` on `owner_id` while a view outside `dropped` scans it: a
+    /// compiled circuit's `ScanDelta` register schema is baked from its source's
+    /// descriptor, its operator traces hold that source's rows at the old shape,
+    /// and a dropped source leaves it nothing to read.
+    fn reject_if_dependent_views(&self, owner_id: u64, op: &str, dropped: &IdSet) -> Result<(), String> {
+        // Name the relation and the user views that block it: the recovery is to
+        // drop those, which neither a bare id nor a chain segment's minted name
+        // tells the author.
+        let blockers = IdSet::new(
+            self.dag
+                .dependents_of(owner_id)
+                .iter()
+                .map(|&dep| self.dag.chain_of(dep))
+                .filter(|&view| !dropped.contains(view)),
+        );
         if blockers.is_empty() {
             return Ok(());
         }
-        let named: Vec<String> = blockers.iter().map(|&id| self.qualified_name(id)).collect();
+        let named: Vec<String> = blockers.ids().iter().map(|&id| self.qualified_name(id)).collect();
         Err(format!(
-            "cannot {op} on '{}': it has dependent views ({}) — drop them first",
+            "cannot {op} '{}': it has dependent views ({}) — drop them first",
             self.qualified_name(owner_id),
             named.join(", ")
         ))
@@ -464,7 +471,7 @@ impl CatalogEngine {
         }
         // Last, as in the rewrite-pair arm: a malformed append is reported as
         // malformed whatever depends on the table.
-        self.reject_if_dependent_views(owner_id, "ADD COLUMN")
+        self.reject_if_dependent_views(owner_id, "ADD COLUMN", &IdSet::default())
     }
 
     /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
@@ -576,7 +583,7 @@ impl CatalogEngine {
     ///
     /// The drop guards key on `net_dead` — the PKs whose bundle net is dead — not
     /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
-    /// "referenced by FK" / "View dependency".
+    /// "referenced by FK" / "has dependent views".
     fn precheck_relation_family(
         &self,
         family: SysFamily,
@@ -585,6 +592,8 @@ impl CatalogEngine {
         net_dead: &IdSet,
     ) -> Result<(), String> {
         let mut claimed: FxHashSet<(u64, Cow<'_, str>)> = FxHashSet::default();
+        // The retired ids a relation of the same name takes over: an ALTER VIEW.
+        let mut replaced: Vec<u64> = Vec::new();
         let creates = IdSet::new(
             sigs.iter()
                 .filter(|s| s.pos.is_some() && s.neg.is_none())
@@ -598,7 +607,7 @@ impl CatalogEngine {
         if family == SysFamily::View {
             for i in batch.live_rows() {
                 let rel = read_rel_row(family, batch, i)?;
-                if creates.contains(rel.id) && matches!(rel.detail, RelDetail::View { owner: None, .. }) {
+                if creates.contains(rel.id) && matches!(rel.detail, RelDetail::View(ViewParts { owner: None, .. })) {
                     created_users.push(rel.id);
                 }
             }
@@ -612,20 +621,20 @@ impl CatalogEngine {
                 return Err(format!("{rel}: the system schema takes no relation"));
             }
             let col_defs = self.read_column_defs(rel.id)?;
-            let schema =
-                build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
+            let schema = build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice())
+                .map_err(|e| format!("{rel} {e}"))?;
             // A leading `_` names a chain segment and nothing else.
             match rel.detail {
-                RelDetail::View { owner: Some(_), .. } if !rel.name.starts_with('_') => {
+                RelDetail::View(ViewParts { owner: Some(_), .. }) if !rel.name.starts_with('_') => {
                     return Err(format!("{rel}: a chain segment's name starts with '_'"));
                 }
-                RelDetail::View { owner: Some(_), .. } => {}
+                RelDetail::View(ViewParts { owner: Some(_), .. }) => {}
                 _ => validate_user_identifier(&rel.name)?,
             }
-            reject_unstorable_name(&rel.name, rel.kind.noun())?;
+            reject_unstorable_name(&rel.name, rel.kind().noun())?;
             // An FK probes its parent's store on every write of the child, which only
             // a base table's ingest runs; a stream push must stay a pure append.
-            if !rel.kind.is_base_table() {
+            if !rel.kind().is_base_table() {
                 if let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some()) {
                     return Err(format!(
                         "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
@@ -634,7 +643,7 @@ impl CatalogEngine {
                 }
             }
             match rel.detail {
-                RelDetail::Table { serial, .. } => {
+                RelDetail::Table(TableProps { serial, .. }) => {
                     if serial {
                         let pk_cols = rel.pk.as_slice().iter().map(|&c| &col_defs[c as usize]);
                         gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
@@ -646,14 +655,14 @@ impl CatalogEngine {
                         }
                     }
                 }
-                RelDetail::View { owner: Some(owner), .. }
+                RelDetail::View(ViewParts { owner: Some(owner), .. })
                     if creates.contains(rel.id) && !created_users.contains(owner) =>
                 {
                     return Err(format!(
                         "{rel} names owner {owner}, which is not a user view this bundle creates"
                     ));
                 }
-                RelDetail::View { .. } => {}
+                RelDetail::View(_) => {}
             }
             let displaced = self.claim_qname(rel.schema_id, rel.name.clone(), rel.id, net_dead, &mut claimed)?;
             // The drop cascade would take the outgoing relation's indexes with it.
@@ -668,6 +677,7 @@ impl CatalogEngine {
                     "{rel} owns an index, which replacing it would drop; DROP INDEX first"
                 ));
             }
+            replaced.extend(displaced);
         }
 
         if family == SysFamily::Table {
@@ -686,15 +696,12 @@ impl CatalogEngine {
             }
         }
 
-        for &id in net_dead.ids() {
-            // A dependent that is itself being dropped in this same batch is
-            // self-resolving — only an *outside* dependent blocks the drop.
-            let still_active = self.dag.dependents_of(id).iter().any(|&dep| !net_dead.contains(dep));
-            if still_active {
-                return Err(format!("View dependency: entity '{}'", self.qualified_name(id)));
-            }
-        }
-        Ok(())
+        // A dependent that is itself being dropped in this same batch is
+        // self-resolving — only an *outside* dependent blocks the drop.
+        net_dead.ids().iter().try_for_each(|&id| {
+            let op = if replaced.contains(&id) { "replace" } else { "DROP" };
+            self.reject_if_dependent_views(id, op, net_dead)
+        })
     }
 
     /// The owner and column rules of a CREATE INDEX on `owner_id`, `unique` or

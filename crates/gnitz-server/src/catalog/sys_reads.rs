@@ -116,7 +116,7 @@ impl CatalogEngine {
                         r.col_idx
                     ));
                 }
-                CatalogColumn::from_row(&r).map_err(|e| format!("column {}: {e}", r.col_idx))
+                r.column().map_err(|e| format!("column {}: {e}", r.col_idx))
             });
             match def {
                 Ok(d) => defs.push(d),

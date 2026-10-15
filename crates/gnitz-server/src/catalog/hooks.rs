@@ -1,5 +1,5 @@
 use gnitz_store::relation::{IndexClaim, RelationSpec};
-use gnitz_wire::TableDistribution;
+use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
 use std::collections::hash_map::Entry;
@@ -11,7 +11,7 @@ use super::sys_tables::{
     build_schema_from_col_defs, pk_signatures, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily,
 };
 use super::CatalogEngine;
-use gnitz_wire::sys_rows::IdxTabRow;
+use gnitz_wire::sys_rows::{IdxTabRow, ViewParts};
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
@@ -44,9 +44,9 @@ impl CatalogEngine {
     /// predicates; the caller names the relation.
     fn register_relation(&mut self, rel: &RelRow<'_>) -> Result<(), String> {
         let col_defs = self.read_column_defs(rel.id)?;
-        let schema = build_schema_from_col_defs(rel.kind, &col_defs, rel.pk.as_slice())?;
+        let schema = build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice())?;
         let placement = match rel.detail {
-            RelDetail::View { owner, .. } => {
+            RelDetail::View(ViewParts { owner, .. }) => {
                 let circuit = self.read_circuit(rel.id)?;
                 let chain = owner.unwrap_or(rel.id);
                 for src in circuit.sources() {
@@ -68,42 +68,48 @@ impl CatalogEngine {
                     // that chain may scan it — and a capacity-bounded view, which
                     // recomputes a key from the rows of what it scans, not at all.
                     let holder = self.dag.chain_of(src);
-                    if holder != src && (holder != chain || rel.kind.is_bounded()) {
+                    if holder != src && (holder != chain || rel.kind().is_bounded()) {
                         return Err(format!(
                             "reads {src}, a segment of view {holder} that holds no rows for it"
                         ));
                     }
                 }
-                self.dag
-                    .register_view(&self.registry, rel.id, &schema, rel.kind.is_bounded(), owner, &circuit)?
+                self.dag.register_view(
+                    &self.registry,
+                    rel.id,
+                    &schema,
+                    rel.kind().is_bounded(),
+                    owner,
+                    &circuit,
+                )?
             }
-            RelDetail::Table {
+            RelDetail::Table(TableProps {
                 distribution: TableDistribution::Replicated,
                 ..
-            } => Placement::Replicated,
-            RelDetail::Table {
+            }) => Placement::Replicated,
+            RelDetail::Table(TableProps {
                 distribution: TableDistribution::Keyed { prefix_len: 0 },
                 ..
-            } => Placement::full_pk(&schema),
-            RelDetail::Table {
+            }) => Placement::full_pk(&schema),
+            RelDetail::Table(TableProps {
                 distribution: TableDistribution::Keyed { prefix_len },
                 ..
-            } => Placement::keyed(&schema, prefix_len as usize),
+            }) => Placement::keyed(&schema, prefix_len as usize),
         };
         gnitz_debug!(
             "catalog: creating {} name={} id={} workers={}",
-            rel.kind.noun(),
+            rel.kind().noun(),
             rel.name,
             rel.id,
             self.registry.slot().of
         );
         self.registry.register(RelationSpec {
             id: rel.id,
-            kind: rel.kind,
+            kind: rel.kind(),
             schema,
             placement,
             pk_repeats: rel.pk_repeats(),
-            compress: rel.compress,
+            compress: rel.compress(),
         })?;
         self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.serial());
         // Derived, not stored: every process builds the same FK indexes from the same

@@ -370,7 +370,7 @@ fn alter_rejection_matrix() {
         (
             "ALTER VIEW base AS SELECT id, c FROM t WHERE c > 0",
             Refused(Error),
-            "dependency",
+            "cannot replace '",
         ),
         ("ALTER TABLE t ALTER COLUMN b SET NOT NULL", Rejected, "SET NOT NULL"),
         (
@@ -428,7 +428,7 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     );
 
     // `b` is read by a view, so its drop refuses — and `a` survives with it.
-    db.refuses("DROP TABLE a, b", Refused(Error), "View dependency");
+    db.refuses("DROP TABLE a, b", Refused(Error), ".keeper) — drop them first");
     assert!(db.exists("a"), "a is untouched");
 
     // A name written twice retires once.

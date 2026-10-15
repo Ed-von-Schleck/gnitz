@@ -1,11 +1,14 @@
 //! Backslash meta-commands, after psql's: the one table that `\?`, completion,
 //! highlighting and dispatch all read, and the commands themselves.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::ops::Range;
 use std::process::Command;
 
 use clap::ValueEnum;
+use gnitz_core::{Catalog, CatalogRelation, RelProps};
+use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::{ColType, RelClass, TypeCode};
 
 use crate::render::{name_of, render, Expanded, Format, Settings, Weights};
@@ -525,7 +528,7 @@ impl Shell {
         let rows = self.with_catalog(|c| {
             c.relations
                 .iter()
-                .filter(|r| keep(r.class))
+                .filter(|r| keep(r.class()))
                 .filter(|r| match pattern {
                     Some(p) if p.contains('.') => glob(p, &r.qualified()),
                     Some(p) => glob(p, &r.name),
@@ -535,8 +538,8 @@ impl Shell {
                     vec![
                         r.schema.clone(),
                         r.name.clone(),
-                        r.class.describe().to_string(),
-                        r.columns.iter().filter(|c| !c.is_hidden).count().to_string(),
+                        r.class().describe().to_string(),
+                        r.columns.iter().filter(|c| !c.def.is_hidden).count().to_string(),
                     ]
                 })
                 .collect::<Vec<_>>()
@@ -560,8 +563,8 @@ impl Shell {
                         r.schema.clone(),
                         i.name.clone(),
                         r.name.clone(),
-                        i.columns.join(", "),
-                        if i.unique { "yes" } else { "no" }.to_string(),
+                        r.column_names(&i.cols).join(", "),
+                        if i.is_unique { "yes" } else { "no" }.to_string(),
                     ]
                 })
                 .collect::<Vec<_>>()
@@ -576,17 +579,28 @@ impl Shell {
     fn describe(&mut self, name: &str, verbose: bool) -> Result<(), Failed> {
         self.refresh_catalog();
         let schema = self.schema();
-        let Some(rel) = self.with_catalog(|c| c.find(&schema, name).cloned()) else {
+        let described = self.with_catalog(|c| c.find(&schema, name).map(|rel| self.description(c, rel, verbose)));
+        let Some(out) = described else {
             return self.fail(format!("Did not find any relation named \"{name}\"."));
         };
-        let mut out = format!("{} \"{}\"\n", capitalize(rel.class.describe()), rel.qualified());
+        self.write_result(&out);
+        Ok(())
+    }
+
+    /// What `\d NAME` prints for `rel`: its columns, then its key, indexes,
+    /// foreign keys both ways, the relations it reads and those that read it,
+    /// and its view budget.
+    fn description(&self, catalog: &Catalog, rel: &CatalogRelation, verbose: bool) -> String {
+        let mut out = format!("{} \"{}\"\n", capitalize(rel.class().describe()), rel.qualified());
         let rows = rel
             .columns
             .iter()
-            .filter(|c| verbose || !c.is_hidden)
-            .map(|c| {
+            .enumerate()
+            .map(|(ci, c)| (ci, &c.def))
+            .filter(|(_, c)| verbose || !c.is_hidden)
+            .map(|(ci, c)| {
                 let mut key = Vec::new();
-                if rel.pk.contains(&c.name) {
+                if rel.pk.as_slice().contains(&(ci as u32)) {
                     key.push("PK");
                 }
                 if c.is_hidden {
@@ -601,24 +615,67 @@ impl Shell {
             })
             .collect();
         out.push_str(&self.listing(&["Column", "Type", "Nullable", "Key"], rows, false));
-        if !rel.pk.is_empty() {
-            out.push_str(&format!("Primary key: ({})\n", rel.pk.join(", ")));
+        // A key of hidden slots alone is one the view minted: shown with them.
+        if verbose || rel.columns_of(&rel.pk).any(|c| !c.def.is_hidden) {
+            let _ = writeln!(out, "Primary key: ({})", rel.column_names(&rel.pk).join(", "));
         }
         if !rel.indexes.is_empty() {
             out.push_str("Indexes:\n");
             for i in &rel.indexes {
-                let unique = if i.unique { " UNIQUE" } else { "" };
-                out.push_str(&format!("    \"{}\"{unique} ({})\n", i.name, i.columns.join(", ")));
+                let unique = if i.is_unique { " UNIQUE" } else { "" };
+                let cols = rel.column_names(&i.cols).join(", ");
+                let _ = writeln!(out, "    \"{}\"{unique} ({cols})", i.name);
             }
         }
-        if let Some(bytes) = rel.budget.capacity_bytes() {
-            out.push_str(&format!("Capacity: {bytes} bytes per worker\n"));
+        let mut fks = rel.columns.iter().filter_map(|c| Some((c, c.fk?))).peekable();
+        if fks.peek().is_some() {
+            out.push_str("Foreign keys:\n");
         }
-        if let Some(bytes) = rel.budget.delta_bytes() {
-            out.push_str(&format!("Delta feed: {bytes} bytes retained\n"));
+        for (c, fk) in fks {
+            let target = catalog.relation(fk.table_id);
+            let table = target.map_or_else(|| fk.table_id.to_string(), CatalogRelation::qualified);
+            let col = target
+                .and_then(|t| t.columns.get(fk.col as usize))
+                .map_or("?", |t| t.def.name.as_str());
+            let cascade = if fk.on_delete == FkAction::Cascade {
+                " ON DELETE CASCADE"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "    ({}) REFERENCES {table}({col}){cascade}", c.def.name);
         }
-        self.write_result(&out);
-        Ok(())
+        let mut referencing = catalog.referencing(rel.id).peekable();
+        if referencing.peek().is_some() {
+            out.push_str("Referenced by:\n");
+        }
+        for r in referencing {
+            let _ = writeln!(out, "    {}", r.qualified());
+        }
+        let reads: Vec<String> = rel
+            .reads
+            .iter()
+            .map(|&id| {
+                catalog
+                    .relation(id)
+                    .map_or_else(|| id.to_string(), CatalogRelation::qualified)
+            })
+            .collect();
+        if !reads.is_empty() {
+            let _ = writeln!(out, "Reads: {}", reads.join(", "));
+        }
+        let readers: Vec<String> = catalog.readers(rel.id).map(CatalogRelation::qualified).collect();
+        if !readers.is_empty() {
+            let _ = writeln!(out, "Read by: {}", readers.join(", "));
+        }
+        if let RelProps::View(props) = rel.props {
+            if let Some(bytes) = props.budget.capacity_bytes() {
+                let _ = writeln!(out, "Capacity: {bytes} bytes per worker");
+            }
+            if let Some(bytes) = props.budget.delta_bytes() {
+                let _ = writeln!(out, "Delta feed: {bytes} bytes retained");
+            }
+        }
+        out
     }
 
     fn edit(&mut self, file: Option<&str>) -> Result<(), Failed> {

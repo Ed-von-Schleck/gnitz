@@ -89,11 +89,11 @@ fn read_rel_row_refuses_a_segment_with_an_option() {
         .unwrap_err();
     assert_eq!(
         err,
-        "catalog invariant violated: internal segment '_seg' (id=30) carries a WITH option"
+        "catalog invariant violated: view '_seg' (id=30) is a chain segment carrying a WITH option"
     );
     let user = row("v", 0);
     let rel = read_rel_row(SysFamily::View, &user, 0).map_err(drop).unwrap();
-    assert!(rel.kind.is_bounded());
+    assert!(rel.kind().is_bounded());
     assert_eq!(rel.to_string(), "view 'v' (id=30)");
 }
 
@@ -115,7 +115,7 @@ fn read_rel_row_reports_a_streams_pk_as_repeating() {
     for stream in [true, false] {
         let batch = row(stream);
         let rel = read_rel_row(SysFamily::Table, &batch, 0).map_err(drop).unwrap();
-        assert_eq!(rel.kind == RelationKind::Stream, stream);
+        assert_eq!(rel.kind() == RelationKind::Stream, stream);
         assert_eq!(rel.pk_repeats(), stream);
         assert!(!rel.serial());
     }

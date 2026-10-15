@@ -146,7 +146,9 @@ fn repl(shell: &mut Shell, vi: bool) -> ExitCode {
         shell.target()
     );
     loop {
-        shell.refresh_catalog_if_stale();
+        // Every prompt: completion offers what the catalog holds now, whichever
+        // session changed it.
+        shell.refresh_catalog();
         if let Some(text) = shell.prefill.take() {
             line_editor.run_edit_commands(&[EditCommand::InsertString(text)]);
         }

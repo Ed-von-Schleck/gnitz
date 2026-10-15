@@ -1,9 +1,10 @@
+use crate::catalog::{idx_rows, Catalog, IndexRow, CATALOG_FAMILIES};
 use crate::connection::{
     promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, RelName, Schema, ZSetBatch};
+use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, Schema, ZSetBatch};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
@@ -82,16 +83,6 @@ pub const RMW_MAX_ATTEMPTS: usize = 4;
 pub struct InlineUniqueIndex {
     pub cols: PkColList,
     pub name: String,
-}
-
-/// One live secondary index, as its IDX_TAB row states it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexRow {
-    /// The id of the table it indexes.
-    pub owner: u64,
-    pub name: String,
-    pub cols: PkColList,
-    pub is_unique: bool,
 }
 
 /// The column a FOREIGN KEY column references. `SelfTable` names the table
@@ -837,18 +828,6 @@ impl GnitzClient {
         self.wait(sent)
     }
 
-    /// System families' rows, each under its spec, with no DDL between them.
-    pub async fn sys_cut<const N: usize>(
-        &mut self,
-        reads: [(u64, &ReadSpec); N],
-    ) -> Result<[ZSetBatch; N], ClientError> {
-        let scans = reads.map(|(family, spec)| (Target::from(family), spec, sys_schema(family)));
-        let mut replies = self.scan_many(&scans).await?.into_iter();
-        Ok(std::array::from_fn(|_| {
-            replies.next().expect("one reply per scan").batch
-        }))
-    }
-
     /// Index `cols` of relation `owner_id`, in that order, under the catalog name
     /// `index_name`.
     pub async fn create_index(
@@ -923,6 +902,13 @@ impl GnitzClient {
     pub async fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
         let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
         Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// The whole catalog, read at one cut.
+    pub async fn catalog(&mut self) -> Result<Catalog, ClientError> {
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let families = self.sys_cut(CATALOG_FAMILIES, &all).await?;
+        Ok(Catalog::decode(&families)?)
     }
 
     // --- Transactions (BEGIN / COMMIT / ROLLBACK) ---
@@ -1122,9 +1108,7 @@ impl GnitzClient {
     pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = gnitz_wire::canonical_identifier(name)?;
         let all = ReadSpec::all_rows(ReadBound::None);
-        let [schemas, views, tables] = self
-            .sys_cut([(SCHEMA_TAB, &all), (VIEW_TAB, &all), (TABLE_TAB, &all)])
-            .await?;
+        let [schemas, views, tables] = self.sys_cut([SCHEMA_TAB, VIEW_TAB, TABLE_TAB], &all).await?;
         let at = schema_row(&schemas, &name)?;
         let schema_id = schemas.pks.get(at) as u64;
 
@@ -1257,7 +1241,7 @@ impl GnitzClient {
                     Cut::after(vid as u128),
                 )));
                 let families = [VIEW_TAB, COL_TAB, CIRCUIT_TAB];
-                let rows = self.sys_cut(families.map(|family| (family, &members))).await?;
+                let rows = self.sys_cut(families, &members).await?;
                 let standing = DdlBundle(families.into_iter().zip(rows).collect());
                 let views = &standing.0[0].1;
                 let i = views
@@ -1459,6 +1443,19 @@ impl GnitzClient {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
         let i = schema_row(&batch, schema_name)?;
         Ok((batch, i))
+    }
+
+    /// `families`' rows under `spec`, with no DDL between them.
+    async fn sys_cut<const N: usize>(
+        &mut self,
+        families: [u64; N],
+        spec: &ReadSpec,
+    ) -> Result<[ZSetBatch; N], ClientError> {
+        let scans = families.map(|family| (Target::from(family), spec, sys_schema(family)));
+        let mut replies = self.scan_many(&scans).await?.into_iter();
+        Ok(std::array::from_fn(|_| {
+            replies.next().expect("one reply per scan").batch
+        }))
     }
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;
@@ -1745,29 +1742,6 @@ impl TxnBuffer {
         out.extend_from_owned(live);
         Ok(out)
     }
-}
-
-/// The live rows of `batch`, a read of IDX_TAB, each with its index in `batch`.
-fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ClientError> {
-    batch
-        .live_rows()
-        .map(|i| {
-            let r = IdxTabRow::read(batch, i).map_err(|e| ProtocolError::DecodeError(format!("index row {i}: {e}")))?;
-            let name = r.name.clone();
-            let (owner, cols, is_unique) = r
-                .parts()
-                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?;
-            Ok((
-                i,
-                IndexRow {
-                    owner,
-                    name: name.into_owned(),
-                    cols,
-                    is_unique,
-                },
-            ))
-        })
-        .collect()
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`. `fks[i]` is

@@ -9,11 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use gnitz_core::{block_on, BlockingHost, ClientError, GnitzClient};
+use gnitz_core::{block_on, BlockingHost, Catalog, ClientError, GnitzClient};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use nu_ansi_term::{Color, Style};
 
-use crate::catalog::Catalog;
 use crate::complete::{Context, SharedContext};
 use crate::lex::{self, Piece, Splitter};
 use crate::render::{render, Format, Settings, Weights};
@@ -60,8 +59,6 @@ pub struct Shell {
     sink: Sink,
     /// The last statement run, which `\e` opens.
     last_statement: String,
-    /// A DDL has run since the catalog snapshot was read.
-    catalog_stale: bool,
     /// Text for the next prompt's buffer, from `\e`.
     pub prefill: Option<String>,
 }
@@ -107,7 +104,6 @@ impl Shell {
             interrupt: options.interrupt,
             sink: Sink::Stdout,
             last_statement: String::new(),
-            catalog_stale: true,
             prefill: None,
         })
     }
@@ -156,18 +152,11 @@ impl Shell {
         self.interrupt.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
     }
 
-    /// Read the catalog again if a DDL may have changed it. A failure leaves
-    /// the old snapshot: completion is a convenience, never a reason to stop.
-    pub fn refresh_catalog_if_stale(&mut self) {
-        if self.catalog_stale {
-            self.refresh_catalog();
-        }
-    }
-
+    /// Read the catalog again, whoever changed it since. A failure leaves the
+    /// old snapshot: completion is a convenience, never a reason to stop.
     pub fn refresh_catalog(&mut self) {
-        if let Ok(catalog) = Catalog::load(&mut self.client) {
+        if let Ok(catalog) = block_on(self.client.catalog()) {
             self.context.write().expect("context lock").catalog = catalog;
-            self.catalog_stale = false;
         }
     }
 
@@ -176,7 +165,6 @@ impl Shell {
             Ok(client) => {
                 self.client = client;
                 self.target = target.to_string();
-                self.catalog_stale = true;
                 Ok(())
             }
             Err(e) => self.fail(format!("could not connect to {target}: {e}")),
@@ -276,10 +264,7 @@ impl Shell {
                 let rows = Rows::decode(&reply);
                 self.print_rows(&rows);
             }
-            SqlResult::Ddl { tag } => {
-                self.catalog_stale = true;
-                self.status(tag);
-            }
+            SqlResult::Ddl { tag } => self.status(tag),
             SqlResult::RowsAffected { tag, count } => self.status(&format!("{tag} {count}")),
             SqlResult::TransactionStarted => self.status("BEGIN"),
             SqlResult::TransactionCommitted { .. } => self.status("COMMIT"),

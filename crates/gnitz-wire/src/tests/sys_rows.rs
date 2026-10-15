@@ -137,7 +137,7 @@ fn a_column_reads_back_out_of_its_row() {
     ] {
         let row = ColTabRow::of(16, 2, col, fk);
         assert_eq!((row.owner_id, row.col_idx), (16, 2));
-        assert_eq!(row.column(), Ok((col.clone(), fk)));
+        assert_eq!(row.column(), Ok(CatalogColumn { def: col.clone(), fk }));
     }
 }
 
@@ -167,6 +167,78 @@ fn a_column_row_refuses_forged_words() {
         (ColTabRow { scale: 3, ..sound.clone() }, "invalid column type"),
     ] {
         let err = r.column().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
+}
+
+/// A relation row's `parts` read back the key and properties its writer packed,
+/// and refuse a word no writer emits.
+#[test]
+fn a_relation_rows_parts_invert_its_packed_words() {
+    let pk = crate::PkColList::from_slice(&[1, 0]);
+    let props = crate::TableProps {
+        serial: false,
+        distribution: crate::TableDistribution::Keyed { prefix_len: 1 },
+        ..Default::default()
+    };
+    let table = TableTabRow {
+        table_id: 17,
+        schema_id: 2,
+        name: "t".into(),
+        pk_col_idx: pk.pack(),
+        flags: props.pack(),
+    };
+    assert_eq!(table.parts(), Ok((pk, props)));
+    let stream_serial = crate::TableProps {
+        stream: true,
+        serial: true,
+        ..Default::default()
+    };
+    let err = TableTabRow {
+        flags: stream_serial.pack(),
+        ..table.clone()
+    }
+    .parts()
+    .unwrap_err();
+    assert!(err.contains("SERIAL"), "{err}");
+
+    let props = crate::ViewProps {
+        budget: crate::ViewBudget::Fed {
+            delta_bytes: std::num::NonZeroU64::new(64).unwrap(),
+        },
+        compress: true,
+    };
+    let (capacity_bytes, delta_bytes) = props.budget.row_words();
+    let view = ViewTabRow {
+        view_id: 18,
+        schema_id: 2,
+        name: "v".into(),
+        pk_col_idx: pk.pack(),
+        capacity_bytes,
+        delta_bytes,
+        owner_view_id: 0,
+        pk_repeats: 1,
+        compress: 1,
+    };
+    let parts = ViewParts { props, owner: None, pk_repeats: true };
+    assert_eq!(view.parts(), Ok((pk, parts)));
+    let segment = ViewTabRow {
+        name: "_seg19".into(),
+        capacity_bytes: 0,
+        delta_bytes: 0,
+        owner_view_id: 19,
+        compress: 0,
+        ..view.clone()
+    };
+    assert_eq!(segment.parts().map(|(_, p)| p.owner), Ok(Some(19)));
+    for (r, expect) in [
+        (ViewTabRow { capacity_bytes: 1, ..view.clone() }, "delta feed"),
+        (ViewTabRow { pk_repeats: 2, ..view.clone() }, "pk_repeats"),
+        (ViewTabRow { compress: 2, ..view.clone() }, "compress"),
+        (ViewTabRow { pk_col_idx: 0, ..view.clone() }, "packed-list flag"),
+        (ViewTabRow { owner_view_id: 19, ..view.clone() }, "WITH option"),
+    ] {
+        let err = r.parts().unwrap_err();
         assert!(err.contains(expect), "{expect}: {err}");
     }
 }

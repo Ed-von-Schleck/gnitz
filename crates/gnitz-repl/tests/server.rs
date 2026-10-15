@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gnitz_core::RelProps;
 use gnitz_repl::render::{Format, Settings};
 use gnitz_repl::shell::{Flow, Options, Shell};
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::{RelClass, ViewBudget};
+use gnitz_wire::{RelClass, ViewBudget, ViewProps};
 
 const WORKERS: usize = 4;
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -116,11 +117,17 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
     sh.refresh_catalog();
     sh.with_catalog(|c| {
         let t = c.find("public", "t").expect("t");
-        assert_eq!(t.class, RelClass::Table);
+        assert_eq!(t.class(), RelClass::Table);
         let cols: Vec<(&str, String, bool)> = t
             .columns
             .iter()
-            .map(|c| (c.name.as_str(), gnitz_sql::sql_type_name(c.ty), c.is_nullable))
+            .map(|c| {
+                (
+                    c.def.name.as_str(),
+                    gnitz_sql::sql_type_name(c.def.ty),
+                    c.def.is_nullable,
+                )
+            })
             .collect();
         assert_eq!(
             cols,
@@ -130,23 +137,60 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
                 ("note", "TEXT".to_string(), true)
             ]
         );
-        assert_eq!(t.pk, ["id"]);
-        assert_eq!(t.indexes.len(), 1);
-        assert_eq!(
-            (t.indexes[0].name.as_str(), t.indexes[0].columns.as_slice()),
-            ("t_kind", &["kind".to_string()][..])
-        );
-        assert_eq!(c.find("public", "ev").expect("ev").class, RelClass::Stream);
+        assert_eq!(t.column_names(&t.pk), ["id"]);
+        let [ix] = &t.indexes[..] else {
+            panic!("{:?}", t.indexes)
+        };
+        assert_eq!((ix.name.as_str(), t.column_names(&ix.cols)), ("t_kind", vec!["kind"]));
+        let ev = c.find("public", "ev").expect("ev");
+        assert_eq!(ev.class(), RelClass::Stream);
         let v = c.find("public", "v").expect("v");
-        assert_eq!(v.class, RelClass::FedView);
-        assert_eq!(v.budget, ViewBudget::from_row(0, 1 << 20).unwrap());
+        assert_eq!(v.class(), RelClass::FedView);
+        assert_eq!(
+            v.props,
+            RelProps::View(ViewProps {
+                budget: ViewBudget::from_row(0, 1 << 20).unwrap(),
+                compress: false
+            })
+        );
+        assert_eq!(v.reads, [ev.id]);
         assert_eq!(c.find("PUBLIC", "V").map(|r| r.id), Some(v.id));
         assert!(c.schemas.contains(&"_system".to_string()));
         assert_eq!(
-            c.find("_system", "tables").expect("_system.tables").class,
+            c.find("_system", "tables").expect("_system.tables").class(),
             RelClass::Catalog
         );
     });
+}
+
+/// `\d` reads the catalog as it stands, whichever session changed it: its
+/// foreign keys both ways, and what a view reads through its chain.
+#[test]
+fn describe_shows_keys_and_what_reads_what() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.txt");
+    let mut sh = shell(server.sock_path(), None);
+    sh.run_script("CREATE TABLE parent (id BIGINT PRIMARY KEY);").unwrap();
+    sh.refresh_catalog();
+
+    shell(server.sock_path(), None)
+        .run_script(
+            "CREATE TABLE child (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE CASCADE);\n\
+             CREATE VIEW joined AS SELECT c.id, p.id AS pid FROM child c JOIN parent p ON c.pid = p.id;",
+        )
+        .unwrap();
+
+    let parent = results(&mut sh, &out, "\\d parent");
+    assert!(parent.contains("Referenced by:\n    public.child\n"), "{parent}");
+    assert!(parent.contains("Read by: public.joined\n"), "{parent}");
+    let child = results(&mut sh, &out, "\\d child");
+    assert!(
+        child.contains("Foreign keys:\n    (pid) REFERENCES public.parent(id) ON DELETE CASCADE\n"),
+        "{child}"
+    );
+    let joined = results(&mut sh, &out, "\\d joined");
+    assert!(joined.contains("Reads: public.parent, public.child\n"), "{joined}");
 }
 
 #[test]

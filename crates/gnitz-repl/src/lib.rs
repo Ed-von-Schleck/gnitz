@@ -6,7 +6,6 @@
 //! they cover; the crate-root `tests/` is the integration suite, gated on the
 //! `integration` feature.
 
-pub mod catalog;
 pub mod complete;
 pub mod editor;
 pub mod highlight;

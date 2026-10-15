@@ -93,7 +93,18 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let err = block_on(client.drop_table(&[rel(&sn, "t")], false))
         .unwrap_err()
         .to_string();
-    assert!(err.contains("View dependency"), "got: {err}");
+    // The table's one direct reader is the chain's first segment; the refusal
+    // names the user view that owns it.
+    assert!(err.contains(&format!("dependent views ({sn}.f)")), "got: {err}");
+
+    // The catalog holds the chain as its user view, reading the base through
+    // both segments, neither a relation of its own.
+    let catalog = block_on(client.catalog()).unwrap();
+    let f = catalog.find(&sn, "f").unwrap();
+    assert_eq!((f.id, f.reads.as_slice()), (owner, &[base_tid][..]));
+    assert!(catalog.relation(owner - 1).is_none() && catalog.relation(owner - 2).is_none());
+    let readers: Vec<u64> = catalog.readers(base_tid).map(|r| r.id).collect();
+    assert_eq!(readers, [owner]);
 
     // A rename is a net-live rewrite of the owner's row: the cascade must not fire.
     let f = block_on(client.resolve_relation(&rel(&sn, "f"))).unwrap();
