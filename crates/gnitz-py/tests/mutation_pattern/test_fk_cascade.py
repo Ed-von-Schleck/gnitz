@@ -4,7 +4,6 @@ by the write's fold and committed with the write or not at all."""
 import contextlib
 
 import pytest
-import gnitz
 import _fk
 from _serverproc import NEEDS_MULTI
 
@@ -64,40 +63,6 @@ def test_a_delete_takes_every_level_of_descendants_and_a_view_follows(client, pl
     assert _fk.held(client, want) == want
 
 
-def test_a_binary_delete_cascades_as_the_statement_does(client):
-    _fk.seed(client, _chain(), _CHAIN_ROWS)
-    client.delete(*client.resolve_table("a"), [2, 3])
-    assert _fk.held(client, _CHAIN_ROWS) == _fk.want(_chain_after({2, 3}))
-
-    # A push whose retraction and insert fold to a surviving row deletes nothing.
-    tid, schema = client.resolve_table("a")
-    client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": 1, "val": 10, "_weight": -1}, {"id": 1, "val": 11}]))
-    after = _chain_after({2, 3})
-    after["a"] = [(1, 11), (4, 40)]
-    assert _fk.held(client, _CHAIN_ROWS) == _fk.want(after)
-
-
-def test_a_cascade_outlasts_the_pushs_own_write_of_the_row(client):
-    """One push deletes row 1 and rewrites row 2 under it: the cascade's delete
-    of row 2 is applied behind the push's own row."""
-    _fk.seed(client, _TREE, {"tree": [(1, None), (2, 1), (3, 2), (4, None)]})
-    tid, schema = client.resolve_table("tree")
-    client.push(tid, gnitz.ZSetBatch(schema).extend(
-        [{"id": 1, "parent_id": None, "_weight": -1}, {"id": 2, "parent_id": 1}]))
-    assert _fk.held(client, ["tree"]) == _fk.want({"tree": [(4, None)]})
-
-
-def test_one_restricting_reference_refuses_the_whole_delete(client):
-    _fk.seed(client, _chain(last="RESTRICT"), _CHAIN_ROWS)
-    with _fk.refused():
-        client.execute_sql("DELETE FROM a WHERE id IN (2, 3)")
-    assert _fk.held(client, _CHAIN_ROWS) == _fk.want(_CHAIN_ROWS)
-
-    # Once nothing restricts the rows the cascade reaches, it runs.
-    client.execute_sql("DELETE FROM c WHERE b_id >= 20 AND b_id < 40; DELETE FROM a WHERE id IN (2, 3)")
-    assert _fk.held(client, _CHAIN_ROWS) == _fk.want(_chain_after({2, 3}))
-
-
 _TREE = ("CREATE TABLE tree (id BIGINT PRIMARY KEY,"
          " parent_id BIGINT REFERENCES tree(id) ON DELETE CASCADE)")
 # Two trees of depth six, three children under every inner node of the first.
@@ -155,10 +120,27 @@ _UNIQUE_CHILD = (
     " pid BIGINT NOT NULL REFERENCES parent(id) ON DELETE CASCADE); "
     "CREATE UNIQUE INDEX child_u ON child(u)"
 )
+# Two children of one parent, one cascading and one restricting.
+_SOFT_HARD = (
+    "CREATE TABLE parent (id BIGINT PRIMARY KEY); "
+    "CREATE TABLE soft (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE CASCADE); "
+    "CREATE TABLE hard (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE NO ACTION)"
+)
+_SOFT_HARD_ROWS = {"parent": [(1,), (2,)], "soft": [(1, 1), (2, 2)], "hard": [(1, 1)]}
 
-# `(ddl, rows seeded per table, statements, every table's rows after — or None
-# where the statements are refused and every table keeps its seed)`.
-_STATEMENTS = {
+# `(ddl, rows seeded per table, the write as `_fk.write` takes it, every table's
+# rows after — or None where the write is refused and every table keeps its seed)`.
+_WRITES = {
+    "a binary delete": (_chain(), _CHAIN_ROWS, ("delete", "a", [2, 3]), _chain_after({2, 3})),
+    # A retraction and an insert folding to a surviving row delete nothing.
+    "a push folding to a surviving row": (
+        _chain(), _CHAIN_ROWS, ("push", "a", [{"id": 1, "val": 10, "_weight": -1}, {"id": 1, "val": 11}]),
+        {**_CHAIN_ROWS, "a": [(1, 11), *_A[1:]]}),
+    # The cascade's delete of row 2 is applied behind the push's own write of it.
+    "a push deleting a row and rewriting its child": (
+        _TREE, {"tree": [(1, None), (2, 1), (3, 2), (4, None)]},
+        ("push", "tree", [{"id": 1, "parent_id": None, "_weight": -1}, {"id": 2, "parent_id": 1}]),
+        {"tree": [(4, None)]}),
     "a root's whole subtree, and not the other tree": (
         _TREE, {"tree": _TREE_A + _TREE_B}, "DELETE FROM tree WHERE id = 1", {"tree": _TREE_B}),
     "an inner node's subtree": (
@@ -237,72 +219,24 @@ _STATEMENTS = {
         _MOVED, _MOVED_ROWS,
         "BEGIN; DELETE FROM p WHERE pid = 2; UPDATE p SET code = 200 WHERE pid = 1; COMMIT",
         {"a": [(1,), (2,)], "p": [(1, 1, 200), (3, 2, 300)], "c": _MOVED_ROWS["c"]}),
+    # One restricting reference refuses the whole delete; once nothing restricts
+    # the rows the cascade reaches, it runs.
+    "a restricting grandchild": (_chain(last="RESTRICT"), _CHAIN_ROWS, "DELETE FROM a WHERE id IN (2, 3)", None),
+    "a restricting grandchild cleared first": (
+        _chain(last="RESTRICT"), _CHAIN_ROWS,
+        "DELETE FROM c WHERE b_id >= 20 AND b_id < 40; DELETE FROM a WHERE id IN (2, 3)", _chain_after({2, 3})),
+    # A cascading sibling's rows are no reason to spare the restricting one's.
+    "a restricting sibling": (_SOFT_HARD, _SOFT_HARD_ROWS, "DELETE FROM parent WHERE id = 1", None),
+    "a cascading sibling beside an unreferencing restricting one": (
+        _SOFT_HARD, _SOFT_HARD_ROWS, "DELETE FROM parent WHERE id = 2",
+        {"parent": [(1,)], "soft": [(1, 1)], "hard": [(1, 1)]}),
 }
 
 
-@pytest.mark.parametrize("ddl,seed,stmts,after", _STATEMENTS.values(), ids=_STATEMENTS.keys())
-def test_a_cascade_deletes_what_the_fold_leaves_referencing_a_deleted_row(client, ddl, seed, stmts, after):
+@pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
+def test_a_cascade_deletes_what_the_fold_leaves_referencing_a_deleted_row(client, ddl, seed, write, after):
     _fk.seed(client, ddl, seed)
     with _fk.refused() if after is None else contextlib.nullcontext():
-        client.execute_sql(stmts)
+        _fk.write(client, write)
     want = after or seed
     assert _fk.held(client, want) == _fk.want(want)
-
-
-def test_a_restricting_edge_beside_a_cascading_one_still_refuses(client):
-    """Two children of one parent: the cascading one's rows are no reason to
-    spare the restricting one's."""
-    ddl = ("CREATE TABLE parent (id BIGINT PRIMARY KEY); "
-           "CREATE TABLE soft (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE CASCADE); "
-           "CREATE TABLE hard (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE NO ACTION)")
-    seed = {"parent": [(1,), (2,)], "soft": [(1, 1), (2, 2)], "hard": [(1, 1)]}
-    _fk.seed(client, ddl, seed)
-    with pytest.raises(gnitz.GnitzIntegrityError, match="cannot delete from .*parent.*referenced by .*hard"):
-        client.execute_sql("DELETE FROM parent WHERE id = 1")
-    assert _fk.held(client, seed) == _fk.want(seed)
-    client.execute_sql("DELETE FROM parent WHERE id = 2")
-    assert _fk.held(client, seed) == _fk.want({"parent": [(1,)], "soft": [(1, 1)], "hard": [(1, 1)]})
-
-
-_WIDE = ("CREATE TABLE parent (id BIGINT PRIMARY KEY); "
-         "CREATE TABLE child (cid BIGINT PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id) ON DELETE CASCADE)")
-
-
-def test_one_writes_cascade_is_bounded(own_server):
-    """A cascade past the budget is refused whole. Rows the write deletes itself
-    are not the cascade's, and do not count against it."""
-    own_server.start(extra_env={"GNITZ_CASCADE_BYTES": "4096"})
-    n = 2000
-    seed = {"parent": [(1,), (2,)], "child": [(i, 1) for i in range(n)] + [(n + i, 2) for i in range(20)]}
-    with gnitz.connect(own_server.target) as conn:
-        _fk.seed(conn, _WIDE, seed)
-        with pytest.raises(gnitz.GnitzError, match="cascades to more rows of .*child.* than one write deletes"):
-            conn.execute_sql("DELETE FROM parent WHERE id = 1")
-        assert _fk.held(conn, seed) == _fk.want(seed)
-
-        conn.execute_sql("DELETE FROM parent WHERE id = 2")
-        seed = {"parent": [(1,)], "child": seed["child"][:n]}
-        assert _fk.held(conn, seed) == _fk.want(seed)
-
-        conn.execute_sql("BEGIN; DELETE FROM child WHERE cid >= 30; DELETE FROM parent WHERE id = 1; COMMIT")
-        assert _fk.held(conn, seed) == {"parent": {}, "child": {}}
-
-
-def test_a_cascade_survives_a_crash(own_server):
-    """A SIGKILL runs no checkpoint, so the cascade comes back through SAL replay,
-    at its own weights."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        _fk.seed(conn, _chain() + _PER_B, _CHAIN_ROWS)
-        conn.execute_sql("DELETE FROM a WHERE id IN (2, 3)")
-    want = _chain_want({2, 3})
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
-        assert _fk.held(conn, want) == want
-        conn.execute_sql("DELETE FROM a WHERE id = 4")
-    want = _chain_want({2, 3, 4})
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
-        assert _fk.held(conn, want) == want

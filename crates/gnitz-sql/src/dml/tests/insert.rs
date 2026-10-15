@@ -72,7 +72,9 @@ fn keys(b: &ZSetBatch) -> Vec<u128> {
 
 /// A column list names which column each value lands in, in any order and case; a
 /// column it leaves out is NULL, a dropped column takes a filler, and a SERIAL
-/// key is left for execute to stamp.
+/// key is left for execute to stamp. `ROW(…)`, the singular `VALUE`, a unary
+/// plus and a parenthesised literal spell the same row, and a signed NULL is the
+/// NULL it spells, not a zero with the null bit clear.
 #[test]
 fn values_land_in_the_columns_the_list_names() {
     let cat = cat();
@@ -96,6 +98,18 @@ fn values_land_in_the_columns_the_list_names() {
             vec![(vec![Int(2), Str("x")], 1), (vec![Int(4), Null], 1)],
         ),
         ("INSERT INTO h VALUES (1, 5)", vec![1], one(&[Int(0), Int(5)])),
+        ("INSERT INTO t VALUES ROW(1, 2, 'x')", vec![1], one(&[Int(2), Str("x")])),
+        ("INSERT INTO t VALUE (1, 2, 'x')", vec![1], one(&[Int(2), Str("x")])),
+        (
+            "INSERT INTO t VALUES (+1, (2), 'x'), ((3), +4, NULL)",
+            vec![1, 3],
+            vec![(vec![Int(2), Str("x")], 1), (vec![Int(4), Null], 1)],
+        ),
+        (
+            "INSERT INTO h VALUES (1, +NULL), (2, -NULL)",
+            vec![1, 2],
+            vec![(vec![Int(0), Null], 1), (vec![Int(0), Null], 1)],
+        ),
         ("INSERT INTO st VALUES (1, 5)", vec![1], one(&[Int(5)])),
         ("INSERT INTO sr VALUES ('x')", vec![], one(&[Str("x")])),
         ("INSERT INTO sr (name) VALUES ('x')", vec![], one(&[Str("x")])),

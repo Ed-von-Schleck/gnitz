@@ -948,6 +948,15 @@ impl PyTxn {
         let client = self.client.bind(py);
         self.on_loop(client)?;
         let clean = exc_type.is_none(py);
+        if !clean {
+            if let Mode::Loop(handle) = client.try_borrow_mut()?.mode() {
+                // The block's own exception outranks a client it closed, whose
+                // transaction closed with it.
+                if handle.closing() {
+                    return handle.settled(py, false.into_py_any(py)?);
+                }
+            }
+        }
         PyClient::run(client, whole!(|c| end_txn(c, clean).await?), |py, ()| {
             false.into_py_any(py)
         })

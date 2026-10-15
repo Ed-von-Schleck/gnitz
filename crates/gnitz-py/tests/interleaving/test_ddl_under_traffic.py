@@ -10,7 +10,7 @@ import threading
 import gnitz
 import pytest
 from _read import bag, rows, scanned
-from _schemas import KV
+from _schemas import KV, kv
 from _serverproc import START_TIMEOUT, join_or_fail, spawn
 
 
@@ -123,6 +123,17 @@ def test_a_push_decoded_before_an_alter_is_refused(own_server):
     finally:
         join_or_fail("the held push never returned", th)
     assert bag(scanned(client, "t")) == {}
+
+
+def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, server):
+    """The commit is validated against the catalog it reaches, not the one the
+    transaction began under, and the refusal names the relation it concerns."""
+    tid = client.create_table("gone", KV)
+    with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
+        with client.transaction() as txn:
+            txn.push(tid, kv((1, 1)), "update")
+            with gnitz.connect(server, schema=client.schema) as other:
+                other.execute_sql("DROP TABLE gone")
 
 
 @pytest.mark.parametrize("body, row", [

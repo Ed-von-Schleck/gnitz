@@ -595,6 +595,11 @@ impl LoopHandle {
         Ok(closed)
     }
 
+    /// Whether the client was asked to close: it takes no call after that.
+    pub(crate) fn closing(&self) -> bool {
+        self.shared.state().closing
+    }
+
     /// A loop future already resolved to `value`.
     pub(crate) fn settled(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;

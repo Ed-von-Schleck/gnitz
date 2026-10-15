@@ -10,7 +10,7 @@ import threading
 
 import gnitz
 import pytest
-from _read import bag, rows, scanned
+from _read import bag, ordered, rows, scanned
 from _serverproc import join_or_fail, spawn
 
 
@@ -21,39 +21,41 @@ def serial_t(client):
     return client.resolve_table("t")[0]
 
 
-def test_every_spelling_numbers_rows_around_its_payload(client):
-    """Every spelling draws its own sequence from 1. The SERIAL column sits
-    between two payload columns, so a column list and a positional INSERT must
-    each land their values around it, and a NULL payload keeps its null bit. A
-    deleted id is never reissued, and a 200-row statement numbers its rows in
-    order and scatters them over every partition exactly once."""
-    for ty in ["SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL2", "SERIAL4", "SERIAL8"]:
-        t = f"t_{ty.lower()}"
-        client.execute_sql(
-            f"CREATE TABLE {t} (a BIGINT, id {ty} PRIMARY KEY, b TEXT); "
-            f"INSERT INTO {t} (a, b) VALUES (10, 'x'), (NULL, NULL); "
-            f"INSERT INTO {t} VALUES (30, 'z'); "
-            f"DELETE FROM {t} WHERE id = 3")
-        values = ", ".join(f"('n{i}')" for i in range(200))
-        first = min(r.id for r in rows(client, f"INSERT INTO {t} (b) VALUES {values} RETURNING id"))
-        assert first > 3, ty
-        assert bag(scanned(client, t), "id", "a", "b") == {
-            (1, 10, "x"): 1, (2, None, None): 1,
-            **{(first + i, None, f"n{i}"): 1 for i in range(200)}}, ty
+@pytest.mark.parametrize("ty", ["SMALLSERIAL", "SERIAL", "BIGSERIAL"])
+def test_every_width_numbers_rows_around_its_payload(client, ty):
+    """Each width draws its sequence from 1; the other spellings are aliases the
+    binder resolves. The SERIAL column sits between two payload columns, so a
+    column list and a positional INSERT must each land their values around it,
+    and a NULL payload keeps its null bit. A deleted id is never reissued, and a
+    200-row statement numbers its rows in order and scatters them over every
+    partition exactly once."""
+    client.execute_sql(
+        f"CREATE TABLE t (a BIGINT, id {ty} PRIMARY KEY, b TEXT); "
+        "INSERT INTO t (a, b) VALUES (10, 'x'), (NULL, NULL); "
+        "INSERT INTO t VALUES (30, 'z'); "
+        "DELETE FROM t WHERE id = 3")
+    values = ", ".join(f"('n{i}')" for i in range(200))
+    first = min(r.id for r in rows(client, f"INSERT INTO t (b) VALUES {values} RETURNING id"))
+    assert first > 3
+    assert bag(scanned(client, "t"), "id", "a", "b") == {
+        (1, 10, "x"): 1, (2, None, None): 1,
+        **{(first + i, None, f"n{i}"): 1 for i in range(200)}}
 
 
 def test_returning_answers_from_the_stamped_ids(client, serial_t):
     """Every projection RETURNING accepts — a wildcard modifier included —
-    answers from the ids the client stamped, and names the rows written."""
-    assert bag(rows(client, "INSERT INTO t (name) VALUES ('a'), ('b') RETURNING id")) == {(1,): 1, (2,): 1}
-    assert bag(rows(client, "INSERT INTO t (name) VALUES ('c') RETURNING *")) == {(3, "c"): 1}
-    assert bag(rows(client, "INSERT INTO t (name) VALUES ('d') RETURNING id, name")) == {(4, "d"): 1}
-    [row] = rows(client, "INSERT INTO t (name) VALUES ('e') RETURNING * EXCEPT (name)")
-    assert (row._fields, row.id) == (("id",), 5)
-    # A RETURNING list binds as a SELECT list: expressions, and no key required.
-    [row] = rows(client, "INSERT INTO t (name) VALUES ('f') RETURNING name, id + 1 AS nxt")
-    assert (row._fields, row.name, row.nxt) == (("name", "nxt"), "f", 7)
-    assert bag(rows(client, "INSERT INTO t (name) VALUES ('g') RETURNING name")) == {("g",): 1}
+    answers from the ids the client stamped, under the names it binds, and names
+    the rows written. It binds as a SELECT list: expressions, and no key
+    required."""
+    for names, returning, want in [
+            ("('a'), ('b')", "id", [{"id": 1}, {"id": 2}]),
+            ("('c')", "*", [{"id": 3, "name": "c"}]),
+            ("('d')", "id, name", [{"id": 4, "name": "d"}]),
+            ("('e')", "* EXCEPT (name)", [{"id": 5}]),
+            ("('f')", "name, id + 1 AS nxt", [{"name": "f", "nxt": 7}]),
+            ("('g')", "name", [{"name": "g"}])]:
+        got = ordered(rows(client, f"INSERT INTO t (name) VALUES {names} RETURNING {returning}"))
+        assert got == [(tuple(w.items()), 1) for w in want], returning
     assert bag(scanned(client, "t")) == {(i + 1, n): 1 for i, n in enumerate("abcdefg")}
 
 

@@ -54,14 +54,21 @@ def test_every_dml_verb_survives_two_crashes(own_server):
     between them. A retraction replayed twice nets the row to weight 0 and a
     push replayed twice to weight 2, so the bag is the observable. A SERIAL
     table rides along: every id drawn after a crash exceeds every id committed
-    before it."""
+    before it. So does a cascading delete, before each crash, whose child rows
+    and the view over them come back at their own weights."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, "
             "s VARCHAR(500) NOT NULL, n BIGINT); "
             "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
-            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c')")
+            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c'); "
+            "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY); "
+            "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, "
+            "pid BIGINT NOT NULL REFERENCES p(id) ON DELETE CASCADE); "
+            "CREATE VIEW per_p AS SELECT pid, COUNT(*) AS n FROM c GROUP BY pid; "
+            "INSERT INTO p VALUES (1), (2); INSERT INTO c VALUES (10, 1), (11, 1), (20, 2); "
+            "DELETE FROM p WHERE id = 1")
         tid, _ = conn.resolve_table("t")
         insert(conn, "t", _ROWS)
         for v in (200, 300, 400):
@@ -78,13 +85,15 @@ def test_every_dml_verb_survives_two_crashes(own_server):
     with gnitz.connect(own_server.target) as conn:
         assert conn.resolve_table("t")[0] == tid, "table_id moved across a crash"
         assert bag(scanned(conn, "t"), *_COLS) == want
-        conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1)")
+        assert [bag(scanned(conn, r)) for r in ("p", "c", "per_p")] == [{(2,): 1}, {(20, 2): 1}, {(2, 1): 1}]
+        conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1); DELETE FROM p WHERE id = 2")
         [d] = rows(conn, "INSERT INTO q (name) VALUES ('d') RETURNING id")
 
     own_server.restart()
     with gnitz.connect(own_server.target) as conn:
         assert bag(scanned(conn, "t"), *_COLS) == want | {
             (300, 3000, "post", 1): 1}, "a second crash with no clean stop between"
+        assert [bag(scanned(conn, r)) for r in ("p", "c", "per_p")] == [{}, {}, {}]
         [e] = rows(conn, "INSERT INTO q (name) VALUES ('e') RETURNING id")
         assert 3 < d.id < e.id, "a SERIAL id reissued across a crash"
         assert bag(scanned(conn, "q"), "id", "name") == {

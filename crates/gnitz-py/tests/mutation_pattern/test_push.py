@@ -39,11 +39,14 @@ _FOLD = {
     "last write wins": ([], [(1, 0, 1), (1, 1, 1)], [(1, 1)]),
     "insert then retract": ([], [(1, 0, 1), (1, 2, -1)], []),
     "retract then insert": ([(1, 0)], [(1, 2, -1), (1, 1, 1)], [(1, 1)]),
+    "retract by key alone": ([(1, 0)], [(1, 2, -1)], []),
+    "retract an absent key": ([(1, 0)], [(2, 1, -1)], [(1, 0)]),
     "weight 3 is one row": ([], [(1, 0, 3)], [(1, 0)]),
     "weight 0 is no row": ([], [(1, 0, 0), (2, 1, 1), (3, 2, 0)], [(2, 1)]),
     "all weight 0": ([(1, 0)], [(2, 1, 0), (3, 2, 0)], [(1, 0)]),
     "independent keys": ([(1, 0), (2, 1), (3, 2)], [(2, 2, 1)], [(1, 0), (2, 2), (3, 2)]),
     "delete by key, absent key": ([(1, 0), (2, 1)], ("delete", [2, 999]), [(1, 0)]),
+    "empty push": ([(1, 0)], [], [(1, 0)]),
 }
 
 
@@ -60,25 +63,13 @@ def test_a_push_folds_by_pk(client, leg, committed, pushed, survivors):
 
     if committed:
         client.push(tid, batch([(pk, i, 1) for pk, i in committed]))
-    if pushed[0] == "delete":
+    if isinstance(pushed, tuple):
         client.delete(tid, schema, pushed[1])
     else:
         client.push(tid, batch(pushed))
 
     want = {(pk, vals[i]): 1 for pk, i in survivors}
     assert bag(scanned(client, "t")) == bag(scanned(client, "v")) == want
-
-
-def test_an_empty_push_writes_nothing_and_keeps_the_connection_aligned(client):
-    """An empty batch ACKs with the "nothing written" LSN 0 — never a scan,
-    whose streamed dump of the table's rows would desync the one-frame push
-    reply. The pushes around it return real LSNs and land whole."""
-    tid = client.create_table("t", _INT)
-    bulk = gnitz.ZSetBatch(_INT).extend([{"pk": i, "val": i * 10} for i in range(1, 1001)])
-    assert client.push(tid, bulk) > 0
-    assert client.push(tid, gnitz.ZSetBatch(_INT)) == 0
-    assert client.push(tid, gnitz.ZSetBatch(_INT).extend([{"pk": 1001, "val": 0}])) > 0
-    assert bag(scanned(client, "t")) == {(i, i * 10): 1 for i in range(1, 1001)} | {(1001, 0): 1}
 
 
 def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
@@ -101,7 +92,7 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
     def value(pk):
         return f"v{pk}" if pk % 2 == 0 else f"long-payload-for-row-{pk}"
 
-    lsns = [[] for _ in range(conns)]
+    lsns = []
 
     def worker(w):
         with gnitz.connect(server) as c:
@@ -110,7 +101,7 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
                 batch = gnitz.ZSetBatch(_STR).extend(
                     [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
                     + [{"pk": 0, "val": f"w{w}r{r}"}])
-                lsns[w].append(c.push(tids[w % 2], batch))
+                lsns.append(c.push(tids[w % 2], batch))
 
     join_or_fail("a concurrent push hung", *[spawn(worker, w) for w in range(conns)])
 
@@ -123,6 +114,5 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
                        for pk in range(1 + w * rounds * per, 1 + (w + 1) * rounds * per)} | {shared: 1}
 
     # Deliberately loose: that pushes coalesce at all, not how far.
-    seen = [lsn for per_conn in lsns for lsn in per_conn]
-    assert len(set(seen)) <= 0.75 * len(seen), (
-        f"{len(set(seen))} zones for {len(seen)} pushes: pushes did not coalesce")
+    assert len(set(lsns)) <= 0.75 * len(lsns), (
+        f"{len(set(lsns))} zones for {len(lsns)} pushes: pushes did not coalesce")

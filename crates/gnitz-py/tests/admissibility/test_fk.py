@@ -236,31 +236,21 @@ _WRITES = {
 }
 
 
-def _write(client, write):
-    if isinstance(write, str):
-        client.execute_sql(write)
-        return
-    verb, table, payload = write
-    tid, schema = client.resolve_table(table)
-    if verb == "push":
-        client.push(tid, gnitz.ZSetBatch(schema).extend(payload))
-    else:
-        client.delete(tid, schema, payload)
-
-
 @pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
 def test_a_write_lands_only_if_every_reference_survives_its_fold(client, ddl, seed, write, after):
     _fk.seed(client, ddl, seed)
     with _fk.refused() if after is None else contextlib.nullcontext():
-        _write(client, write)
+        _fk.write(client, write)
     assert _fk.held(client, seed) == _fk.want(after or seed)
 
 
 def test_a_refused_parent_write_names_its_verb(client):
     """Through a non-PK unique column: moving a referenced code is refused as an
-    update, and removing its row as a delete."""
+    update, and removing its row as a delete, each naming the child that still
+    references it."""
     _fk.seed(client, _CODE_PAIR, _CODE_ROWS)
-    refused = lambda verb: pytest.raises(gnitz.GnitzIntegrityError, match=f"cannot {verb} ")
+    refused = lambda verb: pytest.raises(
+        gnitz.GnitzIntegrityError, match=f"cannot {verb} '.*p', row still referenced by '.*c'")
     with refused("update"):
         client.execute_sql("UPDATE p SET code = 5 WHERE pid = 3")
     with refused("delete from"):
@@ -288,6 +278,30 @@ def test_restrict_over_more_values_than_one_write_carries(client):
 
     client.execute_sql("BEGIN; DELETE FROM child; DELETE FROM parent; COMMIT")
     assert _fk.held(client, seed) == {"parent": {}, "child": {}}
+
+
+_WIDE = ("CREATE TABLE parent (id BIGINT PRIMARY KEY); "
+         "CREATE TABLE child (cid BIGINT PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id) ON DELETE CASCADE)")
+
+
+def test_one_writes_cascade_is_bounded(own_server):
+    """A cascade past the budget is refused whole. Rows the write deletes itself
+    are not the cascade's, and do not count against it."""
+    own_server.start(extra_env={"GNITZ_CASCADE_BYTES": "4096"})
+    n = 2000
+    seed = {"parent": [(1,), (2,)], "child": [(i, 1) for i in range(n)] + [(n + i, 2) for i in range(20)]}
+    with gnitz.connect(own_server.target) as conn:
+        _fk.seed(conn, _WIDE, seed)
+        with pytest.raises(gnitz.GnitzError, match="cascades to more rows of .*child.* than one write deletes"):
+            conn.execute_sql("DELETE FROM parent WHERE id = 1")
+        assert _fk.held(conn, seed) == _fk.want(seed)
+
+        conn.execute_sql("DELETE FROM parent WHERE id = 2")
+        seed = {"parent": [(1,)], "child": seed["child"][:n]}
+        assert _fk.held(conn, seed) == _fk.want(seed)
+
+        conn.execute_sql("BEGIN; DELETE FROM child WHERE cid >= 30; DELETE FROM parent WHERE id = 1; COMMIT")
+        assert _fk.held(conn, seed) == {"parent": {}, "child": {}}
 
 
 # ── What a declaration gates ─────────────────────────────────────────────────

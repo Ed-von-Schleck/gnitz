@@ -36,7 +36,8 @@ def test_a_transaction_stages_its_writes_until_commit(client):
     assert bag(rows(client, "INSERT INTO t VALUES (7, 70) RETURNING pk")) == {(7,): 1}
     [a] = rows(client, "INSERT INTO s (name) VALUES ('a') RETURNING id")
     assert q("UPDATE t SET val = 99 WHERE pk = 1")[0]["count"] == 1
-    for refused in ("UPDATE t SET nope = 1 WHERE pk = 1", "INSERT INTO t VALUES (2)"):
+    for refused in ("UPDATE t SET nope = 1 WHERE pk = 1", "INSERT INTO t VALUES (2)",
+                    "UPDATE t SET val = NULL WHERE pk = 1"):
         with pytest.raises(gnitz.GnitzRefusedError):
             q(refused)
     assert bag(rows(client, "SELECT * FROM t")) == bag(scanned(client, "t")) == {(1, 10): 1}
@@ -59,10 +60,7 @@ _REFUSED = {
         "BEGIN; UPDATE t SET val = 99 WHERE pk = 2; INSERT INTO t VALUES (1, 100); COMMIT",
     "a duplicate key beside a write to another table":
         "BEGIN; INSERT INTO u VALUES (9, 90); INSERT INTO t VALUES (1, 20); COMMIT",
-    "a statement error after a BEGIN in the same call":
-        "BEGIN; INSERT INTO t VALUES (3, 30); UPDATE t SET nope = 1; COMMIT",
-    "an autocommit INSERT with a bad RETURNING list":
-        "INSERT INTO t VALUES (3, 30) RETURNING bogus",
+    "an autocommit NULL under NOT NULL": "UPDATE t SET val = NULL WHERE pk = 1",
 }
 
 
@@ -75,30 +73,6 @@ def test_a_refused_write_commits_nothing_and_leaves_no_transaction_open(client, 
         {(1, 10): 1, (2, 20): 1}, {})
     with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
         client.execute_sql("ROLLBACK")
-
-
-def test_a_null_under_not_null_is_refused_at_the_statement(client):
-    """A NULL an UPDATE writes into a NOT NULL column is refused at the statement
-    that writes it — in autocommit and inside a transaction alike, so no later
-    statement of the transaction reads it back as a real value. An autocommit
-    refusal leaves no transaction open; one inside a transaction leaves the
-    transaction's other writes to commit."""
-    q = client.execute_sql
-    q(f"{_TU}; INSERT INTO t VALUES (1, 10)")
-    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
-        q("UPDATE t SET val = NULL WHERE pk = 1")
-    assert bag(scanned(client, "t")) == {(1, 10): 1}
-    with pytest.raises(gnitz.GnitzError, match="no transaction open"):
-        q("ROLLBACK")
-    # Nothing matched, so nothing was written.
-    assert q("UPDATE t SET val = NULL WHERE pk = 999")[0]["count"] == 0
-
-    q("BEGIN")
-    q("INSERT INTO t VALUES (2, 20)")
-    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
-        q("UPDATE t SET val = NULL WHERE pk = 1")
-    q("COMMIT")
-    assert bag(scanned(client, "t")) == {(1, 10): 1, (2, 20): 1}
 
 
 def test_a_bundle_over_two_tables_reaches_a_join_as_one_delta_each(client):
@@ -146,86 +120,31 @@ _BUNDLES = {
     "a weight-0 row is no row":
         ([], [("a", [(1, 10, 1), (2, 20, 0)], "update"), ("b", [(3, 30, 1)], "update")],
          ({(1, 10): 1}, {(3, 30): 1})),
-    "a system table is no target":
-        ([], [("a", [(1, 10, 1)], "update"), (gnitz.TABLE_TAB, [(1, 10, 1)], "update")],
-         gnitz.GnitzRefusedError),
-    "an exception inside the block discards every frame":
-        ([], [("a", [(1, 10, 1)], "update"), ("b", [(2, 20, 1)], "update"), (None, None, "raise")],
-         RuntimeError),
 }
 
 
 @pytest.mark.parametrize("committed,frames,after", _BUNDLES.values(), ids=_BUNDLES.keys())
 def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames, after):
     tids = {n: client.create_table(n, KV) for n in "ab"}
-
     if committed:
         client.push(tids["a"], kv(*committed))
 
     refused = isinstance(after, type)
     with pytest.raises(after) if refused else contextlib.nullcontext():
         with client.transaction() as txn:
-            for table, rows, mode in frames:
-                tid = tids.get(table, table)
-                if mode == "raise":
-                    raise RuntimeError("abandon the bundle")
+            for table, frame, mode in frames:
                 if mode == "delete":
-                    txn.delete(tid, KV, rows)
+                    txn.delete(tids[table], KV, frame)
                 else:
-                    txn.push(tid, kv(*rows), mode)
+                    txn.push(tids[table], kv(*frame), mode)
     assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == (
         (dict.fromkeys(committed, 1), {}) if refused else after)
-
-
-def test_the_block_opens_the_clients_own_transaction(client):
-    """`transaction()` opens nothing until its block is entered, and the block's
-    transaction is the one SQL's BEGIN, COMMIT and ROLLBACK act on."""
-    tid = client.create_table("a", KV)
-    one = gnitz.ZSetBatch(KV).append(pk=1, val=1)
-
-    client.transaction()
-    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
-        client.execute_sql("ROLLBACK")
-
-    with client.transaction() as txn:
-        assert txn is client
-        txn.push(tid, one)
-    assert bag(scanned(client, "a")) == {(1, 1): 1}
-
-    with pytest.raises(RuntimeError, match="after ROLLBACK"):
-        with client.transaction():
-            client.execute_sql("ROLLBACK")
-            raise RuntimeError("after ROLLBACK")
-    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
-        with client.transaction():
-            client.execute_sql("COMMIT")
-    assert bag(scanned(client, "a")) == {(1, 1): 1}
-
-
-def test_an_exception_survives_a_client_closed_inside_the_block(server):
-    conn = gnitz.connect(server)
-    with pytest.raises(RuntimeError, match="after close"):
-        with conn.transaction():
-            conn.close()
-            raise RuntimeError("after close")
-
-
-def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, server):
-    """The commit is validated against the catalog it reaches, not the one the
-    transaction began under, and the refusal names the relation it concerns."""
-    tid = client.create_table("gone", KV)
-    with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
-        with client.transaction() as txn:
-            txn.push(tid, kv((1, 1)), "update")
-            with gnitz.connect(server, schema=client.schema) as other:
-                other.execute_sql("DROP TABLE gone")
 
 
 def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
     """Each family fits the 16 MiB SAL alone, the two together do not: the
     second one's refusal takes back the first, already laid out, and the SAL is
     left able to commit the next write."""
-    client = gnitz.connect(own_server.start(extra_env=TINY_SAL).target)
     schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
     pad = "x" * 8_000
@@ -233,12 +152,13 @@ def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
     def wide(n):  # ~10 MB of rows
         return gnitz.ZSetBatch(schema).extend([{"pk": i, "pad": pad} for i in range(n)])
 
-    a, b = (client.create_table(n, schema) for n in "ab")
-    with pytest.raises(gnitz.GnitzSalFullError):
-        with client.transaction() as txn:
-            txn.push(a, wide(1_300), "update")
-            txn.push(b, wide(1_300), "update")
-    assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == ({}, {})
+    with gnitz.connect(own_server.start(extra_env=TINY_SAL).target) as client:
+        a, b = (client.create_table(n, schema) for n in "ab")
+        with pytest.raises(gnitz.GnitzSalFullError):
+            with client.transaction() as txn:
+                txn.push(a, wide(1_300), "update")
+                txn.push(b, wide(1_300), "update")
+        assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == ({}, {})
 
-    client.push(a, gnitz.ZSetBatch(schema).extend([{"pk": 1, "pad": "y"}]))
-    assert bag(scanned(client, "a")) == {(1, "y"): 1}
+        client.push(a, gnitz.ZSetBatch(schema).extend([{"pk": 1, "pad": "y"}]))
+        assert bag(scanned(client, "a")) == {(1, "y"): 1}

@@ -15,7 +15,7 @@ import pytest
 import gnitz
 from gnitz import aio
 from _feedviews import churn, fed_view
-from _read import bag, result_rows, rows
+from _read import bag, result_rows, rows, scanned
 from _schemas import KV, SCHEMAS, kv
 
 
@@ -108,6 +108,50 @@ async def test_a_transaction_on_the_loop(aconn, client):
     with pytest.raises(TypeError, match="blocks"):
         async with client.transaction():
             pass
+
+
+def test_the_block_opens_the_clients_own_transaction(client):
+    """`transaction()` opens nothing until its block is entered, and the block's
+    transaction is the one SQL's BEGIN, COMMIT and ROLLBACK act on."""
+    tid = client.create_table("a", KV)
+
+    client.transaction()
+    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
+        client.execute_sql("ROLLBACK")
+
+    with client.transaction() as txn:
+        assert txn is client
+        txn.push(tid, kv((1, 1)))
+    assert bag(scanned(client, "a")) == {(1, 1): 1}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with client.transaction():
+            client.push(tid, kv((2, 2)))
+            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="after ROLLBACK"):
+        with client.transaction():
+            client.execute_sql("ROLLBACK")
+            raise RuntimeError("after ROLLBACK")
+    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
+        with client.transaction():
+            client.execute_sql("COMMIT")
+    assert bag(scanned(client, "a")) == {(1, 1): 1}
+
+
+async def test_an_exception_survives_a_client_closed_inside_the_block(server):
+    """Closing the client drops its open transaction with it, so the block's own
+    exception is what comes out of either exit."""
+    conn = gnitz.connect(server)
+    with pytest.raises(RuntimeError, match="after close"):
+        with conn.transaction():
+            conn.close()
+            raise RuntimeError("after close")
+
+    aconn = await aio.connect(server)
+    with pytest.raises(RuntimeError, match="after close"):
+        async with aconn.transaction():
+            await aconn.aclose()
+            raise RuntimeError("after close")
 
 
 async def test_a_delta_feed_on_the_loop(aconn, client):
@@ -292,3 +336,4 @@ def test_a_pipelined_push_sends_the_batch_as_it_was_called_with(client):
     assert bag(client.scan(tid, KV)) == {(1, 10): 1}
     client.push(tid, batch)
     assert bag(client.scan(tid, KV)) == {(1, 10): 1, (2, 20): 1}
+

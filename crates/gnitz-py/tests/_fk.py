@@ -1,5 +1,5 @@
-"""What the foreign-key suites share: seeding a schema, reading it back as
-bags, and the refusal an FK violation raises."""
+"""What the foreign-key suites share: seeding a schema, writing to it, reading
+it back as bags, and the refusal an FK violation raises."""
 
 import pytest
 import gnitz
@@ -12,6 +12,19 @@ def seed(client, ddl, rows_by_table):
     for table, rows in rows_by_table.items():
         if rows:
             insert(client, table, rows)
+
+
+def write(client, write):
+    """A SQL string, or a binary `("push", table, rows)` / `("delete", table, keys)`."""
+    if isinstance(write, str):
+        client.execute_sql(write)
+        return
+    verb, table, payload = write
+    tid, schema = client.resolve_table(table)
+    if verb == "push":
+        client.push(tid, gnitz.ZSetBatch(schema).extend(payload))
+    else:
+        client.delete(tid, schema, payload)
 
 
 def held(client, relations):

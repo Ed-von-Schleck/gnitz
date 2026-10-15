@@ -37,9 +37,9 @@ def test_a_push_whose_schema_disagrees_is_refused(client):
 @pytest.mark.parametrize("target", ["view", "system table"])
 def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target):
     """A view's tid lives in the same id space as a base table's, and a system
-    family's rows are written by DDL alone, so a raw push or delete addressed to
-    either would commit rows nothing derived. SQL refuses both targets while
-    planning; the raw API reaches only the server's guard. It is one guard on
+    family's rows are written by DDL alone, so a raw push, delete or transaction
+    addressed to either would commit rows nothing derived. SQL refuses both
+    targets while planning; the raw API reaches only the server's guard. It is one guard on
     every write, the empty-batch arm included — so a client bug producing an
     empty batch fails instead of being masked by the no-op ACK a base table
     still gives."""
@@ -56,9 +56,14 @@ def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target)
     before = bag(client.scan(tid, schema))
     assert before
 
+    def in_a_transaction():
+        with client.transaction() as txn:
+            txn.push(tid, gnitz.ZSetBatch(schema).extend([row]))
+
     for write in (lambda: client.push(tid, gnitz.ZSetBatch(schema).extend([row])),
                   lambda: client.delete(tid, schema, [1]),
-                  lambda: client.push(tid, gnitz.ZSetBatch(schema))):
+                  lambda: client.push(tid, gnitz.ZSetBatch(schema)),
+                  in_a_transaction):
         with pytest.raises(gnitz.GnitzRefusedError, match="is not writable"):
             write()
     assert bag(client.scan(tid, schema)) == before
