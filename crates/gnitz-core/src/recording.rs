@@ -11,23 +11,22 @@
 //! [`read`] refuses any other: a frame of another version is not one a replay
 //! could send.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use gnitz_wire::read_u32_le;
 use gnitz_wire::wal::WAL_FORMAT_VERSION;
+use gnitz_wire::{Reader, Writer};
 
 /// The directory every connection of this process records into.
 pub const RECORD_ENV: &str = "GNITZ_RECORD_FRAMES";
 
+/// What a recording file is named with.
+pub const EXT: &str = "frames";
+
 const MAGIC: &[u8; 4] = b"GNZR";
-const FILE_HEADER: usize = 8;
-/// A record's direction byte, connection and frame length.
-const RECORD_HEADER: usize = 9;
 
 /// Which way a recorded frame went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,48 +44,52 @@ pub struct Recorded<'a> {
     pub frame: &'a [u8],
 }
 
+impl Recorded<'_> {
+    fn write(&self, w: &mut Writer) {
+        w.u8(self.dir as u8).u32(self.conn).bytes32(self.frame);
+    }
+}
+
+/// The recording of `records`, in order: what a recording file holds.
+pub fn encode(records: &[Recorded]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.raw(MAGIC).u32(WAL_FORMAT_VERSION);
+    records.iter().for_each(|r| r.write(&mut w));
+    w.into_vec()
+}
+
 /// Every frame of the recording `bytes`, in order.
 pub fn read(bytes: &[u8]) -> Result<Vec<Recorded<'_>>, String> {
-    if bytes.len() < FILE_HEADER || &bytes[..4] != MAGIC {
+    let mut r = Reader::new(bytes);
+    if r.take(MAGIC.len()).ok() != Some(MAGIC) {
         return Err("not a frame recording".into());
     }
-    let version = read_u32_le(bytes, 4);
+    let version = r.u32().map_err(|_| "not a frame recording")?;
     if version != WAL_FORMAT_VERSION {
         return Err(format!(
             "recorded at wire format {version:#x}, this build speaks {WAL_FORMAT_VERSION:#x}"
         ));
     }
-    let mut rest = &bytes[FILE_HEADER..];
     let mut out = Vec::new();
-    while !rest.is_empty() {
-        if rest.len() < RECORD_HEADER {
-            return Err(format!("record {} is truncated", out.len()));
-        }
-        let dir = match rest[0] {
-            0 => Direction::Sent,
-            1 => Direction::Received,
-            d => return Err(format!("record {} names direction {d}", out.len())),
+    while r.remaining() > 0 {
+        let mut record = || {
+            let dir = match r.u8()? {
+                0 => Direction::Sent,
+                1 => Direction::Received,
+                d => return Err(format!("names direction {d}")),
+            };
+            Ok(Recorded { dir, conn: r.u32()?, frame: r.bytes32()? })
         };
-        let conn = read_u32_le(rest, 1);
-        let len = read_u32_le(rest, 5) as usize;
-        let frame = rest[RECORD_HEADER..]
-            .get(..len)
-            .ok_or_else(|| format!("record {} runs past the recording", out.len()))?;
-        out.push(Recorded { conn, dir, frame });
-        rest = &rest[RECORD_HEADER + len..];
+        let record = record().map_err(|e| format!("record {}: {e}", out.len()))?;
+        out.push(record);
     }
     Ok(out)
 }
 
-/// One recording file, shared by every connection of this process to its target.
-struct Recording {
-    file: Mutex<File>,
-    next_conn: AtomicU32,
-}
-
-/// A connection's handle on its recording.
+/// A connection's handle on its recording, a file every connection of this
+/// process to its target shares.
 pub(crate) struct Tap {
-    recording: Arc<Recording>,
+    file: Arc<Mutex<File>>,
     conn: u32,
 }
 
@@ -98,44 +101,42 @@ impl Tap {
 
     /// The tap of a connection to `target`, recording into `dir`.
     fn open_in(dir: &Path, target: &str) -> Tap {
-        static RECORDINGS: Mutex<Option<HashMap<PathBuf, Arc<Recording>>>> = Mutex::new(None);
+        /// A recording's file, and the connections opened onto it.
+        struct Recording {
+            file: Arc<Mutex<File>>,
+            conns: u32,
+        }
+        static RECORDINGS: Mutex<BTreeMap<PathBuf, Recording>> = Mutex::new(BTreeMap::new());
         let name = format!(
-            "{:016x}-{}.frames",
+            "{:016x}-{}.{EXT}",
             gnitz_wire::checksum(target.as_bytes()),
             std::process::id()
         );
         let path = dir.join(name);
         let mut recordings = RECORDINGS.lock().unwrap_or_else(|p| p.into_inner());
-        let recording = recordings
-            .get_or_insert_default()
-            .entry(path)
-            .or_insert_with_key(|path| {
-                std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{RECORD_ENV}: create {}: {e}", dir.display()));
-                let mut file =
-                    File::create(path).unwrap_or_else(|e| panic!("{RECORD_ENV}: create {}: {e}", path.display()));
-                let mut header = MAGIC.to_vec();
-                header.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-                file.write_all(&header)
-                    .unwrap_or_else(|e| panic!("{RECORD_ENV}: write {}: {e}", path.display()));
-                Arc::new(Recording {
-                    file: Mutex::new(file),
-                    next_conn: AtomicU32::new(0),
-                })
-            });
-        let conn = recording.next_conn.fetch_add(1, Ordering::Relaxed);
-        Tap { recording: Arc::clone(recording), conn }
+        let recording = recordings.entry(path).or_insert_with_key(|path| {
+            std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{RECORD_ENV}: create {}: {e}", dir.display()));
+            let mut file =
+                File::create(path).unwrap_or_else(|e| panic!("{RECORD_ENV}: create {}: {e}", path.display()));
+            file.write_all(&encode(&[]))
+                .unwrap_or_else(|e| panic!("{RECORD_ENV}: write {}: {e}", path.display()));
+            Recording {
+                file: Arc::new(Mutex::new(file)),
+                conns: 0,
+            }
+        });
+        let conn = recording.conns;
+        recording.conns += 1;
+        Tap { file: Arc::clone(&recording.file), conn }
     }
 
     /// Record `frame`, which this connection sent or received. One write per
     /// record, so the connections sharing a file never interleave inside one.
     pub(crate) fn note(&self, dir: Direction, frame: &[u8]) {
-        let mut record = Vec::with_capacity(RECORD_HEADER + frame.len());
-        record.push(dir as u8);
-        record.extend_from_slice(&self.conn.to_le_bytes());
-        record.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        record.extend_from_slice(frame);
-        let mut file = self.recording.file.lock().unwrap_or_else(|p| p.into_inner());
-        file.write_all(&record)
+        let mut w = Writer::with_capacity(1 + 4 + 4 + frame.len());
+        Recorded { conn: self.conn, dir, frame }.write(&mut w);
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        file.write_all(&w.into_vec())
             .unwrap_or_else(|e| panic!("{RECORD_ENV}: a frame could not be recorded: {e}"));
     }
 }

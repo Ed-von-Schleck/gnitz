@@ -37,16 +37,10 @@ pub(crate) fn ddl_frame() -> Vec<u8> {
     encode_ddl_txn(&[(CIRCUIT_TAB, batch)])
 }
 
-/// A `SCAN_SPEC` of every row of relation 9.
-pub(crate) fn scan_frame() -> Vec<u8> {
+/// A `SCAN_SPEC` of every row of relation 9 within `bound`.
+pub(crate) fn scan_frame(bound: ReadBound) -> Vec<u8> {
     let mut out = Vec::new();
     let hdr = ControlHeader::naming(ClientVerb::ScanSpec, Target::from(9), 0);
-    append_frame(
-        &mut out,
-        &hdr,
-        &ReadSpec::all_rows(ReadBound::None).encode(),
-        None,
-        None,
-    );
+    append_frame(&mut out, &hdr, &ReadSpec::all_rows(bound).encode(), None, None);
     out
 }

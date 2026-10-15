@@ -113,7 +113,7 @@ impl Fixture {
 
     /// Restart the server, and give the direct client a live connection.
     fn restart_server(&mut self) {
-        self.server.restart();
+        self.server.restart().unwrap();
         self.direct = GnitzClient::connect(self.server.sock_path()).unwrap();
     }
 

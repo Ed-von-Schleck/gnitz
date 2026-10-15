@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{self, Seeds, SEEDS_ENV};
-use gnitz_fuzz::session::{self, Trace};
+use gnitz_fuzz::session;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,13 +29,13 @@ fn main() -> ExitCode {
                 default(info);
                 std::process::abort();
             }));
-            if let Err(finding) = session_of(input, Trace::default()) {
+            if let Err(finding) = session_of(input, false) {
                 eprintln!("finding: {finding}");
                 std::process::abort();
             }
             ExitCode::SUCCESS
         }
-        ["replay", input] => match session_of(input, Trace { frames: true }) {
+        ["replay", input] => match session_of(input, true) {
             Ok(()) => {
                 eprintln!("no finding");
                 ExitCode::SUCCESS
@@ -60,12 +60,12 @@ fn main() -> ExitCode {
 }
 
 /// The session the input file `path` names.
-fn session_of(path: &str, trace: Trace) -> Result<(), String> {
+fn session_of(path: &str, trace: bool) -> Result<(), String> {
     let seeds = gnitz_foundation::env::env_path(SEEDS_ENV).ok_or(format!("{SEEDS_ENV} names no seed directory"))?;
     let seeds = Seeds::open(&seeds).map_err(|e| format!("{}: {e}", seeds.display()))?;
     let input = Input::decode(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?);
     let (seed, file) = seeds.pick(input.seed)?;
-    if trace.frames {
+    if trace {
         eprintln!(
             "seed {} under {:?}, {} edits: {:?}",
             file.display(),
@@ -74,7 +74,7 @@ fn session_of(path: &str, trace: Trace) -> Result<(), String> {
             input.edits
         );
     }
-    session::run(&input, &seed, trace).map_err(|f| f.to_string())
+    session::run(&input, &seed, trace)
 }
 
 /// Import `recordings` into `dir/seeds`, and write every target's starting

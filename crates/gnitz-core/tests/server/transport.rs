@@ -353,7 +353,7 @@ fn a_restart_fails_the_old_connection_fast_and_admits_a_new_one() {
     let targets = [srv.sock_path().to_string(), srv.tls_target()];
     let mut clients: Vec<_> = targets.iter().map(|t| client_with_table(t)).collect();
 
-    srv.restart();
+    srv.restart().unwrap();
 
     for ((client, _, tid, schema), target) in clients.iter_mut().zip(&targets) {
         let t0 = Instant::now();

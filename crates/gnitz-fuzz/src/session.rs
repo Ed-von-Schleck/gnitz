@@ -14,7 +14,6 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::fmt;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{block_on, ClientError, ClientTransport, GnitzClient, RelName};
@@ -29,62 +28,10 @@ use crate::seed::{Frame, Seed};
 const BARRIER_BASE: u64 = CATALOG_ID_CEILING << 1;
 /// How long one session may take before an unanswered request is a finding.
 const SESSION_BUDGET: Duration = Duration::from_secs(20);
-/// The smallest SAL a server takes: each session fallocates its own.
+/// Each session fallocates its own SAL; this keeps it small.
 const SAL_BYTES: &str = "16777216";
 /// The SAL bytes between checkpoints of a session that asks for them often.
 const CHECKPOINT_BYTES: &str = "65536";
-
-/// What a session found wrong.
-#[derive(Debug)]
-pub enum Finding {
-    /// The master exited or a worker died, during `step`.
-    Died { step: Step },
-    /// The server sent a frame whose control block the client's decoder refuses.
-    Undecodable { error: String },
-    /// Frame `frame` went unanswered for the whole session budget.
-    Unanswered { frame: usize },
-    /// A client could not read the server's state back.
-    Unreadable { what: String, error: ClientError },
-    /// The server did not boot again on its own data directory.
-    NoReboot,
-}
-
-impl fmt::Display for Finding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Finding::Died { step } => write!(f, "the server died during {step}"),
-            Finding::Undecodable { error } => write!(f, "the server sent an undecodable frame: {error}"),
-            Finding::Unanswered { frame } => write!(f, "frame {frame} was not answered within {SESSION_BUDGET:?}"),
-            Finding::Unreadable { what, error } => write!(f, "{what} could not be read back: {error}"),
-            Finding::NoReboot => write!(f, "the server did not boot again on its own data"),
-        }
-    }
-}
-
-/// Where in a session a server died.
-#[derive(Debug)]
-pub enum Step {
-    /// Frame `n` of the traffic, or opening the connection it went over.
-    Frame(usize),
-    /// Reading the session's state back.
-    ReadBack,
-}
-
-impl fmt::Display for Step {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Step::Frame(n) => write!(f, "frame {n}"),
-            Step::ReadBack => f.write_str("the read-back"),
-        }
-    }
-}
-
-/// How a session reports what it does.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Trace {
-    /// Print every frame sent and every reply status.
-    pub frames: bool,
-}
 
 /// One connection of a session, and the barrier it waits for.
 struct Conn {
@@ -96,9 +43,11 @@ struct Conn {
     closed: bool,
 }
 
-/// Play `input`'s edit of `seed` into a server booted for it, and judge it.
-/// The server is gone when this returns.
-pub fn run(input: &Input, seed: &Seed, trace: Trace) -> Result<(), Finding> {
+/// Play `input`'s edit of `seed` into a server booted for it, and judge it:
+/// `Err` tells what the session found wrong. The server is gone when this
+/// returns, and its data directory too unless `trace` asks for every frame to
+/// be traced, when a finding prints the server's logs.
+pub fn run(input: &Input, seed: &Seed, trace: bool) -> Result<(), String> {
     let boot = input.boot;
     let mut env = vec![("GNITZ_SAL_BYTES", SAL_BYTES)];
     if boot.checkpoints {
@@ -106,12 +55,12 @@ pub fn run(input: &Input, seed: &Seed, trace: Trace) -> Result<(), Finding> {
     }
     let (mut srv, target) = match boot.tls {
         true => {
-            let (srv, token) = ServerHandle::start_tls_with_token(boot.workers(), &env);
+            let (srv, token) = ServerHandle::start_tls_with_token(boot.workers, &env);
             let target = srv.token_target(&token);
             (srv, target)
         }
         false => {
-            let srv = ServerHandle::start_with_env(boot.workers(), &env);
+            let srv = ServerHandle::start_with_env(boot.workers, &env);
             let target = srv.sock_path().to_owned();
             (srv, target)
         }
@@ -121,34 +70,23 @@ pub fn run(input: &Input, seed: &Seed, trace: Trace) -> Result<(), Finding> {
     let judged = play(&mut srv, &target, &sent, deadline, trace)
         .and_then(|()| read_back(&mut srv, &target))
         .and_then(|()| match boot.crash {
-            true => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| srv.restart()))
-                .map_err(|_| Finding::NoReboot)
+            true => srv
+                .restart()
+                .map_err(|e| format!("the server did not boot again on its own data: {e}"))
                 .and_then(|()| read_back(&mut srv, &target)),
             false => Ok(()),
         });
-    if judged.is_err() && trace.frames {
-        print_worker_logs(srv.data_dir());
+    match trace {
+        // A server that exited prints its logs as it is dropped.
+        true if judged.is_err() && srv.is_alive() => srv.print_logs(),
+        true => {}
+        false => srv.discard(),
     }
     judged
 }
 
-/// The tail of every worker's log under `data_dir`: where a worker's own
-/// failure is told, the master's being on its stderr.
-fn print_worker_logs(data_dir: &std::path::Path) {
-    for w in 0.. {
-        let Ok(log) = std::fs::read_to_string(data_dir.join(format!("worker_{w}.log"))) else {
-            break;
-        };
-        let lines: Vec<&str> = log.lines().collect();
-        eprintln!("──── worker {w} (last 40 lines) ────");
-        lines[lines.len().saturating_sub(40)..]
-            .iter()
-            .for_each(|l| eprintln!("{l}"));
-    }
-}
-
 /// Send each of `sent` and wait until it is answered.
-fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant, trace: Trace) -> Result<(), Finding> {
+fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant, trace: bool) -> Result<(), String> {
     let mut conns: BTreeMap<u32, Conn> = BTreeMap::new();
     for (i, frame) in sent.iter().enumerate() {
         let conn = match conns.entry(frame.conn) {
@@ -162,38 +100,32 @@ fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant,
                 }),
                 // Refused while it runs: the server may cap connections.
                 Err(_) if srv.is_alive() => continue,
-                Err(_) => return Err(Finding::Died { step: Step::Frame(i) }),
+                Err(_) => return Err(format!("the server died during frame {i}")),
             },
         };
-        if trace.frames {
+        if trace {
             eprintln!("> conn {} frame {i}: {}", frame.conn, describe(&frame.bytes));
         }
         conn.transport.enqueue(frame.bytes.clone());
         conn.barrier = BARRIER_BASE + i as u64;
         conn.transport.enqueue(barrier(conn.barrier));
         conn.settled = false;
-        let key = frame.conn;
-        pump(&mut conns, key, deadline, trace).map_err(|e| match e {
-            Pumped::Late => Finding::Unanswered { frame: i },
-            Pumped::Bad(error) => Finding::Undecodable { error },
+        pump(&mut conns, frame.conn, deadline, trace).map_err(|e| match e {
+            None => format!("frame {i} was not answered within {SESSION_BUDGET:?}"),
+            Some(e) => format!("the server sent an undecodable frame: {e}"),
         })?;
         if !srv.is_alive() {
-            return Err(Finding::Died { step: Step::Frame(i) });
+            return Err(format!("the server died during frame {i}"));
         }
         conns.retain(|_, c| !c.closed);
     }
     Ok(())
 }
 
-/// Why [`pump`] stopped short.
-enum Pumped {
-    Late,
-    Bad(String),
-}
-
 /// Read every connection until the one keyed `key` has its barrier answered or
-/// is closed by the server.
-fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: Trace) -> Result<(), Pumped> {
+/// is closed by the server. `Err` holds the decoder's refusal of a frame the
+/// server sent, or `None` for a deadline that passed first.
+fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: bool) -> Result<(), Option<String>> {
     loop {
         if conns[&key].settled {
             return Ok(());
@@ -218,7 +150,7 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: Tra
             .collect();
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(Pumped::Late);
+            return Err(None);
         }
         let ms = left.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: `fds` is a live array of `fds.len()` pollfds.
@@ -236,7 +168,7 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: Tra
             let read = c.transport.read(|frame| {
                 match peek_control_block(&frame) {
                     Ok(ctrl) => {
-                        if trace.frames && ctrl.hdr.target_id < BARRIER_BASE {
+                        if trace && ctrl.hdr.target_id < BARRIER_BASE {
                             eprintln!(
                                 "<   {:?} target {} lane {:?}",
                                 ctrl.hdr.status, ctrl.hdr.target_id, ctrl.hdr.flags.lane
@@ -249,7 +181,7 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: Tra
                 Ok(())
             });
             if let Some(e) = bad {
-                return Err(Pumped::Bad(e));
+                return Err(Some(e));
             }
             if answered {
                 c.settled = true;
@@ -291,10 +223,11 @@ fn describe(frame: &[u8]) -> String {
 /// Read the whole catalog as a client, and scan every relation in it: what
 /// the session left must stay readable. A refusal is an answer; a lost
 /// connection or an undecodable reply is not.
-fn read_back(srv: &mut ServerHandle, target: &str) -> Result<(), Finding> {
+fn read_back(srv: &mut ServerHandle, target: &str) -> Result<(), String> {
+    const DIED: &str = "the server died during the read-back";
     let lost = |srv: &mut ServerHandle, what: String, error: ClientError| match srv.is_alive() {
-        true => Finding::Unreadable { what, error },
-        false => Finding::Died { step: Step::ReadBack },
+        true => format!("{what} could not be read back: {error}"),
+        false => DIED.to_string(),
     };
     let mut client = match GnitzClient::connect(target) {
         Ok(c) => c,
@@ -319,7 +252,7 @@ fn read_back(srv: &mut ServerHandle, target: &str) -> Result<(), Finding> {
         }
     }
     if !srv.is_alive() {
-        return Err(Finding::Died { step: Step::ReadBack });
+        return Err(DIED.to_string());
     }
     Ok(())
 }

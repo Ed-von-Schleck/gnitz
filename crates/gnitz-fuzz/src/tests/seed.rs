@@ -1,17 +1,16 @@
 use super::*;
 
-/// A recording in the format `gnitz_core::recording` writes: a header, then
-/// one record per frame.
+/// A recording of `frames`, each its direction (0 sent), connection and bytes.
 fn recording(frames: &[(u8, u32, &[u8])]) -> Vec<u8> {
-    let mut out = b"GNZR".to_vec();
-    out.extend_from_slice(&gnitz_wire::wal::WAL_FORMAT_VERSION.to_le_bytes());
-    for &(dir, conn, frame) in frames {
-        out.push(dir);
-        out.extend_from_slice(&conn.to_le_bytes());
-        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        out.extend_from_slice(frame);
-    }
-    out
+    let records: Vec<recording::Recorded> = frames
+        .iter()
+        .map(|&(dir, conn, frame)| recording::Recorded {
+            conn,
+            dir: [Direction::Sent, Direction::Received][dir as usize],
+            frame,
+        })
+        .collect();
+    recording::encode(&records)
 }
 
 /// Import keeps one seed per distinct conversation sent, drops recordings

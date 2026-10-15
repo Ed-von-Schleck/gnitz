@@ -51,7 +51,7 @@ enum PollPosition {
 /// Where a poll of `item` stands.
 fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
     let tid = item.view.tid;
-    let kind = match target_kind(shared, item.view, Access::Read) {
+    let kind = match target_kind(shared.cat(), item.view, Access::Read) {
         Ok(kind) => kind,
         Err(fault) => return PollPosition::Fault(fault),
     };
@@ -525,7 +525,7 @@ async fn sync_wait(
     // by. Asked under the catalog lock.
     let caught_up = |(sub, feed): &(Rc<Subscriber>, Rc<Feed>)| {
         let view = feed.key.view;
-        target_kind(shared, view, Access::Read).is_ok() && sub.caught_up(shared.disp().last_delta_round(view.tid))
+        target_kind(shared.cat(), view, Access::Read).is_ok() && sub.caught_up(shared.disp().last_delta_round(view.tid))
     };
     loop {
         held.retain(|(sub, _)| sub.after_tick.get().is_some());
@@ -578,7 +578,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
         let mut first_lock = Some(shared.catalog_rwlock.read().await);
         let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
         for feed in &asked {
-            if let Err(fault) = target_kind(&shared, feed.key.view, Access::Read) {
+            if let Err(fault) = target_kind(shared.cat(), feed.key.view, Access::Read) {
                 feeds.end(feed, &fault);
                 continue;
             }
@@ -598,7 +598,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
             };
             let mut reads = Vec::with_capacity(slice.len());
             for &(feed, cursor) in slice {
-                match target_kind(&shared, feed.key.view, Access::Read) {
+                match target_kind(shared.cat(), feed.key.view, Access::Read) {
                     Ok(_) => reads.push((feed, cursor)),
                     Err(fault) => feeds.end(feed, &fault),
                 }

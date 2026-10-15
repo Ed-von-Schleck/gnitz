@@ -19,7 +19,7 @@ use crate::control::{
     append_frame, frame_size, peek_control_block, ControlHeader, DecodedControl, Target, CTRL_HEADER_SIZE,
 };
 use crate::region::Regions;
-use crate::{ClientVerb, WireFlags, WireStatus};
+use crate::{ClientVerb, Reader, WireFlags, WireStatus};
 use std::num::NonZeroU64;
 use std::ops::Range;
 
@@ -269,14 +269,14 @@ pub fn encode_held(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
 
 /// The ids an [`encode_held`] blob names.
 pub fn decode_held(blob: &[u8]) -> Result<Vec<u64>, String> {
-    let (ids, rest) = blob.as_chunks::<8>();
-    if !rest.is_empty() {
+    if !blob.len().is_multiple_of(8) {
         return Err(format!(
             "SyncPushed: {} bytes of held ids are no whole number of them",
             blob.len()
         ));
     }
-    Ok(ids.iter().map(|id| u64::from_le_bytes(*id)).collect())
+    let mut r = Reader::new(blob);
+    (0..blob.len() / 8).map(|_| r.u64()).collect()
 }
 
 /// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the
@@ -288,18 +288,16 @@ pub fn decode_delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String>
             if c.hdr.target_id == 0 {
                 return Err("DeltaPoll: view id 0 names no view".to_string());
             }
-            let Some((cursor, spec)) = item[c.blob.clone()].split_first_chunk::<CURSOR_SIZE>() else {
+            let blob = &item[c.blob];
+            let mut r = Reader::new(blob);
+            let (Ok(tag), Ok(tick)) = (r.u64(), r.u64()) else {
                 return Err(format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id));
             };
-            let (tag, tick) = cursor.split_at(8);
             Ok(DeltaPollItem {
                 view: c.hdr.target(),
-                from: DeltaCursor::from_pair(
-                    u64::from_le_bytes(tag.try_into().unwrap()),
-                    u64::from_le_bytes(tick.try_into().unwrap()),
-                ),
+                from: DeltaCursor::from_pair(tag, tick),
                 reply_layout: c.hdr.arg0,
-                spec,
+                spec: &blob[CURSOR_SIZE..],
             })
         })
         .collect()

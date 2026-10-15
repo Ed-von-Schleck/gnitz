@@ -1,9 +1,5 @@
 use super::*;
 
-fn framed(payload: &[u8]) -> Vec<u8> {
-    [&frame_len_prefix(payload.len())[..], payload].concat()
-}
-
 /// One `feed` over `src`: the payload, borrowed where it was handed out in place.
 fn feed_one<'s>(d: &mut Deframer, src: &mut &'s [u8]) -> Option<Cow<'s, [u8]>> {
     d.feed(src, |_| Ok::<_, FrameLenError>(()))

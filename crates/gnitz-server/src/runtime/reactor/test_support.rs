@@ -163,10 +163,7 @@ pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Build a length-prefixed wire frame: LE payload length + payload.
-pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
-    [&gnitz_wire::frame_len_prefix(payload.len())[..], payload].concat()
-}
+pub(crate) use gnitz_wire::framed;
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at
 /// most ten seconds; `false` if it never does.

@@ -17,6 +17,11 @@ pub fn frame_len_prefix(len: usize) -> [u8; FRAME_LEN_PREFIX_BYTES] {
     (len as u32).to_le_bytes()
 }
 
+/// `payload` behind its length prefix: one whole frame.
+pub fn framed(payload: &[u8]) -> Vec<u8> {
+    [&frame_len_prefix(payload.len())[..], payload].concat()
+}
+
 /// Why a frame was refused at its length prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLenError {

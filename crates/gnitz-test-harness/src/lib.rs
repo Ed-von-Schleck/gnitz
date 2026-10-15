@@ -6,6 +6,7 @@
 //! A server dies with the thread that started it, so no server outlives a
 //! test process that is killed rather than unwound.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,6 +32,9 @@ struct BootPaths {
 
 pub struct ServerHandle {
     process: Child,
+    /// A pidfd of every worker the master forked, each readable once its
+    /// worker exits.
+    workers_alive: Vec<OwnedFd>,
     paths: BootPaths,
     tmpdir: Option<TempDir>,
     workers: usize,
@@ -134,22 +138,22 @@ impl ServerHandle {
     }
 
     /// Whether the master and every worker it forked are running. A worker's
-    /// death stops the master too, but only once its death watch next looks;
-    /// a dead worker is a zombie of the master until then.
+    /// death stops the master too, but only once its death watch next looks.
     pub fn is_alive(&mut self) -> bool {
         if self.process.try_wait().expect("try_wait").is_some() {
             return false;
         }
-        let pid = self.process.id();
-        // The master's main thread forks the workers. A master gone in between
-        // has no children file, and the next look at it answers.
-        let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
-        children.split_whitespace().all(|child| {
-            fs::read_to_string(format!("/proc/{child}/stat"))
-                .ok()
-                .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().to_owned()))
-                .is_some_and(|rest| !rest.starts_with('Z'))
-        })
+        let mut fds: Vec<libc::pollfd> = self
+            .workers_alive
+            .iter()
+            .map(|fd| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` is a live array of `fds.len()` pollfds.
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) == 0 }
     }
 
     /// A missing binary panics rather than skips: a suite passing without a
@@ -203,6 +207,7 @@ impl ServerHandle {
         };
 
         ServerHandle {
+            workers_alive: worker_pidfds(&process),
             process,
             paths,
             tmpdir: Some(tmpdir),
@@ -273,8 +278,9 @@ impl ServerHandle {
 
     /// Kill the server and respawn it on the same data dir and socket path,
     /// with every flag and environment variable of the first boot. A TLS server
-    /// rebinds the port it had.
-    pub fn restart(&mut self) {
+    /// rebinds the port it had. `Err` carries the stderr tail of a boot that
+    /// did not come up; the handle then holds no running server.
+    pub fn restart(&mut self) -> Result<(), String> {
         if self.is_tls() {
             let listen = format!("--tls-listen={}", self.tls_endpoint());
             for a in self.args.iter_mut().filter(|a| a.starts_with("--tls-listen=")) {
@@ -284,8 +290,27 @@ impl ServerHandle {
         self.process.kill().ok();
         self.process.wait().ok();
         self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.args)
-            // ServerHandle::Drop preserves the tmpdir during the unwind.
-            .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
+            .map_err(|msg| format!("restart failed: {msg}"))?;
+        self.workers_alive = worker_pidfds(&self.process);
+        Ok(())
+    }
+
+    /// Print the tail of the master's stderr and of every worker's log.
+    pub fn print_logs(&self) {
+        eprintln!("\n──── server stderr (last {MAX_TAIL_LINES} lines) ────");
+        eprintln!("{}", read_tail(&self.paths.stderr_path));
+        for w in 0..self.workers {
+            eprintln!("──── worker {w} (last {MAX_TAIL_LINES} lines) ────");
+            eprintln!("{}", read_tail(&self.paths.data_dir.join(format!("worker_{w}.log"))));
+        }
+        eprintln!("──── end server logs ────");
+    }
+
+    /// Stop the server and remove its tmpdir, whatever became of it.
+    pub fn discard(mut self) {
+        let tmpdir = self.tmpdir.take();
+        drop(self);
+        drop(tmpdir);
     }
 }
 
@@ -297,6 +322,24 @@ enum Auth {
     ClientCa,
     /// `--auth-tokens`: an access token.
     Token,
+}
+
+/// A pidfd of every worker the ready server `master` forked. The master forks
+/// them all before it logs ready, and never again.
+fn worker_pidfds(master: &Child) -> Vec<OwnedFd> {
+    let pid = master.id();
+    // The master's main thread forks the workers.
+    let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+    children
+        .split_whitespace()
+        .filter_map(|child| child.parse::<libc::pid_t>().ok())
+        .filter_map(|child| {
+            // SAFETY: pidfd_open takes a pid and flags, and returns a new fd or -1.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) };
+            // SAFETY: a non-negative return is an fd this process now owns.
+            (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        })
+        .collect()
 }
 
 /// Run `bin --new-token file name`, returning the token it prints.
@@ -413,10 +456,7 @@ fn await_log<T>(
     let mut logged = Vec::new();
     loop {
         if let Ok(Some(status)) = proc.try_wait() {
-            return Err(format!(
-                "server exited ({status})\nstderr tail:\n{}",
-                read_stderr_tail(path)
-            ));
+            return Err(format!("server exited ({status})\nstderr tail:\n{}", read_tail(path)));
         }
         logged.clear();
         file.seek(SeekFrom::Start(offset)).expect("seek stderr log");
@@ -427,7 +467,7 @@ fn await_log<T>(
         if Instant::now() >= deadline {
             return Err(format!(
                 "nothing within {STARTUP_TIMEOUT:?}\nstderr tail:\n{}",
-                read_stderr_tail(path)
+                read_tail(path)
             ));
         }
         thread::sleep(POLL_INTERVAL);
@@ -448,27 +488,25 @@ impl Drop for ServerHandle {
             Err(_) => false,
         };
 
-        let tmpdir = self.tmpdir.take();
+        // A discarded server leaves nothing to report.
+        let Some(tmpdir) = self.tmpdir.take() else { return };
         if std::thread::panicking() || crashed {
-            let tail = read_stderr_tail(&self.paths.stderr_path);
-            eprintln!("\n──── server stderr (last 100 lines) ────");
-            eprintln!("{tail}");
-            eprintln!("──── end server stderr ────");
-            if let Some(dir) = tmpdir {
-                eprintln!("server artifacts preserved at: {}", dir.keep().display());
-            }
+            self.print_logs();
+            eprintln!("server artifacts preserved at: {}", tmpdir.keep().display());
         }
         // Clean pass: dropping the TempDir removes the directory.
     }
 }
 
-/// Last ~100 lines of `path`, bounded to the final 128 KiB.
+/// The most lines of a log [`read_tail`] keeps.
+const MAX_TAIL_LINES: usize = 100;
+
+/// The last [`MAX_TAIL_LINES`] lines of `path`, bounded to the final 128 KiB.
 /// Lossy UTF-8 so a binary-garbage tail from a hard crash still prints.
 /// Returns an empty string if the file is missing or unreadable.
-fn read_stderr_tail(path: &Path) -> String {
+fn read_tail(path: &Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
     const MAX_TAIL_BYTES: u64 = 128 * 1024;
-    const MAX_TAIL_LINES: usize = 100;
 
     let Ok(mut f) = fs::File::open(path) else {
         return String::new();

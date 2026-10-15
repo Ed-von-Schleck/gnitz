@@ -10,59 +10,51 @@ use gnitz_wire::fields::Field;
 /// Connections an edit can move a frame onto.
 pub const MAX_CONNS: u32 = 4;
 
-/// One edit of a conversation's sent frames. `frame` names a frame by position
-/// and `pick` a part of it, each wrapping into range; `how` is the rest of
-/// what the edit does, read differently by each kind.
+/// What an edit does: each kind reads the edit's `pick` and `how` its own way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Edit {
+pub enum Kind {
     /// Rewrite one integer: a decoder-read field for an even `pick`, a data
     /// cell for an odd one.
-    Int {
-        frame: u16,
-        pick: u16,
-        how: u64,
-    },
+    Int,
     /// Drop one item of a counted list, its count and every enclosing length
     /// kept true.
-    DropItem {
-        frame: u16,
-        pick: u16,
-        how: u64,
-    },
+    DropItem,
     /// Repeat one item of a counted list, likewise.
-    RepeatItem {
-        frame: u16,
-        pick: u16,
-        how: u64,
-    },
+    RepeatItem,
     /// Rewrite one string's content, every enclosing length kept true: cut,
     /// grown, emptied, or another string's content.
-    Text {
-        frame: u16,
-        pick: u16,
-        how: u64,
-    },
+    Text,
     /// Corrupt bytes, keeping no length true.
-    Bytes {
-        frame: u16,
-        pick: u16,
-        how: u64,
-    },
-    DropFrame {
-        frame: u16,
-    },
-    RepeatFrame {
-        frame: u16,
-    },
+    Bytes,
+    DropFrame,
+    RepeatFrame,
     /// Swap a frame with the one after it.
-    SwapFrame {
-        frame: u16,
-    },
-    /// Send a frame over another connection.
-    MoveFrame {
-        frame: u16,
-        conn: u32,
-    },
+    SwapFrame,
+    /// Send a frame over connection `pick % MAX_CONNS`.
+    MoveFrame,
+}
+
+const KINDS: [Kind; 9] = [
+    Kind::Int,
+    Kind::DropItem,
+    Kind::RepeatItem,
+    Kind::Text,
+    Kind::Bytes,
+    Kind::DropFrame,
+    Kind::RepeatFrame,
+    Kind::SwapFrame,
+    Kind::MoveFrame,
+];
+
+/// One edit of a conversation's sent frames. `frame` names a frame by position
+/// and `pick` a part of it, each wrapping into range; `how` is the rest of
+/// what the edit does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Edit {
+    pub kind: Kind,
+    pub frame: u16,
+    pub pick: u16,
+    pub how: u64,
 }
 
 /// Encoded bytes of one edit: kind, frame, pick, how.
@@ -71,40 +63,12 @@ pub const EDIT_BYTES: usize = 13;
 impl Edit {
     /// The edit `bytes` encodes; every byte string of the length is one.
     pub fn decode(bytes: &[u8; EDIT_BYTES]) -> Edit {
-        let frame = u16::from_le_bytes([bytes[1], bytes[2]]);
-        let pick = u16::from_le_bytes([bytes[3], bytes[4]]);
-        let how = u64::from_le_bytes(bytes[5..].try_into().unwrap());
-        match bytes[0] % 9 {
-            0 => Edit::Int { frame, pick, how },
-            1 => Edit::DropItem { frame, pick, how },
-            2 => Edit::RepeatItem { frame, pick, how },
-            3 => Edit::Text { frame, pick, how },
-            4 => Edit::Bytes { frame, pick, how },
-            5 => Edit::DropFrame { frame },
-            6 => Edit::RepeatFrame { frame },
-            7 => Edit::SwapFrame { frame },
-            _ => Edit::MoveFrame { frame, conn: pick as u32 % MAX_CONNS },
+        Edit {
+            kind: KINDS[bytes[0] as usize % KINDS.len()],
+            frame: u16::from_le_bytes([bytes[1], bytes[2]]),
+            pick: u16::from_le_bytes([bytes[3], bytes[4]]),
+            how: u64::from_le_bytes(bytes[5..].try_into().unwrap()),
         }
-    }
-
-    pub fn encode(&self) -> [u8; EDIT_BYTES] {
-        let (kind, frame, pick, how) = match *self {
-            Edit::Int { frame, pick, how } => (0, frame, pick, how),
-            Edit::DropItem { frame, pick, how } => (1, frame, pick, how),
-            Edit::RepeatItem { frame, pick, how } => (2, frame, pick, how),
-            Edit::Text { frame, pick, how } => (3, frame, pick, how),
-            Edit::Bytes { frame, pick, how } => (4, frame, pick, how),
-            Edit::DropFrame { frame } => (5, frame, 0, 0),
-            Edit::RepeatFrame { frame } => (6, frame, 0, 0),
-            Edit::SwapFrame { frame } => (7, frame, 0, 0),
-            Edit::MoveFrame { frame, conn } => (8, frame, conn as u16, 0),
-        };
-        let mut out = [0u8; EDIT_BYTES];
-        out[0] = kind;
-        out[1..3].copy_from_slice(&frame.to_le_bytes());
-        out[3..5].copy_from_slice(&pick.to_le_bytes());
-        out[5..].copy_from_slice(&how.to_le_bytes());
-        out
     }
 
     /// Apply this edit to `sent`.
@@ -112,26 +76,18 @@ impl Edit {
         if sent.is_empty() {
             return;
         }
-        let (Edit::Int { frame, .. }
-        | Edit::DropItem { frame, .. }
-        | Edit::RepeatItem { frame, .. }
-        | Edit::Text { frame, .. }
-        | Edit::Bytes { frame, .. }
-        | Edit::DropFrame { frame }
-        | Edit::RepeatFrame { frame }
-        | Edit::SwapFrame { frame }
-        | Edit::MoveFrame { frame, .. }) = *self;
-        let (i, n) = (frame as usize % sent.len(), sent.len());
-        match *self {
-            Edit::DropFrame { .. } => drop(sent.remove(i)),
-            Edit::RepeatFrame { .. } => sent.insert(i + 1, sent[i].clone()),
-            Edit::SwapFrame { .. } => sent.swap(i, (i + 1) % n),
-            Edit::MoveFrame { conn, .. } => sent[i].conn = conn,
-            Edit::Int { pick, how, .. } => int(&mut sent[i].bytes, pick, how),
-            Edit::DropItem { pick, how, .. } => item(&mut sent[i].bytes, pick, how, false),
-            Edit::RepeatItem { pick, how, .. } => item(&mut sent[i].bytes, pick, how, true),
-            Edit::Text { pick, how, .. } => text(&mut sent[i].bytes, pick, how),
-            Edit::Bytes { pick, how, .. } => bytes(&mut sent[i].bytes, pick, how),
+        let (i, n) = (self.frame as usize % sent.len(), sent.len());
+        let (pick, how) = (self.pick, self.how);
+        match self.kind {
+            Kind::DropFrame => drop(sent.remove(i)),
+            Kind::RepeatFrame => sent.insert(i + 1, sent[i].clone()),
+            Kind::SwapFrame => sent.swap(i, (i + 1) % n),
+            Kind::MoveFrame => sent[i].conn = u32::from(pick) % MAX_CONNS,
+            Kind::Int => int(&mut sent[i].bytes, pick, how),
+            Kind::DropItem => item(&mut sent[i].bytes, pick, how, false),
+            Kind::RepeatItem => item(&mut sent[i].bytes, pick, how, true),
+            Kind::Text => text(&mut sent[i].bytes, pick, how),
+            Kind::Bytes => bytes(&mut sent[i].bytes, pick, how),
         }
     }
 }
@@ -141,10 +97,10 @@ fn wrap(pick: u64, n: usize) -> Option<usize> {
     (n > 0).then(|| (pick % n as u64) as usize)
 }
 
-fn read_int(frame: &[u8], f: &Field) -> u64 {
-    let mut v = [0u8; 8];
+fn read_int(frame: &[u8], f: &Field) -> u128 {
+    let mut v = [0u8; 16];
     v[..f.width].copy_from_slice(&frame[f.range()]);
-    u64::from_le_bytes(v)
+    u128::from_le_bytes(v)
 }
 
 fn int(frame: &mut [u8], pick: u16, how: u64) {
@@ -159,7 +115,7 @@ fn int(frame: &mut [u8], pick: u16, how: u64) {
     };
     let f = pool[at];
     let bits = f.width as u32 * 8;
-    let mask = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+    let mask = u128::MAX >> (128 - bits);
     let old = read_int(frame, &f);
     let arg = how >> 3;
     let new = match how & 7 {
@@ -174,9 +130,9 @@ fn int(frame: &mut [u8], pick: u16, how: u64) {
             (1 << (bits - 1)) - 1,
             mask >> 1 ^ 1,
         ][arg as usize % 8],
-        1 => old.wrapping_add(arg as i8 as u64),
+        1 => old.wrapping_add(arg as i8 as i128 as u128),
         2 => old ^ (1 << (arg % u64::from(bits))),
-        3 => arg,
+        3 => u128::from(arg),
         // Another field's value of the same width: an id, a column index or a
         // type code that is valid somewhere else in this frame.
         4 => {
@@ -204,11 +160,10 @@ fn item(frame: &mut Vec<u8>, pick: u16, how: u64, repeat: bool) {
     } else {
         count.wrapping_sub(1)
     };
-    let mut counted = frame.clone();
-    counted[list.count..list.count + 2].copy_from_slice(&count.to_le_bytes());
+    frame[list.count..list.count + 2].copy_from_slice(&count.to_le_bytes());
     *frame = match repeat {
-        true => anatomy.splice(&counted, item.end..item.end, &frame[item.clone()]),
-        false => anatomy.splice(&counted, item, &[]),
+        true => anatomy.splice(frame, item.end..item.end, &frame[item.clone()]),
+        false => anatomy.splice(frame, item, &[]),
     };
 }
 

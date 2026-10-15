@@ -20,13 +20,6 @@ fn reply_fuzz() {
         let mut scan = s.submit_scan(Target::from(5), &spec, &schema);
         let mut multi = s.submit_scan_multi(&[(Target::from(5), &spec, &schema), (Target::from(6), &spec, &schema)]);
         let mut delta = s.submit_delta_read(Target::from(7), None, &schema, &spec.encode(), Some(1));
-        let mut answered: [Box<dyn FnMut() -> bool>; 5] = [
-            Box::new(move || ack.try_take().is_some()),
-            Box::new(move || resolve.try_take().is_some()),
-            Box::new(move || scan.try_take().is_some()),
-            Box::new(move || multi.try_take().is_some()),
-            Box::new(move || delta.try_take().is_some()),
-        ];
 
         peer.send_bytes(stream);
         drop(peer);
@@ -39,8 +32,15 @@ fn reply_fuzz() {
             let events = poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap();
             ready = Interest::from_revents(events);
         }
-        for (k, answered) in answered.iter_mut().enumerate() {
-            assert!(answered(), "request {k} was never answered");
+        let answered = [
+            ack.try_take().is_some(),
+            resolve.try_take().is_some(),
+            scan.try_take().is_some(),
+            multi.try_take().is_some(),
+            delta.try_take().is_some(),
+        ];
+        for (k, answered) in answered.into_iter().enumerate() {
+            assert!(answered, "request {k} was never answered");
         }
     });
 }

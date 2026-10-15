@@ -21,8 +21,10 @@
 //!   booted for the one input, and judges what the server did. It is the only
 //!   target that reaches everything between a socket and the stores.
 //! - In-process targets, in the `fuzz/` modules of the crates whose code they
-//!   reach, feed the same edited traffic to the functions the server calls at
-//!   one boundary — many times faster, and under AddressSanitizer.
+//!   reach, run the functions the server or a client calls at one boundary —
+//!   many times faster, and under AddressSanitizer. The `traffic` target plays
+//!   the same edited traffic; the others take raw bytes, started from what
+//!   [`seed::write_starts`] cuts out of the seeds.
 
 pub mod anatomy;
 pub mod edit;

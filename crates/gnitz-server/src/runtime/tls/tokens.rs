@@ -34,6 +34,14 @@ impl Tokens {
         self.by_digest.len()
     }
 
+    /// Tokens holding `token` alone, under `name`.
+    #[cfg(test)]
+    pub(crate) fn holding(name: &str, token: &[u8]) -> Tokens {
+        Tokens {
+            by_digest: [(sha256(token), name.to_string())].into_iter().collect(),
+        }
+    }
+
     /// The name `token` is held under; `None` when it is none held.
     pub(crate) fn check(&self, token: &[u8]) -> Option<&str> {
         self.by_digest.get(&sha256(token)).map(String::as_str)

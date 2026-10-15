@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use gnitz_core::{sys_schema, Schema};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::control::peek_control_block;
+use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::fields::{self, Field, List, Section};
-use gnitz_wire::wal::{self, WAL_HEADER_SIZE};
+use gnitz_wire::wal;
 use gnitz_wire::{txn_frame, Circuit, ClientVerb, ReadSpec, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 /// One data block, and the schema its rows decode under.
@@ -39,11 +39,10 @@ pub struct StringCell {
 #[derive(Clone, Debug, Default)]
 pub struct Anatomy {
     /// Every integer a decoder read: header words, and the words of every
-    /// structure decoded out of a blob, a list or a string — none wider than
-    /// eight bytes, a 16-byte one being its two halves.
+    /// structure decoded out of a blob, a list or a string.
     pub fields: Vec<Field>,
-    /// Every cell of every data block's fixed regions, a 16-byte cell as its
-    /// two halves — the rows, where `fields` are the structure around them.
+    /// Every cell of every data block's fixed regions — the rows, where
+    /// `fields` are the structure around them.
     pub cells: Vec<Field>,
     /// Every length-prefixed section, a frame's blob among them.
     pub sections: Vec<Section>,
@@ -56,23 +55,14 @@ impl Anatomy {
     /// The anatomy of the frame `frame`, as far as the decoders accept it.
     pub fn of(frame: &[u8]) -> Anatomy {
         let mut anatomy = Anatomy::default();
-        let ((), map) = fields::map(frame, || walk_frame(frame, frame, &mut anatomy));
-        // A 16-byte integer is edited as its two halves, as a 16-byte cell is.
-        anatomy.fields = map
-            .fields
-            .into_iter()
-            .flat_map(|f| match f.width {
-                16 => vec![Field { at: f.at, width: 8 }, Field { at: f.at + 8, width: 8 }],
-                _ => vec![f],
-            })
-            .collect();
-        anatomy.sections.extend(map.sections);
+        let ((), map) = fields::map(frame, || {
+            if let Ok(ctrl) = peek_control_block(frame) {
+                walk_frame(frame, frame, ctrl, &mut anatomy);
+            }
+        });
+        anatomy.fields = map.fields;
+        anatomy.sections = map.sections;
         anatomy.lists = map.lists;
-        // A frame's items are peeked twice, once by the item splitter.
-        anatomy.fields.sort_by_key(|f| (f.at, f.width));
-        anatomy.fields.dedup();
-        anatomy.sections.sort_by_key(|s| (s.prefix, s.content.end));
-        anatomy.sections.dedup();
         anatomy
     }
 
@@ -95,14 +85,39 @@ impl Anatomy {
             shift(&range, s.content.start),
             with,
         );
-        let block = &self.blocks[s.block];
-        let encoded = reencode(
-            &frame[block.range.clone()],
-            &block.schema,
-            s.cell - block.range.start,
-            &content,
-        );
-        spliced(frame, &self.sections, block.range.clone(), &encoded)
+        let encoded = self.reencode(frame, s.block, s.cell, &content);
+        spliced(frame, &self.sections, self.blocks[s.block].range.clone(), &encoded)
+    }
+
+    /// Data block `b` of `frame` again, the string whose cell starts at `cell`
+    /// holding `content`, and every string's content rehomed into a fresh
+    /// heap. A cell the anatomy holds no string for keeps its bytes.
+    fn reencode(&self, frame: &[u8], b: usize, cell: usize, content: &[u8]) -> Vec<u8> {
+        let block = &self.blocks[b];
+        let layout = block.schema.layout();
+        let (rows, fixed, _, _) =
+            wal::parse_block(&frame[block.range.clone()], layout.row_width()).expect("a block the anatomy read");
+        let fixed_at = offset(frame, fixed);
+        let mut fixed = fixed.to_vec();
+        let mut heap = Vec::new();
+        for s in self.strings.iter().filter(|s| s.block == b) {
+            let text = if s.cell == cell {
+                content
+            } else {
+                &frame[s.content.clone()]
+            };
+            let at = s.cell - fixed_at;
+            fixed[at..at + 16].copy_from_slice(&gnitz_wire::encode_german_string(text, &mut heap));
+        }
+        let mut regions = gnitz_wire::Regions::new();
+        for r in 0..layout.num_regions() {
+            let start = layout.region_start(r, rows);
+            regions.push(&fixed[start..start + rows * layout.region_stride(r)]);
+        }
+        regions.push(&heap);
+        let mut out = Vec::new();
+        wal::append_block(&regions, 0, &mut out);
+        out
     }
 
     /// The sections lying wholly inside `outer`, re-based onto its start.
@@ -141,72 +156,14 @@ fn spliced(bytes: &[u8], sections: &[Section], range: Range<usize>, with: &[u8])
     out
 }
 
-/// The data block `block` of `schema` again, the string whose cell starts at
-/// `cell` (an offset into the block) holding `content`, and every string's
-/// content rehomed into a fresh heap.
-fn reencode(block: &[u8], schema: &Schema, cell: usize, content: &[u8]) -> Vec<u8> {
-    let layout = schema.layout();
-    let (rows, fixed, heap, _) = wal::parse_block(block, layout.row_width()).expect("a block the anatomy read");
-    let mut fixed = fixed.to_vec();
-    let mut new_heap = Vec::new();
-    for pi in string_slots(schema) {
-        let start = layout.region_start(REG_PAYLOAD_START + pi, rows);
-        for row in 0..rows {
-            let at = start + row * 16;
-            let old: [u8; 16] = fixed[at..at + 16].try_into().unwrap();
-            let text = if WAL_HEADER_SIZE + at == cell {
-                content
-            } else {
-                match string_content(&old, heap) {
-                    Some(r) if gnitz_wire::german_string_inline(&old).is_some() => &old[r],
-                    Some(r) => &heap[r],
-                    // A cell no encoder made keeps its bytes.
-                    None => continue,
-                }
-            };
-            let new = gnitz_wire::encode_german_string(text, &mut new_heap);
-            fixed[at..at + 16].copy_from_slice(&new);
-        }
-    }
-    let mut regions = gnitz_wire::Regions::new();
-    for r in 0..layout.num_regions() {
-        let start = layout.region_start(r, rows);
-        regions.push(&fixed[start..start + rows * layout.region_stride(r)]);
-    }
-    regions.push(&new_heap);
-    let mut out = Vec::new();
-    wal::append_block(&regions, 0, &mut out);
-    out
-}
-
-/// The payload slots of `schema` that hold German strings.
-fn string_slots(schema: &Schema) -> impl Iterator<Item = usize> {
-    let slots = schema.layout().string_payload_slots();
-    (0..64).filter(move |pi| slots >> pi & 1 != 0)
-}
-
-/// Where `cell`'s content lies: inside the cell itself for a short one, in
-/// `heap` for a long one; `None` for a long cell that overruns the heap.
-fn string_content(cell: &[u8; 16], heap: &[u8]) -> Option<Range<usize>> {
-    match gnitz_wire::german_string_inline(cell) {
-        Some(text) => Some(gnitz_wire::GERMAN_INLINE_OFF..gnitz_wire::GERMAN_INLINE_OFF + text.len()),
-        None => gnitz_wire::german_string_heap(cell, heap.len()),
-    }
-}
-
 /// Where `part`, a slice of `root`, starts in it.
 fn offset(root: &[u8], part: &[u8]) -> usize {
     part.as_ptr().addr() - root.as_ptr().addr()
 }
 
-/// Map `frame`, a slice of `root`, and the structures nested in it.
-fn walk_frame(root: &[u8], frame: &[u8], anatomy: &mut Anatomy) {
-    let Ok(ctrl) = peek_control_block(frame) else { return };
-    let base = offset(root, frame);
-    anatomy.sections.push(Section {
-        prefix: base + 4,
-        content: base + ctrl.blob.start..base + ctrl.blob.end,
-    });
+/// Map `frame`, a slice of `root` whose control block is `ctrl`, and the
+/// structures nested in it.
+fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Anatomy) {
     let verb = ctrl.hdr.flags.verb;
     let blob = &frame[ctrl.blob.clone()];
     match verb {
@@ -219,9 +176,8 @@ fn walk_frame(root: &[u8], frame: &[u8], anatomy: &mut Anatomy) {
             .ok()
             .map(|(s, _)| Arc::new(s)),
         // A DDL_TXN item's rows are its system family's, which the item names.
-        None if verb == ClientVerb::DdlTxn => gnitz_wire::SYS_FAMILIES
-            .iter()
-            .any(|f| f.id == ctrl.hdr.target_id)
+        None if verb == ClientVerb::DdlTxn => gnitz_wire::sys_family_index(ctrl.hdr.target_id)
+            .is_some()
             .then(|| Arc::clone(sys_schema(ctrl.hdr.target_id))),
         None => None,
     };
@@ -232,14 +188,29 @@ fn walk_frame(root: &[u8], frame: &[u8], anatomy: &mut Anatomy) {
     if body.is_empty() {
         return;
     }
+    // A scan's and a poll's items carry a read spec in their blob; the other
+    // verbs' items are frames of their own.
     match verb {
-        ClientVerb::ScanMulti => drop(fields::attempt(|| txn_frame::decode_scan_multi(body))),
-        ClientVerb::DeltaPoll => drop(fields::attempt(|| txn_frame::decode_delta_items(body))),
-        _ => {}
-    }
-    if let Ok((items, _)) = fields::attempt(|| txn_frame::decode_items(body, verb)) {
-        for (item, _) in items {
-            walk_frame(root, item, anatomy);
+        ClientVerb::ScanMulti => {
+            if let Ok((scans, _)) = fields::attempt(|| txn_frame::decode_scan_multi(body)) {
+                scans
+                    .iter()
+                    .for_each(|s| drop(fields::attempt(|| ReadSpec::decode(s.spec))));
+            }
+        }
+        ClientVerb::DeltaPoll => {
+            if let Ok((polls, _)) = fields::attempt(|| txn_frame::decode_delta_items(body)) {
+                polls
+                    .iter()
+                    .for_each(|p| drop(fields::attempt(|| ReadSpec::decode(p.spec))));
+            }
+        }
+        _ => {
+            if let Ok((items, _)) = fields::attempt(|| txn_frame::decode_items(body, verb)) {
+                for (item, ctrl) in items {
+                    walk_frame(root, item, ctrl, anatomy);
+                }
+            }
         }
     }
 }
@@ -251,15 +222,10 @@ fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anat
     let Ok(((rows, fixed, heap, _), _)) = fields::attempt(|| wal::parse_block(block, layout.row_width())) else {
         return;
     };
-    let (fixed_at, heap_at) = (offset(root, fixed), offset(root, heap));
+    let fixed_at = offset(root, fixed);
     let b = anatomy.blocks.len();
     let at = offset(root, block);
-    let mut cell = |at: usize, width: usize| match width {
-        16 => anatomy
-            .cells
-            .extend([Field { at, width: 8 }, Field { at: at + 8, width: 8 }]),
-        width => anatomy.cells.push(Field { at, width }),
-    };
+    let mut cell = |at: usize, width: usize| anatomy.cells.push(Field { at, width });
     for r in [REG_WEIGHT, REG_NULL_BMP] {
         let start = fixed_at + layout.region_start(r, rows);
         (0..rows).for_each(|row| cell(start + row * 8, 8));
@@ -279,23 +245,23 @@ fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anat
         }
     }
     let mut strings = Vec::new();
-    for pi in string_slots(&schema) {
+    for pi in gnitz_wire::BitIter(layout.string_payload_slots()) {
         let start = layout.region_start(REG_PAYLOAD_START + pi, rows);
         for row in 0..rows {
-            let c = start + row * 16;
-            let bytes: &[u8; 16] = fixed[c..c + 16].try_into().unwrap();
-            let Some(content) = string_content(bytes, heap) else {
-                continue;
+            let cell = &fixed[start + row * 16..][..16];
+            let content = match gnitz_wire::german_string_inline(cell) {
+                Some(text) => text,
+                // A long cell that overruns the heap is no string.
+                None => match gnitz_wire::german_string_heap(cell, heap.len()) {
+                    Some(r) => &heap[r],
+                    None => continue,
+                },
             };
-            let base = if gnitz_wire::german_string_inline(bytes).is_some() {
-                fixed_at + c
-            } else {
-                heap_at
-            };
+            let content_at = offset(root, content);
             strings.push(StringCell {
                 block: b,
-                cell: fixed_at + c,
-                content: base + content.start..base + content.end,
+                cell: offset(root, cell),
+                content: content_at..content_at + content.len(),
             });
         }
     }

@@ -30,14 +30,14 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
     push_each(&mut client, &keys[..400]);
     drop(client);
     // Replay flushes them into worker 1's shards.
-    srv.restart();
+    srv.restart().unwrap();
     // An empty tail: the next zones number from the system tables alone.
-    srv.restart();
+    srv.restart().unwrap();
 
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     push_each(&mut client, &keys[400..]);
     drop(client);
-    srv.restart();
+    srv.restart().unwrap();
 
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     assert_eq!(

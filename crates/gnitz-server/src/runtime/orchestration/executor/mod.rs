@@ -845,7 +845,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: Decod
     let catalog = shared.catalog_rwlock.read().await;
     // Under the catalog guard, not at decode: a dropped id can be re-created as
     // a stream between the two, and the stream rules below read the kind.
-    let is_stream = target_kind(shared, target, Access::Write)? == RelationKind::Stream;
+    let is_stream = target_kind(shared.cat(), target, Access::Write)? == RelationKind::Stream;
     if is_stream {
         check_stream_push(target_id, batch.as_ref(), mode)?;
     }
@@ -894,7 +894,7 @@ async fn handle_push_txn(
     //    catalog-dependent rules per family.
     let catalog = shared.catalog_rwlock.read().await;
     for head in &heads {
-        target_kind(shared, head.target, Access::TxnWrite)?;
+        target_kind(shared.cat(), head.target, Access::TxnWrite)?;
         shared.cat().recheck_record(head.target.tid, &head.seen)?;
     }
 
@@ -991,10 +991,10 @@ enum Access {
 /// **Only the absent-relation arm carries a status of its own**
 /// ([`WireStatus::NotFound`]): the arms below name a relation that exists, which a
 /// client must not recover from the way it recovers from a vanished one.
-fn target_kind(shared: &Shared, target: Target, access: Access) -> Result<RelationKind, WireFault> {
-    shared.cat().check_token(target)?;
+fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<RelationKind, WireFault> {
+    cat.check_token(target)?;
     let target_id = target.tid;
-    let Some(kind) = shared.cat().registry.relation(target_id).map(Relation::kind) else {
+    let Some(kind) = cat.registry.relation(target_id).map(Relation::kind) else {
         return Err(not_found(target_id));
     };
     match access {
@@ -1112,7 +1112,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
     let catalog = fresh_read_lock(shared, scans.iter().map(|s| s.target.tid), Instant::now()).await?;
     let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
     for scan in scans {
-        let kind = target_kind(shared, scan.target, Access::Read)?;
+        let kind = target_kind(shared.cat(), scan.target, Access::Read)?;
         let (local, lsn) = match kind {
             RelationKind::SystemCatalog => {
                 let spec = ReadSpec::decode(scan.spec).map_err(|e| format!("decode error: {e}"))?;

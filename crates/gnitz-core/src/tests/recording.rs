@@ -54,9 +54,8 @@ fn read_refuses_what_a_replay_could_not_send() {
     header.extend_from_slice(&(WAL_FORMAT_VERSION ^ 1).to_le_bytes());
     assert!(read(&header).unwrap_err().contains("wire format"));
 
-    let mut torn = MAGIC.to_vec();
-    torn.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    let mut torn = encode(&[]);
     assert_eq!(read(&torn).unwrap(), []);
     torn.extend_from_slice(&[0, 0, 0, 0, 0, 9, 0, 0, 0, b'x']);
-    assert!(read(&torn).unwrap_err().contains("runs past"));
+    assert!(read(&torn).unwrap_err().contains("truncated"));
 }

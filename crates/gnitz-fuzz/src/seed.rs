@@ -46,15 +46,12 @@ pub struct Seeds {
     paths: Vec<PathBuf>,
 }
 
-/// What a seed file is named with.
-const SEED_EXT: &str = "frames";
-
 impl Seeds {
     pub fn open(dir: &Path) -> io::Result<Seeds> {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
             .map(|e| e.map(|e| e.path()))
             .collect::<io::Result<_>>()?;
-        paths.retain(|p| p.extension().is_some_and(|e| e == SEED_EXT));
+        paths.retain(|p| p.extension().is_some_and(|e| e == recording::EXT));
         paths.sort();
         Ok(Seeds { paths })
     }
@@ -85,32 +82,22 @@ impl Seeds {
     }
 }
 
-/// Where every target's starting inputs are written under a fuzzing directory:
-/// one per seed for the traffic targets, every expression program the seeds
-/// carry for the VM's, every seed's replies as one stream for the client's,
-/// and a HELLO before a seed's first frames for the handshake's.
-pub const STARTS: [&str; 4] = ["traffic", "program", "reply", "hello"];
-
 /// The one access token the in-process HELLO target's server holds, in the
 /// minted shape; the HELLO starts carry it, so an input can be admitted.
 pub const HELLO_TOKEN: &str = "gnitz_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Write every target's starting inputs for `seeds` into `starts/<target>`.
+/// Write every target's starting inputs for `seeds` into `starts/<target>`:
+/// one per seed for the traffic targets, every expression program the seeds
+/// carry for the VM's, every seed's replies as one stream for the client's,
+/// and a HELLO before a seed's first frames for the handshake's.
 pub fn write_starts(seeds: &Seeds, starts: &Path) -> io::Result<()> {
-    let dirs = STARTS.map(|t| starts.join(t));
-    for d in &dirs {
+    let [traffic, program, reply, hello] = ["traffic", "program", "reply", "hello"].map(|t| starts.join(t));
+    for d in [&traffic, &program, &reply, &hello] {
         std::fs::create_dir_all(d)?;
     }
-    let [traffic, program, reply, hello] = &dirs;
-    let framed = |f: &[u8]| -> Vec<u8> {
-        gnitz_wire::frame_len_prefix(f.len())
-            .into_iter()
-            .chain(f.iter().copied())
-            .collect()
-    };
     for i in 0..seeds.len() {
-        let input = crate::input::Input { seed: i as u16, ..Default::default() };
-        std::fs::write(traffic.join(format!("seed-{i:05}")), input.encode())?;
+        let input = crate::input::Input::unedited(i as u16);
+        std::fs::write(traffic.join(format!("seed-{i:05}")), input)?;
         let seed = seeds.load(i).map_err(io::Error::other)?;
         for frame in &seed.sent {
             let anatomy = crate::anatomy::Anatomy::of(&frame.bytes);
@@ -125,13 +112,13 @@ pub fn write_starts(seeds: &Seeds, starts: &Path) -> io::Result<()> {
             .received
             .iter()
             .filter(|f| f.conn == 0)
-            .flat_map(|f| framed(&f.bytes))
+            .flat_map(|f| gnitz_wire::framed(&f.bytes))
             .collect();
         std::fs::write(reply.join(format!("seed-{i:05}")), replies)?;
         // Its first byte cuts the stream into reads; the rest is a connection.
         let opening = std::iter::once(0)
-            .chain(framed(&gnitz_wire::client_hello(HELLO_TOKEN.as_bytes())))
-            .chain(seed.sent.iter().take(2).flat_map(|f| framed(&f.bytes)))
+            .chain(gnitz_wire::framed(&gnitz_wire::client_hello(HELLO_TOKEN.as_bytes())))
+            .chain(seed.sent.iter().take(2).flat_map(|f| gnitz_wire::framed(&f.bytes)))
             .collect::<Vec<u8>>();
         std::fs::write(hello.join(format!("seed-{i:05}")), opening)?;
     }
@@ -186,7 +173,7 @@ pub fn import(recordings: &Path, seeds: &Path) -> io::Result<Imported> {
             out.oversized += 1;
             continue;
         }
-        std::fs::write(seeds.join(format!("{digest:016x}.{SEED_EXT}")), &bytes)?;
+        std::fs::write(seeds.join(format!("{digest:016x}.{}", recording::EXT)), &bytes)?;
         out.seeds += 1;
     }
     Ok(out)

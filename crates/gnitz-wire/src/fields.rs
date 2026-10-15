@@ -8,8 +8,8 @@
 //! changes. A reader over bytes outside the mapped string, such as a copy,
 //! notes nothing.
 //!
-//! Compiled only under the `field-map` feature: the fuzzer is its one user, and
-//! a build without it reads no thread-local per field.
+//! Compiled only under the `field-map` feature, which the fuzzer turns on:
+//! a build with it reads a thread-local per field, a build without it does not.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -50,12 +50,10 @@ pub struct FieldMap {
     pub lists: Vec<List>,
 }
 
-/// The mapping in progress: the mapped string's address range, the map, and
-/// the lists still being read, innermost last.
+/// The mapping in progress: the mapped string's address range, and the map.
 struct Mapping {
     root: Range<usize>,
     map: FieldMap,
-    open: Vec<List>,
 }
 
 thread_local! {
@@ -71,7 +69,6 @@ pub fn map<T>(root: &[u8], decode: impl FnOnce() -> T) -> (T, FieldMap) {
         *m = Some(Mapping {
             root: addr..addr + root.len(),
             map: FieldMap::default(),
-            open: Vec::new(),
         });
     });
     // Closes the mapping even when `decode` unwinds, so the next map starts clean.
@@ -112,7 +109,6 @@ pub fn attempt<T, E>(decode: impl FnOnce() -> Result<T, E>) -> Result<(T, Vec<Se
                 m.map.fields.truncate(fields);
                 m.map.sections.truncate(sections);
                 m.map.lists.truncate(lists);
-                m.open.clear();
                 Err(e)
             }
         }
@@ -148,27 +144,12 @@ pub(crate) fn note_section(prefix: &[u8], content: &[u8]) {
     });
 }
 
-/// A reader is about to read a list whose count is `count`.
-pub(crate) fn open_list(count: &[u8]) {
-    note(count, |m, at| m.open.push(List { count: at, items: Vec::new() }));
-}
-
-/// The open list's next item spans `item`.
-pub(crate) fn list_item(item: &[u8]) {
-    note(item, |m, at| {
-        if let Some(list) = m.open.last_mut() {
-            list.items.push(at..at + item.len());
-        }
-    });
-}
-
-/// The open list read its last item.
-pub(crate) fn close_list(count: &[u8]) {
+/// A reader took the list counted by `count`, whose items span `items`, each
+/// an offset from `count`'s first byte.
+pub(crate) fn note_list(count: &[u8], items: &[Range<usize>]) {
     note(count, |m, at| {
-        if let Some(pos) = m.open.iter().rposition(|l| l.count == at) {
-            let list = m.open.remove(pos);
-            m.map.lists.push(list);
-        }
+        let items = items.iter().map(|r| at + r.start..at + r.end).collect();
+        m.map.lists.push(List { count: at, items });
     });
 }
 

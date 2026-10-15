@@ -26,12 +26,16 @@ fn the_anatomy_reaches_an_expression_inside_a_circuit_inside_a_row() {
         "the program's own fields are mapped"
     );
     assert!(!a.cells.is_empty(), "the row's cells are mapped");
+    let mut distinct = a.fields.clone();
+    distinct.sort_by_key(|f| (f.at, f.width));
+    distinct.dedup();
+    assert_eq!(distinct.len(), a.fields.len(), "each field is mapped once");
 }
 
 /// A scan's `ReadSpec` blob is mapped past the header's six words.
 #[test]
 fn a_scan_frame_maps_its_read_spec() {
-    let frame = scan_frame();
+    let frame = scan_frame(gnitz_wire::ReadBound::None);
     let a = Anatomy::of(&frame);
     assert!(a.fields.len() > 6, "{:?}", a.fields);
     assert!(a.fields.iter().any(|f| f.at >= gnitz_wire::control::CTRL_HEADER_SIZE));
@@ -71,27 +75,20 @@ fn an_undecodable_frame_has_an_empty_anatomy() {
     assert!(a.fields.is_empty() && a.cells.is_empty() && a.blocks.is_empty());
 }
 
-/// A scan bounded by a key range reads 16-byte key images; each is mapped as
-/// two halves, so no integer an edit picks is wider than eight bytes.
+/// A scan bounded by a key range reads 16-byte key images, each one field,
+/// and an integer edit of any field of it leaves a frame.
 #[test]
-fn a_wide_key_is_mapped_as_two_halves() {
-    use gnitz_wire::control::{append_frame, ControlHeader, Target};
-    use gnitz_wire::{ClientVerb, KeyRange, PkColList, ReadBound, ReadSpec};
+fn a_wide_key_is_one_field() {
+    use gnitz_wire::{KeyRange, PkColList, ReadBound};
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], u128::MAX);
-    let mut frame = Vec::new();
-    let hdr = ControlHeader::naming(ClientVerb::ScanSpec, Target::from(9), 0);
-    append_frame(
-        &mut frame,
-        &hdr,
-        &ReadSpec::all_rows(ReadBound::Range(range)).encode(),
-        None,
-        None,
-    );
+    let frame = scan_frame(ReadBound::Range(range));
     let a = Anatomy::of(&frame);
-    assert!(a.fields.iter().any(|f| f.at >= gnitz_wire::control::CTRL_HEADER_SIZE));
-    assert!(a.fields.iter().all(|f| f.width <= 8), "{:?}", a.fields);
+    assert!(a.fields.iter().any(|f| f.width == 16), "{:?}", a.fields);
     let mut sent = vec![crate::seed::Frame { conn: 0, bytes: frame }];
     for pick in (0..2 * a.fields.len() as u16).step_by(2) {
-        crate::edit::Edit::Int { frame: 0, pick, how: 0 }.apply(&mut sent);
+        for how in 0..8 {
+            let kind = crate::edit::Kind::Int;
+            crate::edit::Edit { kind, frame: 0, pick, how }.apply(&mut sent);
+        }
     }
 }

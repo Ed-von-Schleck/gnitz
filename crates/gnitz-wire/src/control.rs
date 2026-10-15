@@ -199,6 +199,8 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
     r.take(blob_len as usize)
         .map_err(|_| "control blob runs past the frame")?;
     let blob = CTRL_HEADER_SIZE..r.pos();
+    #[cfg(feature = "field-map")]
+    crate::fields::note_section(&data[OFF_BLOB_LEN..OFF_FLAGS], &data[blob.clone()]);
     let status = WireStatus::from_wire(status).ok_or("control header names no status")?;
     let flags = WireFlags::unpack(word)?;
     let schema = if word & FLAG_HAS_SCHEMA != 0 {

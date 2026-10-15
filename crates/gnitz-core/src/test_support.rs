@@ -212,12 +212,7 @@ pub(crate) fn interrupt_self_until(stop: Arc<AtomicBool>) -> std::thread::JoinHa
     })
 }
 
-/// `[u32 LE len][payload]`, what a peer writes.
-pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
-    let mut v = gnitz_wire::frame_len_prefix(payload.len()).to_vec();
-    v.extend_from_slice(payload);
-    v
-}
+pub(crate) use gnitz_wire::framed;
 
 /// The I/O error kind `r` failed with, if it failed with one.
 pub(crate) fn io_kind<T>(r: &Result<T, ProtocolError>) -> Option<std::io::ErrorKind> {

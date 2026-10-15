@@ -221,20 +221,18 @@ impl<'a> Reader<'a> {
     pub fn list<T: Wire>(&mut self, what: &str, cap: usize) -> Result<Vec<T>, String> {
         let n = self.count(what, cap)?;
         #[cfg(feature = "field-map")]
-        let count = &self.buf[self.off - 2..self.off];
-        #[cfg(feature = "field-map")]
-        crate::fields::open_list(count);
+        let (count, mut spans) = (self.off - 2, Vec::with_capacity(n));
         // Sized once: a fallible `collect` has no lower size hint.
         let mut items = Vec::with_capacity(n);
         for _ in 0..n {
             #[cfg(feature = "field-map")]
-            let start = self.off;
+            let start = self.off - count;
             items.push(T::read(self)?);
             #[cfg(feature = "field-map")]
-            crate::fields::list_item(&self.buf[start..self.off]);
+            spans.push(start..self.off - count);
         }
         #[cfg(feature = "field-map")]
-        crate::fields::close_list(count);
+        crate::fields::note_list(&self.buf[count..count + 2], &spans);
         Ok(items)
     }
 

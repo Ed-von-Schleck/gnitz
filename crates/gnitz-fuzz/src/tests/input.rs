@@ -1,22 +1,14 @@
 use super::*;
 
-/// Any bytes decode, and an input encodes to bytes that decode to it.
+/// Any bytes decode, and a seed's unedited input decodes to that seed.
 #[test]
-fn any_bytes_are_an_input_and_inputs_round_trip() {
+fn any_bytes_are_an_input() {
     for bytes in [&[][..], &[0xFF], &[1, 2, 3, 4, 5], &[0x1F; 40]] {
         let input = Input::decode(bytes);
-        assert_eq!(Input::decode(&input.encode()), input);
+        assert!(WORKERS.contains(&input.boot.workers));
+        assert_eq!(input.edits.len(), bytes.len().saturating_sub(HEAD_BYTES) / EDIT_BYTES);
     }
-    let input = Input {
-        boot: Boot {
-            workers: 2,
-            tls: true,
-            crash: true,
-            checkpoints: false,
-        },
-        seed: 513,
-        edits: vec![Edit::SwapFrame { frame: 1 }],
-    };
-    assert_eq!(Input::decode(&input.encode()), input);
-    assert_eq!(input.boot.workers(), 4);
+    let input = Input::decode(&Input::unedited(513));
+    assert_eq!((input.seed, input.edits.len()), (513, 0));
+    assert_eq!(Input::decode(&[0x0E]).boot.workers, 4);
 }

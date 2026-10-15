@@ -13,18 +13,18 @@ use gnitz_fuzz::seed::HELLO_TOKEN as TOKEN;
 /// A peer's bytes, cut where the input's first byte says, under both ceilings.
 #[test]
 fn hello_fuzz() {
-    let tokens = tokens();
+    // The one token the HELLO starts carry.
+    let tokens = Tokens::holding("fuzz", TOKEN.as_bytes());
     bolero::check!().for_each(|bytes: &[u8]| {
         let Some((&cut, stream)) = bytes.split_first() else {
             return;
         };
         let step = cut as usize % 17 + 1;
-        for admitted in [false, true] {
+        let [(frames, _), _] = [false, true].map(|admitted| {
             let whole = deframe(stream, stream.len().max(1), admitted);
-            let split = deframe(stream, step, admitted);
-            agree(&whole, &split, step);
-        }
-        let (frames, _) = deframe(stream, stream.len().max(1), false);
+            agree(&whole, &deframe(stream, step, admitted), step);
+            whole
+        });
         if let Some(Ok(token)) = frames.first().map(|f| gnitz_wire::read_client_hello(f)) {
             tokens.check(token);
         }
@@ -72,32 +72,18 @@ fn deframe(stream: &[u8], step: usize, admitted: bool) -> Deframed {
     (frames, None)
 }
 
-/// The access tokens of a server holding the one token [`TOKEN`], the one
-/// the HELLO starts carry.
-fn tokens() -> Tokens {
-    let digest = ring::digest::digest(&ring::digest::SHA256, TOKEN.as_bytes());
-    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokens");
-    std::fs::write(&path, format!("fuzz {hex}\n")).unwrap();
-    Tokens::load(path.to_str().unwrap()).unwrap()
-}
-
 /// A HELLO carrying [`TOKEN`] and then a frame past the handshake's ceiling is
 /// read alike in one read and in many, and its HELLO is admitted.
 #[test]
 fn an_admitted_hello_deframes_alike_in_any_reads() {
     let hello = gnitz_wire::client_hello(TOKEN.as_bytes());
-    let mut stream = gnitz_wire::frame_len_prefix(hello.len()).to_vec();
-    stream.extend_from_slice(&hello);
     let big = vec![7u8; gnitz_wire::HANDSHAKE_FRAME_MAX + 1];
-    stream.extend_from_slice(&gnitz_wire::frame_len_prefix(big.len()));
-    stream.extend_from_slice(&big);
+    let stream = [gnitz_wire::framed(&hello), gnitz_wire::framed(&big)].concat();
     let (frames, end) = deframe(&stream, 3, true);
     assert!(frames.len() == 2 && end.is_none(), "{end:?}");
     let (frames, end) = deframe(&stream, stream.len(), false);
     assert_eq!(frames.len(), 1, "the handshake's ceiling refuses the second");
     assert!(end.is_some());
     let token = gnitz_wire::read_client_hello(&frames[0]).unwrap();
-    assert_eq!(tokens().check(token), Some("fuzz"));
+    assert_eq!(Tokens::holding("fuzz", TOKEN.as_bytes()).check(token), Some("fuzz"));
 }

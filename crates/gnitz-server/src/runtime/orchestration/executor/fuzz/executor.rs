@@ -10,24 +10,25 @@
 //! each is a panic here, and so is a catalog the session leaves that does not
 //! open again.
 //!
-//! A push lands as the INSERT the master would admit: weights of one, keys
-//! unique within the batch and absent from the store. The effective delta of
-//! any other push is worked out with the workers, which only a server has.
+//! A push lands when the master would admit it: under the master's own access
+//! rules, a stream's batch as the master checks one, and a table's as an
+//! INSERT — weights of one, keys unique within the batch and absent from the
+//! store. A transaction lands whole or not at all. The effective delta of any
+//! other push is worked out with the workers, which only a server has.
 
 use std::collections::HashSet;
 
 use super::*;
-use crate::catalog::{unique_index_creates, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use crate::catalog::{unique_index_creates, SysFamily, ZoneError};
 use crate::test_support::{
-    col_def, col_tab_batch, left_join_circuit, nullable_def, push_view_tab_row, view_blocks, EchoDrive,
+    col_def, col_tab_batch, left_join_circuit, nullable_def, push_view_tab_row, table_tab_batch, view_blocks, EchoDrive,
 };
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::control::{append_frame, ControlHeader};
-use gnitz_wire::sys_rows::{SysRow, TableTabRow};
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem};
-use gnitz_wire::{PkColList, Probe, ReadSpec, TableProps, WireConflictMode};
+use gnitz_wire::{Probe, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
 
@@ -93,14 +94,30 @@ impl Session {
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let (tid, mode) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode);
-                if let Ok((Some(batch), _)) = decode_push_frame(&self.cat, frame, ctrl) {
-                    self.push(tid, mode, batch);
+                let (target, mode) = (ctrl.hdr.target(), ctrl.hdr.flags.conflict_mode);
+                let Ok((batch, _)) = decode_push_frame(&self.cat, frame, ctrl) else {
+                    return;
+                };
+                let admitted = match target_kind(&self.cat, target, Access::Write) {
+                    Ok(RelationKind::Stream) => check_stream_push(target.tid, batch.as_ref(), mode).is_ok(),
+                    Ok(_) => batch.as_ref().is_some_and(|b| self.inserts(target.tid, b)),
+                    Err(_) => false,
+                };
+                if let (true, Some(batch)) = (admitted, batch) {
+                    self.ingest(vec![TxnFamily { tid: target.tid, mode, batch }]);
                 }
             }
             ClientVerb::PushTxn => {
-                if let Ok(txn) = decode_push_txn_frame(&self.cat, body) {
-                    txn.families.into_iter().for_each(|f| self.push(f.tid, f.mode, f.batch));
+                let Ok(txn) = decode_push_txn_frame(&self.cat, body) else {
+                    return;
+                };
+                let admitted = txn
+                    .heads
+                    .iter()
+                    .all(|h| target_kind(&self.cat, h.target, Access::TxnWrite).is_ok())
+                    && txn.families.iter().all(|f| self.inserts(f.tid, &f.batch));
+                if admitted {
+                    self.ingest(txn.families);
                 }
             }
             ClientVerb::ScanSpec => self.scan(ctrl.hdr.target(), &frame[ctrl.blob.clone()], ctrl.hdr.arg0),
@@ -144,19 +161,13 @@ impl Session {
         applied.held_above.into_iter().for_each(|family| self.tick(family));
     }
 
-    /// Ingest `batch` into `tid` if the master would admit it as it stands,
-    /// then tick it.
-    fn push(&mut self, tid: u64, mode: WireConflictMode, batch: Batch) {
-        let Some(kind) = self.cat.registry.relation(tid).map(|r| r.kind()) else {
-            return;
-        };
-        let admitted = match kind {
-            RelationKind::Stream => check_stream_push(tid, Some(&batch), mode).is_ok(),
-            _ => self.inserts(tid, &batch),
-        };
-        if admitted && self.cat.ingest_unticked(tid, batch).is_ok() {
-            self.filled.insert(tid);
-            self.tick(tid);
+    /// Ingest every one of `families`, which the master admitted, and tick each.
+    fn ingest(&mut self, families: Vec<TxnFamily>) {
+        for f in families {
+            if self.cat.ingest_unticked(f.tid, f.batch).is_ok() {
+                self.filled.insert(f.tid);
+                self.tick(f.tid);
+            }
         }
     }
 
@@ -182,12 +193,7 @@ impl Session {
 
     /// Read `target` under the spec `spec`, as a worker answers a scan.
     fn scan(&mut self, target: Target, spec: &[u8], reply_layout: u64) {
-        let readable = self.cat.check_token(target).is_ok()
-            && self
-                .cat
-                .registry
-                .relation(target.tid)
-                .is_some_and(|r| r.kind() != RelationKind::Stream);
+        let readable = target_kind(&self.cat, target, Access::Read).is_ok();
         if let (true, Ok(spec)) = (readable, ReadSpec::decode(spec)) {
             let _ = self.cat.scan_spec(target.tid, spec, reply_layout);
         }
@@ -209,24 +215,13 @@ fn builtin() -> Seed {
     let scratch = tempfile::tempdir().unwrap();
     let mut session = Session::open(scratch.path().to_str().unwrap());
     let ids = 3;
-    let base = CatalogEngine::open(scratch.path().join("probe").to_str().unwrap(), 1)
-        .unwrap()
-        .allocate_ids(ids)
-        .unwrap();
+    // The first ids a fresh catalog allocates.
+    let base = gnitz_wire::FIRST_USER_TABLE_ID;
     let (a, b, view) = (base, base + 1, base + 2);
     let table = |tid: u64, name: &str, cols: &[gnitz_wire::sys_rows::CatalogColumn]| {
-        let mut row = BatchBuilder::new(SysFamily::Table.schema());
-        TableTabRow {
-            table_id: tid,
-            schema_id: PUBLIC_SCHEMA_ID,
-            name: name.into(),
-            pk_col_idx: PkColList::from_slice(&[0]).pack(),
-            flags: TableProps::default().pack(),
-        }
-        .write(&mut row, 1);
         ddl_frame([
             (SysFamily::Column, col_tab_batch(tid, cols, 1)),
-            (SysFamily::Table, row.finish()),
+            (SysFamily::Table, table_tab_batch(&[(tid, name, 1)])),
         ])
     };
     let mut alloc = Vec::new();
