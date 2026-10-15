@@ -277,10 +277,6 @@ class ServerProc:
         seams = [k for k in env if k.startswith("GNITZ_INJECT_")]
         if seams and not is_debug_build():
             pytest.skip(f"injection seam requires a debug build: {', '.join(seams)}")
-        # A killed server's listener can still accept for a moment after it is
-        # reaped, and this boot would refuse a socket that answers.
-        if os.path.exists(self.sock_path):
-            os.unlink(self.sock_path)
         # Where this boot's output starts, so `log_text` can exclude the last.
         self._log_start = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         log = open(self.log_path, "ab")

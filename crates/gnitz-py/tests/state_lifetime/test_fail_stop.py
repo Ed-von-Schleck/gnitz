@@ -13,7 +13,7 @@ fails to emit must surface as an error on the read that waited for it, rather
 than as an OK reply over a view that silently stopped advancing.
 """
 
-import os
+import socket
 
 import pytest
 import gnitz
@@ -50,8 +50,8 @@ def test_a_failed_boot_leaves_the_sal_intact(seam, own_server):
 
     rc = own_server.start_expecting_exit(extra_env=_BOOT_SEAMS[seam])
     assert rc != 0, f"boot should have aborted on the {seam} fault, got rc={rc}"
-    assert not os.path.exists(own_server.sock_path), \
-        "a failed boot must not accept requests"
+    with pytest.raises(OSError):
+        socket.socket(socket.AF_UNIX).connect(own_server.sock_path)
 
     own_server.start()
     with gnitz.connect(own_server.target) as conn:

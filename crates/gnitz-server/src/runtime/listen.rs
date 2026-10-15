@@ -4,11 +4,21 @@
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::runtime::tls::TlsListener;
 
 /// `<data_dir>/<name>` file holding the TLS listener's bound `IP:PORT`.
 const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
+
+/// How long a boot waits for an address that is in use to come free. A killed
+/// server's listening sockets outlive its process for as long as the kernel
+/// takes to tear its io_uring down, so a restart straight after a kill finds
+/// its own address taken; an address still in use after the wait is another
+/// server's.
+pub(crate) const ADDRESS_GRACE: Duration = Duration::from_secs(2);
+/// How often an address in use is tried again within the grace.
+const ADDRESS_RETRY: Duration = Duration::from_millis(5);
 
 /// A bound, listening socket, and what its connections are served under
 /// (`None`: the AF_UNIX socket, served in plaintext and asked for no token).
@@ -29,16 +39,22 @@ pub(crate) fn clear_published(data_dir: &str) -> Result<(), String> {
 }
 
 /// Bind every listener, the AF_UNIX socket last, then publish the endpoint.
-/// Called after the fork, so no worker inherits a listening fd.
+/// Called after the fork, so no worker inherits a listening fd. An address in
+/// use is waited on for up to `grace` ([`ADDRESS_GRACE`]).
 pub(crate) fn bind_listeners(
     data_dir: &str,
     socket_path: &str,
     tls: Option<TlsListener>,
+    grace: Duration,
 ) -> Result<Vec<ClientListener>, String> {
+    let deadline = Instant::now() + grace;
     let tcp = tls
-        .map(|tls| bind_tcp(tls.listen()).map(|(fd, bound)| (fd, bound, tls)))
+        .map(|tls| bind_tcp(tls.listen(), deadline).map(|(fd, bound)| (fd, bound, tls)))
         .transpose()?;
-    let mut listeners = vec![ClientListener { fd: bind_unix(socket_path)?, tls: None }];
+    let mut listeners = vec![ClientListener {
+        fd: bind_unix(socket_path, deadline)?,
+        tls: None,
+    }];
     if let Some((fd, bound, tls)) = tcp {
         let path = format!("{data_dir}/{TLS_ENDPOINT_FILE}");
         std::fs::write(&path, format!("{bound}\n")).map_err(|e| format!("failed to publish {path}: {e}"))?;
@@ -49,10 +65,18 @@ pub(crate) fn bind_listeners(
 }
 
 /// Bind the TCP listener at `addr`, returning it with the address it bound.
-fn bind_tcp(addr: SocketAddr) -> Result<(OwnedFd, SocketAddr), String> {
+/// An address in use is tried again until `deadline`.
+fn bind_tcp(addr: SocketAddr, deadline: Instant) -> Result<(OwnedFd, SocketAddr), String> {
     use gnitz_foundation::posix_io::set_sockopt_int;
 
-    let listener = TcpListener::bind(addr).map_err(|e| format!("failed to bind TLS listener {addr}: {e}"))?;
+    let listener = loop {
+        match TcpListener::bind(addr) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                std::thread::sleep(ADDRESS_RETRY)
+            }
+            r => break r.map_err(|e| format!("failed to bind TLS listener {addr}: {e}"))?,
+        }
+    };
     let fd = listener.as_raw_fd();
     // Both are inherited by every accepted socket. Keepalive lets the kernel
     // reap a half-open peer that would otherwise park its recv forever.
@@ -77,25 +101,32 @@ fn bind_tcp(addr: SocketAddr) -> Result<(OwnedFd, SocketAddr), String> {
 }
 
 /// Bind the AF_UNIX listener at `path`, replacing only a stale socket: a
-/// regular file there, or a socket something answers on, refuses the boot.
-fn bind_unix(path: &str) -> Result<OwnedFd, String> {
+/// regular file there, or a socket something still answers on at `deadline`,
+/// refuses the boot.
+fn bind_unix(path: &str, deadline: Instant) -> Result<OwnedFd, String> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    let listener = match UnixListener::bind(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            let is_socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
-            if !is_socket {
-                return Err(format!("{path} exists and is not a socket"));
+    let listener = loop {
+        match UnixListener::bind(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                let is_socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
+                if !is_socket {
+                    return Err(format!("{path} exists and is not a socket"));
+                }
+                if UnixStream::connect(path).is_ok() {
+                    if Instant::now() < deadline {
+                        std::thread::sleep(ADDRESS_RETRY);
+                        continue;
+                    }
+                    return Err(format!("{path} is served by a running server"));
+                }
+                // Left by a server that is gone.
+                std::fs::remove_file(path).map_err(|e| format!("failed to remove stale socket {path}: {e}"))?;
+                break UnixListener::bind(path);
             }
-            if UnixStream::connect(path).is_ok() {
-                return Err(format!("{path} is served by a running server"));
-            }
-            // Left by a server that is gone.
-            std::fs::remove_file(path).map_err(|e| format!("failed to remove stale socket {path}: {e}"))?;
-            UnixListener::bind(path)
+            r => break r,
         }
-        r => r,
     }
     .map(OwnedFd::from)
     .map_err(|e| format!("failed to create server socket {path}: {e}"))?;
