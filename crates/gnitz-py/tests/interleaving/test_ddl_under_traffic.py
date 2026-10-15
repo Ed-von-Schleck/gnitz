@@ -78,6 +78,16 @@ def test_a_push_decoded_before_an_alter_is_refused(own_server):
     assert bag(scanned(client, "t")) == {}
 
 
+def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, peer):
+    """The commit is validated against the catalog it reaches, not the one the
+    transaction began under, and the refusal names the relation it concerns."""
+    tid = client.create_table("gone", KV)
+    with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
+        with client.transaction() as txn:
+            txn.push(tid, kv((1, 1)), "update")
+            peer().execute_sql("DROP TABLE gone")
+
+
 @pytest.mark.parametrize("body, row", [
     ("SELECT a.id AS aid, b.bv AS bv FROM a JOIN b ON a.k = b.id", lambda i: (i, (i % 5) * 100)),
     ("SELECT a.id AS aid, a.av + 1 AS bv FROM a", lambda i: (i, i * 10 + 1)),
