@@ -15,13 +15,13 @@ claim is forged by a retraction the pusher never held.
 """
 
 import contextlib
-import threading
 
 import pytest
 import gnitz
-from _read import bag, rows as read_rows, scanned
+from _catalog import family
+from _read import bag, scanned
 from _schemas import KV
-from _serverproc import NEEDS_MULTI, TINY_REPLY_FRAMES, TINY_SCAN_CHUNKS, join_or_fail, spawn
+from _serverproc import NEEDS_MULTI, TINY_SCAN_CHUNKS
 from _sql import insert
 
 _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
@@ -33,18 +33,16 @@ _AB_PK = ("CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NUL
 _T_INT = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val INT NOT NULL)"
 
 _CREATE_DUP = "contains duplicate values"
-_VIOLATION = "[Uu]nique index violation"
 
 
-def _violation():
-    return pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION)
+def _violation(cols="val"):
+    """The refusal of a write claiming a value the index over `cols` holds."""
+    return pytest.raises(gnitz.GnitzIntegrityError, match=f"Unique index violation on '[^']*' column '{cols}'")
 
 
-def _has_index(client, table="t"):
-    """True if any live IdxTab row names `table` as its owner."""
-    batch = client.scan(gnitz.IDX_TAB, gnitz.sys_schema(gnitz.IDX_TAB))
-    tid, _ = client.resolve_table(table)
-    return any(r._weight > 0 and r.owner_id == tid for r in batch)
+def _indices(client):
+    """The bag of index ids `t` owns."""
+    return family(client, "indices", "index_id", where=f"owner_id = {client.resolve_table('t')[0]}")
 
 
 def _raw_table(client):
@@ -131,66 +129,18 @@ def test_create_over_present_rows_admits_exactly_a_duplicate_free_seed(
         # The qualified table is what tells the author what to change.
         with pytest.raises(gnitz.GnitzIntegrityError, match=f"{client.schema}.t.*{_CREATE_DUP}"):
             client.execute_sql(create)
-        assert not _has_index(client)
+        assert _indices(client) == {}
         insert(client, "t", [claim])
         landed = claim
     else:
         client.execute_sql(create)
         insert(client, "t", [fresh])
         if claim is not None:
-            with _violation():
+            with _violation(cols):
                 insert(client, "t", [claim])
         landed = fresh
     # Every worker still answers, and nothing a verdict refused landed.
     assert bag(scanned(client, "t")) == dict.fromkeys(seed + [landed], 1)
-
-
-def test_a_smallint_unique_index_refuses_a_value_a_second_push_repeats(client):
-    """A 2-byte key enforces across pushes at both ends of its range and on both
-    sides of zero: each seeded value is refused under a new PK, and a value no
-    row holds lands."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val SMALLINT NOT NULL); "
-        "CREATE UNIQUE INDEX ON t(val)")
-    seed = list(zip(_SPREAD, [-32768, -1, 0, 1, 32767, 7, -7, 100, -100, 255]))
-    insert(client, "t", seed)
-    for pk, val in seed:
-        with _violation():
-            insert(client, "t", [(pk + 1, val)])
-    insert(client, "t", [(5, 8), (6, -8)])
-    assert bag(scanned(client, "t")) == dict.fromkeys(seed + [(5, 8), (6, -8)], 1)
-
-
-def test_concurrent_inserts_during_create(client, server):
-    """A steady INSERT stream into the owner table concurrent with CREATE UNIQUE
-    INDEX. All streamed values are distinct, so — whatever the interleaving — the
-    catalog write lock orders every INSERT strictly before or after the
-    pre-flight+backfill snapshot, the index must be created and enforce, no row
-    may be lost from it, and no worker may wedge."""
-    with gnitz.connect(server, schema=client.schema) as writer:
-        client.execute_sql(_T)
-        # Seed so the pre-flight scan has data on every worker.
-        insert(client, "t", [(i, i) for i in range(1, 201)])
-
-        stop = threading.Event()
-
-        def insert_stream():
-            v = 1000
-            while not stop.is_set() and v < 5000:
-                writer.execute_sql(f"INSERT INTO t VALUES ({v}, {v})")
-                v += 1
-
-        th = spawn(insert_stream)
-        try:
-            client.execute_sql("CREATE UNIQUE INDEX ON t(val)")
-        finally:
-            stop.set()
-            join_or_fail("insert stream did not stop", th)
-
-        # The index enforces a seeded value, and a brand-new one still inserts.
-        with _violation():
-            client.execute_sql("INSERT INTO t VALUES (888888, 1)")
-        client.execute_sql("INSERT INTO t VALUES (888888, 888888)")
 
 
 _n = 2000
@@ -218,34 +168,18 @@ def test_the_preflight_merge_stays_exact_across_its_own_boundaries(own_server, e
     fall, on both verdicts: an all-distinct seed creates and then enforces, and
     one duplicate pair on far-apart PKs — adjacent only in the merged stream —
     is still caught."""
-    srv = gnitz.connect(own_server.start(extra_env=env).target)
-    srv.execute_sql(_T)
-    insert(srv, "t", seed)
-    srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)")
-    with _violation():
-        insert(srv, "t", [claim])
-    srv.execute_sql("DROP INDEX ix")
-
-    insert(srv, "t", [repeat])
-    with pytest.raises(gnitz.GnitzIntegrityError, match=_CREATE_DUP):
+    with gnitz.connect(own_server.start(extra_env=env).target) as srv:
+        srv.execute_sql(_T)
+        insert(srv, "t", seed)
         srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)")
-    assert not _has_index(srv)
+        with _violation():
+            insert(srv, "t", [claim])
+        srv.execute_sql("DROP INDEX ix")
 
-
-def test_unique_index_over_a_long_text_table_past_one_frame(own_server):
-    """An index created over a table of long TEXT rows, each worker's spans
-    past one reply frame, enforces uniqueness."""
-    srv, n = gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target), 800
-    srv.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, u BIGINT NOT NULL, body TEXT NOT NULL)")
-    # 200 bytes of heap per row: several frame budgets on every worker.
-    insert(srv, "t", [(i, i, f"row-{i}-" + "z" * 200) for i in range(n)])
-
-    srv.execute_sql("CREATE UNIQUE INDEX ON t(u)")
-    with _violation():
-        srv.execute_sql("INSERT INTO t VALUES (99999, 7, 'dup')")
-    srv.execute_sql(f"INSERT INTO t VALUES (99999, {n}, 'new')")
-    assert bag(read_rows(srv, "SELECT pk, u FROM t WHERE u = 17")) == {(17, 17): 1}
+        insert(srv, "t", [repeat])
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_CREATE_DUP):
+            srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)")
+        assert _indices(srv) == {}
 
 
 def test_worker_fault_mid_preflight(own_server):
@@ -253,127 +187,137 @@ def test_worker_fault_mid_preflight(own_server):
     client error with no index created, no filter seeded, and every worker
     drained (not wedged): the table stays fully usable, and the PK
     short-circuit — which never fans out — still succeeds."""
-    srv = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_KEY_SPANS_ERROR": "1"}).target)
-    srv.execute_sql(_T)
-    seed = [(pk, pk) for pk in range(1, 33)]
-    insert(srv, "t", seed)
-    with pytest.raises(gnitz.GnitzRefusedError):
-        srv.execute_sql("CREATE UNIQUE INDEX ON t(val)")
-    assert not _has_index(srv)
-    # No filter was seeded and no index exists, so a duplicate value is
-    # accepted — no partial constraint leaked out of the failed DDL.
-    insert(srv, "t", [(100, 1)])
-    # All workers answer a full scan: nobody is wedged on a half-drained
-    # pre-flight train.
-    assert bag(scanned(srv, "t")) == dict.fromkeys(seed + [(100, 1)], 1)
-    # The PK-covering short-circuit returns before any fan-out, so it succeeds
-    # even while every worker's scan path is faulted — for the PK exactly, and
-    # for any column list containing it.
-    srv.execute_sql("CREATE UNIQUE INDEX ON t(pk)")
-    assert _has_index(srv)
-    srv.execute_sql("CREATE UNIQUE INDEX ON t(pk, val)")
+    with gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_KEY_SPANS_ERROR": "1"}).target) as srv:
+        srv.execute_sql(_T)
+        seed = [(pk, pk) for pk in range(1, 33)]
+        insert(srv, "t", seed)
+        with pytest.raises(gnitz.GnitzRefusedError, match="injected key-spans fault"):
+            srv.execute_sql("CREATE UNIQUE INDEX ON t(val)")
+        assert _indices(srv) == {}
+        # No filter was seeded and no index exists, so a duplicate value is
+        # accepted — no partial constraint leaked out of the failed DDL.
+        insert(srv, "t", [(100, 1)])
+        # All workers answer a full scan: nobody is wedged on a half-drained
+        # pre-flight train.
+        assert bag(scanned(srv, "t")) == dict.fromkeys(seed + [(100, 1)], 1)
+        # The PK-covering short-circuit returns before any fan-out, so it
+        # succeeds even while every worker's scan path is faulted — for the PK
+        # exactly, and for any column list containing it.
+        srv.execute_sql("CREATE UNIQUE INDEX ON t(pk); CREATE UNIQUE INDEX ON t(pk, val)")
+        assert len(_indices(srv)) == 2
 
 
 # ── Enforcement once the index exists ────────────────────────────────────────
 
-def test_the_index_enforces_after_a_restart(own_server):
-    """After a restart the index still refuses a held value, on an INSERT and
-    on an UPDATE, and admits a fresh one."""
-    srv = gnitz.connect(own_server.start().target)
-    srv.execute_sql(_T + "; CREATE UNIQUE INDEX ON t(val)")
-    seed = [(pk, pk * 10) for pk in _SPREAD]
-    insert(srv, "t", seed)
-
-    srv = gnitz.connect(own_server.restart(graceful=True).target)
-    with _violation():
-        srv.execute_sql(f"INSERT INTO t VALUES (5, {_SPREAD[3] * 10})")
-    srv.execute_sql("INSERT INTO t VALUES (5, 55)")
-    with _violation():
-        srv.execute_sql(f"UPDATE t SET val = {_SPREAD[0] * 10} WHERE pk = {_SPREAD[5]}")
-    assert bag(scanned(srv, "t")) == dict.fromkeys(seed + [(5, 55)], 1)
-
-
-@pytest.mark.parametrize("ddl", [
-    _T + "; CREATE UNIQUE INDEX ON t(val)",
-    "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT UNIQUE)",
-    _T + "; ALTER TABLE t ADD CONSTRAINT UNIQUE (val)",
-], ids=["create-index", "column-constraint", "add-constraint"])
-def test_every_declaration_entry_point_enforces(client, ddl):
-    """`CREATE UNIQUE INDEX`, a column-level `UNIQUE` and an unnamed `ADD
-    CONSTRAINT ... UNIQUE` register the same index — the column form once
-    discarded it silently."""
-    client.execute_sql(ddl)
-    client.execute_sql("INSERT INTO t VALUES (1, 42)")
-    # A second holder is refused whichever partition it would land on.
-    for pk in (2, 1000000):
-        with _violation():
-            client.execute_sql(f"INSERT INTO t VALUES ({pk}, 42)")
-    # And so is a pair colliding inside one statement.
-    with _violation():
-        client.execute_sql("INSERT INTO t VALUES (3, 7), (4, 7)")
-
-
-@pytest.fixture
-def indexed(client):
-    """`t(pk, val)` with a unique index on `val`."""
-    client.execute_sql(_T + "; CREATE UNIQUE INDEX ON t(val)")
-
-
+_T_IX = _T + "; CREATE UNIQUE INDEX ON t(val)"
 _UPSERT = " ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val"
+_UNIQUE_A = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT UNIQUE)"
+_TWO_IX = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+           "CREATE UNIQUE INDEX ON t(a); CREATE UNIQUE INDEX ON t(b)")
+_WIDE_PK = ("CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
+            " c BIGINT UNSIGNED NOT NULL, val BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b, c)); "
+            "CREATE UNIQUE INDEX ON t(val)")
+# `(7,7,100)` and `(7,7,200)` share their first 16 bytes, so a 16-byte-truncated
+# holder compare would misread a collision between them as the row's own entry.
+_WIDE_ROWS = [(7, 7, 100, 10), (7, 7, 200, 42)]
+_HOLDER = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a {}); CREATE UNIQUE INDEX ix ON t(a)"
+_HOLDER_PK = 999983
+_UPSERT_A = " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a"
+# NULL-valued rows spread over a PK range wide enough to reach every worker.
+_NULLS = [(pk, None) for pk in range(10_000, 10_048)]
+_REPLICATED = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) WITH (replicated = true); "
+               "CREATE UNIQUE INDEX ON t(a)")
 
-_CLAIMS = [
+# `(ddl, committed rows, statement, rows after — or the columns of the index
+# that refuses it, every row then kept)`.
+_CLAIMS = {
     # A row rewriting its own value collides only with its own committed entry,
     # which the write retracts.
-    ("keeps its own value", "INSERT INTO t VALUES (1, 42)" + _UPSERT, [(1, 42), (2, 99)]),
+    "keeps its own value": (_T_IX, [(1, 42), (2, 99)], "INSERT INTO t VALUES (1, 42)" + _UPSERT, [(1, 42), (2, 99)]),
     # Moving to a free value vacates the old one.
-    ("moves to a free value", "INSERT INTO t VALUES (1, 7)" + _UPSERT, [(1, 7), (2, 99)]),
+    "moves to a free value": (_T_IX, [(1, 42), (2, 99)], "INSERT INTO t VALUES (1, 7)" + _UPSERT, [(1, 7), (2, 99)]),
     # A DELETE releases the value it held for a later statement.
-    ("takes a value a DELETE freed",
-     "DELETE FROM t WHERE pk = 1; INSERT INTO t VALUES (3, 42)", [(2, 99), (3, 42)]),
-    # Taking a value another live PK holds is the violation.
-    ("takes a held value", "INSERT INTO t VALUES (1, 99)" + _UPSERT, None),
-    ("update takes a held value", "UPDATE t SET val = 99 WHERE pk = 1", None),
+    "takes a value a DELETE freed": (
+        _T_IX, [(1, 42), (2, 99)], "DELETE FROM t WHERE pk = 1; INSERT INTO t VALUES (3, 42)", [(2, 99), (3, 42)]),
+    # Taking a value another live PK holds is the violation, whichever partition
+    # the new holder lands on.
+    "takes a held value": (_T_IX, [(1, 42), (2, 99)], "INSERT INTO t VALUES (1, 99)" + _UPSERT, "val"),
+    "a fresh PK takes a held value": (_T_IX, [(1, 42), (2, 99)], "INSERT INTO t VALUES (1000000, 42)", "val"),
+    "update takes a held value": (_T_IX, [(1, 42), (2, 99)], "UPDATE t SET val = 99 WHERE pk = 1", "val"),
     # Two rows claiming one *new* value: absent from committed storage, so the
     # occupancy probe answers "free" and only the in-batch check can catch it.
-    ("two upserts claim one new value",
-     "INSERT INTO t VALUES (1, 55), (2, 55)" + _UPSERT, None),
-]
-
-
-@pytest.mark.parametrize("stmt,final", [c[1:] for c in _CLAIMS], ids=[c[0] for c in _CLAIMS])
-def test_a_claim_is_admitted_only_if_it_ends_up_held_once(client, indexed, stmt, final):
-    committed = [(1, 42), (2, 99)]
-    insert(client, "t", committed)
-    with _violation() if final is None else contextlib.nullcontext():
-        client.execute_sql(stmt)
-    assert bag(scanned(client, "t")) == dict.fromkeys(final or committed, 1)
-
-
-def test_two_indices_on_one_table_are_both_enforced(client):
-    client.execute_sql(
+    "two upserts claim one new value": (
+        _T_IX, [(1, 42), (2, 99)], "INSERT INTO t VALUES (1, 55), (2, 55)" + _UPSERT, "val"),
+    "two inserts claim one new value": (_T_IX, [(1, 42)], "INSERT INTO t VALUES (3, 7), (4, 7)", "val"),
+    # A column-level `UNIQUE` registers the same index `CREATE UNIQUE INDEX` does.
+    "a column-level declaration": (_UNIQUE_A, [(1, 42)], "INSERT INTO t VALUES (2, 42)", "a"),
+    # Each of two indices refuses for itself.
+    "the first of two indices": (_TWO_IX, [(1, 10, 20), (2, 11, 21)], "INSERT INTO t VALUES (3, 10, 22)", "a"),
+    "the second of two indices": (_TWO_IX, [(1, 10, 20), (2, 11, 21)], "INSERT INTO t VALUES (4, 12, 20)", "b"),
+    # A bulk transfer: every occupied span resolves to a holder the same bundle
+    # retires.
+    "a shift": (_UNIQUE_A, [(1, 1), (2, 2), (3, 3)], "UPDATE t SET a = a + 1", [(1, 2), (2, 3), (3, 4)]),
+    "a swap": (_UNIQUE_A, [(1, 1), (2, 2), (3, 3)], "UPDATE t SET a = 4 - a", [(1, 3), (2, 2), (3, 1)]),
+    "a composite shift": (
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL, UNIQUE (a, b))",
+        [(1, 7, 1), (2, 7, 2), (3, 7, 3)], "UPDATE t SET b = b + 1", [(1, 7, 2), (2, 7, 3), (3, 7, 4)]),
+    # The holder a probe reports is compared at the PK's full width.
+    "a wide PK takes a held value": (_WIDE_PK, _WIDE_ROWS, "INSERT INTO t VALUES (2, 2, 2, 42)", "val"),
+    "a wide PK takes its neighbour's value": (
+        _WIDE_PK, _WIDE_ROWS, "UPDATE t SET val = 42 WHERE a = 7 AND b = 7 AND c = 100", "val"),
+    "a wide PK keeps its own value": (
+        _WIDE_PK, _WIDE_ROWS, "UPDATE t SET val = 10 WHERE a = 7 AND b = 7 AND c = 100", _WIDE_ROWS),
+    # The `[span || holder PK]` split lands at the whole composite span's width.
+    "a composite span's holder": (
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
-        "CREATE UNIQUE INDEX ON t(a); CREATE UNIQUE INDEX ON t(b)")
-    client.execute_sql("INSERT INTO t VALUES (1, 10, 20), (2, 11, 21)")
-    with _violation():
-        client.execute_sql("INSERT INTO t VALUES (3, 10, 22)")
-    with _violation():
-        client.execute_sql("INSERT INTO t VALUES (4, 12, 20)")
+        "CREATE UNIQUE INDEX ON t(a, b)",
+        [(1, 1, 1), (2, 2, 2)],
+        f"INSERT INTO t VALUES (2, 3, 3), ({_HOLDER_PK}, 1, 1) ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a, "
+        "b = EXCLUDED.b", "a, b"),
+    # A bundle that moves a second committed row's value and claims the
+    # holder's for a fresh PK: the second row is what makes it touch a committed
+    # PK, so the check reaches the holder — past a flood of NULLs, none of which
+    # may claim the zero value's all-zero key image.
+    "the holder past a NULL flood": (
+        _HOLDER.format("BIGINT UNSIGNED"), [(_HOLDER_PK, 0), (1, 77)] + _NULLS,
+        "INSERT INTO t VALUES (1, 88), (2, 0)" + _UPSERT_A, "a"),
+    # Every worker holds a replicated table's whole index and answers for the
+    # same span; the `W` identical answers collapse to one holder, which decides
+    # the verdict.
+    "a replicated holder keeps its value": pytest.param(
+        _REPLICATED, [(1, 42), (2, 77)], f"INSERT INTO t VALUES (2, 88), ({_HOLDER_PK}, 42)" + _UPSERT_A, "a",
+        marks=NEEDS_MULTI),
+    "a replicated holder releases its value": pytest.param(
+        _REPLICATED, [(1, 42), (2, 77)], f"INSERT INTO t VALUES (1, 99), ({_HOLDER_PK}, 42)" + _UPSERT_A,
+        [(1, 99), (2, 77), (_HOLDER_PK, 42)], marks=NEEDS_MULTI),
+}
 
 
-def test_anticorrelated_multi_source_index_merge(client, indexed):
+@pytest.mark.parametrize("ddl,committed,stmt,after", _CLAIMS.values(), ids=_CLAIMS.keys())
+def test_a_claim_is_admitted_only_if_it_ends_up_held_once(client, ddl, committed, stmt, after):
+    client.execute_sql(ddl)
+    insert(client, "t", committed)
+    refused = isinstance(after, str)
+    with _violation(after) if refused else contextlib.nullcontext():
+        client.execute_sql(stmt)
+    assert bag(scanned(client, "t")) == dict.fromkeys(committed if refused else after, 1)
+
+
+def test_anticorrelated_multi_source_index_merge(client):
     """The duplicate check seeks the indexed value in the secondary index, whose
     PK is compound `(value, src_pk)`. With values inserted one per push and
     falling as the PK rises, the check merges N runs. If that merge ordered by
     the raw u128 PK — `(src_pk, value)` — the seek for a smaller value would land
     on a larger value's run, report "absent", and let a duplicate through."""
-    n = 6
-    vals = [(n - i) * 100 for i in range(n)]  # 600, 500, ..., 100
-    for i, val in enumerate(vals):
-        client.execute_sql(f"INSERT INTO t VALUES ({i + 1}, {val})")
+    client.execute_sql(_T_IX)
+    committed = [(i + 1, (6 - i) * 100) for i in range(6)]  # values 600, 500, ..., 100
+    for row in committed:
+        insert(client, "t", [row])
     # Including the smallest values, which a u128 merge would mask.
-    for j, val in enumerate(vals):
+    for j, (_, val) in enumerate(committed):
         with _violation():
-            client.execute_sql(f"INSERT INTO t VALUES ({1000 + j}, {val})")
+            insert(client, "t", [(1000 + j, val)])
+    assert bag(scanned(client, "t")) == dict.fromkeys(committed, 1)
 
 
 # ── The fold a whole write produces, not its rows one at a time ──────────────
@@ -452,60 +396,10 @@ def test_bulk_colliding_fresh_pks_rejected(client):
     assert bag(client.scan(tid, KV)) == dict.fromkeys(committed, 1)
 
 
-_UNIQUE_A = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT UNIQUE)"
-
-
-@pytest.mark.parametrize("ddl,seed,stmt,final", [
-    # Every occupied span resolves to a holder the same bundle retires.
-    (_UNIQUE_A, [(1, 1), (2, 2), (3, 3)], "UPDATE t SET a = a + 1", [(1, 2), (2, 3), (3, 4)]),
-    # Two rows exchange their values in one batch of same-PK upserts.
-    (_UNIQUE_A, [(1, 1), (2, 2), (3, 3)], "UPDATE t SET a = 4 - a", [(1, 3), (2, 2), (3, 1)]),
-    # A composite span, declared as a table constraint.
-    ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL, UNIQUE (a, b))",
-     [(1, 7, 1), (2, 7, 2), (3, 7, 3)], "UPDATE t SET b = b + 1", [(1, 7, 2), (2, 7, 3), (3, 7, 4)]),
-], ids=["shift", "swap", "composite-shift"])
-def test_a_bulk_transfer_within_one_statement_is_admitted(client, ddl, seed, stmt, final):
-    client.execute_sql(ddl)
-    insert(client, "t", seed)
-    client.execute_sql(stmt)
-    assert bag(scanned(client, "t")) == dict.fromkeys(final, 1)
-
-
-def test_a_wide_pk_behind_the_index_is_compared_whole(client):
-    """`(7,7,100)` and `(7,7,200)` share their first 16 bytes. A value held
-    under one wide PK is refused under another, and moving the second row's
-    value onto the first is refused too — a 16-byte-truncated holder compare
-    would misread that collision as the row's own entry. A row rewriting its own
-    unchanged value is admitted, since it retracts that entry itself."""
-    client.execute_sql(
-        "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
-        " c BIGINT UNSIGNED NOT NULL, val BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b, c)); "
-        "CREATE UNIQUE INDEX ON t(val)")
-    insert(client, "t", [(7, 7, 100, 10), (7, 7, 200, 42)])
-    with _violation():
-        client.execute_sql("INSERT INTO t VALUES (2, 2, 2, 42)")
-    with _violation():
-        client.execute_sql("UPDATE t SET val = 42 WHERE a = 7 AND b = 7 AND c = 100")
-    client.execute_sql("UPDATE t SET val = 10 WHERE a = 7 AND b = 7 AND c = 100")
-    assert bag(scanned(client, "t")) == {(7, 7, 100, 10): 1, (7, 7, 200, 42): 1}
-
-
 # ── Resolving the holder a probe reports ─────────────────────────────────────
 #
 # A NULL indexed cell must not claim the all-zero key image, and the holder a
 # probe reports must be the one that currently holds the value.
-
-# NULL-valued rows spread over a PK range wide enough to reach every worker.
-_NULLS = [(pk, None) for pk in range(10_000, 10_048)]
-_HOLDER_PK = 999983
-_UPSERT_A = " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a"
-
-
-def _holder_table(client, col_type):
-    client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a {col_type}); CREATE UNIQUE INDEX ix ON t(a)")
-    return client.resolve_table("t")[0]
-
 
 # `(column type, the value whose order-preserving image is all-zero for it)`.
 @pytest.mark.parametrize("col_type,value", [
@@ -516,30 +410,16 @@ def test_the_zero_image_holder_survives_a_flood_of_nulls(client, col_type, value
     """The index is NULL-distinct (a NULL row has no entry at all), so both a
     direct seek and an UPDATE/DELETE by the zero-image value must reach exactly
     the holder's one row, however many NULL rows were written after it."""
-    tid = _holder_table(client, col_type)
+    client.execute_sql(_HOLDER.format(col_type))
     insert(client, "t", [(_HOLDER_PK, value)])
     insert(client, "t", _NULLS)
 
-    _, schema = client.resolve_table("t")
+    tid, schema = client.resolve_table("t")
     assert bag(client.seek_by_index(tid, schema, [1], [value])) == {(_HOLDER_PK, value): 1}
     for stmt in (f"UPDATE t SET a = {value} WHERE a = {value}", f"DELETE FROM t WHERE a = {value}"):
         res = client.execute_sql(stmt)
         assert (res[0]["type"], res[0]["count"]) == ("RowsAffected", 1), stmt
     assert bag(scanned(client, "t")) == dict.fromkeys(_NULLS, 1)
-
-
-def test_the_constraint_holds_under_the_same_null_flood(client):
-    """A bundle that moves a second committed row's value AND claims the
-    holder's value for a fresh PK must be rejected — the second row is what
-    makes the bundle touch a committed PK, so the check reaches the holder
-    rather than stopping at the claim."""
-    other, fresh = 1, 2
-    _holder_table(client, "BIGINT UNSIGNED")
-    committed = [(_HOLDER_PK, 0), (other, 77)] + _NULLS
-    insert(client, "t", committed)
-    with _violation():
-        client.execute_sql(f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 0)" + _UPSERT_A)
-    assert bag(scanned(client, "t")) == dict.fromkeys(committed, 1)
 
 
 def test_a_value_moved_across_the_drop_index_window(client):
@@ -548,49 +428,14 @@ def test_a_value_moved_across_the_drop_index_window(client):
     before the re-create, so both a direct seek and a bundle claiming the
     value must name the NEW holder, not the pre-DROP one."""
     other, fresh, moved = 555, 556, 31337
-    tid = _holder_table(client, "BIGINT NOT NULL")
+    client.execute_sql(_HOLDER.format("BIGINT NOT NULL"))
     insert(client, "t", [(_HOLDER_PK, 7), (other, 77)])
     client.execute_sql(
         f"DROP INDEX ix; DELETE FROM t WHERE pk = {_HOLDER_PK}; INSERT INTO t VALUES ({moved}, 7); "
         "CREATE UNIQUE INDEX ix ON t(a)")
 
-    _, schema = client.resolve_table("t")
+    tid, schema = client.resolve_table("t")
     assert bag(client.seek_by_index(tid, schema, [1], [7])) == {(moved, 7): 1}
-    with _violation():
+    with _violation("a"):
         client.execute_sql(f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 7)" + _UPSERT_A)
     assert bag(scanned(client, "t")) == {(moved, 7): 1, (other, 77): 1}
-
-
-def test_composite_unique_holder_split(client):
-    """A composite span is wider than one column, so the `[span || holder PK]`
-    split must land at the whole span's width."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
-        "CREATE UNIQUE INDEX ON t(a, b)")
-    insert(client, "t", [(1, 1, 1), (2, 2, 2)])
-    with _violation():
-        client.execute_sql(
-            f"INSERT INTO t VALUES (2, 3, 3), ({_HOLDER_PK}, 1, 1)"
-            " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b")
-    assert bag(scanned(client, "t")) == {(1, 1, 1): 1, (2, 2, 2): 1}
-
-
-def test_replicated_owner_holder_is_deduped_and_decisive(client):
-    """Every worker holds a replicated table's whole index, so every worker
-    answers for the same span. The `W` identical answers must collapse to one
-    holder, and that holder must decide the verdict: the same bundle shape is
-    rejected when the holder keeps the value and accepted when it releases it
-    in the same bundle."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) WITH (replicated = true); "
-        "CREATE UNIQUE INDEX ON t(a)")
-    insert(client, "t", [(1, 42), (2, 77)])
-
-    # pk=1 keeps 42 → the fresh claim collides.
-    with _violation():
-        client.execute_sql(f"INSERT INTO t VALUES (2, 88), ({_HOLDER_PK}, 42)" + _UPSERT_A)
-    assert bag(scanned(client, "t")) == {(1, 42): 1, (2, 77): 1}
-
-    # Same bundle, but the holder releases 42 in it → accepted.
-    client.execute_sql(f"INSERT INTO t VALUES (1, 99), ({_HOLDER_PK}, 42)" + _UPSERT_A)
-    assert bag(scanned(client, "t")) == {(1, 99): 1, (2, 77): 1, (_HOLDER_PK, 42): 1}

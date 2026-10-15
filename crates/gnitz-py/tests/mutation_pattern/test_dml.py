@@ -1,5 +1,6 @@
-"""SQL writes: what an INSERT's VALUES clause spells, and how UPDATE and DELETE
-find their rows, committed and buffered alike.
+"""SQL writes: what an INSERT's VALUES clause spells and its ON CONFLICT
+resolves, and how UPDATE and DELETE find their rows, committed and buffered
+alike.
 
 UPDATE and DELETE resolve their targets through one access-path ladder — PK
 equality, a PK set, a PK range or compound prefix, a unique or non-unique
@@ -18,6 +19,7 @@ leave the given Z-set.
 import gnitz
 import pytest
 from _read import bag, rows, scanned
+from _sql import insert, values
 
 _U64_MAX = (1 << 64) - 1
 _I64_MIN = -(1 << 63)
@@ -188,3 +190,50 @@ def test_an_update_over_a_pk_set_reads_back_every_committed_row(client):
     client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id IN ({in_list})")
     assert bag(scanned(client, "t")) == \
         {(i, i * 10 + (i in wanted)): 1 for i in range(n)}
+
+
+# `(committed rows, statement, rows after)`: `ON CONFLICT` resolves the PK
+# conflict a plain INSERT would be refused on.
+_ON_CONFLICT = {
+    "do nothing with no target": (
+        [(1, 10)], "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT DO NOTHING", [(1, 10), (2, 30)]),
+    "do nothing, conflicts beside a fresh row": (
+        [(1, 10), (2, 20)], "INSERT INTO t VALUES (1, 999), (2, 999), (3, 30) ON CONFLICT (pk) DO NOTHING",
+        [(1, 10), (2, 20), (3, 30)]),
+    "do update from EXCLUDED": (
+        [(1, 10)], "INSERT INTO t VALUES (1, 100), (2, 200) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+        [(1, 100), (2, 200)]),
+    "do update from a literal": (
+        [(1, 10)], "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = 42", [(1, 42)]),
+}
+
+
+@pytest.mark.parametrize("committed,stmt,final", _ON_CONFLICT.values(), ids=_ON_CONFLICT.keys())
+def test_on_conflict_resolves_instead_of_rejecting(client, committed, stmt, final):
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+    insert(client, "t", committed)
+    client.execute_sql(stmt)
+    # A conflict resolved on a worker other than the key's owner leaves the
+    # original row beside its replacement.
+    assert bag(scanned(client, "t")) == dict.fromkeys(final, 1)
+
+
+@pytest.mark.parametrize("arity", [2, 3])
+def test_a_conflict_target_may_name_a_whole_compound_key(client, arity):
+    """The target is the primary key whatever its arity, so the probe resolving
+    which rows conflict has to compare the whole packed key. A probe that
+    compared a prefix would report the new key as a conflict and update the wrong
+    row; one that compared nothing would insert a duplicate."""
+    keys = ", ".join("abc"[:arity])
+
+    def row(k, v):
+        return (k,) * arity + (v,)
+
+    client.execute_sql(
+        "CREATE TABLE c (" + ", ".join(f"{k} BIGINT UNSIGNED NOT NULL" for k in "abc"[:arity])
+        + f", v BIGINT NOT NULL, PRIMARY KEY ({keys}))")
+    insert(client, "c", [row(1, 10), row(2, 20)])
+    client.execute_sql(
+        f"INSERT INTO c VALUES {values([row(1, 111), row(3, 30)])} "
+        f"ON CONFLICT ({keys}) DO UPDATE SET v = EXCLUDED.v")
+    assert bag(scanned(client, "c")) == dict.fromkeys([row(1, 111), row(2, 20), row(3, 30)], 1)

@@ -64,6 +64,13 @@ fn transaction_control_refuses_what_it_cannot_honour() {
         ("CREATE INDEX ON t (v)", "not allowed inside a transaction"),
         ("DROP TABLE t", "not allowed inside a transaction"),
         ("SHOW TABLES", "unsupported SQL statement"),
+        // Refused at COMMIT instead, the write would take the open
+        // transaction's other writes with it.
+        (
+            "INSERT INTO _system.tables VALUES (999999, 1, 'x', 0, 0)",
+            "is a system table",
+        ),
+        ("DELETE FROM _system.tables WHERE table_id = 2", "is a system table"),
     ]) {
         db.refuses(sql, Rejected, needle);
         assert!(db.client.txn_active(), "`{sql}` closed the transaction");

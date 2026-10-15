@@ -113,9 +113,10 @@ _MEMBER_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
                  " PRIMARY KEY (b, a))")
 _LOOP = "CREATE TABLE loop (id BIGINT PRIMARY KEY REFERENCES loop(id))"
 
-# `(ddl, rows seeded per table, statements, every table's rows after — or None
-# where the statements are refused and every table keeps its seed)`.
-_STATEMENTS = {
+# `(ddl, rows seeded per table, the write, every table's rows after — or None
+# where the write is refused and every table keeps its seed)`. A write is SQL
+# statements, or a binary `(verb, table, rows pushed or pks deleted)`.
+_WRITES = {
     "a referenced parent's delete": (_FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 1", None),
     "a referenced HUGEINT value's delete": (_HUGE_PAIR, _HUGE_ROWS, "DELETE FROM p WHERE pid = 1", None),
     "an unreferenced HUGEINT value's delete": (
@@ -205,21 +206,6 @@ _STATEMENTS = {
         {"parent": [(1,)], "child": [(1, 7)]}),
     # A row referencing itself exempts itself.
     "a self-referencing PK row": (_LOOP, {"loop": [(1,)]}, "DELETE FROM loop", {"loop": []}),
-}
-
-
-@pytest.mark.parametrize("ddl,seed,stmts,after", _STATEMENTS.values(), ids=_STATEMENTS.keys())
-def test_a_statement_lands_only_if_every_reference_survives_its_fold(
-        client, ddl, seed, stmts, after):
-    _fk.seed(client, ddl, seed)
-    with _fk.refused() if after is None else contextlib.nullcontext():
-        client.execute_sql(stmts)
-    assert _fk.held(client, seed) == _fk.want(after or seed)
-
-
-# `(ddl, rows seeded per table, (verb, table, rows pushed or pks deleted), every
-# table's rows after — or None where the write is refused)`.
-_WRITES = {
     # `retract(1)` beside `insert(2, parent=1)`: probing committed state finds 1
     # present and would leave a durable dangling reference.
     "a push removing the parent it references": (
@@ -251,33 +237,36 @@ _WRITES = {
 }
 
 
-@pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
-def test_a_binary_write_lands_only_if_every_reference_survives_its_fold(
-        client, ddl, seed, write, after):
-    _fk.seed(client, ddl, seed)
+def _write(client, write):
+    if isinstance(write, str):
+        client.execute_sql(write)
+        return
     verb, table, payload = write
     tid, schema = client.resolve_table(table)
+    if verb == "push":
+        client.push(tid, gnitz.ZSetBatch(schema).extend(payload))
+    else:
+        client.delete(tid, schema, payload)
 
+
+@pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
+def test_a_write_lands_only_if_every_reference_survives_its_fold(client, ddl, seed, write, after):
+    _fk.seed(client, ddl, seed)
     with _fk.refused() if after is None else contextlib.nullcontext():
-        if verb == "push":
-            client.push(tid, gnitz.ZSetBatch(schema).extend(payload))
-        else:
-            client.delete(tid, schema, payload)
+        _write(client, write)
     assert _fk.held(client, seed) == _fk.want(after or seed)
 
 
 def test_a_refused_parent_write_names_its_verb(client):
     """Through a non-PK unique column: moving a referenced code is refused as an
-    update, removing its row as a delete, and an unreferenced code moves."""
+    update, and removing its row as a delete."""
     _fk.seed(client, _CODE_PAIR, _CODE_ROWS)
     refused = lambda verb: pytest.raises(gnitz.GnitzIntegrityError, match=f"cannot {verb} ")
     with refused("update"):
         client.execute_sql("UPDATE p SET code = 5 WHERE pid = 3")
     with refused("delete from"):
         client.execute_sql("DELETE FROM p WHERE pid = 3")
-    client.execute_sql("UPDATE p SET code = 5 WHERE pid = 15")
-    moved = [(15, 5) if pid == 15 else (pid, code) for pid, code in _CODES]
-    assert _fk.held(client, _CODE_ROWS) == _fk.want({"p": moved, "c": _CODES[:10]})
+    assert _fk.held(client, _CODE_ROWS) == _fk.want(_CODE_ROWS)
 
 
 def test_restrict_over_more_values_than_one_write_carries(client):
@@ -302,16 +291,7 @@ def test_restrict_over_more_values_than_one_write_carries(client):
     assert _fk.held(client, seed) == {"parent": {}, "child": {}}
 
 
-# ── What a declaration registers and what it gates ───────────────────────────
-
-def test_only_a_base_table_registers_an_fk_and_a_self_reference_names_itself(client):
-    client.execute_sql(_TREE + "; CREATE VIEW tree_v AS SELECT id, parent_id FROM tree")
-    tid, _ = client.resolve_table("tree")
-    vid, _ = client.resolve_table("tree_v")
-    fks = {(r.owner_id, r.col_idx): r.fk_table_id
-           for r in client.scan(gnitz.COL_TAB, gnitz.sys_schema(gnitz.COL_TAB)) if r.owner_id in (tid, vid)}
-    assert fks == {(tid, 0): 0, (tid, 1): tid, (vid, 0): 0, (vid, 1): 0}
-
+# ── What a declaration gates ─────────────────────────────────────────────────
 
 def test_dup_name_fk_create_leaves_no_phantom_child(client):
     """A duplicate-name CREATE TABLE whose column REFERENCES a parent must not
@@ -341,7 +321,7 @@ def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client):
     leave the constraint with no way to answer — the same gate `DROP TABLE` on
     the parent has, one level down."""
     client.execute_sql(_CODE_PAIR)
-    with pytest.raises(gnitz.GnitzRefusedError, match="(?i)integrity"):
+    with pytest.raises(gnitz.GnitzRefusedError, match="no unique index would remain"):
         client.execute_sql("DROP INDEX p_code")
     client.execute_sql("DROP TABLE c; DROP INDEX p_code")
 
@@ -361,4 +341,3 @@ def test_restrict_survives_dropping_a_unique_index_on_the_fk_column(client):
     client.execute_sql(f"DROP INDEX {client.schema}__child__idx_pid")
     with _fk.refused():
         client.execute_sql("DELETE FROM parent WHERE id = 1")
-    client.execute_sql("DROP TABLE child; DROP TABLE parent")

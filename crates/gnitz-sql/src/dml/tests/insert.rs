@@ -161,6 +161,12 @@ fn a_refused_insert_names_its_rule() {
         ("INSERT INTO t VALUES (2, NULL, 'b')", "column 'v' violates NOT NULL"),
         ("INSERT INTO t (id, s) VALUES (2, 'b')", "column 'v' violates NOT NULL"),
         ("INSERT INTO t VALUES (NULL, 20, 'b')", "column 'id' violates NOT NULL"),
+        // Refused before the merge reads it: an unvalidated NULL would be read
+        // back as a real 0 and committed.
+        (
+            "INSERT INTO t VALUES (1, NULL, 'b') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.s",
+            "column 'v' violates NOT NULL",
+        ),
         ("INSERT INTO t DEFAULT VALUES", "without VALUES"),
         ("INSERT INTO t SELECT * FROM t", "only supports VALUES"),
         ("INSERT INTO t VALUES (2, 20, 'b') LIMIT 1", "LIMIT/OFFSET"),

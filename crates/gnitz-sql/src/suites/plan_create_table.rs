@@ -291,6 +291,11 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
             "CREATE TABLE s (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a)) WITH (stream = true)",
             "UNIQUE",
         ),
+        // A stream holds no rows, so it has no store to compress.
+        (
+            "CREATE TABLE s (id BIGINT PRIMARY KEY, b TEXT) WITH (stream = true, compress = true)",
+            "cannot be compressed",
+        ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
     }

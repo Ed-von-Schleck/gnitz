@@ -166,7 +166,7 @@ def test_a_catalog_view_created_after_the_last_one_was_dropped_is_exact(client, 
 
 
 def test_a_failed_bundle_leaves_every_catalog_view_unchanged(client):
-    """Both bundles are refused by the engine, the first after its column and
+    """Each bundle is refused by the engine, the views' after their column and
     circuit rows were applied."""
     sid = _tables_view(client)
     client.execute_sql(
@@ -184,11 +184,13 @@ def test_a_failed_bundle_leaves_every_catalog_view_unchanged(client):
         )
 
     before = snapshot()
-    for stmt in [
-        "CREATE VIEW sv AS SELECT * FROM _system.sequences",
-        "CREATE TABLE _system.mine (id BIGINT NOT NULL PRIMARY KEY)",
+    for stmt, refusal in [
+        ("CREATE VIEW sv AS SELECT * FROM _system.sequences", "holds no set a view can scan"),
+        ("CREATE TABLE _system.mine (id BIGINT NOT NULL PRIMARY KEY)", "system schema takes no relation"),
+        ("CREATE VIEW _system.mine AS SELECT table_id, name FROM _system.tables",
+         "system schema takes no relation"),
     ]:
-        with pytest.raises(gnitz.GnitzRefusedError):
+        with pytest.raises(gnitz.GnitzRefusedError, match=refusal):
             client.execute_sql(stmt)
         assert snapshot() == before, stmt
 

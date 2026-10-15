@@ -1,12 +1,14 @@
 """The catalog's object lifecycle: a table's declared shape coming back
-unchanged, a dropped relation's id retiring while its siblings keep serving,
-and a dropped index vanishing from the next statement another connection plans.
+unchanged, the foreign key a column registers, a dropped relation's id retiring
+while its siblings keep serving, and a dropped index vanishing from the next
+statement another connection plans.
 
 The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 """
 
 import gnitz
 import pytest
+from _catalog import family
 from _read import access, bag, rows
 from _schemas import KV
 
@@ -34,6 +36,17 @@ def test_create_table_hands_back_the_declared_columns_up_to_the_cap(client):
     assert resolved == tid
     assert [(c.name, c.type_code) for c in schema.columns] == [(c.name, c.type_code) for c in cols]
     assert schema.pk_indices == [1]
+
+
+def test_only_a_base_table_registers_an_fk_and_a_self_reference_names_itself(client):
+    client.execute_sql(
+        "CREATE TABLE tree (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT REFERENCES tree(id)); "
+        "CREATE VIEW tree_v AS SELECT id, parent_id FROM tree")
+    tid, _ = client.resolve_table("tree")
+    vid, _ = client.resolve_table("tree_v")
+    assert family(client, "columns", "owner_id", "col_idx", "fk_table_id",
+                  where=f"owner_id IN ({tid}, {vid})") == \
+        {(tid, 0, 0): 1, (tid, 1, tid): 1, (vid, 0, 0): 1, (vid, 1, 0): 1}
 
 
 def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):

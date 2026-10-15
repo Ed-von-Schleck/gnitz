@@ -552,9 +552,41 @@ fn a_qualified_name_reaches_another_schema() {
             Refused(Error),
             "the system schema takes no relation",
         ),
-        // A family is no base table to the statements that need one.
+        (
+            "CREATE VIEW _system.mine AS SELECT table_id, name FROM _system.tables",
+            Refused(Error),
+            "the system schema takes no relation",
+        ),
+        // `sequences` holds positions rather than a set, and no worker holds it.
+        (
+            "CREATE VIEW sv AS SELECT * FROM _system.sequences",
+            Refused(Error),
+            "holds no set a view can scan",
+        ),
+        (
+            "DROP TABLE _system.tables",
+            Refused(Error),
+            "cannot DROP a system table",
+        ),
+        (
+            "ALTER TABLE _system.tables RENAME TO relations",
+            Refused(Error),
+            "cannot ALTER a system table",
+        ),
+        // A family is no base table to the statements that need one, refused
+        // before any row is read.
         (
             "ALTER TABLE _system.tables ADD COLUMN extra BIGINT",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "ALTER TABLE _system.tables DROP COLUMN flags",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "ALTER TABLE _system.tables RENAME COLUMN name TO label",
             Rejected,
             "is a system table",
         ),
@@ -569,7 +601,28 @@ fn a_qualified_name_reaches_another_schema() {
             "is a system table",
         ),
         (
+            "CREATE UNIQUE INDEX sysux ON _system.tables (name)",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "CREATE TABLE fk_sys (id BIGINT PRIMARY KEY, \
+             t BIGINT UNSIGNED NOT NULL REFERENCES _system.tables(table_id))",
+            Rejected,
+            "is a system table",
+        ),
+        (
             "INSERT INTO _system.schemas VALUES (99, 'forged')",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "UPDATE _system.tables SET name = 'x' WHERE table_id = 2",
+            Rejected,
+            "is a system table",
+        ),
+        (
+            "DELETE FROM _system.tables WHERE table_id = 2",
             Rejected,
             "is a system table",
         ),

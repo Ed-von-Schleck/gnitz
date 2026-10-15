@@ -1,10 +1,11 @@
 """The server refuses what it cannot serve before anything exists.
 
-The refusals themselves are unit-tested (`gnitz-server/src/tests/main.rs`, and
-the TLS ones beside `TlsArgs::resolve`). What only a spawn can show is that each
-ends the process as a usage error with no data directory created, and that an
-environment knob the server cannot read stops the boot instead of running at a
-default nobody asked for.
+The refusals themselves, and what each names, are unit-tested
+(`gnitz-server/src/tests/main.rs`, and the TLS ones beside `TlsArgs::resolve`).
+What only a spawn can show is that a refusal ends the process as a usage error
+with no data directory created — from the argv parser and from the TLS
+resolution that runs after it — and that an environment knob the server cannot
+read stops the boot instead of running at a default nobody asked for.
 """
 
 import os
@@ -17,41 +18,14 @@ from _serverproc import server_binary, server_env
 EX_USAGE = 64
 
 
-def _refused(server, *args, **kw):
-    """Boot with `args` appended, which argv refuses. Returns the boot's output."""
-    assert server.start_expecting_exit(extra_args=args, **kw) == EX_USAGE
-    assert not os.path.exists(server.data_dir), "a refused argv creates nothing"
-    return server.log_text()
-
-
-def test_out_of_range_workers_is_a_usage_error(own_server):
-    assert "--workers" in _refused(own_server, workers=10_000)
-
-
-def test_an_unknown_flag_is_not_a_positional(own_server):
-    assert "--workerz=4" in _refused(own_server, "--workerz=4")
-
-
-def test_a_space_separated_flag_value_is_refused(own_server):
-    assert '"--workers"' in _refused(own_server, "--workers", "4")
-
-
-def test_a_third_positional_is_refused(own_server):
-    assert "/third" in _refused(own_server, "/third")
-
-
-def test_a_public_bind_without_client_authentication_is_refused(own_server):
-    assert "--allow-unauthenticated" in _refused(own_server, "--tls-listen=0.0.0.0:0")
-
-
-def test_one_public_address_needs_a_certificate_naming_it(own_server):
-    out = _refused(own_server, "--tls-listen=192.0.2.1:0", "--allow-unauthenticated")
-    assert "--tls-cert" in out and "--tls-name" in out
-
-
-def test_an_unreadable_pem_file_is_refused(own_server):
-    out = _refused(own_server, "--tls-cert=/nonexistent/cert.pem", "--tls-key=/nonexistent/key.pem")
-    assert "/nonexistent/cert.pem" in out
+@pytest.mark.parametrize("args,named", [
+    (("--workerz=4",), "--workerz=4"),
+    (("--tls-listen=0.0.0.0:0",), "--allow-unauthenticated"),
+], ids=["argv", "tls"])
+def test_a_refused_command_line_is_a_usage_error_that_creates_nothing(own_server, args, named):
+    assert own_server.start_expecting_exit(extra_args=args) == EX_USAGE
+    assert not os.path.exists(own_server.data_dir)
+    assert named in own_server.log_text()
 
 
 @pytest.mark.parametrize("flag", ["--help", "-h"])
@@ -79,6 +53,10 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_CPU_AFFINITY", "off"),
     ("GNITZ_DISABLE_IO_URING", "flase"),
     ("GNITZ_LOG_LEVEL", "verbos"),
+    ("GNITZ_CASCADE_BYTES", "1MB"),
+    ("GNITZ_FK_PRESENCE_KEYS", "-1"),
+    ("GNITZ_PUSH_QUEUE_BYTES", "8M"),
+    ("GNITZ_PATIENT_TICK_GAP_MS", "10ms"),
 ])
 def test_an_unreadable_environment_knob_stops_the_boot(own_server, var, value):
     assert own_server.start_expecting_exit(extra_env={var: value}) != 0

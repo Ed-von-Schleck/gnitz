@@ -216,6 +216,15 @@ def client(server):
         yield conn
 
 
+@pytest.fixture
+def other_client(server):
+    """A second connection to the session server, in a fresh schema of its own
+    beside `client`'s. Requested after `client`, it is dropped first — so a view
+    of `client`'s still reading it fails that drop."""
+    with _in_fresh_schema(server, "o") as conn:
+        yield conn
+
+
 @pytest.fixture(scope="module")
 def module_client(_srv, tmp_path_factory, _sock_path, request):
     """A connection and schema shared by one module — for fixtures whose data no

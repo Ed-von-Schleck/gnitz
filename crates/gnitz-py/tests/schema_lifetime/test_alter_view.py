@@ -152,18 +152,12 @@ def test_a_renamed_source_leaves_the_definition_standing(client, base):
     assert not _replaces(client, "CREATE OR REPLACE VIEW v AS SELECT id, a_new AS a FROM u")
 
 
-def test_one_text_read_in_another_schema_is_another_definition(client, base, server):
+def test_one_text_read_in_another_schema_is_another_definition(client, base, other_client):
     client.execute_sql("CREATE VIEW v AS SELECT id, a FROM t")
     before = client.resolve_table("v")[0]
-    other = f"o{client.schema}"
-    client.create_schema(other)
-    try:
-        with gnitz.connect(server, schema=other) as second:
-            second.execute_sql(
-                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
-            second.execute_sql(f"CREATE OR REPLACE VIEW {client.schema}.v AS SELECT id, a FROM t")
-        assert client.resolve_table("v")[0] != before
-        assert bag(scanned(client, "v"), "id", "a") == {}
-        client.execute_sql("DROP VIEW v")
-    finally:
-        client.drop_schema(other)
+    other_client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
+    other_client.execute_sql(f"CREATE OR REPLACE VIEW {client.schema}.v AS SELECT id, a FROM t")
+    assert client.resolve_table("v")[0] != before
+    assert bag(scanned(client, "v"), "id", "a") == {}
+    client.execute_sql("DROP VIEW v")

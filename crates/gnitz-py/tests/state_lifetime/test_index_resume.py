@@ -26,8 +26,9 @@ from _sql import insert
                          ids=["same-count", "relayout"])
 @pytest.mark.parametrize("owner,ddl", [
     ("t", "CREATE INDEX ON t(g)"),
+    ("t", "CREATE UNIQUE INDEX ON t(g)"),
     ("v", "CREATE VIEW v AS SELECT id, g FROM t; CREATE INDEX ON v(g)"),
-], ids=["table", "view"])
+], ids=["table", "unique", "view"])
 def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, owner, ddl):
     """A graceful stop's shutdown barrier runs a full checkpoint sequence, whose
     ephemeral round publishes every worker's index at the committed generation.
@@ -35,7 +36,8 @@ def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, 
     silent rebuild, so the marker is the discriminating assertion. A restart at
     a different count moves every rank's index home at once: each launched rank
     re-derives its own slice of the one index, and no child written at the old
-    count survives on disk."""
+    count survives on disk. A unique index still refuses a held value, on an
+    INSERT and on an UPDATE, and admits a fresh one."""
     own_server.start(workers=wrote)
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
@@ -50,6 +52,12 @@ def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, 
         for i in (0, 63):
             assert bag(conn.seek_by_index(rid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the restart"
+        if "UNIQUE" in ddl:
+            for stmt in ("INSERT INTO t VALUES (1000, 630)", "UPDATE t SET g = 0 WHERE id = 5"):
+                with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
+                    conn.execute_sql(stmt)
+            conn.execute_sql("INSERT INTO t VALUES (1000, 5)")
+            assert bag(scanned(conn, "t")) == dict.fromkeys([(i, i * 10) for i in range(64)] + [(1000, 5)], 1)
 
     assert own_server.rebuilt_index_counts() == [rebuilt] * own_server.workers
     children = [d for d in os.listdir(relation_dir(own_server.data_dir, rid)) if d.startswith("idx_")]

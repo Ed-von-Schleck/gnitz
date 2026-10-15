@@ -2,8 +2,8 @@
 
 A stream holds no rows and nothing it ingests is recovered, so no binary read
 verb serves one — zero rows would make it indistinguishable from an empty table
-— and no transaction may write one. The SQL statements a stream refuses are
-pinned in the planner's own tests.
+— no transaction may write one, and no push may assert a unique key it does not
+have. The SQL statements a stream refuses are pinned in the planner's own tests.
 """
 
 import pytest
@@ -32,7 +32,7 @@ def test_no_binary_read_verb_serves_a_stream(conn):
         lambda: conn.scan_many([(tid, schema)]),
         lambda: conn.delta_bootstrap(tid, schema),
     ):
-        with pytest.raises(gnitz.GnitzRefusedError, match="stream"):
+        with pytest.raises(gnitz.GnitzRefusedError, match="a stream holds no rows and cannot be read"):
             verb()
 
 
@@ -42,17 +42,16 @@ def test_a_transaction_writing_a_stream_is_refused_whole(conn):
     ordinary table included, rather than lost after a partial commit."""
     t_tid, t_schema = conn.resolve_table("t")
     s_tid, s_schema = conn.resolve_table("s")
-    with pytest.raises(gnitz.GnitzRefusedError, match="stream"):
+    with pytest.raises(gnitz.GnitzRefusedError, match="a stream cannot be written inside a transaction"):
         with conn.transaction() as txn:
             txn.push(t_tid, gnitz.ZSetBatch(t_schema).extend([{"id": 1, "kind": 1}]))
             txn.push(s_tid, gnitz.ZSetBatch(s_schema).extend([{"id": 2, "kind": 2, "amount": 2}]))
     assert bag(conn.scan(t_tid, t_schema)) == {}, "the table's write must be refused with it"
 
 
-def test_a_stream_cannot_be_compressed(module_client):
-    """A stream holds no rows, so it has no store to compress."""
-    with pytest.raises(gnitz.GnitzError, match="cannot be compressed"):
-        module_client.execute_sql(
-            "CREATE TABLE sc (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, body TEXT NOT NULL) "
-            "WITH (stream = true, compress = true)"
-        )
+def test_an_error_mode_push_to_a_stream_is_refused(conn):
+    """Conflict mode `error` asserts that no pushed key is present yet, and a
+    stream's key is not unique: duplicates are its ordinary content."""
+    tid, schema = conn.resolve_table("s")
+    with pytest.raises(gnitz.GnitzRefusedError, match="conflict mode 'error' asserts a primary-key"):
+        conn.push(tid, gnitz.ZSetBatch(schema).extend([{"id": 1, "kind": 1, "amount": 1}]), mode="error")

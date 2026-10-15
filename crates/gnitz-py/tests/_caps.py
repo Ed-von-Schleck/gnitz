@@ -40,4 +40,4 @@ def first_rejected(run, ns):
             assert names_a_cap(e), f"n={n}: the message must name the limit, got: {e}"
             assert n > ns.start, f"n={n}: the smallest shape must be servable"
             return n
-    pytest.fail(f"no n in {ns} crossed the register cap")
+    pytest.fail(f"no n in {ns} crossed a cap")

@@ -1,10 +1,9 @@
 """What the catalog and the wire refuse from a client binding: a pushed schema
-that disagrees with its target, a write aimed at a view, a system relation, a
-base table under a live view, a reserved name, and a relation that is not
-there.
+that disagrees with its target, a write aimed at a view or a system table, a
+base table under a live view, and a relation that is not there.
 
-The engine — not the SQL planner — has to hold these, because every path below
-is a shipped client binding that validates nothing on the way in.
+The engine — not the SQL planner — has to hold the writes, because a binary
+push or delete is a shipped client binding no planner stands in front of.
 """
 
 from decimal import Decimal
@@ -13,47 +12,34 @@ import pytest
 import gnitz
 from _read import bag
 from _schemas import KV
-from _uid import uid
-
-_NOT_WRITABLE = "is not writable"
 
 
-def test_a_push_whose_pk_type_disagrees_is_rejected(client):
-    """A push whose schema lays out a U64 PK as I64 is refused, not reinterpreted
-    at rest; which mismatches the gate distinguishes is pinned in Rust."""
-    tid = client.create_table("t", KV)
-    signed_pk = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64), KV.columns[1]], [0])
-    with pytest.raises(gnitz.GnitzRefusedError, match="Schema mismatch"):
-        client.push(tid, gnitz.ZSetBatch(signed_pk).extend([{"pk": 1, "val": 42}]))
-    assert bag(client.scan(tid, KV)) == {}
-
-
-def test_a_push_whose_decimal_scale_disagrees_is_rejected(client):
-    """A DECIMAL's stored integer means a different number at every scale, so a
-    push encoded at scale 2 onto a scale-4 column would read `1.50` back as
-    `0.0150`. The gate compares the scale; the same push at scale 4 lands."""
+def test_a_push_whose_schema_disagrees_is_refused(client):
+    """A push laying out a U64 PK as I64, or a DECIMAL at another scale, is
+    refused rather than reinterpreted at rest: a scale-2 `1.50` on a scale-4
+    column would read back as `0.0150`. Which mismatches the gate distinguishes
+    is pinned in Rust; the same row in the table's own schema lands."""
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10,4) NOT NULL)")
-    tid, t_schema = client.resolve_table("t")
+        "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, d DECIMAL(10,4) NOT NULL)")
+    tid, schema = client.resolve_table("t")
+    pk, d = schema.columns
+    row = {"pk": 1, "d": Decimal("1.50")}
+    for cols in ([gnitz.ColumnDef("pk", gnitz.TypeCode.I64), d],
+                 [pk, gnitz.ColumnDef("d", gnitz.TypeCode.DECIMAL, scale=2)]):
+        with pytest.raises(gnitz.GnitzRefusedError, match="Schema mismatch"):
+            client.push(tid, gnitz.ZSetBatch(gnitz.Schema(cols, [0])).extend([row]))
+    assert bag(client.scan(tid, schema)) == {}
 
-    def at_scale(scale):
-        schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64),
-                               gnitz.ColumnDef("d", gnitz.TypeCode.DECIMAL, scale=scale)], [0])
-        return gnitz.ZSetBatch(schema).extend([{"pk": 1, "d": Decimal("1.50")}])
-
-    with pytest.raises(gnitz.GnitzRefusedError, match="Schema mismatch"):
-        client.push(tid, at_scale(2))
-    assert bag(client.scan(tid, t_schema)) == {}
-
-    client.push(tid, at_scale(4))
-    assert bag(client.scan(tid, t_schema), "pk", "d") == {(1, Decimal("1.5000")): 1}
+    client.push(tid, gnitz.ZSetBatch(schema).extend([row]))
+    assert bag(client.scan(tid, schema)) == {(1, Decimal("1.5000")): 1}
 
 
-def test_writes_to_a_view_are_rejected_and_change_nothing(client):
-    """A view's tid lives in the same id space as a base table's, so a raw push
-    or delete addressed to one would commit rows its circuit never produced. SQL
-    refuses a view target in the binder; the raw API reaches only the server's
-    guard. It is one guard on
+@pytest.mark.parametrize("target", ["view", "system table"])
+def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target):
+    """A view's tid lives in the same id space as a base table's, and a system
+    family's rows are written by DDL alone, so a raw push or delete addressed to
+    either would commit rows nothing derived. SQL refuses both targets while
+    planning; the raw API reaches only the server's guard. It is one guard on
     every write, the empty-batch arm included — so a client bug producing an
     empty batch fails instead of being masked by the no-op ACK a base table
     still gives."""
@@ -61,91 +47,57 @@ def test_writes_to_a_view_are_rejected_and_change_nothing(client):
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE VIEW v AS SELECT * FROM t WHERE val > 50; "
         "INSERT INTO t VALUES (1, 100), (2, 10)")
-    tid, t_schema = client.resolve_table("t")
-    vid, v_schema = client.resolve_table("v")
-    batch = gnitz.ZSetBatch(v_schema).extend([{"pk": 999, "val": 999}])
+    if target == "view":
+        tid, schema = client.resolve_table("v")
+        row = {"pk": 999, "val": 999}
+    else:
+        tid, schema = gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB)
+        row = {"table_id": 999999, "schema_id": 1, "name": "forged", "pk_col_idx": 0, "flags": 0}
+    before = bag(client.scan(tid, schema))
+    assert before
 
-    for write in (lambda: client.push(vid, batch),
-                  lambda: client.delete(vid, v_schema, [1]),
-                  lambda: client.push(vid, gnitz.ZSetBatch(v_schema))):
-        with pytest.raises(gnitz.GnitzRefusedError, match=_NOT_WRITABLE):
+    for write in (lambda: client.push(tid, gnitz.ZSetBatch(schema).extend([row])),
+                  lambda: client.delete(tid, schema, [1]),
+                  lambda: client.push(tid, gnitz.ZSetBatch(schema))):
+        with pytest.raises(gnitz.GnitzRefusedError, match="is not writable"):
             write()
-    assert bag(client.scan(vid, v_schema)) == {(1, 100): 1}
+    assert bag(client.scan(tid, schema)) == before
 
-    # The same empty batch against the base table is the ordinary no-op ACK.
-    assert client.push(tid, gnitz.ZSetBatch(t_schema)) == 0
+    t_tid, t_schema = client.resolve_table("t")
+    assert client.push(t_tid, gnitz.ZSetBatch(t_schema)) == 0
 
 
 def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
     """A genuinely absent tid reports 'not found' rather than 'not writable',
-    and a name the client itself cannot resolve raises a catchable class, so a
-    caller branches on absence without matching prose."""
+    and an absent schema raises the same class, so a caller branches on absence
+    without matching prose. Every SQL verb's miss is pinned in Rust."""
     batch = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzNotFoundError, match="not found"):
         client.push(99999999, batch)
-    with pytest.raises(gnitz.GnitzNotFoundError):
-        client.scan(99999999, KV)
 
-    with pytest.raises(gnitz.GnitzNotFoundError, match="table 'nope' not found"):
-        client.drop_table("nope")
-
-    # SQL reports the same class for a read and a write.
-    for sql in ("SELECT * FROM nope", "INSERT INTO nope VALUES (1)"):
-        with pytest.raises(gnitz.GnitzNotFoundError):
-            client.execute_sql(sql)
-
-    with pytest.raises(gnitz.GnitzRefusedError):
+    absent = "schema 'nonexistent_schema_xyz' not found"
+    with pytest.raises(gnitz.GnitzNotFoundError, match=absent):
         client.drop_schema("nonexistent_schema_xyz")
     client.schema = "nonexistent_schema_xyz"
-    with pytest.raises(gnitz.GnitzRefusedError):
+    with pytest.raises(gnitz.GnitzNotFoundError, match=absent):
         client.create_table("t", KV)
 
 
-def test_create_schema_rejects_a_leading_underscore(client):
-    """`_` is the system prefix; `create_schema` is the one naming surface with
-    no SQL planner in front of the engine's rule."""
-    with pytest.raises(gnitz.GnitzRefusedError, match="cannot start with '_'"):
-        client.create_schema("_reserved")
-
-
-def test_system_relations_survive_a_rejected_drop(client):
-    """Neither a system table nor the system schema may be dropped, and the
-    rejected cascade must not have retracted a single member on its way to the
-    row it was rejected on."""
-    def sys_ids():
-        return {r["table_id"] for r in client.scan(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))
-                if r["table_id"] < gnitz.FIRST_USER_TABLE_ID}
-
-    before = sys_ids()
-    assert before, "bootstrap registered no system relations"
-
-    with pytest.raises(gnitz.GnitzRefusedError):
-        client.drop_schema("_system")
-    assert sys_ids() == before
-
-    client.schema = "_system"
-    with pytest.raises(gnitz.GnitzRefusedError):
-        client.drop_table("tables")
-    assert sys_ids() == before
-
-
-def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, server):
+def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, other_client):
     """The dependency graph the engine derives from a view's circuit gates DROP
     TABLE and the schema cascade that would reach the table, whichever schema
     the view lives in. The rejected drops leave the table intact, and dropping
-    the view lifts both."""
-    with gnitz.connect(server, schema="s" + uid()) as other:
-        other.create_schema(other.schema)
-        tid = other.create_table("t", KV)
-        client.create_view("v", f"{other.schema}.t")
+    the view lifts both: the cascade at teardown is the second."""
+    tid = other_client.create_table("t", KV)
+    client.create_view("v", f"{other_client.schema}.t")
 
-        for drop in (lambda: other.drop_table("t"), lambda: other.drop_schema(other.schema)):
-            with pytest.raises(gnitz.GnitzRefusedError, match="dependen"):
-                drop()
-        assert other.resolve_table("t")[0] == tid
+    for drop in (lambda: other_client.drop_table("t"),
+                 lambda: other_client.drop_schema(other_client.schema)):
+        with pytest.raises(gnitz.GnitzRefusedError, match=rf"dependent views \({client.schema}\.v\)"):
+            drop()
+    assert other_client.resolve_table("t")[0] == tid
 
-        client.drop_view("v")
-        other.drop_schema(other.schema)
+    client.drop_view("v")
 
 
 @pytest.mark.parametrize("tables,body,base", [
@@ -165,6 +117,7 @@ def test_a_generated_relation_holds_its_base_until_the_view_drops(client, tables
         "; ".join(f"CREATE TABLE {n} (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
                   "b BIGINT NOT NULL)" for n in tables)
         + f"; CREATE VIEW v AS {body}")
-    with pytest.raises(gnitz.GnitzRefusedError, match="dependen"):
+    # A generated relation surfaces as the user view that owns it.
+    with pytest.raises(gnitz.GnitzRefusedError, match=rf"dependent views \({client.schema}\.v\)"):
         client.execute_sql(f"DROP TABLE {base}")
     client.execute_sql(f"DROP VIEW v; DROP TABLE {base}")

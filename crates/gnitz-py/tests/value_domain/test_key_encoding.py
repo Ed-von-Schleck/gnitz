@@ -34,6 +34,7 @@ from decimal import Decimal
 import pytest
 import gnitz
 from _read import access, bag, rows, scanned
+from _sql import insert
 
 U64_MAX = 18446744073709551615
 
@@ -396,3 +397,20 @@ def test_a_lookup_key_names_its_row_exactly_where_a_written_cell_rounds(
     assert bag(gnitz.ZSetBatch(schema).append(k=inexact, v=2).rows()) == {(key, 2): 1}
     client.delete(tid, schema, [key])
     assert bag(scanned(client, "t")) == {}
+
+
+def test_a_smallint_unique_index_refuses_a_value_a_second_push_repeats(client):
+    """A 2-byte index key enforces across pushes at both ends of its range and
+    on both sides of zero: each seeded value is refused under a new PK, and a
+    value no row holds lands."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val SMALLINT NOT NULL); "
+        "CREATE UNIQUE INDEX ON t(val)")
+    seed = list(zip([1, 7, 13, 1000, 99999, 123456, 777777, 8888888, 73501234, 901234567],
+                    [-32768, -1, 0, 1, 32767, 7, -7, 100, -100, 255]))
+    insert(client, "t", seed)
+    for pk, val in seed:
+        with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation on '[^']*' column 'val'"):
+            insert(client, "t", [(pk + 1, val)])
+    insert(client, "t", [(5, 8), (6, -8)])
+    assert bag(scanned(client, "t")) == dict.fromkeys(seed + [(5, 8), (6, -8)], 1)

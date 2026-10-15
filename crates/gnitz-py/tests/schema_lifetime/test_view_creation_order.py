@@ -15,7 +15,6 @@ import pytest
 from _read import bag, scanned
 from _serverproc import NEEDS_MULTI, TINY_SCAN_CHUNKS
 from _shapes import SHAPES, views_ddl
-from _uid import uid
 
 
 @pytest.mark.parametrize("shape", list(SHAPES))
@@ -42,16 +41,16 @@ def _dim_of(pk):
 
 
 @NEEDS_MULTI
-def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(client, server):
+def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(client, other_client):
     """Each schema's exchange rounds stay bound to their own operand schema, and
     one table name in two schemas addresses two relations.
 
     The two facts differ in width (4 columns against 3) and the two view chains
     in depth, so an exchange that labelled its batches with the wrong side's schema
     would cross the two and produce wrong aggregates rather than none. Schema A
-    is asserted once before B exists and again after B is fully live, with a
-    further insert in between — that last insert is what makes A tick while B's
-    views are already running.
+    is asserted once before B holds a relation and again after B is fully live,
+    with a further insert in between — that last insert is what makes A tick
+    while B's views are already running.
     """
     a = client
 
@@ -82,8 +81,7 @@ def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(client, server):
     # B: a five-view chain over a 3-column fact, created while A is live. `v4`'s
     # threshold excludes the smallest label group, so the DISTINCT below it sees
     # fewer labels than `v3` produced.
-    b = gnitz.connect(server, schema="s" + uid())
-    b.create_schema(b.schema)
+    b = other_client
     b.execute_sql(
         "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, dim_pk BIGINT NOT NULL, "
         "amount BIGINT NOT NULL); "
@@ -116,7 +114,6 @@ def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(client, server):
     # A ticks while B's chain is live: its exchange rounds must still be A's own.
     a.execute_sql(fact_rows(_NFACT + 1, _NFACT + 21))
     assert bag(scanned(a, "v_agg"), "region", "total") == want_a(_NFACT + 21), "A after B"
-    b.drop_schema(b.schema)
 
 
 def test_the_backfill_streams_long_strings_across_chunk_boundaries(own_server):

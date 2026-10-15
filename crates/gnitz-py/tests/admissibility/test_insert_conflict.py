@@ -1,17 +1,17 @@
-"""What `INSERT` refuses on a primary key, and what `ON CONFLICT` admits instead.
+"""What `INSERT` refuses on a primary key.
 
 A plain `INSERT` ships conflict mode `Error`: a PK already present — in committed
 state or earlier in the same VALUES list — rejects the whole statement, and
-nothing is applied. `ON CONFLICT (pk)` replaces that verdict with DO NOTHING or
-DO UPDATE. The conflict targets and actions it does not support are pinned in
-the planner's own tests.
+nothing is applied. What `ON CONFLICT` admits instead is in
+mutation_pattern/test_dml.py; the conflict targets and actions it does not
+support are pinned in the planner's own tests.
 """
 
 import pytest
 import gnitz
 from _read import bag, scanned
 from _serverproc import NEEDS_MULTI
-from _sql import insert, values
+from _sql import insert
 
 _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
@@ -49,98 +49,3 @@ def test_duplicate_pk_rejects_the_whole_statement(client, ddl, committed, refuse
         with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)duplicate key"):
             client.execute_sql(stmt)
     assert bag(scanned(client, "t")) == dict.fromkeys(committed, 1)
-
-
-_ON_CONFLICT = [
-    ("do nothing skips the conflict",
-     "INSERT INTO t VALUES (1, 10)",
-     "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT (pk) DO NOTHING",
-     [(1, 10), (2, 30)]),
-    ("do nothing with no target",
-     "INSERT INTO t VALUES (1, 10)",
-     "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT DO NOTHING",
-     [(1, 10), (2, 30)]),
-    ("do nothing, every row conflicts",
-     "INSERT INTO t VALUES (1, 10), (2, 20)",
-     "INSERT INTO t VALUES (1, 999), (2, 999), (3, 30) ON CONFLICT (pk) DO NOTHING",
-     [(1, 10), (2, 20), (3, 30)]),
-    ("do update from EXCLUDED",
-     "INSERT INTO t VALUES (1, 10)",
-     "INSERT INTO t VALUES (1, 100), (2, 200) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-     [(1, 100), (2, 200)]),
-    ("do update from a literal",
-     "INSERT INTO t VALUES (1, 10)",
-     "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = 42",
-     [(1, 42)]),
-]
-
-
-@pytest.mark.parametrize("seed,stmt,final", [c[1:] for c in _ON_CONFLICT],
-                         ids=[c[0] for c in _ON_CONFLICT])
-def test_on_conflict_resolves_instead_of_rejecting(client, seed, stmt, final):
-    client.execute_sql(_T)
-    client.execute_sql(seed)
-    client.execute_sql(stmt)
-    # A conflict resolved on a worker other than the key's owner leaves the
-    # original row beside its replacement.
-    assert bag(scanned(client, "t")) == dict.fromkeys(final, 1)
-
-
-def test_insert_partial_column_list(client):
-    """A column list may name a subset in any order; every column it omits is
-    written NULL (gnitz has no column DEFAULTs), so omitting a NOT NULL one is
-    the NOT NULL violation — raised before anything is written."""
-    client.execute_sql("CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT); " + _T)
-    # Reordered as well as partial: the slot map, not the position, decides
-    # which column each VALUES element lands in.
-    client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)")
-    client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')")
-    assert bag(scanned(client, "p")) == {(1, None, "x"): 1, (2, 20, "y"): 1}
-
-    with pytest.raises(gnitz.GnitzRefusedError, match="(?i)not null"):
-        client.execute_sql("INSERT INTO t (pk) VALUES (1)")
-    assert bag(scanned(client, "t")) == {}
-
-
-def test_do_update_over_a_string_column_and_a_rejected_null(client):
-    """`SET s = EXCLUDED.s` takes the string classifier arm, which the integer
-    tables above never reach. A NULL under a NOT NULL column has to be refused
-    before the merge reads it: the merged batch is the only thing this plan
-    pushes, so an unvalidated NULL would be read back as a real 0 and committed
-    silently."""
-    client.execute_sql(
-        "CREATE TABLE s (pk BIGINT NOT NULL PRIMARY KEY, txt TEXT NOT NULL, "
-        "v BIGINT NOT NULL)")
-    client.execute_sql("INSERT INTO s VALUES (1, 'old', 10)")
-
-    client.execute_sql(
-        "INSERT INTO s VALUES (1, 'new', 11), (2, 'fresh', 22) "
-        "ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt")
-    want = {(1, "new", 10): 1, (2, "fresh", 22): 1}
-    assert bag(scanned(client, "s")) == want
-
-    with pytest.raises(gnitz.GnitzRefusedError, match="(?i)not null"):
-        client.execute_sql(
-            "INSERT INTO s VALUES (1, NULL, 0) ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt")
-    assert bag(scanned(client, "s")) == want, "no silent write survived the refusal"
-
-
-@pytest.mark.parametrize("arity", [2, 3])
-def test_a_conflict_target_may_name_a_whole_compound_key(client, arity):
-    """The target is the primary key whatever its arity, so the probe resolving
-    which rows conflict has to compare the whole packed key. A probe that
-    compared a prefix would report the new key as a conflict and update the wrong
-    row; one that compared nothing would insert a duplicate."""
-    keys = ", ".join("abc"[:arity])
-
-    def row(k, v):
-        return (k,) * arity + (v,)
-
-    client.execute_sql(
-        "CREATE TABLE c (" + ", ".join(f"{k} BIGINT UNSIGNED NOT NULL" for k in "abc"[:arity])
-        + f", v BIGINT NOT NULL, PRIMARY KEY ({keys}))")
-    insert(client, "c", [row(1, 10), row(2, 20)])
-    client.execute_sql(
-        f"INSERT INTO c VALUES {values([row(1, 111), row(3, 30)])} "
-        f"ON CONFLICT ({keys}) DO UPDATE SET v = EXCLUDED.v")
-    assert bag(scanned(client, "c")) == dict.fromkeys([row(1, 111), row(2, 20), row(3, 30)], 1)

@@ -54,6 +54,46 @@ def test_every_insert_acked_across_an_add_column_reads_back(client, server):
         {(k, k, c): 1 for k, c in acked.items()}
 
 
+def test_every_insert_acked_across_a_create_unique_index_reads_back(client, server):
+    """An inserter of distinct values runs across `CREATE UNIQUE INDEX`. The
+    catalog write lock orders every INSERT strictly before or after the
+    pre-flight and backfill snapshot, so every one is acked, the index is
+    created, and it enforces each value an ACK wrote — the backfilled ones and
+    those inserted after it. It keeps going for a fixed count after the CREATE
+    returns, so both sides of the snapshot are always exercised."""
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 201)))
+    acked = list(range(1, 201))
+    started, created = threading.Event(), threading.Event()
+
+    def inserter():
+        try:
+            with gnitz.connect(server, schema=client.schema) as conn:
+                k, after = 1000, 0
+                while after < 20:
+                    after += created.is_set()
+                    conn.execute_sql(f"INSERT INTO t VALUES ({k}, {k})")
+                    acked.append(k)
+                    started.set()
+                    k += 1
+        finally:
+            started.set()
+
+    th = spawn(inserter)
+    try:
+        assert started.wait(START_TIMEOUT), "the inserter never issued a statement"
+        client.execute_sql("CREATE UNIQUE INDEX ON t(v)")
+    finally:
+        created.set()
+        join_or_fail("the inserter hung", th)
+    assert bag(scanned(client, "t")) == {(k, k): 1 for k in acked}
+    for v in (acked[0], acked[200], acked[-1]):
+        with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
+            client.execute_sql(f"INSERT INTO t VALUES (888888, {v})")
+    client.execute_sql("INSERT INTO t VALUES (888888, 888888)")
+
+
 def test_a_push_decoded_before_an_alter_is_refused(own_server):
     """A push matches its schema record against the catalog's and decodes its
     batch before it takes the catalog read lock, and the lock is
