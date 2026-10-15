@@ -261,6 +261,21 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
     })
 }
 
+/// The `WITH (…)` entries that declare `props`, as a `CREATE TABLE` writes
+/// them; the defaults are omitted. [`parse_table_options`]'s inverse.
+pub(crate) fn table_with_options(props: &TableProps) -> Vec<String> {
+    let replicated = props.distribution == TableDistribution::Replicated;
+    [
+        ("replicated", replicated),
+        ("stream", props.stream),
+        ("compress", props.compress),
+    ]
+    .into_iter()
+    .filter(|&(_, on)| on)
+    .map(|(key, _)| format!("{key} = true"))
+    .collect()
+}
+
 /// One UNIQUE constraint as written: the column list — one element for a
 /// column-level `UNIQUE`, the whole ordered list for a table-level one — and the
 /// `CONSTRAINT <name>` it carried, canonical.

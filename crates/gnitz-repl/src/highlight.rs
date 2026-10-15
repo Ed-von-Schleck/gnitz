@@ -51,7 +51,7 @@ pub struct SqlHighlighter {
 impl SqlHighlighter {
     /// The style of each byte range of `src`, in order, covering it whole.
     pub fn spans(&self, src: &str, cursor: usize) -> Vec<(Style, std::ops::Range<usize>)> {
-        let Some(MetaLine { name, command }) = MetaLine::parse(src) else {
+        let Some(MetaLine { name, command, .. }) = MetaLine::parse(src) else {
             return self.sql_spans(src, cursor);
         };
         let cmd_end = name.end;

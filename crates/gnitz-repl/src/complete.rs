@@ -12,7 +12,8 @@ use reedline::{Completer, CompletionResult, Span, Suggestion};
 use gnitz_core::{Catalog, CatalogRelation};
 
 use crate::lex::lex_prefix;
-use crate::meta::{self, ArgKind, MetaLine};
+use crate::meta::{self, ArgKind, MetaLine, Setting};
+use crate::render::{choose, variants};
 
 /// What completion reads: the catalog snapshot and the current schema, which
 /// the shell replaces as they change.
@@ -261,7 +262,7 @@ fn meta_commands() -> impl Iterator<Item = Candidate> {
 }
 
 fn meta_candidates(ctx: &Context, line: &str, meta: MetaLine, start: usize, word: &str) -> (Vec<Candidate>, usize) {
-    let MetaLine { name, command } = meta;
+    let MetaLine { name, command, .. } = meta;
     if start <= name.start || start < name.end && word.starts_with('\\') {
         return (meta_commands().collect(), name.start);
     }
@@ -270,28 +271,20 @@ fn meta_candidates(ctx: &Context, line: &str, meta: MetaLine, start: usize, word
     match kind {
         ArgKind::None => (Vec::new(), start),
         ArgKind::Relation => (relation_candidates(ctx, word), start),
+        ArgKind::Index => (index_candidates(ctx), start),
         ArgKind::Schema => (schema_candidates(ctx), start),
-        ArgKind::Sql => {
-            // `\watch` takes a view name or a SELECT over one.
+        // `\watch` takes a view name or a SELECT over one.
+        ArgKind::Sql if args.is_empty() => {
             let mut c = relation_candidates(ctx, word);
-            if args.is_empty() {
-                c.push(keyword("SELECT", word));
-            } else {
-                return sql_candidates(ctx, line, start, word);
-            }
+            c.push(keyword("SELECT", word));
             (c, start)
         }
-        ArgKind::Choice(values) => (
-            values
-                .iter()
-                .map(|v| Candidate {
-                    kind: Kind::Value,
-                    value: v.to_string(),
-                    description: String::new(),
-                })
-                .collect(),
-            start,
-        ),
+        ArgKind::Sql => sql_candidates(ctx, line, start, word),
+        ArgKind::SettingName => (value_candidates(variants::<Setting>()), start),
+        ArgKind::Value(setting) => {
+            let setting = setting.or_else(|| args.first().and_then(|a| choose::<Setting>(a).ok()));
+            (value_candidates(setting.map_or_else(Vec::new, Setting::values)), start)
+        }
         ArgKind::Path => {
             let path_start = line[..line.len().min(start + word.len())]
                 .rfind(char::is_whitespace)
@@ -332,6 +325,32 @@ fn path_candidates(typed: &str) -> Vec<Candidate> {
                 value: name,
                 description: String::new(),
             }
+        })
+        .collect()
+}
+
+fn value_candidates(values: Vec<String>) -> Vec<Candidate> {
+    values
+        .into_iter()
+        .map(|value| Candidate {
+            kind: Kind::Value,
+            value,
+            description: String::new(),
+        })
+        .collect()
+}
+
+/// Every index, by its name.
+fn index_candidates(ctx: &Context) -> Vec<Candidate> {
+    ctx.catalog
+        .relations
+        .iter()
+        .flat_map(|r| {
+            r.indexes.iter().map(|i| Candidate {
+                kind: Kind::Value,
+                value: i.name.clone(),
+                description: format!("index on {}", r.name),
+            })
         })
         .collect()
 }

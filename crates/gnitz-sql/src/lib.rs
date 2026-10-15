@@ -29,11 +29,12 @@ mod test_support;
 mod types;
 mod validate;
 
+pub use codec::literal::parse_bool;
 pub use error::GnitzSqlError;
 pub use sqlparser;
 pub use types::sql_type_name;
 
-use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
+use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, RelProps, ScanReply, Subscription};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::sync::Arc;
@@ -104,6 +105,15 @@ pub fn function_names() -> impl Iterator<Item = &'static str> {
 /// Every `WITH (…)` option key a `CREATE TABLE` or `CREATE VIEW` accepts.
 pub fn with_option_names() -> impl Iterator<Item = &'static str> {
     ddl::TABLE_OPTIONS.into_iter().chain(ddl::VIEW_OPTIONS)
+}
+
+/// The `WITH (…)` entries that declare `props`, as a `CREATE` writes them; the
+/// defaults are omitted.
+pub fn with_options(props: &RelProps) -> Vec<String> {
+    match props {
+        RelProps::Table(t) => ddl::table_with_options(t),
+        RelProps::View(v) => ddl::view_with_options(v),
+    }
 }
 
 /// Plan `sql`, one `SELECT` over one view with a delta feed, as a subscription:

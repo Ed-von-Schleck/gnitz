@@ -36,8 +36,8 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
     Ok(ColType::of(tc))
 }
 
-/// The SQL spelling of a column type, as a `CREATE TABLE` would write it:
-/// [`sql_col_type`]'s inverse.
+/// The SQL spelling of a column type: [`sql_col_type`]'s inverse on every type
+/// a `CREATE TABLE` accepts.
 pub fn sql_type_name(ty: ColType) -> String {
     let name = match ty.tc {
         TypeCode::U8 => "TINYINT UNSIGNED",

@@ -32,10 +32,10 @@ dirs = "7"
 signal-hook = "0.3"
 crossterm = "0.29"
 libc.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-tempfile.workspace = true
 
 [lints]
 workspace = true

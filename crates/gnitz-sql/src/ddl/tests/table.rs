@@ -113,3 +113,28 @@ fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
         "{e:?}"
     );
 }
+
+#[test]
+fn with_options_spell_every_table_property_a_with_clause_reads_back() {
+    for replicated in [false, true] {
+        for stream in [false, true] {
+            for compress in [false, true] {
+                let props = TableProps {
+                    stream,
+                    serial: false,
+                    distribution: match replicated {
+                        true => TableDistribution::Replicated,
+                        false => TableDistribution::default(),
+                    },
+                    compress,
+                };
+                let entries = table_with_options(&props);
+                let with = match entries.is_empty() {
+                    true => String::new(),
+                    false => format!("WITH ({})", entries.join(", ")),
+                };
+                assert_eq!(parse_table_options(&table_options_of(&with)).unwrap(), props, "{with}");
+            }
+        }
+    }
+}

@@ -180,3 +180,17 @@ fn only_the_scanning_shapes_fold_the_haystack() {
         assert_eq!(!folded.is_empty(), folds, "{pattern:?}");
     }
 }
+
+#[test]
+fn a_glob_encodes_star_and_question_mark_and_keeps_the_rest_literal() {
+    let m = |p: &str| LikeMatcher::compile(LikePattern::glob(p).as_bytes(), true);
+    assert!(hit(&m("ord*"), b"Orders"));
+    assert!(hit(&m("?rders"), b"orders"));
+    assert!(hit(&m("*"), b""));
+    assert!(!hit(&m("ord"), b"orders"));
+    assert!(hit(&m("public.*"), b"public.t"));
+    assert!(hit(&m("a_b%"), b"A_B%"));
+    assert!(!hit(&m("a_b"), b"axb"));
+    assert!(!hit(&m("a%"), b"ab"));
+    assert!(!hit(&m("*a*a*a*a*a*a*a*a*b"), "a".repeat(40).as_bytes()));
+}

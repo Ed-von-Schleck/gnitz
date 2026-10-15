@@ -114,53 +114,51 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
          CREATE VIEW v WITH (delta = '1 MB') AS SELECT kind, COUNT(*) AS n FROM ev GROUP BY kind;",
     )
     .unwrap();
-    sh.refresh_catalog();
-    sh.with_catalog(|c| {
-        let t = c.find("public", "t").expect("t");
-        assert_eq!(t.class(), RelClass::Table);
-        let cols: Vec<(&str, String, bool)> = t
-            .columns
-            .iter()
-            .map(|c| {
-                (
-                    c.def.name.as_str(),
-                    gnitz_sql::sql_type_name(c.def.ty),
-                    c.def.is_nullable,
-                )
-            })
-            .collect();
-        assert_eq!(
-            cols,
-            [
-                ("id", "BIGINT".to_string(), false),
-                ("kind", "BIGINT".to_string(), false),
-                ("note", "TEXT".to_string(), true)
-            ]
-        );
-        assert_eq!(t.column_names(&t.pk), ["id"]);
-        let [ix] = &t.indexes[..] else {
-            panic!("{:?}", t.indexes)
-        };
-        assert_eq!((ix.name.as_str(), t.column_names(&ix.cols)), ("t_kind", vec!["kind"]));
-        let ev = c.find("public", "ev").expect("ev");
-        assert_eq!(ev.class(), RelClass::Stream);
-        let v = c.find("public", "v").expect("v");
-        assert_eq!(v.class(), RelClass::FedView);
-        assert_eq!(
-            v.props,
-            RelProps::View(ViewProps {
-                budget: ViewBudget::from_row(0, 1 << 20).unwrap(),
-                compress: false
-            })
-        );
-        assert_eq!(v.reads, [ev.id]);
-        assert_eq!(c.find("PUBLIC", "V").map(|r| r.id), Some(v.id));
-        assert!(c.schemas.contains(&"_system".to_string()));
-        assert_eq!(
-            c.find("_system", "tables").expect("_system.tables").class(),
-            RelClass::Catalog
-        );
-    });
+    let c = sh.catalog().unwrap();
+    let t = c.find("public", "t").expect("t");
+    assert_eq!(t.class(), RelClass::Table);
+    let cols: Vec<(&str, String, bool)> = t
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.def.name.as_str(),
+                gnitz_sql::sql_type_name(c.def.ty),
+                c.def.is_nullable,
+            )
+        })
+        .collect();
+    assert_eq!(
+        cols,
+        [
+            ("id", "BIGINT".to_string(), false),
+            ("kind", "BIGINT".to_string(), false),
+            ("note", "TEXT".to_string(), true)
+        ]
+    );
+    assert_eq!(t.column_names(&t.pk), ["id"]);
+    let [ix] = &t.indexes[..] else {
+        panic!("{:?}", t.indexes)
+    };
+    assert_eq!((ix.name.as_str(), t.column_names(&ix.cols)), ("t_kind", vec!["kind"]));
+    let ev = c.find("public", "ev").expect("ev");
+    assert_eq!(ev.class(), RelClass::Stream);
+    let v = c.find("public", "v").expect("v");
+    assert_eq!(v.class(), RelClass::FedView);
+    assert_eq!(
+        v.props,
+        RelProps::View(ViewProps {
+            budget: ViewBudget::from_row(0, 1 << 20).unwrap(),
+            compress: false
+        })
+    );
+    assert_eq!(v.reads, [ev.id]);
+    assert_eq!(c.find("PUBLIC", "V").map(|r| r.id), Some(v.id));
+    assert!(c.schemas.contains(&"_system".to_string()));
+    assert_eq!(
+        c.find("_system", "tables").expect("_system.tables").class(),
+        RelClass::Catalog
+    );
 }
 
 /// `\d` reads the catalog as it stands, whichever session changed it: its
@@ -183,14 +181,58 @@ fn describe_shows_keys_and_what_reads_what() {
 
     let parent = results(&mut sh, &out, "\\d parent");
     assert!(parent.contains("Referenced by:\n    public.child\n"), "{parent}");
-    assert!(parent.contains("Read by: public.joined\n"), "{parent}");
+    assert!(parent.contains("Read by:\n    public.joined\n"), "{parent}");
     let child = results(&mut sh, &out, "\\d child");
     assert!(
         child.contains("Foreign keys:\n    (pid) REFERENCES public.parent(id) ON DELETE CASCADE\n"),
         "{child}"
     );
     let joined = results(&mut sh, &out, "\\d joined");
-    assert!(joined.contains("Reads: public.parent, public.child\n"), "{joined}");
+    assert!(
+        joined.contains("Reads:\n    public.parent\n    public.child\n"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn listings_are_results_in_the_output_format() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.csv");
+    let mut sh = shell(server.sock_path(), None);
+    let text = results(
+        &mut sh,
+        &out,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT, note TEXT);\n\\dt",
+    );
+    assert_eq!(text, "Schema,Name,Type,Columns\npublic,t,table,3\n");
+}
+
+#[test]
+fn describe_lists_the_with_options_a_view_was_created_with() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.txt");
+    let mut sh = shell(server.sock_path(), None);
+    let text = results(
+        &mut sh,
+        &out,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT);\n\
+         CREATE VIEW b WITH (capacity = '4 MB', compress = true) AS SELECT id, kind FROM t WHERE kind > 0;\n\
+         \\d b",
+    );
+    assert!(
+        text.contains("With:\n    capacity = '4 MB'\n    compress = true\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn watch_with_no_argument_fails_before_planning() {
+    let server = ServerHandle::start_n(WORKERS);
+    let mut sh = shell(server.sock_path(), None);
+    assert!(sh.meta("\\watch").is_err());
+    assert!(sh.meta("\\watch   ").is_err());
 }
 
 #[test]

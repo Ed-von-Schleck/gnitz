@@ -3,7 +3,8 @@
 
 use std::fmt::Display;
 use std::fs::File;
-use std::io::{BufRead, BufWriter, IsTerminal, Write};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -52,7 +53,6 @@ pub struct Shell {
     target: String,
     context: SharedContext,
     pub settings: Settings,
-    pub timing: bool,
     pub interactive: bool,
     stop_on_error: bool,
     interrupt: Option<Arc<AtomicBool>>,
@@ -61,6 +61,9 @@ pub struct Shell {
     last_statement: String,
     /// Text for the next prompt's buffer, from `\e`.
     pub prefill: Option<String>,
+    /// Where the editors' buffers are written, made on first use and removed
+    /// with the shell.
+    scratch: Option<tempfile::TempDir>,
 }
 
 /// A blocking host whose waits give up once `interrupt` is set.
@@ -98,13 +101,13 @@ impl Shell {
             target: options.target,
             context,
             settings: options.settings,
-            timing: false,
             interactive: options.interactive,
             stop_on_error: options.stop_on_error,
             interrupt: options.interrupt,
             sink: Sink::Stdout,
             last_statement: String::new(),
             prefill: None,
+            scratch: None,
         })
     }
 
@@ -123,10 +126,6 @@ impl Shell {
     /// What completion reads.
     pub fn context(&self) -> SharedContext {
         Arc::clone(&self.context)
-    }
-
-    pub fn with_catalog<T>(&self, f: impl FnOnce(&Catalog) -> T) -> T {
-        f(&self.context.read().expect("context lock").catalog)
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -152,8 +151,26 @@ impl Shell {
         self.interrupt.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
     }
 
-    /// Read the catalog again, whoever changed it since. A failure leaves the
-    /// old snapshot: completion is a convenience, never a reason to stop.
+    /// The catalog as it stands now, for a command that answers from it.
+    pub fn catalog(&mut self) -> Result<Catalog, Failed> {
+        block_on(self.client.catalog()).or_else(|e| self.fail(e))
+    }
+
+    /// The private directory the editors' buffers go in.
+    pub fn scratch(&mut self) -> Result<&Path, Failed> {
+        if self.scratch.is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("gnitz-")
+                .tempdir()
+                .or_else(|e| self.fail(format!("cannot make a scratch directory: {e}")))?;
+            self.scratch = Some(dir);
+        }
+        Ok(self.scratch.as_ref().expect("made above").path())
+    }
+
+    /// Read the catalog again for completion, whoever changed it since. A
+    /// failure leaves the old snapshot: completion is a convenience, never a
+    /// reason to stop.
     pub fn refresh_catalog(&mut self) {
         if let Ok(catalog) = block_on(self.client.catalog()) {
             self.context.write().expect("context lock").catalog = catalog;
@@ -175,6 +192,15 @@ impl Shell {
 
     pub fn run_script(&mut self, text: &str) -> Result<Flow, Failed> {
         self.run_input(text.as_bytes())
+    }
+
+    /// Run the commands in the file at `path`; `-` is stdin.
+    pub fn run_file(&mut self, path: &str) -> Result<Flow, Failed> {
+        if path == "-" {
+            return self.run_input(std::io::stdin().lock());
+        }
+        let file = File::open(path).or_else(|e| self.fail(format!("{path}: {e}")))?;
+        self.run_input(BufReader::new(file))
     }
 
     /// Run a whole script, each piece as soon as it is read: every statement
@@ -252,7 +278,7 @@ impl Shell {
                 r
             }
         };
-        if self.timing {
+        if self.settings.timing {
             self.status(&format_elapsed(elapsed));
         }
         outcome

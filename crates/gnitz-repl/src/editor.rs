@@ -106,8 +106,9 @@ fn add_common_bindings(kb: &mut Keybindings) {
     kb.add_binding(KeyModifiers::ALT, KeyCode::Char('e'), ReedlineEvent::OpenEditor);
 }
 
-/// The editor, reading completions from `context`.
-pub fn build(context: SharedContext, vi: bool, color: bool) -> Reedline {
+/// The editor, reading completions from `context`; Alt-E writes the buffer to
+/// `buffer` for `$EDITOR`.
+pub fn build(context: SharedContext, vi: bool, color: bool, buffer: PathBuf) -> Reedline {
     let menu = IdeMenu::default()
         .with_name(COMPLETION_MENU)
         .with_default_border()
@@ -130,8 +131,7 @@ pub fn build(context: SharedContext, vi: bool, color: bool) -> Reedline {
             Box::new(Emacs::new(kb))
         }
     };
-    let temp = std::env::temp_dir().join(format!("gnitz-buffer-{}.sql", std::process::id()));
-    let editor = editor_command(&temp);
+    let editor = editor_command(&buffer);
     let mut line_editor = Reedline::create()
         .with_completer(Box::new(SqlCompleter::new(context)))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
@@ -139,7 +139,7 @@ pub fn build(context: SharedContext, vi: bool, color: bool) -> Reedline {
         .with_edit_mode(edit_mode)
         .with_quick_completions(false)
         .with_partial_completions(true)
-        .with_buffer_editor(editor, temp)
+        .with_buffer_editor(editor, buffer)
         .with_ansi_colors(color);
     if color {
         line_editor = line_editor

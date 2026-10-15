@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_core::RelProps;
+use gnitz_core::{IndexRow, RelProps};
 use gnitz_wire::sys_rows::CatalogColumn;
 use gnitz_wire::{ColType, ColumnDef, PkColList, TableProps, TypeCode};
 
@@ -27,7 +27,15 @@ fn ctx() -> Context {
         catalog: Catalog {
             schemas: vec!["public".into(), "sales".into()],
             relations: vec![
-                rel(1, "public", "orders", &["id", "customer", "amount"]),
+                CatalogRelation {
+                    indexes: vec![IndexRow {
+                        owner: 1,
+                        name: "orders_customer".into(),
+                        cols: PkColList::from_slice(&[1]),
+                        is_unique: false,
+                    }],
+                    ..rel(1, "public", "orders", &["id", "customer", "amount"])
+                },
                 rel(2, "public", "customers", &["id", "name"]),
                 rel(3, "sales", "leads", &["lead_id"]),
             ],
@@ -91,6 +99,25 @@ fn meta_commands_and_their_arguments_complete() {
     assert_eq!(values("\\x a"), vec!["auto"]);
     assert_eq!(values("\\use sa"), vec!["sales"]);
     assert_eq!(values("\\d cust"), vec!["customers"]);
+}
+
+#[test]
+fn a_pset_value_completes_from_the_option_it_follows() {
+    assert_eq!(values("\\pset footer "), vec!["off", "on"]);
+    assert_eq!(values("\\pset format "), vec!["aligned", "csv", "json", "unaligned"]);
+    assert!(values("\\pset null ").is_empty());
+    assert_eq!(values("\\timing "), vec!["off", "on"]);
+}
+
+#[test]
+fn di_completes_index_names() {
+    assert_eq!(values("\\di ord"), vec!["orders_customer"]);
+}
+
+#[test]
+fn watch_completes_sql_after_its_first_word() {
+    assert!(values("\\watch SELECT * FROM ord").contains(&"orders".to_string()));
+    assert_eq!(values("\\watch ord"), vec!["orders"]);
 }
 
 #[test]

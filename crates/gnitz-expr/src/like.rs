@@ -40,6 +40,20 @@ impl LikePattern {
         Some(LikePattern(out))
     }
 
+    /// A shell glob: `*` matches any characters and `?` one; every other
+    /// character is itself.
+    pub fn glob(text: &str) -> Self {
+        let mut out = Vec::with_capacity(text.len());
+        for c in text.chars() {
+            match c {
+                '*' => out.push(ANY_MANY),
+                '?' => out.push(ANY_ONE),
+                _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
+        LikePattern(out)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -55,7 +69,7 @@ fn is_wildcard(b: &u8) -> bool {
     matches!(*b, ANY_MANY | ANY_ONE)
 }
 
-pub(crate) struct LikeMatcher {
+pub struct LikeMatcher {
     kind: LikeKind,
     /// ILIKE. The literals are already lowercased.
     ci: bool,
@@ -126,7 +140,7 @@ fn specialize(toks: Vec<LikeTok>) -> LikeKind {
 
 impl LikeMatcher {
     /// Total: any bytes are a pattern.
-    pub(crate) fn compile(pattern: &[u8], ci: bool) -> Self {
+    pub fn compile(pattern: &[u8], ci: bool) -> Self {
         LikeMatcher {
             kind: specialize(tokenize(pattern, ci)),
             ci,
@@ -138,7 +152,7 @@ impl LikeMatcher {
     /// `#[inline]`: `self.kind` is invariant in the caller's row loop, which
     /// lets LLVM unswitch this dispatch out of it.
     #[inline]
-    pub(crate) fn matches(&self, h: &[u8], folded: &mut Vec<u8>) -> bool {
+    pub fn matches(&self, h: &[u8], folded: &mut Vec<u8>) -> bool {
         let ci = self.ci;
         match &self.kind {
             LikeKind::Exact(l) => anchored_eq(h, l, ci),

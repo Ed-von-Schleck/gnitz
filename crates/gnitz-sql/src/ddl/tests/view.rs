@@ -51,3 +51,31 @@ fn compress_is_a_boolean_beside_any_budget() {
     assert!(!options_of("WITH (delta = '2 KB')").unwrap().compress);
     assert!(options_of("WITH (compress = 1)").is_err(), "not a boolean");
 }
+
+#[test]
+fn with_options_spell_every_budget_a_with_clause_reads_back() {
+    let kb = |n: u64| NonZeroU64::new(n).unwrap();
+    for budget in [
+        ViewBudget::default(),
+        ViewBudget::Bounded { capacity_bytes: kb(4 << 20) },
+        ViewBudget::Bounded { capacity_bytes: kb(1536) },
+        ViewBudget::Bounded { capacity_bytes: kb(7) },
+        ViewBudget::Fed { delta_bytes: kb(1 << 30) },
+        ViewBudget::Fed { delta_bytes: kb(3 << 10) },
+    ] {
+        for compress in [false, true] {
+            let props = ViewProps { budget, compress };
+            let entries = view_with_options(&props);
+            let with = match entries.is_empty() {
+                true => String::new(),
+                false => format!("WITH ({})", entries.join(", ")),
+            };
+            assert_eq!(options_of(&with).unwrap(), props, "{with}");
+        }
+    }
+    let props = ViewProps {
+        budget: ViewBudget::Bounded { capacity_bytes: kb(1536) },
+        compress: false,
+    };
+    assert_eq!(view_with_options(&props), ["capacity = '1536 B'"]);
+}

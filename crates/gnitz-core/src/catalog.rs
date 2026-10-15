@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use gnitz_wire::sys_rows::{
-    CatalogColumn, CircuitRow, ColTabRow, IdxTabRow, SchemaTabRow, TableTabRow, ViewParts, ViewTabRow,
+    CatalogColumn, CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow, TableTabRow, ViewParts, ViewTabRow,
 };
 use gnitz_wire::{qualified_key, Circuit, PkColList, RelClass, TableProps, ViewProps, SYSTEM_SCHEMA};
 
@@ -130,6 +130,17 @@ impl Catalog {
     /// The views that read relation `id`.
     pub fn readers(&self, id: u64) -> impl Iterator<Item = &CatalogRelation> {
         self.relations.iter().filter(move |r| r.reads.contains(&id))
+    }
+
+    /// The relations `rel` reads, ascending by id.
+    pub fn reads_of<'a>(&'a self, rel: &'a CatalogRelation) -> impl Iterator<Item = &'a CatalogRelation> {
+        rel.reads.iter().filter_map(|&id| self.relation(id))
+    }
+
+    /// The table and column `fk` references.
+    pub fn fk_target(&self, fk: FkRef) -> Option<(&CatalogRelation, &CatalogColumn)> {
+        let table = self.relation(fk.table_id)?;
+        Some((table, table.columns.get(fk.col as usize)?))
     }
 
     /// The tables with a FOREIGN KEY referencing table `id`.

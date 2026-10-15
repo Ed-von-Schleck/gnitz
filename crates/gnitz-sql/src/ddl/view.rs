@@ -18,8 +18,9 @@ use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query};
 /// The `CREATE VIEW … WITH (…)` keys.
 pub(crate) const VIEW_OPTIONS: [&str; 3] = ["capacity", "delta", "compress"];
 
-/// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
-const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
+/// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string,
+/// ascending.
+const SIZE_UNITS: [(&str, u64); 4] = [("B", 1), ("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
 
 /// Decode the `WITH (...)` clause of a `CREATE VIEW`.
 fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
@@ -35,6 +36,34 @@ fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzS
     })
 }
 
+/// The `WITH (…)` entries that declare `props`, as a `CREATE VIEW` writes them;
+/// the defaults are omitted. [`decode_view_options`]'s inverse.
+pub(crate) fn view_with_options(props: &ViewProps) -> Vec<String> {
+    let ViewProps { budget, compress } = *props;
+    let mut out = Vec::new();
+    if let Some(bytes) = budget.capacity_bytes() {
+        out.push(format!("capacity = '{}'", size_text(bytes)));
+    }
+    if let Some(bytes) = budget.delta_bytes() {
+        out.push(format!("delta = '{}'", size_text(bytes)));
+    }
+    if compress {
+        out.push("compress = true".to_string());
+    }
+    out
+}
+
+/// `bytes` in the largest of [`SIZE_UNITS`] that divides it: [`parse_size`]'s
+/// inverse.
+fn size_text(bytes: u64) -> String {
+    let (unit, mult) = SIZE_UNITS
+        .iter()
+        .rev()
+        .find(|&&(_, m)| bytes.is_multiple_of(m))
+        .expect("every count is a whole number of bytes");
+    format!("{} {unit}", bytes / mult)
+}
+
 /// The byte count of one size-valued `CREATE VIEW` option.
 fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64, GnitzSqlError> {
     let Ok(BExpr::LitStr(text)) = bind_constant(value) else {
@@ -45,7 +74,7 @@ fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64,
     parse_size(option, &text)
 }
 
-/// `<uint><unit>` with an optional space, unit in {KB, MB, GB}, binary
+/// `<uint><unit>` with an optional space, unit in {B, KB, MB, GB}, binary
 /// (KB = 2^10). Zero and a `u64`-overflowing product are rejected: a zero
 /// capacity names a store that cannot hold its own skeleton, and a zero delta
 /// budget one that retains nothing.
@@ -53,7 +82,7 @@ fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
     let bad = || {
         GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
-             (a positive integer followed by KB, MB or GB)"
+             (a positive integer followed by B, KB, MB or GB)"
         ))
     };
     let trimmed = text.trim();

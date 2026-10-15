@@ -724,7 +724,7 @@ impl CatalogEngine {
             .iter()
             .find(|&&c| defs.get(c as usize).is_some_and(|d| d.def.is_hidden))
         {
-            // A table hides the columns it dropped, a view the key slots it minted.
+            // A table hides the columns it dropped, a view the key slots it adds.
             let why = if entry.kind().is_base_table() {
                 "dropped"
             } else {

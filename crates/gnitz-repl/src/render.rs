@@ -32,6 +32,16 @@ pub fn name_of(v: &impl clap::ValueEnum) -> String {
         .to_string()
 }
 
+/// Every variant's spelling.
+pub fn variants<E: clap::ValueEnum>() -> Vec<String> {
+    E::value_variants().iter().map(name_of).collect()
+}
+
+/// The variant `v` spells, in any case; the error lists [`variants`].
+pub fn choose<E: clap::ValueEnum>(v: &str) -> Result<E, String> {
+    E::from_str(v, true).map_err(|_| format!("\"{v}\" is not one of {}", variants::<E>().join(", ")))
+}
+
 /// How results are printed.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -45,6 +55,8 @@ pub struct Settings {
     pub pager: bool,
     /// Whether the output carries ANSI styles.
     pub color: bool,
+    /// Whether each statement reports how long it took.
+    pub timing: bool,
 }
 
 impl Settings {
@@ -66,6 +78,7 @@ impl Default for Settings {
             footer: true,
             pager: true,
             color: false,
+            timing: false,
         }
     }
 }

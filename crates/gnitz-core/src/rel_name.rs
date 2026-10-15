@@ -29,14 +29,20 @@ impl RelName {
         Self::build(schema, name, false)
     }
 
-    fn build(schema: &str, name: &str, qualified: bool) -> Result<Self, String> {
+    /// The catalog spelling of the schema `text` names: a reserved schema
+    /// matched in any case, else the identifier folded as SQL folds it.
+    pub fn schema_key(text: &str) -> Result<String, String> {
         let reserved = gnitz_wire::RESERVED_SCHEMAS
             .into_iter()
-            .find(|r| schema.eq_ignore_ascii_case(r));
-        let schema_key = match reserved {
-            Some(r) => r.to_string(),
-            None => gnitz_wire::canonical_identifier(schema)?,
-        };
+            .find(|r| text.eq_ignore_ascii_case(r));
+        match reserved {
+            Some(r) => Ok(r.to_string()),
+            None => gnitz_wire::canonical_identifier(text),
+        }
+    }
+
+    fn build(schema: &str, name: &str, qualified: bool) -> Result<Self, String> {
+        let schema_key = Self::schema_key(schema)?;
         let key = gnitz_wire::qualified_key(&schema_key, &gnitz_wire::canonical_identifier(name)?);
         Ok(RelName {
             key,

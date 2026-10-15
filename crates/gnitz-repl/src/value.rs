@@ -113,6 +113,20 @@ pub struct Rows {
 }
 
 impl Rows {
+    /// Rows of `columns`, each at weight 1.
+    pub fn of(columns: &[(&str, TypeCode)], rows: impl IntoIterator<Item = Vec<Value>>) -> Rows {
+        Rows {
+            columns: columns
+                .iter()
+                .map(|&(name, tc)| Column {
+                    name: name.to_string(),
+                    ty: ColType::of(tc),
+                })
+                .collect(),
+            rows: rows.into_iter().map(|r| (r, 1)).collect(),
+        }
+    }
+
     pub fn decode(reply: &ScanReply) -> Rows {
         let schema = &reply.schema;
         let shown: Vec<(ColumnLocator, ColType)> = schema

@@ -12,7 +12,7 @@ pub(crate) use gnitz_expr::place::{Compared, Placed};
 
 /// The text spellings of a BOOLEAN, PostgreSQL's: case and surrounding
 /// whitespace are ignored.
-pub(crate) fn parse_bool(s: &str) -> Option<bool> {
+pub fn parse_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
         "true" | "t" | "yes" | "y" | "on" | "1" => Some(true),
         "false" | "f" | "no" | "n" | "off" | "0" => Some(false),

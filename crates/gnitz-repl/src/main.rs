@@ -1,9 +1,10 @@
-use std::io::{BufReader, IsTerminal};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Parser;
+use gnitz_core::RelName;
 use gnitz_repl::editor::{self, ShellPrompt};
 use gnitz_repl::render::{Expanded, Format, Settings};
 use gnitz_repl::shell::{Flow, Options, Shell};
@@ -21,7 +22,7 @@ struct Cli {
     target: String,
 
     /// The schema unqualified names resolve in.
-    #[arg(short, long, default_value = "public")]
+    #[arg(short, long, default_value = "public", value_parser = RelName::schema_key)]
     schema: String,
 
     /// Run COMMAND (SQL or a meta-command) and exit. Repeatable.
@@ -99,27 +100,20 @@ fn main() -> ExitCode {
 
     // `-c` and `-f` in order, or stdin when there are none.
     let stdin = ["-".to_string()];
+    let files = match scripted {
+        true => &cli.file[..],
+        false => &stdin[..],
+    };
     let inputs = cli
         .command
         .iter()
         .map(|c| (true, c))
-        .chain(cli.file.iter().map(|f| (false, f)));
-    let inputs: Vec<(bool, &String)> = match scripted {
-        true => inputs.collect(),
-        false => vec![(false, &stdin[0])],
-    };
+        .chain(files.iter().map(|f| (false, f)));
     let mut ok = true;
     for (is_command, input) in inputs {
-        let run = match (is_command, input.as_str()) {
-            (true, command) => shell.run_script(command),
-            (false, "-") => shell.run_input(std::io::stdin().lock()),
-            (false, path) => match std::fs::File::open(path) {
-                Ok(f) => shell.run_input(BufReader::new(f)),
-                Err(e) => {
-                    eprintln!("gnitz: {path}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            },
+        let run = match is_command {
+            true => shell.run_script(input),
+            false => shell.run_file(input),
         };
         match run {
             Ok(Flow::Quit) => break,
@@ -139,7 +133,10 @@ fn main() -> ExitCode {
 }
 
 fn repl(shell: &mut Shell, vi: bool) -> ExitCode {
-    let mut line_editor = editor::build(shell.context(), vi, shell.settings.color);
+    let Ok(buffer) = shell.scratch().map(|dir| dir.join("buffer.sql")) else {
+        return ExitCode::FAILURE;
+    };
+    let mut line_editor = editor::build(shell.context(), vi, shell.settings.color, buffer);
     println!(
         "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
         env!("CARGO_PKG_VERSION"),
