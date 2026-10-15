@@ -28,7 +28,7 @@ use gnitz_wire::WireStatus;
 use gnitz_zset_testkit::{assert_child_ok, run_test_in_child};
 use std::time::Duration;
 use support::common::{block_copy, has_copy, has_manifest, manifest_path, unblock_copy};
-use support::{canonical, canonical_rows, cost, differential, query, sql, Answer, Reply};
+use support::{agreement, canonical, canonical_rows, cost, differential, query, sql, Answer, Reply};
 
 /// `schema.name`.
 fn rel(schema: &str, name: &str) -> RelName {
@@ -2335,6 +2335,7 @@ fn access(fx: &mut Fixture, q: &str) -> String {
 
 /// An index created on a mirrored view upstream reaches the copy at the next
 /// poll, filled from the rows the copy holds, and one dropped leaves it there.
+/// One the view already has is filled at the bootstrap.
 #[test]
 fn an_index_created_upstream_is_used_after_one_poll() {
     let mut fx = Fixture::start();
@@ -2366,6 +2367,12 @@ fn an_index_created_upstream_is_used_after_one_poll() {
         "{report:?}",
     );
     assert_eq!(access(&mut fx, q), unindexed);
+    fx.differential("s", q);
+
+    sql(&mut fx.direct, "s", "CREATE INDEX r_by_v ON v_repl(v)");
+    block_on(fx.mirror().mirror_view(&rel("s", "v_repl"))).expect("mirror v_repl");
+    let q = "SELECT id, v FROM v_repl WHERE v = 60";
+    assert_eq!(access(&mut fx, q), "index range on (v)");
     fx.differential("s", q);
 }
 
@@ -2691,6 +2698,385 @@ fn many_subscribers_of_one_view_each_converge() {
         let rows = differential(&mut client, &mut fx.direct, "s", "SELECT * FROM v_keyed", Answer::Local);
         assert!(rows > 0, "waiter {i}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Aliases: a subscription mirrored as a relation of `_local`
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Mirror what `sql_text` keeps of its view as `_local.<alias>`.
+    fn alias(&mut self, alias: &str, sql_text: &str) -> PollOutcome {
+        block_on(gnitz_sql::mirror_subscription(self.mirror(), "s", alias, sql_text)).expect("mirror the subscription")
+    }
+
+    /// `local_sql` over an alias, answered off its copy, against `served_sql`
+    /// over the view: [`agreement`].
+    fn agree(&mut self, local_sql: &str, served_sql: &str) -> usize {
+        agreement(
+            self.mirror.as_mut().unwrap(),
+            &mut self.direct,
+            "s",
+            local_sql,
+            served_sql,
+            Answer::Local,
+        )
+    }
+
+    /// The whole alias against the `SELECT` it copies.
+    fn kept(&mut self, alias: &str, sql_text: &str) -> usize {
+        self.agree(&format!("SELECT * FROM _local.{alias}"), sql_text)
+    }
+}
+
+/// Two aliases of one view are two copies, each of the columns its `SELECT`
+/// names and the rows its `WHERE` passes; a read of one plans against those
+/// columns, and the view's own name stays an upstream relation, read whole.
+#[test]
+fn two_aliases_of_one_view_each_keep_what_their_select_keeps() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 200);
+    let even = "SELECT a, b, v FROM v_keyed WHERE v % 2 = 0";
+    let mine = "SELECT a, b, body FROM v_keyed WHERE a >= 50 AND a < 120";
+    let (e, m) = (fx.alias("even", even), fx.alias("mine", mine));
+    assert!(
+        e.result.reseeded() && m.result.reseeded(),
+        "a first registration bootstraps"
+    );
+    assert_ne!(e.view_id, m.view_id, "two copies of one upstream view");
+    fx.kept("even", even);
+    fx.kept("mine", mine);
+    for (lo, hi) in [(201, 400), (401, 500)] {
+        churn(&mut fx.direct, lo, hi);
+        sql(&mut fx.direct, "s", "UPDATE t SET v = v + 1 WHERE a >= 50 AND a < 90");
+        let report = fx.drain();
+        assert!(
+            report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+            "{report:?}"
+        );
+        fx.kept("even", even);
+        fx.kept("mine", mine);
+    }
+
+    fx.agree(
+        "SELECT a FROM _local.even WHERE v > 300",
+        "SELECT a FROM v_keyed WHERE v % 2 = 0 AND v > 300",
+    );
+    assert!(
+        block_on(gnitz_sql::execute(fx.mirror(), "s", "SELECT body FROM _local.even")).is_err(),
+        "a column the alias does not keep"
+    );
+    fx.delegated("s", "SELECT a, b, v, body FROM v_keyed");
+}
+
+/// An alias whose `SELECT` leaves out the view's key keeps it hidden, so rows
+/// that agree on every selected column stay rows of their own.
+#[test]
+fn an_alias_that_does_not_select_the_key_keeps_its_rows_apart() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 200);
+    let vs = "SELECT v FROM v_keyed WHERE v > 100";
+    fx.alias("vs", vs);
+    fx.kept("vs", vs);
+    churn(&mut fx.direct, 201, 300);
+    sql(&mut fx.direct, "s", "UPDATE t SET v = 500 WHERE a > 100 AND a < 150");
+    fx.drain();
+    fx.kept("vs", vs);
+    fx.agree(
+        "SELECT v, COUNT(*) AS n FROM _local.vs GROUP BY v",
+        "SELECT v, COUNT(*) AS n FROM v_keyed WHERE v > 100 GROUP BY v",
+    );
+}
+
+/// An alias over an aggregate: groups leave its filter and come back as their
+/// totals move.
+#[test]
+fn an_alias_over_an_aggregate_follows_its_groups_across_the_filter() {
+    let mut fx = Fixture::start();
+    fed_view(
+        &mut fx.direct,
+        "s",
+        "g",
+        "SELECT b, COUNT(*) AS n, SUM(v) AS total FROM t GROUP BY b",
+    );
+    churn(&mut fx.direct, 1, 300);
+    let big = "SELECT b, total FROM g WHERE total > 10000";
+    fx.alias("big", big);
+    assert_eq!(fx.kept("big", big), 7);
+    sql(&mut fx.direct, "s", "UPDATE t SET v = v - 1000 WHERE a < 100 AND b < 3");
+    fx.drain();
+    assert_eq!(fx.kept("big", big), 4, "three groups left the filter");
+    sql(&mut fx.direct, "s", "UPDATE t SET v = v + 2000 WHERE a < 50 AND b = 0");
+    fx.drain();
+    assert_eq!(fx.kept("big", big), 5, "one came back");
+}
+
+/// `_local` is no schema of the server's, and an alias takes only reads.
+#[test]
+fn an_alias_is_a_local_relation_and_nothing_else() {
+    let mut fx = Fixture::start();
+    fx.alias("even", "SELECT a, b, v FROM v_keyed WHERE v % 2 = 0");
+    for stmt in [
+        "CREATE SCHEMA _local",
+        "CREATE TABLE _local.even (id BIGINT NOT NULL PRIMARY KEY)",
+        "SELECT * FROM _local.even",
+    ] {
+        assert!(
+            block_on(gnitz_sql::execute(&mut fx.direct, "s", stmt)).is_err(),
+            "{stmt}: no server holds `_local`"
+        );
+    }
+    for stmt in [
+        "INSERT INTO _local.even VALUES (1, 2, 3)",
+        "DELETE FROM _local.even WHERE a = 1",
+    ] {
+        assert!(
+            block_on(gnitz_sql::execute(fx.mirror(), "s", stmt)).is_err(),
+            "{stmt}: an alias takes only reads"
+        );
+    }
+}
+
+/// An alias keeps each index of its view whose columns it keeps, as a local
+/// store over its own rows: under the alias's column numbers, and holding
+/// nothing its `WHERE` dropped. One the view had is filled at the bootstrap,
+/// one created upstream at the next poll.
+#[test]
+fn an_alias_keeps_the_indexes_whose_columns_it_keeps() {
+    let mut fx = Fixture::start();
+    sql(&mut fx.direct, "s", "CREATE INDEX by_b ON v_keyed(b)");
+    churn(&mut fx.direct, 1, 2000);
+    // `v` leads the SELECT list, so it is not at its upstream column number.
+    fx.alias("even", "SELECT v, a, b FROM v_keyed WHERE v % 2 = 0");
+    fx.alias("low", "SELECT a, b FROM v_keyed WHERE a < 500");
+    assert_eq!(
+        access(&mut fx, "SELECT a FROM _local.low WHERE b = 3"),
+        "index range on (b)"
+    );
+    assert_eq!(
+        access(&mut fx, "SELECT b FROM _local.low WHERE a = 42 AND b = 0"),
+        "pk point lookup"
+    );
+    let q = "SELECT a FROM _local.even WHERE v = 700";
+    assert_eq!(access(&mut fx, q), "full scan");
+
+    sql(&mut fx.direct, "s", "CREATE INDEX by_v ON v_keyed(v)");
+    let report = fx.drain();
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "the rows stay; the index is filled from them: {report:?}"
+    );
+    assert_eq!(access(&mut fx, q), "index range on (v)");
+    assert!(
+        block_on(gnitz_sql::execute(
+            fx.mirror(),
+            "s",
+            "SELECT a FROM _local.even WHERE body = 'x'"
+        ))
+        .is_err(),
+        "a column the alias does not keep"
+    );
+
+    let reads = [
+        (
+            "SELECT a, v FROM _local.even WHERE v = 700",
+            "SELECT a, v FROM v_keyed WHERE v = 700",
+        ),
+        (
+            "SELECT a, v FROM _local.even WHERE v >= 900 AND v < 960",
+            "SELECT a, v FROM v_keyed WHERE v % 2 = 0 AND v >= 900 AND v < 960",
+        ),
+        (
+            "SELECT a FROM _local.low WHERE b = 3",
+            "SELECT a FROM v_keyed WHERE a < 500 AND b = 3",
+        ),
+    ];
+    for (local, served) in reads {
+        fx.agree(local, served);
+    }
+    churn(&mut fx.direct, 2001, 2600);
+    sql(&mut fx.direct, "s", "UPDATE t SET v = 700 WHERE a IN (7, 8, 9)");
+    sql(&mut fx.direct, "s", "UPDATE t SET v = 701 WHERE a = 200");
+    fx.drain();
+    for (local, served) in reads {
+        fx.agree(local, served);
+    }
+    assert!(!canonical(&query(&mut fx.direct, "s", "SELECT a FROM v_keyed WHERE v = 701")).is_empty());
+    assert!(
+        canonical(&fx.local("SELECT a FROM _local.even WHERE v = 701")).is_empty(),
+        "an odd v is outside the alias, index and all"
+    );
+}
+
+/// The same `SELECT` under an alias resumes the copy a reopen finds; another
+/// one — other rows or other columns — holds a foreign cursor, and reseeds.
+#[test]
+fn an_alias_resumes_and_another_select_under_it_reseeds() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 200);
+    let first = "SELECT a, b, v FROM v_keyed WHERE v > 100";
+    assert!(fx.alias("sub", first).result.reseeded());
+    fx.reopen();
+    assert!(
+        !fx.alias("sub", first).result.reseeded(),
+        "the same SELECT resumes its persisted cursor"
+    );
+    churn(&mut fx.direct, 201, 300);
+    fx.reopen();
+    for other in [
+        "SELECT a, b, v FROM v_keyed WHERE v > 400",
+        "SELECT a, b, v, body FROM v_keyed WHERE v > 400",
+    ] {
+        assert!(
+            fx.alias("sub", other).result.reseeded(),
+            "{other}: another SELECT's cursor is foreign"
+        );
+        fx.kept("sub", other);
+    }
+    assert_eq!(fx.mirror().mirrored_ids().len(), 1, "one alias, one copy");
+}
+
+/// An alias holds an id, which a recreated view does not keep, and a plan
+/// compiled against the view's schema, which it may not keep either. A poll
+/// plans the `SELECT` again from its text; until that succeeds the alias is
+/// failed, and its copy answers at the round it reached.
+#[test]
+fn an_alias_follows_its_view_through_a_drop_and_a_recreate() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 200);
+    let even = "SELECT a, b, v FROM v_keyed WHERE v % 2 = 0";
+    let id = fx.alias("even", even).view_id;
+    let held = canonical(&fx.local("SELECT * FROM _local.even"));
+
+    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+    for _ in 0..2 {
+        let report = fx.drain();
+        assert!(
+            matches!(&report[..], [o] if o.view_id == id && matches!(o.result, PollResult::Failed(_))),
+            "{report:?}"
+        );
+    }
+    assert_eq!(
+        canonical(&fx.local("SELECT * FROM _local.even")),
+        held,
+        "the copy answers at the round it reached"
+    );
+
+    fed_view(
+        &mut fx.direct,
+        "s",
+        "v_keyed",
+        "SELECT a, b, v, body FROM t WHERE v > 50",
+    );
+    churn(&mut fx.direct, 201, 300);
+    let report = fx.drain();
+    assert!(
+        matches!(&report[..], [o] if o.view_id == id && o.result.reseeded()),
+        "{report:?}"
+    );
+    fx.kept("even", even);
+    churn(&mut fx.direct, 301, 400);
+    let report = fx.drain();
+    assert!(
+        matches!(&report[..], [o] if matches!(o.result, PollResult::Advanced)),
+        "{report:?}"
+    );
+    fx.kept("even", even);
+
+    // Recreated without a column the SELECT names: there is no plan to make.
+    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+    fed_view(&mut fx.direct, "s", "v_keyed", "SELECT a, b, body FROM t WHERE v > 50");
+    let report = fx.drain();
+    assert!(
+        matches!(&report[..], [PollOutcome { result: PollResult::Failed(e), .. }] if e.to_string().contains("'v'")),
+        "{report:?}"
+    );
+}
+
+/// A restarted server continues no cursor an earlier boot handed out: the
+/// first poll on the new connection reads an alias whole.
+#[test]
+fn an_alias_reseeds_after_a_server_restart() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let even = "SELECT a, b, v FROM v_keyed WHERE v % 2 = 0";
+    fx.alias("even", even);
+    fx.restart_server();
+    fx.reconnect_mirror();
+    churn(&mut fx.direct, 61, 120);
+    let report = fx.drain();
+    assert!(matches!(&report[..], [o] if o.result.reseeded()), "{report:?}");
+    fx.kept("even", even);
+}
+
+/// A held poll over several copies — aliases of one view and a mirrored view of
+/// another table — sleeps through a commit that reaches the view and leaves
+/// every copy nothing, and one answer carries whichever copies the next commit
+/// reached.
+#[test]
+fn a_held_poll_sleeps_through_commits_no_copy_keeps_a_row_of() {
+    const GAP: Duration = Duration::from_millis(600);
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let aliases = [
+        ("a7", "SELECT a, b, v FROM v_keyed WHERE a = 7"),
+        ("a9", "SELECT a, b, v FROM v_keyed WHERE a = 9"),
+        ("big", "SELECT a, b, v FROM v_keyed WHERE v > 100000"),
+    ];
+    for (alias, sql_text) in aliases {
+        fx.alias(alias, sql_text);
+    }
+    block_on(fx.mirror().mirror_view(&rel("s", "v_repl"))).expect("mirror v_repl");
+
+    for (i, last) in [
+        "UPDATE t SET v = v + 2 WHERE a = 9",
+        "INSERT INTO t VALUES (9000, 1, 200000, 0.5, 'big')",
+        "UPDATE r SET v = v + 1 WHERE id = 30",
+        "UPDATE t SET v = 300000 WHERE a IN (7, 9)",
+        "DELETE FROM t WHERE a = 7",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = fx.server.sock_path().to_string();
+        let t0 = std::time::Instant::now();
+        let writer = std::thread::spawn(move || {
+            let mut client = GnitzClient::connect(&target).unwrap();
+            // `v_keyed` keeps this row; no copy does.
+            sql(
+                &mut client,
+                "s",
+                &format!("INSERT INTO t VALUES ({}, 1, 5, 0.5, 'elsewhere')", 5000 + i),
+            );
+            std::thread::sleep(GAP);
+            sql(&mut client, "s", last);
+        });
+        let report = block_on(fx.mirror().sync(HELD))
+            .map(|s| s.mirrored)
+            .expect("a poll the last commit ends");
+        let took = t0.elapsed();
+        writer.join().unwrap();
+        assert!(took >= GAP, "{last}: a commit no copy keeps a row of ended the wait");
+        assert!(took < RELEASED, "{last}: the commit a copy keeps a row of released it");
+        assert!(
+            report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+            "{report:?}"
+        );
+        for (alias, sql_text) in aliases {
+            let (local, sent) = cost(fx.mirror(), |m| query(m, "s", &format!("SELECT * FROM _local.{alias}")));
+            assert_eq!(sent, 0, "{last}: {alias} is answered off its copy");
+            assert_eq!(
+                canonical(&local),
+                canonical(&query(&mut fx.direct, "s", sql_text)),
+                "{last}: {alias}"
+            );
+        }
+        fx.differential("s", "SELECT * FROM v_repl");
+    }
+    assert!(
+        canonical(&fx.local("SELECT * FROM _local.a7")).is_empty(),
+        "the DELETE emptied a7"
+    );
 }
 
 // ---------------------------------------------------------------------------

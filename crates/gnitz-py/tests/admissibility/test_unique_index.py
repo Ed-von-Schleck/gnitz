@@ -20,7 +20,7 @@ import pytest
 import gnitz
 from _catalog import family
 from _read import bag, scanned
-from _schemas import KV
+from _schemas import KV, kv
 from _serverproc import NEEDS_MULTI, TINY_SCAN_CHUNKS
 from _sql import insert
 
@@ -368,9 +368,8 @@ def test_a_write_is_validated_against_its_fold(client, via, committed, frames, f
     before any claim is checked: only the holders the whole write leaves count."""
     tid = _raw_table(client)
     if committed:
-        client.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": p, "val": v} for p, v in committed]))
-    batches = [gnitz.ZSetBatch(KV).extend([{"pk": p, "val": v, "_weight": w} for p, v, w in frame])
-               for frame in frames]
+        client.push(tid, kv(*committed))
+    batches = [kv(*frame) for frame in frames]
 
     with _violation() if final is None else contextlib.nullcontext():
         if via == "push":
@@ -390,9 +389,9 @@ def test_bulk_colliding_fresh_pks_rejected(client):
     tid = _raw_table(client)
     n = 2000
     committed = [(i, i) for i in range(n)]
-    client.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": p, "val": v} for p, v in committed]))
+    client.push(tid, kv(*committed))
     with _violation():
-        client.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": n + i, "val": i} for i in range(n)]))
+        client.push(tid, kv(*((n + i, i) for i in range(n))))
     assert bag(client.scan(tid, KV)) == dict.fromkeys(committed, 1)
 
 

@@ -18,16 +18,13 @@ import gnitz
 import pytest
 from _read import bag
 from _serverproc import TINY_REPLY_FRAMES, join_or_fail, spawn
-from _schemas import KV
+from _schemas import KV, kv
 
 
 def _kvs(*tids):
     """`tids`, each paired with the `KV` schema its rows are read in."""
     return [(t, KV) for t in tids]
 
-
-def _batch(values):
-    return gnitz.ZSetBatch(KV).extend({"pk": pk, "val": val} for pk, val in values)
 
 
 def test_the_results_line_up_with_the_requested_tids(client):
@@ -37,8 +34,8 @@ def test_the_results_line_up_with_the_requested_tids(client):
     master-authored terminal alone. However many relations it names, it is one
     request."""
     a, empty, b = (client.create_table(name, KV) for name in ("a", "empty", "b"))
-    client.push(a, _batch([(pk, pk * 10) for pk in range(20)]))
-    client.push(b, _batch([(99, 990)]))
+    client.push(a, kv(*((pk, pk * 10) for pk in range(20))))
+    client.push(b, kv((99, 990)))
 
     want_a = {(pk, pk * 10): 1 for pk in range(20)}
     before = client.requests_sent
@@ -54,7 +51,7 @@ def test_a_base_and_a_view_snapshot_at_one_cut(client):
     """One hash-partitioned base table and one aggregate view (single-row output,
     read via the replicated/unicast path) agree at the same cut."""
     t = client.create_table("t", KV)
-    client.push(t, _batch([(i, 1) for i in range(20)]))
+    client.push(t, kv(*((i, 1) for i in range(20))))
     client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t")
     v = client.resolve_table("v")
 
@@ -106,8 +103,8 @@ def test_a_commit_is_never_observed_torn(client, server):
         try:
             for i in range(N):
                 with client.transaction() as txn:
-                    txn.push(a, _batch([(i, i)]))
-                    txn.push(b, _batch([(i, i)]))
+                    txn.push(a, kv((i, i)))
+                    txn.push(b, kv((i, i)))
         finally:
             stop.set()
 
@@ -136,7 +133,7 @@ def test_a_view_never_leads_its_base(client, server):
     client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0")
     v = client.resolve_table("v")
 
-    client.push(t, _batch([(i, i) for i in range(10)]))
+    client.push(t, kv(*((i, i) for i in range(10))))
     res = client.scan_many([(t, KV), v])
     assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
 
@@ -146,7 +143,7 @@ def test_a_view_never_leads_its_base(client, server):
     def writer():
         try:
             for i in range(10, 10 + N):
-                client.push(t, _batch([(i, i)]))
+                client.push(t, kv((i, i)))
         finally:
             stop.set()
 
@@ -169,7 +166,7 @@ def test_a_view_never_leads_its_base(client, server):
 
 def test_every_refusal_leaves_the_server_serving(client):
     t = client.create_table("t", KV)
-    client.push(t, _batch([(1, 1)]))
+    client.push(t, kv((1, 1)))
 
     # A repeated tid is legal, so the count alone is what this one crosses.
     with pytest.raises(gnitz.GnitzRefusedError, match="too many items"):
@@ -187,7 +184,7 @@ def test_a_system_family_is_read_beside_user_relations(client):
     """A family is read off the master's own copy, a table off its workers: one
     request answers both, each as its own scan does."""
     t = client.create_table("t", KV)
-    client.push(t, _batch([(1, 1)]))
+    client.push(t, kv((1, 1)))
     tables = gnitz.sys_schema(gnitz.TABLE_TAB)
     first, family, last = client.scan_many([(t, KV), (gnitz.TABLE_TAB, tables), (t, KV)])
     assert bag(first) == bag(last) == {(1, 1): 1}
@@ -196,7 +193,7 @@ def test_a_system_family_is_read_beside_user_relations(client):
 
 def test_a_repeated_tid_is_answered_at_each_position(client):
     t = client.create_table("t", KV)
-    client.push(t, _batch([(1, 1), (2, 2)]))
+    client.push(t, kv((1, 1), (2, 2)))
     assert [bag(r) for r in client.scan_many(_kvs(t, t))] == [{(1, 1): 1, (2, 2): 1}] * 2
 
 
@@ -218,12 +215,12 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):
     # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
     # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
     # genuinely multi-chunk.
-    c.push(big, _batch([(i, i) for i in range(4000)]))
+    c.push(big, kv(*((i, i) for i in range(4000))))
     want_big = {(i, i): 1 for i in range(4000)}
 
     ids = [c.create_table(f"s{k}", KV) for k in range(8)]
     for k, tid in enumerate(ids):
-        c.push(tid, _batch([(k, k * 10)]))
+        c.push(tid, kv((k, k * 10)))
     wants = [{(k, k * 10): 1} for k in range(8)]
     assert [bag(r) for r in c.scan_many(_kvs(big, *ids))] == [want_big] + wants
     assert [bag(r) for r in c.scan_many(_kvs(*ids, big))] == wants + [want_big]

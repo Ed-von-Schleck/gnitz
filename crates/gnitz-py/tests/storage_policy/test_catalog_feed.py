@@ -6,6 +6,7 @@ import time
 from _catalog import schema_id
 from _feedviews import FEED, Subscriber, later
 from _read import rows
+from _serverproc import join_or_fail
 
 
 def _ddl_feed(client):
@@ -51,17 +52,17 @@ def test_a_waiting_poll_is_released_by_a_ddl(client, mirror, server):
         f"CREATE VIEW ddl_feed WITH (delta = '{FEED}') AS "
         f"SELECT table_id, name FROM _system.tables WHERE schema_id = {sid}")
     mirror.mirror_view("ddl_feed")
-    mirror.sync().mirrored
+    mirror.sync()
     names = lambda: sorted(r.name for r in rows(mirror, "SELECT name FROM ddl_feed"))
     assert names() == []
 
     t0 = time.monotonic()
-    mirror.sync(wait=0.3).mirrored
+    mirror.sync(wait=0.3)
     assert time.monotonic() - t0 >= 0.3, "nothing changed, so the reply was held"
 
     writer = later(server, client.schema, 0.2, "CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
     t0 = time.monotonic()
-    mirror.sync(wait=60).mirrored
+    mirror.sync(wait=60)
     assert time.monotonic() - t0 < 20, "the DDL released it, not the wait"
-    writer.join()
+    join_or_fail("the late writer never finished", writer)
     assert names() == ["late"]

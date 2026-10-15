@@ -5,9 +5,8 @@ its exit status — and so run in an interpreter of their own (see `_childproc`)
 import asyncio
 import sys
 
-import gnitz
 from gnitz import aio
-from _schemas import KV
+from _schemas import SCHEMAS, kv
 
 
 def syscalls(target, tid, n, mode):
@@ -16,7 +15,7 @@ def syscalls(target, tid, n, mode):
     tid, n = int(tid), int(n)
 
     def batch(pk):
-        return gnitz.ZSetBatch(KV).extend([{"pk": pk, "val": pk}])
+        return kv((pk, pk))
 
     async def main():
         async with aio.connect(target) as conn:
@@ -36,9 +35,8 @@ def shutdown(target):
     """An exception escapes `asyncio.run` with work in flight."""
     async def main():
         conn = await aio.connect(target)
-        schemas = gnitz.sys_schema(gnitz.SCHEMA_TAB)
-        conn.scan(gnitz.SCHEMA_TAB, schemas)
-        conn.scan(gnitz.SCHEMA_TAB, schemas)
+        conn.scan(*SCHEMAS)
+        conn.scan(*SCHEMAS)
         raise RuntimeError("boom")
 
     asyncio.run(main())

@@ -90,17 +90,31 @@ pub fn differential(
     sql_text: &str,
     answer: Answer,
 ) -> usize {
-    let (local, sent) = cost(mirror, |m| query(m, schema, sql_text));
+    agreement(mirror, server, schema, sql_text, sql_text, answer)
+}
+
+/// [`differential`] where the mirrored read is spelled differently from the
+/// served one — a read of an alias, which no server holds, against the
+/// `SELECT` over the view it copies.
+pub fn agreement(
+    mirror: &mut GnitzClient,
+    server: &mut GnitzClient,
+    schema: &str,
+    local_sql: &str,
+    served_sql: &str,
+    answer: Answer,
+) -> usize {
+    let (local, sent) = cost(mirror, |m| query(m, schema, local_sql));
     match answer {
-        Answer::Local => assert_eq!(sent, 0, "{sql_text}: must be answered off the copy"),
-        Answer::Upstream => assert!(sent > 0, "{sql_text}: must be delegated, not answered off a copy"),
+        Answer::Local => assert_eq!(sent, 0, "{local_sql}: must be answered off the copy"),
+        Answer::Upstream => assert!(sent > 0, "{local_sql}: must be delegated, not answered off a copy"),
     }
-    let remote = query(server, schema, sql_text);
-    assert_eq!(local.0, remote.0, "{sql_text}: the two replies have different schemas");
-    if sql_text.contains("ORDER BY") {
-        assert_same_sequence(sql_text, &local, &remote)
+    let remote = query(server, schema, served_sql);
+    assert_eq!(local.0, remote.0, "{local_sql}: the two replies have different schemas");
+    if local_sql.contains("ORDER BY") {
+        assert_same_sequence(local_sql, &local, &remote)
     } else {
-        assert_same_zset(sql_text, &local, &remote)
+        assert_same_zset(local_sql, &local, &remote)
     }
 }
 

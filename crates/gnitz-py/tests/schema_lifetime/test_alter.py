@@ -10,6 +10,7 @@ is `test_alter_view.py`.
 import gnitz
 import pytest
 from _read import access, bag, rows, scanned
+from _schemas import KV, kv
 from _serverproc import NEEDS_MULTI
 
 
@@ -43,6 +44,19 @@ def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client):
 
 
 @NEEDS_MULTI
+def test_a_batch_built_under_the_names_before_a_rename_lands(client):
+    """A column rename changes names only, so a batch built under the old ones
+    still lays out the table's columns: it lands, and its rows read back under
+    the new name."""
+    tid = client.create_table("t", KV)
+    stale = kv((2, 20))
+    client.push(tid, kv((1, 10)))
+    client.execute_sql("ALTER TABLE t RENAME COLUMN val TO amount")
+    client.push(tid, stale)
+    client.push(tid, kv((3, 30)))
+    assert bag(scanned(client, "t"), "pk", "amount") == {(1, 10): 1, (2, 20): 1, (3, 30): 1}
+
+
 def test_rename_populated_join_view_keeps_its_output_weights(client):
     """Renaming a populated exchange-join view must not re-backfill it: the
     output Z-set is asserted whole before and after, so a second fill shows as

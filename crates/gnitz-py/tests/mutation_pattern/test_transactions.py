@@ -12,7 +12,7 @@ import contextlib
 import pytest
 import gnitz
 from _read import bag, rows, scanned
-from _schemas import KV
+from _schemas import KV, kv
 from _serverproc import TINY_SAL
 
 _TU = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
@@ -159,11 +159,8 @@ _BUNDLES = {
 def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames, after):
     tids = {n: client.create_table(n, KV) for n in "ab"}
 
-    def batch(rows):
-        return gnitz.ZSetBatch(KV).extend([{"pk": p, "val": v, "_weight": w} for p, v, w in rows])
-
     if committed:
-        client.push(tids["a"], batch([(p, v, 1) for p, v in committed]))
+        client.push(tids["a"], kv(*committed))
 
     refused = isinstance(after, type)
     with pytest.raises(after) if refused else contextlib.nullcontext():
@@ -175,7 +172,7 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames
                 if mode == "delete":
                     txn.delete(tid, KV, rows)
                 else:
-                    txn.push(tid, batch(rows), mode)
+                    txn.push(tid, kv(*rows), mode)
     assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == (
         (dict.fromkeys(committed, 1), {}) if refused else after)
 
@@ -219,7 +216,7 @@ def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, server
     tid = client.create_table("gone", KV)
     with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
         with client.transaction() as txn:
-            txn.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": 1, "val": 1}]), "update")
+            txn.push(tid, kv((1, 1)), "update")
             with gnitz.connect(server, schema=client.schema) as other:
                 other.execute_sql("DROP TABLE gone")
 

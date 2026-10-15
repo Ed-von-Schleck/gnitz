@@ -14,7 +14,6 @@ import contextlib
 import pytest
 import gnitz
 import _fk
-from _read import bag, scanned
 from _serverproc import NEEDS_MULTI
 from _sql import insert
 

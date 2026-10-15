@@ -25,10 +25,10 @@ import gnitz
 from gnitz import aio
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    Subscriber, base_tables, churn, later, mk_feed,
+    Subscriber, base_tables, churn, fed_view, later, mk_feed,
 )
 from _read import rows
-from _serverproc import NEEDS_MULTI
+from _serverproc import NEEDS_MULTI, join_or_fail
 
 
 # ── convergence ──────────────────────────────────────────────────────────────
@@ -42,8 +42,7 @@ def test_feed_converges_weight_exact(client, body):
     capture that shipped `+1` with no `-1` fails here where a row-set test would
     pass. The `linear` body carries a >12-byte TEXT payload, so the delta rows
     carry out-of-line strings."""
-    base_tables(client)
-    mk_feed(client, "f", body)
+    fed_view(client, body)
     sub = Subscriber(client, "f")
 
     churn(client, 1, 200)
@@ -60,8 +59,7 @@ def test_a_delta_touching_one_worker_only(client):
     """A one-row insert lands on one worker; the other W−1 emit nothing and write
     no delta row. Any design that assembles whole rounds server-side waits
     forever for a round they will never report — and passes at W=1."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     sub = Subscriber(client, "f")
     sub.bootstrap()
 
@@ -93,8 +91,7 @@ def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client):
     """`CREATE VIEW` drains its source's pending ticks itself, outside the tick
     loop. That round must reach the subscriber like any other, not be gated away
     as "nothing changed"."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     sub = Subscriber(client, "f")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub.bootstrap()
@@ -128,8 +125,7 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
             return hashlib.sha256(fh.read(4 << 20)).hexdigest()
 
     with gnitz.connect(own_server.target) as client:
-        base_tables(client)
-        mk_feed(client, "f", LINEAR)
+        fed_view(client)
         sub = Subscriber(client, "f")
         client.execute_sql("INSERT INTO t VALUES (1, 100, 'x')")
         sub.bootstrap()
@@ -145,8 +141,7 @@ def test_a_poll_after_a_round_of_another_view_keeps_its_cursor(client):
     """A poll answers with the last round that reached its own view: a round
     that reached only another view leaves the cursor where it was, and the
     next one that reaches this view moves it."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     client.execute_sql("CREATE VIEW other AS SELECT id, w FROM u WHERE w > 0")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub = Subscriber(client, "f")
@@ -180,8 +175,7 @@ def test_subscribers_at_one_position_share_one_read(own_server):
 
     target = own_server.target
     with gnitz.connect(target) as writer, gnitz.connect(target) as a, gnitz.connect(target) as b:
-        base_tables(writer)
-        mk_feed(writer, "f", LINEAR)
+        fed_view(writer)
         writer.execute_sql("CREATE VIEW other AS SELECT id, w FROM u WHERE w > 0")
         writer.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
         subs = []
@@ -253,8 +247,7 @@ def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
 def test_a_subscribed_reader_is_pushed_its_deltas(client, body):
     """A sync hands a subscribed reader the deltas a poll would have fetched,
     weights and all: the copy they add up to is the view."""
-    base_tables(client)
-    mk_feed(client, "f", body)
+    fed_view(client, body)
     sub = Subscriber(client, "f")
     churn(client, 1, 30)
     sub.bootstrap()
@@ -276,8 +269,7 @@ def test_a_subscribed_reader_is_pushed_its_deltas(client, body):
 def test_a_waiting_sync_is_held_until_a_commit_reaches_the_view(client, server):
     """With `wait`, a sync that has nothing to report is held for the wait, and
     a commit ends it at once with the commit's rows."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     sub = Subscriber(client, "f")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub.bootstrap()
@@ -291,7 +283,7 @@ def test_a_waiting_sync_is_held_until_a_commit_reaches_the_view(client, server):
     t0 = time.monotonic()
     got = sub.sync(wait=60)
     assert time.monotonic() - t0 < 20, "the commit released it, not the wait"
-    writer.join()
+    join_or_fail("the late writer never finished", writer)
     assert len(got) == 1, "the reply is the commit's delta"
     assert sub.copy == sub.scan()
 
@@ -299,13 +291,11 @@ def test_a_waiting_sync_is_held_until_a_commit_reaches_the_view(client, server):
         sub.sync(wait=-1)
 
 
-@pytest.mark.asyncio
 async def test_a_held_sync_leaves_an_async_client_free(client, server):
     """A sync held with nothing to report does not hold its client: a scan
     submitted beside it is answered and leaves it held, and the commit that
     then reaches the view ends it, with that commit's delta."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     vid, schema = client.resolve_table("f")
     tid, t_schema = client.resolve_table("t")
@@ -321,12 +311,10 @@ async def test_a_held_sync_leaves_an_async_client_free(client, server):
     assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
 
 
-@pytest.mark.asyncio
 async def test_a_held_sync_follows_a_subscription_made_beside_it(client, server):
     """A subscription made while a sync is held is one that sync waits for: a
     commit reaching its view alone ends the hold, with that commit's delta."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     mk_feed(client, "g", "SELECT id, w FROM u WHERE w > 0")
     (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
     async with aio.connect(server, schema=client.schema) as conn:
@@ -339,14 +327,12 @@ async def test_a_held_sync_follows_a_subscription_made_beside_it(client, server)
     assert (pushed[late].error, len(pushed[late].rows)) == (None, 1)
 
 
-@pytest.mark.asyncio
 async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
     """The writes behind a held sync are answered while it waits for a tick,
     which at the pace set here is ten minutes away."""
     own_server.start(extra_env={"GNITZ_PATIENT_TICK_GAP_MS": "600000"})
     with gnitz.connect(own_server.target) as client:
-        base_tables(client)
-        mk_feed(client, "f", LINEAR)
+        fed_view(client)
         client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
         vid, schema = client.resolve_table("f")
         async with aio.connect(own_server.target) as conn:
@@ -367,8 +353,7 @@ def test_a_sync_is_held_for_a_tick_no_longer_than_its_wait(own_server):
     its own wait ends, at a pace that puts the next tick ten minutes away."""
     own_server.start(extra_env={"GNITZ_PATIENT_TICK_GAP_MS": "600000"})
     with gnitz.connect(own_server.target) as client, gnitz.connect(own_server.target) as reader:
-        base_tables(client)
-        mk_feed(client, "f", LINEAR)
+        fed_view(client)
         client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
         # The read ticks the seed, and the pace counts from that tick.
         reader.subscribe(*client.resolve_table("f"))
@@ -441,8 +426,7 @@ def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
     `CREATE OR REPLACE` is the case nothing else would tell a subscriber about:
     unlike the drop, the name still resolves.
     """
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     sub = Subscriber(client, "f")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')")
     sub.bootstrap()
@@ -477,8 +461,7 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
     """
     own_server.start()
     with gnitz.connect(own_server.target) as client:
-        base_tables(client)
-        mk_feed(client, "f", LINEAR)
+        fed_view(client)
         sub = Subscriber(client, "f")
         churn(client, 1, 120)
         sub.bootstrap()

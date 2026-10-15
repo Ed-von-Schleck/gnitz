@@ -4,15 +4,15 @@ import pytest
 
 import gnitz
 from gnitz import aio
-from _read import bag, rows
-from _schemas import KV
+from _read import bag, result_rows, rows
+from _schemas import KV, kv
 
 
 @pytest.fixture
 def items(client):
     """The qualified name of a two-row `(pk, val)` table in `client`'s schema."""
     tid = client.create_table("items", KV)
-    client.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": 1, "val": 10}, {"pk": 2, "val": 20}]))
+    client.push(tid, kv((1, 10), (2, 20)))
     return f"{client.schema}.items"
 
 
@@ -60,7 +60,6 @@ def test_a_malformed_or_unplaced_name_is_refused_as_itself(client, name, exc, ne
         client.resolve_table(name)
 
 
-@pytest.mark.asyncio
 async def test_an_event_loop_connection_names_another_schema(server, client, items):
     """The same from a `gnitz.aio` connection: one in the default schema reads
     another's relation by name, and one opened in that schema needs no
@@ -68,7 +67,6 @@ async def test_an_event_loop_connection_names_another_schema(server, client, ite
     async with aio.connect(server) as public:
         tid, schema = await public.resolve_table(items)
         assert bag(await public.scan(tid, schema)) == _ITEMS
-        (res,) = await public.execute_sql(f"SELECT pk, val FROM {items}")
-        assert bag(res["rows"]) == _ITEMS
+        assert bag(result_rows(await public.execute_sql(f"SELECT pk, val FROM {items}"))) == _ITEMS
     async with aio.connect(server, schema=client.schema) as conn:
         assert (await conn.resolve_table("items"))[0] == tid

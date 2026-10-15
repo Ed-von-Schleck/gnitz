@@ -2,20 +2,16 @@
 how a scanned batch is presented to Python, what an empty result promises, and
 how a row addresses its fields.
 """
-import uuid
-
 import pytest
 
 from gnitz import TypeCode, ColumnDef, Schema, Row, ZSetBatch
+from _read import bag, rows
 from _schemas import KV
 
 
-_UUID = uuid.uuid4()
 _TABLES = {
     "kv": (KV, [{"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}]),
     "empty": (KV, []),
-    "uuid": (Schema([ColumnDef("pk", TypeCode.U64), ColumnDef("id", TypeCode.UUID)], [0]),
-             [{"pk": 1, "id": _UUID}]),
     "under": (Schema([ColumnDef("pk", TypeCode.U64),
                       ColumnDef("weight", TypeCode.I64),
                       ColumnDef("_x", TypeCode.I64)], [0]),
@@ -29,9 +25,9 @@ def scans(module_client):
     its batch, so every test reads the same result objects."""
     conn = module_client
     out = {}
-    for name, (schema, rows) in _TABLES.items():
+    for name, (schema, written) in _TABLES.items():
         tid = conn.create_table(name, schema)
-        conn.push(tid, ZSetBatch(schema).extend(rows))
+        conn.push(tid, ZSetBatch(schema).extend(written))
         out[name] = conn.scan(tid, schema)
     return out
 
@@ -46,13 +42,8 @@ def test_iteration_presents_every_row_with_its_weight(scans):
     iterator would leave the second pass empty."""
     result = scans["kv"]
     assert len(result) == 3
-    assert sorted((r.pk, r.val, r._weight) for r in result) == [(1, 10, 1), (2, 20, 1), (3, 30, 1)]
-    assert sorted((r.pk, r.val, r._weight) for r in result) == [(1, 10, 1), (2, 20, 1), (3, 30, 1)]
+    assert bag(result) == bag(result) == {(1, 10): 1, (2, 20): 1, (3, 30): 1}
     assert result.lsn is not None
-
-
-def test_a_uuid_column_reads_as_canonical_text(scans):
-    assert [r.id for r in scans["uuid"]] == [str(_UUID)]
 
 
 def test_an_empty_result(scans):
@@ -60,21 +51,19 @@ def test_an_empty_result(scans):
     field names without branching on emptiness."""
     result = scans["empty"]
     assert len(result) == 0
-    assert not result
     assert list(result) == []
     assert [c.name for c in result.schema.columns] == ["pk", "val"]
 
 
-def test_including_hidden_presents_every_column_of_the_same_rows(module_client):
+def test_including_hidden_presents_every_column_of_the_same_rows(client):
     """A dropped column is a hidden slot: absent from the default presentation,
     first-class in `including_hidden()`, which reads the same batch at the same
     LSN."""
-    conn = module_client
-    conn.execute_sql(
+    client.execute_sql(
         "CREATE TABLE hid (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "INSERT INTO hid VALUES (1, 10, 100), (2, 20, 200); "
         "ALTER TABLE hid DROP COLUMN a")
-    result = conn.scan(*conn.resolve_table("hid"))
+    result = client.scan(*client.resolve_table("hid"))
     full = result.including_hidden()
 
     assert [r._fields for r in result] == [("pk", "b")] * 2
@@ -160,16 +149,15 @@ def test_a_visible_column_claims_a_name_a_hidden_one_repeats(columns, extra):
     assert r.a == r["a"] == r._asdict()["a"] == 10
 
 
-def test_the_last_of_two_visible_columns_claims_a_repeated_name(module_client):
+def test_the_last_of_two_visible_columns_claims_a_repeated_name(client):
     """A join view's wildcard presents both sides' columns under their own
     names, so `pk` and `a` each appear twice."""
-    conn = module_client
-    conn.execute_sql(
+    client.execute_sql(
         "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE TABLE d (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL); "
         "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk; "
         "INSERT INTO c VALUES (4, 1, 4); INSERT INTO d VALUES (1, 1)")
-    [r] = conn.execute_sql("SELECT * FROM dup")[0]["rows"]
+    [r] = rows(client, "SELECT * FROM dup")
     assert tuple(r) == (4, 1, 4, 1, 1)
     assert r._fields == ("pk", "a", "b", "pk", "a")
     assert r.pk == r["pk"] == r._asdict()["pk"] == 1

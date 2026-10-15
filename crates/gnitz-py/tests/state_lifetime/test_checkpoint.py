@@ -17,7 +17,7 @@ import threading
 import pytest
 import gnitz
 from _read import bag, scanned
-from _schemas import KV
+from _schemas import KV, kv
 from _serverproc import MULTI, START_TIMEOUT, join_or_fail, spawn
 
 
@@ -39,8 +39,7 @@ def _flood(client, tid, started, n_batches=12, batch_size=400):
     after the first push — and on failure, so waiters wake."""
     try:
         for i in range(n_batches):
-            client.push(tid, gnitz.ZSetBatch(KV).extend(
-                {"pk": pk, "val": pk} for pk in range(i * batch_size, (i + 1) * batch_size)))
+            client.push(tid, kv(*((pk, pk) for pk in range(i * batch_size, (i + 1) * batch_size))))
             started.set()
     finally:
         started.set()
@@ -62,7 +61,7 @@ def test_a_view_tracks_its_base_across_frequent_checkpoints(target):
 
     total = 3_000
     for base in range(0, total, 500):
-        client.push(tid, gnitz.ZSetBatch(KV).extend({"pk": i, "val": i} for i in range(base, base + 500)))
+        client.push(tid, kv(*((i, i) for i in range(base, base + 500))))
 
     want = {(i, i): 1 for i in range(total)}
     assert bag(scanned(client, "t"), "pk", "val") == want, "rows lost at a checkpoint"

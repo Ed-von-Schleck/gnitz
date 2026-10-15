@@ -9,7 +9,7 @@ UPDATE and kept on the other is the failure a row-set test cannot see.
 """
 import pytest
 import gnitz
-from _feedviews import GROUPBY, JOIN, LINEAR, Subscriber, base_tables, churn, mk_feed
+from _feedviews import GROUPBY, JOIN, LINEAR, Subscriber, base_tables, churn, fed_view, mk_feed
 from _read import rows
 
 
@@ -34,8 +34,7 @@ def test_a_subscribed_copy_is_the_select_over_the_view(client, body, sql, keep, 
     rounds most workers emit nothing for, and deletes. A key list and a key
     range reach only the workers that own them, which is where a wrong route
     would lose a row."""
-    base_tables(client)
-    mk_feed(client, "f", body)
+    fed_view(client, body)
     churn(client, 1, 200)
     sub = Subscriber(client, "f", sql, keep, cols)
     sub.bootstrap()
@@ -55,8 +54,7 @@ def test_a_subscribed_copy_is_the_select_over_the_view(client, body, sql, keep, 
 def test_a_subscription_bounded_by_the_views_index(client):
     """The planner bounds the read by the view's index: an index walk at the
     bootstrap, the same range as a filter over the feed past it."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     client.execute_sql("CREATE INDEX by_v ON f(v)")
     churn(client, 1, 2000)
     sub = Subscriber(client, "f", "SELECT id, v FROM f WHERE v >= 900 AND v < 1500", lambda r: 900 <= r.v < 1500, ("id", "v"))
@@ -71,8 +69,7 @@ def test_a_subscription_bounded_by_the_views_index(client):
 def test_an_update_of_a_column_the_subscription_drops_ships_nothing(client):
     """An UPDATE is a retraction and an insert. Under a projection that drops
     the column it changed they are one row, and cancel before the reply."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     churn(client, 1, 200)
     slim = Subscriber(client, "f", "SELECT id, v FROM f", lambda r: True, ("id", "v"))
     wide = Subscriber(client, "f", "SELECT id, v, body FROM f", lambda r: True, ("id", "v", "body"))
@@ -89,8 +86,7 @@ def test_a_cursor_of_another_subscription_is_refused(client):
     """The copy a cursor belongs to is one subscription's. Polled under another
     it would apply that one's deltas to this one's rows, so the tag differs and
     the poll is refused as any foreign cursor is."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     churn(client, 1, 200)
     a = Subscriber(client, "f", "SELECT id, v FROM f WHERE v > 100", lambda r: r.v > 100, ("id", "v"))
     b = Subscriber(client, "f", "SELECT id, v FROM f WHERE v > 200", lambda r: r.v > 200, ("id", "v"))
@@ -151,7 +147,6 @@ def test_a_synced_cursor_passes_the_rounds_it_kept_nothing_of(own_server):
 )
 def test_a_subscription_is_a_plain_select(client, sql):
     """A delta of an aggregate, an order or a cut is not that read of a delta."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR)
+    fed_view(client)
     with pytest.raises(gnitz.GnitzError, match="subscription"):
         client.subscription(sql)

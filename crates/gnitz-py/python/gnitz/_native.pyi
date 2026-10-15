@@ -43,6 +43,7 @@ __all__ = [
     "IDX_TAB",
     "FIRST_USER_TABLE_ID",
     "MAX_COLUMNS",
+    "MAX_IN_FLIGHT",
     "debug_assertions",
     "type_codes",
     "instructions_retired",
@@ -55,6 +56,7 @@ COL_TAB: int
 IDX_TAB: int
 FIRST_USER_TABLE_ID: int
 MAX_COLUMNS: int
+MAX_IN_FLIGHT: int
 debug_assertions: bool
 
 def sys_schema(table_id: int) -> Schema: ...

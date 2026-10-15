@@ -6,7 +6,7 @@ from gnitz._native import (
     ColumnDef, Schema, ZSetBatch, GnitzClient, AsyncGnitzClient,
     PollResult, Pushed, Synced, Pending,
     SCHEMA_TAB, TABLE_TAB, COL_TAB, IDX_TAB,
-    FIRST_USER_TABLE_ID, MAX_COLUMNS,
+    FIRST_USER_TABLE_ID, MAX_COLUMNS, MAX_IN_FLIGHT,
     debug_assertions, sys_schema,
 )
 from gnitz._types import (
@@ -26,7 +26,7 @@ __all__ = [
     "ColumnDef", "Schema", "ZSetBatch", "GnitzClient", "AsyncGnitzClient",
     "PollResult", "Pushed", "Synced", "Pending",
     "SCHEMA_TAB", "TABLE_TAB", "COL_TAB", "IDX_TAB",
-    "FIRST_USER_TABLE_ID", "MAX_COLUMNS",
+    "FIRST_USER_TABLE_ID", "MAX_COLUMNS", "MAX_IN_FLIGHT",
     "debug_assertions", "sys_schema",
     "TypeCode", "SqlResult",
     "DdlResult", "RowsAffectedResult", "RowsResult",

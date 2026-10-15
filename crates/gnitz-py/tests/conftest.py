@@ -6,6 +6,7 @@ import warnings
 
 import pytest
 import gnitz
+from gnitz import aio
 from _paths import REPO_ROOT
 from _uid import uid
 from _serverproc import ServerProc
@@ -213,6 +214,13 @@ def client(server):
     (`client.schema`). A second connection a test opens to `server` reaches the
     same relations with `gnitz.connect(server, schema=client.schema)`."""
     with _in_fresh_schema(server, "s") as conn:
+        yield conn
+
+
+@pytest.fixture
+async def aconn(server, client):
+    """A `gnitz.aio` connection on the test's event loop, in `client`'s schema."""
+    async with aio.connect(server, client.schema) as conn:
         yield conn
 
 

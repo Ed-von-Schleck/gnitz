@@ -10,7 +10,7 @@ by the advanced cursor — shows as a weight the folded copy lacks.
 import threading
 
 import gnitz
-from _feedviews import JOIN, Subscriber, base_tables, mk_feed
+from _feedviews import JOIN, Subscriber, fed_view
 from _serverproc import MULTI, join_or_fail, spawn
 
 # Past the threshold the server boots with, so each transaction's commit fires
@@ -23,8 +23,7 @@ _ROUNDS = 5
 def test_a_feed_polled_across_two_source_tick_batches_loses_no_round(own_server):
     own_server.start(workers=MULTI, extra_env={"GNITZ_TICK_COALESCE_ROWS": str(_COALESCE)})
     with gnitz.connect(own_server.target) as client, gnitz.connect(own_server.target) as feed:
-        base_tables(client)
-        mk_feed(client, "f", JOIN)
+        fed_view(client, JOIN)
         t_id, t_schema = client.resolve_table("t")
         u_id, u_schema = client.resolve_table("u")
         sub = Subscriber(feed, "f")

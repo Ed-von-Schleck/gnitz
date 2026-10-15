@@ -211,9 +211,10 @@ class TestAppendKeywordPlan:
         assert any("_weight" in n for n in exc.value.__notes__)
 
     def test_signature_is_introspectable(self):
-        """There are no .pyi stubs, so the method's own text signature is the
-        entire discoverability surface for the `_weight` spelling. A malformed
-        `__text_signature__` on the raw method slot makes this call raise."""
+        """`help()` and `inspect` read the method's runtime text signature, not
+        the stub, and stubtest skips a method whose signature it cannot read. A
+        malformed `__text_signature__` on the raw method slot makes this call
+        raise."""
         assert "_weight" in inspect.signature(ZSetBatch.append).parameters
 
 
@@ -360,29 +361,21 @@ class TestValueCoercion:
                 with pytest.raises(TypeError):
                     ZSetBatch(schema).append(**row)
 
-    def test_u128_keeps_its_full_unsigned_range(self):
-        """A U128 value above `i128::MAX` is legal and must not be rejected as a
-        signed overflow."""
-        u128_max = (1 << 128) - 1
-        schema = Schema([ColumnDef("k", TypeCode.U128),
-                         ColumnDef("v", TypeCode.U128)], [0])
-        batch = ZSetBatch(schema).append(k=u128_max, v=u128_max)
-        assert _col(batch, "k") == [u128_max]
-        assert _col(batch, "v") == [u128_max]
-
-    def test_i128_keeps_its_full_signed_range(self):
-        """The signed twin, and the half no join can reach: a matched join key
-        always lands in the two operands' non-negative overlap, so the negative
-        half of the 128-bit space is only addressable through this path. A key
-        decoded as unsigned comes back as `2**128 - 1` where `-1` was written."""
-        values = [-(2 ** 127), -1, 0, 1, (2 ** 127) - 1]
-        schema = Schema([ColumnDef("k", TypeCode.I128),
-                         ColumnDef("v", TypeCode.I128)], [0])
+    @pytest.mark.parametrize("tc,values", [
+        (TypeCode.U128, [0, 2**64 - 1, 2**64, 2**127, 2**128 - 1]),
+        (TypeCode.I128, [-(2**127), -1, 0, 1, 2**127 - 1]),
+    ], ids=["u128", "i128"])
+    def test_a_128_bit_column_keeps_its_full_range(self, tc, values):
+        """A U128 value above `i128::MAX` is legal rather than a signed overflow,
+        and the negative half of I128 is addressable only through this path: a
+        matched join key always lands in the two operands' non-negative overlap.
+        A value decoded with the other signedness comes back as another number —
+        `2**128 - 1` where `-1` was written."""
+        schema = Schema([ColumnDef("k", tc), ColumnDef("v", tc)], [0])
         batch = ZSetBatch(schema)
         for v in values:
             batch.append(k=v, v=v)
-        assert _col(batch, "k") == values
-        assert _col(batch, "v") == values
+        assert _col(batch, "k") == _col(batch, "v") == values
 
     def test_bytes_and_text_columns_stay_apart(self):
         """BLOB and STRING share one region form, so the extraction is where the
@@ -416,32 +409,6 @@ class TestValueCoercion:
             batch.append(a=1, b=2, v=3)        # the key buffer is clean
             assert [(r.a, r.b, r.v) for r in batch.rows()] == [(1, 2, 3)]
 
-    def test_a_decimal_column_takes_every_spelling_of_one_value(self):
-        """A DECIMAL is a scaled integer, so the binding has to scale whatever it
-        is handed: a `Decimal`, an `int`, a `float`, a string, and a `Decimal` in
-        exponent form all name a value at the column's scale. A longer fraction
-        rounds half away from zero rather than truncating, which is the rule the
-        SQL literal path also follows.
-
-        The refusals are the two ways a value has no scaled image: text that is
-        not a number, and a magnitude past the `i64` behind the scale.
-        """
-        schema = Schema([ColumnDef("id", TypeCode.I64),
-                         ColumnDef("v", TypeCode.DECIMAL, scale=3)], [0])
-        assert schema.columns[1].scale == 3, "a client-authored schema carries the scale"
-
-        batch = ZSetBatch(schema)
-        for i, v in enumerate([Decimal("12.5"), 3, 1.1, "2.2505", Decimal("1E+2")], 1):
-            batch.append(id=i, v=v)
-        assert _col(batch, "v") == [Decimal("12.500"), Decimal("3.000"),
-                                    Decimal("1.100"), Decimal("2.251"),
-                                    Decimal("100.000")]
-
-        with pytest.raises(ValueError):
-            ZSetBatch(schema).append(id=9, v="abc")
-        with pytest.raises(OverflowError):
-            ZSetBatch(schema).append(id=9, v=10**16)
-
     def test_an_f32_column_refuses_a_finite_value_past_its_range(self):
         """A Python float is an f64, narrowed to the column's width. A finite
         value past F32's range has no F32 image, so it is refused as the SQL
@@ -457,6 +424,13 @@ class TestValueCoercion:
         assert _col(batch, "f") == [float("inf")]
 
     @pytest.mark.parametrize("scale,value,want", [
+        (3, Decimal("12.5"), "12.500"),
+        (3, 3, "3.000"),
+        (3, 1.1, "1.100"),
+        (3, "2.2505", "2.251"),
+        (3, Decimal("1E+2"), "100.000"),
+        (3, "abc", ValueError),
+        (3, 10**16, OverflowError),
         (0, "1.25" + "0" * 36, "1"),
         (0, "-1.25" + "0" * 36, "-1"),
         (0, "1.5" + "0" * 37, "2"),
@@ -467,7 +441,13 @@ class TestValueCoercion:
         (2, 1e-19, "0.00"),
         (2, 1e30, OverflowError),
     ])
-    def test_a_decimal_cell_rounds_half_away_from_zero_at_any_length(self, scale, value, want):
+    def test_a_decimal_column_scales_every_spelling_of_a_value(self, scale, value, want):
+        """A DECIMAL is a scaled integer, so the binding scales whatever it is
+        handed — a `Decimal`, an `int`, a `float`, a string, a `Decimal` in
+        exponent form. A longer fraction rounds half away from zero at any
+        length, the rule the SQL literal path also follows. The refusals are
+        the two ways a value has no scaled image: text that is not a number,
+        and a magnitude past the `i64` behind the scale."""
         schema = Schema([ColumnDef("id", TypeCode.I64),
                          ColumnDef("v", TypeCode.DECIMAL, scale=scale)], [0])
         if isinstance(want, type):

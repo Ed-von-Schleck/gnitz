@@ -11,11 +11,11 @@ feed" a comparison of two mechanisms rather than of two setups.
 "capacity is invisible" is a claim about the shapes the other two already cover.
 """
 
-import threading
 import time
 
 import gnitz
-from _read import bag
+from _read import bag, rows
+from _serverproc import spawn
 
 # Big enough that nothing built on these helpers falls off the window; a test
 # about retention sets its own.
@@ -111,19 +111,40 @@ class Subscriber:
 
 
 def later(target, schema, after, statement):
-    """Run `statement` from a connection of its own, `after` seconds from now."""
+    """Run `statement` from a connection of its own, `after` seconds from now,
+    on a `spawn`ed thread: `join_or_fail` it."""
     def run():
         with gnitz.connect(target, schema=schema) as other:
             time.sleep(after)
             other.execute_sql(statement)
 
-    t = threading.Thread(target=run)
-    t.start()
-    return t
+    return spawn(run)
 
 
 def mk_feed(client, name, body, feed=FEED):
     client.execute_sql(f"CREATE VIEW {name} WITH (delta = '{feed}') AS {body}")
+
+
+def fed_view(client, body=LINEAR):
+    """The base tables, and `f` over them keeping a delta feed."""
+    base_tables(client)
+    mk_feed(client, "f", body)
+
+
+def agree(mirror, client, q, *, local=True):
+    """`q` through the mirroring client equals `q` against the server, weight for
+    weight and not vacuously, and was answered where `local` says: off the copy
+    with no request sent, or upstream.
+
+    Without the locality half a copy that is not valid makes the read delegate,
+    and the comparison then holds the server against itself and passes."""
+    before = mirror.requests_sent
+    got = bag(rows(mirror, q))
+    sent = mirror.requests_sent - before
+    assert (sent == 0) == local, f"{q}: {sent} requests sent, answered {'upstream' if sent else 'off the copy'}"
+    want = bag(rows(client, q))
+    assert got or want, f"{q}: both replies are empty, so they agree about nothing"
+    assert got == want, f"{q}: the copy and the server disagree"
 
 
 def base_tables(client):

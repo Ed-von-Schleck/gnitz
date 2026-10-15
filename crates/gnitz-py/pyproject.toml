@@ -36,6 +36,8 @@ dev = [
 
 [tool.pytest.ini_options]
 xfail_strict = true
+# Every `async def` test and fixture runs on pytest-asyncio's loop unmarked.
+asyncio_mode = "auto"
 # A server data dir holds a fallocated SAL, so the defaults (keep 3 sessions,
 # keep every test's dir) are unaffordable. "failed" makes the tmp_path teardown
 # drop a passing test's dir at end of test, which is what bounds a green run's
