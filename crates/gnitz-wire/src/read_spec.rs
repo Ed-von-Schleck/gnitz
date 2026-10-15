@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::codec::{decode_all, Reader, Wire, Writer};
 use crate::range::KeyRange;
-use crate::{MAX_COLUMNS, MAX_PK_BYTES};
+use crate::{widen_pk_be, MAX_COLUMNS, MAX_PK_BYTES, NARROW_PK_MAX_BYTES};
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -123,13 +123,40 @@ impl PkKeys {
     /// Sort and dedup `keys`, each exactly `stride` bytes.
     pub fn from_keys<'a>(stride: usize, keys: impl IntoIterator<Item = &'a [u8]>) -> Self {
         assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        let mut ks: Vec<&[u8]> = keys
+        let keys = keys
             .into_iter()
-            .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"))
-            .collect();
+            .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"));
+        if stride <= NARROW_PK_MAX_BYTES {
+            return Self::from_images(stride, keys.map(widen_pk_be));
+        }
+        let mut ks: Vec<&[u8]> = keys.collect();
         ks.sort_unstable();
         ks.dedup();
         PkKeys { stride: stride as u8, bytes: ks.concat() }
+    }
+
+    /// Sort and dedup key images, each stored as its low `stride` bytes
+    /// big-endian. An image orders as those bytes do; the `u64` arm is the
+    /// narrower sort for keys of at most 8 bytes.
+    pub fn from_images(stride: usize, images: impl IntoIterator<Item = u128>) -> Self {
+        assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        let mut bytes = Vec::new();
+        if stride <= 8 {
+            let mut imgs: Vec<u64> = images.into_iter().map(|v| v as u64).collect();
+            imgs.sort_unstable();
+            imgs.dedup();
+            bytes.reserve(imgs.len() * stride);
+            imgs.iter()
+                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..]));
+        } else {
+            let mut imgs: Vec<u128> = images.into_iter().collect();
+            imgs.sort_unstable();
+            imgs.dedup();
+            bytes.reserve(imgs.len() * stride);
+            imgs.iter()
+                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..]));
+        }
+        PkKeys { stride: stride as u8, bytes }
     }
 
     /// Keys of `stride` already concatenated in strictly ascending order.
@@ -230,12 +257,8 @@ impl ReadSpec {
 
     /// The SCAN_SPEC request blob.
     pub fn encode(&self) -> Vec<u8> {
-        let keys = match &self.bound {
-            ReadBound::PkSet(k) => k.as_bytes().len(),
-            _ => 0,
-        };
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
-        let mut w = Writer::with_capacity(64 + self.predicate.len() + keys + map);
+        let mut w = Writer::with_capacity(64 + self.predicate.len() + self.bound.key_bytes() + map);
 
         w.put(&self.bound).bytes32(&self.predicate);
 
@@ -304,6 +327,28 @@ fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
     let count = r.u32()? as usize;
     let keys = r.take(count * stride)?;
     Ok((stride, keys))
+}
+
+impl ReadBound {
+    /// The bytes of the keys a `PkSet` carries; `0` for any other bound.
+    fn key_bytes(&self) -> usize {
+        match self {
+            ReadBound::PkSet(k) => k.as_bytes().len(),
+            _ => 0,
+        }
+    }
+
+    /// The bound alone, as a `HasPk` request carries its keys.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(16 + self.key_bytes());
+        w.put(self);
+        w.into_vec()
+    }
+
+    /// The inverse of [`Self::encode`], at the trust boundary.
+    pub fn decode(buf: &[u8]) -> Result<Self, String> {
+        decode_all(buf, "read_bound", |r| r.get())
+    }
 }
 
 /// The kind tag, then that kind's layout. [`peek_bound`] reads the same layout.

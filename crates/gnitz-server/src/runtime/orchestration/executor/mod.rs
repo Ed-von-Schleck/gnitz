@@ -27,14 +27,16 @@ use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
 use self::delta::{handle_delta_poll, Feeds, Subscriptions};
-use super::TxnFamily;
 use crate::catalog::CatalogEngine;
+use crate::runtime::committer::TxnFamily;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingWrite};
 use crate::runtime::listen::ClientListener;
-use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
+use crate::runtime::master::{MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{chan, oneshot, select2, AckLease, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, Read, SalExcl};
+use crate::runtime::reactor::{
+    chan, oneshot, select2, AckLease, AsyncRwLock, Either, ReadGuard, RecvBuf, SendBody, TrainLease, WriteGuard,
+};
+use crate::runtime::sal::{Read, SalExcl};
 use crate::runtime::tls::{Served, TlsListener};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
@@ -947,10 +949,8 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
     for (frame, ctrl) in items {
         let (target, mode, basis) = (ctrl.hdr.target(), ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
         let tid = target.tid;
-        let (batch, seen) = decode_push_frame(cat, frame, ctrl).map_err(|e| WireFault {
-            text: format!("TXN family {tid}: {}", e.text),
-            ..e
-        })?;
+        let (batch, seen) =
+            decode_push_frame(cat, frame, ctrl).map_err(|e| e.in_context(format_args!("TXN family {tid}")))?;
         let batch = batch.expect("a PUSH_TXN item carries a data block");
         heads.push(TxnHead { target, basis, seen });
         families.push(TxnFamily { tid, mode, batch });
@@ -1131,11 +1131,11 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
         let cut = shared.disp().scan_cut(|cut| {
             for (scan, s) in fanned {
                 s.lsn = read_watermark(shared, s.kind);
-                cut.read(DirectGroup::new(Read::ScanSpec {
+                cut.read(Read::ScanSpec {
                     tid: scan.target.tid,
                     reply_layout: scan.reply_layout,
                     spec: scan.spec.into(),
-                }))?;
+                })?;
             }
             Ok(())
         });
@@ -1180,6 +1180,18 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
 
 /// Append `msg`'s framed bytes to `out`, so a corked reply never passes through a
 /// buffer of its own.
+/// Forward every frame of `lease` that carries rows to `peer`, workers in ascending
+/// order. Stops at the first failed send, which closes the peer; `Err` on the first
+/// worker fault, leaving the rest undrained.
+async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> {
+    while let Some(f) = lease.next().await? {
+        if peer.send(SendBody::Slot(f.slot)).await.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
     let sz = msg.size();

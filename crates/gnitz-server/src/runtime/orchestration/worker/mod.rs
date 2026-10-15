@@ -17,7 +17,7 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationRegistry;
-use gnitz_wire::WireFault;
+use gnitz_wire::{ReadBound, WireFault};
 use gnitz_zset::repr::Batch;
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ impl<'c> WorkerProcess<'c> {
         match req.what {
             SalRequest::Shutdown => unsafe { libc::_exit(0) },
             SalRequest::Read(read) => {
-                let answer = answer(self.catalog, &read, req.rows.as_deref());
+                let answer = answer(self.catalog, &read);
                 self.reply(req.route, answer);
             }
             SalRequest::Apply(apply) => self.apply_request(req.route, apply, req.rows),
@@ -170,15 +170,16 @@ impl<'c> WorkerProcess<'c> {
     }
 }
 
-/// Answer `read`; `rows` are the keys a probe carries. A function of the catalog
-/// alone: it cannot reach the mesh, so answering a read never enters an exchange
-/// wait.
-fn answer(cat: &mut CatalogEngine, read: &Read<'_>, rows: Option<&Batch>) -> Result<Rows, WireFault> {
+/// Answer `read`. A function of the catalog alone: it cannot reach the mesh, so
+/// answering a read never enters an exchange wait.
+fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
     // Each arm builds its own `Ok`: wrapped around the whole match, every answer
     // would be copied at the width of the widest one.
     match *read {
-        Read::HasPk { tid, probe } => {
-            let keys = rows.ok_or("has_pk: a probe carries its keys")?;
+        Read::HasPk { tid, probe, ref keys } => {
+            let ReadBound::PkSet(keys) = ReadBound::decode(keys)? else {
+                return Err("has_pk: a probe carries a PkSet".into());
+            };
             Ok(Rows::Own(cat.registry.probe(tid, probe, keys)?))
         }
         Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::Shared(cat.scan_spec(

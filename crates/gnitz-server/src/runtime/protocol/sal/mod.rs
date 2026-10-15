@@ -1319,7 +1319,7 @@ impl SalReader {
     ) -> Option<Inbound> {
         let (msg, wire) = self.next()?;
         // The kinds [`DirectGroup::push`] and [`DirectGroup::ddl_sync`] frame with
-        // their target's catalog record.
+        // their target's catalog record: the only groups that carry rows.
         let catalog_record = matches!(msg.head.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
         let known = |tid, record: &[u8]| catalog_record.then(|| catalog_schema(tid, record)).flatten();
         // Fail-stop: a dropped group diverges this worker from the master.
@@ -1336,6 +1336,9 @@ impl SalReader {
             Ok(frame) => frame,
             Err(e) => undecodable(std::mem::take(e)),
         };
+        if rows.is_some() && !catalog_record {
+            undecodable(format!("a {:?} group carries no rows", msg.head.kind));
+        }
         let what = match SalRequest::decode(msg.head.kind, &control.hdr, &wire[control.blob.clone()]) {
             Ok(what) => what,
             Err(e) => undecodable(e),

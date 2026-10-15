@@ -9,22 +9,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use gnitz_wire::WireConflictMode;
-use gnitz_zset::repr::Batch;
-
-/// One decoded, shape-validated transaction family: the target `tid`, its
-/// conflict `mode`, and the decoded batch. The executor decodes into these, the
-/// validator borrows them, and the committer takes them by value.
-///
-/// It lives here rather than in any of those three siblings: the committer, the
-/// only owner, already names the master module, so hosting it there would close
-/// that edge into a cycle.
-pub(crate) struct TxnFamily {
-    pub tid: u64,
-    pub mode: WireConflictMode,
-    pub batch: Batch,
-}
-
 pub(super) mod committer;
 pub(super) mod executor;
 pub(super) mod master;

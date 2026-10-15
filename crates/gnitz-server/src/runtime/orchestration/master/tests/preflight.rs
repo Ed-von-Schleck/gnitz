@@ -1,47 +1,6 @@
 use super::*;
-use crate::test_support::{opk_pk, pk_only_schema, pk_payload_schema};
+use crate::test_support::{opk_pk, pk_only_schema};
 use gnitz_wire::TypeCode;
-
-/// Row `j` of the check batch holds `keys[j]` once the call returns — the order
-/// F1/F2 map replies back by — each image stored as the key column's bytes.
-#[test]
-fn build_check_batch_sorts_the_keys_into_its_rows() {
-    for tc in [TypeCode::I32, TypeCode::I64, TypeCode::I128] {
-        let span = pk_only_schema(&[tc]);
-        let mut keys = [5i32, -1, 0].map(|v| gnitz_wire::key_image(tc, v as u128));
-
-        let batch = build_check_batch(&span, &mut keys);
-
-        assert!(keys.is_sorted());
-        let rows: Vec<&[u8]> = (0..batch.len()).map(|j| batch.get_pk_bytes(j)).collect();
-        let want: Vec<Vec<u8>> = [-1i64, 0, 5].iter().map(|&v| opk_pk(&span, &[v as u128])).collect();
-        assert_eq!(rows, want, "{tc}");
-    }
-}
-
-/// An own-PK probe goes where the relation's keys are held. A replicated
-/// relation's is spread over the full PK instead, since every worker holds it
-/// whole.
-#[test]
-fn an_own_pk_probe_follows_a_keyed_placement_and_spreads_a_replicated_one() {
-    use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-    let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
-    let (full, prefix) = (Placement::full_pk(&schema), Placement::keyed(&schema, 1));
-    for (placement, want) in [(full, full), (prefix, prefix), (Placement::Replicated, full)] {
-        // A stream is storeless, so it registers without a directory.
-        let mut registry = RelationRegistry::new("", gnitz_zset::algebra::Slot::SOLO, StoreConfig::default());
-        let spec = RelationSpec {
-            id: 16,
-            kind: RelationKind::Stream,
-            schema,
-            placement,
-            pk_repeats: false,
-            compress: false,
-        };
-        registry.register(spec).unwrap();
-        assert_eq!(probe_placement(registry.relation(16).unwrap()), want, "{placement:?}");
-    }
-}
 
 /// A write to a parent referenced through its lone PK column probes nothing
 /// unless it deletes: an upsert resolves with no worker answering, and a

@@ -23,14 +23,24 @@ fn every_request() -> Vec<SalRequest<'static>> {
             tids: vec![17, 18].into(),
         }
         .into(),
-        Read::HasPk { tid: 19, probe: Probe::Pk }.into(),
-        Read::HasPk { tid: 20, probe: Probe::PkColumn(21) }.into(),
         Read::HasPk {
-            tid: 22,
-            probe: Probe::IndexAll(cols, NonZeroU64::new(23).unwrap()),
+            tid: 19,
+            probe: Probe::Pk,
+            keys: vec![38u8, 39].into(),
         }
         .into(),
-        Read::HasPk { tid: 37, probe: Probe::Index(cols) }.into(),
+        Read::HasPk {
+            tid: 20,
+            probe: Probe::PkColumn(21),
+            keys: vec![40u8].into(),
+        }
+        .into(),
+        Read::HasPk {
+            tid: 22,
+            probe: Probe::Index(cols, NonZeroU64::new(23).unwrap()),
+            keys: vec![41u8, 42, 43].into(),
+        }
+        .into(),
         Read::KeySpans { tid: 24, cols }.into(),
         Read::ScanSpec {
             tid: 25,

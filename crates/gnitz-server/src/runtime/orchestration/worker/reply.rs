@@ -11,7 +11,7 @@ use ipc::WireMsg;
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Owed {
     /// A read of a view, received while a drive was writing views.
-    Parked(ReplyRoute, Read<'static>, Option<Box<Batch>>),
+    Parked(ReplyRoute, Read<'static>),
     Fault(ReplyRoute, WireFault),
     Train(Train),
 }
@@ -124,10 +124,10 @@ impl WorkerProcess<'_> {
                 i += 1;
                 continue;
             }
-            let Some(Owed::Parked(route, read, rows)) = self.replies.remove(i) else {
+            let Some(Owed::Parked(route, read)) = self.replies.remove(i) else {
                 unreachable!()
             };
-            let answer = answer(self.catalog, &read, rows.as_deref());
+            let answer = answer(self.catalog, &read);
             let may_pass = i == 0 || self.replies[i - 1].cut() != route.cut;
             if let Some(owed) = self.send_or_owe(route, may_pass, answer) {
                 self.replies.insert(i, owed);

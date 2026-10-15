@@ -271,7 +271,7 @@ impl MasterDispatcher {
 
     /// The first dead worker, reported on every probe: a reaped pid answers
     /// ECHILD.
-    pub(crate) fn check_workers(&self) -> Option<usize> {
+    fn check_workers(&self) -> Option<usize> {
         for (w, &pid) in self.worker_pids.iter().enumerate() {
             if pid <= 0 {
                 continue;
@@ -367,7 +367,7 @@ impl MasterDispatcher {
     /// flush fails: the SAL entries about to be discarded are that data's only
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
     /// leaves the SAL intact and aborts or fails the boot.
-    pub(crate) fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
+    fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
         let cat = self.cat_mut();
         cat.flush_all_system_tables()?;
         // Every worker ACKed the FLUSH, so each has applied every DdlSync written

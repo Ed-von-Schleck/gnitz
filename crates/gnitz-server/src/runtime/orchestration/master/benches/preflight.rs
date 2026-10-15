@@ -17,11 +17,26 @@ fn preflight_probe_bench() {
     let cols = [col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).unwrap().schema();
-    let (disp, _) = test_dispatcher(vec![0; 4], &mut engine);
 
     let counter = Counter::instructions();
-    for rows in [1u64, 100, 20_000] {
-        let inserted: Vec<_> = (0..rows).map(|i| (i, 1, i as i64)).collect();
+    for (order, rows) in [1u64, 100, 20_000]
+        .into_iter()
+        .flat_map(|n| [("ascending", n), ("scrambled", n)])
+    {
+        let mut ids: Vec<u64> = (0..rows).collect();
+        if order == "scrambled" {
+            // A fixed Fisher-Yates shuffle under xorshift64.
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            for i in (1..ids.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ids.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+        }
+        let inserted: Vec<_> = ids.iter().map(|&i| (i, 1, i as i64)).collect();
+        // Its own: no worker drains the SAL the validations write to.
+        let (disp, _) = test_dispatcher(vec![0; 4], &mut engine);
         let mut families = vec![TxnFamily {
             tid,
             mode: WireConflictMode::Error,
@@ -32,12 +47,11 @@ fn preflight_probe_bench() {
         let (verdict, instructions) = validate();
         assert!(verdict.is_none(), "{rows} rows: a verdict with no worker answering");
         println!(
-            "preflight_probe_bench {rows:>5} rows {:>7.1} instr/row",
+            "preflight_probe_bench {rows:>5} rows {order:<9} {:>7.1} instr/row",
             instructions as f64 / rows as f64
         );
     }
 
-    drop(disp);
     drop(engine);
     let _ = std::fs::remove_dir_all(dir);
 }

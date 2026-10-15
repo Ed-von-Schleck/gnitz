@@ -7,11 +7,11 @@ use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
+use gnitz_zset::schema::{project_schema, KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};
-use gnitz_wire::{PkColList, PkKeys, ViewBudget};
+use gnitz_wire::{PkColList, PkKeys, Probe, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
 
@@ -349,6 +349,19 @@ impl Relation {
     /// list is deduped by ordered column list, so at most one entry matches.
     pub fn index_on(&self, cols: &[u32]) -> Option<&SecondaryIndex> {
         self.indexes.iter().find(|ix| ix.cols.as_slice() == cols)
+    }
+
+    /// The layout a `probe` of this relation answers in.
+    pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
+        let schema = self.schema();
+        match probe {
+            Probe::Pk => Ok(schema.pk_only()),
+            Probe::PkColumn(col) => project_schema(&schema, &[col]),
+            Probe::Index(cols, _) => self
+                .index_on(cols.as_slice())
+                .map(|ix| ix.schema())
+                .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), self.id())),
+        }
     }
 
     /// Whether rows sit above this relation's cut.

@@ -24,9 +24,8 @@
 //!   catalog mutation, and by graceful shutdown (see `BarrierKind`).
 
 use super::executor::{request_drain, Shared};
-use super::TxnFamily;
 use crate::runtime::reactor::{chan, oneshot, AckLease};
-use gnitz_wire::WireFault;
+use gnitz_wire::{WireConflictMode, WireFault};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
@@ -49,6 +48,16 @@ pub enum CommitRequest {
     },
     /// Wake the committer so it re-tests `checkpoint_warranted`.
     Reclaim,
+}
+
+/// One decoded, shape-validated transaction family: the target `tid`, its
+/// conflict `mode`, and the decoded batch. The executor decodes into these, the
+/// validator borrows them and extends them with the families a delete cascades
+/// to, and the committer takes them by value.
+pub(crate) struct TxnFamily {
+    pub tid: u64,
+    pub mode: WireConflictMode,
+    pub batch: Batch,
 }
 
 /// One write awaiting commit, all-or-nothing: each family is one `Push` group,

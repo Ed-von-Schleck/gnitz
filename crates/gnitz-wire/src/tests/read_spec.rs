@@ -157,6 +157,46 @@ fn pk_keys_sort_and_dedup() {
     assert_eq!(PkKeys::from_sorted(2, vec![0, 1, 0, 9, 1, 0]), k);
 }
 
+/// At every narrow stride, sorting images builds the list a byte sort does,
+/// both arms of the integer width included; a wide stride keeps the byte sort.
+#[test]
+fn pk_keys_from_images_is_the_byte_sort() {
+    let mut x = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834u128;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for stride in 1..=MAX_PK_BYTES {
+        let mut raw: Vec<Vec<u8>> = (0..64)
+            .map(|_| next().to_be_bytes()[..stride.min(16)].to_vec())
+            .collect();
+        raw.iter_mut().for_each(|k| k.resize(stride, 7));
+        raw.push(raw[3].clone());
+        let mut want = raw.clone();
+        want.sort_unstable();
+        want.dedup();
+        let k = PkKeys::from_keys(stride, raw.iter().map(|k| &k[..]));
+        assert_eq!(k.as_bytes(), want.concat(), "stride {stride}");
+        if stride <= NARROW_PK_MAX_BYTES {
+            let images = raw.iter().map(|k| crate::widen_pk_be(k));
+            assert_eq!(PkKeys::from_images(stride, images), k, "stride {stride}");
+        }
+    }
+}
+
+/// A bound encoded alone decodes to itself; trailing bytes are refused.
+#[test]
+fn a_read_bound_round_trips_alone() {
+    for bound in [ReadBound::None, ReadBound::PkSet(keys(8))] {
+        let blob = bound.encode();
+        assert_eq!(ReadBound::decode(&blob), Ok(bound));
+        assert!(ReadBound::decode(&[blob, vec![0]].concat()).is_err());
+    }
+    assert!(ReadBound::decode(&[]).is_err());
+}
+
 #[test]
 #[should_panic(expected = "strictly ascending")]
 fn pk_keys_from_sorted_refuses_a_repeat() {

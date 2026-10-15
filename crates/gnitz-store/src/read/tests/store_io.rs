@@ -246,14 +246,11 @@ fn open_bound_refuses_a_foreign_key_stride_and_an_unknown_relation() {
     assert!(r.open_bound(999_999, ReadBound::None, At::Now).is_err());
 }
 
-/// Probe keys over the table's own PK store, one row per id.
-fn pk_probe(ids: &[u128]) -> Batch {
+/// Probe keys over the table's own PK store, one per id.
+fn pk_probe(ids: &[u128]) -> PkKeys {
     let schema = pk_only_schema(&[TypeCode::U64]);
-    let mut keys = Batch::empty_with_schema(&schema);
-    for &id in ids {
-        keys.push_key_row(&opk_pk(&schema, &[id]), 1);
-    }
-    keys
+    let keys: Vec<Vec<u8>> = ids.iter().map(|&id| opk_pk(&schema, &[id])).collect();
+    PkKeys::from_keys(schema.pk_stride(), keys.iter().map(Vec::as_slice))
 }
 
 /// The rows of a probe reply as `(key bytes, weight)`.
@@ -270,24 +267,25 @@ fn a_column_probe_answers_each_live_key_with_its_column() {
     let mut r = fixture(|id| id as i64 * 10);
     let schema = make_schema_u64_i64();
     r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
-    let got = r.probe(TID, Probe::PkColumn(1), &pk_probe(&[2, 5, 7, 300])).unwrap();
+    let got = r.probe(TID, Probe::PkColumn(1), pk_probe(&[2, 5, 7, 300])).unwrap();
     let rows: Vec<_> = (0..got.len())
         .map(|i| (got.get_pk(i), got.get_weight(i), payload0_i64(&got, i)))
         .collect();
     assert_eq!(rows, [(2, 1, 20), (7, 1, 70)]);
 }
 
-/// A PK probe echoes each key a live row carries, and nothing at all for an id
-/// this process has not registered.
+/// A PK probe echoes each key a live row carries, and refuses an id this
+/// process has not registered.
 #[test]
 fn a_pk_probe_echoes_the_keys_a_live_row_carries() {
     let mut r = fixture(|id| id as i64 * 10);
     let schema = make_schema_u64_i64();
     r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
     let keys = pk_probe(&[2, 5, 7, 300]);
-    let held = r.probe(TID, Probe::Pk, &keys).unwrap();
-    assert_eq!(reply_rows(&held), reply_rows(&pk_probe(&[2, 7])));
-    assert!(r.probe(999_999, Probe::Pk, &keys).unwrap().is_empty());
+    let held = r.probe(TID, Probe::Pk, keys.clone()).unwrap();
+    let want: Vec<_> = pk_probe(&[2, 7]).iter().map(|k| (k.to_vec(), 1)).collect();
+    assert_eq!(reply_rows(&held), want);
+    assert!(r.probe(999_999, Probe::Pk, keys).is_err());
 }
 
 /// The index of [`fixture`], with what builds a stored entry and a probe key
@@ -309,13 +307,10 @@ impl ValIndex {
     }
 
     /// The probe keys of `vals`: each one's span.
-    fn keys(&self, vals: &[i64]) -> Batch {
-        let mut keys = BatchBuilder::new(&self.spec.span_schema());
-        for &val in vals {
-            keys.begin_row(val as u128, 1);
-            keys.end_row();
-        }
-        keys.finish()
+    fn keys(&self, vals: &[i64]) -> PkKeys {
+        let span = self.spec.span_schema();
+        let keys: Vec<Vec<u8>> = vals.iter().map(|&val| opk_pk(&span, &[val as u128])).collect();
+        PkKeys::from_keys(span.pk_stride(), keys.iter().map(Vec::as_slice))
     }
 }
 
@@ -323,21 +318,18 @@ fn cap(n: u64) -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(n).unwrap()
 }
 
-/// An index probe answers a held span with its first stored entry, or with
-/// every one up to a cap counted across the keys, and a span no row holds with
-/// nothing.
+/// An index probe answers a held span with every stored entry up to a cap
+/// counted across the keys, and a span no row holds with nothing.
 #[test]
 fn an_index_probe_answers_a_held_span_with_its_holders() {
     // Ids 2k and 2k + 1 share `val = 10k`.
     let r = fixture(|id| (id / 2) as i64 * 10);
     let cols = PkColList::from_slice(&[1]);
     let ix = ValIndex::of(&r);
-    let probe = |probe, vals: &[i64]| reply_rows(&r.probe(TID, probe, &ix.keys(vals)).unwrap());
-    let all = |n| Probe::IndexAll(cols, cap(n));
+    let probe = |probe, vals: &[i64]| reply_rows(&r.probe(TID, probe, ix.keys(vals)).unwrap());
+    let all = |n| Probe::Index(cols, cap(n));
     let entry = |id, val| (ix.entry(id, val), 1);
 
-    assert_eq!(probe(Probe::Index(cols), &[20, 25]), [entry(4, 20)]);
-    assert_eq!(probe(Probe::Index(cols), &[10, 20]), [entry(2, 10), entry(4, 20)]);
     assert_eq!(probe(all(1), &[20, 25]), [entry(4, 20)]);
     assert_eq!(probe(all(2), &[20, 25]), [entry(4, 20), entry(5, 20)]);
     assert_eq!(probe(all(8), &[20, 25]), [entry(4, 20), entry(5, 20)]);
@@ -349,7 +341,7 @@ fn an_index_probe_answers_a_held_span_with_its_holders() {
 
 /// An index probe's one cursor answers each key as a seek of its own does: a
 /// run of misses ahead of a hit, a hit ahead of its neighbour, and a miss past
-/// the last entry. Keys that do not strictly ascend are refused.
+/// the last entry.
 #[test]
 fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
     // Ids 2k and 2k + 1 share `val = 10k`.
@@ -357,16 +349,10 @@ fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
     let cols = PkColList::from_slice(&[1]);
     let ix = ValIndex::of(&r);
     let vals = [-5, 1, 2, 3, 10, 20, 21, 30, 5000];
-    for (probe, per_value) in [(Probe::Index(cols), 1), (Probe::IndexAll(cols, cap(64)), 2)] {
-        let probe = |vals: &[i64]| r.probe(TID, probe, &ix.keys(vals));
-        let alone: Vec<_> = vals.iter().flat_map(|&v| reply_rows(&probe(&[v]).unwrap())).collect();
-        assert_eq!(reply_rows(&probe(&vals).unwrap()), alone, "{per_value} per value");
-        assert_eq!(alone.len(), 3 * per_value, "three held values");
-    }
-    for vals in [&[10, 10][..], &[20, 10]] {
-        let got = r.probe(TID, Probe::Index(cols), &ix.keys(vals));
-        assert!(got.is_err(), "{vals:?}");
-    }
+    let probe = |vals: &[i64]| r.probe(TID, Probe::Index(cols, cap(64)), ix.keys(vals));
+    let alone: Vec<_> = vals.iter().flat_map(|&v| reply_rows(&probe(&[v]).unwrap())).collect();
+    assert_eq!(reply_rows(&probe(&vals).unwrap()), alone);
+    assert_eq!(alone.len(), 3 * 2, "three held values, two holders each");
 }
 
 /// A probe is refused when no index is on its column list, and when its keys are
@@ -374,15 +360,18 @@ fn an_index_probe_seeks_ascending_keys_with_one_cursor() {
 #[test]
 fn a_probe_refuses_a_missing_index_and_a_foreign_key_stride() {
     let r = fixture(|id| id as i64);
-    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols));
+    let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), cap(1));
     let span_keys = ValIndex::of(&r).keys(&[2]);
     for (id, probe) in [(TID, index(&[0, 1])), (999_999, index(&[1]))] {
-        assert!(r.probe(id, probe, &span_keys).is_err(), "{id} {probe:?}");
+        assert!(r.probe(id, probe, span_keys.clone()).is_err(), "{id} {probe:?}");
     }
-    assert!(r.probe(TID, index(&[1]), &span_keys).is_ok());
+    assert!(r.probe(TID, index(&[1]), span_keys).is_ok());
     // A whole entry is a span and a source PK: wider than either store's key.
-    let wide = Batch::empty_with_schema(&r.relation(TID).unwrap().index_on(&[1]).unwrap().schema());
+    let wide = r.relation(TID).unwrap().index_on(&[1]).unwrap().schema().pk_stride();
     for probe in [Probe::Pk, Probe::PkColumn(1), index(&[1])] {
-        assert!(r.probe(TID, probe, &wide).is_err(), "{probe:?}");
+        assert!(
+            r.probe(TID, probe, PkKeys::from_sorted(wide, Vec::new())).is_err(),
+            "{probe:?}"
+        );
     }
 }

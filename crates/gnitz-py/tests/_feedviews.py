@@ -25,7 +25,7 @@ FEED = "32 MB"
 # capacity cases. A store spills once its RAM tier crosses this ceiling, which
 # only happens at a memtable fold or a checkpoint's ephemeral round — so the
 # checkpoint threshold is squeezed too.
-SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}
+SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(16 * 1024)}
 
 LINEAR = "SELECT id, v, body FROM t WHERE v > 10"
 JOIN = "SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid"

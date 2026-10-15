@@ -9,8 +9,7 @@ use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, RelationFixture, TID,
 };
-use gnitz_wire::{PkColList, Probe, TypeCode};
-use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_wire::{PkColList, PkKeys, Probe, TypeCode};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Sorted runs a probe's cursor merges (one ingest round each).
@@ -33,23 +32,21 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
 }
 
 /// The probe keys `vals`, ascending, over `schema`'s one key column.
-fn keys(schema: &SchemaDescriptor, vals: impl Iterator<Item = u64>) -> Batch {
-    let mut bb = BatchBuilder::new(schema);
-    for v in vals {
-        bb.begin_row(v as u128, 1);
-        bb.end_row();
-    }
-    bb.finish()
+fn keys(schema: &SchemaDescriptor, vals: impl Iterator<Item = u64>) -> PkKeys {
+    let tc = schema.pk_columns().next().expect("one key column").1.type_code;
+    let images = vals.map(|v| gnitz_wire::key_image(tc, v as u128));
+    PkKeys::from_images(schema.pk_stride(), images)
 }
 
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn probe_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let cell = |label: &str, r: &RelationFixture, probe: Probe, keys: Batch, want: u64| {
+    let cell = |label: &str, r: &RelationFixture, probe: Probe, keys: PkKeys, want: u64| {
         // Untimed: the batch pool and the cursor's sources are warm.
-        black_box(r.probe(TID, probe, &keys).unwrap());
-        let (reply, instructions) = counter.measure(|| r.probe(TID, probe, &keys).unwrap());
+        black_box(r.probe(TID, probe, keys.clone()).unwrap());
+        let copy = keys.clone();
+        let (reply, instructions) = counter.measure(|| r.probe(TID, probe, copy).unwrap());
         assert_eq!(reply.len() as u64, want, "{label}: reply rows");
         println!(
             "probe_bench {label:<28} {:>8} keys {:>8} rows {:>9.1} instr/key",
@@ -58,8 +55,8 @@ fn probe_bench() {
             instructions as f64 / keys.len() as f64
         );
     };
-    let index = Probe::Index(PkColList::from_slice(&[1]));
-    let index_all = |cap| Probe::IndexAll(PkColList::from_slice(&[1]), NonZeroU64::new(cap).unwrap());
+    let index_all = |cap| Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::new(cap).unwrap());
+    let index = index_all(u64::MAX);
     let span = pk_only_schema(&[TypeCode::I64]);
     let pk = pk_only_schema(&[TypeCode::U64]);
 
@@ -82,10 +79,9 @@ fn probe_bench() {
     cell("pk column", &unique, Probe::PkColumn(1), keys(&pk, 0..ROWS), ROWS);
 
     // Four holders per value, every value probed: the group ends the walk, then
-    // the first entry does, then the reply's cap does.
+    // the reply's cap does.
     let groups = fixture(|id| (id / 4) as i64);
     let vals = || keys(&span, 0..ROWS / 4);
-    cell("index, 4 holders, all", &groups, index_all(2 * ROWS), vals(), ROWS);
-    cell("index, 4 holders, first", &groups, index, vals(), ROWS / 4);
+    cell("index, 4 holders, all", &groups, index, vals(), ROWS);
     cell("index, 4 holders, half", &groups, index_all(ROWS / 2), vals(), ROWS / 2);
 }

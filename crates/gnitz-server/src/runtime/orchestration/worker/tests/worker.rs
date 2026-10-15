@@ -9,9 +9,9 @@ use crate::test_support::{
     pk_only_schema, register_identity_view, scan_all, weighted_rows,
 };
 use gnitz_wire::control::{peek_control_block, DecodedControl};
-use gnitz_wire::{PkColList, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
+use gnitz_wire::{PkColList, PkKeys, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
+use gnitz_zset::schema::SchemaDescriptor;
 use std::borrow::Cow;
 
 // -- fixtures ---------------------------------------------------------------
@@ -82,24 +82,16 @@ fn scan(tid: u64, schema: &SchemaDescriptor) -> Read<'static> {
     }
 }
 
-/// `ids` as the keys a PK probe of a `U64`-keyed relation carries, behind their
-/// schema record.
-pub(super) fn pk_keys(ids: &[u64]) -> (Vec<u8>, Batch) {
-    let schema = pk_only_schema(&[TypeCode::U64]);
-    let mut keys = Batch::with_capacity(&schema, ids.len());
-    for id in ids {
-        keys.push_key_row(&id.to_be_bytes(), 1);
-    }
-    (encode_schema_block(&schema), keys)
+/// `ids` as the keys a PK probe of a `U64`-keyed relation carries: an encoded
+/// `ReadBound::PkSet`.
+pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
+    let keys: Vec<[u8; 8]> = ids.iter().map(|id| id.to_be_bytes()).collect();
+    ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..]))).encode()
 }
 
 /// A PK probe of `tid` at `keys`.
-pub(super) fn probe<'a>(tid: u64, keys: &'a (Vec<u8>, Batch), request_id: u32) -> DirectGroup<'a> {
-    DirectGroup {
-        schema: Some(&keys.0),
-        data: GroupData::Same(keys.1.wire_whole()),
-        ..addressed(Read::HasPk { tid, probe: Probe::Pk }, request_id)
-    }
+pub(super) fn probe(tid: u64, keys: &[u8], request_id: u32) -> DirectGroup<'_> {
+    addressed(Read::HasPk { tid, probe: Probe::Pk, keys: keys.into() }, request_id)
 }
 
 /// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
@@ -234,7 +226,14 @@ fn in_wait_dispositions() {
         addressed(delta, 2),
         addressed(scan(tid, &schema), 3),
         addressed(spans, 4),
-        addressed(Read::HasPk { tid, probe: Probe::Pk }, 5),
+        addressed(
+            Read::HasPk {
+                tid,
+                probe: Probe::Pk,
+                keys: Cow::Borrowed(&[]),
+            },
+            5,
+        ),
         addressed(Apply::Push { tid }, 6),
         ddl,
         addressed(Apply::Flush, 7),
@@ -255,7 +254,7 @@ fn in_wait_dispositions() {
     );
     assert!(out[0].ctrl.hdr.flags.scan_last);
     let fault = out[1].ctrl.fault(&out[1].bytes).expect("a fault frame");
-    assert!(fault.text.contains("carries its keys"), "{fault}");
+    assert!(fault.text.contains("read_bound"), "{fault}");
 }
 
 /// One Tick group carrying two tids ticks both — each drains its buffered

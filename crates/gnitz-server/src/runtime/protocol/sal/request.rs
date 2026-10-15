@@ -12,8 +12,12 @@ use gnitz_wire::{PkColList, PkListRole, Probe, WireFlags};
 /// A request answered with rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Read<'a> {
-    /// `probe` at the keys the group carries.
-    HasPk { tid: u64, probe: Probe },
+    /// `probe` at `keys`, an encoded `ReadBound::PkSet`.
+    HasPk {
+        tid: u64,
+        probe: Probe,
+        keys: Cow<'a, [u8]>,
+    },
     /// The sorted spans of `cols` over `tid`.
     KeySpans { tid: u64, cols: PkColList },
     /// The encoded `ReadSpec` `spec`, in the layout whose digest is `reply_layout`.
@@ -92,12 +96,13 @@ impl SalRequest<'_> {
                 blob: gnitz_wire::as_le_bytes(tids),
                 ..head
             },
-            SalRequest::Read(Read::HasPk { tid, probe }) => {
+            SalRequest::Read(Read::HasPk { tid, probe, ref keys }) => {
                 let (probe_mode, arg0, arg1) = probe.wire();
                 WireMsg {
                     target_id: tid,
                     arg0,
                     arg1,
+                    blob: keys,
                     flags: WireFlags { probe_mode, ..Default::default() },
                     ..head
                 }
@@ -144,7 +149,7 @@ impl SalRequest<'static> {
             SalMessageKind::HasPk => {
                 let probe =
                     Probe::from_wire(hdr.flags.probe_mode, hdr.arg0, hdr.arg1).map_err(|e| format!("has_pk: {e}"))?;
-                Read::HasPk { tid, probe }.into()
+                Read::HasPk { tid, probe, keys: blob.to_vec().into() }.into()
             }
             SalMessageKind::KeySpans => {
                 let cols = PkColList::unpack(hdr.arg1)

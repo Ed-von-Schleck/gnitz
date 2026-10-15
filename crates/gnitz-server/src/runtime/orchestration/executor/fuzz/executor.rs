@@ -28,7 +28,7 @@ use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::control::{append_frame, ControlHeader};
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem};
-use gnitz_wire::{Probe, ReadSpec};
+use gnitz_wire::{PkKeys, Probe, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
 
@@ -183,11 +183,9 @@ impl Session {
         if keys.windows(2).any(|w| w[0] == w[1]) {
             return false;
         }
-        let mut probed = Batch::empty_with_schema(&batch.schema().pk_only());
-        keys.into_iter().for_each(|k| probed.push_key_row(k, 1));
         self.cat
             .registry
-            .probe(tid, Probe::Pk, &probed)
+            .probe(tid, Probe::Pk, PkKeys::from_sorted(stride, keys.concat()))
             .is_ok_and(|held| held.is_empty())
     }
 

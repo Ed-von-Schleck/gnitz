@@ -14,14 +14,6 @@ use crate::runtime::sal::{GroupTargets, SalMessageKind};
 /// The request id every worker's boot verdict answers on.
 pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
 
-/// Worker `w`'s fault `f`, its text naming the worker and `op`.
-fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
-    WireFault {
-        text: format!("worker {w}: {op}: {}", f.text),
-        ..f
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -252,7 +244,7 @@ impl TrainLease {
             let slot = self.next_slot(w).await;
             let ctrl = slot.control();
             if let Some(f) = ctrl.fault(slot.bytes()) {
-                return Err(worker_fault(w, &format!("{:?}", self.kind), f));
+                return Err(f.in_context(format_args!("worker {w}: {:?}", self.kind)));
             }
             debug_assert!(
                 ctrl.schema.is_none(),

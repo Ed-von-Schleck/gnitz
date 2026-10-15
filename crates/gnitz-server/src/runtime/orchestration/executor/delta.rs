@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
-use super::{all_ticked, encode_response_into, fresh_read_lock, send_fault, send_msg, target_kind, Access, Shared};
-use crate::runtime::master::forward_scan;
+use super::{
+    all_ticked, encode_response_into, forward_scan, fresh_read_lock, send_fault, send_msg, target_kind, Access, Shared,
+};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, PeerGone, ReadGuard, SendBody, TrainLease};
 use crate::runtime::wire as ipc;

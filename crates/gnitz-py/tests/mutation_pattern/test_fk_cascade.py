@@ -148,6 +148,13 @@ _MOVED = (
     "CREATE TABLE c (cid BIGINT PRIMARY KEY, ref BIGINT REFERENCES p(code) ON DELETE CASCADE)"
 )
 _MOVED_ROWS = {"a": [(1,), (2,)], "p": [(1, 1, 100), (2, None, 200), (3, 2, 300)], "c": [(10, 200), (11, 300)]}
+# A UNIQUE column on the cascading child.
+_UNIQUE_CHILD = (
+    "CREATE TABLE parent (id BIGINT PRIMARY KEY); "
+    "CREATE TABLE child (cid BIGINT PRIMARY KEY, u BIGINT,"
+    " pid BIGINT NOT NULL REFERENCES parent(id) ON DELETE CASCADE); "
+    "CREATE UNIQUE INDEX child_u ON child(u)"
+)
 
 # `(ddl, rows seeded per table, statements, every table's rows after — or None
 # where the statements are refused and every table keeps its seed)`.
@@ -218,6 +225,13 @@ _STATEMENTS = {
         "BEGIN; DELETE FROM p WHERE pid = 2; UPDATE p SET code = 200 WHERE pid = 1; "
         "DELETE FROM a WHERE id = 1; COMMIT",
         {"a": [(2,)], "p": [(3, 2, 300)], "c": [(11, 300)]}),
+    # Two rows of the transaction claim `u = 5`, and the cascade deletes one of
+    # them: the rules hold of the bundle the cascade completes.
+    "a unique value the cascade leaves one row holding": (
+        _UNIQUE_CHILD, {"parent": [(1,), (2,)], "child": [(10, 1, 1)]},
+        "BEGIN; UPDATE child SET u = 5 WHERE cid = 10; INSERT INTO child VALUES (11, 5, 2); "
+        "DELETE FROM parent WHERE id = 1; COMMIT",
+        {"parent": [(2,)], "child": [(11, 5, 2)]}),
     # The same hand-over where nothing deletes row 1: the code has not left.
     "a code moved onto a row that stays": (
         _MOVED, _MOVED_ROWS,

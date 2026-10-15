@@ -103,6 +103,7 @@ impl Placement {
 
     /// The worker that stores the row keyed `pk`; `None` unless rows are
     /// key-routed.
+    #[inline]
     pub fn owner(self, pk: &[u8], num_workers: usize) -> Option<usize> {
         match self {
             Placement::Keyed { dist_stride } => Some(worker_for_pk_bytes(&pk[..dist_stride as usize], num_workers)),
