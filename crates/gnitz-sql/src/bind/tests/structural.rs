@@ -541,3 +541,12 @@ fn each_keyword_call_binds() {
     }
     assert_eq!(samples.map(|(n, _)| n), KEYWORD_CALLS);
 }
+
+#[test]
+fn a_calendar_field_ignores_case_and_a_plural_s() {
+    assert_eq!(calendar_field("YEARS"), Some(CalendarOp::Year));
+    assert_eq!(calendar_field(" isoweek "), Some(CalendarOp::Week));
+    assert_eq!(calendar_field("DayOfYear"), Some(CalendarOp::Doy));
+    assert_eq!(calendar_field("s"), None);
+    assert_eq!(calendar_field("fortnight"), None);
+}

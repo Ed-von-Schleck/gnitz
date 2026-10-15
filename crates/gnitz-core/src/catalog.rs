@@ -11,7 +11,7 @@ use std::fmt;
 use gnitz_wire::sys_rows::{
     CatalogColumn, CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow, TableTabRow, ViewParts, ViewTabRow,
 };
-use gnitz_wire::{qualified_key, Circuit, PkColList, RelClass, TableProps, ViewProps, SYSTEM_SCHEMA};
+use gnitz_wire::{qualified_key, Circuit, ColumnDef, PkColList, RelClass, TableProps, ViewProps, SYSTEM_SCHEMA};
 
 use crate::{ProtocolError, RelName, ZSetBatch};
 
@@ -97,6 +97,11 @@ impl CatalogRelation {
         cols.as_slice().iter().filter_map(|&ci| self.columns.get(ci as usize))
     }
 
+    /// The columns a client reads, in schema order.
+    pub fn visible_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().map(|c| &c.def).filter(|c| !c.is_hidden)
+    }
+
     /// The names of [`columns_of`](Self::columns_of) `cols`.
     pub fn column_names<'a>(&'a self, cols: &'a PkColList) -> Vec<&'a str> {
         self.columns_of(cols).map(|c| c.def.name.as_str()).collect()
@@ -113,10 +118,8 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// The relation `text` names, `schema.name` or a name in `schema`, spelled
-    /// in any case.
-    pub fn find(&self, schema: &str, text: &str) -> Option<&CatalogRelation> {
-        let name = RelName::parse(schema, text).ok()?;
+    /// The relation `name` names.
+    pub fn get(&self, name: &RelName) -> Option<&CatalogRelation> {
         self.relations
             .iter()
             .find(|r| r.schema == name.schema() && r.name == name.name())

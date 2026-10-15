@@ -49,17 +49,17 @@ pub struct Options {
 }
 
 pub struct Shell {
-    client: GnitzClient,
+    pub(crate) client: GnitzClient,
     target: String,
     /// The schema unqualified names resolve in.
-    schema: String,
+    pub(crate) schema: String,
     pub settings: Settings,
     pub interactive: bool,
     stop_on_error: bool,
     interrupt: Option<Arc<AtomicBool>>,
     sink: Sink,
     /// The last statement run, which `\e` opens.
-    last_statement: String,
+    pub(crate) last_statement: String,
     /// Text for the next prompt's buffer, from `\e`.
     pub prefill: Option<String>,
     /// Where the editors' buffers are written, made on first use and removed
@@ -116,20 +116,8 @@ impl Shell {
         &self.schema
     }
 
-    pub fn set_schema(&mut self, schema: &str) {
-        self.schema = schema.to_string();
-    }
-
     pub fn in_transaction(&self) -> bool {
         self.client.txn_active()
-    }
-
-    pub fn last_statement(&self) -> &str {
-        &self.last_statement
-    }
-
-    pub fn client(&mut self) -> &mut GnitzClient {
-        &mut self.client
     }
 
     /// Clear an interrupt that arrived before the wait it would cancel.
@@ -330,7 +318,7 @@ impl Shell {
             return true;
         };
         let lines = text.lines().count();
-        let widest = text.lines().map(crate::render::console_width).max().unwrap_or(0);
+        let widest = text.lines().map(console::measure_text_width).max().unwrap_or(0);
         lines < usize::from(h).saturating_sub(1) && widest <= usize::from(w)
     }
 

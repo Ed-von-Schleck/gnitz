@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gnitz_core::RelProps;
+use gnitz_core::{RelName, RelProps};
 use gnitz_repl::render::{Format, Settings};
 use gnitz_repl::shell::{Flow, Options, Shell};
 use gnitz_test_harness::ServerHandle;
@@ -115,7 +115,7 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
     )
     .unwrap();
     let c = sh.catalog().unwrap();
-    let t = c.find("public", "t").expect("t");
+    let t = c.get(&RelName::new("public", "t").unwrap()).expect("t");
     assert_eq!(t.class(), RelClass::Table);
     let cols: Vec<(&str, String, bool)> = t
         .columns
@@ -141,9 +141,9 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
         panic!("{:?}", t.indexes)
     };
     assert_eq!((ix.name.as_str(), t.column_names(&ix.cols)), ("t_kind", vec!["kind"]));
-    let ev = c.find("public", "ev").expect("ev");
+    let ev = c.get(&RelName::new("public", "ev").unwrap()).expect("ev");
     assert_eq!(ev.class(), RelClass::Stream);
-    let v = c.find("public", "v").expect("v");
+    let v = c.get(&RelName::new("public", "v").unwrap()).expect("v");
     assert_eq!(v.class(), RelClass::FedView);
     assert_eq!(
         v.props,
@@ -153,10 +153,12 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
         })
     );
     assert_eq!(v.reads, [ev.id]);
-    assert_eq!(c.find("PUBLIC", "V").map(|r| r.id), Some(v.id));
+    assert_eq!(c.get(&RelName::new("PUBLIC", "V").unwrap()).map(|r| r.id), Some(v.id));
     assert!(c.schemas.contains(&"_system".to_string()));
     assert_eq!(
-        c.find("_system", "tables").expect("_system.tables").class(),
+        c.get(&RelName::new("_system", "tables").unwrap())
+            .expect("_system.tables")
+            .class(),
         RelClass::Catalog
     );
 }
@@ -205,6 +207,30 @@ fn listings_are_results_in_the_output_format() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT, note TEXT);\n\\dt",
     );
     assert_eq!(text, "Schema,Name,Type,Columns\npublic,t,table,3\n");
+}
+
+/// A name a meta-command takes is read as SQL reads one: quoted, qualified,
+/// and a pattern over the qualified name.
+#[test]
+fn meta_command_names_read_as_sql_reads_them() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.csv");
+    let mut sh = shell(server.sock_path(), None);
+    sh.run_script("CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT);\nCREATE INDEX t_kind ON t (kind);")
+        .unwrap();
+    for name in ["\"t\"", "public.\"t\""] {
+        let text = results(&mut sh, &out, &format!("\\d {name}"));
+        assert!(text.contains("Table \"public.t\""), "{name}: {text}");
+    }
+    assert_eq!(
+        results(&mut sh, &out, "\\dt \"t\""),
+        "Schema,Name,Type,Columns\npublic,t,table,2\n"
+    );
+    assert_eq!(
+        results(&mut sh, &out, "\\di public.*"),
+        "Schema,Name,Table,Columns,Unique\npublic,t_kind,t,kind,false\n"
+    );
 }
 
 #[test]

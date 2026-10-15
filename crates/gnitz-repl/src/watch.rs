@@ -18,12 +18,11 @@ use crate::value::Rows;
 /// bounds how long such a Ctrl-C takes to stop the watch.
 const HOLD: Duration = Duration::from_millis(500);
 
-/// The `SELECT` a `\watch` argument stands for: a bare relation name reads
-/// the view whole.
-pub fn watch_query(arg: &str) -> String {
+/// The `SELECT` a `\watch` argument stands for: a relation name alone, as
+/// SQL reads one in `schema`, reads the view whole.
+pub fn watch_query(arg: &str, schema: &str) -> String {
     let arg = arg.trim().trim_end_matches(';').trim();
-    let is_name = !arg.is_empty() && arg.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"'));
-    match is_name {
+    match gnitz_sql::parse_relation_name(arg, schema).is_some() {
         true => format!("SELECT * FROM {arg}"),
         false => arg.to_string(),
     }
@@ -42,29 +41,14 @@ fn restart_status(e: &ClientError) -> Option<WireStatus> {
     }
 }
 
-fn local_time() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs()) as libc::time_t;
-    // SAFETY: `tm` is plain data `localtime_r` fills in; both pointers are to
-    // locals that outlive the call.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { !libc::localtime_r(&now, &mut tm).is_null() };
-    match ok {
-        true => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
-        false => String::new(),
-    }
-}
-
 impl Shell {
     fn plan_watch(&mut self, sql: &str) -> Result<Subscription, GnitzSqlError> {
-        let schema = self.schema().to_string();
-        block_on(gnitz_sql::plan_subscription(self.client(), &schema, sql))
+        block_on(gnitz_sql::plan_subscription(&mut self.client, &self.schema, sql))
     }
 
     /// Subscribe to `plan` from scratch: its id, and the view whole.
     fn subscribe(&mut self, plan: &Subscription) -> Result<(u64, ScanReply), ClientError> {
-        let (id, rows, _cursor) = block_on(self.client().subscribe(&*plan.upstream, None, &plan.schema, &plan.spec))?;
+        let (id, rows, _cursor) = block_on(self.client.subscribe(&*plan.upstream, None, &plan.schema, &plan.spec))?;
         Ok((id, rows))
     }
 
@@ -73,7 +57,10 @@ impl Shell {
     fn watch_banner(&mut self, label: &str, rows: &Rows) {
         let plus: i64 = rows.rows.iter().map(|&(_, w)| w.max(0)).sum();
         let minus: i64 = rows.rows.iter().map(|&(_, w)| (-w).max(0)).sum();
-        let line = format!("── {} {label}  +{plus} −{minus}", local_time());
+        let line = format!(
+            "── {} {label}  +{plus} −{minus}",
+            chrono::Local::now().format("%H:%M:%S")
+        );
         if matches!(self.settings.format, Format::Csv | Format::Json) {
             self.status(&line);
             return;
@@ -107,23 +94,17 @@ impl Shell {
     /// Follow the delta feed of the view `arg` names, or of the `SELECT` over
     /// one it is, until interrupted.
     pub fn watch(&mut self, arg: &str) -> Result<(), Failed> {
-        let sql = watch_query(arg);
+        let sql = watch_query(arg, &self.schema);
         self.clear_interrupt();
-        let mut plan = match self.plan_watch(&sql) {
-            Ok(p) => p,
-            Err(e) => return self.fail(e),
-        };
-        let (mut id, first) = match self.subscribe(&plan) {
-            Ok(s) => s,
-            Err(e) => return self.fail(e),
-        };
+        let mut plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
+        let (mut id, first) = self.subscribe(&plan).or_else(|e| self.fail(e))?;
         self.status("Watching; Ctrl-C stops.");
         self.watch_print("snapshot", &first, true);
         let outcome = loop {
             if self.interrupted() {
                 break Ok(());
             }
-            let synced = match block_on(self.client().sync(HOLD)) {
+            let synced = match block_on(self.client.sync(HOLD)) {
                 Ok(s) => s,
                 Err(ClientError::Interrupted(_)) => {
                     // Past the `^C` the terminal echoed.
@@ -151,7 +132,7 @@ impl Shell {
                 break self.fail(e);
             }
             if let Some((status, cause)) = restart {
-                self.client().unsubscribe(id);
+                self.client.unsubscribe(id);
                 self.note(&format!("{cause}; reading the view whole again"));
                 if status == WireStatus::StaleCatalog {
                     plan = match self.plan_watch(&sql) {
@@ -168,7 +149,7 @@ impl Shell {
                 }
             }
         };
-        self.client().unsubscribe(id);
+        self.client.unsubscribe(id);
         self.clear_interrupt();
         outcome
     }

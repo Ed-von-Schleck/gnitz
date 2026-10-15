@@ -1,6 +1,7 @@
 //! Result rendering: the output formats `\pset` selects, over decoded rows.
 
 use comfy_table::{presets, Cell, CellAlignment, ContentArrangement, Table};
+use console::measure_text_width;
 use nu_ansi_term::{Color, Style};
 
 use crate::value::{is_numeric, Rows, Value};
@@ -22,24 +23,6 @@ pub enum Expanded {
     On,
     /// Expanded only where the aligned table would be wider than the terminal.
     Auto,
-}
-
-/// How a `\pset` value is spelled.
-pub fn name_of(v: &impl clap::ValueEnum) -> String {
-    v.to_possible_value()
-        .expect("no variant is skipped")
-        .get_name()
-        .to_string()
-}
-
-/// Every variant's spelling.
-pub fn variants<E: clap::ValueEnum>() -> Vec<String> {
-    E::value_variants().iter().map(name_of).collect()
-}
-
-/// The variant `v` spells, in any case; the error lists [`variants`].
-pub fn choose<E: clap::ValueEnum>(v: &str) -> Result<E, String> {
-    E::from_str(v, true).map_err(|_| format!("\"{v}\" is not one of {}", variants::<E>().join(", ")))
 }
 
 /// How results are printed.
@@ -134,9 +117,10 @@ impl Grid {
     }
 
     /// The width the aligned table takes unwrapped: each column as wide as
-    /// its widest line, plus a space either side and one border each.
+    /// its widest line, measured as comfy-table measures it, plus a space
+    /// either side and one border each.
     fn table_width(&self, settings: &Settings) -> usize {
-        let widest = |s: &str| s.lines().map(console_width).max().unwrap_or(0);
+        let widest = |s: &str| s.lines().map(measure_text_width).max().unwrap_or(0);
         let null = widest(&settings.null);
         let cols = self.header.len();
         let content: usize = (0..cols)
@@ -215,24 +199,6 @@ fn build_table(grid: &Grid, settings: &Settings) -> Table {
     table
 }
 
-/// The columns `s` takes on a terminal: ANSI escapes take none.
-pub fn console_width(s: &str) -> usize {
-    let mut width = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            width += 1;
-        }
-    }
-    width
-}
-
 fn aligned(grid: &Grid, settings: &Settings, width: Option<u16>) -> String {
     let mut table = build_table(grid, settings);
     match width {
@@ -250,7 +216,7 @@ fn aligned(grid: &Grid, settings: &Settings, width: Option<u16>) -> String {
 }
 
 fn expanded(grid: &Grid, settings: &Settings) -> String {
-    let label_width = grid.header.iter().map(|h| h.chars().count()).max().unwrap_or(0);
+    let label_width = grid.header.iter().map(|h| measure_text_width(h)).max().unwrap_or(0);
     let mut out = String::new();
     for (i, row) in grid.rows.iter().enumerate() {
         let banner = format!("-[ RECORD {} ]", i + 1);
@@ -258,7 +224,7 @@ fn expanded(grid: &Grid, settings: &Settings) -> String {
             .iter()
             .map(|c| {
                 c.as_deref()
-                    .map_or(settings.null.chars().count(), |s| s.chars().count())
+                    .map_or(measure_text_width(&settings.null), measure_text_width)
             })
             .max()
             .unwrap_or(0);
@@ -268,7 +234,8 @@ fn expanded(grid: &Grid, settings: &Settings) -> String {
         out.push('\n');
         for (h, cell) in grid.header.iter().zip(row) {
             let value = cell.clone().unwrap_or_else(|| null_cell(settings));
-            let label = settings.paint(Style::new().bold(), &format!("{h:<label_width$}"));
+            let pad = " ".repeat(label_width - measure_text_width(h));
+            let label = settings.paint(Style::new().bold(), &format!("{h}{pad}"));
             out.push_str(&format!("{label} | {value}\n"));
         }
     }

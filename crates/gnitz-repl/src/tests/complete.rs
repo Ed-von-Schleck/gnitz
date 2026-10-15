@@ -208,3 +208,65 @@ fn a_path_lists_its_directory() {
         vec![(format!("{typed}a.sql"), true), (format!("{typed}sub/"), false)]
     );
 }
+
+#[test]
+fn nothing_is_offered_inside_a_literal_a_comment_or_a_number() {
+    for line in [
+        "INSERT INTO t VALUES ('ord",
+        "-- sel",
+        "/* sel",
+        "SELECT * FROM orders LIMIT 10",
+        "SELECT * FROM sales.\"ord",
+    ] {
+        assert!(values(line).is_empty(), "{line}: {:?}", values(line));
+    }
+    assert!(values("-- c\nsel").contains(&"select".to_string()));
+    assert_eq!(values("SELECT * FROM \"ord")[0], "orders");
+}
+
+#[test]
+fn a_qualifier_the_binder_refuses_names_no_relation() {
+    let ctx = Context {
+        catalog: Catalog {
+            relations: vec![rel(9, "public", "sales.leads", &["x"])],
+            ..ctx().catalog
+        },
+        ..ctx()
+    };
+    let line = "SELECT * FROM \"sales.leads\" x WHERE x.";
+    assert!(suggest(&ctx, line, line.len()).is_empty());
+}
+
+#[test]
+fn a_name_is_written_as_sql_reads_it_back() {
+    let ctx = Context {
+        catalog: Catalog {
+            relations: vec![
+                rel(1, "public", "t", &["id", "name", "a b", "null", "from"]),
+                rel(2, "public", "2024_sales", &["id"]),
+            ],
+            ..ctx().catalog
+        },
+        ..ctx()
+    };
+    let line = "SELECT  FROM t";
+    let v: Vec<String> = suggest(&ctx, line, 7).into_iter().map(|s| s.value).collect();
+    for c in ["id", "name", "\"a b\"", "\"null\"", "\"from\""] {
+        assert!(v.contains(&c.to_string()), "{c}: {v:?}");
+    }
+    let line = "SELECT * FROM 20";
+    let v: Vec<String> = suggest(&ctx, line, line.len()).into_iter().map(|s| s.value).collect();
+    assert!(v.is_empty(), "a number is no word: {v:?}");
+    let line = "SELECT * FROM ";
+    let v: Vec<String> = suggest(&ctx, line, line.len()).into_iter().map(|s| s.value).collect();
+    assert!(v.contains(&"\"2024_sales\"".to_string()), "{v:?}");
+    let line = "SELECT a FROM t";
+    let v: Vec<String> = suggest(&ctx, line, 8).into_iter().map(|s| s.value).collect();
+    assert!(v.contains(&"\"a b\"".to_string()), "{v:?}");
+}
+
+#[test]
+fn quantifiers_are_offered() {
+    assert!(values("SELECT * FROM orders WHERE id = AN").contains(&"ANY".to_string()));
+    assert!(values("SELECT * FROM orders WHERE id = SOM").contains(&"SOME".to_string()));
+}

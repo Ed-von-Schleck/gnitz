@@ -10,27 +10,30 @@ use std::process::Command;
 use clap::ValueEnum;
 use gnitz_core::{Catalog, CatalogRelation, RelName, RelProps};
 use gnitz_expr::{LikeMatcher, LikePattern};
+use gnitz_sql::sqlparser::tokenizer::Token;
 use gnitz_wire::sys_rows::FkAction;
-use gnitz_wire::{RelClass, TypeCode};
+use gnitz_wire::{qualified_key, RelClass, TypeCode};
 
-use crate::render::{choose, name_of, render, variants, Expanded, Format, Settings, Weights};
+use crate::editor::{editor, editor_command, KEY_HELP};
+use crate::render::{render, Expanded, Format, Settings, Weights};
 use crate::shell::{Failed, Flow, Shell};
 use crate::value::{Rows, Value};
 
-/// What a meta-command's argument at one position is, for completion.
-#[derive(Clone, Copy, Debug)]
+/// What a meta-command's argument is, for completion.
+#[derive(Clone, Copy)]
 pub enum ArgKind {
     None,
     /// A relation of a class the predicate keeps.
     Relation(fn(RelClass) -> bool),
     Index,
     Schema,
-    /// A view name or a `SELECT` over one, to the end of the line.
-    Sql,
-    /// A [`Setting`]'s name.
-    SettingName,
-    /// A value of that setting, or of the one the first argument names.
-    Value(Option<Setting>),
+    /// SQL to the end of the line over the relations of the classes the
+    /// predicate keeps; a relation name alone as its first word.
+    Sql(fn(RelClass) -> bool),
+    /// A [`Setting`]'s name, then that setting's value.
+    Setting,
+    /// A value of that setting.
+    Value(Setting),
     Path,
 }
 
@@ -56,7 +59,7 @@ impl Call<'_> {
 
     /// The relation classes the command's argument names.
     pub fn relations(&self) -> fn(RelClass) -> bool {
-        match self.command.arg(0) {
+        match self.command.arg {
             ArgKind::Relation(keep) => keep,
             _ => |_| true,
         }
@@ -81,8 +84,8 @@ pub struct MetaCommand {
     /// The argument synopsis `\?` prints.
     pub args: &'static str,
     pub help: &'static str,
-    /// The kind of each positional argument.
-    pub arg_kinds: &'static [ArgKind],
+    /// What its argument is.
+    pub arg: ArgKind,
     /// What the command does.
     pub run: fn(&mut Shell, &Call<'_>) -> Result<Flow, Failed>,
 }
@@ -91,10 +94,6 @@ impl MetaCommand {
     pub fn name(&self) -> &'static str {
         self.names[0]
     }
-
-    pub fn arg(&self, i: usize) -> ArgKind {
-        self.arg_kinds.get(i).copied().unwrap_or(ArgKind::None)
-    }
 }
 
 pub const COMMANDS: &[MetaCommand] = &[
@@ -102,35 +101,35 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\?", "\\h", "\\help"],
         args: "",
         help: "show this help",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, _| sh.help(),
     },
     MetaCommand {
         names: &["\\q", "\\quit"],
         args: "",
         help: "quit",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |_, _| Ok(Flow::Quit),
     },
     MetaCommand {
         names: &["\\c"],
         args: "[TARGET]",
         help: "reconnect, to TARGET if given",
-        arg_kinds: &[ArgKind::Path],
+        arg: ArgKind::Path,
         run: |sh, c| sh.connect_to(c.path().as_deref()),
     },
     MetaCommand {
         names: &["\\conninfo"],
         args: "",
         help: "show the connection",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, _| sh.conninfo(),
     },
     MetaCommand {
         names: &["\\use"],
         args: "SCHEMA",
         help: "resolve unqualified names in SCHEMA",
-        arg_kinds: &[ArgKind::Schema],
+        arg: ArgKind::Schema,
         run: |sh, c| match c.arg() {
             Some(schema) => sh.use_schema(schema),
             None => sh.fail("\\use needs a schema name"),
@@ -140,7 +139,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\d"],
         args: "[NAME]",
         help: "list relations, or describe NAME (\\d+ shows hidden columns)",
-        arg_kinds: &[ArgKind::Relation(|_| true)],
+        arg: ArgKind::Relation(|_| true),
         run: |sh, c| match c.arg() {
             Some(name) => sh.describe(name, c.verbose),
             None => sh.list(None, |k| k != RelClass::Catalog),
@@ -150,49 +149,49 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\dt"],
         args: "[PATTERN]",
         help: "list tables",
-        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Table)],
+        arg: ArgKind::Relation(|k| k == RelClass::Table),
         run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\dv"],
         args: "[PATTERN]",
         help: "list views",
-        arg_kinds: &[ArgKind::Relation(RelClass::is_view)],
+        arg: ArgKind::Relation(RelClass::is_view),
         run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\ds"],
         args: "[PATTERN]",
         help: "list streams",
-        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Stream)],
+        arg: ArgKind::Relation(|k| k == RelClass::Stream),
         run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\dS"],
         args: "[PATTERN]",
         help: "list system relations",
-        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Catalog)],
+        arg: ArgKind::Relation(|k| k == RelClass::Catalog),
         run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\di"],
         args: "[PATTERN]",
         help: "list indexes",
-        arg_kinds: &[ArgKind::Index],
+        arg: ArgKind::Index,
         run: |sh, c| sh.list_indexes(c.arg()),
     },
     MetaCommand {
         names: &["\\dn"],
         args: "",
         help: "list schemas",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, _| sh.list_schemas(),
     },
     MetaCommand {
         names: &["\\watch"],
         args: "VIEW | SELECT ...",
         help: "stream a delta-fed view's changes, weights and all, until Ctrl-C",
-        arg_kinds: &[ArgKind::Sql],
+        arg: ArgKind::Sql(|k| k == RelClass::FedView),
         run: |sh, c| match c.rest.is_empty() {
             true => sh.fail("\\watch needs a view name or a SELECT over one"),
             false => sh.watch(c.rest).map(|()| Flow::Continue),
@@ -202,14 +201,14 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\x"],
         args: "[on|off|auto]",
         help: "toggle expanded output",
-        arg_kinds: &[ArgKind::Value(Some(Setting::Expanded))],
+        arg: ArgKind::Value(Setting::Expanded),
         run: |sh, c| sh.set_option(Setting::Expanded, c.arg()),
     },
     MetaCommand {
         names: &["\\a"],
         args: "",
         help: "toggle between aligned and unaligned output",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, _| {
             let to = match sh.settings.format {
                 Format::Aligned => "unaligned",
@@ -222,21 +221,21 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\pset"],
         args: "[OPTION [VALUE]]",
         help: "show the output options, or show or set one",
-        arg_kinds: &[ArgKind::SettingName, ArgKind::Value(None)],
+        arg: ArgKind::Setting,
         run: |sh, c| sh.pset(c.rest),
     },
     MetaCommand {
         names: &["\\timing"],
         args: "[on|off]",
         help: "toggle timing of statements",
-        arg_kinds: &[ArgKind::Value(Some(Setting::Timing))],
+        arg: ArgKind::Value(Setting::Timing),
         run: |sh, c| sh.set_option(Setting::Timing, c.arg()),
     },
     MetaCommand {
         names: &["\\o"],
         args: "[FILE]",
         help: "send results to FILE, or back to stdout",
-        arg_kinds: &[ArgKind::Path],
+        arg: ArgKind::Path,
         run: |sh, c| {
             match c.path() {
                 Some(path) => sh.output_to_file(&path)?,
@@ -249,7 +248,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\i"],
         args: "FILE",
         help: "run the commands in FILE",
-        arg_kinds: &[ArgKind::Path],
+        arg: ArgKind::Path,
         run: |sh, c| match c.path() {
             Some(path) => sh.run_file(&path),
             None => sh.fail("\\i needs a file name"),
@@ -259,14 +258,14 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\e"],
         args: "[FILE]",
         help: "edit the last statement, or FILE, in $EDITOR",
-        arg_kinds: &[ArgKind::Path],
+        arg: ArgKind::Path,
         run: |sh, c| sh.edit(c.path().as_deref()),
     },
     MetaCommand {
         names: &["\\echo"],
         args: "TEXT",
         help: "print TEXT",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, c| {
             sh.write_result(&format!("{}\n", c.rest));
             Ok(Flow::Continue)
@@ -276,7 +275,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\!"],
         args: "[COMMAND]",
         help: "run COMMAND in a shell",
-        arg_kinds: &[],
+        arg: ArgKind::None,
         run: |sh, c| sh.shell_command(c.rest),
     },
 ];
@@ -312,6 +311,24 @@ impl MetaLine {
             command: lookup(base.unwrap_or(word)),
         })
     }
+}
+
+/// How a `\pset` value is spelled.
+pub fn name_of(v: &impl clap::ValueEnum) -> String {
+    v.to_possible_value()
+        .expect("no variant is skipped")
+        .get_name()
+        .to_string()
+}
+
+/// Every variant's spelling.
+pub fn variants<E: clap::ValueEnum>() -> Vec<String> {
+    E::value_variants().iter().map(name_of).collect()
+}
+
+/// The variant `v` spells, in any case; the error lists [`variants`].
+pub fn choose<E: clap::ValueEnum>(v: &str) -> Result<E, String> {
+    E::from_str(v, true).map_err(|_| format!("\"{v}\" is not one of {}", variants::<E>().join(", ")))
 }
 
 /// An option `\pset` shows and sets.
@@ -374,7 +391,7 @@ impl Setting {
             }
             Setting::Null => {
                 if let Some(v) = value {
-                    s.null = v.trim_matches('\'').to_string();
+                    s.null = single_quoted(v).unwrap_or_else(|| v.to_string());
                 }
             }
             Setting::Footer => s.footer = flag(s.footer)?,
@@ -384,7 +401,11 @@ impl Setting {
                 s.expanded = match value {
                     None if s.expanded == Expanded::Off => Expanded::On,
                     None => Expanded::Off,
-                    Some(v) => choose(v)?,
+                    Some(v) => match gnitz_sql::parse_bool(v) {
+                        Some(true) => Expanded::On,
+                        Some(false) => Expanded::Off,
+                        None => choose(v)?,
+                    },
                 }
             }
         }
@@ -400,9 +421,31 @@ fn on_off(b: bool) -> &'static str {
     }
 }
 
-/// `pattern`, a psql wildcard pattern, as a case-insensitive matcher.
-fn glob_matcher(pattern: Option<&str>) -> Option<LikeMatcher> {
-    pattern.map(|p| LikeMatcher::compile(LikePattern::glob(p).as_bytes(), true))
+/// The text of `v` when it lexes as one single-quoted string.
+fn single_quoted(v: &str) -> Option<String> {
+    match crate::lex::lex(v)?.as_slice() {
+        [l] => match &l.token {
+            Token::SingleQuotedString(text) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `pattern`, a psql wildcard pattern, as a case-insensitive test of a
+/// relation's or index's schema and name: of the qualified name when the
+/// pattern has a `.`, else of the name. Double quotes are dropped, as psql reads
+/// them as quoting; a catalog name holds none.
+fn glob(pattern: Option<&str>) -> impl FnMut(&str, &str) -> bool {
+    let pattern = pattern.map(|p| p.replace('"', ""));
+    let qualified = pattern.as_ref().is_some_and(|p| p.contains('.'));
+    let m = pattern.map(|p| LikeMatcher::compile(LikePattern::glob(&p).as_bytes(), true));
+    let mut folded = Vec::new();
+    move |schema, name| match &m {
+        None => true,
+        Some(m) if qualified => m.matches(qualified_key(schema, name).as_bytes(), &mut folded),
+        Some(m) => m.matches(name.as_bytes(), &mut folded),
+    }
 }
 
 impl Shell {
@@ -435,7 +478,7 @@ impl Shell {
             })
             .collect();
         let width = entries.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
-        let mut out = String::from("General\n  SQL statements end with ';'. Tab completes, Ctrl-R searches history,\n  Alt-Enter inserts a newline, Alt-E opens the buffer in $EDITOR.\n\nMeta-commands\n");
+        let mut out = format!("General\n{KEY_HELP}\nMeta-commands\n");
         for (synopsis, help) in &entries {
             let _ = writeln!(out, "  {synopsis:<width$}  {help}");
         }
@@ -462,7 +505,7 @@ impl Shell {
         let Some(known) = key.filter(|k| catalog.schemas.contains(k)) else {
             return self.fail(format!("schema \"{schema}\" does not exist"));
         };
-        self.set_schema(&known);
+        self.schema = known;
         Ok(Flow::Continue)
     }
 
@@ -493,58 +536,37 @@ impl Shell {
 
     fn list(&mut self, pattern: Option<&str>, keep: fn(RelClass) -> bool) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let matcher = glob_matcher(pattern);
-        let qualified = pattern.is_some_and(|p| p.contains('.'));
-        let mut folded = Vec::new();
-        let rows: Vec<Vec<Value>> = catalog
+        let mut matches = glob(pattern);
+        let rows = catalog
             .relations
             .iter()
-            .filter(|r| keep(r.class()))
-            .filter(|r| {
-                let Some(m) = &matcher else {
-                    return true;
-                };
-                match qualified {
-                    true => m.matches(r.qualified().as_bytes(), &mut folded),
-                    false => m.matches(r.name.as_bytes(), &mut folded),
-                }
-            })
+            .filter(|r| keep(r.class()) && matches(&r.schema, &r.name))
             .map(|r| {
                 vec![
                     Value::Text(r.schema.clone()),
                     Value::Text(r.name.clone()),
                     Value::Text(r.class().describe().to_string()),
-                    Value::Int(r.columns.iter().filter(|c| !c.def.is_hidden).count() as i128),
+                    Value::Int(r.visible_columns().count() as i128),
                 ]
             })
             .collect();
-        if rows.is_empty() {
-            self.status("Did not find any matching relations.");
-            return Ok(Flow::Continue);
-        }
         let columns = [
             ("Schema", TypeCode::String),
             ("Name", TypeCode::String),
             ("Type", TypeCode::String),
             ("Columns", TypeCode::I64),
         ];
-        self.print_rows(&Rows::of(&columns, rows));
-        Ok(Flow::Continue)
+        self.print_listing("relations", &columns, rows)
     }
 
     fn list_indexes(&mut self, pattern: Option<&str>) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let matcher = glob_matcher(pattern);
-        let mut folded = Vec::new();
-        let rows: Vec<Vec<Value>> = catalog
+        let mut matches = glob(pattern);
+        let rows = catalog
             .relations
             .iter()
             .flat_map(|r| r.indexes.iter().map(move |i| (r, i)))
-            .filter(|(_, i)| {
-                matcher
-                    .as_ref()
-                    .is_none_or(|m| m.matches(i.name.as_bytes(), &mut folded))
-            })
+            .filter(|(r, i)| matches(&r.schema, &i.name))
             .map(|(r, i)| {
                 vec![
                     Value::Text(r.schema.clone()),
@@ -555,10 +577,6 @@ impl Shell {
                 ]
             })
             .collect();
-        if rows.is_empty() {
-            self.status("Did not find any matching indexes.");
-            return Ok(Flow::Continue);
-        }
         let columns = [
             ("Schema", TypeCode::String),
             ("Name", TypeCode::String),
@@ -566,7 +584,20 @@ impl Shell {
             ("Columns", TypeCode::String),
             ("Unique", TypeCode::Bool),
         ];
-        self.print_rows(&Rows::of(&columns, rows));
+        self.print_listing("indexes", &columns, rows)
+    }
+
+    /// A listing's rows, or that it found none.
+    fn print_listing(
+        &mut self,
+        noun: &str,
+        columns: &[(&str, TypeCode)],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Flow, Failed> {
+        match rows.is_empty() {
+            true => self.status(&format!("Did not find any matching {noun}.")),
+            false => self.print_rows(&Rows::of(columns, rows)),
+        }
         Ok(Flow::Continue)
     }
 
@@ -579,7 +610,8 @@ impl Shell {
 
     fn describe(&mut self, name: &str, verbose: bool) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let Some(rel) = catalog.find(self.schema(), name) else {
+        let found = gnitz_sql::parse_relation_name(name, &self.schema).and_then(|n| catalog.get(&n));
+        let Some(rel) = found else {
             return self.fail(format!("Did not find any relation named \"{name}\"."));
         };
         let out = self.description(&catalog, rel, verbose);
@@ -691,8 +723,8 @@ impl Shell {
             Some(f) => PathBuf::from(f),
             None => {
                 let path = self.scratch()?.join("edit.sql");
-                let text = self.last_statement().to_string();
-                std::fs::write(&path, text).or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
+                std::fs::write(&path, &self.last_statement)
+                    .or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
                 path
             }
         };
@@ -721,21 +753,6 @@ impl Shell {
         }
         Ok(Flow::Continue)
     }
-}
-
-/// `$VISUAL`, else `$EDITOR`, else `vi`.
-fn editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string())
-}
-
-/// The user's editor, run on `path` through the shell so `$EDITOR` may carry
-/// arguments.
-pub fn editor_command(path: &std::path::Path) -> Command {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(format!("{} \"$1\"", editor())).arg("sh").arg(path);
-    cmd
 }
 
 fn capitalize(s: &str) -> String {

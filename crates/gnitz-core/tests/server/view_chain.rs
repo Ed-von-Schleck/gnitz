@@ -8,7 +8,7 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_core::{PlannedView, ViewBundle};
+use gnitz_core::{PlannedView, RelName, ViewBundle};
 use gnitz_wire::sys_rows::ViewTabSlot;
 use gnitz_wire::{Circuit, ViewProps, VIEW_TAB};
 
@@ -100,7 +100,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     // The catalog holds the chain as its user view, reading the base through
     // both segments, neither a relation of its own.
     let catalog = block_on(client.catalog()).unwrap();
-    let f = catalog.find(&sn, "f").unwrap();
+    let f = catalog.get(&RelName::new(&sn, "f").unwrap()).unwrap();
     assert_eq!((f.id, f.reads.as_slice()), (owner, &[base_tid][..]));
     assert!(catalog.relation(owner - 1).is_none() && catalog.relation(owner - 2).is_none());
     let readers: Vec<u64> = catalog.readers(base_tid).map(|r| r.id).collect();

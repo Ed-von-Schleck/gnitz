@@ -2,7 +2,8 @@
 //! prompt of this shell.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
@@ -14,7 +15,6 @@ use reedline::{
 
 use crate::highlight::SqlHighlighter;
 use crate::lex;
-use crate::meta::editor_command;
 
 const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_CAPACITY: usize = 10_000;
@@ -87,6 +87,9 @@ fn history_path() -> Option<PathBuf> {
     Some(dir.join("history"))
 }
 
+/// What `\?` says of the keys [`add_common_bindings`] binds.
+pub const KEY_HELP: &str = "  SQL statements end with ';'. Tab completes, Ctrl-R searches history,\n  Alt-Enter inserts a newline, Alt-E opens the buffer in $EDITOR.\n";
+
 fn add_common_bindings(kb: &mut Keybindings) {
     kb.add_binding(
         KeyModifiers::NONE,
@@ -103,6 +106,21 @@ fn add_common_bindings(kb: &mut Keybindings) {
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
     kb.add_binding(KeyModifiers::ALT, KeyCode::Char('e'), ReedlineEvent::OpenEditor);
+}
+
+/// `$VISUAL`, else `$EDITOR`, else `vi`.
+pub fn editor() -> String {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string())
+}
+
+/// The user's editor, run on `path` through the shell so `$EDITOR` may carry
+/// arguments.
+pub fn editor_command(path: &Path) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(format!("{} \"$1\"", editor())).arg("sh").arg(path);
+    cmd
 }
 
 /// The editor, without a completer: the shell sets one at each prompt. Alt-E

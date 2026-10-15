@@ -97,7 +97,7 @@ fn a_relation_is_classed_by_its_own_row() {
         .view(20, "feed", 0, fed, &[17]);
     let catalog = rows.decode();
 
-    let class = |schema: &str, name: &str| catalog.find(schema, name).unwrap().class();
+    let class = |schema: &str, name: &str| catalog.get(&RelName::new(schema, name).unwrap()).unwrap().class();
     assert_eq!(class(SYSTEM_SCHEMA, "tables"), RelClass::Catalog);
     assert_eq!(class("app", "t"), RelClass::Table);
     assert_eq!(class("app", "events"), RelClass::Stream);
@@ -139,7 +139,7 @@ fn a_table_carries_its_columns_key_fks_and_indexes() {
     rows.put(&index, 1);
     let catalog = rows.decode();
 
-    let child = catalog.find("app", "child").unwrap();
+    let child = catalog.get(&RelName::new("app", "child").unwrap()).unwrap();
     assert_eq!(child.props, RelProps::Table(props));
     let cols: Vec<_> = child.columns.iter().map(|c| (c.def.name.as_str(), c.fk)).collect();
     assert_eq!(cols, [("id", None), ("parent_id", Some(fk)), ("note", None)]);
@@ -149,7 +149,11 @@ fn a_table_carries_its_columns_key_fks_and_indexes() {
     };
     assert_eq!((ix.name.as_str(), ix.is_unique), ("child_note", true));
     assert_eq!(child.column_names(&ix.cols), ["note", "parent_id"]);
-    assert!(catalog.find("app", "parent").unwrap().indexes.is_empty());
+    assert!(catalog
+        .get(&RelName::new("app", "parent").unwrap())
+        .unwrap()
+        .indexes
+        .is_empty());
 }
 
 /// A view's segments are its own: it reads what its chain scans from outside
@@ -166,7 +170,7 @@ fn a_view_reads_through_its_chain() {
         .view(22, "over", 0, ViewProps::default(), &[21, 17]);
     let catalog = rows.decode();
 
-    let reads = |name: &str| catalog.find("app", name).unwrap().reads.clone();
+    let reads = |name: &str| catalog.get(&RelName::new("app", name).unwrap()).unwrap().reads.clone();
     assert_eq!(reads("joined"), [17, 18]);
     assert_eq!(reads("over"), [17, 21]);
     assert!(reads("a").is_empty());

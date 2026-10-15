@@ -72,3 +72,16 @@ fn expand_home_reads_only_the_own_home() {
     assert_eq!(expand_home("~bob/x"), "~bob/x");
     assert_eq!(expand_home("a/~/x"), "a/~/x");
 }
+
+#[test]
+fn expanded_reads_boolean_spellings_and_null_reads_a_sql_string() {
+    let mut s = Settings::default();
+    Setting::Expanded.set(&mut s, Some("yes")).unwrap();
+    assert_eq!(s.expanded, Expanded::On);
+    Setting::Expanded.set(&mut s, Some("off")).unwrap();
+    assert_eq!(s.expanded, Expanded::Off);
+    Setting::Null.set(&mut s, Some("'it''s'")).unwrap();
+    assert_eq!(s.null, "it's");
+    Setting::Null.set(&mut s, Some("(none)")).unwrap();
+    assert_eq!(s.null, "(none)");
+}

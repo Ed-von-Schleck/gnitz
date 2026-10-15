@@ -591,24 +591,29 @@ const VOLATILE_FNS: &[&str] = &[
 /// are ignored. `DATE_TRUNC`'s units are this same vocabulary read through
 /// [`CalendarOp::trunc_of`], so they are not spelled a second time.
 fn calendar_field(name: &str) -> Option<CalendarOp> {
-    use CalendarOp as C;
     let n = name.trim().to_ascii_lowercase();
-    match n.strip_suffix('s').filter(|s| !s.is_empty()).unwrap_or(&n) {
-        "year" => Some(C::Year),
-        "quarter" => Some(C::Quarter),
-        "month" => Some(C::Month),
-        "week" | "isoweek" => Some(C::Week),
-        "day" => Some(C::Day),
-        "dow" | "dayofweek" => Some(C::Dow),
-        "isodow" => Some(C::Isodow),
-        "doy" | "dayofyear" => Some(C::Doy),
-        "hour" => Some(C::Hour),
-        "minute" => Some(C::Minute),
-        "second" => Some(C::Second),
-        "epoch" => Some(C::Epoch),
-        _ => None,
-    }
+    let n = n.strip_suffix('s').filter(|s| !s.is_empty()).unwrap_or(&n);
+    CALENDAR_FIELDS.iter().find(|&&(f, _)| f == n).map(|&(_, op)| op)
 }
+
+/// The unit names [`calendar_field`] reads, singular and lowercase.
+pub(crate) const CALENDAR_FIELDS: &[(&str, CalendarOp)] = &[
+    ("year", CalendarOp::Year),
+    ("quarter", CalendarOp::Quarter),
+    ("month", CalendarOp::Month),
+    ("week", CalendarOp::Week),
+    ("isoweek", CalendarOp::Week),
+    ("day", CalendarOp::Day),
+    ("dow", CalendarOp::Dow),
+    ("dayofweek", CalendarOp::Dow),
+    ("isodow", CalendarOp::Isodow),
+    ("doy", CalendarOp::Doy),
+    ("dayofyear", CalendarOp::Doy),
+    ("hour", CalendarOp::Hour),
+    ("minute", CalendarOp::Minute),
+    ("second", CalendarOp::Second),
+    ("epoch", CalendarOp::Epoch),
+];
 
 fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
     let n = single_part_ident(&f.name)?;

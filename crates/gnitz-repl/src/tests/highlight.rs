@@ -73,3 +73,15 @@ fn the_bracket_at_the_cursor_and_its_partner_are_marked() {
         .collect();
     assert_eq!(marked, vec![open, src.len() - 1]);
 }
+
+#[test]
+fn only_the_shell_s_vocabulary_is_a_keyword() {
+    let p = Palette::default();
+    let src = "SELECT id, name FROM t";
+    assert_eq!(style_of(src, "id"), p.identifier);
+    assert_eq!(style_of(src, "name"), p.identifier);
+    assert_eq!(style_of("CREATE TABLE t (a BIGINT)", "BIGINT"), p.keyword);
+    assert_eq!(style_of("CREATE TABLE t (a bigint)", "bigint"), p.keyword);
+    assert_eq!(style_of("SELECT 1 = ANY (SELECT 1)", "ANY"), p.keyword);
+    assert_eq!(style_of("SELECT EXTRACT(year FROM d) FROM t", "year"), p.keyword);
+}

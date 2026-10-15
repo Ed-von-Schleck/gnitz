@@ -100,8 +100,22 @@ fn auto_expands_only_what_is_wider_than_the_terminal() {
 }
 
 #[test]
-fn console_width_skips_ansi_escapes() {
-    assert_eq!(console_width("\x1b[1;36mab\x1b[0m"), 2);
+fn a_wide_character_cell_expands_auto_where_its_char_count_would_fit() {
+    let settings = Settings {
+        expanded: Expanded::Auto,
+        footer: false,
+        ..Settings::default()
+    };
+    let r = Rows {
+        columns: vec![Column {
+            name: "x".into(),
+            ty: ColType::of(TypeCode::String),
+        }],
+        rows: vec![(vec![Value::Text("数据库数据库数据库数".into())], 1)],
+    };
+    // Ten chars take 14 columns as a table, twenty wide ones 24.
+    assert!(render(&r, Weights::Repeat, &settings, Some(20), false).starts_with("-[ RECORD 1 ]"));
+    assert!(render(&r, Weights::Repeat, &settings, Some(24), false).contains('│'));
 }
 
 #[test]
@@ -110,9 +124,10 @@ fn the_measured_table_width_is_the_rendered_one() {
     let mut r = rows();
     r.rows
         .push((vec![Value::Int(-30), Value::Text("two\nlines".into())], 1));
+    r.rows.push((vec![Value::Int(7), Value::Text("数据库".into())], 1));
     for weights in [Weights::Repeat, Weights::Column] {
         let out = render(&r, weights, &settings, None, false);
-        let widest = out.lines().map(console_width).max().unwrap_or(0);
+        let widest = out.lines().map(console::measure_text_width).max().unwrap_or(0);
         assert_eq!(Grid::of(&r, weights).table_width(&settings), widest, "{out}");
     }
 }

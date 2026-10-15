@@ -1,11 +1,10 @@
 //! Syntax highlighting of the input line, by the tokens `sqlparser` reads.
 
-use gnitz_sql::sqlparser::keywords::Keyword;
 use gnitz_sql::sqlparser::tokenizer::Token;
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
-use crate::lex::{is_comment, lex_prefix, Lexeme};
+use crate::lex::{is_comment, is_keyword, lex_prefix, Lexeme};
 use crate::meta::{ArgKind, MetaLine};
 
 /// The style of each token class.
@@ -57,7 +56,7 @@ impl SqlHighlighter {
         let cmd_end = name.end;
         let mut spans = vec![(Style::new(), 0..name.start), (self.palette.meta, name)];
         // A command that takes SQL, `\watch`, has its argument read as SQL.
-        if command.is_some_and(|c| matches!(c.arg(0), ArgKind::Sql)) {
+        if command.is_some_and(|c| matches!(c.arg, ArgKind::Sql(_))) {
             spans.extend(
                 self.sql_spans(&src[cmd_end..], cursor.saturating_sub(cmd_end))
                     .into_iter()
@@ -107,7 +106,7 @@ impl SqlHighlighter {
                 let qualified = matches!(prev, Some(Token::Period)) || matches!(next, Some(Token::Period));
                 if matches!(next, Some(Token::LParen)) && !qualified && is_function(&w.value) {
                     p.function
-                } else if w.keyword != Keyword::NoKeyword && !qualified {
+                } else if is_keyword(w) && !qualified {
                     p.keyword
                 } else {
                     p.identifier
