@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::scatter::with_routed;
 use super::*;
-use crate::catalog::{SysFamily, ZoneGroup};
+use crate::catalog::{SysFamily, ZoneError, ZoneSink};
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
 use gnitz_foundation::posix_io::retry_eintr;
@@ -167,14 +167,11 @@ impl MasterDispatcher {
     /// Log a DDL batch of `family` inside `scope`'s zone — one LSN across a DDL's
     /// groups, so recovery groups them atomically — and send it to every worker.
     /// A family that reaches no worker is logged and addresses none. Publishes
-    /// nothing; that is the scope's commit.
+    /// nothing; that is the scope's commit. Reads no catalog, so it runs while
+    /// the catalog is mutably borrowed.
     fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
         let target_id = family.id();
-        let record = self
-            .cat()
-            .schema_record(target_id)
-            .expect("a wire target is registered under the catalog lock");
-        let mut group = DirectGroup::ddl_sync(target_id, &record, batch);
+        let mut group = DirectGroup::ddl_sync(target_id, family.record(), batch);
         if family.master_only() {
             group.targets = GroupTargets {
                 set: WorkerSet::EMPTY,
@@ -186,34 +183,33 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Emit `zone`, which the catalog has applied, as one SAL zone and mark it
-    /// applied; answers the zone LSN. Submits no fdatasync. A zone the log
-    /// refuses reached no worker — its scope drops unpublished — so the catalog
-    /// is put back and the refusal answered.
-    pub(crate) fn emit_zone(
+    /// Run catalog write `write` with its groups laid out as one SAL zone, and mark
+    /// the zone applied: the write's value and the zone LSN. A write the catalog or
+    /// the log refuses leaves the catalog as it was and its scope unpublished. A
+    /// diverged catalog is one no log describes, so the process ends on it.
+    /// Submits no fdatasync.
+    pub(crate) fn emit_zone<T>(
         &self,
         excl: &mut SalExcl<'_>,
-        zone: Vec<ZoneGroup>,
         op: &'static str,
-    ) -> Result<u64, WireFault> {
+        write: impl FnOnce(&mut CatalogEngine, &mut ZoneSink<'_>) -> Result<T, ZoneError>,
+    ) -> Result<(T, u64), WireFault> {
         let scope = excl.begin("ddl");
         let zone_lsn = scope.lsn();
-        let laid_out = zone
-            .iter()
-            .try_for_each(|g| self.broadcast_ddl(&scope, g.family, &g.batch));
-        if let Err(refused) = laid_out {
-            drop(scope);
-            if let Err(e) = self.cat_mut().undo(zone) {
-                gnitz_fatal_abort!("{op}: the log refused the zone ({refused}); undoing it failed: {e}");
-            }
-            return Err(refused);
-        }
+        let written = write(self.cat_mut(), &mut |family, batch| {
+            self.broadcast_ddl(&scope, family, batch)
+        });
+        let value = match written {
+            Ok(v) => v,
+            Err(ZoneError::Refused(e)) => return Err(e),
+            Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{op}: {e}"),
+        };
         // Only a closed zone raises the replay floor: an LSN no member carries can
         // be the next scope's, whose zone boot replay would then skip.
         if scope.commit() {
             self.cat_mut().mark_zone_applied(zone_lsn);
         }
-        Ok(zone_lsn)
+        Ok((value, zone_lsn))
     }
 
     /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK

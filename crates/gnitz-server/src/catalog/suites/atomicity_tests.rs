@@ -297,7 +297,7 @@ fn sequence_advances_leave_no_negative_ghost() {
 }
 
 // ── Undoing a DROP must not stage the restored relation's directory ──────────
-// `undo` negates a dropped relation's `-1` back to `+1`, so the
+// The undo of a refused DROP negates its `-1` back to `+1`, so the
 // register hook runs on a directory that already holds live shards. Staging it
 // for crash-cleanup would let a failure inside the re-registration delete them,
 // and the next boot — replaying the same TABLE_TAB row, since the DDL never
@@ -315,27 +315,33 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
         1,
         "the fixture table must have one live TABLE_TAB row"
     );
-    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop_batch)])).unwrap();
-    assert!(!engine.registry.has_id(tid), "the drop must unregister the table");
+    // The DROP of a bundle the log refuses at its Column group, after its Table
+    // group applied. The refusing sink makes the restoring `build_relation_store`
+    // fail: a plain file where the per-worker child directory belongs, which
+    // `Table::new` cannot open.
+    let mut sink = |family: SysFamily, _: &Batch| {
+        if family != SysFamily::Column {
+            return Ok(());
+        }
+        assert!(
+            std::path::Path::new(&reldir).is_dir(),
+            "a drop leaves the directory to the sweep"
+        );
+        let child = fs::read_dir(&reldir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .expect("one store child")
+            .path();
+        fs::remove_dir_all(&child).unwrap();
+        fs::write(&child, b"not a directory").unwrap();
+        Err("the log refuses the zone".into())
+    };
+    let refused = engine.apply_bundle(bundle([(SysFamily::Table, drop_batch)]), &mut sink);
     assert!(
-        std::path::Path::new(&reldir).is_dir(),
-        "a drop leaves the directory to the sweep"
+        matches!(refused, Err(ZoneError::Diverged(_))),
+        "the restored relation's store cannot be opened"
     );
-
-    // Make the restoring `build_relation_store` fail: a plain file where the
-    // per-worker child directory belongs, which `Table::new` cannot open.
-    let child = fs::read_dir(&reldir)
-        .unwrap()
-        .flatten()
-        .find(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .expect("one store child")
-        .path();
-    fs::remove_dir_all(&child).unwrap();
-    fs::write(&child, b"not a directory").unwrap();
-
-    engine
-        .undo(zone)
-        .expect_err("the restored relation's store cannot be opened");
     assert!(
         std::path::Path::new(&reldir).is_dir(),
         "the restored relation's directory must survive a failure inside its re-registration"

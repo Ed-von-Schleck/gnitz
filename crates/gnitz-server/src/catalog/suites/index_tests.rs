@@ -402,43 +402,6 @@ fn test_drop_table_cleans_up_indices() {
 // the database un-openable.
 
 #[test]
-fn test_drop_table_cascades_secondary_index() {
-    let dir = temp_dir("drop_table_cascade_sec");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let tid = engine.create_table("public.cascade_tbl", &cols, &[0]).unwrap();
-    engine.create_index("public.cascade_tbl", &["val"], false).unwrap();
-
-    let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
-    assert!(engine.has_index_by_name(&idx_name));
-    let idx_records_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
-    assert!(idx_records_before >= 1);
-
-    // Drop the table WITHOUT dropping the index first.
-    engine.drop_table("public.cascade_tbl").unwrap();
-
-    assert!(
-        !engine.has_index_by_name(&idx_name),
-        "in-memory index registry must forget the index"
-    );
-    assert!(!engine.registry.has_id(tid));
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        idx_records_before - 1,
-        "sys_indices must retract exactly one record"
-    );
-
-    // Reopen: before the fix, replay_catalog would fail here because
-    // the orphaned sys_indices row references tid which no longer exists.
-    engine.close();
-    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine2.has_index_by_name(&idx_name));
-    engine2.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn test_drop_table_cascades_fk_index() {
     let dir = temp_dir("drop_table_cascade_fk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -779,6 +742,29 @@ fn test_promote_unique_index_over_fk_column_empty() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Drop the indexes `idx_ids` in a bundle that also drops a scratch table, and
+/// refuse it at the Table group. A drop-only bundle applies in reverse
+/// `SysFamily::ALL` order, so the Index group is applied, then undone while its
+/// owner stays registered.
+fn apply_index_drop_then_refuse(engine: &mut CatalogEngine, idx_ids: &[u64]) {
+    let scratch = engine
+        .create_table("public.scratch", &[col_def("id", TypeCode::U64)], &[0])
+        .unwrap();
+    let blocks = bundle([
+        (SysFamily::Index, engine.retract_under(SysFamily::Index, idx_ids)),
+        (SysFamily::Table, engine.retract_under(SysFamily::Table, &[scratch])),
+    ]);
+    let mut sink = |f: SysFamily, _: &Batch| match f {
+        SysFamily::Table => Err("the log refuses the zone".into()),
+        _ => Ok(()),
+    };
+    let refused = engine.apply_bundle(blocks, &mut sink);
+    assert!(
+        matches!(refused, Err(ZoneError::Refused(_))),
+        "the bundle must be refused and undone"
+    );
+}
+
 /// A shared circuit's directory is named by its column list, so undoing the
 /// drop of the last index on it re-opens the directory it already had — the one
 /// the workers, which never saw the undone drop, still hold.
@@ -810,9 +796,7 @@ fn undone_drop_of_a_shared_index_keeps_its_directory() {
     let before = index_dirs();
     assert_eq!(before.len(), 1, "{before:?}");
 
-    let drop = engine.retract_under(SysFamily::Index, &ids[1..]);
-    let zone = engine.apply_bundle(bundle([(SysFamily::Index, drop)])).unwrap();
-    engine.undo(zone).unwrap();
+    apply_index_drop_then_refuse(&mut engine, &ids[1..]);
     assert_eq!(engine.index_ids_of(tid), vec![ids[1]]);
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
     assert_eq!(index_dirs(), before);
@@ -2040,11 +2024,7 @@ fn undone_drop_index_refills_the_restored_circuit() {
 
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
-    let drop = engine.retract_under(SysFamily::Index, &[idx_id]);
-    let zone = engine.apply_bundle(bundle([(SysFamily::Index, drop)])).unwrap();
-    assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_none());
-
-    engine.undo(zone).unwrap();
+    apply_index_drop_then_refuse(&mut engine, &[idx_id]);
 
     let found = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
     let row = found.expect("the restored index must hold the flushed row");

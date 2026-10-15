@@ -5,8 +5,7 @@
 //! half that can be pulled in — as a dev-dependency.
 
 use crate::catalog::cache::encode_record;
-use crate::catalog::CatalogColumn;
-use crate::test_support::arb_schema;
+use crate::test_support::{arb_schema, cols_of};
 
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
@@ -14,24 +13,11 @@ use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use proptest::prelude::*;
 
-/// The catalog's column records for `schema`, named `c{i}`.
-fn catalog_defs(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
-    column_defs(schema).map(|def| CatalogColumn { def, fk: None }).collect()
-}
-
-fn column_defs(schema: &SchemaDescriptor) -> impl Iterator<Item = ColumnDef> + '_ {
-    schema
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, c)| ColumnDef::new(format!("c{i}"), c.type_code, c.nullable))
-}
-
 proptest! {
     /// Catalog encoder → catalog decoder.
     #[test]
     fn schema_roundtrip_catalog_codec(schema in arb_schema(MAX_PK_COLUMNS)) {
-        let record = encode_record(schema.pk_cols(), &catalog_defs(&schema));
+        let record = encode_record(schema.pk_cols(), &cols_of(&schema));
         prop_assert_eq!(decode_schema_block(&record).unwrap(), schema);
     }
 
@@ -39,14 +25,14 @@ proptest! {
     /// to differ — decodes to the relation's own schema.
     #[test]
     fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
-        let mut defs: Vec<ColumnDef> = column_defs(&schema).collect();
+        let mut defs: Vec<ColumnDef> = cols_of(&schema).into_iter().map(|c| c.def).collect();
         for c in &mut defs {
             c.name = format!("renamed_{}", c.name);
             c.is_hidden = hidden;
         }
         let frame = gnitz_wire::schema_block::encode(defs.iter().map(ColumnDef::block_col), schema.pk_cols());
         prop_assert_eq!(
-            check_same_types(&frame, &encode_record(schema.pk_cols(), &catalog_defs(&schema))),
+            check_same_types(&frame, &encode_record(schema.pk_cols(), &cols_of(&schema))),
             Ok(())
         );
         prop_assert_eq!(decode_schema_block(&frame).unwrap(), schema);

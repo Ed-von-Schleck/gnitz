@@ -45,10 +45,9 @@ pub(crate) use constraints::{FkEdge, RowConstraints};
 pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
 pub(crate) use sys_tables::{write_col_tab_rows, CatalogColumn, PUBLIC_SCHEMA_ID};
-// The DDL_TXN driver's bundle decoders: it resolves each family once, carries
-// the value, and reads back what the bundle created or dropped.
-pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-pub(crate) use write_path::{ZoneError, ZoneGroup};
+// The DDL_TXN driver's unique-index pre-flight input.
+pub(crate) use sys_tables::unique_index_creates;
+pub(crate) use write_path::{ZoneError, ZoneSink};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

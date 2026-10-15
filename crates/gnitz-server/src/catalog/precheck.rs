@@ -13,8 +13,8 @@ use rustc_hash::FxHashSet;
 
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    build_schema_from_col_defs, check_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkSignature, RelDetail,
-    SysFamily, SYSTEM_SCHEMA_ID,
+    build_schema_from_col_defs, check_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkShape, PkSignature,
+    RelDetail, RelRow, SysFamily, SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
 
@@ -133,10 +133,10 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
 /// with the id counter at `next_id`.
 fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<Vec<PkSignature>, String> {
     check_row_weights(family, batch)?;
-    let sigs = pk_signatures(family, batch);
+    let sigs = pk_signatures(batch);
     for sig in &sigs {
         check_pk_multiplicity(family, sig)?;
-        if family.retracts_with_owner() && sig.pos.is_none() && sig.neg.is_some() {
+        if family.retracts_with_owner() && sig.shape() == PkShape::Drop {
             return Err(format!(
                 "a {} is retracted only with its owner ({})",
                 family.row_noun(),
@@ -154,7 +154,7 @@ fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<V
 /// circuit.
 fn check_circuit_rows(batch: &Batch, created: &IdSet) -> Result<(), String> {
     for i in batch.live_rows() {
-        let view_id = SysFamily::Circuit.leading_id(batch.get_pk(i));
+        let view_id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
         if !created.contains(view_id) {
             return Err(format!(
                 "a circuit names view {view_id}, which this transaction does not create"
@@ -499,7 +499,6 @@ impl CatalogEngine {
     pub(in crate::catalog) fn precheck_bundle(
         &self,
         families: &[Option<Batch>; SysFamily::COUNT],
-        new_views: &[u64],
     ) -> Result<(), String> {
         if let Some(f) = SysFamily::ALL
             .into_iter()
@@ -515,7 +514,17 @@ impl CatalogEngine {
             self.check_column_owners(cols, families)?;
         }
         if let Some(b) = families[SysFamily::Circuit.index()].as_ref() {
-            check_circuit_rows(b, &IdSet::new(new_views.iter().copied()))?;
+            let created = families[SysFamily::View.index()]
+                .as_ref()
+                .map_or_else(IdSet::default, |v| {
+                    IdSet::new(
+                        pk_signatures(v)
+                            .into_iter()
+                            .filter(|s| s.shape() == PkShape::Create)
+                            .map(|s| s.leading),
+                    )
+                });
+            check_circuit_rows(b, &created)?;
         }
         Ok(())
     }
@@ -531,7 +540,7 @@ impl CatalogEngine {
         );
         let mut altered: Option<u64> = None;
         for i in cols.live_rows() {
-            let owner_id = SysFamily::Column.leading_id(cols.get_pk(i));
+            let owner_id = gnitz_wire::sys_leading_id(cols.get_pk_bytes(i));
             // An ALTER must be its bundle's only change, on one owner: nothing can undo
             // its descriptor swap, so the swap must be the bundle's last fallible step.
             if self.registry.has_id(owner_id) {
@@ -594,28 +603,24 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<(u64, Cow<'_, str>)> = FxHashSet::default();
         // The retired ids a relation of the same name takes over: an ALTER VIEW.
         let mut replaced: Vec<u64> = Vec::new();
-        let creates = IdSet::new(
-            sigs.iter()
-                .filter(|s| s.pos.is_some() && s.neg.is_none())
-                .map(|s| s.leading),
-        );
+        let creates = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading));
         if let Some(id) = creates.ids().iter().find(|&&id| self.registry.has_id(id)) {
             return Err(format!("relation id {id} already exists"));
         }
         // The only owners a created view may name: a chain is created whole.
-        let mut created_users = Vec::new();
-        if family == SysFamily::View {
-            for i in batch.live_rows() {
-                let rel = read_rel_row(family, batch, i)?;
-                if creates.contains(rel.id) && matches!(rel.detail, RelDetail::View(ViewParts { owner: None, .. })) {
-                    created_users.push(rel.id);
-                }
-            }
-        }
-        let created_users = IdSet::new(created_users);
+        let rels: Vec<RelRow<'_>> = batch
+            .live_rows()
+            .map(|i| read_rel_row(family, batch, i))
+            .collect::<Result<_, _>>()?;
+        let created_users = IdSet::new(
+            rels.iter()
+                .filter(|rel| {
+                    creates.contains(rel.id) && matches!(rel.detail, RelDetail::View(ViewParts { owner: None, .. }))
+                })
+                .map(|rel| rel.id),
+        );
 
-        for i in batch.live_rows() {
-            let rel = read_rel_row(family, batch, i)?;
+        for rel in &rels {
             // The system schema holds the catalog's own relations and nothing else.
             if rel.schema_id == SYSTEM_SCHEMA_ID {
                 return Err(format!("{rel}: the system schema takes no relation"));

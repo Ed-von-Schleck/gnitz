@@ -3,12 +3,13 @@ use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
 use std::collections::hash_map::Entry;
+use std::rc::Rc;
 
 use super::cache::{encode_record, RelationEntry};
 use super::constraints::FkEdge;
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    build_schema_from_col_defs, pk_signatures, read_rel_row, CatalogColumn, RelDetail, RelRow, SysFamily,
+    build_schema_from_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkShape, RelDetail, RelRow, SysFamily,
 };
 use super::CatalogEngine;
 use gnitz_wire::sys_rows::{IdxTabRow, ViewParts};
@@ -111,7 +112,12 @@ impl CatalogEngine {
             pk_repeats: rel.pk_repeats(),
             compress: rel.compress(),
         })?;
-        self.enter_relation(rel.id, schema.pk_cols(), &col_defs, rel.serial());
+        self.enter_relation(
+            rel.id,
+            encode_record(schema.pk_cols(), &col_defs),
+            &col_defs,
+            rel.serial(),
+        );
         // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included — a
         // parent's RESTRICT probe reads the child through it.
@@ -129,7 +135,13 @@ impl CatalogEngine {
 
     /// Enter registered relation `id`'s [`RelationEntry`], and index the FK edges it
     /// declares by parent.
-    pub(in crate::catalog) fn enter_relation(&mut self, id: u64, pk: &[u32], defs: &[CatalogColumn], serial: bool) {
+    pub(in crate::catalog) fn enter_relation(
+        &mut self,
+        id: u64,
+        record: Rc<[u8]>,
+        defs: &[CatalogColumn],
+        serial: bool,
+    ) {
         let fks: Vec<FkEdge> = defs
             .iter()
             .enumerate()
@@ -146,7 +158,6 @@ impl CatalogEngine {
         for e in &fks {
             self.caches.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
         }
-        let record = encode_record(pk, defs);
         self.caches.relations.insert(id, RelationEntry { record, fks, serial });
     }
 
@@ -172,11 +183,11 @@ impl CatalogEngine {
     /// create; a rename pair carries both and is neither.
     fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let mut creates: Vec<(u64, usize)> = Vec::new();
-        for sig in pk_signatures(family, batch) {
-            match (sig.neg, sig.pos) {
-                (Some(_), None) => self.unregister_relation(sig.leading),
-                (None, Some(row)) => creates.push((sig.leading, row)),
-                _ => {}
+        for sig in pk_signatures(batch) {
+            match sig.shape() {
+                PkShape::Drop => self.unregister_relation(sig.leading),
+                PkShape::Create => creates.push((sig.leading, sig.row)),
+                PkShape::Pair => {}
             }
         }
         // Registering a view reads its sources' placements, and ids ascend
@@ -198,7 +209,7 @@ impl CatalogEngine {
 
     /// Apply a column ALTER (or its undo) to every registered owner.
     fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
-        let owners = IdSet::new((0..batch.len()).map(|i| SysFamily::Column.leading_id(batch.get_pk(i))));
+        let owners = IdSet::new((0..batch.len()).map(|i| gnitz_wire::sys_leading_id(batch.get_pk_bytes(i))));
         for &owner in owners.ids() {
             let Some((kind, cur)) = self.registry.relation(owner).map(|e| (e.kind(), e.schema())) else {
                 continue;

@@ -103,15 +103,16 @@ fn an_index_row_repeating_a_column_is_refused() {
     let (mut engine, tid, dir) = table_fixture("bundle_index_repeated_col", &id_v());
     let index_id = engine.allocate_ids(1).unwrap();
 
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    let sink: &mut dyn gnitz_wire::sys_rows::SysRowSink = &mut bb;
-    sink.begin_row(&[index_id as u128], 1);
-    sink.put_u64(tid);
-    sink.put_u64(PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11);
-    sink.put_string("ix");
-    sink.put_u64(0);
-    sink.end_row();
-    let err = engine.precheck_family(SysFamily::Index, &bb.finish()).unwrap_err();
+    let row = gnitz_wire::sys_rows::IdxTabRow {
+        index_id,
+        owner_id: tid,
+        source_col_idx: PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11,
+        name: "ix".into(),
+        is_unique: 0,
+    };
+    let err = engine
+        .precheck_family(SysFamily::Index, &crate::test_support::sys_batch([(row, 1)]))
+        .unwrap_err();
     assert!(err.contains("names column 1 twice"), "{err}");
 
     engine.close();
@@ -212,10 +213,8 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
         for &(weight, vid) in rows {
             push_view_tab_row(&mut bb, weight, vid, "v", 0, 0, 0);
         }
-        let views = bb.finish();
-        let created = family_pk_partition(SysFamily::View, &views).creates;
-        families[SysFamily::View.index()] = Some(views);
-        engine.precheck_bundle(&families, &created)
+        families[SysFamily::View.index()] = Some(bb.finish());
+        engine.precheck_bundle(&families)
     };
 
     for (rows, uncreated) in [(&[][..], 30), (&[(1, 30)], 20), (&[(1, 30), (-1, 20), (1, 20)], 20)] {
@@ -274,7 +273,7 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
         drop(SysFamily::Table, tid),
         drop(SysFamily::View, vid),
     ]);
-    engine.apply_bundle(drops).unwrap();
+    engine.apply_bundle(drops, &mut |_, _| Ok(())).unwrap();
     assert!(engine.schema_id("s").is_none());
     assert!(!engine.registry.has_id(tid) && !engine.registry.has_id(vid));
     assert!(engine.dag.dependents_of(tid).is_empty());

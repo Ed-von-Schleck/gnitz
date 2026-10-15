@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{idx_tab_batch, push_sys_row, push_view_tab_row, table_tab_batch};
+use crate::test_support::{push_sys_row, push_view_tab_row};
 use gnitz_wire::sys_rows::IdxTabSlot;
 use gnitz_zset::repr::BatchBuilder;
 
@@ -15,47 +15,7 @@ fn the_pair_keyed_familys_at_rest_pk_leads_with_its_owner() {
         batch.get_pk_bytes(0),
         [0, 0, 0, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
     );
-    assert_eq!(family.leading_id(batch.get_pk(0)), 0x1122);
-}
-
-/// A rename is a `(-1, +1)` rewrite pair on one PK, in either row order: neither
-/// a create nor a drop, so DDL paths keyed off these lists leave a renamed table
-/// alone.
-#[test]
-fn family_pk_partition_reports_creates_and_drops_and_neither_for_a_pair() {
-    let batch = table_tab_batch(&[
-        (41, "c", 1),
-        (42, "d", -1),
-        (43, "old", -1),
-        (43, "new", 1),
-        (44, "new", 1),
-        (44, "old", -1),
-        (45, "c2", 1),
-    ]);
-    let p = family_pk_partition(SysFamily::Table, &batch);
-    assert_eq!((p.creates, p.drops), (vec![41, 45], vec![42]));
-}
-
-#[test]
-fn idx_tab_partition_carries_each_rows_column_list() {
-    let mut batch = idx_tab_batch(50, 20, &[1, 2], "a", true, 1);
-    for (index_id, owner_id, cols, weight) in [(51, 21, &[3][..], -1), (52, 22, &[1], -1), (52, 22, &[1], 1)] {
-        batch.append_batch(&idx_tab_batch(index_id, owner_id, cols, "b", false, weight));
-    }
-    // A row whose column list does not decode is in neither list.
-    let mut undecodable = BatchBuilder::new(SysFamily::Index.schema());
-    push_sys_row(&mut undecodable, SysFamily::Index, [53, 0], 1, |_| 0);
-    batch.append_batch(&undecodable.finish());
-
-    let p = idx_tab_partition(&batch);
-    let creates: Vec<_> = p
-        .creates
-        .iter()
-        .map(|(o, c, props)| (*o, c.as_slice(), *props))
-        .collect();
-    let drops: Vec<_> = p.drops.iter().map(|(o, c)| (*o, c.as_slice())).collect();
-    assert_eq!(creates, [(20, &[1, 2][..], true)]);
-    assert_eq!(drops, [(21, &[3][..])]);
+    assert_eq!(gnitz_wire::sys_leading_id(batch.get_pk_bytes(0)), 0x1122);
 }
 
 /// An IDX_TAB word that is not a packed list is refused as a column list.

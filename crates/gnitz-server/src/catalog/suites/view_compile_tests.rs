@@ -250,15 +250,21 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes();
-    let zone = engine
-        .apply_bundle(bundle(filtered_view_blocks(new_vid, base_tid, &pred, bb.finish())))
-        .unwrap();
     let new_dir = relation_dir(&dir, new_vid);
-    assert!(!engine.registry.has_id(old_vid), "the bundle retires the incumbent");
-    assert!(engine.registry.has_id(new_vid), "and registers the replacement");
-
-    // The log refuses the zone: the driver undoes it.
-    engine.undo(zone).unwrap();
+    // The log refuses the bundle's last group, the incumbent's retracted column
+    // records, once the rest of it has applied: the catalog undoes it.
+    let mut sink = |f: SysFamily, b: &Batch| match f {
+        SysFamily::Column if b.get_weight(0) < 0 => Err("the log refuses the zone".into()),
+        _ => Ok(()),
+    };
+    let refused = engine.apply_bundle(
+        bundle(filtered_view_blocks(new_vid, base_tid, &pred, bb.finish())),
+        &mut sink,
+    );
+    assert!(
+        matches!(refused, Err(ZoneError::Refused(_))),
+        "the bundle must be refused and undone"
+    );
     engine.reclaim_orphan_dirs();
 
     assert!(

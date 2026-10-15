@@ -41,12 +41,6 @@ impl IdSet {
     }
 }
 
-/// The OPK of a U64 system id — also the leading-column prefix of a pair-keyed
-/// family's key. Every system PK column is U64 (asserted beside `SYS_FAMILIES`).
-fn sys_key(id: u64) -> [u8; 8] {
-    id.to_be_bytes()
-}
-
 impl CatalogEngine {
     // -- System-table reads ---------------------------------------------------
 
@@ -59,7 +53,7 @@ impl CatalogEngine {
 
     /// The live row of single-column-keyed `family` at `id`.
     pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: u64) -> Option<StoredRow> {
-        self.sys_relation(family).live_row_at(&sys_key(id)).1
+        self.sys_relation(family).live_row_at(&gnitz_wire::sys_key(id)).1
     }
 
     /// View `id`'s circuit, decoded from its `circuits` row.
@@ -74,7 +68,7 @@ impl CatalogEngine {
     /// row itself for a single-column key, the owner's whole band for a pair.
     pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: u64, f: impl FnMut(&ReadCursor)) {
         self.sys_relation(family)
-            .for_each_positive_with_prefix(&sys_key(leading), f)
+            .for_each_positive_with_prefix(&gnitz_wire::sys_key(leading), f)
     }
 
     /// The live rows of `family` that `keep` selects, in key order.

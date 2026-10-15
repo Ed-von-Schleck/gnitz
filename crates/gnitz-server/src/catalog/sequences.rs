@@ -6,7 +6,7 @@ use gnitz_wire::sys_rows::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::sys_tables::{SysFamily, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_NEXT_ID, SEQ_ID_TOPOLOGY};
-use super::write_path::{ZoneError, ZoneGroup};
+use super::write_path::{ZoneError, ZoneSink};
 use super::CatalogEngine;
 
 /// Operator-state format version. Bump on any change to an operator-state
@@ -28,7 +28,7 @@ impl CatalogEngine {
     pub(in crate::catalog) fn raise_next_id(&mut self, family: SysFamily, batch: &Batch) {
         if family.allocates_ids() {
             for i in 0..batch.len() {
-                let id = family.leading_id(batch.get_pk(i));
+                let id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
                 self.next_id = self.next_id.max(id.saturating_add(1));
             }
         }
@@ -63,46 +63,42 @@ impl CatalogEngine {
         Some(stored.next_val)
     }
 
-    /// Reserve the next `count` SERIAL ids of table `seq_id`: their base, and the
-    /// applied `sequences` group recording them.
-    pub(crate) fn reserve_user_sequence(&mut self, seq_id: u64, count: u64) -> Result<(i64, ZoneGroup), ZoneError> {
+    /// Reserve the next `count` SERIAL ids of table `seq_id` and answer their
+    /// base, laying the `sequences` delta recording them out through `sink`
+    /// before it is applied.
+    pub(crate) fn reserve_user_sequence(
+        &mut self,
+        seq_id: u64,
+        count: u64,
+        sink: &mut ZoneSink<'_>,
+    ) -> Result<i64, ZoneError> {
         if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
-            return Err(ZoneError::Refused(format!("relation {seq_id} is not a SERIAL table")));
+            return Err(ZoneError::Refused(
+                format!("relation {seq_id} is not a SERIAL table").into(),
+            ));
         }
         let invalid = || {
-            ZoneError::Refused(format!(
-                "SERIAL range of {count} on sequence {seq_id} is invalid or exhausted"
-            ))
+            ZoneError::Refused(format!("SERIAL range of {count} on sequence {seq_id} is invalid or exhausted").into())
         };
-        let base = self
-            .sequence_value(seq_id)
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(invalid)?;
+        let old = self.sequence_value(seq_id);
+        let base = old.unwrap_or(0).checked_add(1).ok_or_else(invalid)?;
         let last = validated_run_last(base, count, i64::MAX as u64).ok_or_else(invalid)?;
-        let batch = self.set_sequence(seq_id, last).map_err(ZoneError::Diverged)?;
-        // No view scans `sequences`: its registration is refused.
-        let group = ZoneGroup {
-            family: SysFamily::Sequence,
-            batch,
-            scanned: false,
-        };
-        Ok((base as i64, group))
+        let delta = sequence_delta(seq_id, old, last);
+        sink(SysFamily::Sequence, &delta).map_err(ZoneError::Refused)?;
+        self.registry
+            .ingest(SysFamily::Sequence.id(), delta)
+            .map_err(ZoneError::Diverged)?;
+        Ok(base as i64)
     }
 
-    /// Move `sequences` row `seq_id` to `value`: the delta applied, empty when
-    /// the row already held it.
-    pub(in crate::catalog) fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<Batch, String> {
+    /// Move `sequences` row `seq_id` to `value`.
+    pub(in crate::catalog) fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
         let old = self.sequence_value(seq_id);
-        let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
-        if old != Some(value) {
-            for (next_val, w) in old.map(|v| (v, -1)).into_iter().chain([(value, 1)]) {
-                SeqTabRow { seq_id, next_val }.write(&mut bb, w);
-            }
+        if old == Some(value) {
+            return Ok(());
         }
-        let delta = bb.finish();
-        self.registry.ingest(SysFamily::Sequence.id(), delta.clone())?;
-        Ok(delta)
+        self.registry
+            .ingest(SysFamily::Sequence.id(), sequence_delta(seq_id, old, value))
     }
 
     /// Write the next catalog id to `sequences`, then flush every system table
@@ -144,8 +140,16 @@ impl CatalogEngine {
     /// Record the launched topology. Durable at the next system flush.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), String> {
         self.set_sequence(SEQ_ID_TOPOLOGY, topology_word(worker_count))
-            .map(drop)
     }
+}
+
+/// `sequences` row `seq_id` moved from `old` to `value`.
+fn sequence_delta(seq_id: u64, old: Option<u64>, value: u64) -> Batch {
+    let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
+    for (next_val, w) in old.map(|v| (v, -1)).into_iter().chain([(value, 1)]) {
+        SeqTabRow { seq_id, next_val }.write(&mut bb, w);
+    }
+    bb.finish()
 }
 
 /// The last id of a `count`-long run starting at `base`, or `None` if `count`

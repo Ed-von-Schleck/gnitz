@@ -124,8 +124,15 @@ fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
 /// Reserve `count` SERIAL ids of `seq`: their base and the `sequences` delta it
 /// applied, or the refusal's text.
 fn reserve(engine: &mut CatalogEngine, seq: u64, count: u64) -> Result<(i64, Batch), String> {
-    let (base, group) = engine.reserve_user_sequence(seq, count).map_err(refusal)?;
-    Ok((base, group.batch))
+    let mut laid = Vec::new();
+    let base = engine
+        .reserve_user_sequence(seq, count, &mut |_, b| {
+            laid.push(b.clone());
+            Ok(())
+        })
+        .map_err(refusal)?;
+    assert_eq!(laid.len(), 1, "a reservation lays out one group");
+    Ok((base, laid.remove(0)))
 }
 
 /// `(live rows, net-negative rows)` of every system family.
@@ -263,15 +270,14 @@ fn discard(engine: CatalogEngine) {
 /// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
 /// `flags` words — the shapes `create_table` cannot make.
 fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    let sink: &mut dyn gnitz_wire::sys_rows::SysRowSink = &mut bb;
-    sink.begin_row(&[tid as u128], 1);
-    sink.put_u64(PUBLIC_SCHEMA_ID);
-    sink.put_string(table_name);
-    sink.put_u64(pk_col_idx);
-    sink.put_u64(flags);
-    sink.end_row();
-    bb.finish()
+    let row = gnitz_wire::sys_rows::TableTabRow {
+        table_id: tid,
+        schema_id: PUBLIC_SCHEMA_ID,
+        name: table_name.into(),
+        pk_col_idx,
+        flags,
+    };
+    crate::test_support::sys_batch([(row, 1)])
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces

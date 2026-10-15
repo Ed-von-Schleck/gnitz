@@ -1,6 +1,6 @@
 //! System table constants, the per-family descriptor table, the per-family row
 //! decoders over those constants, and the batch-shape analyses (per-PK
-//! signatures, sign partitions) every guard and hook keys on.
+//! signatures and their shapes) every guard and hook keys on.
 //!
 //! Pure data, stateless codecs and batch-local analysis — no state, no
 //! CatalogEngine dependency.
@@ -155,7 +155,7 @@ pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[C
 /// summed weight. A PK carrying both signs is a **rewrite pair** (a rename).
 pub(super) struct PkSignature {
     pub(super) pk: u128,
-    /// [`SysFamily::leading_id`] of `pk`, so no consumer re-derives it.
+    /// `sys_leading_id` of the key, so no consumer re-derives it.
     pub(super) leading: u64,
     /// First row index carrying this PK; its OPK bytes address the live row.
     pub(super) row: usize,
@@ -167,25 +167,37 @@ pub(super) struct PkSignature {
     pub(super) sum: i64,
 }
 
+/// Which signs one delta carries on one PK.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PkShape {
+    Create,
+    Drop,
+    /// Both signs on one PK — a rewrite (a rename), whose net stays live.
+    Pair,
+}
+
 impl PkSignature {
-    /// A rewrite pair — both signs on one PK, whose net stays live.
-    pub(super) fn is_pair(&self) -> bool {
-        self.neg.is_some() && self.pos.is_some()
+    pub(super) fn shape(&self) -> PkShape {
+        match (self.neg, self.pos) {
+            (Some(_), Some(_)) => PkShape::Pair,
+            (Some(_), None) => PkShape::Drop,
+            (None, _) => PkShape::Create,
+        }
     }
 
     /// The DDL verb this shape performs, for guard messages.
     pub(super) fn verb(&self) -> &'static str {
-        match (self.neg.is_some(), self.pos.is_some()) {
-            (true, true) => "ALTER",
-            (true, false) => "DROP",
-            _ => "CREATE",
+        match self.shape() {
+            PkShape::Pair => "ALTER",
+            PkShape::Drop => "DROP",
+            PkShape::Create => "CREATE",
         }
     }
 }
 
 /// One [`PkSignature`] per distinct PK, in first-appearance order, over a batch in
 /// any row order. Zero-weight rows are skipped.
-pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature> {
+pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();
     for i in 0..batch.len() {
@@ -197,7 +209,7 @@ pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature
         let slot = *by_pk.entry(pk).or_insert_with(|| {
             sigs.push(PkSignature {
                 pk,
-                leading: family.leading_id(pk),
+                leading: gnitz_wire::sys_leading_id(batch.get_pk_bytes(i)),
                 row: i,
                 neg: None,
                 pos: None,
@@ -216,58 +228,16 @@ pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature
     sigs
 }
 
-/// One family delta split by sign, rewrite pairs excluded — a rename's `-1,+1`
-/// on one PK is neither a create nor a drop. Batch-local: both signs of a pair
-/// arrive as one batch on every path.
-#[derive(Default)]
-pub(crate) struct PkPartition {
-    pub(crate) creates: Vec<u64>,
-    pub(crate) drops: Vec<u64>,
-}
-
-pub(crate) fn family_pk_partition(family: SysFamily, batch: &Batch) -> PkPartition {
-    let mut out = PkPartition::default();
-    for sig in pk_signatures(family, batch) {
-        if sig.is_pair() {
-            continue;
-        }
-        if sig.pos.is_some() {
-            &mut out.creates
-        } else {
-            &mut out.drops
-        }
-        .push(sig.leading);
-    }
-    out
-}
-
-/// [`PkPartition`] for IDX_TAB, carrying each row's decoded column list — what
-/// the DDL driver's unique pre-flight and filter teardown key on. A row whose
-/// list does not decode is skipped; the precheck rejects the batch over it.
-#[derive(Default)]
-pub(crate) struct IdxPartition {
-    /// `(owner_id, cols, is_unique)`.
-    pub(crate) creates: Vec<(u64, PkColList, bool)>,
-    pub(crate) drops: Vec<(u64, PkColList)>,
-}
-
-pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
-    let mut out = IdxPartition::default();
-    for sig in pk_signatures(SysFamily::Index, batch) {
-        if sig.is_pair() {
-            continue;
-        }
-        let row = sig.pos.or(sig.neg).expect("pk_signatures skips a zero-weight row");
-        let Ok((owner_id, cols, is_unique)) = IdxTabRow::read(batch, row).and_then(|r| r.parts()) else {
-            continue;
-        };
-        if sig.pos.is_some() {
-            out.creates.push((owner_id, cols, is_unique));
-        } else {
-            out.drops.push((owner_id, cols));
-        }
-    }
-    out
+/// `(owner, cols)` of every unique index `batch` (an IDX_TAB delta) creates: the
+/// DDL driver's pre-flight input, read before the precheck. A row that does not
+/// decode is skipped; the precheck refuses the bundle over it.
+pub(crate) fn unique_index_creates(batch: &Batch) -> Vec<(u64, PkColList)> {
+    pk_signatures(batch)
+        .into_iter()
+        .filter(|s| s.shape() == PkShape::Create)
+        .filter_map(|s| IdxTabRow::read(batch, s.row).and_then(|r| r.parts()).ok())
+        .filter_map(|(owner, cols, unique)| unique.then_some((owner, cols)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +251,16 @@ static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|
         let f = &gnitz_wire::SYS_FAMILIES[i];
         let cols: Vec<SchemaColumn> = f.cols.iter().map(|c| SchemaColumn::new(c.type_code, false)).collect();
         SchemaDescriptor::new(&cols, f.pk_cols)
+    })
+});
+
+/// One named record per family, indexed by [`SysFamily::index`]: what every
+/// DdlSync group of the family carries.
+static RECORDS: LazyLock<[Box<[u8]>; SysFamily::COUNT]> = LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let family = SysFamily::ALL[i];
+        let defs = family.column_defs();
+        gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), family.wire().pk_cols).into()
     })
 });
 
@@ -397,6 +377,11 @@ impl SysFamily {
         &SCHEMAS[self.index()]
     }
 
+    /// This family's named record.
+    pub(crate) fn record(self) -> &'static [u8] {
+        &RECORDS[self.index()]
+    }
+
     /// This family's column definitions, from the same wire slice its schema is
     /// built from — compile-time data, never read back from COL_TAB.
     pub(in crate::catalog) fn column_defs(self) -> Vec<CatalogColumn> {
@@ -449,22 +434,6 @@ impl SysFamily {
             SysFamily::Table => &[SysFamily::Schema, SysFamily::Column],
             SysFamily::View => &[SysFamily::Schema, SysFamily::Column, SysFamily::Circuit],
             SysFamily::Index => &[SysFamily::Table, SysFamily::View],
-        }
-    }
-
-    /// The leading id of one of this family's PKs: the whole key where it is one
-    /// column, its high half where the key is a pair — where `pk as u64` would
-    /// take the trailing half instead (a column index).
-    #[inline]
-    pub(super) fn leading_id(self, pk: u128) -> u64 {
-        match self {
-            SysFamily::Column => gnitz_wire::unpack_pair_pk(pk).0,
-            SysFamily::Schema
-            | SysFamily::Table
-            | SysFamily::View
-            | SysFamily::Index
-            | SysFamily::Sequence
-            | SysFamily::Circuit => pk as u64,
         }
     }
 

@@ -5,7 +5,7 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
-use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, SysRowSink, TableTabRow};
+use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow};
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
@@ -129,14 +129,14 @@ pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColu
 /// `circuit` as `vid`'s CIRCUIT_TAB batch, through the row writer the client
 /// commits with.
 pub fn circuit_batch(vid: u64, circuit: &Circuit) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Circuit.schema());
     let circuit = circuit.encode();
-    CircuitRow {
-        view_id: vid,
-        circuit: circuit.as_slice().into(),
-    }
-    .write(&mut bb, 1);
-    bb.finish()
+    sys_batch([(
+        CircuitRow {
+            view_id: vid,
+            circuit: circuit.as_slice().into(),
+        },
+        1,
+    )])
 }
 
 /// `vid`'s CIRCUIT_TAB row holding `cell` as given, whatever it decodes to.
@@ -315,13 +315,17 @@ pub fn apply_ddl(
     engine: &mut CatalogEngine,
     blocks: impl IntoIterator<Item = (SysFamily, Batch)>,
 ) -> Result<(), String> {
-    engine.apply_bundle(bundle(blocks)).map(drop).map_err(refusal)
+    engine
+        .apply_bundle(bundle(blocks), &mut |_, _| Ok(()))
+        .map(drop)
+        .map_err(refusal)
 }
 
 /// Either refusal of a catalog write, as its text.
 pub fn refusal(e: ZoneError) -> String {
     match e {
-        ZoneError::Refused(e) | ZoneError::Diverged(e) => e,
+        ZoneError::Refused(f) => f.text,
+        ZoneError::Diverged(e) => e,
     }
 }
 
@@ -346,6 +350,16 @@ pub fn view_blocks<'a>(
 
 // ── System-row fixtures ──────────────────────────────────────────────────
 
+/// `rows` as one batch of their family, each at its weight.
+pub fn sys_batch<R: SysRow>(rows: impl IntoIterator<Item = (R, i64)>) -> Batch {
+    let family = SysFamily::from_id(R::FAMILY).expect("a SysRow names a system family");
+    let mut bb = BatchBuilder::new(family.schema());
+    for (row, weight) in rows {
+        row.write(&mut bb, weight);
+    }
+    bb.finish()
+}
+
 /// Append one `family` row keyed `key` — the leading id, then the member a
 /// pair-keyed family adds — at `weight`. Payload column `pi` holds `cell(pi)`: a
 /// U64 as it is, a STRING or BLOB as a text of it too long to sit inline, so a
@@ -365,8 +379,7 @@ pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], wei
 /// A TABLE_TAB batch of `(table_id, name, weight)` rows: `public` tables keyed
 /// on column 0, under default props.
 pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    for &(table_id, name, weight) in rows {
+    sys_batch(rows.iter().map(|&(table_id, name, weight)| {
         let row = TableTabRow {
             table_id,
             schema_id: PUBLIC_SCHEMA_ID,
@@ -374,18 +387,16 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
             pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
             flags: gnitz_wire::TableProps::default().pack(),
         };
-        row.write(&mut bb, weight);
-    }
-    bb.finish()
+        (row, weight)
+    }))
 }
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
 pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
-    for &(schema_id, name, weight) in rows {
-        SchemaTabRow { schema_id, name: name.into() }.write(&mut bb, weight);
-    }
-    bb.finish()
+    sys_batch(
+        rows.iter()
+            .map(|&(schema_id, name, weight)| (SchemaTabRow { schema_id, name: name.into() }, weight)),
+    )
 }
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
@@ -397,20 +408,19 @@ pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batc
 
 /// The one-row IDX_TAB batch of an index over `cols` at `weight`.
 pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_unique: bool, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    IdxTabRow {
+    let row = IdxTabRow {
         index_id,
         owner_id,
         source_col_idx: gnitz_wire::PkColList::from_slice(cols).pack(),
         name: name.into(),
         is_unique: is_unique as u64,
-    }
-    .write(&mut bb, weight);
-    bb.finish()
+    };
+    sys_batch([(row, weight)])
 }
 
-/// Append one raw VIEW_TAB row with PK list `[0]`, word by word, so a test can forge
-/// budget words no `ViewBudget` holds (`0` = off; `owner_view_id` `0` = a user view).
+/// Append one VIEW_TAB row with PK list `[0]`. Every budget field is a raw
+/// word, so a test can forge one no `ViewBudget` holds (`0` = off;
+/// `owner_view_id` `0` = a user view).
 pub fn push_view_tab_row(
     bb: &mut BatchBuilder,
     weight: i64,
@@ -420,17 +430,18 @@ pub fn push_view_tab_row(
     delta_bytes: u64,
     owner_view_id: u64,
 ) {
-    let sink: &mut dyn SysRowSink = bb;
-    sink.begin_row(&[vid as u128], weight);
-    sink.put_u64(PUBLIC_SCHEMA_ID);
-    sink.put_string(view_name);
-    sink.put_u64(gnitz_wire::PkColList::from_slice(&[0]).pack());
-    sink.put_u64(capacity_bytes);
-    sink.put_u64(delta_bytes);
-    sink.put_u64(owner_view_id);
-    sink.put_u64(0); // pk_repeats
-    sink.put_u64(0); // compress
-    sink.end_row();
+    let row = ViewTabRow {
+        view_id: vid,
+        schema_id: PUBLIC_SCHEMA_ID,
+        name: view_name.into(),
+        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+        capacity_bytes,
+        delta_bytes,
+        owner_view_id,
+        pk_repeats: 0,
+        compress: 0,
+    };
+    row.write(bb, weight);
 }
 
 /// Register a view running `circuit` as one DDL bundle, returning its vid or

@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -76,7 +78,7 @@ impl CatalogEngine {
                     compress: false,
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
-            engine.enter_relation(family.id(), family.schema().pk_cols(), &family.column_defs(), false);
+            engine.enter_relation(family.id(), Rc::from(family.record()), &family.column_defs(), false);
         }
 
         engine.system_zone = engine.registry.system_replay_floors().into_values().max().unwrap_or(0);

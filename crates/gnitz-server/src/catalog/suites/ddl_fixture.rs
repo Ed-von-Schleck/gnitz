@@ -8,12 +8,11 @@
 //! same way, without a server.
 
 use super::super::*;
-use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch};
+use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch, sys_batch};
 use gnitz_wire::payload_u64;
-use gnitz_wire::sys_rows::{IdxTabSlot, SysRow, TableTabRow};
+use gnitz_wire::sys_rows::{IdxTabSlot, TableTabRow};
 use gnitz_wire::validate_user_identifier;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::BatchBuilder;
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
 /// points take qualified-name strings; the wire path ships schema and entity ids
@@ -151,7 +150,6 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_ids(1).unwrap();
 
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
         let row = TableTabRow {
             table_id: tid,
             schema_id: sid,
@@ -159,10 +157,9 @@ impl CatalogEngine {
             pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols).pack(),
             flags: props.pack(),
         };
-        row.write(&mut bb, 1);
         let blocks = [
             (SysFamily::Column, col_tab_batch(tid, col_defs, 1)),
-            (SysFamily::Table, bb.finish()),
+            (SysFamily::Table, sys_batch([(row, 1)])),
         ];
         apply_ddl(self, blocks)?;
         Ok(tid)
@@ -251,7 +248,6 @@ impl CatalogEngine {
         let col_batch = col_tab_batch(tid, cols, 1);
         self.ddl_sync(SysFamily::Column.id(), col_batch)?;
 
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
         let row = TableTabRow {
             table_id: tid,
             schema_id,
@@ -259,7 +255,6 @@ impl CatalogEngine {
             pk_col_idx: gnitz_wire::PkColList::from_slice(pk).pack(),
             flags: gnitz_wire::TableProps::default().pack(),
         };
-        row.write(&mut bb, 1);
-        self.ddl_sync(SysFamily::Table.id(), bb.finish())
+        self.ddl_sync(SysFamily::Table.id(), sys_batch([(row, 1)]))
     }
 }

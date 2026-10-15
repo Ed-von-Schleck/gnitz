@@ -91,11 +91,22 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
     });
 }
 
+/// Fill the log until it refuses a group far smaller than any DDL zone.
+fn fill_log(excl: &mut crate::runtime::sal::SalExcl<'_>) {
+    for tids in [1 << 12, 1 << 4, 1] {
+        let tick = || Apply::Tick {
+            first_round: 2,
+            tids: vec![0; tids].into(),
+        };
+        while excl.write(&DirectGroup::new(tick())).is_ok() {}
+    }
+}
+
 /// A zone the log has no room for is refused with the SAL's own status and
 /// reaches no store: every system family holds the rows and weights it held
 /// before, and the same bundle applies once a checkpoint has reset the log.
 #[test]
-fn a_zone_the_log_refuses_is_undone_and_applies_after_a_checkpoint() {
+fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     use crate::catalog::SysFamily;
     use crate::test_support::{bundle, col_def, col_tab_batch, net_weight, scan_all, table_tab_batch};
 
@@ -120,29 +131,74 @@ fn a_zone_the_log_refuses_is_undone_and_applies_after_a_checkpoint() {
 
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
     let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
-    // Fill the log until it refuses a group far smaller than the zone.
-    for tids in [1 << 12, 1 << 4] {
-        let tick = || Apply::Tick {
-            first_round: 2,
-            tids: vec![0; tids].into(),
-        };
-        while excl.write(&DirectGroup::new(tick())).is_ok() {}
-    }
+    fill_log(&mut excl);
+    let watermark = disp.sal().watermark();
 
-    let zone = engine.apply_bundle(create()).unwrap();
-    assert!(engine.registry.has_id(tid));
     let refused = disp
-        .emit_zone(&mut excl, zone, "test")
+        .emit_zone(&mut excl, "test", |cat, sink| {
+            cat.apply_bundle(create(), sink).map(drop)
+        })
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
-    assert!(!engine.registry.has_id(tid), "the refused table is unregistered");
+    assert!(!engine.registry.has_id(tid), "the refused table is not registered");
     assert_eq!(held(&mut engine), before);
+    assert_eq!(
+        disp.sal().watermark(),
+        watermark,
+        "the refused zone's scope is discarded"
+    );
 
     disp.checkpoint_post_ack(&mut excl).unwrap();
-    let zone = engine.apply_bundle(create()).unwrap();
-    disp.emit_zone(&mut excl, zone, "test")
+    disp.emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(create(), sink))
         .expect("the reset log takes the zone");
     assert!(engine.registry.has_id(tid));
+
+    drop(excl);
+    drop(disp);
+    engine.close();
+}
+
+/// An ADD COLUMN the log refuses leaves the table's schema and column records
+/// as they were — its descriptor swap cannot be undone, so it must never run —
+/// and applies once a checkpoint has reset the log.
+#[test]
+fn a_log_refusal_of_add_column_leaves_the_schema() {
+    use crate::catalog::SysFamily;
+    use crate::test_support::{bundle, col_def, nullable_def, scan_all};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let cols = [
+        col_def("id", gnitz_wire::TypeCode::U64),
+        col_def("v", gnitz_wire::TypeCode::U64),
+    ];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let add = || {
+        let mut bb = gnitz_zset::repr::BatchBuilder::new(SysFamily::Column.schema());
+        nullable_def("w", gnitz_wire::TypeCode::U64).write_col_tab_row(&mut bb, tid, 2, 1);
+        bundle([(SysFamily::Column, bb.finish())])
+    };
+    let width = |engine: &CatalogEngine| engine.registry.relation(tid).unwrap().schema().num_columns();
+    let record = engine.schema_record(tid).unwrap();
+    let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
+
+    let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+    let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
+    fill_log(&mut excl);
+
+    let refused = disp
+        .emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(add(), sink).map(drop))
+        .expect_err("no room for the zone");
+    assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
+    assert_eq!(width(&engine), 2, "the refused ADD COLUMN leaves the schema");
+    assert_eq!(engine.schema_record(tid).unwrap(), record);
+    assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows);
+
+    disp.checkpoint_post_ack(&mut excl).unwrap();
+    disp.emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(add(), sink))
+        .expect("the reset log takes the zone");
+    assert_eq!(width(&engine), 3, "the retry widens the schema");
+    assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows + 1);
 
     drop(excl);
     drop(disp);
@@ -163,7 +219,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         user_seq = engine.create_serial_table("public.t").unwrap();
         // Reserve straight into the catalog — no SAL involved, so the advance
         // lands ONLY in the sys_sequences MemTable.
-        engine.reserve_user_sequence(user_seq, 64).unwrap();
+        engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
         let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
         disp.checkpoint_post_ack(&mut try_poll_once(disp.sal().lock()).expect("uncontended"))

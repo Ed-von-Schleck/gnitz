@@ -138,7 +138,7 @@ impl DdlBundle {
             for i in 0..rows.len() {
                 ids.insert(match *family {
                     IDX_TAB => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
-                    _ => u64::from_be_bytes(rows.pks.get_bytes(i)[..8].try_into().expect("a u64 key column")),
+                    _ => gnitz_wire::sys_leading_id(rows.pks.get_bytes(i)),
                 });
             }
         }

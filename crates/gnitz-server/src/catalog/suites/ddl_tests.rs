@@ -703,8 +703,14 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     // The table's retraction: its apply retracts the owned index (IDX) ahead of
     // it and the columns (COL) behind it.
     let drop = engine.retract_under(SysFamily::Table, &[tid]);
-    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop)])).unwrap();
-    let tids: Vec<u64> = zone.iter().map(|g| g.family.id()).collect();
+    let mut tids: Vec<u64> = Vec::new();
+    let mut sink = |f: SysFamily, _: &Batch| {
+        tids.push(f.id());
+        Ok(())
+    };
+    engine
+        .apply_bundle(bundle([(SysFamily::Table, drop)]), &mut sink)
+        .unwrap();
 
     let pos = |id: u64| tids.iter().position(|&t| t == id);
     let idx_pos =
@@ -995,9 +1001,14 @@ fn set_based_table_drop_applies_one_group_per_family() {
     }
 
     let drop = engine.retract_under(SysFamily::Table, &tids);
-    let zone = engine.apply_bundle(bundle([(SysFamily::Table, drop)])).unwrap();
-
-    let families: Vec<SysFamily> = zone.iter().map(|g| g.family).collect();
+    let mut families: Vec<SysFamily> = Vec::new();
+    let mut sink = |f: SysFamily, _: &Batch| {
+        families.push(f);
+        Ok(())
+    };
+    engine
+        .apply_bundle(bundle([(SysFamily::Table, drop)]), &mut sink)
+        .unwrap();
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
     assert!(tids.iter().all(|&t| !engine.registry.has_id(t)));
 
@@ -1026,6 +1037,62 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
     (v, s)
 }
 
+/// What an applied bundle reports it did is read off the groups it applied, so
+/// it carries the drop cascade: a view's segments, a table's indexes.
+#[test]
+fn applied_ddl_reports_the_cascade_and_what_it_created() {
+    let dir = temp_dir("applied_ddl_report");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let no_log = &mut |_: SysFamily, _: &Batch| Ok(());
+
+    // A view over `views`: a CREATE VIEW writes a family a view scans.
+    let watcher = register_identity_view(&mut engine, gnitz_wire::VIEW_TAB, "w", &SysFamily::View.column_defs());
+    let base = engine
+        .create_table("public.src", &[col_def("id", TypeCode::U64)], &[0])
+        .unwrap();
+    let cols = [col_def("id", TypeCode::U64)];
+    let vid = engine.allocate_ids(1).unwrap();
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    push_view_tab_row(&mut bb, 1, vid, "created", 0, 0, 0);
+    let identity = crate::test_support::identity_circuit(base, gnitz_wire::ReadBound::None);
+    let created = engine
+        .apply_bundle(bundle(view_blocks([(vid, &identity, &cols[..])], bb.finish())), no_log)
+        .unwrap();
+    assert_eq!(created.created_views, [vid]);
+    assert_eq!(created.held_above, [gnitz_wire::VIEW_TAB]);
+    assert!(created.dropped_relations.is_empty() && created.dropped_indexes.is_empty());
+    engine.drop_view("public.w").unwrap();
+    assert!(!engine.registry.has_id(watcher));
+
+    let (v, s) = view_with_segment(&mut engine);
+    let drop = engine.retract_under(SysFamily::View, &[v]);
+    let dropped = engine.apply_bundle(bundle([(SysFamily::View, drop)]), no_log).unwrap();
+    let mut relations = dropped.dropped_relations.clone();
+    relations.sort_unstable();
+    assert_eq!(relations, [v, s], "the segment drops with its view");
+
+    let tid = engine
+        .create_table(
+            "public.t",
+            &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
+            &[0],
+        )
+        .unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let drop = engine.retract_under(SysFamily::Table, &[tid]);
+    let dropped = engine.apply_bundle(bundle([(SysFamily::Table, drop)]), no_log).unwrap();
+    assert_eq!(dropped.dropped_relations, [tid]);
+    let indexes: Vec<_> = dropped
+        .dropped_indexes
+        .iter()
+        .map(|(owner, cols)| (*owner, cols.as_slice().to_vec()))
+        .collect();
+    assert_eq!(indexes, [(tid, vec![1])], "the index drops with its table");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn view_drop_retracts_its_segments() {
     let dir = temp_dir("view_drop_segments");
@@ -1033,9 +1100,14 @@ fn view_drop_retracts_its_segments() {
     let (v, s) = view_with_segment(&mut engine);
 
     let drop = engine.retract_under(SysFamily::View, &[v]);
-    let zone = engine.apply_bundle(bundle([(SysFamily::View, drop)])).unwrap();
-
-    let families: Vec<SysFamily> = zone.iter().map(|g| g.family).collect();
+    let mut families: Vec<SysFamily> = Vec::new();
+    let mut sink = |f: SysFamily, _: &Batch| {
+        families.push(f);
+        Ok(())
+    };
+    engine
+        .apply_bundle(bundle([(SysFamily::View, drop)]), &mut sink)
+        .unwrap();
     assert_eq!(families, [SysFamily::View, SysFamily::Circuit, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry.has_id(id));

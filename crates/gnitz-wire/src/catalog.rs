@@ -180,6 +180,18 @@ pub const SYS_FAMILIES: &[WireSysFamily] = &[
     fam(SEQ_TAB, "sequences", crate::sys_rows::SEQ_TAB_SHAPE),
 ];
 
+/// The OPK of system id `id`: a single-column family's whole key, and the
+/// leading-column prefix of a pair-keyed one's. Every system key column is a U64.
+pub fn sys_key(id: u64) -> [u8; 8] {
+    id.to_be_bytes()
+}
+
+/// The leading key column of a system row's OPK key — the inverse of [`sys_key`]
+/// over its first eight bytes.
+pub fn sys_leading_id(key: &[u8]) -> u64 {
+    u64::from_be_bytes(key[..8].try_into().expect("a system key leads with a U64 column"))
+}
+
 /// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
 pub const fn sys_family_index(id: u64) -> Option<usize> {
     let mut i = 0;
