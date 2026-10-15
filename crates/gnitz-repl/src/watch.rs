@@ -58,7 +58,7 @@ fn local_time() -> String {
 
 impl Shell {
     fn plan_watch(&mut self, sql: &str) -> Result<Subscription, GnitzSqlError> {
-        let schema = self.schema();
+        let schema = self.schema().to_string();
         block_on(gnitz_sql::plan_subscription(self.client(), &schema, sql))
     }
 

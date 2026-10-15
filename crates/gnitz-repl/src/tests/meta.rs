@@ -27,13 +27,6 @@ fn every_command_name_is_unique_and_found() {
 }
 
 #[test]
-fn watch_sql_runs_past_its_first_word() {
-    let watch = lookup("\\watch").unwrap();
-    assert!(matches!(watch.arg(5), ArgKind::Sql));
-    assert!(matches!(lookup("\\x").unwrap().arg(1), ArgKind::None));
-}
-
-#[test]
 fn a_boolean_setting_reads_postgres_spellings_in_any_case() {
     let mut s = Settings::default();
     Setting::Timing.set(&mut s, Some("ON")).unwrap();
@@ -69,4 +62,13 @@ fn expanded_toggles_between_off_and_on() {
     Setting::Expanded.set(&mut s, Some("auto")).unwrap();
     Setting::Expanded.set(&mut s, None).unwrap();
     assert_eq!(s.expanded, Expanded::Off);
+}
+
+#[test]
+fn expand_home_reads_only_the_own_home() {
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(expand_home("~/x"), format!("{}/x", home.display()));
+    assert_eq!(expand_home("~"), home.display().to_string());
+    assert_eq!(expand_home("~bob/x"), "~bob/x");
+    assert_eq!(expand_home("a/~/x"), "a/~/x");
 }

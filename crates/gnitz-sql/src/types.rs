@@ -109,12 +109,63 @@ fn serial_type(dt: &DataType) -> Option<TypeCode> {
         return None;
     }
     let ident = crate::ast_util::object_name_ident(name)?;
-    match ident.value.to_ascii_uppercase().as_str() {
-        "SMALLSERIAL" | "SERIAL2" => Some(TypeCode::I16),
-        "SERIAL" | "SERIAL4" => Some(TypeCode::I32),
-        "BIGSERIAL" | "SERIAL8" => Some(TypeCode::I64),
-        _ => None,
-    }
+    SERIAL_TYPES
+        .iter()
+        .find(|(n, _)| ident.value.eq_ignore_ascii_case(n))
+        .map(|&(_, tc)| tc)
+}
+
+/// The SERIAL family, by spelling: each its signed integer.
+const SERIAL_TYPES: &[(&str, TypeCode)] = &[
+    ("SMALLSERIAL", TypeCode::I16),
+    ("SERIAL2", TypeCode::I16),
+    ("SERIAL", TypeCode::I32),
+    ("SERIAL4", TypeCode::I32),
+    ("BIGSERIAL", TypeCode::I64),
+    ("SERIAL8", TypeCode::I64),
+];
+
+/// Every spelling [`sql_col_type`] accepts, without its modifiers.
+pub(crate) const TYPE_NAMES: &[&str] = &[
+    "TINYINT",
+    "SMALLINT",
+    "INT",
+    "INTEGER",
+    "BIGINT",
+    "TINYINT UNSIGNED",
+    "SMALLINT UNSIGNED",
+    "INT UNSIGNED",
+    "INTEGER UNSIGNED",
+    "UNSIGNED INTEGER",
+    "BIGINT UNSIGNED",
+    "UINT128",
+    "UHUGEINT",
+    "INT128",
+    "HUGEINT",
+    "FLOAT",
+    "DOUBLE",
+    "DOUBLE PRECISION",
+    "REAL",
+    "VARCHAR",
+    "TEXT",
+    "CHAR",
+    "UUID",
+    "BOOLEAN",
+    "BOOL",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMP WITHOUT TIME ZONE",
+    "DATETIME",
+    "TIMESTAMP_NTZ",
+    "DECIMAL",
+    "NUMERIC",
+    "DEC",
+];
+
+/// Every column type spelling a `CREATE TABLE` accepts, the SERIAL family's
+/// included, without modifiers.
+pub fn type_names() -> impl Iterator<Item = &'static str> {
+    TYPE_NAMES.iter().copied().chain(SERIAL_TYPES.iter().map(|&(n, _)| n))
 }
 
 #[cfg(test)]

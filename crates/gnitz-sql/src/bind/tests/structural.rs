@@ -521,3 +521,23 @@ fn every_structurally_bound_name_is_unique() {
         );
     }
 }
+
+/// Each of [`KEYWORD_CALLS`] binds, through the node sqlparser parses it into.
+#[test]
+fn each_keyword_call_binds() {
+    let samples = [
+        ("CAST", "CAST(c AS BIGINT)"),
+        ("CEIL", "CEIL(c)"),
+        ("EXTRACT", "EXTRACT(YEAR FROM c)"),
+        ("FLOOR", "FLOOR(c)"),
+        ("POSITION", "POSITION('x' IN c)"),
+        ("SAFE_CAST", "SAFE_CAST(c AS BIGINT)"),
+        ("SUBSTR", "SUBSTR(c, 1, 2)"),
+        ("TRIM", "TRIM(c)"),
+        ("TRY_CAST", "TRY_CAST(c AS BIGINT)"),
+    ];
+    for (_, sample) in samples {
+        b(sample);
+    }
+    assert_eq!(samples.map(|(n, _)| n), KEYWORD_CALLS);
+}

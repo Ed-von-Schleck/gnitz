@@ -1,7 +1,9 @@
 use super::*;
+use std::num::NonZeroU64;
+
 use gnitz_core::{IndexRow, RelProps};
 use gnitz_wire::sys_rows::CatalogColumn;
-use gnitz_wire::{ColType, ColumnDef, PkColList, TableProps, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, PkColList, TableProps, TypeCode, ViewBudget, ViewProps};
 
 fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
     CatalogRelation {
@@ -38,6 +40,15 @@ fn ctx() -> Context {
                 },
                 rel(2, "public", "customers", &["id", "name"]),
                 rel(3, "sales", "leads", &["lead_id"]),
+                CatalogRelation {
+                    props: RelProps::View(ViewProps {
+                        budget: ViewBudget::Fed {
+                            delta_bytes: NonZeroU64::new(1 << 20).unwrap(),
+                        },
+                        compress: false,
+                    }),
+                    ..rel(4, "public", "feed", &["id", "total"])
+                },
             ],
         },
         schema: "public".into(),
@@ -115,9 +126,10 @@ fn di_completes_index_names() {
 }
 
 #[test]
-fn watch_completes_sql_after_its_first_word() {
-    assert!(values("\\watch SELECT * FROM ord").contains(&"orders".to_string()));
-    assert_eq!(values("\\watch ord"), vec!["orders"]);
+fn watch_completes_delta_fed_views_and_sql_over_them() {
+    assert!(values("\\watch ord").is_empty());
+    assert_eq!(values("\\watch SELECT * FROM fe"), vec!["feed"]);
+    assert_eq!(values("\\watch "), vec!["feed", "SELECT"]);
 }
 
 #[test]
@@ -125,4 +137,74 @@ fn replacement_spans_cover_the_typed_word() {
     let line = "SELECT * FROM sales.le";
     let s = suggest(&ctx(), line, line.len());
     assert_eq!(s[0].span, Span::new(14, line.len()));
+}
+
+#[test]
+fn a_cursor_in_the_command_word_completes_command_names() {
+    let v = values("\\d+");
+    assert!(!v.iter().any(|s| s.contains("orders")), "{v:?}");
+    assert_eq!(values("\\d+ cust"), vec!["customers"]);
+}
+
+#[test]
+fn a_meta_argument_starts_past_any_whitespace() {
+    assert_eq!(values("\\d\u{a0}cu"), vec!["customers"]);
+    suggest(&ctx(), " \\d", 0);
+}
+
+#[test]
+fn a_relation_is_qualified_only_by_the_name_the_binder_reads() {
+    assert!(values("SELECT * FROM orders AS o WHERE orders.").is_empty());
+    assert_eq!(
+        values("SELECT * FROM orders source WHERE source."),
+        vec!["source.amount", "source.customer", "source.id"]
+    );
+    assert!(values("SELECT sales.leads.").is_empty());
+    assert_eq!(
+        values("SELECT * FROM orders o, customers c WHERE c."),
+        vec!["c.id", "c.name"]
+    );
+    assert!(values("DROP TABLE IF EXISTS ord").contains(&"orders".to_string()));
+}
+
+#[test]
+fn only_the_statement_under_the_cursor_names_relations() {
+    assert!(values("SELECT * FROM orders o; SELECT o.").is_empty());
+    assert!(!values("SELECT 1; ").iter().any(|v| v.starts_with('\\')));
+}
+
+#[test]
+fn a_derived_table_leaves_the_items_after_it() {
+    let line = "SELECT o. FROM (SELECT * FROM customers) d, orders o";
+    let v: Vec<String> = suggest(&ctx(), line, 9).into_iter().map(|s| s.value).collect();
+    assert_eq!(v, vec!["o.amount", "o.customer", "o.id"]);
+}
+
+#[test]
+fn relation_arguments_list_their_command_s_classes() {
+    let dt = values("\\dt ");
+    assert!(dt.contains(&"orders".to_string()) && !dt.contains(&"feed".to_string()));
+    assert_eq!(values("\\dv "), vec!["feed"]);
+    assert_eq!(values("\\d sales."), vec!["sales.leads"]);
+}
+
+#[test]
+fn types_and_keyword_functions_come_from_the_planner() {
+    assert!(values("CREATE TABLE t (a BIGINT UNS").contains(&"UNSIGNED".to_string()));
+    assert!(values("CREATE TABLE t (a SMALLS").contains(&"SMALLSERIAL".to_string()));
+    assert!(values("SELECT flo").contains(&"floor".to_string()));
+}
+
+#[test]
+fn a_path_lists_its_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.sql"), "").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let typed = format!("{}/", dir.path().display());
+    let s = suggest(&ctx(), &format!("\\i {typed}"), typed.len() + 3);
+    let v: Vec<(String, bool)> = s.into_iter().map(|s| (s.value, s.append_whitespace)).collect();
+    assert_eq!(
+        v,
+        vec![(format!("{typed}a.sql"), true), (format!("{typed}sub/"), false)]
+    );
 }

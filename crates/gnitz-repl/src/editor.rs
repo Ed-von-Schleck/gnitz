@@ -8,11 +8,10 @@ use nu_ansi_term::{Color, Style};
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     default_vi_visual_keybindings, DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, IdeMenu,
-    KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    InputMode, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
 };
 
-use crate::complete::{SharedContext, SqlCompleter};
 use crate::highlight::SqlHighlighter;
 use crate::lex;
 use crate::meta::editor_command;
@@ -106,11 +105,13 @@ fn add_common_bindings(kb: &mut Keybindings) {
     kb.add_binding(KeyModifiers::ALT, KeyCode::Char('e'), ReedlineEvent::OpenEditor);
 }
 
-/// The editor, reading completions from `context`; Alt-E writes the buffer to
-/// `buffer` for `$EDITOR`.
-pub fn build(context: SharedContext, vi: bool, color: bool, buffer: PathBuf) -> Reedline {
+/// The editor, without a completer: the shell sets one at each prompt. Alt-E
+/// writes the buffer to `buffer` for `$EDITOR`.
+pub fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
+    // The whole buffer, so the completer reads references past the cursor.
     let menu = IdeMenu::default()
         .with_name(COMPLETION_MENU)
+        .with_input_mode(InputMode::FullBuffer)
         .with_default_border()
         .with_description_mode(DescriptionMode::PreferRight)
         .with_max_completion_height(12)
@@ -133,7 +134,6 @@ pub fn build(context: SharedContext, vi: bool, color: bool, buffer: PathBuf) -> 
     };
     let editor = editor_command(&buffer);
     let mut line_editor = Reedline::create()
-        .with_completer(Box::new(SqlCompleter::new(context)))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_validator(Box::new(SqlValidator))
         .with_edit_mode(edit_mode)

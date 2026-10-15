@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{parse_stmt, rejected};
 use sqlparser::ast::Statement;
+use sqlparser::parser::Parser;
 
 /// `CREATE TABLE t (c <decl>)`'s one column, through `column_def`.
 fn declared(decl: &str) -> Result<(ColumnDef, bool), GnitzSqlError> {
@@ -122,5 +123,27 @@ fn sql_type_name_round_trips() {
         let spelled = sql_type_name(ty);
         let (def, _) = declared(&spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
         assert_eq!(def.ty, ty, "{spelled}");
+    }
+}
+
+/// `type_names` and the planner agree both ways: every listed spelling
+/// declares, and every single word the planner declares is a word of one.
+#[test]
+fn type_names_are_the_spellings_the_planner_accepts() {
+    for name in type_names() {
+        let decl = match name {
+            "DECIMAL" | "NUMERIC" | "DEC" => format!("{name}(10, 2)"),
+            _ => name.to_string(),
+        };
+        declared(&decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
+    }
+    let words: Vec<&str> = type_names().flat_map(str::split_whitespace).collect();
+    for &kw in sqlparser::keywords::ALL_KEYWORDS {
+        let accepted =
+            Parser::parse_sql(&crate::DIALECT, &format!("CREATE TABLE t (c {kw})")).is_ok_and(|_| declared(kw).is_ok());
+        assert!(
+            !accepted || words.contains(&kw),
+            "{kw} declares but is not in type_names()"
+        );
     }
 }

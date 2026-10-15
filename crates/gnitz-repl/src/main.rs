@@ -136,21 +136,23 @@ fn repl(shell: &mut Shell, vi: bool) -> ExitCode {
     let Ok(buffer) = shell.scratch().map(|dir| dir.join("buffer.sql")) else {
         return ExitCode::FAILURE;
     };
-    let mut line_editor = editor::build(shell.context(), vi, shell.settings.color, buffer);
+    let mut line_editor = editor::build(vi, shell.settings.color, buffer);
     println!(
         "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
         env!("CARGO_PKG_VERSION"),
         shell.target()
     );
     loop {
-        // Every prompt: completion offers what the catalog holds now, whichever
-        // session changed it.
-        shell.refresh_catalog();
+        // Completion offers what the catalog holds now, whichever session
+        // changed it; a failed read keeps the previous completer.
+        if let Some(ctx) = shell.completion() {
+            line_editor = line_editor.with_completer(Box::new(ctx));
+        }
         if let Some(text) = shell.prefill.take() {
             line_editor.run_edit_commands(&[EditCommand::InsertString(text)]);
         }
         let prompt = ShellPrompt {
-            schema: shell.schema(),
+            schema: shell.schema().to_string(),
             in_transaction: shell.in_transaction(),
         };
         match line_editor.read_line(&prompt) {

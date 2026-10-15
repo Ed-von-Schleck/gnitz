@@ -7,14 +7,14 @@ use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{block_on, BlockingHost, Catalog, ClientError, GnitzClient};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use nu_ansi_term::{Color, Style};
 
-use crate::complete::{Context, SharedContext};
+use crate::complete::Context;
 use crate::lex::{self, Piece, Splitter};
 use crate::render::{render, Format, Settings, Weights};
 use crate::value::Rows;
@@ -51,7 +51,8 @@ pub struct Options {
 pub struct Shell {
     client: GnitzClient,
     target: String,
-    context: SharedContext,
+    /// The schema unqualified names resolve in.
+    schema: String,
     pub settings: Settings,
     pub interactive: bool,
     stop_on_error: bool,
@@ -92,14 +93,10 @@ fn is_disconnect(e: &GnitzSqlError) -> bool {
 impl Shell {
     pub fn connect(options: Options) -> Result<Shell, ClientError> {
         let client = connect(&options.target, options.interrupt.clone())?;
-        let context = Arc::new(RwLock::new(Context {
-            catalog: Catalog::default(),
-            schema: options.schema,
-        }));
         Ok(Shell {
             client,
             target: options.target,
-            context,
+            schema: options.schema,
             settings: options.settings,
             interactive: options.interactive,
             stop_on_error: options.stop_on_error,
@@ -115,17 +112,12 @@ impl Shell {
         &self.target
     }
 
-    pub fn schema(&self) -> String {
-        self.context.read().expect("context lock").schema.clone()
+    pub fn schema(&self) -> &str {
+        &self.schema
     }
 
     pub fn set_schema(&mut self, schema: &str) {
-        self.context.write().expect("context lock").schema = schema.to_string();
-    }
-
-    /// What completion reads.
-    pub fn context(&self) -> SharedContext {
-        Arc::clone(&self.context)
+        self.schema = schema.to_string();
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -168,13 +160,13 @@ impl Shell {
         Ok(self.scratch.as_ref().expect("made above").path())
     }
 
-    /// Read the catalog again for completion, whoever changed it since. A
-    /// failure leaves the old snapshot: completion is a convenience, never a
-    /// reason to stop.
-    pub fn refresh_catalog(&mut self) {
-        if let Ok(catalog) = block_on(self.client.catalog()) {
-            self.context.write().expect("context lock").catalog = catalog;
-        }
+    /// What completion reads now: the catalog as it stands, and the schema.
+    /// `None` when the catalog cannot be read; completion is a convenience,
+    /// never a reason to stop.
+    pub fn completion(&mut self) -> Option<Context> {
+        block_on(self.client.catalog())
+            .ok()
+            .map(|catalog| Context { catalog, schema: self.schema.clone() })
     }
 
     pub fn reconnect(&mut self, target: &str) -> Result<(), Failed> {
@@ -253,9 +245,8 @@ impl Shell {
     fn run_statement(&mut self, stmt: &str) -> Result<(), Failed> {
         self.last_statement = format!("{stmt};");
         self.clear_interrupt();
-        let schema = self.schema();
         let started = Instant::now();
-        let result = block_on(gnitz_sql::execute(&mut self.client, &schema, stmt));
+        let result = block_on(gnitz_sql::execute(&mut self.client, &self.schema, stmt));
         let elapsed = started.elapsed();
         let outcome = match result {
             Ok(results) => {

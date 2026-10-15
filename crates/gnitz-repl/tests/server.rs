@@ -170,7 +170,6 @@ fn describe_shows_keys_and_what_reads_what() {
     let out = dir.path().join("out.txt");
     let mut sh = shell(server.sock_path(), None);
     sh.run_script("CREATE TABLE parent (id BIGINT PRIMARY KEY);").unwrap();
-    sh.refresh_catalog();
 
     shell(server.sock_path(), None)
         .run_script(

@@ -552,6 +552,20 @@ const SCALAR_CALLS: &[(&str, Call)] = &[
     ("DATE_PART", Call::DatePart),
 ];
 
+/// Functions sqlparser parses into their own expression nodes, which
+/// `bind_structural` binds by node.
+pub(crate) const KEYWORD_CALLS: &[&str] = &[
+    "CAST",
+    "CEIL",
+    "EXTRACT",
+    "FLOOR",
+    "POSITION",
+    "SAFE_CAST",
+    "SUBSTR",
+    "TRIM",
+    "TRY_CAST",
+];
+
 /// The names of [`SCALAR_CALLS`].
 pub(crate) fn scalar_call_names() -> impl Iterator<Item = &'static str> {
     SCALAR_CALLS.iter().map(|&(n, _)| n)

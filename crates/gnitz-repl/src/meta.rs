@@ -1,13 +1,14 @@
 //! Backslash meta-commands, after psql's: the one table that `\?`, completion,
 //! highlighting and dispatch all read, and the commands themselves.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 
 use clap::ValueEnum;
-use gnitz_core::{Catalog, CatalogRelation, RelProps};
+use gnitz_core::{Catalog, CatalogRelation, RelName, RelProps};
 use gnitz_expr::{LikeMatcher, LikePattern};
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::{RelClass, TypeCode};
@@ -20,10 +21,11 @@ use crate::value::{Rows, Value};
 #[derive(Clone, Copy, Debug)]
 pub enum ArgKind {
     None,
-    Relation,
+    /// A relation of a class the predicate keeps.
+    Relation(fn(RelClass) -> bool),
     Index,
     Schema,
-    /// A view name or a `SELECT` over one.
+    /// A view name or a `SELECT` over one, to the end of the line.
     Sql,
     /// A [`Setting`]'s name.
     SettingName,
@@ -34,6 +36,7 @@ pub enum ArgKind {
 
 /// One meta-command line, as its handler reads it.
 pub struct Call<'a> {
+    pub command: &'static MetaCommand,
     /// Everything after the command word, trimmed.
     pub rest: &'a str,
     /// Whether the command word ended in `+`.
@@ -44,6 +47,31 @@ impl Call<'_> {
     /// The first argument.
     pub fn arg(&self) -> Option<&str> {
         self.rest.split_whitespace().next()
+    }
+
+    /// The first argument, a path, with a leading `~` expanded.
+    pub fn path(&self) -> Option<Cow<'_, str>> {
+        self.arg().map(expand_home)
+    }
+
+    /// The relation classes the command's argument names.
+    pub fn relations(&self) -> fn(RelClass) -> bool {
+        match self.command.arg(0) {
+            ArgKind::Relation(keep) => keep,
+            _ => |_| true,
+        }
+    }
+}
+
+/// `path` with a leading `~` or `~/` read as the home directory; `~user` and a
+/// home directory that is unknown or not UTF-8 leave it as it is.
+pub(crate) fn expand_home(path: &str) -> Cow<'_, str> {
+    let Some(rest) = path.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')) else {
+        return Cow::Borrowed(path);
+    };
+    match dirs::home_dir().as_deref().and_then(std::path::Path::to_str) {
+        Some(home) => Cow::Owned(format!("{home}{rest}")),
+        None => Cow::Borrowed(path),
     }
 }
 
@@ -65,12 +93,7 @@ impl MetaCommand {
     }
 
     pub fn arg(&self, i: usize) -> ArgKind {
-        match (self.arg_kinds.get(i), self.arg_kinds.last()) {
-            (Some(&k), _) => k,
-            // `\watch`'s SQL runs on past its first word.
-            (None, Some(&ArgKind::Sql)) => ArgKind::Sql,
-            _ => ArgKind::None,
-        }
+        self.arg_kinds.get(i).copied().unwrap_or(ArgKind::None)
     }
 }
 
@@ -94,7 +117,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "[TARGET]",
         help: "reconnect, to TARGET if given",
         arg_kinds: &[ArgKind::Path],
-        run: |sh, c| sh.connect_to(c.arg()),
+        run: |sh, c| sh.connect_to(c.path().as_deref()),
     },
     MetaCommand {
         names: &["\\conninfo"],
@@ -117,7 +140,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\d"],
         args: "[NAME]",
         help: "list relations, or describe NAME (\\d+ shows hidden columns)",
-        arg_kinds: &[ArgKind::Relation],
+        arg_kinds: &[ArgKind::Relation(|_| true)],
         run: |sh, c| match c.arg() {
             Some(name) => sh.describe(name, c.verbose),
             None => sh.list(None, |k| k != RelClass::Catalog),
@@ -127,29 +150,29 @@ pub const COMMANDS: &[MetaCommand] = &[
         names: &["\\dt"],
         args: "[PATTERN]",
         help: "list tables",
-        arg_kinds: &[ArgKind::Relation],
-        run: |sh, c| sh.list(c.arg(), |k| k == RelClass::Table),
+        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Table)],
+        run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\dv"],
         args: "[PATTERN]",
         help: "list views",
-        arg_kinds: &[ArgKind::Relation],
-        run: |sh, c| sh.list(c.arg(), RelClass::is_view),
+        arg_kinds: &[ArgKind::Relation(RelClass::is_view)],
+        run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\ds"],
         args: "[PATTERN]",
         help: "list streams",
-        arg_kinds: &[ArgKind::Relation],
-        run: |sh, c| sh.list(c.arg(), |k| k == RelClass::Stream),
+        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Stream)],
+        run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\dS"],
         args: "[PATTERN]",
         help: "list system relations",
-        arg_kinds: &[ArgKind::Relation],
-        run: |sh, c| sh.list(c.arg(), |k| k == RelClass::Catalog),
+        arg_kinds: &[ArgKind::Relation(|k| k == RelClass::Catalog)],
+        run: |sh, c| sh.list(c.arg(), c.relations()),
     },
     MetaCommand {
         names: &["\\di"],
@@ -215,8 +238,8 @@ pub const COMMANDS: &[MetaCommand] = &[
         help: "send results to FILE, or back to stdout",
         arg_kinds: &[ArgKind::Path],
         run: |sh, c| {
-            match c.arg() {
-                Some(path) => sh.output_to_file(path)?,
+            match c.path() {
+                Some(path) => sh.output_to_file(&path)?,
                 None => sh.output_to_stdout(),
             }
             Ok(Flow::Continue)
@@ -227,8 +250,8 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "FILE",
         help: "run the commands in FILE",
         arg_kinds: &[ArgKind::Path],
-        run: |sh, c| match c.arg() {
-            Some(path) => sh.run_file(path),
+        run: |sh, c| match c.path() {
+            Some(path) => sh.run_file(&path),
             None => sh.fail("\\i needs a file name"),
         },
     },
@@ -237,7 +260,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "[FILE]",
         help: "edit the last statement, or FILE, in $EDITOR",
         arg_kinds: &[ArgKind::Path],
-        run: |sh, c| sh.edit(c.arg()),
+        run: |sh, c| sh.edit(c.path().as_deref()),
     },
     MetaCommand {
         names: &["\\echo"],
@@ -392,7 +415,11 @@ impl Shell {
         let Some(cmd) = command else {
             return self.fail(format!("invalid command {}; try \\? for help", &line[name]));
         };
-        let call = Call { rest: line[name.end..].trim(), verbose };
+        let call = Call {
+            command: cmd,
+            rest: line[name.end..].trim(),
+            verbose,
+        };
         (cmd.run)(self, &call)
     }
 
@@ -431,10 +458,11 @@ impl Shell {
 
     fn use_schema(&mut self, schema: &str) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let Some(known) = catalog.schemas.iter().find(|s| s.eq_ignore_ascii_case(schema)) else {
+        let key = RelName::schema_key(schema).ok();
+        let Some(known) = key.filter(|k| catalog.schemas.contains(k)) else {
             return self.fail(format!("schema \"{schema}\" does not exist"));
         };
-        self.set_schema(known);
+        self.set_schema(&known);
         Ok(Flow::Continue)
     }
 
@@ -551,7 +579,7 @@ impl Shell {
 
     fn describe(&mut self, name: &str, verbose: bool) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let Some(rel) = catalog.find(&self.schema(), name) else {
+        let Some(rel) = catalog.find(self.schema(), name) else {
             return self.fail(format!("Did not find any relation named \"{name}\"."));
         };
         let out = self.description(&catalog, rel, verbose);

@@ -10,5 +10,5 @@ mod structural;
 pub(crate) use resolve::{apply_positional_aliases, find_unique_column, output_column, require_column, Catalog};
 pub(crate) use structural::{
     bind_conjuncts, bind_constant, bind_structural, maybe_negate, scalar_call_names, single_relation_col_idx,
-    unsupported_subquery, LeafBinder,
+    unsupported_subquery, LeafBinder, KEYWORD_CALLS,
 };

@@ -32,7 +32,7 @@ mod validate;
 pub use codec::literal::parse_bool;
 pub use error::GnitzSqlError;
 pub use sqlparser;
-pub use types::sql_type_name;
+pub use types::{sql_type_name, type_names};
 
 use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, RelProps, ScanReply, Subscription};
 use sqlparser::dialect::GenericDialect;
@@ -94,10 +94,11 @@ pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> 
 }
 
 /// Every function name a statement may call, in the spelling the binder matches
-/// case-insensitively: the scalar functions, the aggregates and the window-only
-/// ranking functions.
+/// case-insensitively: the scalar functions, the ones sqlparser parses into
+/// their own nodes, the aggregates and the window-only ranking functions.
 pub fn function_names() -> impl Iterator<Item = &'static str> {
     bind::scalar_call_names()
+        .chain(bind::KEYWORD_CALLS.iter().copied())
         .chain(agg::agg_names())
         .chain(hir::ranking_names())
 }

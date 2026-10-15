@@ -1,83 +1,79 @@
 //! Tab completion: meta-commands and their arguments, and SQL — keywords,
 //! functions, and the relations and columns of the catalog snapshot.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::borrow::Cow;
 
+use gnitz_sql::sqlparser::ast::{ObjectName, TableFactor};
 use gnitz_sql::sqlparser::keywords::Keyword;
+use gnitz_sql::sqlparser::parser::Parser;
 use gnitz_sql::sqlparser::tokenizer::Token;
+use gnitz_wire::RelClass;
 use nu_ansi_term::{Color, Style};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 use gnitz_core::{Catalog, CatalogRelation};
 
-use crate::lex::lex_prefix;
+use crate::lex::{lex_prefix, Lexeme};
 use crate::meta::{self, ArgKind, MetaLine, Setting};
 use crate::render::{choose, variants};
 
-/// What completion reads: the catalog snapshot and the current schema, which
-/// the shell replaces as they change.
+/// What completion reads: the catalog snapshot and the current schema. The
+/// shell builds one at each prompt.
 #[derive(Default)]
 pub struct Context {
     pub catalog: Catalog,
     pub schema: String,
 }
 
-pub type SharedContext = Arc<RwLock<Context>>;
-
-/// The SQL words offered beside the catalog's names and the planner's function
-/// and `WITH` option names: the statements and clauses gnitz runs, and its
-/// column types.
+/// The statement and clause words offered beside the catalog's names and the
+/// planner's function, type and `WITH` option names.
 const KEYWORDS: &[&str] = &[
+    "ACTION",
     "ADD",
     "ALL",
     "ALTER",
     "AND",
+    "ANY",
     "AS",
     "ASC",
     "BEGIN",
     "BETWEEN",
-    "BIGINT",
-    "BIGSERIAL",
-    "BOOLEAN",
     "BY",
     "CASCADE",
     "CASE",
-    "CAST",
+    "CLUSTER",
     "COLUMN",
     "COMMIT",
+    "CONFLICT",
     "CONSTRAINT",
     "CREATE",
     "CROSS",
-    "DATE",
-    "DECIMAL",
+    "CURRENT",
     "DEFAULT",
     "DELETE",
     "DESC",
     "DISTINCT",
-    "DOUBLE",
+    "DO",
     "DROP",
     "ELSE",
     "END",
     "EXCEPT",
     "EXISTS",
     "EXPLAIN",
-    "EXTRACT",
     "FALSE",
     "FIRST",
-    "FLOAT",
+    "FOLLOWING",
     "FOREIGN",
     "FROM",
     "FULL",
     "GROUP",
     "HAVING",
-    "HUGEINT",
     "IF",
+    "ILIKE",
     "IN",
     "INDEX",
     "INNER",
     "INSERT",
-    "INT",
     "INTERSECT",
     "INTO",
     "IS",
@@ -87,7 +83,10 @@ const KEYWORDS: &[&str] = &[
     "LEFT",
     "LIKE",
     "LIMIT",
+    "NATURAL",
+    "NO",
     "NOT",
+    "NOTHING",
     "NULL",
     "NULLS",
     "OFFSET",
@@ -97,34 +96,32 @@ const KEYWORDS: &[&str] = &[
     "OUTER",
     "OVER",
     "PARTITION",
+    "PRECEDING",
     "PRIMARY",
     "QUALIFY",
+    "RANGE",
     "REFERENCES",
     "RENAME",
+    "RESTRICT",
     "RETURNING",
     "RIGHT",
     "ROLLBACK",
-    "SCHEMA",
+    "ROW",
+    "ROWS",
     "SELECT",
-    "SERIAL",
     "SET",
-    "SMALLINT",
     "START",
     "TABLE",
-    "TEXT",
     "THEN",
-    "TIMESTAMP",
-    "TINYINT",
     "TO",
     "TRANSACTION",
     "TRUE",
-    "UHUGEINT",
+    "UNBOUNDED",
     "UNION",
     "UNIQUE",
-    "UNSIGNED",
+    "UNKNOWN",
     "UPDATE",
     "USING",
-    "UUID",
     "VALUES",
     "VIEW",
     "WHEN",
@@ -134,25 +131,20 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Keywords after which a relation name comes next.
-const BEFORE_RELATION: &[Keyword] = &[
+const RELATION_KEYWORDS: &[Keyword] = &[
     Keyword::FROM,
     Keyword::JOIN,
-    Keyword::INTO,
     Keyword::UPDATE,
+    Keyword::INTO,
     Keyword::TABLE,
     Keyword::VIEW,
-    Keyword::DESCRIBE,
     Keyword::EXISTS,
 ];
 
-pub struct SqlCompleter {
-    context: SharedContext,
-}
-
-impl SqlCompleter {
-    pub fn new(context: SharedContext) -> Self {
-        SqlCompleter { context }
-    }
+/// The one relation class `\watch` reads: `plan_subscription` takes a `SELECT`
+/// over a delta-fed view.
+fn fed(k: RelClass) -> bool {
+    k == RelClass::FedView
 }
 
 /// Suggestion kinds, in the order they are listed.
@@ -165,7 +157,6 @@ enum Kind {
     Keyword,
     Meta,
     Value,
-    Path,
 }
 
 impl Kind {
@@ -177,7 +168,7 @@ impl Kind {
             Kind::Function => Style::new().fg(Color::LightCyan),
             Kind::Keyword => Style::new().fg(Color::LightBlue),
             Kind::Meta => Style::new().fg(Color::Yellow),
-            Kind::Value | Kind::Path => Style::new(),
+            Kind::Value => Style::new(),
         }
     }
 }
@@ -185,38 +176,33 @@ impl Kind {
 struct Candidate {
     kind: Kind,
     value: String,
-    description: String,
+    description: Option<String>,
 }
 
-/// The start of the word `before` ends in: identifier characters, `.`, a
-/// quote, and a leading backslash.
+/// The start of the SQL word `before` ends in: identifier characters, `.` and
+/// a quote.
 fn word_start(before: &str) -> usize {
     before
         .char_indices()
         .rev()
-        .find(|&(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '\\' | '$')))
+        .find(|&(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '$')))
         .map_or(0, |(i, c)| i + c.len_utf8())
 }
 
-impl Completer for SqlCompleter {
+impl Completer for Context {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let ctx = self.context.read().expect("completion context lock");
-        let suggestions = suggest(&ctx, line, pos);
-        CompletionResult::fresh(suggestions)
+        CompletionResult::fresh(suggest(self, line, pos))
     }
 }
 
 /// The suggestions for the cursor at `pos` of `line`.
 pub fn suggest(ctx: &Context, line: &str, pos: usize) -> Vec<Suggestion> {
     let before = &line[..pos];
-    let start = word_start(before);
-    let word = &before[start..];
-    let (candidates, replace_from) = match MetaLine::parse(line) {
-        Some(meta) => meta_candidates(ctx, line, meta, start, word),
-        None => sql_candidates(ctx, line, start, word),
+    let (candidates, from) = match MetaLine::parse(before) {
+        Some(meta) => meta_candidates(ctx, line, pos, meta),
+        None => sql_candidates(ctx, line, pos, 0, |_| true),
     };
-    let typed = &before[replace_from..];
-    finish(candidates, typed, Span::new(replace_from, pos))
+    finish(candidates, &before[from..], Span::new(from, pos))
 }
 
 /// Rank `candidates` against what was `typed`: prefix matches first, then
@@ -226,10 +212,10 @@ fn finish(candidates: Vec<Candidate>, typed: &str, span: Span) -> Vec<Suggestion
     let mut scored: Vec<(u8, Candidate)> = candidates
         .into_iter()
         .filter_map(|c| {
-            let hay = c.value.trim_start_matches('"').to_lowercase();
+            let hay = c.value.to_lowercase();
             if hay.starts_with(&needle) {
                 Some((0, c))
-            } else if !needle.is_empty() && hay.contains(&needle) {
+            } else if hay.contains(&needle) {
                 Some((1, c))
             } else {
                 None
@@ -242,9 +228,9 @@ fn finish(candidates: Vec<Candidate>, typed: &str, span: Span) -> Vec<Suggestion
     scored
         .into_iter()
         .map(|(_, c)| Suggestion {
-            append_whitespace: !matches!(c.kind, Kind::Path | Kind::Schema) && !c.value.ends_with('.'),
+            append_whitespace: !c.value.ends_with(['.', '/']),
             value: c.value,
-            description: (!c.description.is_empty()).then_some(c.description),
+            description: c.description,
             style: Some(c.kind.style()),
             span,
             ..Default::default()
@@ -257,73 +243,80 @@ fn meta_commands() -> impl Iterator<Item = Candidate> {
     meta::COMMANDS.iter().map(|m| Candidate {
         kind: Kind::Meta,
         value: m.name().to_string(),
-        description: m.help.to_string(),
+        description: Some(m.help.to_string()),
     })
 }
 
-fn meta_candidates(ctx: &Context, line: &str, meta: MetaLine, start: usize, word: &str) -> (Vec<Candidate>, usize) {
+/// A meta-command's arguments are whitespace-separated, so its word under the
+/// cursor is whatever follows the last whitespace.
+fn meta_candidates(ctx: &Context, line: &str, pos: usize, meta: MetaLine) -> (Vec<Candidate>, usize) {
     let MetaLine { name, command, .. } = meta;
-    if start <= name.start || start < name.end && word.starts_with('\\') {
+    if pos == name.end {
         return (meta_commands().collect(), name.start);
     }
-    let args: Vec<&str> = line[name.end..start].split_whitespace().collect();
-    let kind = command.map_or(ArgKind::None, |m| m.arg(args.len()));
-    match kind {
-        ArgKind::None => (Vec::new(), start),
-        ArgKind::Relation => (relation_candidates(ctx, word), start),
-        ArgKind::Index => (index_candidates(ctx), start),
-        ArgKind::Schema => (schema_candidates(ctx), start),
-        // `\watch` takes a view name or a SELECT over one.
-        ArgKind::Sql if args.is_empty() => {
-            let mut c = relation_candidates(ctx, word);
-            c.push(keyword("SELECT", word));
-            (c, start)
-        }
-        ArgKind::Sql => sql_candidates(ctx, line, start, word),
-        ArgKind::SettingName => (value_candidates(variants::<Setting>()), start),
+    let Some(cmd) = command else {
+        return (Vec::new(), pos);
+    };
+    // `\watch`'s argument is SQL to the end of the line.
+    if matches!(cmd.arg(0), ArgKind::Sql) {
+        return watch_candidates(ctx, line, pos, name.end);
+    }
+    let before = &line[..pos];
+    let arg_start = before.trim_end_matches(|c: char| !c.is_whitespace()).len();
+    let args: Vec<&str> = before[name.end..arg_start].split_whitespace().collect();
+    let word = &before[arg_start..];
+    let out = match cmd.arg(args.len()) {
+        ArgKind::None | ArgKind::Sql => Vec::new(),
+        ArgKind::Relation(keep) => relation_candidates(ctx, word, keep),
+        ArgKind::Index => index_candidates(ctx),
+        ArgKind::Schema => schema_candidates(ctx),
+        ArgKind::SettingName => value_candidates(variants::<Setting>()),
         ArgKind::Value(setting) => {
             let setting = setting.or_else(|| args.first().and_then(|a| choose::<Setting>(a).ok()));
-            (value_candidates(setting.map_or_else(Vec::new, Setting::values)), start)
+            value_candidates(setting.map_or_else(Vec::new, Setting::values))
         }
-        ArgKind::Path => {
-            let path_start = line[..line.len().min(start + word.len())]
-                .rfind(char::is_whitespace)
-                .map_or(start, |i| i + 1);
-            (path_candidates(&line[path_start..start + word.len()]), path_start)
-        }
+        ArgKind::Path => path_candidates(word),
+    };
+    (out, arg_start)
+}
+
+/// `\watch`'s argument, the SQL from `base`: a view name or a `SELECT` as its
+/// first word, then SQL over the delta-fed views.
+fn watch_candidates(ctx: &Context, line: &str, pos: usize, base: usize) -> (Vec<Candidate>, usize) {
+    let start = base + word_start(&line[base..pos]);
+    if !line[base..start].trim().is_empty() {
+        return sql_candidates(ctx, line, pos, base, fed);
     }
+    let word = &line[start..pos];
+    let mut out = relation_candidates(ctx, word, fed);
+    out.push(Candidate {
+        kind: Kind::Keyword,
+        value: cased("SELECT", word),
+        description: None,
+    });
+    (out, start)
 }
 
 fn path_candidates(typed: &str) -> Vec<Candidate> {
-    let (dir, shown_dir) = match typed.rfind('/') {
-        Some(i) => (
-            if i == 0 {
-                "/".to_string()
-            } else {
-                typed[..i].to_string()
-            },
-            &typed[..=i],
-        ),
-        None => (".".to_string(), ""),
+    let shown = &typed[..typed.rfind('/').map_or(0, |i| i + 1)];
+    let dir = match shown {
+        "" => Cow::Borrowed("."),
+        s => meta::expand_home(s),
     };
-    let dir = match dir.strip_prefix("~") {
-        Some(rest) => dirs::home_dir().map_or(dir.clone(), |h| format!("{}{rest}", h.display())),
-        None => dir,
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(&*dir) else {
         return Vec::new();
     };
     entries
         .flatten()
         .map(|e| {
-            let mut name = format!("{shown_dir}{}", e.file_name().to_string_lossy());
+            let mut name = format!("{shown}{}", e.file_name().to_string_lossy());
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 name.push('/');
             }
             Candidate {
-                kind: Kind::Path,
+                kind: Kind::Value,
                 value: name,
-                description: String::new(),
+                description: None,
             }
         })
         .collect()
@@ -335,7 +328,7 @@ fn value_candidates(values: Vec<String>) -> Vec<Candidate> {
         .map(|value| Candidate {
             kind: Kind::Value,
             value,
-            description: String::new(),
+            description: None,
         })
         .collect()
 }
@@ -349,7 +342,7 @@ fn index_candidates(ctx: &Context) -> Vec<Candidate> {
             r.indexes.iter().map(|i| Candidate {
                 kind: Kind::Value,
                 value: i.name.clone(),
-                description: format!("index on {}", r.name),
+                description: Some(format!("index on {}", r.name)),
             })
         })
         .collect()
@@ -362,158 +355,195 @@ fn schema_candidates(ctx: &Context) -> Vec<Candidate> {
         .map(|s| Candidate {
             kind: Kind::Schema,
             value: s.clone(),
-            description: "schema".to_string(),
+            description: Some("schema".to_string()),
         })
         .collect()
 }
 
-/// The relations, unqualified in the current schema and qualified elsewhere;
-/// with a qualifier typed, that schema's relations.
-fn relation_candidates(ctx: &Context, word: &str) -> Vec<Candidate> {
+/// The relations of the classes `keep` keeps: unqualified in the current
+/// schema, qualified elsewhere, beside each other schema holding one; with a
+/// qualifier typed, that schema's.
+fn relation_candidates(ctx: &Context, word: &str, keep: fn(RelClass) -> bool) -> Vec<Candidate> {
+    let kept = ctx.catalog.relations.iter().filter(|r| keep(r.class()));
+    let candidate = |r: &CatalogRelation, value: String| Candidate {
+        kind: Kind::Relation,
+        value,
+        description: Some(r.class().describe().to_string()),
+    };
     if let Some((qual, _)) = word.rsplit_once('.') {
-        return ctx
-            .catalog
-            .relations
-            .iter()
+        return kept
             .filter(|r| r.schema.eq_ignore_ascii_case(qual))
-            .map(|r| Candidate {
-                kind: Kind::Relation,
-                value: format!("{qual}.{}", r.name),
-                description: r.class().describe().to_string(),
-            })
+            .map(|r| candidate(r, r.qualified()))
             .collect();
     }
-    let mut out: Vec<Candidate> = ctx
-        .catalog
-        .relations
-        .iter()
-        .map(|r| Candidate {
-            kind: Kind::Relation,
-            value: match r.schema == ctx.schema {
-                true => r.name.clone(),
-                false => r.qualified(),
-            },
-            description: r.class().describe().to_string(),
+    let mut out: Vec<Candidate> = kept
+        .clone()
+        .map(|r| match r.schema == ctx.schema {
+            true => candidate(r, r.name.clone()),
+            false => candidate(r, r.qualified()),
         })
         .collect();
-    out.extend(ctx.catalog.schemas.iter().map(|s| Candidate {
-        kind: Kind::Schema,
-        value: format!("{s}."),
-        description: "schema".to_string(),
-    }));
+    out.extend(
+        ctx.catalog
+            .schemas
+            .iter()
+            .filter(|s| **s != ctx.schema && kept.clone().any(|r| r.schema == **s))
+            .map(|s| Candidate {
+                kind: Kind::Schema,
+                value: format!("{s}."),
+                description: Some("schema".to_string()),
+            }),
+    );
     out
 }
 
-/// `kw` in the case the user is typing in.
-fn keyword(kw: &str, word: &str) -> Candidate {
-    let lower = !word.is_empty() && word.chars().all(|c| !c.is_ascii_uppercase());
-    Candidate {
-        kind: Kind::Keyword,
-        value: match lower {
-            true => kw.to_ascii_lowercase(),
-            false => kw.to_string(),
-        },
-        description: String::new(),
+/// `s` in the case the user is typing in.
+fn cased(s: &str, word: &str) -> String {
+    match !word.is_empty() && word.chars().all(|c| !c.is_ascii_uppercase()) {
+        true => s.to_ascii_lowercase(),
+        false => s.to_ascii_uppercase(),
     }
 }
 
-/// The relations a statement names after FROM, JOIN, INTO or UPDATE, keyed by
-/// the name it is read under there: its alias, else its own name.
-fn referenced<'a>(ctx: &'a Context, line: &str) -> HashMap<String, &'a CatalogRelation> {
-    let (lexemes, _) = lex_prefix(line);
-    let words: Vec<&Token> = lexemes.iter().filter(|l| !l.is_trivia()).map(|l| &l.token).collect();
-    let mut out = HashMap::new();
-    let mut i = 0;
-    while i < words.len() {
-        let introduces = matches!(words[i], Token::Word(w) if matches!(w.keyword, Keyword::FROM | Keyword::JOIN | Keyword::INTO | Keyword::UPDATE))
-            || (matches!(words[i], Token::Comma) && !out.is_empty());
-        i += 1;
-        if !introduces {
+/// The relations `stmt` names, in statement order, each under the name the
+/// binder reads it by: its alias, else its unqualified name. Each introducer's
+/// items are read with sqlparser's own grammar, independently of the others,
+/// so an unfinished item ends only its own list.
+fn referenced<'a>(ctx: &'a Context, stmt: &[Lexeme]) -> Vec<(String, &'a CatalogRelation)> {
+    let mut out = Vec::new();
+    for (i, l) in stmt.iter().enumerate() {
+        let Token::Word(w) = &l.token else {
+            continue;
+        };
+        if !RELATION_KEYWORDS.contains(&w.keyword) {
             continue;
         }
-        let Some(Token::Word(first)) = words.get(i) else {
-            continue;
-        };
-        let mut name = first.value.clone();
-        i += 1;
-        if let (Some(Token::Period), Some(Token::Word(second))) = (words.get(i), words.get(i + 1)) {
-            name = format!("{name}.{}", second.value);
-            i += 2;
-        }
-        let Some(rel) = ctx.catalog.find(&ctx.schema, &name) else {
-            continue;
-        };
-        let alias = match (words.get(i), words.get(i + 1)) {
-            (Some(Token::Word(w)), Some(Token::Word(a))) if w.keyword == Keyword::AS => Some(a.value.clone()),
-            (Some(Token::Word(a)), _) if a.keyword == Keyword::NoKeyword => Some(a.value.clone()),
-            _ => None,
-        };
-        out.insert(rel.name.to_lowercase(), rel);
-        out.insert(rel.qualified().to_lowercase(), rel);
-        if let Some(a) = alias {
-            out.insert(a.to_lowercase(), rel);
+        let rest = stmt[i + 1..].iter().map(|l| l.token.clone()).collect();
+        let mut p = Parser::new(&gnitz_sql::DIALECT).with_tokens(rest);
+        match w.keyword {
+            // A table factor: the dialect's alias rule, derived tables, comma lists.
+            Keyword::FROM | Keyword::JOIN | Keyword::UPDATE => {
+                while let Ok(factor) = p.parse_table_factor() {
+                    if let TableFactor::Table { name, alias, .. } = factor {
+                        push(&mut out, ctx, &name, alias.map(|a| a.name.value));
+                    }
+                    if !p.consume_token(&Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            // A bare name: `INTO t (a, b)` must not parse as a table function.
+            _ => {
+                if let Ok(name) = p.parse_object_name(false) {
+                    push(&mut out, ctx, &name, None);
+                }
+            }
         }
     }
     out
 }
 
-fn column_candidates<'a>(rel: &'a CatalogRelation, qualifier: Option<&str>) -> impl Iterator<Item = Candidate> + 'a {
-    let qualifier = qualifier.map(str::to_string);
+/// `name` under `alias`, else under its own name, when the catalog holds it.
+fn push<'a>(out: &mut Vec<(String, &'a CatalogRelation)>, ctx: &'a Context, name: &ObjectName, alias: Option<String>) {
+    let parts: Option<Vec<&str>> = name.0.iter().map(|p| p.as_ident().map(|i| i.value.as_str())).collect();
+    let Some(rel) = parts.and_then(|p| ctx.catalog.find(&ctx.schema, &p.join("."))) else {
+        return;
+    };
+    out.push((alias.unwrap_or_else(|| rel.name.clone()), rel));
+}
+
+/// `rel`'s visible columns, each written after `prefix`.
+fn column_candidates<'a>(rel: &'a CatalogRelation, prefix: &'a str) -> impl Iterator<Item = Candidate> + 'a {
     rel.columns
         .iter()
         .map(|c| &c.def)
         .filter(|c| !c.is_hidden)
         .map(move |c| Candidate {
             kind: Kind::Column,
-            value: match &qualifier {
-                Some(q) => format!("{q}.{}", c.name),
-                None => c.name.clone(),
-            },
-            description: format!("{} · {}", gnitz_sql::sql_type_name(c.ty), rel.name),
+            value: format!("{prefix}{}", c.name),
+            description: Some(format!("{} · {}", gnitz_sql::sql_type_name(c.ty), rel.name)),
         })
 }
 
-fn sql_candidates(ctx: &Context, line: &str, start: usize, word: &str) -> (Vec<Candidate>, usize) {
-    let refs = referenced(ctx, line);
+/// The SQL from `base` with the cursor at `pos`, read one statement at a time:
+/// the one under the cursor names the relations its columns come from.
+fn sql_candidates(
+    ctx: &Context,
+    line: &str,
+    pos: usize,
+    base: usize,
+    keep: fn(RelClass) -> bool,
+) -> (Vec<Candidate>, usize) {
+    let start = base + word_start(&line[base..pos]);
+    let word = &line[start..pos];
+    let (lexemes, _) = lex_prefix(&line[base..]);
+    let lexemes: Vec<Lexeme> = lexemes
+        .into_iter()
+        .filter(|l| !l.is_trivia())
+        .map(|l| Lexeme {
+            range: l.range.start + base..l.range.end + base,
+            token: l.token,
+        })
+        .collect();
+    let is_semi = |l: &Lexeme| l.token == Token::SemiColon;
+    let from = lexemes
+        .iter()
+        .rposition(|l| is_semi(l) && l.range.end <= pos)
+        .map_or(0, |i| i + 1);
+    let to = lexemes
+        .iter()
+        .position(|l| is_semi(l) && l.range.start >= pos)
+        .unwrap_or(lexemes.len());
+    let stmt = &lexemes[from..to];
+    let prev = stmt.iter().rev().find(|l| l.range.end <= start).map(|l| &l.token);
+    let refs = referenced(ctx, stmt);
+
     if let Some((qual, _)) = word.rsplit_once('.') {
-        if let Some(rel) = refs
-            .get(&qual.to_lowercase())
-            .copied()
-            .or_else(|| ctx.catalog.find(&ctx.schema, qual))
-        {
-            return (column_candidates(rel, Some(qual)).collect(), start);
-        }
-        return (relation_candidates(ctx, word), start);
+        // A qualifier names one of the statement's relations; only a statement
+        // naming none reads it as a relation of the catalog.
+        let rel = match refs.is_empty() {
+            false => refs.iter().find(|(n, _)| n.eq_ignore_ascii_case(qual)).map(|&(_, r)| r),
+            true if !qual.contains('.') => ctx.catalog.find(&ctx.schema, qual),
+            true => None,
+        };
+        let out = match rel {
+            Some(r) => column_candidates(r, &word[..qual.len() + 1]).collect(),
+            None => relation_candidates(ctx, word, keep),
+        };
+        return (out, start);
     }
-    let (prior, _) = lex_prefix(&line[..start]);
-    let prev = prior.iter().rev().find(|l| !l.is_trivia()).map(|l| &l.token);
     if let Some(Token::Word(w)) = prev {
-        if BEFORE_RELATION.contains(&w.keyword) {
-            return (relation_candidates(ctx, word), start);
+        if RELATION_KEYWORDS.contains(&w.keyword) {
+            return (relation_candidates(ctx, word, keep), start);
         }
     }
-    let mut out: Vec<Candidate> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for rel in refs.values() {
-        if seen.insert(rel.id) {
-            out.extend(column_candidates(rel, None));
-        }
-    }
+    let mut out: Vec<Candidate> = refs.iter().flat_map(|&(_, r)| column_candidates(r, "")).collect();
     out.extend(gnitz_sql::function_names().map(|f| Candidate {
         kind: Kind::Function,
-        description: "function".to_string(),
-        ..keyword(&f.to_ascii_uppercase(), word)
+        value: cased(f, word),
+        description: Some("function".to_string()),
     }));
-    out.extend(KEYWORDS.iter().map(|k| keyword(k, word)));
+    // Completion replaces one word, so a type spelled in several is offered
+    // word by word.
+    let words = KEYWORDS
+        .iter()
+        .copied()
+        .chain(gnitz_sql::type_names().flat_map(str::split_whitespace));
+    out.extend(words.map(|k| Candidate {
+        kind: Kind::Keyword,
+        value: cased(k, word),
+        description: None,
+    }));
     out.extend(gnitz_sql::with_option_names().map(|o| Candidate {
         kind: Kind::Keyword,
         value: o.to_string(),
-        description: "WITH option".to_string(),
+        description: Some("WITH option".to_string()),
     }));
-    if prev.is_none() {
+    // A buffer is a meta-command only when it starts with one.
+    if base == 0 && line[..start].trim().is_empty() {
         out.extend(meta_commands());
     }
-    out.extend(relation_candidates(ctx, word));
+    out.extend(relation_candidates(ctx, word, keep));
     (out, start)
 }
 
