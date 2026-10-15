@@ -77,6 +77,10 @@ TINY_REPLY_FRAMES = {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)}
 # the watchdog, which fires at the threshold, is the only thing that can reclaim.
 TINY_SAL = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}
 
+# The pending rows of one table that fire a tick without a read draining it.
+TICK_COALESCE_ROWS = 10_000
+
+
 def server_env():
     """The environment every test-spawned server boots in: this process's, plus
     the defaults below wherever the caller has not set one itself.
@@ -93,10 +97,16 @@ def server_env():
     `GNITZ_CPU_AFFINITY`: the placement is derived from `sched_getaffinity` and
     knows nothing of other tenants, so concurrent servers pin onto each other's
     cores.
+
+    `GNITZ_TICK_COALESCE_ROWS` is set outright, not defaulted: a test sizing a
+    push to fire a tick reads the threshold from `TICK_COALESCE_ROWS`, so the
+    server must boot with that value; a test needing another passes it in
+    `extra_env`.
     """
     env = os.environ.copy()
     for k, v in (("GNITZ_SAL_BYTES", str(128 * 1024 * 1024)), ("GNITZ_CPU_AFFINITY", "0")):
         env.setdefault(k, v)
+    env["GNITZ_TICK_COALESCE_ROWS"] = str(TICK_COALESCE_ROWS)
     return env
 
 
@@ -515,3 +525,21 @@ def join_or_fail(why, *threads):
     for t in threads:
         if t.error is not None:
             raise t.error
+
+
+def across(ddl, step, after=20):
+    """Run `step(k)` for k = 0, 1, … — once before `ddl()` starts on a `spawn`ed
+    thread, throughout it, and `after` more times once it returned — and return
+    how many steps ran. Both sides of the DDL are therefore always exercised."""
+    step(0)
+    th = spawn(ddl)
+    k, past, deadline = 1, 0, time.monotonic() + HANG_TIMEOUT
+    try:
+        while past < after:
+            assert time.monotonic() < deadline, "the DDL never returned"
+            past += not th.is_alive()
+            step(k)
+            k += 1
+    finally:
+        join_or_fail("the DDL hung", th)
+    return k

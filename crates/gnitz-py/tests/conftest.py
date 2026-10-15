@@ -211,10 +211,16 @@ def _in_fresh_schema(target, prefix):
 @pytest.fixture
 def client(server):
     """Per-test connection to the session server, in a fresh schema of its own
-    (`client.schema`). A second connection a test opens to `server` reaches the
-    same relations with `gnitz.connect(server, schema=client.schema)`."""
+    (`client.schema`). `peer()` opens another connection to the same relations."""
     with _in_fresh_schema(server, "s") as conn:
         yield conn
+
+
+@pytest.fixture
+def peer(server, client):
+    """Factory for further connections in `client`'s schema, closed at teardown."""
+    with contextlib.ExitStack() as stack:
+        yield lambda: stack.enter_context(gnitz.connect(server, schema=client.schema))
 
 
 @pytest.fixture

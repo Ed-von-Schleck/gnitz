@@ -8,7 +8,6 @@ connection's ids only rise; a cached range abandoned on refill leaves a gap.
 
 import threading
 
-import gnitz
 import pytest
 from _read import bag, ordered, rows, scanned
 from _serverproc import join_or_fail, spawn
@@ -80,7 +79,7 @@ def test_a_serial_key_reaches_derived_schemas_as_a_plain_column(client, serial_t
     assert bag(scanned(client, "g"), "id", "n") == {(i, 1): 1 for i in range(1, 5)}
 
 
-def test_concurrent_connections_never_share_an_id(client, serial_t, server):
+def test_concurrent_connections_never_share_an_id(client, serial_t, peer):
     """Four fresh connections — none saw the CREATE, so each recognizes the
     SERIAL column from the catalog alone — draw ids at once in 30-row
     statements, so each refills its cached range several times and abandons a
@@ -91,20 +90,18 @@ def test_concurrent_connections_never_share_an_id(client, serial_t, server):
     ids = [[] for _ in range(writers)]
     done = threading.Event()
 
-    def writer(w):
-        with gnitz.connect(server, schema=client.schema) as c:
-            for s in range(statements):
-                values = ", ".join(f"('w{w}s{s}r{r}')" for r in range(per))
-                ids[w] += [r.id for r in rows(c, f"INSERT INTO t (name) VALUES {values} RETURNING id")]
+    def writer(c, w):
+        for s in range(statements):
+            values = ", ".join(f"('w{w}s{s}r{r}')" for r in range(per))
+            ids[w] += [r.id for r in rows(c, f"INSERT INTO t (name) VALUES {values} RETURNING id")]
 
-    def seeker():
-        with gnitz.connect(server, schema=client.schema) as c:
-            schema = c.resolve_table("t")[1]
-            while not done.is_set():
-                list(c.seek(serial_t, schema, pk=1))
+    def seeker(c):
+        schema = c.resolve_table("t")[1]
+        while not done.is_set():
+            list(c.seek(serial_t, schema, pk=1))
 
-    threads = [spawn(writer, w) for w in range(writers)]
-    seek = spawn(seeker)
+    threads = [spawn(writer, peer(), w) for w in range(writers)]
+    seek = spawn(seeker, peer())
     join_or_fail("a SERIAL writer hung", *threads)
     done.set()
     join_or_fail("a seek hung behind SERIAL allocation", seek)

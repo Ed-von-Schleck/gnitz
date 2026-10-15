@@ -141,7 +141,7 @@ def test_a_unique_constraint_holds_under_checkpoint_pressure(target):
     join_or_fail(_HUNG, spawn(_flood, pusher, filler, started), spawn(insert_loop))
 
     assert bag(scanned(inserter, "unique_t"), "pk", "val") == {(i, i * 10): 1 for i in range(n_rows)}
-    with pytest.raises(gnitz.GnitzIntegrityError, match="[Uu]nique index violation"):
+    with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
         inserter.execute_sql(f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)")
 
 

@@ -57,14 +57,18 @@ const PUSH_HOLD_MAX_POLLS: u32 = 2_000;
 
 /// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
 /// every hold-seam needs: it holds no lock while it waits, so the event it waits
-/// for can actually happen, and the bound releases it if that event never comes —
-/// a misarmed test then fails on its own assertion instead of wedging the node.
+/// for can actually happen, and the bound releases it if that event never comes
+/// instead of wedging the node. It logs when it parks and which way it released,
+/// so a test waits for the park and asserts the release rather than passing on a
+/// hold that never engaged.
 ///
 /// Polling rather than a handle keeps each seam self-contained: nothing outside
 /// one needs to know it exists.
 async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() -> bool) {
+    gnitz_note!("{}: parked", what);
     for _ in 0..polls {
         if ready() {
+            gnitz_note!("{}: released by its event", what);
             return;
         }
         shared.disp().reactor().sleep(Duration::from_millis(1)).await;

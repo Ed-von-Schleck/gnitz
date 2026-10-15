@@ -70,7 +70,7 @@ def test_an_aborted_ddl_leaves_no_durable_trace(own_server):
 
         conn.execute_sql(_ABORTED["u"])
         conn.execute_sql("INSERT INTO u VALUES (1, 10)")
-        with pytest.raises(gnitz.GnitzIntegrityError, match="[Uu]nique index violation"):
+        with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
             conn.execute_sql("INSERT INTO u VALUES (2, 10)")
 
         assert bag(scanned(conn, "parent"), "id") == {

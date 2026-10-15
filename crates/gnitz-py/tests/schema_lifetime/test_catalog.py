@@ -10,7 +10,7 @@ import gnitz
 import pytest
 from _catalog import family
 from _read import access, bag, rows
-from _schemas import KV
+from _schemas import KV, kv
 
 
 def test_create_table_hands_back_the_declared_columns_up_to_the_cap(client):
@@ -57,14 +57,14 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
     va = client.create_view("va", "src")
     vb = client.create_view("vb", "src")
 
-    client.push(tid, gnitz.ZSetBatch(KV).append(pk=1, val=10))
+    client.push(tid, kv((1, 10)))
     for vid in (va, vb):
         assert bag(client.scan(vid, KV), "pk", "val") == {(1, 10): 1}
 
     client.drop_view("va")
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(va, KV)
-    client.push(tid, gnitz.ZSetBatch(KV).append(pk=2, val=20))
+    client.push(tid, kv((2, 20)))
     assert bag(client.scan(vb, KV), "pk", "val") == {(1, 10): 1, (2, 20): 1}
 
     client.drop_view("vb")
@@ -73,8 +73,7 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
         client.scan(tid, KV)
 
 
-def test_drop_index_is_seen_by_the_next_statement_on_another_connection(
-        client, server):
+def test_drop_index_is_seen_by_the_next_statement_on_another_connection(client, peer):
     """A drops the index B's last plan used; B's very next statement is planned
     against its absence, and against the recreated index at once.
 
@@ -88,9 +87,9 @@ def test_drop_index_is_seen_by_the_next_statement_on_another_connection(
         "INSERT INTO t VALUES (1, 10), (2, 20); "
         "CREATE INDEX ix ON t (v)")
 
-    with gnitz.connect(server, schema=client.schema) as b:
-        for ddl, indexed in ((None, True), ("DROP INDEX ix", False), ("CREATE INDEX ix ON t (v)", True)):
-            if ddl:
-                client.execute_sql(ddl)
-            assert access(b, q) == ("index range on (v)" if indexed else "full scan"), ddl
-            assert bag(rows(b, q), "id") == {(2,): 1}, ddl
+    b = peer()
+    for ddl, indexed in ((None, True), ("DROP INDEX ix", False), ("CREATE INDEX ix ON t (v)", True)):
+        if ddl:
+            client.execute_sql(ddl)
+        assert access(b, q) == ("index range on (v)" if indexed else "full scan"), ddl
+        assert bag(rows(b, q), "id") == {(2,): 1}, ddl
