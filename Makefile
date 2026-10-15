@@ -20,8 +20,11 @@ PROFILE    ?=                                # bench-profile: comma-separated la
 LABEL      ?=                                # bench: a label in the results directory's name
 A          ?=                                # bench-compare: the results directory before (default: the second latest)
 B          ?=                                # bench-compare: the results directory after (default: the latest)
-T          ?=                                # cargo test name filter
+T          ?=                                # cargo test name filter; fuzz: the target (traffic, program or reply)
 K          ?=                                # pytest -k expression
+JOBS       ?= 1                              # fuzz-server: AFL++ instances, one core each
+TIME       ?=                                # fuzz, fuzz-server: seconds to run (default: until stopped)
+IN         ?=                                # fuzz-replay: the input file to replay
 
 # The instruction set every build targets. Canonical copy lives in
 # crates/.cargo/config.toml; it is restated here because Cargo's RUSTFLAGS
@@ -31,13 +34,18 @@ K          ?=                                # pytest -k expression
 # For a machine-specific build use `make bench-native`, which exports RUSTFLAGS.
 TARGET_CPU ?= x86-64-v3
 
+# The features that compile the suites driving a real server.
+INTEGRATION := --features gnitz-sql/integration --features gnitz-core/integration \
+               --features gnitz-tokio/integration --features gnitz-repl/integration
+
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \
         server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
         e2e-checked e2e-debug release-test \
         clean distclean \
         bench-rust bench bench-full bench-disk bench-profile bench-compare bench-report bench-native \
-        profiling-server pyext-profiling
+        profiling-server pyext-profiling \
+        fuzz-seeds fuzz-server fuzz fuzz-replay
 
 all: test
 
@@ -50,7 +58,7 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration $(T)
+	cd crates && cargo test --workspace --exclude gnitz-py $(INTEGRATION) $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
 	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz $(T)
@@ -62,7 +70,7 @@ fmt-check: ## Check formatting without writing (CI gate)
 	cd crates && cargo fmt --all --check
 
 clippy: ## Lint the workspace incl. integration tests; warnings are errors
-	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration -- -D warnings
+	cd crates && cargo clippy --workspace --all-targets $(INTEGRATION) -- -D warnings
 
 check: ## Fast type-check without producing binaries
 	cd crates && cargo check --workspace
@@ -130,6 +138,73 @@ e2e-checked: checked-server pyext ## Run the E2E suite against the layout-verify
 release-test: e2e-release ## Validate the release build end-to-end
 
 # ---------------------------------------------------------------------------
+# Fuzzing — everything a network delivers (crates/gnitz-fuzz). Seeds are the
+# traffic of every test that drives a server, recorded; an input is a program
+# of edits to one seed. Everything lives under the gitignored tmp/fuzz, and the
+# engines' instrumentation and the sanitizer need a nightly toolchain, beside
+# cargo-afl (fuzz-server) and cargo-bolero (fuzz). Nightly lints may be newer
+# than stable's, so they warn rather than fail these builds.
+# ---------------------------------------------------------------------------
+FUZZ           := $(CURDIR)/tmp/fuzz
+FUZZ_RUSTFLAGS := -C target-cpu=$(TARGET_CPU) --cap-lints=warn
+FUZZ_SERVER    := $(CURDIR)/crates/target/afl/debug/gnitz-server
+FUZZ_DRIVER    := $(CURDIR)/crates/target/release/gnitz-fuzz
+
+# A test whose server is its own is a recording that replays: the E2E suite
+# gives each test one while recording. A failing test fails the recording run.
+fuzz-seeds: server pyext ## Record the traffic of every test that drives a server, as fuzz seeds -> tmp/fuzz/seeds
+	rm -rf $(FUZZ)/recordings
+	cd crates && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings cargo test --workspace --exclude gnitz-py $(INTEGRATION)
+	cd crates/gnitz-py && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings GNITZ_WORKERS=4 uv run pytest tests/ -q
+	cd crates && cargo run --release -p gnitz-fuzz -- import $(FUZZ)/recordings $(FUZZ)
+
+# The server is the debug one under AddressSanitizer, built by cargo-afl with
+# AFL++'s coverage, which its forked workers write into the same map as the
+# master. The driver is AFL++'s target, booting that server for each input; it
+# carries no coverage of its own, so it runs without a fork server and the map
+# is sized to the server's. A session is a few seconds at worst: the timeout
+# leaves the driver's own budget room to report an unanswered request first.
+fuzz-server: ## Fuzz real servers with edited seed traffic under AFL++ (JOBS=, TIME=; after fuzz-seeds)
+	@test -d $(FUZZ)/starts/traffic || { echo "no fuzz seeds: run make fuzz-seeds first" >&2; exit 1; }
+	cd crates && AFL_USE_ASAN=1 AFLRS_NO_CMPLOG=1 RUSTFLAGS="$(FUZZ_RUSTFLAGS)" \
+		cargo +nightly afl build -p gnitz --target-dir target/afl
+	cd crates && cargo build --release -p gnitz-fuzz
+	mkdir -p $(FUZZ)/run
+	export GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds GNITZ_SERVER_BIN=$(FUZZ_SERVER) TMPDIR=$(FUZZ)/run \
+		AFL_MAP_SIZE=$$(AFL_DUMP_MAP_SIZE=1 $(FUZZ_SERVER)) AFL_NO_FORKSRV=1 AFL_SKIP_BIN_CHECK=1 \
+		AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1; \
+	in=$(FUZZ)/starts/traffic; if [ -d $(FUZZ)/afl/main ]; then in=-; fi; \
+	afl() { (cd crates && cargo +nightly afl fuzz -c - -i "$$in" -o $(FUZZ)/afl -t 60000 \
+		$(if $(TIME),-V $(TIME)) "$$@" -- $(FUZZ_DRIVER) run @@); }; \
+	trap 'kill $$(jobs -p) 2>/dev/null' EXIT; \
+	for j in $$(seq 2 $(JOBS)); do AFL_NO_UI=1 afl -S s$$j > $(FUZZ)/afl-s$$j.log 2>&1 & done; \
+	afl -M main
+
+# The in-process targets, each a `*_fuzz` test in the `fuzz/` module of the code
+# it reaches, as name@package@test; plain `cargo test` runs each for a second on
+# random inputs. Their inputs touch far more code than libFuzzer is built for, so
+# hit counts are left out of its features, and an input may grow to its full
+# length at once.
+FUZZ_TARGETS := traffic@gnitz@runtime::orchestration::executor::fuzz::traffic_fuzz \
+                program@gnitz-expr@program::fuzz::program_fuzz \
+                reply@gnitz-core@connection::fuzz::reply_fuzz \
+                hello@gnitz@runtime::reactor::io::fuzz::hello_fuzz
+fuzz_target   = $(subst @, ,$(filter $(T)@%,$(FUZZ_TARGETS)))
+
+fuzz: ## Fuzz an in-process target under libFuzzer + ASan: T=traffic (DDL, pushes, scans), program (expression VM), reply (client), hello (before admission); TIME=
+	@test -n "$(fuzz_target)" || { echo "T= names no fuzz target: one of $(foreach t,$(FUZZ_TARGETS),$(firstword $(subst @, ,$(t))))" >&2; exit 1; }
+	mkdir -p $(FUZZ)/corpus/$(T)
+	$(if $(wildcard $(FUZZ)/starts/$(T)/*),cp -n $(FUZZ)/starts/$(T)/* $(FUZZ)/corpus/$(T)/)
+	cd crates && $(if $(wildcard $(FUZZ)/seeds),GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds) RUSTFLAGS="$(FUZZ_RUSTFLAGS)" \
+		cargo bolero test -p $(word 2,$(fuzz_target)) --toolchain nightly --target-dir target/bolero \
+		--corpus-dir $(FUZZ)/corpus/$(T) --crashes-dir $(FUZZ)/crashes/$(T) -l 4096 \
+		$(if $(TIME),-T $(TIME)s) --engine-args=-use_counters=0 --engine-args=-len_control=0 $(word 3,$(fuzz_target))
+
+fuzz-replay: ## Replay one fuzz-server input against its server, every frame traced (IN=<file>)
+	cd crates && cargo build --release -p gnitz-fuzz
+	GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds GNITZ_SERVER_BIN=$(FUZZ_SERVER) $(FUZZ_DRIVER) replay $(IN)
+
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -166,7 +241,7 @@ bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs 
 	mkdir -p tmp
 	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) TMPDIR=$(abspath tmp) \
 		cargo test --release --workspace --exclude gnitz-py --tests \
-		--features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration \
+		$(INTEGRATION) \
 		$(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1
 

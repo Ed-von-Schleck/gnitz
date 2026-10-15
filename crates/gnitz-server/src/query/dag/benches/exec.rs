@@ -9,7 +9,7 @@
 
 use super::tests::{delta_for, drive, engine_with_base, engine_with_views, tick_over, view_cols};
 use super::*;
-use crate::test_support::{net_weight, register_identity_view};
+use crate::test_support::{net_weight, register_identity_view, EchoDrive};
 use gnitz_store::relation::Relation;
 
 /// Timed ticks per cell of the closure, with one row and with none.
@@ -74,28 +74,6 @@ fn drive_tick_bench() {
     }
 }
 
-/// A host whose exchange hands this worker its own rows back: every round of a
-/// drive runs, at the cost of everything but the mesh.
-struct Echo<'a>(&'a mut crate::catalog::CatalogEngine, u64);
-
-impl DriveHost for Echo<'_> {
-    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
-        (&mut self.0.dag, &mut self.0.registry)
-    }
-
-    fn exchange(
-        &mut self,
-        _view_id: u64,
-        batch: Cow<'_, Batch>,
-        _plan: &ScatterPlan,
-        _fold: bool,
-        drained: bool,
-    ) -> (Batch, bool) {
-        self.1 += 1;
-        (batch.into_owned(), drained)
-    }
-}
-
 /// Ticks of a worker beside three others, through views that exchange: a
 /// `GROUP BY`, a global `COUNT(*)` and a hash-keyed `DISTINCT`, per step over
 /// one row and per row of a wide tick; then wide ticks of a source eight
@@ -153,12 +131,12 @@ fn drive_round_bench() {
     try_register_view(&mut engine, circuit, "distinct", &hashed_cols, 0, 0).unwrap();
 
     let steps = engine.dag.tick_schedule(base).len() as u64;
-    let mut host = Echo(&mut engine, 0);
+    let mut host = EchoDrive::new(&mut engine);
     drive(&mut host, base, None);
-    let before = host.1;
+    let before = host.rounds;
     let ((), one_row) = counter.measure(|| {
         for i in 0..TICKS {
-            let d = delta(host.0, base, i..i + 1);
+            let d = delta(host.cat, base, i..i + 1);
             drive(&mut host, base, Some(d));
         }
     });
@@ -167,11 +145,11 @@ fn drive_round_bench() {
             drive(&mut host, base, None);
         }
     });
-    assert_eq!(host.1 - before, 2 * TICKS * steps, "a round a step, rows or none");
+    assert_eq!(host.rounds - before, 2 * TICKS * steps, "a round a step, rows or none");
     let wide: Vec<Batch> = (0..WIDE_TICKS)
         .map(|t| {
             delta(
-                host.0,
+                host.cat,
                 base,
                 TICKS + t * WIDE_TICK_ROWS..TICKS + (t + 1) * WIDE_TICK_ROWS,
             )

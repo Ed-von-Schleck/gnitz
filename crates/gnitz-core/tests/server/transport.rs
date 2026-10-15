@@ -187,7 +187,7 @@ fn assert_refused(target: &str, names: &str) {
 
 #[test]
 fn a_token_server_admits_only_a_held_token() {
-    let (srv, token) = ServerHandle::start_tls_with_token(4);
+    let (srv, token) = ServerHandle::start_tls_with_token(4, &[]);
     assert_refused(&srv.tls_target(), "requires an access token");
     let mut wrong = token.clone();
     wrong.replace_range(wrong.len() - 1.., if token.ends_with('0') { "1" } else { "0" });
@@ -205,7 +205,7 @@ fn a_token_server_admits_only_a_held_token() {
 
 #[test]
 fn a_sighup_reloads_the_token_file() {
-    let (mut srv, first) = ServerHandle::start_tls_with_token(4);
+    let (mut srv, first) = ServerHandle::start_tls_with_token(4, &[]);
     let (mut held, _, tid, schema) = client_with_table(&srv.token_target(&first));
 
     let second = srv.new_token("second");

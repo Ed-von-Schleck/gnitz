@@ -344,6 +344,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
 | `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
+| `gnitz-fuzz` | Dev-only: fuzzing through what a network delivers — seeds from recorded traffic, edits placed by what the decoders read, and the driver that plays edited traffic into a real server |
 
 ### The engine (`gnitz-zset` + `gnitz-store` + `gnitz-server`)
 
@@ -423,6 +424,7 @@ before anything is created.
 | `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
 | `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
 | `GNITZ_RAM_TIER_BYTES` | Per-store RAM-tier ceiling before it spills to a shard; shrink it to reach the disk regime on small data |
+| `GNITZ_RECORD_FRAMES` | A directory every client connection of the process records its frames into: fuzz seeds |
 
 ## Debug logging
 
@@ -707,6 +709,37 @@ in a `tests/` file. Add one there: name the test `*_bench`, mark it `#[ignore]`,
 measure only the hot region — instructions retired where the question is cost,
 wall clock where it is latency — and `std::hint::black_box` anything the
 optimizer could elide.
+
+## Fuzzing
+
+Everything a network delivers is fuzzed: the frames a client sends a server,
+and the frames a server sends back.
+
+```bash
+make fuzz-seeds                # record the traffic of every test that drives a server
+make fuzz-server JOBS=8        # real servers under AFL++: socket to store, master and workers
+make fuzz T=traffic            # in-process under libFuzzer + ASan: traffic, program, reply or hello
+make fuzz-replay IN=<file>     # one input, every frame traced
+```
+
+**Seeds are recorded traffic, and an input is a program of edits to one
+seed.** An edit is placed by what the production decoders read of a frame, so
+inputs follow a format when it changes, and no corpus is checked in.
+
+**A finding** is a server that stops, sends a frame a client cannot decode,
+leaves a request unanswered, keeps state no client can read back, or does not
+boot again on its own data; or a client that panics, or leaves a request
+unanswered, on any reply stream. A refusal is never a finding.
+
+A recording replays only against the catalog it was taken on, so a test
+recorded for seeds owns its server; the E2E suite gives each test one while
+`GNITZ_RECORD_FRAMES` is set. A recording of another wire format version is
+refused: record again after a format change.
+
+An in-process target is a `*_fuzz` test in a `fuzz/` module beside the code it
+reaches, attached as that module's tests and benchmarks are; plain `cargo test`
+runs each for a second on random inputs. Fuzzing needs a nightly toolchain,
+`cargo-afl` and `cargo-bolero`.
 
 ## Debugging failures
 

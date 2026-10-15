@@ -1,0 +1,25 @@
+[package]
+name = "gnitz-fuzz"
+description = "Fuzzing gnitz through everything a network delivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "gnitz-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+gnitz-core.workspace = true
+gnitz-expr.workspace = true
+gnitz-foundation.workspace = true
+gnitz-test-harness = { path = "../gnitz-test-harness" }
+gnitz-wire = { workspace = true, features = ["field-map"] }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

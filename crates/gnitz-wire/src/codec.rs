@@ -142,24 +142,33 @@ impl<'a> Reader<'a> {
         )
     }
 
+    /// The next `N` bytes, as the one integer field they are.
+    #[inline]
+    fn int<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self.take(N)?;
+        #[cfg(feature = "field-map")]
+        crate::fields::note_field(bytes);
+        Ok(bytes.try_into().unwrap())
+    }
+
     #[inline]
     pub fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+        Ok(self.int::<1>()?[0])
     }
     #[inline]
     pub fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.int()?))
     }
     #[inline]
     pub fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.int()?))
     }
     #[inline]
     pub fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(self.int()?))
     }
     pub fn u128(&mut self) -> Result<u128, String> {
-        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+        Ok(u128::from_le_bytes(self.int()?))
     }
 
     /// A boolean byte: `0` or `1`, and nothing else.
@@ -187,7 +196,10 @@ impl<'a> Reader<'a> {
     #[inline]
     pub fn bytes32(&mut self) -> Result<&'a [u8], String> {
         let n = self.u32()? as usize;
-        self.take(n)
+        let content = self.take(n)?;
+        #[cfg(feature = "field-map")]
+        crate::fields::note_section(&self.buf[self.off - n - 4..self.off - n], content);
+        Ok(content)
     }
 
     pub fn get<T: Wire>(&mut self) -> Result<T, String> {
@@ -208,11 +220,21 @@ impl<'a> Reader<'a> {
     /// A counted list of at most `cap` items — the inverse of [`Writer::list`].
     pub fn list<T: Wire>(&mut self, what: &str, cap: usize) -> Result<Vec<T>, String> {
         let n = self.count(what, cap)?;
+        #[cfg(feature = "field-map")]
+        let count = &self.buf[self.off - 2..self.off];
+        #[cfg(feature = "field-map")]
+        crate::fields::open_list(count);
         // Sized once: a fallible `collect` has no lower size hint.
         let mut items = Vec::with_capacity(n);
         for _ in 0..n {
+            #[cfg(feature = "field-map")]
+            let start = self.off;
             items.push(T::read(self)?);
+            #[cfg(feature = "field-map")]
+            crate::fields::list_item(&self.buf[start..self.off]);
         }
+        #[cfg(feature = "field-map")]
+        crate::fields::close_list(count);
         Ok(items)
     }
 

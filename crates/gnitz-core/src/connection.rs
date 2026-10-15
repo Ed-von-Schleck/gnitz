@@ -1048,5 +1048,9 @@ fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<
 mod tests;
 
 #[cfg(test)]
+#[path = "fuzz/connection.rs"]
+mod fuzz;
+
+#[cfg(test)]
 #[path = "benches/connection.rs"]
 mod bench;

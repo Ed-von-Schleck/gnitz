@@ -2,6 +2,9 @@
 //! private tmpdir. On a failing test the server's stderr tail is printed
 //! and the tmpdir is preserved for post-mortem; on a clean pass the
 //! tmpdir is removed.
+//!
+//! A server dies with the thread that started it, so no server outlives a
+//! test process that is killed rather than unwound.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -48,6 +51,11 @@ impl ServerHandle {
         self.paths.sock_path.to_str().expect("tmpdir path is not UTF-8")
     }
 
+    /// The server's data directory, where its workers' logs are too.
+    pub fn data_dir(&self) -> &Path {
+        &self.paths.data_dir
+    }
+
     pub fn start() -> Self {
         Self::start_n(1)
     }
@@ -85,10 +93,10 @@ impl ServerHandle {
         Self::start_inner(workers, &[], Some("127.0.0.1:0"), Auth::ClientCa)
     }
 
-    /// [`Self::start_tls`] requiring an access token, and the one its token
-    /// file holds at boot.
-    pub fn start_tls_with_token(workers: usize) -> (Self, String) {
-        let mut srv = Self::start_inner(workers, &[], Some("127.0.0.1:0"), Auth::Token);
+    /// [`Self::start_tls_with_env`] requiring an access token, and the one its
+    /// token file holds at boot.
+    pub fn start_tls_with_token(workers: usize, extra_env: &[(&str, &str)]) -> (Self, String) {
+        let mut srv = Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), Auth::Token);
         let token = srv.first_token.take().expect("a token server mints its first token");
         (srv, token)
     }
@@ -125,9 +133,23 @@ impl ServerHandle {
         .unwrap_or_else(|e| panic!("the server never reported the reload: {e}"))
     }
 
-    /// Whether the server is still running; a worker's death stops the master too.
+    /// Whether the master and every worker it forked are running. A worker's
+    /// death stops the master too, but only once its death watch next looks;
+    /// a dead worker is a zombie of the master until then.
     pub fn is_alive(&mut self) -> bool {
-        self.process.try_wait().expect("try_wait").is_none()
+        if self.process.try_wait().expect("try_wait").is_some() {
+            return false;
+        }
+        let pid = self.process.id();
+        // The master's main thread forks the workers. A master gone in between
+        // has no children file, and the next look at it answers.
+        let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        children.split_whitespace().all(|child| {
+            fs::read_to_string(format!("/proc/{child}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().to_owned()))
+                .is_some_and(|rest| !rest.starts_with('Z'))
+        })
     }
 
     /// A missing binary panics rather than skips: a suite passing without a
@@ -261,9 +283,6 @@ impl ServerHandle {
         }
         self.process.kill().ok();
         self.process.wait().ok();
-        // The killed master can still accept for a moment after `wait()`, and the
-        // new boot would refuse a socket something answers on.
-        fs::remove_file(&self.paths.sock_path).ok();
         self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.args)
             // ServerHandle::Drop preserves the tmpdir during the unwind.
             .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
@@ -340,6 +359,14 @@ fn spawn_and_wait_ready(
     let offset = stderr_file.metadata().expect("stderr log metadata").len();
 
     let mut cmd = Command::new(&paths.bin);
+    // SAFETY: `prctl` is async-signal-safe, and the closure allocates nothing.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
     cmd.arg(&paths.data_dir)
         .arg(&paths.sock_path)
         .stdout(Stdio::null())
@@ -513,6 +540,8 @@ pub fn strace_test(child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCoun
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // A child recording its frames would count the recording's own writes.
+    cmd.env_remove("GNITZ_RECORD_FRAMES");
     let out = cmd.output().expect("spawn strace");
     assert!(
         out.status.success(),

@@ -1,6 +1,11 @@
 //! Client transport: frames over an AF_UNIX stream socket or TLS 1.3 over TCP
 //! (`tls.rs`), the same wire bytes on both. Nothing here waits except the HELLO
 //! exchange inside [`ClientTransport::connect`].
+//!
+//! It is the frame layer under a [`Session`](crate::Session), which knows which
+//! request a frame answers; this layer knows only frames. A connection of a
+//! process that records ([`crate::recording`]) records every frame it sends or
+//! receives after its HELLO.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -14,6 +19,7 @@ use std::time::Instant;
 use gnitz_wire::{AuthStatus, Deframer, FrameLenError, HelloError};
 
 use super::error::ProtocolError;
+use crate::recording::{Direction, Tap};
 use crate::ClientError;
 
 mod tls;
@@ -28,6 +34,8 @@ pub struct ClientTransport {
     /// A read ended with bytes of it unfed, so the stream has lost its framing.
     torn: bool,
     queue: OutQueue,
+    /// Where this connection records its frames, when its process records.
+    tap: Option<Tap>,
 }
 
 /// Bytes one socket read can take, short of a read straight into a payload.
@@ -144,6 +152,7 @@ impl ClientTransport {
             window: Box::new_uninit_slice(WINDOW_BYTES),
             torn: false,
             queue: OutQueue::default(),
+            tap: None,
         }
     }
 
@@ -161,6 +170,7 @@ impl ClientTransport {
             None => (ClientTransport::unix(UnixStream::connect(target)?)?, Vec::new()),
         };
         t.hello(&token, until)?;
+        t.tap = Tap::open(target);
         Ok(t)
     }
 
@@ -232,13 +242,16 @@ impl ClientTransport {
 
     /// Queue an owned frame behind everything already queued. Nothing is
     /// written here; `flush` ships the queue.
-    pub(crate) fn enqueue(&mut self, payload: Vec<u8>) {
+    pub fn enqueue(&mut self, payload: Vec<u8>) {
+        if let Some(tap) = &self.tap {
+            tap.note(Direction::Sent, &payload);
+        }
         self.queue.push(gnitz_wire::frame_len_prefix(payload.len()), payload);
     }
 
     /// Write what the fd accepts from the queue cursor. Never parks; what is
     /// left is reported by `wants_write`.
-    pub(crate) fn flush(&mut self) -> Result<(), ProtocolError> {
+    pub fn flush(&mut self) -> Result<(), ProtocolError> {
         loop {
             self.inner.ship_ciphertext()?;
             if self.inner.has_pending_ciphertext() || self.queue.is_empty() {
@@ -262,14 +275,14 @@ impl ClientTransport {
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
     /// interest. On TLS the ciphertext can outlast the queue that emptied into
     /// it.
-    pub(crate) fn wants_write(&self) -> bool {
+    pub fn wants_write(&self) -> bool {
         !self.queue.is_empty() || self.inner.has_pending_ciphertext()
     }
 
     /// Shut the socket down so the peer sees EOF, and drop every queued frame.
     /// The fd stays open until the transport drops, since a reactor may still
     /// have it registered.
-    pub(crate) fn close(&mut self) {
+    pub fn close(&mut self) {
         // SAFETY: `as_raw_fd` is this transport's own open socket.
         let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
         self.queue = OutQueue::default();
@@ -277,11 +290,11 @@ impl ClientTransport {
 
     /// One read of the socket, handing `on_frame` every frame it completes.
     /// True when the read filled its window, so more may be waiting.
-    pub(crate) fn read(
+    pub fn read(
         &mut self,
         mut on_frame: impl FnMut(Cow<'_, [u8]>) -> Result<(), ProtocolError>,
     ) -> Result<bool, ProtocolError> {
-        let ClientTransport { inner, deframer, window, torn, .. } = self;
+        let ClientTransport { inner, deframer, window, torn, tap, .. } = self;
         if *torn {
             return Err(std::io::Error::other("an earlier read was abandoned with bytes unfed").into());
         }
@@ -294,6 +307,9 @@ impl ClientTransport {
         let Some(n) = recv(fd, into)? else { return Ok(false) };
         let mut feed = |deframer: &mut Deframer, mut src: &[u8]| {
             while let Some((frame, ())) = deframer.feed(&mut src, |_| Ok::<_, ProtocolError>(()))? {
+                if let Some(tap) = tap {
+                    tap.note(Direction::Received, &frame);
+                }
                 on_frame(frame)?;
             }
             Ok::<_, ProtocolError>(())

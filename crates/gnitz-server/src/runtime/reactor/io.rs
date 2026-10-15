@@ -343,3 +343,7 @@ impl RecvFilter for Plain {
 #[cfg(test)]
 #[path = "tests/io.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fuzz/io.rs"]
+mod fuzz;

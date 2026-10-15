@@ -299,6 +299,43 @@ impl crate::query::DriveHost for LocalDrive<'_> {
     }
 }
 
+/// A drive host whose exchange hands its one worker its own rows back: every
+/// round of a drive runs, as at one worker, at the cost of everything but the
+/// mesh. Counts the rounds it exchanged.
+pub struct EchoDrive<'a> {
+    pub cat: &'a mut CatalogEngine,
+    pub rounds: u64,
+}
+
+impl<'a> EchoDrive<'a> {
+    pub fn new(cat: &'a mut CatalogEngine) -> Self {
+        EchoDrive { cat, rounds: 0 }
+    }
+}
+
+impl crate::query::DriveHost for EchoDrive<'_> {
+    fn parts(
+        &mut self,
+    ) -> (
+        &mut crate::query::DagEngine,
+        &mut gnitz_store::relation::RelationRegistry,
+    ) {
+        (&mut self.cat.dag, &mut self.cat.registry)
+    }
+
+    fn exchange(
+        &mut self,
+        _view_id: u64,
+        batch: std::borrow::Cow<'_, Batch>,
+        _plan: &gnitz_zset::algebra::ScatterPlan,
+        _fold: bool,
+        drained: bool,
+    ) -> (Batch, bool) {
+        self.rounds += 1;
+        (batch.into_owned(), drained)
+    }
+}
+
 // ── DDL entry ────────────────────────────────────────────────────────────
 
 /// A `DDL_TXN` bundle of `blocks`, one per family.

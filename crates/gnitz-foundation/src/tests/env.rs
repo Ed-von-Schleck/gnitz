@@ -27,6 +27,7 @@ fn flag_reads_its_spellings_in_any_case_and_nothing_else() {
 fn an_unset_variable_reads_as_its_default() {
     assert_eq!(env_num("GNITZ_TEST_ENV_UNSET", 7u64), 7);
     assert!(env_flag("GNITZ_TEST_ENV_UNSET", true));
+    assert_eq!(env_path("GNITZ_TEST_ENV_UNSET"), None);
     assert_eq!(read("GNITZ_X", None, 7u64, positive, ""), 7);
 }
 

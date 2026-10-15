@@ -35,6 +35,10 @@ ring = "0.17"
 # schema-codec suite).
 gnitz-core = { path = "../gnitz-core" }
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
+# The in-process fuzz targets: inputs and seeds are the session fuzzer's, and
+# `cargo bolero` runs a target under libFuzzer.
+gnitz-fuzz = { path = "../gnitz-fuzz" }
+bolero = "0.13"
 proptest.workspace = true
 tempfile.workspace = true
 

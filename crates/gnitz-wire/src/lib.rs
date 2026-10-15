@@ -145,6 +145,8 @@ mod xxh;
 
 pub mod control;
 pub mod decimal;
+#[cfg(feature = "field-map")]
+pub mod fields;
 pub mod schema_block;
 pub mod sys_rows;
 pub mod txn_frame;

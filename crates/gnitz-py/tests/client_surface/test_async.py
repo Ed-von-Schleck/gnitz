@@ -280,7 +280,9 @@ def _strace_counts(target, tid, n, mode):
     out = subprocess.run(
         ["strace", "-f", "-c", "-o", "/dev/stdout",
          *_childproc.argv("_aiochild", "syscalls", target, tid, n, mode)],
-        capture_output=True, text=True, timeout=180, env=_childproc.env())
+        capture_output=True, text=True, timeout=180,
+        # A child recording its frames would count the recording's own writes.
+        env={k: v for k, v in _childproc.env().items() if k != "GNITZ_RECORD_FRAMES"})
     assert out.returncode == 0, f"child exited {out.returncode}\n{out.stdout}\n{out.stderr}"
     counts = {}
     for line in out.stdout.splitlines():

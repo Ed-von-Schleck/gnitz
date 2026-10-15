@@ -2476,3 +2476,7 @@ fn u64_verdict(rule: U64Rule, ops: &Operands, col_is_u64: bool, so_far: u64) -> 
 #[cfg(test)]
 #[path = "tests/program.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fuzz/program.rs"]
+mod fuzz;

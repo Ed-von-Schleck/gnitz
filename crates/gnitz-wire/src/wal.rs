@@ -7,7 +7,7 @@
 //! The dead-byte bound is the writer's claim, which an untrusting reader
 //! recomputes.
 
-use crate::{read_u32_le, write_u32_le, SYS_SCHEMA_DIGEST};
+use crate::{read_u32_le, write_u32_le, Reader, SYS_SCHEMA_DIGEST};
 
 pub const WAL_HEADER_SIZE: usize = 20;
 
@@ -113,16 +113,17 @@ pub type ParsedBlock<'a> = (usize, &'a [u8], &'a [u8], usize);
 /// block.
 pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'static str> {
     let block = block_slice(block)?;
-    if read_u32_le(block, WAL_OFF_VERSION) != WAL_FORMAT_VERSION {
+    let mut r = Reader::new(block);
+    // The header's words in layout order; `block_slice` has seen it whole.
+    let [_, version, rows, heap_len, heap_dead] = [(); 5].map(|()| r.u32().expect("a whole header") as usize);
+    debug_assert_eq!(r.pos(), WAL_HEADER_SIZE);
+    if version as u32 != WAL_FORMAT_VERSION {
         return Err("unknown block version");
     }
     let size = block.len();
-    let rows = read_u32_le(block, WAL_OFF_ROWS) as usize;
     if rows == 0 {
         return Err("block holds no rows");
     }
-    let heap_len = read_u32_le(block, WAL_OFF_HEAP_LEN) as usize;
-    let heap_dead = read_u32_le(block, WAL_OFF_HEAP_DEAD) as usize;
     let fixed_end = rows.checked_mul(row_width).and_then(|f| f.checked_add(WAL_HEADER_SIZE));
     let Some(fixed_end) = fixed_end.filter(|&e| e.checked_add(heap_len) == Some(size)) else {
         return Err("block size does not match its rows and heap");

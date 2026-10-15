@@ -27,6 +27,12 @@ _LOG_PATH = os.path.join(_TMP_DIR, "server_debug.log")
 # after a green run — `--basetemp` disables both.
 os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", _TMP_DIR)
 
+# `GNITZ_RECORD_FRAMES` (`make fuzz-seeds`) has every client connection record
+# its frames, and a recording replays only against the catalog it was taken on.
+# So while it is set, each test, and each module's shared client, is served by a
+# fresh server of its own rather than the session's.
+_RECORDING = bool(os.environ.get("GNITZ_RECORD_FRAMES"))
+
 # AF_UNIX caps sun_path at 108 bytes including the NUL, and the failure is an
 # opaque errno rather than a message naming the path. Every socket the suite
 # creates goes through `_sock_path`, which holds them under this budget; the
@@ -142,11 +148,42 @@ def _session_target(srv, tmp_path_factory, user):
     return srv.target
 
 
+@contextlib.contextmanager
+def _fresh_proc(tmp_path_factory, sock_path):
+    """A server of its own, stopped and reclaimed on exit."""
+    proc = ServerProc(str(tmp_path_factory.mktemp("r") / "data"), sock_path)
+    proc.start()
+    try:
+        yield proc
+    finally:
+        proc.stop()
+        shutil.rmtree(os.path.dirname(proc.data_dir), ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _serving(_srv, tmp_path_factory, _sock_path, request):
+    """The session server; a fresh server while recording."""
+    if _RECORDING:
+        with _fresh_proc(tmp_path_factory, _sock_path()) as proc:
+            yield proc
+    else:
+        _session_target(_srv, tmp_path_factory, request.node.nodeid)
+        yield _srv
+
+
 @pytest.fixture
-def server(_srv, tmp_path_factory, request):
+def server_proc(_srv, tmp_path_factory, _sock_path, request):
+    """The `ServerProc` behind `server`, for a test that needs more of it than
+    its connect target, such as its TLS address."""
+    with _serving(_srv, tmp_path_factory, _sock_path, request) as proc:
+        yield proc
+
+
+@pytest.fixture
+def server(server_proc):
     """Connect target of the session server (socket path, or the TLS address
     under GNITZ_TRANSPORT=tls)."""
-    return _session_target(_srv, tmp_path_factory, request.node.nodeid)
+    return server_proc.target
 
 
 @contextlib.contextmanager
@@ -180,11 +217,12 @@ def client(server):
 
 
 @pytest.fixture(scope="module")
-def module_client(_srv, tmp_path_factory, request):
+def module_client(_srv, tmp_path_factory, _sock_path, request):
     """A connection and schema shared by one module — for fixtures whose data no
     test changes, built once instead of once per case."""
-    with _in_fresh_schema(_session_target(_srv, tmp_path_factory, request.node.nodeid), "m") as conn:
-        yield conn
+    with _serving(_srv, tmp_path_factory, _sock_path, request) as proc:
+        with _in_fresh_schema(proc.target, "m") as conn:
+            yield conn
 
 
 @pytest.fixture

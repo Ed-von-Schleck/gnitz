@@ -9,6 +9,8 @@ pub(crate) use config::{Served, TlsArgs, TlsListener};
 #[cfg(test)]
 pub(crate) use config::{TLS_CERT_FILE, TLS_KEY_FILE};
 pub(crate) use tokens::mint as mint_token;
+#[cfg(test)]
+pub(crate) use tokens::Tokens;
 
 use std::cell::RefCell;
 use std::io::{BufRead, ErrorKind, Write};

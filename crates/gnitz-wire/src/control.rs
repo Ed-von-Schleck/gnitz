@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use crate::codec::Reader;
 use crate::flags::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
-use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
+use crate::{write_u32_le, write_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
 
 // Layout (all little-endian):
 //   [0,4)   STATUS     u32   `WireStatus`
@@ -188,17 +188,18 @@ pub fn encode_frame_head(
 /// Decode the control header at the front of the whole frame `data`, and locate
 /// the blocks behind it.
 pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
+    if data.len() < CTRL_HEADER_SIZE {
+        return Err("control header truncated".into());
+    }
     let mut r = Reader::new(data);
-    let h: &[u8; CTRL_HEADER_SIZE] = r
-        .take(CTRL_HEADER_SIZE)
-        .map_err(|_| "control header truncated")?
-        .try_into()
-        .unwrap();
-    let blob_len = read_u32_le(h, OFF_BLOB_LEN) as usize;
-    r.take(blob_len).map_err(|_| "control blob runs past the frame")?;
+    // The header's words in layout order, each read whole: none can run short.
+    let [status, blob_len] = [(); 2].map(|()| r.u32().expect("a whole header"));
+    let [word, target_id, arg0, arg1] = [(); 4].map(|()| r.u64().expect("a whole header"));
+    debug_assert_eq!(r.pos(), CTRL_HEADER_SIZE);
+    r.take(blob_len as usize)
+        .map_err(|_| "control blob runs past the frame")?;
     let blob = CTRL_HEADER_SIZE..r.pos();
-    let status = WireStatus::from_wire(read_u32_le(h, OFF_STATUS)).ok_or("control header names no status")?;
-    let word = read_u64_le(h, OFF_FLAGS);
+    let status = WireStatus::from_wire(status).ok_or("control header names no status")?;
     let flags = WireFlags::unpack(word)?;
     let schema = if word & FLAG_HAS_SCHEMA != 0 {
         let s = r.bytes32().map_err(|e| format!("schema record: {e}"))?;
@@ -214,13 +215,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
         None
     };
     Ok(DecodedControl {
-        hdr: ControlHeader {
-            status,
-            flags,
-            target_id: read_u64_le(h, OFF_TARGET_ID),
-            arg0: read_u64_le(h, OFF_ARG0),
-            arg1: read_u64_le(h, OFF_ARG1),
-        },
+        hdr: ControlHeader { status, flags, target_id, arg0, arg1 },
         blob,
         body: r.pos()..data.len(),
         schema,

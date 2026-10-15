@@ -78,6 +78,23 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
     Ok((family, batch))
 }
 
+/// A `DDL_TXN` body as one block per family, each family's wal-block slice
+/// materialised into an owned batch under its own schema — see
+/// [`decode_sys_family`]. One slot per family: every list derived from a bundle
+/// reads one block of each.
+pub(super) fn decode_bundle(body: &[u8]) -> Result<[Option<Batch>; SysFamily::COUNT], WireFault> {
+    let items =
+        gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(|e| format!("decode error: {e}"))?;
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    for (frame, ctrl) in items {
+        let (family, batch) = decode_sys_family(frame, ctrl).map_err(|e| format!("DDL_TXN: {e}"))?;
+        if families[family.index()].replace(batch).is_some() {
+            return Err(format!("DDL_TXN: bundle carries two blocks for family {}", family.id()).into());
+        }
+    }
+    Ok(families)
+}
+
 /// Atomic DDL transaction: ingest a bundle of system-table family batches under
 /// one durable SAL zone. Reached only via the `DDL_TXN` route. Every catalog
 /// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
@@ -98,19 +115,9 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// one could only describe a relation that does not exist.
 pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
     let t_ddl_start = Instant::now();
-    // Decode the bundle and materialise each family's wal-block slice into an
-    // owned Batch up front (before any lock) — see `decode_sys_family`.
-    let items =
-        gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(|e| format!("decode error: {e}"))?;
-    let family_count = items.len();
-    // One slot per family: every list derived below reads one block of each.
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    for (frame, ctrl) in items {
-        let (family, batch) = decode_sys_family(frame, ctrl).map_err(|e| format!("DDL_TXN: {e}"))?;
-        if families[family.index()].replace(batch).is_some() {
-            return Err(format!("DDL_TXN: bundle carries two blocks for family {}", family.id()).into());
-        }
-    }
+    // Decoded up front, before any lock.
+    let families = decode_bundle(body)?;
+    let family_count = families.iter().flatten().count();
 
     let unique_creates = families[SysFamily::Index.index()]
         .as_ref()

@@ -12,6 +12,7 @@ mod error;
 mod mirror;
 mod protocol;
 mod pushed;
+pub mod recording;
 mod rel_name;
 #[cfg(test)]
 mod test_support;
@@ -30,7 +31,7 @@ pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Sub
 pub use protocol::error::ProtocolError;
 pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};
-pub(crate) use protocol::transport::ClientTransport;
+pub use protocol::transport::ClientTransport;
 pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };

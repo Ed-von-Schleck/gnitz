@@ -1,4 +1,4 @@
-//! Numeric and boolean `GNITZ_*` overrides. The parse rules are pure functions
+//! Numeric, boolean and path `GNITZ_*` overrides. The parse rules are pure functions
 //! of the raw value, shared with `fault`'s seams. A reader returns the `default`
 //! it names only for an unset variable; a value its rule rejects panics, so no
 //! reader selects a value the operator did not ask for.
@@ -48,6 +48,14 @@ pub fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default:
 pub fn env_flag(name: &str, default: bool) -> bool {
     let raw = std::env::var(name).ok();
     read(name, raw.as_deref(), default, flag, "a boolean (0|1|true|false|yes|no)")
+}
+
+/// A path env override, `None` when unset; an empty value, which names no
+/// path, panics.
+pub fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os(name)?;
+    assert!(!raw.is_empty(), "{name}=\"\" is not a path");
+    Some(raw.into())
 }
 
 #[cfg(test)]

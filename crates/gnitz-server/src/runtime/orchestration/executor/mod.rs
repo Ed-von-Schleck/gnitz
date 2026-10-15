@@ -1255,5 +1255,9 @@ fn check_stream_push(target_id: u64, batch: Option<&Batch>, mode: gnitz_wire::Wi
 }
 
 #[cfg(test)]
+#[path = "fuzz/executor.rs"]
+mod fuzz;
+
+#[cfg(test)]
 #[path = "tests/executor.rs"]
 mod tests;

@@ -10,6 +10,10 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# `gnitz_wire::fields`: the field map of what a decode read, for the fuzzer.
+field-map = []
+
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
