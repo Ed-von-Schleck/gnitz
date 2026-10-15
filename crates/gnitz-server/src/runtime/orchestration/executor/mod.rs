@@ -45,8 +45,6 @@ use gnitz_wire::txn_frame::ScanItem;
 use gnitz_wire::{ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
-const TICK_COALESCE_ROWS: usize = 10_000;
-
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
 /// would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
@@ -182,6 +180,9 @@ pub struct Shared {
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
     tick_rows: RefCell<FxHashMap<u64, usize>>,
+    /// The pending rows of one table that fire an auto-tick.
+    /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
+    tick_coalesce_rows: usize,
     sync_waiters: SyncWaiters,
     feeds: Feeds,
     /// The most bytes of pushed trains sent one connection between two of its
@@ -373,7 +374,7 @@ impl Shared {
             for (tid, n) in rows.filter(|&(tid, _)| dag.is_scanned(tid)) {
                 *pending.entry(tid).or_insert(0) += n;
             }
-            pending.values().any(|&rows| rows >= TICK_COALESCE_ROWS)
+            pending.values().any(|&rows| rows >= self.tick_coalesce_rows)
         };
         if crossed {
             self.tick_tx.send(TickTrigger::Auto);
@@ -423,6 +424,7 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
         tick_tx,
         last_tick_lsn: Cell::new(boot_seed),
         tick_rows: RefCell::new(FxHashMap::default()),
+        tick_coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
         sync_waiters: SyncWaiters::default(),
         feeds,
         push_queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),

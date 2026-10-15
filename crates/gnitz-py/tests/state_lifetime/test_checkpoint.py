@@ -21,13 +21,17 @@ from _schemas import KV
 from _serverproc import MULTI, START_TIMEOUT, join_or_fail, spawn
 
 
+_COALESCE = 1_000
+
+
 @pytest.fixture
 def target(own_server):
     """Connect target of a server whose SAL checkpoints at 32 KB: a single push
     of ~500 rows encodes to roughly 30-60 KB, so checkpoints fire repeatedly
-    during a test's own writes. Multi-worker, since an exchange is what a
-    checkpoint can strand."""
-    return own_server.start(workers=MULTI, extra_env={"GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}).target
+    during a test's own writes. A table's pending rows auto-tick at `_COALESCE`.
+    Multi-worker, since an exchange is what a checkpoint can strand."""
+    return own_server.start(workers=MULTI, extra_env={
+        "GNITZ_CHECKPOINT_BYTES": str(32 * 1024), "GNITZ_TICK_COALESCE_ROWS": str(_COALESCE)}).target
 
 
 def _flood(client, tid, started, n_batches=12, batch_size=400):
@@ -46,7 +50,7 @@ _HUNG = "a thread hung during a concurrent checkpoint"
 
 
 def test_a_view_tracks_its_base_across_frequent_checkpoints(target):
-    """15 000 rows exceeds TICK_COALESCE_ROWS (10 000), so ticks fire mid-sequence
+    """3 000 rows exceed `_COALESCE` three times, so ticks fire mid-sequence
     and a checkpoint lands between committed-but-unticked view deltas and the tick
     that would apply them. If the checkpoint's flush discards the workers'
     buffered deltas the base keeps the rows but no later tick ever reaches the
@@ -56,9 +60,9 @@ def test_a_view_tracks_its_base_across_frequent_checkpoints(target):
     tid = client.create_table("t", KV)
     client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t")
 
-    total = 15_000
-    for base in range(0, total, 1_000):
-        client.push(tid, gnitz.ZSetBatch(KV).extend({"pk": i, "val": i} for i in range(base, base + 1_000)))
+    total = 3_000
+    for base in range(0, total, 500):
+        client.push(tid, gnitz.ZSetBatch(KV).extend({"pk": i, "val": i} for i in range(base, base + 500)))
 
     want = {(i, i): 1 for i in range(total)}
     assert bag(scanned(client, "t"), "pk", "val") == want, "rows lost at a checkpoint"
@@ -77,7 +81,7 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(target):
     pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t")
     vid, v_schema = pusher.resolve_table("v")
 
-    n_batches, batch_size = 40, 300   # 300 < TICK_COALESCE_ROWS: no auto-tick
+    n_batches, batch_size = 40, 300   # 300 < _COALESCE: no auto-tick per batch
     started = threading.Event()
 
     def scan_loop():

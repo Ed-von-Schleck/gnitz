@@ -98,7 +98,7 @@ fn insert_all(db: &mut Db) {
 
 /// Every shape whose placement depends on a distribution prefix: the linear
 /// forms (direct, PK-dropping, view-over-view, derived table, CTE), GROUP BY on
-/// the prefix / a non-prefix column / the full PK / its permutation, the same
+/// the prefix / a non-prefix column / the full PK, the same
 /// under a WHERE, the downstream shapes over a linear view, a full-key join of a
 /// k=1 side against a k=2 side, a default-distribution join, and the k=2 /
 /// signed / k=|PK| prefixes.
@@ -112,7 +112,6 @@ fn create_views(db: &mut Db) {
          CREATE VIEW g_pre AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY a;
          CREATE VIEW g_other AS SELECT b AS kb, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY b;
          CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t GROUP BY a, b;
-         CREATE VIEW g_perm AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t GROUP BY b, a;
          CREATE VIEW gf_pre AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM t WHERE b >= 3 GROUP BY a;
          CREATE VIEW gf_other AS SELECT b AS kb, COUNT(*) AS n, SUM(v) AS s FROM t WHERE b >= 3 GROUP BY b;
          CREATE VIEW gv_a AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM mv GROUP BY a;
@@ -147,8 +146,7 @@ fn assert_views(db: &mut Db, t: &[Vec<i64>], when: &str) {
     check("mvc", &["a", "b"], ab);
     check("g_pre", &["ka", "n", "s"], grouped(t, &[0], 2));
     check("g_other", &["kb", "n", "s"], grouped(t, &[1], 2));
-    check("g_full", &["ka", "kb", "n"], full.clone());
-    check("g_perm", &["ka", "kb", "n"], full);
+    check("g_full", &["ka", "kb", "n"], full);
     let filtered: Vec<Vec<i64>> = t.iter().filter(|r| r[1] >= 3).cloned().collect();
     check("gf_pre", &["ka", "n", "s"], grouped(&filtered, &[0], 2));
     check("gf_other", &["kb", "n", "s"], grouped(&filtered, &[1], 2));

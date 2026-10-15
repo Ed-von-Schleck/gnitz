@@ -231,9 +231,6 @@ def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(
     """A key toggling NULL ↔ real moves the row between the match branch and the
     bypass branch, which must be exact complements at every tick. A stale verdict
     leaves the old row at weight 1 beside the new one.
-
-    Going back to NULL is a delete plus an insert because `SET col = NULL` is not
-    expressible — orthogonal to the key path under test.
     """
     client.execute_sql(
         f"CREATE VIEW v AS SELECT l.id AS id, r.name AS name "
@@ -247,8 +244,7 @@ def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(
     client.execute_sql("UPDATE l SET fk = 5 WHERE id = 1")
     assert bag(scanned(client, "v"), "id", "name") == {(1, 905): 1}
 
-    client.execute_sql("DELETE FROM l WHERE id = 1")
-    client.execute_sql("INSERT INTO l VALUES (1, NULL)")
+    client.execute_sql("UPDATE l SET fk = NULL WHERE id = 1")
     assert bag(scanned(client, "v"), "id", "name") == unmatched
 
     client.execute_sql("DELETE FROM l WHERE id = 1")

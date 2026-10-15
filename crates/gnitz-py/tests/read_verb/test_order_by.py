@@ -280,4 +280,4 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
     want = {}
     for r, w in _window(full, 333, 900):
         want[(r["v"],)] = want.get((r["v"],), 0) + w
-    assert bag(got) == dict(sorted(want.items(), key=repr))
+    assert bag(got) == want

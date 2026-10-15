@@ -17,6 +17,7 @@ import gnitz
 import pytest
 from _serverproc import NEEDS_MULTI
 from _read import bag, rows, scanned
+from _shapes import ONE_SOURCE_OPS, setop
 from _sql import churn, insert, values
 
 pytestmark = NEEDS_MULTI
@@ -69,14 +70,13 @@ def test_a_read_of_a_replicated_table_returns_one_copy(dim, where, keep):
     assert bag(got, "id", "cust", "val") == {r: 1 for r in _DIM if keep(*r)}
 
 
-@pytest.mark.parametrize("options", ["replicated = true", "stream = true, replicated = true"],
-                         ids=["table", "stream"])
-def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, options):
-    """Every worker holds the whole relation, so a view that combined the copies
-    would count each row W times."""
+def test_an_aggregate_over_a_replicated_stream_counts_one_copy(client):
+    """Every worker ingests the whole stream, so a view that combined the copies
+    would count each row W times. A replicated table's aggregates are among the
+    shapes below."""
     client.execute_sql(
         "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
-        f"amount BIGINT NOT NULL) WITH ({options}); "
+        "amount BIGINT NOT NULL) WITH (stream = true, replicated = true); "
         "CREATE VIEW per_grp AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
         "FROM src GROUP BY grp; "
         "CREATE VIEW overall AS SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM src; "
@@ -153,13 +153,11 @@ def test_every_write_reaches_every_copy(client):
 
 # ── Every shape over every replicated placement ──────────────────────────────
 
-_SETOPS = {"ua": "UNION ALL", "u": "UNION", "ia": "INTERSECT ALL", "i": "INTERSECT",
-           "ea": "EXCEPT ALL", "e": "EXCEPT"}
 _PAIR = "SELECT a.pk AS l, b.pk AS r FROM a"
 
 # view -> (columns read back, body)
 _VIEWS = {
-    **{n: (("k", "x"), f"SELECT k, x FROM a {op} SELECT k, y FROM b") for n, op in _SETOPS.items()},
+    **{f"s_{n}": (("k", "x"), f"SELECT k, x FROM a {op} SELECT k, y FROM b") for n, op in ONE_SOURCE_OPS.items()},
     "dist": (("k",), "SELECT DISTINCT k FROM a"),
     "twice": (("k", "x"), "SELECT k, x FROM a UNION ALL SELECT k, x FROM a"),
     "eq": (("l", "r"), f"{_PAIR} JOIN b ON a.k = b.k"),
@@ -177,8 +175,13 @@ _VIEWS = {
     "not_in_b": (("pk",), "SELECT pk FROM a WHERE k NOT IN (SELECT k FROM b)"),
     "in_pk": (("pk",), "SELECT pk FROM a WHERE k IN (SELECT pk FROM b)"),
     "not_in_pk": (("pk",), "SELECT pk FROM a WHERE k NOT IN (SELECT pk FROM b)"),
-    "per_k": (("k", "n"), "SELECT k, COUNT(*) AS n FROM ua GROUP BY k"),
-    "c_and_ua": (("k", "x"), "SELECT k, x FROM c UNION ALL SELECT k, x FROM ua"),
+    "lt_max": (("pk",), "SELECT pk FROM a WHERE x < (SELECT MAX(y) FROM b)"),
+    "n_b": (("pk", "n"), "SELECT pk, (SELECT COUNT(*) FROM b) AS n FROM a"),
+    "per_k_a": (("k", "n", "s"), "SELECT k, COUNT(*) AS n, SUM(x) AS s FROM a GROUP BY k"),
+    "overall": (("n", "s"), "SELECT COUNT(*) AS n, SUM(x) AS s FROM a"),
+    "top2": (("pk", "x"), "SELECT pk, x FROM a ORDER BY pk DESC LIMIT 2"),
+    "per_k": (("k", "n"), "SELECT k, COUNT(*) AS n FROM s_ua GROUP BY k"),
+    "c_and_ua": (("k", "x"), "SELECT k, x FROM c UNION ALL SELECT k, x FROM s_ua"),
 }
 
 # (k, x) rows of `a` repeat, some of them also in `b`, and `x` is sometimes
@@ -187,15 +190,17 @@ _A = {p: (p % 4, None if p % 7 == 0 else p % 6) for p in range(1, 17)}
 _B = {p: (p % 3, p % 5) for p in range(1, 13)}
 _C = {p: (p % 4, p % 6) for p in range(1, 7)}
 
-# (statement, table, changes)
+# (statement, table, changes): `a` meets a `b` never populated first, and one
+# emptied again last.
 _CHURN = [
-    (f"INSERT INTO b VALUES {values((p, *r) for p, r in _B.items())}", "b", _B),
-    (f"INSERT INTO c VALUES {values((p, *r) for p, r in _C.items())}", "c", _C),
     (f"INSERT INTO a VALUES {values((p, *r) for p, r in _A.items())}", "a", _A),
+    (f"INSERT INTO c VALUES {values((p, *r) for p, r in _C.items())}", "c", _C),
+    (f"INSERT INTO b VALUES {values((p, *r) for p, r in _B.items())}", "b", _B),
     ("DELETE FROM a WHERE pk IN (5, 10, 15)", "a", dict.fromkeys((5, 10, 15))),
     ("UPDATE b SET y = y + 3 WHERE pk IN (1, 5, 9)",
      "b", {p: (_B[p][0], _B[p][1] + 3) for p in (1, 5, 9)}),
     ("DELETE FROM b WHERE pk > 8", "b", dict.fromkeys(range(9, 13))),
+    ("DELETE FROM b", "b", dict.fromkeys(range(1, 9))),
 ]
 
 
@@ -224,17 +229,22 @@ def _want(a, b, c):
     def rng(ak, x, bk, y):
         return _lt(x, y)
 
+    def total(xs):
+        xs = [x for x in xs if x is not None]
+        return sum(xs) if xs else None
+
     b_keys = {bk for bk, _ in b.values()}
+    top = max((y for _, y in b.values()), default=None)
+    by_k = {}
+    for k, x in a.values():
+        by_k.setdefault(k, []).append(x)
     return {
-        "ua": ca + cb, "u": dict.fromkeys(ca | cb, 1),
-        "ia": ca & cb, "i": dict.fromkeys(ca & cb, 1),
-        "ea": ca - cb, "e": dict.fromkeys(ca.keys() - cb.keys(), 1),
+        **{f"s_{n}": setop(op, ca, cb) for n, op in ONE_SOURCE_OPS.items()},
         "dist": dict.fromkeys(((k,) for k, _ in a.values()), 1),
         "twice": ca + ca,
         "eq": pairs(lambda ak, x, bk, y: ak == bk),
         "eq_left": left(lambda ak, x, bk, y: ak == bk),
-        "eq_left_pk": {**{(l, ak): 1 for l, (ak, _) in a.items() if ak in b},
-                       **{(l, None): 1 for l, (ak, _) in a.items() if ak not in b}},
+        "eq_left_pk": {(l, ak if ak in b else None): 1 for l, (ak, _) in a.items()},
         "band": pairs(band), "band_left": left(band),
         "rng": pairs(rng), "rng_left": left(rng),
         "product": pairs(lambda *_: True),
@@ -244,6 +254,11 @@ def _want(a, b, c):
         "not_in_b": where(lambda k, x: k not in b_keys),
         "in_pk": where(lambda k, x: k in b),
         "not_in_pk": where(lambda k, x: k not in b),
+        "lt_max": where(lambda k, x: _lt(x, top)),
+        "n_b": {(p, len(b)): 1 for p in a},
+        "per_k_a": {(k, len(xs), total(xs)): 1 for k, xs in by_k.items()},
+        "overall": {(len(a), total(x for _, x in a.values())): 1},
+        "top2": {(p, a[p][1]): 1 for p in sorted(a)[-2:]},
         "per_k": dict.fromkeys(Counter(k for k, _ in (ca + cb).elements()).items(), 1),
         "c_and_ua": Counter(c.values()) + ca + cb,
     }
@@ -266,8 +281,10 @@ def test_every_shape_keeps_its_weights_over_replicated_sources(client,
     A replicated preserved side of an outer, semi or anti join cannot stay local
     against a partitioned partner either: every worker would clamp its whole
     copy against its own slice of the partner, null-filling or keeping a row
-    once per worker. `c_and_ua`
-    unions a partitioned table with `ua`, which is replicated when both its
+    once per worker. An uncorrelated scalar's one row, computed on every worker
+    holding a replicated `b`, must reach each outer row once — over a `b` never
+    populated and one emptied again too, where it is the ground row. `c_and_ua`
+    unions a partitioned table with `s_ua`, which is replicated when both its
     sources are.
     """
     client.execute_sql(
@@ -283,26 +300,3 @@ def test_every_shape_keeps_its_weights_over_replicated_sources(client,
         want = _want(state["a"], state["b"], state["c"])
         for name, (cols, _) in _VIEWS.items():
             assert bag(scanned(client, name), *cols) == want[name], (sql, name)
-
-
-def test_an_uncorrelated_scalar_over_a_replicated_relation_counts_once(client):
-    """The subquery's one row is computed on every worker that holds the
-    replicated relation, and must reach each outer row once — through an empty
-    relation, where it is the ground row, at both ends."""
-    client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
-        "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL) WITH (replicated = true); "
-        "CREATE VIEW lt_max_r AS SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM rb); "
-        "CREATE VIEW proj_r AS SELECT a.id, (SELECT COUNT(*) FROM rb) AS n FROM a; "
-        "INSERT INTO a VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 21)))
-    rb = {}
-    for sql in churn(client, rb, [
-        ("SELECT 1", {}),
-        ("INSERT INTO rb VALUES (1, 5), (2, 12)", {1: 5, 2: 12}),
-        ("INSERT INTO rb VALUES (3, 30)", {3: 30}),
-        ("DELETE FROM rb WHERE id = 3", {3: None}),
-        ("DELETE FROM rb", {1: None, 2: None}),
-    ]):
-        top = max(rb.values(), default=None)
-        assert bag(scanned(client, "lt_max_r"), "id") == {(i,): 1 for i in range(1, 21) if _lt(i, top)}, sql
-        assert bag(scanned(client, "proj_r"), "id", "n") == {(i, len(rb)): 1 for i in range(1, 21)}, sql

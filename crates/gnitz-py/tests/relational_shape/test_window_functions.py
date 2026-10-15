@@ -356,7 +356,7 @@ def test_a_window_takes_an_ordered_indexs_keys(client):
         state = list(rows.values())
 
         def check(view, names, want):
-            assert bag(scanned(client, view), "id", *names) == dict(sorted(Counter(want).items(), key=repr)), (sql, view)
+            assert bag(scanned(client, view), "id", *names) == Counter(want), (sql, view)
 
         v = _values(state, ["k"], [("o", False, True)], "a")
         check("nf", ("r", "d", "t"), [(i, v[i][0], v[i][1], v[i][2]) for i in rows])
@@ -412,7 +412,7 @@ def test_a_window_over_a_bag_weighs_every_copy(client):
         state = [dict(id=(k, a), k=k, a=a, w=w) for (k, a), w in copies.items()]
         v = _values(state, ["k"], [("a", False, False)], "a")
         want = {(k, a, *v[k, a]): w for (k, a), w in copies.items()}
-        assert bag(scanned(client, "w"), "k", "a", "r", "d", "t", "c") == dict(sorted(want.items(), key=repr)), sql
+        assert bag(scanned(client, "w"), "k", "a", "r", "d", "t", "c") == want, sql
 
     write("x", "INSERT INTO x VALUES (1, 1, 10), (2, 1, 10), (3, 1, 20), (4, 2, 5)",
           {1: (1, 10), 2: (1, 10), 3: (1, 20), 4: (2, 5)})

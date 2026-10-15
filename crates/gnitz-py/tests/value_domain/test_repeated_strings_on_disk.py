@@ -51,7 +51,7 @@ def test_repeated_strings_survive_the_shards(own_server):
         conn.execute_sql("CREATE VIEW v AS SELECT id, constant, inline, long, unique_, maybe FROM t WHERE id >= 0")
         for lo in range(0, _ROWS, 500):
             _push(conn, [_row(i) for i in range(lo, lo + 500)])
-        assert bag(scanned(conn, "t"), *_COLS) == dict(sorted(want.items(), key=repr))
+        assert bag(scanned(conn, "t"), *_COLS) == want
         assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)
 
     own_server.restart(graceful=True)
@@ -61,7 +61,7 @@ def test_repeated_strings_survive_the_shards(own_server):
     user = [s for s in stores if s["store"] == "rows" and s["relation"] >= gnitz.FIRST_USER_TABLE_ID]
     assert user and all(" dict " in s["regions"] for s in user), report
     with gnitz.connect(own_server.target) as conn:
-        assert bag(scanned(conn, "t"), *_COLS) == dict(sorted(want.items(), key=repr)), "after the restart"
+        assert bag(scanned(conn, "t"), *_COLS) == want, "after the restart"
         assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)
         assert bag(conn.seek(*conn.resolve_table("t"), 4321), *_COLS) == {_row(4321): 1}
 
@@ -74,5 +74,5 @@ def test_repeated_strings_survive_the_shards(own_server):
             del want[_row(r[0])]
             want[r] = 1
         want = {r: w for r, w in want.items() if r[0] < 5000}
-        assert bag(scanned(conn, "t"), *_COLS) == dict(sorted(want.items(), key=repr)), "after the churn"
+        assert bag(scanned(conn, "t"), *_COLS) == want, "after the churn"
         assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)

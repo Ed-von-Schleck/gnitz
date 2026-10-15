@@ -109,6 +109,15 @@ _SO = [(pk, pk % 4, pk * 3) for pk in range(24)]
 _CB = [(a, b, a * 100 + b) for a in range(1, 9) for b in range(1, 5)]
 _FT = [(i, i % 4, (100 if i <= 18 else 5000)) for i in range(1, 25)]
 _GT = "CREATE TABLE gt (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)"
+# `t` varies within a `k` group on both sides, so each group holds matches and
+# non-matches rather than the whole product.
+_BP = [(k, b, k * 10 + b) for k in range(1, 7) for b in range(1, 4)]
+_BQ = [(k, b, k * 10 + 2 * b) for k in range(1, 7) for b in range(1, 4)]
+# `dt`'s join key `k` is neither its PK nor equal to it; `du` row 1003 is
+# deleted again.
+_DT_ROWS = [(i, 1000 + i, i * 10) for i in range(1, 25)]
+_DU = [(1000 + i, i * 100 + 1) for i in range(1, 25)]
+_DT_LIVE = [r for r in _DT_ROWS if r[1] != 1003]
 
 
 # `kb` overlaps `ka`, agreeing on a third of the shared ids; `kc` and `kd` repeat
@@ -128,6 +137,16 @@ def _bag(rows, keep=lambda *r: True, order=None):
 
 def _ks(keep):
     return Counter((k,) for _, k, _ in _A if keep(k))
+
+
+def _band_over(cluster):
+    """A band join of two `(k, b)`-keyed tables placed by `cluster`."""
+    ddl = "; ".join(f"CREATE TABLE {t} (k BIGINT NOT NULL, b BIGINT NOT NULL, t BIGINT NOT NULL, "
+                    f"PRIMARY KEY (k, b)){cluster}" for t in ("p", "q"))
+    return (ddl, f"INSERT INTO p VALUES {values(_BP)}; INSERT INTO q VALUES {values(_BQ)}",
+            {"v": ("SELECT p.k AS k, p.b AS pb, q.b AS qb FROM p JOIN q ON p.k = q.k AND p.t < q.t",
+                   ("k", "pb", "qb"),
+                   {(pk, pb, qb): 1 for pk, pb, pt in _BP for qk, qb, qt in _BQ if pk == qk and pt < qt})})
 
 
 def _by_group(rows):
@@ -154,6 +173,28 @@ SHAPES = {
                        ("aid", "bid"), {(i, k): 1 for i, k, _ in _A if _band(i)})}),
     "band_left": _ab({"v": (f"{_PAIR} LEFT JOIN b ON a.k = b.id AND a.av < b.bv",
                             ("aid", "bid"), {(i, k if _band(i) else None): 1 for i, k, _ in _A})}),
+    # The band relays by its equality prefix alone: skipped where that prefix is
+    # the tables' distribution key, run where the whole PK places their rows.
+    "band_cluster_by_k": _band_over(" CLUSTER BY k"),
+    "band_whole_pk": _band_over(""),
+    # A derived side whose `Map` moves the join key off the slot `dt` holds it
+    # in: computed beside it, duplicated, or computed itself. The master must
+    # scatter `dt`'s delta by the source column the key came from.
+    "derived_join_side": (
+        "CREATE TABLE dt (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL); "
+        "CREATE TABLE du (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)",
+        f"INSERT INTO dt VALUES {values(_DT_ROWS)}; INSERT INTO du VALUES {values(_DU)}; "
+        "DELETE FROM du WHERE id = 1003",
+        {"computed": ("SELECT x.k AS k, x.s AS s, du.b AS b FROM (SELECT a + 1 AS s, k FROM dt) x "
+                      "JOIN du ON x.k = du.id",
+                      ("k", "s", "b"), {(k, a + 1, i * 100 + 1): 1 for i, k, a in _DT_LIVE}),
+         "duplicated": ("SELECT x.k AS k, x.k2 AS k2, du.b AS b FROM (SELECT k, k AS k2 FROM dt) x "
+                        "JOIN du ON x.k2 = du.id",
+                        ("k", "k2", "b"), {(k, k, i * 100 + 1): 1 for i, k, _ in _DT_LIVE}),
+         # `a * 10 + 1` is `du.b` on every row.
+         "computed_key": ("SELECT x.id AS id, du.b AS b FROM (SELECT id, a * 10 + 1 AS s FROM dt) x "
+                          "JOIN du ON x.s = du.b",
+                          ("id", "b"), {(i, a * 10 + 1): 1 for i, _, a in _DT_LIVE})}),
     # Every `k = 4` row is past the threshold, so the LEFT form null-fills six rows.
     "range": _ab({"v": (f"{_PAIR} JOIN b ON a.k < b.id",
                         ("aid", "bid"), {(i, j): 1 for i, k, _ in _A for j, _ in _B if k < j})}),

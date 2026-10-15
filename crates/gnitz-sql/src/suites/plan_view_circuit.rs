@@ -523,8 +523,9 @@ fn scatter_keys(chain: &PlannedChain) -> Vec<(u64, Vec<u32>)> {
 const A: u64 = 18;
 const B: u64 = 19;
 
-/// A side states the slots its delta is routed by: an equi join's whole key, a
-/// band's equality prefix, none for a pure range or a cross join — and the whole
+/// A side states the slots its delta is routed by, in its source's own columns:
+/// an equi join's whole key, a band's equality prefix, none for a pure range or
+/// a cross join — and the whole
 /// source PK for the outer side of an EXISTS over a pure range, which is owned
 /// before it is joined.
 #[test]
@@ -539,6 +540,9 @@ fn a_join_side_states_the_slots_its_delta_is_routed_by() {
         ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w", &[], &[]),
         ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", &[], &[]),
         ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", &[0], &[]),
+        // A derived side whose `Map` moves the key off its source slot.
+        ("SELECT x.k AS k, x.s AS s, b.w FROM (SELECT v + 1 AS s, k FROM a) x JOIN b ON x.k = b.k", &[1], &[1]),
+        ("SELECT x.k AS k, x.k2 AS k2, b.w FROM (SELECT k, k AS k2 FROM a) x JOIN b ON x.k2 = b.k", &[1], &[1]),
     ];
     for &(body, a, b) in rows {
         let keys = scatter_keys(&view(&cat, body));

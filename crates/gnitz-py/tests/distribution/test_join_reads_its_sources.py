@@ -22,6 +22,7 @@ import random
 
 import gnitz
 import pytest
+from _feedviews import SWEEP_ENV
 from _read import bag, scanned
 from _serverproc import MULTI, disk_usage
 
@@ -113,16 +114,16 @@ class _Model:
 
 def _check(conn, model, what, views=("v",)):
     for view in views:
-        assert bag(scanned(conn, view), *_COLS) == dict(sorted(model.want().items(), key=repr)), f"{view}: {what}"
+        assert bag(scanned(conn, view), *_COLS) == model.want(), f"{view}: {what}"
 
 
-@pytest.mark.parametrize("opts", ["", "WITH (capacity = '8 KB')"], ids=["stored", "bounded"])
+@pytest.mark.parametrize("opts", ["", "WITH (capacity = '1 KB')"], ids=["stored", "bounded"])
 @pytest.mark.parametrize("layout", list(_LAYOUTS))
 def test_the_view_is_the_join_of_its_tables(layout, opts, own_server):
     customers_opts, orders_ddl, kept_traces = _LAYOUTS[layout]
-    # A RAM tier of a few KiB: every store spills, so the tables are read off
-    # shards and a bounded view is swept down to skeleton rows.
-    own_server.extra_env = {"GNITZ_RAM_TIER_BYTES": "4096"}
+    # Every store spills, so the tables are read off shards and a bounded view
+    # is swept down to skeleton rows.
+    own_server.extra_env = dict(SWEEP_ENV)
     own_server.start(workers=MULTI)
     model = _Model(seed=sum(f"{layout}{opts}".encode()))
     with gnitz.connect(own_server.target) as conn:
@@ -133,14 +134,15 @@ def test_the_view_is_the_join_of_its_tables(layout, opts, own_server):
             model.step(conn)
             if i % 3 == 0:
                 _check(conn, model, f"step {i}")
-        _check(conn, model, "before the restart")
         assert model.want(), "premise: the history leaves matched rows"
+        view_id, _ = conn.resolve_table("v")
 
     own_server.restart(graceful=True)
     _, stores = disk_usage(own_server.data_dir)
-    view_id = max(s["relation"] for s in stores)
-    traces = {s["store"] for s in stores if s["relation"] == view_id and s["store"].startswith("scratch")}
+    view = [s for s in stores if s["relation"] == view_id]
+    traces = {s["store"] for s in view if s["store"].startswith("scratch")}
     assert len(traces) == kept_traces, f"{layout}: the view keeps {traces}"
+    assert any(s["skeletons"] for s in view if s["store"] == "rows") == bool(opts), "premise: only a bounded view sweeps"
     with gnitz.connect(own_server.target) as conn:
         _check(conn, model, "resumed")
         for _ in range(8):

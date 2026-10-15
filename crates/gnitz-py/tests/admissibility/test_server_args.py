@@ -57,6 +57,7 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_FK_PRESENCE_KEYS", "-1"),
     ("GNITZ_PUSH_QUEUE_BYTES", "8M"),
     ("GNITZ_PATIENT_TICK_GAP_MS", "10ms"),
+    ("GNITZ_TICK_COALESCE_ROWS", "10k"),
 ])
 def test_an_unreadable_environment_knob_stops_the_boot(own_server, var, value):
     assert own_server.start_expecting_exit(extra_env={var: value}) != 0
