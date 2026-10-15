@@ -264,6 +264,8 @@ fn alter_results_and_if_exists_no_ops() {
 
     db.exec("ALTER VIEW vw2 AS SELECT id, w FROM t2 WHERE w >= 30");
     assert_eq!(db.scan("vw2", &["id", "w"]), at_weight_one(&[vec![3, 30], vec![4, 40]]));
+    // An existing column ends the statement before the dependent view's RESTRICT.
+    db.exec("ALTER TABLE t2 ADD COLUMN IF NOT EXISTS w TEXT");
     db.exec("DROP VIEW vw2; ALTER TABLE t2 DROP COLUMN b");
     assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a"]);
     db.exec("INSERT INTO t2 VALUES (5, 50, 5)");
@@ -279,6 +281,15 @@ fn alter_results_and_if_exists_no_ops() {
         [[6, NULL, 1]]
     );
 
+    // A dropped column's name is free: IF NOT EXISTS appends a new column under it.
+    db.exec("ALTER TABLE t2 ADD COLUMN IF NOT EXISTS b BIGINT; ALTER TABLE t2 ADD COLUMN IF NOT EXISTS b TEXT");
+    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a", "b"]);
+    db.exec("INSERT INTO t2 VALUES (7, 70, 7, 700)");
+    assert_eq!(
+        db.rows("SELECT id, b FROM t2 WHERE id >= 6", &["id", "b"]),
+        at_weight_one(&[vec![6, NULL], vec![7, 700]])
+    );
+
     // A bounded view keeps its capacity across a rename, so it stays a leaf.
     db.exec("CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, w FROM t2; ALTER TABLE bv RENAME TO bv2");
     db.refuses("CREATE VIEW over AS SELECT id FROM bv2", Rejected, "capacity-bounded");
@@ -287,6 +298,7 @@ fn alter_results_and_if_exists_no_ops() {
         "ALTER TABLE IF EXISTS nope RENAME TO x;
          ALTER TABLE IF EXISTS nope DROP COLUMN a;
          ALTER TABLE IF EXISTS nope ADD CONSTRAINT cq UNIQUE (v);
+         ALTER TABLE IF EXISTS nope ADD COLUMN IF NOT EXISTS x BIGINT;
          ALTER TABLE t2 DROP CONSTRAINT IF EXISTS nope",
     );
 }
@@ -324,11 +336,6 @@ fn alter_rejection_matrix() {
         ),
         ("ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)", Rejected, "CHECK"),
         ("ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8", Rejected, "COLLATE"),
-        (
-            "ALTER TABLE t ADD COLUMN IF NOT EXISTS x BIGINT",
-            Rejected,
-            "IF NOT EXISTS",
-        ),
         ("ALTER TABLE t ADD COLUMN x BIGINT FIRST", Rejected, "FIRST/AFTER"),
         ("ALTER TABLE t ADD COLUMN x BIGINT AFTER a", Rejected, "FIRST/AFTER"),
         (
@@ -337,6 +344,17 @@ fn alter_rejection_matrix() {
             "duplicate column name",
         ),
         ("ALTER TABLE st ADD COLUMN x BIGINT", Rejected, "is a stream"),
+        // The class and the clauses are checked before the IF NOT EXISTS no-op.
+        (
+            "ALTER TABLE st ADD COLUMN IF NOT EXISTS v BIGINT",
+            Rejected,
+            "is a stream",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS a BIGINT NOT NULL",
+            Rejected,
+            "NOT NULL",
+        ),
         ("ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)", Rejected, "is a stream"),
         ("ALTER TABLE t RENAME TO otherschema.t2", Rejected, "cross-schema"),
         // The new name is checked before the IF EXISTS no-op.

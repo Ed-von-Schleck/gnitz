@@ -25,7 +25,10 @@ enum Action<'a> {
         old: &'a str,
         new: &'a str,
     },
-    AddColumn(gnitz_wire::ColumnDef),
+    AddColumn {
+        def: gnitz_wire::ColumnDef,
+        if_not_exists: bool,
+    },
     DropColumn {
         name: &'a str,
         if_exists: bool,
@@ -110,7 +113,8 @@ pub(crate) async fn execute_alter_table(
                 .alter_rename_column(rel.tid, require_column(cols, old)?, new)
                 .await?
         }
-        Action::AddColumn(def) => client.alter_add_column(&rel, &def).await?,
+        Action::AddColumn { def, if_not_exists: true } if find_unique_column(cols, &def.name)?.is_some() => {}
+        Action::AddColumn { def, .. } => client.alter_add_column(&rel, &def).await?,
         Action::DropColumn { name, if_exists: true } if find_unique_column(cols, name)?.is_none() => {}
         Action::DropColumn { name, .. } => client.alter_drop_column(rel.tid, require_column(cols, name)?).await?,
         Action::DropNotNull { name } => client.alter_drop_not_null(rel.tid, require_column(cols, name)?).await?,
@@ -170,7 +174,6 @@ fn parse<'a>(
             column_position,
         } => {
             const CTX: &str = "ALTER TABLE ADD COLUMN";
-            reject_if(*if_not_exists, CTX, "IF NOT EXISTS")?;
             reject_if(
                 column_position.is_some(),
                 CTX,
@@ -179,7 +182,7 @@ fn parse<'a>(
             reject_unhonored_column_options(col, ColumnOptionSite::AddColumn)?;
             let (def, serial) = column_def(col)?;
             reject_if(serial, CTX, "SERIAL")?;
-            Ok((CTX, Action::AddColumn(def)))
+            Ok((CTX, Action::AddColumn { def, if_not_exists: *if_not_exists }))
         }
         AlterTableOperation::DropColumn {
             // Inert: `DROP c` and `DROP COLUMN c` mean the same thing.
