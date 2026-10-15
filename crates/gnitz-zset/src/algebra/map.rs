@@ -42,7 +42,9 @@ enum PkSource {
     /// Pack the reindex columns' OPK bytes contiguously into the output PK — the
     /// `_join_pk` of an equijoin / GROUP BY repartition. The output stride
     /// legitimately differs from the input's (U64 input → U128 synthetic PK).
-    Pack(ReindexPacker),
+    /// A row with any of the `drop_nulls` null bits set is dropped: a
+    /// [`gnitz_wire::NullKeys::Drop`] reindex's nullable key columns.
+    Pack { packer: ReindexPacker, drop_nulls: u64 },
     /// Hash each output row's payload columns into its PK.
     HashRow(FoldCols),
 }
@@ -166,9 +168,6 @@ pub struct MapPlan {
     pk_source: PkSource,
     /// The input's German-string payload slots some copy reads.
     copied_string_slots: u64,
-    /// A row with any of these null bits set is dropped: a
-    /// [`gnitz_wire::NullKeys::Drop`] reindex's nullable key columns.
-    null_key_mask: u64,
     out_schema: SchemaDescriptor,
 }
 
@@ -242,21 +241,23 @@ impl MapPlan {
     /// client-supplied column list clears. Every kind ends in the same
     /// [`Self::from_map`], so an elided map is validated like any other.
     pub fn from_wire(in_schema: &SchemaDescriptor, mk: &gnitz_wire::MapKind) -> Result<Self, String> {
-        let mut null_key_mask = 0;
         let (out_schema, prog, pk_source) = match mk {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
 
             gnitz_wire::MapKind::Reindex { keep, key, nulls, .. } => {
                 let packer = ReindexPacker::new(in_schema, key)?;
                 let out_schema = packer.output_schema(in_schema, keep)?;
-                if *nulls == gnitz_wire::NullKeys::Drop {
-                    null_key_mask = key
-                        .iter()
-                        .filter_map(|&(c, _)| in_schema.payload_slot(c as usize))
-                        .fold(0, |mask, slot| mask | 1u64 << slot)
-                        & in_schema.nullable_payload_slots();
-                }
-                (out_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
+                let drop_nulls = match nulls {
+                    gnitz_wire::NullKeys::Drop => {
+                        key.iter()
+                            .filter_map(|&(c, _)| in_schema.payload_slot(c as usize))
+                            .fold(0, |mask, slot| mask | 1u64 << slot)
+                            & in_schema.nullable_payload_slots()
+                    }
+                    gnitz_wire::NullKeys::Keep => 0,
+                };
+                let pk_source = PkSource::Pack { packer, drop_nulls };
+                (out_schema, LogicalProgram::copy_cols(keep), pk_source)
             }
 
             gnitz_wire::MapKind::HashRow { cols } => {
@@ -272,9 +273,8 @@ impl MapPlan {
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };
-        let plan = Self::from_map(prog, in_schema, &out_schema, pk_source)
-            .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
-        Ok(MapPlan { null_key_mask, ..plan })
+        Self::from_map(prog, in_schema, &out_schema, pk_source)
+            .map_err(|e| format!("map: program/schema mismatch: {e}"))
     }
 
     /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
@@ -308,7 +308,6 @@ impl MapPlan {
             ev,
             pk_source,
             copied_string_slots,
-            null_key_mask: 0,
             out_schema: *out_schema,
         })
     }
@@ -323,13 +322,13 @@ impl MapPlan {
     /// its own order, then holds each output key's rows together. `None` for
     /// every other map.
     pub fn rekeys_onto_pk_prefix(&self) -> Option<Vec<ColumnLocator>> {
-        let PkSource::Pack(packer) = &self.pk_source else {
+        let PkSource::Pack { packer, drop_nulls } = &self.pk_source else {
             return None;
         };
         packer.pk_range().filter(|&(at, _)| at == 0)?;
         // A PK column is never NULL, and a reindex copies each kept column at
         // its own type.
-        debug_assert!(self.null_key_mask == 0 && !self.ev.emits_anything());
+        debug_assert!(*drop_nulls == 0 && !self.ev.emits_anything());
         debug_assert!(self.ev.copies().iter().all(|c| c.width == c.src.size()));
         Some(self.ev.copies().iter().map(|c| c.src).collect())
     }
@@ -351,12 +350,12 @@ impl MapPlan {
     pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
         let whole = [(0, in_batch.count)];
         let runs;
-        let ranges: &[(usize, usize)] = match self.null_key_mask {
-            0 => &whole,
-            mask => {
-                runs = in_batch.runs_without_nulls(mask);
+        let ranges: &[(usize, usize)] = match self.pk_source {
+            PkSource::Pack { drop_nulls, .. } if drop_nulls != 0 => {
+                runs = in_batch.runs_without_nulls(drop_nulls);
                 &runs
             }
+            _ => &whole,
         };
         let n = crate::repr::range_rows(ranges);
         if n == 0 {
@@ -379,7 +378,7 @@ impl MapPlan {
         }
         let compact_below = match (self.ev.emits_anything(), &self.pk_source) {
             (true, _) => COMPACT_RUN_LEN,
-            (false, PkSource::Pack(_)) => PACK_COMPACT_RUN_LEN,
+            (false, PkSource::Pack { .. }) => PACK_COMPACT_RUN_LEN,
             // Fixed-width columns gather as cheaply as they map; a string would
             // be relocated twice.
             (false, _) if src.schema().string_payload_slots() == 0 => COMPACT_RUN_LEN,
@@ -432,7 +431,7 @@ impl MapPlan {
                 output.pk_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
                     .copy_from_slice(&in_batch.pk_data()[src_start * pk_st..(src_start + n) * pk_st]);
             }
-            PkSource::Pack(packer) => {
+            PkSource::Pack { packer, .. } => {
                 debug_assert_eq!(output.schema.pk_stride(), packer.out_stride);
                 let stride = packer.out_stride;
                 let pk = &mut output.pk_mut()[dst_base * stride..];

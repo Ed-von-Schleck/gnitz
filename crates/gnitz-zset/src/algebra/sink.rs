@@ -12,19 +12,20 @@ use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 
 /// A read sink resolved against its source schema, and the reply it is building.
-pub struct SinkPlan {
-    map: Option<MapPlan>,
-    kind: Kind,
-}
+pub struct SinkPlan(Kind);
 
 enum Kind {
-    /// Forward rows: every survivor, or the ones `cut` keeps.
-    Rows { keeper: Batch, cut: Option<Cut> },
-    /// Partial reduce-output rows. `mapped` is the one mapped batch of the whole
-    /// scan: `clear` keeps its buffers.
+    /// Forward rows, mapped or not: every survivor, or the ones `cut` keeps.
+    Rows {
+        map: Option<MapPlan>,
+        keeper: Batch,
+        cut: Option<Cut>,
+    },
+    /// Partial reduce-output rows. A map's batch is the one mapped batch of the
+    /// whole scan: `clear` keeps its buffers.
     Fold {
+        map: Option<(MapPlan, Batch)>,
         fold: Box<AdhocFold>,
-        mapped: Option<Batch>,
     },
 }
 
@@ -58,7 +59,10 @@ impl SinkPlan {
         let kind = match &sink.kind {
             SinkKind::Fold(agg) => Kind::Fold {
                 fold: Box::new(AdhocFold::new(&sink_in, agg, group_cap)?),
-                mapped: map.as_ref().map(|m| Batch::empty_with_schema(m.out_schema())),
+                map: map.map(|m| {
+                    let mapped = Batch::empty_with_schema(m.out_schema());
+                    (m, mapped)
+                }),
             },
             SinkKind::Rows { cut } => {
                 let cut = match cut {
@@ -81,17 +85,18 @@ impl SinkPlan {
                     }
                 };
                 Kind::Rows {
+                    map,
                     keeper: Batch::empty_with_schema(&sink_in),
                     cut,
                 }
             }
         };
-        Ok(SinkPlan { map, kind })
+        Ok(SinkPlan(kind))
     }
 
     /// The layout [`Self::finish`] emits.
     pub fn output_schema(&self) -> &SchemaDescriptor {
-        match &self.kind {
+        match &self.0 {
             Kind::Rows { keeper, .. } => keeper.schema(),
             Kind::Fold { fold, .. } => fold.output_schema(),
         }
@@ -100,7 +105,7 @@ impl SinkPlan {
     /// How many source rows the first drain should visit, of at most
     /// `chunk_rows`: an unordered cut needs no more than its window.
     pub fn first_drain(&self, chunk_rows: usize) -> usize {
-        match &self.kind {
+        match &self.0 {
             Kind::Rows {
                 cut: Some(Cut::Prefix { window, .. }), ..
             } => (window.get() as usize).min(chunk_rows),
@@ -113,12 +118,13 @@ impl SinkPlan {
     /// more rows; `Err` past a fold's group cap.
     pub fn push(&mut self, chunk: &Batch, ranges: &mut Vec<(usize, usize)>) -> Result<bool, String> {
         let mb = chunk.as_mem_batch();
-        match &mut self.kind {
-            Kind::Rows { keeper, cut: None } => {
-                append_survivors(self.map.as_mut(), chunk, keeper, ranges);
+        match &mut self.0 {
+            Kind::Rows { map, keeper, cut: None } => {
+                append_survivors(map.as_mut(), chunk, keeper, ranges);
                 Ok(false)
             }
             Kind::Rows {
+                map,
                 keeper,
                 cut: Some(Cut::Prefix { window, summed }),
             } => {
@@ -141,10 +147,11 @@ impl SinkPlan {
                     ranges.truncate(i + 1);
                     break;
                 }
-                append_survivors(self.map.as_mut(), chunk, keeper, ranges);
+                append_survivors(map.as_mut(), chunk, keeper, ranges);
                 Ok(*summed >= window)
             }
             Kind::Rows {
+                map,
                 keeper,
                 cut: Some(Cut::TopK { order, window, summed, bound }),
             } => {
@@ -154,7 +161,7 @@ impl SinkPlan {
                 *summed = ranges
                     .iter()
                     .fold(*summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
-                append_survivors(self.map.as_mut(), chunk, keeper, ranges);
+                append_survivors(map.as_mut(), chunk, keeper, ranges);
                 // Mid-scan the keeper is still growing, so a trim at `window`
                 // would re-sort after every chunk to shed rows the next chunk
                 // replaces.
@@ -163,17 +170,16 @@ impl SinkPlan {
                 }
                 Ok(false)
             }
-            Kind::Fold { fold, mapped } => {
-                match (&mut self.map, mapped) {
-                    (Some(plan), Some(dst)) => {
-                        dst.clear();
-                        plan.append_map_ranges(chunk, dst, ranges);
-                        // The map already dropped the non-survivors, so every
-                        // row of `dst` folds.
-                        fold.fold_ranges(dst, &[(0, dst.len())])?;
-                    }
-                    _ => fold.fold_ranges(chunk, ranges)?,
-                }
+            Kind::Fold { map: Some((plan, dst)), fold } => {
+                dst.clear();
+                plan.append_map_ranges(chunk, dst, ranges);
+                // The map already dropped the non-survivors, so every row of
+                // `dst` folds.
+                fold.fold_ranges(dst, &[(0, dst.len())])?;
+                Ok(false)
+            }
+            Kind::Fold { map: None, fold } => {
+                fold.fold_ranges(chunk, ranges)?;
                 Ok(false)
             }
         }
@@ -181,8 +187,8 @@ impl SinkPlan {
 
     /// The reply: the kept rows, or one partial row per group.
     pub fn finish(self) -> Batch {
-        match self.kind {
-            Kind::Rows { mut keeper, cut } => {
+        match self.0 {
+            Kind::Rows { mut keeper, cut, .. } => {
                 // The keeper is the reply now: shed an ordered keeper down to
                 // the smallest superset the client can still cut exactly. At or
                 // below the window that cuts nothing.

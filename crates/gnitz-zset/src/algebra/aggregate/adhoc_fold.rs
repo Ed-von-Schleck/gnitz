@@ -15,9 +15,8 @@
 use gnitz_wire::AggReadSpec;
 
 use super::agg::{AggValues, RangeGroups};
-use super::emit::emit_reduce_row;
-use super::shape::ReduceShape;
-use crate::algebra::group_key::{ground_pk, GroupNumbers, GroupOutKey, IdentityLoop};
+use super::shape::{emit_reduce_row, ReduceShape};
+use crate::algebra::group_key::{ground_pk, GroupNumbers, IdentityLoop};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 
@@ -40,12 +39,9 @@ impl AdhocFold {
     /// The fold of `agg` over `src_schema`, refused for a spec the schema cannot
     /// serve.
     pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, String> {
-        let refuse = |e| format!("scan_spec fold: {e}");
-        let (key, prefix) =
-            GroupOutKey::new(src_schema, &agg.group_cols, agg.group_cols.iter().copied()).map_err(refuse)?;
-        let mut groups = Batch::empty_with_schema(&prefix.finish().map_err(refuse)?);
-        let empty = key.is_global();
-        let shape = ReduceShape::new(src_schema, key, prefix, &agg.aggs, empty).map_err(refuse)?;
+        let (shape, leading) =
+            ReduceShape::new(src_schema, &agg.group_cols, &agg.aggs).map_err(|e| format!("scan_spec fold: {e}"))?;
+        let mut groups = Batch::empty_with_schema(&leading);
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
             groups.push_key_row(ground_pk().bytes(), 1);
@@ -94,7 +90,7 @@ impl AdhocFold {
             mb: &mb,
             ranges,
         };
-        shape.key.with_identity(&mb, assign)?;
+        shape.key.with_identity(&mb, ranges, assign)?;
         vals.resize(groups.count);
         for (k, agg) in shape.aggs.iter().enumerate() {
             vals.fold(k, agg, &mb, ranges, &ord[..]);

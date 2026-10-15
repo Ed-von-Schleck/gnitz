@@ -215,3 +215,64 @@ fn narrow_pk_opk_inverts_the_widening() {
         }
     }
 }
+
+/// A packed key read over survivor runs hands each of their rows the identity
+/// it has over the whole batch, at every sparsity, packed a column at a time or
+/// a row at a time.
+#[test]
+fn packed_identities_over_runs_are_their_whole_batch_identities() {
+    /// The identities of `runs`' rows, in row order.
+    struct Over<'a>(&'a [(usize, usize)]);
+    impl IdentityLoop for Over<'_> {
+        type Out = Vec<u128>;
+        fn run(self, identity: impl Fn(usize) -> u128) -> Vec<u128> {
+            self.0.iter().flat_map(|&(s, e)| s..e).map(identity).collect()
+        }
+    }
+    const N: usize = 512;
+    let c = SchemaColumn::new;
+    let ints = SchemaDescriptor::new(
+        &[c(TypeCode::U64, false), c(TypeCode::I64, true), c(TypeCode::I32, false)],
+        &[0],
+    );
+    let strs = SchemaDescriptor::new(&[c(TypeCode::U64, false), c(TypeCode::String, false)], &[0]);
+    for (schema, cols) in [(&ints, &[1u32, 2][..]), (&strs, &[1][..])] {
+        let mut b = BatchBuilder::new(schema);
+        for i in 0..N as u64 {
+            b.begin_row(i as u128, 1);
+            match cols.len() {
+                2 => {
+                    b.put_opt_int((i % 7 != 0).then(|| mix(i) as i64 as u128));
+                    b.put_int(mix(i ^ 1) as u32 as u128);
+                }
+                _ => b.put_string(&format!("a group key of some length {}", mix(i) % 97)),
+            }
+            b.end_row();
+        }
+        let batch = b.finish();
+        let mb = batch.as_mem_batch();
+        let (key, _) = GroupOutKey::new(schema, cols, []).unwrap();
+        assert!(matches!(key.key, GroupKey::Packed(_)), "{cols:?} packs");
+        let whole = key.with_identity(&mb, &[(0, N)], Over(&[(0, N)]));
+        for (gap, run) in [
+            (0, 1),
+            (1, 1),
+            (7, 1),
+            (15, 1),
+            (16, 1),
+            (63, 1),
+            (56, 8),
+            (16, 16),
+            (500, 3),
+        ] {
+            let runs: Vec<(usize, usize)> = (0..N).step_by(gap + run).map(|s| (s, (s + run).min(N))).collect();
+            let want: Vec<u128> = runs.iter().flat_map(|&(s, e)| s..e).map(|r| whole[r]).collect();
+            assert_eq!(
+                key.with_identity(&mb, &runs, Over(&runs)),
+                want,
+                "{cols:?}: runs of {run}, gaps of {gap}"
+            );
+        }
+        assert!(key.with_identity(&mb, &[], Over(&[])).is_empty(), "{cols:?}: no rows");
+    }
+}

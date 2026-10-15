@@ -117,11 +117,14 @@ fn filter_keeps_exactly_the_matching_rows() {
     let rows = [(1, 3, 5), (2, -2, 15), (3, 1, 10), (4, 2, 20), (5, 1, 0)];
     let input = make_batch(&schema, &rows);
 
-    let out = op_filter(&input, &mut gt(10)).expect("a selective filter copies");
+    let out = op_filter(Cow::Borrowed(&input), &mut gt(10));
     let want: Vec<_> = rows.iter().copied().filter(|&(.., v)| v > 10).collect();
     assert_eq!(weighted_rows(&out), weighted_rows(&make_batch(&schema, &want)));
     assert!(out.is_consolidated());
-    assert!(op_filter(&input, &mut gt(-1)).is_none());
+    // Every row passes: an owned input is the output, not a copy of it.
+    let owned = input.clone();
+    let regions = owned.pk_data().as_ptr();
+    assert_eq!(op_filter(Cow::Owned(owned), &mut gt(-1)).pk_data().as_ptr(), regions);
 }
 
 // ── Derived output schemas ──────────────────────────────────────────────

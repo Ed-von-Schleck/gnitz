@@ -430,7 +430,7 @@ impl ReindexPacker {
     }
 
     /// Whether [`Self::pack_rows`] packs a column at a time.
-    fn packs_by_column(&self) -> bool {
+    pub(crate) fn packs_by_column(&self) -> bool {
         self.fold.is_empty() && self.columns().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 

@@ -70,7 +70,7 @@ impl Stores<'_> {
             };
             for &pc in term.steps.iter() {
                 rows = match &mut instructions[pc].op {
-                    Op::Filter(pred) => algebra::op_filter(&rows, pred).unwrap_or(rows),
+                    Op::Filter(pred) => algebra::op_filter(Cow::Owned(rows), pred),
                     // A map may reorder the payload a run sorts by.
                     Op::Map(plan) => plan.evaluate_map_batch(&rows).into_consolidated(),
                     _ => unreachable!("a history step is a filter or a map"),
@@ -297,8 +297,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
             // register's label is never read.
             _ if all_empty => continue,
 
-            Op::Filter(pred) => algebra::op_filter(&batches[in_reg.at()], pred)
-                .unwrap_or_else(|| operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned()),
+            Op::Filter(pred) => algebra::op_filter(operand(&mut batches[in_reg.at()], takes(in_reg)), pred),
 
             Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
 

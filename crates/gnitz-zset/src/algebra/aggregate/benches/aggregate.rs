@@ -215,3 +215,90 @@ fn adhoc_fold_shapes_bench() {
         }
     }
 }
+
+/// Instructions per surviving row of a fold grouped by a packed key — two
+/// integer columns, or one string — over survivor ranges of each density.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn adhoc_fold_sparse_bench() {
+    let c = SchemaColumn::new;
+    let ints = SchemaDescriptor::new(
+        &[
+            c(TypeCode::U64, false),
+            c(TypeCode::I64, false),
+            c(TypeCode::I32, false),
+            c(TypeCode::I64, false),
+        ],
+        &[0],
+    );
+    let strs = SchemaDescriptor::new(
+        &[
+            c(TypeCode::U64, false),
+            c(TypeCode::String, false),
+            c(TypeCode::I64, false),
+        ],
+        &[0],
+    );
+    let counter = Counter::instructions();
+    for (label, schema, group_cols, sum_col) in [("i64+i32", &ints, vec![1u32, 2], 3u32), ("string", &strs, vec![1], 2)]
+    {
+        let chunks: Vec<Batch> = (0..N / CHUNK)
+            .map(|ch| {
+                let mut b = BatchBuilder::new(schema);
+                for i in ch * CHUNK..(ch + 1) * CHUNK {
+                    b.begin_row(i as u128, 1);
+                    let g = mix(i) % 1000;
+                    if group_cols.len() == 2 {
+                        b.put_int(g as u128);
+                        b.put_int((g * 7) as u32 as u128);
+                    } else {
+                        b.put_string(&format!("group-key-string-{g:08}"));
+                    }
+                    b.put_int(mix(i ^ 7) as i64 as u128);
+                    b.end_row();
+                }
+                b.finish()
+            })
+            .collect();
+        let spec = AggReadSpec {
+            group_cols: group_cols.clone(),
+            aggs: vec![
+                AggDescriptor::COUNT_STAR,
+                AggDescriptor { agg_op: AggFunc::Sum, col_idx: sum_col },
+            ],
+        };
+        let n = CHUNK as usize;
+        for (density, ranges) in [
+            ("whole", vec![(0, n)]),
+            (
+                "runs of 8 in 64",
+                (0..n).step_by(64).map(|s| (s, s + 8)).collect::<Vec<_>>(),
+            ),
+            ("1 row in 2", (0..n).step_by(2).map(|s| (s, s + 1)).collect()),
+            ("1 row in 4", (0..n).step_by(4).map(|s| (s, s + 1)).collect()),
+            ("1 row in 8", (0..n).step_by(8).map(|s| (s, s + 1)).collect()),
+            ("1 row in 16", (0..n).step_by(16).map(|s| (s, s + 1)).collect()),
+            ("1 row in 32", (0..n).step_by(32).map(|s| (s, s + 1)).collect()),
+            ("1 row in 64", (0..n).step_by(64).map(|s| (s, s + 1)).collect()),
+            ("runs of 2 in 8", (0..n).step_by(8).map(|s| (s, s + 2)).collect()),
+            ("runs of 4 in 8", (0..n).step_by(8).map(|s| (s, s + 4)).collect()),
+            ("runs of 16 in 32", (0..n).step_by(32).map(|s| (s, s + 16)).collect()),
+        ] {
+            let kept: usize = ranges.iter().map(|&(s, e)| e - s).sum::<usize>() * chunks.len();
+            let fold = || {
+                let mut fold = AdhocFold::new(schema, &spec, GROUP_CAP).unwrap();
+                for c in &chunks {
+                    fold.fold_ranges(c, &ranges).unwrap();
+                }
+                fold.finish()
+            };
+            std::hint::black_box(fold());
+            let (out, instructions) = counter.measure(fold);
+            std::hint::black_box(out);
+            println!(
+                "adhoc_fold_sparse_bench {label:<8} {density:<16} {:>7.1} instr/surviving row",
+                instructions as f64 / kept as f64
+            );
+        }
+    }
+}

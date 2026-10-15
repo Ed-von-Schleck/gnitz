@@ -2,7 +2,7 @@
 //! `ReduceShape` the ad-hoc fold shares.
 
 use super::avi::{avi_batch, AviBake};
-use crate::algebra::{emit_reduce_row, ground_pk, Agg, AggValues, GroupOutKey, ReduceShape};
+use crate::algebra::{emit_reduce_row, ground_pk, Agg, AggValues, ReduceShape};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::AggDescriptor;
@@ -65,9 +65,7 @@ impl ReducePlan {
             !seeds_ground || group_cols.is_empty(),
             "the ground row carries no group columns"
         );
-        let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
-        let empty = key.is_global();
-        let shape = ReduceShape::new(input, key, prefix, aggs, empty)?;
+        let (shape, _) = ReduceShape::new(input, group_cols, aggs)?;
         let avi = AviBake::new(input, group_cols, &shape.aggs)?;
         let ground = seeds_ground.then(|| {
             let mut v0 = Batch::with_capacity(&shape.output_schema, 1);

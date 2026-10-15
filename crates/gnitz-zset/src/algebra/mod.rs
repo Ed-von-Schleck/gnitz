@@ -8,7 +8,8 @@
 //!   - `reindex`     — the key composers a reindex Map and an exchange scatter share, and a
 //!     secondary index's entries
 //!   - `order_image` — the byte images an ordered index keys by
-//!   - `sink`        — the sink of an ad-hoc read: forward, top-k or fold
+//!   - `route`       — which worker owns a key, and where a relation's rows live
+//!   - `sink`        — the sink of an ad-hoc read: map, then forward, top-k or fold
 //!
 //! Nothing here reads a trace: each is a function of the one batch it is handed.
 //! The linear ones are their own incremental form, so the read executor in

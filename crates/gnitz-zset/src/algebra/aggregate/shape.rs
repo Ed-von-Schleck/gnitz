@@ -1,8 +1,9 @@
 //! `ReduceShape`: what a reduce's rows look like, shared by the circuit reduce,
 //! the ad-hoc fold and the window.
-use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::repr::{Batch, MemBatch};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
 
-use super::agg::Agg;
+use super::agg::{Agg, AggValues};
 use crate::algebra::group_key::GroupOutKey;
 use gnitz_wire::AggDescriptor;
 
@@ -15,17 +16,43 @@ pub(crate) struct ReduceShape {
 }
 
 impl ReduceShape {
-    /// [`resolve_aggs`] behind `key`'s leading `prefix` columns.
+    /// `aggs` over `input` grouped by `group_cols`, behind the group key region
+    /// and the group columns it does not spell — the leading columns, whose
+    /// schema comes second.
     pub(crate) fn new(
         input: &SchemaDescriptor,
-        key: GroupOutKey,
-        prefix: DerivedSchema,
+        group_cols: &[u32],
         aggs: &[AggDescriptor],
-        empty: bool,
-    ) -> Result<Self, String> {
-        let (output_schema, aggs) = resolve_aggs(input, prefix, aggs, empty)?;
-        Ok(ReduceShape { output_schema, key, aggs })
+    ) -> Result<(Self, SchemaDescriptor), String> {
+        let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
+        // A prefix of the output's columns: it finishes wherever the output does,
+        // whose refusal comes first.
+        let leading = prefix.finish();
+        // A global reduce's one group has a value over no rows.
+        let (output_schema, aggs) = resolve_aggs(input, prefix, aggs, key.is_global())?;
+        Ok((ReduceShape { output_schema, key, aggs }, leading?))
     }
+}
+
+/// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying the
+/// group columns from `group`'s row at its locators — the ground row has none —
+/// and each of `aggs` from group `g` of `vals`.
+pub(crate) fn emit_reduce_row(
+    output: &mut Batch,
+    group: Option<(&MemBatch, usize, &[ColumnLocator])>,
+    out_pk_bytes: &[u8],
+    aggs: &[Agg],
+    vals: &AggValues,
+    g: usize,
+) {
+    output.begin_row(out_pk_bytes, 1);
+    if let Some((src, row, locs)) = group {
+        output.append_cells_from(0, locs, src, row);
+    }
+    for (k, agg) in aggs.iter().enumerate() {
+        vals.emit(k, agg, g, output);
+    }
+    output.commit_row();
 }
 
 /// `aggs` over `input`, emitted behind the `prefix` columns: the output layout,

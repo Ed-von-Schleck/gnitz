@@ -16,19 +16,19 @@ use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 // ---------------------------------------------------------------------------
 
 /// Filter: retain rows where predicate returns true, by contiguous-range bulk
-/// copy. `None` when every row passed, so the caller can hand its own input
-/// through instead of paying `from_ranges` a whole-batch copy, blob heap
-/// included. An index-bounded backfill takes that path on every chunk: the
-/// access path already satisfies the predicate the circuit still carries.
-pub fn op_filter(batch: &Batch, pred: &mut RowFilter) -> Option<Batch> {
+/// copy. When every row passes, the input is the output — moved when it is
+/// owned — rather than a whole-batch copy, blob heap included. An
+/// index-bounded backfill takes that path on every chunk: the access path
+/// already satisfies the predicate the circuit still carries.
+pub fn op_filter(batch: Cow<'_, Batch>, pred: &mut RowFilter) -> Batch {
     // `ranges` lends `out` so a *chunked* scan can carry one list; this caller
     // has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     pred.ranges(&batch.as_mem_batch(), &mut ranges);
     if ranges == [(0, batch.count)] {
-        return None;
+        return batch.into_owned();
     }
-    Some(Batch::from_ranges(batch, &ranges, 0))
+    Batch::from_ranges(&batch, &ranges, 0)
 }
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a

@@ -257,10 +257,11 @@ impl GroupOutKey {
         }
     }
 
-    /// `body` over `mb`, handed each row's identity: the output PK up to 16 bytes,
-    /// widened, else its XXH3-128. The key's form and width are matched once per call.
+    /// `body` over `mb`, handed the identity of each row of `rows`: the output PK
+    /// up to 16 bytes, widened, else its XXH3-128. The key's form and width are
+    /// matched once per call.
     #[inline]
-    pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, body: L) -> L::Out {
+    pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
         if let Some(cells) = self.key.cells(mb) {
             return for_cell_width!(cells.width, |W| match cells.opk {
                 true => body.run(|r| cell_image::<W, true>(cells.cell::<W>(r), cells.signed)),
@@ -269,7 +270,7 @@ impl GroupOutKey {
         }
         match &self.key {
             GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r, mb.get_null_word(r))),
-            GroupKey::Packed(p) => packed_identity(p, mb, body),
+            GroupKey::Packed(p) => packed_identity(p, mb, rows, body),
             &GroupKey::PkRange { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
             GroupKey::Image(_) => unreachable!("an image key is one cell"),
         }
@@ -285,7 +286,7 @@ impl GroupOutKey {
                 identity(self.0)
             }
         }
-        self.with_identity(mb, At(row))
+        self.with_identity(mb, &[(row, row + 1)], At(row))
     }
 
     /// The input columns the output carries after its key.
@@ -320,7 +321,10 @@ impl GroupOutKey {
         // Nor do too few rows pay for a hash table.
         let hashes =
             n >= HASH_MIN_ROWS && !matches!(self.key, GroupKey::PkRange { n: w, .. } if w > NARROW_PK_MAX_BYTES);
-        if let Some(groups) = hashes.then(|| self.with_identity(mb, Hashed { n })).flatten() {
+        if let Some(groups) = hashes
+            .then(|| self.with_identity(mb, &[(0, n)], Hashed { n }))
+            .flatten()
+        {
             return groups;
         }
         match &self.key {
@@ -340,14 +344,26 @@ impl GroupOutKey {
     }
 }
 
-/// [`GroupOutKey::with_identity`] over a packed `_group_pk`: the keys packed a
-/// column at a time, once for the whole loop. Out of line, so the loops that
-/// read their key in place compile as they do without it.
+/// [`GroupOutKey::with_identity`] over a packed `_group_pk`: every row packed once
+/// for the whole loop where `rows` are all of them, or where the key packs a
+/// column at a time and `rows` hold more than one row in
+/// `PACK_ROWS_MIN_SPARSITY`; else each of `rows` packs its own key as it is read.
+/// Out of line, so the loops that read their key in place compile as they do
+/// without it.
 #[inline(never)]
-fn packed_identity<L: IdentityLoop>(p: &ReindexPacker, mb: &MemBatch, body: L) -> L::Out {
-    let (keys, w) = (p.keys(mb), p.out_stride);
-    body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]))
+fn packed_identity<L: IdentityLoop>(p: &ReindexPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
+    let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.count;
+    let every = rows == [(0, mb.count)];
+    if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
+        let (keys, w) = (p.keys(mb), p.out_stride);
+        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
+    }
+    body.run(|r| p.narrow_image(mb, r))
 }
+
+/// Fewest rows per row read at which [`packed_identity`] packs a column-packed
+/// key a row at a time, rather than every row.
+const PACK_ROWS_MIN_SPARSITY: usize = 16;
 
 /// The runs of equal adjacent keys over rows `0..n`, each as `[start, end)`.
 fn equal_runs<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Vec<(usize, usize)> {
