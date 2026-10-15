@@ -163,3 +163,16 @@ fn every_truncation_is_its_units_field() {
     let truncs: Vec<CalendarOp> = CalendarOp::ALL.iter().copied().filter(|op| op.keeps_type()).collect();
     assert_eq!(reachable, truncs);
 }
+
+#[test]
+fn formatted_dates_and_timestamps_parse_back() {
+    for days in [-719_528, -1, 0, 1, 19_000, 2_932_896] {
+        let text = format_date(days);
+        assert_eq!(parse_date(&text).map(i64::from), Some(days), "{text}");
+    }
+    for micros in [0, 1, -1, 1_500_000, 86_399_999_999, 1_700_000_000_123_400] {
+        let text = format_timestamp(micros);
+        assert_eq!(parse_timestamp(&text), Some(micros), "{text}");
+    }
+    assert_eq!(format_timestamp(1_500_000), "1970-01-01 00:00:01.5");
+}

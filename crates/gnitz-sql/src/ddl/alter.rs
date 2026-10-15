@@ -9,7 +9,6 @@ use crate::bind::{find_unique_column, require_column};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, require_class, validate_user_name, ClassWant};
 use crate::types::column_def;
-use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
@@ -79,7 +78,7 @@ pub(crate) async fn execute_alter_table(
     client: &mut GnitzClient,
     schema_name: &str,
     alter: &AlterTable,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<(), GnitzSqlError> {
     reject_unhonored_alter_table_clauses(alter)?;
     let [operation] = alter.operations.as_slice() else {
         return Err(unsupported_clause(
@@ -92,7 +91,7 @@ pub(crate) async fn execute_alter_table(
 
     let Some(rel) = client.resolve(&source_name).await? else {
         return if alter.if_exists {
-            Ok(SqlResult::Ddl)
+            Ok(())
         } else {
             Err(missing_relation(&source_name))
         };
@@ -130,7 +129,7 @@ pub(crate) async fn execute_alter_table(
         }
         Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, name, if_exists).await?,
     }
-    Ok(SqlResult::Ddl)
+    Ok(())
 }
 
 /// The operation's context and [`Action`] on `source`, or the rejection the

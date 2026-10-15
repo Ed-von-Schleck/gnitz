@@ -27,6 +27,11 @@ const AGG_NAMES: [(&str, AggFunc); 5] = [
     ("avg", AggFunc::Avg),
 ];
 
+/// The names of [`AGG_NAMES`].
+pub(crate) fn agg_names() -> impl Iterator<Item = &'static str> {
+    AGG_NAMES.into_iter().map(|(n, _)| n)
+}
+
 /// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
 /// matched case-insensitively without allocating; `None` for any other name.
 pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {

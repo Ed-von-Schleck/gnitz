@@ -9,19 +9,21 @@ use crate::hir::ViewBody;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
-use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};
 use std::num::NonZeroU64;
 
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query};
 
+/// The `CREATE VIEW … WITH (…)` keys.
+pub(crate) const VIEW_OPTIONS: [&str; 3] = ["capacity", "delta", "compress"];
+
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
 
 /// Decode the `WITH (...)` clause of a `CREATE VIEW`.
 fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
-    let [capacity, delta, compress] = kv_options(options, "CREATE VIEW", ["capacity", "delta", "compress"])?;
+    let [capacity, delta, compress] = kv_options(options, "CREATE VIEW", VIEW_OPTIONS)?;
     let budget = ViewBudget::from_budgets(
         capacity.map(|v| size_option("capacity", v)).transpose()?,
         delta.map(|v| size_option("delta", v)).transpose()?,
@@ -211,13 +213,10 @@ fn plan_segments<'a>(
 }
 
 /// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.
-pub(crate) async fn execute_view_chain(
-    client: &mut GnitzClient,
-    chain: PlannedChain,
-) -> Result<SqlResult, GnitzSqlError> {
+pub(crate) async fn execute_view_chain(client: &mut GnitzClient, chain: PlannedChain) -> Result<(), GnitzSqlError> {
     let PlannedChain { name, bundle, props, replacing } = chain;
     client.create_view_chain(&name, bundle, props, replacing).await?;
-    Ok(SqlResult::Ddl)
+    Ok(())
 }
 
 #[cfg(test)]

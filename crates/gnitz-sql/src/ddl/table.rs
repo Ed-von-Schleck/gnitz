@@ -10,7 +10,6 @@ use crate::bind::{require_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
-use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema};
 use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::TableDistribution;
@@ -243,11 +242,13 @@ fn resolve_fk_target(
     ))
 }
 
+/// The `CREATE TABLE … WITH (…)` keys.
+pub(crate) const TABLE_OPTIONS: [&str; 3] = ["replicated", "stream", "compress"];
+
 /// The boolean properties of `CREATE TABLE … WITH (…)`. A `Keyed` distribution's
 /// prefix is left at its default; the CLUSTER BY phase fills it.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
-    let [replicated, stream, compress] =
-        kv_options(table_options, "CREATE TABLE", ["replicated", "stream", "compress"])?;
+    let [replicated, stream, compress] = kv_options(table_options, "CREATE TABLE", TABLE_OPTIONS)?;
     let distribution = match bool_option("replicated", replicated)? {
         true => TableDistribution::Replicated,
         false => TableDistribution::default(),
@@ -767,15 +768,12 @@ pub(crate) fn plan_create_table(
 }
 /// Commit a planned `CREATE TABLE`: one bundle carrying the table, its columns
 /// and its inline unique indexes.
-pub(crate) async fn execute_create_table(
-    client: &mut GnitzClient,
-    plan: TablePlan,
-) -> Result<SqlResult, GnitzSqlError> {
+pub(crate) async fn execute_create_table(client: &mut GnitzClient, plan: TablePlan) -> Result<(), GnitzSqlError> {
     let TablePlan { name, schema, fks, props, unique_indexes } = plan;
     client
         .create_table(&name, &schema, &fks, props, &unique_indexes)
         .await?;
-    Ok(SqlResult::Ddl)
+    Ok(())
 }
 
 pub(crate) async fn execute_drop(
@@ -784,7 +782,7 @@ pub(crate) async fn execute_drop(
     object_type: &ObjectType,
     names: &[sqlparser::ast::ObjectName],
     if_exists: bool,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<(), GnitzSqlError> {
     // The kind is the statement's, not each name's, so it is settled once.
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
         return Err(unsupported_clause("DROP", &object_type.to_string()));
@@ -799,7 +797,7 @@ pub(crate) async fn execute_drop(
             .collect::<Result<Vec<String>, _>>()?;
         let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
         client.drop_indexes_by_name(&targets, if_exists).await?;
-        return Ok(SqlResult::Ddl);
+        return Ok(());
     }
     let targets = names
         .iter()
@@ -809,7 +807,7 @@ pub(crate) async fn execute_drop(
         ObjectType::View => client.drop_view(&targets, if_exists).await?,
         _ => client.drop_table(&targets, if_exists).await?,
     }
-    Ok(SqlResult::Ddl)
+    Ok(())
 }
 
 /// Which surface asked for the index, and the options only that surface can
@@ -889,7 +887,7 @@ pub(crate) async fn execute_create_index(
     client: &mut GnitzClient,
     schema_name: &str,
     ci: &sqlparser::ast::CreateIndex,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<(), GnitzSqlError> {
     reject_unhonored_create_index_clauses(ci)?;
     let owner_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;
     let explicit_name = ci
@@ -923,7 +921,7 @@ pub(crate) async fn create_index_core(
     client: &mut GnitzClient,
     target: &gnitz_core::RelDescriptor,
     req: &IndexRequest<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<(), GnitzSqlError> {
     let ctx = req.site.context();
     if req.columns.is_empty() {
         return Err(GnitzSqlError::Rejected(format!("{ctx}: at least one column required")));
@@ -940,7 +938,7 @@ pub(crate) async fn create_index_core(
             // this relation or any other — means this CREATE would fail; the clause
             // says skip it. Without it the collision errors in `create_index`.
             if req.site.if_not_exists() && client.index_rows().await?.iter().any(|r| r.name == name) {
-                return Ok(SqlResult::Ddl);
+                return Ok(());
             }
             name
         }
@@ -967,7 +965,7 @@ pub(crate) async fn create_index_core(
     client
         .create_index(owner_id, cols, &index_name, req.site.is_unique())
         .await?;
-    Ok(SqlResult::Ddl)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -104,3 +104,23 @@ fn each_refused_spelling_names_its_reason() {
         assert!(m.contains(needle), "{decl}: {m:?} does not name {needle:?}");
     }
 }
+
+/// Every declarable type's SQL spelling declares that type again. No column
+/// declaration produces a BLOB, though a system family holds one.
+#[test]
+fn sql_type_name_round_trips() {
+    let types = TypeCode::ALL
+        .iter()
+        .filter(|&&tc| !matches!(tc, TypeCode::Decimal | TypeCode::Blob))
+        .map(|&tc| ColType::of(tc))
+        .chain([
+            ColType::decimal(0),
+            ColType::decimal(2),
+            ColType::decimal(MAX_DECIMAL_SCALE),
+        ]);
+    for ty in types {
+        let spelled = sql_type_name(ty);
+        let (def, _) = declared(&spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
+        assert_eq!(def.ty, ty, "{spelled}");
+    }
+}

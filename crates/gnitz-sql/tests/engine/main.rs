@@ -103,7 +103,7 @@ impl Db {
 
     pub fn affected(&mut self, sql: &str) -> usize {
         match self.exec(sql) {
-            SqlResult::RowsAffected { count } => count,
+            SqlResult::RowsAffected { count, .. } => count,
             other => panic!("expected RowsAffected from `{sql}`, got {other:?}"),
         }
     }

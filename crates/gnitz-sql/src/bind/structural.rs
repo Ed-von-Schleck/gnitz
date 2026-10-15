@@ -552,6 +552,11 @@ const SCALAR_CALLS: &[(&str, Call)] = &[
     ("DATE_PART", Call::DatePart),
 ];
 
+/// The names of [`SCALAR_CALLS`].
+pub(crate) fn scalar_call_names() -> impl Iterator<Item = &'static str> {
+    SCALAR_CALLS.iter().map(|&(n, _)| n)
+}
+
 /// The clock and random functions, beside [`SCALAR_CALLS`] so the two name
 /// tables live together. Listed to say *why* they are refused, which the
 /// unknown-name error they would otherwise take cannot: nothing re-evaluates a

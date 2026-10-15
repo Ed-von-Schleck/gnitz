@@ -390,16 +390,26 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     }
 }
 
+/// The window-only functions, by their SQL spelling; the aggregates are
+/// windowed under their own names.
+const RANKING_NAMES: [(&str, WinFunc); 3] = [
+    ("rank", WinFunc::Rank),
+    ("dense_rank", WinFunc::DenseRank),
+    ("row_number", WinFunc::RowNumber),
+];
+
+/// The names of [`RANKING_NAMES`].
+pub(crate) fn ranking_names() -> impl Iterator<Item = &'static str> {
+    RANKING_NAMES.into_iter().map(|(n, _)| n)
+}
+
 /// Classify a windowed call into its function and its unbound argument.
 fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>), GnitzSqlError> {
     let call = PlainCall::check(f, CallSurface::Window)?;
     let name = single_part_ident(&f.name).ok_or_else(|| unknown_function(f))?;
-    let ranking = match name.to_ascii_lowercase().as_str() {
-        "rank" => Some(WinFunc::Rank),
-        "dense_rank" => Some(WinFunc::DenseRank),
-        "row_number" => Some(WinFunc::RowNumber),
-        _ => None,
-    };
+    let ranking = RANKING_NAMES
+        .into_iter()
+        .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f));
     let Some(func) = ranking else {
         if agg_func_from_name(name).is_none() {
             return Err(GnitzSqlError::Rejected(format!(

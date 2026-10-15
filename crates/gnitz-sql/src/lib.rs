@@ -30,18 +30,29 @@ mod types;
 mod validate;
 
 pub use error::GnitzSqlError;
+pub use sqlparser;
+pub use types::sql_type_name;
 
 use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::sync::Arc;
 
+/// The dialect every statement is parsed under. A client that tokenizes text it
+/// will submit uses this one, so it splits statements where the parser does.
+pub const DIALECT: GenericDialect = GenericDialect {};
+
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
 pub enum SqlResult {
-    /// A CREATE, DROP or ALTER succeeded — or, under `IF [NOT] EXISTS`, had nothing to do.
-    Ddl,
+    /// A CREATE, DROP or ALTER succeeded — or, under `IF [NOT] EXISTS`, had
+    /// nothing to do. `tag` is its command tag, e.g. `CREATE INDEX`.
+    Ddl {
+        tag: &'static str,
+    },
+    /// An INSERT, UPDATE or DELETE wrote `count` rows; `tag` is its verb.
     RowsAffected {
+        tag: &'static str,
         count: usize,
     },
     Rows(ScanReply),
@@ -60,7 +71,7 @@ pub enum SqlResult {
 /// (and its `EXPLAIN`) over a relation the client's local copy holds is answered
 /// off that copy; everything else runs on the connection.
 pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let stmts = Parser::parse_sql(&DIALECT, sql)?;
     let mut results = Vec::with_capacity(stmts.len());
     // One begun by an earlier call is the caller's to end.
     let mut began_here = false;
@@ -81,6 +92,20 @@ pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> 
     Ok(results)
 }
 
+/// Every function name a statement may call, in the spelling the binder matches
+/// case-insensitively: the scalar functions, the aggregates and the window-only
+/// ranking functions.
+pub fn function_names() -> impl Iterator<Item = &'static str> {
+    bind::scalar_call_names()
+        .chain(agg::agg_names())
+        .chain(hir::ranking_names())
+}
+
+/// Every `WITH (…)` option key a `CREATE TABLE` or `CREATE VIEW` accepts.
+pub fn with_option_names() -> impl Iterator<Item = &'static str> {
+    ddl::TABLE_OPTIONS.into_iter().chain(ddl::VIEW_OPTIONS)
+}
+
 /// Plan `sql`, one `SELECT` over one view with a delta feed, as a subscription:
 /// what a delta read of the view carries to be answered with only the rows and
 /// columns the `SELECT` keeps. The view's key rides along, hidden where the
@@ -90,7 +115,7 @@ pub async fn plan_subscription(
     schema_name: &str,
     sql: &str,
 ) -> Result<Subscription, GnitzSqlError> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let stmts = Parser::parse_sql(&DIALECT, sql)?;
     let [stmt] = &stmts[..] else {
         return Err(error::unsupported_clause("a subscription", "more than one statement"));
     };

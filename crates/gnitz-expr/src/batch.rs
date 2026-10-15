@@ -892,23 +892,26 @@ fn arena_push_int(arena: &mut Vec<u8>, magnitude: u64, neg: bool) -> StrView {
 /// outside `[1e-4, 1e15)`. The switch is what bounds the output — Rust's
 /// positional `Display` is unbounded, rendering `1e300` as 301 digits and
 /// `5e-324` as 326. Non-finite values are spelled as PostgreSQL spells them,
-/// rather than Rust's `inf`.
-fn arena_push_float(arena: &mut Vec<u8>, v: f64) -> StrView {
-    if !v.is_finite() {
-        let name = if v.is_nan() {
-            "NaN"
-        } else if v > 0.0 {
-            "Infinity"
+/// rather than Rust's `inf`. An `f32` keeps its own shortest form.
+pub struct FloatText<T>(pub T);
+
+impl<T: Copy + Into<f64> + fmt::Display + fmt::LowerExp> fmt::Display for FloatText<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let v: f64 = self.0.into();
+        if v.is_nan() {
+            f.write_str("NaN")
+        } else if v.is_infinite() {
+            f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" })
+        } else if v == 0.0 || (1e-4..1e15).contains(&v.abs()) {
+            fmt::Display::fmt(&self.0, f)
         } else {
-            "-Infinity"
-        };
-        return arena_push_text(arena, format_args!("{name}"));
+            fmt::LowerExp::fmt(&self.0, f)
+        }
     }
-    if v == 0.0 || (1e-4..1e15).contains(&v.abs()) {
-        arena_push_text(arena, format_args!("{v}"))
-    } else {
-        arena_push_text(arena, format_args!("{v:e}"))
-    }
+}
+
+fn arena_push_float(arena: &mut Vec<u8>, v: f64) -> StrView {
+    arena_push_text(arena, format_args!("{}", FloatText(v)))
 }
 
 /// SELECT's branch choice, and the null mask that follows from it — the half

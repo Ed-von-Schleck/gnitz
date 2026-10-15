@@ -837,6 +837,18 @@ impl GnitzClient {
         self.wait(sent)
     }
 
+    /// System families' rows, each under its spec, with no DDL between them.
+    pub async fn sys_cut<const N: usize>(
+        &mut self,
+        reads: [(u64, &ReadSpec); N],
+    ) -> Result<[ZSetBatch; N], ClientError> {
+        let scans = reads.map(|(family, spec)| (Target::from(family), spec, sys_schema(family)));
+        let mut replies = self.scan_many(&scans).await?.into_iter();
+        Ok(std::array::from_fn(|_| {
+            replies.next().expect("one reply per scan").batch
+        }))
+    }
+
     /// Index `cols` of relation `owner_id`, in that order, under the catalog name
     /// `index_name`.
     pub async fn create_index(
@@ -1447,15 +1459,6 @@ impl GnitzClient {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
         let i = schema_row(&batch, schema_name)?;
         Ok((batch, i))
-    }
-
-    /// System families' rows, each under its spec, with no DDL between them.
-    async fn sys_cut<const N: usize>(&mut self, reads: [(u64, &ReadSpec); N]) -> Result<[ZSetBatch; N], ClientError> {
-        let scans = reads.map(|(family, spec)| (Target::from(family), spec, sys_schema(family)));
-        let mut replies = self.scan_many(&scans).await?.into_iter();
-        Ok(std::array::from_fn(|_| {
-            replies.next().expect("one reply per scan").batch
-        }))
     }
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;

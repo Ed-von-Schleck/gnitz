@@ -120,6 +120,25 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     days.checked_mul(MICROS_PER_DAY)?.checked_add(tod)
 }
 
+/// A day count as `YYYY-MM-DD`: [`parse_date`]'s inverse.
+pub fn format_date(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A microsecond count as `YYYY-MM-DD HH:MM:SS`, with the fraction only as
+/// long as it needs to be: [`parse_timestamp`]'s inverse.
+pub fn format_timestamp(micros: i64) -> String {
+    let (days, h, mi, s, us) = split_micros(micros);
+    let mut out = format!("{} {h:02}:{mi:02}:{s:02}", format_date(days));
+    if us != 0 {
+        let frac = format!("{us:06}");
+        out.push('.');
+        out.push_str(frac.trim_end_matches('0'));
+    }
+    out
+}
+
 /// A microsecond count as `(days, hour, minute, second, microsecond)`, the
 /// day floored so a pre-epoch instant keeps a non-negative time of day.
 pub const fn split_micros(us: i64) -> (i64, u32, u32, u32, u32) {

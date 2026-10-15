@@ -8,7 +8,7 @@ use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::{WireFault, WireStatus};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectType, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -222,7 +222,7 @@ pub(crate) async fn execute_statement(
                 false,
                 |cat| dml::plan_update(update, cat),
                 |_| true,
-                dml::execute_mutation,
+                async |client, plan| dml::execute_mutation(client, plan, "UPDATE").await,
             )
             .await
         }
@@ -233,7 +233,7 @@ pub(crate) async fn execute_statement(
                 false,
                 |cat| dml::plan_delete(del, cat),
                 |_| true,
-                dml::execute_mutation,
+                async |client, plan| dml::execute_mutation(client, plan, "DELETE").await,
             )
             .await
         }
@@ -250,6 +250,23 @@ pub(crate) async fn execute_statement(
                 "this statement is not allowed inside a transaction".to_string(),
             ))
         }
+        Statement::CreateTable(_)
+        | Statement::Drop { .. }
+        | Statement::CreateView(_)
+        | Statement::CreateIndex(_)
+        | Statement::AlterTable(_)
+        | Statement::AlterView { .. } => {
+            execute_ddl(client, schema_name, stmt).await?;
+            Ok(SqlResult::Ddl { tag: ddl_tag(stmt) })
+        }
+        _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
+    }
+}
+
+/// Run one DDL statement; [`execute_statement`] has refused it inside a
+/// transaction.
+async fn execute_ddl(client: &mut GnitzClient, schema_name: &str, stmt: &Statement) -> Result<(), GnitzSqlError> {
+    match stmt {
         Statement::CreateTable(create) => {
             match planned(client, schema_name, false, false, |cat| {
                 ddl::plan_create_table(create, cat)
@@ -258,7 +275,7 @@ pub(crate) async fn execute_statement(
             .0?
             {
                 Some(plan) => ddl::execute_create_table(client, plan).await,
-                None => Ok(SqlResult::Ddl),
+                None => Ok(()),
             }
         }
         // The one statement whose clause rejections live in the router: sqlparser
@@ -288,7 +305,7 @@ pub(crate) async fn execute_statement(
                 .0?
             {
                 Some(chain) => ddl::execute_view_chain(client, chain).await,
-                None => Ok(SqlResult::Ddl),
+                None => Ok(()),
             }
         }
         Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci).await,
@@ -301,7 +318,22 @@ pub(crate) async fn execute_statement(
             .0?;
             ddl::execute_view_chain(client, chain).await
         }
-        _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
+        _ => unreachable!("execute_statement routes only DDL here"),
+    }
+}
+
+/// The command tag of a DDL statement [`execute_ddl`] ran.
+fn ddl_tag(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::CreateView(_) => "CREATE VIEW",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::AlterTable(_) => "ALTER TABLE",
+        Statement::AlterView { .. } => "ALTER VIEW",
+        Statement::Drop { object_type: ObjectType::Table, .. } => "DROP TABLE",
+        Statement::Drop { object_type: ObjectType::View, .. } => "DROP VIEW",
+        Statement::Drop { object_type: ObjectType::Index, .. } => "DROP INDEX",
+        _ => unreachable!("execute_ddl runs only these"),
     }
 }
 

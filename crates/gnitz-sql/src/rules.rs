@@ -121,16 +121,6 @@ impl ClassWant {
     }
 }
 
-/// How a rejection names the class a relation has: the wire noun, with a view's
-/// options spelled out where a requirement can turn on them.
-fn class_noun(class: RelClass) -> &'static str {
-    match class {
-        RelClass::BoundedView => "capacity-bounded view",
-        RelClass::FedView => "view with a delta feed",
-        RelClass::Table | RelClass::Stream | RelClass::View | RelClass::Catalog => class.noun(),
-    }
-}
-
 /// Reject a relation of the wrong class for `op`.
 pub(crate) fn require_class(
     rel: &RelDescriptor,
@@ -143,7 +133,7 @@ pub(crate) fn require_class(
     }
     Err(GnitzSqlError::Rejected(format!(
         "'{name}' is a {}; {op} requires {}",
-        class_noun(rel.class),
+        rel.class.describe(),
         want.noun()
     )))
 }

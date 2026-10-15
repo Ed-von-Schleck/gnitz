@@ -36,6 +36,33 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
     Ok(ColType::of(tc))
 }
 
+/// The SQL spelling of a column type, as a `CREATE TABLE` would write it:
+/// [`sql_col_type`]'s inverse.
+pub fn sql_type_name(ty: ColType) -> String {
+    let name = match ty.tc {
+        TypeCode::U8 => "TINYINT UNSIGNED",
+        TypeCode::I8 => "TINYINT",
+        TypeCode::U16 => "SMALLINT UNSIGNED",
+        TypeCode::I16 => "SMALLINT",
+        TypeCode::U32 => "INT UNSIGNED",
+        TypeCode::I32 => "INT",
+        TypeCode::U64 => "BIGINT UNSIGNED",
+        TypeCode::I64 => "BIGINT",
+        TypeCode::U128 => "UHUGEINT",
+        TypeCode::I128 => "HUGEINT",
+        TypeCode::F32 => "FLOAT",
+        TypeCode::F64 => "DOUBLE",
+        TypeCode::String => "TEXT",
+        TypeCode::Blob => "BLOB",
+        TypeCode::UUID => "UUID",
+        TypeCode::Date => "DATE",
+        TypeCode::Timestamp => "TIMESTAMP",
+        TypeCode::Bool => "BOOLEAN",
+        TypeCode::Decimal => return ty.to_string(),
+    };
+    name.to_string()
+}
+
 /// `DECIMAL(p, s)` / `NUMERIC(p, s)`: fixed-point at scale `s` (`DECIMAL(p)` is
 /// scale 0), `p` in `1..=MAX_DECIMAL_SCALE`. The precision bounds nothing finer — a value is
 /// bounded by the `i64` behind its scale.

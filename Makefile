@@ -50,7 +50,7 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration $(T)
+	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
 	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz $(T)
@@ -62,7 +62,7 @@ fmt-check: ## Check formatting without writing (CI gate)
 	cd crates && cargo fmt --all --check
 
 clippy: ## Lint the workspace incl. integration tests; warnings are errors
-	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration -- -D warnings
+	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration -- -D warnings
 
 check: ## Fast type-check without producing binaries
 	cd crates && cargo check --workspace
@@ -166,7 +166,7 @@ bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs 
 	mkdir -p tmp
 	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) TMPDIR=$(abspath tmp) \
 		cargo test --release --workspace --exclude gnitz-py --tests \
-		--features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration \
+		--features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration --features gnitz-repl/integration \
 		$(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1
 

@@ -141,8 +141,13 @@ fn plan_mutation(
     Ok(MutationPlan { target, bound, predicate, set })
 }
 
-/// Read the rows the WHERE matches, then write [`delta`] of them.
-pub(crate) async fn execute_mutation(client: &mut GnitzClient, plan: MutationPlan) -> Result<SqlResult, GnitzSqlError> {
+/// Read the rows the WHERE matches, then write [`delta`] of them; `tag` is
+/// the statement's command tag.
+pub(crate) async fn execute_mutation(
+    client: &mut GnitzClient,
+    plan: MutationPlan,
+    tag: &'static str,
+) -> Result<SqlResult, GnitzSqlError> {
     let MutationPlan { target, bound, predicate, mut set } = plan;
     let keys_only = set.is_none();
     let count = client
@@ -150,7 +155,7 @@ pub(crate) async fn execute_mutation(client: &mut GnitzClient, plan: MutationPla
             delta(set.as_deref_mut(), rows, &target.schema)
         })
         .await?;
-    Ok(SqlResult::RowsAffected { count })
+    Ok(SqlResult::RowsAffected { tag, count })
 }
 
 /// What a mutation writes for the `rows` it read: under a SET list the rewritten

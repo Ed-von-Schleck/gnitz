@@ -414,7 +414,7 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
                 None => {
                     let count = rows.len();
                     client.push(&*target, schema, rows, mode).await?;
-                    Ok(SqlResult::RowsAffected { count })
+                    Ok(SqlResult::RowsAffected { tag: "INSERT", count })
                 }
             }
         }
@@ -426,7 +426,7 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
                     resolve_conflicts(&rows, held, set.as_deref_mut(), schema)
                 })
                 .await?;
-            Ok(SqlResult::RowsAffected { count })
+            Ok(SqlResult::RowsAffected { tag: "INSERT", count })
         }
     }
 }

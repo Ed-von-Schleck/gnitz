@@ -749,10 +749,10 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyA
     let dicts = results.into_iter().map(|r| {
         let d = PyDict::new(py);
         match r {
-            SqlResult::Ddl => {
+            SqlResult::Ddl { .. } => {
                 d.set_item(k_type, pyo3::intern!(py, "Ddl"))?;
             }
-            SqlResult::RowsAffected { count } => {
+            SqlResult::RowsAffected { count, .. } => {
                 d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;
                 d.set_item(pyo3::intern!(py, "count"), count)?;
             }

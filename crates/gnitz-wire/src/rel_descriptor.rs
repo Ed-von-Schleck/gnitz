@@ -32,6 +32,15 @@ impl RelClass {
         }
     }
 
+    /// [`Self::noun`], naming a view's budget too.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RelClass::BoundedView => "capacity-bounded view",
+            RelClass::FedView => "view with a delta feed",
+            RelClass::Table | RelClass::Stream | RelClass::View | RelClass::Catalog => self.noun(),
+        }
+    }
+
     pub fn is_view(self) -> bool {
         matches!(self, RelClass::View | RelClass::BoundedView | RelClass::FedView)
     }
