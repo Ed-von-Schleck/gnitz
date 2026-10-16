@@ -374,7 +374,7 @@ impl MasterDispatcher {
         // before it; the flush above made every applied DROP durable.
         cat.reclaim_orphan_dirs();
         excl.checkpoint_reset();
-        gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
+        gnitz_note!("SAL checkpoint epoch={}", self.sal.epoch());
         Ok(())
     }
 

@@ -23,9 +23,8 @@ EX_USAGE = 64
     (("--tls-listen=0.0.0.0:0",), "--allow-unauthenticated"),
 ], ids=["argv", "tls"])
 def test_a_refused_command_line_is_a_usage_error_that_creates_nothing(own_server, args, named):
-    assert own_server.start_expecting_exit(extra_args=args) == EX_USAGE
+    assert own_server.start_expecting_exit(named, extra_args=args) == EX_USAGE
     assert not os.path.exists(own_server.data_dir)
-    assert named in own_server.log_text()
 
 
 @pytest.mark.parametrize("flag", ["--help", "-h"])
@@ -60,6 +59,5 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_TICK_COALESCE_ROWS", "10k"),
 ])
 def test_an_unreadable_environment_knob_stops_the_boot(own_server, var, value):
-    assert own_server.start_expecting_exit(extra_env={var: value}) != 0
     # A knob only a worker reads is refused in that worker's log.
-    assert var in own_server.log_text() or var in "".join(own_server.worker_log_texts())
+    own_server.start_expecting_exit(var, extra_env={var: value})

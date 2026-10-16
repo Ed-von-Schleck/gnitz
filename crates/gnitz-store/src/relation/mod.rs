@@ -107,16 +107,15 @@ impl SecondaryIndex {
         t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r), Cut::Now)
     }
 
-    /// Project `source` into this index's layout and ingest the result.
-    /// `Ok(false)` when the projection was empty: the key spec rejects rows, so
-    /// a non-empty `source` can still project to nothing.
-    pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<bool, StorageError> {
+    /// Project `source` into this index's layout and ingest the result. The key
+    /// spec rejects rows, so a non-empty `source` can project to nothing.
+    pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
         let table = self.store.held_mut();
         let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
-        table.ingest(projected).map(|()| true)
+        table.ingest(projected)
     }
 
     /// Whether this process's store of the index came back from a checkpoint

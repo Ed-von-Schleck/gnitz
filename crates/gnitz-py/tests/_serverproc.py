@@ -72,11 +72,6 @@ TINY_SCAN_CHUNKS = {"GNITZ_SCAN_CHUNK_ROWS": "3"}
 # back-pressures by bytes, not a frame count.
 TINY_REPLY_FRAMES = {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)}
 
-# SAL pinned to its 16 MiB floor with the checkpoint threshold at 15 MiB, high
-# enough that a test's pushes stop short of it and only its reads cross it — so
-# the watchdog, which fires at the threshold, is the only thing that can reclaim.
-TINY_SAL = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}
-
 # Stores reach the disk regime on a few thousand rows. A store spills once its
 # RAM tier crosses this ceiling, which only happens at a memtable fold or a
 # checkpoint's ephemeral round — so the checkpoint threshold is squeezed too.
@@ -84,6 +79,10 @@ SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(16 * 
 
 # The pending rows of one table that fire a tick without a read draining it.
 TICK_COALESCE_ROWS = 10_000
+
+# Every stage `GNITZ_INJECT_RECOVERY_PANIC` names: the boot's recovery steps
+# from the generation bump to the view backfill.
+RECOVERY_STAGES = ["genbump", "reset", "sweep", "backfill"]
 
 
 def server_env():
@@ -325,10 +324,12 @@ class ServerProc:
         self.tls_target = f"tls://127.0.0.1:{port}?ca={self.data_dir}/tls_cert.pem"
         return self
 
-    def start_expecting_exit(self, *, workers=None, extra_env=None, extra_args=(), timeout=20.0):
+    def start_expecting_exit(self, marker, *, workers=None, extra_env=None, extra_args=(), timeout=20.0):
         """Spawn a server expected to die during boot. Returns its non-zero exit
-        code, having confirmed it never became ready. `extra_args` follow the
-        arguments every boot gets, so a flag given there replaces its default."""
+        code, having confirmed it never became ready and logged `marker` — in the
+        master's log or a worker's — so a boot that died of anything else fails.
+        `extra_args` follow the arguments every boot gets, so a flag given there
+        replaces its default."""
         if workers is not None:
             self.workers = workers
         self.proc = self._popen(extra_env, extra_args, server_preexec_no_core)
@@ -336,6 +337,11 @@ class ServerProc:
         while time.time() < deadline:
             rc = self.proc.poll()
             if rc is not None:
+                # Reaps the workers the master's PDEATHSIG reaches only asynchronously.
+                self.stop()
+                assert rc != 0, f"the boot exited cleanly\n{self.log_tail()}"
+                assert marker in self.log_text() or any(marker in t for t in self.worker_log_texts()), \
+                    f"the boot died without logging {marker!r}, rc={rc}\n{self.log_tail()}"
                 return rc
             if _READY_MARKER in self.log_text():
                 self.stop()
@@ -453,8 +459,11 @@ class ServerProc:
         in each is this boot's."""
         texts = []
         for w in range(self.workers):
-            with open(os.path.join(self.data_dir, f"worker_{w}.log")) as f:
-                texts.append(f.read())
+            try:
+                with open(os.path.join(self.data_dir, f"worker_{w}.log")) as f:
+                    texts.append(f.read())
+            except FileNotFoundError:
+                texts.append("")
         return texts
 
     def rebuilt_view_count(self):
@@ -483,8 +492,8 @@ class ServerProc:
         return any("re-sliced from" in t for t in self.worker_log_texts())
 
     def sal_checkpoints(self):
-        """How many SAL checkpoint resets this boot has logged. Only visible at
-        `GNITZ_LOG_LEVEL=normal`, so a test reading it must set that."""
+        """How many SAL resets this boot has logged: one at the boot's own
+        checkpoint, then two per checkpoint — its base and its ephemeral round."""
         return self.log_text().count("SAL checkpoint epoch=")
 
 

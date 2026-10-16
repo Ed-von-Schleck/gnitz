@@ -13,7 +13,6 @@ import pytest
 import gnitz
 from _read import bag, rows, scanned
 from _schemas import KV, kv
-from _serverproc import TINY_SAL
 
 _TU = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
        "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
@@ -152,7 +151,8 @@ def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
     def wide(n):  # ~10 MB of rows
         return gnitz.ZSetBatch(schema).extend([{"pk": i, "pad": pad} for i in range(n)])
 
-    with gnitz.connect(own_server.start(extra_env=TINY_SAL).target) as client:
+    with gnitz.connect(own_server.start(extra_env={
+            "GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}).target) as client:
         a, b = (client.create_table(n, schema) for n in "ab")
         with pytest.raises(gnitz.GnitzSalFullError):
             with client.transaction() as txn:

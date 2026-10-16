@@ -26,9 +26,8 @@ _SEAM = {"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"}
 
 _ABORTED = {
     "t": "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-    # An FK bundle: the pre-fix cross-zone orphan (COL_TAB committed in its own
-    # zone before the owning TABLE_TAB) is structurally unconstructible once a
-    # CREATE is one atomic message, so this is the regression proof.
+    # An FK bundle: its COL_TAB rows must roll back with the TABLE_TAB row they
+    # belong to.
     "child": "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, "
              "pid BIGINT NOT NULL REFERENCES parent(id))",
     "v": "CREATE VIEW v AS SELECT id FROM parent",
@@ -41,9 +40,9 @@ _ABORTED = {
 
 def test_an_aborted_ddl_leaves_no_durable_trace(own_server):
     """Four DDL bundles, each aborted on its own boot, then one clean boot that
-    must find no trace of any of them: nothing resolves, every name is free to
-    re-create, a re-created UNIQUE still enforces, and no phantom FK child or view
-    dependency blocks the parent's DELETE or its DROP."""
+    must find no trace of any of them: nothing resolves, a table re-created under
+    an aborted name is exact, a re-created UNIQUE still enforces, and no phantom
+    FK child or view dependency blocks the parent's DELETE or its DROP."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)")

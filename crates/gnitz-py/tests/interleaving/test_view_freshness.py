@@ -10,6 +10,7 @@ answered by each worker only once its drive has ended.
 """
 
 import gnitz
+import pytest
 from _read import bag, scanned
 from _schemas import KV, kv
 from _serverproc import TICK_COALESCE_ROWS, across
@@ -105,3 +106,24 @@ def test_an_unrelated_pending_tick_does_not_gate_the_read(client):
 
     # And the drain is not simply broken: v2's own read does absorb it.
     assert client.scan(v2, v2_schema).lsn >= push_lsn, "a read of the dirty view must drain its source"
+
+
+def test_a_failed_tick_fails_its_read_and_stays_pending(own_server):
+    """A view tick that fails to emit fails the read waiting on it, rather than
+    answering OK over a view that silently stopped advancing, and the next read
+    ticks the same delta.
+
+    The emit failure needs a seam; a real one takes a full SAL. The CREATE VIEW
+    has nothing pending, emits no tick and so cannot spend it."""
+    with gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_TICK_EMIT_ERROR": "1"}).target) as client:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+            "CREATE VIEW v AS SELECT pk, val FROM t WHERE val > 5; "
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 1)")
+
+        with pytest.raises(gnitz.GnitzRefusedError):
+            scanned(client, "v")
+
+        # One read is the whole claim: polling for convergence would also pass on
+        # a view that converges and then diverges again.
+        assert bag(scanned(client, "v"), "pk", "val") == {(1, 10): 1, (2, 20): 1}

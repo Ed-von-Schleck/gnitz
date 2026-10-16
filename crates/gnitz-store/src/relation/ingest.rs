@@ -150,11 +150,7 @@ impl RelationRegistry {
 
         for ix in entry.indexes.iter_mut() {
             let cols = ix.cols;
-            let res = match ix.project_and_ingest(&effective) {
-                // The seam reports from a write that ran; an empty projection is none.
-                Ok(false) => continue,
-                other => other.map(drop),
-            };
+            let res = ix.project_and_ingest(&effective);
             inject_ingest_apply_error("index", kind, res).map_err(|e| {
                 format!(
                     "ingest into index on columns {:?} of relation {id}: {e}",

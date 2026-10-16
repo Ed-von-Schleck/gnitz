@@ -12,10 +12,11 @@ that comes back empty or short. Every test reads the view's Z-set against the
 value recomputed from the rows pushed.
 """
 
+import pytest
 import gnitz
-from _read import bag, scanned
+from _read import bag, rows, scanned
 from _serverproc import disk_usage
-from _sql import values
+from _sql import insert, values
 
 _REGIONS = ["north", "south", "east"]
 
@@ -26,7 +27,7 @@ def _orders(keys):
 
 def _build(conn, orders):
     """Rows before the view, so the view is built by a backfill through its
-    segment. Answers the view's id."""
+    segment. Answers the segment's id."""
     customers = [(c, _REGIONS[c % 3]) for c in range(1, 8)]
     conn.execute_sql(
         "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region TEXT NOT NULL); "
@@ -36,7 +37,9 @@ def _build(conn, orders):
         f"INSERT INTO orders VALUES {values(orders)}; "
         "CREATE VIEW by_region AS SELECT c.region, COUNT(*) AS n, SUM(o.amount) AS total "
         "FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region")
-    return conn.resolve_table("by_region")[0]
+    view = conn.resolve_table("by_region")[0]
+    [segment] = rows(conn, f"SELECT view_id FROM _system.views WHERE owner_view_id = {view}")
+    return segment.view_id
 
 
 def _want(orders, moved=()):
@@ -56,12 +59,11 @@ def _assert_view(srv, orders, ctx, moved=()):
     assert got == want, f"{ctx}: the view is {got}, want {want}"
 
 
-def _segment_stores(srv, view):
-    """`{store: rows}` of `view`'s one segment, off the files of a stopped
-    server. The planner allocates a chain's ids consecutively, its user view last."""
+def _segment_stores(srv, segment):
+    """`{store: rows}` of `segment`, off the files of a stopped server."""
     out = {}
     for s in disk_usage(srv.data_dir)[1]:
-        if s["relation"] == view - 1:
+        if s["relation"] == segment:
             out[s["store"]] = out.get(s["store"], 0) + s["rows"]
     return out
 
@@ -73,11 +75,11 @@ def test_a_built_chain_holds_no_segment_rows_and_keeps_ticking(own_server):
     orders = _orders(range(1, 41))
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
-        view = _build(conn, orders)
+        segment = _build(conn, orders)
     _assert_view(own_server, orders, "built by a backfill")
     own_server.stop_graceful()
 
-    stores = _segment_stores(own_server, view)
+    stores = _segment_stores(own_server, segment)
     traces = {store: rows for store, rows in stores.items() if store != "rows"}
     assert any(traces.values()), f"the segment holds no trace at all: {stores}"
     assert stores.get("rows", 0) == 0, f"a built chain's segment still holds its rows: {stores}"
@@ -86,7 +88,7 @@ def test_a_built_chain_holds_no_segment_rows_and_keeps_ticking(own_server):
     assert own_server.rebuilt_view_count() == 0, "a built chain must resume"
     more = _orders(range(41, 61))
     with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(f"INSERT INTO orders VALUES {values(more)}")
+        insert(conn, "orders", more)
         conn.execute_sql("DELETE FROM orders WHERE id <= 10")
         # A customer moving region retracts and re-adds every order it has.
         conn.execute_sql("UPDATE customers SET region = 'north' WHERE id = 2")
@@ -94,32 +96,23 @@ def test_a_built_chain_holds_no_segment_rows_and_keeps_ticking(own_server):
     _assert_view(own_server, kept, "a resumed chain must tick from both sources", moved={2})
 
 
-def test_a_rebuilt_chain_rebuilds_its_segment(own_server):
-    """A crash before any checkpoint of the chain rebuilds it whole: the view's
-    backfill reads segment rows the same boot put back."""
-    orders = _orders(range(1, 41))
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        view = _build(conn, orders)
-    own_server.restart()
-    assert own_server.rebuilt_view_count() == 2, "the segment and its view rebuild together"
-    _assert_view(own_server, orders, "rebuilt after a crash")
-
-    more = _orders(range(41, 61))
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(f"INSERT INTO orders VALUES {values(more)}")
-    _assert_view(own_server, orders + more, "a rebuilt chain must keep ticking")
-    own_server.stop_graceful()
-    assert _segment_stores(own_server, view).get("rows", 0) == 0, "a rebuilt chain's segment still holds its rows"
-
-
-def test_a_changed_worker_count_rebuilds_a_built_chain(own_server):
-    """A relayout rebuilds every view. The chain was checkpointed with its
-    segment's rows already dropped, so the rebuild has to refill them."""
+@pytest.mark.parametrize("boundary", [{}, {"graceful": True, "workers": 2}], ids=["crash", "relayout"])
+def test_a_rebuilt_chain_rebuilds_its_segment(own_server, boundary):
+    """A crash before any checkpoint of the chain rebuilds it whole, and so does a
+    relayout of a chain checkpointed with its segment's rows already dropped: the
+    view's backfill reads segment rows the same boot put back, and drops them
+    again once built."""
     orders = _orders(range(1, 41))
     own_server.start(workers=4)
     with gnitz.connect(own_server.target) as conn:
-        _build(conn, orders)
-    own_server.restart(graceful=True, workers=2)
-    assert own_server.rebuilt_view_count() == 2
-    _assert_view(own_server, orders, "rebuilt at another worker count")
+        segment = _build(conn, orders)
+    own_server.restart(**boundary)
+    assert own_server.rebuilt_view_count() == 2, "the segment and its view rebuild together"
+    _assert_view(own_server, orders, "rebuilt")
+
+    more = _orders(range(41, 61))
+    with gnitz.connect(own_server.target) as conn:
+        insert(conn, "orders", more)
+    _assert_view(own_server, orders + more, "a rebuilt chain must keep ticking")
+    own_server.stop_graceful()
+    assert _segment_stores(own_server, segment).get("rows", 0) == 0, "a rebuilt chain's segment still holds its rows"

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{park_until, request_barrier, send_ack, Shared};
 use crate::catalog::{unique_index_creates, SysFamily};
-use crate::runtime::committer::BarrierKind;
+use crate::runtime::committer::{BarrierKind, CHECKPOINTS_BEHIND_DDL};
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::WriteGuard;
@@ -64,6 +64,21 @@ const HOLD_TICK_MAX_POLLS: u32 = 10_000;
 pub(super) async fn hold_tick_for_ddl(shared: &Shared) {
     park_until(shared, HOLD_TICK_MAX_POLLS, "tick hold", || {
         DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
+    })
+    .await
+}
+
+/// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: see `hold_ddl_for_checkpoint`.
+static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
+
+/// Hold the first DDL, its zone written and its locks still held, until a
+/// checkpoint sequence waits on its tick gate, so that sequence provably starts
+/// inside the DDL. The zone moves the SAL cursor, so a checkpoint threshold
+/// below one zone has the watchdog wake the committer into that wait. One-shot.
+async fn hold_ddl_for_checkpoint(shared: &Shared) {
+    let seen = CHECKPOINTS_BEHIND_DDL.load(Ordering::Relaxed);
+    park_until(shared, HOLD_TICK_MAX_POLLS, "ddl hold", || {
+        CHECKPOINTS_BEHIND_DDL.load(Ordering::Relaxed) > seen
     })
     .await
 }
@@ -189,6 +204,9 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         shared.sync_waiters.wake(family);
     }
 
+    if DDL_HOLD_FOR_CHECKPOINT.take_once() {
+        hold_ddl_for_checkpoint(shared).await;
+    }
     drop(locks);
     send_ack(peer, 0, zone_lsn);
     let total = t_ddl_start.elapsed();

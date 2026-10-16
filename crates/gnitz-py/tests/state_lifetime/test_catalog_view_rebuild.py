@@ -4,7 +4,7 @@ exact over the catalog the boot recovered."""
 import pytest
 import gnitz
 from _read import bag, rows, scanned
-from _serverproc import MULTI
+from _serverproc import MULTI, RECOVERY_STAGES
 
 # `cat` scans a family, `over` scans `cat`, `joined` mixes a family with a keyed
 # table; `plain` reaches user tables alone and is the one that resumes.
@@ -53,27 +53,16 @@ def _assert_exact(srv, ctx):
         return sorted(names.values())
 
 
-def test_a_graceful_restart_rebuilds_the_catalog_views_alone(own_server):
-    _setup(own_server)
-    own_server.restart(graceful=True)
-    assert own_server.rebuilt_view_count() == CATALOG_VIEWS, \
-        "every view reaching a family rebuilds; the one over user tables resumes"
-    assert _assert_exact(own_server, "after a graceful restart") == ["a", "b", "notes"]
-
-    # A rebuilt view keeps ticking.
-    with gnitz.connect(own_server.target) as conn:
-        _make(conn, ["c"])
-        conn.execute_sql("DROP TABLE a")
-    assert _assert_exact(own_server, "live after the rebuild") == ["b", "c", "notes"]
-
-
 @pytest.mark.parametrize("ddl_in_tail", [False, True], ids=["push-tail", "ddl-tail"])
-def test_a_crash_rebuilds_the_catalog_views_over_the_whole_catalog(own_server, ddl_in_tail):
-    """Checkpointed, then killed with a tail: the tail's catalog rows are in the
-    families before the views exist, so the rebuild reads them once."""
+def test_every_boot_rebuilds_the_catalog_views_over_the_whole_catalog(own_server, ddl_in_tail):
+    """A graceful restart rebuilds every view reaching a family and resumes the
+    one over user tables alone. Then killed with a tail: the tail's catalog rows
+    are in the families before the views exist, so the rebuild reads them once."""
     _setup(own_server)
     own_server.restart(graceful=True)
-    want = ["a", "b", "notes"]
+    assert own_server.rebuilt_view_count() == CATALOG_VIEWS
+    want = _assert_exact(own_server, "after a graceful restart")
+    assert want == ["a", "b", "notes"]
     with gnitz.connect(own_server.target) as conn:
         if ddl_in_tail:
             _make(conn, ["c"])
@@ -87,10 +76,11 @@ def test_a_crash_rebuilds_the_catalog_views_over_the_whole_catalog(own_server, d
     assert _assert_exact(own_server, "after the crash") == want
     with gnitz.connect(own_server.target) as conn:
         _make(conn, ["d"])
-    assert _assert_exact(own_server, "live after the crash") == sorted(want + ["d"])
+        conn.execute_sql(f"DROP TABLE {want[0]}")
+    assert _assert_exact(own_server, "live after the crash") == sorted(want[1:] + ["d"])
 
 
-@pytest.mark.parametrize("stage", ["genbump", "reset", "sweep", "backfill"])
+@pytest.mark.parametrize("stage", RECOVERY_STAGES)
 def test_a_crash_in_the_recovery_window_leaves_the_catalog_views_exact(stage, own_server):
     _setup(own_server)
     own_server.restart(graceful=True)
@@ -99,8 +89,8 @@ def test_a_crash_in_the_recovery_window_leaves_the_catalog_views_exact(stage, ow
         conn.execute_sql("DROP TABLE a")
     own_server.stop()
 
-    rc = own_server.start_expecting_exit(extra_env={"GNITZ_INJECT_RECOVERY_PANIC": stage})
-    assert rc != 0, f"the injected panic at {stage} must crash boot"
+    own_server.start_expecting_exit(
+        f"injected recovery panic at {stage}", extra_env={"GNITZ_INJECT_RECOVERY_PANIC": stage})
 
     own_server.start()
     assert _assert_exact(own_server, f"after a crash at {stage}") == ["b", "c", "notes"]
@@ -113,6 +103,8 @@ def test_a_restart_at_another_worker_count_rebuilds_them_exact(own_server, befor
     with gnitz.connect(own_server.target) as conn:
         _make(conn, ["c"])
     own_server.restart(workers=after)
+    assert own_server.resliced()
+    assert own_server.rebuilt_view_count() == CATALOG_VIEWS + 1, "a changed count invalidates every view"
     assert _assert_exact(own_server, f"{before} -> {after} workers") == ["a", "b", "c", "notes"]
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql("DROP TABLE b")

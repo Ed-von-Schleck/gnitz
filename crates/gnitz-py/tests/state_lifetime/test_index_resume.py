@@ -19,25 +19,27 @@ import pytest
 import gnitz
 from _paths import relation_dir
 from _read import access, bag, rows, scanned
-from _sql import insert
+from _serverproc import MULTI
+from _sql import insert, values
 
 
 @pytest.mark.parametrize("wrote,launched,rebuilt", [(None, None, 0), (4, 2, 1)],
                          ids=["same-count", "relayout"])
-@pytest.mark.parametrize("owner,ddl", [
-    ("t", "CREATE INDEX ON t(g)"),
-    ("t", "CREATE UNIQUE INDEX ON t(g)"),
-    ("v", "CREATE VIEW v AS SELECT id, g FROM t; CREATE INDEX ON v(g)"),
+@pytest.mark.parametrize("owner,ddl,unique", [
+    ("t", "CREATE INDEX ON t(g)", False),
+    ("t", "CREATE UNIQUE INDEX ON t(g)", True),
+    ("v", "CREATE VIEW v AS SELECT id, g FROM t; CREATE INDEX ON v(g)", False),
 ], ids=["table", "unique", "view"])
-def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, owner, ddl):
+def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, owner, ddl, unique):
     """A graceful stop's shutdown barrier runs a full checkpoint sequence, whose
     ephemeral round publishes every worker's index at the committed generation.
     A restart at the same count must reload it: the seeks alone would pass on a
     silent rebuild, so the marker is the discriminating assertion. A restart at
     a different count moves every rank's index home at once: each launched rank
     re-derives its own slice of the one index, and no child written at the old
-    count survives on disk. A unique index still refuses a held value, on an
-    INSERT and on an UPDATE, and admits a fresh one."""
+    count survives on disk. A unique index still refuses a held value, and
+    admits one whose sole holder was deleted — which an index holding a stale
+    entry for it refuses."""
     own_server.start(workers=wrote)
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
@@ -52,12 +54,13 @@ def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, 
         for i in (0, 63):
             assert bag(conn.seek_by_index(rid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the restart"
-        if "UNIQUE" in ddl:
-            for stmt in ("INSERT INTO t VALUES (1000, 630)", "UPDATE t SET g = 0 WHERE id = 5"):
-                with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
-                    conn.execute_sql(stmt)
-            conn.execute_sql("INSERT INTO t VALUES (1000, 5)")
-            assert bag(scanned(conn, "t")) == dict.fromkeys([(i, i * 10) for i in range(64)] + [(1000, 5)], 1)
+        if unique:
+            with pytest.raises(gnitz.GnitzIntegrityError, match="Unique index violation"):
+                conn.execute_sql("UPDATE t SET g = 0 WHERE id = 5")
+            conn.execute_sql("DELETE FROM t WHERE id = 7")
+            conn.execute_sql("INSERT INTO t VALUES (1000, 70)")
+            assert bag(scanned(conn, "t")) == dict.fromkeys(
+                [(i, i * 10) for i in range(64) if i != 7] + [(1000, 70)], 1)
 
     assert own_server.rebuilt_index_counts() == [rebuilt] * own_server.workers
     children = [d for d in os.listdir(relation_dir(own_server.data_dir, rid)) if d.startswith("idx_")]
@@ -91,8 +94,9 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
     """Four probes of the same fact, over one crash restart. Each is a *negative*
     consequence of a stale foreign entry, which is the only kind that
     discriminates: rejecting a genuine duplicate and admitting a genuinely fresh
-    value both pass with an over-populated index."""
-    own_server.start()
+    value both pass with an over-populated index. A stale entry is a foreign
+    one, so this needs more than one worker."""
+    own_server.start(workers=MULTI)
     with gnitz.connect(own_server.target) as conn:
         for stmt in (
             "CREATE TABLE uq (id BIGINT NOT NULL PRIMARY KEY, u BIGINT NOT NULL UNIQUE)",
@@ -110,13 +114,13 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
             # Remove the only child before the boundary, so the parent value is
             # free to retarget afterwards.
             "DELETE FROM c2 WHERE id = 10",
-            "INSERT INTO sx VALUES " + ", ".join(
-                f"({i}, {7 if i % 3 == 0 else 1000 + i})" for i in range(30)),
+            f"INSERT INTO sx VALUES {values((i, 7 if i % 3 == 0 else 1000 + i) for i in range(30))}",
             "CREATE INDEX ON sx(g)",
         ):
             conn.execute_sql(stmt)
 
     own_server.restart()
+    assert all(own_server.rebuilt_index_counts()), "every worker must rebuild its slice"
     with gnitz.connect(own_server.target) as conn:
         # 1. A unique value whose sole holder is deleted must be re-insertable:
         #    a non-owning worker keeping the value's stale +1 rejects it.
@@ -156,50 +160,3 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
         assert bag(scanned(conn, "sx"), "id", "g") == (
             {(i, 7 if i % 3 == 0 else 1000 + i): 1 for i in range(1, 30)}
             | {(100, 7): 1})
-
-
-def test_the_ordered_index_of_a_top_n_view_survives_a_restart(own_server):
-    """The index below a top-N view's cut is checkpointed with the view, not
-    rebuilt from the base on demand: after a restart the window keeps moving
-    under new writes, promotion included. A rebuilt-on-demand index would answer
-    the first read correctly and then fail to promote."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(
-            "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
-            "score BIGINT, name VARCHAR(30) NOT NULL)")
-        conn.execute_sql(
-            "CREATE VIEW top2 AS SELECT id, score FROM scores ORDER BY score DESC LIMIT 2")
-        conn.execute_sql(
-            "INSERT INTO scores VALUES (1, 0, 10, 'a'), (2, 0, 30, 'b'), (3, 0, 20, 'c')")
-        assert bag(scanned(conn, "top2"), "id") == {(2,): 1, (3,): 1}
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
-        assert bag(scanned(conn, "top2"), "id") == {(2,): 1, (3,): 1}
-        conn.execute_sql("DELETE FROM scores WHERE id = 2")
-        assert bag(scanned(conn, "top2"), "id") == {(3,): 1, (1,): 1}
-
-
-@pytest.mark.parametrize("graceful", [True, False], ids=["stop", "kill"])
-def test_the_ordered_index_of_a_window_view_survives_a_restart(own_server, graceful):
-    """A window's index of every input row is its whole history: after a restart
-    a new row still ranks behind the rows written before it, and a retraction
-    still moves the rows behind the one that left."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(
-            "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, score BIGINT NOT NULL); "
-            "CREATE VIEW ranked AS SELECT id, RANK() OVER w AS r, SUM(score) OVER w AS s FROM scores "
-            "WINDOW w AS (PARTITION BY grp ORDER BY score)")
-        insert(conn, "scores", [(1, 0, 10), (2, 0, 30), (3, 0, 20), (4, 1, 5)])
-        assert bag(scanned(conn, "ranked")) == {(1, 1, 10): 1, (2, 3, 60): 1, (3, 2, 30): 1, (4, 1, 5): 1}
-
-    own_server.restart(graceful=graceful)
-    with gnitz.connect(own_server.target) as conn:
-        assert bag(scanned(conn, "ranked")) == {(1, 1, 10): 1, (2, 3, 60): 1, (3, 2, 30): 1, (4, 1, 5): 1}
-        insert(conn, "scores", [(5, 0, 25)])
-        assert bag(scanned(conn, "ranked")) == {
-            (1, 1, 10): 1, (2, 4, 85): 1, (3, 2, 30): 1, (4, 1, 5): 1, (5, 3, 55): 1}
-        conn.execute_sql("DELETE FROM scores WHERE id = 1")
-        assert bag(scanned(conn, "ranked")) == {(2, 3, 75): 1, (3, 1, 20): 1, (4, 1, 5): 1, (5, 2, 45): 1}

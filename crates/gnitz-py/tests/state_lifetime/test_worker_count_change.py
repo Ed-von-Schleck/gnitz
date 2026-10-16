@@ -21,6 +21,7 @@ duplicated replicated copy produces, and exactly what keying by PK would hide.
 import pytest
 import gnitz
 from _read import bag, scanned
+from _sql import insert
 
 
 def _replicated_dim(conn):
@@ -47,10 +48,8 @@ def _join_over_dim(conn):
 
 def _insert_pairs(conn, lo, hi):
     """One `dim` row and one matching `fact` row per key in [lo, hi)."""
-    conn.execute_sql(
-        "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(lo, hi)))
-    conn.execute_sql(
-        "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, hi)))
+    insert(conn, "dim", [(i, i * 10) for i in range(lo, hi)])
+    insert(conn, "fact", [(i, i) for i in range(lo, hi)])
 
 
 def _joined(srv):
@@ -77,9 +76,7 @@ def test_an_unflushed_tail_survives_a_worker_count_change(wrote, launched, own_s
             "u BIGINT NOT NULL UNIQUE, PRIMARY KEY (a, b)) CLUSTER BY a")
         # A pinned key set — 20 distinct `a`, 10 `b` each — so a changed hash
         # fails loudly instead of silently degrading the partition spread.
-        conn.execute_sql(
-            "INSERT INTO t VALUES " + ",".join(f"({a}, {b}, {a * 10 + b})"
-                                               for a, b in keys))
+        insert(conn, "t", [(a, b, a * 10 + b) for a, b in keys])
         # Still in the same tail: retract one key and re-insert it.
         conn.execute_sql("DELETE FROM t WHERE a = 7 AND b = 3")
         conn.execute_sql("INSERT INTO t VALUES (7, 3, 73)")
@@ -153,12 +150,10 @@ def test_a_join_compiled_after_a_reboot_reaches_every_replicated_copy(own_server
     own_server.start(workers=4)
     with gnitz.connect(own_server.target) as conn:
         _replicated_dim(conn)
-        conn.execute_sql(
-            "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(8)))
+        insert(conn, "dim", [(i, i * 10) for i in range(8)])
 
     own_server.restart(workers=4)
     with gnitz.connect(own_server.target) as conn:
         _join_over_dim(conn)
-        conn.execute_sql(
-            "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i % 8})" for i in range(40)))
+        insert(conn, "fact", [(i, i % 8) for i in range(40)])
     assert _joined(own_server) == {(i, (i % 8) * 10): 1 for i in range(40)}

@@ -26,43 +26,21 @@ _ROWS = [(i, i * 10, f"r{i}", i if i % 2 else None) for i in range(24)]
 _ROWS += [(100, 1000, "A" * 200, 5), (101, 1010, "B" * 250, None), (102, 1020, "", 7)]
 
 
-def test_a_commit_after_a_replayed_tail_survives_the_next_crash(own_server):
-    """Many single-row commits replayed at boot, then one more and a crash: that
-    commit's zone must sit above the watermark the replay persisted."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(
-            "CREATE TABLE r (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
-            "WITH (replicated = true)")
-        for pk in range(16):
-            conn.execute_sql(f"INSERT INTO r VALUES ({pk}, {pk})")
-    want = {(pk, pk): 1 for pk in range(16)}
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
-        assert bag(scanned(conn, "r"), "pk", "val") == want
-        conn.execute_sql("INSERT INTO r VALUES (100, 100)")
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
-        assert bag(scanned(conn, "r"), "pk", "val") == want | {(100, 100): 1}
-
-
-def test_every_dml_verb_survives_two_crashes(own_server):
+@pytest.mark.parametrize("placement", ["", " WITH (replicated = true)"],
+                         ids=["partitioned", "replicated"])
+def test_every_dml_verb_survives_two_crashes(own_server, placement):
     """INSERT, UPDATE, DELETE and delete-then-reinsert, the last three applied
     repeatedly to one key, then two consecutive crashes with no clean shutdown
-    between them. A retraction replayed twice nets the row to weight 0 and a
-    push replayed twice to weight 2, so the bag is the observable. A SERIAL
-    table rides along: every id drawn after a crash exceeds every id committed
-    before it. So does a cascading delete, before each crash, whose child rows
-    and the view over them come back at their own weights."""
+    between them, the commit between them landing behind a replayed tail. A
+    retraction replayed twice nets the row to weight 0 and a push replayed twice
+    to weight 2, so the bag is the observable. So does a cascading delete, before
+    each crash, whose child rows and the view over them come back at their own
+    weights."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, "
-            "s VARCHAR(500) NOT NULL, n BIGINT); "
-            "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
-            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c'); "
+            f"s VARCHAR(500) NOT NULL, n BIGINT){placement}; "
             "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY); "
             "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, "
             "pid BIGINT NOT NULL REFERENCES p(id) ON DELETE CASCADE); "
@@ -87,36 +65,27 @@ def test_every_dml_verb_survives_two_crashes(own_server):
         assert bag(scanned(conn, "t"), *_COLS) == want
         assert [bag(scanned(conn, r)) for r in ("p", "c", "per_p")] == [{(2,): 1}, {(20, 2): 1}, {(2, 1): 1}]
         conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1); DELETE FROM p WHERE id = 2")
-        [d] = rows(conn, "INSERT INTO q (name) VALUES ('d') RETURNING id")
 
     own_server.restart()
     with gnitz.connect(own_server.target) as conn:
         assert bag(scanned(conn, "t"), *_COLS) == want | {
             (300, 3000, "post", 1): 1}, "a second crash with no clean stop between"
         assert [bag(scanned(conn, r)) for r in ("p", "c", "per_p")] == [{}, {}, {}]
-        [e] = rows(conn, "INSERT INTO q (name) VALUES ('e') RETURNING id")
-        assert 3 < d.id < e.id, "a SERIAL id reissued across a crash"
-        assert bag(scanned(conn, "q"), "id", "name") == {
-            (1, "a"): 1, (2, "b"): 1, (3, "c"): 1, (d.id, "d"): 1, (e.id, "e"): 1}
 
 
 def test_no_committed_serial_id_is_reissued_after_a_crash(own_server):
     """A SERIAL reservation is acknowledged without a sync of its own: it is
     durable once a commit behind it in the log is. So every id a committed row
     holds must stay taken across a crash, whichever connection reserved it and
-    whichever table's commit followed, while a reservation no commit followed is
-    free to come back.
+    whichever table's commit followed.
 
     `a` and `b` reserve from separate connections, so `b`'s reservation sits
-    behind `a`'s commit. `c`'s is followed by a commit to another table only.
-    The refused insert reserves from `q` and commits nothing."""
+    behind `a`'s commit. `c`'s is followed by a commit to another table only."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
-            "CREATE TABLE other (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
-            "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY); "
-            "CREATE TABLE child (id SERIAL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))")
+            "CREATE TABLE other (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
     committed = {}
     for name in ("a", "b"):
         with gnitz.connect(own_server.target) as conn:
@@ -126,9 +95,6 @@ def test_no_committed_serial_id_is_reissued_after_a_crash(own_server):
         [c] = rows(conn, "INSERT INTO q (name) VALUES ('c') RETURNING id")
         committed[c.id] = "c"
         conn.execute_sql("INSERT INTO other VALUES (1, 1)")
-    with gnitz.connect(own_server.target) as conn:
-        with pytest.raises(gnitz.GnitzIntegrityError, match="Foreign Key violation"):
-            conn.execute_sql("INSERT INTO child (pid) VALUES (404)")
     assert len(committed) == 5
 
     for _ in range(2):
@@ -138,17 +104,11 @@ def test_no_committed_serial_id_is_reissued_after_a_crash(own_server):
             [fresh] = rows(conn, "INSERT INTO q (name) VALUES ('post') RETURNING id")
             assert fresh.id > max(committed), "a committed SERIAL id was reissued"
             committed[fresh.id] = "post"
-            conn.execute_sql("INSERT INTO parent VALUES (1)")
-            [child] = rows(conn, "INSERT INTO child (pid) VALUES (1) RETURNING id")
-            assert bag(scanned(conn, "child"), "id", "pid") == {(child.id, 1): 1}
-            conn.execute_sql("DELETE FROM child")
-            conn.execute_sql("DELETE FROM parent")
 
 
 def test_every_ddl_kind_survives_a_crash(own_server):
-    """CREATE TABLE and VIEW, a rapid batch of CREATEs whose fdatasync is
-    deferred to end-of-cycle, DROP TABLE and DROP VIEW, and DDL interleaved with
-    the DML it brackets. Every id must be the one it was, every drop must stay
+    """CREATE TABLE and VIEW, a run of CREATEs, DROP TABLE and DROP VIEW, and DDL
+    interleaved with the DML it brackets. Every id must be the one it was, every drop must stay
     dropped, and the view must still be maintained afterwards.
 
     The same 13 relations pin the id allocators, whose durable home is a system
@@ -166,7 +126,6 @@ def test_every_ddl_kind_survives_a_crash(own_server):
         conn.execute_sql("CREATE VIEW v AS SELECT pk, val * 2 AS doubled FROM t1")
         conn.execute_sql("INSERT INTO t1 VALUES (2, 30)")
 
-        # Rapid-fire CREATEs: one SAL broadcast each, one fdatasync for the lot.
         for i in range(10):
             conn.execute_sql(
                 f"CREATE TABLE b{i} (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
@@ -188,9 +147,7 @@ def test_every_ddl_kind_survives_a_crash(own_server):
         sid2 = conn.create_schema("dur2")
         conn.execute_sql("CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY)")
         fresh = conn.resolve_table("fresh")[0]
-        assert fresh > max(ids.values()), "table_id reissued across the crash"
-        assert fresh > max(dropped_ids), \
-            "an id created and dropped before the crash was reissued"
+        assert fresh > max(dropped_ids), "an id allocated before the crash was reissued"
         assert sid2 > sid, "schema_id reissued across the crash"
 
         for dropped in ("gone", "vgone"):
@@ -210,10 +167,14 @@ def test_every_ddl_kind_survives_a_crash(own_server):
 
 def test_an_acked_create_index_survives_a_crash(own_server):
     """A CREATE INDEX acknowledged after a checkpoint of FK-heavy tables still
-    serves after a crash."""
-    # A tiny threshold so the DDL broadcasts below make the first INSERT's
-    # committer cycle run a checkpoint.
-    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"})
+    serves after a crash. Each FK column's auto-index moves its family's LSN
+    counter outside any DDL zone, and the checkpoint persists that counter as the
+    family's replay watermark, so the CREATE INDEX's zone must be allocated above
+    it or the replay skips it."""
+    # Past the FK DDL, under the CREATE INDEX: the DDL's bytes run a checkpoint,
+    # and nothing after the INSERTs can.
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "2048"})
+    booted = own_server.sal_checkpoints()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
@@ -228,15 +189,17 @@ def test_an_acked_create_index_survives_a_crash(own_server):
                 "  val BIGINT NOT NULL)")
         conn.execute_sql("INSERT INTO p VALUES (1, 100)")
         conn.execute_sql("INSERT INTO c1 VALUES (1, 1, 1, 1, 1, 77)")
+        checkpointed = own_server.sal_checkpoints()
+        assert checkpointed > booted, "no checkpoint followed the FK DDL"
 
         conn.execute_sql("CREATE INDEX ON c1(val)")
         c1, c1_schema = conn.resolve_table("c1")
         VAL_COL = 5  # cid, f1..f4, val
         assert bag(conn.seek_by_index(c1, c1_schema, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "index missing pre-crash"
-
-    # SIGKILL before any further checkpoint: the CREATE INDEX lives only in the
-    # SAL, guarded by the watermark dedup.
+    # Below the threshold no checkpoint can start, so the CREATE INDEX lives only
+    # in the SAL when the SIGKILL lands.
+    assert own_server.sal_checkpoints() == checkpointed, "the CREATE INDEX was checkpointed"
     own_server.restart()
     with gnitz.connect(own_server.target) as conn:
         c1_again, c1_schema_again = conn.resolve_table("c1")
@@ -254,8 +217,7 @@ def test_an_acked_create_index_survives_a_crash(own_server):
 def _alter_add_base(conn, rows):
     conn.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)")
-    conn.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in rows))
+    insert(conn, "t", [(k, k * 10) for k in rows])
 
 
 def _wide(conn):

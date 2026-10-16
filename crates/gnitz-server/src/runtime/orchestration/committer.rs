@@ -29,6 +29,7 @@ use gnitz_wire::{WireConflictMode, WireFault};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -179,6 +180,10 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // pending-tick counts cannot grow.
     // Stamping after a failed drain would make the views' missing deltas
     // generation-valid. Unstamped, they stay behind the generation the base
+/// Checkpoint sequences that waited for a DDL to release the tick gate. Its one
+/// reader is the `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` seam.
+pub(crate) static CHECKPOINTS_BEHIND_DDL: AtomicU64 = AtomicU64::new(0);
+
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the Shutdown barrier.
     if let Err(e) = request_drain(shared, Instant::now()).await {
@@ -189,6 +194,7 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // Step 3 — EPHEMERAL ROUND, with no tick running.
     let _park = shared.tick_gate.write().await;
     shared
+        CHECKPOINTS_BEHIND_DDL.fetch_add(1, Ordering::Relaxed);
         .disp()
         .checkpoint_ephemeral()
         .await
