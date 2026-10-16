@@ -1,31 +1,23 @@
-"""The base tables, view bodies and churn the storage-policy suites share, and
+"""The base tables, view bodies and churn the feed and mirror suites share, and
 the weight-exact comparison over the fed ones.
 
 `storage_policy/test_delta_feed.py` drives the feed by hand — bootstrap, poll,
 apply — and `client_surface/test_mirror.py` drives the same views through a
 mirroring client, which does that for it. Both need the same base tables, the
 same churn (inserts, an UPDATE and a DELETE, so a round carries retractions and
-not just insertions), and the same view bodies; `Subscriber` is the by-hand feed client. Keeping one copy here is what makes "the mirror agrees with the
-feed" a comparison of two mechanisms rather than of two setups.
-`storage_policy/test_capacity_bounded_views.py` runs the same bodies bounded, so
-"capacity is invisible" is a claim about the shapes the other two already cover.
+not just insertions), and the same view bodies; `Subscriber` is the by-hand feed
+client. Keeping one copy here is what makes "the mirror agrees with the feed" a
+comparison of two mechanisms rather than of two setups.
+`storage_policy/test_capacity_bounded_views.py` runs the `LINEAR` and `JOIN`
+bodies bounded, so "capacity is invisible" is a claim about shapes the other two
+already cover.
 """
 
-import time
-
-import gnitz
 from _read import bag, rows
-from _serverproc import spawn
 
 # Big enough that nothing built on these helpers falls off the window; a test
 # about retention sets its own.
 FEED = "32 MB"
-
-# `own_server.extra_env` for a server whose stores sweep on modest data — the
-# capacity cases. A store spills once its RAM tier crosses this ceiling, which
-# only happens at a memtable fold or a checkpoint's ephemeral round — so the
-# checkpoint threshold is squeezed too.
-SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(16 * 1024)}
 
 LINEAR = "SELECT id, v, body FROM t WHERE v > 10"
 JOIN = "SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid"
@@ -39,11 +31,10 @@ class Subscriber:
     whole content of a delta row is its weight.
 
     With `sql`, the copy is that `SELECT` over the view instead of the view
-    whole, and is held against the same filter in Python — `keep`, over the
-    columns `cols` — applied to a plain scan of the view."""
+    whole, and is held against the same `SELECT` answered by the server."""
 
-    def __init__(self, client, name, sql=None, keep=lambda r: True, cols=()):
-        self.client, self.keep, self.cols = client, keep, cols
+    def __init__(self, client, name, sql=None):
+        self.client, self.sql = client, sql
         self.vid, self.view_schema = client.resolve_table(name)
         self.schema, self.spec = self.view_schema, None
         if sql is not None:
@@ -53,7 +44,7 @@ class Subscriber:
         self.cursor = (0, 0)
 
     def _bag(self, rows):
-        return bag(rows, *self.cols) if self.spec is not None else bag(rows.including_hidden())
+        return bag(rows) if self.sql is not None else bag(rows.including_hidden())
 
     def _apply(self, rows):
         for k, w in self._bag(rows).items():
@@ -94,10 +85,9 @@ class Subscriber:
         assert len(self.poll()) == 0, "one poll left a round behind"
 
     def scan(self):
-        full = self.client.scan(self.vid, self.view_schema)
-        if self.spec is None:
-            return bag(full.including_hidden())
-        return bag([r for r in full if self.keep(r)], *self.cols)
+        if self.sql is not None:
+            return bag(rows(self.client, self.sql))
+        return bag(self.client.scan(self.vid, self.view_schema).including_hidden())
 
     def assert_converged(self, what=""):
         """Poll, then require the copy to equal what it copies as a multiset;
@@ -108,17 +98,6 @@ class Subscriber:
         assert live or self.copy or self.spec is not None, f"{what}: both sides are empty, so they agree about nothing"
         assert self.copy == live, what
         return len(live)
-
-
-def later(target, schema, after, statement):
-    """Run `statement` from a connection of its own, `after` seconds from now,
-    on a `spawn`ed thread: `join_or_fail` it."""
-    def run():
-        with gnitz.connect(target, schema=schema) as other:
-            time.sleep(after)
-            other.execute_sql(statement)
-
-    return spawn(run)
 
 
 def mk_feed(client, name, body, feed=FEED):

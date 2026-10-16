@@ -9,7 +9,7 @@ import gnitz
 from gnitz import aio
 from _paths import REPO_ROOT
 from _uid import uid
-from _serverproc import ServerProc
+from _serverproc import SWEEP_ENV, ServerProc
 
 _TMP_DIR = str(REPO_ROOT / "tmp")
 os.makedirs(_TMP_DIR, exist_ok=True)
@@ -90,6 +90,13 @@ def own_server(tmp_path, _sock_path):
         yield proc
     finally:
         proc.stop()
+
+
+@pytest.fixture
+def sweeping(own_server):
+    """An `own_server`, started, whose stores reach the disk on modest data."""
+    own_server.extra_env.update(SWEEP_ENV)
+    return own_server.start()
 
 
 def _boot_session_server(srv, tmp_path_factory):

@@ -22,9 +22,8 @@ import random
 
 import gnitz
 import pytest
-from _feedviews import SWEEP_ENV
 from _read import bag, scanned
-from _serverproc import MULTI, disk_usage
+from _serverproc import MULTI, SWEEP_ENV, disk_usage
 
 _CUSTOMERS = "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, address TEXT){}"
 _ORDERS = "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, customer_id BIGINT NOT NULL, note TEXT NOT NULL)"

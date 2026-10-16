@@ -14,9 +14,7 @@ The stores reach the disk regime on a few thousand rows through `SWEEP_ENV`.
 A stream refuses `WITH (compress = true)`: `admissibility/test_stream_rejections.py`.
 """
 
-import pytest
 import gnitz
-from _feedviews import SWEEP_ENV
 from _read import bag, rows
 from _serverproc import disk_usage
 
@@ -81,36 +79,29 @@ def _coded(data_dir, name_id, plain_id):
     return any("blob symbols" in s["regions"] for s in stores if s["relation"] == name_id and s["store"] == "rows")
 
 
-@pytest.fixture
-def sweeping(own_server):
-    """A started server whose stores reach the disk on modest data."""
-    own_server.extra_env.update(SWEEP_ENV)
-    return own_server.start()
-
-
 def test_a_compressed_relation_reads_as_its_plain_twin(sweeping):
-    c = gnitz.connect(sweeping.target)
-    _tables(c)
     views = {
         "lin": "SELECT id, v, body FROM {t} WHERE v > 10",
         "joined": "SELECT {t}.id, {t}.body, u.w FROM {t} JOIN u ON {t}.id = u.tid",
     }
-    for name, body in views.items():
-        c.execute_sql(f"CREATE VIEW {name} WITH (compress = true) AS {body.format(t='t')}")
-        c.execute_sql(f"CREATE VIEW p_{name} AS {body.format(t='pt')}")
-    _churn(c, 1, 1500)
-    _agree(c, views)
+    with gnitz.connect(sweeping.target) as c:
+        _tables(c)
+        for name, body in views.items():
+            c.execute_sql(f"CREATE VIEW {name} WITH (compress = true) AS {body.format(t='t')}")
+            c.execute_sql(f"CREATE VIEW p_{name} AS {body.format(t='pt')}")
+        _churn(c, 1, 1500)
+        _agree(c, views)
+        ids = {name: c.resolve_table(name)[0] for name in ["t", "pt", *views, *(f"p_{v}" for v in views)]}
 
     sweeping.restart()
-    c = gnitz.connect(sweeping.target)
-    _agree(c, views)
-    _churn(c, 1501, 2500)
-    _agree(c, views)
+    with gnitz.connect(sweeping.target) as c:
+        _agree(c, views)
+        _churn(c, 1501, 2500)
+        _agree(c, views)
 
     sweeping.restart(graceful=True)
-    c = gnitz.connect(sweeping.target)
-    _agree(c, views)
-    tid, pid = c.resolve_table("t")[0], c.resolve_table("pt")[0]
-    assert _coded(sweeping.data_dir, tid, pid), "the table's heaps are coded"
+    with gnitz.connect(sweeping.target) as c:
+        _agree(c, views)
+    assert _coded(sweeping.data_dir, ids["t"], ids["pt"]), "the table's heaps are coded"
     for name in views:
-        assert _coded(sweeping.data_dir, c.resolve_table(name)[0], c.resolve_table(f"p_{name}")[0]), name
+        assert _coded(sweeping.data_dir, ids[name], ids[f"p_{name}"]), name

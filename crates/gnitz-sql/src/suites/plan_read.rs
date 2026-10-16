@@ -753,6 +753,27 @@ fn a_read_the_planner_rejects_names_its_rule() {
     assert!(m.contains("DISTINCT"), "got {m}");
 }
 
+/// A subscription is a rows read: a delta of an aggregate, an order or a cut is
+/// not that read of a delta.
+#[test]
+fn a_subscription_is_a_plain_rows_read() {
+    let cat = cat();
+    let sub = |sql: &str| {
+        read(&cat, sql)
+            .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+            .into_subscription()
+    };
+    assert!(sub("SELECT id, v FROM tv WHERE v > 1").is_ok());
+    for sql in [
+        "SELECT COUNT(*) FROM tv",
+        "SELECT DISTINCT v FROM tv",
+        "SELECT id FROM tv ORDER BY v",
+        "SELECT id FROM tv LIMIT 3",
+    ] {
+        assert_rejects(sql, sub(sql), "a subscription");
+    }
+}
+
 // ── Parity inside the single-relation scope ──────────────────────────────────
 
 /// Whatever the flat query plans, the CTE plans; and a name the CTE does not

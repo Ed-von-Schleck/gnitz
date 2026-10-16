@@ -77,6 +77,11 @@ TINY_REPLY_FRAMES = {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)}
 # the watchdog, which fires at the threshold, is the only thing that can reclaim.
 TINY_SAL = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}
 
+# Stores reach the disk regime on a few thousand rows. A store spills once its
+# RAM tier crosses this ceiling, which only happens at a memtable fold or a
+# checkpoint's ephemeral round — so the checkpoint threshold is squeezed too.
+SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(16 * 1024)}
+
 # The pending rows of one table that fire a tick without a read draining it.
 TICK_COALESCE_ROWS = 10_000
 

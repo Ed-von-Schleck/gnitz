@@ -20,6 +20,7 @@ import os
 
 import pytest
 import gnitz
+from _paths import relation_dir
 from _read import bag, rows
 from _serverproc import NEEDS_MULTI
 from _sql import insert
@@ -45,15 +46,16 @@ def test_views_over_a_stream_track_pushes_from_their_creation_on(client):
     """A GROUP BY view tracks every push. A view over that *view* backfills from
     its accumulated output store like over any view, while a second view over the
     stream itself starts empty: a stream's backfill scans a store that holds no
-    rows. Every read verb — SQL, `scan`, `scan_many` — drains the tick the push
-    before it left pending."""
+    rows, and the push no read had drained yet is ticked before the view exists.
+    Every read verb — SQL, `scan`, `scan_many` — drains the tick the push before
+    it left pending."""
     _stream(client)
     client.execute_sql(f"CREATE VIEW hot AS {_HOT}")
     insert(client, "s", [(i, i % 3, i * 10) for i in range(1, 31)])
+    client.execute_sql(f"CREATE VIEW late AS {_HOT}")
     assert _read(client, "hot") == {(0, 1650): 1, (1, 1450): 1, (2, 1550): 1}
 
     client.execute_sql("CREATE VIEW big AS SELECT kind, total FROM hot WHERE total > 1500")
-    client.execute_sql(f"CREATE VIEW late AS {_HOT}")
     assert _read(client, "big") == {(0, 1650): 1, (2, 1550): 1}
     assert _read(client, "late") == {}
 
@@ -64,21 +66,6 @@ def test_views_over_a_stream_track_pushes_from_their_creation_on(client):
     assert bag(client.scan_many([(vid, schema)])[0]) == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
     assert _read(client, "late") == {(1, 107): 1}
     assert _read(client, "big") == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
-
-
-def test_a_view_created_behind_an_unread_push_starts_empty(client):
-    """A push no read has drained yet is ticked before a view over the stream is
-    created, so the view holds none of it — and every row pushed from then on."""
-    _stream(client)
-    client.execute_sql(f"CREATE VIEW hot AS {_HOT}")
-    insert(client, "s", [(i, i % 3, i * 10) for i in range(1, 31)])
-
-    client.execute_sql(f"CREATE VIEW late AS {_HOT}")
-    assert _read(client, "late") == {}
-    assert _read(client, "hot") == {(0, 1650): 1, (1, 1450): 1, (2, 1550): 1}
-
-    insert(client, "s", [(99, 1, 7)])
-    assert _read(client, "late") == {(1, 7): 1}
 
 
 def test_drop_and_rename_stay_available_on_a_stream(client):
@@ -97,7 +84,7 @@ def test_drop_and_rename_stay_available_on_a_stream(client):
     client.execute_sql("DROP VIEW hot")
     client.execute_sql("DROP TABLE events")
     with pytest.raises(gnitz.GnitzNotFoundError):
-        client.execute_sql("CREATE VIEW hot2 AS SELECT id FROM events")
+        client.resolve_table("events")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +96,8 @@ def test_drop_and_rename_stay_available_on_a_stream(client):
 # The stream carries `kind` 1 and 2; `dim` carries k 1, 2 and 3.
 _BOOT_SHAPES = [
     ("agg", _HOT, {}),
+    # Reaches the stream only through `agg`.
+    ("over_agg", "SELECT kind, total FROM agg WHERE total > 0", {}),
     ("inner_v", "SELECT dim.k, s.amount FROM dim JOIN s ON dim.k = s.kind", {}),
     # Every preserved row comes back null-filled: the null-fill is weight-exact,
     # so a witness clamped to 1 over a matched row would leak an extra one here.
@@ -116,122 +105,76 @@ _BOOT_SHAPES = [
      {(1, None): 1, (2, None): 1, (3, None): 1}),
     # The non-monotone direction: the view *grows* when the stream empties.
     ("grown", "SELECT k FROM dim EXCEPT SELECT kind FROM s", {(1,): 1, (2,): 1, (3,): 1}),
+    # Created over a table and retargeted onto the stream by `ALTER VIEW`: the
+    # boot decides by the view's sources as they are, not as created.
+    ("moved", None, {}),
 ]
+_PUSHED = {
+    "agg": {(1, 100): 1, (2, 200): 1},
+    "over_agg": {(1, 100): 1, (2, 200): 1},
+    "inner_v": {(1, 100): 1, (2, 200): 1},
+    "left_v": {(1, 100): 1, (2, 200): 1, (3, None): 1},
+    "grown": {(3,): 1},
+    "moved": {(1, 100): 1, (2, 200): 1},
+}
+# `tv` over the table `t` beside them is resumed and published as any view is.
+_T_ROWS = {(i, 1, 10): 1 for i in range(1, 11)}
+_TV = {(1, 100): 1, (5, 50): 1}
 
 
-def test_a_stream_fed_view_returns_to_its_never_received_a_row_value(own_server):
-    """A graceful stop checkpoints each view's state, so the boot must reject that
-    state rather than resume onto inputs that no longer exist. The value it comes
-    back with is what the view would hold if the stream had never received a row —
-    which for a set difference is *more* rows than it held before, not fewer.
+def test_a_view_a_stream_reaches_comes_back_as_if_the_stream_never_received_a_row(own_server):
+    """Nothing a stream ingests is recovered: a crash replays its SAL tail into no
+    view, and a graceful stop checkpoints no view it reaches — the boot rebuilds
+    those whatever their stores hold, so a published one would be state nothing
+    reads. Either way each comes back holding what it would if the stream had
+    never received a row, which for a set difference is *more* rows than before.
 
-    `moved` was created over a table and retargeted onto the stream by `ALTER
-    VIEW`: the boot decides by the view's sources as they are, not as created."""
+    The base table beside the stream is unaffected, at its own weights: a
+    replayed group applied twice is ten rows at weight 2."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql("CREATE TABLE dim (k BIGINT NOT NULL PRIMARY KEY, label BIGINT NOT NULL)")
         conn.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
         _stream(conn)
-        for name, body, _after in _BOOT_SHAPES:
-            conn.execute_sql(f"CREATE VIEW {name} AS {body}")
+        conn.execute_sql("CREATE VIEW tv AS SELECT kind, SUM(amount) AS total FROM t GROUP BY kind")
         conn.execute_sql("CREATE VIEW moved AS SELECT kind, SUM(amount) AS total FROM t GROUP BY kind")
+        for name, body, _ in _BOOT_SHAPES:
+            if body is not None:
+                conn.execute_sql(f"CREATE VIEW {name} AS {body}")
         insert(conn, "dim", [(k, k * 7) for k in (1, 2, 3)])
-        insert(conn, "t", [(1, 5, 50)])
+        insert(conn, "t", [(100, 5, 50)])
         assert _read(conn, "moved") == {(5, 50): 1}
         conn.execute_sql(f"ALTER VIEW moved AS {_HOT}")
-        insert(conn, "s", [(1, 1, 100), (2, 2, 200)])
+        insert(conn, "t", [(i, 1, 10) for i in range(1, 11)])
+        ids = {name: conn.resolve_table(name)[0] for name in ["tv", *_PUSHED]}
 
-        names = [name for name, _b, _a in _BOOT_SHAPES] + ["moved"]
-        assert {name: _read(conn, name) for name in names} == {
-            "agg": {(1, 100): 1, (2, 200): 1},
-            "inner_v": {(1, 100): 1, (2, 200): 1},
-            "left_v": {(1, 100): 1, (2, 200): 1, (3, None): 1},
-            "grown": {(3,): 1},
-            "moved": {(1, 100): 1, (2, 200): 1},
-        }
+    def push_and_restart(**how):
+        with gnitz.connect(own_server.target) as conn:
+            insert(conn, "s", [(1, 1, 100), (2, 2, 200)])
+            assert {name: _read(conn, name) for name in _PUSHED} == _PUSHED
+        own_server.restart(**how)
+        with gnitz.connect(own_server.target) as conn:
+            assert {name: _read(conn, name) for name in _PUSHED} == {name: want for name, _, want in _BOOT_SHAPES}
+            assert _read(conn, "tv") == _TV
+            assert _read(conn, "t") == {**_T_ROWS, (100, 5, 50): 1}
 
-    own_server.restart(graceful=True)
+    def published(name):
+        return glob.glob(os.path.join(relation_dir(own_server.data_dir, ids[name]), "*", "manifest.bin"))
 
+    push_and_restart()
+    push_and_restart(graceful=True)
+    assert own_server.rebuilt_view_count() == len(_PUSHED), "the views the stream reaches, and not `tv`"
+
+    # The stream's own definition is durable, and still accepts pushes the
+    # rebuilt views track.
     with gnitz.connect(own_server.target) as conn:
-        assert {name: _read(conn, name) for name in names} == {
-            **{name: want for name, _b, want in _BOOT_SHAPES}, "moved": {},
-        }
-        # The stream's own definition is durable, and still accepts pushes the
-        # rebuilt views track.
         insert(conn, "s", [(1, 1, 42)])
-        assert _read(conn, "agg") == {(1, 42): 1}
+        assert _read(conn, "over_agg") == {(1, 42): 1}
         assert _read(conn, "grown") == {(2,): 1, (3,): 1}
-
-
-def _published_stores(data_dir, tid):
-    """The store directories of relation `tid` that hold a manifest."""
-    return glob.glob(os.path.join(data_dir, "_relations", str(tid), "*", "manifest.bin"))
-
-
-def test_a_checkpoint_publishes_no_view_a_stream_reaches(own_server):
-    """A boot rebuilds every view a stream reaches whatever its stores hold, so a
-    checkpoint that published them would write state nothing reads. `sv` is fed by
-    the stream, `over_sv` only reaches it through `sv`, and `tv` beside them over a
-    table is published and resumed, so the absence is about the stream."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
-        _stream(conn)
-        for name, src in (("tv", "t"), ("sv", "s")):
-            conn.execute_sql(
-                f"CREATE VIEW {name} AS SELECT kind, SUM(amount) AS total FROM {src} GROUP BY kind")
-        conn.execute_sql("CREATE VIEW over_sv AS SELECT kind, total FROM sv WHERE total > 0")
-        insert(conn, "t", [(i, 1, 10) for i in range(1, 11)])
-        insert(conn, "s", [(i, 2, 10) for i in range(1, 11)])
-        assert _read(conn, "sv") == {(2, 100): 1}
-        assert _read(conn, "over_sv") == {(2, 100): 1}
-        ids = {name: conn.resolve_table(name)[0] for name in ("tv", "sv", "over_sv")}
-
+    # The boot's own checkpoint and this stop's publish none of them either.
     own_server.stop_graceful()
-    assert _published_stores(own_server.data_dir, ids["tv"]), "a view over a table is published"
-    assert _published_stores(own_server.data_dir, ids["sv"]) == []
-    assert _published_stores(own_server.data_dir, ids["over_sv"]) == []
-
-    own_server.start()
-    assert own_server.rebuilt_view_count() == 2, "the two views the stream reaches, and not `tv`"
-    with gnitz.connect(own_server.target) as conn:
-        assert _read(conn, "tv") == {(1, 100): 1}
-        assert _read(conn, "sv") == {}
-        assert _read(conn, "over_sv") == {}
-        insert(conn, "s", [(1, 3, 7)])
-        assert _read(conn, "over_sv") == {(3, 7): 1}
-
-    # The boot's own checkpoint and the next stop's publish them no more than the first did.
-    own_server.stop_graceful()
-    assert _published_stores(own_server.data_dir, ids["tv"])
-    assert _published_stores(own_server.data_dir, ids["sv"]) == []
-    assert _published_stores(own_server.data_dir, ids["over_sv"]) == []
-
-
-def test_a_crash_keeps_the_table_tail_and_drops_the_stream_tail(own_server):
-    """A SIGKILL runs no checkpoint, so everything comes back through SAL replay,
-    and a stream group in the replayed tail reaches no view. The base table beside
-    it must be unaffected — and at its own weights: a replayed group applied twice
-    is ten rows at weight 2."""
-    own_server.start()
-    with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
-        _stream(conn)
-        for name, src in (("tv", "t"), ("sv", "s")):
-            conn.execute_sql(
-                f"CREATE VIEW {name} AS SELECT kind, SUM(amount) AS total FROM {src} GROUP BY kind",
-            )
-        insert(conn, "t", [(i, 1, 10) for i in range(1, 11)])
-        insert(conn, "s", [(i, 2, 10) for i in range(1, 11)])
-        assert _read(conn, "tv") == {(1, 100): 1}
-        assert _read(conn, "sv") == {(2, 100): 1}
-
-    own_server.restart()
-
-    with gnitz.connect(own_server.target) as conn:
-        assert _read(conn, "tv") == {(1, 100): 1}, "the base table's tail must still replay into its view"
-        assert _read(conn, "sv") == {}, "the stream's tail must reach no view"
-        assert _read(conn, "t") == {(i, 1, 10): 1 for i in range(1, 11)}
+    assert published("tv"), "a view over a table is published"
+    assert [name for name in _PUSHED if published(name)] == []
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +205,17 @@ def test_a_stream_is_an_append_only_bag(client):
 
     with pytest.raises(gnitz.GnitzRefusedError, match="append-only"):
         client.delete(tid, schema, [1])
+    # A batch with one retraction is refused whole, its insert included.
+    mixed = gnitz.ZSetBatch(schema).extend([
+        {"id": 3, "kind": 3, "amount": 3, "_weight": 1},
+        {"id": 1, "kind": 4, "amount": 100, "_weight": -1},
+    ])
+    with pytest.raises(gnitz.GnitzRefusedError, match="append-only"):
+        client.push(tid, mixed)
     assert _read(client, "pass") == want, "a refused push must leave nothing behind"
 
     # A weight above 1 is bag multiplicity, and lands as that weight.
-    b = gnitz.ZSetBatch(schema)
-    b.append(id=2, kind=2, amount=3, _weight=5)
-    client.push(tid, b)
+    assert client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": 2, "kind": 2, "amount": 3, "_weight": 5}])) == 0
     assert _read(client, "pass") == {**want, (2, 2, 3): 5}
 
 
@@ -294,12 +242,8 @@ def test_a_stream_push_replies_lsn_zero(client):
     push replies its zone LSN, and a stream push, which is not durable, `0`."""
     client.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
     _stream(client)
-    t_tid, t_schema = client.resolve_table("t")
-    s_tid, s_schema = client.resolve_table("s")
-
-    tb = gnitz.ZSetBatch(t_schema)
-    tb.append(id=1, kind=1, amount=10, _weight=1)
-    assert client.push(t_tid, tb) > 0
-    sb = gnitz.ZSetBatch(s_schema)
-    sb.append(id=1, kind=1, amount=1, _weight=1)
-    assert client.push(s_tid, sb) == 0, "a stream push is not durable"
+    lsn = {}
+    for name in ("t", "s"):
+        tid, schema = client.resolve_table(name)
+        lsn[name] = client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": 1, "kind": 1, "amount": 10}]))
+    assert lsn["t"] > 0 and lsn["s"] == 0, lsn

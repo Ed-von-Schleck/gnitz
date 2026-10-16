@@ -17,7 +17,7 @@ import random
 
 import gnitz
 from _read import bag, scanned
-from _serverproc import MULTI, disk_usage
+from _serverproc import MULTI, SWEEP_ENV, disk_usage
 
 _GROUPS = 6_000
 _VIEWS = {
@@ -29,10 +29,8 @@ _VIEWS = {
 
 def _push(conn, rows, weight=1):
     tid, schema = conn.resolve_table("t")
-    batch = gnitz.ZSetBatch(schema)
-    for id_, (g, v) in rows.items():
-        batch.append(_weight=weight, id=id_, g=g, v=v)
-    conn.push(tid, batch)
+    conn.push(tid, gnitz.ZSetBatch(schema).extend(
+        {"id": id_, "g": g, "v": v, "_weight": weight} for id_, (g, v) in rows.items()))
 
 
 def _assert_views(conn, live, ctx):
@@ -64,7 +62,7 @@ def _churn(conn, live, rng, rounds, next_id):
 
 
 def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(own_server):
-    own_server.extra_env = {"GNITZ_RAM_TIER_BYTES": "1024"}
+    own_server.extra_env.update(SWEEP_ENV)
     own_server.start(workers=MULTI)
     rng, live = random.Random(11), {}
     with gnitz.connect(own_server.target) as conn:
@@ -82,21 +80,19 @@ def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(own_server
 
     own_server.restart(graceful=True)
     with gnitz.connect(own_server.target) as conn:
-        ids = {name: conn.resolve_table(name)[0] for name in _VIEWS}
+        ids = {name: conn.resolve_table(name)[0] for name in ["t", *_VIEWS]}
     # The report reads the files alone, beside the server now running on them.
     report, stores = disk_usage(own_server.data_dir)
 
-    def kinds(relation=None):
-        """The stores holding shards, without the node each is numbered by."""
-        return {s["store"].rstrip("0123456789").rstrip("_") for s in stores
-                if s["relation"] == relation or (relation is None and s["relation"] >= gnitz.FIRST_USER_TABLE_ID)}
+    def kinds(name):
+        """The stores of `name` holding shards, without the node each is numbered by."""
+        return {s["store"].rstrip("0123456789").rstrip("_") for s in stores if s["relation"] == ids[name]}
 
-    assert kinds(ids["by_g"]) == {"rows"}, report
-    assert kinds(ids["ext"]) == {"rows", "scratch_reduce", "scratch_avidx"}, report
+    assert kinds("t") == kinds("by_g") == {"rows"}, report
+    assert kinds("ext") == {"rows", "scratch_reduce", "scratch_avidx"}, report
     # The top-N's index of every input row is the one store it keeps beside
     # the view's rows.
-    assert kinds(ids["top"]) == {"rows", "scratch_topnidx"}, report
-    assert kinds() == {"rows", "scratch_reduce", "scratch_avidx", "scratch_topnidx"}, report
+    assert kinds("top") == {"rows", "scratch_topnidx"}, report
     with gnitz.connect(own_server.target) as conn:
         _assert_views(conn, live, "after a graceful restart")
         _churn(conn, live, rng, 2, next_id)
