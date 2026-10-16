@@ -141,7 +141,12 @@ impl Session {
             }
             ClientVerb::SnapshotPage => {
                 if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()]) {
-                    drop(self.cat.registry.pinned_page(ctrl.hdr.arg0, ctrl.hdr.target_id, &page));
+                    drop(self.cat.registry.pinned_page(
+                        ctrl.hdr.arg0,
+                        ctrl.hdr.target_id,
+                        &page,
+                        self.cat.registry.slot(),
+                    ));
                 }
             }
             ClientVerb::SnapshotClose => drop(self.cat.registry.unpin(ctrl.hdr.arg0)),

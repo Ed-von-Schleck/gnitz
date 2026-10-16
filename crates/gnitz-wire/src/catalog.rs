@@ -294,6 +294,9 @@ pub fn qualified_key(schema_name: &str, name: &str) -> String {
 /// with one bit per payload column, so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
 
+/// The most workers a cluster runs.
+pub const MAX_WORKERS: usize = 64;
+
 /// Payload slot of column `ci`: its position among the columns not in `pk`, or
 /// `None` for a PK column.
 pub const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {

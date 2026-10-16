@@ -95,7 +95,6 @@ impl Shell {
     /// one it is, until interrupted.
     pub fn watch(&mut self, arg: &str) -> Result<(), Failed> {
         let sql = watch_query(arg, &self.schema);
-        self.clear_interrupt();
         let mut plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
         let (mut id, first) = self.subscribe(&plan).or_else(|e| self.fail(e))?;
         self.status("Watching; Ctrl-C stops.");

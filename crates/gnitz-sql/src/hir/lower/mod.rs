@@ -28,7 +28,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::project::{compute_map, payload_program, ProjItem};
 pub(crate) use chain::{EmitPieces, ViewChain};
-use gnitz_core::{RelDescriptor, Schema, ViewBundle};
+use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use std::collections::HashSet;
@@ -207,10 +207,14 @@ pub(crate) fn project_front(
     Ok((node, out))
 }
 
-/// Lower a bound view body to its bundle. The view lists its visible columns in
+/// Lower a bound view body to its segments and the user-named view. The view lists its visible columns in
 /// `names` order, each under the name its column of `names` gives it: the final
 /// frame's regions under the SELECT list's numbering.
-pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result<ViewBundle, GnitzSqlError> {
+pub(crate) fn lower(
+    rel: Rc<RelExpr>,
+    bounded: bool,
+    names: &[HirCol],
+) -> Result<(Vec<PlannedView>, PlannedView), GnitzSqlError> {
     let mut chain = ViewChain::default();
     // A top-N carries its input's columns key first: the SELECT list is a
     // projection over it.

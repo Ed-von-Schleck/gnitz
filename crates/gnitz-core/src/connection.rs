@@ -584,13 +584,14 @@ impl Session {
         sent
     }
 
-    /// SNAPSHOT_PAGE: the first `limit` rows of `tid` as snapshot `snapshot`
-    /// holds it, after `after`, replied in `reply_schema`'s layout.
+    /// SNAPSHOT_PAGE: up to `limit` rows of `tid` as snapshot `snapshot` holds
+    /// it, each worker's after its key in `after` — every worker's first rows
+    /// with `after` empty — replied in `reply_schema`'s layout.
     pub fn submit_snapshot_page(
         &mut self,
         snapshot: u64,
         tid: u64,
-        after: Option<&[u8]>,
+        after: &[Option<Vec<u8>>],
         limit: u64,
         reply_schema: &Arc<Schema>,
     ) -> Sent<SnapshotPage> {
@@ -598,7 +599,7 @@ impl Session {
         let request = gnitz_wire::snapshot::PageRequest {
             layout: reply_schema.layout().layout_digest(),
             limit,
-            after: after.map(<[u8]>::to_vec),
+            after: after.to_vec(),
         };
         let (to, sent) = promise();
         let slot = Slot::Page {

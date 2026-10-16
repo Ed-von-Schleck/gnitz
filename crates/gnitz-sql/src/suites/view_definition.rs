@@ -73,11 +73,7 @@ fn client_catalog(cat: &TestCatalog, names: &[String]) -> Catalog {
 }
 
 fn definition(chain: &PlannedChain) -> &ViewDefinition {
-    chain
-        .bundle
-        .definition
-        .as_ref()
-        .expect("a planned view records its definition")
+    &chain.bundle.definition
 }
 
 /// One chain member as committed: its encoded circuit, its key and its

@@ -3,7 +3,7 @@
 //! a view's body is its recorded text with the names the catalog holds now
 //! standing where the original ones stood.
 
-use gnitz_core::{Catalog, CatalogRelation, IndexRow, RelProps, ViewDefinition};
+use gnitz_core::{Catalog, CatalogRelation, RelProps, ViewDefinition};
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::TableDistribution;
 
@@ -24,7 +24,7 @@ pub fn qualified_name(rel: &CatalogRelation) -> String {
 /// The `CREATE TABLE` that declares base table or stream `rel`: its visible
 /// columns, key, foreign keys, every unique index as a named constraint, and its
 /// distribution and options. The table's other indexes are
-/// [`create_index_statement`]'s.
+/// [`create_index_statements`]'.
 pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result<String, String> {
     let RelProps::Table(props) = rel.props else {
         return Err(format!("{} is not a table", rel.qualified()));
@@ -88,15 +88,22 @@ pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Resul
     Ok(out)
 }
 
-/// The `CREATE INDEX` that declares `index` over `rel`.
-pub fn create_index_statement(rel: &CatalogRelation, index: &IndexRow) -> String {
-    format!(
-        "CREATE {}INDEX {} ON {} ({})",
-        if index.is_unique { "UNIQUE " } else { "" },
-        column_text(&index.name),
-        qualified_name(rel),
-        column_list(rel.column_names(&index.cols))
-    )
+/// The `CREATE INDEX` statements of every index of `rel` that its own `CREATE`
+/// statement does not declare: a view's every index, a table's non-unique ones.
+pub fn create_index_statements(rel: &CatalogRelation) -> impl Iterator<Item = String> + '_ {
+    let view = matches!(rel.props, RelProps::View(_));
+    rel.indexes
+        .iter()
+        .filter(move |i| view || !i.is_unique)
+        .map(move |index| {
+            format!(
+                "CREATE {}INDEX {} ON {} ({})",
+                if index.is_unique { "UNIQUE " } else { "" },
+                column_text(&index.name),
+                qualified_name(rel),
+                column_list(rel.column_names(&index.cols))
+            )
+        })
 }
 
 /// The `CREATE VIEW` that declares user view `rel` as it stands now.
@@ -104,10 +111,7 @@ pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result
     let RelProps::View(props) = rel.props else {
         return Err(format!("{} is not a view", rel.qualified()));
     };
-    let def = rel
-        .definition()
-        .map_err(|e| format!("{}: {e}", rel.qualified()))?
-        .ok_or_else(|| format!("{} records no definition", rel.qualified()))?;
+    let def = rel.definition().map_err(|e| format!("{}: {e}", rel.qualified()))?;
     let mut out = format!("CREATE VIEW {}", qualified_name(rel));
     let names: Vec<&str> = rel.visible_columns().map(|c| c.name.as_str()).collect();
     if !same_names(&def.body_columns, &names) {

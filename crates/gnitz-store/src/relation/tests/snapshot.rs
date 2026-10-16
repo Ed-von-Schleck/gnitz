@@ -2,6 +2,7 @@ use super::*;
 use crate::relation::StoreConfig;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, payload0_i64, relation_fixture_with, rows_spec, TID};
 use gnitz_wire::snapshot::{PageRequest, MAX_PAGE_ROWS};
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
 
 /// A store whose RAM tier spills after a few rows, so a handful of rounds puts
@@ -14,7 +15,7 @@ fn spilling() -> StoreConfig {
 }
 
 fn page(layout: u64, limit: u64) -> PageRequest {
-    PageRequest { layout, limit, after: None }
+    PageRequest { layout, limit, after: Vec::new() }
 }
 
 fn rows_of(b: &Batch) -> Vec<(u64, i64, i64)> {
@@ -55,13 +56,13 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     live.sort_unstable();
     assert_eq!(live, (40..80).map(|k| (k, 1, 2)).collect::<Vec<_>>());
     assert_eq!(
-        rows_of(&r.pinned_page(7, TID, &page(layout, MAX_PAGE_ROWS)).unwrap()),
+        rows_of(&r.pinned_page(7, TID, &page(layout, MAX_PAGE_ROWS), Slot::SOLO).unwrap()),
         before
     );
 
     assert!(r.unpin(7));
     assert!(!r.unpin(7));
-    let err = r.pinned_page(7, TID, &page(layout, 1)).err().unwrap();
+    let err = r.pinned_page(7, TID, &page(layout, 1), Slot::SOLO).err().unwrap();
     assert!(err.contains("not pinned"), "{err}");
 }
 
@@ -76,7 +77,10 @@ fn a_pin_holds_only_what_its_filter_keeps_and_its_id_is_its_own() {
         [round(0, 3, 1)],
     );
     r.pin(1, |k| k == RelationKind::SystemCatalog).unwrap();
-    let err = r.pinned_page(1, TID, &page(schema.layout_digest(), 1)).err().unwrap();
+    let err = r
+        .pinned_page(1, TID, &page(schema.layout_digest(), 1), Slot::SOLO)
+        .err()
+        .unwrap();
     assert!(err.contains("holds no relation"), "{err}");
     assert!(r.pin(1, |_| true).is_err());
     assert_eq!(r.snapshots.len(), 1);

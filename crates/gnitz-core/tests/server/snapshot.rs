@@ -8,13 +8,12 @@ use gnitz_wire::{TableDistribution, ViewProps};
 
 const WORKERS: usize = 4;
 
-/// Every row of `tid` as snapshot `id` holds it, read `page_rows` per worker
-/// at a time.
+/// Every row of `tid` as snapshot `id` holds it, read `page_rows` at a time.
 fn read(client: &mut GnitzClient, id: u64, tid: u64, schema: &Arc<Schema>, page_rows: u64) -> ZSetBatch {
     let mut all = ZSetBatch::new(schema);
     block_on(client.snapshot_read(id, tid, schema, page_rows, |b| {
         all.extend_from_owned(b);
-        Ok(())
+        Ok::<_, ClientError>(())
     }))
     .unwrap();
     all
@@ -98,6 +97,8 @@ fn pages_of_a_compound_key_return_every_row_once() {
     }
 }
 
+/// Only the owner answers a replicated table with rows; every other worker's
+/// empty train still reaches the client, so each page names every worker.
 #[test]
 fn a_replicated_table_is_read_once() {
     let srv = ServerHandle::start_n(WORKERS);
@@ -110,12 +111,69 @@ fn a_replicated_table_is_read_once() {
         ..TableProps::default()
     };
     let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], props, &[])).unwrap();
-    push(&mut client, tid, &schema, rows(&schema, 0..50));
+    push(&mut client, tid, &schema, rows(&schema, 0..100));
     let id = block_on(client.snapshot_open()).unwrap();
-    assert_eq!(
-        weighted_rows(&read(&mut client, id, tid, &schema, 8)),
-        weighted_rows(&rows(&schema, 0..50))
-    );
+    let page = block_on(client.snapshot_page(id, tid, &[], 40, &schema)).unwrap();
+    assert_eq!(page.worker_ends.len(), WORKERS);
+    let mut pages = 0;
+    let mut all = ZSetBatch::new(&schema);
+    block_on(client.snapshot_read(id, tid, &schema, 40, |b| {
+        pages += 1;
+        all.extend_from_owned(b);
+        Ok::<_, ClientError>(())
+    }))
+    .unwrap();
+    assert_eq!(weighted_rows(&all), weighted_rows(&rows(&schema, 0..100)));
+    // The owner's share is 10 a page.
+    assert_eq!(pages, 11);
+}
+
+/// Under `CLUSTER BY` a key prefix, a worker holds whole prefix groups larger
+/// than its share of a page; each page still takes every worker's share, so the
+/// read takes as many pages as the fullest worker's rows need.
+#[test]
+fn a_page_takes_every_workers_share_however_its_keys_interleave() {
+    let srv = ServerHandle::start_n(WORKERS);
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let sn = unique_schema("k");
+    block_on(client.create_schema(&sn)).unwrap();
+    let cols = vec![
+        ColumnDef::new("a", TypeCode::I64, false),
+        ColumnDef::new("b", TypeCode::I64, false),
+    ];
+    let schema = Arc::new(Schema::from_parts(cols, &[0, 1]).unwrap());
+    let props = TableProps {
+        distribution: TableDistribution::Keyed { prefix_len: 1 },
+        ..TableProps::default()
+    };
+    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], props, &[])).unwrap();
+    let mut batch = ZSetBatch::new(&schema);
+    let mut app = BatchAppender::new(&mut batch);
+    for a in 0i64..64 {
+        for b in 0i64..20 {
+            app.add_row_natives(&[a as i128 as u128, b as i128 as u128], 1);
+        }
+    }
+    push(&mut client, tid, &schema, batch);
+    let id = block_on(client.snapshot_open()).unwrap();
+
+    let whole = block_on(client.snapshot_page(id, tid, &[], 4000, &schema)).unwrap();
+    assert_eq!(whole.batch.len(), 1280);
+    let ends = &whole.worker_ends;
+    let fullest = (0..ends.len())
+        .map(|w| ends[w] - if w == 0 { 0 } else { ends[w - 1] })
+        .max()
+        .unwrap();
+
+    let (mut pages, mut total) = (0, 0);
+    block_on(client.snapshot_read(id, tid, &schema, 40, |b| {
+        pages += 1;
+        total += b.len();
+        Ok::<_, ClientError>(())
+    }))
+    .unwrap();
+    assert_eq!(total, 1280);
+    assert_eq!(pages, fullest / 10 + 1);
 }
 
 /// The catalog is pinned with the rows: a relation dropped after the pin is
@@ -156,10 +214,7 @@ fn a_snapshot_holds_the_serial_positions_of_its_cut() {
     let base = block_on(client.reserve_serial_ids(&desc, 40_000)).unwrap();
     let id = block_on(client.snapshot_open()).unwrap();
     let serials = block_on(client.snapshot_serials(id)).unwrap();
-    assert_eq!(
-        serials.iter().find(|&&(t, _)| t == tid).map(|&(_, last)| last),
-        Some(base as u64 + 39_999)
-    );
+    assert_eq!(serials.get(&tid).copied(), Some(base as u64 + 39_999));
 }
 
 #[test]
@@ -171,12 +226,12 @@ fn a_snapshot_is_its_connections_alone_and_ends_with_it() {
     let id = block_on(owner.snapshot_open()).unwrap();
 
     let mut other = GnitzClient::connect(srv.sock_path()).unwrap();
-    let err = block_on(other.snapshot_page(id, tid, None, 5, &schema)).unwrap_err();
+    let err = block_on(other.snapshot_page(id, tid, &[], 5, &schema)).unwrap_err();
     assert!(err.to_string().contains("not this connection's"), "{err}");
     assert!(block_on(other.snapshot_close(id)).is_err());
 
     block_on(owner.snapshot_close(id)).unwrap();
-    assert!(block_on(owner.snapshot_page(id, tid, None, 5, &schema)).is_err());
+    assert!(block_on(owner.snapshot_page(id, tid, &[], 5, &schema)).is_err());
     assert!(block_on(owner.snapshot_close(id)).is_err());
 
     // A connection holds a few at most; closing one makes room.
@@ -200,9 +255,9 @@ fn a_page_in_another_layout_is_refused() {
     let (_, tid, _) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
     let id = block_on(client.snapshot_open()).unwrap();
     let wrong = Arc::new(schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I32)]));
-    let err = block_on(client.snapshot_page(id, tid, None, 5, &wrong)).unwrap_err();
+    let err = block_on(client.snapshot_page(id, tid, &[], 5, &wrong)).unwrap_err();
     assert!(err.to_string().contains("layout"), "{err}");
-    assert!(block_on(client.snapshot_page(id, tid, None, 0, &wrong)).is_err());
+    assert!(block_on(client.snapshot_page(id, tid, &[], 0, &wrong)).is_err());
 }
 
 // ── BACKUP ───────────────────────────────────────────────────────────

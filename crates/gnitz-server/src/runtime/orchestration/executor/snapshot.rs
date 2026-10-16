@@ -12,14 +12,16 @@
 
 use std::cell::Cell;
 
-use super::{forward_scan, send_ack, send_msg, Shared};
+use super::{send_ack, send_msg, Shared};
 use crate::runtime::peer::Peer;
+use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::control::ControlHeader;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::WireFault;
+use gnitz_zset::algebra::Slot;
 
 /// The snapshots one connection may hold at a time.
 pub(super) const MAX_SNAPSHOTS_PER_CONNECTION: usize = 4;
@@ -69,7 +71,8 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
 
 /// SNAPSHOT_PAGE: a page of `hdr.target_id` as snapshot `hdr.arg0` holds it.
 /// The master answers a relation its own pin holds — a system family — and
-/// every worker the rest.
+/// every worker the rest, each worker's train forwarded in rank order, an empty
+/// one included, so the client reads each worker's last key by its position.
 pub(super) async fn page(
     shared: &Shared,
     peer: &Peer,
@@ -83,7 +86,7 @@ pub(super) async fn page(
     }
     let request = PageRequest::decode(blob).map_err(|e| format!("decode error: {e}"))?;
     if shared.cat().registry.pins(id, tid) {
-        let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
+        let rows = shared.cat().registry.pinned_page(id, tid, &request, Slot::SOLO)?;
         send_msg(
             peer,
             ipc::WireMsg {
@@ -94,7 +97,20 @@ pub(super) async fn page(
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
         let mut leases = shared.disp().scan_cut(|cut| cut.read_all(read)).await?;
-        forward_scan(peer, &leases.pop().expect("one read, one lease")).await?;
+        let lease = leases.pop().expect("one read, one lease");
+        'forward: for w in lease.workers().iter() {
+            let mut forwarded = false;
+            while let Some(f) = lease.next_of(w).await? {
+                forwarded = true;
+                if peer.send(SendBody::Slot(f.slot)).await.is_err() {
+                    break 'forward;
+                }
+            }
+            // A train with no rows ends in a frame `next_of` does not hand out.
+            if !forwarded {
+                send_msg(peer, ipc::WireMsg::train_frame(tid, true));
+            }
+        }
     }
     send_ack(peer, tid, 0);
     Ok(())

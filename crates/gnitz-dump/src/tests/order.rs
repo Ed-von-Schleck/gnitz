@@ -39,13 +39,33 @@ fn every_row_comes_after_its_parent() {
         (5, Some(5)),
         (6, Some(99)),
     ]);
-    let got = ids(&batch, &order(&batch, &schema, &[(1, 0)]));
-    assert_eq!(got, [1, 5, 6, 3, 2, 4]);
+    let (order, acyclic) = order(&batch, &schema, &[1]);
+    assert_eq!(ids(&batch, &order), [1, 5, 6, 3, 2, 4]);
+    assert_eq!(acyclic, 6);
 }
 
 #[test]
 fn a_cycle_comes_last() {
     let (batch, schema) = tree(&[(1, Some(2)), (2, Some(1)), (3, None), (4, Some(1))]);
-    let got = ids(&batch, &order(&batch, &schema, &[(1, 0)]));
-    assert_eq!(got, [3, 1, 2, 4]);
+    let (order, acyclic) = order(&batch, &schema, &[1]);
+    assert_eq!(ids(&batch, &order), [3, 1, 2, 4]);
+    assert_eq!(acyclic, 1);
+}
+
+#[test]
+fn a_row_waiting_on_a_cycle_comes_at_or_after_its_position() {
+    // 1 and 2 reference each other, 3 is a child of 2, and 4 stands apart.
+    let (batch, schema) = tree(&[(3, Some(2)), (1, Some(2)), (4, None), (2, Some(1))]);
+    let (order, acyclic) = order(&batch, &schema, &[1]);
+    assert_eq!(acyclic, 1);
+    assert_eq!(ids(&batch, &order[..acyclic]), [4]);
+    let mut waiting = ids(&batch, &order[acyclic..]);
+    waiting.sort_unstable();
+    assert_eq!(waiting, [1, 2, 3]);
+}
+
+#[test]
+fn a_table_with_no_reference_keeps_its_order() {
+    let (batch, schema) = tree(&[(2, Some(1)), (1, None)]);
+    assert_eq!(order(&batch, &schema, &[]), (vec![0, 1], 2));
 }

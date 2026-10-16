@@ -213,7 +213,12 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
         }
         Read::SnapshotPage { snapshot, tid, ref page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
-            Ok(Rows::Own(cat.registry.pinned_page(snapshot, tid, &page)?))
+            Ok(Rows::Own(cat.registry.pinned_page(
+                snapshot,
+                tid,
+                &page,
+                cat.registry.slot(),
+            )?))
         }
         Read::Backup { ref dir } => {
             let dir = std::str::from_utf8(dir).map_err(|_| "a backup directory that is not UTF-8".to_string())?;

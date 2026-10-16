@@ -1,11 +1,11 @@
 //! The CREATE VIEW segment sink: the hidden segments a body's lowering cuts,
-//! collected into a [`ViewBundle`]. A segment is named by its position, which
+//! collected ahead of the user-named view. A segment is named by its position, which
 //! commit substitutes for a real id, so lowering reaches no server.
 
 use super::super::physical::Frame;
 use super::super::RelExpr;
 use super::{SegInput, SegSource};
-use gnitz_core::{segment_id, PlannedView, ViewBundle};
+use gnitz_core::{segment_id, PlannedView};
 use gnitz_wire::Circuit;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,13 +48,9 @@ impl ViewChain {
         !self.segments.is_empty()
     }
 
-    /// The bundle, with the user-named view `p` after every segment.
-    pub(super) fn finish(self, p: EmitPieces) -> ViewBundle {
-        ViewBundle {
-            segments: self.segments,
-            view: p.seal().0,
-            definition: None,
-        }
+    /// The segments, and the user-named view `p` that comes after every one.
+    pub(super) fn finish(self, p: EmitPieces) -> (Vec<PlannedView>, PlannedView) {
+        (self.segments, p.seal().0)
     }
 }
 

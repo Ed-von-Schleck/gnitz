@@ -32,7 +32,7 @@ mod validate;
 
 pub use codec::literal::parse_bool;
 pub use ddl::render::{
-    create_index_statement, create_schema_statement, create_table_statement, create_view_statement, qualified_name,
+    create_index_statements, create_schema_statement, create_table_statement, create_view_statement, qualified_name,
     view_body,
 };
 pub use error::GnitzSqlError;

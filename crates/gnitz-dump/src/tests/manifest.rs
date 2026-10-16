@@ -23,6 +23,7 @@ fn sample() -> Manifest {
             schema: "sales".into(),
             name: "hot".into(),
         }],
+        indexes: vec!["hot_k".into()],
     }
 }
 

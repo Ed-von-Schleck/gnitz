@@ -8,7 +8,7 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_core::{PlannedView, RelName, ViewBundle};
+use gnitz_core::{PlannedView, RelName, ViewBundle, ViewDefinition};
 use gnitz_wire::sys_rows::ViewTabSlot;
 use gnitz_wire::{Circuit, ViewProps, VIEW_TAB};
 
@@ -35,11 +35,29 @@ fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
     }
 }
 
+/// A definition no reader of these tests renders.
+fn definition() -> ViewDefinition {
+    ViewDefinition {
+        query: "SELECT 1".to_string(),
+        body_columns: Vec::new(),
+        refs: Vec::new(),
+    }
+}
+
+/// `view` as a bundle of no segments.
+fn alone(view: PlannedView) -> ViewBundle {
+    ViewBundle {
+        segments: Vec::new(),
+        view,
+        definition: definition(),
+    }
+}
+
 /// A three-view bundle: segment `h` reads base, segment `g` reads `h`, and `f`
 /// (the user-named view) reads `g`.
 fn chain(base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
     ViewBundle {
-        definition: None,
+        definition: definition(),
         segments: vec![segment(base_tid, schema), segment(gnitz_core::segment_id(0), schema)],
         view: segment(gnitz_core::segment_id(1), schema),
     }
@@ -131,7 +149,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // A committed view whose name the bundle's user-named view reuses.
     let taken = block_on(client.create_view_chain(
         &rel(&sn, "taken"),
-        segment(base_tid, &schema).into(),
+        alone(segment(base_tid, &schema)),
         ViewProps::default(),
         None,
     ))
@@ -152,7 +170,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A segment naming a later segment scans a relation no older than itself.
     let forward = ViewBundle {
-        definition: None,
+        definition: definition(),
         segments: vec![segment(gnitz_core::segment_id(1), &schema), segment(base_tid, &schema)],
         view: segment(gnitz_core::segment_id(0), &schema),
     };
@@ -174,7 +192,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         circuit: wide,
         ..segment(base_tid, &schema)
     };
-    let err = block_on(client.create_view_chain(&rel(&sn, "wide"), planned.into(), ViewProps::default(), None))
+    let err = block_on(client.create_view_chain(&rel(&sn, "wide"), alone(planned), ViewProps::default(), None))
         .unwrap_err()
         .to_string();
     assert!(
@@ -189,7 +207,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
     let planned = ViewBundle {
-        definition: None,
+        definition: definition(),
         segments: (1..over).map(|_| segment(base_tid, &schema)).collect(),
         view: segment(base_tid, &schema),
     };
@@ -223,7 +241,7 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, base_tid, schema) = make_base(&mut client);
     let bundle = ViewBundle {
-        definition: None,
+        definition: definition(),
         segments: Vec::new(),
         view: segment(base_tid, &schema),
     };

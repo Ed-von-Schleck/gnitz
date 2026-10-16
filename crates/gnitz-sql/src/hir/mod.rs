@@ -25,23 +25,24 @@ use crate::agg::AggFunc;
 use crate::ast_util::AggArg;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
-use gnitz_core::{RelDescriptor, ViewBundle};
+use gnitz_core::{PlannedView, RelDescriptor};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A view body compiled: its bundle, every place its text names a catalog
+/// A view body compiled: its segments and the user-named view, every place its text names a catalog
 /// relation, and the names it gives its visible output columns before the
 /// statement's column list renames them.
 pub(crate) struct LoweredView {
-    pub(crate) bundle: ViewBundle,
+    pub(crate) segments: Vec<PlannedView>,
+    pub(crate) view: PlannedView,
     pub(crate) refs: Vec<BoundRef>,
     pub(crate) body_columns: Vec<String>,
 }
 
 /// The one compiler core: bind a query — its CTEs, then its body — to one
-/// `RelExpr` tree, and lower it to its view bundle. A CTE is a subtree of that
+/// `RelExpr` tree, and lower it to its segments and view. A CTE is a subtree of that
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
 pub(crate) fn bind_and_lower<'a>(
@@ -63,8 +64,13 @@ pub(crate) fn bind_and_lower<'a>(
         .map(|c| c.def.name.clone())
         .collect();
     crate::bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
-    let bundle = lower::lower(rel, bounded, &names)?;
-    Ok(LoweredView { bundle, refs: cx.refs, body_columns })
+    let (segments, view) = lower::lower(rel, bounded, &names)?;
+    Ok(LoweredView {
+        segments,
+        view,
+        refs: cx.refs,
+        body_columns,
+    })
 }
 
 pub(crate) use lower::fold::FoldPieces;

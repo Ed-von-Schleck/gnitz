@@ -62,7 +62,7 @@ pub struct CatalogRelation {
     pub reads: Vec<u64>,
     /// A user view's [`ViewDefinition`] as its row stores it, undecoded so one
     /// unreadable definition costs only its own view; empty for every other
-    /// relation and for a view no planner wrote.
+    /// relation.
     pub definition: Vec<u8>,
 }
 
@@ -81,12 +81,9 @@ impl CatalogRelation {
         }
     }
 
-    /// A user view's definition; `Ok(None)` for a relation that stores none.
-    pub fn definition(&self) -> Result<Option<ViewDefinition>, String> {
-        match self.definition.is_empty() {
-            true => Ok(None),
-            false => ViewDefinition::decode(&self.definition).map(Some),
-        }
+    /// A user view's definition; an error for a relation that stores none.
+    pub fn definition(&self) -> Result<ViewDefinition, String> {
+        ViewDefinition::decode(&self.definition)
     }
 
     /// What this relation is, as a RESOLVE of it answers.

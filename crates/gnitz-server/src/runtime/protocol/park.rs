@@ -174,8 +174,8 @@ impl Park {
 // WorkerSet
 // ---------------------------------------------------------------------------
 
-/// The most workers a cluster runs: [`WorkerSet`] holds one bit per worker.
-pub(crate) const MAX_WORKERS: usize = 64;
+// [`WorkerSet`] holds one bit per worker.
+pub(crate) use gnitz_wire::MAX_WORKERS;
 
 /// A subset of the workers. `ALL` is unbounded; every other set holds only
 /// launched workers.

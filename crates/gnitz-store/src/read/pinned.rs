@@ -3,6 +3,7 @@
 //! for.
 
 use gnitz_wire::snapshot::PageRequest;
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{from_runs, from_runs_in_band, Batch};
 use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 
@@ -10,18 +11,20 @@ use super::scan_spec::check_layout;
 use crate::relation::RelationRegistry;
 
 impl RelationRegistry {
-    /// The first `page.limit` live rows of relation `id` as `snapshot` pinned it
-    /// whose key sorts strictly above `page.after` — every row with `after`
-    /// `None` — in key order, in the layout `page.layout` names. Exactly `limit`
-    /// rows unless the pinned store holds fewer, so a page shorter than `limit`
-    /// is the store's last.
-    pub fn pinned_page(&self, snapshot: u64, id: u64, page: &PageRequest) -> Result<Batch, String> {
+    /// The first live rows of relation `id` as `snapshot` pinned it whose key
+    /// sorts strictly above the cursor `page` names for `store` — every row with
+    /// none — in key order, in the layout `page.layout` names: `store`'s share of
+    /// `page.limit`, exactly, unless the pinned store holds fewer, so a page
+    /// shorter than the share is the store's last.
+    pub fn pinned_page(&self, snapshot: u64, id: u64, page: &PageRequest, store: Slot) -> Result<Batch, String> {
+        let after = page.after_at(store.rank as usize, store.of as usize)?;
+        let share = PageRequest::rows_per_store(page.limit, store.of as usize);
         let store = self.pinned_store(snapshot, id)?;
         let schema = store.schema;
         check_layout(page.layout, &schema)?;
-        let limit = usize::try_from(page.limit).map_err(|_| format!("a page of {} rows", page.limit))?;
+        let limit = usize::try_from(share).map_err(|_| format!("a page of {share} rows"))?;
         let (runs, cap) = (store.runs.iter().cloned(), store.runs.len());
-        let mut cursor = match &page.after {
+        let mut cursor = match after {
             None => from_runs(runs, schema, cap),
             Some(after) => {
                 if after.len() != schema.pk_stride() {

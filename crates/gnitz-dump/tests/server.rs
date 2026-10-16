@@ -4,11 +4,16 @@
 //! view's, the statements that recreate them, and the SERIAL positions.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use gnitz_core::{block_on, BatchAppender, Catalog, GnitzClient, RelName, RelProps, ScanReply, ZSetBatch};
 use gnitz_sql::SqlResult;
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::WireConflictMode;
+use gnitz_wire::{Circuit, OpNode, ReadBound, WireConflictMode};
+use parquet::column::writer::ColumnWriter;
+use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::writer::SerializedFileWriter;
 
 /// Every kind of thing a dump carries, and the renames it has to survive.
 const SCRIPT: &str = "
@@ -200,7 +205,7 @@ fn a_restore_refuses_a_database_holding_its_names() {
     let mut a = GnitzClient::connect(src.sock_path()).unwrap();
     exec(
         &mut a,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY); INSERT INTO t VALUES (1)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT); CREATE INDEX t_v ON t (v); INSERT INTO t VALUES (1, 2)",
     );
     let dir = tempfile::tempdir().unwrap();
     dump(&mut a, dir.path());
@@ -209,25 +214,162 @@ fn a_restore_refuses_a_database_holding_its_names() {
     // A non-empty directory is no place for a dump.
     let err = block_on(gnitz_dump::dump(&mut a, dir.path())).unwrap_err();
     assert!(err.0.contains("not empty"), "{err}");
+
+    // An index name is the database's, whatever relation holds it.
+    let dst = ServerHandle::start_n(2);
+    let mut b = GnitzClient::connect(dst.sock_path()).unwrap();
+    exec(
+        &mut b,
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, w BIGINT); CREATE INDEX t_v ON other (w)",
+    );
+    let before = statements(&block_on(b.catalog()).unwrap());
+    let err = block_on(gnitz_dump::restore(&mut b, dir.path())).unwrap_err();
+    assert!(err.0.contains("already holds index t_v"), "{err}");
+    assert_eq!(statements(&block_on(b.catalog()).unwrap()), before);
 }
 
-/// A dump is one cut: rows written while it runs are not in it, and a table
-/// dropped after it starts still is.
+/// Whether the circuit of view `name` reads its source through a bound.
+fn scans_bounded(client: &mut GnitzClient, name: &str) -> bool {
+    let catalog = block_on(client.catalog()).unwrap();
+    let id = catalog.get(&RelName::new("public", name).unwrap()).unwrap().id;
+    let found = rows(
+        client,
+        &format!("SELECT circuit FROM _system.circuits WHERE view_id = {id}"),
+    );
+    let [(cells, 1)] = &found[..] else {
+        panic!("{name}: {} circuit rows", found.len())
+    };
+    let circuit = Circuit::decode(cells[0].as_deref().unwrap()).unwrap();
+    let mut bounds = circuit.nodes().iter().filter_map(|n| match &n.op {
+        OpNode::ScanDelta { bound, .. } => Some(bound),
+        _ => None,
+    });
+    let bound = bounds.next().expect("a scan");
+    assert!(bounds.next().is_none(), "{name}: one scan");
+    *bound != ReadBound::None
+}
+
+/// The indexes of the views' sources are created ahead of the views, so a view
+/// is planned with the same index bound it was planned with first.
 #[test]
-fn a_dump_is_the_cut_its_snapshot_pinned() {
+fn a_restored_view_keeps_its_index_bound() {
+    let src = ServerHandle::start_n(2);
+    let mut a = GnitzClient::connect(src.sock_path()).unwrap();
+    exec(
+        &mut a,
+        "CREATE TABLE s (id BIGINT PRIMARY KEY, k BIGINT); CREATE INDEX s_k ON s (k);
+         CREATE VIEW sv AS SELECT id FROM s WHERE k = 7",
+    );
+    assert!(scans_bounded(&mut a, "sv"));
+    let dir = tempfile::tempdir().unwrap();
+    dump(&mut a, dir.path());
+    let dst = ServerHandle::start_n(2);
+    let mut b = GnitzClient::connect(dst.sock_path()).unwrap();
+    block_on(gnitz_dump::restore(&mut b, dir.path())).unwrap();
+    assert!(scans_bounded(&mut b, "sv"));
+}
+
+/// A restore pushes without a duplicate-key check, so a file holding a key
+/// twice, which no dump writes, is caught by the rows it leaves.
+#[test]
+fn a_file_holding_a_key_twice_is_refused() {
+    let src = ServerHandle::start_n(2);
+    let mut a = GnitzClient::connect(src.sock_path()).unwrap();
+    exec(
+        &mut a,
+        "CREATE TABLE d (id BIGINT PRIMARY KEY, v BIGINT NOT NULL); INSERT INTO d VALUES (1, 10), (2, 20)",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    dump(&mut a, dir.path());
+
+    let manifest_path = dir.path().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let entry = &mut manifest["tables"][0];
+    assert_eq!(entry["name"], "d");
+    let file = dir.path().join(entry["file"].as_str().unwrap());
+    entry["rows"] = 3.into();
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let reader = SerializedFileReader::new(std::fs::File::open(&file).unwrap()).unwrap();
+    let meta = reader.metadata().file_metadata();
+    let root = Arc::new(meta.schema().clone());
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(meta.key_value_metadata().cloned())
+        .build();
+    drop(reader);
+    let mut w = SerializedFileWriter::new(std::fs::File::create(&file).unwrap(), root, Arc::new(props)).unwrap();
+    let mut group = w.next_row_group().unwrap();
+    for values in [[1i64, 2, 1], [10, 20, 30]] {
+        let mut col = group.next_column().unwrap().unwrap();
+        let ColumnWriter::Int64ColumnWriter(c) = col.untyped() else {
+            panic!("two BIGINT columns")
+        };
+        c.write_batch(&values, None, None).unwrap();
+        col.close().unwrap();
+    }
+    group.close().unwrap();
+    w.close().unwrap();
+
+    let dst = ServerHandle::start_n(2);
+    let mut b = GnitzClient::connect(dst.sock_path()).unwrap();
+    let err = block_on(gnitz_dump::restore(&mut b, dir.path())).unwrap_err();
+    assert!(err.0.contains("3 rows, of which 2 have distinct keys"), "{err}");
+}
+
+/// Rows of `(id, parent, body)`, each about 250 bytes in a push, for `ids`.
+fn tree_rows(
+    desc: &gnitz_core::RelDescriptor,
+    ids: impl Iterator<Item = i64>,
+    parent: impl Fn(i64) -> Option<i64>,
+) -> ZSetBatch {
+    let mut batch = ZSetBatch::new(&desc.schema);
+    let mut app = BatchAppender::new(&mut batch);
+    for id in ids {
+        let r = app.add_row(id as u128, 1);
+        match parent(id) {
+            Some(p) => r.int_val(i128::from(p)),
+            None => r.null(),
+        };
+        r.str_val(&format!("{id:0>200}"));
+    }
+    batch
+}
+
+/// A table that references itself and takes more than one push is restored in
+/// an order where every row's parents come first, and the rows of a reference
+/// cycle in one push.
+#[test]
+fn a_self_referencing_table_larger_than_a_push_restores() {
+    const ROWS: i64 = 84_000;
     let src = ServerHandle::start_n(4);
     let mut a = GnitzClient::connect(src.sock_path()).unwrap();
-    exec(&mut a, "CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)");
-    let values: Vec<String> = (0..40_000).map(|i| format!("({i}, 'row {i}')")).collect();
-    for chunk in values.chunks(5_000) {
-        exec(&mut a, &format!("INSERT INTO t VALUES {}", chunk.join(", ")));
+    exec(
+        &mut a,
+        "CREATE TABLE chain (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES chain (id), body TEXT);
+         CREATE TABLE ring (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES ring (id), body TEXT)",
+    );
+    // Each row's parent has the next larger id, so key order puts children
+    // before their parents; pushed parents first.
+    let chain = block_on(a.resolve_relation(&RelName::new("public", "chain").unwrap())).unwrap();
+    for top in (0..ROWS).rev().step_by(20_000) {
+        let batch = tree_rows(&chain, ((top - 19_999).max(0)..=top).rev(), |id| {
+            (id + 1 < ROWS).then_some(id + 1)
+        });
+        block_on(a.push(&*chain, &chain.schema, batch, WireConflictMode::Error)).unwrap();
     }
-    let dir = tempfile::tempdir().unwrap();
-    let summary = dump(&mut a, dir.path());
-    assert_eq!(summary.rows, 40_000);
+    // One cycle through every row, which only one push can carry.
+    let ring = block_on(a.resolve_relation(&RelName::new("public", "ring").unwrap())).unwrap();
+    let batch = tree_rows(&ring, 0..ROWS, |id| Some((id + 1) % ROWS));
+    block_on(a.push(&*ring, &ring.schema, batch, WireConflictMode::Error)).unwrap();
 
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(dump(&mut a, dir.path()).rows, 2 * ROWS as u64);
     let dst = ServerHandle::start_n(3);
     let mut b = GnitzClient::connect(dst.sock_path()).unwrap();
     block_on(gnitz_dump::restore(&mut b, dir.path())).unwrap();
-    assert_eq!(rows(&mut a, "SELECT * FROM t"), rows(&mut b, "SELECT * FROM t"));
+    for table in ["chain", "ring"] {
+        let q = format!("SELECT * FROM {table}");
+        assert_eq!(rows(&mut a, &q), rows(&mut b, &q), "{table}");
+    }
 }

@@ -233,9 +233,8 @@ pub struct PlannedView {
 pub struct ViewBundle {
     pub segments: Vec<PlannedView>,
     pub view: PlannedView,
-    /// What the user-named view's row records of its body; `None` writes an
-    /// empty definition.
-    pub definition: Option<ViewDefinition>,
+    /// What the user-named view's row records of its body.
+    pub definition: ViewDefinition,
 }
 
 impl ViewBundle {
@@ -290,16 +289,6 @@ impl ViewBundle {
                 },
                 1,
             );
-        }
-    }
-}
-
-impl From<PlannedView> for ViewBundle {
-    fn from(view: PlannedView) -> Self {
-        ViewBundle {
-            segments: Vec::new(),
-            view,
-            definition: None,
         }
     }
 }
@@ -961,6 +950,11 @@ impl GnitzClient {
     // discards it. All state-machine errors are raised here; the SQL dispatch
     // arms and the Python context manager only translate them.
 
+    /// Whether the connection has ended, so no request on it can be answered.
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
     /// True while a transaction is open.
     pub fn txn_active(&self) -> bool {
         self.txn.is_some()
@@ -1250,8 +1244,9 @@ impl GnitzClient {
             pk_repeats: source.pk_repeats,
         };
         let bundle = ViewBundle {
-            definition: Some(passthrough_definition(source)),
-            ..planned.into()
+            segments: Vec::new(),
+            view: planned,
+            definition: passthrough_definition(source),
         };
         self.create_view_chain(view, bundle, props, None).await
     }
@@ -1320,11 +1315,7 @@ impl GnitzClient {
         };
 
         let base = self.alloc_ids(n_views as u64).await?;
-        let definition = bundle
-            .definition
-            .as_ref()
-            .map(ViewDefinition::encode)
-            .unwrap_or_default();
+        let definition = bundle.definition.encode();
         bundle.put_rows(&mut b, view_name, props, &definition, schema_id, base);
         self.commit_ddl(b).await?;
         Ok(base + n_segments)

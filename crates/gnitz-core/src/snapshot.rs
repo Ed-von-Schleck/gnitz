@@ -5,15 +5,17 @@
 //! hold, and see one cut of all of them while writes go on. A snapshot is its
 //! connection's and ends with it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::sys_rows::SeqTabRow;
 
 use crate::catalog::CATALOG_FAMILIES;
 use crate::connection::SnapshotPage;
 use crate::{sys_schema, Catalog, ClientError, GnitzClient, Pending, Request, Schema, ZSetBatch};
 
-/// The rows a page asks each worker for when a caller names no other size.
+/// The rows a page holds when a caller names no other size.
 pub const DEFAULT_PAGE_ROWS: u64 = 16_384;
 
 impl GnitzClient {
@@ -33,13 +35,14 @@ impl GnitzClient {
         self.ack(Request::Backup(name)).await.map(drop)
     }
 
-    /// One page of relation `tid` as snapshot `id` holds it: each worker's
-    /// first `limit` rows above `after`, in `schema`'s layout.
+    /// One page of relation `tid` as snapshot `id` holds it: up to `limit`
+    /// rows, each worker's share of them after its key in `after` — from its
+    /// first row with `after` empty — in `schema`'s layout.
     pub fn snapshot_page(
         &mut self,
         id: u64,
         tid: u64,
-        after: Option<&[u8]>,
+        after: &[Option<Vec<u8>>],
         limit: u64,
         schema: &Arc<Schema>,
     ) -> Pending<'_, SnapshotPage> {
@@ -48,44 +51,45 @@ impl GnitzClient {
     }
 
     /// Every row of relation `tid` as snapshot `id` holds it, handed to `each` a
-    /// batch at a time, no row twice. A batch is up to `page_rows` rows of each
-    /// worker; its rows are in no order across batches or workers.
-    pub async fn snapshot_read(
+    /// batch at a time, no row twice: up to `page_rows` rows a batch, in no order
+    /// across batches or workers.
+    pub async fn snapshot_read<E: From<ClientError>>(
         &mut self,
         id: u64,
         tid: u64,
         schema: &Arc<Schema>,
         page_rows: u64,
-        mut each: impl FnMut(ZSetBatch) -> Result<(), ClientError>,
-    ) -> Result<(), ClientError> {
-        let mut after: Option<Vec<u8>> = None;
+        mut each: impl FnMut(ZSetBatch) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // Each worker's last key handed out; empty until the first page names the workers.
+        let mut after: Vec<Option<Vec<u8>>> = Vec::new();
         loop {
-            let SnapshotPage { mut batch, worker_ends } =
-                self.snapshot_page(id, tid, after.as_deref(), page_rows, schema).await?;
+            let SnapshotPage { batch, worker_ends } = self.snapshot_page(id, tid, &after, page_rows, schema).await?;
             let segments = segments(&worker_ends);
-            // A worker that filled its page may hold more past its last row, so
-            // only what every such worker has passed is read whole.
-            let frontier = segments
-                .iter()
-                .filter(|&&(start, end)| (end - start) as u64 == page_rows)
-                .map(|&(_, end)| batch.pks.get_bytes(end - 1))
-                .min()
-                .map(<[u8]>::to_vec);
-            let Some(frontier) = frontier else {
-                return each(batch);
-            };
-            let kept: Vec<(usize, usize)> = segments
-                .iter()
-                .map(|&(start, end)| {
-                    let below = (start..end)
-                        .take_while(|&i| batch.pks.get_bytes(i) <= &frontier[..])
-                        .count();
-                    (start, start + below)
-                })
-                .collect();
-            batch.retain_ranges(&kept);
+            if after.is_empty() {
+                after = vec![None; segments.len()];
+            }
+            if segments.len() != after.len() {
+                return Err(ClientError::from(format!(
+                    "a page of {} workers after one of {}",
+                    segments.len(),
+                    after.len()
+                ))
+                .into());
+            }
+            let share = PageRequest::rows_per_store(page_rows, segments.len());
+            // A worker that filled its share may hold more past its last row.
+            let mut more = false;
+            for (at, &(start, end)) in after.iter_mut().zip(&segments) {
+                if end > start {
+                    *at = Some(batch.pks.get_bytes(end - 1).to_vec());
+                }
+                more |= (end - start) as u64 == share;
+            }
             each(batch)?;
-            after = Some(frontier);
+            if !more {
+                return Ok(());
+            }
         }
     }
 
@@ -94,7 +98,7 @@ impl GnitzClient {
         let mut all = ZSetBatch::new(schema);
         self.snapshot_read(id, tid, schema, DEFAULT_PAGE_ROWS, |batch| {
             all.extend_from_owned(batch);
-            Ok(())
+            Ok::<_, ClientError>(())
         })
         .await?;
         Ok(all)
@@ -112,7 +116,7 @@ impl GnitzClient {
 
     /// Each SERIAL table's id and the last id its sequence has handed out, as
     /// snapshot `id` holds them.
-    pub async fn snapshot_serials(&mut self, id: u64) -> Result<Vec<(u64, u64)>, ClientError> {
+    pub async fn snapshot_serials(&mut self, id: u64) -> Result<HashMap<u64, u64>, ClientError> {
         let rows = self
             .snapshot_rows(id, gnitz_wire::SEQ_TAB, sys_schema(gnitz_wire::SEQ_TAB))
             .await?;

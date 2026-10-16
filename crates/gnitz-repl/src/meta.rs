@@ -752,20 +752,14 @@ impl Shell {
     fn dump(&mut self, dir: &str) -> Result<Flow, Failed> {
         let done = gnitz_core::block_on(gnitz_dump::dump(&mut self.client, std::path::Path::new(dir)));
         let s = done.or_else(|e| self.fail(format!("\\dump: {e}")))?;
-        self.status(&format!(
-            "dumped {} schema(s), {} table(s), {} view(s) and {} row(s) into {dir}",
-            s.schemas, s.tables, s.views, s.rows
-        ));
+        self.status(&format!("dumped {s} into {dir}"));
         Ok(Flow::Continue)
     }
 
     fn restore(&mut self, dir: &str) -> Result<Flow, Failed> {
         let done = gnitz_core::block_on(gnitz_dump::restore(&mut self.client, std::path::Path::new(dir)));
         let s = done.or_else(|e| self.fail(format!("\\restore: {e}")))?;
-        self.status(&format!(
-            "restored {} schema(s), {} table(s), {} view(s) and {} row(s) from {dir}",
-            s.schemas, s.tables, s.views, s.rows
-        ));
+        self.status(&format!("restored {s} from {dir}"));
         Ok(Flow::Continue)
     }
 

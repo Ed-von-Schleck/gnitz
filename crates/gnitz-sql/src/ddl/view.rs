@@ -249,8 +249,9 @@ fn plan_segments<'a>(
     let lowered = crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
     let definition = record_definition(text, &lowered)?;
     Ok(ViewBundle {
-        definition: Some(definition),
-        ..lowered.bundle
+        segments: lowered.segments,
+        view: lowered.view,
+        definition,
     })
 }
 

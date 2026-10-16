@@ -153,6 +153,29 @@ fn a_file_of_other_columns_is_refused() {
     assert!(TableReader::open(&path, &other).is_err());
 }
 
+/// A column of another gnitz type is refused though its Parquet column is the
+/// same physical type, or the same Parquet type altogether.
+#[test]
+fn a_column_of_another_gnitz_type_is_refused() {
+    let table = |v: TypeCode| {
+        Arc::new(
+            Schema::from_parts(
+                vec![ColumnDef::new("k", TypeCode::I64, false), ColumnDef::new("v", v, false)],
+                &[0],
+            )
+            .unwrap(),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for (written, opened) in [(TypeCode::Date, TypeCode::I32), (TypeCode::U128, TypeCode::I128)] {
+        let path = dir.path().join(format!("{written}.parquet"));
+        TableWriter::create(&path, &table(written)).unwrap().finish().unwrap();
+        TableReader::open(&path, &table(written)).unwrap();
+        let err = TableReader::open(&path, &table(opened)).err().unwrap();
+        assert!(err.0.contains("its columns are not the table's"), "{err}");
+    }
+}
+
 #[test]
 fn the_file_names_each_columns_gnitz_type() {
     let schema = every_type();
@@ -169,7 +192,30 @@ fn the_file_names_each_columns_gnitz_type() {
     let types: Vec<String> = serde_json::from_str(&types).unwrap();
     assert_eq!(types[0], "SMALLINT");
     assert!(types.contains(&"HUGEINT".to_string()) && types.contains(&"UHUGEINT".to_string()));
-    assert_eq!(types.last().unwrap(), "DECIMAL(18, 2)");
+    assert_eq!(
+        types[2..].iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "TINYINT UNSIGNED",
+            "TINYINT",
+            "SMALLINT UNSIGNED",
+            "SMALLINT",
+            "INT UNSIGNED",
+            "INT",
+            "BIGINT UNSIGNED",
+            "BIGINT",
+            "UHUGEINT",
+            "HUGEINT",
+            "UUID",
+            "FLOAT",
+            "DOUBLE",
+            "TEXT",
+            "BLOB",
+            "DATE",
+            "TIMESTAMP",
+            "BOOLEAN",
+            "DECIMAL(18, 2)",
+        ]
+    );
 }
 
 #[test]
@@ -186,14 +232,27 @@ fn a_key_out_of_its_columns_range_is_refused() {
             .unwrap(),
         )
     };
-    let (wide, narrow) = (table(TypeCode::U32), table(TypeCode::I8));
+    let narrow = table(TypeCode::I8);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.parquet");
-    let mut batch = ZSetBatch::new(&wide);
-    BatchAppender::new(&mut batch).add_row(300, 1).int_val(1);
-    let mut w = TableWriter::create(&path, &wide).unwrap();
-    w.write(&batch).unwrap();
-    w.finish().unwrap();
+    // A file this writer never produces: the I8 key's INT32 holds 300.
+    let (root, types) = file_layout(&narrow).unwrap();
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]))
+        .build();
+    let mut w = SerializedFileWriter::new(File::create(&path).unwrap(), Arc::new(root), Arc::new(props)).unwrap();
+    let mut group = w.next_row_group().unwrap();
+    for _ in 0..2 {
+        let mut col = group.next_column().unwrap().unwrap();
+        match col.untyped() {
+            ColumnWriter::Int32ColumnWriter(c) => c.write_batch(&[300], None, None).unwrap(),
+            ColumnWriter::Int64ColumnWriter(c) => c.write_batch(&[1], None, None).unwrap(),
+            _ => unreachable!("an INT32 key and an INT64 payload"),
+        };
+        col.close().unwrap();
+    }
+    group.close().unwrap();
+    w.close().unwrap();
     let err = TableReader::open(&path, &narrow).unwrap().next_group().unwrap_err();
     assert!(err.0.contains("out of range"), "{err}");
 }

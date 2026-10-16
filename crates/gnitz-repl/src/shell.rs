@@ -82,14 +82,6 @@ fn connect(target: &str, interrupt: Option<Arc<AtomicBool>>) -> Result<GnitzClie
     block_on(GnitzClient::connect_with(target, Box::new(host(interrupt))))
 }
 
-/// Whether `e` ended the connection, so a statement after it needs a new one.
-fn is_disconnect(e: &GnitzSqlError) -> bool {
-    matches!(
-        e,
-        GnitzSqlError::Client(ClientError::Closed | ClientError::ConnectionLost(_))
-    )
-}
-
 impl Shell {
     pub fn connect(options: Options) -> Result<Shell, ClientError> {
         let client = connect(&options.target, options.interrupt.clone())?;
@@ -201,10 +193,17 @@ impl Shell {
                     None => break,
                 },
             };
+            self.clear_interrupt();
             let r = match piece {
                 Piece::Meta(line) => self.meta(&line),
                 Piece::Sql(sql) => self.run_sql(&sql),
             };
+            if r.is_err() && self.client.is_closed() {
+                let target = self.target.clone();
+                if self.reconnect(&target).is_ok() {
+                    self.note("reconnected; an open transaction was lost");
+                }
+            }
             match r {
                 Ok(Flow::Quit) => return Ok(Flow::Quit),
                 Ok(Flow::Continue) => {}
@@ -247,12 +246,6 @@ impl Shell {
                 let r = self.fail(&e);
                 if let GnitzSqlError::Client(ClientError::Interrupted(_)) = e {
                     self.note("the statement may still complete on the server");
-                }
-                if is_disconnect(&e) {
-                    let target = self.target.clone();
-                    if self.reconnect(&target).is_ok() {
-                        self.note("reconnected; an open transaction was lost");
-                    }
                 }
                 r
             }
