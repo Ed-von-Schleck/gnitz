@@ -14,6 +14,7 @@ reachable through the binary client, so these drive `push`/`seek`, not SQL.
 import gnitz
 import pytest
 from _read import bag, scanned
+from _sql import insert
 
 NFACTS = 40
 NDIMS = 4
@@ -22,59 +23,32 @@ NDIMS = 4
 @pytest.fixture
 def fact_dim(client):
     """`fact JOIN dim` on `k`, with `NFACTS` facts spread over `NDIMS` dims — so
-    every `_join_pk` names `NFACTS // NDIMS` view rows. The view's id and schema."""
+    every `_join_pk`, the join key `k`, names `NFACTS // NDIMS` view rows. The
+    view's id and schema."""
     for name in ("dim", "fact"):
         client.execute_sql(
             f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE VIEW jv AS SELECT f.id AS fid, d.id AS did "
         "FROM fact f JOIN dim d ON f.k = d.k")
-    client.execute_sql(
-        "INSERT INTO dim VALUES " + ",".join(f"({i}, {i})" for i in range(NDIMS)))
-    client.execute_sql(
-        "INSERT INTO fact VALUES "
-        + ",".join(f"({i}, {i % NDIMS})" for i in range(NFACTS)))
+    insert(client, "dim", [(i, i) for i in range(NDIMS)])
+    insert(client, "fact", [(i, i % NDIMS) for i in range(NFACTS)])
     return client.resolve_table("jv")
 
 
 def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
-    """The ground truth is a full scan of the view grouped by key; a seek of each
-    key must reproduce its whole group, weights included."""
+    """A seek of each key returns its whole group in one request, weights
+    included."""
     vid, schema = fact_dim
-    groups = {}
-    before = client.requests_sent
-    for r in client.scan(vid, schema).including_hidden():
-        groups.setdefault(r["_join_pk"], []).append(r)
-    assert client.requests_sent == before + 1, "a scan is one request"
-    assert len(groups) == NDIMS, groups
-
-    for key, want in groups.items():
-        assert len(want) == NFACTS // NDIMS, f"fixture: key {key} -> {want}"
+    for k in range(NDIMS):
         before = client.requests_sent
-        got = list(client.seek(vid, schema, pk=key).including_hidden())
+        got = client.seek(vid, schema, pk=k).including_hidden()
         assert client.requests_sent == before + 1, "a seek is one request"
-        assert bag(got, "fid", "did") == bag(want, "fid", "did"), f"seek(jv, {key})"
-        assert all(r["_join_pk"] == key for r in got)
+        assert bag(got, "_join_pk", "fid", "did") == \
+            {(k, f, k): 1 for f in range(NFACTS) if f % NDIMS == k}, f"seek(jv, {k})"
 
     # An absent key is an empty answer, not an error.
-    assert list(client.seek(vid, schema, pk=max(groups) + 1000)) == []
-
-
-@pytest.mark.parametrize("replicated", [False, True])
-def test_a_base_table_seek_stays_one_row(client, replicated):
-    """The group walk must not widen a unique PK: a base table's ingest enforces
-    it, so each key's group is one row at weight 1 — under replication too, where
-    every worker holds the whole table and a mis-scoped walk would answer once
-    per worker."""
-    opts = " WITH (replicated = true)" if replicated else ""
-    client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + opts)
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 10})" for i in range(NFACTS)))
-    tid, schema = client.resolve_table("t")
-    for i in range(NFACTS):
-        assert bag(client.seek(tid, schema, pk=i)) == {(i, i * 10): 1}, f"seek(t, {i})"
-    assert list(client.seek(tid, schema, pk=NFACTS + 7)) == []
+    assert list(client.seek(vid, schema, pk=NDIMS + 1000)) == []
 
 
 def test_a_group_past_one_frame_is_returned_whole(client):

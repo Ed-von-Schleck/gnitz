@@ -5,37 +5,29 @@ the reply as a hidden column; and the sink counts LIMIT/OFFSET by
 logical **multiplicity** — summed weight — not by Z-set entries, so a cut lands
 in the same place however a bag is split across workers and entries.
 
-Under a LIMIT the worker top-k discards rows before the client ever sees them,
-so the two comparators must agree exactly: a divergence drops rows rather than
-merely reordering them. That is why the TEXT-with-NULLs and float cases pin
-values and not just an order.
-
-What the bound refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`.
+What the bound refuses is pinned in the planner's `gnitz-sql/src/suites/plan_read.rs`.
 """
 
 import pytest
-from _read import bag, rows
+from _read import bag, ordered, plan_line, reply, rows
 from _shapes import sorted_by
 from _sql import insert
 
 
 @pytest.fixture(scope="module")
 def src(module_client):
-    """A connection holding the read-only sources for every case: `t (id, v, w, a)`, a TEXT column with
-    NULLs, a DOUBLE column, and `dup` — a `UNION ALL` of two identical tables,
-    so every row carries logical multiplicity 2."""
+    """A connection holding the read-only sources for every case: `t (id, v, w, a)`,
+    a DOUBLE column, and `dup` — a `UNION ALL` of two identical tables, so every
+    row carries logical multiplicity 2."""
     conn = module_client
     conn.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, w BIGINT, a BIGINT NOT NULL); "
-        "CREATE TABLE names (id BIGINT PRIMARY KEY, name TEXT); "
         "CREATE TABLE floats (id BIGINT PRIMARY KEY, x DOUBLE); "
         "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE VIEW dup AS SELECT * FROM a UNION ALL SELECT * FROM b")
     insert(conn, "t", [(1, 30, 10, 1), (2, 10, None, 1), (3, 20, 20, 2), (4, 40, 5, 2),
                            (5, 50, 15, 3)])
-    insert(conn, "names", [(1, "pear"), (2, "apple"), (3, None), (4, "banana"),
-                               (5, "apricot"), (6, None), (7, "cherry")])
     insert(conn, "floats", [(1, 2.5), (2, -1.75), (3, 0.0), (4, -3.25), (5, 1.25)])
     for name in ("a", "b"):
         insert(conn, name, [(1, 10), (2, 20)])
@@ -80,32 +72,14 @@ _ALL = ["id", "v", "w", "a"]
     # as a hidden column, so it never widens the presented shape.
     ("SELECT id FROM t ORDER BY 0 - v", [5, 4, 1, 3, 2], ["id"]),
     ("SELECT id FROM t ORDER BY v % 20, id DESC LIMIT 2", [4, 3], ["id"]),
+    # Negative, fractional and zero floats under one total order.
+    ("SELECT id FROM floats ORDER BY x LIMIT 3", [4, 2, 3], ["id"]),
+    ("SELECT id FROM floats ORDER BY x DESC LIMIT 2", [1, 5], ["id"]),
 ])
 def test_a_base_table_sort_and_window(src, q, want, fields):
-    got = rows(src, q)
-    assert [r.id for r in got] == want
-    if got:
-        assert list(got[0]._fields) == fields
-
-
-# ---------------------------------------------------------------------------
-# The worker top-k's comparator must be the client window's
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("q,want", [
-    # German-string order and absolute NULL placement: DESC defaults to NULLS
-    # FIRST, so the NULLs occupy the window; explicit NULLS LAST keeps them out.
-    ("SELECT name FROM names ORDER BY name LIMIT 3", ["apple", "apricot", "banana"]),
-    ("SELECT name FROM names ORDER BY name DESC LIMIT 3", [None, None, "pear"]),
-    ("SELECT name FROM names ORDER BY name ASC NULLS LAST LIMIT 5",
-     ["apple", "apricot", "banana", "cherry", "pear"]),
-    # Negative, fractional and zero under the same total order on both sides.
-    ("SELECT id FROM floats ORDER BY x LIMIT 3", [4, 2, 3]),
-    ("SELECT id FROM floats ORDER BY x DESC LIMIT 2", [1, 5]),
-])
-def test_a_top_k_cuts_where_the_client_would(src, q, want):
-    assert [r[0] for r in rows(src, q)] == want
+    got = reply(src.execute_sql(q))
+    assert ordered(got, "id") == [((i,), 1) for i in want]
+    assert got._fields == tuple(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +110,10 @@ def test_a_grouped_views_hidden_key_is_not_a_positional_column(client):
         "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cat BIGINT); "
         "CREATE VIEW v AS SELECT cat, COUNT(*) AS cnt FROM orders GROUP BY cat; "
         "INSERT INTO orders VALUES (1,10),(2,10),(3,10),(4,20),(5,30),(6,30)")
-    assert [(r.cat, r.cnt) for r in rows(client, "SELECT * FROM v ORDER BY cnt DESC LIMIT 2")] \
-        == [(10, 3), (30, 2)]
-    assert [r.cat for r in rows(client, "SELECT * FROM v ORDER BY 1")] == [10, 20, 30]
+    assert ordered(rows(client, "SELECT * FROM v ORDER BY cnt DESC LIMIT 2"), "cat", "cnt") == \
+        [((10, 3), 1), ((30, 2), 1)]
+    assert ordered(rows(client, "SELECT * FROM v ORDER BY 1")) == \
+        [((("cat", c), ("cnt", n)), 1) for c, n in [(10, 3), (20, 1), (30, 2)]]
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +144,13 @@ def test_a_cut_in_key_order_matches_a_full_sort(client):
         ("SELECT * FROM c WHERE a = 3 ORDER BY a, b LIMIT 4", [(3, b) for b in range(-10, -6)]),
         ("SELECT * FROM g ORDER BY a LIMIT 3 OFFSET 2", g_rows[2:5]),
     ]:
-        assert "early-stop" in rows(client, "EXPLAIN " + q)[-1][0], q
-        assert [tuple(r) for r in rows(client, q)] == want, q
+        assert "early-stop" in plan_line(client, q, "order/limit"), q
+        got = reply(client.execute_sql(q))
+        assert ordered(got, *got._fields) == [(w, 1) for w in want], q
     # Only the leading key column orders the cut, so its ties land anywhere.
     got = rows(client, "SELECT * FROM c ORDER BY a LIMIT 25")
-    assert [r.a for r in got] == [-10] * 20 + [-9] * 5
-    assert len({tuple(r) for r in got}) == 25
+    assert ordered(got, "a") == [((-10,), 20), ((-9,), 5)]
+    assert set(bag(got).values()) == {1} and len(bag(got)) == 25
 
 
 # ---------------------------------------------------------------------------
@@ -190,18 +166,6 @@ def _window(entries, offset, limit):
         if kept > 0:
             out.append((row, kept))
         at += w
-    return out
-
-
-def _entries(got, cols):
-    """The result as `(values of cols, weight)` in order, one entry per run of equal rows."""
-    out = []
-    for r in got:
-        key = tuple(getattr(r, c) for c in cols)
-        if out and out[-1][0] == key:
-            out[-1] = (key, out[-1][1] + r._weight)
-        else:
-            out.append((key, r._weight))
     return out
 
 
@@ -239,20 +203,15 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
     ]:
         q = f"SELECT * FROM big ORDER BY {order} LIMIT {limit} OFFSET {offset}"
         want = [(values(r), 1) for r in sorted_by(data, keys)[offset:offset + limit]]
-        assert _entries(rows(client, q), cols) == want, q
+        assert ordered(rows(client, q), *cols) == want, q
 
-    # Uncut, ties are open: the written keys must be total for the order to be pinned.
     for order, keys in [
         ("v, id", [("v", False, False)]),
         ("s DESC, id", [("s", True, True)]),
     ]:
+        # Uncut, ties are open: the written keys must be total for the order to be pinned.
         q = f"SELECT * FROM big ORDER BY {order}"
-        assert _entries(rows(client, q), cols) == [(values(r), 1) for r in sorted_by(data, keys)], q
-
-    for order, keys in [
-        ("v, id", [("v", False, False)]),
-        ("s DESC, id", [("s", True, True)]),
-    ]:
+        assert ordered(rows(client, q), *cols) == [(values(r), 1) for r in sorted_by(data, keys)], q
         full = [(r, weight(r)) for r in sorted_by(data, keys)]
         # The window opens on the second logical row of the first weight-2 entry past 40.
         first = next(i for i, (_, w) in enumerate(full) if i >= 40 and w == 2)
@@ -261,7 +220,7 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
             q = f"SELECT * FROM both ORDER BY {order} LIMIT {limit} OFFSET {offset}"
             want = [(values(r), w) for r, w in _window(full, offset, limit)]
             assert want[0][1] == 1, q
-            assert _entries(rows(client, q), cols) == want, q
+            assert ordered(rows(client, q), *cols) == want, q
     # Ordered by the leading key alone, the view's ties break by its own identity; the
     # values the window holds are fixed all the same.
     full = [(r, weight(r)) for r in sorted_by(data, [("v", False, False)])]

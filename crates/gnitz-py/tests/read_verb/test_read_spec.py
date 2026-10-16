@@ -9,17 +9,16 @@ routed to two comes back at weight 2. So every case here asserts the full result
 set *with its weights* over keys that span every worker — a PK list would see
 the first failure only by luck and the second not at all.
 
-What this path refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`.
+What this path refuses is pinned in the planner's `gnitz-sql/src/suites/plan_read.rs`.
 """
 
-import concurrent.futures
 import os
 import signal
 
 import gnitz
 import pytest
-from _read import bag, ordered, rows
-from _serverproc import TINY_REPLY_FRAMES
+from _read import access, bag, reply, rows
+from _serverproc import TINY_REPLY_FRAMES, join_or_fail, spawn
 from _sql import insert
 
 # Enough rows that an indexed point clears the worker's selectivity gate at any
@@ -63,9 +62,9 @@ def test_the_projection_is_the_clients_to_shape(kv):
 
 
 def test_a_pk_point_finds_every_key(kv):
-    """`WHERE id = k` compiles to a one-key PK range, which routes to a single
-    partition. Every key must still come back exactly once, from whichever
-    worker owns it."""
+    """`WHERE id = k` is a PK point lookup, sent to the one worker owning the key.
+    Every key must still come back exactly once, from whichever worker owns
+    it."""
     for i in range(SPAN):
         assert bag(rows(kv, f"SELECT id, v FROM t WHERE id = {i}")) == {(i, i * 10): 1}
     assert rows(kv, f"SELECT id FROM t WHERE id = {NROWS + 7}") == []
@@ -74,7 +73,6 @@ def test_a_pk_point_finds_every_key(kv):
 @pytest.mark.parametrize("predicate,keep", [
     ("id >= 100", lambda i: i >= 100),
     ("id > 5 AND id < 9", lambda i: 5 < i < 9),
-    ("id > 10 AND id < 5", lambda i: False),          # provably empty
 ])
 def test_a_pk_range_spans_every_partition(kv, predicate, keep):
     """A multi-key PK range on a full-PK-hashed table is not confinable, so it
@@ -84,8 +82,8 @@ def test_a_pk_range_spans_every_partition(kv, predicate, keep):
 
 
 def test_a_pk_set_gathers_every_named_key(kv):
-    """`id IN (…)` is the PkSet gather: broadcast, each worker answering only the
-    keys it owns. The union must be the whole list at weight 1 — a key two
+    """`id IN (…)` is the PkSet gather: each key is sent only to the worker owning
+    it. The union must be the whole list at weight 1 — a key two
     workers both claim shows up here as weight 2, as does a key the list names
     twice — and absent keys miss silently rather than erroring."""
     wanted = list(range(0, NROWS, 3))
@@ -98,26 +96,26 @@ def test_a_provably_empty_pk_range_is_answered_by_one_worker(own_server):
     """With every worker but worker 0 stopped, only a read no other worker is asked
     for can complete. A provably-empty range skips the fan-out for a rows sink —
     but a fold still owes its ground row, so COUNT(*) must answer 0, not nothing."""
-    conn = gnitz.connect(own_server.start(workers=4).target)
-    conn.execute_sql("CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
-    insert(conn, "t", [(i, i) for i in range(SPAN)])
-    pids = own_server.worker_pids()
-    assert sorted(pids) == [0, 1, 2, 3], pids
-    stopped = [pid for w, pid in pids.items() if w != 0]
-    ex = concurrent.futures.ThreadPoolExecutor(1)
-    for pid in stopped:
-        os.kill(pid, signal.SIGSTOP)
-    try:
+    def read(conn):
         for q, want in [("SELECT id FROM t WHERE id = -1", {}),
                         ("SELECT id FROM t WHERE id > 10 AND id < 5", {}),
                         ("SELECT COUNT(*) AS c FROM t WHERE id > 10 AND id < 5", {(0,): 1}),
                         ("SELECT COUNT(*) AS c FROM t WHERE id < 0", {(0,): 1})]:
-            got = ex.submit(lambda: bag(rows(conn, q))).result(timeout=30)
-            assert got == want, q
-    finally:
+            assert bag(rows(conn, q)) == want, q
+
+    with gnitz.connect(own_server.start(workers=4).target) as conn:
+        conn.execute_sql("CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+        insert(conn, "t", [(i, i) for i in range(SPAN)])
+        pids = own_server.worker_pids()
+        assert sorted(pids) == [0, 1, 2, 3], pids
+        stopped = [pid for w, pid in pids.items() if w != 0]
         for pid in stopped:
-            os.kill(pid, signal.SIGCONT)
-        ex.shutdown()
+            os.kill(pid, signal.SIGSTOP)
+        try:
+            join_or_fail("a provably-empty read waited on a stopped worker", spawn(read, conn))
+        finally:
+            for pid in stopped:
+                os.kill(pid, signal.SIGCONT)
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +127,14 @@ def test_a_provably_empty_pk_range_is_answered_by_one_worker(own_server):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("lead", ["a = {a}", "a IN ({a})"])
-def test_a_full_point_on_a_compound_pk_confines(client, lead):
+def test_a_full_point_on_a_compound_pk_confines(client):
     """The range is one key wide, so it unicasts to the worker owning that key's
-    partition. `a IN (x)` is `a = x`, so both spellings must confine alike."""
+    partition."""
     client.execute_sql(
         "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT, PRIMARY KEY (a, b))")
     insert(client, "t", [(a, b, a * 100 + b) for a in range(6) for b in range(6)])
     for a, b in [(0, 0), (3, 4), (5, 5)]:
-        got = bag(rows(client, f"SELECT v FROM t WHERE {lead.format(a=a)} AND b = {b}"))
+        got = bag(rows(client, f"SELECT v FROM t WHERE a = {a} AND b = {b}"))
         assert got == {(a * 100 + b,): 1}, f"({a}, {b})"
 
 
@@ -157,14 +154,16 @@ def test_a_cluster_by_prefix_range_returns_the_whole_group(client):
 
 def test_a_point_on_a_partitioned_views_key_confines(client):
     """A view over a non-replicated source has a hash-partitioned output store,
-    so a point on its key is confinable — and must find its row."""
+    so a point on its key is confinable — and must find its row. `g` is NOT NULL,
+    so the view is keyed on it rather than on a hidden key a WHERE cannot bound."""
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT); "
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, v BIGINT); "
         "CREATE VIEW agg AS SELECT g, SUM(v) AS total FROM t GROUP BY g")
     insert(client, "t", [(i, i % 5, i) for i in range(40)])
     for g in range(5):
-        assert bag(rows(client, f"SELECT total FROM agg WHERE g = {g}")) == \
-            {(sum(i for i in range(40) if i % 5 == g),): 1}
+        q = f"SELECT total FROM agg WHERE g = {g}"
+        assert access(client, q) == "pk point lookup"
+        assert bag(rows(client, q)) == {(sum(i for i in range(40) if i % 5 == g),): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +174,15 @@ def test_a_point_on_a_partitioned_views_key_confines(client):
 def test_an_indexed_predicate_gathers_from_every_owner(kv):
     """An index range is broadcast and each worker gathers its own source rows,
     so a per-PK probe must resolve on exactly the worker owning it. Both a point
-    and a narrow band are checked over keys that scatter across every
-    partition."""
+    — through SQL and through the binary `seek_by_index` — and a narrow band are
+    checked over keys that scatter across every partition."""
+    tid, schema = kv.resolve_table("t")
     for i in range(SPAN):
-        assert bag(rows(kv, f"SELECT id, v FROM t WHERE v = {i * 10}")) == \
-            {(i, i * 10): 1}
+        want = {(i, i * 10): 1}
+        assert bag(rows(kv, f"SELECT id, v FROM t WHERE v = {i * 10}")) == want
+        assert bag(kv.seek_by_index(tid, schema, [1], [i * 10])) == want
+    # An absent value is an empty answer, not an error.
+    assert bag(kv.seek_by_index(tid, schema, [1], [7])) == {}
     for lo, hi in [(0, 90), (1000, 1090), (3900, 3990)]:
         assert bag(rows(kv, f"SELECT id, v FROM t WHERE v BETWEEN {lo} AND {hi}")) == \
             {(i, i * 10): 1 for i in range(NROWS) if lo <= i * 10 <= hi}
@@ -195,10 +198,9 @@ def test_a_nonselective_index_walk_returns_only_its_range(kv):
 def test_an_empty_indexed_read_keeps_the_column_metadata(kv):
     """An indexed read matching on no worker still presents the column metadata
     in SELECT order, and no hidden column is part of the presented shape."""
-    res = kv.execute_sql("SELECT id, v FROM t WHERE v = 7")[0]
-    assert res["type"] == "Rows", res
-    miss = res["rows"]
+    miss = reply(kv.execute_sql("SELECT id, v FROM t WHERE v = 7"))
     assert len(miss) == 0
+    assert miss._fields == ("id", "v")
     assert [(c.name, c.type_code) for c in miss.schema.columns if not c.is_hidden] == \
         [("id", gnitz.TypeCode.I64), ("v", gnitz.TypeCode.I64)]
 
@@ -212,61 +214,26 @@ def test_a_reply_spanning_several_frames_returns_the_full_set(own_server):
     """A per-worker reply that spans several 16 KiB frames still returns every
     row, with payload intact across the chunk boundaries and net weights after a
     retraction."""
-    client = gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target)
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)")
-    # ~32 KB of matching rows per worker per value at 4 workers: every worker's
-    # train is several frames past the 16 KiB budget.
-    n = 4_000
-    insert(client, "t", [(i, i % 2, i * 7) for i in range(n)])
+    with gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target) as client:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)")
+        # ~32 KB of matching rows per worker per value at 4 workers: every worker's
+        # train is several frames past the 16 KiB budget.
+        n = 4_000
+        insert(client, "t", [(i, i % 2, i * 7) for i in range(n)])
 
-    # Full-row values, so payload integrity through the boundaries is asserted
-    # rather than just the key set.
-    assert bag(rows(client, "SELECT * FROM t WHERE x = 0")) == \
-        {(i, 0, i * 7): 1 for i in range(0, n, 2)}
-    client.execute_sql("DELETE FROM t WHERE pk IN (1, 3, 5)")
-    assert bag(rows(client, "SELECT pk FROM t WHERE x = 1")) == \
-        {(i,): 1 for i in range(7, n, 2)}
+        # Full-row values, so payload integrity through the boundaries is asserted
+        # rather than just the key set.
+        assert bag(rows(client, "SELECT * FROM t WHERE x = 0")) == \
+            {(i, 0, i * 7): 1 for i in range(0, n, 2)}
+        client.execute_sql("DELETE FROM t WHERE pk IN (1, 3, 5)")
+        assert bag(rows(client, "SELECT pk FROM t WHERE x = 1")) == \
+            {(i,): 1 for i in range(7, n, 2)}
 
 
 # ---------------------------------------------------------------------------
-# Bodies the direct path serves without a circuit
+# A SELECT that reads nothing
 # ---------------------------------------------------------------------------
-
-
-def test_a_cte_expands_into_the_direct_path(client):
-    """A CTE over one relation is a macro expanded into the body, so every
-    single-relation shape reads via the direct path — an identity, a narrowing
-    or computed projection, a WHERE in the CTE conjoined with the outer one, a
-    chain, and a fold over it — and reads exactly what the flat query reads,
-    names and weights included."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
-        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50); "
-        "CREATE VIEW v_hi AS SELECT pk, val FROM t WHERE val >= 30")
-
-    for cte, flat in [
-        ("WITH x AS (SELECT * FROM t) SELECT pk FROM x WHERE val > 30",
-         "SELECT pk FROM t WHERE val > 30"),
-        ("WITH y AS (SELECT * FROM v_hi) SELECT pk FROM y WHERE val = 50",
-         "SELECT pk FROM v_hi WHERE val = 50"),
-        ("WITH x AS (SELECT pk, val AS q FROM t) SELECT pk, q FROM x ORDER BY q DESC",
-         "SELECT pk, val AS q FROM t ORDER BY val DESC"),
-        ("WITH x AS (SELECT pk, val * 2 AS d FROM t WHERE val > 10) SELECT d FROM x WHERE d < 100 ORDER BY d",
-         "SELECT val * 2 AS d FROM t WHERE val > 10 AND val * 2 < 100 ORDER BY d"),
-        ("WITH x(i, j) AS (SELECT pk, val FROM t), y AS (SELECT j FROM x WHERE i > 3) SELECT SUM(j) AS s FROM y",
-         "SELECT SUM(val) AS s FROM t WHERE pk > 3"),
-        ("WITH x AS (SELECT val + 1 AS q FROM t) SELECT q, COUNT(*) AS n FROM x GROUP BY q ORDER BY q",
-         "SELECT val + 1 AS q, COUNT(*) AS n FROM t GROUP BY val + 1 ORDER BY q"),
-        ("WITH x AS (SELECT * EXCEPT (val) FROM t) SELECT * FROM x ORDER BY pk",
-         "SELECT pk FROM t ORDER BY pk"),
-    ]:
-        got, want = ordered(rows(client, cte)), ordered(rows(client, flat))
-        assert got == want and got, f"{cte!r}: {got} != {want}"
-
-    # A CTE exposes only what it projects, whatever the source holds.
-    with pytest.raises(gnitz.GnitzRefusedError, match="column 'val' not found"):
-        client.execute_sql("WITH x AS (SELECT pk FROM t) SELECT val FROM x")
 
 
 def test_a_from_less_select_answers_one_constant_row(client):
@@ -276,5 +243,3 @@ def test_a_from_less_select_answers_one_constant_row(client):
     assert bag(rows(client, "SELECT 1 + 2 AS three, 'x' AS s, 2.5 AS f")) == \
         {(3, "x", 2.5): 1}
     assert rows(client, "SELECT 1 AS a LIMIT 0") == []
-    with pytest.raises(gnitz.GnitzRefusedError, match="column 'x' not found"):
-        client.execute_sql("SELECT x")

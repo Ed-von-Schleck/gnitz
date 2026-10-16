@@ -19,10 +19,16 @@ def rows(client, q):
 def result_rows(results):
     """`rows` over the results `execute_sql` already returned — an awaited
     call's, or a `Pending`'s."""
+    return list(reply(results))
+
+
+def reply(results):
+    """The one `ScanResult` of a one-statement SELECT's `results`: what `rows`
+    lists, with the names, schema and LSN the result carries beside them."""
     assert len(results) == 1, f"expected one statement result, got {len(results)}"
     res = results[0]
     assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"
-    return list(res["rows"])
+    return res["rows"]
 
 
 def bag(rows, *cols):
@@ -46,20 +52,37 @@ def bag(rows, *cols):
     return {k: w for k, w in sorted(acc.items(), key=repr) if w != 0}
 
 
-def ordered(rows):
-    """Each row as its `(name, value)` pairs and its weight, in result order —
-    `bag`'s counterpart for a result whose order is the thing under test."""
-    return [(tuple(r._asdict().items()), r._weight) for r in rows]
+def ordered(rows, *cols):
+    """`[(values of cols, weight)]` in result order, one entry per run of equal
+    rows — `bag`'s counterpart for a result whose order is the thing under test.
+    With no `cols`, each row is its `(name, value)` pairs.
+
+    Summing a run rather than listing entries makes the answer invariant to how
+    a multiplicity is split across entries, as `bag` is."""
+    out = []
+    for r in rows:
+        d = r._asdict()
+        k = tuple(d[c] for c in cols) if cols else tuple(d.items())
+        if out and out[-1][0] == k:
+            out[-1] = (k, out[-1][1] + r._weight)
+        else:
+            out.append((k, r._weight))
+    return out
+
+
+def plan_line(client, q, label):
+    """What EXPLAIN's `label:` line says of `q`. Found by prefix rather than by
+    row position, so adding a plan line cannot silently make this read a
+    different fact."""
+    lines = [r[0] for r in rows(client, "EXPLAIN " + q)]
+    got = [ln.removeprefix(label + ": ") for ln in lines if ln.startswith(label + ": ")]
+    assert len(got) == 1, lines
+    return got[0]
 
 
 def access(client, q):
-    """What EXPLAIN's `access:` line says of `q` — which walk the plan chose.
-    Found by prefix rather than by row position, so adding a plan line cannot
-    silently make this read a different fact."""
-    lines = [r[0] for r in rows(client, "EXPLAIN " + q)]
-    got = [ln.removeprefix("access: ") for ln in lines if ln.startswith("access: ")]
-    assert len(got) == 1, lines
-    return got[0]
+    """Which walk the plan chose for `q`."""
+    return plan_line(client, q, "access")
 
 
 def scanned(client, name, *, hidden=False):

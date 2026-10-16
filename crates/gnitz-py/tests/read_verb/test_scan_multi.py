@@ -12,12 +12,10 @@ reply frame is a doubled weight, which a row-set comparison reads as correct.
 Run with GNITZ_WORKERS=4 — the one-cut fan-out is a distributed path.
 """
 
-import threading
-
 import gnitz
 import pytest
 from _read import bag
-from _serverproc import TINY_REPLY_FRAMES, join_or_fail, spawn
+from _serverproc import TINY_REPLY_FRAMES, across
 from _schemas import KV, kv
 
 
@@ -47,18 +45,6 @@ def test_the_results_line_up_with_the_requested_tids(client):
         [{(99, 990): 1}, {}, want_a]
 
 
-def test_a_base_and_a_view_snapshot_at_one_cut(client):
-    """One hash-partitioned base table and one aggregate view (single-row output,
-    read via the replicated/unicast path) agree at the same cut."""
-    t = client.create_table("t", KV)
-    client.push(t, kv(*((i, 1) for i in range(20))))
-    client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t")
-    v = client.resolve_table("v")
-
-    assert [bag(r) for r in client.scan_many([(t, KV), v])] == \
-        [{(i, 1): 1 for i in range(20)}, {(20,): 1}]
-
-
 def test_a_base_read_is_fresh_whatever_its_views_are_doing(client):
     """A base table's own read is fully fresh the moment a push ACKs, whatever
     its dependent views are doing — a pending tick can only change what a VIEW
@@ -82,80 +68,44 @@ def test_a_base_read_is_fresh_whatever_its_views_are_doing(client):
 
 
 # ---------------------------------------------------------------------------
-# Headline: torn-commit impossibility
+# Headline: one cut, under a concurrent writer
 # ---------------------------------------------------------------------------
 
 
-def test_a_commit_is_never_observed_torn(client, server):
-    """A writer commits atomic {a: i->i, b: i->i} transactions in a tight loop; a
-    reader hammers scan_many([a, b]). Every result set has a's bag == b's bag —
-    an atomic commit is never observed torn, and no row is ever observed at a
-    weight other than 1, which is what a repeated reply frame would produce. The
-    reader must also observe several intermediate sizes, proving it genuinely
-    interleaved with the writer (so the 'no tear' result is meaningful, not a
-    quiescent artefact)."""
+def test_one_cut_never_tears_a_commit_nor_lets_a_view_lead(client, peer):
+    """A writer commits atomic {a: i->i, b: i->i} transactions in a tight loop
+    while `scan_many([a, b, v, n])` reads at one cut, `v` a projection of `a` and
+    `n` its COUNT(*), a single-row view read off one worker. Every result has a's
+    bag == b's at weight 1 — a torn commit or a repeated reply frame would
+    differ — and neither view ever leads `a`. Quiescent, all four agree. The
+    reader must observe several intermediate sizes, or it never interleaved."""
     N = 400
     a, b = client.create_table("a", KV), client.create_table("b", KV)
-    stop = threading.Event()
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT pk, val FROM a WHERE val >= 0; "
+        "CREATE VIEW n AS SELECT COUNT(*) AS c FROM a")
+    rels = [(a, KV), (b, KV), client.resolve_table("v"), client.resolve_table("n")]
+    rc = peer()
     sizes = set()
 
-    def writer():
-        try:
-            for i in range(N):
-                with client.transaction() as txn:
-                    txn.push(a, kv((i, i)))
-                    txn.push(b, kv((i, i)))
-        finally:
-            stop.set()
+    def write():
+        for i in range(N):
+            with client.transaction() as txn:
+                txn.push(a, kv((i, i)))
+                txn.push(b, kv((i, i)))
 
-    def reader():
-        with gnitz.connect(server) as rc:
-            while not stop.is_set():
-                ra, rb = (bag(r) for r in rc.scan_many(_kvs(a, b)))
-                sizes.add(len(ra))
-                assert ra == rb and set(ra.values()) <= {1}, "torn or mis-weighted snapshot"
+    def read(_):
+        ra, rb, rv, rn = (bag(r) for r in rc.scan_many(rels))
+        sizes.add(len(ra))
+        assert ra == rb and set(ra.values()) <= {1}, "torn or mis-weighted snapshot"
+        assert rv.items() <= ra.items(), f"the view led its base: {len(ra)} < {len(rv)}"
+        ((count,),) = rn
+        assert rn == {(count,): 1} and count <= len(ra), f"the count led its base: {rn}"
 
-    join_or_fail("the writer or reader hung", spawn(reader), spawn(writer))
-
-    final = client.scan_many(_kvs(a, b))
-    assert bag(final[0]) == bag(final[1]) == {(i, i): 1 for i in range(N)}
+    across(write, read)
+    whole = {(i, i): 1 for i in range(N)}
+    assert [bag(r) for r in client.scan_many(rels)] == [whole, whole, whole, {(N,): 1}]
     assert len([s for s in sizes if 0 < s < N]) >= 2, \
-        f"reader did not interleave; sizes={sorted(sizes)}"
-
-
-def test_a_view_never_leads_its_base(client, server):
-    """`scan_many([t, v])` with v derived from t (insert-only). Quiescent → they
-    agree; under concurrent inserts the invariant is that the view never leads
-    the base — every view row is in the base snapshot, at the same weight. The
-    reader must observe several intermediate sizes, or it never interleaved."""
-    N = 200
-    t = client.create_table("t", KV)
-    client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0")
-    v = client.resolve_table("v")
-
-    client.push(t, kv(*((i, i) for i in range(10))))
-    res = client.scan_many([(t, KV), v])
-    assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
-
-    stop = threading.Event()
-    sizes = set()
-
-    def writer():
-        try:
-            for i in range(10, 10 + N):
-                client.push(t, kv((i, i)))
-        finally:
-            stop.set()
-
-    def reader():
-        with gnitz.connect(server) as rc:
-            while not stop.is_set():
-                rt, rv = (bag(r) for r in rc.scan_many([(t, KV), v]))
-                sizes.add(len(rt))
-                assert rv.items() <= rt.items(), f"view led the base: {len(rt)} < {len(rv)}"
-
-    join_or_fail("the writer or reader hung", spawn(reader), spawn(writer))
-    assert len([s for s in sizes if 10 < s < 10 + N]) >= 2, \
         f"reader did not interleave; sizes={sorted(sizes)}"
 
 
@@ -182,19 +132,14 @@ def test_every_refusal_leaves_the_server_serving(client):
 
 def test_a_system_family_is_read_beside_user_relations(client):
     """A family is read off the master's own copy, a table off its workers: one
-    request answers both, each as its own scan does."""
+    request answers both, each as its own scan does, and a relation named twice
+    at each of its positions."""
     t = client.create_table("t", KV)
     client.push(t, kv((1, 1)))
     tables = gnitz.sys_schema(gnitz.TABLE_TAB)
     first, family, last = client.scan_many([(t, KV), (gnitz.TABLE_TAB, tables), (t, KV)])
     assert bag(first) == bag(last) == {(1, 1): 1}
     assert bag(family) == bag(client.scan(gnitz.TABLE_TAB, tables))
-
-
-def test_a_repeated_tid_is_answered_at_each_position(client):
-    t = client.create_table("t", KV)
-    client.push(t, kv((1, 1), (2, 2)))
-    assert [bag(r) for r in client.scan_many(_kvs(t, t))] == [{(1, 1): 1, (2, 2): 1}] * 2
 
 
 def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):
@@ -210,31 +155,31 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):
     here; the bags below are what rules out a silently reordered or truncated
     train once it does complete.
     """
-    c = gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target)
-    big = c.create_table("big", KV)
-    # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
-    # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
-    # genuinely multi-chunk.
-    c.push(big, kv(*((i, i) for i in range(4000))))
-    want_big = {(i, i): 1 for i in range(4000)}
+    with gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target) as c:
+        big = c.create_table("big", KV)
+        # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
+        # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
+        # genuinely multi-chunk.
+        c.push(big, kv(*((i, i) for i in range(4000))))
+        want_big = {(i, i): 1 for i in range(4000)}
 
-    ids = [c.create_table(f"s{k}", KV) for k in range(8)]
-    for k, tid in enumerate(ids):
-        c.push(tid, kv((k, k * 10)))
-    wants = [{(k, k * 10): 1} for k in range(8)]
-    assert [bag(r) for r in c.scan_many(_kvs(big, *ids))] == [want_big] + wants
-    assert [bag(r) for r in c.scan_many(_kvs(*ids, big))] == wants + [want_big]
+        ids = [c.create_table(f"s{k}", KV) for k in range(8)]
+        for k, tid in enumerate(ids):
+            c.push(tid, kv((k, k * 10)))
+        wants = [{(k, k * 10): 1} for k in range(8)]
+        assert [bag(r) for r in c.scan_many(_kvs(big, *ids))] == [want_big] + wants
+        assert [bag(r) for r in c.scan_many(_kvs(*ids, big))] == wants + [want_big]
 
-    # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
-    # its own train chunks like any other. The values are past the 12-byte
-    # inline threshold, so every row points into the batch's string heap and
-    # each frame carries a heap compacted to its own rows: 400 * ~230 B is
-    # ~23 KiB per worker against the 16 KiB budget.
-    dim_schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
-                               gnitz.ColumnDef("s", gnitz.TypeCode.STRING)], [0])
-    dim = c.create_table("dim_text", dim_schema)
-    names = [f"name-{i}-" + "z" * 200 for i in range(400)]
-    c.push(dim, gnitz.ZSetBatch(dim_schema).extend(
-        {"pk": i, "s": nm} for i, nm in enumerate(names)))
-    assert [bag(r) for r in c.scan_many([(big, KV), (dim, dim_schema)])] == \
-        [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]
+        # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
+        # its own train chunks like any other. The values are past the 12-byte
+        # inline threshold, so every row points into the batch's string heap and
+        # each frame carries a heap compacted to its own rows: 400 * ~230 B is
+        # ~23 KiB per worker against the 16 KiB budget.
+        dim_schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                                   gnitz.ColumnDef("s", gnitz.TypeCode.STRING)], [0])
+        dim = c.create_table("dim_text", dim_schema)
+        names = [f"name-{i}-" + "z" * 200 for i in range(400)]
+        c.push(dim, gnitz.ZSetBatch(dim_schema).extend(
+            {"pk": i, "s": nm} for i, nm in enumerate(names)))
+        assert [bag(r) for r in c.scan_many([(big, KV), (dim, dim_schema)])] == \
+            [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]

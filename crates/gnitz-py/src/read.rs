@@ -345,6 +345,13 @@ impl PyScanResult {
         PySchema { rust: Arc::clone(&self.schema) }
     }
 
+    /// The names of the columns this result presents, in order — its rows'
+    /// `_fields`, answered by an empty result too.
+    #[getter]
+    fn _fields<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.row_type.0.bind(py).getattr(intern!(py, "_fields"))
+    }
+
     fn __iter__(slf: Py<Self>) -> PyRowIterator {
         PyRowIterator { data: slf, row_buf: Vec::new(), pos: 0 }
     }

@@ -808,6 +808,14 @@ fn a_cte_expands_to_the_flat_query() {
             "SELECT g, SUM(v + 1) AS s FROM t GROUP BY g ORDER BY s",
         ),
         (
+            "WITH x AS (SELECT v + 1 AS q FROM t) SELECT q, COUNT(*) AS n FROM x GROUP BY q ORDER BY q",
+            "SELECT v + 1 AS q, COUNT(*) AS n FROM t GROUP BY v + 1 ORDER BY q",
+        ),
+        (
+            "WITH x AS (SELECT * FROM tv) SELECT id FROM x WHERE v = 5",
+            "SELECT id FROM tv WHERE v = 5",
+        ),
+        (
             "WITH x AS (SELECT * FROM t) SELECT y.id FROM x AS y ORDER BY y.v",
             "SELECT id FROM t ORDER BY v",
         ),
@@ -998,6 +1006,67 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         ("SELECT id FROM t ORDER BY nope + 1", "column 'nope' not found"),
     ] {
         assert_rejects(sql, read(&cat, sql), msg);
+    }
+}
+
+/// The grouped rules a direct SELECT and a view body share refuse each body on
+/// both paths alike: a guard that stops firing on one turns that path's refusal
+/// into a wrong answer.
+#[test]
+fn a_grouped_guard_refuses_a_read_as_it_does_a_view() {
+    let cat = base();
+    for (body, msg) in [
+        // A float key breaks the byte-equal key contract; the expression form has
+        // no column name to blame, so it is a separate rejection site.
+        (
+            "SELECT f, COUNT(*) AS c FROM ty GROUP BY f",
+            "float column 'f' cannot be a key",
+        ),
+        (
+            "SELECT f + 1 AS k, COUNT(*) AS c FROM ty GROUP BY f + 1",
+            "a float-valued expression cannot be a key",
+        ),
+        (
+            "SELECT DISTINCT f FROM ty",
+            "SELECT DISTINCT: float column 'f' cannot be a key",
+        ),
+        (
+            "SELECT id, COUNT(*) AS c FROM t GROUP BY g",
+            "GROUP BY: column 'id' must appear in GROUP BY",
+        ),
+        (
+            "SELECT id + 1 AS k, COUNT(*) AS c FROM t GROUP BY g",
+            "GROUP BY: column 'id' must appear in GROUP BY",
+        ),
+        // `g * 2` is not `g + 1`, so it reads an ungrouped column.
+        (
+            "SELECT g * 2 AS k FROM t GROUP BY g + 1",
+            "GROUP BY: column 'g' must appear in GROUP BY",
+        ),
+        (
+            "SELECT SUM(COUNT(id)) AS s FROM t GROUP BY g",
+            "aggregate functions are not allowed here",
+        ),
+        (
+            "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING id > 1",
+            "HAVING: column 'id' must appear in GROUP BY",
+        ),
+        // A number is no condition, and nor is an aggregate that is not a BOOLEAN.
+        (
+            "SELECT g FROM t GROUP BY g HAVING 1",
+            "this operand is I64; a condition must be BOOLEAN",
+        ),
+        (
+            "SELECT g FROM t GROUP BY g HAVING SUM(g)",
+            "column \"_agg\" is I64; a condition must be BOOLEAN",
+        ),
+        (
+            "SELECT g FROM t GROUP BY g HAVING -(SUM(g) * 0.0)",
+            "this operand is F64; a condition must be BOOLEAN",
+        ),
+    ] {
+        assert_rejects(body, read(&cat, body), msg);
+        assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), msg);
     }
 }
 

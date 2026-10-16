@@ -10,16 +10,15 @@ keyed read of it. Values are compared through `bag`, so weights count too.
 """
 import gnitz
 import pytest
-from _read import access, bag, ordered, rows
+from _read import access, bag, ordered, reply, rows
 from _shapes import grouped
 from _sql import insert
 
 
 def _read(client, q):
     """The visible column names of `q`'s reply, in order, and its bag."""
-    (res,) = client.execute_sql(q)
-    assert res["type"] == "Rows", res
-    return [c.name for c in res["rows"].schema.columns if not c.is_hidden], bag(res["rows"])
+    res = reply(client.execute_sql(q))
+    return list(res._fields), bag(res)
 
 
 _T = [(i, i % 3, i * 10) for i in range(1, 10)]

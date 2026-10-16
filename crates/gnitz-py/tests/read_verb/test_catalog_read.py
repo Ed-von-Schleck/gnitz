@@ -3,7 +3,7 @@
 
 import gnitz
 from _catalog import family, schema_id
-from _read import bag, rows, scanned
+from _read import bag, ordered, rows, scanned
 
 
 def _three_tables(client):
@@ -19,7 +19,7 @@ def test_a_family_reads_as_the_scan_of_its_id(client):
     any spelling of the schema."""
     _three_tables(client)
     want = bag(client.scan(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB)), "table_id", "name")
-    assert bag(rows(client, "SELECT table_id, name FROM _system.tables")) == want
+    assert family(client, "tables", "table_id", "name") == want
     assert bag(rows(client, "SELECT table_id, name FROM _SYSTEM.Tables")) == want
     assert bag(scanned(client, "_system.tables"), "table_id", "name") == want
     assert set(want.values()) == {1}
@@ -49,12 +49,14 @@ def test_a_family_is_counted_grouped_and_ordered(client):
     top = rows(
         client,
         f"SELECT name FROM _system.tables WHERE schema_id = {sid} ORDER BY name DESC LIMIT 2")
-    assert [r.name for r in top] == ["c", "b"]
+    assert ordered(top, "name") == [(("c",), 1), (("b",), 1)]
 
 
 def test_sequences_is_readable(client):
-    """No view may scan it, but it reads like the others."""
+    """No view may scan it, but it reads like the others: one row per serial
+    table, keyed by its id, past every id the table has handed out."""
     client.execute_sql("CREATE TABLE s (id BIGSERIAL PRIMARY KEY, v BIGINT NOT NULL)")
     client.execute_sql("INSERT INTO s (v) VALUES (1), (2)")
-    got = rows(client, "SELECT * FROM _system.sequences")
-    assert got and all(r._weight == 1 for r in got)
+    tid = client.resolve_table("s")[0]
+    (seq,) = rows(client, f"SELECT next_val FROM _system.sequences WHERE seq_id = {tid}")
+    assert seq._weight == 1 and seq.next_val > 2
