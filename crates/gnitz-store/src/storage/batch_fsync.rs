@@ -28,16 +28,16 @@ pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
     if BLOCKING.load(Relaxed) {
         return Ok(None);
     }
-    match IoUring::new(FD_CHUNK_THRESHOLD as u32) {
-        Ok(r) => Ok(Some(r)),
-        // Docker's default seccomp profile and `kernel.io_uring_disabled=2` report one of these.
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EACCES)) => {
-            gnitz_warn!("io_uring unavailable ({e}); flushing through blocking fsync");
-            BLOCKING.store(true, Relaxed);
-            Ok(None)
-        }
-        Err(e) => Err(e.into()),
-    }
+    let e = match IoUring::new(FD_CHUNK_THRESHOLD as u32) {
+        Ok(r) => return Ok(Some(r)),
+        Err(e) => e,
+    };
+    let Some(why) = gnitz_foundation::host::io_uring_refusal(&e) else {
+        return Err(e.into());
+    };
+    gnitz_warn!("io_uring unavailable ({e}: {why}); flushing through blocking fsync");
+    BLOCKING.store(true, Relaxed);
+    Ok(None)
 }
 
 /// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time; `DATASYNC` in

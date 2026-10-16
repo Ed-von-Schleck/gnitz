@@ -50,7 +50,11 @@ Arguments:
   <socket_path>   Path for the Unix domain socket to listen on
 
 Options:
-  --workers=N          Number of worker processes (default: 1)
+  --workers=N|auto     Number of worker processes (default: 1). `auto` takes
+                       one per physical core the process may run on — or per
+                       whole CPU of a cgroup CPU quota narrower than that —
+                       less one for the master. A boot at a different count
+                       than the last relays the data onto the new count.
   --log-level=LEVEL    Set log verbosity: quiet, normal, verbose (default: quiet)
   --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
                        address (port 0 = ephemeral). The bound address is
@@ -145,13 +149,17 @@ fn parse_level(s: &str) -> Result<Level, String> {
     }
 }
 
-/// Parse `--workers=N` into `1..=MAX_WORKERS`.
-fn parse_workers(val: &str) -> Result<u32, String> {
+/// Parse `--workers=N` into `1..=MAX_WORKERS`, or `--workers=auto` into `None`.
+fn parse_workers(val: &str) -> Result<Option<u32>, String> {
     const MAX: u32 = runtime::MAX_WORKERS as u32;
+    if val == "auto" {
+        return Ok(None);
+    }
     val.parse()
         .ok()
         .filter(|n| (1..=MAX).contains(n))
-        .ok_or_else(|| format!("--workers must be between 1 and {MAX} (got {val:?})"))
+        .map(Some)
+        .ok_or_else(|| format!("--workers must be auto or between 1 and {MAX} (got {val:?})"))
 }
 
 /// What argv asks for: each flag parsed, and the TLS flags checked against each
@@ -159,7 +167,8 @@ fn parse_workers(val: &str) -> Result<u32, String> {
 struct Args {
     data_dir: String,
     socket_path: String,
-    workers: u32,
+    /// `None`: `--workers=auto`.
+    workers: Option<u32>,
     level: Level,
     tls: Option<runtime::TlsArgs>,
 }
@@ -170,7 +179,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
         Some(v) => parse_level(v).map_err(|e| format!("GNITZ_LOG_LEVEL: {e}"))?,
         None => Level::Quiet,
     };
-    let mut workers = 1;
+    let mut workers = Some(1);
     let (mut tls_listen, mut cert, mut key, mut client_ca, mut auth_tokens) = (None, None, None, None, None);
     let mut names: Vec<String> = Vec::new();
     let mut allow_unauthenticated = false;

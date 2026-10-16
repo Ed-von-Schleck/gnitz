@@ -18,7 +18,7 @@ use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::{WorkerPark, WorkerParks};
-use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
+use crate::runtime::reactor::{check_host, select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{TlsArgs, TlsListener};
@@ -187,8 +187,8 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: 
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> i32 {
-    match run_server(data_dir, socket_path, num_workers, tls) {
+pub fn server_main(data_dir: &str, socket_path: &str, workers: Option<u32>, tls: Option<TlsArgs>) -> i32 {
+    match run_server(data_dir, socket_path, workers, tls) {
         Ok(rc) => rc,
         Err(e) => {
             gnitz_error!("{e}");
@@ -411,7 +411,11 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> Result<i32, String> {
+/// `workers`: the worker count, or `None` to size it from the host.
+fn run_server(data_dir: &str, socket_path: &str, workers: Option<u32>, tls: Option<TlsArgs>) -> Result<i32, String> {
+    // Ahead of anything a refusal would have to undo: the reactor cannot run
+    // without io_uring, and nothing else tells a container why.
+    check_host()?;
     executor::install_reload_handler();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
@@ -419,8 +423,8 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     raise_fd_limit((limits.max_conns as u64).saturating_add(FD_RESERVE));
 
     // Before any io_uring worker thread exists: each keeps the mask it starts with.
+    let (num_workers, pinning) = affinity::pin_master(workers)?;
     let nw = num_workers as usize;
-    let pinning = affinity::pin_master(nw)?;
 
     gnitz_info!("Opening database at {}", data_dir);
 

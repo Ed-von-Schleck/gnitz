@@ -4,7 +4,7 @@
 //!     `#[macro_export]`ed, so they land at this crate's root, not in `log`
 //!   - `env`        — `GNITZ_*` environment-variable overrides
 //!   - `fault`      — debug-only `GNITZ_INJECT_*` fault-injection seams
-//!   - `host`       — what the machine or container will give us (RAM budget)
+//!   - `host`       — what the machine or container will give us (RAM budget, CPU quota)
 //!   - `posix_io`   — the syscall idioms `std` lacks: an EINTR retry and an integer
 //!     socket option
 //!   - `perf`       — cost probes: instructions retired, context switches and

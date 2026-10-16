@@ -127,10 +127,12 @@ impl Reactor {
         match udata_kind(user_data) {
             KIND_FUTEX_WAITV => {
                 // No drain here: the pass's own drain follows CQE dispatch.
+                // The boot's `check_host` saw the opcode supported, so these are
+                // a malformed wait, which no later pass repairs.
                 if res == -libc::ENOSYS || res == -libc::EINVAL {
                     gnitz_fatal_abort!(
-                        "reactor: io_uring IORING_OP_FUTEX_WAITV unsupported (res={}); Linux 6.7+ required",
-                        res
+                        "reactor: IORING_OP_FUTEX_WAITV failed: {}",
+                        std::io::Error::from_raw_os_error(-res)
                     );
                 }
                 self.futex_waitv_armed.set(false);

@@ -2,9 +2,12 @@
 //! everything left over. `GNITZ_CPU_AFFINITY=0` turns it off.
 //!
 //! The placement sees only `sched_getaffinity`, so two servers on one host pin
-//! onto each other unless each runs in its own cgroup cpuset.
+//! onto each other unless each runs in its own cgroup cpuset. A cgroup CPU quota
+//! narrower than that cpuset turns pinning off: the cores are shared.
 
 use std::collections::BTreeMap;
+
+use super::MAX_WORKERS;
 
 const CPU_ROOT: &str = "/sys/devices/system/cpu";
 const NODE_ROOT: &str = "/sys/devices/system/node";
@@ -27,25 +30,51 @@ impl Pinning {
     }
 }
 
-/// Plan the placement, log it, and pin the calling (master) process to its
-/// share. `Ok(None)`: nothing is pinned.
-pub fn pin_master(workers: usize) -> Result<Option<Pinning>, String> {
+/// Size the workers, plan their placement, log both, and pin the calling
+/// (master) process to its share. `requested` is the worker count, or `None`
+/// for [`auto_count`] over this host. `Ok((workers, None))`: nothing is pinned.
+pub fn pin_master(requested: Option<u32>) -> Result<(u32, Option<Pinning>), String> {
+    let allowed = allowed_cpus();
+    let quota = gnitz_foundation::host::cpu_quota();
+    let order = read_order(&allowed);
+    let workers = requested.unwrap_or_else(|| {
+        let n = auto_count(order.len(), quota);
+        gnitz_note!("workers: {n} (auto)");
+        n
+    });
     if !gnitz_foundation::env::env_flag("GNITZ_CPU_AFFINITY", true) {
         gnitz_note!("affinity: not applied (disabled by GNITZ_CPU_AFFINITY)");
-        return Ok(None);
+        return Ok((workers, None));
     }
-    let order = read_order(&allowed_cpus());
+    // A quota below the cpuset means the cpuset holds CPUs other cgroups run on
+    // too, as a container given `--cpus` or a Kubernetes pod without exclusive
+    // cores has, and a worker pinned to a busy one could not move off it.
+    if let Some(quota) = quota.filter(|&q| q < allowed.len()) {
+        gnitz_note!(
+            "affinity: not applied (a CPU quota of {quota} whole CPUs, below the {} allowed: the cores are shared)",
+            allowed.len()
+        );
+        return Ok((workers, None));
+    }
     let usable = order.len();
-    let Some(p) = assign(order, workers) else {
+    let Some(p) = assign(order, workers as usize) else {
         gnitz_note!("affinity: not applied ({workers} workers, {usable} usable cores)");
-        return Ok(None);
+        return Ok((workers, None));
     };
     for (w, core) in p.workers.iter().enumerate() {
         gnitz_note!("affinity: W{w} {}", fmt_cpu_list(core));
     }
     gnitz_note!("affinity: master {}", fmt_cpu_list(&p.master));
     pin_self("master", &p.master)?;
-    Ok(Some(p))
+    Ok((workers, Some(p)))
+}
+
+/// The worker count `--workers=auto` picks over `cores` physical cores and a
+/// `quota` of whole CPUs: one per core or per CPU, whichever is fewer, less one
+/// for the master — the most [`assign`] can place — and at least one.
+fn auto_count(cores: usize, quota: Option<usize>) -> u32 {
+    let budget = quota.map_or(cores, |q| q.min(cores));
+    budget.saturating_sub(1).clamp(1, MAX_WORKERS) as u32
 }
 
 /// Parse a sysfs CPU list — `"0-3,8,12-15"` — into ascending CPU ids; a

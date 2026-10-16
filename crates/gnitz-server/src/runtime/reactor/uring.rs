@@ -3,7 +3,7 @@
 use std::mem::MaybeUninit;
 use std::time::Duration;
 
-use io_uring::{cqueue, squeue, types, IoUring};
+use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
 pub(super) struct IoUringRing {
     ring: IoUring,
@@ -21,6 +21,44 @@ fn entered(rc: std::io::Result<usize>) {
         // A broken ring or a lost completion, which no later pass repairs.
         _ => gnitz_fatal_abort!("reactor: io_uring_enter failed: {e}"),
     }
+}
+
+/// Every opcode the reactor issues, by its kernel name.
+const OPCODES: [(u8, &str); 5] = [
+    (opcode::Accept::CODE, "ACCEPT"),
+    (opcode::Recv::CODE, "RECV"),
+    (opcode::Send::CODE, "SEND"),
+    (opcode::Fsync::CODE, "FSYNC"),
+    (opcode::FutexWaitV::CODE, "FUTEX_WAITV"),
+];
+
+/// Whether this host gives the reactor what it runs on: a ring, and every
+/// opcode in [`OPCODES`]. The error names the cause and its remedy — a refusal
+/// here is a host's configuration, most often a container's seccomp profile.
+pub(crate) fn check_host() -> Result<(), String> {
+    let refused = |syscall: &str, e: std::io::Error| match gnitz_foundation::host::io_uring_refusal(&e) {
+        Some(why) => format!("{syscall} failed: {e}; {why}"),
+        None => format!("{syscall} failed: {e}"),
+    };
+    let ring = IoUring::new(2).map_err(|e| refused("io_uring_setup", e))?;
+    let mut probe = Probe::new();
+    ring.submitter()
+        .register_probe(&mut probe)
+        .map_err(|e| refused("io_uring_register", e))?;
+    let missing: Vec<&str> = OPCODES
+        .iter()
+        .filter(|&&(code, _)| !probe.is_supported(code))
+        .map(|&(_, name)| name)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    Err(format!(
+        "kernel {} lacks io_uring IORING_OP_{}: Linux 6.7 or later is required",
+        release.trim(),
+        missing.join(", IORING_OP_")
+    ))
 }
 
 impl IoUringRing {
@@ -84,3 +122,7 @@ impl Drop for IoUringRing {
             .register_sync_cancel(None, types::CancelBuilder::any());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/uring.rs"]
+mod tests;

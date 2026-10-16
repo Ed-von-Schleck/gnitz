@@ -25,6 +25,10 @@ K          ?=                                # pytest -k expression
 JOBS       ?= 1                              # fuzz-server: AFL++ instances, one core each
 TIME       ?=                                # fuzz, fuzz-server: seconds to run (default: until stopped)
 IN         ?=                                # fuzz-replay: the input file to replay
+# image: the engine that builds and runs it, and the repository it is tagged
+# into. Commented above, not beside: make keeps the spaces before a `#`.
+CONTAINER  ?= $(shell command -v podman || command -v docker)
+IMAGE      ?= gnitz-server
 
 # The instruction set every build targets. Canonical copy lives in
 # crates/.cargo/config.toml; it is restated here because Cargo's RUSTFLAGS
@@ -45,7 +49,8 @@ INTEGRATION := --features gnitz-sql/integration --features gnitz-core/integratio
         clean distclean \
         bench-rust bench bench-full bench-disk bench-profile bench-compare bench-report bench-native \
         profiling-server pyext-profiling \
-        fuzz-seeds fuzz-server fuzz fuzz-replay
+        fuzz-seeds fuzz-server fuzz fuzz-replay \
+        image image-test container-seccomp
 
 all: test
 
@@ -203,6 +208,23 @@ fuzz: ## Fuzz an in-process target under libFuzzer + ASan: T=traffic (DDL, pushe
 fuzz-replay: ## Replay one fuzz-server input against its server, every frame traced (IN=<file>)
 	cd crates && cargo build --release -p gnitz-fuzz
 	GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds GNITZ_SERVER_BIN=$(FUZZ_SERVER) $(FUZZ_DRIVER) replay $(IN)
+
+# ---------------------------------------------------------------------------
+# Container image — container/README.md says how to run it
+# ---------------------------------------------------------------------------
+
+IMAGE_TAG = $(shell git describe --always --dirty)
+
+image: ## Build the server container image -> $(IMAGE):<git describe> and :latest (CONTAINER=podman|docker)
+	@test -n "$(CONTAINER)" || { echo "image: neither podman nor docker is installed"; exit 1; }
+	$(CONTAINER) build --file container/Containerfile --build-arg VERSION=$(IMAGE_TAG) \
+		--tag $(IMAGE):$(IMAGE_TAG) --tag $(IMAGE):latest .
+
+image-test: image pyext ## Boot the image as it is deployed and query it over TLS; then see it refused, with its remedy, under a default seccomp profile
+	cd crates/gnitz-py && uv run python ../../container/smoke.py $(CONTAINER) $(IMAGE):$(IMAGE_TAG)
+
+container-seccomp: ## Regenerate container/seccomp.json from the pinned upstream Docker profile
+	python3 -I container/seccomp.py
 
 # ---------------------------------------------------------------------------
 # Housekeeping

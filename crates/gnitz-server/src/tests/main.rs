@@ -25,6 +25,7 @@ fn every_refusal_names_what_it_refuses() {
         ("--workers=0 /data /sock", None, "--workers"),
         (too_many.as_str(), None, "--workers"),
         ("--workers=abc /data /sock", None, "--workers"),
+        ("--workers=Auto /data /sock", None, "--workers"),
         ("--tls-listen=localhost:0 /data /sock", None, "localhost:0"),
         (
             "--tls-listen=127.0.0.1:0 --tls-cert=c.pem /data /sock",
@@ -70,11 +71,12 @@ fn the_level_is_the_flag_else_the_environment_else_quiet() {
 }
 
 #[test]
-fn the_worker_count_defaults_to_one_and_reaches_max_workers() {
+fn the_worker_count_defaults_to_one_and_reaches_max_workers_or_auto() {
     for (flag, workers) in [
-        (String::new(), 1),
-        ("--workers=1".to_string(), 1),
-        (format!("--workers={MAX_WORKERS}"), MAX_WORKERS as u32),
+        (String::new(), Some(1)),
+        ("--workers=1".to_string(), Some(1)),
+        (format!("--workers={MAX_WORKERS}"), Some(MAX_WORKERS as u32)),
+        ("--workers=auto".to_string(), None),
     ] {
         assert_eq!(parse(&format!("/data /sock {flag}"), None).unwrap().workers, workers);
     }

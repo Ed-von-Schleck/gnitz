@@ -304,6 +304,11 @@ list, this is not. The ones whose semantics are not obvious from the name:
 - **`make e2e-checked`** runs the suite against release codegen with the Z-set
   layout verifiers left in. Run it when the unsafe batch kernels changed or a
   bug is release-only — release compiles the layout verifiers out.
+- **`make image`** builds the server's container image, and **`make
+  image-test`** boots it as it is deployed. The server refuses to boot without
+  io_uring, which every container runtime's default seccomp profile denies, so
+  the image runs only under `container/seccomp.json`; `container/README.md` is
+  the deployment guide.
 
 The Python extension that ships is the one maturin installs at
 `crates/gnitz-py/python/gnitz/_native*.so`. `crates/target/*/libgnitz.so` is
@@ -330,7 +335,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 
 | Crate | Role |
 |-------|------|
-| `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and the syscall idioms `std` lacks — independent leaves every other crate may name |
+| `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and CPU quota and the syscall idioms `std` lacks — independent leaves every other crate may name |
 | `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
 | `gnitz-expr` | The one expression evaluator, the schema descriptor, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
 | `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |

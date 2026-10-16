@@ -75,3 +75,23 @@ fn assign_leaves_the_master_at_least_one_core() {
         assert!(assign(order(), workers).is_none(), "{workers} workers");
     }
 }
+
+/// One worker per core, or per whole CPU of a narrower quota, less the
+/// master's; never zero and never past the cap.
+#[test]
+fn auto_workers_leaves_the_master_one_and_keeps_one() {
+    for (cores, quota, want) in [
+        (8, None, 7),
+        (8, Some(4), 3),
+        (8, Some(12), 7),
+        (8, Some(0), 1),
+        (1, None, 1),
+        (0, None, 1),
+        (MAX_WORKERS + 8, None, MAX_WORKERS as u32),
+    ] {
+        assert_eq!(auto_count(cores, quota), want, "{cores} cores, quota {quota:?}");
+    }
+    // The count it picks is one `assign` places.
+    let order: Vec<Core> = (0..8).map(|c| vec![c]).collect();
+    assert!(assign(order, auto_count(8, None) as usize).is_some());
+}

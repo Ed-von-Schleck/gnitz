@@ -36,6 +36,7 @@ mod uring;
 mod wake_queue;
 
 pub(crate) use conn::{PeerGone, SendBody};
+pub(crate) use uring::check_host;
 
 pub(crate) use futures::{AckLease, TrainFrame, TrainLease, BOOT_READY_REQUEST_ID};
 use futures::{Route, TimerFuture};

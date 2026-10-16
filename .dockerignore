@@ -1,0 +1,12 @@
+# The image build (container/Containerfile) reads the workspace and the licences.
+*
+!crates
+!LICENSE-APACHE
+!LICENSE-MIT
+crates/target
+crates/**/.venv
+crates/**/__pycache__
+crates/**/*.so
+crates/**/.ruff_cache
+crates/**/.mypy_cache
+crates/**/.pytest_cache
