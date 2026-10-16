@@ -170,7 +170,7 @@ fn hydrate_filtered_limit_bench() {
     let (mut engine, _, view) = bounded_fixture("hydrate_filtered_limit", 64 << 10);
     let spec = ReadSpec {
         bound: ReadBound::None,
-        predicate: cmp_const(gnitz_expr::CmpOp::Eq, 1, payload(M)[0] as i64).to_blob_bytes(),
+        predicate: cmp_all(&[(gnitz_expr::CmpOp::Eq, 1, payload(M)[0] as i64)]).to_blob_bytes(),
         sink: gnitz_wire::ReadSink {
             map: None,
             kind: gnitz_wire::SinkKind::Rows {

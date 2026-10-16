@@ -9,11 +9,11 @@ use std::hint::black_box;
 
 use super::tests::layout_of;
 use crate::relation::{Cut as At, RelationKind};
-use crate::test_support::{cmp_const, cut, img, map_of, relation_fixture, rows_spec, RelationFixture, TID};
+use crate::test_support::{cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec};
+use crate::test_support::{RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
-    AggDescriptor, AggFunc, AggReadSpec, ComputeMap, Cut, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec,
-    SinkKind, TypeCode,
+    AggDescriptor, AggFunc, AggReadSpec, ComputeMap, Cut, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode,
 };
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -33,15 +33,10 @@ fn schema(payload: &[TypeCode]) -> SchemaDescriptor {
 /// A base table over [`schema`]`(payload)`, indexed on `indexed`, holding ids
 /// `0..ROWS` at weight 1 as one run of the RAM tier. `put_row` writes a row's
 /// payload.
-fn fixture(payload: &[TypeCode], indexed: &[u32], mut put_row: impl FnMut(&mut BatchBuilder, u64)) -> RelationFixture {
+fn fixture(payload: &[TypeCode], indexed: &[&[u32]], put_row: impl FnMut(&mut BatchBuilder, u64)) -> RelationFixture {
     let schema = schema(payload);
-    let mut bb = BatchBuilder::new(&schema);
-    for id in 0..ROWS {
-        bb.begin_row(id as u128, 1);
-        put_row(&mut bb, id);
-        bb.end_row();
-    }
-    let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [bb.finish()]);
+    let rows = id_rows(&schema, (0..ROWS).map(|id| (id, 1)), put_row);
+    let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [rows]);
     let table = r.relation(TID).unwrap().table();
     assert_eq!((table.all_shard_arcs().len(), table.runs(At::Now).count()), (0, 1));
     r
@@ -49,7 +44,7 @@ fn fixture(payload: &[TypeCode], indexed: &[u32], mut put_row: impl FnMut(&mut B
 
 /// `col < lit` over a fixed-int column, as a wire predicate.
 fn lt(col: u32, lit: i64) -> Vec<u8> {
-    cmp_const(CmpOp::Lt, col, lit).to_blob_bytes()
+    cmp_all(&[(CmpOp::Lt, col, lit)]).to_blob_bytes()
 }
 
 /// `COUNT(*)` and `SUM(sum_col)` per group of `group_cols`, over `map`'s output.
@@ -85,7 +80,7 @@ fn scan_spec_bench() {
 
     // `id | c0 = id % 512 | c1 = id % 2 | c2, a permutation of the ids | c3 = id / 7`,
     // indexed on `c2`.
-    let r = fixture(&[I64; 4], &[3], |bb, id| {
+    let r = fixture(&[I64; 4], &[&[3]], |bb, id| {
         bb.put_u64(id % 512);
         bb.put_u64(id % 2);
         bb.put_u64(id * 179_999 % ROWS);
@@ -137,10 +132,9 @@ fn scan_spec_bench() {
 
     // The 100 smallest `c0` of the reply, which all tie, so the row's identity
     // orders them.
-    let order = vec![OrderKey { col: 3, desc: false, nulls_first: false }];
     let top = ReadSpec {
         predicate: lt(1, 256),
-        ..rows_spec(copy.clone(), cut(100, order))
+        ..rows_spec(copy.clone(), cut(100, order_by(3, false)))
     };
     cell("ORDER BY .. LIMIT 100", &r, top, 100, ROWS);
     let first = ReadSpec {
@@ -148,17 +142,10 @@ fn scan_spec_bench() {
         ..rows_spec(copy, cut(100, vec![]))
     };
     cell("LIMIT 100", &r, first, 100, 100);
-    // A cut by the key over every row. Descending ranks them all; ascending is the
-    // walk's own order, which the planner ships as the cut alone.
-    let key_desc = vec![OrderKey { col: 0, desc: true, nulls_first: false }];
-    cell(
-        "ORDER BY id DESC LIMIT 100",
-        &r,
-        rows_spec(None, cut(100, key_desc)),
-        100,
-        ROWS,
-    );
-    cell("ORDER BY id LIMIT 100", &r, rows_spec(None, cut(100, vec![])), 100, 100);
+    // A cut by the key over every row, descending, ranks them all; ascending is the
+    // walk's own order, which the planner ships as the cut alone: the LIMIT above.
+    let key_desc = rows_spec(None, cut(100, order_by(0, true)));
+    cell("ORDER BY id DESC LIMIT 100", &r, key_desc, 100, ROWS);
 
     // The widest range of `c2` the index is walked for, and one row wider,
     // which scans the table under the range.
@@ -166,13 +153,7 @@ fn scan_spec_bench() {
         ("range, index walk", ROWS / 16, true),
         ("range, filtered scan", ROWS / 16 + 1, false),
     ] {
-        let range = KeyRange::new(
-            PkColList::from_slice(&[3]),
-            &[],
-            Cut::before(img(0)),
-            Cut::before(img(width as i64)),
-        );
-        let bound = ReadBound::Range(range);
+        let bound = col_range(3, Cut::before(img(0)), Cut::before(img(width as i64)));
         let (source, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(source, SourceCursor::Bounded(_)), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);

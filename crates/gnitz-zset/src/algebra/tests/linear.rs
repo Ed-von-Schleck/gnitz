@@ -110,7 +110,7 @@ fn union_is_the_zset_sum_under_every_input_layout() {
 fn filter_keeps_exactly_the_matching_rows() {
     let schema = make_schema_u64_i64();
     let gt = |k: i64| {
-        crate::test_support::cmp_const(gnitz_expr::CmpOp::Gt, 1, k)
+        crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Gt, 1, k)])
             .resolve_filter(&schema)
             .unwrap()
     };

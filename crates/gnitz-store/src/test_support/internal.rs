@@ -7,9 +7,11 @@ use std::path::Path;
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget};
+use gnitz_wire::{
+    ComputeMap, Cut, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
+};
 use gnitz_zset::algebra::{Placement, Slot};
-use gnitz_zset::repr::Batch;
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// A table under `dir` at a RAM tier of `ram_tier_bytes`, its shards unbounded.
@@ -83,11 +85,11 @@ pub(crate) fn fed_view(delta_bytes: u64) -> RelationKind {
 }
 
 /// A registry holding [`TID`] as a `kind` relation over `schema`, with an index
-/// on each column of `indexed`, holding `rounds`, one ingest each.
+/// on each column list of `indexed`, holding `rounds`, one ingest each.
 pub(crate) fn relation_fixture(
     kind: RelationKind,
     schema: SchemaDescriptor,
-    indexed: &[u32],
+    indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
     relation_fixture_with(StoreConfig::default(), kind, schema, indexed, rounds)
@@ -98,7 +100,7 @@ pub(crate) fn relation_fixture_with(
     config: StoreConfig,
     kind: RelationKind,
     schema: SchemaDescriptor,
-    indexed: &[u32],
+    indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
@@ -113,12 +115,12 @@ pub(crate) fn relation_fixture_with(
             compress: false,
         })
         .unwrap();
-    for (id, &col) in (TID + 1..).zip(indexed) {
+    for (id, &cols) in (TID + 1..).zip(indexed) {
         registry
             .add_index(
                 TID,
                 IndexClaim::Index { id, unique: false },
-                gnitz_wire::PkColList::from_slice(&[col]),
+                PkColList::from_slice(cols),
             )
             .unwrap();
     }
@@ -147,18 +149,36 @@ pub(crate) fn rows_spec(map: Option<ComputeMap>, cut: Option<RowsCut>) -> ReadSp
     }
 }
 
-/// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
-pub(crate) fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
-    let mut eb = gnitz_expr::ExprBuilder::new();
-    let v = eb.emit(gnitz_expr::LogicalInstr::LoadCol { col });
-    let lo_c = eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lo, unsigned: false });
-    let mut keep = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Ge, a: v, b: lo_c });
-    if let Some(hi) = hi {
-        let hi_c = eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: hi, unsigned: false });
-        let lt = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Lt, a: v, b: hi_c });
-        keep = eb.emit(gnitz_expr::LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
+/// `lo <= col < hi`, as a wire predicate.
+pub(crate) fn between(col: u32, lo: i64, hi: i64) -> Vec<u8> {
+    use gnitz_expr::CmpOp::{Ge, Lt};
+    crate::test_support::cmp_all(&[(Ge, col, lo), (Lt, col, hi)]).to_blob_bytes()
+}
+
+/// The bound `start..end` over the one column `col`.
+pub(crate) fn col_range(col: u32, start: Cut, end: Cut) -> ReadBound {
+    ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end))
+}
+
+/// One cut key: column `col`, NULLs last.
+pub(crate) fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
+    vec![OrderKey { col, desc, nulls_first: false }]
+}
+
+/// A batch over `schema`, whose PK is one U64 column, of a row per `(id, weight)`,
+/// `put_row` writing row `id`'s payload.
+pub(crate) fn id_rows(
+    schema: &SchemaDescriptor,
+    rows: impl IntoIterator<Item = (u64, i64)>,
+    mut put_row: impl FnMut(&mut BatchBuilder, u64),
+) -> Batch {
+    let mut bb = BatchBuilder::new(schema);
+    for (id, w) in rows {
+        bb.begin_row(id as u128, w);
+        put_row(&mut bb, id);
+        bb.end_row();
     }
-    eb.build(vec![gnitz_expr::Sink::Reg(keep)]).unwrap().to_blob_bytes()
+    bb.finish()
 }
 
 /// `program` as a sink map declaring `reply`'s payload columns.

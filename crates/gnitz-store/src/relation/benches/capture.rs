@@ -11,9 +11,9 @@
 use std::hint::black_box;
 
 use crate::relation::RelationKind;
-use crate::test_support::{relation_fixture, RelationFixture, TID};
+use crate::test_support::{fed_view, relation_fixture, RelationFixture, TID};
 use gnitz_foundation::perf::{Counter, Resident};
-use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewBudget, WireStatus};
+use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewBudget};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -91,22 +91,13 @@ fn run(counter: &Counter, kind: RelationKind, strings: bool, rounds: u64, per_ro
 }
 
 /// The lowest cursor the feed still serves, and the bytes of the rows past it.
-fn readable(r: &RelationFixture, strings: bool, last_round: u64) -> (u64, usize, usize) {
+fn readable(r: &RelationFixture, strings: bool) -> (u64, usize, usize) {
+    let floor = r.relation(TID).unwrap().feed().unwrap().dropped_through().max(1);
     let layout = schema(strings).layout_digest();
-    let read = |after: u64| r.delta_read(TID, after, ReadSpec::all_rows(ReadBound::None), layout);
-    let (mut lo, mut hi) = (1, last_round);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        match read(mid) {
-            Ok(_) => hi = mid,
-            Err(f) => {
-                assert!(matches!(f.status, WireStatus::DeltaExpired), "{}", f.text);
-                lo = mid + 1;
-            }
-        }
-    }
-    let rows = read(lo).unwrap();
-    (lo, rows.len(), rows.total_bytes())
+    let rows = r
+        .delta_read(TID, floor, ReadSpec::all_rows(ReadBound::None), layout)
+        .unwrap();
+    (floor, rows.len(), rows.total_bytes())
 }
 
 fn env_list(name: &str, default: &[u64]) -> Vec<u64> {
@@ -136,16 +127,16 @@ fn delta_capture_bench() {
                 let row_bytes = round(&schema(strings), strings, 0, 64).total_bytes() as u64 / 64;
                 let rounds = (2 * (ram_tier + budget) / row_bytes).div_ceil(per_round);
                 let rows = rounds * per_round;
-                let fed = RelationKind::View(ViewBudget::Fed {
-                    delta_bytes: std::num::NonZeroU64::new(budget).unwrap(),
-                });
-                for (kind, kind_name) in [(RelationKind::View(ViewBudget::Plain), "plain"), (fed, "fed")] {
+                for (kind, kind_name) in [
+                    (RelationKind::View(ViewBudget::Plain), "plain"),
+                    (fed_view(budget), "fed"),
+                ] {
                     if !only("GNITZ_CAPTURE_KIND", kind_name) {
                         continue;
                     }
                     let ran = run(&counter, kind, strings, rounds, per_round);
                     let (floor, kept_rows, kept_bytes) = match kind_name {
-                        "fed" => readable(&ran.fixture, strings, 1 + rounds),
+                        "fed" => readable(&ran.fixture, strings),
                         _ => (0, 0, 0),
                     };
                     black_box(&ran.fixture);
@@ -174,10 +165,7 @@ fn delta_capture_bench() {
 fn delta_idle_bench() {
     for budget_mib in env_list("GNITZ_CAPTURE_BUDGETS_MIB", &[4, 64, 256]) {
         let resident = Resident::baseline().expect("run under GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072");
-        let fed = RelationKind::View(ViewBudget::Fed {
-            delta_bytes: std::num::NonZeroU64::new(budget_mib << 20).unwrap(),
-        });
-        let mut r = relation_fixture(fed, schema(false), &[], []);
+        let mut r = relation_fixture(fed_view(budget_mib << 20), schema(false), &[], []);
         let idle = resident.added();
         r.ingest_at(TID, round(&schema(false), false, 0, 1), Some(2), false)
             .unwrap();

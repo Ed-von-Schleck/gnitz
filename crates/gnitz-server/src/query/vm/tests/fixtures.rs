@@ -143,7 +143,7 @@ impl std::ops::Deref for TestVm {
 
 /// `Filter(col > lit)` over `schema`'s integer column `col`.
 pub(super) fn filter_gt(schema: &SchemaDescriptor, col: u32, lit: i64) -> Op {
-    let program = crate::test_support::cmp_const(gnitz_expr::CmpOp::Gt, col, lit);
+    let program = crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Gt, col, lit)]);
     Op::Filter(Box::new(program.resolve_filter(schema).unwrap()))
 }
 

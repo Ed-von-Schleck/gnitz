@@ -29,6 +29,18 @@ use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
 
+/// Refuses `keys` unless each is `stride` bytes, the key of the store `verb` reads
+/// of relation `id`: a key list of another width names none of its keys.
+fn check_stride(verb: &str, id: u64, keys: &PkKeys, stride: usize) -> Result<(), String> {
+    match keys.stride() == stride {
+        true => Ok(()),
+        false => Err(format!(
+            "{verb}: key stride {} != the read store's {stride} (relation {id})",
+            keys.stride()
+        )),
+    }
+}
+
 /// Recomputes a capacity-bounded view's rows at its skeleton keys, from the view's
 /// own maintained state. A host that maintains no circuit has none.
 pub trait SkeletonHydrator {

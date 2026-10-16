@@ -1,34 +1,35 @@
 use super::*;
-use crate::relation::RelationKind;
-use crate::test_support::{relation_fixture, RelationFixture, TID};
+use crate::relation::{RelationKind, StoreConfig};
+use crate::test_support::{id_rows, pk_only_schema, relation_fixture_with, u64_pk_schema, RelationFixture, TID};
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::SchemaColumn;
 
 const ROWS: u64 = 50;
 
-/// `(id U64 PK | val I64 NULL)` holding ids `0..ROWS` at `val = -(id / 2)`, so
-/// spans repeat and descend as ids ascend; every seventh row's `val` is NULL.
+/// Row `id`'s `val`: `-(id / 2)`, so spans repeat and descend as ids ascend; NULL
+/// for every seventh row.
+fn val(id: u64) -> Option<i64> {
+    (!id.is_multiple_of(7)).then_some(-((id / 2) as i64))
+}
+
+/// `(id U64 PK | val I64 NULL)` holding ids `0..ROWS`, every third then retracted,
+/// read `chunk_rows` rows a chunk and spilling its sorts three 8-byte records a run.
 /// Indexed on `val` when `indexed`.
-fn fixture(indexed: bool) -> RelationFixture {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
-    let mut bb = BatchBuilder::new(&schema);
-    for id in 0..ROWS {
-        bb.begin_row(id as u128, 1);
-        match id % 7 {
-            0 => bb.put_null(),
-            _ => bb.put_int((-((id / 2) as i64)) as u128),
-        }
-        bb.end_row();
-    }
-    let indexed: &[u32] = if indexed { &[1] } else { &[] };
-    relation_fixture(RelationKind::BaseTable, schema, indexed, [bb.finish()])
+fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let rows = |w: i64, ids: &mut dyn Iterator<Item = u64>| {
+        id_rows(&schema, ids.map(|id| (id, w)), |bb, id| {
+            bb.put_opt_int(val(id).map(|v| v as u128))
+        })
+    };
+    let config = StoreConfig {
+        scan_chunk_rows: chunk_rows,
+        key_spans_spill_bytes: 24,
+        ..StoreConfig::default()
+    };
+    let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };
+    let rounds = [rows(1, &mut (0..ROWS)), rows(-1, &mut (0..ROWS).step_by(3))];
+    relation_fixture_with(config, RelationKind::BaseTable, schema, indexed, rounds)
 }
 
 /// Every span of `spans` in order, and the row count of each chunk.
@@ -47,25 +48,22 @@ fn drain(mut spans: KeySpans) -> (Vec<Vec<u8>>, Vec<usize>) {
 
 /// The spans of a relation are one sorted list whether an index on the columns
 /// holds them or a sort of the rows makes them — across chunk boundaries, and
-/// with a spill budget of a few records — and a NULL in the column yields none.
+/// with a spill budget of a few records — and neither a NULL in the column nor a
+/// retracted row yields one. A column list the relation does not have, or a
+/// relation it does not hold, is refused before anything is read.
 #[test]
 fn the_index_and_the_sort_yield_the_same_sorted_spans() {
-    let span_schema = crate::test_support::pk_only_schema(&[TypeCode::I64]);
+    let span_schema = pk_only_schema(&[TypeCode::I64]);
     let mut want: Vec<Vec<u8>> = (0..ROWS)
-        .filter(|id| id % 7 != 0)
-        .map(|id| {
-            let val = -((id / 2) as i64);
-            span_schema.opk_key_cols(&[val as u128]).pk_bytes().to_vec()
-        })
+        .filter(|id| !id.is_multiple_of(3))
+        .filter_map(val)
+        .map(|v| span_schema.opk_key_cols(&[v as u128]).pk_bytes().to_vec())
         .collect();
     want.sort();
 
     for chunk_rows in [1, 4, 1024] {
         for indexed in [true, false] {
-            let mut r = fixture(indexed);
-            r.config.scan_chunk_rows = chunk_rows;
-            // Three 8-byte records a run.
-            r.config.key_spans_spill_bytes = 24;
+            let r = fixture(indexed, chunk_rows);
             assert_eq!(r.relation(TID).unwrap().index_on(&[1]).is_some(), indexed);
 
             let (got, chunks) = drain(r.key_spans(TID, &[1]).unwrap());
@@ -77,12 +75,8 @@ fn the_index_and_the_sort_yield_the_same_sorted_spans() {
             assert_eq!(chunks.len(), want.len().div_ceil(chunk_rows), "indexed={indexed}");
         }
     }
-}
 
-/// A column list the relation does not have is refused before anything is read.
-#[test]
-fn spans_of_a_column_the_relation_lacks_are_refused() {
-    let r = fixture(false);
+    let r = fixture(false, 1024);
     assert!(r.key_spans(TID, &[9]).is_err());
     assert!(r.key_spans(TID + 100, &[1]).is_err());
 }

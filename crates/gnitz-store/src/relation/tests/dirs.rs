@@ -102,7 +102,7 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
         config,
         RelationKind::BaseTable,
         schema,
-        &[1],
+        &[&[1]],
         [make_batch_raw(&schema, &rows)],
     );
     r.checkpoint_base().unwrap();

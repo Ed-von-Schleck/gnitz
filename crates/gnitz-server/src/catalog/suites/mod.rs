@@ -26,7 +26,6 @@ mod view_tick_bench;
 mod wide_pk_validation;
 
 use std::fs;
-use std::rc::Rc;
 
 use gnitz_store::relation::{
     relation_dir, relations_dir, ChildAddr, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec,
@@ -58,11 +57,11 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    apply_ddl, bundle, circuit_batch, cmp_const, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
+    apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
     fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
     pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, refusal, register_identity_view, scan_all,
-    schema_tab_batch, scratch_dir, seek_by_index, seek_by_index_range, sum_weights, table_tab_batch,
-    try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, LocalDrive,
+    schema_tab_batch, scratch_dir, sum_weights, table_tab_batch, try_register_identity_view, try_register_view,
+    two_term_join_circuit, uuid_def, view_blocks, LocalDrive,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table

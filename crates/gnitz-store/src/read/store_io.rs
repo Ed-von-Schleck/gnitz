@@ -3,6 +3,7 @@
 //! an index over it;
 //! [`RelationRegistry::probe`] answers a HasPk probe.
 
+use super::check_stride;
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
 use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
@@ -16,13 +17,7 @@ impl RelationRegistry {
     /// Answer `probe` at `keys` over the rows this process holds of `id`.
     pub fn probe(&self, id: u64, probe: Probe, keys: PkKeys) -> Result<Batch, String> {
         let relation = self.relation_or_err(id)?;
-        let stride = keys.stride();
-        let keyed_as = |expected: usize| match expected == stride {
-            true => Ok(()),
-            false => Err(format!(
-                "probe: key stride {stride} != the probed store's {expected} (table {id})"
-            )),
-        };
+        let keyed_as = |stride| check_stride("probe", id, &keys, stride);
         match probe {
             Probe::Pk => {
                 keyed_as(relation.schema().pk_stride())?;
@@ -42,7 +37,7 @@ impl RelationRegistry {
                     .flatten()
                     .copied()
                     .collect();
-                let live = PkKeys::from_sorted(stride, live);
+                let live = PkKeys::from_sorted(keys.stride(), live);
                 relation.gather(live, Cut::Now).project_live(&[col])
             }
             Probe::Index(cols, cap) => {
@@ -74,14 +69,7 @@ impl RelationRegistry {
         let cursor = match bound {
             ReadBound::None => SourceCursor::Full(Box::new(entry.table().open_cursor(cut))),
             ReadBound::PkSet(keys) => {
-                let schema = entry.schema();
-                if keys.stride() != schema.pk_stride() {
-                    return Err(format!(
-                        "open_bound: PkSet key stride {} != pk_stride {} (table {id})",
-                        keys.stride(),
-                        schema.pk_stride()
-                    ));
-                }
+                check_stride("open_bound", id, &keys, entry.schema().pk_stride())?;
                 // A key this worker holds no row for copies nothing.
                 SourceCursor::PkSet(Box::new(entry.gather(keys, cut)))
             }

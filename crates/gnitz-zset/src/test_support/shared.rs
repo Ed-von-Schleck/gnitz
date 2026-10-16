@@ -171,17 +171,25 @@ pub fn sweep_bit_flips(buf: &mut [u8], span: std::ops::Range<usize>, mut check: 
     }
 }
 
-/// `col <op> lit` over a fixed-int column — the program shape a `WHERE`
-/// conjunct compiles to, built through the client's own `ExprBuilder`.
-pub fn cmp_const(op: gnitz_expr::CmpOp, col: u32, lit: i64) -> gnitz_expr::LogicalProgram {
-    use gnitz_expr::LogicalInstr::{Cmp, LoadCol, LoadConst};
+/// The conjunction of `col <op> lit` over fixed-int columns — the program shape a
+/// `WHERE` of such conjuncts compiles to, built through the client's own
+/// `ExprBuilder`.
+pub fn cmp_all(conjuncts: &[(gnitz_expr::CmpOp, u32, i64)]) -> gnitz_expr::LogicalProgram {
+    use gnitz_expr::LogicalInstr::{BoolBinary, Cmp, LoadCol, LoadConst};
     let mut eb = gnitz_expr::ExprBuilder::new();
-    let (a, b) = (
-        eb.emit(LoadCol { col }),
-        eb.emit(LoadConst { val: lit, unsigned: false }),
-    );
-    let r = eb.emit(Cmp { op, a, b });
-    eb.build(vec![gnitz_expr::Sink::Reg(r)]).expect("a well-formed program")
+    let keep = conjuncts
+        .iter()
+        .map(|&(op, col, lit)| {
+            let a = eb.emit(LoadCol { col });
+            let b = eb.emit(LoadConst { val: lit, unsigned: false });
+            eb.emit(Cmp { op, a, b })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .reduce(|a, b| eb.emit(BoolBinary { a, b, is_or: false }))
+        .expect("at least one conjunct");
+    eb.build(vec![gnitz_expr::Sink::Reg(keep)])
+        .expect("a well-formed program")
 }
 
 /// A row's logical identity: its PK bytes plus one entry per payload column.
@@ -431,6 +439,16 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64,
 /// Payload column 0 of row `row`, an 8-byte integer.
 pub fn payload0_i64<S: gnitz_wire::RowSource>(src: &S, row: usize) -> i64 {
     gnitz_wire::payload_u64(src, row, 0) as i64
+}
+
+/// The `(pk, weight, payload)` rows [`make_batch_raw`] would build `batch` from,
+/// sorted: a batch's row order is not what a test compares.
+pub fn batch_rows(batch: &Batch) -> Vec<(u64, i64, i64)> {
+    let mut rows: Vec<_> = (0..batch.len())
+        .map(|i| (batch.get_pk(i) as u64, batch.get_weight(i), payload0_i64(batch, i)))
+        .collect();
+    rows.sort_unstable();
+    rows
 }
 
 /// The Z-set sum of `inputs`, net-zero elements dropped.

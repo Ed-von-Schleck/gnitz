@@ -1,6 +1,6 @@
 use super::*;
 use crate::relation::StoreConfig;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, payload0_i64, relation_fixture_with, rows_spec, TID};
+use crate::test_support::{batch_rows, make_batch_raw, make_schema_u64_i64, relation_fixture_with, rows_spec, TID};
 use gnitz_wire::snapshot::{PageRequest, MAX_PAGE_ROWS};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
@@ -18,12 +18,6 @@ fn page(layout: u64, limit: u64) -> PageRequest {
     PageRequest { layout, limit, after: Vec::new() }
 }
 
-fn rows_of(b: &Batch) -> Vec<(u64, i64, i64)> {
-    (0..b.len())
-        .map(|i| (b.get_pk(i) as u64, b.get_weight(i), payload0_i64(b, i)))
-        .collect()
-}
-
 fn round(lo: u64, hi: u64, val: i64) -> Batch {
     let rows: Vec<_> = (lo..hi).map(|k| (k, 1, val)).collect();
     make_batch_raw(&make_schema_u64_i64(), &rows)
@@ -36,8 +30,7 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let mut r = relation_fixture_with(spilling(), RelationKind::BaseTable, schema, &[], rounds);
     r.checkpoint_base().unwrap();
     let layout = schema.layout_digest();
-    let mut before = rows_of(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
-    before.sort_unstable();
+    let before = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
     assert_eq!(before.len(), 80);
 
     r.pin(7, |k| k == RelationKind::BaseTable).unwrap();
@@ -52,11 +45,10 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     r.ingest(TID, make_batch_raw(&schema, &gone)).unwrap();
     r.checkpoint_base().unwrap();
 
-    let mut live = rows_of(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
-    live.sort_unstable();
+    let live = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
     assert_eq!(live, (40..80).map(|k| (k, 1, 2)).collect::<Vec<_>>());
     assert_eq!(
-        rows_of(&r.pinned_page(7, TID, &page(layout, MAX_PAGE_ROWS), Slot::SOLO).unwrap()),
+        batch_rows(&r.pinned_page(7, TID, &page(layout, MAX_PAGE_ROWS), Slot::SOLO).unwrap()),
         before
     );
 

@@ -463,7 +463,7 @@ fn a_clamp_reads_its_sources_where_they_hold_its_history() {
             let a = scan(c, 10);
             let a = c.filter(
                 a,
-                crate::test_support::cmp_const(gnitz_expr::CmpOp::Lt, 2, 100).to_blob_bytes(),
+                crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Lt, 2, 100)]).to_blob_bytes(),
             );
             let a = c.map(a, &[2]);
             let b = scan(c, 11);

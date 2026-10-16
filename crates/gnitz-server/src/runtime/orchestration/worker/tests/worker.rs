@@ -692,9 +692,8 @@ fn a_train_advances_with_every_request() {
     assert_eq!(owed(&wp), [("train", 11)], "ten frames, six sent");
 }
 
-/// A span train carries every span in order, off the index and off the sort
-/// alike, cut into frames by `chunk_rows` or the byte budget, whichever is hit
-/// first, and ends in one row-less terminal frame.
+/// A span train carries every span in order, cut into frames by `chunk_rows` or
+/// the byte budget, whichever is hit first, and ends in one row-less terminal frame.
 #[test]
 fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
     let span_schema = pk_only_schema(&[TypeCode::I64]);
@@ -707,51 +706,45 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         (0, full, 4, 0..=0),
         (24, 400, 1024, 2..=24),
     ];
-    for indexed in [true, false] {
-        for (n, budget, chunk_rows, carrying) in cases.clone() {
-            let (mut engine, tid) = engine_with_table(&format!("span_train_{indexed}_{n}"));
-            if indexed {
-                let claim = gnitz_store::relation::IndexClaim::Index { id: tid + 1, unique: false };
-                engine.registry.add_index(tid, claim, cols).unwrap();
-            }
-            // Values descend as ids ascend, so span order is not row order.
-            let held: Vec<_> = (0..n).map(|i| (i, 1, -(i as i64))).collect();
-            engine
-                .registry
-                .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
-                .unwrap();
-            engine.registry.set_scan_chunk_rows(chunk_rows);
-            let (mut wp, _sal, rx) = test_worker(&mut engine);
-            wp.reply_frame_budget = budget;
+    for (n, budget, chunk_rows, carrying) in cases {
+        let (mut engine, tid) = engine_with_table(&format!("span_train_{n}"));
+        // Values descend as ids ascend, so span order is not row order.
+        let held: Vec<_> = (0..n).map(|i| (i, 1, -(i as i64))).collect();
+        engine
+            .registry
+            .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
+            .unwrap();
+        engine.registry.set_scan_chunk_rows(chunk_rows);
+        let (mut wp, _sal, rx) = test_worker(&mut engine);
+        wp.reply_frame_budget = budget;
 
-            let spans = wp.catalog.registry.key_spans(tid, cols.as_slice()).unwrap();
-            wp.reply(route(tid, 9, 1), Ok(Rows::Spans(Box::new(spans))));
-            assert!(
-                frames(&rx).is_empty(),
-                "a span train is never sent from where it is answered"
-            );
-            drain_replies(&mut wp);
+        let spans = wp.catalog.registry.key_spans(tid, cols.as_slice()).unwrap();
+        wp.reply(route(tid, 9, 1), Ok(Rows::Spans(Box::new(spans))));
+        assert!(
+            frames(&rx).is_empty(),
+            "a span train is never sent from where it is answered"
+        );
+        drain_replies(&mut wp);
 
-            let out = frames(&rx);
-            let (last, body) = out.split_last().expect("a terminal frame");
-            assert!(last.ctrl.hdr.flags.scan_last && last.ctrl.data.is_none());
-            assert!(carrying.contains(&body.len()), "{n} spans: {} frames", body.len());
-            let mut got = Vec::new();
-            for f in &out {
-                assert_eq!((f.req, f.ctrl.hdr.status), (9, WireStatus::Ok));
-                assert!(f.ctrl.hdr.flags.continuation, "every span frame carries continuation");
-                assert!(f.ctrl.schema.is_none(), "the master builds the frame schema itself");
-                let rows = f.rows(&span_schema);
-                got.extend((0..rows.len()).map(|i| rows.get_pk_bytes(i).to_vec()));
-            }
-            assert!(body
-                .iter()
-                .all(|f| !f.ctrl.hdr.flags.scan_last && f.ctrl.data.is_some()));
-            let want: Vec<Vec<u8>> = (0..n)
-                .rev()
-                .map(|i| span_schema.opk_key_cols(&[-(i as i64) as u128]).pk_bytes().to_vec())
-                .collect();
-            assert_eq!(got, want, "indexed={indexed}, {n} spans");
+        let out = frames(&rx);
+        let (last, body) = out.split_last().expect("a terminal frame");
+        assert!(last.ctrl.hdr.flags.scan_last && last.ctrl.data.is_none());
+        assert!(carrying.contains(&body.len()), "{n} spans: {} frames", body.len());
+        let mut got = Vec::new();
+        for f in &out {
+            assert_eq!((f.req, f.ctrl.hdr.status), (9, WireStatus::Ok));
+            assert!(f.ctrl.hdr.flags.continuation, "every span frame carries continuation");
+            assert!(f.ctrl.schema.is_none(), "the master builds the frame schema itself");
+            let rows = f.rows(&span_schema);
+            got.extend((0..rows.len()).map(|i| rows.get_pk_bytes(i).to_vec()));
         }
+        assert!(body
+            .iter()
+            .all(|f| !f.ctrl.hdr.flags.scan_last && f.ctrl.data.is_some()));
+        let want: Vec<Vec<u8>> = (0..n)
+            .rev()
+            .map(|i| span_schema.opk_key_cols(&[-(i as i64) as u128]).pk_bytes().to_vec())
+            .collect();
+        assert_eq!(got, want, "{n} spans");
     }
 }

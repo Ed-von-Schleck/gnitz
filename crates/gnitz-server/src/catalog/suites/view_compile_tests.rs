@@ -49,7 +49,7 @@ fn test_compile_verdict() {
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
-    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let ok_vid =
         try_register_filtered_view(&mut engine, base_tid, "vok", &pred).expect("a well-formed circuit compiles");
     assert!(engine.registry.has_id(ok_vid));
@@ -197,7 +197,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
 
     // The replacement's column records must be stored before its VIEW_TAB row is
@@ -239,7 +239,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes();
+    let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
     let old_dir = relation_dir(&dir, old_vid);
 
@@ -249,7 +249,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
-    let pred = cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes();
+    let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 50)]).to_blob_bytes();
     let new_dir = relation_dir(&dir, new_vid);
     // The log refuses the bundle's last group, the incumbent's retracted column
     // records, once the rest of it has applied: the catalog undoes it.

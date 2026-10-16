@@ -25,7 +25,7 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
         let rows: Vec<_> = (round..ROWS).step_by(RUNS).map(|id| (id, 1, val_of(id))).collect();
         make_batch_raw(&schema, &rows)
     });
-    let r = relation_fixture(RelationKind::BaseTable, schema, &[1], rounds);
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[&[1]], rounds);
     let table = r.relation(TID).unwrap().table();
     assert_eq!((table.all_shard_arcs().len(), table.runs(At::Now).count()), (0, RUNS));
     r

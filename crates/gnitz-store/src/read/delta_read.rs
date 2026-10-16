@@ -6,6 +6,7 @@ use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
+use super::check_stride;
 use super::scan_spec::check_layout;
 use crate::relation::RelationRegistry;
 use gnitz_zset::algebra::SinkPlan;
@@ -81,14 +82,7 @@ impl RelationRegistry {
             plan.push(rows, &mut ranges).map(drop)
         };
         if let ReadBound::PkSet(keys) = &bound {
-            if keys.stride() != view.pk_stride() {
-                return Err(format!(
-                    "delta_read: PkSet key stride {} != pk_stride {} (relation {id})",
-                    keys.stride(),
-                    view.pk_stride()
-                )
-                .into());
-            }
+            check_stride("delta_read", id, keys, view.pk_stride())?;
             // The keyed rows of every round, read a chunk at a time.
             let mut keyed = Vec::new();
             let mut chunk = Batch::empty_with_schema(&view);
