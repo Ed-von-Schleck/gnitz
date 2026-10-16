@@ -53,6 +53,7 @@ impl ViewChain {
         ViewBundle {
             segments: self.segments,
             view: p.seal().0,
+            definition: None,
         }
     }
 }

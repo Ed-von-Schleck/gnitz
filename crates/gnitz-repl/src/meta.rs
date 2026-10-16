@@ -138,7 +138,7 @@ pub const COMMANDS: &[MetaCommand] = &[
     MetaCommand {
         names: &["\\d"],
         args: "[NAME]",
-        help: "list relations, or describe NAME (\\d+ shows hidden columns)",
+        help: "list relations, or describe NAME (\\d+ shows hidden columns and a view's definition)",
         arg: ArgKind::Relation(|_| true),
         run: |sh, c| match c.arg() {
             Some(name) => sh.describe(name, c.verbose),
@@ -252,6 +252,36 @@ pub const COMMANDS: &[MetaCommand] = &[
         run: |sh, c| match c.path() {
             Some(path) => sh.run_file(&path),
             None => sh.fail("\\i needs a file name"),
+        },
+    },
+    MetaCommand {
+        names: &["\\dump"],
+        args: "DIR",
+        help: "dump the database into DIR: its schema as SQL, its rows as Parquet",
+        arg: ArgKind::Path,
+        run: |sh, c| match c.path() {
+            Some(dir) => sh.dump(&dir),
+            None => sh.fail("\\dump needs a directory"),
+        },
+    },
+    MetaCommand {
+        names: &["\\restore"],
+        args: "DIR",
+        help: "restore the dump in DIR into this database",
+        arg: ArgKind::Path,
+        run: |sh, c| match c.path() {
+            Some(dir) => sh.restore(&dir),
+            None => sh.fail("\\restore needs a directory"),
+        },
+    },
+    MetaCommand {
+        names: &["\\backup"],
+        args: "NAME",
+        help: "copy the server's data directory, at a checkpoint, into its backup directory as NAME",
+        arg: ArgKind::None,
+        run: |sh, c| match c.arg() {
+            Some(name) => sh.backup(name),
+            None => sh.fail("\\backup needs a name"),
         },
     },
     MetaCommand {
@@ -712,7 +742,37 @@ impl Shell {
             catalog.readers(rel.id).map(CatalogRelation::qualified).collect(),
         );
         section("With", gnitz_sql::with_options(&rel.props));
+        if verbose && matches!(rel.props, RelProps::View(_)) {
+            let definition = gnitz_sql::create_view_statement(catalog, rel).unwrap_or_else(|e| format!("({e})"));
+            section("Definition", definition.lines().map(str::to_string).collect());
+        }
         out
+    }
+
+    fn dump(&mut self, dir: &str) -> Result<Flow, Failed> {
+        let done = gnitz_core::block_on(gnitz_dump::dump(&mut self.client, std::path::Path::new(dir)));
+        let s = done.or_else(|e| self.fail(format!("\\dump: {e}")))?;
+        self.status(&format!(
+            "dumped {} schema(s), {} table(s), {} view(s) and {} row(s) into {dir}",
+            s.schemas, s.tables, s.views, s.rows
+        ));
+        Ok(Flow::Continue)
+    }
+
+    fn restore(&mut self, dir: &str) -> Result<Flow, Failed> {
+        let done = gnitz_core::block_on(gnitz_dump::restore(&mut self.client, std::path::Path::new(dir)));
+        let s = done.or_else(|e| self.fail(format!("\\restore: {e}")))?;
+        self.status(&format!(
+            "restored {} schema(s), {} table(s), {} view(s) and {} row(s) from {dir}",
+            s.schemas, s.tables, s.views, s.rows
+        ));
+        Ok(Flow::Continue)
+    }
+
+    fn backup(&mut self, name: &str) -> Result<Flow, Failed> {
+        gnitz_core::block_on(self.client.backup(name)).or_else(|e| self.fail(format!("\\backup: {e}")))?;
+        self.status(&format!("backed up as {name}"));
+        Ok(Flow::Continue)
     }
 
     fn edit(&mut self, file: Option<&str>) -> Result<Flow, Failed> {

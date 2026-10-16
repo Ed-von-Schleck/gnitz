@@ -7,6 +7,7 @@ mod ddl_txn;
 mod key_reply;
 mod read_modify_write;
 mod scan_spec_guard;
+mod snapshot;
 mod spine;
 mod transport;
 mod view_chain;

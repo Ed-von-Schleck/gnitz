@@ -343,6 +343,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
 | `gnitz-repl` | The interactive SQL shell, binary `gnitz`: a line editor over `gnitz-sql`, with psql-style meta-commands and `\watch` over a delta feed |
+| `gnitz-dump` | Logical dump and restore: a database as SQL and Parquet, read from one snapshot, restored into a build of the same formats or a later one |
 | `gnitz-zset` | The Z-set kernel: the key and payload-order kernels, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
 | `gnitz-server` | The multi-process server binary, whose cargo package is `gnitz`: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |

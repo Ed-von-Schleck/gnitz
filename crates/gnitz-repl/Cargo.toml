@@ -21,6 +21,7 @@ integration = []
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
 gnitz-sql = { path = "../gnitz-sql" }
+gnitz-dump = { path = "../gnitz-dump" }
 gnitz-wire.workspace = true
 reedline = "0.52"
 nu-ansi-term = "0.50"

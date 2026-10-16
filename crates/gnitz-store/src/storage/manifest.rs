@@ -235,17 +235,31 @@ pub(crate) fn retire_store(store_dir: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Make `dst_dir` a durable hard-linked copy of the published store at `src_dir`.
-pub(crate) fn link_store(src_dir: &str, dst_dir: &str) -> Result<(), StorageError> {
-    let m = read(src_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
+/// Make `dst_dir` a durable copy of the store `src_dir` published — its
+/// manifest and the shards that manifest names, the shards durable ahead of the
+/// manifest. Each file is hard-linked where `dst_dir` shares `src_dir`'s
+/// filesystem, and copied and synced where it does not; the file names are
+/// kept, since a shard's descriptor digest covers its own. `Ok(false)`, with
+/// nothing made, where `src_dir` published no manifest.
+pub(crate) fn link_store(src_dir: &str, dst_dir: &str) -> Result<bool, StorageError> {
+    let put = |src: &str, dst: &str| match fs::hard_link(src, dst) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            fs::copy(src, dst)?;
+            fs::File::open(dst)?.sync_all()
+        }
+        r => r,
+    };
+    let Some(m) = read(src_dir)? else {
+        return Ok(false);
+    };
     fs::create_dir_all(dst_dir)?;
     for e in &m.shards.entries {
-        fs::hard_link(shard_path(src_dir, e.seq), shard_path(dst_dir, e.seq))?;
+        put(&shard_path(src_dir, e.seq), &shard_path(dst_dir, e.seq))?;
     }
-    // The shards are durable before a manifest names them.
     fsync_dir(dst_dir)?;
-    fs::hard_link(manifest_path(src_dir), manifest_path(dst_dir))?;
-    Ok(fsync_dir(dst_dir)?)
+    put(&manifest_path(src_dir), &manifest_path(dst_dir))?;
+    fsync_dir(dst_dir)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

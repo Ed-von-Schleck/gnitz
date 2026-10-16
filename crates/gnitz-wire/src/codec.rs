@@ -100,6 +100,29 @@ impl Wire for bool {
     }
 }
 
+/// A presence flag, then the value when present.
+impl<T: Wire> Wire for Option<T> {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            Some(v) => w.bool(true).put(v),
+            None => w.bool(false),
+        };
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        r.bool()?.then(|| r.get()).transpose()
+    }
+}
+
+/// UTF-8 text as a [`Writer::bytes32`] section.
+impl Wire for String {
+    fn write(&self, w: &mut Writer) {
+        w.bytes32(self.as_bytes());
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        String::from_utf8(r.bytes32()?.to_vec()).map_err(|_| "text is not UTF-8".to_string())
+    }
+}
+
 impl<A: Wire, B: Wire> Wire for (A, B) {
     fn write(&self, w: &mut Writer) {
         w.put(&self.0).put(&self.1);

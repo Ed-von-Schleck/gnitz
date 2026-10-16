@@ -82,3 +82,50 @@ fn children_at_generation_reads_the_rows_and_the_scratch() {
         "a stale scratch child is a mismatch"
     );
 }
+
+/// What a store published reaches a second directory whole: a registry opened
+/// over it reads every row the first held at its last checkpoint, and none
+/// pushed after.
+#[test]
+fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
+    use crate::relation::{RelationKind, RelationSpec, StoreConfig};
+    use crate::test_support::{make_batch_raw, relation_fixture_with, TID};
+    use gnitz_zset::algebra::Placement;
+
+    let schema = make_schema_u64_i64();
+    let config = StoreConfig {
+        ram_tier_bytes: 256,
+        ..StoreConfig::default()
+    };
+    let rows: Vec<_> = (0..50).map(|k| (k, 1, k as i64)).collect();
+    let mut r = relation_fixture_with(
+        config,
+        RelationKind::BaseTable,
+        schema,
+        &[1],
+        [make_batch_raw(&schema, &rows)],
+    );
+    r.checkpoint_base().unwrap();
+    // After the checkpoint, so only the SAL would carry it: not in the copy.
+    r.ingest(TID, make_batch_raw(&schema, &[(99, 1, 0)])).unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    let dest = dest.path().to_str().unwrap();
+    assert!(r.link_published_into(dest).unwrap() >= 1);
+
+    let mut copy = RelationRegistry::new(dest, Slot::SOLO, config);
+    copy.register(RelationSpec {
+        id: TID,
+        kind: RelationKind::BaseTable,
+        schema,
+        placement: Placement::full_pk(&schema),
+        pk_repeats: false,
+        compress: false,
+    })
+    .unwrap();
+    let keys: Vec<u64> = {
+        let all = copy.relation(TID).unwrap().full_scan();
+        (0..all.len()).map(|i| all.get_pk(i) as u64).collect()
+    };
+    assert_eq!(keys, (0..50).collect::<Vec<_>>());
+}

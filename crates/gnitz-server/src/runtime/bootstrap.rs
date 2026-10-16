@@ -187,8 +187,14 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: 
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, workers: Option<u32>, tls: Option<TlsArgs>) -> i32 {
-    match run_server(data_dir, socket_path, workers, tls) {
+pub fn server_main(
+    data_dir: &str,
+    socket_path: &str,
+    workers: Option<u32>,
+    tls: Option<TlsArgs>,
+    backup_dir: Option<String>,
+) -> i32 {
+    match run_server(data_dir, socket_path, workers, tls, backup_dir) {
         Ok(rc) => rc,
         Err(e) => {
             gnitz_error!("{e}");
@@ -412,7 +418,13 @@ fn raise_fd_limit(target: u64) {
 }
 
 /// `workers`: the worker count, or `None` to size it from the host.
-fn run_server(data_dir: &str, socket_path: &str, workers: Option<u32>, tls: Option<TlsArgs>) -> Result<i32, String> {
+fn run_server(
+    data_dir: &str,
+    socket_path: &str,
+    workers: Option<u32>,
+    tls: Option<TlsArgs>,
+    backup_dir: Option<String>,
+) -> Result<i32, String> {
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
@@ -479,7 +491,7 @@ fn run_server(data_dir: &str, socket_path: &str, workers: Option<u32>, tls: Opti
     })?;
 
     let listeners = listen::bind_listeners(data_dir, socket_path, tls, listen::ADDRESS_GRACE)?;
-    Ok(executor::run(dispatcher, data_dir, listeners))
+    Ok(executor::run(dispatcher, data_dir, backup_dir, listeners))
 }
 
 #[cfg(test)]

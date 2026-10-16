@@ -165,6 +165,7 @@ fn the_system_schema_takes_no_relation() {
         owner_view_id: 0,
         pk_repeats: 0,
         compress: 0,
+        definition: Default::default(),
     }
     .write(&mut view, 1);
     let family_cols = SysFamily::Table.column_defs();

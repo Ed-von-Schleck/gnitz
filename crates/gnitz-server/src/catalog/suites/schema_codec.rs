@@ -187,6 +187,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             owner_view_id: 0,
             pk_repeats: 0,
             compress: 0,
+            definition: Default::default(),
         };
         row.write(&mut BatchAppender::new(&mut b), 1);
         b

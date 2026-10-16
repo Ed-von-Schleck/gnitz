@@ -13,7 +13,7 @@ use gnitz_wire::sys_rows::{
 };
 use gnitz_wire::{qualified_key, Circuit, ColumnDef, PkColList, RelClass, TableProps, ViewProps, SYSTEM_SCHEMA};
 
-use crate::{ProtocolError, RelName, ZSetBatch};
+use crate::{ProtocolError, RelName, ViewDefinition, ZSetBatch};
 
 /// The families a [`Catalog`] is decoded from, in the order
 /// [`Catalog::decode`] takes their rows.
@@ -60,6 +60,10 @@ pub struct CatalogRelation {
     /// The relations a view's chain scans, ascending; empty for any other
     /// relation.
     pub reads: Vec<u64>,
+    /// A user view's [`ViewDefinition`] as its row stores it, undecoded so one
+    /// unreadable definition costs only its own view; empty for every other
+    /// relation and for a view no planner wrote.
+    pub definition: Vec<u8>,
 }
 
 impl CatalogRelation {
@@ -73,6 +77,15 @@ impl CatalogRelation {
             pk,
             indexes: Vec::new(),
             reads: Vec::new(),
+            definition: Vec::new(),
+        }
+    }
+
+    /// A user view's definition; `Ok(None)` for a relation that stores none.
+    pub fn definition(&self) -> Result<Option<ViewDefinition>, String> {
+        match self.definition.is_empty() {
+            true => Ok(None),
+            false => ViewDefinition::decode(&self.definition).map(Some),
         }
     }
 
@@ -185,13 +198,15 @@ impl Catalog {
                 r.parts().map_err(|e| bad(format_args!("view '{}'", r.name), e))?;
             chain_of.insert(r.view_id, owner.unwrap_or(r.view_id));
             if owner.is_none() {
-                relations.push(CatalogRelation::new(
+                let mut rel = CatalogRelation::new(
                     r.view_id,
                     schema_of(r.schema_id),
                     r.name.into_owned(),
                     RelProps::View(props),
                     pk,
-                ));
+                );
+                rel.definition = r.definition.into_owned();
+                relations.push(rel);
             }
         }
         let slot_of: HashMap<u64, usize> = relations.iter().enumerate().map(|(at, r)| (r.id, at)).collect();

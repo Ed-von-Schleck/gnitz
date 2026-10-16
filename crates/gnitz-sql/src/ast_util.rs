@@ -10,9 +10,10 @@ use gnitz_core::RelName;
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{
-    ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, TableAliasColumnDef, Value, Visit, Visitor,
+    ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, Spanned, TableAliasColumnDef, Value, Visit, Visitor,
     WildcardAdditionalOptions,
 };
+use sqlparser::tokenizer::Span;
 use std::ops::ControlFlow;
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
@@ -465,13 +466,44 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
     }
 }
 
+/// A plain-table FROM factor as written: the relation it names, the name the
+/// statement reads it by, and the positional column aliases its alias carries.
+pub(crate) struct TableRef<'a> {
+    pub(crate) name: RelName,
+    /// The declared alias when present, else the name without its schema.
+    pub(crate) alias: String,
+    /// `FROM t AS d(x, y)`'s `(x, y)`: empty where none was written.
+    pub(crate) columns: &'a [TableAliasColumnDef],
+    /// Where the relation name lies in the statement text.
+    pub(crate) name_span: Span,
+    /// Where the declared alias's name lies; `None` without one.
+    pub(crate) alias_span: Option<Span>,
+}
+
 /// `(relation name, effective alias)` of a plain-table FROM factor: the
-/// declared alias when present, else the name without its schema.
+/// declared alias when present, else the name without its schema. A positional
+/// column alias list is refused: the statements this serves name a table to
+/// write, whose columns keep their own names.
 pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     session_schema: &str,
     context: &str,
 ) -> Result<(RelName, String), GnitzSqlError> {
+    let TableRef { name, alias, columns, .. } = extract_table_ref(tf, session_schema, context)?;
+    reject_if(
+        !columns.is_empty(),
+        context,
+        "positional column aliases on the table it writes",
+    )?;
+    Ok((name, alias))
+}
+
+/// The [`TableRef`] a plain-table FROM factor writes.
+pub(crate) fn extract_table_ref<'a>(
+    tf: &'a sqlparser::ast::TableFactor,
+    session_schema: &str,
+    context: &str,
+) -> Result<TableRef<'a>, GnitzSqlError> {
     let sqlparser::ast::TableFactor::Table {
         name,
         alias,
@@ -496,7 +528,7 @@ pub(crate) fn extract_table_name_and_alias(
     reject_if(json_path.is_some(), context, "a JSON path on a table")?;
     reject_if(sample.is_some(), context, "TABLESAMPLE")?;
     let table_name = extract_object_name(name, session_schema, context)?;
-    let alias = match alias {
+    let (alias, columns, alias_span) = match alias {
         Some(a) => {
             let sqlparser::ast::TableAlias {
                 explicit: _,
@@ -504,20 +536,19 @@ pub(crate) fn extract_table_name_and_alias(
                 columns,
                 at,
             } = a;
-            // `FROM t AS d(x, y)` renames the columns positionally; honoring only
-            // the relation alias would answer with `t`'s own column names.
-            reject_if(
-                !columns.is_empty(),
-                context,
-                "positional column aliases on a FROM table",
-            )?;
             // Unreachable under GenericDialect; named so a dialect change is not silent.
             reject_if(at.is_some(), context, "AT (PartiQL index alias)")?;
-            alias_name.value.clone()
+            (alias_name.value.clone(), columns.as_slice(), Some(alias_name.span))
         }
-        None => table_name.spelled_name().to_string(),
+        None => (table_name.spelled_name().to_string(), &[][..], None),
     };
-    Ok((table_name, alias))
+    Ok(TableRef {
+        name: table_name,
+        alias,
+        columns,
+        name_span: name.span(),
+        alias_span,
+    })
 }
 
 /// The names a table alias gives its columns. A type on one is refused: it

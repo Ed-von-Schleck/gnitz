@@ -1,6 +1,7 @@
 //! CREATE / ALTER VIEW: decode the statement's own clauses and options, compile
 //! the body (`hir::bind_and_lower`) into a view bundle, and commit it atomically.
 
+use super::definition::record_definition;
 use super::guard::{bool_option, kv_options};
 use crate::ast_util::extract_object_name;
 use crate::bind::{bind_constant, Catalog};
@@ -8,6 +9,7 @@ use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::ViewBody;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
+use crate::source::StatementText;
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use gnitz_core::{GnitzClient, RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};
@@ -162,7 +164,11 @@ pub(crate) struct PlannedChain {
 }
 
 /// Plan a `CREATE VIEW`; `None` when `IF NOT EXISTS` finds the name taken.
-pub(crate) fn plan_create_view(cv: &CreateView, cat: &dyn Catalog) -> Result<Option<PlannedChain>, GnitzSqlError> {
+pub(crate) fn plan_create_view(
+    cv: &CreateView,
+    text: StatementText<'_>,
+    cat: &dyn Catalog,
+) -> Result<Option<PlannedChain>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
 
@@ -189,7 +195,7 @@ pub(crate) fn plan_create_view(cv: &CreateView, cat: &dyn Catalog) -> Result<Opt
     let props = decode_view_options(&cv.options)?;
     let view = ViewBody { stmt: "CREATE VIEW", replacing };
     let aliases = cv.columns.iter().map(|c| &c.name);
-    let bundle = plan_segments(cat, view, &cv.query, aliases, props)?;
+    let bundle = plan_segments(cat, view, &cv.query, text, aliases, props)?;
     Ok(Some(PlannedChain {
         name: view_name,
         bundle,
@@ -205,6 +211,7 @@ pub(crate) fn plan_alter_view(
     columns: &[Ident],
     query: &Query,
     with_options: &[sqlparser::ast::SqlOption],
+    text: StatementText<'_>,
     cat: &dyn Catalog,
 ) -> Result<PlannedChain, GnitzSqlError> {
     // Only `CREATE OR REPLACE VIEW` states a view's options.
@@ -218,7 +225,7 @@ pub(crate) fn plan_alter_view(
         replacing: Some(old_vid),
     };
     let props = ViewProps::default();
-    let bundle = plan_segments(cat, view, query, columns.iter(), props)?;
+    let bundle = plan_segments(cat, view, query, text, columns.iter(), props)?;
     Ok(PlannedChain {
         name: named,
         bundle,
@@ -228,17 +235,23 @@ pub(crate) fn plan_alter_view(
 }
 
 /// Compile a view body to its segment bundle, the user-named view's visible
-/// output columns renamed by `aliases`.
+/// output columns renamed by `aliases`, carrying the definition `text` declares.
 fn plan_segments<'a>(
     cat: &dyn Catalog,
     view: ViewBody,
     query: &Query,
+    text: StatementText<'_>,
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
     props: ViewProps,
 ) -> Result<ViewBundle, GnitzSqlError> {
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
     let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
-    crate::hir::bind_and_lower(cat, query, view, bounded, aliases)
+    let lowered = crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
+    let definition = record_definition(text, &lowered)?;
+    Ok(ViewBundle {
+        definition: Some(definition),
+        ..lowered.bundle
+    })
 }
 
 /// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.

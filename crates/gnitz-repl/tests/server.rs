@@ -313,3 +313,77 @@ fn watch_refuses_a_view_without_a_delta_feed() {
     .unwrap();
     assert!(sh.meta("\\watch plain").is_err());
 }
+
+const APP: &str = "
+    CREATE SCHEMA app;
+    CREATE TABLE app.users (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, manager BIGINT REFERENCES app.users (id));
+    CREATE TABLE app.scores (user_id BIGINT NOT NULL REFERENCES app.users (id) ON DELETE CASCADE, game INT,
+        points DECIMAL(10, 2), PRIMARY KEY (user_id, game)) CLUSTER BY user_id;
+    CREATE INDEX scores_game ON app.scores (game);
+    INSERT INTO app.users (name, manager) VALUES ('boss', NULL);
+    INSERT INTO app.users (name, manager) VALUES ('ann', 1), ('bob', 1);
+    INSERT INTO app.scores VALUES (1, 1, 10.5), (2, 1, 3.25), (3, 2, 7);
+    CREATE VIEW app.leaders AS
+        SELECT u.name, SUM(s.points) AS total FROM app.scores AS s JOIN app.users u ON s.user_id = u.id
+        GROUP BY u.name;
+    ALTER TABLE app.users RENAME COLUMN name TO display_name;
+    ALTER TABLE app.scores RENAME TO results;
+";
+
+/// `\d+` writes a view's definition under the names its sources carry now.
+#[test]
+fn describe_verbose_shows_a_views_definition() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.txt");
+    let mut sh = shell(server.sock_path(), None);
+    sh.run_script(APP).unwrap();
+    let text = results(&mut sh, &out, "\\d+ app.leaders");
+    assert!(
+        text.contains(
+            "Definition:\n    CREATE VIEW app.leaders AS\n    SELECT u.name, SUM(s.points) AS total \
+             FROM app.results AS s JOIN app.users u(id, name, manager) ON s.user_id = u.id\n"
+        ),
+        "{text}"
+    );
+}
+
+/// `\dump` into a directory and `\restore` from it on another server give the
+/// same answers.
+#[test]
+fn dump_and_restore_carry_a_database_between_servers() {
+    let source = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("dump");
+    let out = dir.path().join("out.csv");
+    let mut sh = shell(source.sock_path(), None);
+    sh.run_script(APP).unwrap();
+    sh.run_script(&format!("\\dump {}", dump.display())).unwrap();
+    let schema = std::fs::read_to_string(dump.join("schema.sql")).unwrap();
+    assert!(schema.contains("CREATE TABLE app.results (\n"), "{schema}");
+    let post = std::fs::read_to_string(dump.join("post-data.sql")).unwrap();
+    assert!(
+        post.contains("CREATE INDEX scores_game ON app.results (game);"),
+        "{post}"
+    );
+    let queries =
+        "SELECT * FROM app.leaders ORDER BY name;\nSELECT id, display_name, manager FROM app.users ORDER BY id;";
+    let before = results(&mut sh, &out, queries);
+
+    let target = ServerHandle::start_n(2);
+    let mut sh = shell(target.sock_path(), None);
+    sh.run_script(&format!("\\restore {}", dump.display())).unwrap();
+    assert_eq!(results(&mut sh, &out, queries), before);
+    assert!(sh.run_script(&format!("\\restore {}", dump.display())).is_err());
+}
+
+#[test]
+fn backup_writes_an_entry_of_the_backup_directory() {
+    let server = ServerHandle::start_with_backups(WORKERS);
+    let mut sh = shell(server.sock_path(), None);
+    sh.run_script("CREATE TABLE t (id BIGINT PRIMARY KEY); INSERT INTO t VALUES (1);\n\\backup nightly")
+        .unwrap();
+    assert!(server.backups().join("nightly").join("_relations").is_dir());
+    assert!(sh.meta("\\backup nightly").is_err());
+    assert!(sh.meta("\\backup").is_err());
+}

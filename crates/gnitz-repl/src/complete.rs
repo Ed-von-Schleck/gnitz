@@ -247,16 +247,13 @@ fn schema_candidates(ctx: &Context) -> Vec<Candidate> {
 /// qualifier typed, that schema's. Each part is written as SQL reads it back.
 fn relation_candidates(ctx: &Context, word: &str, keep: fn(RelClass) -> bool) -> Vec<Candidate> {
     let kept = ctx.catalog.relations.iter().filter(|r| keep(r.class()));
-    let candidate = |r: &CatalogRelation, qualify: bool| {
-        let name = gnitz_sql::relation_text(&r.name);
-        Candidate {
-            kind: Kind::Relation,
-            value: match qualify {
-                true => format!("{}.{name}", gnitz_sql::relation_text(&r.schema)),
-                false => name.into_owned(),
-            },
-            description: Some(r.class().describe().to_string()),
-        }
+    let candidate = |r: &CatalogRelation, qualify: bool| Candidate {
+        kind: Kind::Relation,
+        value: match qualify {
+            true => gnitz_sql::qualified_name(r),
+            false => gnitz_sql::relation_text(&r.name).into_owned(),
+        },
+        description: Some(r.class().describe().to_string()),
     };
     if let Some((qual, _)) = word.rsplit_once('.') {
         return kept

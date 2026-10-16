@@ -1,5 +1,5 @@
-//! The relation registry — what relations this process holds, and the stores
-//! behind them.
+//! The relation registry — what relations this process holds, the stores
+//! behind them, and the snapshots of those stores it has pinned (`snapshot`).
 //!
 //! Every relation enters through [`RelationRegistry::register`].
 
@@ -22,6 +22,7 @@ mod disk_usage;
 mod feed;
 mod ingest;
 mod repartition;
+mod snapshot;
 mod store;
 mod store_lifecycle;
 mod unique_pk;
@@ -463,6 +464,8 @@ pub struct RelationRegistry {
     pub(crate) config: StoreConfig,
     /// What this process is to the stores it registered.
     pub(crate) residency: Residency,
+    /// The snapshots this process holds pinned, by id.
+    pub(crate) snapshots: FxHashMap<u64, snapshot::Pinned>,
 }
 
 impl RelationRegistry {
@@ -477,6 +480,7 @@ impl RelationRegistry {
                 ..config
             },
             residency: Residency::Origin,
+            snapshots: FxHashMap::default(),
         }
     }
 

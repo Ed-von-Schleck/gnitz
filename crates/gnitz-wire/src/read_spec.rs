@@ -260,12 +260,7 @@ impl ReadSpec {
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
         let mut w = Writer::with_capacity(64 + self.predicate.len() + self.bound.key_bytes() + map);
 
-        w.put(&self.bound).bytes32(&self.predicate);
-
-        match &self.sink.map {
-            Some(m) => w.bool(true).put(m),
-            None => w.bool(false),
-        };
+        w.put(&self.bound).bytes32(&self.predicate).put(&self.sink.map);
 
         match &self.sink.kind {
             // `k`, or `0` for no cut; only a cut carries an order list.
@@ -283,7 +278,7 @@ impl ReadSpec {
 
             let predicate = r.bytes32()?.to_vec();
 
-            let map = if r.bool()? { Some(r.get()?) } else { None };
+            let map = r.get()?;
 
             let kind = match r.u8()? {
                 SINK_ROWS => {

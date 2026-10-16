@@ -5,11 +5,10 @@ use super::super::{
     cross_comparison, hircol_of, side, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side,
     SubqueryKind, SubqueryRef,
 };
-use super::{bind_body_suffix, resolve_relation, BindCx, BodyShape, JoinScope, ScopeLeaf, SubPolicy};
+use super::{bind_body_suffix, resolve_table_ref, BindCx, BodyShape, JoinScope, ScopeLeaf, SubPolicy};
 use crate::agg::AggFunc;
 use crate::ast_util::{
-    classify_agg_call, classify_from, col_ref_parts, extract_table_name_and_alias, is_agg_call, peel_nested, AggArg,
-    FromShape,
+    classify_agg_call, classify_from, col_ref_parts, extract_table_ref, is_agg_call, peel_nested, AggArg, FromShape,
 };
 use crate::bind::{bind_conjuncts, bind_structural, maybe_negate, single_relation_col_idx, unsupported_subquery};
 use crate::error::GnitzSqlError;
@@ -92,14 +91,14 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
     };
-    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, cx.cx.cat.schema_name(), "subquery")?;
+    let tref = extract_table_ref(factor, cx.cx.cat.schema_name(), "subquery")?;
+    let inner_alias = tref.alias.clone();
     if outer_alias.eq_ignore_ascii_case(&inner_alias) {
         return Err(GnitzSqlError::Rejected(format!(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
-    let inner_get = resolve_relation(cx.cx, &inner_name)?;
-    let inner_cols = inner_get.cols();
+    let (inner_get, inner_cols) = resolve_table_ref(cx.cx, &tref)?;
 
     let mut local_preds: Vec<HirExpr> = Vec::new();
     let mut correlation: Vec<HirExpr> = Vec::new();

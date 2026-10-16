@@ -4,6 +4,7 @@
 use crate::bind::Catalog;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
+use crate::source::StatementText;
 use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
@@ -138,6 +139,7 @@ pub(crate) async fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
+    text: StatementText<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     match stmt {
         // Bare `DESC t` is `Statement::ExplainTable`, table introspection, and falls to
@@ -239,6 +241,7 @@ pub(crate) async fn execute_statement(
         }
         // Refused, not failed: the transaction stays open.
         Statement::CreateTable(_)
+        | Statement::CreateSchema { .. }
         | Statement::Drop { .. }
         | Statement::CreateView(_)
         | Statement::CreateIndex(_)
@@ -251,12 +254,13 @@ pub(crate) async fn execute_statement(
             ))
         }
         Statement::CreateTable(_)
+        | Statement::CreateSchema { .. }
         | Statement::Drop { .. }
         | Statement::CreateView(_)
         | Statement::CreateIndex(_)
         | Statement::AlterTable(_)
         | Statement::AlterView { .. } => {
-            execute_ddl(client, schema_name, stmt).await?;
+            execute_ddl(client, schema_name, stmt, text).await?;
             Ok(SqlResult::Ddl { tag: ddl_tag(stmt) })
         }
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
@@ -265,7 +269,12 @@ pub(crate) async fn execute_statement(
 
 /// Run one DDL statement; [`execute_statement`] has refused it inside a
 /// transaction.
-async fn execute_ddl(client: &mut GnitzClient, schema_name: &str, stmt: &Statement) -> Result<(), GnitzSqlError> {
+async fn execute_ddl(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    stmt: &Statement,
+    text: StatementText<'_>,
+) -> Result<(), GnitzSqlError> {
     match stmt {
         Statement::CreateTable(create) => {
             match planned(client, schema_name, false, false, |cat| {
@@ -300,19 +309,40 @@ async fn execute_ddl(client: &mut GnitzClient, schema_name: &str, stmt: &Stateme
             ddl::execute_drop(client, schema_name, object_type, names, *if_exists).await
         }
         Statement::CreateView(cv) => {
-            match planned(client, schema_name, false, false, |cat| ddl::plan_create_view(cv, cat))
-                .await
-                .0?
+            match planned(client, schema_name, false, false, |cat| {
+                ddl::plan_create_view(cv, text, cat)
+            })
+            .await
+            .0?
             {
                 Some(chain) => ddl::execute_view_chain(client, chain).await,
                 None => Ok(()),
             }
         }
         Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci).await,
+        Statement::CreateSchema {
+            schema_name: name,
+            if_not_exists,
+            with,
+            options,
+            default_collate_spec,
+            clone,
+        } => {
+            ddl::execute_create_schema(
+                client,
+                name,
+                *if_not_exists,
+                with.as_deref(),
+                options.as_deref(),
+                default_collate_spec.as_ref(),
+                clone.as_ref(),
+            )
+            .await
+        }
         Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a).await,
         Statement::AlterView { name, query, columns, with_options } => {
             let chain = planned(client, schema_name, false, false, |cat| {
-                ddl::plan_alter_view(name, columns, query, with_options, cat)
+                ddl::plan_alter_view(name, columns, query, with_options, text, cat)
             })
             .await
             .0?;
@@ -326,6 +356,7 @@ async fn execute_ddl(client: &mut GnitzClient, schema_name: &str, stmt: &Stateme
 fn ddl_tag(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::CreateSchema { .. } => "CREATE SCHEMA",
         Statement::CreateView(_) => "CREATE VIEW",
         Statement::CreateIndex(_) => "CREATE INDEX",
         Statement::AlterTable(_) => "ALTER TABLE",

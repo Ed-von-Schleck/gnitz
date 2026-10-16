@@ -459,3 +459,75 @@ fn bounded_view_eligibility_is_the_engines() {
         db.exec("DROP VIEW b");
     }
 }
+
+// ── Column alias lists on a table ────────────────────────────────────────────
+
+/// `FROM t AS x(a, b, …)` renames t's columns positionally, in an ad-hoc read
+/// and a view body alike — a join's side and an EXISTS subquery's relation
+/// included — and the body reads them by the new names only.
+#[test]
+fn a_column_alias_list_renames_a_tables_columns() {
+    let mut db = Db::boot(4);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, v BIGINT NOT NULL);
+         CREATE TABLE u (id BIGINT PRIMARY KEY, g BIGINT NOT NULL);
+         INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+         INSERT INTO u VALUES (7, 20), (8, 30)",
+    );
+    assert_eq!(
+        db.rows("SELECT k, val FROM t AS x(k, grp, val) WHERE grp >= 20", &["k", "val"]),
+        [[2, 200, 1], [3, 300, 1]]
+    );
+    db.exec(
+        "CREATE VIEW renamed AS SELECT x.k, x.val FROM t AS x(k, grp, val) WHERE x.grp > 10;
+         CREATE VIEW joined AS SELECT a.k, b.uid FROM t a(k, grp, val) JOIN u AS b(uid, ug) ON a.grp = b.ug;
+         CREATE VIEW matched AS SELECT k FROM t AS o(k, grp, val)
+             WHERE EXISTS (SELECT 1 FROM u AS i(uid, ug) WHERE i.ug = o.grp)",
+    );
+    assert_eq!(db.scan("renamed", &["k", "val"]), [[2, 200, 1], [3, 300, 1]]);
+    assert_eq!(db.scan("joined", &["k", "uid"]), [[2, 7, 1], [3, 8, 1]]);
+    assert_eq!(db.scan("matched", &["k"]), [[2, 1], [3, 1]]);
+    db.exec("INSERT INTO t VALUES (4, 30, 400)");
+    assert_eq!(db.scan("joined", &["k", "uid"]), [[2, 7, 1], [3, 8, 1], [4, 8, 1]]);
+
+    db.refuses("SELECT g FROM t AS x(k, grp, val)", Rejected, "not found");
+    db.refuses("SELECT * FROM t AS x(k, grp)", Rejected, "defines 2 column aliases");
+    db.refuses(
+        "DELETE FROM t AS x(k, grp, val) WHERE k = 1",
+        Rejected,
+        "positional column aliases",
+    );
+}
+
+/// `CREATE SCHEMA` and a BLOB column are plain SQL.
+#[test]
+fn create_schema_and_a_blob_column_are_sql() {
+    let mut db = Db::boot(2);
+    db.exec("CREATE SCHEMA archive; CREATE SCHEMA IF NOT EXISTS archive");
+    db.refuses("CREATE SCHEMA archive", Refused(Error), "");
+    db.refuses("CREATE SCHEMA a.b", Rejected, "one identifier");
+    db.exec("CREATE TABLE archive.files (id BIGINT PRIMARY KEY, body BLOB, note BYTEA NOT NULL)");
+    let files = block_on(db.client.resolve_relation(&rel("archive", "files"))).unwrap();
+    let types: Vec<TypeCode> = files.schema.columns().iter().map(|c| c.ty.tc).collect();
+    assert_eq!(types, [TypeCode::I64, TypeCode::Blob, TypeCode::Blob]);
+}
+
+/// The definition a view records is how its body was spelled; restating the
+/// same body another way keeps the view, its id and its dependents.
+#[test]
+fn another_spelling_of_a_views_body_keeps_the_view() {
+    let mut db = Db::boot(2);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL);
+         CREATE VIEW v AS SELECT id, g FROM t;
+         CREATE VIEW w AS SELECT id FROM v",
+    );
+    let before = db.rel("v").tid;
+    db.exec("CREATE OR REPLACE VIEW v AS select  x.id ,\n x.g from t x");
+    assert_eq!(db.rel("v").tid, before);
+    db.refuses(
+        "CREATE OR REPLACE VIEW v AS SELECT id, g FROM t WHERE g > 1",
+        Refused(Error),
+        "dependent",
+    );
+}

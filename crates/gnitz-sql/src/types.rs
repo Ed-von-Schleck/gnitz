@@ -16,6 +16,7 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
         DataType::Float(_) => TypeCode::F32,
         DataType::Double(_) | DataType::DoublePrecision | DataType::Real => TypeCode::F64,
         DataType::Varchar(_) | DataType::Text | DataType::Char(_) => TypeCode::String,
+        DataType::Blob(None) | DataType::Bytea => TypeCode::Blob,
         DataType::UInt128 | DataType::UHugeInt => TypeCode::U128,
         DataType::Int128 | DataType::HugeInt => TypeCode::I128,
         DataType::Uuid => TypeCode::UUID,
@@ -115,7 +116,13 @@ fn serial_type(dt: &DataType) -> Option<TypeCode> {
         .map(|&(_, tc)| tc)
 }
 
-/// The SERIAL family, by spelling: each its signed integer.
+/// The SERIAL spelling a column of integer type `tc` is declared by.
+pub(crate) fn serial_type_name(tc: TypeCode) -> Option<&'static str> {
+    SERIAL_TYPES.iter().find(|&&(_, t)| t == tc).map(|&(n, _)| n)
+}
+
+/// The SERIAL family, by spelling: each its signed integer, the spelling a
+/// column is written back by first.
 const SERIAL_TYPES: &[(&str, TypeCode)] = &[
     ("SMALLSERIAL", TypeCode::I16),
     ("SERIAL2", TypeCode::I16),
@@ -149,6 +156,8 @@ pub(crate) const TYPE_NAMES: &[&str] = &[
     "VARCHAR",
     "TEXT",
     "CHAR",
+    "BLOB",
+    "BYTEA",
     "UUID",
     "BOOLEAN",
     "BOOL",

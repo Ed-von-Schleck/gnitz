@@ -99,6 +99,9 @@ fn route_read(read: &Read<'_>, rel: &Relation, nw: usize) -> ReadRoute {
             },
         ),
         Read::ScanSpec { spec, .. } | Read::Delta { spec, .. } => (gnitz_wire::peek_bound(spec), rel.placement()),
+        Read::Pin { .. } | Read::Unpin { .. } | Read::SnapshotPage { .. } | Read::Backup { .. } => {
+            unreachable!("a read of no live relation's rows is routed by ScanCut::read_all")
+        }
     };
     let whole = |set| ReadRoute { set, per_worker: None };
     let owner = |k: &[u8]| placement.owner(k, nw).expect("a key-routed placement owns every key");
@@ -179,6 +182,16 @@ impl<'d> ScanCut<'d> {
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         self.excl
             .write(&DirectGroup { data, targets: lease.targets(), ..group })?;
+        self.scans.push(lease);
+        Ok(())
+    }
+
+    /// `read` written to every worker, under a reply id leased for them: a read
+    /// no live relation's placement routes.
+    pub(crate) fn read_all(&mut self, read: Read<'_>) -> Result<(), WireFault> {
+        let group = DirectGroup::new(read);
+        let lease = self.disp.reactor.lease_train(WorkerSet::ALL, group.request.kind());
+        self.excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
         self.scans.push(lease);
         Ok(())
     }

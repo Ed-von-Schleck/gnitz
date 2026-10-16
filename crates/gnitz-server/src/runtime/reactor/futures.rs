@@ -270,6 +270,13 @@ impl TrainLease {
         Ok(None)
     }
 
+    /// Wait out every worker's train, for a request answered with no rows; the
+    /// first fault.
+    pub(crate) async fn finish(&self) -> Result<(), WireFault> {
+        while self.next().await?.is_some() {}
+        Ok(())
+    }
+
     /// Worker `w`'s next routed slot.
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {

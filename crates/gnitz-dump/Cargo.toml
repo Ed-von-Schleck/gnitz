@@ -1,0 +1,31 @@
+[package]
+name = "gnitz-dump"
+description = "Logical dump and restore for the gnitz database: schema as SQL, rows as Parquet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+integration = []
+
+[dependencies]
+gnitz-core.workspace = true
+gnitz-expr.workspace = true
+gnitz-wire.workspace = true
+gnitz-sql = { path = "../gnitz-sql" }
+# The low-level column API alone: no Arrow, and zstd the one codec a dump writes.
+parquet = { version = "60", default-features = false, features = ["zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+gnitz-test-harness = { path = "../gnitz-test-harness" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

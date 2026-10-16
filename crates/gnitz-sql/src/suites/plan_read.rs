@@ -712,14 +712,13 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT *, * FROM t WHERE v > 0", "duplicate column name"),
         ("SELECT DISTINCT *, * FROM t", "duplicate column name"),
         ("SELECT t.*, t.* FROM t", "duplicate column name"),
-        // `AS d(x, y)` renames the columns positionally; honoring only the
-        // relation alias would answer under `t`'s own column names.
-        ("SELECT * FROM t AS d(x, y)", "positional column aliases"),
-        // The FROM name is checked before the clause gate, on either sink.
+        // `AS d(…)` renames every visible column, in order, or none.
         (
-            "SELECT DISTINCT ON (v) * FROM t AS d(x, y)",
-            "positional column aliases",
+            "SELECT * FROM t AS d(x, y)",
+            "table 'd' defines 2 column aliases but body returns 3 columns",
         ),
+        ("SELECT * FROM t AS d(x, x, y)", "duplicate"),
+        ("SELECT * FROM t AS d(x BIGINT, y, z)", "a type on a column alias"),
         // ORDER BY parses before the SELECT list binds, on every surface.
         ("SELECT nope FROM t ORDER BY 1.5", "ORDER BY position"),
         // The reply is numbered after the WHERE compiles, so a statement wrong in both

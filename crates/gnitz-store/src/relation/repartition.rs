@@ -109,7 +109,10 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
         slot: Slot::new(0, source),
     }
     .dir(rel_dir);
-    cluster_children(launched).try_for_each(|target| link_store(&source_dir, &target.dir(rel_dir)))
+    cluster_children(launched).try_for_each(|target| match link_store(&source_dir, &target.dir(rel_dir))? {
+        true => Ok(()),
+        false => Err(StorageError::Io(libc::ENOENT)),
+    })
 }
 
 /// Key-routed relations: scatter the merged source set to its owners, cutting

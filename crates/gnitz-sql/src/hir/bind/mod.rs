@@ -19,8 +19,8 @@ use super::{
     SubqueryKind, SubqueryRef,
 };
 use crate::ast_util::{
-    alias_column_names, body_is_grouped, expand_wildcard_item, extract_table_name_and_alias, has_visible_column,
-    is_agg_call, peel_nested, scalar_projection_item, select_is_distinct, single_part_ident,
+    alias_column_names, body_is_grouped, expand_wildcard_item, extract_table_ref, has_visible_column, is_agg_call,
+    peel_nested, scalar_projection_item, select_is_distinct, single_part_ident, TableRef,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::{
@@ -34,7 +34,7 @@ use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_o
 use crate::validate::{
     cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses,
 };
-use gnitz_core::{RelDescriptor, RelName, Schema};
+use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColType, ColumnDef};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
@@ -42,6 +42,7 @@ use sqlparser::ast::{
     Expr, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
     SetQuantifier, TableFactor,
 };
+use sqlparser::tokenizer::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -123,8 +124,8 @@ pub(crate) struct BindCx<'c> {
     pub(crate) ids: &'c ColIdGen,
     pub(crate) view: ViewBody,
     surface: Surface,
-    /// Each catalog relation read, under the name it was written by.
-    pub(crate) names: Vec<(u64, String)>,
+    /// Each place the text names a catalog relation, in bind order.
+    pub(crate) refs: Vec<BoundRef>,
     /// The CTEs bound so far, by canonical (ASCII-lowercase) name.
     ctes: HashMap<String, Cte>,
 }
@@ -136,7 +137,7 @@ impl<'c> BindCx<'c> {
             ids,
             view,
             surface: Surface::ViewBody,
-            names: Vec::new(),
+            refs: Vec::new(),
             ctes: HashMap::new(),
         }
     }
@@ -151,9 +152,45 @@ impl<'c> BindCx<'c> {
     }
 }
 
+/// One place a body's text names a catalog relation: what a stored view
+/// definition needs to write the body again under the names the catalog holds
+/// later.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundRef {
+    pub(crate) tid: u64,
+    /// The relation's name as written.
+    pub(crate) name: String,
+    /// Where the relation name lies in the statement text.
+    pub(crate) name_span: Span,
+    /// Where the declared alias's name lies; `None` without one.
+    pub(crate) alias_span: Option<Span>,
+    /// The name the body reads the relation by.
+    pub(crate) alias: String,
+    /// The relation's visible column names, which the body reads it by; `None`
+    /// where the reference renames them with a column alias list of its own.
+    pub(crate) columns: Option<Vec<String>>,
+}
+
+/// The subtree a relation name reads, under the column aliases the reference
+/// declares: the CTE it names, else the catalog relation. Every relation a body
+/// names in FROM resolves here.
+fn resolve_table_ref(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
+    let rel = resolve_relation(cx, tref)?;
+    let mut cols = rel.cols();
+    if !tref.columns.is_empty() {
+        let ctx = format!("table '{}'", tref.alias);
+        apply_positional_aliases(
+            alias_column_names(tref.columns, &ctx)?,
+            cols.iter_mut().map(|c| &mut c.def),
+            &ctx,
+        )?;
+    }
+    Ok((rel, cols))
+}
+
 /// The subtree a relation name reads: the CTE it names, else the catalog relation.
-/// Every relation a view body names resolves here.
-fn resolve_relation(cx: &mut BindCx<'_>, name: &RelName) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn resolve_relation(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let name = &tref.name;
     // A CTE lives in no schema.
     let cte = (!name.is_qualified()).then(|| cx.ctes.get(name.name()));
     if let Some(cte) = cte.flatten() {
@@ -172,7 +209,18 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &RelName) -> Result<Rc<RelExpr>, 
         Surface::ViewBody => (ClassWant::ViewSource, cx.view.stmt),
     };
     require_class(&rel, name, want, op)?;
-    cx.names.push((rel.tid, name.to_string()));
+    let columns = tref
+        .columns
+        .is_empty()
+        .then(|| rel.schema.visible_columns().map(|(_, c)| c.name.clone()).collect());
+    cx.refs.push(BoundRef {
+        tid: rel.tid,
+        name: name.to_string(),
+        name_span: tref.name_span,
+        alias_span: tref.alias_span,
+        alias: tref.alias.clone(),
+        columns,
+    });
     Ok(RelExpr::get(cx.ids, rel))
 }
 
@@ -320,10 +368,9 @@ fn resolve_table_factor(
         )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
-    let (name, alias) = extract_table_name_and_alias(factor, cx.cat.schema_name(), cx.view.stmt)?;
-    let rel = resolve_relation(cx, &name)?;
-    let cols = rel.cols();
-    Ok((rel, alias, cols))
+    let tref = extract_table_ref(factor, cx.cat.schema_name(), cx.view.stmt)?;
+    let (rel, cols) = resolve_table_ref(cx, &tref)?;
+    Ok((rel, tref.alias, cols))
 }
 
 /// Bind one single-SELECT body to `Project(Filter?(source))`, where `source` is

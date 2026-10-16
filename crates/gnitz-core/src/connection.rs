@@ -49,6 +49,15 @@ pub struct ScanReply {
     pub lsn: Option<u64>,
 }
 
+/// One page of a snapshot read.
+#[derive(Debug)]
+pub struct SnapshotPage {
+    /// Each train's rows in key order, one train after another.
+    pub batch: ZSetBatch,
+    /// Where each train's rows end in `batch`.
+    pub worker_ends: Vec<usize>,
+}
+
 /// One relation, as a RESOLVE describes it.
 #[derive(Debug)]
 pub struct RelDescriptor {
@@ -147,6 +156,12 @@ pub enum Request<'a> {
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
     },
+    /// SNAPSHOT_OPEN; the ACK names the snapshot.
+    SnapshotOpen,
+    /// SNAPSHOT_CLOSE of this snapshot.
+    SnapshotClose(u64),
+    /// BACKUP into the backup directory's entry of this name.
+    Backup(&'a str),
 }
 
 impl Request<'_> {
@@ -191,6 +206,18 @@ impl Request<'_> {
                     target.tid,
                 )
             }
+            Request::SnapshotOpen => {
+                let hdr = ControlHeader::naming(ClientVerb::SnapshotOpen, Target::from(0), 0);
+                (encode_frame(hdr, &[], None, None), 0)
+            }
+            Request::SnapshotClose(id) => {
+                let hdr = ControlHeader::naming(ClientVerb::SnapshotClose, Target::from(0), id);
+                (encode_frame(hdr, &[], None, None), 0)
+            }
+            Request::Backup(name) => {
+                let hdr = ControlHeader::naming(ClientVerb::Backup, Target::from(0), 0);
+                (encode_frame(hdr, name.as_bytes(), None, None), 0)
+            }
         })
     }
 }
@@ -220,6 +247,15 @@ enum Slot {
         /// The subscription id the view is kept as from that cursor.
         keep: Option<u64>,
         to: Promise<(ScanReply, DeltaCursor)>,
+    },
+    /// SNAPSHOT_PAGE: a scan's trains, with where each worker's ends.
+    Page {
+        tid: u64,
+        reply_schema: Arc<Schema>,
+        data: Option<ZSetBatch>,
+        /// The row count at the end of each worker's train so far.
+        worker_ends: Vec<usize>,
+        to: Promise<SnapshotPage>,
     },
     /// One train per relation, each decoded under the schema paired with it.
     /// The train in progress is `rels[replies.len()]`.
@@ -545,6 +581,34 @@ impl Session {
             to,
         };
         self.enqueue(encode_frame(hdr, &spec.encode(), None, None), slot);
+        sent
+    }
+
+    /// SNAPSHOT_PAGE: the first `limit` rows of `tid` as snapshot `snapshot`
+    /// holds it, after `after`, replied in `reply_schema`'s layout.
+    pub fn submit_snapshot_page(
+        &mut self,
+        snapshot: u64,
+        tid: u64,
+        after: Option<&[u8]>,
+        limit: u64,
+        reply_schema: &Arc<Schema>,
+    ) -> Sent<SnapshotPage> {
+        let hdr = ControlHeader::naming(ClientVerb::SnapshotPage, Target::from(tid), snapshot);
+        let request = gnitz_wire::snapshot::PageRequest {
+            layout: reply_schema.layout().layout_digest(),
+            limit,
+            after: after.map(<[u8]>::to_vec),
+        };
+        let (to, sent) = promise();
+        let slot = Slot::Page {
+            tid,
+            reply_schema: Arc::clone(reply_schema),
+            data: None,
+            worker_ends: Vec::new(),
+            to,
+        };
+        self.enqueue(encode_frame(hdr, &request.encode(), None, None), slot);
         sent
     }
 
@@ -880,7 +944,9 @@ impl Slot {
         // so a frame naming another would decode under the wrong schema
         // silently; make it loud.
         let want = match &*self {
-            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } => Some(*tid),
+            Slot::Ack { tid, .. } | Slot::Scan { tid, .. } | Slot::Delta { tid, .. } | Slot::Page { tid, .. } => {
+                Some(*tid)
+            }
             Slot::Sync { .. } => Some(0),
             Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
@@ -934,9 +1000,12 @@ impl Slot {
                     Taker::Nobody => {}
                 }
             }
-            (Slot::Scan { reply_schema, data, .. } | Slot::Delta { reply_schema, data, .. }, Some(r)) => {
-                decode(data, reply_schema, &buf[r])?
-            }
+            (
+                Slot::Scan { reply_schema, data, .. }
+                | Slot::Delta { reply_schema, data, .. }
+                | Slot::Page { reply_schema, data, .. },
+                Some(r),
+            ) => decode(data, reply_schema, &buf[r])?,
             (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
             (Slot::Ack { .. } | Slot::Resolve { .. } | Slot::Sync { .. }, Some(_)) => {
                 return Err(ProtocolError::DecodeError(
@@ -945,6 +1014,11 @@ impl Slot {
             }
         }
 
+        if let Slot::Page { data, worker_ends, .. } = &mut *self {
+            if ctrl.hdr.flags.scan_last {
+                worker_ends.push(data.as_ref().map_or(0, ZSetBatch::len));
+            }
+        }
         if ctrl.hdr.flags.continuation {
             return Ok(false);
         }
@@ -963,6 +1037,11 @@ impl Slot {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
             Slot::Scan { reply_schema, data, to, .. } => to.fulfil(Ok(scan_reply(reply_schema, data))),
+            Slot::Page { reply_schema, data, worker_ends, to, .. } => {
+                let batch = scan_reply(reply_schema, data).batch;
+                let worker_ends = std::mem::take(worker_ends);
+                to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
+            }
             Slot::Delta { reply_schema, data, keep, to, .. } => {
                 let cursor = cursor()?;
                 // Held before the reader takes the reply: a train pushed for
@@ -1004,6 +1083,7 @@ impl Slot {
             Slot::Ack { to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { to } => to.fulfil(Err(why)),
             Slot::Scan { to, .. } => to.fulfil(Err(why)),
+            Slot::Page { to, .. } => to.fulfil(Err(why)),
             Slot::Delta { to, .. } => to.fulfil(Err(why)),
             Slot::Multi { to, .. } => to.fulfil(Err(why)),
             Slot::DeltaPoll { views, at, poll, first, blocks } => {

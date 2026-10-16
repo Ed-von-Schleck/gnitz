@@ -19,6 +19,7 @@
 
 mod delta_read;
 mod key_spans;
+mod pinned;
 mod scan_spec;
 mod store_io;
 

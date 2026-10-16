@@ -43,6 +43,8 @@ fn each_accepted_spelling_declares_its_type() {
         ("VARCHAR", t(String)),
         ("TEXT", t(String)),
         ("CHAR", t(String)),
+        ("BLOB", t(Blob)),
+        ("BYTEA", t(Blob)),
         ("UUID", t(UUID)),
         ("BOOLEAN", t(Bool)),
         ("BOOL", t(Bool)),
@@ -81,6 +83,16 @@ fn each_accepted_spelling_declares_its_type() {
             "{decl}"
         );
     }
+    // Written back by a spelling that declares the same column.
+    for tc in [I16, I32, I64] {
+        let name = serial_type_name(tc).unwrap();
+        assert_eq!(
+            declared(name).unwrap(),
+            (ColumnDef::new("c", tc, false), true),
+            "{name}"
+        );
+    }
+    assert_eq!(serial_type_name(U64), None);
 }
 
 /// Every refused spelling names what is wrong with it.
@@ -100,19 +112,20 @@ fn each_refused_spelling_names_its_reason() {
         ("HYPERLOGLOG", "unsupported SQL type: HYPERLOGLOG"),
         // A modifier makes it no SERIAL spelling, so it falls to the type map.
         ("SERIAL(5)", "unsupported SQL type: SERIAL(5)"),
+        // A BLOB is unbounded; a length would have to be enforced or ignored.
+        ("BLOB(16)", "unsupported SQL type: BLOB(16)"),
     ] {
         let m = rejected(declared(decl));
         assert!(m.contains(needle), "{decl}: {m:?} does not name {needle:?}");
     }
 }
 
-/// Every declarable type's SQL spelling declares that type again. No column
-/// declaration produces a BLOB, though a system family holds one.
+/// Every type's SQL spelling declares that type again.
 #[test]
 fn sql_type_name_round_trips() {
     let types = TypeCode::ALL
         .iter()
-        .filter(|&&tc| !matches!(tc, TypeCode::Decimal | TypeCode::Blob))
+        .filter(|&&tc| tc != TypeCode::Decimal)
         .map(|&tc| ColType::of(tc))
         .chain([
             ColType::decimal(0),

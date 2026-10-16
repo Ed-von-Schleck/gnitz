@@ -14,8 +14,10 @@ mod protocol;
 mod pushed;
 pub mod recording;
 mod rel_name;
+mod snapshot;
 #[cfg(test)]
 mod test_support;
+mod view_def;
 
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{
@@ -23,8 +25,8 @@ pub use client::{
     Host, InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
-    promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, Target, MAX_IN_FLIGHT,
-    MAX_QUEUED_BYTES,
+    promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, SnapshotPage, Target,
+    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
 pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
@@ -38,3 +40,5 @@ pub use protocol::types::{
 pub use protocol::wal_block::append_own_regions;
 pub use pushed::{Pushed, Synced};
 pub use rel_name::RelName;
+pub use snapshot::DEFAULT_PAGE_ROWS;
+pub use view_def::{RelationRef, ViewDefinition};

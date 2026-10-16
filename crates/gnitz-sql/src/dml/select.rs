@@ -23,7 +23,7 @@
 //! `dml::explain` formats the same plan instead of dispatching it.
 
 use crate::agg::ground_partial_schema;
-use crate::ast_util::{body_is_grouped, classify_from, extract_table_name_and_alias, select_is_distinct, FromShape};
+use crate::ast_util::{body_is_grouped, classify_from, extract_table_ref, select_is_distinct, FromShape};
 use crate::bind::Catalog;
 use crate::dml::plan::{bound_and_predicate, walks_in_pk_order};
 use crate::error::{derivation, reject_if, GnitzSqlError};
@@ -239,7 +239,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         }
         FromShape::SinglePlainRelation(factor) => {
             // The FROM name is checked before the clause gate.
-            extract_table_name_and_alias(factor, cat.schema_name(), "FROM")?;
+            extract_table_ref(factor, cat.schema_name(), "FROM")?;
             reject_unhonored_select_clauses(select, HonoredClauses::for_body(distinct), ctx)?;
         }
         FromShape::Derived(construct) => return Err(derivation(construct)),

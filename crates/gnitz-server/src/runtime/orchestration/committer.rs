@@ -49,6 +49,16 @@ pub enum CommitRequest {
     },
     /// Wake the committer so it re-tests `checkpoint_warranted`.
     Reclaim,
+    /// Commit what is queued ahead, checkpoint, and copy the data directory
+    /// into `dir` (see `BackupJob`).
+    Backup(BackupJob),
+}
+
+/// A backup the committer runs: the full checkpoint sequence, then every
+/// published store put into `dir`, with nothing committed in between.
+pub struct BackupJob {
+    pub dir: String,
+    pub done: oneshot::Sender<Result<(), WireFault>>,
 }
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
@@ -102,29 +112,40 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
             run_checkpoint_sequence(&shared).await;
         }
 
-        let PendingBatch { writes, barrier } = batch;
+        let PendingBatch { writes, end } = batch;
         if !writes.is_empty() {
             commit_writes(&shared, writes).await;
         }
 
-        if let Some((_, b)) = barrier {
-            b.send(());
+        match end {
+            None => {}
+            Some(BatchEnd::Barrier(_, done)) => done.send(()),
+            Some(BatchEnd::Backup(BackupJob { dir, done })) => {
+                run_checkpoint_sequence(&shared).await;
+                done.send(shared.disp().backup_round(&dir).await);
+            }
         }
     }
 }
 
 /// Whether this batch warrants the full checkpoint sequence.
 fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
-    matches!(batch.barrier, Some((BarrierKind::Shutdown, _))) || shared.disp().sal().needs_checkpoint()
+    matches!(batch.end, Some(BatchEnd::Barrier(BarrierKind::Shutdown, _))) || shared.disp().sal().needs_checkpoint()
 }
 
 /// One committer batch: the writes to commit together.
 #[derive(Default)]
 struct PendingBatch {
     writes: Vec<PendingWrite>,
-    /// The barrier that ended this batch, if one did: signalled once the batch —
-    /// and any checkpoint sequence — has committed.
-    barrier: Option<(BarrierKind, oneshot::Sender<()>)>,
+    /// The request that ended this batch, if one did.
+    end: Option<BatchEnd>,
+}
+
+/// A request that ends a committer batch, run once the batch has committed.
+enum BatchEnd {
+    /// Signalled once the batch — and any checkpoint sequence — has committed.
+    Barrier(BarrierKind, oneshot::Sender<()>),
+    Backup(BackupJob),
 }
 
 /// Sort `first` into the batch, then keep draining requests already queued
@@ -148,7 +169,12 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
                 b.writes.push(w);
             }
             CommitRequest::Barrier { kind, done } => {
-                b.barrier = Some((kind, done));
+                b.end = Some(BatchEnd::Barrier(kind, done));
+                break;
+            }
+            // Ends the batch as a barrier does, and for the same reason.
+            CommitRequest::Backup(job) => {
+                b.end = Some(BatchEnd::Backup(job));
                 break;
             }
             CommitRequest::Reclaim => {}
@@ -157,6 +183,10 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     }
     b
 }
+
+/// Checkpoint sequences that waited for a DDL to release the tick gate. Its one
+/// reader is the `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` seam.
+pub(crate) static CHECKPOINTS_BEHIND_DDL: AtomicU64 = AtomicU64::new(0);
 
 /// The full steady-state checkpoint sequence: base round → drain → tick gate →
 /// ephemeral round. The base round advances the generation when it has pushes
@@ -168,6 +198,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // A checkpoint sequence starts after a DDL that holds the tick gate.
     if shared.tick_gate.is_write_held() {
+        CHECKPOINTS_BEHIND_DDL.fetch_add(1, Ordering::Relaxed);
         drop(shared.tick_gate.read().await);
     }
     shared
@@ -180,10 +211,6 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // pending-tick counts cannot grow.
     // Stamping after a failed drain would make the views' missing deltas
     // generation-valid. Unstamped, they stay behind the generation the base
-/// Checkpoint sequences that waited for a DDL to release the tick gate. Its one
-/// reader is the `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` seam.
-pub(crate) static CHECKPOINTS_BEHIND_DDL: AtomicU64 = AtomicU64::new(0);
-
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the Shutdown barrier.
     if let Err(e) = request_drain(shared, Instant::now()).await {
@@ -194,7 +221,6 @@ pub(crate) static CHECKPOINTS_BEHIND_DDL: AtomicU64 = AtomicU64::new(0);
     // Step 3 — EPHEMERAL ROUND, with no tick running.
     let _park = shared.tick_gate.write().await;
     shared
-        CHECKPOINTS_BEHIND_DDL.fetch_add(1, Ordering::Relaxed);
         .disp()
         .checkpoint_ephemeral()
         .await

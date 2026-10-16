@@ -73,6 +73,8 @@ struct Session {
     round: u64,
     /// The tables a push has filled.
     filled: HashSet<u64>,
+    /// The last snapshot id handed out.
+    snapshots: u64,
 }
 
 impl Session {
@@ -81,6 +83,7 @@ impl Session {
             cat: CatalogEngine::open(path, 1).expect("a fresh catalog opens"),
             round: 1,
             filled: HashSet::new(),
+            snapshots: 0,
         }
     }
 
@@ -127,8 +130,27 @@ impl Session {
                 }
             }
             ClientVerb::AllocIds => drop(self.cat.allocate_ids(ctrl.hdr.arg0)),
+            // One process is both the master and its worker, so it pins both.
+            ClientVerb::SnapshotOpen => {
+                self.snapshots += 1;
+                let keep = |k| matches!(k, RelationKind::BaseTable | RelationKind::SystemCatalog);
+                self.cat
+                    .registry
+                    .pin(self.snapshots, keep)
+                    .expect("a fresh snapshot id pins");
+            }
+            ClientVerb::SnapshotPage => {
+                if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()]) {
+                    drop(self.cat.registry.pinned_page(ctrl.hdr.arg0, ctrl.hdr.target_id, &page));
+                }
+            }
+            ClientVerb::SnapshotClose => drop(self.cat.registry.unpin(ctrl.hdr.arg0)),
             // Each reads, or moves, nothing a circuit runs over.
-            ClientVerb::Resolve | ClientVerb::AllocSerialRange | ClientVerb::DeltaPoll | ClientVerb::SyncPushed => {}
+            ClientVerb::Resolve
+            | ClientVerb::AllocSerialRange
+            | ClientVerb::DeltaPoll
+            | ClientVerb::SyncPushed
+            | ClientVerb::Backup => {}
         }
     }
 

@@ -39,6 +39,7 @@ fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
 /// (the user-named view) reads `g`.
 fn chain(base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
     ViewBundle {
+        definition: None,
         segments: vec![segment(base_tid, schema), segment(gnitz_core::segment_id(0), schema)],
         view: segment(gnitz_core::segment_id(1), schema),
     }
@@ -151,6 +152,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A segment naming a later segment scans a relation no older than itself.
     let forward = ViewBundle {
+        definition: None,
         segments: vec![segment(gnitz_core::segment_id(1), &schema), segment(base_tid, &schema)],
         view: segment(gnitz_core::segment_id(0), &schema),
     };
@@ -187,6 +189,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
     let planned = ViewBundle {
+        definition: None,
         segments: (1..over).map(|_| segment(base_tid, &schema)).collect(),
         view: segment(base_tid, &schema),
     };
@@ -220,6 +223,7 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, base_tid, schema) = make_base(&mut client);
     let bundle = ViewBundle {
+        definition: None,
         segments: Vec::new(),
         view: segment(base_tid, &schema),
     };

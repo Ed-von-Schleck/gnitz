@@ -477,6 +477,7 @@ pub fn push_view_tab_row(
         owner_view_id,
         pk_repeats: 0,
         compress: 0,
+        definition: Default::default(),
     };
     row.write(bb, weight);
 }

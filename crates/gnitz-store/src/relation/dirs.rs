@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::PkColList;
 
-use super::RelationRegistry;
-use crate::storage::{manifest_path, read_at, read_intact, retire_store};
+use super::{RelationRegistry, Residency};
+use crate::storage::{link_store, manifest_path, read_at, read_intact, retire_store};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::StorageError;
 
@@ -290,6 +290,41 @@ impl RelationRegistry {
             .map_err(|e| format!("reclaim children of '{dir}': {e}"))?;
         }
         Ok(())
+    }
+
+    /// Put every store this process published into the data directory `dest`, at
+    /// the path it holds under this one: hard-linked where `dest` shares this
+    /// directory's filesystem, copied where it does not. A worker puts the
+    /// children of its own slot; the master, the system families' stores it
+    /// holds. A store's manifest is what was published, so a store with none is
+    /// left for the boot over `dest` to rebuild. Returns the stores put.
+    pub fn link_published_into(&self, dest: &str) -> Result<usize, String> {
+        let mut put = 0;
+        for &id in self.tables.keys() {
+            let (src_rel, dst_rel) = (relation_dir(&self.base_dir, id), relation_dir(dest, id));
+            let children = match self.residency {
+                Residency::Master => vec![String::new()],
+                Residency::Worker | Residency::Origin => subdir_names(&src_rel)
+                    .map_err(|e| format!("list '{src_rel}': {e}"))?
+                    .into_iter()
+                    .filter(|n| ChildAddr::parse(n).is_some_and(|c| c.slot == self.slot))
+                    .map(|n| format!("/{n}"))
+                    .collect(),
+            };
+            let mut linked_here = false;
+            for child in children {
+                let (src, dst) = (format!("{src_rel}{child}"), format!("{dst_rel}{child}"));
+                if link_store(&src, &dst).map_err(|e| format!("put '{src}' into '{dst}': {e}"))? {
+                    linked_here = true;
+                    put += 1;
+                }
+            }
+            if linked_here {
+                // A child's directory entry, durable in the relation's.
+                fsync_dir(&dst_rel).map_err(|e| format!("fsync '{dst_rel}': {e}"))?;
+            }
+        }
+        Ok(put)
     }
 }
 

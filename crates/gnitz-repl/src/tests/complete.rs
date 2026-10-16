@@ -21,6 +21,7 @@ fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
         pk: PkColList::from_slice(&[0]),
         indexes: vec![],
         reads: vec![],
+        definition: vec![],
     }
 }
 

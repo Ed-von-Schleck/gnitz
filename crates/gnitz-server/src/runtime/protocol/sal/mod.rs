@@ -352,6 +352,10 @@ gnitz_wire::wire_enum! {
         Tick = 10,
         ScanSpec = 11,
         DeltaRead = 12,
+        Pin = 13,
+        Unpin = 14,
+        SnapshotPage = 15,
+        Backup = 16,
     }
 }
 

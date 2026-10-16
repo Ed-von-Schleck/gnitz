@@ -16,9 +16,11 @@ use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalReques
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::RelationRegistry;
+use gnitz_store::relation::{RelationKind, RelationRegistry};
+use gnitz_wire::TypeCode;
 use gnitz_wire::{ReadBound, WireFault};
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // WorkerProcess
@@ -199,7 +201,32 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
             }
             Ok(Rows::Spans(Box::new(cat.registry.key_spans(tid, cols.as_slice())?)))
         }
+        // A worker holds no system family a snapshot reads: the master answers
+        // those from its own pin.
+        Read::Pin { snapshot } => {
+            cat.registry.pin(snapshot, |k| k == RelationKind::BaseTable)?;
+            Ok(no_rows())
+        }
+        Read::Unpin { snapshot } => {
+            cat.registry.unpin(snapshot);
+            Ok(no_rows())
+        }
+        Read::SnapshotPage { snapshot, tid, ref page } => {
+            let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
+            Ok(Rows::Own(cat.registry.pinned_page(snapshot, tid, &page)?))
+        }
+        Read::Backup { ref dir } => {
+            let dir = std::str::from_utf8(dir).map_err(|_| "a backup directory that is not UTF-8".to_string())?;
+            cat.registry.link_published_into(dir)?;
+            Ok(no_rows())
+        }
     }
+}
+
+/// The reply of a read that answers with no rows: one empty frame.
+fn no_rows() -> Rows {
+    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
+    Rows::Own(Batch::empty_with_schema(&schema))
 }
 
 #[cfg(test)]

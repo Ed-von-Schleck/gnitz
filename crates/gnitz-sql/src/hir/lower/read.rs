@@ -4,7 +4,7 @@
 //! flat query binds to, which the rows reply and [`super::fold`] then lower.
 
 use super::super::physical::{self, Frame, Slot};
-use super::super::{as_col, hircol_of, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::super::{as_col, hircol_of, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::fold::{distinct_fold, fold, FoldPieces};
 use crate::error::{derivation, GnitzSqlError};
 use crate::ir::{BExpr, BoundExpr};
@@ -144,12 +144,8 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
 }
 
 /// Lower a bound ad-hoc body; `placed` is the item each ORDER BY expression key
-/// sorts on, and `names` the catalog names the bind read.
-pub(crate) fn lower_read(
-    rel: &Rc<RelExpr>,
-    placed: Vec<usize>,
-    names: &[(u64, String)],
-) -> Result<AdhocRead, GnitzSqlError> {
+/// sorts on, and `refs` the catalog relations the bind read.
+pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef]) -> Result<AdhocRead, GnitzSqlError> {
     let internal = || GnitzSqlError::Internal("an ad-hoc read body is not a projection".into());
     let (lin, shape) = match rel.as_ref() {
         RelExpr::Distinct { input } => {
@@ -182,7 +178,7 @@ pub(crate) fn lower_read(
     };
     let (desc, source) = lin.source()?;
     let conjuncts = Frame::scan(desc, source).resolve_preds(&lin.preds)?;
-    let name = names.iter().find(|(tid, _)| *tid == desc.tid).map(|(_, n)| n.clone());
+    let name = refs.iter().find(|r| r.tid == desc.tid).map(|r| r.name.clone());
     Ok(AdhocRead::Relation {
         desc: Arc::clone(desc),
         name: name.ok_or_else(internal)?,

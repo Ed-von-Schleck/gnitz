@@ -146,6 +146,10 @@ sys_row! {
         pk_repeats: U64,
         /// A boolean ([`crate::bool_word`]): [`crate::ViewProps::compress`].
         compress: U64,
+        /// The user view's body as its planner recorded it, for a client to
+        /// write the view again; the engine stores it verbatim and reads none of
+        /// it. Empty for a chain segment, and for a view no planner wrote.
+        definition: Blob,
     }
 }
 
@@ -332,6 +336,9 @@ impl ViewTabRow<'_> {
         let owner = (self.owner_view_id != 0).then_some(self.owner_view_id);
         if owner.is_some() && props != crate::ViewProps::default() {
             return Err("is a chain segment carrying a WITH option".to_string());
+        }
+        if owner.is_some() && !self.definition.is_empty() {
+            return Err("is a chain segment carrying a definition".to_string());
         }
         Ok((pk, ViewParts { props, owner, pk_repeats }))
     }

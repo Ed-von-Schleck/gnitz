@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use gnitz_sql::sqlparser::keywords::Keyword;
-use gnitz_sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Whitespace, Word};
+use gnitz_sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace, Word};
 
 /// A token and the bytes of the input it covers.
 #[derive(Debug, Clone)]
@@ -20,42 +20,6 @@ impl Lexeme {
     }
 }
 
-/// Maps tokenizer `Location`s (1-based line, 1-based column in chars) to byte
-/// offsets of the input. The tokens' locations only move forward, so it walks
-/// the input once.
-struct Offsets<'a> {
-    src: &'a str,
-    /// The last location mapped, and its byte.
-    at: Location,
-    byte: usize,
-}
-
-impl<'a> Offsets<'a> {
-    fn new(src: &'a str) -> Self {
-        Offsets {
-            src,
-            at: Location { line: 1, column: 1 },
-            byte: 0,
-        }
-    }
-
-    fn byte(&mut self, loc: Location) -> usize {
-        let mut chars = self.src[self.byte..].char_indices();
-        let base = self.byte;
-        while (self.at.line, self.at.column) < (loc.line, loc.column) {
-            let Some((i, c)) = chars.next() else {
-                return self.src.len();
-            };
-            self.byte = base + i + c.len_utf8();
-            match c {
-                '\n' => self.at = Location { line: self.at.line + 1, column: 1 },
-                _ => self.at.column += 1,
-            }
-        }
-        self.byte
-    }
-}
-
 /// The lexemes of `src` as far as it tokenizes, and the byte the rest starts
 /// at: `src.len()` when it all does, else where an unterminated string or
 /// comment begins.
@@ -64,13 +28,15 @@ pub fn lex_prefix(src: &str) -> (Vec<Lexeme>, usize) {
     let whole = Tokenizer::new(&gnitz_sql::DIALECT, src)
         .tokenize_with_location_into_buf(&mut tokens)
         .is_ok();
-    let mut offsets = Offsets::new(src);
+    let mut offsets = gnitz_sql::Offsets::new(src);
+    // A span the tokenizer reports lies in `src`.
+    let mut byte = |loc| offsets.byte(loc).unwrap_or(src.len());
     let lexemes: Vec<Lexeme> = tokens
         .into_iter()
         .filter(|t| t.token != Token::EOF)
         .map(|TokenWithSpan { token, span }| Lexeme {
             token,
-            range: offsets.byte(span.start)..offsets.byte(span.end),
+            range: byte(span.start)..byte(span.end),
         })
         .collect();
     let end = match whole {

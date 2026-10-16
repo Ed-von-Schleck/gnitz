@@ -148,6 +148,7 @@ pub mod decimal;
 #[cfg(feature = "field-map")]
 pub mod fields;
 pub mod schema_block;
+pub mod snapshot;
 pub mod sys_rows;
 pub mod txn_frame;
 pub mod wal;

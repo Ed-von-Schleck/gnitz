@@ -74,6 +74,24 @@ impl ServerHandle {
         Self::start_inner(workers, extra_env, None, Auth::None)
     }
 
+    /// [`Self::start_n`] with `--backup-dir` naming [`Self::backups`], a
+    /// directory of its tmpdir.
+    pub fn start_with_backups(workers: usize) -> Self {
+        Self::boot(workers, &[], None, Auth::None, Boot::WithBackups)
+    }
+
+    /// [`Self::start_n`] over the existing data directory `data_dir` — a backup
+    /// entry, say — which outlives the handle.
+    pub fn start_on(data_dir: &Path, workers: usize) -> Self {
+        Self::boot(workers, &[], None, Auth::None, Boot::On(data_dir.to_path_buf()))
+    }
+
+    /// The `--backup-dir` of a [`Self::start_with_backups`] server.
+    pub fn backups(&self) -> PathBuf {
+        let dir = self.args.iter().find_map(|a| a.strip_prefix("--backup-dir="));
+        PathBuf::from(dir.expect("backups requires a start_with_backups server"))
+    }
+
     /// Start with a TLS listener on an ephemeral loopback port, reached through
     /// [`Self::tls_target`].
     pub fn start_tls(workers: usize) -> Self {
@@ -159,6 +177,10 @@ impl ServerHandle {
     /// A missing binary panics rather than skips: a suite passing without a
     /// server tests nothing.
     fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, auth: Auth) -> Self {
+        Self::boot(workers, extra_env, tls_listen, auth, Boot::Fresh)
+    }
+
+    fn boot(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, auth: Auth, how: Boot) -> Self {
         let bin = env::var("GNITZ_SERVER_BIN")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
         assert!(
@@ -169,9 +191,13 @@ impl ServerHandle {
             .prefix("gnitz_test_")
             .tempdir()
             .expect("failed to create tempdir");
+        let data_dir = match &how {
+            Boot::On(dir) => dir.clone(),
+            Boot::Fresh | Boot::WithBackups => tmpdir.path().join("data"),
+        };
         let paths = BootPaths {
             bin,
-            data_dir: tmpdir.path().join("data"),
+            data_dir,
             sock_path: tmpdir.path().join("gnitz.sock"),
             stderr_path: tmpdir.path().join("server_stderr.log"),
         };
@@ -179,6 +205,11 @@ impl ServerHandle {
 
         // Build the TLS argv, minting what the client authentication needs.
         let mut args: Vec<String> = Vec::new();
+        if let Boot::WithBackups = how {
+            let backups = tmpdir.path().join("backups");
+            fs::create_dir(&backups).expect("create the backup directory");
+            args.push(format!("--backup-dir={}", backups.display()));
+        }
         let mut mtls_client: Option<(PathBuf, PathBuf)> = None;
         let mut first_token = None;
         if let Some(addr) = tls_listen {
@@ -312,6 +343,16 @@ impl ServerHandle {
         drop(self);
         drop(tmpdir);
     }
+}
+
+/// What a boot starts from.
+enum Boot {
+    /// A data directory of its own, created by the boot.
+    Fresh,
+    /// [`Self::Fresh`], with a backup directory beside it.
+    WithBackups,
+    /// An existing data directory the handle does not own.
+    On(PathBuf),
 }
 
 /// How a TLS listener authenticates its clients, beyond what a loopback bind needs.

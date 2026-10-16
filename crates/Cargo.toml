@@ -9,6 +9,7 @@ members = [
     "gnitz-tokio",
     "gnitz-py",
     "gnitz-repl",
+    "gnitz-dump",
     "gnitz-store",
     "gnitz-zset",
     "gnitz-mirror",

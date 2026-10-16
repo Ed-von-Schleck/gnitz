@@ -19,7 +19,7 @@ mod physical;
 mod place;
 mod window;
 
-pub(crate) use bind::{bind_single_table, ViewBody};
+pub(crate) use bind::{bind_single_table, BoundRef, ViewBody};
 
 use crate::agg::AggFunc;
 use crate::ast_util::AggArg;
@@ -31,6 +31,15 @@ use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// A view body compiled: its bundle, every place its text names a catalog
+/// relation, and the names it gives its visible output columns before the
+/// statement's column list renames them.
+pub(crate) struct LoweredView {
+    pub(crate) bundle: ViewBundle,
+    pub(crate) refs: Vec<BoundRef>,
+    pub(crate) body_columns: Vec<String>,
+}
+
 /// The one compiler core: bind a query — its CTEs, then its body — to one
 /// `RelExpr` tree, and lower it to its view bundle. A CTE is a subtree of that
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
@@ -41,15 +50,21 @@ pub(crate) fn bind_and_lower<'a>(
     view: bind::ViewBody,
     bounded: bool,
     aliases: impl ExactSizeIterator<Item = &'a sqlparser::ast::Ident>,
-) -> Result<ViewBundle, GnitzSqlError> {
+) -> Result<LoweredView, GnitzSqlError> {
     let ids = ColIdGen::new();
     let stmt = view.stmt;
     let mut cx = bind::BindCx::new(cat, &ids, view);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
     let mut names = rel.cols();
+    let body_columns = names
+        .iter()
+        .filter(|c| !c.def.is_hidden)
+        .map(|c| c.def.name.clone())
+        .collect();
     crate::bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
-    lower::lower(rel, bounded, &names)
+    let bundle = lower::lower(rel, bounded, &names)?;
+    Ok(LoweredView { bundle, refs: cx.refs, body_columns })
 }
 
 pub(crate) use lower::fold::FoldPieces;
@@ -71,7 +86,7 @@ pub(crate) fn bind_adhoc_read(
     let mut cx = bind::BindCx::adhoc(cat, &ids, op);
     bind::bind_ctes(&mut cx, query)?;
     let (rel, placed) = bind::bind_select(&mut cx, select, order_exprs)?;
-    lower::read::lower_read(&rel, placed, &cx.names)
+    lower::read::lower_read(&rel, placed, &cx.refs)
 }
 
 /// An `INSERT … RETURNING` list as the reply items of a read of `desc`.

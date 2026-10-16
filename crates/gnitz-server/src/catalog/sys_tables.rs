@@ -401,7 +401,7 @@ impl SysFamily {
             SysFamily::Schema => {
                 for (schema_id, name) in [
                     (SYSTEM_SCHEMA_ID, gnitz_wire::SYSTEM_SCHEMA),
-                    (PUBLIC_SCHEMA_ID, "public"),
+                    (PUBLIC_SCHEMA_ID, gnitz_wire::PUBLIC_SCHEMA),
                 ] {
                     SchemaTabRow { schema_id, name: name.into() }.write(bb, 1);
                 }

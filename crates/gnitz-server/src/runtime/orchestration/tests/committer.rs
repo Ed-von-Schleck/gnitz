@@ -63,7 +63,11 @@ fn a_batch_ends_at_the_row_cap_or_a_barrier() {
         let first = rx.try_recv().expect("queued");
         let b = drain_ready_batch(&mut rx, first);
         let left = std::iter::from_fn(|| rx.try_recv()).count();
-        let got = (b.writes.len(), b.barrier.map(|(k, _)| k), left);
+        let barrier = match b.end {
+            Some(BatchEnd::Barrier(k, _)) => Some(k),
+            _ => None,
+        };
+        let got = (b.writes.len(), barrier, left);
         assert_eq!(got, want, "case {i}");
     }
 }

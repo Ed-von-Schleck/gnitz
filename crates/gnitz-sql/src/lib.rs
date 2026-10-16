@@ -21,6 +21,7 @@ mod hir;
 mod ir;
 mod project;
 mod rules;
+mod source;
 #[cfg(test)]
 mod suites;
 mod tail;
@@ -30,7 +31,12 @@ mod types;
 mod validate;
 
 pub use codec::literal::parse_bool;
+pub use ddl::render::{
+    create_index_statement, create_schema_statement, create_table_statement, create_view_statement, qualified_name,
+    view_body,
+};
 pub use error::GnitzSqlError;
+pub use source::Offsets;
 pub use sqlparser;
 pub use types::{sql_type_name, type_names};
 
@@ -75,12 +81,12 @@ pub enum SqlResult {
 /// (and its `EXPLAIN`) over a relation the client's local copy holds is answered
 /// off that copy; everything else runs on the connection.
 pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-    let stmts = Parser::parse_sql(&DIALECT, sql)?;
+    let stmts = source::split_statements(sql)?;
     let mut results = Vec::with_capacity(stmts.len());
     // One begun by an earlier call is the caller's to end.
     let mut began_here = false;
-    for stmt in &stmts {
-        match dispatch::execute_statement(client, schema_name, stmt).await {
+    for (stmt, text) in &stmts {
+        match dispatch::execute_statement(client, schema_name, stmt, *text).await {
             Ok(r) => {
                 began_here |= matches!(r, SqlResult::TransactionStarted);
                 results.push(r);
@@ -115,7 +121,8 @@ pub fn calendar_field_names() -> impl Iterator<Item = &'static str> {
 /// its alias, else its unqualified name. `None` for anything but a plain
 /// table reference the binder accepts.
 pub fn table_factor_name(tf: &TableFactor, schema: &str) -> Option<(RelName, String)> {
-    ast_util::extract_table_name_and_alias(tf, schema, "").ok()
+    let tref = ast_util::extract_table_ref(tf, schema, "").ok()?;
+    Some((tref.name, tref.alias))
 }
 
 /// The relation `name` names, unqualified ones in `schema`.

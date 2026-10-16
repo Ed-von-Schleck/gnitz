@@ -1,7 +1,8 @@
 //! Server executor: the process lifecycle, the `Shared` state, the request
 //! router and every read/push handler, and the reply-frame vocabulary. The
 //! catalog-zone write path is the child `ddl`; the delta feed's readers are
-//! the child `delta`.
+//! the child `delta`; a connection's snapshots are the child `snapshot`, and
+//! BACKUP the child `backup`.
 //!
 //! The master owns one `Reactor`: [`run`] spawns its tasks on it
 //! and races the signal loop against a worker's death.
@@ -13,8 +14,10 @@
 //! The one thing another task sends a client is a pushed train, and it only
 //! queues it: the connection's task ships it between two replies.
 
+mod backup;
 mod ddl;
 mod delta;
+mod snapshot;
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, OwnedFd};
@@ -27,6 +30,7 @@ use gnitz_foundation::fault::Seam;
 
 use self::ddl::{handle_ddl_txn, hold_tick_for_ddl, reserve_serial_range, TICK_HOLD_FOR_DDL};
 use self::delta::{handle_delta_poll, Feeds, Subscriptions};
+use self::snapshot::{HeldSnapshots, Snapshots};
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::TxnFamily;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingWrite};
@@ -220,6 +224,11 @@ pub struct Shared {
     /// (`GNITZ_PATIENT_TICK_GAP_MS`): a held sync is re-issued the moment it is
     /// answered, so unpaced it would tick per commit.
     patient_tick_gap: Duration,
+    /// Every connection's snapshots.
+    snapshots: Snapshots,
+    /// The directory BACKUP writes its entries into (`--backup-dir`); `None`
+    /// refuses BACKUP.
+    backup_dir: Option<String>,
 }
 
 /// The table locks one task holds.
@@ -413,7 +422,12 @@ impl Shared {
 
 /// Serve `listeners` until a shutdown signal or a worker's death; the process's
 /// exit code.
-pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>) -> i32 {
+pub fn run(
+    dispatcher: Rc<MasterDispatcher>,
+    data_dir: &str,
+    backup_dir: Option<String>,
+    listeners: Vec<ClientListener>,
+) -> i32 {
     let reactor = dispatcher.reactor().clone();
     let boot_seed = dispatcher.sal().watermark();
 
@@ -442,6 +456,8 @@ pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<Clie
             (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
         )),
         patient_tick_gap: Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10)),
+        snapshots: Snapshots::default(),
+        backup_dir,
     });
 
     // Catch SIGTERM/SIGINT so the signal loop can drive a final checkpoint
@@ -519,6 +535,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, served: Option<Rc<Se
     }
 
     let mut subs = Subscriptions::default();
+    let mut snapshots = HeldSnapshots::default();
     loop {
         // Ahead of the next request: a client that always has one ready is
         // still answered its sync.
@@ -532,12 +549,13 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, served: Option<Rc<Se
             }
         }
         let Some(buf) = peer.next_request().await else { break };
-        handle_message(peer, &mut subs, buf, shared).await;
+        handle_message(peer, &mut subs, &mut snapshots, buf, shared).await;
         // Behind the reply, where a pushed train splits none. A client that
         // is gone is found out by the next request.
         let _ = subs.ship(peer).await;
     }
     subs.leave(&shared.feeds, |_| true);
+    snapshot::release_all(shared, snapshots).await;
 }
 
 /// Answer the client's HELLO, its verdict on the access token it carries; true
@@ -716,7 +734,13 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(peer: &Peer, subs: &mut Subscriptions, buf: RecvBuf, shared: &Rc<Shared>) {
+async fn handle_message(
+    peer: &Peer,
+    subs: &mut Subscriptions,
+    snapshots: &mut HeldSnapshots,
+    buf: RecvBuf,
+    shared: &Rc<Shared>,
+) {
     // ONE control-header parse for the whole request: routing, the schema-hint
     // decision and the push decode all read this same parse.
     let ctrl = match gnitz_wire::control::peek_control_block(buf.as_slice()) {
@@ -727,7 +751,7 @@ async fn handle_message(peer: &Peer, subs: &mut Subscriptions, buf: RecvBuf, sha
         }
     };
     let target_id = ctrl.hdr.target_id;
-    if let Err(f) = dispatch_request(peer, subs, buf, ctrl, shared).await {
+    if let Err(f) = dispatch_request(peer, subs, snapshots, buf, ctrl, shared).await {
         send_fault(peer, target_id, &f);
     }
 }
@@ -738,6 +762,7 @@ async fn handle_message(peer: &Peer, subs: &mut Subscriptions, buf: RecvBuf, sha
 async fn dispatch_request(
     peer: &Peer,
     subs: &mut Subscriptions,
+    snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
     ctrl: gnitz_wire::control::DecodedControl,
     shared: &Rc<Shared>,
@@ -796,6 +821,25 @@ async fn dispatch_request(
             let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
                 .map_err(|e| WireFault::from(format!("decode error: {e}")));
             subs.ask_sync(&shared.feeds, held, ctrl.hdr.arg0);
+            Ok(())
+        }
+
+        // A snapshot and a backup name no relation of the live catalog in
+        // `target_id`: a page names one of the snapshot's.
+        ClientVerb::SnapshotOpen => {
+            let id = snapshot::open(shared, snapshots).await?;
+            send_ack(peer, target_id, id);
+            Ok(())
+        }
+        ClientVerb::SnapshotPage => snapshot::page(shared, peer, snapshots, &ctrl.hdr, &data[ctrl.blob.clone()]).await,
+        ClientVerb::SnapshotClose => {
+            snapshot::close(shared, snapshots, ctrl.hdr.arg0).await?;
+            send_ack(peer, target_id, 0);
+            Ok(())
+        }
+        ClientVerb::Backup => {
+            backup::backup(shared, &data[ctrl.blob.clone()]).await?;
+            send_ack(peer, target_id, 0);
             Ok(())
         }
     }

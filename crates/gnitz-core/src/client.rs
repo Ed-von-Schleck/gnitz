@@ -4,7 +4,7 @@ use crate::connection::{
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, Schema, ZSetBatch};
+use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, RelationRef, Schema, ViewDefinition, ZSetBatch};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
@@ -173,6 +173,26 @@ impl DdlBundle {
 /// `create_view_chain` counts them.
 pub const MAX_CHAIN_SEGMENTS: usize = 64;
 
+/// The definition of a passthrough view over `source`: `SELECT *` of it, which
+/// is what the view computes. The name in the text only marks where `source`
+/// stands; writing the definition back out puts the name it holds then.
+fn passthrough_definition(source: &RelDescriptor) -> ViewDefinition {
+    const QUERY: &str = "SELECT * FROM source";
+    let at = QUERY.len() - "source".len();
+    let columns: Vec<String> = source.schema.visible_columns().map(|(_, c)| c.name.clone()).collect();
+    ViewDefinition {
+        query: QUERY.to_string(),
+        body_columns: columns.clone(),
+        refs: vec![RelationRef {
+            tid: source.tid,
+            name: at as u32..QUERY.len() as u32,
+            alias_end: None,
+            alias: "source".to_string(),
+            columns: Some(columns),
+        }],
+    }
+}
+
 /// How an internal chain segment is named, from its own allocated view id.
 ///
 /// Unique because vids are, and unspellable at every SQL surface because
@@ -213,23 +233,34 @@ pub struct PlannedView {
 pub struct ViewBundle {
     pub segments: Vec<PlannedView>,
     pub view: PlannedView,
+    /// What the user-named view's row records of its body; `None` writes an
+    /// empty definition.
+    pub definition: Option<ViewDefinition>,
 }
 
 impl ViewBundle {
     /// The chain's catalog rows at `+1`, its first member standing at `base`:
     /// each segment named by [`segment_name`] and owned by the user-named view,
-    /// which stands last under `view_name` and `props`.
-    fn put_rows(&self, b: &mut DdlBundle, view_name: &str, props: ViewProps, schema_id: u64, base: u64) {
+    /// which stands last under `view_name` and `props`, recording `definition`.
+    fn put_rows(
+        &self,
+        b: &mut DdlBundle,
+        view_name: &str,
+        props: ViewProps,
+        definition: &[u8],
+        schema_id: u64,
+        base: u64,
+    ) {
         let owner_vid = base + self.segments.len() as u64;
         for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
             let mut circuit = pv.circuit.clone();
             for src in circuit.sources_mut() {
                 *src = source_at(*src, base);
             }
-            let (name, owner_view_id, props) = if vid == owner_vid {
-                (view_name.to_string(), 0, props)
+            let (name, owner_view_id, props, definition) = if vid == owner_vid {
+                (view_name.to_string(), 0, props, definition)
             } else {
-                (segment_name(vid), owner_vid, ViewProps::default())
+                (segment_name(vid), owner_vid, ViewProps::default(), &[][..])
             };
 
             // A foreign key constrains a base table, not a view.
@@ -255,6 +286,7 @@ impl ViewBundle {
                     owner_view_id,
                     pk_repeats: pv.pk_repeats as u64,
                     compress: props.compress as u64,
+                    definition: definition.into(),
                 },
                 1,
             );
@@ -264,7 +296,11 @@ impl ViewBundle {
 
 impl From<PlannedView> for ViewBundle {
     fn from(view: PlannedView) -> Self {
-        ViewBundle { segments: Vec::new(), view }
+        ViewBundle {
+            segments: Vec::new(),
+            view,
+            definition: None,
+        }
     }
 }
 
@@ -575,7 +611,7 @@ impl GnitzClient {
 
     // ── Waiting ────────────────────────────────────────────────────────────
 
-    fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
+    pub(crate) fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
         let sent = self.session.submit(req);
         self.wait(sent)
     }
@@ -631,6 +667,13 @@ impl GnitzClient {
                 Ok(base)
             }
         }
+    }
+
+    /// Reserve exactly `count` SERIAL ids of `table` and return the first,
+    /// leaving this client's own reservation untouched: what puts a restored
+    /// table's sequence where its dump left it.
+    pub async fn reserve_serial_exact(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
+        self.ack(Request::AllocSerial { table: table.into(), count }).await
     }
 
     // --- Raw ops ---
@@ -1206,7 +1249,11 @@ impl GnitzClient {
             schema: Arc::clone(&source.schema),
             pk_repeats: source.pk_repeats,
         };
-        self.create_view_chain(view, planned.into(), props, None).await
+        let bundle = ViewBundle {
+            definition: Some(passthrough_definition(source)),
+            ..planned.into()
+        };
+        self.create_view_chain(view, bundle, props, None).await
     }
 
     /// Create `bundle` as `view` in one atomic `DDL_TXN` and return its id.
@@ -1250,8 +1297,14 @@ impl GnitzClient {
                     .ok_or_else(|| not_found("view", view))?;
                 let schema_id = payload_u64(views, i, RELTAB_PAY_SCHEMA_ID);
 
+                // The definition says how the body was spelled, which is no
+                // part of what the view is: another spelling of the same body
+                // is the same view, and keeps the standing definition.
+                let standing_definition = ViewTabRow::read(views, i)
+                    .map_err(|e| ClientError::from(format!("view {vid}: {e}")))?
+                    .definition;
                 let mut want = DdlBundle::default();
-                bundle.put_rows(&mut want, view_name, props, schema_id, base);
+                bundle.put_rows(&mut want, view_name, props, &standing_definition, schema_id, base);
                 if want.same_rows(&standing) {
                     return Ok(vid);
                 }
@@ -1267,7 +1320,12 @@ impl GnitzClient {
         };
 
         let base = self.alloc_ids(n_views as u64).await?;
-        bundle.put_rows(&mut b, view_name, props, schema_id, base);
+        let definition = bundle
+            .definition
+            .as_ref()
+            .map(ViewDefinition::encode)
+            .unwrap_or_default();
+        bundle.put_rows(&mut b, view_name, props, &definition, schema_id, base);
         self.commit_ddl(b).await?;
         Ok(base + n_segments)
     }

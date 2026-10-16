@@ -86,6 +86,7 @@ fn a_row_writes_one_value_of_its_columns_type_per_payload_column() {
         owner_view_id: 21,
         pk_repeats: 1,
         compress: 1,
+        definition: Default::default(),
     });
     let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
     check(&ColTabRow::of(16, 2, &col, None));
@@ -219,6 +220,7 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         owner_view_id: 0,
         pk_repeats: 1,
         compress: 1,
+        definition: Default::default(),
     };
     let parts = ViewParts { props, owner: None, pk_repeats: true };
     assert_eq!(view.parts(), Ok((pk, parts)));
@@ -228,6 +230,7 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         delta_bytes: 0,
         owner_view_id: 19,
         compress: 0,
+        definition: Default::default(),
         ..view.clone()
     };
     assert_eq!(segment.parts().map(|(_, p)| p.owner), Ok(Some(19)));

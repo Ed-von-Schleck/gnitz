@@ -94,6 +94,12 @@ Options:
                        --auth-tokens a loopback bind trusts every local UID (like
                        the always-on AF_UNIX socket), gated only by network
                        reachability and filesystem permissions.
+  --backup-dir=DIR     Let clients BACKUP: each backup is a new entry of DIR, an
+                       existing directory, holding a copy of the data directory
+                       at a checkpoint — every store hard-linked where DIR
+                       shares the data directory's filesystem, copied where it
+                       does not. Start a server on an entry to restore it, at
+                       any worker count. Without it BACKUP is refused.
   --new-token          Start no server: mint an access token named <name>,
                        append its SHA-256 to <token_file> (created owner-only if
                        absent) and print the token, which is kept nowhere else.
@@ -171,6 +177,7 @@ struct Args {
     workers: Option<u32>,
     level: Level,
     tls: Option<runtime::TlsArgs>,
+    backup_dir: Option<String>,
 }
 
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
@@ -183,6 +190,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     let (mut tls_listen, mut cert, mut key, mut client_ca, mut auth_tokens) = (None, None, None, None, None);
     let mut names: Vec<String> = Vec::new();
     let mut allow_unauthenticated = false;
+    let mut backup_dir = None;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
         if let Some(val) = arg.strip_prefix("--log-level=") {
@@ -211,6 +219,8 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             auth_tokens = Some(val.to_string());
         } else if arg == "--allow-unauthenticated" {
             allow_unauthenticated = true;
+        } else if let Some(val) = arg.strip_prefix("--backup-dir=") {
+            backup_dir = Some(parse_backup_dir(val)?);
         } else if arg.starts_with('-') {
             return Err(format!("unknown option {arg:?}"));
         } else {
@@ -252,7 +262,20 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
         workers,
         level,
         tls,
+        backup_dir,
     })
+}
+
+/// `--backup-dir=DIR`: a directory that exists, as an absolute path, so a
+/// backup's entry does not move with the server's working directory.
+fn parse_backup_dir(val: &str) -> Result<String, String> {
+    let dir = std::fs::canonicalize(val).map_err(|e| format!("--backup-dir={val}: {e}"))?;
+    if !dir.is_dir() {
+        return Err(format!("--backup-dir={val}: not a directory"));
+    }
+    dir.into_os_string()
+        .into_string()
+        .map_err(|_| format!("--backup-dir={val}: not a UTF-8 path"))
 }
 
 /// Ends the process at a panic, whichever profile compiled it: only the
@@ -314,6 +337,7 @@ fn main() {
         &args.socket_path,
         args.workers,
         tls,
+        args.backup_dir,
     ));
 }
 

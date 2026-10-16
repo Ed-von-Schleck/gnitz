@@ -169,6 +169,7 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
     match verb {
         ClientVerb::ScanSpec => drop(fields::attempt(|| ReadSpec::decode(blob))),
         ClientVerb::SyncPushed => drop(fields::attempt(|| txn_frame::decode_held(blob))),
+        ClientVerb::SnapshotPage => drop(fields::attempt(|| gnitz_wire::snapshot::PageRequest::decode(blob))),
         _ => {}
     }
     let schema = match &ctrl.schema {

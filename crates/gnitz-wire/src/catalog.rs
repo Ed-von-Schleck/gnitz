@@ -237,6 +237,10 @@ pub const LOCAL_SCHEMA: &str = "_local";
 /// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
 pub const SYSTEM_SCHEMA: &str = "_system";
 
+/// The schema every database holds from its first boot, where an unqualified
+/// name resolves unless a session names another.
+pub const PUBLIC_SCHEMA: &str = "public";
+
 /// The schemas a relation's name may spell that no user can create.
 pub const RESERVED_SCHEMAS: [&str; 2] = [LOCAL_SCHEMA, SYSTEM_SCHEMA];
 

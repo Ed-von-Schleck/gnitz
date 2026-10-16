@@ -34,6 +34,19 @@ pub(crate) enum Read<'a> {
         reply_layout: u64,
         spec: Cow<'a, [u8]>,
     },
+    /// Pin every base table's store as snapshot `snapshot`, here in the log.
+    Pin { snapshot: u64 },
+    /// Release snapshot `snapshot`.
+    Unpin { snapshot: u64 },
+    /// A page of `tid` as `snapshot` pinned it: the encoded
+    /// `gnitz_wire::snapshot::PageRequest` `page` names its rows.
+    SnapshotPage {
+        snapshot: u64,
+        tid: u64,
+        page: Cow<'a, [u8]>,
+    },
+    /// Link every store this process published into the data directory `dir`.
+    Backup { dir: Cow<'a, [u8]> },
 }
 
 /// A request that changes this worker's state.
@@ -69,6 +82,10 @@ impl SalRequest<'_> {
             SalRequest::Read(Read::KeySpans { .. }) => SalMessageKind::KeySpans,
             SalRequest::Read(Read::ScanSpec { .. }) => SalMessageKind::ScanSpec,
             SalRequest::Read(Read::Delta { .. }) => SalMessageKind::DeltaRead,
+            SalRequest::Read(Read::Pin { .. }) => SalMessageKind::Pin,
+            SalRequest::Read(Read::Unpin { .. }) => SalMessageKind::Unpin,
+            SalRequest::Read(Read::SnapshotPage { .. }) => SalMessageKind::SnapshotPage,
+            SalRequest::Read(Read::Backup { .. }) => SalMessageKind::Backup,
             SalRequest::Apply(Apply::Flush) => SalMessageKind::Flush,
             SalRequest::Apply(Apply::FlushEph { .. }) => SalMessageKind::FlushEph,
             SalRequest::Apply(Apply::DdlSync { .. }) => SalMessageKind::DdlSync,
@@ -125,6 +142,14 @@ impl SalRequest<'_> {
                 blob: spec,
                 ..head
             },
+            SalRequest::Read(Read::Pin { snapshot } | Read::Unpin { snapshot }) => WireMsg { arg0: snapshot, ..head },
+            SalRequest::Read(Read::SnapshotPage { snapshot, tid, ref page }) => WireMsg {
+                target_id: tid,
+                arg0: snapshot,
+                blob: page,
+                ..head
+            },
+            SalRequest::Read(Read::Backup { ref dir }) => WireMsg { blob: dir, ..head },
         }
     }
 }
@@ -169,6 +194,15 @@ impl SalRequest<'static> {
                 spec: blob.to_vec().into(),
             }
             .into(),
+            SalMessageKind::Pin => Read::Pin { snapshot: hdr.arg0 }.into(),
+            SalMessageKind::Unpin => Read::Unpin { snapshot: hdr.arg0 }.into(),
+            SalMessageKind::SnapshotPage => Read::SnapshotPage {
+                snapshot: hdr.arg0,
+                tid,
+                page: blob.to_vec().into(),
+            }
+            .into(),
+            SalMessageKind::Backup => Read::Backup { dir: blob.to_vec().into() }.into(),
         })
     }
 }

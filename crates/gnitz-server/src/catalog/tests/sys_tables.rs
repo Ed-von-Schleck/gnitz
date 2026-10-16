@@ -124,6 +124,7 @@ fn every_system_family_reads_back_the_row_it_wrote() {
         owner_view_id: 10,
         pk_repeats: 1,
         compress: 0,
+        definition: Default::default(),
     };
     assert_eq!(
         ViewTabRow::read(&sys_batch(SysFamily::View, |bb| r.write(bb, 1)), 0),

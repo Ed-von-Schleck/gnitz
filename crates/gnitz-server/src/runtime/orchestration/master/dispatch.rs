@@ -9,7 +9,7 @@ use super::*;
 use crate::catalog::{SysFamily, ZoneError, ZoneSink};
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
-use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_foundation::posix_io::{self, retry_eintr};
 
 /// How often a worker's death is probed for.
 pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
@@ -375,6 +375,26 @@ impl MasterDispatcher {
         cat.reclaim_orphan_dirs();
         excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={}", self.sal.epoch());
+        Ok(())
+    }
+
+    /// A backup's copy, run by the committer right behind a checkpoint: every
+    /// worker puts the stores it published into the data directory `dir`, then
+    /// the master puts its system families', and the directory tree is synced.
+    /// `dir` exists; everything under it is made here.
+    pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
+        let relations = gnitz_store::relation::relations_dir(dir);
+        std::fs::create_dir(&relations).map_err(|e| format!("create '{relations}': {e}"))?;
+        let mut leases = self
+            .scan_cut(|cut| cut.read_all(Read::Backup { dir: dir.as_bytes().into() }))
+            .await?;
+        leases.pop().expect("one read, one lease").finish().await?;
+        self.cat().registry.link_published_into(dir)?;
+        let parent = std::path::Path::new(dir).parent().and_then(std::path::Path::to_str);
+        for d in [Some(relations.as_str()), Some(dir), parent].into_iter().flatten() {
+            posix_io::fsync_dir(d).map_err(|e| format!("fsync '{d}': {e}"))?;
+        }
+        gnitz_info!("backup into {} complete", dir);
         Ok(())
     }
 

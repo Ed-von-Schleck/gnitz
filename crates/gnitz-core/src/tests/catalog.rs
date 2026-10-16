@@ -54,6 +54,7 @@ impl Rows {
             owner_view_id: owner,
             pk_repeats: 0,
             compress: props.compress as u64,
+            definition: Default::default(),
         };
         let mut circuit = Circuit::default();
         for &source in sources {

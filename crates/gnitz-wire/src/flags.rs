@@ -50,6 +50,22 @@ wire_enum! {
         /// the pushes acknowledged before this request, and end the others. The
         /// [`WireLane::SyncAnswer`] is held up to `arg0` ms while none was sent a row.
         SyncPushed = 13,
+        /// Pin every base table and system family as one point of the log holds
+        /// them; the reply's `arg0` names the snapshot. It is the connection's,
+        /// and lives until a [`Self::SnapshotClose`] names it or the connection
+        /// ends.
+        SnapshotOpen = 14,
+        /// A page of relation `target_id` as snapshot `arg0` holds it — the rows
+        /// and the key the blob names ([`crate::snapshot::PageRequest`]) —
+        /// replied as a scan is: one train per worker, or one frame where the
+        /// master holds the relation, each in key order and full but for the
+        /// last.
+        SnapshotPage = 15,
+        /// Release snapshot `arg0`.
+        SnapshotClose = 16,
+        /// Copy the data directory, at a checkpoint, under the backup directory
+        /// the server was started with, as the entry the blob names.
+        Backup = 17,
     }
 }
 
