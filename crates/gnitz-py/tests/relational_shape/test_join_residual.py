@@ -11,37 +11,25 @@ Ground truth is recomputed from the rows the test wrote, never scanned back
 from the engine, and compared as a weighted bag.
 """
 from _read import bag, scanned
-from _sql import churn
+from _sql import churn, inserting
 
 
-def _known(*vals):
-    return all(v is not None for v in vals)
-
-
-# name -> (the ON beyond `a.k = b.k`, or a whole ON where it starts with "ON:",
-# the same predicate over (a row, b row)).
+# name -> (the predicate beyond `a.k = b.k`, the same over (a row, b row)). A
+# residual comparison against NULL is UNKNOWN and drops the pair; a join carries
+# at most one range in its physical shape, so a second inequality rides above a
+# band; a string residual compares content — every value shares a 13-byte prefix
+# and so lives out of line, differing only in the heap tail — and a literal
+# operand takes the same opcodes; `IS NULL` over a NOT NULL column folds to an
+# always-empty view.
 _PREDICATES = {
     "literal": ("a.x > 150", lambda a, b: a["x"] > 150),
     "both_sides": ("a.x > b.y", lambda a, b: a["x"] > b["y"]),
     "two_conjuncts": ("a.x > 100 AND b.y = 5", lambda a, b: a["x"] > 100 and b["y"] == 5),
-}
-
-# view -> (ON clause, the same predicate). A residual comparison against NULL is
-# UNKNOWN and drops the pair; a join carries at most one range in its physical
-# shape, so a second inequality rides above a band or a pure range; a string
-# residual compares content — every value shares a 13-byte prefix and so lives
-# out of line, differing only in the heap tail — and a literal operand takes the
-# same opcodes; `IS NULL` over a NOT NULL column folds to an always-empty view.
-_RESIDUALS = {
-    "not_equal": ("a.k = b.k AND a.v <> b.v",
-                  lambda a, b: a["k"] == b["k"] and _known(a["v"]) and a["v"] != b["v"]),
-    "band_second_range": ("a.k = b.k AND a.lo < b.hi AND a.x > b.y",
-                          lambda a, b: a["k"] == b["k"] and a["lo"] < b["hi"] and a["x"] > b["y"]),
-    "pure_second_range": ("a.lo < b.hi AND a.x > b.y", lambda a, b: a["lo"] < b["hi"] and a["x"] > b["y"]),
-    "string_pair": ("a.k = b.k AND a.s <> b.s", lambda a, b: a["k"] == b["k"] and a["s"] != b["s"]),
-    "string_literal": ("a.k = b.k AND a.s < 'commonprefix_M'",
-                       lambda a, b: a["k"] == b["k"] and a["s"] < "commonprefix_M"),
-    "folded": ("a.k = b.k AND a.x IS NULL", lambda a, b: False),
+    "not_equal": ("a.v <> b.v", lambda a, b: a["v"] is not None and a["v"] != b["v"]),
+    "second_range": ("a.lo < b.hi AND a.x > b.y", lambda a, b: a["lo"] < b["hi"] and a["x"] > b["y"]),
+    "string_pair": ("a.s <> b.s", lambda a, b: a["s"] != b["s"]),
+    "string_literal": ("a.s < 'commonprefix_M'", lambda a, b: a["s"] < "commonprefix_M"),
+    "folded": ("a.x IS NULL", lambda a, b: False),
 }
 
 _A = ("id", "k", "v", "lo", "x", "s")
@@ -49,17 +37,12 @@ _B = ("id", "k", "v", "hi", "y", "s")
 
 # (statement, table, {id: the rest of the row}); a `None` row deletes the id.
 _CHURN = [
-    ("INSERT INTO b VALUES (10, 1, 5, 50, 5, 'commonprefix_BBBB'), (11, 1, 8, 10, 5, 'commonprefix_SAME'), "
-     "(12, 2, 9, 99, 0, 'commonprefix_ZZZZ')",
-     "b", {10: (1, 5, 50, 5, "commonprefix_BBBB"), 11: (1, 8, 10, 5, "commonprefix_SAME"),
-           12: (2, 9, 99, 0, "commonprefix_ZZZZ")}),
+    inserting("b", {10: (1, 5, 50, 5, "commonprefix_BBBB"), 11: (1, 8, 10, 5, "commonprefix_SAME"),
+                    12: (2, 9, 99, 0, "commonprefix_ZZZZ")}),
     # a(5)'s key has no b at all, so no predicate can readmit it.
-    ("INSERT INTO a VALUES (1, 1, 5, 20, 9, 'commonprefix_AAAA'), (2, 1, 7, 5, 1, 'commonprefix_SAME'), "
-     "(3, 2, NULL, 1, 200, 'commonprefix_SAME'), (4, 1, NULL, 1, 160, 'commonprefix_AAAB'), "
-     "(5, 99, 1, 1, 400, 'commonprefix_SAME')",
-     "a", {1: (1, 5, 20, 9, "commonprefix_AAAA"), 2: (1, 7, 5, 1, "commonprefix_SAME"),
-           3: (2, None, 1, 200, "commonprefix_SAME"), 4: (1, None, 1, 160, "commonprefix_AAAB"),
-           5: (99, 1, 1, 400, "commonprefix_SAME")}),
+    inserting("a", {1: (1, 5, 20, 9, "commonprefix_AAAA"), 2: (1, 7, 5, 1, "commonprefix_SAME"),
+                    3: (2, None, 1, 200, "commonprefix_SAME"), 4: (1, None, 1, 160, "commonprefix_AAAB"),
+                    5: (99, 1, 1, 400, "commonprefix_SAME")}),
     # Deltas that change only a residual's outcome must still enter or leave.
     ("UPDATE b SET v = 7 WHERE id = 11", "b", {11: (1, 7, 10, 5, "commonprefix_SAME")}),
     ("UPDATE a SET v = 6 WHERE id = 1", "a", {1: (1, 6, 20, 9, "commonprefix_AAAA")}),
@@ -83,7 +66,8 @@ def test_a_residual_filters_the_join_output_through_churn(client):
         + "; ".join(f"CREATE VIEW on_{n} AS {pair} ON a.k = b.k AND ({p}); "
                     f"CREATE VIEW where_{n} AS {pair} ON a.k = b.k WHERE {p}"
                     for n, (p, _) in _PREDICATES.items()) + "; "
-        + "; ".join(f"CREATE VIEW {n} AS {pair} ON {on}" for n, (on, _) in _RESIDUALS.items()))
+        # The second range rides above a pure range join too.
+        + f"CREATE VIEW pure_second_range AS {pair} ON {_PREDICATES['second_range'][0]}")
 
     state = {"a": {}, "b": {}}
     for sql in churn(client, state, _CHURN):
@@ -97,5 +81,5 @@ def test_a_residual_filters_the_join_output_through_churn(client):
             want = pairs(lambda ar, br, p=p: ar["k"] == br["k"] and p(ar, br))
             for form in ("on", "where"):
                 assert bag(scanned(client, f"{form}_{n}"), "aid", "bid") == want, (sql, form, n)
-        for n, (_, on) in _RESIDUALS.items():
-            assert bag(scanned(client, n), "aid", "bid") == pairs(on), (sql, n)
+        assert bag(scanned(client, "pure_second_range"), "aid", "bid") == \
+            pairs(_PREDICATES["second_range"][1]), sql

@@ -18,35 +18,25 @@ import operator
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import RANGE_OPS, known
+from _sql import churn, inserting, values
 
-
-def _cmp(op):
-    """`op` under SQL 3VL: a comparison against NULL admits nothing."""
-    return lambda l, r: l is not None and r is not None and op(l, r)
-
-
-_PURE = {"lt": ("<", _cmp(operator.lt)), "le": ("<=", _cmp(operator.le)),
-         "gt": (">", _cmp(operator.gt)), "ge": (">=", _cmp(operator.ge))}
-_EQ, _LE = _cmp(operator.eq), _cmp(operator.le)
+_PURE = {n: (op, known(f)) for n, (op, f) in RANGE_OPS.items()}
+_EQ, _LE = known(operator.eq), known(operator.le)
 
 # (statement, table, {pk: (k, k2, x-or-y)}); a `None` row deletes the pk.
 _CHURN = [
     # The thin side first, then a delta wider than it in one epoch: residues mod
     # 23 put `x == y` pairs in the data, separating the inclusive operators from
     # the strict ones.
-    ("INSERT INTO b VALUES " + ", ".join(f"({i}, {i % 8}, {i % 2}, {i * 5 % 23})" for i in range(1, 21)),
-     "b", {i: (i % 8, i % 2, i * 5 % 23) for i in range(1, 21)}),
-    ("INSERT INTO a VALUES " + ", ".join(f"({i}, {i % 8}, {i % 2}, {i * 7 % 23})" for i in range(1, 61)),
-     "a", {i: (i % 8, i % 2, i * 7 % 23) for i in range(1, 61)}),
+    inserting("b", {i: (i % 8, i % 2, i * 5 % 23) for i in range(1, 21)}),
+    inserting("a", {i: (i % 8, i % 2, i * 7 % 23) for i in range(1, 61)}),
     # Narrow deltas on each side in turn: the other bilinear term.
-    ("INSERT INTO a VALUES (100, 1, 1, 11)", "a", {100: (1, 1, 11)}),
-    ("INSERT INTO b VALUES (100, 1, 1, 12)", "b", {100: (1, 1, 12)}),
+    inserting("a", {100: (1, 1, 11)}),
+    inserting("b", {100: (1, 1, 12)}),
     # A NULL in the equality key or the range column, on either side.
-    ("INSERT INTO a VALUES (101, NULL, 1, 5), (102, 1, 1, NULL)",
-     "a", {101: (None, 1, 5), 102: (1, 1, None)}),
-    ("INSERT INTO b VALUES (101, NULL, 1, 20), (102, 1, 1, NULL)",
-     "b", {101: (None, 1, 20), 102: (1, 1, None)}),
+    inserting("a", {101: (None, 1, 5), 102: (1, 1, None)}),
+    inserting("b", {101: (None, 1, 20), 102: (1, 1, None)}),
     # A pair's `+1` and `-1` come from opposite terms on different workers and
     # must cancel through the output exchange: the range column moves out, then
     # the equality key moves to another group.
@@ -90,39 +80,6 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client):
             Counter(ai for ai, _ in pairs(lambda ar, br: _PURE["lt"][1](ar[2], br[2]))).items(), 1), sql
 
 
-def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client):
-    """A band LEFT JOIN over a join-keyed input whose two rows differ only in the
-    range value: each null-fills exactly while nothing matches it."""
-    client.execute_sql(
-        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, g BIGINT NOT NULL, x BIGINT NOT NULL); "
-        "CREATE TABLE q (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
-        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, y BIGINT NOT NULL); "
-        "CREATE VIEW band_over_join AS SELECT d.v AS v, r.id AS rid "
-        "FROM (SELECT p.g AS g, p.x AS x, q.v AS v FROM p JOIN q ON p.k = q.k) d "
-        "LEFT JOIN r ON d.g = r.g AND d.x <= r.y")
-    steps = [
-        ("INSERT INTO q VALUES (1, 7), (2, 8)", "q", {1: (7,), 2: (8,)}),
-        # p(1) and p(2) share `k` and so `v`, and differ only in `x`.
-        ("INSERT INTO p VALUES (1, 1, 5, 10), (2, 1, 5, 100), (3, 2, 5, 40)",
-         "p", {1: (1, 5, 10), 2: (1, 5, 100), 3: (2, 5, 40)}),
-        # p(1) matches both, p(2) neither.
-        ("INSERT INTO r VALUES (1, 5, 50), (2, 5, 60)", "r", {1: (5, 50), 2: (5, 60)}),
-        ("UPDATE p SET x = 55 WHERE id = 2", "p", {2: (1, 5, 55)}),
-        ("DELETE FROM r WHERE id = 2", "r", {2: None}),
-        ("DELETE FROM q WHERE k = 1", "q", {1: None}),
-    ]
-    state = {"p": {}, "q": {}, "r": {}}
-    for sql in churn(client, state, steps):
-        want = Counter()
-        for k, g, x in state["p"].values():
-            if k not in state["q"]:
-                continue
-            v = state["q"][k][0]
-            matched = [ri for ri, (rg, y) in state["r"].items() if rg == g and x <= y]
-            want.update([(v, ri) for ri in matched] or [(v, None)])
-        assert bag(scanned(client, "band_over_join"), "v", "rid") == want, sql
-
-
 def test_the_pair_pk_is_the_source_keys_at_their_own_width(client):
     """The output key is the source-PK pair. When the range column *is* the PK
     on both sides no co-partition shortcut applies, and the pair key is the pair
@@ -136,10 +93,10 @@ def test_the_pair_pk_is_the_source_keys_at_their_own_width(client):
         "CREATE TABLE pb (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (k1, k2)); "
         "CREATE VIEW wide AS SELECT pa.k1 AS ak1, pa.k2 AS ak2, pb.k1 AS bk1, pb.k2 AS bk2 "
         "FROM pa JOIN pb ON pa.x < pb.y; "
-        f"INSERT INTO ra VALUES {', '.join(f'({x})' for x in range(1, 16))}; "
-        f"INSERT INTO rb VALUES {', '.join(f'({y})' for y in range(5, 20))}; "
-        f"INSERT INTO pa VALUES {', '.join(f'({i}, {i * 2}, {i * 7 % 19})' for i in range(1, 13))}; "
-        f"INSERT INTO pb VALUES {', '.join(f'({i}, {i * 3}, {i * 5 % 19})' for i in range(1, 13))}")
+        f"INSERT INTO ra VALUES {values((x,) for x in range(1, 16))}; "
+        f"INSERT INTO rb VALUES {values((y,) for y in range(5, 20))}; "
+        f"INSERT INTO pa VALUES {values((i, i * 2, i * 7 % 19) for i in range(1, 13))}; "
+        f"INSERT INTO pb VALUES {values((i, i * 3, i * 5 % 19) for i in range(1, 13))}")
     assert bag(scanned(client, "on_pk"), "aid", "bid") == {
         (x, y): 1 for x in range(1, 16) for y in range(5, 20) if x < y}
 

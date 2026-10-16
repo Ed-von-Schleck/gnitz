@@ -15,46 +15,34 @@ decisions are only real at W > 1.
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import agg, groups
+from _sql import churn, inserting, values
 
 
 def _fold(vals):
-    """`(COUNT, SUM, AVG, MIN, MAX)` over the non-NULL `vals`: NULL for all but
-    COUNT once none is left."""
-    live = [v for v in vals if v is not None]
-    if not live:
-        return 0, None, None, None, None
-    return len(live), sum(live), sum(live) / len(live), min(live), max(live)
-
-
-def _groups(rows, key):
-    out = {}
-    for r in rows:
-        out.setdefault(key(r), []).append(r)
-    return out
+    """`(COUNT, SUM, AVG, MIN, MAX)` over `vals`."""
+    vals = list(vals)
+    return tuple(agg(f, vals) for f in ("COUNT", "SUM", "AVG", "MIN", "MAX"))
 
 
 _LONG1, _LONG2 = "long-heap-backed-key-1", "long-heap-backed-key-2"
 
-# (statement, {pk: (g, s, a, n)}).
+# (statement, table, {pk: (g, s, a, n)}).
 _GROUPED_CHURN = [
     # g=10's `a` averages to 7/3, g=20's `n` is all NULL, and only g=30 passes
     # `a > 100`; `s` is inline for "ab" and heap-backed for the long keys.
-    ("INSERT INTO t VALUES (1, 10, 'ab', 1, 5), (2, 10, 'ab', 2, NULL), "
-     f"(3, 10, '{_LONG1}', 4, 15), (4, 20, '{_LONG2}', 5, NULL), (5, 30, 'ab', 200, NULL), "
-     f"(6, 30, '{_LONG1}', 300, NULL)",
-     {1: (10, "ab", 1, 5), 2: (10, "ab", 2, None), 3: (10, _LONG1, 4, 15),
-      4: (20, _LONG2, 5, None), 5: (30, "ab", 200, None), 6: (30, _LONG1, 300, None)}),
-    ("UPDATE t SET a = 9 WHERE pk = 3", {3: (10, _LONG1, 9, 15)}),
+    inserting("t", {1: (10, "ab", 1, 5), 2: (10, "ab", 2, None), 3: (10, _LONG1, 4, 15),
+                    4: (20, _LONG2, 5, None), 5: (30, "ab", 200, None), 6: (30, _LONG1, 300, None)}),
+    ("UPDATE t SET a = 9 WHERE pk = 3", "t", {3: (10, _LONG1, 9, 15)}),
     # The extremum's holder leaves: MIN/MAX recompute the next-best from history.
-    ("DELETE FROM t WHERE pk = 3", {3: None}),
-    ("UPDATE t SET n = 0 WHERE pk = 2", {2: (10, "ab", 2, 0)}),
-    ("INSERT INTO t VALUES (7, 20, 'ab', 6, 3)", {7: (20, "ab", 6, 3)}),
+    ("DELETE FROM t WHERE pk = 3", "t", {3: None}),
+    ("UPDATE t SET n = 0 WHERE pk = 2", "t", {2: (10, "ab", 2, 0)}),
+    inserting("t", {7: (20, "ab", 6, 3)}),
     # g=20's last non-NULL `n` leaves; the group lives on at COUNT(*) 1.
-    ("DELETE FROM t WHERE pk = 7", {7: None}),
-    ("DELETE FROM t WHERE g = 10", {1: None, 2: None}),
+    ("DELETE FROM t WHERE pk = 7", "t", {7: None}),
+    ("DELETE FROM t WHERE g = 10", "t", {1: None, 2: None}),
     # A group born with every `n` NULL.
-    ("INSERT INTO t VALUES (8, 10, 'ab', 8, NULL)", {8: (10, "ab", 8, None)}),
+    inserting("t", {8: (10, "ab", 8, None)}),
 ]
 
 
@@ -80,10 +68,11 @@ def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client):
         "CREATE VIEW filtered AS SELECT g, COUNT(*) AS c, SUM(a) AS sa FROM t "
         "WHERE a > 100 GROUP BY g")
 
-    rows = {}
-    for sql in churn(client, rows, _GROUPED_CHURN):
+    state = {"t": {}}
+    for sql in churn(client, state, _GROUPED_CHURN):
+        rows = state["t"]
         by_g = {g: (len(rs), _fold(r[2] for r in rs), _fold(r[3] for r in rs))
-                for g, rs in _groups(rows.values(), lambda r: r[0]).items()}
+                for g, rs in groups(rows.values(), lambda r: r[0]).items()}
 
         assert bag(scanned(client, "every"), "g", "c", "sa", "aa", "mina", "maxa", "cn",
                    "can", "sn", "an", "minn", "maxn") == {
@@ -93,22 +82,21 @@ def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client):
                 (g, fn[i]): 1 for g, (_, _, fn) in by_g.items()}, (sql, f)
         assert bag(scanned(client, "by_s"), "s", "aa", "sn") == {
             (s, _fold(r[2] for r in rs)[2], _fold(r[3] for r in rs)[1]): 1
-            for s, rs in _groups(rows.values(), lambda r: r[1]).items()}, sql
+            for s, rs in groups(rows.values(), lambda r: r[1]).items()}, sql
         assert bag(scanned(client, "by_gs"), "g", "s", "c", "aa") == {
             (g, s, len(rs), _fold(r[2] for r in rs)[2]): 1
-            for (g, s), rs in _groups(rows.values(), lambda r: r[:2]).items()}, sql
+            for (g, s), rs in groups(rows.values(), lambda r: r[:2]).items()}, sql
         assert bag(scanned(client, "filtered"), "g", "c", "sa") == {
             (g, len(rs), sum(r[2] for r in rs)): 1
-            for g, rs in _groups([r for r in rows.values() if r[2] > 100], lambda r: r[0]).items()}, sql
+            for g, rs in groups([r for r in rows.values() if r[2] > 100], lambda r: r[0]).items()}, sql
 
 
 def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client):
-    """Three reduce inputs that are another operator's output deltas: a DISTINCT,
+    """Two reduce inputs that are another operator's output deltas: a DISTINCT,
     whose boundary crossings reach COUNT(*) once per pair, through duplicate
-    carriers and a cross-group move; another reduce, whose emptied group must
-    vanish rather than feed a phantom `(s=0, c=1)` downstream; and a fan-out join,
-    where one join-output key spans several groups, so a group's extremes must
-    never pull a neighbour's rows."""
+    carriers and a cross-group move; and another reduce, whose emptied group must
+    vanish rather than feed a phantom `(s=0, c=1)` downstream. A join's output
+    delta is test_groupby_chain.py's."""
     client.execute_sql(
         "CREATE TABLE e (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, k BIGINT NOT NULL); "
         "CREATE VIEW d AS SELECT DISTINCT g, k FROM e; "
@@ -117,39 +105,21 @@ def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client):
         "CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s")
 
     rows = {}
-    for sql in churn(client, rows, [
-        ("INSERT INTO e VALUES (1, 1, 7), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 2, 10)",
-         {1: (1, 7), 2: (1, 7), 3: (1, 8), 4: (2, 9), 5: (2, 10)}),
-        ("DELETE FROM e WHERE pk = 1", {1: None}),
-        ("DELETE FROM e WHERE pk = 2", {2: None}),
-        ("INSERT INTO e VALUES (6, 2, 9)", {6: (2, 9)}),
-        ("UPDATE e SET k = 9 WHERE pk = 5", {5: (2, 9)}),
+    for sql in churn(client, {"e": rows}, [
+        inserting("e", {1: (1, 7), 2: (1, 7), 3: (1, 8), 4: (2, 9), 5: (2, 10)}),
+        ("DELETE FROM e WHERE pk = 1", "e", {1: None}),
+        ("DELETE FROM e WHERE pk = 2", "e", {2: None}),
+        inserting("e", {6: (2, 9)}),
+        ("UPDATE e SET k = 9 WHERE pk = 5", "e", {5: (2, 9)}),
         # One epoch retracting a pair from one group and inserting it into another.
-        ("UPDATE e SET g = 1 WHERE pk = 4", {4: (1, 9)}),
-        ("DELETE FROM e WHERE g = 2", {5: None, 6: None}),
+        ("UPDATE e SET g = 1 WHERE pk = 4", "e", {4: (1, 9)}),
+        ("DELETE FROM e WHERE g = 2", "e", {5: None, 6: None}),
     ]):
-        by_g = _groups(rows.values(), lambda r: r[0])
+        by_g = groups(rows.values(), lambda r: r[0])
         assert bag(scanned(client, "dc"), "g", "c") == {
             (g, len({k for _, k in rs})): 1 for g, rs in by_g.items()}, sql
         assert bag(scanned(client, "ov"), "s", "c") == {
             sc: 1 for sc in Counter(sum(k for _, k in rs) for rs in by_g.values()).items()}, sql
-
-    client.execute_sql(
-        "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY); "
-        "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, g INT NOT NULL, "
-        "x BIGINT NOT NULL, y BIGINT NOT NULL); "
-        "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
-        "FROM fact JOIN dim ON fact.fid = dim.fkey; "
-        "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c FROM j GROUP BY g; "
-        "INSERT INTO fact VALUES (1), (2); "
-        "INSERT INTO dim VALUES (1, 1, 10, 5, 100), (2, 1, 20, 7, 200), (3, 2, 10, 3, 50), "
-        "(4, 2, 20, 9, 300)")
-    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
-        (10, 3, 100, 2): 1, (20, 7, 300, 2): 1}
-    # g=10's MIN holder goes: it recomputes to 5, never to g=20's smaller entry.
-    client.execute_sql("DELETE FROM dim WHERE did = 3")
-    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
-        (10, 5, 100, 1): 1, (20, 7, 300, 2): 1}
 
 
 # HAVING predicate -> the groups it admits before and after pk 1 leaves. Over
@@ -209,22 +179,21 @@ def test_having_filters_groups_on_the_grouped_relation(client):
         "(4, 30, 0, 1000), (5, 40, 5, -32768), (6, 40, -5, 7); "
         "INSERT INTO h2 VALUES (5, 6), (5, 7)")
 
-    counts = {10: 2, 20: 1, 30: 1, 40: 2}
-    for step in (0, 1):
-        if step:
-            client.execute_sql("DELETE FROM h WHERE pk = 1")
-            counts[10] = 1
+    # (statement, each group's COUNT(*), the groups holding a positive `v`).
+    for step, (sql, counts, positive) in enumerate([
+        (None, {10: 2, 20: 1, 30: 1, 40: 2}, (10, 40)),
+        ("DELETE FROM h WHERE pk = 1", {10: 1, 20: 1, 30: 1, 40: 2}, (40,)),
+    ]):
+        if sql:
+            client.execute_sql(sql)
         for i, (pred, admitted) in enumerate(_HAVING.items()):
             assert bag(scanned(client, f"p{i}"), "k", "c") == {
                 (k, counts[k]): 1 for k in admitted[step]}, (step, pred)
-        assert bag(scanned(client, "unprojected_key"), "k", "c") == \
-            ({(10, 1): 1, (40, 1): 1} if step == 0 else {(40, 1): 1})
+        assert bag(scanned(client, "unprojected_key"), "k", "c") == {(k, 1): 1 for k in positive}
         assert bag(scanned(client, "aliased"), "x", "c") == {(30, 1): 1, (40, 2): 1}
-        assert bag(scanned(client, "unprojected_agg"), "k") == \
-            ({(10,): 1, (40,): 1} if step == 0 else {(40,): 1})
+        assert bag(scanned(client, "unprojected_agg"), "k") == {(k,): 1 for k, c in counts.items() if c > 1}
         assert bag(scanned(client, "pk_null"), "pk", "c") == {}
-        assert bag(scanned(client, "pk_not_null"), "pk", "c") == {
-            (pk, 1): 1 for pk in range(1 + step, 7)}
+        assert bag(scanned(client, "pk_not_null"), "pk", "c") == {(pk, 1): 1 for pk in range(1 + step, 7)}
         assert bag(scanned(client, "compound_pk"), "a", "b", "c") == {(5, 6, 1): 1, (5, 7, 1): 1}
         assert bag(scanned(client, "narrow"), "k", "m") == {(10, 1500): 1, (20, 30000): 1}
 
@@ -258,18 +227,17 @@ def test_a_global_aggregate_is_one_row_over_any_source(client):
 
     mixed = {pk: ((pk * 7) % 50, None if pk % 3 == 0 else pk) for pk in range(10, 50)}
     rows = {}
-    for sql in churn(client, rows, [
-        ("SELECT 1", {}),
+    for sql in churn(client, {"t": rows}, [
+        (None, {}),
         # A genuine zero sum, with `n` fresh and all NULL.
-        ("INSERT INTO t VALUES (1, 5, NULL), (2, -5, NULL)", {1: (5, None), 2: (-5, None)}),
-        ("INSERT INTO t VALUES " + ", ".join(
-            f"({pk}, {a}, {'NULL' if n is None else n})" for pk, (a, n) in mixed.items()), mixed),
-        ("UPDATE t SET a = 100 WHERE pk = 15", {15: (100, mixed[15][1])}),
-        ("UPDATE t SET n = 9 WHERE pk = 12", {12: (mixed[12][0], 9)}),
+        inserting("t", {1: (5, None), 2: (-5, None)}),
+        inserting("t", mixed),
+        ("UPDATE t SET a = 100 WHERE pk = 15", "t", {15: (100, mixed[15][1])}),
+        ("UPDATE t SET n = 9 WHERE pk = 12", "t", {12: (mixed[12][0], 9)}),
         ("DELETE FROM t WHERE pk IN (1, " + ", ".join(map(str, range(11, 50, 2))) + ")",
-         {pk: None for pk in [1, *range(11, 50, 2)]}),
-        ("DELETE FROM t", {pk: None for pk in [2, *range(10, 50, 2)]}),
-        ("INSERT INTO t VALUES (99, 3, 4)", {99: (3, 4)}),
+         "t", {pk: None for pk in [1, *range(11, 50, 2)]}),
+        ("DELETE FROM t", "t", {pk: None for pk in [2, *range(10, 50, 2)]}),
+        inserting("t", {99: (3, 4)}),
     ]):
         c = len(rows)
         _, sa, aa, lo, hi = _fold(a for a, _ in rows.values())
@@ -311,19 +279,17 @@ def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client):
         "COUNT(*) AS c FROM ev GROUP BY k")
 
     rows = {}
-    for sql in churn(client, rows, [
-        ("INSERT INTO ev VALUES (1, 10, 7, 'a'), (2, 10, 7, 'b'), (3, 10, 8, 'a'), "
-         "(4, 20, 7, 'a'), (5, 20, NULL, 'a'), (6, 30, NULL, 'c')",
-         {1: (10, 7, "a"), 2: (10, 7, "b"), 3: (10, 8, "a"), 4: (20, 7, "a"),
-          5: (20, None, "a"), 6: (30, None, "c")}),
-        ("DELETE FROM ev WHERE pk = 1", {1: None}),
-        ("DELETE FROM ev WHERE pk = 2", {2: None}),
-        ("UPDATE ev SET k = 10 WHERE pk = 4", {4: (10, 7, "a")}),
-        ("INSERT INTO ev VALUES (7, 20, 1, 'z')", {7: (20, 1, "z")}),
-        ("DELETE FROM ev WHERE pk = 6", {6: None}),
+    for sql in churn(client, {"ev": rows}, [
+        inserting("ev", {1: (10, 7, "a"), 2: (10, 7, "b"), 3: (10, 8, "a"), 4: (20, 7, "a"),
+                         5: (20, None, "a"), 6: (30, None, "c")}),
+        ("DELETE FROM ev WHERE pk = 1", "ev", {1: None}),
+        ("DELETE FROM ev WHERE pk = 2", "ev", {2: None}),
+        ("UPDATE ev SET k = 10 WHERE pk = 4", "ev", {4: (10, 7, "a")}),
+        inserting("ev", {7: (20, 1, "z")}),
+        ("DELETE FROM ev WHERE pk = 6", "ev", {6: None}),
     ]):
         by_k = {k: (rs, {r[1] for r in rs} - {None})
-                for k, rs in _groups(rows.values(), lambda r: r[0]).items()}
+                for k, rs in groups(rows.values(), lambda r: r[0]).items()}
 
         assert bag(scanned(client, "per_k"), "k", "n") == {
             (k, len(us)): 1 for k, (_, us) in by_k.items()}, sql
@@ -362,7 +328,7 @@ def test_a_compound_group_key_is_emitted_in_source_key_order(client):
         "CREATE VIEW g4 AS SELECT a, b, c, d, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi "
         "FROM t4 GROUP BY a, b, c, d; "
         "INSERT INTO t2 VALUES (1, 7, 100), (2, 8, 200), (3, 1, 300); "
-        f"INSERT INTO t4 VALUES {', '.join(map(str, quads))}")
+        f"INSERT INTO t4 VALUES {values(quads)}")
 
     assert bag(scanned(client, "perm"), "ka", "kb", "s") == {
         (1, 7, 100): 1, (2, 8, 200): 1, (3, 1, 300): 1}

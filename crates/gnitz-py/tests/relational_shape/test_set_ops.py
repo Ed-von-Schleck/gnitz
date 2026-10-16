@@ -15,46 +15,40 @@ from collections import Counter
 
 from _read import bag, scanned
 from _shapes import ONE_SOURCE_OPS, setop
-from _sql import churn
+from _sql import churn, inserting
 
 
 # view -> (operator as written, the operator it computes). `MINUS` is Oracle's
 # spelling of EXCEPT, quantifiers included.
-_OPS = {
-    "ua": ("UNION ALL", "UNION ALL"), "u": ("UNION", "UNION"),
-    "ia": ("INTERSECT ALL", "INTERSECT ALL"), "i": ("INTERSECT", "INTERSECT"),
-    "ea": ("EXCEPT ALL", "EXCEPT ALL"), "e": ("EXCEPT", "EXCEPT"),
-    "ma": ("MINUS ALL", "EXCEPT ALL"), "m": ("MINUS", "EXCEPT"), "md": ("MINUS DISTINCT", "EXCEPT"),
-}
+_OPS = {n: (op, op) for n, op in ONE_SOURCE_OPS.items()} | {
+    "ma": ("MINUS ALL", "EXCEPT ALL"), "m": ("MINUS", "EXCEPT"), "md": ("MINUS DISTINCT", "EXCEPT")}
 # Unprojected, so identity is the whole (pk, val) row rather than the PK.
 _STAR_OPS = {"sx": "EXCEPT", "si": "INTERSECT", "sua": "UNION ALL"}
 # (statement, table, {pk: (val,)}); a `None` row deletes the pk.
 _CHURN = [
     # A branch may arrive before the other has anything.
-    ("INSERT INTO b VALUES (8, 40)", "b", {8: (40,)}),
+    inserting("b", {8: (40,)}),
     # Three rows carry 10, so a DISTINCT/ALL split shows.
-    ("INSERT INTO a VALUES (1, 10), (2, 10), (3, 10), (4, 20)", "a",
-     {1: (10,), 2: (10,), 3: (10,), 4: (20,)}),
+    inserting("a", {1: (10,), 2: (10,), 3: (10,), 4: (20,)}),
     # 10 overlaps at unequal multiplicity and 30 is right-only (cR=2, cL=0), which
     # drives the clamp's pre-image integral net-negative. (1, 999) shares a's PK 1
     # and (4, 20) is a's row verbatim: under SELECT * two elements and one.
-    ("INSERT INTO b VALUES (5, 10), (6, 30), (7, 30), (1, 999), (4, 20)", "b",
-     {5: (10,), 6: (30,), 7: (30,), 1: (999,), 4: (20,)}),
+    inserting("b", {5: (10,), 6: (30,), 7: (30,), 1: (999,), 4: (20,)}),
     ("DELETE FROM b WHERE pk = 5", "b", {5: None}),
     # A retraction and an insertion under one PK: an exit and an entry together.
     ("UPDATE a SET val = 30 WHERE pk = 4", "a", {4: (30,)}),
     ("DELETE FROM a WHERE pk IN (1, 2, 3)", "a", {1: None, 2: None, 3: None}),
     # NULL is its own value: two coalesce under a deduplicating op, keep their
     # multiplicity under ALL, and never meet a genuine 0.
-    ("INSERT INTO b VALUES (12, NULL), (13, NULL), (14, 0)", "b", {12: (None,), 13: (None,), 14: (0,)}),
-    ("INSERT INTO a VALUES (15, 0), (16, 30)", "a", {15: (0,), 16: (30,)}),
+    inserting("b", {12: (None,), 13: (None,), 14: (0,)}),
+    inserting("a", {15: (0,), 16: (30,)}),
     # One value driven back and forth across membership, through the tick where
     # its pre-image integral is -1 while the output stays clamped at 0.
-    ("INSERT INTO a VALUES (9, 50)", "a", {9: (50,)}),
-    ("INSERT INTO b VALUES (10, 50)", "b", {10: (50,)}),
+    inserting("a", {9: (50,)}),
+    inserting("b", {10: (50,)}),
     ("DELETE FROM a WHERE pk = 9", "a", {9: None}),
     ("DELETE FROM b WHERE pk = 10", "b", {10: None}),
-    ("INSERT INTO a VALUES (11, 50)", "a", {11: (50,)}),
+    inserting("a", {11: (50,)}),
 ]
 
 
@@ -71,7 +65,7 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client):
         "INSERT INTO c VALUES (1, 30); "
         "CREATE VIEW av AS SELECT pk, val FROM a WHERE val > 15; "
         "CREATE VIEW aw AS SELECT pk, val FROM a WHERE val > 25; "
-        + "; ".join(f"CREATE VIEW {n} AS SELECT val FROM a {op} SELECT val FROM b"
+        + "; ".join(f"CREATE VIEW v_{n} AS SELECT val FROM a {op} SELECT val FROM b"
                     for n, (op, _) in _OPS.items()) + "; "
         + "; ".join(f"CREATE VIEW {n} AS SELECT * FROM a {op} SELECT * FROM b"
                     for n, op in _STAR_OPS.items()) + "; "
@@ -88,8 +82,8 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client):
     for sql in churn(client, state, _CHURN):
         a, b = state["a"], state["b"]
         vals = Counter(a.values()), Counter(b.values())
-        for name, (_, op) in _OPS.items():
-            assert bag(scanned(client, name), "val") == setop(op, *vals), (sql, name)
+        for n, (_, op) in _OPS.items():
+            assert bag(scanned(client, f"v_{n}"), "val") == setop(op, *vals), (sql, n)
         for name, op in _STAR_OPS.items():
             assert bag(scanned(client, name), "pk", "val") == setop(
                 op, *(Counter((pk, *row) for pk, row in t.items()) for t in (a, b))), (sql, name)

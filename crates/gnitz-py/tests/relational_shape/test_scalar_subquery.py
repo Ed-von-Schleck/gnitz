@@ -23,17 +23,13 @@ retracting the old leaves both present, which a value lookup would not see.
 
 Run with GNITZ_WORKERS=4 — a global reduce funnels, a grouped one exchanges.
 """
+import operator
+
 from _read import bag, scanned
-from _sql import churn
+from _shapes import agg, known
+from _sql import churn, inserting, values
 
-
-def _gt(l, r):
-    return l is not None and r is not None and l > r
-
-
-def _sum(vals):
-    live = [v for v in vals if v is not None]
-    return sum(live) if live else None
+_GT, _EQ = known(operator.gt), known(operator.eq)
 
 
 _COUNT = "(SELECT COUNT(*) FROM b WHERE b.k = a.k)"
@@ -80,16 +76,15 @@ _VIEWS = [
 ]
 
 _CHURN = [
-    ("SELECT 1", "b", {}),
-    ("INSERT INTO c VALUES (1, 10, 9)", "c", {1: (10, 9)}),
+    (None, {}),
+    inserting("c", {1: (10, 9)}),
     # Every b group, and b itself, empty: COUNT reads 0, everything else NULL.
-    ("INSERT INTO b VALUES (1, 10, 4), (2, 10, 10)", "b", {1: (10, 4), 2: (10, 10)}),
+    inserting("b", {1: (10, 4), 2: (10, 10)}),
     # A genuine 0 minimum over the whole of b.
-    ("INSERT INTO b VALUES (3, 20, 0)", "b", {3: (20, 0)}),
-    ("INSERT INTO n VALUES (1, 10, 7, 1.5), (2, 10, -3, -2.25), (3, 20, 2147483647, 0.5)", "n",
-     {1: (10, 7, 1.5), 2: (10, -3, -2.25), 3: (20, 2147483647, 0.5)}),
-    ("INSERT INTO d VALUES (1, 5)", "d", {1: (5,)}),
-    ("INSERT INTO d VALUES (2, NULL)", "d", {2: (None,)}),
+    inserting("b", {3: (20, 0)}),
+    inserting("n", {1: (10, 7, 1.5), 2: (10, -3, -2.25), 3: (20, 2147483647, 0.5)}),
+    inserting("d", {1: (5,)}),
+    inserting("d", {2: (None,)}),
     # The MIN of group 10 is retracted and re-derives from history.
     ("DELETE FROM b WHERE id = 1", "b", {1: None}),
     # Both extrema of group 10 are retracted and re-derive at their own width.
@@ -112,6 +107,9 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
     `v = MIN` admit nothing where a raw 0 would admit `v = 0` and `v < 0`, and 0
     for COUNT. A bare MIN/MAX item over an INT and a FLOAT column is stored at that
     column's width."""
+    # k=10 sums to 105, so only a row that is its whole group reaches `own_group`;
+    # v = 0 and v = -7 are the values a raw 0 ground would admit.
+    a = {1: (10, 100), 2: (10, 5), 3: (20, 7), 4: (30, 0), 5: (40, -7)}
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL); "
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, w BIGINT NOT NULL); "
@@ -119,10 +117,7 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
         "CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, y BIGINT); "
         "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, i INT NOT NULL, f FLOAT NOT NULL); "
         + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS) + "; "
-        # k=10 sums to 105, so only a row that is its whole group reaches `own_group`;
-        # v = 0 and v = -7 are the values a raw 0 ground would admit.
-        "INSERT INTO a VALUES (1, 10, 100), (2, 10, 5), (3, 20, 7), (4, 30, 0), (5, 40, -7)")
-    a = {1: (10, 100), 2: (10, 5), 3: (20, 7), 4: (30, 0), 5: (40, -7)}
+        + f"INSERT INTO a VALUES {values((i, *r) for i, r in a.items())}")
 
     state = {"b": {}, "c": {}, "d": {}, "n": {}}
     for sql in churn(client, state, _CHURN):
@@ -130,23 +125,23 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
         ws = {i: [w for bk, w in b.values() if bk == k] for i, (k, _) in a.items()}
         every_w = [w for _, w in b.values()]
         top, low = max(every_w, default=None), min(every_w, default=None)
-        dsum = _sum(y for (y,) in d.values())
+        dsum = agg("SUM", [y for (y,) in d.values()])
 
         def ids(keep):
             return {(i,): 1 for i, (k, v) in a.items() if keep(i, k, v)}
 
         assert bag(scanned(client, "proj"), "id", "c", "s", "mn", "mx", "av") == {
-            (i, len(g), _sum(g), min(g, default=None), max(g, default=None),
-             sum(g) / len(g) if g else None): 1 for i, g in ws.items()}, sql
+            (i, *(agg(f, g) for f in ("COUNT", "SUM", "MIN", "MAX", "AVG"))): 1 for i, g in ws.items()}, sql
         assert bag(scanned(client, "filtered"), "id", "c") == {
             (i, sum(w > 5 for w in g)): 1 for i, g in ws.items()}, sql
         assert bag(scanned(client, "at_least_two"), "id") == ids(lambda i, k, v: len(ws[i]) >= 2), sql
         assert bag(scanned(client, "mixed"), "id", "hit") == {
-            (i, int(bool(ws[i]))): 1 for i, (_, v) in a.items() if v > 0 or _gt(_sum(ws[i]), 100)}, sql
+            (i, int(bool(ws[i]))): 1 for i, (_, v) in a.items() if v > 0 or _GT(agg("SUM", ws[i]), 100)}, sql
         assert bag(scanned(client, "own_group"), "id") == ids(
             lambda i, k, v: v >= sum(ov for ok, ov in a.values() if ok == k)), sql
         assert bag(scanned(client, "stacked"), "id", "sb", "sc") == {
-            (i, _sum(ws[i]), _sum(x for ck, x in c.values() if ck == k)): 1 for i, (k, _) in a.items()}, sql
+            (i, agg("SUM", ws[i]), agg("SUM", [x for ck, x in c.values() if ck == k])): 1
+            for i, (k, _) in a.items()}, sql
         assert bag(scanned(client, "coalesced"), "id", "c") == {(i, len(g)): 1 for i, g in ws.items()}, sql
         for name in ("not_null", "global_not_null"):
             assert bag(scanned(client, name), "id") == ids(lambda i, k, v: True), (sql, name)
@@ -158,22 +153,22 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
         assert bag(scanned(client, "ge_all"), "id") == ids(
             lambda i, k, v: not ws[i] or v >= max(ws[i])), sql
         assert bag(scanned(client, "not_lt_any"), "id") == ids(lambda i, k, v: not lt_any(i, k, v)), sql
-        assert bag(scanned(client, "global_lt_any"), "id") == ids(lambda i, k, v: _gt(top, v)), sql
+        for name in ("global_lt_any", "lt_max"):
+            assert bag(scanned(client, name), "id") == ids(lambda i, k, v: _GT(top, v)), (sql, name)
         assert bag(scanned(client, "composed"), "id", "c") == {
-            (i, len(ws[i])): 1 for i, (_, v) in a.items() if _gt(top, v)}, sql
-        assert bag(scanned(client, "lt_max"), "id") == ids(lambda i, k, v: _gt(top, v)), sql
-        assert bag(scanned(client, "eq_min"), "id") == ids(lambda i, k, v: low is not None and v == low), sql
+            (i, len(ws[i])): 1 for i, (_, v) in a.items() if _GT(top, v)}, sql
+        assert bag(scanned(client, "eq_min"), "id") == ids(lambda i, k, v: _EQ(v, low)), sql
         assert bag(scanned(client, "eq_count"), "id") == ids(lambda i, k, v: v == len(b)), sql
-        assert bag(scanned(client, "eq_sum"), "id") == ids(lambda i, k, v: dsum is not None and v == dsum), sql
-        assert bag(scanned(client, "lt_sum"), "id") == ids(lambda i, k, v: _gt(dsum, v)), sql
+        assert bag(scanned(client, "eq_sum"), "id") == ids(lambda i, k, v: _EQ(v, dsum)), sql
+        assert bag(scanned(client, "lt_sum"), "id") == ids(lambda i, k, v: _GT(dsum, v)), sql
         assert bag(scanned(client, "global_proj"), "id", "n", "mx") == {(i, len(b), top): 1 for i in a}, sql
         assert bag(scanned(client, "ne_count"), "id") == ids(lambda i, k, v: v != len(b)), sql
         assert bag(scanned(client, "global_ge_all"), "id") == ids(lambda i, k, v: top is None or v >= top), sql
-        assert bag(scanned(client, "not_global_lt_any"), "id") == ids(lambda i, k, v: not _gt(top, v)), sql
+        assert bag(scanned(client, "not_global_lt_any"), "id") == ids(lambda i, k, v: not _GT(top, v)), sql
         assert bag(scanned(client, "avg_cmp"), "id") == ids(
             lambda i, k, v: bool(every_w) and v < sum(every_w) / len(every_w)), sql
-        assert bag(scanned(client, "or_global"), "id") == ids(lambda i, k, v: v == 0 or _gt(v, low)), sql
-        assert bag(scanned(client, "shifted"), "id") == ids(lambda i, k, v: _gt(top, v + 1)), sql
+        assert bag(scanned(client, "or_global"), "id") == ids(lambda i, k, v: v == 0 or _GT(v, low)), sql
+        assert bag(scanned(client, "shifted"), "id") == ids(lambda i, k, v: _GT(top, v + 1)), sql
         ns = {i: [(ni, nf) for nk, ni, nf in state["n"].values() if nk == k] for i, (k, _) in a.items()}
         assert bag(scanned(client, "narrow"), "id", "mi", "mf") == {
             (i, max((ni for ni, _ in g), default=None), min((nf for _, nf in g), default=None)): 1

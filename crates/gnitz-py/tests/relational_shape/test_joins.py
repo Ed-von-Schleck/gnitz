@@ -15,24 +15,19 @@ only where a spelling's rule differs by orientation (the USING merge keeps the
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _sql import churn, inserting, values
 
 # (statement, table, {pk: row}); a `None` row deletes the pk. Rows are
 # l: (k, x, y, lv), r: (x, y, name), c: (x, y, cv) under the key (k1, k2, k3).
 _CHURN = [
     # r(40) shares r(10)'s (x, y), so the two-column key is many-to-many.
-    ("INSERT INTO r VALUES (10, 1, 100, 'Alice'), (20, 2, 200, 'Bob'), (30, 7, 7, 'Cy'), "
-     "(40, 1, 100, 'Dup')",
-     "r", {10: (1, 100, "Alice"), 20: (2, 200, "Bob"), 30: (7, 7, "Cy"), 40: (1, 100, "Dup")}),
+    inserting("r", {10: (1, 100, "Alice"), 20: (2, 200, "Bob"), 30: (7, 7, "Cy"), 40: (1, 100, "Dup")}),
     # l(4)'s key 99 names no r; l(2) agrees with r(20) on x alone; l(5)'s x fills
     # both slots of r(30)'s (x, x).
-    ("INSERT INTO l VALUES (1, 10, 1, 100, 100), (2, 20, 2, 999, 200), (3, 10, 1, 100, 300), "
-     "(4, 99, 5, 5, 400), (5, 30, 7, 0, 500)",
-     "l", {1: (10, 1, 100, 100), 2: (20, 2, 999, 200), 3: (10, 1, 100, 300),
-           4: (99, 5, 5, 400), 5: (30, 7, 0, 500)}),
+    inserting("l", {1: (10, 1, 100, 100), 2: (20, 2, 999, 200), 3: (10, 1, 100, 300),
+                    4: (99, 5, 5, 400), 5: (30, 7, 0, 500)}),
     # Three rows whose 24-byte key shares its first 16 bytes.
-    ("INSERT INTO c VALUES (1, 1, 1, 1, 100, 11), (1, 1, 2, 1, 100, 22), (1, 1, 3, 2, 200, 33)",
-     "c", {(1, 1, 1): (1, 100, 11), (1, 1, 2): (1, 100, 22), (1, 1, 3): (2, 200, 33)}),
+    inserting("c", {(1, 1, 1): (1, 100, 11), (1, 1, 2): (1, 100, 22), (1, 1, 3): (2, 200, 33)}),
     ("UPDATE l SET lv = 999 WHERE id = 1", "l", {1: (10, 1, 100, 999)}),
     ("UPDATE l SET k = 20 WHERE id = 3", "l", {3: (20, 1, 100, 300)}),
     ("UPDATE c SET cv = 222 WHERE k1 = 1 AND k2 = 1 AND k3 = 2", "c", {(1, 1, 2): (1, 100, 222)}),
@@ -127,12 +122,10 @@ def test_every_spelling_of_one_join_compiles_to_one_graph(client):
 
     t, u, c = {}, {}, {}
     for sql in churn(client, {"t": t, "u": u, "c": c}, [
-        ("INSERT INTO c VALUES (20, 5), (21, 6)", "c", {20: 5, 21: 6}),
-        ("INSERT INTO u VALUES (10, 1, 5, 7, 1.5, 5), (11, 2, 1, 9, 2.5, 6), (12, 2, 6, 8, 3.5, 5)",
-         "u", {10: (1, 5, 7, 1.5, 5), 11: (2, 1, 9, 2.5, 6), 12: (2, 6, 8, 3.5, 5)}),
+        inserting("c", {20: 5, 21: 6}),
+        inserting("u", {10: (1, 5, 7, 1.5, 5), 11: (2, 1, 9, 2.5, 6), 12: (2, 6, 8, 3.5, 5)}),
         # k=1 is one-to-one, k=2 one-to-many, and t(3) is a second row at k=1.
-        ("INSERT INTO t VALUES (1, 1, 1, 7, 1.5), (2, 2, 2, 8, 2.5), (3, 1, 3, 7, 9.5)",
-         "t", {1: (1, 1, 7, 1.5), 2: (2, 2, 8, 2.5), 3: (1, 3, 7, 9.5)}),
+        inserting("t", {1: (1, 1, 7, 1.5), 2: (2, 2, 8, 2.5), 3: (1, 3, 7, 9.5)}),
         ("UPDATE t SET k = 2 WHERE id = 1", "t", {1: (2, 1, 7, 1.5)}),
         ("DELETE FROM u WHERE id = 12", "u", {12: None}),
     ]):
@@ -155,6 +148,9 @@ def test_every_spelling_of_one_join_compiles_to_one_graph(client):
         for name in ("spine_comma", "spine_explicit", "spine_mixed"):
             assert bag(scanned(client, name), "tid", "uid", "cid") == {
                 (ti, ui, ci): 1 for ti, ui in keyed for ci, j in c.items() if u[ui][4] == j}, (sql, name)
+
+
+_NC = {1: (5, 9), 6: (6, 9)}
 
 
 def test_natural_and_using_merge_each_shared_name_into_one(client):
@@ -184,28 +180,23 @@ def test_natural_and_using_merge_each_shared_name_into_one(client):
         "CREATE VIEW three AS SELECT na.id AS ai, nc.id AS ci FROM na JOIN nb USING (k) JOIN nc USING (k); "
         "INSERT INTO l VALUES (1, 10), (2, 20); "
         "INSERT INTO r VALUES (7, 70), (8, 80), (9, 90); "
-        "INSERT INTO nc VALUES (1, 5, 9), (6, 6, 9)")
+        f"INSERT INTO nc VALUES {values((i, *kv) for i, kv in _NC.items())}")
     assert bag(scanned(client, "product"), "x", "y") == {
         (x, y): 1 for x in (10, 20) for y in (70, 80, 90)}
 
-    na = {1: (5, 9), 2: (6, 9), 3: (7, 9), 4: (8, 0)}
-    nb = {1: (5, 9), 2: (6, 9), 3: (0, 9), 5: (8, 1)}
-    nc = {1: (5, 9), 6: (6, 9)}
-    for sql, changes in [
+    state = {"na": {}, "nb": {}}
+    for sql in churn(client, state, [
         # nb(3) shares only `id` and `v` with na(3); nb(5) shares only `k` with na(4).
-        ("INSERT INTO na VALUES (1, 5, 9), (2, 6, 9), (3, 7, 9), (4, 8, 0); "
-         "INSERT INTO nb VALUES (1, 5, 9), (2, 6, 9), (3, 0, 9), (5, 8, 1)", {}),
-        ("UPDATE nb SET k = 7 WHERE id = 3", {3: (7, 9)}),
-    ]:
-        client.execute_sql(sql)
-        nb.update(changes)
+        inserting("na", {1: (5, 9), 2: (6, 9), 3: (7, 9), 4: (8, 0)}),
+        inserting("nb", {1: (5, 9), 2: (6, 9), 3: (0, 9), 5: (8, 1)}),
+        ("UPDATE nb SET k = 7 WHERE id = 3", "nb", {3: (7, 9)}),
+    ]):
+        na, nb, nc = state["na"], state["nb"], _NC
 
         assert bag(scanned(client, "pair"), "id", "k", "v") == {
             (i, *kv): 1 for i, kv in na.items() if nb.get(i) == kv}, sql
-        chain = scanned(client, "chain")
-        assert bag(chain, "id", "k", "v") == {
+        assert bag(scanned(client, "chain")) == {
             (i, *kv): 1 for i, kv in na.items() if nb.get(i) == kv == nc.get(i)}, sql
-        assert all(set(row._fields) == {"id", "k", "v"} for row in chain), sql
         assert bag(scanned(client, "both_merged"), "aid", "bid", "merged", "right_k", "v") == {
             (ai, bi, k, k, v): 1 for ai, (k, v) in na.items() for bi, bkv in nb.items()
             if bkv == (k, v)}, sql

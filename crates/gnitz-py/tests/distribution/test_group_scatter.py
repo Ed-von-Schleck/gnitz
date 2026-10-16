@@ -13,6 +13,7 @@ worker every row is already co-located, so the whole module needs W > 1.
 import pytest
 from _read import bag, rows
 from _serverproc import NEEDS_MULTI
+from _shapes import groups
 from _sql import churn, insert, values
 
 pytestmark = NEEDS_MULTI
@@ -61,10 +62,7 @@ _CHURN = [
 
 def _groups(state, group):
     cols = [_COL[c.strip()] for c in group.split(",")]
-    groups = {}
-    for r in state.values():
-        groups.setdefault(tuple(r[c] for c in cols), []).append(r)
-    return groups
+    return groups(state.values(), lambda r: tuple(r[c] for c in cols))
 
 
 def _want_fold(state, group):

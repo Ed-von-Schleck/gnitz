@@ -11,11 +11,15 @@ field *names*, never a column count; and the weights alongside them are what
 shows the key is still doing its physical job.
 """
 from _read import bag, scanned
+from _shapes import views_ddl
 
-# view -> (body, its visible columns, its bag before and after `a(2)` leaves).
+_JOIN = "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k"
+
+# view -> (body, its visible columns, its bag before and after `a(2)` leaves), in
+# creation order.
 _SHAPES = {
-    "equi_join": ("SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-                  ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    "equi_join": (_JOIN, ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    "equi_join_twin": (_JOIN, ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
     # Three pairs satisfy a.k < b.k and all project to one tuple, so the pair key
     # is what keeps them three elements rather than one.
     "range_join": ("SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k < b.k",
@@ -44,12 +48,13 @@ _SHAPES = {
     "wildcard_exclude": ("SELECT * EXCLUDE (k, cat) FROM a",
                          ("pk", "av"), {(1, 100): 1, (2, 100): 1}, {(1, 100): 1}),
     # A hidden key never re-enters through a downstream wildcard, however deep.
-    "stacked": ("SELECT * FROM over_jv1", ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    "over_join": ("SELECT * FROM equi_join", ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    "stacked": ("SELECT * FROM over_join", ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
     # Downstream identity is the projected content: two structurally identical
     # join views meet UNION ALL as one tuple at weight 2 and UNION at weight 1.
-    "union_all_of_twins": ("SELECT * FROM jv1 UNION ALL SELECT * FROM jv2",
+    "union_all_of_twins": ("SELECT * FROM equi_join UNION ALL SELECT * FROM equi_join_twin",
                            ("av", "bv"), {(100, 200): 2}, {(100, 200): 2}),
-    "union_of_twins": ("SELECT * FROM jv1 UNION SELECT * FROM jv2",
+    "union_of_twins": ("SELECT * FROM equi_join UNION SELECT * FROM equi_join_twin",
                        ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
 }
 
@@ -59,25 +64,22 @@ def test_a_key_slot_is_absent_from_every_client_row(client):
     are exactly the projected names, and the weights show the key still keying
     through a retraction. `including_hidden()` is the debugging escape hatch: it
     presents the synthetic key first, carrying the decoded join-key value."""
-    join = "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k"
     client.execute_sql(
         "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL, "
         "cat TEXT NOT NULL); "
         "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL); "
-        f"CREATE VIEW jv1 AS {join}; CREATE VIEW jv2 AS {join}; "
-        "CREATE VIEW over_jv1 AS SELECT * FROM jv1; "
-        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, *_) in _SHAPES.items()) + "; "
+        + views_ddl(_SHAPES) + "; "
         "INSERT INTO a VALUES (1, 7, 100, 'x'), (2, 5, 100, 'y'); "
         "INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)")
 
-    for step in ("before", "after"):
-        if step == "after":
-            client.execute_sql("DELETE FROM a WHERE pk = 2")
-        for name, (_, cols, before, after) in _SHAPES.items():
+    for step, sql in enumerate((None, "DELETE FROM a WHERE pk = 2")):
+        if sql:
+            client.execute_sql(sql)
+        for name, (_, cols, *want) in _SHAPES.items():
             rows = scanned(client, name)
-            assert bag(rows, *cols) == (before if step == "before" else after), (step, name)
-            assert all(set(r._fields) == set(cols) for r in rows), (step, name, rows)
+            assert bag(rows) == want[step], (sql, name)
+            assert {r._fields for r in rows} == {cols}, (sql, name, rows)
 
-    raw = scanned(client, "jv1", hidden=True)
+    raw = scanned(client, "equi_join", hidden=True)
     assert [r._fields[0] for r in raw] == ["_join_pk"], raw
     assert bag(raw, "_join_pk", "av", "bv") == {(7, 100, 200): 1}

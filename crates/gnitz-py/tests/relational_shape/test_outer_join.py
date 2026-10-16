@@ -21,15 +21,10 @@ import operator
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import RANGE_OPS, known
+from _sql import churn, inserting
 
-
-def _cmp(op):
-    """`op` under SQL 3VL: a comparison against NULL admits nothing."""
-    return lambda l, r: l is not None and r is not None and op(l, r)
-
-
-_EQ, _LE, _LT, _GT = (_cmp(o) for o in (operator.eq, operator.le, operator.lt, operator.gt))
+_EQ, _LE, _GT = (known(o) for o in (operator.eq, operator.le, operator.gt))
 
 
 def _join(a, b, on, kind):
@@ -55,9 +50,8 @@ _ON = {
     "eq_on_b": ("a.k = b.k AND b.y > 20", lambda ar, br: _EQ(ar["k"], br["k"]) and _GT(br["y"], 20)),
     "band_on_b": ("a.k = b.k AND a.x <= b.y AND b.id > 3",
                   lambda ar, br: _EQ(ar["k"], br["k"]) and _LE(ar["x"], br["y"]) and br["id"] > 3),
-    **{f"range_{n}": (f"a.x {op} b.y", lambda ar, br, f=_cmp(f): f(ar["x"], br["y"]))
-       for n, op, f in (("lt", "<", operator.lt), ("le", "<=", operator.le),
-                        ("gt", ">", operator.gt), ("ge", ">=", operator.ge))},
+    **{f"range_{n}": (f"a.x {op} b.y", lambda ar, br, f=known(f): f(ar["x"], br["y"]))
+       for n, (op, f) in RANGE_OPS.items()},
 }
 
 # view -> (ON, kind, SQL WHERE or None, the same filter over the output pair).
@@ -95,13 +89,13 @@ _CHURN = [
      {1: (1, 10, "alpha", 7), 2: (2, 20, "beta", None), 3: (None, 30, "gamma", 42),
       4: (3, None, "delta", None)}),
     # b rows no key matches; b(2) is still a range match for `>`.
-    ("INSERT INTO b VALUES (1, NULL, NULL), (2, NULL, 5)", "b", {1: (None, None), 2: (None, 5)}),
+    inserting("b", {1: (None, None), 2: (None, 5)}),
     # a(1)'s first match retracts its fill in the epoch the pair appears.
-    ("INSERT INTO b VALUES (3, 1, 50)", "b", {3: (1, 50)}),
+    inserting("b", {3: (1, 50)}),
     # A second match leaves a(1) matched at weight 1; b(6) completes a(2)'s k=2 key.
-    ("INSERT INTO b VALUES (4, 1, 15), (6, 2, 20)", "b", {4: (1, 15), 6: (2, 20)}),
+    inserting("b", {4: (1, 15), 6: (2, 20)}),
     # The extreme `y`, and a b row no a row matches.
-    ("INSERT INTO b VALUES (5, 9, 100)", "b", {5: (9, 100)}),
+    inserting("b", {5: (9, 100)}),
     # Deleting the extreme moves the pure-range threshold; the next b does not.
     ("DELETE FROM b WHERE id = 5", "b", {5: None}),
     ("DELETE FROM b WHERE id = 4", "b", {4: None}),
@@ -112,7 +106,7 @@ _CHURN = [
     # A left-only and a right-only fill that both pack their pair key to zeros,
     # told apart only by their null bitmaps.
     ("INSERT INTO a VALUES (0, 0, 77, 1000, 'zero', NULL)", "a", {0: (77, 1000, "zero", None)}),
-    ("INSERT INTO b VALUES (0, 78, 1)", "b", {0: (78, 1)}),
+    inserting("b", {0: (78, 1)}),
 ]
 
 
@@ -170,3 +164,35 @@ def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(clien
         assert bag(scanned(client, "promoted"), "aid", "cid") == Counter(
             (ar["id"], ar["id"]) for ar, br in _join(A, B, _ON["eq"][1], "LEFT")
             if ar["id"] in c and _EQ(_col(br, "y"), c[ar["id"]])), sql
+
+
+def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client):
+    """A band LEFT JOIN over a join-keyed input whose two rows differ only in the
+    range value: each null-fills exactly while nothing matches it."""
+    client.execute_sql(
+        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, g BIGINT NOT NULL, x BIGINT NOT NULL); "
+        "CREATE TABLE q (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, y BIGINT NOT NULL); "
+        "CREATE VIEW band_over_join AS SELECT d.v AS v, r.id AS rid "
+        "FROM (SELECT p.g AS g, p.x AS x, q.v AS v FROM p JOIN q ON p.k = q.k) d "
+        "LEFT JOIN r ON d.g = r.g AND d.x <= r.y")
+    steps = [
+        inserting("q", {1: 7, 2: 8}),
+        # p(1) and p(2) share `k` and so `v`, and differ only in `x`.
+        inserting("p", {1: (1, 5, 10), 2: (1, 5, 100), 3: (2, 5, 40)}),
+        # p(1) matches both, p(2) neither.
+        inserting("r", {1: (5, 50), 2: (5, 60)}),
+        ("UPDATE p SET x = 55 WHERE id = 2", "p", {2: (1, 5, 55)}),
+        ("DELETE FROM r WHERE id = 2", "r", {2: None}),
+        ("DELETE FROM q WHERE k = 1", "q", {1: None}),
+    ]
+    state = {"p": {}, "q": {}, "r": {}}
+    for sql in churn(client, state, steps):
+        want = Counter()
+        for k, g, x in state["p"].values():
+            if k not in state["q"]:
+                continue
+            v = state["q"][k]
+            matched = [ri for ri, (rg, y) in state["r"].items() if rg == g and x <= y]
+            want.update([(v, ri) for ri in matched] or [(v, None)])
+        assert bag(scanned(client, "band_over_join"), "v", "rid") == want, sql

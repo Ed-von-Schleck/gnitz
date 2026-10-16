@@ -17,26 +17,22 @@ cap.
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _sql import churn, inserting
 
 # (statement, table, {id: row}); a `None` row deletes the id. Rows are
 # a: (k, v, p, dead), b: (k, v, q), c: (k, v).
 _CHURN = [
-    ("INSERT INTO b VALUES (10, 500, 11, 4), (20, 600, 22, 4), (30, 999, 33, 1)",
-     "b", {10: (500, 11, 4), 20: (600, 22, 4), 30: (999, 33, 1)}),
-    ("INSERT INTO c VALUES (500, 0, 99), (600, 5, 88), (700, 50, 88), (800, 0, 10), (5, 3, 77)",
-     "c", {500: (0, 99), 600: (5, 88), 700: (50, 88), 800: (0, 10), 5: (3, 77)}),
+    inserting("b", {10: (500, 11, 4), 20: (600, 22, 4), 30: (999, 33, 1)}),
+    inserting("c", {500: (0, 99), 600: (5, 88), 700: (50, 88), 800: (0, 10), 5: (3, 77)}),
     # a(3)'s key names no b; a(4)'s b(30) names no c.
-    ("INSERT INTO a VALUES (1, 10, 700, 5, 999), (2, 10, 800, 3, 0), (3, 99, 700, 9, 1), "
-     "(4, 30, 5, 9, 2)",
-     "a", {1: (10, 700, 5, 999), 2: (10, 800, 3, 0), 3: (99, 700, 9, 1), 4: (30, 5, 9, 2)}),
+    inserting("a", {1: (10, 700, 5, 999), 2: (10, 800, 3, 0), 3: (99, 700, 9, 1), 4: (30, 5, 9, 2)}),
     # Re-keying the head moves its row onto another path in one epoch.
     ("UPDATE a SET k = 20 WHERE id = 1", "a", {1: (20, 700, 5, 999)}),
     ("UPDATE a SET dead = 12345 WHERE id = 1", "a", {1: (20, 700, 5, 12345)}),
     ("DELETE FROM c WHERE id = 700", "c", {700: None}),
     # The bridge row in the middle relation retracts everything derived from it.
     ("DELETE FROM b WHERE id = 10", "b", {10: None}),
-    ("INSERT INTO c VALUES (999, 0, 0)", "c", {999: (0, 0)}),
+    inserting("c", {999: (0, 0)}),
 ]
 
 
@@ -82,7 +78,7 @@ def test_a_chain_resolves_every_relation_below_each_step(client):
         direct = Counter((i, c[bk][1]) for i, (bk, *_) in via_b.items() if bk in c)
         for name in ("direct", "nested_cte"):
             assert bag(scanned(client, name), "aid", "cv") == direct, (sql, name)
-        assert bag(scanned(client, "aliased"), "x") == Counter((i,) for i, _ in direct), sql
+        assert bag(scanned(client, "aliased"), "x") == Counter((i,) for i, _ in direct.elements()), sql
         assert bag(scanned(client, "deep"), "av", "bv", "cv") == Counter(
             (a[i][1], bv, c[a[i][1]][1]) for i, (_, bv, _) in via_b.items()
             if a[i][1] in c and c[a[i][1]][1] > 50), sql

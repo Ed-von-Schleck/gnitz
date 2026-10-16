@@ -11,13 +11,14 @@ one row at weight W — so a presence check passes under them. At one worker the
 is a single copy and none of it can happen, so the whole module needs W > 1.
 """
 
+import operator
 from collections import Counter
 
 import gnitz
 import pytest
 from _serverproc import NEEDS_MULTI
 from _read import bag, rows, scanned
-from _shapes import ONE_SOURCE_OPS, setop
+from _shapes import ONE_SOURCE_OPS, agg, groups, known, setop
 from _sql import churn, insert, values
 
 pytestmark = NEEDS_MULTI
@@ -204,8 +205,7 @@ _CHURN = [
 ]
 
 
-def _lt(l, r):
-    return l is not None and r is not None and l < r
+_lt = known(operator.lt)
 
 
 def _want(a, b, c):
@@ -229,15 +229,8 @@ def _want(a, b, c):
     def rng(ak, x, bk, y):
         return _lt(x, y)
 
-    def total(xs):
-        xs = [x for x in xs if x is not None]
-        return sum(xs) if xs else None
-
     b_keys = {bk for bk, _ in b.values()}
     top = max((y for _, y in b.values()), default=None)
-    by_k = {}
-    for k, x in a.values():
-        by_k.setdefault(k, []).append(x)
     return {
         **{f"s_{n}": setop(op, ca, cb) for n, op in ONE_SOURCE_OPS.items()},
         "dist": dict.fromkeys(((k,) for k, _ in a.values()), 1),
@@ -256,8 +249,9 @@ def _want(a, b, c):
         "not_in_pk": where(lambda k, x: k not in b),
         "lt_max": where(lambda k, x: _lt(x, top)),
         "n_b": {(p, len(b)): 1 for p in a},
-        "per_k_a": {(k, len(xs), total(xs)): 1 for k, xs in by_k.items()},
-        "overall": {(len(a), total(x for _, x in a.values())): 1},
+        "per_k_a": {(k, len(rs), agg("SUM", [x for _, x in rs])): 1
+                    for k, rs in groups(a.values(), lambda r: r[0]).items()},
+        "overall": {(len(a), agg("SUM", [x for _, x in a.values()])): 1},
         "top2": {(p, a[p][1]): 1 for p in sorted(a)[-2:]},
         "per_k": dict.fromkeys(Counter(k for k, _ in (ca + cb).elements()).items(), 1),
         "c_and_ua": Counter(c.values()) + ca + cb,

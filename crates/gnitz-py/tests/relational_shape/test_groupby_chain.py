@@ -14,10 +14,13 @@ Every assertion is a weighted bag: a chain that emitted a group twice, or left a
 retracted row behind at weight 0, would pass a row-set comparison. The outer-join
 form is test_outer_join.py's.
 """
-from collections import Counter
+from operator import itemgetter
 
+import gnitz
+from _exprs import declared
 from _read import bag, rows, scanned
-from _sql import churn
+from _shapes import grouped, groups
+from _sql import churn, inserting, values
 
 _JOIN = "FROM orders JOIN customers ON orders.cid = customers.id"
 
@@ -45,12 +48,13 @@ _VIEWS = [
     f"star_distinct AS SELECT DISTINCT grp {_JOIN} JOIN zones ON customers.region = zones.id",
 ]
 
+_CUSTOMERS = {1: ("Alice", 100, 1000), 2: ("Bob", 200, 2000), 3: ("Cy", 300, 3000)}
+_ZONES = {100: 7, 200: 7, 300: 8}
+
 _CHURN = [
-    ("INSERT INTO customers VALUES (1, 'Alice', 100, 1000), (2, 'Bob', 200, 2000), "
-     "(3, 'Cy', 300, 3000); INSERT INTO zones VALUES (100, 7), (200, 7), (300, 8)", "orders", {}),
-    ("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)",
-     "orders", {1: (1, 50), 2: (1, 80), 3: (2, 30)}),
-    ("INSERT INTO orders VALUES (4, 1, 20), (5, 3, 60)", "orders", {4: (1, 20), 5: (3, 60)}),
+    (None, {}),
+    inserting("orders", {1: (1, 50), 2: (1, 80), 3: (2, 30)}),
+    inserting("orders", {4: (1, 20), 5: (3, 60)}),
     ("DELETE FROM orders WHERE id = 2", "orders", {2: None}),
     ("UPDATE customers SET region = 300 WHERE id = 2", "customers", {2: ("Bob", 300, 2000)}),
     # Every carrier of one group at once.
@@ -67,41 +71,55 @@ def test_a_reduce_and_a_join_compose_in_either_order_through_churn(client):
         "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, "
         "region BIGINT NOT NULL, amt BIGINT NOT NULL); "
         "CREATE TABLE zones (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL); "
-        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS))
-    zones = {100: 7, 200: 7, 300: 8}
+        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS) + "; "
+        f"INSERT INTO customers VALUES {values((i, *r) for i, r in _CUSTOMERS.items())}; "
+        f"INSERT INTO zones VALUES {values(_ZONES.items())}")
 
-    state = {"orders": {}, "customers": {1: ("Alice", 100, 1000), 2: ("Bob", 200, 2000),
-                                         3: ("Cy", 300, 3000)}}
+    state = {"orders": {}, "customers": dict(_CUSTOMERS)}
     for sql in churn(client, state, _CHURN):
         orders, customers = state["orders"], state["customers"]
-        joined = [(oi, amt, customers[cid]) for oi, (cid, amt) in orders.items() if cid in customers]
+        joined = [(oi, amt, customers[cid][1]) for oi, (cid, amt) in orders.items() if cid in customers]
+        amt, region = itemgetter(1), itemgetter(2)
 
-        def grouped(rows, key, fold):
-            out = {}
-            for r in rows:
-                out.setdefault(key(r), []).append(r)
-            return {(k, *fold(rs)): 1 for k, rs in out.items()}
-
-        totals = grouped(orders.items(), lambda o: o[1][0], lambda rs: (sum(r[1][1] for r in rs),))
+        totals = grouped(orders.values(), lambda o: o[0], lambda o: o[1])
         assert bag(scanned(client, "cte_then_join"), "nm", "tot") == {
             (customers[cid][0], t): 1 for cid, t in totals if cid in customers}, sql
         assert bag(scanned(client, "two_ctes"), "so", "sc") == {
             (t, customers[cid][2]): 1 for cid, t in totals if cid in customers}, sql
-        assert bag(scanned(client, "by_region"), "reg", "total") == grouped(
-            joined, lambda j: j[2][1], lambda rs: (sum(r[1] for r in rs),)), sql
+        assert bag(scanned(client, "by_region"), "reg", "total") == grouped(joined, region, amt), sql
         assert bag(scanned(client, "filtered"), "reg", "n", "s") == grouped(
-            [j for j in joined if j[1] > 40], lambda j: j[2][1], lambda rs: (len(rs), sum(r[1] for r in rs))), sql
+            [j for j in joined if j[1] > 40], region, lambda j: 1, amt), sql
         assert bag(scanned(client, "by_order_id"), "reg", "n") == grouped(
-            [j for j in joined if j[0] > 1], lambda j: j[2][1], lambda rs: (len(rs),)), sql
+            [j for j in joined if j[0] > 1], region, lambda j: 1), sql
         assert bag(scanned(client, "global"), "s") == {(sum(j[1] for j in joined) if joined else None,): 1}, sql
-        assert bag(scanned(client, "extremes"), "reg", "lo", "hi") == grouped(
-            joined, lambda j: j[2][1], lambda rs: (min(r[1] for r in rs), max(r[1] for r in rs))), sql
+        assert bag(scanned(client, "extremes"), "reg", "lo", "hi") == {
+            (r, min(map(amt, js)), max(map(amt, js))): 1 for r, js in groups(joined, region).items()}, sql
         assert bag(scanned(client, "counted"), "n") == {(len(joined),): 1}, sql
-        assert bag(scanned(client, "regions"), "reg") == {(j[2][1],): 1 for j in joined}, sql
+        assert bag(scanned(client, "regions"), "reg") == {(region(j),): 1 for j in joined}, sql
         assert bag(scanned(client, "star"), "grp", "total") == grouped(
-            joined, lambda j: zones[j[2][1]], lambda rs: (sum(r[1] for r in rs),)), sql
-        assert bag(scanned(client, "star_distinct"), "grp") == Counter(
-            {(zones[j[2][1]],): 1 for j in joined}), sql
+            joined, lambda j: _ZONES[region(j)], amt), sql
+        assert bag(scanned(client, "star_distinct"), "grp") == {(_ZONES[region(j)],): 1 for j in joined}, sql
+
+
+def test_a_reduce_over_a_fan_out_join_keeps_each_group_apart(client):
+    """One join-output key spans several groups, so a group's extremes must
+    never pull a neighbour's rows when its holder leaves."""
+    client.execute_sql(
+        "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY); "
+        "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, g INT NOT NULL, "
+        "x BIGINT NOT NULL, y BIGINT NOT NULL); "
+        "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
+        "FROM fact JOIN dim ON fact.fid = dim.fkey; "
+        "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c FROM j GROUP BY g; "
+        "INSERT INTO fact VALUES (1), (2); "
+        "INSERT INTO dim VALUES (1, 1, 10, 5, 100), (2, 1, 20, 7, 200), (3, 2, 10, 3, 50), "
+        "(4, 2, 20, 9, 300)")
+    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
+        (10, 3, 100, 2): 1, (20, 7, 300, 2): 1}
+    # g=10's MIN holder goes: it recomputes to 5, never to g=20's smaller entry.
+    client.execute_sql("DELETE FROM dim WHERE did = 3")
+    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
+        (10, 5, 100, 1): 1, (20, 7, 300, 2): 1}
 
 
 def test_a_computed_group_input_is_declared_as_the_value_it_computes(client):
@@ -123,6 +141,11 @@ def test_a_computed_group_input_is_declared_as_the_value_it_computes(client):
     }
     for view, (body, _) in bodies.items():
         client.execute_sql(f"CREATE VIEW {view} AS {body}")
+
+    ty = gnitz.TypeCode
+    for view, col, want in (("neg_sum", "s", ty.I64), ("neg_key", "k", ty.I64), ("real_sum", "s", ty.F64),
+                            ("narrow_key", "k", ty.I16)):
+        assert declared(client, view)[col] == (want, 0), view
 
     def check(expected):
         for view, (body, cols) in bodies.items():

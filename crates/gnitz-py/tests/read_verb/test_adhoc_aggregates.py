@@ -19,6 +19,7 @@ import pytest
 from _caps import conjunct_ladder, first_rejected
 from _read import access, bag, ordered, rows, scanned
 from _serverproc import TINY_SCAN_CHUNKS
+from _shapes import groups
 from _sql import insert
 from _uid import uid as _uid
 
@@ -75,10 +76,7 @@ def _reject_both(client, query):
 def _grouped_oracle(src, key, value):
     """`{(key(group), value(rows of that group)): 1}` over `src` — the weighted
     bag a `SELECT key, value … GROUP BY key` owes."""
-    groups = {}
-    for row in src:
-        groups.setdefault(key(row), []).append(row)
-    return {(k, value(g)): 1 for k, g in groups.items()}
+    return {(k, value(g)): 1 for k, g in groups(src, key).items()}
 
 
 # ---------------------------------------------------------------------------

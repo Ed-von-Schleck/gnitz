@@ -24,16 +24,24 @@ def insert(client, table, rows):
     client.execute_sql(f"INSERT INTO {table} VALUES {values(rows)}")
 
 
+def inserting(table, rows):
+    """The `churn` step inserting `rows`, `{pk: rest of the row}`, into `table`;
+    a scalar pk or row is one column."""
+    def cols(v):
+        return v if isinstance(v, tuple) else (v,)
+    return f"INSERT INTO {table} VALUES {values((*cols(k), *cols(r)) for k, r in rows.items())}", table, rows
+
+
 def churn(client, state, steps):
     """Run each `(statement, table, {pk: row})` step and replay it into
     `state[table]` — a `None` row deletes the pk — yielding the statement once
     both hold the step, for the caller to assert against. A step naming no table
-    replays into `state` itself, and a statement may be a callable taking the
-    client, for a write SQL does not spell."""
+    replays into `state` itself; a statement may be a callable taking the client,
+    for a write SQL does not spell, or `None`, for a step that only observes."""
     for stmt, *table, changes in steps:
         if callable(stmt):
             stmt(client)
-        else:
+        elif stmt is not None:
             client.execute_sql(stmt)
         rows = state[table[0]] if table else state
         for pk, row in changes.items():

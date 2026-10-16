@@ -14,18 +14,14 @@ rewritten to a BOOLEAN **mark** that ordinary expression evaluation consumes.
 
 Run with GNITZ_WORKERS=4: the correlation key is an exchange key.
 """
+import operator
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import known
+from _sql import churn, inserting
 
-
-def _lt(l, r):
-    return l is not None and r is not None and l < r
-
-
-def _eq(l, r):
-    return l is not None and r is not None and l == r
+_lt, _eq = known(operator.lt), known(operator.eq)
 
 
 # name -> (correlation SQL, the same predicate over (a row, b row)). A NULL key
@@ -37,9 +33,12 @@ _CORR = {
     "compound": ("b.k1 = a.k1 AND b.k2 = a.k2", lambda a, b: (b["k1"], b["k2"]) == (a["k1"], a["k2"])),
     "band": ("b.k = a.k AND b.t < a.t", lambda a, b: _eq(b["k"], a["k"]) and b["t"] < a["t"]),
     "range": ("b.y < a.x", lambda a, b: _lt(b["y"], a["x"])),
-    # Local conjuncts: the inner one pre-filters b, so a failing row is no match.
+    # An inner local conjunct pre-filters b, so a failing row is no match.
     "local": ("b.k = a.k AND b.w > 5", lambda a, b: _eq(b["k"], a["k"]) and b["w"] > 5),
 }
+
+# A conjunct of the outer WHERE beside the subquery, by correlation.
+_OUTER = {"local": ("v > 100 AND ", lambda r: r["v"] > 100)}
 
 # The mark lowering, over NOT NULL operands.
 _MARK = {
@@ -54,17 +53,15 @@ _B_COLS = ("id", "k", "k1", "k2", "t", "w", "y")
 # (statement, table, {id: the rest of the row}); a `None` row deletes the id.
 _CHURN = [
     # a(5) shares a(1)'s `k`, `k1` and `k2` but not its `v`.
-    ("INSERT INTO a VALUES (1, 10, 7, 70, 50, 10, 100), (2, 20, 7, 71, 5, 20, 200), "
-     "(3, NULL, 8, 70, 50, NULL, 300), (4, 30, 8, 80, 60, 30, 999), (5, 10, 7, 70, 50, NULL, 5)",
-     "a", {1: (10, 7, 70, 50, 10, 100), 2: (20, 7, 71, 5, 20, 200),
-           3: (None, 8, 70, 50, None, 300), 4: (30, 8, 80, 60, 30, 999), 5: (10, 7, 70, 50, None, 5)}),
+    inserting("a", {1: (10, 7, 70, 50, 10, 100), 2: (20, 7, 71, 5, 20, 200),
+                    3: (None, 8, 70, 50, None, 300), 4: (30, 8, 80, 60, 30, 999), 5: (10, 7, 70, 50, None, 5)}),
     # A NULL-keyed inner row, and an all-NULL range column: an empty threshold.
-    ("INSERT INTO b VALUES (1, NULL, 7, 70, 40, 5, NULL)", "b", {1: (None, 7, 70, 40, 5, None)}),
-    ("INSERT INTO b VALUES (2, 10, 7, 70, 45, 8, 15)", "b", {2: (10, 7, 70, 45, 8, 15)}),
+    inserting("b", {1: (None, 7, 70, 40, 5, None)}),
+    inserting("b", {2: (10, 7, 70, 45, 8, 15)}),
     # A second match for a(1) under every correlation: its weight stays 1.
-    ("INSERT INTO b VALUES (3, 10, 7, 71, 5, 9, 5)", "b", {3: (10, 7, 71, 5, 9, 5)}),
-    ("INSERT INTO b VALUES (4, 20, 8, 80, 1, 3, 100)", "b", {4: (20, 8, 80, 1, 3, 100)}),
-    ("INSERT INTO b VALUES (5, 20, 8, 80, 2, 6, 1)", "b", {5: (20, 8, 80, 2, 6, 1)}),
+    inserting("b", {3: (10, 7, 71, 5, 9, 5)}),
+    inserting("b", {4: (20, 8, 80, 1, 3, 100)}),
+    inserting("b", {5: (20, 8, 80, 2, 6, 1)}),
     # One of two matches goes; then the range threshold's holder.
     ("DELETE FROM b WHERE id = 2", "b", {2: None}),
     ("DELETE FROM b WHERE id = 5", "b", {5: None}),
@@ -73,8 +70,7 @@ _CHURN = [
     ("DELETE FROM b", "b", {1: None, 3: None, 4: None}),
     # With no `b.k = 10`, a(1) matches both rows on `k2` and `w < v` and a(5)
     # neither: two rows one `k` groups, whose match counts differ.
-    ("INSERT INTO b VALUES (6, NULL, 7, 70, 1, 50, NULL), (7, NULL, 7, 70, 1, 60, NULL)",
-     "b", {6: (None, 7, 70, 1, 50, None), 7: (None, 7, 70, 1, 60, None)}),
+    inserting("b", {6: (None, 7, 70, 1, 50, None), 7: (None, 7, 70, 1, 60, None)}),
 ]
 
 
@@ -92,10 +88,9 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client):
         "k2 BIGINT NOT NULL, t BIGINT NOT NULL, x BIGINT, v BIGINT NOT NULL); "
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, k1 BIGINT NOT NULL, "
         "k2 BIGINT NOT NULL, t BIGINT NOT NULL, w BIGINT NOT NULL, y BIGINT); "
-        + "; ".join(f"CREATE VIEW semi_{n} AS SELECT id FROM a WHERE EXISTS ({ex} {corr}); "
-                    f"CREATE VIEW anti_{n} AS SELECT id FROM a WHERE NOT EXISTS ({ex} {corr})"
-                    for n, (corr, _) in _CORR.items() if n != "local") + "; "
-        f"CREATE VIEW semi_local AS SELECT id FROM a WHERE v > 100 AND EXISTS ({ex} {_CORR['local'][0]}); "
+        + "; ".join(f"CREATE VIEW semi_{n} AS SELECT id FROM a WHERE {outer}EXISTS ({ex} {corr}); "
+                    f"CREATE VIEW anti_{n} AS SELECT id FROM a WHERE {outer}NOT EXISTS ({ex} {corr})"
+                    for n, (corr, _) in _CORR.items() for outer in [_OUTER.get(n, ("",))[0]]) + "; "
         "CREATE VIEW in_k1 AS SELECT id FROM a WHERE k1 IN (SELECT k1 FROM b); "
         "CREATE VIEW not_in_k1 AS SELECT id FROM a WHERE k1 NOT IN (SELECT k1 FROM b); "
         "CREATE VIEW in_nullable AS SELECT id FROM a WHERE k IN (SELECT k FROM b); "
@@ -130,10 +125,10 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client):
             return lambda r: any(pred(r, br) for br in b.values())
 
         for n, (_, pred) in _CORR.items():
-            assert bag(scanned(client, f"semi_{n}"), "id") == \
-                ids(lambda r: (n != "local" or r["v"] > 100) and exists(pred)(r)), (sql, n)
-            if n != "local":
-                assert bag(scanned(client, f"anti_{n}"), "id") == ids(lambda r: not exists(pred)(r)), (sql, n)
+            outer = _OUTER.get(n, (None, lambda r: True))[1]
+            assert bag(scanned(client, f"semi_{n}"), "id") == ids(lambda r: outer(r) and exists(pred)(r)), (sql, n)
+            assert bag(scanned(client, f"anti_{n}"), "id") == \
+                ids(lambda r: outer(r) and not exists(pred)(r)), (sql, n)
         b_k1 = {br["k1"] for br in b.values()}
         assert bag(scanned(client, "in_k1"), "id") == ids(lambda r: r["k1"] in b_k1), sql
         assert bag(scanned(client, "not_in_k1"), "id") == ids(lambda r: r["k1"] not in b_k1), sql
@@ -143,9 +138,8 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client):
         assert bag(scanned(client, "above"), "id") == {i: 1 for i in in_eq if i[0] >= 2}, sql
         for name, keep in (("star_eq", exists(_CORR["eq"][1])), ("star_band", exists(_CORR["band"][1])),
                            ("star_mark", lambda r: r["v"] == 999 or exists(_MARK["eq"][1])(r))):
-            star = scanned(client, name)
-            assert bag(star, *_A_COLS) == {tuple(r.values()): 1 for r in a.values() if keep(r)}, (sql, name)
-            assert all(set(row._fields) == set(_A_COLS) for row in star), (sql, name)
+            assert bag(scanned(client, name)) == {
+                tuple(r.values()): 1 for r in a.values() if keep(r)}, (sql, name)
 
         mark = exists(_MARK["eq"][1])
         for name, keep in (

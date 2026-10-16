@@ -13,7 +13,7 @@ Run with GNITZ_WORKERS=4 — the broadcast and the trace's worker filter are wha
 keep the product from multiplying.
 """
 from _read import bag, scanned
-from _sql import churn
+from _sql import churn, inserting
 
 # view -> (FROM clause, what it admits of (t.v, u.w)). `CROSS JOIN`, the comma
 # and an ON comparing no column across the sides are one keyless step; a residual
@@ -36,16 +36,16 @@ _LONG = "two-one-" + "x" * 40
 _CHURN = [
     (f"INSERT INTO c VALUES (1, 1, 'one-one'), (1, 2, 'one-two'), (2, 1, '{_LONG}')",
      "c", {(1, 1): "one-one", (1, 2): "one-two", (2, 1): _LONG}),
-    ("INSERT INTO t VALUES (1, 1), (2, 2), (3, 0)", "t", {1: 1, 2: 2, 3: 0}),
-    ("INSERT INTO u VALUES (10, 0), (20, 1)", "u", {10: 0, 20: 1}),
-    ("INSERT INTO t VALUES (4, 4)", "t", {4: 4}),
+    inserting("t", {1: 1, 2: 2, 3: 0}),
+    inserting("u", {10: 0, 20: 1}),
+    inserting("t", {4: 4}),
     ("DELETE FROM t WHERE id = 2", "t", {2: None}),
-    ("INSERT INTO u VALUES (30, 1)", "u", {30: 1}),
+    inserting("u", {30: 1}),
     ("UPDATE u SET w = 9 WHERE id = 10", "u", {10: 9}),
     ("UPDATE t SET v = 7 WHERE id = 3", "t", {3: 7}),
     ("DELETE FROM c WHERE a = 1 AND b = 2", "c", {(1, 2): None}),
     ("DELETE FROM u", "u", {10: None, 20: None, 30: None}),
-    ("INSERT INTO u VALUES (40, 4)", "u", {40: 4}),
+    inserting("u", {40: 4}),
 ]
 
 
@@ -85,9 +85,7 @@ def test_each_delta_adds_or_retracts_exactly_its_pairs(client):
             {(x, y): 1 for x in t for y in t if x != y}, sql
         assert bag(scanned(client, "tri"), "tid", "uid", "ca", "cb") == \
             {(ti, ui, a, b): 1 for ti in t for ui in u for a, b in c}, sql
-        star = scanned(client, "star")
-        assert bag(star, "a", "b", "s", "id", "w") == {
+        assert bag(scanned(client, "star")) == {
             (a, b, s, ui, uw): 1 for (a, b), s in c.items() for ui, uw in u.items()}, sql
-        assert all(set(r._fields) == {"a", "b", "s", "id", "w"} for r in star), sql
         assert bag(scanned(client, "g"), "tid", "n", "s") == (
             {(ti, len(u), sum(u.values())): 1 for ti in t} if u else {}), sql

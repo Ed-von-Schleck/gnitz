@@ -12,25 +12,23 @@ the same rule is test_set_ops.py's.
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _sql import churn, inserting
 
 _COLS = ("id", "mgr", "k", "v", "sal", "dept")
 
-# (statement, {id: row}); a `None` row deletes the id.
+# (statement, table, {id: row}); a `None` row deletes the id.
 _CHURN = [
     # One epoch creates matches on both sides of every join at once: three rows
     # sharing k=5 must make the full 3x3 product, which dropping the cross-term
     # would undercount.
-    ("INSERT INTO emp VALUES (1, 0, 5, 10, 500, 10), (2, 1, 5, 20, 600, 10), (3, 1, 5, 30, 400, 10)",
-     {1: (0, 5, 10, 500, 10), 2: (1, 5, 20, 600, 10), 3: (1, 5, 30, 400, 10)}),
+    inserting("emp", {1: (0, 5, 10, 500, 10), 2: (1, 5, 20, 600, 10), 3: (1, 5, 30, 400, 10)}),
     # emp(2) stays in `emp` but leaves `positive`.
-    ("UPDATE emp SET v = -1 WHERE id = 2", {2: (1, 5, -1, 600, 10)}),
-    ("INSERT INTO emp VALUES (4, 3, 5, 11, 700, 10), (5, 4, 6, 70, 100, 20)",
-     {4: (3, 5, 11, 700, 10), 5: (4, 6, 70, 100, 20)}),
-    ("UPDATE emp SET sal = 900 WHERE id = 3", {3: (1, 5, 30, 900, 10)}),
-    ("UPDATE emp SET v = 60 WHERE id = 1", {1: (0, 5, 60, 500, 10)}),
+    ("UPDATE emp SET v = -1 WHERE id = 2", "emp", {2: (1, 5, -1, 600, 10)}),
+    inserting("emp", {4: (3, 5, 11, 700, 10), 5: (4, 6, 70, 100, 20)}),
+    ("UPDATE emp SET sal = 900 WHERE id = 3", "emp", {3: (1, 5, 30, 900, 10)}),
+    ("UPDATE emp SET v = 60 WHERE id = 1", "emp", {1: (0, 5, 60, 500, 10)}),
     # A manager leaves: every report's row and every product row it was in.
-    ("DELETE FROM emp WHERE id = 1", {1: None}),
+    ("DELETE FROM emp WHERE id = 1", "emp", {1: None}),
 ]
 
 
@@ -59,9 +57,9 @@ def test_a_join_over_one_source_emits_every_product_row_once(client):
         "JOIN dept d ON e.dept = d.id; "
         "CREATE VIEW using_self AS SELECT x.id AS xid, y.id AS yid FROM emp x JOIN emp y USING (k)")
 
-    state = {}
+    state = {"emp": {}}
     for sql in churn(client, state, _CHURN):
-        emp = {i: dict(zip(_COLS, (i, *row))) for i, row in state.items()}
+        emp = {i: dict(zip(_COLS, (i, *row))) for i, row in state["emp"].items()}
         rows = list(emp.values())
 
         def pairs(left, right, on):

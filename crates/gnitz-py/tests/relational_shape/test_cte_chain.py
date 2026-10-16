@@ -15,7 +15,8 @@ and not as an extra row.
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import views_ddl
+from _sql import churn, inserting
 
 
 def _set(vals):
@@ -101,15 +102,13 @@ _VIEWS = {
 
 # (statement, table, {id: (a, b)}); a `None` row deletes the id.
 _CHURN = [
-    ("INSERT INTO u VALUES (1, 30, 60), (2, 90, 0), (4, 7, 20), (7, 30, 0)",
-     "u", {1: (30, 60), 2: (90, 0), 4: (7, 20), 7: (30, 0)}),
+    inserting("u", {1: (30, 60), 2: (90, 0), 4: (7, 20), 7: (30, 0)}),
     # t(1) and t(2) share every column but the key, so a join through them carries weight 2.
-    ("INSERT INTO t VALUES (1, 10, 7), (2, 10, 7), (3, 20, 200), (4, 200, 50), (5, 150, 0)",
-     "t", {1: (10, 7), 2: (10, 7), 3: (20, 200), 4: (200, 50), 5: (150, 0)}),
+    inserting("t", {1: (10, 7), 2: (10, 7), 3: (20, 200), 4: (200, 50), 5: (150, 0)}),
     ("UPDATE t SET a = 300 WHERE id = 2", "t", {2: (300, 7)}),
     ("DELETE FROM t WHERE id = 1", "t", {1: None}),
     ("DELETE FROM u WHERE id = 2", "u", {2: None}),
-    ("INSERT INTO t VALUES (6, 3, 7)", "t", {6: (3, 7)}),
+    inserting("t", {6: (3, 7)}),
 ]
 
 
@@ -119,7 +118,7 @@ def test_a_cut_segment_answers_as_the_body_it_was_cut_from(client):
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
-        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in _VIEWS.items()))
+        + views_ddl(_VIEWS))
 
     state = {"t": {}, "u": {}}
     for sql in churn(client, state, _CHURN):

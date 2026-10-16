@@ -14,11 +14,11 @@ in a column no view reads coincide once it is dropped from the join payload.
 
 Run with GNITZ_WORKERS=4: the fill must cancel per worker.
 """
-import operator
 from collections import Counter
 
 from _read import bag, scanned
-from _sql import churn
+from _shapes import views_ddl
+from _sql import churn, inserting
 
 _ID = "SELECT uv.k AS k, uv.x AS x, b.id AS bid"
 
@@ -43,7 +43,7 @@ _MATCH = {
     "k": lambda k, x, bid, bk, y: k == bk,
     "pk": lambda k, x, bid, bk, y: k == bid,
     "band": lambda k, x, bid, bk, y: k == bk and x <= y,
-    "range": lambda k, x, bid, bk, y: operator.lt(x, y),
+    "range": lambda k, x, bid, bk, y: x < y,
     "all": lambda k, x, bid, bk, y: True,
 }
 
@@ -59,7 +59,7 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client):
         "CREATE TABLE l (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, kept BIGINT NOT NULL, "
         "dropped BIGINT NOT NULL); "
         "CREATE VIEW uv AS SELECT k, x FROM s1 UNION ALL SELECT k, x FROM s2; "
-        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in _KINDS.items()) + "; "
+        + views_ddl(_KINDS) + "; "
         "CREATE VIEW pruned AS SELECT l.kept, b.y FROM l LEFT JOIN b ON l.k = b.k; "
         # (5, 10) and (9, 99) each arrive from both branches.
         "INSERT INTO s1 VALUES (1, 5, 10), (2, 9, 99); "
@@ -68,11 +68,11 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client):
     uv = {(5, 10): 2, (9, 99): 2}
 
     b = {}
-    for sql in churn(client, b, [
-        ("SELECT 1", {}),
-        ("INSERT INTO b VALUES (5, 5, 50)", {5: (5, 50)}),
-        ("INSERT INTO b VALUES (6, 5, 60)", {6: (5, 60)}),
-        ("DELETE FROM b", {5: None, 6: None}),
+    for sql in churn(client, {"b": b}, [
+        (None, {}),
+        inserting("b", {5: (5, 50)}),
+        inserting("b", {6: (5, 60)}),
+        ("DELETE FROM b", "b", {5: None, 6: None}),
     ]):
 
         for name, (_, match, owes) in _KINDS.items():

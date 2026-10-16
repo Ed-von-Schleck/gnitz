@@ -15,6 +15,7 @@ What the bound refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`
 
 import pytest
 from _read import bag, rows
+from _shapes import sorted_by
 from _sql import insert
 
 
@@ -181,18 +182,6 @@ def test_a_cut_in_key_order_matches_a_full_sort(client):
 # ---------------------------------------------------------------------------
 
 
-def _sorted_by(data, keys):
-    """`data` (dict rows) ordered by `keys` — `(column, desc, nulls_first)` each — ties
-    in ascending `id`, the identity a cut breaks them by."""
-    out = sorted(data, key=lambda r: r["id"])
-    for col, desc, nulls_first in reversed(keys):
-        nulls = [r for r in out if r[col] is None]
-        # A reversed sort still keeps equal keys in their order.
-        vals = sorted((r for r in out if r[col] is not None), key=lambda r: r[col], reverse=desc)
-        out = nulls + vals if nulls_first else vals + nulls
-    return out
-
-
 def _window(entries, offset, limit):
     """`entries` — `(row, weight)` in order — cut to logical rows `[offset, offset + limit)`."""
     out, at = [], 0
@@ -249,7 +238,7 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
         ("v, id DESC", [("v", False, False), ("id", True, True)], 300, 100),
     ]:
         q = f"SELECT * FROM big ORDER BY {order} LIMIT {limit} OFFSET {offset}"
-        want = [(values(r), 1) for r in _sorted_by(data, keys)[offset:offset + limit]]
+        want = [(values(r), 1) for r in sorted_by(data, keys)[offset:offset + limit]]
         assert _entries(rows(client, q), cols) == want, q
 
     # Uncut, ties are open: the written keys must be total for the order to be pinned.
@@ -258,13 +247,13 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
         ("s DESC, id", [("s", True, True)]),
     ]:
         q = f"SELECT * FROM big ORDER BY {order}"
-        assert _entries(rows(client, q), cols) == [(values(r), 1) for r in _sorted_by(data, keys)], q
+        assert _entries(rows(client, q), cols) == [(values(r), 1) for r in sorted_by(data, keys)], q
 
     for order, keys in [
         ("v, id", [("v", False, False)]),
         ("s DESC, id", [("s", True, True)]),
     ]:
-        full = [(r, weight(r)) for r in _sorted_by(data, keys)]
+        full = [(r, weight(r)) for r in sorted_by(data, keys)]
         # The window opens on the second logical row of the first weight-2 entry past 40.
         first = next(i for i, (_, w) in enumerate(full) if i >= 40 and w == 2)
         offset = sum(w for _, w in full[:first]) + 1
@@ -275,7 +264,7 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
             assert _entries(rows(client, q), cols) == want, q
     # Ordered by the leading key alone, the view's ties break by its own identity; the
     # values the window holds are fixed all the same.
-    full = [(r, weight(r)) for r in _sorted_by(data, [("v", False, False)])]
+    full = [(r, weight(r)) for r in sorted_by(data, [("v", False, False)])]
     got = rows(client, "SELECT v FROM both ORDER BY v LIMIT 900 OFFSET 333")
     want = {}
     for r, w in _window(full, 333, 900):

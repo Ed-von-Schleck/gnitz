@@ -1,4 +1,6 @@
-"""One catalogue of view shapes, for the sweeps that hold the shape fixed and
+"""The reference semantics every view expectation is computed with — grouping,
+aggregates, comparison and ordering under SQL's NULL rules, the set operators —
+and one catalogue of view shapes, for the sweeps that hold the shape fixed and
 vary *when* a view meets its rows: created over rows already there
 (`schema_lifetime/test_view_creation_order.py`), or maintained and then carried
 across a process boundary (`state_lifetime/test_view_rebuild.py`).
@@ -20,20 +22,59 @@ own. That isolation matters for `join`: neither of its bases roots any other
 exchange view, which is what once left an `ExchangeShard`-only classifier with
 an empty base set and the join a deterministic per-key prefix at W>1.
 """
+import operator
 from collections import Counter
 
 from _sql import values
 
 
+def groups(rows, key):
+    """`{key(r): [the rows with that key]}`, in first-seen order."""
+    out = {}
+    for r in rows:
+        out.setdefault(key(r), []).append(r)
+    return out
+
+
 def grouped(rows, key, *vals):
     """`{(key, *sums): 1}` — what a GROUP BY view must equal, each `vals` entry
     a row -> number summed over the group."""
-    acc = {}
-    for r in rows:
-        acc.setdefault(key(r), [0] * len(vals))
-        for i, v in enumerate(vals):
-            acc[key(r)][i] += v(r)
-    return {(k, *v): 1 for k, v in acc.items()}
+    return {(k, *(sum(v(r) for r in rs) for v in vals)): 1 for k, rs in groups(rows, key).items()}
+
+
+def agg(kind, vals):
+    """One SQL aggregate over `vals`: COUNT* counts every value, the rest skip
+    NULLs, and each but COUNT is NULL once none is left."""
+    if kind == "COUNT*":
+        return len(vals)
+    live = [v for v in vals if v is not None]
+    if kind == "COUNT":
+        return len(live)
+    if not live:
+        return None
+    return {"SUM": sum, "MIN": min, "MAX": max, "AVG": lambda v: sum(v) / len(v)}[kind](live)
+
+
+def known(op):
+    """`op` under SQL 3VL: a comparison against NULL admits nothing."""
+    return lambda l, r: l is not None and r is not None and op(l, r)
+
+
+# Each range comparison, by the suffix its view carries.
+RANGE_OPS = {"lt": ("<", operator.lt), "le": ("<=", operator.le), "gt": (">", operator.gt),
+             "ge": (">=", operator.ge)}
+
+
+def sorted_by(rows, keys):
+    """`rows` (dicts) ordered by `keys` — `(column, desc, nulls_first)` each —
+    ties in ascending `id`, the identity a cut breaks them by."""
+    out = sorted(rows, key=lambda r: r["id"])
+    for col, desc, nulls_first in reversed(keys):
+        nulls = [r for r in out if r[col] is None]
+        # A reversed sort still keeps equal keys in their order.
+        vals = sorted((r for r in out if r[col] is not None), key=lambda r: r[col], reverse=desc)
+        out = nulls + vals if nulls_first else vals + nulls
+    return out
 
 
 def setop(op, left, right):
@@ -147,13 +188,6 @@ def _band_over(cluster):
             {"v": ("SELECT p.k AS k, p.b AS pb, q.b AS qb FROM p JOIN q ON p.k = q.k AND p.t < q.t",
                    ("k", "pb", "qb"),
                    {(pk, pb, qb): 1 for pk, pb, pt in _BP for qk, qb, qt in _BQ if pk == qk and pt < qt})})
-
-
-def _by_group(rows):
-    out = {}
-    for _, g, v in rows:
-        out.setdefault(g, []).append(v)
-    return out
 
 
 _U64 = [0, 1, 2**63, 2**64 - 1]
@@ -278,7 +312,8 @@ SHAPES = {
         _table("t", ("g", "a"), _MM)[1] + "; DELETE FROM t WHERE id = 0",
         {"v": ("SELECT g, MIN(a) AS lo, MAX(a) AS hi, AVG(a) AS av, COUNT(*) AS c FROM t GROUP BY g",
                ("g", "lo", "hi", "av", "c"),
-               {(g, min(vs), max(vs), sum(vs) / len(vs), len(vs)): 1 for g, vs in _by_group(_MM_LIVE).items()})}),
+               {(g, *(agg(f, [r[2] for r in rs]) for f in ("MIN", "MAX", "AVG", "COUNT"))): 1
+                for g, rs in groups(_MM_LIVE, lambda r: r[1]).items()})}),
     # One join-output key spans six groups, so each group's MIN must isolate.
     "min_over_fanout_join": _ab({"v": (
         "SELECT a.av AS g, MIN(a.id) AS lo, MAX(b.bv) AS hi FROM b JOIN a ON b.id = a.k GROUP BY a.av",
@@ -417,4 +452,5 @@ SHAPES = {
 
 
 def views_ddl(views):
-    return "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in views.items())
+    """The `CREATE VIEW`s of `{view: (body, ...)}`, in its order."""
+    return "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, *_) in views.items())

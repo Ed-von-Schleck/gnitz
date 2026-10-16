@@ -10,19 +10,16 @@ keyed read of it. Values are compared through `bag`, so weights count too.
 """
 import gnitz
 import pytest
-from _read import access, bag, rows
+from _read import access, bag, ordered, rows
 from _shapes import grouped
-
-
-def _names(client, q):
-    """The visible column names of `q`'s reply, in order."""
-    res = client.execute_sql(q)[0]
-    assert res["type"] == "Rows", res
-    return [c.name for c in res["rows"].schema.columns if not c.is_hidden]
+from _sql import insert
 
 
 def _read(client, q):
-    return _names(client, q), bag(rows(client, q))
+    """The visible column names of `q`'s reply, in order, and its bag."""
+    (res,) = client.execute_sql(q)
+    assert res["type"] == "Rows", res
+    return [c.name for c in res["rows"].schema.columns if not c.is_hidden], bag(res["rows"])
 
 
 _T = [(i, i % 3, i * 10) for i in range(1, 10)]
@@ -33,7 +30,7 @@ def base(client):
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)"
     )
-    client.execute_sql("INSERT INTO t VALUES " + ",".join(f"({i}, {a}, {b})" for i, a, b in _T))
+    insert(client, "t", _T)
     return client
 
 
@@ -95,50 +92,36 @@ def test_column_aliases_name_the_select_list_in_order(base):
     assert bag(rows(base, "SELECT y FROM v WHERE y = 4")) == {(4,): 1}
 
 
-def test_a_view_over_a_reordered_view_reads_it_by_name(base):
-    base.execute_sql("CREATE VIEW v AS SELECT b, id, a FROM t")
-    base.execute_sql("CREATE VIEW w AS SELECT * FROM v WHERE a > 0")
-    base.execute_sql("CREATE VIEW g AS SELECT a, SUM(b) AS s FROM v GROUP BY a")
+def test_a_view_over_a_reordered_view_reads_it_by_name_and_key(base):
+    """A view over `v`, whose key sits second, resolves its columns by name, and
+    a keyed read of `v` finds the key wherever it sits."""
+    base.execute_sql(
+        "CREATE VIEW v AS SELECT b, id, a FROM t; "
+        "CREATE VIEW w AS SELECT * FROM v WHERE a > 0; "
+        "CREATE VIEW g AS SELECT a, SUM(b) AS s FROM v GROUP BY a")
     assert _read(base, "SELECT * FROM w") == (
         ["b", "id", "a"],
         {(b, i, a): 1 for i, a, b in _T if a > 0},
     )
     assert bag(rows(base, "SELECT * FROM g")) == grouped(_T, lambda r: r[1], lambda r: r[2])
-    base.execute_sql("INSERT INTO t VALUES (10, 1, 100)")
-    assert bag(rows(base, "SELECT b, id FROM w WHERE id = 10")) == {(100, 10): 1}
-
-
-def test_a_keyed_read_of_a_reordered_view_finds_its_key(base):
-    base.execute_sql("CREATE VIEW v AS SELECT b, id, a FROM t")
     q = "SELECT b, id, a FROM v WHERE id = 4"
     assert access(base, q) == "pk point lookup"
     assert _read(base, q) == (["b", "id", "a"], {(40, 4, 1): 1})
     q = "SELECT id FROM v WHERE id > 6"
     assert access(base, q) == "pk range walk"
     assert bag(rows(base, q)) == {(7,): 1, (8,): 1, (9,): 1}
-    base.execute_sql("DELETE FROM t WHERE id = 4")
+    base.execute_sql("INSERT INTO t VALUES (10, 1, 100); DELETE FROM t WHERE id = 4")
+    assert bag(rows(base, "SELECT b, id FROM w WHERE id = 10")) == {(100, 10): 1}
     assert bag(rows(base, "SELECT b, id, a FROM v WHERE id = 4")) == {}
 
 
-@pytest.mark.parametrize(
-    "ddl",
-    [
-        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, w BIGINT NOT NULL)",
-        "CREATE TABLE r (v BIGINT NOT NULL, id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)",
-    ],
-    ids=["pk_first", "pk_middle"],
-)
-def test_an_adhoc_reply_is_its_select_order(client, ddl):
-    client.execute_sql(ddl)
-    cols = "id, v, w" if "PRIMARY KEY, v" in ddl else "v, id, w"
-    rs = [(i, i * 7 % 10, i * 100) for i in range(1, 9)]
-    vals = [(v, i, w) if cols.startswith("v") else (i, v, w) for i, v, w in rs]
-    client.execute_sql(f"INSERT INTO r ({cols}) VALUES " + ",".join(str(t) for t in vals))
-    got = rows(client, "SELECT v, id FROM r ORDER BY id LIMIT 3")
-    assert [tuple(r) for r in got] == [(v, i) for i, v, _ in rs[:3]]
-    assert _names(client, "SELECT v, id FROM r ORDER BY id LIMIT 3") == ["v", "id"]
-    assert _read(client, "SELECT id, v FROM r") == (["id", "v"], {(i, v): 1 for i, v, _ in rs})
-    assert _read(client, "SELECT * FROM r") == (
-        cols.split(", "),
-        {tuple({"id": i, "v": v, "w": w}[c] for c in cols.split(", ")): 1 for i, v, w in rs},
-    )
+@pytest.mark.parametrize("cols", [("id", "v", "w"), ("v", "id", "w")], ids=["pk_first", "pk_middle"])
+def test_an_adhoc_reply_is_its_select_order(client, cols):
+    client.execute_sql("CREATE TABLE r (" + ", ".join(
+        f"{c} BIGINT NOT NULL" + (" PRIMARY KEY" if c == "id" else "") for c in cols) + ")")
+    rs = [dict(id=i, v=i * 7 % 10, w=i * 100) for i in range(1, 9)]
+    insert(client, "r", [tuple(r[c] for c in cols) for r in rs])
+    assert ordered(rows(client, "SELECT v, id FROM r ORDER BY id LIMIT 3")) == [
+        ((("v", r["v"]), ("id", r["id"])), 1) for r in rs[:3]]
+    assert _read(client, "SELECT id, v FROM r") == (["id", "v"], {(r["id"], r["v"]): 1 for r in rs})
+    assert _read(client, "SELECT * FROM r") == (list(cols), {tuple(r[c] for c in cols): 1 for r in rs})
