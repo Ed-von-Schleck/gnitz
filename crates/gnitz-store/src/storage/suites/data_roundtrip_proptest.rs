@@ -2,17 +2,18 @@
 //!
 //! The schema codec has its own round-trip proptest; this is the analogous
 //! coverage for the **data** layer — the path from `Batch` → run set →
-//! shard file → `MappedShard` / `ReadCursor` — over random `(type codes, PK
-//! arity, payload shape, column interleaving)`: every PK-width arm, both read
-//! paths (the `full_scan` merge cursor and the direct `slice_to_owned_batch`
-//! shard decode), and the non-prefix payload-slot renumbering.
+//! shard file → compaction → `MappedShard` / `ReadCursor` — over random `(type
+//! codes, PK arity, payload shape, column interleaving)`: every PK-width arm,
+//! both read paths (the `full_scan` merge cursor and the direct
+//! `slice_to_owned_batch` shard decode), and the non-prefix payload-slot
+//! renumbering.
 
 use proptest::prelude::*;
 
 use gnitz_wire::MAX_PK_COLUMNS;
 
 use crate::storage::{flush_barrier, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{self, arb_schema, row_key, zset_of};
+use crate::test_support::{self, arb_schema, row_key, zset_of, zset_sum};
 
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -86,6 +87,10 @@ fn arb_string(rng: &mut crate::test_support::Rng) -> Vec<u8> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Ingests, each flushed: one more than the L0 shards a store holds before it
+/// owes a compaction.
+const WAVES: usize = 5;
+
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
     let p = if durable {
         RecoverySource::SalReplay
@@ -96,142 +101,68 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
 }
 
 proptest! {
-    /// Ingest -> flush -> scan round-trips the multiset, for both persistence
-    /// modes at every PK width and column interleaving.
+    /// Ingested in waves, each flushed (durable) or folded into the RAM tier
+    /// (ephemeral): `has_pk_bytes` finds exactly the rows ingested so far and
+    /// never an absent prefix twin the PK filter may pass; both read paths
+    /// serve the multiset, a durable store's past the L0 compaction its waves
+    /// owe; and a negated ingest of half the rows leaves the other half.
     #[test]
-    fn batch_roundtrip(
+    fn data_roundtrip(
         schema in arb_schema(MAX_PK_COLUMNS),
-        rows in 1usize..=64,
+        rows in WAVES..=64,
         durable in any::<bool>(),
         seed in any::<u64>(),
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let mut table = new_table(&dir.path().join("rt"), schema, durable);
-        let (original, _) = arb_batch(&schema, rows, seed);
+        let mut table = new_table(&dir.path().join("t"), schema, durable);
+        let (original, mut absent) = arb_batch(&schema, rows, seed);
+        // Same leading PK columns, trailing ordinal `rows`: never a real row.
+        absent.push(rows as u128);
+        let absent = test_support::opk_pk(&schema, &absent);
+        let finds = |table: &Table, live: std::ops::Range<usize>| {
+            !table.has_pk_bytes(&absent)
+                && (0..rows).all(|i| table.has_pk_bytes(original.get_pk_bytes(i)) == live.contains(&i))
+        };
 
-        table.ingest(Batch::clone(&original)).unwrap();
-        if durable { flush_barrier([&mut table], 0) } else { table.fold_to_ram() }.unwrap();
+        for k in 0..WAVES {
+            let end = (k + 1) * rows / WAVES;
+            // Each wave non-empty, since `rows >= WAVES`.
+            table.ingest(Batch::from_ranges(&original, &[(k * rows / WAVES, end)], 0)).unwrap();
+            prop_assert!(finds(&table, 0..end));
+            if durable { flush_barrier([&mut table], 0) } else { table.fold_to_ram() }.unwrap();
+            prop_assert!(finds(&table, 0..end));
+        }
 
-        let expected = zset_of(&original, &schema);
-
-        // Cursor / byte-merge path — width-agnostic, exercised for both stores.
-        prop_assert_eq!(
-            &expected, &zset_of(table.full_scan().as_ref(), &schema),
-            "full_scan != ingest at pk_stride {}", schema.pk_stride(),
-        );
-
-        let shards = table.all_shard_arcs();
+        let mut expected = zset_of(&original, &schema);
         if durable {
-            // A durable flush synchronously commits exactly one on-disk shard.
-            prop_assert_eq!(shards.len(), 1);
+            // One L0 shard per wave crosses `l0.len() > 4`, so the store owes
+            // the fold into guards below L0.
+            table.settle().unwrap();
+            prop_assert!(table.level_shape().1.iter().sum::<usize>() > 0, "no L0->L1 compaction");
             // Direct shard decode of the on-disk region layout.
-            let owned = shards[0].slice_to_owned_batch(0, shards[0].row_count());
-            prop_assert_eq!(&expected, &zset_of(&owned, &schema));
+            let owned: Vec<Batch> = table
+                .all_shard_arcs()
+                .iter()
+                .map(|s| s.slice_to_owned_batch(0, s.row_count()))
+                .collect();
+            prop_assert_eq!(&expected, &zset_sum(&owned, &schema));
         } else {
-            // A sub-ceiling ephemeral flush writes no shard; rows live in
-            // the RAM tier and are served by full_scan (asserted above).
-            prop_assert!(shards.is_empty());
+            // A sub-ceiling ephemeral store writes no shard.
+            prop_assert!(table.all_shard_arcs().is_empty());
         }
-    }
+        prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
 
-    /// has_pk_bytes re-finds every ingested row before and after flush; an
-    /// absent prefix-twin is rejected both times. Durable so the post-flush
-    /// shard PK filter is probed.
-    #[test]
-    fn point_lookup_after_flush(schema in arb_schema(MAX_PK_COLUMNS), rows in 1usize..=64, seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut table = new_table(&dir.path().join("pl"), schema, true);
-        let (original, leading) = arb_batch(&schema, rows, seed);
-
-        // Absent prefix-twin: same leading PK columns, trailing ordinal == rows
-        // (never used by a real row): the PK filter may report it as a false
-        // positive, which the scan must reject.
-        let mut absent_vals = leading.clone();
-        absent_vals.push(rows as u128);
-        let absent = crate::test_support::opk_pk(&schema, &absent_vals);
-
-        table.ingest(Batch::clone(&original)).unwrap();
-
-        for i in 0..rows {
-            prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
-        }
-        prop_assert!(!table.has_pk_bytes(&absent));
-
-        flush_barrier([&mut table], 0).unwrap();
-
-        for i in 0..rows {
-            prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
-        }
-        prop_assert!(!table.has_pk_bytes(&absent));
-    }
-
-    /// live_row_at is a read-only probe; physical retraction ingests a
-    /// negated batch. full_scan nets shard (+w) against memtable (-w) to zero.
-    #[test]
-    fn retract_then_scan(schema in arb_schema(MAX_PK_COLUMNS), rows in 2usize..=64, seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut table = new_table(&dir.path().join("rx"), schema, true);
-        let (original, _) = arb_batch(&schema, rows, seed);
-
-        table.ingest(Batch::clone(&original)).unwrap();
-        flush_barrier([&mut table], 0).unwrap(); // rows now live in one on-disk shard
-
-        let half = rows / 2; // retract rows [0, half)
-
-        // Read-only probe of the live shard rows.
+        let half = rows / 2;
         for i in 0..half {
             let (w, found) = table.live_row_at(original.get_pk_bytes(i));
             prop_assert_eq!(w, original.get_weight(i));
             prop_assert!(found.is_some());
         }
-
-        // Physical retraction: ingest the same rows negated into the memtable.
-        let neg = Batch::from_ranges(&original, &[(0, half)], 0);
-        table.ingest(neg.negated()).unwrap();
-
-        for i in 0..half {
-            prop_assert!(!table.has_pk_bytes(original.get_pk_bytes(i)));
-        }
-
-        // Surviving set == the un-retracted half [half, rows).
-        let mut expected = zset_of(&original, &schema);
+        table.ingest(Batch::from_ranges(&original, &[(0, half)], 0).negated()).unwrap();
+        prop_assert!(finds(&table, half..rows));
         for i in 0..half {
             expected.remove(&row_key(&original, &schema, i));
         }
-        prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
-    }
-
-    /// Flush in 5 waves (> L0_COMPACT_THRESHOLD == 4), then compact: the k-way
-    /// shard merge must preserve the multiset over a random schema.
-    #[test]
-    fn compaction_roundtrip(schema in arb_schema(MAX_PK_COLUMNS), rows in 5usize..=64, seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut table = new_table(&dir.path().join("cp"), schema, true);
-        let (original, _) = arb_batch(&schema, rows, seed);
-
-        // Exactly WAVES non-empty flushes -> WAVES L0 shards. WAVES == 5 is the
-        // minimum that crosses the strictly-greater trigger (l0.len() > 4). The
-        // boundaries k*rows/WAVES distribute rows evenly; rows >= WAVES makes
-        // every wave non-empty (each gets >= floor(rows/WAVES) >= 1 rows).
-        // append_batch relocates string blobs (the batch has a schema), so each
-        // wave is self-contained.
-        const WAVES: usize = 5;
-        for k in 0..WAVES {
-            let start = k * rows / WAVES;
-            let end = (k + 1) * rows / WAVES;
-            let wave = Batch::from_ranges(&original, &[(start, end)], 0);
-            table.ingest(wave).unwrap();
-            flush_barrier([&mut table], 0).unwrap();
-        }
-        // Registering the WAVES'th shard crosses `l0.len() > 4`, so the store
-        // owes the fold into guards below L0.
-        table.settle().unwrap();
-        prop_assert!(
-            table.level_shape().1.iter().sum::<usize>() > 0,
-            "WAVES flushes must have driven an L0->L1 compaction"
-        );
-
-        let expected = zset_of(&original, &schema);
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
     }
 }

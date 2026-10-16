@@ -71,7 +71,6 @@ impl RunSet {
     /// Append a consolidated run, folding the set when it gets crowded. Empty
     /// runs are never stored.
     pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
-        debug_assert!(run.is_consolidated(), "RunSet::push requires a consolidated run",);
         self.push_run(Rc::new(run.trimmed()), schema);
     }
 

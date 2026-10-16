@@ -1,58 +1,36 @@
 use super::*;
-use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 
-fn open_written(dir: &Path, name: &str) -> File {
-    use std::io::Write;
-    let mut f = File::create(dir.join(name)).expect("create");
-    f.write_all(b"hello").expect("write");
-    f
+fn ring() -> IoUring {
+    new_ring().unwrap().expect("io_uring is a build prerequisite")
 }
 
-/// A ring, or `None` where this host denies io_uring, so the caller can skip.
-fn ring_or_skip() -> Option<Option<IoUring>> {
-    new_ring().expect("io_uring setup").map(Some)
-}
-
-/// EINTR on the first submit is retried.
+/// An interrupted submit and one that returns with nothing reaped are retried
+/// until every fsync completes, leaving the ring empty for the next batch; a
+/// submit failing otherwise surfaces its errno.
 #[test]
-fn batch_sync_retries_after_eintr() {
-    let Some(mut ring) = ring_or_skip() else { return };
-    let dir = tempfile::tempdir().unwrap();
-    let files: Vec<File> = (0..3)
-        .map(|i| open_written(dir.path(), &format!("eintr_{i}.bin")))
-        .collect();
-
-    let mut call_count = 0usize;
-    let result = batch_sync_with(&mut ring, &files, DATASYNC, |r, want| {
-        call_count += 1;
-        if call_count == 1 {
-            // EINTR without submitting: the SQEs stay queued for the retry.
-            Err(std::io::Error::from_raw_os_error(libc::EINTR))
-        } else {
-            r.submit_and_wait(want)
+fn batch_sync_reaps_through_interrupted_and_short_submits() {
+    let mut ring = ring();
+    let files: Vec<File> = (0..16).map(|_| tempfile::tempfile().unwrap()).collect();
+    let mut calls = 0;
+    batch_sync_with(Some(&mut ring), &files, DATASYNC, |r, want| {
+        calls += 1;
+        match calls {
+            // Neither submits: the SQEs stay queued for the retry.
+            1 => Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+            2 => Ok(0),
+            _ => r.submit_and_wait(want),
         }
+    })
+    .expect("retried submits");
+    assert_eq!(calls, 3);
+    assert!(ring.submission().is_empty(), "every SQE was submitted");
+    assert!(ring.completion().is_empty(), "every CQE was reaped");
+
+    let got = batch_sync_with(Some(&mut ring), &files, DATASYNC, |_, _| {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
     });
-
-    assert!(result.is_ok(), "EINTR should be retried, got: {result:?}");
-    assert_eq!(call_count, 2, "exactly one EINTR then one successful submit expected");
-}
-
-/// A submit that returns before the fsyncs complete must not end the batch early.
-#[test]
-fn batch_sync_waits_out_a_short_submit() {
-    let Some(mut ring) = ring_or_skip() else { return };
-    let dir = tempfile::tempdir().unwrap();
-    let files: Vec<File> = (0..16)
-        .map(|i| open_written(dir.path(), &format!("short_{i}.bin")))
-        .collect();
-
-    batch_sync_with(&mut ring, &files, DATASYNC, |r, _| r.submit()).expect("short submits");
-    let r = ring.as_mut().unwrap();
-    assert!(r.submission().is_empty(), "every SQE was submitted");
-    assert!(r.completion().is_empty(), "every CQE was reaped");
-
-    batch_sync_with(&mut ring, &files, DATASYNC, |r, want| r.submit_and_wait(want))
-        .expect("a second batch on the same ring");
+    assert_eq!(got, Err(StorageError::Io(libc::EIO)));
 }
 
 /// Two full chunks plus a tail, through a ring and through the blocking
@@ -62,12 +40,12 @@ fn sync_paths_spans_several_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let paths: Vec<_> = (0..2 * FD_CHUNK_THRESHOLD + 1)
         .map(|i| {
-            let name = format!("chunk_{i}.bin");
-            open_written(dir.path(), &name);
-            dir.path().join(name)
+            let p = dir.path().join(i.to_string());
+            File::create(&p).unwrap();
+            p
         })
         .collect();
-    for mut ring in [ring_or_skip().flatten(), None] {
+    for mut ring in [Some(ring()), None] {
         sync_paths(&mut ring, &paths, DATASYNC).expect("chunked fdatasync");
         sync_paths(&mut ring, [dir.path()], FsyncFlags::empty()).expect("directory fsync");
     }
@@ -76,13 +54,10 @@ fn sync_paths_spans_several_chunks() {
 /// A failed fsync surfaces its errno, from a CQE and from the fallback alike.
 #[test]
 fn a_failed_fsync_reports_its_errno() {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` holds the two descriptors `pipe` writes.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: each descriptor is fresh and owned by exactly one `File`.
-    let files: Vec<File> = fds.iter().map(|&fd| unsafe { File::from_raw_fd(fd) }).collect();
-    for mut ring in [ring_or_skip().flatten(), None] {
-        let got = batch_sync_with(&mut ring, &files, DATASYNC, |r, want| r.submit_and_wait(want));
+    let (r, w) = std::io::pipe().unwrap();
+    let files = [File::from(OwnedFd::from(r)), File::from(OwnedFd::from(w))];
+    for mut ring in [Some(ring()), None] {
+        let got = batch_sync_with(ring.as_mut(), &files, DATASYNC, |r, want| r.submit_and_wait(want));
         assert_eq!(got, Err(StorageError::Io(libc::EINVAL)), "a pipe cannot be synced");
     }
 }

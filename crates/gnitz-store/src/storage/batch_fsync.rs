@@ -54,14 +54,14 @@ pub(super) fn sync_paths<P: AsRef<Path>>(
             .take(FD_CHUNK_THRESHOLD)
             .map(File::open)
             .collect::<Result<_, _>>()?;
-        batch_sync_with(ring, &files, flags, |r, want| r.submit_and_wait(want))?;
+        batch_sync_with(ring.as_mut(), &files, flags, |r, want| r.submit_and_wait(want))?;
     }
     Ok(())
 }
 
 /// Sync every file in `files`, with the submit call injectable for tests.
 fn batch_sync_with(
-    ring: &mut Option<IoUring>,
+    ring: Option<&mut IoUring>,
     files: &[File],
     flags: FsyncFlags,
     mut submit: impl FnMut(&mut IoUring, usize) -> std::io::Result<usize>,

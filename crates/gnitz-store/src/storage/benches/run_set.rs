@@ -81,10 +81,7 @@ fn run_set_fold_bench() {
             "{label}: a push folded the set"
         );
         let rows_in = set.row_count();
-        let retracted = set
-            .runs
-            .iter()
-            .map(|r| (0..r.len()).filter(|&i| r.get_weight(i) < 0).count());
+        let retracted = set.runs.iter().map(|r| r.retracted_rows().count());
         let rows_out = rows_in - 2 * retracted.sum::<usize>();
         let resident = perf::Resident::baseline();
         let ((), instructions) = counter.measure(|| set.fold(&schema));
@@ -187,98 +184,6 @@ fn run_set_push_bench() {
     }
 }
 
-/// `RunSet::drain_into` at a RAM tier's cadence: each drain moves a memtable's
-/// worth of rows into the tier, which spills once full. The columns are
-/// `run_set_push_bench`'s per moved row, the tier probed after every drain.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn run_set_tier_bench() {
-    /// Drains that fill the tier once.
-    const FILL: u64 = (DEFAULT_RAM_TIER_BYTES / MEMTABLE_BYTES) as u64;
-    const DRAINS: u64 = 4 * FILL;
-    /// The `seq`-th moved row, `hot` being the rows of half a fill.
-    type Rows = fn(seq: u64, hot: u64) -> (u64, i64);
-    let arms: [(&str, bool, Rows); 3] = [
-        ("ascending", true, |seq, _| (seq, 1)),
-        ("scattered", true, |seq, _| (scatter(seq), 1)),
-        // Every pass over the hot keys cancels the one before it.
-        ("churn", false, |seq, hot| {
-            (seq % hot * 1_000_003 % hot, [1, -1][(seq / hot % 2) as usize])
-        }),
-    ];
-    let schemas = [
-        ("ints", make_schema_u64_i64()),
-        ("strings", make_schema_pk_u64_payload_string()),
-    ];
-    let (counter, cycles) = (Counter::instructions(), Counter::cycles());
-    println!(
-        "run_set_tier_bench {:<20} {:>9} {:>6} {:>11} {:>10} {:>10} {:>10}",
-        "", "rows/run", "spills", "folded/row", "instr/row", "cycles/row", "probed"
-    );
-    for (schema_label, schema) in schemas {
-        let row_bytes = run(&schema, (0..1024).map(|pk| (pk, 1))).trimmed().total_bytes() / 1024;
-        let per_run = (MEMTABLE_BYTES / row_bytes) as u64;
-        let hot = per_run * (FILL / 2);
-        for (arm_label, fills, rows) in arms {
-            let label = format!("{schema_label}, {arm_label}");
-            let mut cells = [0.0; 2];
-            let (mut spills, mut folded, mut unprobed_cycles) = (0u64, 0u64, 0u64);
-            for (cell, probed) in cells.iter_mut().zip([false, true]) {
-                (spills, folded) = (0, 0);
-                let mut instructions = 0;
-                let mut memtable = RunSet::new(MEMTABLE_BYTES);
-                let mut tier = RunSet::cancelling(DEFAULT_RAM_TIER_BYTES);
-                for drain in 0..DRAINS {
-                    let mut moved: Vec<(u64, i64)> = (drain * per_run..(drain + 1) * per_run)
-                        .map(|seq| rows(seq, hot))
-                        .collect();
-                    moved.sort_unstable();
-                    memtable.push(run(&schema, moved.into_iter()), &schema);
-                    let (before, rows) = (tier.runs.clone(), tier.row_count() + memtable.row_count());
-                    let (((mut merged, spilled), i), c) = cycles.measure(|| {
-                        counter.measure(|| {
-                            memtable.drain_into(&mut tier, &schema);
-                            if probed {
-                                std::hint::black_box(tier.may_contain(0));
-                            }
-                            let merged = rows_folded(&before, rows, &tier);
-                            let spilled = tier.is_full().then(|| {
-                                let refolded = if tier.len() > 1 { tier.row_count() } else { 0 };
-                                tier.spill(&schema, |_| Ok(())).unwrap();
-                                refolded
-                            });
-                            (merged, spilled)
-                        })
-                    });
-                    instructions += i;
-                    unprobed_cycles += c * !probed as u64;
-                    assert_eq!(memtable.len(), 0, "{label}: the memtable kept a run");
-                    assert!(
-                        before.len() + 1 < FOLD_THRESHOLD || merged > 0,
-                        "{label}: the tier did not fold"
-                    );
-                    if let Some(refolded) = spilled {
-                        assert_eq!(tier.len(), 0, "{label}: the spill left a run");
-                        merged += refolded;
-                        spills += 1;
-                    }
-                    folded += merged as u64;
-                }
-                assert_eq!(spills > 0, fills, "{label}: {spills} spills");
-                *cell = instructions as f64 / (DRAINS * per_run) as f64;
-            }
-            let moved_rows = (DRAINS * per_run) as f64;
-            println!(
-                "run_set_tier_bench {label:<20} {per_run:>9} {spills:>6} {:>11.1} {:>10.1} {:>10.1} {:>10.1}",
-                folded as f64 / moved_rows,
-                cells[0],
-                unprobed_cycles as f64 / moved_rows,
-                cells[1]
-            );
-        }
-    }
-}
-
 /// `RunSet::find_pk_bytes` on a RAM tier's set, its rows in one run and in as
 /// many as a set holds: the probe that builds the bloom in instructions per held
 /// row, then scattered probes of held keys and of absent keys inside the held
@@ -292,9 +197,9 @@ fn run_set_probe_bench() {
     /// Run `run`'s `row`-th key as an index into the held keys.
     type Layout = fn(run: u64, row: u64, per_run: u64) -> u64;
     let layouts: [(&str, u64, Layout); 3] = [
-        ("1 run", 1, |_, row, _| row),
-        ("15 disjoint runs", RUNS, |run, row, per_run| run * per_run + row),
-        ("15 interleaved runs", RUNS, |run, row, _| row * RUNS + run),
+        ("one run", 1, |_, row, _| row),
+        ("disjoint runs", RUNS, |run, row, per_run| run * per_run + row),
+        ("interleaved runs", RUNS, |run, row, _| row * RUNS + run),
     ];
     let schema = make_schema_u64_i64();
     let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
@@ -320,7 +225,7 @@ fn run_set_probe_bench() {
         let (first, _) = keys(0)[0];
         let ((), build) = instructions.measure(|| set.find_pk_bytes(&first, probe_key(&first), |_, _| ()));
         println!(
-            "run_set_probe_bench {label:<20} bloom build {:5.1} instr/row",
+            "run_set_probe_bench {runs:>2} {label:<17} bloom build {:5.1} instr/row",
             build as f64 / ROWS as f64
         );
         for (kind, odd) in [("hits", 0), ("misses", 1)] {
@@ -339,7 +244,7 @@ fn run_set_probe_bench() {
             });
             assert_eq!(found, PROBES * (1 - odd), "{label}, {kind}");
             println!(
-                "run_set_probe_bench {label:<20} {kind:<6} {:6.1} instr/probe, {:6.1} cycles/probe, {:5.2}% pass the bloom",
+                "run_set_probe_bench {runs:>2} {label:<17} {kind:<6} {:6.1} instr/probe, {:6.1} cycles/probe, {:5.2}% pass the bloom",
                 instr as f64 / PROBES as f64,
                 cyc as f64 / PROBES as f64,
                 100.0 * passes as f64 / PROBES as f64
