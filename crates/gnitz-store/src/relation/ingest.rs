@@ -260,5 +260,9 @@ impl RelationRegistry {
 }
 
 #[cfg(test)]
+#[path = "tests/ingest.rs"]
+mod tests;
+
+#[cfg(test)]
 #[path = "benches/capture.rs"]
 mod bench;

@@ -12,8 +12,6 @@ mod fk_tests;
 #[path = "benches/hydrate.rs"]
 mod hydrate_bench;
 mod index_tests;
-#[path = "benches/ingest_unticked.rs"]
-mod ingest_unticked_bench;
 mod reopen_rebuild_tests;
 mod schema_codec;
 mod source_cursor_tests;
@@ -28,14 +26,12 @@ mod wide_pk_validation;
 use std::fs;
 
 use gnitz_store::relation::{
-    relation_dir, relations_dir, ChildAddr, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec,
-    SecondaryIndex, StoreConfig,
+    relation_dir, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec, SecondaryIndex, StoreConfig,
 };
 use gnitz_wire::payload_u64;
 use gnitz_wire::{Circuit, NullKeys, PkColList, ReindexRole, TypeCode, PK_LIST_PACKED_FLAG};
-use gnitz_zset::algebra::{Placement, Slot};
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
-use gnitz_zset::schema::SchemaDescriptor;
 
 use super::sys_tables::*;
 use super::*;

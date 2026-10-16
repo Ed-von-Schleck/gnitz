@@ -1,4 +1,5 @@
 use super::enforce_unique_pk;
+use crate::storage::flush_barrier;
 use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
     scratch_table, zset_of,
@@ -68,6 +69,12 @@ const SCRIPT: &[Step] = &[
         &[(5, 1, Some(1)), (6, 0, None), (7, 1, Some(3))],
     ),
     (
+        "identical upsert",
+        &[(7, 1, 3)],
+        &[(7, -1, 3), (7, 1, 3)],
+        &[(7, 1, Some(3))],
+    ),
+    (
         "fresh passthrough",
         &[(10, 1, 1), (8, 1, 2), (9, 1, 3)],
         &[(10, 1, 1), (8, 1, 2), (9, 1, 3)],
@@ -75,8 +82,9 @@ const SCRIPT: &[Step] = &[
     ),
 ];
 
-/// One script of pushes, run at every PK shape. Every key's net weight stays in
-/// `{0, 1}`, and the effective batch carries no cancelling pair.
+/// One script of pushes, run at every PK shape, its stored rows in RAM and in
+/// shards. Every key's net weight stays in `{0, 1}`, and the effective batch is
+/// exactly the script's, row for row.
 #[test]
 fn enforce_unique_pk_holds_at_every_pk_shape() {
     type Key = fn(usize) -> Vec<u128>;
@@ -90,7 +98,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         }),
     ];
 
-    for (name, pk_types, key) in cases {
+    for ((name, pk_types, key), flushed) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
         let schema = pk_payload_schema(pk_types);
         let dir = tempfile::tempdir().unwrap();
         let mut pt = scratch_table(dir.path(), schema);
@@ -101,11 +109,14 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         };
 
         for &(step, push, want, live) in SCRIPT {
-            let what = format!("{name}: {step}");
+            let what = format!("{name}, flushed {flushed}: {step}");
             let eff = enforce_unique_pk(&pt, batch(push));
             assert_eq!(zset_of(&eff, &schema), zset_of(&batch(want), &schema), "{what}");
             assert_eq!(eff.len(), want.len(), "{what}: effective row count");
-            pt.ingest(eff.to_consolidated()).unwrap();
+            pt.ingest(eff).unwrap();
+            if flushed {
+                flush_barrier([&mut pt], 0).unwrap();
+            }
             for &(i, net, payload) in live {
                 let (w, row) = pt.live_row_at(&k[i]);
                 assert_eq!(
@@ -118,8 +129,8 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
     }
 }
 
-/// Heap strings read back intact, from kept rows and from a stored row's
-/// retraction alike.
+/// Heap strings read back intact, from kept rows and from the retraction of a
+/// row stored in a shard alike.
 #[test]
 fn enforce_unique_pk_keeps_heap_strings_intact() {
     let schema = make_schema_pk_u64_payload_string();
@@ -131,6 +142,8 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
 
     let seed = enforce_unique_pk(&pt, make_batch_bytes(&schema, &[(1, 1, long1)]));
     pt.ingest(seed).unwrap();
+    flush_barrier([&mut pt], 0).unwrap();
+    assert!(!pt.all_shard_arcs().is_empty());
 
     let eff = enforce_unique_pk(
         &pt,

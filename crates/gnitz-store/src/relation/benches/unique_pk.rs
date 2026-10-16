@@ -1,13 +1,14 @@
 //! The base-table write path, in instructions per pushed row: `enforce_unique_pk`
-//! against the store, then the store's ingest of the effective batch — as a table
-//! no view scans takes it, and as a scanned one does, sealed after every push and
-//! after every [`TICK_ROWS`].
+//! against the store alone, and the registry's whole write of the push — as a
+//! table no view scans takes it, and as a scanned one does, above the cut and
+//! sealed after every push and after every [`TICK_ROWS`].
 //!
 //! `cd crates && cargo test -p gnitz-store --release unique_pk_bench -- --ignored --nocapture --test-threads=1`
 
 use super::enforce_unique_pk;
-use crate::storage::{RecoverySource, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, new_table};
+use crate::relation::{RelationKind, StoreConfig};
+use crate::storage::DEFAULT_RAM_TIER_BYTES;
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, relation_fixture_with, TID};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -88,46 +89,52 @@ fn unique_pk_bench() {
         ),
     ];
 
-    let dir = tempfile::tempdir().unwrap();
     let counter = gnitz_foundation::perf::Counter::instructions();
     println!(
         "{:<26} {:>5} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
-        "instr/row", "push", "enforce", "ingest", "enforce", "seal/push", "enforce", "seal/tick"
+        "instr/row", "push", "enforce", "write", "enforce", "seal/push", "enforce", "seal/tick"
     );
-    for (case, (label, schema, tier, row, eff_per_row)) in arms.into_iter().enumerate() {
+    for (label, schema, tier, row, eff_per_row) in arms {
         for per in [1, 1000] {
             // Rows between two seals; `None` is the table no view scans.
             let cells = [None, Some(per), Some(TICK_ROWS)].map(|tick| {
-                let path = dir.path().join(format!("{case}-{per}-{tick:?}"));
-                let mut table = new_table(path, schema, RecoverySource::SalReplay, tier);
-                for b in pushes(&schema, 1000, |s| (s, 1, 0)) {
-                    table.ingest(b).unwrap();
-                }
+                let config = StoreConfig {
+                    ram_tier_bytes: tier,
+                    ..StoreConfig::default()
+                };
+                let held = pushes(&schema, 1000, |s| (s, 1, 0));
+                let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &[], held);
                 let spilled = tier == SPILL_TIER;
-                assert_eq!(!table.all_shard_arcs().is_empty(), spilled, "{label}: held in shards");
+                let in_shards = |r: &crate::test_support::RelationFixture| {
+                    !r.relation(TID).unwrap().store.held().all_shard_arcs().is_empty()
+                };
+                assert_eq!(in_shards(&r), spilled, "{label}: held in shards");
 
-                let (mut enforce, mut store, mut eff_rows) = (0, 0, 0);
+                let (mut enforce, mut write, mut eff_rows) = (0, 0, 0);
                 for (push, b) in (1..).zip(pushes(&schema, per, row)) {
-                    let (eff, e) = counter.measure(|| enforce_unique_pk(&table, b));
+                    let probe = b.clone();
+                    let table = r.relation(TID).unwrap().store.held();
+                    let (eff, e) = counter.measure(|| enforce_unique_pk(table, probe));
                     eff_rows += eff.len() as u64;
-                    let ((), s) = counter.measure(|| match tick {
-                        None => table.ingest(eff).unwrap(),
+                    drop(eff);
+                    let ((), w) = counter.measure(|| match tick {
+                        None => r.ingest(TID, b).unwrap(),
                         Some(rows) => {
-                            table.ingest_pending(eff);
+                            r.ingest_pending(TID, b).unwrap();
                             if push * per % rows == 0 {
-                                black_box(table.seal().unwrap());
+                                black_box(r.seal(TID).unwrap());
                             }
                         }
                     });
                     enforce += e;
-                    store += s;
+                    write += w;
                 }
-                assert_eq!(!table.all_shard_arcs().is_empty(), spilled, "{label}: spilled");
+                assert_eq!(in_shards(&r), spilled, "{label}: spilled");
                 assert!(
                     per > 1 || eff_rows == ROWS * eff_per_row,
                     "{label}: {eff_rows} effective rows"
                 );
-                [enforce, store].map(|instructions: u64| instructions as f64 / ROWS as f64)
+                [enforce, write].map(|instructions: u64| instructions as f64 / ROWS as f64)
             });
             let [[e0, s0], [e1, s1], [e2, s2]] = cells;
             println!("{label:<26} {per:>5} | {e0:>9.1} {s0:>9.1} | {e1:>9.1} {s1:>9.1} | {e2:>9.1} {s2:>9.1}");

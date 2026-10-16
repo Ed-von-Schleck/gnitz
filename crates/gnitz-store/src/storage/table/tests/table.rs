@@ -90,6 +90,30 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, 
         }
         assert_eq!(gathered, want, "gather at {cut:?}");
 
+        // Every other key's leading column alone: a gather and a cursor between
+        // the first and last answer every row under each, and nothing else.
+        let p = s.pk_prefix_stride(1);
+        if p < s.pk_stride() {
+            let mut prefixes: Vec<&[u8]> = keys.iter().map(|k| &k[..p]).collect();
+            prefixes.dedup();
+            let prefixes: Vec<&[u8]> = prefixes.into_iter().step_by(2).collect();
+            let under = |zset: &HashMap<RowKey, i64>| -> HashMap<RowKey, i64> {
+                zset.iter()
+                    .filter(|(k, _)| prefixes.contains(&&k.0[..p]))
+                    .map(|(k, &w)| (k.clone(), w))
+                    .collect()
+            };
+            let mut gather = t.gather(PkKeys::from_sorted(p, prefixes.concat()), cut);
+            let mut gathered: HashMap<RowKey, i64> = HashMap::new();
+            while let Some(b) = gather.drain_chunk(3) {
+                gathered.extend(zset_of(&b, &s));
+            }
+            assert_eq!(gathered, under(&want), "prefix gather at {cut:?}");
+            let (first, last) = (prefixes[0], prefixes[prefixes.len() - 1]);
+            let between = zset_of(&t.cursor_between(first, last, cut).materialize(), &s);
+            assert_eq!(under(&between), under(&want), "prefix cursor at {cut:?}");
+        }
+
         assert_eq!(
             zset_of(&t.open_cursor(cut).materialize(), &s),
             want,

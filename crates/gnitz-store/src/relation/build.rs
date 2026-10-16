@@ -142,3 +142,7 @@ impl RelationRegistry {
             .map_err(|e| format!("open store '{dir}': {e}"))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/build.rs"]
+mod tests;

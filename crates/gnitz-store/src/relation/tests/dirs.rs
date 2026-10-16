@@ -1,6 +1,11 @@
 use super::*;
-use crate::storage::flush_barrier;
-use crate::test_support::{make_schema_u64_i64, scratch_table};
+use crate::relation::{RelationKind, StoreConfig};
+use crate::storage::{flush_barrier, manifest_path};
+use crate::test_support::{
+    flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, relation_fixture_with, scratch_table, solo, spec,
+    spilling, zset_of, TID,
+};
+use gnitz_wire::ViewBudget;
 
 #[test]
 fn parse_inverts_name_for_every_grammar() {
@@ -85,21 +90,15 @@ fn children_at_generation_reads_the_rows_and_the_scratch() {
 
 /// What a store published reaches a second directory whole: a registry opened
 /// over it reads every row the first held at its last checkpoint, and none
-/// pushed after.
+/// pushed after. A store with no manifest, as an index after a base round, is
+/// not put.
 #[test]
 fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
-    use crate::relation::{RelationKind, RelationSpec, StoreConfig};
-    use crate::test_support::{make_batch_raw, relation_fixture_with, TID};
-    use gnitz_zset::algebra::Placement;
-
     let schema = make_schema_u64_i64();
-    let config = StoreConfig {
-        ram_tier_bytes: 256,
-        ..StoreConfig::default()
-    };
     let rows: Vec<_> = (0..50).map(|k| (k, 1, k as i64)).collect();
+    // Spilling, so the store put is several shards.
     let mut r = relation_fixture_with(
-        config,
+        spilling(),
         RelationKind::BaseTable,
         schema,
         &[&[1]],
@@ -111,21 +110,106 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
 
     let dest = tempfile::tempdir().unwrap();
     let dest = dest.path().to_str().unwrap();
-    assert!(r.link_published_into(dest).unwrap() >= 1);
-
-    let mut copy = RelationRegistry::new(dest, Slot::SOLO, config);
-    copy.register(RelationSpec {
-        id: TID,
-        kind: RelationKind::BaseTable,
-        schema,
-        placement: Placement::full_pk(&schema),
-        pk_repeats: false,
-        compress: false,
-    })
-    .unwrap();
-    let keys: Vec<u64> = {
-        let all = copy.relation(TID).unwrap().full_scan();
-        (0..all.len()).map(|i| all.get_pk(i) as u64).collect()
+    assert_eq!(r.link_published_into(dest).unwrap(), 1);
+    let index = ChildAddr {
+        kind: ChildKind::Index(PkColList::from_slice(&[1])),
+        slot: Slot::SOLO,
     };
-    assert_eq!(keys, (0..50).collect::<Vec<_>>());
+    assert!(!std::path::Path::new(&index.dir(&relation_dir(dest, TID))).exists());
+
+    let mut copy = RelationRegistry::new(dest, Slot::SOLO, spilling());
+    copy.register(spec(TID, RelationKind::BaseTable, schema)).unwrap();
+    assert_eq!(
+        zset_of(&copy.relation(TID).unwrap().full_scan(), &schema),
+        zset_of(&make_batch_raw(&schema, &rows), &schema)
+    );
+}
+
+/// Only a directory named exactly as a relation's is read, and a damaged
+/// manifest holds no record.
+#[test]
+fn persisted_records_reads_well_formed_relation_manifests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    let (good, damaged) = (123, 124);
+    let view = |id| spec(id, RelationKind::View(ViewBudget::Plain), make_schema_u64_i64());
+    registry.register(view(good)).unwrap();
+    registry.register(view(damaged)).unwrap();
+    registry.set_caller_record(good, b"good".to_vec()).unwrap();
+    registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
+    registry.checkpoint_ephemeral([], 3, |_| true).unwrap();
+
+    flip_last_byte_in_place(manifest_path(&registry.child_dir(damaged, ChildKind::Rows)));
+    // A name that parses to `good`'s id but is not the name its directory has.
+    let rows = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
+    let alias = format!("{}/0{good}", relations_dir(registry.base_dir()));
+    std::fs::create_dir_all(rows.dir(&alias)).unwrap();
+    std::fs::copy(
+        manifest_path(&registry.child_dir(good, ChildKind::Rows)),
+        rows.manifest(&alias),
+    )
+    .unwrap();
+
+    let records: Vec<(u64, (u64, Vec<u8>))> = registry
+        .persisted_records()
+        .unwrap()
+        .into_iter()
+        .map(|(id, r)| (id, r.unwrap()))
+        .collect();
+    assert_eq!(records, vec![(good, (3, b"good".to_vec()))]);
+}
+
+/// A sweep removes every relation directory no relation holds, and every child
+/// of a held one laid out for another worker count or an index no circuit
+/// covers; it leaves the rest, a name in no child grammar included, and a second
+/// sweep finds nothing to remove.
+#[test]
+fn a_sweep_reclaims_exactly_what_no_relation_owns() {
+    let schema = make_schema_u64_i64();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_str().unwrap();
+    // Rank 0 of 3, holding a table indexed on its payload column.
+    let mut r = RelationRegistry::new(base, Slot::new(0, 3), StoreConfig::default());
+    r.register(spec(TID, RelationKind::BaseTable, schema)).unwrap();
+    r.add_index(
+        TID,
+        crate::relation::IndexClaim::Index { id: TID + 1, unique: false },
+        PkColList::from_slice(&[1]),
+    )
+    .unwrap();
+    r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
+    r.checkpoint_base().unwrap();
+
+    let rel = relation_dir(base, TID);
+    let unowned = [
+        format!("{}/ghost_{TID}", relations_dir(base)),
+        relation_dir(base, TID + 50),
+        format!("{rel}/w0of2"),
+        format!("{rel}/w1of2"),
+        format!("{rel}/scratch_agg_w1of2"),
+        format!("{rel}/idx_7_w0of2"),
+        format!("{rel}/idx_0-1_w0of3"),
+    ];
+    let kept = [
+        format!("{rel}/w0of3"),
+        format!("{rel}/idx_1_w0of3"),
+        format!("{rel}/scratch_agg_w2of3"),
+        format!("{rel}/data_keep"),
+    ];
+    for dir in unowned.iter().chain(&kept) {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for _ in 0..2 {
+        r.reclaim_orphan_relation_dirs().unwrap();
+        for dir in &unowned {
+            assert!(!std::path::Path::new(dir).exists(), "{dir} is reclaimed");
+        }
+        for dir in &kept {
+            assert!(std::path::Path::new(dir).exists(), "{dir} is kept");
+        }
+    }
+    assert_eq!(
+        zset_of(&r.relation(TID).unwrap().full_scan(), &schema),
+        zset_of(&make_batch_raw(&schema, &[(1, 1, 7)]), &schema)
+    );
 }

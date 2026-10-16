@@ -77,6 +77,32 @@ impl std::ops::DerefMut for RelationFixture {
     }
 }
 
+/// Relation `id`, a `kind` over `schema`, placed by its full PK.
+pub(crate) fn spec(id: u64, kind: RelationKind, schema: SchemaDescriptor) -> RelationSpec {
+    RelationSpec {
+        id,
+        kind,
+        schema,
+        placement: Placement::full_pk(&schema),
+        pk_repeats: false,
+        compress: false,
+    }
+}
+
+/// A one-worker registry over `base`.
+pub(crate) fn solo(base: impl AsRef<Path>) -> RelationRegistry {
+    RelationRegistry::new(base.as_ref().to_str().unwrap(), Slot::SOLO, StoreConfig::default())
+}
+
+/// A store config whose RAM tier spills after a few rows, so a handful of
+/// rounds puts rows in several shards.
+pub(crate) fn spilling() -> StoreConfig {
+    StoreConfig {
+        ram_tier_bytes: 256,
+        ..StoreConfig::default()
+    }
+}
+
 /// A fed view, its feed retaining `delta_bytes`.
 pub(crate) fn fed_view(delta_bytes: u64) -> RelationKind {
     RelationKind::View(ViewBudget::Fed {
@@ -105,16 +131,7 @@ pub(crate) fn relation_fixture_with(
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, config);
-    registry
-        .register(RelationSpec {
-            id: TID,
-            kind,
-            schema,
-            placement: Placement::full_pk(&schema),
-            pk_repeats: false,
-            compress: false,
-        })
-        .unwrap();
+    registry.register(spec(TID, kind, schema)).unwrap();
     for (id, &cols) in (TID + 1..).zip(indexed) {
         registry
             .add_index(

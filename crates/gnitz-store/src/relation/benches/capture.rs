@@ -47,7 +47,8 @@ fn round(s: &SchemaDescriptor, strings: bool, first: u64, rows: u64) -> Batch {
     bb.finish()
 }
 
-/// `(rchar-independent) wchar, write_bytes` of this process so far.
+/// `wchar, write_bytes` of this process so far: bytes handed to `write`, and
+/// bytes sent to storage.
 fn io_written() -> (u64, u64) {
     let io = std::fs::read_to_string("/proc/self/io").expect("read /proc/self/io");
     let field = |name: &str| {
@@ -135,9 +136,9 @@ fn delta_capture_bench() {
                         continue;
                     }
                     let ran = run(&counter, kind, strings, rounds, per_round);
-                    let (floor, kept_rows, kept_bytes) = match kind_name {
-                        "fed" => readable(&ran.fixture, strings),
-                        _ => (0, 0, 0),
+                    let (floor, kept_rows, kept_bytes) = match kind.has_delta_feed() {
+                        true => readable(&ran.fixture, strings),
+                        false => (0, 0, 0),
                     };
                     black_box(&ran.fixture);
                     println!(
@@ -155,22 +156,5 @@ fn delta_capture_bench() {
                 }
             }
         }
-    }
-}
-
-/// What a fed view that captured nothing, and then one row, holds resident:
-/// one line per budget, each meaningful in a process of its own.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn delta_idle_bench() {
-    for budget_mib in env_list("GNITZ_CAPTURE_BUDGETS_MIB", &[4, 64, 256]) {
-        let resident = Resident::baseline().expect("run under GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072");
-        let mut r = relation_fixture(fed_view(budget_mib << 20), schema(false), &[], []);
-        let idle = resident.added();
-        r.ingest_at(TID, round(&schema(false), false, 0, 1), Some(2), false)
-            .unwrap();
-        let one_row = resident.added();
-        black_box(&r);
-        println!("delta_idle_bench budget_mib={budget_mib} idle_rss={idle} one_row_rss={one_row}");
     }
 }

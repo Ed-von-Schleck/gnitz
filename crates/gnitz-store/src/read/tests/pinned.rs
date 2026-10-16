@@ -1,6 +1,8 @@
 use super::*;
-use crate::relation::{RelationKind, StoreConfig};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, TID};
+use crate::relation::RelationKind;
+use crate::test_support::{
+    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spilling, TID,
+};
 
 /// A page of `limit` rows after `after`, in `make_schema_u64_i64`'s layout.
 fn page(limit: u64, after: Option<&[u8]>) -> PageRequest {
@@ -24,15 +26,11 @@ fn keys(b: &Batch) -> Vec<u64> {
 /// `(0..100)`, cancelled rows among them, pinned as snapshot 1.
 fn pinned() -> crate::test_support::RelationFixture {
     let schema = make_schema_u64_i64();
-    let config = StoreConfig {
-        ram_tier_bytes: 256,
-        ..StoreConfig::default()
-    };
     let all: Vec<_> = (0..100).map(|k| (k, 1, 0)).collect();
     // Every third key retracted in a later round, so a drain meets cancelled groups.
     let cancelled: Vec<_> = (0..100).step_by(3).map(|k| (k, -1, 0)).collect();
     let rounds = [make_batch_raw(&schema, &all), make_batch_raw(&schema, &cancelled)];
-    let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &[], rounds);
+    let mut r = relation_fixture_with(spilling(), RelationKind::BaseTable, schema, &[], rounds);
     r.pin(1, |k| k == RelationKind::BaseTable).unwrap();
     r
 }

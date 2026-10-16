@@ -1,18 +1,10 @@
 use super::*;
-use crate::relation::StoreConfig;
-use crate::test_support::{batch_rows, make_batch_raw, make_schema_u64_i64, relation_fixture_with, rows_spec, TID};
+use crate::test_support::{
+    batch_rows, make_batch_raw, make_schema_u64_i64, relation_fixture, relation_fixture_with, rows_spec, spilling, TID,
+};
 use gnitz_wire::snapshot::{PageRequest, MAX_PAGE_ROWS};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
-
-/// A store whose RAM tier spills after a few rows, so a handful of rounds puts
-/// rows in shards and later rounds fold and retire them.
-fn spilling() -> StoreConfig {
-    StoreConfig {
-        ram_tier_bytes: 256,
-        ..StoreConfig::default()
-    }
-}
 
 fn page(layout: u64, limit: u64) -> PageRequest {
     PageRequest { layout, limit, after: Vec::new() }
@@ -27,11 +19,12 @@ fn round(lo: u64, hi: u64, val: i64) -> Batch {
 fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let schema = make_schema_u64_i64();
     let rounds = (0..8).map(|i| round(i * 10, i * 10 + 10, 1));
+    // Spilling, so later rounds fold the pinned runs and retire their shards.
     let mut r = relation_fixture_with(spilling(), RelationKind::BaseTable, schema, &[], rounds);
     r.checkpoint_base().unwrap();
     let layout = schema.layout_digest();
     let before = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
-    assert_eq!(before.len(), 80);
+    assert_eq!(before, (0..80).map(|k| (k, 1, 1)).collect::<Vec<_>>());
 
     r.pin(7, |k| k == RelationKind::BaseTable).unwrap();
     // Overwrite every row, delete half, and keep spilling and flushing so the
@@ -61,13 +54,7 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
 #[test]
 fn a_pin_holds_only_what_its_filter_keeps_and_its_id_is_its_own() {
     let schema = make_schema_u64_i64();
-    let mut r = relation_fixture_with(
-        StoreConfig::default(),
-        RelationKind::BaseTable,
-        schema,
-        &[],
-        [round(0, 3, 1)],
-    );
+    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], [round(0, 3, 1)]);
     r.pin(1, |k| k == RelationKind::SystemCatalog).unwrap();
     let err = r
         .pinned_page(1, TID, &page(schema.layout_digest(), 1), Slot::SOLO)
