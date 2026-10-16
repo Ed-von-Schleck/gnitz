@@ -25,7 +25,7 @@ from collections import Counter
 from _sql import values
 
 
-def _grouped(rows, key, *vals):
+def grouped(rows, key, *vals):
     """`{(key, *sums): 1}` — what a GROUP BY view must equal, each `vals` entry
     a row -> number summed over the group."""
     acc = {}
@@ -96,7 +96,7 @@ _PG = [(i, i % 3, i + 1) for i in range(24)]
 _SIB = [(i, i % 4, i) for i in range(24)]
 _NEST = [(i, i * 10) for i in range(12)]
 _DIA = [(i, i % 4, i + 1) for i in range(24)]
-_DIA_SUM = {g: s for (g, s) in _grouped(_DIA, lambda r: r[1], lambda r: r[2])}
+_DIA_SUM = {g: s for (g, s) in grouped(_DIA, lambda r: r[1], lambda r: r[2])}
 # pk 0, group 0's MIN holder, is deleted again.
 _MM = [(i, i % 6, (i * 7) % 50) for i in range(24)]
 _MM_LIVE = _MM[1:]
@@ -234,9 +234,9 @@ SHAPES = {
     "shared_base_groupby": (
         *_over(_table("t", ("g", "val"), _SB)),
         {"vx1": ("SELECT g, SUM(val) AS s FROM t GROUP BY g", ("g", "s"),
-                 _grouped(_SB, lambda r: r[1], lambda r: r[2])),
+                 grouped(_SB, lambda r: r[1], lambda r: r[2])),
          "vx2": ("SELECT g, SUM(id) AS s FROM t GROUP BY g", ("g", "s"),
-                 _grouped(_SB, lambda r: r[1], lambda r: r[0]))}),
+                 grouped(_SB, lambda r: r[1], lambda r: r[0]))}),
     # An exchange view over another: driving the base fills the chain
     # transitively, and driving the intermediate as a source too would
     # double-fill the top view in a hashmap-order-dependent way. The decoys
@@ -257,14 +257,14 @@ SHAPES = {
     "projection_over_groupby": (
         *_over(_table("t", ("g", "val"), _PG)),
         {"vx": ("SELECT g, SUM(val) AS s FROM t GROUP BY g", ("g", "s"),
-                _grouped(_PG, lambda r: r[1], lambda r: r[2])),
+                grouped(_PG, lambda r: r[1], lambda r: r[2])),
          "vn": ("SELECT g, s + 1 AS s1 FROM vx", ("g", "s1"),
-                {(g, s + 1): 1 for g, s in _grouped(_PG, lambda r: r[1], lambda r: r[2])})}),
+                {(g, s + 1): 1 for g, s in grouped(_PG, lambda r: r[1], lambda r: r[2])})}),
     "projection_sibling_of_groupby": (
         *_over(_table("t", ("g", "val"), _SIB)),
         {"vn": ("SELECT id, val + 1 AS plus1 FROM t", ("id", "plus1"), {(i, v + 1): 1 for i, _, v in _SIB}),
          "vx": ("SELECT g, SUM(val) AS s FROM t GROUP BY g", ("g", "s"),
-                _grouped(_SIB, lambda r: r[1], lambda r: r[2]))}),
+                grouped(_SIB, lambda r: r[1], lambda r: r[2]))}),
     # Both views are cascade-unreachable, so the depth sort must fill the inner
     # one first or the outer reads an empty source.
     "nested_projections": (
@@ -285,7 +285,7 @@ SHAPES = {
         ("g", "lo", "hi"), {(av, i, _BV[k]): 1 for i, k, av in _A})}),
     "reduce_into_join": _ab({"v": (
         "WITH s AS (SELECT k, SUM(av) AS t FROM a GROUP BY k) SELECT b.bv AS bv, s.t AS t FROM s JOIN b ON s.k = b.id",
-        ("bv", "t"), {(_BV[k], t): 1 for k, t in _grouped(_A, lambda r: r[1], lambda r: r[2])})}),
+        ("bv", "t"), {(_BV[k], t): 1 for k, t in grouped(_A, lambda r: r[1], lambda r: r[2])})}),
     # A contiguous low-id range fails the predicate on every worker's first
     # chunks, so the exchanged pre-phase payload for those rounds is empty.
     # Inferring "done" from an empty round truncates the view.
@@ -293,7 +293,7 @@ SHAPES = {
         *_over(_table("ft", ("category", "amount"), _FT)),
         {"fv": ("SELECT category, COUNT(*) AS cnt, SUM(amount) AS total FROM ft WHERE amount > 1000 GROUP BY category",
                 ("category", "cnt", "total"),
-                _grouped([r for r in _FT if r[2] > 1000], lambda r: r[1], lambda r: 1, lambda r: r[2]))}),
+                grouped([r for r in _FT if r[2] > 1000], lambda r: r[1], lambda r: 1, lambda r: r[2]))}),
     # A linear final whose delta source is an in-bundle hidden segment that
     # exchanges — grouped, joined, or a linear segment between two grouped ones —
     # so the segment must be filled before the final reads it.

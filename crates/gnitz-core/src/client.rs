@@ -1369,8 +1369,8 @@ impl GnitzClient {
     }
 
     /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
-    /// *resolve* miss alone; a name that resolves but holds no row in `family` —
-    /// `DROP TABLE <view>` — is the hard `not_found`.
+    /// *resolve* miss alone; a name held by the other kind — `DROP TABLE <view>` —
+    /// is refused as such, never as a `not_found` a caller may read as "already gone".
     async fn relation_retraction(
         &mut self,
         family: u64,
@@ -1380,6 +1380,14 @@ impl GnitzClient {
         let Some(desc) = self.resolve(name).await? else {
             return Ok(None);
         };
+        if desc.class.is_view() != (family == VIEW_TAB) {
+            return Err(format!(
+                "'{name}' is a {}; DROP {} requires a {noun}",
+                desc.class.describe(),
+                noun.to_uppercase()
+            )
+            .into());
+        }
         let (scanned, i) = self
             .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, name))
             .await?;

@@ -209,7 +209,7 @@ def test_an_acked_create_index_survives_a_crash(own_server):
 
 
 # ── ALTER TABLE ADD COLUMN across the boundary ──────────────────────────────
-# `schema_lifetime/test_alter_add.py` owns the live semantics and delegates the
+# `schema_lifetime/test_alter.py` owns the live semantics and delegates the
 # replay paths here: the pre-ALTER SAL tail carries pushes embedded at the *old*
 # width, and a checkpointed shard was written at it.
 

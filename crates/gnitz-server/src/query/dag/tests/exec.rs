@@ -234,6 +234,31 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
     assert_eq!(held(&mut engine, view), zset_of(&want, want.schema()));
 }
 
+/// Each backfill chunk relocates its strings into a fresh blob arena, so a heap
+/// string must come through a chunk boundary intact: 3-row chunks make 10 rows
+/// span four.
+#[test]
+fn a_backfill_carries_heap_strings_across_chunk_boundaries() {
+    let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", "backfill_strings"), 1).unwrap();
+    let cols = [col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
+    let base = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let view = register_identity_view(&mut engine, base, "v", &cols);
+    let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
+    let mut bb = gnitz_zset::repr::BatchBuilder::new(&schema);
+    for i in 0..10 {
+        bb.begin_row(i, 1);
+        bb.put_string(&format!("row_{i:02}_{}", "x".repeat(40)));
+        bb.end_row();
+    }
+    engine.registry.ingest(base, bb.finish()).unwrap();
+    engine.registry.set_scan_chunk_rows(3);
+
+    backfill(&mut LocalDrive(&mut engine), view).unwrap();
+
+    assert_eq!(held(&mut engine, view), held(&mut engine, base));
+    assert_eq!(held(&mut engine, view).len(), 10);
+}
+
 /// A backfill opens the bound its view's circuit recorded — a walk of the index
 /// while the catalog holds one, a full scan once it is dropped — and an
 /// unbounded view's opens a full scan.

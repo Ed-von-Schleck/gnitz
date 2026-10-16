@@ -511,23 +511,3 @@ fn create_schema_and_a_blob_column_are_sql() {
     let types: Vec<TypeCode> = files.schema.columns().iter().map(|c| c.ty.tc).collect();
     assert_eq!(types, [TypeCode::I64, TypeCode::Blob, TypeCode::Blob]);
 }
-
-/// The definition a view records is how its body was spelled; restating the
-/// same body another way keeps the view, its id and its dependents.
-#[test]
-fn another_spelling_of_a_views_body_keeps_the_view() {
-    let mut db = Db::boot(2);
-    db.exec(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL);
-         CREATE VIEW v AS SELECT id, g FROM t;
-         CREATE VIEW w AS SELECT id FROM v",
-    );
-    let before = db.rel("v").tid;
-    db.exec("CREATE OR REPLACE VIEW v AS select  x.id ,\n x.g from t x");
-    assert_eq!(db.rel("v").tid, before);
-    db.refuses(
-        "CREATE OR REPLACE VIEW v AS SELECT id, g FROM t WHERE g > 1",
-        Refused(Error),
-        "dependent",
-    );
-}

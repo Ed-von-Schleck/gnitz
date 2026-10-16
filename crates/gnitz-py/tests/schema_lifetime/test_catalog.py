@@ -1,7 +1,6 @@
 """The catalog's object lifecycle: a table's declared shape coming back
 unchanged, the foreign key a column registers, a dropped relation's id retiring
-while its siblings keep serving, and a dropped index vanishing from the next
-statement another connection plans.
+while its siblings keep serving.
 
 The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 """
@@ -9,7 +8,7 @@ The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 import gnitz
 import pytest
 from _catalog import family
-from _read import access, bag, rows
+from _read import bag
 from _schemas import KV, kv
 
 
@@ -72,24 +71,3 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(tid, KV)
 
-
-def test_drop_index_is_seen_by_the_next_statement_on_another_connection(client, peer):
-    """A drops the index B's last plan used; B's very next statement is planned
-    against its absence, and against the recreated index at once.
-
-    Asserted through EXPLAIN's access line: a plan against a stale index list
-    and one against a fresh one answer the same rows, so only the chosen walk
-    tells them apart.
-    """
-    q = "SELECT id FROM t WHERE v = 20"
-    client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
-        "INSERT INTO t VALUES (1, 10), (2, 20); "
-        "CREATE INDEX ix ON t (v)")
-
-    b = peer()
-    for ddl, indexed in ((None, True), ("DROP INDEX ix", False), ("CREATE INDEX ix ON t (v)", True)):
-        if ddl:
-            client.execute_sql(ddl)
-        assert access(b, q) == ("index range on (v)" if indexed else "full scan"), ddl
-        assert bag(rows(b, q), "id") == {(2,): 1}, ddl

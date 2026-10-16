@@ -8,8 +8,10 @@ the view sees the declared order and the declared names on the right values:
 `SELECT *`, a `CREATE VIEW v (x, y)` alias list, a view over the view, and a
 keyed read of it. Values are compared through `bag`, so weights count too.
 """
+import gnitz
 import pytest
 from _read import access, bag, rows
+from _shapes import grouped
 
 
 def _names(client, q):
@@ -71,9 +73,24 @@ def test_select_star_over_a_view_is_its_select_order(base, body, names, want):
 
 
 def test_column_aliases_name_the_select_list_in_order(base):
-    """`y` names `id`, the key, though the key is stored first."""
-    base.execute_sql("CREATE VIEW v (x, y) AS SELECT a, id FROM t")
-    assert _read(base, "SELECT * FROM v") == (["x", "y"], {(a, i): 1 for i, a, _ in _T})
+    """`y` names `id`, the key, though the key is stored first. The list names the
+    output positionally on every body and budget and on both spellings: a bounded
+    view, a join whose hidden `_join_pk` it skips, and `ALTER VIEW w (x, y)`. The
+    names land on the registered schema, so a view over `v` selects the aliases
+    and the body's own names no longer resolve."""
+    base.execute_sql(
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL); INSERT INTO u VALUES (70, 1); "
+        "CREATE VIEW v (x, y) AS SELECT a, id FROM t; "
+        "CREATE VIEW bv (x, y) WITH (capacity = '4 MB') AS SELECT a, id FROM t; "
+        "CREATE VIEW j (x, y) AS SELECT u.id AS uid, t.id FROM t JOIN u ON t.a = u.a; "
+        "CREATE VIEW over_v AS SELECT x, y FROM v; "
+        "CREATE VIEW w AS SELECT id, b FROM t; ALTER VIEW w (x, y) AS SELECT a, id FROM t")
+    want = {(a, i): 1 for i, a, _ in _T}
+    for name, w in (("v", want), ("bv", want), ("over_v", want), ("w", want),
+                    ("j", {(70, i): 1 for i, a, _ in _T if a == 1})):
+        assert _read(base, f"SELECT * FROM {name}") == (["x", "y"], w), name
+    with pytest.raises(gnitz.GnitzRefusedError, match="column 'id' not found"):
+        base.execute_sql("CREATE VIEW nope AS SELECT id FROM v")
     assert bag(rows(base, "SELECT x FROM v")) == {(a,): 3 for a in range(3)}
     assert bag(rows(base, "SELECT y FROM v WHERE y = 4")) == {(4,): 1}
 
@@ -86,10 +103,7 @@ def test_a_view_over_a_reordered_view_reads_it_by_name(base):
         ["b", "id", "a"],
         {(b, i, a): 1 for i, a, b in _T if a > 0},
     )
-    sums = {}
-    for _, a, b in _T:
-        sums[a] = sums.get(a, 0) + b
-    assert bag(rows(base, "SELECT * FROM g")) == {(a, s): 1 for a, s in sums.items()}
+    assert bag(rows(base, "SELECT * FROM g")) == grouped(_T, lambda r: r[1], lambda r: r[2])
     base.execute_sql("INSERT INTO t VALUES (10, 1, 100)")
     assert bag(rows(base, "SELECT b, id FROM w WHERE id = 10")) == {(100, 10): 1}
 

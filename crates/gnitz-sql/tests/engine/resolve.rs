@@ -466,6 +466,8 @@ fn a_kept_descriptor_answers_nothing_without_a_request() {
         unindexed,
         "the EXPLAIN names the index another client created"
     );
+    a.exec("DROP INDEX ix");
+    assert_eq!(plan(&mut b), unindexed, "and stops naming it once dropped");
 }
 
 /// A descriptor is stale only when its own relation resolves differently:
