@@ -32,9 +32,27 @@ fn order_index_batch_bench() {
         u64,
         u64,
     );
-    let cases: [Case; 12] = [
+    let cases: [Case; 15] = [
         ("global, I64 key", &[INT], &[], &[1], u64::MAX, 4096),
         ("I64 group, I64 key", &[INT, INT], &[1], &[2], u64::MAX, 4096),
+        // Keys that agree on every byte but the lowest.
+        ("I64 group, dense I64 key", &[INT, INT], &[1], &[2], 256, 4096),
+        (
+            "nullable I64 group, I64 key",
+            &[INT_NULL, INT],
+            &[1],
+            &[2],
+            u64::MAX,
+            4096,
+        ),
+        (
+            "2 nullable I64 groups, I64 key",
+            &[INT_NULL, INT_NULL, INT],
+            &[1, 2],
+            &[3],
+            u64::MAX,
+            4096,
+        ),
         (
             "I64 group, nullable I64 key",
             &[INT, INT_NULL],
@@ -117,9 +135,9 @@ fn order_index_batch_bench() {
                         false => mix(i + c as u64),
                     };
                     match (col.type_code, col.nullable) {
+                        _ if group_cols.contains(&c) => b.put_int((mix(i) % groups) as u128),
                         (TypeCode::String, _) => b.put_string(&format!("{v:040}")),
                         (_, true) => b.put_opt_int((i % 4 != 0).then_some(v as u128)),
-                        _ if group_cols.contains(&c) => b.put_int((mix(i) % groups) as u128),
                         _ => b.put_u64(v),
                     }
                 }
@@ -136,14 +154,15 @@ fn order_index_batch_bench() {
         let (entries, build) = counter.measure(|| std::hint::black_box(index.batch(&d1)));
         assert_eq!(entries.count, d1.count, "one entry per delta row");
         let bytes = entries.total_bytes() as f64 / N as f64;
+        let pk = index.schema.pk_stride();
         let (folded, fold) = counter.measure(|| std::hint::black_box(entries.to_consolidated()));
         assert_eq!(folded.count, d1.count, "no two entries are one element");
-        let mut h = Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, 10, 0).unwrap(), &[]);
+        let mut h = Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, 10, 0).unwrap());
         let retraction = d1.clone().negated().into_consolidated();
         let [e1, e2, e3] = [&d1, &d2, &retraction].map(|d| h.measure(&counter, d) as f64 / N as f64);
         println!(
-            "order_index_batch_bench {label:<33} index {bytes:6.1} B/row, build {:6.1}, fold {:7.1}; top-10 empty {e1:7.1}, \
-             populated {e2:7.1}, retraction {e3:7.1} instr/row",
+            "order_index_batch_bench {label:<33} index {bytes:6.1} B/row (pk {pk:2}), build {:6.1}, fold {:7.1}; \
+             top-10 empty {e1:7.1}, populated {e2:7.1}, retraction {e3:7.1} instr/row",
             build as f64 / N as f64,
             fold as f64 / N as f64,
         );

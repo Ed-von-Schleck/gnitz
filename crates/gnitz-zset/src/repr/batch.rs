@@ -1173,17 +1173,11 @@ impl Batch {
         }
     }
 
-    /// Append the columns at `locs` of `src`'s row into output slots `first..`
-    /// of the open row, a NULL one as a NULL.
+    /// Append the columns at `locs` of `src`'s row as the open row's payload
+    /// slots, in order, a NULL one as a NULL.
     #[inline(always)]
-    pub(crate) fn append_cells_from<S: RowSource>(
-        &mut self,
-        first: usize,
-        locs: &[ColumnLocator],
-        src: &S,
-        row: usize,
-    ) {
-        for (out_pi, loc) in (first..).zip(locs) {
+    pub(crate) fn append_cells_from<S: RowSource>(&mut self, locs: &[ColumnLocator], src: &S, row: usize) {
+        for (out_pi, loc) in locs.iter().enumerate() {
             match *loc {
                 ColumnLocator::Pk { .. } => {
                     let mut scratch = [0u8; 16];

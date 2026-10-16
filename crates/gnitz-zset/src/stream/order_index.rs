@@ -304,7 +304,7 @@ impl Walk<'_> {
     /// has open.
     #[inline(always)]
     pub(in crate::stream) fn append_row(&self, out: &mut Batch, at: At) {
-        with_row!(self, at, |src, row| out.append_cells_from(0, &self.index.row, src, row));
+        with_row!(self, at, |src, row| out.append_cells_from(&self.index.row, src, row));
     }
 }
 

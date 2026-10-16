@@ -1,4 +1,3 @@
-use super::tests::ClampRow;
 use super::*;
 use crate::test_support::{make_batch, make_schema_u64_i64, make_string_batch, TestTrace};
 use gnitz_wire::ClampKind::Distinct;
@@ -10,7 +9,7 @@ use gnitz_wire::ClampKind::Distinct;
 fn weight_clamp_bench() {
     const N: u64 = 4096;
     let ints = make_schema_u64_i64();
-    let batch = |rows: &mut dyn Iterator<Item = ClampRow>| make_batch(&ints, &rows.collect::<Vec<_>>());
+    let batch = |rows: &mut dyn Iterator<Item = (u64, i64, i64)>| make_batch(&ints, &rows.collect::<Vec<_>>());
     let dense = |w: i64| batch(&mut (0..N).map(|k| (k, w, 0)));
     let evens = |w: i64| batch(&mut (0..N).map(|k| (2 * k, w, 0)));
     // `pk` 1 holding the payloads `2, 4, ..= 2g`.
@@ -23,55 +22,67 @@ fn weight_clamp_bench() {
         make_string_batch(&rows)
     };
 
-    // The trace, the runs it is dealt into, and the delta.
-    let shapes: [(&str, Batch, usize, Batch); 13] = [
+    // The trace, the runs it is dealt into, the delta, and the rows it emits.
+    let shapes: [(&str, Batch, usize, Batch, usize); 13] = [
         (
             "sparse, 4 runs",
             batch(&mut (0..65_536).map(|k| (2 * k, 1, 0))),
             4,
             batch(&mut (0..N).map(|k| (16_384 + 3 * k, 1, 0))),
+            2048,
         ),
-        ("dense retract, 1 run", dense(1), 1, dense(-1)),
-        ("dense re-add, 1 run", dense(1), 1, dense(1)),
-        ("dense retract, 4 runs", dense(1), 4, dense(-1)),
-        ("spread, half hits", evens(1), 1, dense(-1)),
+        ("dense retract, 1 run", dense(1), 1, dense(-1), 4096),
+        ("dense re-add, 1 run", dense(1), 1, dense(1), 0),
+        ("dense retract, 4 runs", dense(1), 4, dense(-1), 4096),
+        ("spread, half hits", evens(1), 1, dense(-1), 2048),
         (
             "spread, half hits, strings",
             strings(&mut (0..N).map(|k| (2 * k, 1))),
             1,
             strings(&mut (0..N).map(|k| (k, -1))),
+            2048,
         ),
         (
             "insert-only, all emit",
             batch(&mut (0..N).map(|k| (2 * k + 1, 1, 0))),
             1,
             evens(1),
+            4096,
         ),
         (
             "hot, 1 probe past the group, G=100000, 4 runs",
             hot(100_000),
             4,
             batch(&mut std::iter::once((1, 1, 200_010))),
+            1,
         ),
-        ("hot, 256 probes, G=1000, 1 run", hot(1_000), 1, probes(1_000, 0)),
-        ("hot, 256 probes, G=1000, 4 runs", hot(1_000), 4, probes(1_000, 0)),
+        ("hot, 256 probes, G=1000, 1 run", hot(1_000), 1, probes(1_000, 0), 256),
+        ("hot, 256 probes, G=1000, 4 runs", hot(1_000), 4, probes(1_000, 0), 256),
         (
             "hot, 256 absent probes, G=1000, 4 runs",
             hot(1_000),
             4,
             probes(1_000, 1),
+            0,
         ),
-        ("hot, 256 probes, G=100000, 4 runs", hot(100_000), 4, probes(100_000, 0)),
+        (
+            "hot, 256 probes, G=100000, 4 runs",
+            hot(100_000),
+            4,
+            probes(100_000, 0),
+            256,
+        ),
         (
             "hot, 256 absent probes, G=100000, 4 runs",
             hot(100_000),
             4,
             probes(100_000, 1),
+            0,
         ),
     ];
 
     let counter = gnitz_foundation::perf::Counter::instructions();
-    for (name, trace, runs, delta) in shapes {
+    for (name, trace, runs, delta, want) in shapes {
         let trace = TestTrace::dealt(&trace, runs);
         // The first pass takes the pool's first allocations.
         let [_, (out, instructions)] = [(); 2].map(|()| {
@@ -84,6 +95,7 @@ fn weight_clamp_bench() {
                 )
             })
         });
+        assert_eq!(out.count, want, "{name}");
         println!(
             "weight_clamp_bench {name:<42} {:>8.1} instr/row (out {})",
             instructions as f64 / delta.count as f64,

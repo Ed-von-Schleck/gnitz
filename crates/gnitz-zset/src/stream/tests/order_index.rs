@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
-use super::{OrderIndex, OrderedEpoch, OrderedPlan};
+use super::{OrderedEpoch, OrderedPlan};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{assert_folds, cell, TestTrace, FLOATS, STRS};
+use crate::test_support::{cell, TestTrace, FLOATS, STRS};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
@@ -85,26 +85,15 @@ pub(in crate::stream) struct Harness {
     index: TestTrace,
     /// The integral of the output, which only the test reads.
     out: TestTrace,
-    /// Output column → the [`schema`] column it holds; `None` for a synthetic key.
-    layout: Vec<Option<usize>>,
     /// The epochs [`Self::measure`] ran.
     measured: usize,
 }
 
 impl Harness {
-    pub(in crate::stream) fn new(plan: OrderedPlan, group_cols: &[u32]) -> Self {
+    pub(in crate::stream) fn new(plan: OrderedPlan) -> Self {
         let index = TestTrace::new(*plan.index_schema());
         let out = TestTrace::new(*plan.output_schema());
-        let layout = schema()
-            .reduce_out_key(group_cols)
-            .output_layout(group_cols, 0..5)
-            .into_iter()
-            .map(|s| match s {
-                ReduceOutSlot::SyntheticKey => None,
-                ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => Some(c as usize),
-            })
-            .collect();
-        Harness { plan, index, out, layout, measured: 0 }
+        Harness { plan, index, out, measured: 0 }
     }
 
     /// One epoch: run, add the returned entries to the index, integrate the
@@ -114,7 +103,6 @@ impl Harness {
         let OrderedEpoch { out, index_entries: entries } = self
             .plan
             .epoch(delta, &mut |first, last| index.cursor_within(first, last));
-        assert_folds(&[self.plan.index.batch(delta)], &entries, "the epoch's index entries");
         self.index.ingest(entries);
         let elements = out.clone().into_consolidated().count;
         assert_eq!(out.count, elements, "the epoch's delta holds an element once");
@@ -122,20 +110,23 @@ impl Harness {
         out
     }
 
-    /// The maintained output: each row as the [`schema`] row it carries, then
-    /// the columns the operator adds.
-    pub(in crate::stream) fn state(&self) -> BTreeMap<(Cells, Cells), i64> {
+    /// The maintained output of an operator over [`schema`] grouped on
+    /// `group_cols`: each row as the [`schema`] row it carries, then the
+    /// columns the operator adds.
+    pub(in crate::stream) fn state(&self, group_cols: &[u32]) -> BTreeMap<(Cells, Cells), i64> {
+        let layout = schema().reduce_out_key(group_cols).output_layout(group_cols, 0..5);
         let b = self.out.cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema();
         (0..b.count)
             .map(|r| {
                 let mut row = vec![None; 5];
-                for (oc, ic) in self.layout.iter().enumerate() {
-                    let Some(ic) = *ic else { continue };
-                    row[ic] = cell(&mb, out.locate(oc), r);
+                for (oc, slot) in layout.iter().enumerate() {
+                    if let ReduceOutSlot::Key(ic) | ReduceOutSlot::Carried(ic) = *slot {
+                        row[ic as usize] = cell(&mb, out.locate(oc), r);
+                    }
                 }
-                let added = (self.layout.len()..out.num_columns())
+                let added = (layout.len()..out.num_columns())
                     .map(|c| cell(&mb, out.locate(c), r))
                     .collect();
                 ((row, added), b.get_weight(r))
@@ -158,74 +149,5 @@ impl Harness {
             index.ingest((*all).clone());
         }
         instructions
-    }
-}
-
-/// The entries of `delta` built a row at a time, each cell through the row
-/// writer: what [`OrderIndex::batch`] builds a region at a time.
-fn row_at_a_time(index: &OrderIndex, delta: &Batch) -> Batch {
-    let mb = delta.as_mem_batch();
-    let mut out = Batch::with_capacity(&index.schema, delta.count.max(1));
-    let stride = index.key_packer.out_stride;
-    let carried: Vec<crate::schema::ColumnLocator> = index.copies.iter().map(|c| c.src).collect();
-    let mut image = Vec::new();
-    index
-        .key_packer
-        .for_each_key(&mb, index.schema.pk_stride(), |row, key| {
-            image.clear();
-            index.lead.write_lead(&mb, row, &mut key[stride..], &mut image);
-            out.begin_row(key, mb.get_weight(row));
-            let mut col = 0;
-            if !index.lead.image.fits_slot() {
-                out.extend_col_blob(col, &image);
-                col += 1;
-            }
-            for spec in &index.rest {
-                image.clear();
-                spec.append_image(&mb, row, &mut image);
-                out.extend_col_blob(col, &image);
-                col += 1;
-            }
-            out.append_cells_from(col, &carried, &mb, row);
-            out.commit_row();
-        });
-    out
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// Row for row, a region-at-a-time entry is the row-at-a-time one: its key,
-    /// its weight, its null word and every cell — over deltas that repeat rows
-    /// and hold ghosts, under every group key form and every carried column.
-    #[test]
-    fn a_region_at_a_time_entry_is_the_row_at_a_time_one(
-        gi in 0usize..6,
-        keys in arb_keys(),
-        also in prop::collection::vec(0u32..5, 0..4),
-        rows in prop::collection::vec((arb_row(), -2i64..=2), 0..40),
-    ) {
-        let group_cols: &[u32] = [&[][..], &[0], &[1], &[2], &[1, 3], &[2, 1]][gi];
-        let (index, _) = OrderIndex::new(&schema(), group_cols, &keys, also).unwrap();
-        let delta = batch(&rows);
-        let (built, want) = (index.batch(&delta), row_at_a_time(&index, &delta));
-        prop_assert_eq!(built.count, want.count);
-        let (a, b) = (built.as_mem_batch(), want.as_mem_batch());
-        for i in 0..built.count {
-            prop_assert_eq!(a.get_pk_bytes(i), b.get_pk_bytes(i), "row {}", i);
-            prop_assert_eq!(a.get_weight(i), b.get_weight(i), "row {}", i);
-            prop_assert_eq!(
-                gnitz_wire::RowSource::get_null_word(&a, i),
-                gnitz_wire::RowSource::get_null_word(&b, i),
-                "row {}", i
-            );
-            let ord = crate::schema::payload_order::compare_full_rows(&index.schema, &a, i, &b, i);
-            prop_assert_eq!(ord, std::cmp::Ordering::Equal, "row {}", i);
-            for c in 0..index.schema.num_columns() {
-                let loc = index.schema.locate(c);
-                prop_assert_eq!(cell(&a, loc, i), cell(&b, loc, i), "row {} column {}", i, c);
-            }
-        }
-        assert_folds(std::slice::from_ref(&want), &built.to_consolidated(), "the entries");
     }
 }

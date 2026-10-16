@@ -68,11 +68,11 @@ proptest! {
     ) {
         let group_cols: &[u32] = [&[][..], &[0], &[1], &[2], &[1, 3]][gi];
         let plan = OrderedPlan::top_n(&schema(), group_cols, &keys, limit, offset).unwrap();
-        let mut h = Harness::new(plan, group_cols);
+        let mut h = Harness::new(plan);
         let mut model = BTreeMap::new();
         for targets in &ticks {
             h.tick(&batch(&delta_to(&mut model, targets)));
-            prop_assert_eq!(h.state(), window(&model, group_cols, &keys, limit, offset));
+            prop_assert_eq!(h.state(group_cols), window(&model, group_cols, &keys, limit, offset));
         }
     }
 
@@ -85,10 +85,10 @@ proptest! {
         offset in arb_bound(),
         ticks in arb_ticks(arb_row()),
     ) {
-        let partial = || Harness::new(OrderedPlan::top_n_partial(&schema(), &keys, limit, offset).unwrap(), &[]);
+        let partial = || Harness::new(OrderedPlan::top_n_partial(&schema(), &keys, limit, offset).unwrap());
         let mut workers = [partial(), partial()];
         let partials = workers[0].plan.output_schema;
-        let mut combine = Harness::new(OrderedPlan::top_n_combine(&partials, &keys, limit, offset).unwrap(), &[]);
+        let mut combine = Harness::new(OrderedPlan::top_n_combine(&partials, &keys, limit, offset).unwrap());
         let mut model = BTreeMap::new();
         for targets in &ticks {
             let delta = delta_to(&mut model, targets);
@@ -100,7 +100,7 @@ proptest! {
                 })
                 .collect();
             combine.tick(&Batch::concat(&partials, relayed.iter().map(Batch::as_mem_batch)));
-            prop_assert_eq!(combine.state(), window(&model, &[], &keys, limit, offset));
+            prop_assert_eq!(combine.state(&[]), window(&model, &[], &keys, limit, offset));
         }
     }
 }
@@ -123,9 +123,13 @@ fn a_nullable_key_places_nulls_by_nulls_first_in_either_direction() {
         (true, true, [1, 5]),
     ] {
         let key = OrderKey { col: 2, desc, nulls_first };
-        let mut h = Harness::new(OrderedPlan::top_n(&schema(), &[1], &[key], 1, 0).unwrap(), &[1]);
+        let mut h = Harness::new(OrderedPlan::top_n(&schema(), &[1], &[key], 1, 0).unwrap());
         h.tick(&batch(&rows));
-        let ids: Vec<Vec<u8>> = h.state().into_keys().map(|(row, _)| row[0].clone().unwrap()).collect();
+        let ids: Vec<Vec<u8>> = h
+            .state(&[1])
+            .into_keys()
+            .map(|(row, _)| row[0].clone().unwrap())
+            .collect();
         let want: Vec<Vec<u8>> = want.iter().map(|id: &u64| id.to_le_bytes().to_vec()).collect();
         assert_eq!(ids, want, "desc={desc} nulls_first={nulls_first}");
     }

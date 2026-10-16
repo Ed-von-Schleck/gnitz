@@ -158,7 +158,7 @@ impl IdentityLoop for AssignGroups<'_> {
                     ));
                 }
                 groups.begin_row(shape.key.out_pk(mb, row).bytes(), 1);
-                groups.append_cells_from(0, shape.key.carried(), mb, row);
+                groups.append_cells_from(shape.key.carried(), mb, row);
                 groups.commit_row();
                 Ok(g as u32)
             })?;

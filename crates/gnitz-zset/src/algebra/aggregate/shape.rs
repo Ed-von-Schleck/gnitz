@@ -47,7 +47,7 @@ pub(crate) fn emit_reduce_row(
 ) {
     output.begin_row(out_pk_bytes, 1);
     if let Some((src, row, locs)) = group {
-        output.append_cells_from(0, locs, src, row);
+        output.append_cells_from(locs, src, row);
     }
     for (k, agg) in aggs.iter().enumerate() {
         vals.emit(k, agg, g, output);

@@ -120,7 +120,7 @@ impl PkSetGather {
         self.for_each_live_row(usize::MAX, |c| {
             let (src, row) = c.current_row_source();
             out.begin_row(c.current_pk_bytes(), 1);
-            out.append_cells_from(0, &locs, src, row);
+            out.append_cells_from(&locs, src, row);
             out.commit_row();
         });
         Ok(out)

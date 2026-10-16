@@ -7,7 +7,7 @@ pub mod ladder;
 pub mod rng;
 pub mod shared;
 
-pub use internal::*;
+pub(crate) use internal::*;
 pub use ladder::*;
 pub use rng::*;
 pub use shared::*;

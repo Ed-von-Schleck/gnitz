@@ -108,11 +108,11 @@ proptest! {
     ) {
         let group_cols: &[u32] = [&[][..], &[1], &[0], &[1, 0]][gi];
         let plan = OrderedPlan::window(&schema(), group_cols, &keys, &aggs(), true, true).unwrap();
-        let mut h = Harness::new(plan, group_cols);
+        let mut h = Harness::new(plan);
         let mut model = BTreeMap::new();
         for targets in &ticks {
             h.tick(&batch(&delta_to(&mut model, targets)));
-            prop_assert_eq!(h.state(), window(&model, group_cols, &keys));
+            prop_assert_eq!(h.state(group_cols), window(&model, group_cols, &keys));
         }
     }
 }
@@ -123,7 +123,7 @@ proptest! {
 fn a_row_moves_the_rows_behind_it_and_no_others() {
     let key = OrderKey { col: 2, desc: false, nulls_first: false };
     let plan = OrderedPlan::window(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 2)], false, false).unwrap();
-    let mut h = Harness::new(plan, &[1]);
+    let mut h = Harness::new(plan);
     let row = |id, val| ((id, 7, Some(val), None, 0), 1);
     h.tick(&batch(&[row(1, 10), row(2, 20), row(3, 30)]));
     assert_eq!(h.tick(&batch(&[row(4, 40)])).count, 1, "an append");
@@ -144,15 +144,15 @@ fn a_row_moves_the_rows_behind_it_and_no_others() {
 fn a_float_sum_is_a_function_of_the_group() {
     let key = OrderKey { col: 0, desc: false, nulls_first: false };
     let plan = OrderedPlan::window(&schema(), &[1], &[key], &[agg(AggFunc::Sum, 4)], false, false).unwrap();
-    let mut h = Harness::new(plan, &[1]);
+    let mut h = Harness::new(plan);
     let row = |id: u64, f: f64| ((id, 0, None, None, f.to_bits()), 1);
     h.tick(&batch(&[row(2, 0.1), row(3, 0.2), row(4, 1e17)]));
-    let before = h.state();
+    let before = h.state(&[1]);
     let wedge = batch(&[row(1, 0.3)]);
     h.tick(&wedge);
-    assert_ne!(h.state(), before);
+    assert_ne!(h.state(&[1]), before);
     h.tick(&wedge.negated());
-    assert_eq!(h.state(), before);
+    assert_eq!(h.state(&[1]), before);
 }
 
 #[test]
