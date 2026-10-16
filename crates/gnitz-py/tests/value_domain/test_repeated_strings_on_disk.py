@@ -33,10 +33,7 @@ def _row(i, tag=""):
 
 def _push(conn, rows):
     tid, schema = conn.resolve_table("t")
-    batch = gnitz.ZSetBatch(schema)
-    for r in rows:
-        batch.append(**dict(zip(_COLS, r)))
-    conn.push(tid, batch)
+    conn.push(tid, gnitz.ZSetBatch(schema).extend(dict(zip(_COLS, r)) for r in rows))
 
 
 def test_repeated_strings_survive_the_shards(own_server):
@@ -52,7 +49,7 @@ def test_repeated_strings_survive_the_shards(own_server):
         for lo in range(0, _ROWS, 500):
             _push(conn, [_row(i) for i in range(lo, lo + 500)])
         assert bag(scanned(conn, "t"), *_COLS) == want
-        assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)
+        assert bag(scanned(conn, "v"), *_COLS) == want
 
     own_server.restart(graceful=True)
     # The premise: the shards the restart reads carry every image. The report
@@ -62,17 +59,13 @@ def test_repeated_strings_survive_the_shards(own_server):
     assert user and all(" dict " in s["regions"] for s in user), report
     with gnitz.connect(own_server.target) as conn:
         assert bag(scanned(conn, "t"), *_COLS) == want, "after the restart"
-        assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)
+        assert bag(scanned(conn, "v"), *_COLS) == want, "after the restart"
         assert bag(conn.seek(*conn.resolve_table("t"), 4321), *_COLS) == {_row(4321): 1}
 
         # An upsert retracts a stored row by its full content, so it must find
         # the stored strings equal to the ones pushed.
-        changed = [_row(i, tag="-changed") for i in range(0, _ROWS, 3)]
-        _push(conn, changed)
+        _push(conn, [_row(i, tag="-changed") for i in range(0, _ROWS, 3)])
         conn.execute_sql("DELETE FROM t WHERE id >= 5000")
-        for r in changed:
-            del want[_row(r[0])]
-            want[r] = 1
-        want = {r: w for r, w in want.items() if r[0] < 5000}
+        want = {_row(i, tag="-changed" if i % 3 == 0 else ""): 1 for i in range(5000)}
         assert bag(scanned(conn, "t"), *_COLS) == want, "after the churn"
-        assert bag(scanned(conn, "v"), *_COLS) == bag(scanned(conn, "t"), *_COLS)
+        assert bag(scanned(conn, "v"), *_COLS) == want, "after the churn"

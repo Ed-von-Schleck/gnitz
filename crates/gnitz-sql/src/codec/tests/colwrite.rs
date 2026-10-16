@@ -1,6 +1,7 @@
 use super::*;
 use crate::bind::bind_constant;
 use crate::test_support::{ncol, parse_expr_sql};
+use gnitz_wire::FixedInt;
 
 const U128_MAX: &str = "340282366920938463463374607431768211455";
 
@@ -41,6 +42,27 @@ fn an_integer_stored_cell_is_the_low_bytes_of_its_value() {
         ),
     ] {
         assert_eq!(cell(tc, src), want, "{tc:?} {src}");
+    }
+}
+
+/// Every integer column stores both ends of its range and refuses the value one
+/// past each end, rather than wrapping it onto another row's value.
+#[test]
+fn an_integer_cell_holds_its_range_and_refuses_one_past_it() {
+    for &tc in TypeCode::ALL {
+        let Some(fi) = FixedInt::exact(tc) else { continue };
+        let (lo, hi) = fi.range();
+        for v in [lo, hi] {
+            assert_eq!(
+                cell(tc, &v.to_string()),
+                fi.pack(v).to_le_bytes()[..fi.width()],
+                "{tc:?} {v}"
+            );
+        }
+        for v in [lo - 1, hi + 1] {
+            let m = write(tc, &v.to_string()).unwrap_err();
+            assert!(m.contains("value out of range"), "{tc:?} {v}: {m}");
+        }
     }
 }
 

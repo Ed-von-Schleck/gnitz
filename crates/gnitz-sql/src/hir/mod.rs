@@ -560,7 +560,7 @@ impl JoinType {
 pub(crate) struct EqPair {
     pub left: ColId,
     pub right: ColId,
-    pub tc: TypeCode,
+    pub ty: ColType,
 }
 
 /// The one range/band conjunct of a join: the two `ColId`s, the canonicalized
@@ -570,7 +570,7 @@ pub(crate) struct HirRange {
     pub left: ColId,
     pub right: ColId,
     pub op: RangeRel,
-    pub tc: TypeCode,
+    pub ty: ColType,
 }
 
 /// A join's keys: its equality pairs and at most one range conjunct.
@@ -652,12 +652,12 @@ impl JoinClass {
 
     /// Each key slot's common type, in [`Self::key_cols`] order: the eq pairs',
     /// then the range's.
+    pub(crate) fn key_types(&self) -> impl Iterator<Item = ColType> + '_ {
+        self.eq.iter().map(|p| p.ty).chain(self.range.iter().map(|r| r.ty))
+    }
+
     pub(crate) fn key_tcs(&self) -> Vec<TypeCode> {
-        self.eq
-            .iter()
-            .map(|p| p.tc)
-            .chain(self.range.iter().map(|r| r.tc))
-            .collect()
+        self.key_types().map(|t| t.tc).collect()
     }
 
     pub(crate) fn shape(&self) -> JoinShape {

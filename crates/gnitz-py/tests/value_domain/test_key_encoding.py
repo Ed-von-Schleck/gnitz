@@ -1,167 +1,80 @@
-"""The order-preserving key: plain unsigned `memcmp` over the encoded bytes *is*
-the typed lexicographic key order, at every width, sign and arity.
+"""The order-preserving key across its columns: plain unsigned `memcmp` over the
+encoded bytes *is* the typed lexicographic key order at every arity.
 
-**Order is asserted through range predicates, never through a sorted read.** A
-range on a key column is lowered to a walk over the OPK bytes, so the rows it
-returns are a direct statement about the byte order the encoder produced. Sorting
-the scanned keys in Python and comparing to `sorted(values)` — the shape this
-file replaces — is invariant to whatever order the engine produced and proves
-only that the key decodes.
+A compound key is its columns packed tightly in PK-list order, so an earlier
+column dominates a later one whatever their values. Adversarial high-half values
+are what distinguish that walk from a compare that treats the packed bytes as
+one wide integer with the later column most significant. A single column's
+order, the sign flip, is asserted per type beside the cross-encoder key test.
 
-Two properties carry every case:
-
-  * **Sign.** A signed column has its high bit flipped, so `-1` sorts below `0`
-    rather than above every positive. A range spanning zero is the one read that
-    separates the two.
-  * **Arity.** A compound key is its columns packed tightly in PK-list order, so
-    an earlier column dominates a later one whatever their values. Adversarial
-    high-half values are what distinguish that walk from a compare that treats
-    the packed bytes as one wide integer with the later column most significant.
-
-`gnitz-wire`'s own tests sweep the encoder over every PK-eligible type. What an
-end-to-end test adds is that a SQL range predicate lowers to that byte walk,
-which is not per-width — hence the narrowest and widest of each sign, not the
-full ladder.
+Order is asserted through range predicates, never through a sorted read: a
+range on a key column is lowered to a walk over the encoded bytes, so the rows
+it returns are a direct statement about the byte order the encoder produced.
 
 Asserted on weights throughout: the failure a mis-encoded key produces is a
 retraction that seeks a key no row carries, which leaves the old row behind at
 weight 1 beside the new one — and a row set reads that as correct.
 """
 
-from datetime import date, datetime
+import operator
 from decimal import Decimal
 
 import pytest
 import gnitz
 from _read import access, bag, rows, scanned
-from _sql import insert
+from _sql import insert, values
 
 U64_MAX = 18446744073709551615
-
-
-def _seed(client, ddl, rows_sql):
-    client.execute_sql(ddl)
-    client.execute_sql(f"INSERT INTO t VALUES {rows_sql}")
-
-
-# ---------------------------------------------------------------------------
-# Single-column keys: the sign flip
-# ---------------------------------------------------------------------------
-
-# (SQL spelling, keys spanning the type's range and zero). Each list holds the
-# minimum, -1, 0 and the maximum, so the range below cuts between -1 and 0 —
-# the one boundary a missing sign flip moves.
-_SIGNED_KEYS = [
-    ("TINYINT", [-128, -1, 0, 127]),
-    ("BIGINT", [-9223372036854775808, -1, 0, 9223372036854775807]),
-]
-
-_UNSIGNED_KEYS = [
-    ("TINYINT UNSIGNED", [0, 1, 127, 128, 255]),
-    ("BIGINT UNSIGNED", [0, 1, 2**63, U64_MAX]),
-]
-
-
-@pytest.mark.parametrize("pk_sql,keys", _SIGNED_KEYS,
-                         ids=[t[0].lower() for t in _SIGNED_KEYS])
-def test_a_signed_key_range_cuts_at_zero_not_at_the_wrap(
-        client, pk_sql, keys):
-    """Without the sign flip a negative key encodes above every positive one, so
-    `k >= 0` would return the negatives and `k < 0` nothing. The two halves are
-    asserted as exact complements, which no single range can fake."""
-    _seed(client,
-          f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-          ", ".join(f"({k}, {i})" for i, k in enumerate(keys)))
-
-    neg = {(k, i) for i, k in enumerate(keys) if k < 0}
-    pos = {(k, i) for i, k in enumerate(keys) if k >= 0}
-    assert bag(rows(client, "SELECT k, v FROM t WHERE k < 0")) == {p: 1 for p in neg}
-    assert bag(rows(client, "SELECT k, v FROM t WHERE k >= 0")) == {p: 1 for p in pos}
-    # A strict bound at the minimum still admits the other negative, so the order
-    # holds inside the negative run too, not merely between the signs.
-    assert bag(rows(client, f"SELECT k FROM t WHERE k > {keys[0]}")) == \
-        {(k,): 1 for k in keys[1:]}
-
-
-@pytest.mark.parametrize("pk_sql,keys", _UNSIGNED_KEYS,
-                         ids=[t[0].split()[0].lower() + "u" for t in _UNSIGNED_KEYS])
-def test_an_unsigned_key_range_orders_past_the_signed_midpoint(
-        client, pk_sql, keys):
-    """The mirror case: an unsigned column must *not* flip. A spurious flip
-    would sort the values above the signed midpoint below the ones under it, so
-    the cut is taken there."""
-    mid = 1 << (keys[-1].bit_length() - 1)
-    _seed(client,
-          f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-          ", ".join(f"({k}, {i})" for i, k in enumerate(keys)))
-
-    assert bag(rows(client, f"SELECT k FROM t WHERE k >= {mid}")) == \
-        {(k,): 1 for k in keys if k >= mid}
-    assert bag(rows(client, f"SELECT k FROM t WHERE k < {mid}")) == \
-        {(k,): 1 for k in keys if k < mid}
 
 
 # ---------------------------------------------------------------------------
 # Compound keys: the column-by-column walk
 # ---------------------------------------------------------------------------
 
-# (PK column DDL, rows as (a, b, payload), the (a, b) to retract). `b` carries
-# its type's maximum, so a compare treating the packed key as one wide integer
-# would invert the order the leading column dictates.
+# (`a` type, `b` type, rows as (a, b, payload)). In the lowest `a` group `b`
+# carries its type's maximum, so a compare treating the packed key as one wide
+# integer would invert the order the leading column dictates.
 _COMPOUND = [
-    pytest.param(
-        "a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL",
-        [(2, 1, 21), (1, U64_MAX, 1399), (1, 5, 15), (1, 0, 10), (2, 0, 20)],
-        (1, U64_MAX), id="stride16"),
-    pytest.param(
-        "a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL",
-        [(2, 0, 20), (-3, U64_MAX, 399), (-3, 0, 30), (-1, 5, 15), (2, 1, 21)],
-        (-3, U64_MAX), id="stride16-signed"),
-    pytest.param(
-        "a BIGINT UNSIGNED NOT NULL, b INT UNSIGNED NOT NULL",
-        [(1, 0, 10), (1, 4294967295, 11), (1, 7, 17), (2, 0, 20)],
-        (1, 4294967295), id="stride12"),
+    pytest.param("BIGINT UNSIGNED", "BIGINT UNSIGNED",
+                 [(2, 1, 21), (1, U64_MAX, 1399), (1, 5, 15), (1, 0, 10), (2, 0, 20)], id="stride16"),
+    pytest.param("BIGINT", "BIGINT UNSIGNED",
+                 [(2, 0, 20), (-3, U64_MAX, 399), (-3, 0, 30), (-1, 5, 15), (2, 1, 21)],
+                 id="stride16-signed"),
+    pytest.param("BIGINT UNSIGNED", "INT UNSIGNED",
+                 [(1, 0, 10), (1, 4294967295, 11), (1, 7, 17), (2, 0, 20)], id="stride12"),
 ]
 
 
-@pytest.mark.parametrize("cols,seed,retract", _COMPOUND)
-def test_an_earlier_key_column_dominates_a_later_one(
-        client, cols, seed, retract):
+@pytest.mark.parametrize("a_sql,b_sql,seed", _COMPOUND)
+def test_an_earlier_key_column_dominates_a_later_one(client, a_sql, b_sql, seed):
     """Rows arrive scrambled and must consolidate into exactly the tuples
     written, each at weight 1 — a mis-ordered key groups two distinct rows and
-    their weights accumulate against the wrong element. The retracted row is the
-    one a compare stopping at the leading column would fold against its sibling.
-    """
-    _seed(client,
-          f"CREATE TABLE t ({cols}, payload BIGINT, PRIMARY KEY (a, b))",
-          ", ".join(f"({a}, {b}, {p})" for a, b, p in seed))
+    their weights accumulate against the wrong element. `b` is declared before
+    `a`, so a pack following declaration order rather than the PK list would
+    interleave the groups, and a range within the lowest group walks a
+    contiguous run of the packed key.
 
-    assert bag(scanned(client, "t"), "a", "b", "payload") == {r: 1 for r in seed}
-    client.execute_sql(f"DELETE FROM t WHERE a = {retract[0]} AND b = {retract[1]}")
+    The group's two extremes are retracted, one by SQL and one by the client's
+    `delete`, which packs the key tuple itself at `pk_stride` — the members'
+    widths summed with no padding. A key packed at the wrong offset, width or
+    order names a row that does not exist, and the retraction is then dropped
+    without an error.
+    """
+    client.execute_sql(
+        f"CREATE TABLE t (b {b_sql} NOT NULL, payload BIGINT, a {a_sql} NOT NULL, "
+        f"PRIMARY KEY (a, b)); INSERT INTO t (a, b, payload) VALUES {values(seed)}")
+    tid, schema = client.resolve_table("t")
+    assert bag(scanned(client, "t"), "a", "b", "payload") == dict.fromkeys(seed, 1)
+
+    lo = min(a for a, _, _ in seed)
+    least, most = min(b for a, b, _ in seed if a == lo), max(b for a, b, _ in seed if a == lo)
+    assert bag(rows(client, f"SELECT b, payload FROM t WHERE a = {lo} AND b > {least}")) == \
+        {(b, p): 1 for a, b, p in seed if a == lo and b > least}
+
+    client.execute_sql(f"DELETE FROM t WHERE a = {lo} AND b = {most}")
+    client.delete(tid, schema, [(lo, least)])
     assert bag(scanned(client, "t"), "a", "b", "payload") == \
-        {r: 1 for r in seed if r[:2] != retract}
-
-
-def test_a_range_on_a_later_key_column_confines_within_its_prefix(client):
-    """Pinning the leading column and ranging on the next one walks a contiguous
-    run of the packed key. The PK list and the column order disagree below, so a
-    pack following declaration order would interleave the two groups instead.
-    """
-    seed = [(1, 0, 1), (1, 5, 2), (1, U64_MAX, 3), (2, 0, 4), (2, 5, 5)]
-    client.execute_sql(
-        "CREATE TABLE t (b BIGINT UNSIGNED NOT NULL, payload BIGINT, "
-        "a BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b))")
-    _, schema = client.resolve_table("t")
-    assert schema.pk_indices == [2, 0], "the PK list order, not the column order"
-    client.execute_sql(
-        "INSERT INTO t (a, b, payload) VALUES " +
-        ", ".join(f"({a}, {b}, {p})" for a, b, p in seed))
-
-    assert bag(rows(client, "SELECT b, payload FROM t WHERE a = 1 AND b > 0")) == \
-        {(b, p): 1 for a, b, p in seed if a == 1 and b > 0}
-    # The whole leading group, including its extreme trailing value.
-    assert bag(rows(client, "SELECT b FROM t WHERE a = 1")) == \
-        {(b,): 1 for a, b, _ in seed if a == 1}
+        {r: 1 for r in seed if r[:2] not in ((lo, least), (lo, most))}
 
 
 def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
@@ -176,10 +89,10 @@ def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
     """
     seed = [(-3, 1, 1, 311), (-3, 1, 2, 312), (-3, U64_MAX, 0, 1399),
             (-3, 2, 1, 321), (2, 1, 1, 211)]
-    _seed(client,
-          "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL, "
-          "c BIGINT UNSIGNED NOT NULL, payload BIGINT, PRIMARY KEY (a, b, c))",
-          ", ".join(f"({a}, {b}, {c}, {p})" for a, b, c, p in seed))
+    client.execute_sql(
+        "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "c BIGINT UNSIGNED NOT NULL, payload BIGINT, PRIMARY KEY (a, b, c))")
+    insert(client, "t", seed)
 
     assert bag(scanned(client, "t"), "a", "b", "c", "payload") == {r: 1 for r in seed}
     assert bag(rows(client, "SELECT payload FROM t WHERE a < 0")) == \
@@ -195,69 +108,39 @@ def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
     assert bag(rows(client,
                     "SELECT payload FROM t WHERE a = -3 AND b = 1 AND c = 99")) == {}
 
-    # The retraction takes the sibling and leaves the other at weight 1.
+    # The retraction takes the sibling and leaves the other at weight 1, by SQL
+    # and by the client's `delete`, which packs the 24-byte key itself.
     client.execute_sql("DELETE FROM t WHERE a = -3 AND b = 1 AND c = 2")
+    client.delete(*client.resolve_table("t"), [(-3, U64_MAX, 0)])
     assert bag(scanned(client, "t"), "a", "b", "c", "payload") == \
-        {r: 1 for r in seed if r[:3] != (-3, 1, 2)}
+        {r: 1 for r in seed if r[:3] not in ((-3, 1, 2), (-3, U64_MAX, 0))}
 
 
-@pytest.mark.parametrize("widths,keys", [
-    ((8, 8), [(1, 2), (3, 4), (5, 6)]),
-    ((8, 8, 8), [(1, 1, 1), (1, 1, 2), (2, 2, 2)]),
-], ids=["stride16", "stride24"])
-def test_a_compound_retraction_names_its_row(client, widths, keys):
-    """The delete verb takes a compound key as the tuple of its column values,
-    and the client packs it at `pk_stride` — the members' widths summed with no
-    padding. A key packed at the wrong offset, width or order names a row that
-    does not exist, and the retraction is then dropped without an error. Stride
-    24 is past the width a single packed compare covers, so the engine locates
-    it by a byte walk instead.
-    """
-    cols = "abc"[:len(widths)]
-    ddl_cols = ", ".join(f"{c} BIGINT UNSIGNED NOT NULL" for c in cols)
-    _seed(client,
-          f"CREATE TABLE t ({ddl_cols}, payload BIGINT, PRIMARY KEY ({', '.join(cols)}))",
-          ", ".join("(" + ", ".join(str(x) for x in k) + f", {i})"
-                    for i, k in enumerate(keys)))
-    tid, schema = client.resolve_table("t")
-
-    gone = keys[1]
-    client.delete(tid, schema, [gone])
-
-    assert bag(scanned(client, "t"), *cols, "payload") == \
-        {k + (i,): 1 for i, k in enumerate(keys) if k != gone}
-
-
-@pytest.mark.parametrize("pk_ddl,pk_list,keys", [
+@pytest.mark.parametrize("pk_ddl,cols,keys", [
     pytest.param("a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
-                 "c BIGINT UNSIGNED NOT NULL", "(a, b, c)",
+                 "c BIGINT UNSIGNED NOT NULL", "a, b, c",
                  [(1, 1, 1), (1, 1, 2), (3, 4, 5)], id="source-24"),
-    pytest.param("a UUID NOT NULL", "(a)",
+    pytest.param("a UUID NOT NULL", "a",
                  [("00000000-0000-0000-0000-000000000001",),
                   ("00000000-0000-0000-0000-000000000002",),
                   ("ffffffff-ffff-ffff-ffff-ffffffffffff",)], id="source-16"),
 ])
 def test_an_index_key_grows_with_its_sources_key_and_stays_exact(
-        client, pk_ddl, pk_list, keys):
+        client, pk_ddl, cols, keys):
     """An index row is keyed by the indexed column followed by the whole source
     key, so its own key is 8 + the source's — 32 and 24 here, both past the
     packed-compare width. An index key truncated at the narrow width would fold
     the two rows sharing payload 100 into one entry and lose a row, and the
     `access:` line is what stops a full-scan fallback passing silently.
     """
-    cols = ", ".join(pk_list.strip("()").split(", "))
     client.execute_sql(
-        f"CREATE TABLE src ({pk_ddl}, payload BIGINT NOT NULL, PRIMARY KEY {pk_list})")
-    client.execute_sql("CREATE INDEX ON src (payload)")
+        f"CREATE TABLE src ({pk_ddl}, payload BIGINT NOT NULL, PRIMARY KEY ({cols})); "
+        "CREATE INDEX ON src (payload)")
     # The first two rows share payload 100; the third carries 200.
-    client.execute_sql(
-        "INSERT INTO src VALUES " + ", ".join(
-            "(" + ", ".join(repr(x) if isinstance(x, str) else str(x) for x in k)
-            + f", {p})" for k, p in zip(keys, [100, 100, 200])))
+    insert(client, "src", [(*k, p) for k, p in zip(keys, [100, 100, 200])])
 
     q = f"SELECT {cols} FROM src WHERE payload = 100"
-    assert access(client, q) == "index range on (payload)", \
-        access(client, q)
+    assert access(client, q) == "index range on (payload)"
     assert bag(rows(client, q)) == {keys[0]: 1, keys[1]: 1}
     assert bag(rows(client, f"SELECT {cols} FROM src WHERE payload = 200")) == \
         {keys[2]: 1}
@@ -271,132 +154,36 @@ def test_an_index_key_grows_with_its_sources_key_and_stays_exact(
 # column's type, or between two of its values, must mean the same on both.
 # ---------------------------------------------------------------------------
 
-_U64_KEYS = [0, 1, 2**63, U64_MAX]
-_OPS = [("=", lambda a, b: a == b), ("<>", lambda a, b: a != b), ("<", lambda a, b: a < b),
-        ("<=", lambda a, b: a <= b), (">", lambda a, b: a > b), (">=", lambda a, b: a >= b)]
+_OPS = [("=", operator.eq), ("<>", operator.ne), ("<", operator.lt),
+        ("<=", operator.le), (">", operator.gt), (">=", operator.ge)]
 
-
-def test_a_u64_key_and_a_u64_column_agree_on_any_integer_literal(client):
-    _seed(client,
-          "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
-          "v BIGINT NOT NULL)",
-          ", ".join(f"({k}, {k}, {i})" for i, k in enumerate(_U64_KEYS)))
-    assert access(client, "SELECT v FROM t WHERE k < -1") == "pk range walk"
-    for lit in [-5, -1, 0, U64_MAX, U64_MAX + 1]:
-        for op, holds in _OPS:
-            want = {(i,): 1 for i, k in enumerate(_U64_KEYS) if holds(k, lit)}
-            for col in ("k", "u"):
-                q = f"SELECT v FROM t WHERE {col} {op} {lit}"
-                assert bag(rows(client, q)) == want, q
-
-
-def test_a_view_over_a_negative_bound_does_not_depend_on_backfill(client):
-    """A view's backfill is bounded by the walk and its deltas pass the filter,
-    so a view created before the rows and one created after must agree."""
-    client.execute_sql(
-        "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
-    client.execute_sql("CREATE VIEW none_before AS SELECT k FROM t WHERE k <= -1")
-    client.execute_sql("CREATE VIEW all_before AS SELECT k FROM t WHERE k > -1")
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({k}, {i})" for i, k in enumerate(_U64_KEYS)))
-    client.execute_sql("CREATE VIEW none_after AS SELECT k FROM t WHERE k <= -1")
-    client.execute_sql("CREATE VIEW all_after AS SELECT k FROM t WHERE k > -1")
-    every = {(k,): 1 for k in _U64_KEYS}
-    assert bag(scanned(client, "none_before")) == {}
-    assert bag(scanned(client, "none_after")) == {}
-    assert bag(scanned(client, "all_before")) == every
-    assert bag(scanned(client, "all_after")) == every
-
-
-def test_a_date_literal_is_a_timestamp_keys_midnight(client):
-    client.execute_sql("CREATE TABLE t (ts TIMESTAMP NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
-    client.execute_sql("INSERT INTO t VALUES (DATE '2020-01-02', 1)")
-    by_date = rows(client, "SELECT ts, v FROM t WHERE ts = DATE '2020-01-02'")
-    by_ts = rows(client, "SELECT ts, v FROM t WHERE ts = TIMESTAMP '2020-01-02 00:00:00'")
-    assert bag(by_date) == bag(by_ts) and len(by_date) == 1
-
-
-def test_a_fraction_bounds_an_integer_key_as_the_filter_does(client):
-    keys = [-2, -1, 0, 1, 2, 3]
-    _seed(client,
-          "CREATE TABLE t (k BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL)",
-          ", ".join(f"({k}, {k})" for k in keys))
-    assert access(client, "SELECT k FROM t WHERE k < 1.5") == "pk range walk"
-    for pred, holds in [("< 1.5", lambda x: x < 1.5), ("> -1.5", lambda x: x > -1.5),
-                        ("= 1.5", lambda x: False), ("<> 1.5", lambda x: True)]:
-        want = {(k,): 1 for k in keys if holds(k)}
-        for col in ("k", "i"):
-            q = f"SELECT k FROM t WHERE {col} {pred}"
-            assert bag(rows(client, q)) == want, q
-
-
-def test_a_decimal_column_reads_a_string_literal_at_its_scale(client):
-    _seed(client,
-          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10, 2) NOT NULL)",
-          "(1, 1.5), (2, 2.5)")
-    assert bag(rows(client, "SELECT id FROM t WHERE d = '1.50'")) == {(1,): 1}
-
-
-def test_a_u64_column_and_a_signed_column_compare_by_value(client):
-    pairs = [(U64_MAX, -1), (0, -1), (5, 5), (2**63, 2**63 - 1), (3, 7)]
-    _seed(client,
-          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
-          "i BIGINT NOT NULL)",
-          ", ".join(f"({n}, {u}, {i})" for n, (u, i) in enumerate(pairs)))
-    for op, holds in _OPS:
-        want = {(n,): 1 for n, (u, i) in enumerate(pairs) if holds(u, i)}
-        assert bag(rows(client, f"SELECT id FROM t WHERE u {op} i")) == want, op
-
-
-def test_a_date_and_a_timestamp_meet_in_microseconds(client):
-    _seed(client,
-          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, d DATE NOT NULL, "
-          "ts TIMESTAMP NOT NULL)",
-          "(1, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 00:00:00'), "
-          "(2, 0, DATE '2020-01-02', TIMESTAMP '2020-01-01 12:00:00'), "
-          "(3, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00')")
-    assert bag(rows(client, "SELECT id FROM t WHERE d > ts")) == {(2,): 1}
-    assert bag(rows(client, "SELECT id FROM t WHERE d = ts")) == {(1,): 1}
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT id, CASE WHEN k = 1 THEN d ELSE ts END AS t FROM t")
-    want = rows(client,
-                "SELECT id, CASE WHEN k = 1 THEN CAST(d AS TIMESTAMP) ELSE ts END AS t FROM t")
-    assert bag(scanned(client, "v")) == bag(want)
-
-
-# ---------------------------------------------------------------------------
-# A lookup key the column cannot hold exactly
-# ---------------------------------------------------------------------------
-
-_NOON = datetime(2024, 2, 29, 13)
-
-# (PK column type, stored literal, the key as it reads back, a value a written
-# cell rounds onto that key)
-_INEXACT = [
-    ("DECIMAL(10, 2)", "5.00", Decimal("5.00"), Decimal("5.004")),
-    ("DATE", "DATE '2024-02-29'", date(2024, 2, 29), _NOON),
+# (key type, keys, literals outside the type or between two of its values)
+_LITERALS = [
+    pytest.param("BIGINT UNSIGNED", [0, 1, 2**63, U64_MAX],
+                 ["-5", "-1", "0", str(U64_MAX), str(U64_MAX + 1)], id="u64-outside"),
+    pytest.param("BIGINT", [-2, -1, 0, 1, 2, 3], ["1.5", "-1.5"], id="i64-fraction"),
+    pytest.param("DECIMAL(6, 2)", [Decimal(i - 6) / 4 for i in range(12)],
+                 ["1.255", "-0.505", "1.25"], id="decimal-finer"),
 ]
 
 
-@pytest.mark.parametrize("pk_sql,stored,key,inexact", _INEXACT, ids=["decimal", "date"])
-def test_a_lookup_key_names_its_row_exactly_where_a_written_cell_rounds(
-        client, pk_sql, stored, key, inexact):
-    """`append` rounds a value onto the nearest key; `seek` and `delete` refuse
-    it, and the row that key names stays."""
-    _seed(client, f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-          f"({stored}, 1)")
-    tid, schema = client.resolve_table("t")
-
-    assert bag(client.seek(tid, schema, key)) == {(key, 1): 1}
-    with pytest.raises(ValueError):
-        client.seek(tid, schema, inexact)
-    with pytest.raises(ValueError):
-        client.delete(tid, schema, [inexact])
-    assert bag(scanned(client, "t")) == {(key, 1): 1}
-
-    assert bag(gnitz.ZSetBatch(schema).append(k=inexact, v=2).rows()) == {(key, 2): 1}
-    client.delete(tid, schema, [key])
-    assert bag(scanned(client, "t")) == {}
+@pytest.mark.parametrize("sql,keys,lits", _LITERALS)
+def test_a_literal_bounds_a_key_walk_as_it_bounds_the_filter(client, sql, keys, lits):
+    """A key column's predicate is served by a walk over its encoded bytes, the
+    same predicate on a non-key column by the filter program. A literal outside
+    the column's type, or between two of its values, must mean the same on
+    both: `=` misses rather than rounding onto a neighbour, and every range cuts
+    between the two values the literal falls between. A literal the column
+    holds rides alongside as the control."""
+    client.execute_sql(f"CREATE TABLE t (k {sql} NOT NULL PRIMARY KEY, c {sql} NOT NULL)")
+    insert(client, "t", [(k, k) for k in keys])
+    assert access(client, f"SELECT k FROM t WHERE k < {lits[0]}") == "pk range walk"
+    for lit in lits:
+        for op, holds in _OPS:
+            want = {(k,): 1 for k in keys if holds(k, Decimal(lit))}
+            for col in ("k", "c"):
+                q = f"SELECT k FROM t WHERE {col} {op} {lit}"
+                assert bag(rows(client, q)) == want, q
 
 
 def test_a_smallint_unique_index_refuses_a_value_a_second_push_repeats(client):

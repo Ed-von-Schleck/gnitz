@@ -4,8 +4,7 @@ A NULL payload cell is **zero-filled and the null bitmap is the sole truth**, so
 a test only proves something read that bitmap if the zero would have answered
 differently. Every case here therefore pairs a NULL against the type's own zero —
 the integer `0`, the empty string — rather than against an arbitrary value: a
-predicate over a NULL that a zero would also fail proves nothing. The families
-whose zero is not an integer are `test_value_round_trip.py`'s.
+predicate over a NULL that a zero would also fail proves nothing.
 
 The bitmap is indexed by *payload* position, which is the column's index minus
 the number of PK columns before it. For a PK declared as a prefix that is the
@@ -21,57 +20,70 @@ is the *type*: each width has its own load and its own bit, and a width-specific
 path could obey the rule for BIGINT and not for TINYINT.
 """
 
+from datetime import date, datetime
+from decimal import Decimal
+
 import pytest
 from _read import bag, rows, scanned
+from _sql import insert, lit
 
-# (SQL spelling, the type's minimum, its maximum).
-_WIDTHS = [
-    ("TINYINT", -128, 127),
-    ("SMALLINT", -32768, 32767),
-    ("INT", -2147483648, 2147483647),
-    ("BIGINT", -9223372036854775808, 9223372036854775807),
-    ("TINYINT UNSIGNED", 0, 255),
-    ("SMALLINT UNSIGNED", 0, 65535),
-    ("INT UNSIGNED", 0, 4294967295),
-    ("BIGINT UNSIGNED", 0, 18446744073709551615),
+# (SQL spelling, the type's own zero, then its extremes where it has them). The
+# zero is the value a read that ignored the bitmap would return for a NULL.
+_TYPES = [
+    ("TINYINT", [0, -128, 127]),
+    ("SMALLINT", [0, -32768, 32767]),
+    ("INT", [0, -2147483648, 2147483647]),
+    ("BIGINT", [0, -9223372036854775808, 9223372036854775807]),
+    ("TINYINT UNSIGNED", [0, 255]),
+    ("SMALLINT UNSIGNED", [0, 65535]),
+    ("INT UNSIGNED", [0, 4294967295]),
+    ("BIGINT UNSIGNED", [0, 18446744073709551615]),
+    ("UINT128", [0]),
+    ("INT128", [0]),
+    ("FLOAT", [0.0]),
+    ("DOUBLE", [0.0]),
+    ("TEXT", [""]),
+    ("UUID", ["00000000-0000-0000-0000-000000000000"]),
+    ("DECIMAL(18, 2)", [Decimal("0.00")]),
+    ("DATE", [date(1970, 1, 1)]),
+    ("TIMESTAMP", [datetime(1970, 1, 1)]),
+    ("BOOLEAN", [False]),
 ]
+# A 128-bit column takes no expression, so its NULL is read through the scan alone.
+_NO_EXPR = {"UINT128", "INT128", "UUID"}
 
 
 # ---------------------------------------------------------------------------
-# The null bit, per width and per position
+# The null bit, per type and per position
 # ---------------------------------------------------------------------------
 
 
-def test_a_null_is_distinct_from_its_types_zero_at_every_width(client):
-    """`v = 0` must admit the written zero and exclude the NULL, though the
-    NULL's payload cell holds the same zero bytes. `IS NULL` and `IS NOT NULL`
-    are asserted as exact complements, and `v > 0` rides alongside because the
-    ordering load is the other genuinely per-width part of the read."""
-    cols = [f"v{i}" for i in range(len(_WIDTHS))]
+def test_a_null_is_distinct_from_its_types_zero_in_every_column_type(client):
+    """`v = zero` must admit the written zero and exclude the NULL, though the
+    NULL's payload cell holds the same zero bytes, and a read hands the NULL
+    back as `None`. `IS NULL` and `IS NOT NULL` are asserted as exact
+    complements, and `v > zero` rides alongside because the ordering load is
+    the other per-width part of the read."""
+    cols = [f"v{i}" for i in range(len(_TYPES))]
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, " +
-        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _WIDTHS)) + ")")
-    # One row per value class, every column at once. An unsigned minimum *is*
-    # zero, so those two rows agree there and differ in every signed column.
-    nulls = [None] * len(_WIDTHS)
-    zeros = [0] * len(_WIDTHS)
-    minima = [lo for _, lo, _ in _WIDTHS]
-    maxima = [hi for _, _, hi in _WIDTHS]
-    seed = [nulls, zeros, minima, maxima]
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(
-            f"({i}, " + ", ".join("NULL" if v is None else str(v) for v in r) + ")"
-            for i, r in enumerate(seed)))
+        ", ".join(f"{c} {sql}" for c, (sql, _) in zip(cols, _TYPES)) + ")")
+    # Row 0 is all NULL, row 1 every type's zero, the rest its extremes, a type
+    # with fewer repeating its zero.
+    seed = [(0, *[None] * len(_TYPES))] + [
+        (i, *(vals[(i - 1) % len(vals)] for _, vals in _TYPES)) for i in range(1, 4)]
+    insert(client, "t", seed)
+    assert bag(scanned(client, "t"), "pk", *cols) == dict.fromkeys(seed, 1)
 
-    for j, (sql, _lo, _hi) in enumerate(_WIDTHS):
-        col = [r[j] for r in seed]
-        for pred, keep in (("= 0", lambda v: v == 0),
-                           ("> 0", lambda v: v is not None and v > 0),
+    for j, (sql, (zero, *_)) in enumerate(_TYPES, start=1):
+        if sql in _NO_EXPR:
+            continue
+        for pred, keep in ((f"= {lit(zero)}", lambda v: v is not None and v == zero),
+                           (f"> {lit(zero)}", lambda v: v is not None and v > zero),
                            ("IS NULL", lambda v: v is None),
                            ("IS NOT NULL", lambda v: v is not None)):
-            want = {(i,): 1 for i, v in enumerate(col) if keep(v)}
-            assert bag(rows(client,
-                            f"SELECT pk FROM t WHERE {cols[j]} {pred}")) == want, \
+            want = {(r[0],): 1 for r in seed if keep(r[j])}
+            assert bag(rows(client, f"SELECT pk FROM t WHERE {cols[j - 1]} {pred}")) == want, \
                 f"{sql} {pred}"
 
 
@@ -94,10 +106,7 @@ def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
     for i in range(8):
         vals = [None if i >> b & 1 else (b + 1) * 10 for b in range(3)]
         seed.append((vals[0], i, vals[1], i, vals[2]))
-    client.execute_sql(
-        "INSERT INTO t (p1, a, p2, b, p3) VALUES " +
-        ", ".join("(" + ", ".join("NULL" if v is None else str(v) for v in r) + ")"
-                  for r in seed))
+    insert(client, "t", seed)
 
     assert bag(scanned(client, "t"), "p1", "a", "p2", "b", "p3") == \
         {r: 1 for r in seed}
@@ -115,39 +124,28 @@ def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def lr(client):
-    """`l(id, fk)` and `r(k, rk, name)`, both join keys nullable, with a real
-    `0` key present on the right.
-
-    `0` is the value that matters: a NULL key reindexed to a synthetic key of
-    zero would collide with it, which is a wrong *match* rather than a missing
-    one — the failure a "NULL matched nothing" assertion alone cannot see.
-    """
-    client.execute_sql(
-        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT)")
-    client.execute_sql(
-        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk BIGINT, name BIGINT)")
-
-
-def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
-    """Both directions at once: the left NULL must miss the right `0`, and two
-    NULLs — one on each side — must miss each other. Only the real pair matches,
-    at weight 1 — and a matched row's NULL payload crosses the join still NULL.
+@pytest.mark.parametrize("key_sql,zero,x", [("BIGINT", "0", "7"), ("TEXT", "''", "'x'")],
+                         ids=["int", "text"])
+def test_a_null_key_matches_neither_its_types_zero_nor_another_null(client, key_sql, zero, x):
+    """Both directions at once: the left NULL must miss the right zero, and two
+    NULLs — one on each side — must miss each other. A NULL key reindexed to a
+    synthetic key of zero would collide with the real zero, and a string key
+    routes by the hash of its content, which for the empty string is what a
+    NULL's absent content hashes to: a wrong *match* rather than a missing one,
+    which a "NULL matched nothing" assertion alone cannot see. Only the real
+    pairs match, at weight 1, and a matched row's NULL payload crosses the join
+    still NULL.
 
     The key here is `r.rk`, a plain column the exchange builds a key for; the
-    left-join case below joins `r.k`, the key region itself — two routes to the
-    same collision.
+    boundary-crossing case below joins `r.k`, the key region itself — two routes
+    to the same collision.
     """
     client.execute_sql(
-        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk")
-    client.execute_sql(
-        "INSERT INTO r VALUES (100, 0, 900), (101, NULL, 901), (102, 7, NULL)")
-    client.execute_sql(
-        "INSERT INTO l VALUES (1, NULL), (2, 0), (3, 7), (4, NULL)")
-
-    # id 2 matches the real 0; id 3 matches 7. The two NULL left rows match
-    # neither the real 0 nor the NULL right row.
+        f"CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk {key_sql}); "
+        f"CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk {key_sql}, name BIGINT); "
+        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk; "
+        f"INSERT INTO r VALUES (100, {zero}, 900), (101, NULL, 901), (102, {x}, NULL); "
+        f"INSERT INTO l VALUES (1, NULL), (2, {zero}), (3, {x}), (4, NULL)")
     assert bag(scanned(client, "v"), "id", "name") == {(2, 900): 1, (3, None): 1}
 
 
@@ -218,24 +216,25 @@ def test_a_null_group_key_and_a_null_extremum_are_not_zero(client):
     expect(None)
     # Lower the NULL group's MIN and raise the zero group's MAX: neither moves the other.
     client.execute_sql("INSERT INTO t VALUES (6, NULL, 10), (7, 0, 999)")
-    expect(None, null_group=(3, 10, 100), zero_group=(3, 7, 999))
+    grown = {"null_group": (3, 10, 100), "zero_group": (3, 7, 999)}
+    expect(None, **grown)
     client.execute_sql("UPDATE t SET v = 0 WHERE pk = 5")
-    expect(0, null_group=(3, 10, 100), zero_group=(3, 7, 999))
+    expect(0, **grown)
     client.execute_sql("UPDATE t SET v = 7 WHERE pk = 5")
-    expect(7, null_group=(3, 10, 100), zero_group=(3, 7, 999))
+    expect(7, **grown)
 
 
 @pytest.mark.parametrize("kind", ["JOIN", "LEFT JOIN"])
-def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(
-        client, lr, kind):
+def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(client, kind):
     """A key toggling NULL ↔ real moves the row between the match branch and the
     bypass branch, which must be exact complements at every tick. A stale verdict
     leaves the old row at weight 1 beside the new one.
     """
     client.execute_sql(
-        f"CREATE VIEW v AS SELECT l.id AS id, r.name AS name "
-        f"FROM l {kind} r ON l.fk = r.k")
-    client.execute_sql("INSERT INTO r VALUES (5, NULL, 905)")
+        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT); "
+        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, name BIGINT); "
+        f"CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l {kind} r ON l.fk = r.k; "
+        "INSERT INTO r VALUES (5, 905)")
     unmatched = {(1, None): 1} if kind == "LEFT JOIN" else {}
 
     client.execute_sql("INSERT INTO l VALUES (1, NULL)")
@@ -249,36 +248,3 @@ def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(
 
     client.execute_sql("DELETE FROM l WHERE id = 1")
     assert bag(scanned(client, "v"), "id", "name") == {}
-
-
-def test_a_null_string_key_matches_neither_the_empty_string_nor_another_null(
-        client):
-    """A string key routes by the hash of its content, and the empty string
-    hashes what a NULL's absent content would. They must stay distinct — the
-    string counterpart of the NULL-versus-zero collision above."""
-    client.execute_sql(
-        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, sk TEXT)")
-    client.execute_sql(
-        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk TEXT, name BIGINT NOT NULL)")
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.sk = r.rk")
-    client.execute_sql(
-        "INSERT INTO r VALUES (1, '', 900), (2, 'x', 901), (3, NULL, 902)")
-    client.execute_sql(
-        "INSERT INTO l VALUES (1, NULL), (2, ''), (3, 'x')")
-
-    assert bag(scanned(client, "v"), "id", "name") == {(2, 900): 1, (3, 901): 1}
-
-
-def test_the_minimum_literal_and_a_negated_unsigned_column_compute_exactly(client):
-    """`-9223372036854775808` is a BIGINT literal a filter compares like any other,
-    not only where a key seek or a written cell reads it; and ABS over `-u` of an
-    unsigned column computes both kernels, so it answers `u` — with a NULL row
-    left NULL rather than read as its zero."""
-    client.execute_sql(
-        "CREATE TABLE m (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT, u INT UNSIGNED)")
-    client.execute_sql(
-        "INSERT INTO m VALUES (1, -9223372036854775808, 4000000000), (2, 0, 7), (3, NULL, NULL)")
-    assert bag(rows(client, "SELECT pk FROM m WHERE b = -9223372036854775808")) == {(1,): 1}
-    assert bag(rows(client, "SELECT pk, ABS(-u) AS a FROM m"), "pk", "a") == {
-        (1, 4000000000): 1, (2, 7): 1, (3, None): 1}

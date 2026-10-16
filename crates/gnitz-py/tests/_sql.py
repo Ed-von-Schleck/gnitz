@@ -1,19 +1,22 @@
 """How a test writes: one literal rule for every INSERT it builds, and one
 replay rule for a scenario that keeps its own copy of what it wrote."""
 
+from datetime import date
 
-def _lit(v):
+
+def lit(v):
+    """One SQL literal: `None` is NULL, a `str`, `date` or `datetime` is quoted
+    in its ISO spelling, anything else its Python spelling."""
     if v is None:
         return "NULL"
-    if isinstance(v, str):
-        return "'" + v.replace("'", "''") + "'"
+    if isinstance(v, (str, date)):
+        return "'" + str(v).replace("'", "''") + "'"
     return str(v)
 
 
 def values(rows):
-    """`(a, b), (c, d)` for a VALUES clause: `None` is NULL, a `str` is a quoted
-    string, anything else its Python spelling."""
-    return ", ".join("(" + ", ".join(_lit(v) for v in r) + ")" for r in rows)
+    """`(a, b), (c, d)` for a VALUES clause, each value a `lit`."""
+    return ", ".join("(" + ", ".join(lit(v) for v in r) + ")" for r in rows)
 
 
 def insert(client, table, rows):

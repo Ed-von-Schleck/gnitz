@@ -156,6 +156,9 @@ def _by_group(rows):
     return out
 
 
+_U64 = [0, 1, 2**63, 2**64 - 1]
+
+
 SHAPES = {
     "proj": _a({"v": ("SELECT id, av + 1 AS p FROM a", ("id", "p"), {(i, av + 1): 1 for i, _, av in _A})}),
 
@@ -402,6 +405,14 @@ SHAPES = {
         "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a",
         f"INSERT INTO cbt VALUES {values(_CB)}",
         {"cbv": ("SELECT a, b, v FROM cbt WHERE v > 0", ("a", "b", "v"), dict.fromkeys(_CB, 1))}),
+
+    # A bound outside the key's type: a backfill walks the key bytes and a
+    # delta passes the filter, so both must read `-1` alike.
+    "key_bound_outside_its_type": (
+        "CREATE TABLE ub (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        f"INSERT INTO ub VALUES {values((k, i) for i, k in enumerate(_U64))}",
+        {"none": ("SELECT k FROM ub WHERE k <= -1", ("k",), {}),
+         "every": ("SELECT k FROM ub WHERE k > -1", ("k",), {(k,): 1 for k in _U64})}),
 }
 
 

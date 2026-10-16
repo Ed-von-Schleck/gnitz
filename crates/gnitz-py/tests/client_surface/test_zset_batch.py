@@ -361,6 +361,15 @@ class TestValueCoercion:
                 with pytest.raises(TypeError):
                     ZSetBatch(schema).append(**row)
 
+    def test_a_boolean_column_takes_a_bool_and_nothing_else(self):
+        """An integer is refused where it could be read as a truth value — `1`
+        is a number in SQL too — and so is the text and the float that spell
+        one."""
+        schema = Schema([ColumnDef("id", TypeCode.I64), ColumnDef("b", TypeCode.BOOLEAN)], [0])
+        for bad in (1, 0, "true", 1.0):
+            with pytest.raises(TypeError):
+                ZSetBatch(schema).append(id=9, b=bad)
+
     @pytest.mark.parametrize("tc,values", [
         (TypeCode.U128, [0, 2**64 - 1, 2**64, 2**127, 2**128 - 1]),
         (TypeCode.I128, [-(2**127), -1, 0, 1, 2**127 - 1]),

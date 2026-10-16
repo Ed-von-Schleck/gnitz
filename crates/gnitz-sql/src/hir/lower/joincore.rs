@@ -7,7 +7,7 @@ use crate::rules::reject_arity;
 
 use gnitz_core::Schema;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
-use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
+use gnitz_wire::{Circuit, ColType, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
 
 /// This side's reindex key over `cols`, each slot typed at its `slot_tcs` type.
 fn side_reindex_key(cols: &[usize], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
@@ -95,7 +95,11 @@ fn rekey_pk_coldefs<'a>(
         .enumerate()
         .map(|(slot, (schema, c))| {
             let src = &schema.columns()[c as usize];
-            ColumnDef::new(name(slot, src), src.ty.tc.reindex_output_type(), false).hidden()
+            let ty = ColType {
+                tc: src.ty.tc.reindex_output_type(),
+                ..src.ty
+            };
+            ColumnDef::typed(name(slot, src), ty, false).hidden()
         })
         .collect()
 }
@@ -296,7 +300,7 @@ pub(super) fn range_prologue<'a>(
     };
     let (owned_a, int_a) = match reindex_a {
         _ if pure && kind.has_nu(true) => {
-            let (owned, int_a) = own_a(cb, &sides[0], inputs[0], range.tc, reindex_a.is_none())?;
+            let (owned, int_a) = own_a(cb, &sides[0], inputs[0], range.ty.tc, reindex_a.is_none())?;
             (Some(owned), int_a)
         }
         Some(r) if pure => (None, cb.worker_filter(r)),
@@ -312,7 +316,7 @@ pub(super) fn range_prologue<'a>(
         owned_a,
         int_a,
         k: tcs.len(),
-        range_tc: range.tc,
+        range_tc: range.ty.tc,
         op: range.op,
     })
 }
@@ -348,18 +352,18 @@ fn own_a(
 
 /// The hidden `_join_pk` output PK columns of an equi join, one per key slot at
 /// its pair's common type.
-pub(crate) fn join_pk_coldefs(target_tcs: &[TypeCode]) -> Vec<ColumnDef> {
-    let k = target_tcs.len();
-    target_tcs
-        .iter()
+pub(crate) fn join_pk_coldefs(class: &JoinClass) -> Vec<ColumnDef> {
+    let k = class.key_types().count();
+    class
+        .key_types()
         .enumerate()
-        .map(|(i, &t)| {
+        .map(|(i, ty)| {
             let name = if k == 1 {
                 "_join_pk".to_string()
             } else {
                 format!("_join_pk_{i}")
             };
-            ColumnDef::new(name, t, false).hidden()
+            ColumnDef::typed(name, ty, false).hidden()
         })
         .collect()
 }

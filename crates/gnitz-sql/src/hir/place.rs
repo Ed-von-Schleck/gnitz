@@ -6,7 +6,7 @@ use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};
-use gnitz_wire::{ColumnDef, JoinKeyRule, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, JoinKeyRule};
 use std::rc::Rc;
 
 /// Where a conjunct was written: in the join's own ON, or in a filter over it.
@@ -156,8 +156,8 @@ impl JoinClass {
             Some(_) => validate_range_join_key_pair(&l.def, &r.def),
         };
         match (tc, range) {
-            (Ok(tc), None) => self.eq.push(EqPair { left: l.id, right: r.id, tc }),
-            (Ok(tc), Some(op)) => self.range = Some(HirRange { left: l.id, right: r.id, op, tc }),
+            (Ok(ty), None) => self.eq.push(EqPair { left: l.id, right: r.id, ty }),
+            (Ok(ty), Some(op)) => self.range = Some(HirRange { left: l.id, right: r.id, op, ty }),
             (Err(e), _) if origin == Origin::On => return Err(e),
             (Err(_), _) => return Ok(Some(conj)),
         }
@@ -213,7 +213,7 @@ fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), GnitzSqlErr
 }
 
 /// Validate one equijoin key pair and return the key type both sides pack at.
-fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
+fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType, GnitzSqlError> {
     let t = left
         .ty
         .tc
@@ -250,14 +250,15 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCod
             left.name, left.ty, right.name, right.ty
         )));
     }
-    Ok(t)
+    // A DECIMAL pair shares its scale, and any other pair has none.
+    Ok(ColType { tc: t, scale: left.ty.scale })
 }
 
 /// Validate the range conjunct's key pair and return its common reindex output
 /// type `T`. A range bound must be order-preserving: STRING/BLOB reindex to a
 /// 16-byte content hash that is equality-correct but NOT order-preserving, so
 /// they are rejected here (they remain legal in the equality prefix).
-fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
+fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType, GnitzSqlError> {
     for col in [left, right] {
         if col.ty.tc.is_german_string() {
             return Err(GnitzSqlError::Rejected(format!(

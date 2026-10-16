@@ -12,9 +12,6 @@ Each function's **result type** is asserted beside its value. DATE_TRUNC returns
 the input type, EXTRACT returns an integer, and a date difference is an integer
 rather than a date — a function that returned the right number at the wrong type
 would render correctly here and mis-key a downstream join.
-
-That DATE and TIMESTAMP are types — their literals, their storage integer, their
-key behaviour — is `value_domain/test_temporal.py`.
 """
 
 from datetime import date, datetime

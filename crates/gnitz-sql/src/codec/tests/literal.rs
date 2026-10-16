@@ -78,7 +78,7 @@ fn a_literal_is_placed_among_the_values_of_the_type() {
         (TypeCode::I8.into(), "-128.4", Some(Below { nearest: Some(i8(-128)) })),
         (TypeCode::I8.into(), "127.5", ABOVE),
         (TypeCode::I8.into(), "-128.5", BELOW),
-        // A 16-byte type takes whole numbers, and a UUID its string spelling.
+        // A 16-byte type takes whole numbers, and a UUID its string spelling too.
         (TypeCode::I128.into(), "-5", Some(At(-5i128 as u128))),
         (TypeCode::I128.into(), U128_MAX, ABOVE),
         (TypeCode::U128.into(), "-0", Some(At(0))),
@@ -91,6 +91,7 @@ fn a_literal_is_placed_among_the_values_of_the_type() {
             "'550e8400-e29b-41d4-a716-446655440000'",
             Some(At(0x550e8400_e29b_41d4_a716_446655440000)),
         ),
+        (TypeCode::UUID.into(), "42", Some(At(42))),
         (TypeCode::UUID.into(), "'not-a-uuid'", None),
         // A DECIMAL reads a literal, or its string spelling, at its scale.
         (d2, "1.5", Some(At(150))),

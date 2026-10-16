@@ -2,7 +2,7 @@
 //! key slots, nullability, type codes and the PK column set — planned with no
 //! server against a hand-built catalog.
 
-use gnitz_wire::{RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 
 use super::*;
 
@@ -773,6 +773,31 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
 }
 
 // ── joins ────────────────────────────────────────────────────────────────────
+
+/// A key column a join mints from a DECIMAL — an equi join's `_join_pk`, a
+/// range join's source-PK `_pair_pk_*` — keeps its scale, so the stored integer
+/// reads back as the same fixed-point value.
+#[test]
+fn a_synthetic_key_over_a_decimal_keeps_its_scale() {
+    let i = TypeCode::I64;
+    let d = |name| ColumnDef::typed(name, ColType::decimal(2), false);
+    let cat = catalog(vec![
+        ("a", table(30, vec![d("k"), col("x", i)], vec![0])),
+        ("b", table(31, vec![d("k"), col("y", i)], vec![0])),
+    ]);
+    for (body, key) in [
+        ("SELECT a.x, b.y FROM a JOIN b ON a.k = b.k", "_join_pk"),
+        ("SELECT a.x, b.y FROM a JOIN b ON a.x < b.y", "_pair_pk_0"),
+    ] {
+        let chain = view(&cat, body);
+        let cols = final_view(&chain).schema.columns();
+        let c = cols
+            .iter()
+            .find(|c| c.name == key)
+            .unwrap_or_else(|| panic!("{body}: no {key}"));
+        assert_eq!(c.ty, ColType::decimal(2), "{body}");
+    }
+}
 
 /// A join view's PK is its synthetic `_join_pk` — one hidden column per equi
 /// pair, promoted to the narrowest signed type holding both sides; a range

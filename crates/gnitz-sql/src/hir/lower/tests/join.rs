@@ -74,7 +74,7 @@ fn join_keep_rules() {
                 true => vec![EqPair {
                     left: col(0, 2),
                     right: col(1, 1),
-                    tc: TypeCode::U64,
+                    ty: TypeCode::U64.into(),
                 }],
                 false => Vec::new(),
             },
@@ -82,7 +82,7 @@ fn join_keep_rules() {
                 left: col(0, 3),
                 right: col(1, 2),
                 op: RangeRel::Le,
-                tc: TypeCode::U64,
+                ty: TypeCode::U64.into(),
             }),
         };
         let preds: Vec<HirExpr> = reads

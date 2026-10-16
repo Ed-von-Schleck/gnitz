@@ -43,7 +43,7 @@ pub(super) fn lower_join_view(
 
     let out_key = class.out_key(kind);
     let out_pk = match out_key {
-        OutKey::JoinKey => join_pk_coldefs(&class.key_tcs()),
+        OutKey::JoinKey => join_pk_coldefs(class),
         OutKey::PairPk => {
             let surface = match class.shape() {
                 JoinShape::Cross => "CROSS JOIN output PK",
