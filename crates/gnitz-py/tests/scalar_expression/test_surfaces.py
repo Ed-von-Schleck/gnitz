@@ -14,15 +14,17 @@ as a blob. Agreement across them is a property only a running cluster answers.
 
 import pytest
 import gnitz
+from _exprs import filtered
 from _read import bag, rows, scanned
+from _sql import insert
 
 U64_HIGH = 2**63 + 5  # past the signed boundary: a negative i64 bit pattern
 U64_MAX = 2**64 - 1
 
 # One row per interesting sign and width, by pk. `s` is the one nullable column,
 # so a NULL anywhere else is the expression's own.
-_ROWS = {1: "(1, -9, 'alpha', 0.5, 5)", 2: f"(2, 3, 'beta', 1.5, {U64_HIGH})",
-         3: "(3, -1, '100%', 2.7, 9)", 4: "(4, 0, NULL, 1e300, 0)"}
+_ROWS = {1: (1, -9, "alpha", 0.5, 5), 2: (2, 3, "beta", 1.5, U64_HIGH),
+         3: (3, -1, "100%", 2.7, 9), 4: (4, 0, None, 1e300, 0)}
 
 
 @pytest.fixture
@@ -31,7 +33,7 @@ def surf(client):
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
         "s TEXT, f DOUBLE NOT NULL, u BIGINT UNSIGNED NOT NULL)")
-    client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS.values()))
+    insert(client, "t", _ROWS.values())
 
 
 # Each predicate against the pks it selects. Every operand class is here: an
@@ -54,31 +56,24 @@ _PREDICATES = {
     "s = 'alpha' AND pk = 1": {1},
     "UPPER(s) = 'BETA'": {2},
     "s < 'b'": {1, 3},
-    "s ILIKE 'A%'": {1},
-    "s NOT LIKE 'al%'": {2, 3},
-    r"s LIKE '100\%'": {3},
     "s IN ('beta', 'x')": {2},
     "s NOT IN ('beta', 'x')": {1, 3},
 }
 
 
 def test_every_surface_selects_the_same_rows(client, surf):
-    """For each predicate: what the maintained filter holds, the ad-hoc WHERE
-    returns and the DELETE residual removes — after which the view retracts
-    exactly those rows, and re-admits them when they return."""
-    views = {p: f"v{n}" for n, p in enumerate(_PREDICATES)}
-    for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}")
+    """For each predicate: what the filter view holds, the ad-hoc WHERE returns
+    and the DELETE residual removes — after which the view retracts exactly
+    those rows, and re-admits them when they return."""
+    held = filtered(client, _PREDICATES, key="pk")
+    assert held() == _PREDICATES
 
     for p, want in _PREDICATES.items():
-        selected = {(k,): 1 for k in want}
-        assert bag(scanned(client, views[p])) == selected, p
-        assert bag(rows(client, f"SELECT pk FROM t WHERE {p}")) == selected, p
-
         client.execute_sql(f"DELETE FROM t WHERE {p}")
-        assert bag(scanned(client, "t"), "pk") == {(k,): 1 for k in _ROWS.keys() - want}, p
-        assert bag(scanned(client, views[p])) == {}, p
-        client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS[k] for k in sorted(want)))
+        assert bag(scanned(client, "t")) == {_ROWS[k]: 1 for k in _ROWS.keys() - want}, p
+        assert held(p) == {p: set()}
+        insert(client, "t", [_ROWS[k] for k in sorted(want)])
+    assert held() == _PREDICATES
 
 
 def test_a_value_and_a_group_key_evaluate_alike_across_a_retraction(client, surf):
@@ -140,11 +135,13 @@ def test_a_wide_literal_is_checked_against_its_target_before_any_row(client):
         "v BIGINT UNSIGNED NOT NULL)")
     client.execute_sql("INSERT INTO t VALUES (1, 100)")
 
-    for stmt in (f"DELETE FROM t WHERE v + {U64_MAX + 1} = 0",
-                 f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999",
-                 "UPDATE t SET v = -1 WHERE pk = 999",
-                 f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}"):
-        with pytest.raises(gnitz.GnitzRefusedError):
+    for stmt, needle in (
+            (f"DELETE FROM t WHERE v + {U64_MAX + 1} = 0", "does not fit a 64-bit register"),
+            (f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999", "U64 value out of range"),
+            ("UPDATE t SET v = -1 WHERE pk = 999", "U64 value out of range"),
+            (f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}",
+             "U64 value out of range")):
+        with pytest.raises(gnitz.GnitzRefusedError, match=needle):
             client.execute_sql(stmt)
     assert bag(scanned(client, "t")) == {(1, 100): 1}
     # The top of the unsigned range is a comparison operand like any other.

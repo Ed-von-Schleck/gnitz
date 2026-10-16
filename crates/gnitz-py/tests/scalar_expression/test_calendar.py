@@ -16,28 +16,22 @@ would render correctly here and mis-key a downstream join.
 
 from datetime import date, datetime
 
-import pytest
 import gnitz
-from _read import bag, rows, scanned
+from _exprs import declared, projected
+from _read import bag, scanned
 
-DATE, TS, I64 = gnitz.TypeCode.DATE, gnitz.TypeCode.TIMESTAMP, gnitz.TypeCode.I64
+TC = gnitz.TypeCode
+DATE, TS, I64, BOOL = (TC.DATE, 0), (TC.TIMESTAMP, 0), (TC.I64, 0), (TC.BOOLEAN, 0)
 
-
-@pytest.fixture
-def cal(client):
-    """Four rows chosen so every calendar edge is present at once: a leap day, a
-    month end at the last microsecond, a Sunday in an ISO week belonging to the
-    previous year paired with a pre-epoch timestamp, and an all-NULL row."""
-    client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DATE, ts TIMESTAMP, "
-        "amt BIGINT NOT NULL)")
-    client.execute_sql(
-        "INSERT INTO t VALUES "
-        "(1, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:45:07', 10), "
-        "(2, DATE '2024-03-31', TIMESTAMP '2024-03-31 23:59:59.999999', 20), "
-        "(3, DATE '2021-01-03', TIMESTAMP '1969-12-31 23:00:00', 30), "
-        "(4, NULL, NULL, 40)")
-
+_T = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DATE, ts TIMESTAMP, amt BIGINT NOT NULL)"
+# Every calendar edge at once: a leap day, a month end at the last microsecond,
+# a Sunday in an ISO week belonging to the previous year beside a pre-epoch
+# instant half a second past a whole hour, and an all-NULL row.
+_SEED = ("INSERT INTO t VALUES "
+         "(1, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:45:07', 10), "
+         "(2, DATE '2024-03-31', TIMESTAMP '2024-03-31 23:59:59.999999', 20), "
+         "(3, DATE '2021-01-03', TIMESTAMP '1969-12-31 23:00:00.5', 30), "
+         "(4, NULL, NULL, 40)")
 
 # Each function against its result type and its value on ids 1..4. Every one
 # propagates a NULL input rather than substituting the epoch.
@@ -54,8 +48,8 @@ _FUNCTIONS = {
     "EXTRACT(HOUR FROM ts)": (I64, [13, 23, 23, None]),
     "DATE_PART('minute', ts)": (I64, [45, 59, 0, None]),
     "EXTRACT(SECOND FROM ts)": (I64, [7, 59, 0, None]),
-    # The pre-epoch timestamp floors rather than rounding toward zero, which is
-    # what makes its epoch exactly -3600.
+    # The pre-epoch instant is -3599.5 s: flooring gives -3600, rounding toward
+    # zero would give -3599 — and would truncate it into 1970 below.
     "EXTRACT(EPOCH FROM ts)": (I64, [1709214307, 1711929599, -3600, None]),
     # A month end truncates to the month's first day, not its last; the week
     # truncation of 2021-01-03 crosses a year boundary.
@@ -72,53 +66,41 @@ _FUNCTIONS = {
     "d - DATE '2024-01-01'": (I64, [59, 90, -1093, None]),
     "ts - 1000000": (TS, [datetime(2024, 2, 29, 13, 45, 6),
                           datetime(2024, 3, 31, 23, 59, 58, 999_999),
-                          datetime(1969, 12, 31, 22, 59, 59), None]),
+                          datetime(1969, 12, 31, 22, 59, 59, 500_000), None]),
+    # A comparison parses its literal at the column's type, so a bare string and
+    # a typed literal name the same value — a BETWEEN's two bounds included.
+    "ts >= TIMESTAMP '2024-03-01 00:00:00' OR d < '2022-01-01'": (BOOL, [False, True, True, None]),
+    "d = DATE '2024-02-29'": (BOOL, [True, False, False, None]),
+    "d BETWEEN '2024-01-01' AND '2024-12-31'": (BOOL, [True, True, False, None]),
 }
 
 
-def test_each_calendar_function_keeps_its_own_result_type(client, cal):
-    """One projection per function, so the result types are stated as one table
-    — served alike by a maintained view and an ad-hoc read. A predicate parses
-    its literal at the column's type, so a bare string and a typed literal
-    select the same rows, including a BETWEEN, whose bounds parse separately."""
-    select = "SELECT id, " + ", ".join(
-        f"{e} AS c{n}" for n, e in enumerate(_FUNCTIONS)) + " FROM t"
-    client.execute_sql(f"CREATE VIEW v AS {select}")
-
-    declared = [c.type_code for c in client.resolve_table("v")[1].columns[1:]]
-    assert declared == [tc for tc, _ in _FUNCTIONS.values()]
-
-    expected = {r: 1 for r in zip([1, 2, 3, 4], *(vs for _, vs in _FUNCTIONS.values()))}
-    assert bag(scanned(client, "v")) == expected
-    assert bag(rows(client, select)) == expected
-
-    client.execute_sql(
-        "CREATE VIEW recent AS SELECT id FROM t "
-        "WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' OR d < '2022-01-01'")
-    assert bag(scanned(client, "recent")) == {(2,): 1, (3,): 1}
-    assert bag(rows(client, "SELECT id FROM t WHERE d = DATE '2024-02-29'")) == {(1,): 1}
-    assert bag(rows(client, "SELECT COUNT(*) AS n FROM t "
-                                "WHERE d BETWEEN '2024-01-01' AND '2024-12-31'")) == {(2,): 1}
+def test_each_calendar_function_keeps_its_own_result_type(client):
+    client.execute_sql(_T)
+    projected(client, _SEED, _FUNCTIONS)
 
 
-def test_a_truncation_used_as_a_group_key_maintains_its_buckets(client, cal):
+def test_a_truncation_used_as_a_group_key_maintains_its_buckets(client):
     """DATE_TRUNC in a GROUP BY makes the bucket a computed key, so the reduce
-    must re-derive it on every delta. The NULL row forms its own bucket — a
-    grouping that dropped it would lose a row rather than mis-place one."""
+    must re-derive it on every delta, and an extremum over a temporal column
+    keeps its type. The NULL row forms its own bucket — a grouping that dropped
+    it would lose a row rather than mis-place one."""
+    client.execute_sql(_T)
     client.execute_sql(
         "CREATE VIEW bym AS SELECT DATE_TRUNC('month', d) AS month, SUM(amt) AS total, "
         "MIN(ts) AS first_ts, MAX(d) AS last_d, COUNT(*) AS n "
         "FROM t GROUP BY DATE_TRUNC('month', d)")
-    types = {c.name: c.type_code for c in client.resolve_table("bym")[1].columns}
+    types = declared(client, "bym")
     assert (types["month"], types["first_ts"], types["last_d"]) == (DATE, TS, DATE)
 
+    client.execute_sql(_SEED)
     client.execute_sql(
         "INSERT INTO t VALUES (5, DATE '2024-02-01', TIMESTAMP '2024-02-01 00:00:00', 5)")
     cols = ("month", "total", "first_ts", "last_d", "n")
     unchanged = {
         (date(2024, 3, 1), 20, datetime(2024, 3, 31, 23, 59, 59, 999_999),
          date(2024, 3, 31), 1): 1,
-        (date(2021, 1, 1), 30, datetime(1969, 12, 31, 23), date(2021, 1, 3), 1): 1,
+        (date(2021, 1, 1), 30, datetime(1969, 12, 31, 23, 0, 0, 500_000), date(2021, 1, 3), 1): 1,
         (None, 40, None, None, 1): 1,
     }
     assert bag(scanned(client, "bym"), *cols) == {

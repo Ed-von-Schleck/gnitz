@@ -20,74 +20,51 @@ is `value_domain/test_decimal.py`.
 from decimal import Decimal as D
 
 import gnitz
+from _exprs import declared, projected
 from _read import bag, rows, scanned
 
-DEC, F64, I64 = gnitz.TypeCode.DECIMAL, gnitz.TypeCode.F64, gnitz.TypeCode.I64
+TC = gnitz.TypeCode
+F64, I64, BOOL = (TC.F64, 0), (TC.I64, 0), (TC.BOOLEAN, 0)
 
 
-def _declared(client, name):
-    """`{column name: (type code, scale)}` of relation `name`."""
-    return {c.name: (c.type_code, c.scale) for c in client.resolve_table(name)[1].columns}
+def DEC(scale):
+    return (TC.DECIMAL, scale)
 
 
 # Each operator against its value on ids 1..5. An operator propagates a NULL
 # operand; GREATEST instead skips it, as it does in PostgreSQL.
 _OPERATORS = {
     # scale(price) + scale(qty) = 2 + 3.
-    "price * qty": [D("37.50000"), D("0.35000"), D("0.00713"), None, D("2.02000")],
-    "price * 1.1": [D("13.750"), D("0.110"), D("7.843"), D("-0.550"), D("1.111")],
-    "price + 0.005": [D("12.505"), D("0.105"), D("7.135"), D("-0.495"), D("1.015")],
+    "price * qty": (DEC(5), [D("37.50000"), D("0.35000"), D("0.00713"), None, D("2.02000")]),
+    "price * 1.1": (DEC(3), [D("13.750"), D("0.110"), D("7.843"), D("-0.550"), D("1.111")]),
+    "price + 0.005": (DEC(3), [D("12.505"), D("0.105"), D("7.135"), D("-0.495"), D("1.015")]),
     # A division is not closed over the class.
-    "price / 4": [3.125, 0.025, 1.7825, -0.125, 0.2525],
-    "ROUND(price * qty, 2)": [D("37.50"), D("0.35"), D("0.01"), None, D("2.02")],
+    "price / 4": (F64, [3.125, 0.025, 1.7825, -0.125, 0.2525]),
+    "ROUND(price * qty, 2)": (DEC(2), [D("37.50"), D("0.35"), D("0.01"), None, D("2.02")]),
     # A cast to an integer rounds half away from zero: -0.50 becomes -1.
-    "CAST(price AS BIGINT)": [13, 0, 7, -1, 1],
-    "FLOOR(price)": [D(12), D(0), D(7), D(-1), D(1)],
-    "CEIL(price)": [D(13), D(1), D(8), D(0), D(2)],
-    "CAST(price AS DECIMAL(6, 1))": [D("12.5"), D("0.1"), D("7.1"), D("-0.5"), D("1.0")],
-    "CAST(price AS DOUBLE)": [12.5, 0.1, 7.13, -0.5, 1.01],
-    "-price": [D("-12.50"), D("-0.10"), D("-7.13"), D("0.50"), D("-1.01")],
-    "price % 1": [D("0.50"), D("0.10"), D("0.13"), D("-0.50"), D("0.01")],
-    "GREATEST(price, qty)": [D("12.500"), D("3.500"), D("7.130"), D("-0.500"), D("2.000")],
-    "CASE WHEN price > 1 THEN price ELSE 0.5 END": [D("12.50"), D("0.50"), D("7.13"),
-                                                    D("0.50"), D("1.01")],
+    "CAST(price AS BIGINT)": (I64, [13, 0, 7, -1, 1]),
+    "FLOOR(price)": (DEC(0), [D(12), D(0), D(7), D(-1), D(1)]),
+    "CEIL(price)": (DEC(0), [D(13), D(1), D(8), D(0), D(2)]),
+    "CAST(price AS DECIMAL(6, 1))": (DEC(1), [D("12.5"), D("0.1"), D("7.1"), D("-0.5"),
+                                              D("1.0")]),
+    "CAST(price AS DOUBLE)": (F64, [12.5, 0.1, 7.13, -0.5, 1.01]),
+    "-price": (DEC(2), [D("-12.50"), D("-0.10"), D("-7.13"), D("0.50"), D("-1.01")]),
+    "price % 1": (DEC(2), [D("0.50"), D("0.10"), D("0.13"), D("-0.50"), D("0.01")]),
+    "GREATEST(price, qty)": (DEC(3), [D("12.500"), D("3.500"), D("7.130"), D("-0.500"),
+                                      D("2.000")]),
+    "CASE WHEN price > 1 THEN price ELSE 0.5 END": (DEC(2), [D("12.50"), D("0.50"), D("7.13"),
+                                                             D("0.50"), D("1.01")]),
+    # A comparison against a computed scale, or a literal list and bounds each
+    # parsed at the column's scale.
+    "price IN (12.5, 1.01, 7)": (BOOL, [True, False, False, False, True]),
+    "price < 1 AND qty >= 2": (BOOL, [False, True, False, None, False]),
+    "price * qty > 30": (BOOL, [True, False, False, None, False]),
+    "price BETWEEN 1 AND 8": (BOOL, [False, False, True, False, True]),
 }
 
 
 def test_each_operator_carries_its_own_result_scale(client, priced):
-    """One column per operator class, so the scale rule is one table — served
-    alike by a maintained view and an ad-hoc read, and re-derived on the
-    retraction an UPDATE makes. A predicate parses its literal at the column's
-    scale, so `12.5` and `12.50` name one value while `12.501` names none."""
-    select = "SELECT id, " + ", ".join(
-        f"{e} AS c{n}" for n, e in enumerate(_OPERATORS)) + " FROM t"
-    client.execute_sql(f"CREATE VIEW v AS {select}")
-
-    declared = _declared(client, "v")
-    assert [declared[f"c{list(_OPERATORS).index(e)}"] for e in
-            ("price * qty", "price / 4", "CAST(price AS BIGINT)")] == [(DEC, 5), (F64, 0), (I64, 0)]
-
-    expected = {r: 1 for r in zip([1, 2, 3, 4, 5], *_OPERATORS.values())}
-    assert bag(scanned(client, "v")) == expected
-    assert bag(rows(client, select)) == expected
-
-    def ids(where):
-        return bag(rows(client, f"SELECT id FROM t WHERE {where}"))
-
-    assert ids("price > 9.99") == {(1,): 1}
-    assert ids("price = 12.5") == {(1,): 1}
-    assert ids("price = 12.501") == {}
-    assert ids("price IN (12.5, 1.01, 7)") == {(1,): 1, (5,): 1}
-    assert ids("price < 1 AND qty >= 2") == {(2,): 1}
-    assert ids("price * qty > 30") == {(1,): 1}
-    assert ids("price BETWEEN 1 AND 8") == {(3,): 1, (5,): 1}
-
-    client.execute_sql("UPDATE t SET price = 0.20, qty = 0.5 WHERE id = 2")
-    after = bag(scanned(client, "v"))
-    assert after == bag(rows(client, select))
-    assert bag(scanned(client, "v"), "id", "c0") == {
-        (1, D("37.50000")): 1, (2, D("0.10000")): 1, (3, D("0.00713")): 1, (4, None): 1,
-        (5, D("2.02000")): 1}
+    projected(client, priced, _OPERATORS)
 
 
 def test_an_aggregate_keeps_the_class_or_leaves_it_as_rows_cross_a_bound(client, priced):
@@ -100,9 +77,10 @@ def test_an_aggregate_keeps_the_class_or_leaves_it_as_rows_cross_a_bound(client,
            "COUNT(*) AS n, SUM(price * qty) AS tot FROM t GROUP BY cat")
     client.execute_sql(f"CREATE VIEW agg AS {agg}")
     client.execute_sql("CREATE VIEW cheap AS SELECT id, price FROM t WHERE price <= 1.005")
-    declared = _declared(client, "agg")
-    assert [declared[k] for k in ("s", "lo", "hi", "a", "tot")] == \
-        [(DEC, 2), (DEC, 2), (DEC, 3), (F64, 0), (DEC, 5)]
+    types = declared(client, "agg")
+    assert [types[k] for k in ("s", "lo", "hi", "a", "tot")] == \
+        [DEC(2), DEC(2), DEC(3), F64, DEC(5)]
+    client.execute_sql(priced)
 
     assert bag(scanned(client, "agg")) == bag(rows(client, agg)) == {
         (1, D("12.60"), D("0.10"), D("3.500"), 6.3, 2, D("37.85000")): 1,

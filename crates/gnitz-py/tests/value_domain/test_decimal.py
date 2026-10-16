@@ -22,6 +22,7 @@ def test_the_declared_scale_reaches_the_catalog_and_the_wire(client, priced):
     """Every literal form lands at the column's scale, rounding half away from
     zero when it carries more fraction than the scale holds. `NUMERIC` is the
     same type under another spelling."""
+    client.execute_sql(priced)
     tid, schema = client.resolve_table("t")
     # `Decimal("3.000") == 3`, so the rows below cannot see a scale.
     assert [(c.type_code, c.scale) for c in schema.columns[2:]] == [(DEC, 2), (DEC, 3)]
@@ -39,6 +40,7 @@ def test_a_grouped_or_joined_decimal_key_keeps_its_scale(client, priced):
     """A DECIMAL used as a group key or a join key carries its scale into the
     output schema, so the key a downstream reader sees, hidden or not, is the
     same fixed-point value rather than a bare integer."""
+    client.execute_sql(priced)
     client.execute_sql(
         "CREATE VIEW byp AS SELECT price, COUNT(*) AS n FROM t GROUP BY price")
     _, bs = client.resolve_table("byp")

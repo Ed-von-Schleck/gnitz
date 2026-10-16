@@ -261,12 +261,13 @@ def priced(client):
     one row of each spelling a literal can take: a plain decimal, a string, a
     negative beside a NULL, an integer widened to the scale, and one whose
     fraction is longer than the scale, so it must round and its product needs
-    five decimal places."""
+    five decimal places. Creates `t` and returns the INSERT holding them, for the
+    test to run before or after the views it creates."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, "
-        "price DECIMAL(10, 2) NOT NULL, qty NUMERIC(8, 3)); "
-        "INSERT INTO t VALUES (1, 1, 12.50, 3), (2, 1, 0.10, 3.5), "
-        "(3, 2, '7.125', '0.001'), (4, 2, -0.5, NULL), (5, 3, 1.005, 2)")
+        "price DECIMAL(10, 2) NOT NULL, qty NUMERIC(8, 3))")
+    return ("INSERT INTO t VALUES (1, 1, 12.50, 3), (2, 1, 0.10, 3.5), "
+            "(3, 2, '7.125', '0.001'), (4, 2, -0.5, NULL), (5, 3, 1.005, 2)")
 
 
 # ── mirror fixtures ───────────────────────────────────────────────────────────

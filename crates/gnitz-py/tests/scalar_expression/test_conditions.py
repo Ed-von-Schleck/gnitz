@@ -7,27 +7,31 @@ and the two convert to and from a number only through a CAST.
 
 Asserted on weights, and across a retraction: a verdict over a flag is
 recomputed when the flag changes, and a stale one leaves the old row behind.
+The connectives' three-valued table is `test_three_valued_logic.py`'s.
 """
 
 import itertools
 
 import gnitz
 import pytest
+from _exprs import declared, filtered
 from _read import bag, rows, scanned
+from _sql import insert
 
 _T = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, b BOOLEAN, c BOOLEAN, x BIGINT)"
 # Every pairing of TRUE / FALSE / NULL for `b` and `c`, ids 1 to 9 in that
 # order with `c` varying fastest; `x` is the id.
 _FLAGS = dict(enumerate(itertools.product((True, False, None), repeat=2), 1))
-_ROWS = "INSERT INTO t VALUES " + ", ".join(
-    "(%d, %s, %s, %d)" % (i, *("NULL" if v is None else str(v).upper() for v in bc), i) for i, bc in _FLAGS.items())
+
+
+def _seed(client):
+    insert(client, "t", [(i, b, c, i) for i, (b, c) in _FLAGS.items()])
+
 
 # Each condition against the ids it admits.
 _CONDITIONS = {
     "b": {1, 2, 3},
     "NOT b": {4, 5, 6},
-    "b AND c": {1},
-    "b OR c": {1, 2, 3, 4, 7},
     "b AND x > 1": {2, 3},
     "b = TRUE": {1, 2, 3},
     "b = FALSE": {4, 5, 6},
@@ -46,7 +50,6 @@ _CONDITIONS = {
     "b IS UNKNOWN": {7, 8, 9},
     "b IS NOT UNKNOWN": {1, 2, 3, 4, 5, 6},
     "(b AND c) IS NOT TRUE": {2, 3, 4, 5, 6, 7, 8, 9},
-    "b IS DISTINCT FROM c": {2, 3, 4, 6, 7, 8},
     "COALESCE(b, c)": {1, 2, 3, 7},
     "CASE WHEN x > 5 THEN c ELSE b END": {1, 2, 3, 7},
     "CAST(x - 1 AS BOOLEAN)": {2, 3, 4, 5, 6, 7, 8, 9},
@@ -62,21 +65,17 @@ def test_a_condition_reads_a_boolean_across_a_retraction(client):
     Swapping `b` and `c` moves rows across each condition's boundary, so the
     view's delta must retract exactly what the old flags admitted."""
     client.execute_sql(_T)
-    views = {c: f"v{n}" for n, c in enumerate(_CONDITIONS)}
-    for cond, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT id FROM t WHERE {cond}")
-    client.execute_sql(_ROWS)
-    for cond, want in _CONDITIONS.items():
-        assert bag(scanned(client, views[cond])) == {(k,): 1 for k in want}, cond
-        assert bag(rows(client, f"SELECT id FROM t WHERE {cond}")) == {(k,): 1 for k in want}, cond
+    held = filtered(client, _CONDITIONS)
+    _seed(client)
+    assert held() == _CONDITIONS
 
     # `b` and `c` trade places, which maps id 2 ↔ 4, 3 ↔ 7 and 6 ↔ 8 in the
     # pairing table and leaves `x` behind on the row it was written to.
     client.execute_sql("UPDATE t SET b = c, c = b")
     swap = {2: 4, 4: 2, 3: 7, 7: 3, 6: 8, 8: 6}
-    for cond in ("b", "NOT b", "b AND c", "b OR c", "b = c", "b < c", "b IS NOT TRUE", "b IS UNKNOWN"):
-        want = {swap.get(k, k) for k in _CONDITIONS[cond]}
-        assert bag(scanned(client, views[cond])) == {(k,): 1 for k in want}, cond
+    got = held()
+    for cond in ("b", "NOT b", "b = c", "b < c", "b IS NOT TRUE", "b IS UNKNOWN"):
+        assert got[cond] == {swap.get(k, k) for k in _CONDITIONS[cond]}, cond
 
 
 def test_a_projected_test_is_a_boolean_column(client):
@@ -99,17 +98,15 @@ def test_a_projected_test_is_a_boolean_column(client):
     }
     client.execute_sql("CREATE VIEW v AS SELECT id, " + ", ".join(f"{e} AS {n}" for n, e in items.items()) + " FROM t")
     client.execute_sql("CREATE VIEW vv AS SELECT id FROM v WHERE both OR nb")
-    _, schema = client.resolve_table("v")
-    assert [c.type_code for c in schema.columns[1:]] == [gnitz.TypeCode.BOOLEAN] * len(items)
-    client.execute_sql(_ROWS)
+    assert list(declared(client, "v").values())[1:] == [(gnitz.TypeCode.BOOLEAN, 0)] * len(items)
+    _seed(client)
 
-    b = {i: bc[0] for i, bc in _FLAGS.items()}
-    c = {i: bc[1] for i, bc in _FLAGS.items()}
-    and3 = lambda p, q: False if p is False or q is False else (None if p is None or q is None else True)
+    and3 = lambda p, q: (False if p is False or q is False
+                         else None if p is None or q is None else True)
     want = {
-        (i, i > 5, and3(b[i], c[i]), None if b[i] is None else not b[i], b[i] is None, b[i] is True,
-         c[i] if i > 5 else b[i], bool(b[i]), i != 1, True, i in (1, 2, 9), i == 1): 1
-        for i in range(1, 10)
+        (i, i > 5, and3(b, c), None if b is None else not b, b is None, b is True,
+         c if i > 5 else b, bool(b), i != 1, True, i in (1, 2, 9), i == 1): 1
+        for i, (b, c) in _FLAGS.items()
     }
     got = scanned(client, "v")
     assert bag(got) == want
@@ -119,7 +116,7 @@ def test_a_projected_test_is_a_boolean_column(client):
 
     client.execute_sql("DELETE FROM t WHERE id IN (1, 4)")
     assert bag(scanned(client, "vv")) == {(5,): 1, (6,): 1}
-    assert bag(scanned(client, "v"), "id") == {(i,): 1 for i in (2, 3, 5, 6, 7, 8, 9)}
+    assert bag(scanned(client, "v")) == {r: 1 for r in want if r[0] not in (1, 4)}
 
 
 def test_a_boolean_converts_to_a_number_and_text_only_by_cast(client):
@@ -131,7 +128,7 @@ def test_a_boolean_converts_to_a_number_and_text_only_by_cast(client):
     client.execute_sql(
         "CREATE VIEW tally AS SELECT SUM(CAST(b AS BIGINT)) AS yes, "
         "SUM(CASE WHEN b THEN 0 ELSE 1 END) AS not_yes, COUNT(b) AS known FROM t")
-    client.execute_sql(_ROWS)
+    _seed(client)
     assert bag(rows(client, "SELECT id, n, s, cc FROM v WHERE id IN (1, 4, 7)")) == {
         (1, 1, "true", "b=true"): 1, (4, 0, "false", "b=false"): 1, (7, None, None, "b="): 1,
     }
@@ -140,44 +137,46 @@ def test_a_boolean_converts_to_a_number_and_text_only_by_cast(client):
     assert bag(scanned(client, "tally")) == {(4, 5, 7): 1}
 
 
+@pytest.fixture(scope="module")
+def mixed(module_client):
+    """`t` holding one row, and `u` to join it to. Every statement run against
+    them is refused, so every case sees the same relations."""
+    module_client.execute_sql(
+        f"{_T}; CREATE TABLE u (n BIGINT NOT NULL PRIMARY KEY, flag BOOLEAN); "
+        "INSERT INTO t VALUES (5, TRUE, FALSE, 5)")
+    return module_client
+
+
 @pytest.mark.parametrize("sql,needle", [
     # A number is not a condition.
-    ("SELECT id FROM t WHERE x", "a condition must be BOOLEAN"),
-    ("SELECT id FROM t WHERE b AND x", "a condition must be BOOLEAN"),
-    ("SELECT id FROM t WHERE NOT x", "a condition must be BOOLEAN"),
-    ("SELECT id, CASE WHEN x THEN 1 ELSE 0 END AS y FROM t", "a condition must be BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE x", "a condition must be BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE b AND x", "a condition must be BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE NOT x", "a condition must be BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id, CASE WHEN x THEN 1 ELSE 0 END AS y FROM t",
+     "a condition must be BOOLEAN"),
     # A BOOLEAN is not a number.
-    ("SELECT id, b + 1 AS y FROM t", "not supported on a BOOLEAN operand"),
-    ("SELECT id, -b AS y FROM t", "BOOLEAN"),
-    ("SELECT id, ABS(b) AS y FROM t", "BOOLEAN"),
-    ("SELECT id FROM t WHERE b = 1", "between BOOLEAN and"),
-    ("SELECT id FROM t WHERE x = TRUE", "BOOLEAN"),
-    ("SELECT id FROM t WHERE b IN (1, 0)", "between BOOLEAN and"),
-    ("SELECT id FROM t WHERE b = 'maybe'", "invalid BOOLEAN literal"),
-    ("SELECT id, CASE WHEN b THEN 1 ELSE FALSE END AS y FROM t", "BOOLEAN"),
-    ("SELECT id, COALESCE(b, 0) AS y FROM t", "BOOLEAN"),
-    ("SELECT id, GREATEST(b, x) AS y FROM t", "BOOLEAN"),
-    ("SELECT id, CAST(b AS DOUBLE) AS y FROM t", "CAST of BOOLEAN to"),
-    ("SELECT id, CAST(b AS DATE) AS y FROM t", "CAST of BOOLEAN to"),
-    ("SELECT id, CAST(CAST(x AS TEXT) AS BOOLEAN) AS y FROM t", "literal only"),
-    ("SELECT id, CAST('maybe' AS BOOLEAN) AS y FROM t", "invalid BOOLEAN literal"),
-    ("SELECT id FROM t WHERE x IS UNKNOWN", "IS UNKNOWN takes a BOOLEAN"),
-    ("SELECT SUM(b) AS s FROM t", "SUM: not supported on BOOLEAN"),
-    ("SELECT AVG(b) AS s FROM t", "not supported on BOOLEAN"),
-    ("SELECT SUM(x > 1) AS s FROM t", "BOOLEAN"),
-    ("SELECT t.id FROM t JOIN u ON t.b = u.n", "BOOLEAN"),
-    ("SELECT x FROM t UNION SELECT flag FROM u", "type mismatch"),
-])
-def test_a_boolean_and_a_number_do_not_mix(client, sql, needle):
-    """Every mixed form is refused as a view body, naming the rule — where a
-    silent coercion would make `b = 2` false for a true `b`."""
-    client.execute_sql(_T)
-    client.execute_sql("CREATE TABLE u (n BIGINT NOT NULL PRIMARY KEY, flag BOOLEAN)")
-    with pytest.raises(gnitz.GnitzError, match=needle):
-        client.execute_sql(f"CREATE VIEW bad AS {sql}")
-
-
-@pytest.mark.parametrize("sql,needle", [
+    ("CREATE VIEW bad AS SELECT id, b + 1 AS y FROM t", "not supported on a BOOLEAN operand"),
+    ("CREATE VIEW bad AS SELECT id, -b AS y FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id, ABS(b) AS y FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE b = 1", "between BOOLEAN and"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE x = TRUE", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE b IN (1, 0)", "between BOOLEAN and"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE b = 'maybe'", "invalid BOOLEAN literal"),
+    ("CREATE VIEW bad AS SELECT id, CASE WHEN b THEN 1 ELSE FALSE END AS y FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id, COALESCE(b, 0) AS y FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id, GREATEST(b, x) AS y FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT id, CAST(b AS DOUBLE) AS y FROM t", "CAST of BOOLEAN to"),
+    ("CREATE VIEW bad AS SELECT id, CAST(b AS DATE) AS y FROM t", "CAST of BOOLEAN to"),
+    ("CREATE VIEW bad AS SELECT id, CAST(CAST(x AS TEXT) AS BOOLEAN) AS y FROM t", "literal only"),
+    ("CREATE VIEW bad AS SELECT id, CAST('maybe' AS BOOLEAN) AS y FROM t",
+     "invalid BOOLEAN literal"),
+    ("CREATE VIEW bad AS SELECT id FROM t WHERE x IS UNKNOWN", "IS UNKNOWN takes a BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT SUM(b) AS s FROM t", "SUM: not supported on BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT AVG(b) AS s FROM t", "not supported on BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT SUM(x > 1) AS s FROM t", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT t.id FROM t JOIN u ON t.b = u.n", "BOOLEAN"),
+    ("CREATE VIEW bad AS SELECT x FROM t UNION SELECT flag FROM u", "type mismatch"),
+    # A write takes a BOOLEAN only where the column is one.
     ("INSERT INTO t VALUES (1, 1, NULL, 1)", "1 is not a BOOLEAN value"),
     ("INSERT INTO t VALUES (1, 'maybe', NULL, 1)", "invalid BOOLEAN literal"),
     ("INSERT INTO t VALUES (1, TRUE, NULL, TRUE)", "TRUE is not a"),
@@ -187,9 +186,9 @@ def test_a_boolean_and_a_number_do_not_mix(client, sql, needle):
     ("UPDATE t SET x = x > 1", "cannot assign a"),
     ("DELETE FROM t WHERE x", "a condition must be BOOLEAN"),
 ])
-def test_a_write_takes_a_boolean_only_where_the_column_is_one(client, sql, needle):
-    client.execute_sql(_T)
-    client.execute_sql("INSERT INTO t VALUES (5, TRUE, FALSE, 5)")
+def test_a_boolean_and_a_number_do_not_mix(mixed, sql, needle):
+    """Every mixed form is refused naming the rule — where a silent coercion
+    would make `b = 2` false for a true `b` — and nothing is created or written."""
     with pytest.raises(gnitz.GnitzError, match=needle):
-        client.execute_sql(sql)
-    assert bag(scanned(client, "t")) == {(5, True, False, 5): 1}
+        mixed.execute_sql(sql)
+    assert bag(scanned(mixed, "t")) == {(5, True, False, 5): 1}

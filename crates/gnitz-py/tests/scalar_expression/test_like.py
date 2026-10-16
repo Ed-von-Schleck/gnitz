@@ -12,12 +12,13 @@ ordinary nullable boolean, and that a view filter, an ad-hoc read and a DML
 residual cannot disagree about one.
 """
 
+from _exprs import filtered
 from _read import bag, rows, scanned
 
 # id 6 and 7 carry the characters the escape rules are about: a literal percent,
 # and a trailing backslash that is only an escape if escaping is on.
-_ROWS = r"(1, 'abc'), (2, 'abyz'), (3, 'xxmidxx'), (4, 'exact'), (5, 'ALICE'), " \
-        r"(6, '100%'), (7, '100\'), (8, NULL)"
+_SEED = r"INSERT INTO t VALUES (1, 'abc'), (2, 'abyz'), (3, 'xxmidxx'), (4, 'exact'), " \
+        r"(5, 'ALICE'), (6, '100%'), (7, '100\'), (8, NULL)"
 
 _PATTERNS = {
     # One per specialization, then the generic walk.
@@ -31,8 +32,8 @@ _PATTERNS = {
     "s ILIKE 'alice'": {5},
     "s LIKE 'alice'": set(),
     "s ILIKE '%c%'": {1, 4, 5},
-    # NOT LIKE is `bool_not` over the verdict, so a NULL subject stays NULL and
-    # is admitted by neither direction.
+    # NOT LIKE negates the verdict, so a NULL subject stays NULL and is admitted
+    # by neither direction.
     "s NOT LIKE 'ab%'": {3, 4, 5, 6, 7},
     "s NOT ILIKE 'A%'": {3, 4, 6, 7},
     # The ESCAPE clause reaches the pattern encoder: the default makes `\%` a literal
@@ -58,40 +59,33 @@ def test_a_pattern_answers_alike_on_every_surface_as_its_rows_move(client):
     matches and admitted to every one it now does — each exactly once — and a
     row that arrives only later is matched by the pattern compiled earlier."""
     client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
-    views = {p: f"v{n}" for n, p in enumerate(_PATTERNS)}
-    for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT id FROM t WHERE {p}")
+    held = filtered(client, _PATTERNS)
     # A LIKE is a value as much as a predicate, so it can be projected and
     # stored — with the NULL a NULL subject produces surviving into the column.
     client.execute_sql(f"CREATE VIEW flags AS {_FLAGS}")
-    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}")
+    client.execute_sql(_SEED)
 
-    def ids(pred):
-        return bag(scanned(client, views[pred]))
+    def flags():
+        got = bag(scanned(client, "flags"))
+        assert got == bag(rows(client, _FLAGS))
+        return got
 
-    def every_surface_agrees():
-        for p, v in views.items():
-            assert bag(scanned(client, v)) == \
-                bag(rows(client, f"SELECT id FROM t WHERE {p}")), p
-        assert bag(scanned(client, "flags")) == bag(rows(client, _FLAGS))
-
-    for p, want in _PATTERNS.items():
-        assert ids(p) == {(i,): 1 for i in want}, p
-    assert bag(scanned(client, "flags")) == {
-        (1, 1, 1): 1, (2, 1, 1): 1, (3, 0, 0): 1, (4, 0, 0): 1,
-        (5, 0, 1): 1, (6, 0, 0): 1, (7, 0, 0): 1, (8, None, None): 1,
+    assert held() == _PATTERNS
+    assert flags() == {
+        (1, True, True): 1, (2, True, True): 1, (3, False, False): 1, (4, False, False): 1,
+        (5, False, True): 1, (6, False, False): 1, (7, False, False): 1, (8, None, None): 1,
     }
-    every_surface_agrees()
 
     client.execute_sql("DELETE FROM t WHERE id = 2")
     client.execute_sql("UPDATE t SET s = 'abq' WHERE id = 5")
     client.execute_sql("UPDATE t SET s = 'inexact' WHERE id = 4")
     client.execute_sql("INSERT INTO t VALUES (9, 'abz')")
-    assert ids("s LIKE 'ab%'") == {(1,): 1, (5,): 1, (9,): 1}
-    assert ids("s LIKE '%yz'") == {}
-    assert ids("s LIKE 'a_c%'") == {(1,): 1}, "`a_c%` needs a `c` in third place"
-    assert ids("s LIKE 'exact'") == {}
-    every_surface_agrees()
+    got = held()
+    assert got["s LIKE 'ab%'"] == {1, 5, 9}
+    assert got["s LIKE '%yz'"] == set()
+    assert got["s LIKE 'a_c%'"] == {1}, "`a_c%` needs a `c` in third place"
+    assert got["s LIKE 'exact'"] == set()
+    flags()
 
     # What a LIKE view holds is exactly what a LIKE delete removes.
     client.execute_sql("DELETE FROM t WHERE s ILIKE 'a%'")
@@ -99,4 +93,5 @@ def test_a_pattern_answers_alike_on_every_surface_as_its_rows_move(client):
     assert bag(scanned(client, "t")) == {
         (3, "xxmidxx"): 1, (4, "inexact"): 1, (6, "touched"): 1, (7, "touched"): 1,
         (8, None): 1}
-    every_surface_agrees()
+    held()
+    flags()

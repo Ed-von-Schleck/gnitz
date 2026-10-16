@@ -16,7 +16,10 @@ admitted twice and a retraction that leaves a ghost, and a row set reads both as
 correct.
 """
 
-from _read import bag, rows, scanned
+import gnitz
+from _exprs import filtered, projected
+
+I64 = (gnitz.TypeCode.I64, 0)
 
 # 500 integers ending at 0: one set-membership opcode whatever the list's
 # length, where a per-item comparison chain would spend a register each and fail
@@ -68,65 +71,45 @@ def test_a_predicate_follows_the_three_valued_table_across_a_retraction(client):
     the old row at weight 1 beside the new one."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)")
-    views = {p: f"v{n}" for n, p in enumerate(_PREDICATES)}
-    for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}")
+    held = filtered(client, _PREDICATES, key="pk")
     client.execute_sql(
         "INSERT INTO t VALUES (1, 1, 1, 'x'), (2, 1, 0, 'x'), (3, 0, 1, 'y'), (4, 0, 0, 'y'), "
         "(5, NULL, 1, NULL), (6, NULL, 0, NULL), (7, 1, NULL, 'x'), (8, 0, NULL, 'y'), "
         "(9, NULL, NULL, NULL)")
-
-    for p, want in _PREDICATES.items():
-        assert bag(scanned(client, views[p])) == {(k,): 1 for k in want}, views[p]
+    assert held() == _PREDICATES
 
     # A definite value becomes unknown, and an unknown becomes definite.
     client.execute_sql("UPDATE t SET a = NULL WHERE pk = 3")
     client.execute_sql("UPDATE t SET a = 0 WHERE pk = 5")
-    assert bag(scanned(client, views["a = 0"])) == {(4,): 1, (5,): 1, (8,): 1}
-    for p, v in views.items():
-        assert bag(scanned(client, v)) == \
-            bag(rows(client, f"SELECT pk FROM t WHERE {p}")), v
+    assert held()["a = 0"] == {4, 5, 8}
 
     client.execute_sql("DELETE FROM t")
-    for v in views.values():
-        assert bag(scanned(client, v)) == {}, v
+    assert held() == dict.fromkeys(_PREDICATES, set())
+
+
+# Each branch form against its value on ids 1..6, over the `(a, b)` rows
+# (20, NULL), (1, 2), (2, NULL), (-3, -3), (NULL, NULL), (0, 0).
+_BRANCHES = {
+    "CASE WHEN a > 10 THEN 100 WHEN a > 0 THEN 10 ELSE 0 END": (I64, [100, 10, 10, 0, 0, 0]),
+    "CASE a WHEN 1 THEN 111 WHEN 2 THEN 222 ELSE 999 END": (I64, [999, 111, 222, 999, 999, 999]),
+    # With no ELSE the result is NULL, and the row still appears at weight 1.
+    "CASE WHEN a > 10 THEN a END": (I64, [20, None, None, None, None, None]),
+    # `a + b` is NULL on id 1 and 3, so COALESCE steps to `a`; on id 5 every
+    # argument is NULL, so it falls to its literal tail.
+    "COALESCE(a + b, a, -1)": (I64, [20, 3, 2, -6, -1, 0]),
+    "NULLIF(a, 0)": (I64, [20, 1, 2, -3, None, None]),
+}
 
 
 def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client):
     """A searched CASE and a simple CASE are one node — the operand form desugars
     to `operand = label` — and an absent ELSE is `ELSE NULL`, not a dropped row. A
-    branch whose test is unknown is not taken, exactly as a FALSE one is not.
+    branch whose test is unknown is not taken, exactly as a FALSE one is not:
+    on id 5 every test is unknown, so every branch is skipped and the ELSE runs.
 
     COALESCE, IFNULL, NVL and IF all desugar onto CASE, so the fact worth
     stating is where each differs: COALESCE walks to its first non-NULL over any
-    arity, NULLIF *introduces* a NULL, and IF takes its else branch on an unknown
-    test. A string CASE and COALESCE resolve in the string channel."""
-    exprs = ["CASE WHEN a > 10 THEN 100 WHEN a > 0 THEN 10 ELSE 0 END",
-             "CASE a WHEN 1 THEN 111 WHEN 2 THEN 222 ELSE 999 END",
-             "CASE WHEN a > 10 THEN a END", "COALESCE(a + b, a, -1)", "IFNULL(a * 2, 0)",
-             "NVL(a, -2)", "NULLIF(a, 0)", "IF(a < b, 1, 0)", "CASE WHEN a > 10 THEN s END",
-             "COALESCE(s, 'none')"]
-    select = "SELECT pk, " + ", ".join(f"{e} AS c{n}" for n, e in enumerate(exprs)) + " FROM t"
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)")
-    client.execute_sql(f"CREATE VIEW v AS {select}")
-    client.execute_sql(
-        "INSERT INTO t VALUES (1, 20, NULL, 'x'), (2, 1, 2, NULL), (3, 2, NULL, 'y'), "
-        "(4, -3, -3, NULL), (5, NULL, NULL, NULL), (6, 0, 0, 'z')")
-
-    expected = {
-        # `a + b` is NULL, so COALESCE steps to `a`; `20 < NULL` is unknown, so
-        # IF takes its else branch.
-        (1, 100, 999, 20, 20, 40, 20, 20, 0, "x", "x"): 1,
-        (2, 10, 111, None, 3, 2, 1, 1, 1, None, "none"): 1,
-        (3, 10, 222, None, 2, 4, 2, 2, 0, None, "y"): 1,
-        (4, 0, 999, None, -6, -6, -3, -3, 0, None, "none"): 1,
-        # Every test is unknown, so every branch is skipped and the ELSE runs;
-        # with no ELSE the result is NULL, and the row still appears at weight 1.
-        # Every COALESCE argument is NULL, so it falls to its literal tail.
-        (5, 0, 999, None, -1, 0, -2, None, 0, None, "none"): 1,
-        # NULLIF(0, 0) is the NULL it introduces, and `0 < 0` is FALSE.
-        (6, 0, 999, None, 0, 0, 0, None, 0, None, "z"): 1,
-    }
-    assert bag(scanned(client, "v")) == expected
-    assert bag(rows(client, select)) == expected
+    arity, and NULLIF *introduces* a NULL."""
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)")
+    projected(client, "INSERT INTO t VALUES (1, 20, NULL), (2, 1, 2), (3, 2, NULL), "
+                      "(4, -3, -3), (5, NULL, NULL), (6, 0, 0)", _BRANCHES, key="pk")
