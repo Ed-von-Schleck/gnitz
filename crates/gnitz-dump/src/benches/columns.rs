@@ -6,7 +6,7 @@ use gnitz_wire::ColType;
 const ROWS: usize = 1 << 20;
 
 /// Rows a row group holds, as a dump page of the default size does.
-const GROUP: usize = 16_384;
+const GROUP: usize = gnitz_core::DEFAULT_PAGE_ROWS as usize;
 
 /// A BIGINT key and one column `v` of type `ty`.
 fn table(ty: ColType, nullable: bool) -> Arc<Schema> {
@@ -47,6 +47,14 @@ fn columns_bench() {
     let dir = tempfile::tempdir().unwrap();
     type Fill = Box<dyn Fn(&mut BatchAppender<'_>, usize)>;
     let cases: Vec<(&str, ColType, bool, Fill)> = vec![
+        (
+            "INT",
+            ColType::of(TypeCode::I32),
+            false,
+            Box::new(|r, i| {
+                r.int_val(i128::from(scramble(i) as i32));
+            }),
+        ),
         (
             "BIGINT",
             ColType::of(TypeCode::I64),

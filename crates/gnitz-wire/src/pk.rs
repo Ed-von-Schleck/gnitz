@@ -140,6 +140,35 @@ pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, width: usize, signe
     }
 }
 
+/// Encode `src`'s native little-endian cells, `width` bytes each, as the OPK column at
+/// byte `off` of each `stride`-byte row of `pk`: the inverse of [`decode_pk_cells`].
+pub fn encode_pk_cells(src: &[u8], width: usize, signed: bool, pk: &mut [u8], stride: usize, off: usize) {
+    macro_rules! encode_rows {
+        ($ty:ty) => {{
+            const W: usize = std::mem::size_of::<$ty>();
+            assert!(off + W <= stride, "a cell lies inside its row");
+            let cells = src.as_chunks::<W>().0;
+            if stride == W {
+                for (cell, dst) in cells.iter().zip(pk.as_chunks_mut::<W>().0) {
+                    store_opk(dst, <$ty>::from_le_bytes(*cell) as u128, signed);
+                }
+            } else {
+                for (cell, row) in cells.iter().zip(pk.chunks_exact_mut(stride)) {
+                    store_opk(&mut row[off..off + W], <$ty>::from_le_bytes(*cell) as u128, signed);
+                }
+            }
+        }};
+    }
+    match width {
+        1 => encode_rows!(u8),
+        2 => encode_rows!(u16),
+        4 => encode_rows!(u32),
+        8 => encode_rows!(u64),
+        16 => encode_rows!(u128),
+        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
+    }
+}
+
 /// Widest PK region [`widen_pk_be`] packs into a `u128`; a wider key is ordered
 /// and hashed as raw bytes.
 pub const NARROW_PK_MAX_BYTES: usize = 16;

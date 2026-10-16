@@ -184,6 +184,35 @@ impl PkColumn {
         c
     }
 
+    /// A column of `schema`'s keys from each key column's native little-endian cells, in
+    /// PK-list order: [`Self::push_natives`] over every row at once.
+    pub fn from_native_columns(schema: &Schema, cols: &[Vec<u8>]) -> Self {
+        let mut c = Self::empty_for_schema(schema);
+        let types = c.types;
+        let keys = &types[..c.n as usize];
+        // Hard, not debug-only: a missing or short column would leave key bytes unencoded.
+        assert_eq!(
+            cols.len(),
+            keys.len(),
+            "from_native_columns: one cell column per key column"
+        );
+        let n = cols[0].len() / keys[0].wire_stride();
+        let stride = c.stride();
+        c.buf = vec![0; n * stride];
+        let mut off = 0;
+        for (tc, cells) in keys.iter().zip(cols) {
+            let w = tc.wire_stride();
+            assert_eq!(
+                cells.len(),
+                n * w,
+                "from_native_columns: key columns of different lengths"
+            );
+            gnitz_wire::encode_pk_cells(cells, w, tc.is_signed_int(), &mut c.buf, stride, off);
+            off += w;
+        }
+        c
+    }
+
     /// Bytes per row.
     #[inline]
     pub fn stride(&self) -> usize {

@@ -203,6 +203,44 @@ fn a_compound_key_has_no_scalar_form() {
     }
 }
 
+/// A key column built from whole native columns is the one `push_natives` builds
+/// a row at a time, for a compound key of mixed sign and for a lone wide key; a
+/// column shorter than the others is refused.
+#[test]
+fn from_native_columns_is_push_natives_over_every_row() {
+    let compound = Schema::from_parts(
+        vec![
+            ColumnDef::new("a", TypeCode::I16, false),
+            ColumnDef::new("b", TypeCode::U32, false),
+        ],
+        &[0, 1],
+    )
+    .unwrap();
+    let a: [i16; 5] = [i16::MIN, -1, 0, 1, i16::MAX];
+    let b: [u32; 5] = [0, 1, 0x8000_0000, 7, u32::MAX];
+    let mut want = PkColumn::empty_for_schema(&compound);
+    for (&x, &y) in a.iter().zip(&b) {
+        want.push_natives(&[u128::from(x as u16), u128::from(y)]);
+    }
+    let cols = vec![
+        a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+        b.iter().flat_map(|y| y.to_le_bytes()).collect(),
+    ];
+    assert_eq!(PkColumn::from_native_columns(&compound, &cols), want);
+
+    let wide = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U128, false)], &[0]).unwrap();
+    let vals = [0, 1, u128::MAX, 1 << 127, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210];
+    let cells: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        PkColumn::from_native_columns(&wide, &[cells]),
+        PkColumn::from_natives(&wide, vals)
+    );
+
+    let short = vec![cols[0].clone(), cols[1][..16].to_vec()];
+    let refused = std::panic::catch_unwind(|| PkColumn::from_native_columns(&compound, &short));
+    assert!(refused.is_err(), "a short key column must panic");
+}
+
 /// `extend_from_owned` concatenates rows across String and Bytes columns, and
 /// shifts each moved German cell onto its body's new place in the arena.
 #[test]

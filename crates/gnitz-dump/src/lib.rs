@@ -182,7 +182,9 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
                 };
                 if class == RelClass::Table {
                     let file = format!("data/{}.parquet", manifest.tables.len());
-                    entry.rows = dump_rows(client, snapshot, rel, &dir.join(&file)).await?;
+                    entry.rows = dump_rows(client, snapshot, rel, &dir.join(&file))
+                        .await
+                        .map_err(|e| DumpError(format!("{}: {e}", rel.qualified())))?;
                     entry.file = Some(file);
                 }
                 manifest.tables.push(entry);
@@ -229,9 +231,7 @@ async fn dump_rows(
     let mut writer = TableWriter::create(path, &schema)?;
     client
         .snapshot_read(snapshot, rel.id, &schema, DEFAULT_PAGE_ROWS, |batch| {
-            writer
-                .write(&batch)
-                .map_err(|e| DumpError(format!("{}: {e}", rel.qualified())))
+            writer.write(&batch)
         })
         .await?;
     writer.finish()
@@ -277,7 +277,9 @@ pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, Du
         let name = RelName::new(&t.schema, &t.name)?;
         let desc = client.resolve_relation(&name).await?;
         if let Some(file) = &t.file {
-            let rows = restore_rows(client, &catalog, &desc, &dir.join(file)).await?;
+            let rows = restore_rows(client, &catalog, &desc, &dir.join(file))
+                .await
+                .map_err(|e| DumpError(format!("{file}: {e}")))?;
             if rows != t.rows {
                 return Err(DumpError(format!("{file} holds {rows} rows, the manifest {}", t.rows)));
             }
@@ -302,7 +304,7 @@ async fn restore_rows(
     let mut reader = TableReader::open(path, &desc.schema)?;
     let rel = catalog
         .relation(desc.tid)
-        .ok_or_else(|| DumpError(format!("{}: its table is not in the restored catalog", path.display())))?;
+        .ok_or_else(|| DumpError::from("its table is not in the restored catalog"))?;
     // The columns that reference this table's own key.
     let refs: Vec<usize> = rel
         .columns
@@ -330,10 +332,7 @@ async fn restore_rows(
     // The table was new, so a key the file holds twice replaced a row rather than being refused.
     let held = held_rows(client, rel).await?;
     if held != rows {
-        return Err(DumpError(format!(
-            "{}: {rows} rows, of which {held} have distinct keys",
-            path.display()
-        )));
+        return Err(DumpError(format!("{rows} rows, of which {held} have distinct keys")));
     }
     Ok(rows)
 }

@@ -97,6 +97,33 @@ fn decode_pk_cells_matches_decode_pk_cell() {
     }
 }
 
+/// The column encoder writes cells the column decoder reads back unchanged, at
+/// every width, for a column that is the whole row and for one inside a wider
+/// key, and leaves the row's other bytes as they were.
+#[test]
+fn encode_pk_cells_inverts_decode_pk_cells() {
+    let rows = 37usize;
+    for width in [1usize, 2, 4, 8, 16] {
+        for (stride, off) in [(width, 0), (width + 11, 3)] {
+            let src: Vec<u8> = (0..rows * width)
+                .map(|i| (i as u8).wrapping_mul(151).wrapping_add(7))
+                .collect();
+            for signed in [false, true] {
+                let before = vec![0xA5u8; rows * stride];
+                let mut pk = before.clone();
+                encode_pk_cells(&src, width, signed, &mut pk, stride, off);
+                let mut back = vec![0u8; rows * width];
+                decode_pk_cells(&pk, stride, off, width, signed, &mut back);
+                assert_eq!(back, src, "width {width} stride {stride} signed {signed}");
+                for (r, (row, was)) in pk.chunks_exact(stride).zip(before.chunks_exact(stride)).enumerate() {
+                    assert_eq!(row[..off], was[..off], "row {r} before the cell");
+                    assert_eq!(row[off + width..], was[off + width..], "row {r} after the cell");
+                }
+            }
+        }
+    }
+}
+
 /// The width-specialized arms must agree with the general right-align form at
 /// every stride a PK region can have — the 9..=15 overlapping-load band and
 /// the 3/5/6/7 widths only the buffer arm serves — including the all-zero and

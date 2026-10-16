@@ -17,19 +17,18 @@ pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> (Vec<
         return ((0..n as u32).collect(), n);
     }
     let layout = schema.layout();
-    // A cell as the key the engine checks a reference by, which compares equal
-    // across a key and a payload column of one type.
-    let cell = |ci: usize, row: usize| {
-        let loc = layout.locate(ci);
-        (!loc.is_null(batch, row)).then(|| loc.opk_image(batch, row))
-    };
+    let ref_locs: Vec<_> = refs.iter().map(|&c| layout.locate(c)).collect();
     let key = layout.locate(schema.pk_cols()[0] as usize);
     let holder: HashMap<u128, u32> = (0..n).map(|r| (key.opk_image(batch, r), r as u32)).collect();
     let mut waiting = vec![0usize; n];
     let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (row, waits) in waiting.iter_mut().enumerate() {
-        for &child_col in refs {
-            let parent = cell(child_col, row).and_then(|k| holder.get(&k).copied());
+        for loc in &ref_locs {
+            // The cell as the key the engine checks a reference by, which compares
+            // equal across a key and a payload column of one type.
+            let parent = (!loc.is_null(batch, row))
+                .then(|| loc.opk_image(batch, row))
+                .and_then(|k| holder.get(&k).copied());
             // A row referencing itself, or no row of this table, waits on nothing here.
             if let Some(p) = parent.filter(|&p| p as usize != row) {
                 *waits += 1;

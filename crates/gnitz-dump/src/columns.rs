@@ -23,22 +23,25 @@
 //! names each column's gnitz type, which is what tells HUGEINT from UHUGEINT. A
 //! nullable column is OPTIONAL, every other one REQUIRED.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use gnitz_core::{push_zero_cell, Schema, ZSetBatch};
+use gnitz_core::{push_zero_cell, PkColumn, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
-use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::column::writer::ColumnWriter;
-use parquet::data_type::{ByteArray, DataType, FixedLenByteArray};
+use parquet::column::reader::{get_typed_column_reader, ColumnReader};
+use parquet::data_type::{
+    BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray, FixedLenByteArrayType, FloatType,
+    Int32Type, Int64Type,
+};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::SerializedFileWriter;
+use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter};
 use parquet::schema::types::{ColumnPath, Type};
 
 use crate::DumpError;
@@ -72,55 +75,98 @@ fn file_layout(schema: &Schema) -> Result<(Type, String), DumpError> {
     ))
 }
 
+/// How a gnitz type's cells are held in its Parquet column.
+#[derive(Clone, Copy)]
+enum Codec {
+    /// INT32: an integer of at most 4 bytes; an unsigned one by its bits.
+    Int32(FixedInt),
+    /// INT64: an 8-byte integer; an unsigned one by its bits.
+    Int64,
+    Bool,
+    Float,
+    Double,
+    /// FIXED_LEN_BYTE_ARRAY(16): a 128-bit cell, big-endian.
+    Wide,
+    /// FIXED_LEN_BYTE_ARRAY(DECIMAL_BYTES): a DECIMAL's i64, big-endian and sign-extended.
+    Decimal,
+    /// BYTE_ARRAY; a TEXT one is UTF-8.
+    Bytes {
+        text: bool,
+    },
+}
+
+impl Codec {
+    fn physical(self) -> Physical {
+        match self {
+            Codec::Int32(_) => Physical::INT32,
+            Codec::Int64 => Physical::INT64,
+            Codec::Bool => Physical::BOOLEAN,
+            Codec::Float => Physical::FLOAT,
+            Codec::Double => Physical::DOUBLE,
+            Codec::Wide | Codec::Decimal => Physical::FIXED_LEN_BYTE_ARRAY,
+            Codec::Bytes { .. } => Physical::BYTE_ARRAY,
+        }
+    }
+}
+
+/// `ty`'s cells in the file, and the logical type its Parquet column carries.
+fn codec(ty: ColType) -> (Codec, Option<LogicalType>) {
+    let int = |fi: FixedInt| {
+        let bits = 8 * fi.width() as i8;
+        let codec = if bits == 64 { Codec::Int64 } else { Codec::Int32(fi) };
+        (codec, Some(LogicalType::integer(bits, fi.is_signed())))
+    };
+    match ty.tc {
+        TypeCode::U8 => int(FixedInt::U8),
+        TypeCode::I8 => int(FixedInt::I8),
+        TypeCode::U16 => int(FixedInt::U16),
+        TypeCode::I16 => int(FixedInt::I16),
+        TypeCode::U32 => int(FixedInt::U32),
+        TypeCode::I32 => int(FixedInt::I32),
+        TypeCode::U64 => int(FixedInt::U64),
+        TypeCode::I64 => int(FixedInt::I64),
+        TypeCode::U128 | TypeCode::I128 => (Codec::Wide, None),
+        TypeCode::UUID => (Codec::Wide, Some(LogicalType::Uuid)),
+        TypeCode::F32 => (Codec::Float, None),
+        TypeCode::F64 => (Codec::Double, None),
+        TypeCode::String => (Codec::Bytes { text: true }, Some(LogicalType::String)),
+        TypeCode::Blob => (Codec::Bytes { text: false }, None),
+        TypeCode::Date => (Codec::Int32(FixedInt::I32), Some(LogicalType::Date)),
+        TypeCode::Timestamp => (Codec::Int64, Some(LogicalType::timestamp(false, TimeUnit::MICROS))),
+        TypeCode::Decimal => (
+            Codec::Decimal,
+            Some(LogicalType::decimal(i32::from(ty.scale), DECIMAL_PRECISION)),
+        ),
+        TypeCode::Bool => (Codec::Bool, None),
+    }
+}
+
 /// The Parquet column `def` is written as.
 fn parquet_column(def: &ColumnDef) -> Result<Type, DumpError> {
-    let tc = def.ty.tc;
-    let int = |bits: i8, signed: bool| (Physical::INT32, Some(LogicalType::integer(bits, signed)));
-    let (physical, logical) = match tc {
-        TypeCode::U8 => int(8, false),
-        TypeCode::I8 => int(8, true),
-        TypeCode::U16 => int(16, false),
-        TypeCode::I16 => int(16, true),
-        TypeCode::U32 => int(32, false),
-        TypeCode::I32 => int(32, true),
-        TypeCode::U64 => (Physical::INT64, Some(LogicalType::integer(64, false))),
-        TypeCode::I64 => (Physical::INT64, Some(LogicalType::integer(64, true))),
-        TypeCode::U128 | TypeCode::I128 => (Physical::FIXED_LEN_BYTE_ARRAY, None),
-        TypeCode::UUID => (Physical::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid)),
-        TypeCode::F32 => (Physical::FLOAT, None),
-        TypeCode::F64 => (Physical::DOUBLE, None),
-        TypeCode::String => (Physical::BYTE_ARRAY, Some(LogicalType::String)),
-        TypeCode::Blob => (Physical::BYTE_ARRAY, None),
-        TypeCode::Date => (Physical::INT32, Some(LogicalType::Date)),
-        TypeCode::Timestamp => (Physical::INT64, Some(LogicalType::timestamp(false, TimeUnit::MICROS))),
-        TypeCode::Decimal => (
-            Physical::FIXED_LEN_BYTE_ARRAY,
-            Some(LogicalType::decimal(i32::from(def.ty.scale), DECIMAL_PRECISION)),
-        ),
-        TypeCode::Bool => (Physical::BOOLEAN, None),
-    };
-    let mut b = Type::primitive_type_builder(&def.name, physical)
+    let (codec, logical) = codec(def.ty);
+    let b = Type::primitive_type_builder(&def.name, codec.physical())
         .with_repetition(if def.is_nullable {
             Repetition::OPTIONAL
         } else {
             Repetition::REQUIRED
         })
         .with_logical_type(logical);
-    if tc == TypeCode::Decimal {
-        b = b
+    let b = match codec {
+        Codec::Wide => b.with_length(16),
+        Codec::Decimal => b
             .with_length(DECIMAL_BYTES as i32)
             .with_precision(DECIMAL_PRECISION)
-            .with_scale(i32::from(def.ty.scale));
-    } else if physical == Physical::FIXED_LEN_BYTE_ARRAY {
-        b = b.with_length(16);
-    }
+            .with_scale(i32::from(def.ty.scale)),
+        _ => b,
+    };
     Ok(b.build()?)
 }
 
 /// A table's Parquet file, written a batch — one row group — at a time.
 pub(crate) struct TableWriter {
     writer: SerializedFileWriter<File>,
-    cols: Vec<(ColumnLocator, ColumnDef)>,
+    /// Each visible column's place in a batch, its codec, and whether it may be NULL.
+    cols: Vec<(ColumnLocator, Codec, bool)>,
 }
 
 impl TableWriter {
@@ -131,8 +177,8 @@ impl TableWriter {
             .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]));
         // A lone key column's values are distinct within the file, so a
         // dictionary would hold every one and add an index per row.
-        if let &[key] = schema.pk_cols() {
-            let name = schema.columns()[key as usize].name.as_str();
+        if let Some(key) = schema.layout().lone_pk_col() {
+            let name = schema.columns()[key].name.as_str();
             props = props.set_column_dictionary_enabled(ColumnPath::from(name), false);
         }
         let file = File::create(path)?;
@@ -140,7 +186,7 @@ impl TableWriter {
             writer: SerializedFileWriter::new(file, Arc::new(root), Arc::new(props.build()))?,
             cols: schema
                 .visible_columns()
-                .map(|(ci, def)| (schema.layout().locate(ci), def.clone()))
+                .map(|(ci, def)| (schema.layout().locate(ci), codec(def.ty).0, def.is_nullable))
                 .collect(),
         })
     }
@@ -156,8 +202,8 @@ impl TableWriter {
         let mut group = self.writer.next_row_group()?;
         let mut cols = self.cols.iter();
         while let Some(mut writer) = group.next_column()? {
-            let (loc, def) = cols.next().expect("one writer per column");
-            write_column(writer.untyped(), batch, *loc, def)?;
+            let &(loc, codec, nullable) = cols.next().expect("one writer per column");
+            write_column(&mut writer, batch, loc, codec, nullable)?;
             writer.close()?;
         }
         group.close()?;
@@ -166,95 +212,105 @@ impl TableWriter {
 
     /// Close the file; the rows it holds.
     pub(crate) fn finish(self) -> Result<u64, DumpError> {
-        let rows = self.writer.close()?.file_metadata().num_rows();
-        u64::try_from(rows).map_err(|_| DumpError::from("a negative row count"))
+        Ok(self.writer.close()?.file_metadata().num_rows() as u64)
     }
 }
 
-/// Column `loc`, defined by `def`, of `batch` into `writer`.
+/// Column `loc` of `batch` into `writer`, its cells as `codec` holds them. The
+/// file's schema is built from the same `codec`, so `writer` is of its type.
 fn write_column(
-    writer: &mut ColumnWriter<'_>,
+    writer: &mut SerializedColumnWriter<'_>,
     batch: &ZSetBatch,
     loc: ColumnLocator,
-    def: &ColumnDef,
+    codec: Codec,
+    nullable: bool,
 ) -> Result<(), DumpError> {
-    let present: Vec<usize> = (0..batch.len()).filter(|&i| !loc.is_null(batch, i)).collect();
-    let levels: Option<Vec<i16>> = def.is_nullable.then(|| {
-        let mut levels = vec![0; batch.len()];
-        for &i in &present {
-            levels[i] = 1;
-        }
-        levels
-    });
+    let bit = loc.null_bit();
+    let levels: Option<Vec<i16>> = nullable.then(|| batch.nulls.iter().map(|&w| i16::from(w & bit == 0)).collect());
     let levels = levels.as_deref();
-    // An integer cell, its bits kept: an unsigned value past the signed range
-    // reads back as the same bits.
-    let fi = FixedInt::from_type_code(def.ty.tc);
-    let int = |i: usize| loc.decode_i64(batch, i, fi.expect("an INT32, INT64 or BOOLEAN column holds integers"));
-    // A float cell, which no key column holds: its stored bytes.
-    let bytes = |i: usize| loc.bytes(batch, i);
-    match writer {
-        ColumnWriter::Int32ColumnWriter(w) => {
-            let values: Vec<i32> = present.iter().map(|&i| int(i) as i32).collect();
-            w.write_batch(&values, levels, None)?;
+    // Native little-endian cells; a key column's are decoded out of the key region.
+    let cells: Cow<'_, [u8]> = match loc {
+        ColumnLocator::Payload { slot, .. } => Cow::Borrowed(&batch.payload[slot as usize].bytes),
+        ColumnLocator::Pk { byte_off, size, type_code } => {
+            let mut cells = vec![0; batch.len() * size as usize];
+            gnitz_wire::decode_pk_cells(
+                batch.pks.region(),
+                batch.pks.stride(),
+                byte_off as usize,
+                size as usize,
+                type_code.is_signed_int(),
+                &mut cells,
+            );
+            Cow::Owned(cells)
         }
-        ColumnWriter::Int64ColumnWriter(w) => {
-            let values: Vec<i64> = present.iter().map(|&i| int(i)).collect();
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::BoolColumnWriter(w) => {
-            let values: Vec<bool> = present.iter().map(|&i| int(i) != 0).collect();
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::FloatColumnWriter(w) => {
-            let values: Vec<f32> = present
-                .iter()
-                .map(|&i| f32::from_le_bytes(bytes(i).try_into().expect("a FLOAT cell is 4 bytes")))
-                .collect();
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::DoubleColumnWriter(w) => {
-            let values: Vec<f64> = present
-                .iter()
-                .map(|&i| f64::from_le_bytes(bytes(i).try_into().expect("a DOUBLE cell is 8 bytes")))
-                .collect();
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::FixedLenByteArrayColumnWriter(w) => {
-            let values = if def.ty.tc == TypeCode::Decimal {
-                byte_values(&present, |i, all| {
-                    let v = i128::from(loc.decode_i64(batch, i, FixedInt::I64));
-                    all.extend_from_slice(&v.to_be_bytes()[16 - DECIMAL_BYTES..]);
-                })
-            } else {
-                byte_values(&present, |i, all| {
-                    let mut scratch = [0u8; 16];
-                    let le: [u8; 16] = loc
-                        .native_le_bytes(batch, i, &mut scratch)
-                        .try_into()
-                        .expect("a 128-bit cell is 16 bytes");
-                    all.extend_from_slice(&u128::from_le_bytes(le).to_be_bytes());
-                })
-            };
-            let values: Vec<FixedLenByteArray> = values.into_iter().map(FixedLenByteArray::from).collect();
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::ByteArrayColumnWriter(w) => {
-            let values = byte_values(&present, |i, all| all.extend_from_slice(&loc.content(batch, i)));
-            w.write_batch(&values, levels, None)?;
-        }
-        ColumnWriter::Int96ColumnWriter(_) => unreachable!("no gnitz type is written as INT96"),
+    };
+    let present = cells
+        .chunks_exact(loc.size())
+        .zip(&batch.nulls)
+        .filter(|&(_, &w)| w & bit == 0)
+        .map(|(c, _)| c);
+    let le = |c: &[u8]| -> [u8; 8] { c.try_into().expect("an 8-byte cell") };
+    // An unsigned integer past the signed range is kept as its bits.
+    match codec {
+        Codec::Int32(fi) => put::<Int32Type>(writer, present.map(|c| fi.decode_le_i64(c) as i32).collect(), levels),
+        Codec::Int64 => put::<Int64Type>(writer, present.map(|c| i64::from_le_bytes(le(c))).collect(), levels),
+        Codec::Bool => put::<BoolType>(writer, present.map(|c| c[0] != 0).collect(), levels),
+        Codec::Float => put::<FloatType>(
+            writer,
+            present
+                .map(|c| f32::from_le_bytes(c.try_into().expect("a 4-byte cell")))
+                .collect(),
+            levels,
+        ),
+        Codec::Double => put::<DoubleType>(writer, present.map(|c| f64::from_le_bytes(le(c))).collect(), levels),
+        Codec::Wide => put::<FixedLenByteArrayType>(
+            writer,
+            flba(byte_values(present, |c, all| {
+                let cell: [u8; 16] = c.try_into().expect("a 16-byte cell");
+                all.extend_from_slice(&u128::from_le_bytes(cell).to_be_bytes());
+            })),
+            levels,
+        ),
+        Codec::Decimal => put::<FixedLenByteArrayType>(
+            writer,
+            flba(byte_values(present, |c, all| {
+                let v = i64::from_le_bytes(le(c));
+                all.push((v >> 63) as u8);
+                all.extend_from_slice(&v.to_be_bytes());
+            })),
+            levels,
+        ),
+        Codec::Bytes { .. } => put::<ByteArrayType>(
+            writer,
+            byte_values(present, |c, all| {
+                all.extend_from_slice(gnitz_wire::german_string_content(c, &batch.blob))
+            }),
+            levels,
+        ),
     }
+}
+
+/// `values` and their `levels` as one column chunk of `writer`, of type `T`.
+fn put<T: DataType>(
+    writer: &mut SerializedColumnWriter<'_>,
+    values: Vec<T::T>,
+    levels: Option<&[i16]>,
+) -> Result<(), DumpError> {
+    writer.typed::<T>().write_batch(&values, levels, None)?;
     Ok(())
 }
 
-/// The cell of each row of `present`, which `cell` appends to one buffer, as
-/// values over that buffer.
-fn byte_values(present: &[usize], mut cell: impl FnMut(usize, &mut Vec<u8>)) -> Vec<ByteArray> {
+fn flba(v: Vec<ByteArray>) -> Vec<FixedLenByteArray> {
+    v.into_iter().map(FixedLenByteArray::from).collect()
+}
+
+/// Each of `cells`, which `cell` appends to one buffer, as values over that
+/// buffer.
+fn byte_values<'c>(cells: impl Iterator<Item = &'c [u8]>, mut cell: impl FnMut(&[u8], &mut Vec<u8>)) -> Vec<ByteArray> {
     let mut all = Vec::new();
-    let mut ends = Vec::with_capacity(present.len());
-    for &i in present {
-        cell(i, &mut all);
+    let mut ends = Vec::with_capacity(cells.size_hint().1.unwrap_or(0));
+    for c in cells {
+        cell(c, &mut all);
         ends.push(all.len());
     }
     let all = Bytes::from(all);
@@ -273,7 +329,6 @@ fn byte_values(present: &[usize], mut cell: impl FnMut(usize, &mut Vec<u8>)) -> 
 pub(crate) struct TableReader {
     reader: SerializedFileReader<File>,
     schema: Arc<Schema>,
-    path: String,
     next: usize,
 }
 
@@ -282,13 +337,10 @@ impl TableReader {
     /// nullability.
     pub(crate) fn open(path: &Path, schema: &Arc<Schema>) -> Result<TableReader, DumpError> {
         let reader = SerializedFileReader::new(File::open(path)?)?;
-        let shown = path.display().to_string();
         // A file's columns are the dumped table's visible ones, and a restored
         // table has no other, so a file column stands at its schema index.
-        if schema.visible_columns().count() != schema.columns().len() {
-            return Err(DumpError::from(format!(
-                "{shown}: restored into a table with hidden columns"
-            )));
+        if schema.columns().iter().any(|c| c.is_hidden) {
+            return Err(DumpError::from("restored into a table with hidden columns"));
         }
         let (root, types) = file_layout(schema)?;
         let meta = reader.metadata().file_metadata();
@@ -297,12 +349,11 @@ impl TableReader {
             .and_then(|kv| kv.iter().find(|kv| kv.key == COLUMNS_KEY))
             .and_then(|kv| kv.value.as_deref());
         if *meta.schema() != root || recorded != Some(types.as_str()) {
-            return Err(DumpError::from(format!("{shown}: its columns are not the table's")));
+            return Err(DumpError::from("its columns are not the table's"));
         }
         Ok(TableReader {
             reader,
             schema: Arc::clone(schema),
-            path: shown,
             next: 0,
         })
     }
@@ -315,204 +366,156 @@ impl TableReader {
         let group = self.reader.get_row_group(self.next)?;
         self.next += 1;
         let schema = &self.schema;
-        let layout = schema.layout();
         let n = usize::try_from(group.metadata().num_rows()).map_err(|_| DumpError::from("a negative row count"))?;
         let mut batch = ZSetBatch::new(schema);
         batch.weights = vec![1; n];
         batch.nulls = vec![0; n];
-        let pk = schema.pk_cols();
-        let mut keys: Vec<Vec<u8>> = vec![Vec::new(); pk.len()];
-        for (ci, def) in schema.columns().iter().enumerate() {
-            let mut cells = Vec::with_capacity(n * def.ty.tc.wire_stride());
-            let nulls = read_column(group.get_column_reader(ci)?, n, def, &mut cells, &mut batch.blob)
-                .map_err(|e| DumpError(format!("{}: column {}: {e}", self.path, def.name)))?;
-            match layout.payload_slot(ci) {
-                Some(pi) => {
-                    for row in nulls {
-                        gnitz_wire::null_word_set(&mut batch.nulls[row], pi, true);
-                    }
-                    batch.payload[pi].bytes = cells;
-                }
-                None => keys[pk.iter().position(|&k| k as usize == ci).expect("a key column")] = cells,
-            }
+        let ZSetBatch { payload, nulls, blob, .. } = &mut batch;
+        // A file column stands at its schema index: the table has no hidden column (see `open`).
+        let mut read = |ci: usize, cells: &mut Vec<u8>| -> Result<(), DumpError> {
+            let def = &schema.columns()[ci];
+            let null_words = def
+                .is_nullable
+                .then_some((&mut nulls[..], schema.layout().locate(ci).null_bit()));
+            read_column(group.get_column_reader(ci)?, n, def.ty, cells, null_words, blob)
+                .map_err(|e| DumpError(format!("column {}: {e}", def.name)))
+        };
+        let mut keys = Vec::with_capacity(schema.pk_cols().len());
+        for &ci in schema.pk_cols() {
+            let mut cells = Vec::new();
+            read(ci as usize, &mut cells)?;
+            keys.push(cells);
         }
-        // Each key cell is its native little-endian bytes; zero-extended,
-        // `push_natives` truncates it back to the column's width.
-        let widths: Vec<usize> = pk
-            .iter()
-            .map(|&ci| schema.columns()[ci as usize].ty.tc.wire_stride())
-            .collect();
-        let mut natives = vec![0u128; pk.len()];
-        batch.pks.reserve(n);
-        for row in 0..n {
-            for ((v, cells), &w) in natives.iter_mut().zip(&keys).zip(&widths) {
-                let mut le = [0u8; 16];
-                le[..w].copy_from_slice(&cells[row * w..][..w]);
-                *v = u128::from_le_bytes(le);
-            }
-            batch.pks.push_natives(&natives);
+        for (pi, ci, _) in schema.payload_columns() {
+            read(ci, &mut payload[pi].bytes)?;
         }
+        batch.pks = PkColumn::from_native_columns(schema, &keys);
         Ok(Some(batch))
     }
 }
 
-/// The `n` cells of column `def` appended to `cells` as a batch region holds
-/// them — native little-endian, a zero cell under NULL, a string's bytes
-/// spilled into `blob` — and the rows that are NULL.
+/// The `n` cells of a column of type `ty` appended to `cells` as a batch region
+/// holds them — native little-endian, a zero cell under NULL, a string's bytes
+/// spilled into `blob` — each NULL row's word in `nulls` given the column's bit.
 fn read_column(
     reader: ColumnReader,
     n: usize,
-    def: &ColumnDef,
+    ty: ColType,
     cells: &mut Vec<u8>,
+    nulls: Option<(&mut [u64], u64)>,
     blob: &mut Vec<u8>,
-) -> Result<Vec<usize>, String> {
-    let tc = def.ty.tc;
-    let mut levels = def.is_nullable.then(|| Vec::with_capacity(n));
-    let fixed_int = || FixedInt::from_type_code(tc).ok_or_else(|| format!("an integer for a {tc} column"));
-    // An integer as the column holds it, refused outside its range.
-    let int = |fi: FixedInt, v: i128, out: &mut Vec<u8>| {
-        let (lo, hi) = fi.range();
-        if !(lo..=hi).contains(&v) {
-            return Err(format!("{v} is out of range for {tc}"));
-        }
-        out.extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
-        Ok(())
-    };
-    match reader {
-        ColumnReader::Int32ColumnReader(r) => {
-            let fi = fixed_int()?;
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                int(
-                    fi,
-                    if fi.is_signed() {
-                        i128::from(v)
-                    } else {
-                        i128::from(v as u32)
-                    },
-                    out,
-                )
-            })
-        }
-        ColumnReader::Int64ColumnReader(r) => {
-            let fi = fixed_int()?;
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                int(
-                    fi,
-                    if fi.is_signed() {
-                        i128::from(v)
-                    } else {
-                        i128::from(v as u64)
-                    },
-                    out,
-                )
-            })
-        }
-        ColumnReader::BoolColumnReader(r) => {
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                out.push(u8::from(v));
-                Ok(())
-            })
-        }
-        ColumnReader::FloatColumnReader(r) => {
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                out.extend_from_slice(&v.to_le_bytes());
-                Ok(())
-            })
-        }
-        ColumnReader::DoubleColumnReader(r) => {
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                out.extend_from_slice(&v.to_le_bytes());
-                Ok(())
-            })
-        }
-        ColumnReader::FixedLenByteArrayColumnReader(r) => {
-            let values = read_all(r, n, levels.as_mut())?;
-            let sized = |v: &FixedLenByteArray, len: usize| match v.data().len() == len {
-                true => Ok(()),
-                false => Err(format!("a {tc} cell of {} bytes", v.data().len())),
-            };
-            if tc == TypeCode::Decimal {
-                fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                    sized(&v, DECIMAL_BYTES)?;
-                    let sign = if v.data()[0] & 0x80 != 0 { 0xff } else { 0 };
-                    let mut be = [sign; 16];
-                    be[16 - DECIMAL_BYTES..].copy_from_slice(v.data());
-                    let wide = i128::from_be_bytes(be);
-                    let v = i64::try_from(wide).map_err(|_| format!("{wide} is out of range for {tc}"))?;
-                    out.extend_from_slice(&v.to_le_bytes());
-                    Ok(())
-                })
-            } else {
-                fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                    sized(&v, 16)?;
-                    out.extend(v.data().iter().rev());
-                    Ok(())
-                })
+) -> Result<(), String> {
+    let tc = ty.tc;
+    match codec(ty).0 {
+        Codec::Int32(fi) => match fi.width() {
+            1 => read_int32::<1>(reader, n, tc, cells, nulls, fi),
+            2 => read_int32::<2>(reader, n, tc, cells, nulls, fi),
+            _ => read_int32::<4>(reader, n, tc, cells, nulls, fi),
+        },
+        Codec::Int64 => read_cells::<Int64Type>(reader, n, tc, cells, nulls, |v, out| {
+            out.extend_from_slice(&v.to_le_bytes());
+            Ok(())
+        }),
+        Codec::Bool => read_cells::<BoolType>(reader, n, tc, cells, nulls, |v, out| {
+            out.push(u8::from(v));
+            Ok(())
+        }),
+        Codec::Float => read_cells::<FloatType>(reader, n, tc, cells, nulls, |v, out| {
+            out.extend_from_slice(&v.to_le_bytes());
+            Ok(())
+        }),
+        Codec::Double => read_cells::<DoubleType>(reader, n, tc, cells, nulls, |v, out| {
+            out.extend_from_slice(&v.to_le_bytes());
+            Ok(())
+        }),
+        Codec::Wide => read_cells::<FixedLenByteArrayType>(reader, n, tc, cells, nulls, |v, out| {
+            let be: &[u8; 16] = sized(v.data(), tc)?;
+            out.extend_from_slice(&u128::from_be_bytes(*be).to_le_bytes());
+            Ok(())
+        }),
+        Codec::Decimal => read_cells::<FixedLenByteArrayType>(reader, n, tc, cells, nulls, |v, out| {
+            let [sign, be @ ..] = sized::<DECIMAL_BYTES>(v.data(), tc)?;
+            let x = i64::from_be_bytes(*be);
+            // Nine bytes of two's complement hold an `i64` exactly when the top
+            // one is the sign of the rest.
+            if *sign != (x >> 63) as u8 {
+                return Err(format!("a {tc} cell out of range of a 64-bit integer"));
             }
-        }
-        ColumnReader::ByteArrayColumnReader(r) => {
-            let values = read_all(r, n, levels.as_mut())?;
-            fill(values, levels.as_deref(), n, tc, cells, |v, out| {
-                if tc == TypeCode::String && std::str::from_utf8(v.data()).is_err() {
-                    return Err("a TEXT cell that is not UTF-8".to_string());
-                }
-                out.extend_from_slice(&gnitz_wire::encode_german_string(v.data(), blob));
-                Ok(())
-            })
-        }
-        ColumnReader::Int96ColumnReader(_) => Err("an INT96 column".to_string()),
+            out.extend_from_slice(&x.to_le_bytes());
+            Ok(())
+        }),
+        Codec::Bytes { text } => read_cells::<ByteArrayType>(reader, n, tc, cells, nulls, |v, out| {
+            if text && std::str::from_utf8(v.data()).is_err() {
+                return Err("a TEXT cell that is not UTF-8".to_string());
+            }
+            out.extend_from_slice(&gnitz_wire::encode_german_string(v.data(), blob));
+            Ok(())
+        }),
     }
 }
 
-/// The values of a column chunk of `n` rows, and its levels into `levels`
-/// where it has them; refused when the chunk holds fewer rows.
-fn read_all<T: DataType>(
-    mut r: ColumnReaderImpl<T>,
+/// A fixed-length cell of `tc`, refused unless it is `N` bytes long.
+fn sized<const N: usize>(d: &[u8], tc: TypeCode) -> Result<&[u8; N], String> {
+    d.try_into().map_err(|_| format!("a {tc} cell of {} bytes", d.len()))
+}
+
+/// An INT32 column of a type `W` bytes wide, refused where a value is out of its range.
+fn read_int32<const W: usize>(
+    reader: ColumnReader,
     n: usize,
-    mut levels: Option<&mut Vec<i16>>,
-) -> Result<Vec<T::T>, String> {
+    tc: TypeCode,
+    cells: &mut Vec<u8>,
+    nulls: Option<(&mut [u64], u64)>,
+    fi: FixedInt,
+) -> Result<(), String> {
+    read_cells::<Int32Type>(reader, n, tc, cells, nulls, |v, out| {
+        // A value the column cannot hold changes when cut to its width.
+        if fi.unpack(u128::from(v as u32)) as i32 != v {
+            return Err(format!("{v} is out of range for {tc}"));
+        }
+        out.extend_from_slice(&v.to_le_bytes()[..W]);
+        Ok(())
+    })
+}
+
+/// The `n` values of a column chunk, appended to `cells` as `put` writes each one; a zero
+/// cell of `tc` for each NULL row, whose word in `nulls` gets the column's bit. `nulls` is
+/// `Some` exactly when the column may be NULL. `open` checked the file's schema against
+/// `file_layout`, so `reader` is of type `T`.
+fn read_cells<T: DataType>(
+    reader: ColumnReader,
+    n: usize,
+    tc: TypeCode,
+    cells: &mut Vec<u8>,
+    mut nulls: Option<(&mut [u64], u64)>,
+    mut put: impl FnMut(T::T, &mut Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut r = get_typed_column_reader::<T>(reader);
+    let mut levels = nulls.is_some().then(|| Vec::with_capacity(n));
     let mut values = Vec::with_capacity(n);
     let mut got = 0;
     while got < n {
         let (records, _, _) = r
-            .read_records(n - got, levels.as_deref_mut(), None, &mut values)
+            .read_records(n - got, levels.as_mut(), None, &mut values)
             .map_err(|e| e.to_string())?;
         if records == 0 {
             return Err("a column chunk shorter than its row group".to_string());
         }
         got += records;
     }
-    Ok(values)
-}
-
-/// The `n` rows of a column of type `tc` into `cells`: a zero cell where
-/// `levels` says NULL, else the next of `values` as `put` writes it. The rows
-/// that are NULL.
-fn fill<V>(
-    values: Vec<V>,
-    levels: Option<&[i16]>,
-    n: usize,
-    tc: TypeCode,
-    cells: &mut Vec<u8>,
-    mut put: impl FnMut(V, &mut Vec<u8>) -> Result<(), String>,
-) -> Result<Vec<usize>, String> {
-    let mut nulls = Vec::new();
+    cells.reserve(n * tc.wire_stride());
     let mut values = values.into_iter();
     for row in 0..n {
-        if levels.is_some_and(|l| l[row] == 0) {
-            push_zero_cell(cells, tc);
-            nulls.push(row);
-            continue;
+        if let (Some(levels), Some((words, bit))) = (&levels, &mut nulls) {
+            if levels[row] == 0 {
+                push_zero_cell(cells, tc);
+                words[row] |= *bit;
+                continue;
+            }
         }
-        let v = values.next().ok_or("fewer values than rows")?;
-        put(v, cells)?;
+        put(values.next().ok_or("fewer values than rows")?, cells)?;
     }
-    Ok(nulls)
+    Ok(())
 }
 
 #[cfg(test)]

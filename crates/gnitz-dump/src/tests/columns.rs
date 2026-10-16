@@ -1,6 +1,7 @@
 use super::*;
 use gnitz_core::BatchAppender;
 use gnitz_wire::ColType;
+use parquet::column::writer::ColumnWriter;
 
 /// One column of every type, the nullable ones NULL in odd rows, under a
 /// compound key of a signed and an unsigned column.
@@ -254,5 +255,45 @@ fn a_key_out_of_its_columns_range_is_refused() {
     group.close().unwrap();
     w.close().unwrap();
     let err = TableReader::open(&path, &narrow).unwrap().next_group().unwrap_err();
+    assert!(err.0.contains("out of range"), "{err}");
+}
+
+/// A DECIMAL cell whose nine bytes hold 2^63, one past `i64::MAX`, is refused
+/// rather than wrapped.
+#[test]
+fn a_decimal_past_i64_is_refused() {
+    let schema = Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("k", TypeCode::I64, false),
+                ColumnDef::typed("v".to_string(), ColType::decimal(2), false),
+            ],
+            &[0],
+        )
+        .unwrap(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.parquet");
+    let (root, types) = file_layout(&schema).unwrap();
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]))
+        .build();
+    let mut w = SerializedFileWriter::new(File::create(&path).unwrap(), Arc::new(root), Arc::new(props)).unwrap();
+    let mut group = w.next_row_group().unwrap();
+    for _ in 0..2 {
+        let mut col = group.next_column().unwrap().unwrap();
+        match col.untyped() {
+            ColumnWriter::Int64ColumnWriter(c) => c.write_batch(&[1], None, None).unwrap(),
+            ColumnWriter::FixedLenByteArrayColumnWriter(c) => {
+                let cell = FixedLenByteArray::from(vec![0x00, 0x80, 0, 0, 0, 0, 0, 0, 0]);
+                c.write_batch(&[cell], None, None).unwrap()
+            }
+            _ => unreachable!("an INT64 key and a DECIMAL payload"),
+        };
+        col.close().unwrap();
+    }
+    group.close().unwrap();
+    w.close().unwrap();
+    let err = TableReader::open(&path, &schema).unwrap().next_group().unwrap_err();
     assert!(err.0.contains("out of range"), "{err}");
 }
