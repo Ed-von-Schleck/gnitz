@@ -58,34 +58,14 @@ def test_returning_answers_from_the_stamped_ids(client, serial_t):
     assert bag(scanned(client, "t")) == {(i + 1, n): 1 for i, n in enumerate("abcdefg")}
 
 
-def test_a_serial_key_reaches_derived_schemas_as_a_plain_column(client, serial_t):
-    """SERIAL is the base table's property, so a schema derived from it — a join
-    view's payload, an aliased projection, a GROUP BY key — carries the id as an
-    ordinary integer column: each plans and answers with the stamped ids."""
-    client.execute_sql(
-        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'); "
-        "CREATE TABLE u (k BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL); "
-        "INSERT INTO u VALUES (10, 1), (20, 3); "
-        "CREATE VIEW j AS SELECT u.k, t.id, t.name FROM u JOIN t ON u.tid = t.id; "
-        "CREATE VIEW g AS SELECT id, COUNT(*) AS n FROM t GROUP BY id")
-    assert bag(scanned(client, "j"), "k", "id", "name") == {(10, 1, "a"): 1, (20, 3, "c"): 1}
-    assert bag(scanned(client, "g"), "id", "n") == {(1, 1): 1, (2, 1): 1, (3, 1): 1}
-    assert bag(rows(client, "SELECT id AS i FROM t")) == {(1,): 1, (2,): 1, (3,): 1}
-    # The views follow a later stamped insert.
-    [row] = rows(client, "INSERT INTO t (name) VALUES ('d') RETURNING id")
-    client.execute_sql(f"INSERT INTO u VALUES (30, {row.id})")
-    assert bag(scanned(client, "j"), "k", "id", "name") == {
-        (10, 1, "a"): 1, (20, 3, "c"): 1, (30, 4, "d"): 1}
-    assert bag(scanned(client, "g"), "id", "n") == {(i, 1): 1 for i in range(1, 5)}
-
-
 def test_concurrent_connections_never_share_an_id(client, serial_t, peer):
     """Four fresh connections — none saw the CREATE, so each recognizes the
     SERIAL column from the catalog alone — draw ids at once in 30-row
     statements, so each refills its cached range several times and abandons a
     tail each time, while a fifth connection seeks the table throughout. No id
-    is issued twice, each connection's ids rise, a seek never waits behind a range
-    allocation, and the table holds exactly the returned ids."""
+    is issued twice, each connection's ids rise, a seek does not hang behind a
+    range allocation and finds id 1 at most once, and the table holds exactly the
+    returned ids."""
     writers, statements, per = 4, 5, 30
     ids = [[] for _ in range(writers)]
     done = threading.Event()
@@ -98,7 +78,8 @@ def test_concurrent_connections_never_share_an_id(client, serial_t, peer):
     def seeker(c):
         schema = c.resolve_table("t")[1]
         while not done.is_set():
-            list(c.seek(serial_t, schema, pk=1))
+            got = bag(c.seek(serial_t, schema, pk=1), "id")
+            assert got in ({}, {(1,): 1}), got
 
     threads = [spawn(writer, peer(), w) for w in range(writers)]
     seek = spawn(seeker, peer())

@@ -7,17 +7,18 @@ index, a predicate scan — and the bound together with the server-side
 predicate is the whole WHERE. Inside a transaction a statement must also see
 the transaction's own buffered rows, which no server-side walk ever saw: a row
 born in it, a committed row it overrode, one it deleted. A key the expression
-VM cannot hold (a 64-bit extreme, a UUID, a 128-bit decimal) has to be applied
+VM cannot hold (a 64-bit extreme, a UUID, a 128-bit integer) has to be applied
 by the walk alone, even over a buffer.
 
 So every scenario runs twice — statement by statement in autocommit, and as
 one BEGIN … COMMIT — and both must report the given per-statement counts and
-leave the given Z-set.
+leave the given Z-set, in the table and in a passthrough view over it: the
+table clamps an upsert's weight to 1 and the view does not, so a retraction or
+insert emitted twice shows only in the view.
 """
 
-import gnitz
 import pytest
-from _read import bag, rows, scanned
+from _read import bag, scanned
 
 _U64_MAX = (1 << 64) - 1
 _I64_MIN = -(1 << 63)
@@ -51,7 +52,7 @@ _LADDER_STEPS = [
     ("DELETE FROM {t} WHERE val IN (1, 57, 501)", 2),                  # tombstoned 5 carried 501
     ("INSERT INTO {t} VALUES (1, 0, 0, 1, 'x'), (6, 60, 60, 6, 'y') "
      "ON CONFLICT (pk) DO UPDATE SET val = val + 100", 2),
-    ("INSERT INTO {t} VALUES (6, 0, 0, 6, 'x'), (7, 70, 70, 7, 'z') ON CONFLICT (pk) DO NOTHING", 1),
+    ("INSERT INTO {t} VALUES (6, 0, 0, 6, 'x'), (7, 70, 70, 7, 'z') ON CONFLICT DO NOTHING", 1),
     ("DELETE FROM {t} WHERE pk = 6", 1),
     ("INSERT INTO {t} VALUES (6, 7, 60, 6, 'w') "
      "ON CONFLICT (pk) DO UPDATE SET val = val + 100", 1),             # a deleted key is no conflict
@@ -71,6 +72,19 @@ def _wide_key(pk_sql, key, other, other_py):
              (f"UPDATE {{t}} SET v = 8 WHERE id IN ({other}, {other})", 1),
              (f"DELETE FROM {{t}} WHERE id IN ({key})", 1)],
             [(other_py, 8)])
+
+
+def _pk_in(opts):
+    """A `pk IN (…)` list over keys spanning every worker: each present key it
+    names is reached once, and absent keys add nothing."""
+    def keys(hi):
+        return ", ".join(map(str, range(1, hi + 1)))
+
+    return (f"CREATE TABLE {{t}} (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL){opts}",
+            ", ".join(f"({i}, {i})" for i in range(0, 1010, 2)),
+            [(f"UPDATE {{t}} SET v = v + 1 WHERE id IN ({keys(1000)})", 500),
+             (f"DELETE FROM {{t}} WHERE id IN ({keys(500)})", 250)],
+            [(0, 0), *((i, i + 1) for i in range(502, 1001, 2)), *((i, i) for i in range(1002, 1010, 2))])
 
 
 # name -> (CREATE for table {t}, seed VALUES, steps, final rows)
@@ -102,13 +116,6 @@ _SCENARIOS = {
         [("INSERT INTO {t} VALUES (1, 1, 1, 111), (1, 1, 3, 30) "
           "ON CONFLICT (a, b, c) DO UPDATE SET v = EXCLUDED.v", 2)],
         [(1, 1, 1, 111), (1, 1, 2, 20), (1, 1, 3, 30)]),
-    "on-conflict": (
-        "CREATE TABLE {t} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-        "(1, 10), (2, 20)",
-        [("INSERT INTO {t} VALUES (1, 999), (3, 30) ON CONFLICT DO NOTHING", 1),
-         ("INSERT INTO {t} VALUES (2, 200), (4, 40) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val", 2),
-         ("INSERT INTO {t} VALUES (3, 0) ON CONFLICT (pk) DO UPDATE SET val = 42", 1)],
-        [(1, 10), (2, 200), (3, 42), (4, 40)]),
     "u64-max-key": _wide_key("BIGINT UNSIGNED", _U64_MAX, 1, 1),
     "i64-min-key": _wide_key("BIGINT", _I64_MIN, -1, -1),
     "uuid-key": _wide_key("UUID", f"'{_UUID_A}'", f"'{_UUID_B}'", _UUID_B),
@@ -136,6 +143,8 @@ _SCENARIOS = {
          ("UPDATE {t} SET v = 2 WHERE u > 99 AND u < 160", 2),
          ("DELETE FROM {t} WHERE u >= 200", 1)],
         [(1, 1, 0), (2, 100, 2), (4, 150, 2)]),
+    "pk-in-list": _pk_in(""),
+    "pk-in-list-replicated": _pk_in(" WITH (replicated = true)"),
 }
 
 
@@ -143,38 +152,12 @@ _SCENARIOS = {
 def test_a_transaction_resolves_each_statement_as_autocommit_does(
         client, create, seed, steps, final):
     for t in ("ac", "tx"):
-        client.execute_sql(f"{create}; INSERT INTO {{t}} VALUES {seed}".format(t=t))
-    sqls, counts = [s for s, _ in steps], [n for _, n in steps]
+        client.execute_sql(
+            f"{create}; CREATE VIEW {{t}}v AS SELECT * FROM {{t}}; INSERT INTO {{t}} VALUES {seed}".format(t=t))
+    sqls, counts = zip(*steps)
 
     ac = [client.execute_sql(s.format(t="ac"))[0]["count"] for s in sqls]
     res = client.execute_sql("; ".join(["BEGIN", *sqls, "COMMIT"]).format(t="tx"))
-    assert ac == [r["count"] for r in res[1:-1]] == counts
-    assert bag(scanned(client, "ac")) == bag(scanned(client, "tx")) == dict.fromkeys(final, 1)
-
-
-@pytest.mark.parametrize("placement", ["keyed", "replicated", "view"])
-def test_a_pk_in_list_reaches_every_named_key(client, placement):
-    """A `pk IN (…)` list over keys spanning every worker, on a keyed table, a
-    replicated one, and a view over the replicated one: a SELECT reads, an UPDATE
-    rewrites and a DELETE removes exactly the present keys it names, so a key the
-    gather drops is a row missed, kept at its old value, or left behind. Absent
-    keys contribute nothing."""
-    n = 1_000
-    opts = "" if placement == "keyed" else " WITH (replicated = true)"
-    client.execute_sql(
-        f"CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL){opts}")
-    read = "t"
-    if placement == "view":
-        client.execute_sql("CREATE VIEW w AS SELECT id, v FROM t")
-        read = "w"
-    tid, schema = client.resolve_table("t")
-    client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": i, "v": i} for i in range(0, n + 10, 2)]))
-
-    keys = ", ".join(str(i) for i in range(1, n + 1))
-    inside = range(2, n + 1, 2)
-    outside = {(i, i): 1 for i in (0, *range(n + 2, n + 10, 2))}
-    assert bag(rows(client, f"SELECT id, v FROM {read} WHERE id IN ({keys})")) == {(i, i): 1 for i in inside}
-    assert client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id IN ({keys})")[0]["count"] == len(inside)
-    assert bag(scanned(client, read)) == {(i, i + 1): 1 for i in inside} | outside
-    assert client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})")[0]["count"] == len(inside)
-    assert bag(scanned(client, read)) == outside
+    assert ac == [r["count"] for r in res[1:-1]] == list(counts)
+    want = dict.fromkeys(final, 1)
+    assert [bag(scanned(client, n)) for n in ("ac", "acv", "tx", "txv")] == [want] * 4

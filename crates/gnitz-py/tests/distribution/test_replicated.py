@@ -37,13 +37,15 @@ _DIM = [(i, i % 7, i * 10) for i in range(1, 41)] + \
 
 @pytest.fixture(scope="module")
 def dim(module_client):
-    """A connection holding a replicated `dim` with both index kinds. Read-only."""
+    """A connection holding a replicated `dim` with both index kinds, and `dimv`,
+    a passthrough view over it. Read-only."""
     conn = module_client
     conn.execute_sql(
         "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL, "
         "val BIGINT NOT NULL)" + _REPL)
     insert(conn, "dim", _DIM)
-    conn.execute_sql("CREATE INDEX ON dim(cust); CREATE UNIQUE INDEX ON dim(val)")
+    conn.execute_sql("CREATE INDEX ON dim(cust); CREATE UNIQUE INDEX ON dim(val); "
+                     "CREATE VIEW dimv AS SELECT * FROM dim")
     return conn
 
 
@@ -62,12 +64,14 @@ def dim(module_client):
                  id="pk-in-list"),
     pytest.param("id BETWEEN 5 AND 12", lambda i, c, v: 5 <= i <= 12, id="pk-range"),
 ])
-def test_a_read_of_a_replicated_table_returns_one_copy(dim, where, keep):
-    """Every worker's copy matches every predicate, so a read that gathered from
-    all of them returns each row at weight W. The PK-keyed reads carry the
-    opposite hazard: confining one to the worker its key would hash to under
-    partitioning is correct only by accident of which copy answers."""
-    got = scanned(dim, "dim") if where is None else rows(dim, f"SELECT * FROM dim WHERE {where}")
+@pytest.mark.parametrize("rel", ["dim", "dimv"], ids=["table", "view"])
+def test_a_read_of_a_replicated_table_returns_one_copy(dim, rel, where, keep):
+    """Every worker's copy of the table, and of a view over it, matches every
+    predicate, so a read that gathered from all of them returns each row at
+    weight W. The PK-keyed reads carry the opposite hazard: confining one to the
+    worker its key would hash to under partitioning is correct only by accident
+    of which copy answers."""
+    got = scanned(dim, rel) if where is None else rows(dim, f"SELECT * FROM {rel} WHERE {where}")
     assert bag(got, "id", "cust", "val") == {r: 1 for r in _DIM if keep(*r)}
 
 

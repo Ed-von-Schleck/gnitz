@@ -13,7 +13,7 @@ _DDL = (
     "CREATE TABLE parent (id BIGINT PRIMARY KEY, root_id BIGINT REFERENCES root(id) ON DELETE CASCADE); "
     "CREATE TABLE child (cid BIGINT PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))"
 )
-_ROWS = {"root": [(1,), (2,)], "parent": [(1, 1), (2, 2), (3, None)], "child": []}
+_ROWS = {"root": [(1,), (2,)], "parent": [(1, 1), (2, 2), (3, None)]}
 
 # `(the write to the parent, whether a reference to parent 1 is still valid after it)`.
 _PARENT_WRITES = {
@@ -50,35 +50,41 @@ def test_random_writes_agree_with_the_set_of_parents(own_server, keys):
     parents, children = set(), {}
     block = list(range(100, 170))
 
+    fk, dup_key = "foreign key", "duplicate key"
+
     def step():
-        """`(statement, whether it is refused, its effect on the model)`."""
+        """`(statement, the pattern of the refusal it meets or None, its effect
+        on the model)`."""
         k = rng.random()
         pid, cid = rng.randrange(1, 9), rng.randrange(1, 13)
         if k < 0.04:
-            fresh = not parents & set(block)
-            return ("INSERT INTO parent VALUES " + ", ".join(f"({i}, NULL)" for i in block), not fresh,
-                    lambda: parents.update(block))
+            return ("INSERT INTO parent VALUES " + ", ".join(f"({i}, NULL)" for i in block),
+                    dup_key if parents.intersection(block) else None, lambda: parents.update(block))
         if k < 0.08:
-            free = not set(children.values()) & set(block)
-            return (f"DELETE FROM parent WHERE id IN ({', '.join(map(str, block))})", not free,
+            return (f"DELETE FROM parent WHERE id IN ({', '.join(map(str, block))})",
+                    fk if set(children.values()).intersection(block) else None,
                     lambda: parents.difference_update(block))
         if k < 0.30:
-            return (f"INSERT INTO parent VALUES ({pid}, NULL)", pid in parents, lambda: parents.add(pid))
+            return (f"INSERT INTO parent VALUES ({pid}, NULL)", dup_key if pid in parents else None,
+                    lambda: parents.add(pid))
         if k < 0.45:
-            return (f"DELETE FROM parent WHERE id = {pid}", pid in children.values(), lambda: parents.discard(pid))
+            return (f"DELETE FROM parent WHERE id = {pid}", fk if pid in children.values() else None,
+                    lambda: parents.discard(pid))
         if k < 0.85:
             ref = rng.choice(sorted(parents)) if parents and rng.random() < 0.8 else rng.choice([pid, 100, 169])
-            return (f"INSERT INTO child VALUES ({cid}, {ref})", cid in children or ref not in parents,
-                    lambda: children.__setitem__(cid, ref))
-        return (f"DELETE FROM child WHERE cid = {cid}", False, lambda: children.pop(cid, None))
+            dup, dangling = cid in children, ref not in parents
+            refusal = f"{dup_key}|{fk}" if dup and dangling else dup_key if dup else fk if dangling else None
+            return (f"INSERT INTO child VALUES ({cid}, {ref})", refusal, lambda: children.__setitem__(cid, ref))
+        return (f"DELETE FROM child WHERE cid = {cid}", None, lambda: children.pop(cid, None))
 
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(_DDL)
         for _ in range(700):
-            sql, refused, apply = step()
-            with pytest.raises(gnitz.GnitzIntegrityError) if refused else contextlib.nullcontext():
+            sql, refusal, apply = step()
+            with (contextlib.nullcontext() if refusal is None
+                  else pytest.raises(gnitz.GnitzIntegrityError, match=f"(?i){refusal}")):
                 conn.execute_sql(sql)
-            if not refused:
+            if refusal is None:
                 apply()
         want = {"parent": [(p, None) for p in parents], "child": list(children.items())}
         assert _fk.held(conn, want) == _fk.want(want)

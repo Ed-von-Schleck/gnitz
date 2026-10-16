@@ -124,6 +124,7 @@ def test_a_decimal_key_past_the_columns_range_reaches_no_row(client):
     ("TINYINT", [-2**7, -35, -1, 0, 1, 35, 2**7 - 1], 0),
     ("HUGEINT", [-2**127, -35, -1, 0, 1, 35, 2**127 - 1], 0),
     ("BIGINT UNSIGNED", [0, 1, 35, 2**63, _U64_MAX], 2**63),
+    ("UINT128", [0, 1, 35, 2**64, 2**127, 2**128 - 1], 2**127),
 ])
 def test_an_index_walks_every_width_and_sign(client, coltype, vals, mid):
     """An index keys a column at the column's own width, so a walk over it

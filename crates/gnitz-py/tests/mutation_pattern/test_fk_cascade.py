@@ -26,12 +26,6 @@ _A = [(i, i * 10) for i in range(1, 5)]
 _B = [(a * 10 + j, a) for a, _ in _A for j in range(3)]
 _C = [(b * 10 + k, f"c{b}-{k}", b) for b, _ in _B for k in range(2)]
 _CHAIN_ROWS = {"a": _A, "b": _B, "c": _C}
-_PLACEMENTS = {
-    "partitioned": {},
-    "replicated-parent": pytest.param({"a": _REPL}, marks=NEEDS_MULTI),
-    "replicated-child": pytest.param({"b": _REPL, "c": _REPL}, marks=NEEDS_MULTI),
-    "all-replicated": pytest.param({"a": _REPL, "b": _REPL, "c": _REPL}, marks=NEEDS_MULTI),
-}
 
 
 def _chain_after(gone):
@@ -41,33 +35,22 @@ def _chain_after(gone):
     return {"a": [r for r in _A if r[0] not in gone], "b": b, "c": [r for r in _C if r[2] in kept]}
 
 
-def _chain_want(gone):
-    """The bags of the chain, and of `per_b` over it, once the `a` rows `gone` left."""
-    after = _chain_after(gone)
-    return {**_fk.want(after), "per_b": dict.fromkeys(((b, 2) for b, _ in after["b"]), 1)}
-
-
-@pytest.mark.parametrize("placement", _PLACEMENTS.values(), ids=_PLACEMENTS.keys())
-def test_a_delete_takes_every_level_of_descendants_and_a_view_follows(client, placement):
-    _fk.seed(client, _chain(**placement) + _PER_B, _CHAIN_ROWS)
-    want = _chain_want(set())
-    assert _fk.held(client, want) == want
-
-    client.execute_sql("DELETE FROM a WHERE id IN (2, 3)")
-    want = _chain_want({2, 3})
-    assert _fk.held(client, want) == want
-
-    # A row with no descendants left, and one that never existed.
-    client.execute_sql("DELETE FROM b WHERE a_id = 1; DELETE FROM a WHERE id IN (1, 99)")
-    want = _chain_want({1, 2, 3})
-    assert _fk.held(client, want) == want
+_GONE = _chain_after({1, 2, 3})
+# Every table's `WITH` clause and marks, per placement.
+_PLACEMENTS = {
+    "partitioned": ({}, ()),
+    "replicated-parent": ({"a": _REPL}, NEEDS_MULTI),
+    "replicated-child": ({"b": _REPL, "c": _REPL}, NEEDS_MULTI),
+    "all-replicated": ({"a": _REPL, "b": _REPL, "c": _REPL}, NEEDS_MULTI),
+}
 
 
 _TREE = ("CREATE TABLE tree (id BIGINT PRIMARY KEY,"
          " parent_id BIGINT REFERENCES tree(id) ON DELETE CASCADE)")
 # Two trees of depth six, three children under every inner node of the first.
 _TREE_A = [(1, None)] + [(n * 10 + k, n) for n in (1, 11, 111, 1111, 11111) for k in (1, 2, 3)]
-_TREE_B = [(2, None)] + [(2 * 10**d + 2, 2 * 10**(d - 1) + (2 if d > 1 else 0)) for d in range(1, 6)]
+_B_CHAIN = [2, 22, 202, 2002, 20002, 200002]
+_TREE_B = [(2, None), *zip(_B_CHAIN[1:], _B_CHAIN)]
 _TWO_PARENTS = (
     "CREATE TABLE parent (id BIGINT PRIMARY KEY); "
     "CREATE TABLE child (cid BIGINT PRIMARY KEY,"
@@ -131,6 +114,12 @@ _SOFT_HARD_ROWS = {"parent": [(1,), (2,)], "soft": [(1, 1), (2, 2)], "hard": [(1
 # `(ddl, rows seeded per table, the write as `_fk.write` takes it, every table's
 # rows after — or None where the write is refused and every table keeps its seed)`.
 _WRITES = {
+    # A delete, then one of a row with no descendants left and of one that never existed.
+    **{f"every level of descendants, {name}": pytest.param(
+        _chain(**with_) + _PER_B, _CHAIN_ROWS,
+        "DELETE FROM a WHERE id IN (2, 3); DELETE FROM b WHERE a_id = 1; DELETE FROM a WHERE id IN (1, 99)",
+        {**_GONE, "per_b": [(b, 2) for b, _ in _GONE["b"]]}, marks=marks)
+       for name, (with_, marks) in _PLACEMENTS.items()},
     "a binary delete": (_chain(), _CHAIN_ROWS, ("delete", "a", [2, 3]), _chain_after({2, 3})),
     # A retraction and an insert folding to a surviving row delete nothing.
     "a push folding to a surviving row": (

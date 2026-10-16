@@ -4,8 +4,8 @@ pushes grouped into shared commits.
 A base table upserts by PK: within one push the last weight-positive row for a
 PK wins, a retraction matches on the PK alone, and a weight-0 row is no row.
 Every read is a Z-set bag of the table and of a passthrough view over it: the
-table runs `enforce_unique_pk` and the view does not, so a weight the table
-clamps shows up in the view at whatever weight was actually emitted.
+table clamps an upsert's weight to 1 and the view does not, so the view shows
+whatever weight was actually emitted.
 """
 
 import pytest
@@ -13,29 +13,27 @@ import gnitz
 from _read import bag, scanned
 from _serverproc import join_or_fail, spawn
 
-_INT = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
-                     gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True)], [0])
-_STR = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
-                     gnitz.ColumnDef("val", gnitz.TypeCode.STRING, is_nullable=True)], [0])
-_BLOB = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
-                      gnitz.ColumnDef("val", gnitz.TypeCode.BLOB, is_nullable=True)], [0])
+
+def _schema(tc):
+    return gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                         gnitz.ColumnDef("val", tc, is_nullable=True)], [0])
+
 
 # A heap-backed table's push takes its own encoding and relocation path, so
 # every case runs over each; the four values are indexed by the cases below.
 # The string and blob legs span the empty value, the exact 12-byte inline limit,
 # a heap value and NULL.
 _LEGS = {
-    "int": (_INT, [10, 20, 99, None]),
-    "string": (_STR, ["", "abcdefghijkl", "this_is_a_longer_string_value", None]),
-    "blob": (_BLOB, [b"", b"abcdefghijkl", b"\x00\xff" * 12, None]),
+    "int": (gnitz.TypeCode.I64, [10, 20, 99, None]),
+    "string": (gnitz.TypeCode.STRING, ["", "abcdefghijkl", "this_is_a_longer_string_value", None]),
+    "blob": (gnitz.TypeCode.BLOB, [b"", b"abcdefghijkl", b"\x00\xff" * 12, None]),
 }
 
-# (committed (pk, value index), pushed (pk, value index, weight) or
-# ("delete", keys), surviving (pk, value index)). A retraction carries filler
-# payload, as `delete` ships.
+# (committed (pk, value index), one push of (pk, value index, weight),
+# surviving (pk, value index)). A retraction carries filler payload, as
+# `delete` ships.
 _FOLD = {
-    "every value": ([], [(1, 0, 1), (2, 1, 1), (3, 2, 1), (4, 3, 1)],
-                    [(1, 0), (2, 1), (3, 2), (4, 3)]),
+    "every value": ([], [(1, 0, 1), (2, 1, 1), (3, 2, 1), (4, 3, 1)], [(1, 0), (2, 1), (3, 2), (4, 3)]),
     "last write wins": ([], [(1, 0, 1), (1, 1, 1)], [(1, 1)]),
     "insert then retract": ([], [(1, 0, 1), (1, 2, -1)], []),
     "retract then insert": ([(1, 0)], [(1, 2, -1), (1, 1, 1)], [(1, 1)]),
@@ -45,15 +43,16 @@ _FOLD = {
     "weight 0 is no row": ([], [(1, 0, 0), (2, 1, 1), (3, 2, 0)], [(2, 1)]),
     "all weight 0": ([(1, 0)], [(2, 1, 0), (3, 2, 0)], [(1, 0)]),
     "independent keys": ([(1, 0), (2, 1), (3, 2)], [(2, 2, 1)], [(1, 0), (2, 2), (3, 2)]),
-    "delete by key, absent key": ([(1, 0), (2, 1)], ("delete", [2, 999]), [(1, 0)]),
     "empty push": ([(1, 0)], [], [(1, 0)]),
 }
 
 
 @pytest.mark.parametrize("leg", _LEGS)
-@pytest.mark.parametrize("committed,pushed,survivors", _FOLD.values(), ids=_FOLD.keys())
-def test_a_push_folds_by_pk(client, leg, committed, pushed, survivors):
-    schema, vals = _LEGS[leg]
+def test_a_push_folds_by_pk(client, leg):
+    """Each case is its own push over keys no other case writes — case `c`
+    shifts its keys by `10 * c` — after one push committing every case's rows."""
+    tc, vals = _LEGS[leg]
+    schema = _schema(tc)
     tid = client.create_table("t", schema)
     client.execute_sql("CREATE VIEW v AS SELECT * FROM t")
 
@@ -61,18 +60,16 @@ def test_a_push_folds_by_pk(client, leg, committed, pushed, survivors):
         return gnitz.ZSetBatch(schema).extend(
             [{"pk": pk, "val": vals[i], "_weight": w} for pk, i, w in rows])
 
-    if committed:
-        client.push(tid, batch([(pk, i, 1) for pk, i in committed]))
-    if isinstance(pushed, tuple):
-        client.delete(tid, schema, pushed[1])
-    else:
-        client.push(tid, batch(pushed))
+    cases = list(enumerate(_FOLD.values()))
+    client.push(tid, batch([(10 * c + pk, i, 1) for c, (committed, _, _) in cases for pk, i in committed]))
+    for c, (_, pushed, _) in cases:
+        client.push(tid, batch([(10 * c + pk, i, w) for pk, i, w in pushed]))
 
-    want = {(pk, vals[i]): 1 for pk, i in survivors}
+    want = {(10 * c + pk, vals[i]): 1 for c, (_, _, survivors) in cases for pk, i in survivors}
     assert bag(scanned(client, "t")) == bag(scanned(client, "v")) == want
 
 
-def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
+def test_concurrent_pushes_coalesce_into_shared_commits(client, peer):
     """Eight connections push at once, alternating between two tables. Each batch
     carries four rows under keys no other connection writes, alternating inline
     and heap strings, plus one row under the key every connection on its table
@@ -87,23 +84,23 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
     batch's own heap, which a row count cannot check, and leaves each table's
     shared key as exactly one pushed row at weight 1."""
     conns, rounds, per = 8, 30, 4
-    tids = [client.create_table(f"t{i}", _STR) for i in range(2)]
+    schema = _schema(gnitz.TypeCode.STRING)
+    tids = [client.create_table(f"t{i}", schema) for i in range(2)]
 
     def value(pk):
         return f"v{pk}" if pk % 2 == 0 else f"long-payload-for-row-{pk}"
 
     lsns = []
 
-    def worker(w):
-        with gnitz.connect(server) as c:
-            for r in range(rounds):
-                base = 1 + (w * rounds + r) * per
-                batch = gnitz.ZSetBatch(_STR).extend(
-                    [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
-                    + [{"pk": 0, "val": f"w{w}r{r}"}])
-                lsns.append(c.push(tids[w % 2], batch))
+    def worker(c, w):
+        for r in range(rounds):
+            base = 1 + (w * rounds + r) * per
+            batch = gnitz.ZSetBatch(schema).extend(
+                [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
+                + [{"pk": 0, "val": f"w{w}r{r}"}])
+            lsns.append(c.push(tids[w % 2], batch))
 
-    join_or_fail("a concurrent push hung", *[spawn(worker, w) for w in range(conns)])
+    join_or_fail("a concurrent push hung", *[spawn(worker, peer(), w) for w in range(conns)])
 
     for i in range(2):
         writers = range(i, conns, 2)

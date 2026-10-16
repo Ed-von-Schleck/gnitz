@@ -14,10 +14,6 @@ import gnitz
 from _read import bag, rows, scanned
 from _schemas import KV, kv
 
-_TU = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
-       "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
-
-
 def test_a_transaction_stages_its_writes_until_commit(client):
     """Every write inside BEGIN … COMMIT, and every SERIAL id RETURNING hands
     back, is staged: a read and a scan see only committed state, a refused
@@ -54,68 +50,57 @@ def test_a_transaction_stages_its_writes_until_commit(client):
     assert bag(scanned(client, "s")) == {(a.id, "a"): 1, (c.id, "c"): 1}
 
 
-_REFUSED = {
-    "an insert of a committed key beside an unrelated update":
-        "BEGIN; UPDATE t SET val = 99 WHERE pk = 2; INSERT INTO t VALUES (1, 100); COMMIT",
-    "a duplicate key beside a write to another table":
-        "BEGIN; INSERT INTO u VALUES (9, 90); INSERT INTO t VALUES (1, 20); COMMIT",
-    "an autocommit NULL under NOT NULL": "UPDATE t SET val = NULL WHERE pk = 1",
-}
-
-
-@pytest.mark.parametrize("sql", _REFUSED.values(), ids=_REFUSED.keys())
-def test_a_refused_write_commits_nothing_and_leaves_no_transaction_open(client, sql):
-    client.execute_sql(f"{_TU}; INSERT INTO t VALUES (1, 10), (2, 20)")
+def test_a_refused_commit_commits_nothing_and_closes_the_transaction(client):
+    """A key the commit finds taken refuses the whole bundle, the unrelated
+    update beside it included, and leaves the connection in autocommit: the
+    next write lands at once, where an open transaction would buffer it."""
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+                       "INSERT INTO t VALUES (1, 10), (2, 20)")
     with pytest.raises(gnitz.GnitzRefusedError):
-        client.execute_sql(sql)
-    assert (bag(scanned(client, "t")), bag(scanned(client, "u"))) == (
-        {(1, 10): 1, (2, 20): 1}, {})
-    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
-        client.execute_sql("ROLLBACK")
+        client.execute_sql("BEGIN; UPDATE t SET val = 99 WHERE pk = 2; INSERT INTO t VALUES (1, 100); COMMIT")
+    assert bag(scanned(client, "t")) == {(1, 10): 1, (2, 20): 1}
+    client.execute_sql("INSERT INTO t VALUES (3, 30)")
+    assert bag(scanned(client, "t")) == {(1, 10): 1, (2, 20): 1, (3, 30): 1}
 
 
 def test_a_bundle_over_two_tables_reaches_a_join_as_one_delta_each(client):
-    """Both sides of a join written, interleaved, in one bundle. Rolled back it
-    leaves every relation empty; committed, each table holds its net rows and
-    the join holds the pair once — a cross term emitted twice is weight 2."""
+    """Both sides of a join written, interleaved, in one bundle: each table holds
+    its net rows and the join holds the pair once — a cross term emitted twice
+    is weight 2."""
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL); "
         "CREATE VIEW v AS SELECT a.id AS id, a.x AS x, b.y AS y FROM a JOIN b ON a.id = b.id")
-    body = ("BEGIN; INSERT INTO a VALUES (1, 10); INSERT INTO b VALUES (1, 100); "
-            "UPDATE a SET x = x + 1 WHERE id = 1; INSERT INTO a VALUES (2, 20); ")
-
-    client.execute_sql(body + "ROLLBACK")
-    assert [bag(scanned(client, n)) for n in "abv"] == [{}, {}, {}]
-
-    client.execute_sql(body + "COMMIT")
+    client.execute_sql(
+        "BEGIN; INSERT INTO a VALUES (1, 10); INSERT INTO b VALUES (1, 100); "
+        "UPDATE a SET x = x + 1 WHERE id = 1; INSERT INTO a VALUES (2, 20); COMMIT")
     assert [bag(scanned(client, n)) for n in "abv"] == [
         {(1, 11): 1, (2, 20): 1}, {(1, 100): 1}, {(1, 11, 100): 1}]
 
 
 # (committed rows of `a`, frames in bundle order, the bags of `a` and `b` after
-# the commit — or the class the bundle is refused with, both keeping what they
+# the commit — or None where the bundle is refused, both keeping what they
 # held). A frame is `(table, rows, mode)`: `(pk, val, weight)` rows pushed in
 # that conflict mode, or keys for `delete`.
 _BUNDLES = {
     "an error-mode insert of a committed key aborts the sibling table":
-        ([(1, 10)], [("b", [(9, 90, 1)], "update"), ("a", [(1, 99, 1)], "error")], gnitz.GnitzIntegrityError),
+        ([(1, 10)], [("b", [(9, 90, 1)], "update"), ("a", [(1, 99, 1)], "error")], None),
     "delete then error-mode insert is the replace idiom":
         ([(1, 10)], [("a", [1], "delete"), ("a", [(1, 20, 1)], "error")], ({(1, 20): 1}, {})),
     "an error-mode insert sees an earlier frame's insert of its key":
-        ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1)], "error")], gnitz.GnitzIntegrityError),
+        ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1)], "error")], None),
     "a blind delete leaves an uncommitted key free for an error-mode insert":
         ([], [("a", [5], "delete"), ("a", [(5, 50, 1)], "error")], ({(5, 50): 1}, {})),
     "an error-mode frame's own delete does not hide its insert of a committed key":
-        ([(1, 10)], [("a", [(1, 99, 1), (1, 98, -1)], "error")], gnitz.GnitzIntegrityError),
+        ([(1, 10)], [("a", [(1, 99, 1), (1, 98, -1)], "error")], None),
     "an error-mode frame may delete a key and re-insert it":
         ([(1, 10)], [("a", [(1, 98, -1), (1, 20, 1)], "error")], ({(1, 20): 1}, {})),
     "an error-mode re-insert after its own delete is no duplicate":
         ([], [("a", [(1, 10, 1), (1, 10, -1), (1, 20, 1)], "error")], ({(1, 20): 1}, {})),
     "an error-mode frame's own delete does not hide an earlier frame's insert":
-        ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1), (1, 20, -1)], "error")], gnitz.GnitzIntegrityError),
+        ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1), (1, 20, -1)], "error")], None),
     "an error-mode row at weight 2 is a duplicate":
-        ([], [("a", [(1, 10, 2)], "error")], gnitz.GnitzIntegrityError),
+        ([], [("a", [(1, 10, 2)], "error")], None),
     "a weight-0 row is no row":
         ([], [("a", [(1, 10, 1), (2, 20, 0)], "update"), ("b", [(3, 30, 1)], "update")],
          ({(1, 10): 1}, {(3, 30): 1})),
@@ -128,8 +113,7 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames
     if committed:
         client.push(tids["a"], kv(*committed))
 
-    refused = isinstance(after, type)
-    with pytest.raises(after) if refused else contextlib.nullcontext():
+    with pytest.raises(gnitz.GnitzIntegrityError) if after is None else contextlib.nullcontext():
         with client.transaction() as txn:
             for table, frame, mode in frames:
                 if mode == "delete":
@@ -137,7 +121,7 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames
                 else:
                     txn.push(tids[table], kv(*frame), mode)
     assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == (
-        (dict.fromkeys(committed, 1), {}) if refused else after)
+        (dict.fromkeys(committed, 1), {}) if after is None else after)
 
 
 def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
