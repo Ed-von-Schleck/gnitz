@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema};
+use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, Rng};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -164,19 +164,25 @@ fn merged_consolidated_bench() {
     /// Row `i` of side 0 or 1 as `(pk, payload)`, each side strictly ascending:
     /// the merge takes consolidated operands.
     type Row = fn(usize, usize) -> (usize, usize);
-    // Each with the row count of side 1; side 0 holds `N`.
-    let cases: [(&str, Row, usize); 5] = [
-        ("shared_pk_interleave", |i, side| (i / 8, 2 * (i % 8) + side), N),
-        ("shared_pk_fold", |i, _| (i / 8, i % 8), N),
-        ("alt1", |i, side| (2 * i + side, i), N),
-        ("runs4096", |i, side| ((2 * (i / RUN) + side) * RUN + i % RUN, i), N),
+    // Each with the row count of side 1 and of the output; side 0 holds `N`.
+    let cases: [(&str, Row, usize, usize); 5] = [
+        ("shared_pk_interleave", |i, side| (i / 8, 2 * (i % 8) + side), N, 2 * N),
+        ("shared_pk_fold", |i, _| (i / 8, i % 8), N, N),
+        ("alt1", |i, side| (2 * i + side, i), N, 2 * N),
+        (
+            "runs4096",
+            |i, side| ((2 * (i / RUN) + side) * RUN + i % RUN, i),
+            N,
+            2 * N,
+        ),
         (
             "dominant",
             |i, side| (if side == 0 { i + i / RUN } else { i * (RUN + 1) + RUN }, i),
             N / RUN,
+            N + N / RUN,
         ),
     ];
-    for (label, row, side1) in cases {
+    for (label, row, side1, survivors) in cases {
         let [a, b] = [(0, N), (1, side1)].map(|(side, n)| {
             let rows: Vec<(u64, i64, i64)> = (0..n)
                 .map(|i| row(i, side))
@@ -187,11 +193,11 @@ fn merged_consolidated_bench() {
         let rows = (N + side1) as f64;
         black_box(a.merged_consolidated(&b, &schema));
         let ((out, instr), cyc) = cycles.measure(|| instructions.measure(|| a.merged_consolidated(&b, &schema)));
+        assert_eq!(out.count, survivors, "{label}");
         println!(
-            "merged_consolidated_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row ({} rows out)",
+            "merged_consolidated_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row",
             instr as f64 / rows,
             cyc as f64 / rows,
-            out.count
         );
     }
 }
@@ -277,16 +283,10 @@ fn two_way_shapes_bench() {
     for (ty, schema) in [("narrow", make_schema_u64_i64()), ("wide", wide), ("u128 pk", wide_pk)] {
         for shape in ["disjoint", "replace", "append"] {
             for (d, s) in sizes {
-                let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (d as u64) << 20 ^ s as u64;
-                let mut xorshift = move || {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    state
-                };
+                let mut rng = Rng::new((d as u64) << 20 ^ s as u64);
                 // One bit short of the key's width, which `append` sets.
                 let bits = schema.pk_stride() as u32 * 8 - 1;
-                let mut key = || (((xorshift() as u128) << 64) | xorshift() as u128) >> (128 - bits);
+                let mut key = || rng.gen_u128() >> (128 - bits);
                 let mut a_keys: Vec<u128> = (0..d).map(|_| key()).collect();
                 a_keys.sort_unstable();
                 a_keys.dedup();
@@ -321,13 +321,12 @@ fn two_way_shapes_bench() {
                     ("two-way", &|| a.merged_consolidated(&b, &schema)),
                     ("n-way", &|| merge_consolidated(&mem, &schema)),
                 ];
-                let want = kernels[1].1();
+                let (two, n) = (kernels[0].1(), kernels[1].1());
+                assert_eq!(two.pk_data(), n.pk_data(), "the kernels agree on keys");
+                assert_eq!(two.weight_data(), n.weight_data(), "the kernels agree on weights");
+                drop((two, n));
                 let mut line = format!("{ty:<7} {shape:<8} {d:>7}+{s:<6}");
                 for (name, kernel) in kernels {
-                    let got = kernel();
-                    assert_eq!(got.pk_data(), want.pk_data(), "{name}: keys");
-                    assert_eq!(got.weight_data(), want.weight_data(), "{name}: weights");
-                    drop(got);
                     let run = || (0..calls).for_each(|_| drop(black_box(kernel())));
                     // The least of several runs: nothing but the kernel can lower a count.
                     let mut least = [u64::MAX; 3];

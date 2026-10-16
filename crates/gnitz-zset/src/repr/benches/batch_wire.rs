@@ -1,10 +1,7 @@
-use super::tests::string_batch;
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{
-    encode_to_wire_vec, make_schema_pk_u64_payload_string, pk_u64_two_i64_schema, u64_pk_schema,
-};
+use crate::test_support::{encode_to_wire_vec, pk_u64_two_i64_schema, string_batch, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -31,11 +28,12 @@ fn wal_block_bench() {
                 black_box(black_box(&batch).wire_whole().unwrap().encode(black_box(&mut buf)));
             }
         });
-        let ((), decode) = counter.measure(|| {
-            for _ in 0..ITERS {
-                black_box(MemBatch::of_wal_block(black_box(&buf), &schema).unwrap().count);
-            }
+        let (decoded, decode) = counter.measure(|| {
+            (0..ITERS)
+                .map(|_| MemBatch::of_wal_block(black_box(&buf), &schema).unwrap().count)
+                .sum::<usize>()
         });
+        assert_eq!(decoded, rows * ITERS);
         println!(
             "wal_block_bench {rows} rows: encode {} instr/block, decode {}",
             encode / ITERS as u64,
@@ -89,13 +87,10 @@ fn foreign_decode_bench() {
         ("512 bytes, ASCII", "abcdefgh".repeat(64)),
         ("512 bytes, non-ASCII", "aéb€".repeat(73)),
     ] {
-        let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
-        for i in 0..ROWS {
-            b.begin_row(i as u128, 1);
-            b.put_string(&format!("{}{}", i % 10, &unit[1..]));
-            b.end_row();
-        }
-        measure(label, b.finish());
+        let rows: Vec<_> = (0..ROWS as u64)
+            .map(|i| (i, format!("{}{}", i % 10, &unit[1..])))
+            .collect();
+        measure(label, string_batch(&rows));
     }
 }
 
@@ -139,6 +134,7 @@ fn reply_chunk_strings_bench() {
                 start += frame.rows();
                 frames += 1;
             }
+            assert_eq!(start, N, "every row went out");
             (frames, bytes)
         });
         black_box(&buf);

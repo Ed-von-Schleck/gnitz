@@ -4,7 +4,7 @@ use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    weighted_rows,
+    ragged_batch, ragged_schema, string_batch, weighted_rows,
 };
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
@@ -126,11 +126,33 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
     }
 }
 
-/// Every encoder round-trips through the validated decode at narrow and odd PK
-/// and payload strides, where a block's regions start unaligned.
-#[test]
-fn every_encoder_round_trips_at_narrow_strides() {
+/// Twenty rows naming one 200-byte span, as a join's fan-out writes them.
+fn shared_span() -> Batch {
+    let one = string_batch(&[(1, "v".repeat(200))]);
+    let mut shared = Batch::with_capacity(one.schema(), 20);
+    shared
+        .append_session(20)
+        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
+    assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
+    shared
+}
+
+/// The batches every wire encoder is checked over: fixed-width rows; inline,
+/// mixed, spilling and page-sized strings; rows naming one span; and narrow and
+/// odd PK and payload strides, where a block's regions start unaligned.
+fn wire_batches() -> Vec<Batch> {
     use TypeCode::*;
+    let mut mixed = vec![(0u64, "a".repeat(64))];
+    mixed.extend((1..30).map(|i| (i, "abcdefghijkl".to_string())));
+    let fixed: Vec<(u64, i64, i64)> = (1..=30).map(|i| (i, 1, i as i64)).collect();
+    let mut batches = vec![
+        make_batch(&make_schema_u64_i64(), &fixed),
+        string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>()),
+        string_batch(&mixed),
+        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
+        string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]),
+        shared_span(),
+    ];
     for (pk, payload) in [
         (&[U8][..], I16),
         (&[U16], U8),
@@ -141,48 +163,16 @@ fn every_encoder_round_trips_at_narrow_strides() {
         let mut cols: Vec<SchemaColumn> = pk.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
         cols.extend([SchemaColumn::new(payload, true), SchemaColumn::new(String, false)]);
         let key: Vec<u32> = (0..pk.len() as u32).collect();
-        let schema = SchemaDescriptor::new(&cols, &key);
-        let mut b = BatchBuilder::new(&schema);
-        for i in 0..5u128 {
+        let mut b = BatchBuilder::new(&SchemaDescriptor::new(&cols, &key));
+        for i in 0..20u128 {
             b.begin_row_natives(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
             b.put_opt_int((i % 2 == 0).then_some(i * 7));
             b.put_string(&format!("row {i} holds a string past the inline limit"));
             b.end_row();
         }
-        let src = b.finish();
-        let stride = schema.pk_stride();
-        let decode = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, &schema).unwrap());
-
-        assert_eq!(
-            decode(&encode_to_wire_vec(&src)),
-            weighted_rows(&src),
-            "stride {stride}: whole"
-        );
-
-        let mut buf = vec![0u8; src.wire_whole().unwrap().byte_size()];
-        let range = src.wire_rows_within(1, usize::MAX).unwrap();
-        let n = range.encode(&mut buf);
-        assert_eq!(n, range.byte_size(), "stride {stride}: range size");
-        assert_eq!(decode(&buf[..n]), weighted_rows(&src)[1..], "stride {stride}: range");
-
-        let listed = src.wire_listed(&[4, 0, 2]).unwrap();
-        let n = listed.encode(&mut buf);
-        assert_eq!(n, listed.byte_size(), "stride {stride}: scattered size");
-        let picked = src.indexed_rows(&[4, 0, 2]);
-        assert_eq!(decode(&buf[..n]), weighted_rows(&picked), "stride {stride}: scattered");
+        batches.push(b.finish());
     }
-}
-
-/// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column.
-/// Values past `SHORT_STRING_THRESHOLD` live in the heap.
-pub(super) fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
-    let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
-    for (pk, v) in rows {
-        b.begin_row(*pk as u128, 1);
-        b.put_string(v.as_ref());
-        b.end_row();
-    }
-    b.finish()
+    batches
 }
 
 /// A row run, and a scattered prefix, is the longest run whose block — sized as
@@ -190,29 +180,14 @@ pub(super) fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
 /// No rows is no block.
 #[test]
 fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
-    let one = string_batch(&[(1, "v".repeat(200))]);
-    // Rows naming one span, as a join's fan-out writes them.
-    let mut shared = Batch::with_capacity(one.schema(), 20);
-    shared
-        .append_session(20)
-        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
-    let mut mixed = vec![(0u64, "a".repeat(64))];
-    mixed.extend((1..30).map(|i| (i, "abcdefghijkl".to_string())));
-    let fixed: Vec<(u64, i64, i64)> = (1..=30).map(|i| (i, 1, i as i64)).collect();
-    for b in [
-        make_batch(&make_schema_u64_i64(), &fixed),
-        string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>()),
-        string_batch(&mixed),
-        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
-        string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]),
-        shared,
-    ] {
+    for b in wire_batches() {
         let whole = b.wire_whole().unwrap().byte_size();
         let mut buf = vec![0u8; 2 * whole];
         let size = |rows: &[u32]| b.encode_listed(rows, 0, &mut vec![0; 2 * whole], true).unwrap();
         assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
         assert!(Batch::empty_with_schema(b.schema()).wire_whole().is_none());
         let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
+        assert_eq!(read_back(&encode_to_wire_vec(&b)), weighted_rows(&b), "whole");
         for start in [0, 1] {
             let rest = b.len() - start;
             let run = |k: usize| (start as u32..(start + k) as u32).collect::<Vec<_>>();
@@ -247,19 +222,7 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
 /// out a copy per cell or, for rows naming one span, once.
 #[test]
 fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
-    let one = string_batch(&[(1, "v".repeat(200))]);
-    // Rows naming one span, as a join's fan-out writes them.
-    let mut shared = Batch::with_capacity(one.schema(), 20);
-    shared
-        .append_session(20)
-        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
-    assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
-    let fixed: Vec<(u64, i64, i64)> = (1..=20).map(|i| (i, 1, i as i64)).collect();
-    for b in [
-        make_batch(&make_schema_u64_i64(), &fixed),
-        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
-        shared.clone(),
-    ] {
+    for b in wire_batches().into_iter().filter(|b| b.len() >= 20) {
         for list in [&[0u32, 3, 7, 19][..], &[19, 3, 0], &[5]] {
             let rows = b.wire_listed(list).unwrap();
             assert_eq!(rows.rows(), list.len());
@@ -279,6 +242,7 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
         }
         assert!(b.wire_listed(&[]).is_none());
     }
+    let shared = shared_span();
     let three = shared.wire_listed(&[0, 1, 2]).unwrap();
     assert_eq!(
         three.byte_size(),
@@ -292,25 +256,9 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
 /// the batch it was encoded from.
 #[test]
 fn a_viewed_wal_block_reads_as_its_batch() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U8, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::U32, false),
-        ],
-        &[0],
-    );
+    let schema = ragged_schema();
     for rows in [1usize, 3, 8, 13] {
-        let mut b = BatchBuilder::new(&schema);
-        for i in 0..rows as u128 {
-            b.begin_row(i + 1, 1 + (i % 3) as i64);
-            b.put_int(i % 200);
-            b.put_opt_int((i % 4 != 0).then_some(i * 11));
-            b.put_int(i * 1000);
-            b.end_row();
-        }
-        let mut src = b.finish();
+        let mut src = ragged_batch(rows);
         src.certify_consolidated();
         let block = encode_to_wire_vec(&src);
         let mb = MemBatch::of_wal_block(&block, &schema).unwrap();
@@ -339,9 +287,7 @@ fn a_viewed_wal_block_reads_as_its_batch() {
 #[test]
 fn dead_heap_round_trips_an_engine_block() {
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]);
-    b.blob.extend_from_slice(&[0; 7]);
-    b.dead_heap = 7;
+    let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]).padded(7);
     let block = encode_to_wire_vec(&b);
     let decoded = Batch::decode_from_wal_block(&block, &schema).unwrap();
     assert_eq!((decoded.dead_heap, decoded.blob.len()), (7, b.blob.len()));

@@ -40,22 +40,17 @@ fn for_compaction_bench() {
         for s in &inputs {
             s.verify_body().unwrap();
         }
-        let (((), i), c) = cycles.measure(|| {
+        let ((rows, i), c) = cycles.measure(|| {
             instructions.measure(|| {
                 let mut starts = vec![0usize; inputs.len()];
-                for g in 0..guard_keys.len() {
-                    black_box(merge_guard(
-                        &inputs,
-                        &guard_keys,
-                        g,
-                        &mut starts,
-                        skeleton,
-                        &schema,
-                        None,
-                    ));
-                }
+                (0..guard_keys.len())
+                    .filter_map(|g| merge_guard(&inputs, &guard_keys, g, &mut starts, skeleton, &schema, None))
+                    .map(|(_, run)| black_box(run).row_count())
+                    .sum::<usize>()
             })
         });
+        // Every source holds every key, each under its own payload.
+        assert_eq!(rows, if skeleton { per } else { TOTAL });
         println!(
             "{sources} sources x {guards} guards{}: {:.1} instr/row, {:.1} cycles/row",
             if skeleton { ", all skeleton" } else { "" },
@@ -128,9 +123,12 @@ fn distinct_compaction_bench() {
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);
             });
+            // Over the decoded windows `merge_guard` merges, so that the difference
+            // is the output batch.
             let (rows, merge) = instructions.measure(|| {
+                let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();
                 let mut rows = 0u64;
-                run_merge(&inputs, &schema, |src, row, w| {
+                run_merge(&windows, &schema, |src, row, w| {
                     rows += black_box((src, row, w)).2 as u64
                 });
                 rows

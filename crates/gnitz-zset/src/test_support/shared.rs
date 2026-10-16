@@ -463,8 +463,9 @@ pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, 
     want
 }
 
-/// One fixed-int schema per `pk_width_dispatch` arm — `≤8` (strides 1, 4, 8),
-/// `9..=16`, `17..=32` and the `>32` fallback — and a nullable-string schema
+/// Fixed-int schemas at both edges of every argsort key form — `≤8` (strides 1,
+/// 4, 8), `9..=16` (12, 16), the packed `17..=28` (17, 24, 28), `29..=32` (29,
+/// 32) and the `>32` fallback (80) — and a nullable-string schema
 /// under the generic comparator at a narrow PK, a wide one, and one whose PK
 /// columns sit among the payload columns in an order other than the schema's.
 pub fn fold_schemas() -> Vec<SchemaDescriptor> {
@@ -480,7 +481,12 @@ pub fn fold_schemas() -> Vec<SchemaDescriptor> {
         pk_payload_schema(&[I32]),
         pk_payload_schema(&[U32, U64]),
         pk_payload_schema(&[U64, I32]),
+        pk_payload_schema(&[U128]),
+        pk_payload_schema(&[U128, U8]),
         pk_payload_schema(&[U64; 3]),
+        pk_payload_schema(&[U128, U64, U32]),
+        pk_payload_schema(&[U128, U64, U32, U8]),
+        pk_payload_schema(&[U128, U128]),
         pk_payload_schema(&[U128; 5]),
         generic(&[U64]),
         generic(&[U64; 3]),

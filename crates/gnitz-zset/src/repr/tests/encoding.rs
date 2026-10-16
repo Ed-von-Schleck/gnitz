@@ -258,11 +258,6 @@ fn seq_image(values: &[Vec<u8>], heap: &mut HeapWriter) -> Vec<u8> {
     seq_encode(&cells, span, Heap::Plain(&src), heap)
 }
 
-/// `bytes` appended to `heap` as one value.
-pub(super) fn push_bytes(heap: &mut HeapWriter, bytes: &[u8]) {
-    heap.push(Heap::Plain(bytes).value(0, bytes.len()).unwrap());
-}
-
 #[test]
 fn seq_roundtrips_at_every_length_width() {
     // One length takes a byte as thirty do.
@@ -276,7 +271,7 @@ fn seq_roundtrips_at_every_length_width() {
         let values = seq_values(rows, spread);
         // The heap a second column packs behind a first.
         let mut heap = HeapWriter::plain();
-        push_bytes(&mut heap, &[0xEE; 77]);
+        heap.push(Heap::Plain(&[0xEE; 77]).value(0, 77).unwrap());
         let image = seq_image(&values, &mut heap);
         let heap = heap.finish().1;
         let lens = values.iter().map(Vec::len);
@@ -413,26 +408,14 @@ fn sparse_roundtrips_framed_and_unframed() {
             let held: Vec<u128> = (0..rows).filter(|&row| !is_null(row)).map(value).collect();
             let image = sparse_encode(&src, width, fi, is_null);
             let values = image.len() - SPARSE_RANKS_AT - rows.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY;
-            // The bytes the values' span needs, and whether a frame of them is the smaller.
-            let span = held
-                .iter()
-                .max()
-                .zip(held.iter().min())
-                .map_or(0, |(max, min)| max - min);
-            let need = (128 - span.leading_zeros() as usize).div_ceil(8);
-            let framed = fi.is_some() && need > 0 && for_image_len(held.len(), need) < held.len() * width;
+            let framed_at = fi.and_then(|fi| expected_bw(&held.iter().map(|&v| v as i128).collect::<Vec<_>>(), fi));
             assert_eq!(
                 values,
-                if framed {
-                    for_image_len(held.len(), need)
-                } else {
-                    held.len() * width
-                },
+                framed_at.map_or(held.len() * width, |bw| for_image_len(held.len(), bw)),
                 "{width}: {rows} rows"
             );
             if rows > DECODE_BLOCK_ROWS {
-                assert_eq!(framed, bw < width, "{width}: {rows} rows frame");
-                assert!(!framed || need == bw, "{width}: {rows} rows frame at {need} bytes");
+                assert_eq!(framed_at.unwrap_or(width), bw, "{width}: {rows} rows frame");
             }
 
             let sparse = SparseImage::parse(&image, rows, width).unwrap();
@@ -591,6 +574,7 @@ fn key_roundtrips_and_seeks_as_the_region_it_packs() {
     type Value = fn(usize, usize) -> u128;
     // A few values per column, whatever the columns.
     const SMALL: Value = |i, c| ((i * [3, 5, 7, 11, 13][c]) % [50, 7, 1000, 9, 300][c]) as u128;
+    const FEW: Value = |i, c| (i * (c + 3) % 5) as u128;
     // Each case's packed row width at 1500 rows, or `None` where the encoder declines.
     let cases: Vec<(&str, Vec<TypeCode>, Value, Option<usize>)> = vec![
         ("a narrow u64", vec![U64], |i, _| 1000 + (i as u128 * 7) % 5000, Some(2)),
@@ -652,10 +636,15 @@ fn key_roundtrips_and_seeks_as_the_region_it_packs() {
             None,
         ),
         ("one key", vec![U64, I32], |_, c| [5, 6][c], None),
+        // Fields that end at their row's end: the wide loads and stores of the
+        // last rows are the ones that could leave the region.
+        ("u64, u16", vec![U64, U16], FEW, Some(1)),
+        ("u8, u8", vec![U8, U8], FEW, Some(1)),
+        ("u128, u8", vec![U128, U8], FEW, Some(1)),
     ];
     let mut rng = Rng::new(0x004B_4559);
     for (label, types, value, packed_stride) in cases {
-        for n in [2, DECODE_BLOCK_ROWS + 1, 1500] {
+        for n in [2, 3, 9, 20, DECODE_BLOCK_ROWS + 1, 1500] {
             let (schema, raw) = key_region(&types, n, value);
             let (fields, stride) = (KeyLayout::of(&schema), schema.pk_stride());
             let Some(image) = key_encode(&raw, &schema) else {
@@ -758,26 +747,4 @@ fn a_key_minimum_past_its_field_wraps() {
     let field = |rows: &[u8]| gnitz_wire::widen_pk_be(&rows[299 * 10 + 2..]);
     assert_eq!(field(&decoded), field(&raw) - 1);
     assert_eq!(key.seek(&raw[..10], None), 0, "below every forged minimum");
-}
-
-/// Key shapes whose fields end at their row's end, at a few rows: the wide loads
-/// and stores of the last rows are the ones that could leave the region. Small
-/// enough to run under Miri.
-#[test]
-fn key_roundtrips_at_a_few_rows() {
-    use TypeCode::*;
-    for types in [vec![U32, I16, U8], vec![U64, U16], vec![U8, U8], vec![U128, U8]] {
-        for n in [2usize, 3, 9, 20] {
-            let (schema, raw) = key_region(&types, n, |i, c| (i * (c + 3) % 5) as u128);
-            let Some(image) = key_encode(&raw, &schema) else {
-                continue;
-            };
-            let key = KeyImage::parse(&image, n, &schema).unwrap();
-            let mut decoded = vec![0u8; raw.len()];
-            key.decode(0, &mut decoded);
-            assert!(decoded == raw, "{types:?} at {n} rows");
-            let stride = schema.pk_stride();
-            assert_eq!(key.seek(&raw[..stride], None), 0, "{types:?} at {n} rows");
-        }
-    }
 }

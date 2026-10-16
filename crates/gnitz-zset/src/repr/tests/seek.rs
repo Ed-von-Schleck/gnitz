@@ -1,7 +1,7 @@
 use super::*;
 
-/// Both seeks equal the linear lower bound, for every row count, hint and width
-/// arm. Keys differ only in their last two bytes, past the register from stride 24.
+/// The seeks equal the linear lower bound, and the key's rows run from it to the
+/// linear upper bound, for every row count, hint and width arm. Keys differ only in their last two bytes, past the register from stride 24.
 #[test]
 fn seek_matches_the_linear_lower_bound_at_every_width() {
     let vals: [u16; 8] = [10, 10, 20, 30, 30, 30, 40, 50];
@@ -24,6 +24,12 @@ fn seek_matches_the_linear_lower_bound_at_every_width() {
                     unsafe { seek_lower_bound(n, stride, pk, &key) },
                     expected,
                     "lower bound stride={stride} n={n} p={p}"
+                );
+                let upper = (0..n).find(|&i| row(i) > &key[..]).unwrap_or(n);
+                assert_eq!(
+                    unsafe { seek_pk_rows(n, stride, pk, &key) },
+                    expected..upper,
+                    "rows of stride={stride} n={n} p={p}"
                 );
                 // Hints past `n` included: a caller's hint may have run off the end.
                 for hint in 0..=vals.len() {

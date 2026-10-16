@@ -197,6 +197,45 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
     }
 }
 
+/// A `U64` key over `U8`, nullable `I64` and `U16` columns: a row is 35 bytes
+/// and no payload region starts at a multiple of 8 of them.
+pub(crate) fn ragged_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U8, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U16, false),
+        ],
+        &[0],
+    )
+}
+
+/// `rows` rows of [`ragged_schema`], every fifth with its `I64` NULL.
+pub(crate) fn ragged_batch(rows: usize) -> Batch {
+    let mut b = crate::repr::BatchBuilder::new(&ragged_schema());
+    for i in 0..rows as u128 {
+        b.begin_row(i, 1 + i as i64 % 3);
+        b.put_int(i % 251);
+        b.put_opt_int((i % 5 != 0).then_some(i * 10));
+        b.put_int(i % 65_521);
+        b.end_row();
+    }
+    b.finish()
+}
+
+/// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column,
+/// in the order given.
+pub(crate) fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
+    let mut b = crate::repr::BatchBuilder::new(&super::shared::make_schema_pk_u64_payload_string());
+    for (pk, v) in rows {
+        b.begin_row(*pk as u128, 1);
+        b.put_string(v.as_ref());
+        b.end_row();
+    }
+    b.finish()
+}
+
 /// Payload column 0's string on every row, in order.
 pub(crate) fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
     (0..batch.len())

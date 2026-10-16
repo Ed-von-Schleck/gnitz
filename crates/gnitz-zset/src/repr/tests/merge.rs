@@ -3,7 +3,7 @@ use crate::repr::shard_reader::MappedShard;
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch_u128_raw, make_schema_pk_u64_payload_string,
-    make_schema_u128_i64, make_schema_u64_i64, make_string_batch, map_shard, payload0_i64,
+    make_schema_u128_i64, make_string_batch, map_shard,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
@@ -20,7 +20,7 @@ fn merge_relocating<S: ColumnarSource>(batches: &[S], schema: &SchemaDescriptor)
 
 /// Every fold the engine runs over `runs`, each sorted by (PK, payload), checked
 /// to reach their Z-set sum.
-fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, Batch)> {
+fn every_fold(case: &str, schema: &SchemaDescriptor, runs: &[Batch]) {
     let mem: Vec<MemBatch> = runs.iter().map(Batch::as_mem_batch).collect();
     let consolidated: Vec<Batch> = runs.iter().map(|b| b.clone().into_consolidated()).collect();
     let consolidated_mem: Vec<MemBatch> = consolidated.iter().map(Batch::as_mem_batch).collect();
@@ -46,21 +46,20 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
         ("N-way over shards", merge_relocating(&shards, schema)),
         ("pairwise", pairwise),
     ];
-    for (what, got) in &folds {
-        assert_folds(runs, got, what);
+    for (path, got) in &folds {
+        assert_folds(runs, got, &format!("{case}: {path}"));
         got.debug_verify_dead_heap();
     }
-    folds
 }
 
-/// The Z-set fold, as `(label, inputs, expected output)`.
-type FoldCase<'a> = (&'a str, &'a [&'a [(u128, i64, i64)]], &'a [(u128, i64, i64)]);
+/// Runs in (PK, payload) order, some with in-run duplicates and zero weights,
+/// that every fold path must take to their Z-set sum, as `(label, runs)`.
+type FoldCase<'a> = (&'a str, &'a [&'a [(u128, i64, i64)]]);
 
 const FOLD_CASES: &[FoldCase] = &[
     (
         "a single source passes through",
         &[&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]],
-        &[(10, 1, 100), (20, 1, 200), (30, 1, 300)],
     ),
     (
         "three sources interleave",
@@ -69,69 +68,54 @@ const FOLD_CASES: &[FoldCase] = &[
             &[(20, 1, 200), (50, 1, 500)],
             &[(30, 1, 300), (60, 1, 600)],
         ],
-        &[
-            (10, 1, 100),
-            (20, 1, 200),
-            (30, 1, 300),
-            (40, 1, 400),
-            (50, 1, 500),
-            (60, 1, 600),
-        ],
     ),
     (
-        "weights sum across sources",
-        &[&[(10, 1, 100)], &[(10, 2, 100)]],
-        &[(10, 3, 100)],
+        "ascending sources with an empty one among them",
+        &[&[(1, 1, 10), (2, 1, 20)], &[], &[(3, 1, 30), (4, 1, 40)]],
     ),
+    (
+        "descending sources",
+        &[&[(3, 1, 30), (4, 1, 40)], &[(1, 1, 10), (2, 1, 20)]],
+    ),
+    (
+        "ascending sources that meet at one PK",
+        &[&[(1, 1, 10), (2, 1, 20)], &[(2, -1, 20), (5, 1, 50)]],
+    ),
+    ("weights sum across sources", &[&[(10, 1, 100)], &[(10, 2, 100)]]),
     (
         "a ghost drops and its neighbours survive",
         &[&[(10, 1, 100), (20, 1, 200)], &[(10, -1, 100)], &[(30, 1, 300)]],
-        &[(20, 1, 200), (30, 1, 300)],
     ),
-    ("no sources at all", &[], &[]),
-    (
-        "an empty source beside a live one",
-        &[&[], &[(10, 1, 100)]],
-        &[(10, 1, 100)],
-    ),
+    ("no sources at all", &[]),
+    ("an empty source beside a live one", &[&[], &[(10, 1, 100)]]),
     (
         "the PK's high word separates",
         &[&[(10, 1, 100)], &[((1u128 << 64) | 10, 1, 200)]],
-        &[(10, 1, 100), ((1u128 << 64) | 10, 1, 200)],
     ),
     (
         "a zero-weight input row never reaches the writer",
         &[&[(10, 0, 100), (20, 1, 200)]],
-        &[(20, 1, 200)],
     ),
     (
         "duplicates within one source fold",
         &[&[(10, 1, 100), (10, 1, 100), (20, 1, 200)]],
-        &[(10, 2, 100), (20, 1, 200)],
     ),
     (
         "one PK's payloads interleave across sources and fold apart",
         &[&[(5, 1, 100)], &[(5, 1, 200)], &[(5, -1, 100)]],
-        &[(5, 1, 200)],
     ),
     (
         "one PK with distinct payloads stays distinct",
         &[&[(10, 1, 100), (10, 1, 200), (20, 1, 300)]],
-        &[(10, 1, 100), (10, 1, 200), (20, 1, 300)],
     ),
 ];
 
 #[test]
 fn every_fold_path_reaches_each_fold_case() {
     let schema = make_schema_u128_i64();
-    for &(what, inputs, want) in FOLD_CASES {
+    for &(what, inputs) in FOLD_CASES {
         let runs: Vec<Batch> = inputs.iter().map(|rows| make_batch_u128_raw(&schema, rows)).collect();
-        for (path, got) in every_fold(&schema, &runs) {
-            let rows: Vec<(u128, i64, i64)> = (0..got.count)
-                .map(|i| (got.get_pk(i), got.get_weight(i), payload0_i64(&got, i)))
-                .collect();
-            assert_eq!(rows, want, "{what}: {path}");
-        }
+        every_fold(what, &schema, &runs);
     }
 }
 
@@ -151,7 +135,7 @@ proptest::proptest! {
             .chunks(rows.len().div_ceil(runs).max(1))
             .map(|c| fold_batch(&s, c).into_consolidated())
             .collect();
-        every_fold(&s, &runs);
+        every_fold("", &s, &runs);
     }
 }
 
@@ -192,14 +176,11 @@ fn a_carried_merge_reads_back_every_string() {
     let (p, q, r, s, t) = (v(b'p', 14), v(b'q', 40), v(b'r', 25), v(b's', 33), v(b't', 17));
     let a_rows: Vec<(u64, i64, &[u8])> = vec![(1, 1, &p), (2, 1, b"short"), (5, 1, &q), (5, 2, &s), (9, 1, &t)];
     let b_rows: Vec<(u64, i64, &[u8])> = vec![(3, 1, &r), (4, 1, &p), (5, 1, &r), (5, -2, &s), (8, 1, &q)];
-    let padded = |rows: &[(u64, i64, &[u8])], pad: usize| {
-        let mut b = make_string_batch(rows);
-        b.blob.extend(std::iter::repeat_n(0u8, pad));
-        b.dead_heap += pad;
-        b
-    };
     for (pad_a, pad_b) in [(0, 0), (1000, 0), (0, 1000)] {
-        let (a, b) = (padded(&a_rows, pad_a), padded(&b_rows, pad_b));
+        let (a, b) = (
+            make_string_batch(&a_rows).padded(pad_a),
+            make_string_batch(&b_rows).padded(pad_b),
+        );
         let out = a.merged_consolidated(&b, &schema);
         assert_folds(&[a, b], &out, &format!("padding ({pad_a}, {pad_b})"));
         out.debug_verify_dead_heap();
@@ -210,86 +191,17 @@ fn a_carried_merge_reads_back_every_string() {
     }
 }
 
-/// Sources that ascend past one another merge to their rows in order, an empty
-/// one among them or not; two that meet at one PK are folded.
-#[test]
-fn ascending_sources_merge_to_their_rows_in_order() {
-    use crate::test_support::{make_batch, weighted_rows};
-    let schema = make_schema_u64_i64();
-    let (low, empty) = (make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]), make_batch(&schema, &[]));
-    let high = make_batch(&schema, &[(3, 1, 30), (4, 1, 40)]);
-    let merge = |sources: &[&Batch]| {
-        let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
-        let out = merge_consolidated(&mem, &schema);
-        assert!(out.is_consolidated());
-        weighted_rows(&out)
-    };
-    let all = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    assert_eq!(merge(&[&low, &empty, &high]), weighted_rows(&all));
-    assert_eq!(
-        merge(&[&high, &low]),
-        weighted_rows(&all),
-        "descending sources interleave"
-    );
-
-    let meets = make_batch(&schema, &[(2, -1, 20), (5, 1, 50)]);
-    let folded = make_batch(&schema, &[(1, 1, 10), (5, 1, 50)]);
-    assert_eq!(merge(&[&low, &meets]), weighted_rows(&folded));
-    assert_eq!(merge(&[]), vec![]);
-}
-
-/// `into_consolidated` folds an unsorted batch to its Z-set at the PK widths on
-/// either side of each argsort key form: keys that differ in their last byte
-/// alone, rows that share a PK and differ in payload, and rows that cancel.
-#[test]
-fn consolidation_folds_at_every_sort_key_boundary() {
-    use crate::test_support::{make_batch_opk, pk_payload_schema, Rng};
-    use std::collections::BTreeMap;
-    use TypeCode::{U128, U32, U64, U8};
-    let mut rng = Rng::new(7);
-    for pk in [
-        &[U128][..],
-        &[U128, U8],
-        &[U128, U64, U32],
-        &[U128, U64, U32, U8],
-        &[U128, U128],
-    ] {
-        let schema = pk_payload_schema(pk);
-        let stride = schema.pk_stride();
-        let mut model: BTreeMap<(Vec<u8>, i64), i64> = BTreeMap::new();
-        let rows: Vec<(Vec<u8>, i64, i64)> = (0..400)
-            .map(|_| {
-                let mut key = vec![0xA5u8; stride];
-                key[stride - 1] = rng.gen_range(4) as u8;
-                key[0] = rng.gen_range(2) as u8;
-                (key, [-1, 1, 2][rng.gen_range(3) as usize], rng.gen_range(3) as i64)
-            })
-            .collect();
-        for (key, w, val) in &rows {
-            *model.entry((key.clone(), *val)).or_default() += w;
-        }
-        model.retain(|_, w| *w != 0);
-        let out = make_batch_opk(&schema, &rows).into_consolidated();
-        let got: Vec<((Vec<u8>, i64), i64)> = (0..out.len())
-            .map(|r| ((out.get_pk_bytes(r).to_vec(), payload0_i64(&out, r)), out.get_weight(r)))
-            .collect();
-        assert_eq!(got, model.into_iter().collect::<Vec<_>>(), "a {stride}-byte PK");
-    }
-}
-
 /// A merge over wide PKs folds to the Z-set its sources sum to, in (PK,
 /// payload) order, wherever the keys differ: in the bytes every row shares
 /// (none do, then), in the span the tournament is keyed by, and behind it.
 #[test]
 fn wide_pk_merges_fold_to_the_sum_of_their_sources() {
     use crate::test_support::{make_batch_opk, pk_payload_schema, Rng};
-    use std::collections::BTreeMap;
     let mut rng = Rng::new(11);
     for pk_cols in [3usize, 5] {
         let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
         // The columns that vary; the others are one value in every row.
         for varying in 0..1u32 << pk_cols {
-            let mut model: BTreeMap<(Vec<u8>, i64), i64> = BTreeMap::new();
             let sources: Vec<Batch> = (0..1 + rng.gen_range(5))
                 .map(|_| {
                     let rows: Vec<(Vec<u8>, i64, i64)> = (0..rng.gen_range(60))
@@ -305,22 +217,14 @@ fn wide_pk_merges_fold_to_the_sum_of_their_sources() {
                             )
                         })
                         .collect();
-                    for (pk, w, val) in &rows {
-                        *model.entry((pk.clone(), *val)).or_default() += w;
-                    }
                     make_batch_opk(&schema, &rows).into_consolidated()
                 })
                 .collect();
-            model.retain(|_, w| *w != 0);
             let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
-            let out = merge_consolidated(&mem, &schema);
-            let got: Vec<((Vec<u8>, i64), i64)> = (0..out.len())
-                .map(|r| ((out.get_pk_bytes(r).to_vec(), payload0_i64(&out, r)), out.get_weight(r)))
-                .collect();
-            assert_eq!(
-                got,
-                model.into_iter().collect::<Vec<_>>(),
-                "{pk_cols} columns, varying {varying:b}"
+            assert_folds(
+                &sources,
+                &merge_consolidated(&mem, &schema),
+                &format!("{pk_cols} columns, varying {varying:b}"),
             );
         }
     }

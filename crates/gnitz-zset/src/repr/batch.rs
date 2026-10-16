@@ -297,6 +297,14 @@ impl Batch {
         self.region_at_mut(REG_NULL_BMP)
     }
 
+    /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
+    #[cfg(test)]
+    pub(crate) fn padded(mut self, pad: usize) -> Batch {
+        self.blob.extend(std::iter::repeat_n(0u8, pad));
+        self.dead_heap += pad;
+        self
+    }
+
     // ── Row accessors ───────────────────────────────────────────────────
 
     #[inline(always)]

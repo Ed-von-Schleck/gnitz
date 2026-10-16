@@ -71,8 +71,8 @@ fn batch_builder_writes_string_cells_and_nulls() {
     for (i, &(a, b)) in cases.iter().enumerate() {
         for (col, want) in [(0usize, a), (1, b)] {
             assert_eq!(
-                batch.get_null_word(i) >> col & 1,
-                u64::from(want.is_none()),
+                gnitz_wire::null_word_get(batch.get_null_word(i), col),
+                want.is_none(),
                 "row {i} col {col} null bit"
             );
             match want {

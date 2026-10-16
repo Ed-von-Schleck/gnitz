@@ -133,11 +133,7 @@ fn key_bench() {
     for (label, types, value) in shapes {
         let (schema, raw) = key_region(&types, N, value);
         let stride = schema.pk_stride();
-        let ((image, _), encode) = instructions.measure(|| {
-            let image = key_encode(black_box(&raw), &schema).expect("region must pack");
-            let len = image.len();
-            (image, len)
-        });
+        let (image, encode) = instructions.measure(|| key_encode(black_box(&raw), &schema).expect("region must pack"));
         let key = KeyImage::parse(&image, N, &schema).expect("the encoder's image parses");
         let mut decoded = vec![0u8; raw.len()];
         let ((), decode) = instructions.measure(|| black_box(&key).decode(0, black_box(&mut decoded)));

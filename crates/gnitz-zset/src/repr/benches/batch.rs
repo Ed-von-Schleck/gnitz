@@ -1,7 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema};
+use crate::test_support::{
+    make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema, string_batch,
+};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -151,9 +153,7 @@ fn consolidate_small_bench() {
 fn append_batch_strings_bench() {
     const ROWS: usize = 64;
     const APPENDS: usize = 10_000;
-    let values: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("{i:040}").into_bytes()).collect();
-    let rows: Vec<(u64, i64, &[u8])> = values.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
-    let src = make_string_batch(&rows);
+    let src = string_batch(&(0..ROWS as u64).map(|i| (i, format!("{i:040}"))).collect::<Vec<_>>());
     let counter = Counter::instructions();
     let (dst, instructions) = counter.measure(|| {
         let mut dst = Batch::empty_with_schema(src.schema());

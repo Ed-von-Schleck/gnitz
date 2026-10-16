@@ -1,7 +1,10 @@
 use super::*;
-use crate::repr::{BatchBuilder, MappedShard};
+use crate::repr::BatchBuilder;
 use crate::schema::{SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch};
+use crate::test_support::{
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
+    string_batch,
+};
 use gnitz_wire::Heap;
 
 /// Any change to the written bytes, the writer's own or a dependency's, needs a
@@ -95,42 +98,38 @@ fn write_refuses_an_existing_path_and_leaves_it_intact() {
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
-/// A shard carries no dead heap bytes: a run whose fold left dead spans behind
-/// writes only the spans its rows reference, and every row reads back.
-#[test]
-fn a_shard_drops_its_runs_dead_heap() {
-    use crate::test_support::{make_schema_pk_u64_payload_string, make_string_batch, map_shard, read_strings};
-    use gnitz_wire::RowSource;
-    let (x, y) = ([b'x'; 20], [b'y'; 20]);
-    let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
-    let run = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &make_schema_pk_u64_payload_string());
-    assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
-
-    let dir = tempfile::tempdir().unwrap();
-    let shard = map_shard(&dir.path().join("s.db"), &run);
-    assert_eq!(
-        shard.heap().plain_len(),
-        y.len(),
-        "only the referenced span reaches disk"
-    );
-    assert_eq!(read_strings(&shard.slice_to_owned_batch(0, 1)), [y.to_vec()]);
-}
-
-/// The heap of the shard `rows` are written as, and its string region's encoding.
-fn written_strings(rows: &[(u64, i64, &[u8])]) -> (usize, Encoding) {
+/// The heap of the shard `batch` is written as, and its string region's
+/// encoding; every row reads back.
+fn written_strings(batch: &Batch) -> (usize, Encoding) {
     use gnitz_wire::RowSource;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
-    let batch = make_string_batch(rows);
-    batch
-        .write_as_shard(path.to_str().unwrap(), ShardWriteOpts::default())
-        .unwrap();
-    let image = std::fs::read(&path).unwrap();
-    let shard = MappedShard::open(path.to_str().unwrap(), batch.schema()).unwrap();
-    for (row, &(_, _, want)) in rows.iter().enumerate() {
-        assert_eq!(gnitz_wire::payload_bytes(&shard, row, 0), want, "row {row}");
+    let shard = map_shard(&path, batch);
+    assert_eq!(shard.row_count(), batch.len());
+    for row in 0..batch.len() {
+        assert_eq!(
+            gnitz_wire::payload_bytes(&*shard, row, 0),
+            gnitz_wire::payload_bytes(batch, row, 0),
+            "row {row}"
+        );
     }
+    let image = std::fs::read(&path).unwrap();
     (shard.heap().plain_len(), spans_of(&image)[REG_PAYLOAD_START].encoding)
+}
+
+/// A shard carries no dead heap bytes: a run whose fold left dead spans behind
+/// writes only the spans its rows reference, held by one row or by several.
+#[test]
+fn a_shard_drops_its_runs_dead_heap() {
+    let (x, y) = ([b'x'; 20], [b'y'; 20]);
+    for copies in [1, 3] {
+        let mut rows = vec![(1, 1, &x[..])];
+        rows.extend((2..2 + copies).map(|pk| (pk, 1, &y[..])));
+        let retract = make_string_batch(&[(1, -1, &x)]);
+        let run = make_string_batch(&rows).merged_consolidated(&retract, &make_schema_pk_u64_payload_string());
+        assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
+        assert_eq!(written_strings(&run), (y.len(), Encoding::Constant), "{copies} copies");
+    }
 }
 
 /// A long value several rows hold reaches the heap once, whichever image the
@@ -140,30 +139,19 @@ fn a_repeated_long_string_reaches_the_heap_once() {
     let (x, y) = ([b'x'; 20], [b'y'; 33]);
     // Three rows: a dictionary would not be the smaller image.
     let few: Vec<(u64, i64, &[u8])> = vec![(1, 1, &x), (2, 1, &y), (3, 1, &x)];
-    assert_eq!(written_strings(&few), (x.len() + y.len(), Encoding::Raw));
+    assert_eq!(
+        written_strings(&make_string_batch(&few)),
+        (x.len() + y.len(), Encoding::Raw)
+    );
     let many: Vec<(u64, i64, &[u8])> = (1..=40)
         .map(|pk| (pk, 1, if pk % 3 == 0 { &y[..] } else { &x[..] }))
         .collect();
-    assert_eq!(written_strings(&many), (x.len() + y.len(), Encoding::Dict));
+    assert_eq!(
+        written_strings(&make_string_batch(&many)),
+        (x.len() + y.len(), Encoding::Dict)
+    );
     let one: Vec<(u64, i64, &[u8])> = (1..=40).map(|pk| (pk, 1, &y[..])).collect();
-    assert_eq!(written_strings(&one), (y.len(), Encoding::Constant));
-}
-
-/// A packed heap holds no dead bytes either: a run whose fold left dead spans
-/// behind writes the values its rows still hold.
-#[test]
-fn a_packed_shard_drops_its_runs_dead_heap() {
-    use crate::test_support::map_shard;
-    use gnitz_wire::RowSource;
-    let (x, y) = ([b'x'; 20], [b'y'; 20]);
-    let a = make_string_batch(&[(1, 1, &x), (2, 1, &y), (3, 1, &y), (4, 1, &y)]);
-    let run = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &make_schema_pk_u64_payload_string());
-    assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
-
-    let dir = tempfile::tempdir().unwrap();
-    let shard = map_shard(&dir.path().join("s.db"), &run);
-    assert_eq!(shard.heap().plain_len(), y.len());
-    assert_eq!(shard.row_count(), 3);
+    assert_eq!(written_strings(&make_string_batch(&one)), (y.len(), Encoding::Constant));
 }
 
 /// `2 * values` cells holding each of `values` strings of `width` bytes twice,
@@ -232,20 +220,24 @@ fn more_short_values_than_a_dictionary_holds_are_their_lengths() {
 /// smaller region.
 #[test]
 fn distinct_strings_are_their_lengths() {
-    let distinct = |n: u64| -> Vec<(u64, i64, Vec<u8>)> {
-        (1..=n)
-            .map(|pk| (pk, 1, format!("{pk:0w$}", w = 8 + pk as usize % 9).into_bytes()))
-            .collect()
+    let distinct = |n: u64| {
+        string_batch(
+            &(1..=n)
+                .map(|pk| (pk, format!("{pk:0w$}", w = 8 + pk as usize % 9)))
+                .collect::<Vec<_>>(),
+        )
     };
-    let written = |rows: &[(u64, i64, Vec<u8>)]| {
-        let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(pk, w, s)| (*pk, *w, &s[..])).collect();
-        written_strings(&rows)
+    let long = |b: &Batch| {
+        read_strings(b)
+            .iter()
+            .map(Vec::len)
+            .filter(|&len| len > 12)
+            .sum::<usize>()
     };
-    let long = |rows: &[(u64, i64, Vec<u8>)]| rows.iter().map(|r| r.2.len()).filter(|&len| len > 12).sum::<usize>();
     let (two, forty) = (distinct(2), distinct(40));
-    assert_eq!(written(&two), (long(&two), Encoding::Raw));
-    assert_eq!(written(&forty), (long(&forty), Encoding::Seq));
-    assert_eq!(written(&distinct(1)).1, Encoding::Constant);
+    assert_eq!(written_strings(&two), (long(&two), Encoding::Raw));
+    assert_eq!(written_strings(&forty), (long(&forty), Encoding::Seq));
+    assert_eq!(written_strings(&distinct(1)).1, Encoding::Constant);
 }
 
 /// The sample finds a value repeated across the column and one repeated only

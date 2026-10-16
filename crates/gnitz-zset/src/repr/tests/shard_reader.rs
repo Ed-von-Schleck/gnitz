@@ -8,11 +8,11 @@ use super::*;
 use crate::repr::error::StorageError;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema, prose,
-    sweep_bit_flips, u64_pk_schema,
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, mix, payload0_i64,
+    pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::num_regions;
-use gnitz_wire::{read_i64_le, write_u64_le};
+use gnitz_wire::write_u64_le;
 
 /// Write `batch` through the production writer to `dir/name`, its heap coded
 /// under a codebook trained on it where that pays.
@@ -318,7 +318,7 @@ fn shapes() -> Vec<Shape> {
             written: build(sparse_mix, 900, |b, i| {
                 b.begin_row(i as u128, 1);
                 b.put_opt_int((i % 9 == 0).then_some((i as u128 + 1) * (u128::MAX / 1000)));
-                b.put_opt_int((i % 4 == 1).then_some((i as u128 * 0x9E37_79B9_7F4A_7C15) & u64::MAX as u128));
+                b.put_opt_int((i % 4 == 1).then_some(mix(i as u64) as u128));
                 b.put_opt_int((i % 3 != 0).then_some(40_000 + i as u128));
             }),
             reader: sparse_mix,
@@ -633,8 +633,7 @@ fn shapes() -> Vec<Shape> {
         Shape {
             label: "3xu64 pk too wide to pack",
             written: build(all_pk, 200, |b, i| {
-                let spread =
-                    |c: u64| ((i as u64 * 3 + c).wrapping_mul(0x9E37_79B9_7F4A_7C15) | i as u64 >> 1 << 60) as u128;
+                let spread = |c: u64| (mix(i as u64 * 3 + c) | i as u64 >> 1 << 60) as u128;
                 b.begin_row_natives(&[(i as u128) << 56, spread(1), spread(2)], 1)
             }),
             reader: all_pk,
@@ -807,7 +806,7 @@ fn a_point_read_decodes_one_block_and_keeps_its_address() {
     let shard = packed_three_blocks(dir.path());
     let row = DECODE_BLOCK_ROWS + 3;
     let first = shard.get_col_ptr(row, 0, 8);
-    assert_eq!(read_i64_le(first, 0), 5_000 + (row % 200) as i64);
+    assert_eq!(payload0_i64(&shard, row), 5_000 + (row % 200) as i64);
     assert_eq!(shard.decoded_blocks(0), 1);
     assert_eq!(shard.get_col_ptr(row, 0, 8).as_ptr(), first.as_ptr());
     assert_eq!(shard.decoded_blocks(0), 1);
@@ -885,20 +884,21 @@ fn shard_wider_than_reader_schema_opens() {
     });
     let shard_path = write(dir.path(), "wide.db", &wide);
 
-    let shard = MappedShard::open(&shard_path, &make_schema_u64_i64()).unwrap();
+    let narrow = make_schema_u64_i64();
     // The surplus column is NULL in every row; its bit names no column of the
-    // reader's schema.
-    for row in 0..3 {
-        assert_eq!(read_i64_le(shard.get_col_ptr(row, 0, 8), 0), (row as i64 + 1) * 10);
-        assert_eq!(shard.get_null_word(row), 0, "row {row}");
-    }
-    let sliced = shard.slice_to_owned_batch(0, 3);
-    assert!((0..3).all(|row| sliced.get_null_word(row) == 0));
+    // reader's schema, so every surface reads the narrow batch, null word and all.
+    let want = rows_of(
+        &make_batch(&narrow, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).as_mem_batch(),
+        &narrow,
+    );
+    let shard = MappedShard::open(&shard_path, &narrow).unwrap();
+    assert_eq!(rows_of(&shard, &narrow), want);
+    assert_eq!(rows_of(&shard.slice_to_owned_batch(0, 3).as_mem_batch(), &narrow), want);
     let rebound = MappedShard::open(&shard_path, &schema_with_appended(TypeCode::I64))
         .unwrap()
-        .rebind(&make_schema_u64_i64())
+        .rebind(&narrow)
         .unwrap();
-    assert!((0..3).all(|row| rebound.get_null_word(row) == 0));
+    assert_eq!(rows_of(&rebound, &narrow), want);
     // The blob region came from the *file's* index, not the reader's.
     assert_eq!(shard.heap().plain_len(), 0);
 }
@@ -1130,6 +1130,12 @@ fn each_forgery_is_refused_with_its_own_verdict() {
             "region past the end",
         ),
         ("empty file", false, Box::new(|d| d.clear()), "empty file"),
+        (
+            "shorter than the header",
+            false,
+            Box::new(|d| d.truncate(HEADER_SIZE - 1)),
+            "shorter than the header",
+        ),
         (
             "truncated directory",
             false,
