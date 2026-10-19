@@ -4,9 +4,9 @@
 //! literal, so `300` means the same thing whichever verb writes it; and
 //! [`check_not_null`] is the NOT NULL verdict both DML write paths take.
 
-use crate::codec::literal::assign;
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
+use crate::literal::assign;
 use gnitz_core::push_zero_cell;
 use gnitz_wire::{ColumnDef, TypeCode};
 

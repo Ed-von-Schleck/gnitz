@@ -5,6 +5,7 @@
 //! Transactions need no special casing in the verbs: the client buffers every
 //! write while one is open, and a read-modify-write reads through that buffer.
 
+mod colwrite;
 mod explain;
 mod insert;
 mod mutate;

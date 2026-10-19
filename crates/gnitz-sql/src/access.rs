@@ -1,10 +1,10 @@
 //! Access-path recognition over bound conjuncts, shared by the DML planners and the
 //! view compiler: [`candidates`] lists every bound a WHERE admits, best first.
 //!
-//! An **AST-free leaf** — `ir`, `codec::literal` and the client crates, nothing else.
+//! An **AST-free leaf** — `ir`, `literal` and the client crates, nothing else.
 
-use crate::codec::literal::{place, Compared, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
+use crate::literal::{place, Compared, Placed};
 use gnitz_core::Schema;
 use gnitz_expr::CmpOp;
 use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};

@@ -648,6 +648,18 @@ impl<R> BExpr<R> {
         }
     }
 
+    /// A numeric literal as a float column's value. A magnitude past `i128` is
+    /// included, which a DOUBLE holds and no integer parse would.
+    pub(crate) fn float_literal(&self) -> Option<f64> {
+        match self {
+            BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v as f64),
+            BExpr::LitFloat { v, .. } => Some(*v),
+            BExpr::LitWide(n) if n.is_negative() => Some(-(n.mag as f64)),
+            BExpr::LitWide(n) => Some(n.mag as f64),
+            _ => None,
+        }
+    }
+
     /// Whether this is a literal, NULL included.
     pub(crate) fn is_literal(&self) -> bool {
         matches!(

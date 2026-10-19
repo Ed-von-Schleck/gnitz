@@ -5,12 +5,12 @@
 //! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
 //! projection expression it emits.
 
-use crate::codec::literal::{assign, float_value, invalid_literal, place, Compared, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
     bin_types, blend_type, check_decimal_scale, operand_ty_pair, operand_tys, range_step, reads_unsigned, BExpr, BinOp,
     BoundExpr, NumFunc, RangeStep, RegClass, StrArg, StrFunc, BOOL, STRING,
 };
+use crate::literal::{assign, invalid_literal, place, Compared, Placed};
 use gnitz_core::Schema;
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LogicalInstr as L,
@@ -181,7 +181,7 @@ impl Lowering<'_> {
             (_, RegClass::Dec(_)) if e.decimal_literal().is_some() => Some(to),
             // A computed float is whatever binary64 makes of the literal, an
             // infinity included: only a stored cell refuses one.
-            (_, RegClass::Float) => match float_value(e) {
+            (_, RegClass::Float) => match e.float_literal() {
                 Some(v) => return Ok(self.eb.const_f64(v)),
                 None => None,
             },

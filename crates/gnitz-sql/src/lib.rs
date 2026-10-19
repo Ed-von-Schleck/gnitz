@@ -10,7 +10,6 @@ mod access;
 mod agg;
 mod ast_util;
 mod bind;
-mod codec;
 mod ddl;
 mod dispatch;
 mod dml;
@@ -19,6 +18,7 @@ mod exec;
 mod expr_lower;
 mod hir;
 mod ir;
+mod literal;
 mod project;
 mod rules;
 mod source;
@@ -30,12 +30,12 @@ mod test_support;
 mod types;
 mod validate;
 
-pub use codec::literal::parse_bool;
 pub use ddl::render::{
     create_index_statements, create_schema_statement, create_table_statement, create_view_statement, qualified_name,
     view_body,
 };
 pub use error::GnitzSqlError;
+pub use literal::parse_bool;
 pub use source::Offsets;
 pub use sqlparser;
 pub use types::{sql_type_name, type_names};

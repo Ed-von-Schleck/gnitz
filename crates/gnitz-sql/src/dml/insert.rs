@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use super::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::ast_util::{extract_object_name, single_part_ident};
 use crate::bind::bind_constant;
 use crate::bind::{require_column, Catalog};
-use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;

@@ -31,7 +31,7 @@ pub(crate) fn parse_temporal(tc: TypeCode, s: &str) -> Option<i64> {
 }
 
 /// The refusal of string `s` as a spelling of type `ty`.
-pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
+pub(crate) fn invalid_literal(ty: ColType, s: &str) -> String {
     format!("invalid {ty} literal: '{s}'")
 }
 
@@ -40,32 +40,21 @@ pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
 /// that value narrowed.
 pub(crate) fn assign<R>(lit: &BExpr<R>, ty: ColType) -> Result<u128, String> {
     let stored = match ty.tc {
-        // SQL spells no infinity, so an infinite value is a literal past `f64`.
-        TypeCode::F64 => float_value(lit).map(|v| v.is_finite().then(|| u128::from(v.to_bits()))),
-        TypeCode::F32 => float_value(lit).map(|v| {
-            let f = gnitz_wire::narrow_f32(v).filter(|f| f.is_finite());
-            f.map(|f| u128::from(f.to_bits()))
-        }),
+        // SQL spells no infinity, so an infinite value is a literal past the float type.
+        TypeCode::F64 => lit
+            .float_literal()
+            .map(|v| v.is_finite().then(|| u128::from(v.to_bits()))),
+        TypeCode::F32 => lit
+            .float_literal()
+            .map(|v| v as f32)
+            .map(|f| f.is_finite().then(|| u128::from(f.to_bits()))),
         _ => place(lit, ty).map(Placed::stored),
     };
-    let v = stored
-        .map(|v| v.ok_or_else(|| format!("{ty} value out of range: {}", lit.literal_text())))
-        .transpose()?;
-    v.ok_or_else(|| match lit {
-        BExpr::LitStr(s) => invalid_literal(ty, s),
-        _ => format!("{} is not a {ty} value", lit.literal_text()),
-    })
-}
-
-/// A numeric literal as a float column's value. A magnitude past `i128` is
-/// included, which a DOUBLE holds and no integer parse would.
-pub(crate) fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
-    match lit {
-        BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v as f64),
-        BExpr::LitFloat { v, .. } => Some(*v),
-        BExpr::LitWide(n) if n.is_negative() => Some(-(n.mag as f64)),
-        BExpr::LitWide(n) => Some(n.mag as f64),
-        _ => None,
+    match (stored, lit) {
+        (Some(Some(v)), _) => Ok(v),
+        (Some(None), _) => Err(format!("{ty} value out of range: {}", lit.literal_text())),
+        (None, BExpr::LitStr(s)) => Err(invalid_literal(ty, s)),
+        (None, _) => Err(format!("{} is not a {ty} value", lit.literal_text())),
     }
 }
 
@@ -107,8 +96,7 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
         Some(_) if s > 0 && tc.is_temporal() => None,
         Some(fi) => Some(place_scaled(fi, v, s, ty.scale)),
         None if s > 0 => None,
-        None if tc == TypeCode::I128 => Some(Placed::At(v as u128)),
-        None if v < 0 => Some(Placed::Below { nearest: None }),
+        None if v < 0 && tc != TypeCode::I128 => Some(Placed::Below { nearest: None }),
         None => Some(Placed::At(v as u128)),
     }
 }

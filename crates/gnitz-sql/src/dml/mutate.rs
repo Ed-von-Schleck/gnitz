@@ -8,11 +8,11 @@
 //! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
+use super::colwrite::{append_value_to_col, check_not_null};
 use crate::ast_util::{
     classify_from, col_ref_parts, expr_any, extract_table_name_and_alias, single_part_ident, FromShape,
 };
 use crate::bind::{require_column, Catalog};
-use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::expr_lower::compile_scalar_evaluator;
