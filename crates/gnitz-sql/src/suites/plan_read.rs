@@ -585,7 +585,7 @@ fn a_parenthesized_column_reference_reads_like_a_bare_one() {
         let p = read(&cat, parens).unwrap_or_else(|e| panic!("`{parens}`: {e:?}"));
         let b = read(&cat, bare).unwrap();
         assert_eq!(p.spec(), b.spec(), "`{parens}`");
-        assert_eq!(visible(p.reply_schema()), visible(b.reply_schema()), "`{parens}`");
+        assert_eq!(p.reply_schema(), b.reply_schema(), "`{parens}`");
     }
     // Peeling the wrapper must not turn a computed item into a column reference.
     let s = read(&cat, "SELECT (v + 1) AS x FROM t").unwrap();
@@ -819,6 +819,11 @@ fn a_cte_expands_to_the_flat_query() {
             "SELECT id, v FROM t",
         ),
         ("WITH x AS (SELECT * FROM t) SELECT x.* FROM x", "SELECT t.* FROM t"),
+        // A hidden ORDER BY item that copies an earlier item only once substituted.
+        (
+            "WITH x AS (SELECT id, id AS k, v FROM t) SELECT v FROM x ORDER BY k",
+            "SELECT v FROM t ORDER BY id",
+        ),
         // An ORDER BY key names the CTE's column, whatever the source calls it.
         (
             "WITH x AS (SELECT id, g AS v, v AS g FROM t) SELECT id FROM x ORDER BY v",
@@ -833,7 +838,7 @@ fn a_cte_expands_to_the_flat_query() {
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
         assert_eq!(explain_lines(&c, false), explain_lines(&f, false), "`{cte}`");
         assert_eq!(c.spec(), f.spec(), "`{cte}`");
-        assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
+        assert_eq!(c.reply_schema(), f.reply_schema(), "`{cte}`");
     }
     for (sql, msg) in [
         ("WITH x AS (SELECT id FROM t) SELECT v FROM x", "column 'v' not found"),
@@ -986,7 +991,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let twin = read(&cat, named).unwrap_or_else(|e| panic!("`{named}`: {e:?}"));
-        assert_eq!(visible(plan.reply_schema()), visible(twin.reply_schema()), "`{sql}`");
+        assert_eq!(plan.reply_schema(), twin.reply_schema(), "`{sql}`");
         assert_eq!(explain(&cat, sql), explain(&cat, named), "`{sql}`");
     }
     for (sql, msg) in [
@@ -1195,7 +1200,7 @@ fn a_grouped_cte_reads_as_its_fold() {
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
         assert_eq!(explain_lines(&c, false), explain_lines(&f, false), "`{cte}`");
         assert_eq!(c.spec(), f.spec(), "`{cte}`");
-        assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
+        assert_eq!(c.reply_schema(), f.reply_schema(), "`{cte}`");
     }
 }
 

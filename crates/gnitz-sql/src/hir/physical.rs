@@ -208,12 +208,20 @@ pub(crate) fn physicalize_projection(
 
 /// Pin the source PK to slots `0..k` in PK-list order, as the engine's
 /// `project_schema` does: each PK column's first pass-through moves there, and
-/// one nothing passes through is prepended hidden.
+/// one nothing passes through is prepended hidden. A hidden key slot carries the
+/// source's definition of its column.
 fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source: &Schema) {
     for (target, &pk) in source.pk_cols().iter().enumerate() {
         let pk = pk as usize;
         let slot = match slots.iter().position(|(item, ..)| item.passthrough_src() == Some(pk)) {
-            Some(pos) => slots.remove(pos),
+            Some(pos) => {
+                let (item, id, def) = slots.remove(pos);
+                let def = match def.is_hidden {
+                    true => source.columns()[pk].clone().hidden(),
+                    false => def,
+                };
+                (item, id, def)
+            }
             None => (
                 ProjItem::PassThrough { src_col: pk },
                 None,

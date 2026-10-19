@@ -301,11 +301,9 @@ pub(crate) struct RowsReply {
     /// The ORDER BY keys over `schema`.
     pub(crate) order: Vec<OrderKey>,
     /// `order` as the worker's sink numbers its input: the program's output, key
-    /// region first, or the relation where there is no program.
+    /// region first, or the relation where there is no program. Empty where the
+    /// worker's walk already yields `order`.
     pub(crate) sink_order: Vec<OrderKey>,
-    /// Whether `order` ascends a leading run of the relation's PK columns, so
-    /// rows in store order are already in it.
-    pub(crate) pk_ordered: bool,
     /// `(relation column, reply column)` for each relation column an item copies
     /// verbatim, at the first item that does.
     pub(crate) copied: Vec<(u32, u32)>,
@@ -322,18 +320,13 @@ pub(crate) fn reply_rows(
     // A hidden item is an ORDER BY key; one an earlier item already computes sorts on it.
     let mut items: Vec<ProjEntry> = Vec::with_capacity(written.len());
     let mut at = Vec::with_capacity(written.len());
-    for mut it in written {
+    for it in written {
         let twin = match it.out.def.is_hidden {
             true => items.iter().position(|p| p.expr == it.expr),
             false => None,
         };
         at.push(twin.unwrap_or(items.len()));
         if twin.is_none() {
-            // A hidden copy of a key column is the key riding hidden, under its own definition.
-            let col = source.iter().position(|c| as_col(&it.expr) == Some(c.id));
-            if let Some(col) = col.filter(|&c| it.out.def.is_hidden && desc.schema.layout().is_pk_col(c)) {
-                it.out.def = source[col].def.clone().hidden();
-            }
             items.push(it);
         }
     }
@@ -349,8 +342,13 @@ pub(crate) fn reply_rows(
 }
 
 impl AdhocRows {
-    /// The reply, ordered by `keys`.
-    pub(crate) fn reply(self, keys: &[crate::tail::OrderKey<'_>]) -> Result<RowsReply, GnitzSqlError> {
+    /// The reply, ordered by `keys`, for a worker whose walk yields rows in the
+    /// relation's PK order when `walks_in_pk_order`.
+    pub(crate) fn reply(
+        self,
+        keys: &[crate::tail::OrderKey<'_>],
+        walks_in_pk_order: bool,
+    ) -> Result<RowsReply, GnitzSqlError> {
         let AdhocRows { src, cols, proj, layout, placed } = self;
         let item_order = wire_keys(keys, cols.iter().map(|c| &c.def), placed)?;
         let k = src.schema.pk_cols().len();
@@ -390,18 +388,20 @@ impl AdhocRows {
                 copied.push((src, column_of[slot]));
             }
         }
+        // A walk in PK order yields keys ascending a leading run of the PK columns.
+        let pk_ordered = slots.len() <= k
+            && slots
+                .iter()
+                .zip(src.schema.pk_cols())
+                .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
         Ok(RowsReply {
             order: numbered(&|slot| column_of[slot] as usize),
             // The worker's sink numbers its input: the program's output, or the relation.
-            sink_order: match unmapped {
-                true => numbered(&|slot| source_col(slot).expect("an unmapped reply copies every column")),
-                false => numbered(&|slot| slot),
+            sink_order: match (walks_in_pk_order && pk_ordered, unmapped) {
+                (true, _) => Vec::new(),
+                (false, true) => numbered(&|slot| source_col(slot).expect("an unmapped reply copies every column")),
+                (false, false) => numbered(&|slot| slot),
             },
-            pk_ordered: slots.len() <= k
-                && slots
-                    .iter()
-                    .zip(src.schema.pk_cols())
-                    .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize)),
             copied,
             program,
             schema: Arc::new(schema),

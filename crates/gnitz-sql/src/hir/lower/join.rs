@@ -36,10 +36,11 @@ pub(super) fn lower_join_view(
         unreachable!("lower_join_view receives a Join");
     };
     let kind = *kind;
-    let down = Demand { items, where_preds };
+    let mut refs = HashSet::new();
+    Demand { items, where_preds }.refs(&mut refs);
 
     let mut cb = Circuit::default();
-    let (inputs, sides) = emit_join_inputs(chain, &mut cb, down, [left, right], kind, class)?;
+    let (inputs, sides) = emit_join_inputs(chain, &mut cb, &refs, [left, right], kind, class)?;
 
     let out_key = class.out_key(kind);
     let out_pk = match out_key {
@@ -100,21 +101,16 @@ pub(super) fn lower_join_view(
 }
 
 /// A join's two inputs opened through the spine and emitted into `cb`, each
-/// carrying what `down` reads and its own keys, and kept under [`join_keep`].
+/// carrying the `refs` read above it and its own keys, and kept under [`join_keep`].
 fn emit_join_inputs(
     chain: &mut ViewChain,
     cb: &mut Circuit,
-    down: Demand<'_>,
+    refs: &HashSet<ColId>,
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
 ) -> Result<([NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
-    let live = |is_left: bool| {
-        let mut live = HashSet::new();
-        down.refs(&mut live);
-        live.extend(class.key_cols(is_left));
-        live
-    };
+    let live = |is_left: bool| -> HashSet<ColId> { refs.iter().copied().chain(class.key_cols(is_left)).collect() };
     let (live_l, live_r) = (live(true), live(false));
     let mut l = spine::open(chain, left, &live_l)?;
     let mut r = spine::open(chain, right, &live_r)?;
@@ -146,7 +142,7 @@ fn emit_join_inputs(
         false => (l.emit(cb, Top::Slots)?, r.emit(cb, Top::Slots)?),
     };
     let frames = [left_frame, right_frame];
-    let [kept_l, kept_r] = join_keep(down, class, kind, &frames)?;
+    let [kept_l, kept_r] = join_keep(refs, class, kind, &frames)?;
     let [frame_l, frame_r] = frames;
     let side = |frame: Frame, origin, (keep, pk_arity), is_left| -> Result<JoinSide, GnitzSqlError> {
         Ok(JoinSide {
@@ -229,7 +225,7 @@ impl JoinSide {
 /// a range. A wildcard projection is already expanded into `ProjEntry` column
 /// refs by bind, so Rule 1 covers `SELECT *`.
 fn join_keep(
-    down: Demand<'_>,
+    refs: &HashSet<ColId>,
     class: &JoinClass,
     kind: JoinType,
     frames: &[Frame; 2],
@@ -237,12 +233,7 @@ fn join_keep(
     let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
     // Rules 1 + 2: the projection and the WHERE over the join. The mark column is
     // in neither layout: the shell substitutes it per branch by its BOOLEAN constant.
-    let mut referenced: HashSet<ColId> = HashSet::new();
-    down.refs(&mut referenced);
-    if let JoinType::Mark(mark) = kind {
-        referenced.remove(&mark);
-    }
-    for id in referenced {
+    for &id in refs.iter().filter(|&&id| kind != JoinType::Mark(id)) {
         let side = usize::from(!frames[0].layout.contains(&Some(id)));
         keep[side][frames[side].slot(id)?] = true;
     }
@@ -264,11 +255,9 @@ fn join_keep(
                 keep[side][c as usize] = true;
             }
         }
-    }
-    // Rule 5, the fallback: a side with a ν needs an identity to subtract on. A
-    // side without a ν keeps nothing — column 0 would split one trace element per
-    // key into one per row.
-    for (side, is_left) in [(0, true), (1, false)] {
+        // Rule 5, the fallback: a side with a ν needs an identity to subtract on. A
+        // side without a ν keeps nothing — column 0 would split one trace element per
+        // key into one per row.
         if kind.has_nu(is_left) && !keep[side].contains(&true) {
             keep[side][0] = true;
         }

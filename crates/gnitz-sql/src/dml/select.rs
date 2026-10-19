@@ -300,22 +300,15 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 program,
                 order,
                 sink_order,
-                pk_ordered,
                 copied,
-            } = rows.reply(&keys)?;
+            } = rows.reply(&keys, in_pk_order)?;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
             let cut = window
                 .end()
                 .and_then(|end| NonZeroU64::new(end as u64))
-                .map(|k| RowsCut {
-                    k,
-                    // A worker walking in the order asked for meets its smallest rows
-                    // first, so it stops at the window instead of ranking every row.
-                    order: match pk_ordered && in_pk_order {
-                        true => Vec::new(),
-                        false => sink_order,
-                    },
-                });
+                // A worker walking in the order asked for meets its smallest rows
+                // first, so it stops at the window instead of ranking every row.
+                .map(|k| RowsCut { k, order: sink_order });
             let sink = ReadSink {
                 map: program.map(|p| compute_map(p, &reply_schema)),
                 kind: SinkKind::Rows { cut },

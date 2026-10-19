@@ -354,7 +354,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
         .as_deref()
         .map(|items| {
             let RowsReply { schema: out_schema, program, .. } =
-                crate::hir::bind_returning(items, &target, table_name.spelled_name())?.reply(&[])?;
+                crate::hir::bind_returning(items, &target, table_name.spelled_name())?.reply(&[], true)?;
             let map = program
                 .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                 .transpose()?;

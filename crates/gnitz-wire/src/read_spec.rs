@@ -81,9 +81,10 @@ pub struct ReadSink {
 pub struct RowsCut {
     /// OFFSET + LIMIT in logical rows (summed weight).
     pub k: NonZeroU64,
-    /// ORDER BY keys applied in sequence; `col` indexes the sink input (= the
-    /// reply layout). `len ≤ MAX_ORDER_KEYS`; empty = the first rows the walk
-    /// yields.
+    /// ORDER BY keys applied in sequence; `col` numbers the sink input: the
+    /// map's output (source PK first, then the declared slots), or the source
+    /// itself with no map. `len ≤ MAX_ORDER_KEYS`; empty = the first rows the
+    /// walk yields.
     pub order: Vec<OrderKey>,
 }
 
