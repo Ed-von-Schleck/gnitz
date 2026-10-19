@@ -32,9 +32,10 @@ pub(super) struct EmitCtx<'a> {
     /// The integral of each node some join probes.
     pub(super) integrals: Vec<Option<Integral>>,
     pub(super) sources: FxHashMap<u64, Scan>,
-    /// The view, where its store is the integral of its output node's register:
-    /// a bounded view's may hold a skeleton row in a row's place.
-    store_out: Option<u64>,
+    /// The view, whose store is the integral of its output node's register. A
+    /// bounded view's store may hold a skeleton row in a row's place, so its
+    /// output node is never a reduce: hydration refuses that shape.
+    view: u64,
 }
 
 /// One scanned source: the register its delta seeds, the register its scans read — the
@@ -54,13 +55,13 @@ impl<'a> EmitCtx<'a> {
         self.prog.declare(format!("{kind}_{nid}"), schema)
     }
 
-    /// `circuit` emitted whole under the routing `meta` derived from it.
-    /// `store_out`: the view, where its store holds its output node's rows.
+    /// `circuit` emitted whole under the routing `meta` derived from it, as the
+    /// plan of view `view`.
     pub(super) fn emit(
         circuit: &'a Circuit,
         registry: &'a RelationRegistry,
         meta: &'a ViewMeta,
-        store_out: Option<u64>,
+        view: u64,
     ) -> Result<Self, String> {
         let nodes = circuit.nodes().len();
         let mut ctx = EmitCtx {
@@ -72,7 +73,7 @@ impl<'a> EmitCtx<'a> {
             partials: vec![false; nodes],
             integrals: vec![None; nodes],
             sources: FxHashMap::default(),
-            store_out,
+            view,
         };
         for (nid, op) in circuit.ops() {
             let reg = emit_node(&mut ctx, nid, op)?;
@@ -81,12 +82,12 @@ impl<'a> EmitCtx<'a> {
         Ok(ctx)
     }
 
-    /// The output trace of reduce `nid`: the view's store where that
-    /// holds the node's rows, else a child declared under `kind`.
+    /// The output trace of reduce `nid`: the view's store where the node is the
+    /// output, else a child declared under `kind`.
     fn out_trace(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> Integral {
-        match self.store_out {
-            Some(view) if self.circuit.out() == nid => Integral::Relation(view),
-            _ => Integral::Own(self.declare_child(kind, nid, schema)),
+        match self.circuit.out() == nid {
+            true => Integral::Relation(self.view),
+            false => Integral::Own(self.declare_child(kind, nid, schema)),
         }
     }
 

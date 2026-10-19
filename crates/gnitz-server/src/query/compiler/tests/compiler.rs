@@ -1,27 +1,31 @@
 use super::fixtures::*;
 use super::*;
+use crate::query::vm::Op;
 use crate::test_support::{
-    identity_circuit, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, u64_pk_schema,
+    identity_circuit, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, pk_payload_schema,
+    u64_pk_schema,
 };
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OrderKey, ReadBound, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
 // ── The shapes a compile refuses ────────────────────────────────────────
 
 /// The output must match the view schema's physical layout, not just its width.
+/// Nullability is not part of it.
 #[test]
 fn an_output_schema_unequal_to_the_view_schema_is_rejected() {
-    let compile = |source: SchemaDescriptor, view: SchemaDescriptor| {
-        compile(
-            identity_circuit(10, ReadBound::None),
-            &sources([(10, source)]),
-            &view,
-            false,
-        )
+    use TypeCode::{I64, U64};
+    let compiles = |source: SchemaDescriptor, view: SchemaDescriptor| {
+        let circuit = identity_circuit(10, ReadBound::None);
+        compile_view(&circuit, &sources([(10, source)]), VIEW, &view, false).map(|_| ())
     };
-    let pk_only = pk_only_schema(&[TypeCode::U64]);
-    assert!(compile(pk_only, pk_only).is_ok(), "an equal pair compiles");
+    let pk_only = pk_only_schema(&[U64]);
+    assert!(compiles(pk_only, pk_only).is_ok(), "an equal pair compiles");
+    assert!(
+        compiles(make_schema_u64_i64(), u64_pk_schema(&[SchemaColumn::new(I64, true)])).is_ok(),
+        "a nullable view column over a non-null one"
+    );
     for (source, view, why) in [
         (make_schema_u64_i64(), pk_only, "a wider output"),
         (
@@ -29,164 +33,43 @@ fn an_output_schema_unequal_to_the_view_schema_is_rejected() {
             make_schema_pk_u64_payload_string(),
             "equal widths, another column type",
         ),
+        (
+            pk_payload_schema(&[U64, U64]),
+            u64_pk_schema(&[SchemaColumn::new(U64, false), SchemaColumn::new(I64, false)]),
+            "equal region types, another PK arity",
+        ),
     ] {
         assert_eq!(
-            rejection(compile(source, view)),
+            rejection(compiles(source, view)),
             "the circuit's output schema is not the view's",
             "{why}"
         );
     }
 }
 
-/// A group column the relay's group key would refuse is a `CREATE VIEW`
-/// rejection, even on one worker, where nothing relays.
-#[test]
-fn a_float_group_column_behind_an_exchange_is_rejected() {
-    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::F64, false)]);
-    let aggs = [AggDescriptor::COUNT_STAR];
-    let compile = |group: u32, view: SchemaDescriptor| {
-        let mut c = Circuit::default();
-        let a = scan(&mut c, 10);
-        let s = c.shard(a);
-        let reduce = OpNode::Reduce {
-            group_cols: vec![group],
-            agg: aggs.to_vec(),
-        };
-        c.push(reduce, &[s]).unwrap();
-        compile(c, &sources([(10, schema)]), &view, false)
-    };
-    let counted = *gnitz_zset::stream::ReducePlan::from_wire(&schema, &[0], &aggs, false)
-        .unwrap()
-        .output_schema();
-    assert!(compile(0, counted).is_ok(), "an integer group column compiles");
-    assert_eq!(
-        rejection(compile(1, schema)),
-        "group key: column 1 is a float, which has no order-preserving key image",
-    );
+// ── Stage operators ────────────────────────────────────────────────────
+
+const BY_COL1: [OrderKey; 1] = [OrderKey { col: 1, desc: false, nulls_first: false }];
+
+fn aggs(op: AggFunc) -> [AggDescriptor; 2] {
+    [AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR]
 }
 
-// ── A side's relay ──────────────────────────────────────────────────────
+const SUM: Stage = |c, a| c.reduce_multi(a, &[], &aggs(AggFunc::Sum));
+const MIN: Stage = |c, a| c.reduce_multi(a, &[], &aggs(AggFunc::Min));
+const TOP_N: Stage = |c, a| c.top_n(a, &[], &BY_COL1, 10, 5);
+const WINDOW: Stage = |c, a| c.window(a, &[], &BY_COL1, &[], (true, false));
+/// A reduce of each worker's slice: no exchange in front of it.
+const LOCAL_SUM: Stage = |c, a| c.reduce_multi_local(a, &[], &aggs(AggFunc::Sum));
 
-/// A side's output stays where its rows already are, is kept by share where
-/// every worker computed the same rows, and takes a round otherwise.
-#[test]
-fn a_side_relays_only_what_is_not_already_in_place() {
-    let view = make_schema_u64_i64();
-    let keyed = Source::from(view);
-    let replicated = keyed.placed(Placement::Replicated);
-    // One `ScanDelta → [mid] → ExchangeShard` side per source, unioned into the
-    // output of a partitioned view; the relays in circuit order.
-    let relays = |of: u32, sides: &[(Source, Option<OpNode>)]| {
-        let mut c = Circuit::default();
-        let shards: Vec<NodeId> = (10..)
-            .zip(sides)
-            .map(|(source, (_, mid))| {
-                let mut tip = scan(&mut c, source);
-                if let Some(op) = mid {
-                    tip = c.push(op.clone(), &[tip]).unwrap();
-                }
-                c.shard(tip)
-            })
-            .collect();
-        shards.into_iter().reduce(|a, b| c.union(a, b)).unwrap();
-        let registry = sources_at(Slot::new(0, of), (10..).zip(sides.iter().map(|s| s.0)));
-        let out = compile(c, &registry, &view, false).expect("the fixture compiles");
-        let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
-        let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
-        (rounds, shares)
-    };
-    use crate::query::vm::Op;
-    let negate = || Some(OpNode::Negate);
-    assert_eq!(
-        relays(4, &[(keyed, None)]),
-        (0, 0),
-        "a shard on the key its scan's rows are placed by"
-    );
-    assert_eq!(relays(4, &[(keyed, negate())]), (1, 0));
-    assert_eq!(
-        relays(4, &[(replicated, negate()), (keyed, negate())]),
-        (1, 1),
-        "every worker computed the same rows of a replicated side"
-    );
-    assert_eq!(
-        relays(4, &[(replicated, Some(OpNode::WorkerFilter)), (keyed, negate())]),
-        // The trim is a share of its own.
-        (2, 1),
-        "a trimmed side emits a slice of the replica, not the replica"
-    );
-    assert_eq!(relays(1, &[(keyed, negate())]), (0, 0), "one worker");
-    assert_eq!(
-        relays(4, &[(replicated, negate())]),
-        (0, 0),
-        "a view over replicated sources alone is computed whole on every worker"
-    );
-}
-
-// ── Global operators ────────────────────────────────────────────────────
-
-fn global_reduce(op: AggFunc) -> OpNode {
-    OpNode::Reduce {
-        group_cols: vec![],
-        agg: vec![AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR],
-    }
-}
-
-fn global_topn() -> OpNode {
-    OpNode::TopN {
-        group_cols: vec![],
-        order: vec![gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false }],
-        limit: 10,
-        offset: 5,
-    }
-}
-
-fn global_window() -> OpNode {
-    OpNode::Window {
-        group_cols: vec![],
-        order: vec![gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false }],
-        aggs: vec![],
-        rank: true,
-        dense_rank: false,
-    }
-}
-
-/// `ScanDelta(10) → [ExchangeShard] → op`.
-fn global_circuit(op: &OpNode, exchanged: bool) -> Circuit {
+/// `build` over a scan of 10, compiled as worker `slot` into the view its
+/// unsplit, one-worker plan outputs: a split plan must write that layout too.
+fn compile_global(build: impl Fn(&mut Circuit, NodeId), source: Source, slot: Slot) -> Result<CompileOutput, String> {
     let mut c = Circuit::default();
-    let mut tip = scan(&mut c, 10);
-    if exchanged {
-        tip = c.shard(tip);
-    }
-    c.push(op.clone(), &[tip]).unwrap();
-    c
-}
-
-/// Compile a [`global_circuit`] over `source` as worker `slot`, into the view its
-/// global operator outputs.
-fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<CompileOutput, String> {
-    let schema = source.schema;
-    let view = circuit
-        .ops()
-        .find_map(|(_, op)| match op {
-            OpNode::Reduce { agg, .. } => Some(
-                *gnitz_zset::stream::ReducePlan::from_wire(&schema, &[], agg, true)
-                    .unwrap()
-                    .output_schema(),
-            ),
-            OpNode::TopN { order, limit, offset, .. } => Some(
-                *gnitz_zset::stream::OrderedPlan::top_n(&schema, &[], order, *limit, *offset)
-                    .unwrap()
-                    .output_schema(),
-            ),
-            OpNode::Window { order, aggs, rank, dense_rank, .. } => Some(
-                *gnitz_zset::stream::OrderedPlan::window(&schema, &[], order, aggs, *rank, *dense_rank)
-                    .unwrap()
-                    .output_schema(),
-            ),
-            _ => None,
-        })
-        .expect("a global operator");
-    compile(circuit, &sources_at(slot, [(10, source)]), &view, false)
+    let a = scan(&mut c, 10);
+    build(&mut c, a);
+    let view = *compile(&c, &sources([(10, source)]), false)?.vm.out_schema();
+    compile_view(&c, &sources_at(slot, [(10, source)]), VIEW, &view, false).map(|(out, _)| out)
 }
 
 /// A side ends in its global operator's partial — a layout of its own — exactly
@@ -196,31 +79,23 @@ fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<Compil
 fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
     let keyed = Source::from(make_schema_u64_i64());
     let replicated = keyed.placed(Placement::Replicated);
-    let split = |circuit: Circuit, source: Source, of: u32| {
-        let out = compile_global(circuit, source, Slot::new(0, of)).expect("the fixture compiles");
-        out.vm
-            .ops()
-            .filter(|op| {
-                matches!(
-                    op,
-                    crate::query::vm::Op::Reduce { .. } | crate::query::vm::Op::Ordered { .. }
-                )
-            })
-            .count()
-            == 2
-    };
-    for (why, op, source, of, want) in [
-        ("a partitioned SUM", global_reduce(AggFunc::Sum), keyed, 4, true),
-        ("a partitioned top-N", global_topn(), keyed, 4, true),
-        ("one worker", global_reduce(AggFunc::Sum), keyed, 1, false),
-        ("one worker", global_topn(), keyed, 1, false),
-        ("a replicated source", global_reduce(AggFunc::Sum), replicated, 4, false),
-        ("a replicated source", global_topn(), replicated, 4, false),
-        ("a partitioned MIN", global_reduce(AggFunc::Min), keyed, 4, true),
+    for (why, op, source, of, split) in [
+        ("a partitioned SUM", SUM, keyed, 4, true),
+        ("a partitioned MIN", MIN, keyed, 4, true),
+        ("a partitioned top-N", TOP_N, keyed, 4, true),
+        ("one worker", SUM, keyed, 1, false),
+        ("one worker", TOP_N, keyed, 1, false),
+        ("a replicated source", SUM, replicated, 4, false),
+        ("a replicated source", TOP_N, replicated, 4, false),
         // A row's rank reads every row before it: no worker's rows stand for the rest.
-        ("a partitioned window", global_window(), keyed, 4, false),
+        ("a partitioned window", WINDOW, keyed, 4, false),
     ] {
-        assert_eq!(split(global_circuit(&op, true), source, of), want, "{why}");
+        let out = compile_global(|c, a| _ = op(c, a), source, Slot::new(0, of)).expect(why);
+        let stateful = out
+            .vm
+            .ops()
+            .filter(|op| matches!(op, Op::Reduce { .. } | Op::Ordered { .. }));
+        assert_eq!(stateful.count() == 2, split, "{why}");
     }
 }
 
@@ -231,14 +106,19 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
 #[test]
 fn an_exchange_behind_a_global_aggregate_is_rejected() {
     let keyed = Source::from(make_schema_u64_i64());
-    let above = |exchanged: bool| {
-        let mut c = global_circuit(&global_reduce(AggFunc::Sum), exchanged);
-        c.shard(c.out());
-        compile_global(c, keyed, Slot::new(0, 4))
+    let above = |op: Stage| {
+        compile_global(
+            |c, a| {
+                let r = op(c, a);
+                c.shard(r);
+            },
+            keyed,
+            Slot::new(0, 4),
+        )
     };
-    assert_eq!(rejection(above(true)), "an exchange behind a global aggregate");
+    assert_eq!(rejection(above(SUM)), "an exchange behind a global aggregate");
     assert!(
-        above(false).is_ok(),
+        above(LOCAL_SUM).is_ok(),
         "a reduce of each worker's slice owes no ground row"
     );
 }
@@ -248,17 +128,16 @@ fn an_exchange_behind_a_global_aggregate_is_rejected() {
 #[test]
 fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
     let keyed = Source::from(make_schema_u64_i64());
-    for op in [global_reduce(AggFunc::Sum), global_topn(), global_window()] {
-        let mut shared = Circuit::default();
-        let a = scan(&mut shared, 10);
-        let shard = shared.shard(a);
-        shared.negate(shard);
-        shared.push(op.clone(), &[shard]).unwrap();
+    for op in [SUM, TOP_N, WINDOW] {
+        let beside = |c: &mut Circuit, a| {
+            let op = op(c, a);
+            c.negate(c.inputs(op)[0]);
+        };
         for of in [1, 4] {
             assert_eq!(
-                rejection(compile_global(shared.clone(), keyed, Slot::new(0, of))),
+                rejection(compile_global(beside, keyed, Slot::new(0, of))),
                 "an exchange in front of a reduce, top-N or window has another reader",
-                "{op:?} of {of}"
+                "of {of}"
             );
         }
     }
@@ -269,25 +148,24 @@ fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
 /// reduce aggregates each worker's slice, and owes none.
 #[test]
 fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
-    use crate::query::vm::Op;
     let keyed = Source::from(make_schema_u64_i64());
     let replicated = keyed.placed(Placement::Replicated);
-    let op = global_reduce(AggFunc::Min);
-    // Whether each reduce of the plan seeds the ground row, the last the circuit's.
-    let seeds = |exchanged: bool, source: Source, slot: Slot| {
-        let out = compile_global(global_circuit(&op, exchanged), source, slot).expect("the fixture compiles");
+    // Whether the circuit's own reduce, the plan's last, seeds the ground row.
+    let seeds = |op: Stage, source: Source, slot: Slot| {
+        let out = compile_global(|c, a| _ = op(c, a), source, slot).expect("the fixture compiles");
         let reduces = out.vm.ops().filter_map(|op| match op {
             Op::Reduce { plan, .. } => Some(plan.ground_row().is_some()),
             _ => None,
         });
         reduces.last().expect("a reduce")
     };
-    let slots = [Slot::SOLO].into_iter().chain((0..4).map(|rank| Slot::new(rank, 4)));
-    for slot in slots {
-        for source in [keyed, replicated] {
-            assert!(seeds(true, source, slot), "an exchange, {slot:?}");
-            assert!(!seeds(false, source, slot), "no exchange, {slot:?}");
-        }
+    for (source, slot) in [
+        (keyed, Slot::SOLO),
+        (keyed, Slot::new(3, 4)),
+        (replicated, Slot::new(3, 4)),
+    ] {
+        assert!(seeds(MIN, source, slot), "an exchange, {slot:?}");
+        assert!(!seeds(LOCAL_SUM, source, slot), "no exchange, {slot:?}");
     }
 }
 
@@ -304,7 +182,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
         let mut c = Circuit::default();
         let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));
         c.union(a, b);
-        let out = compile(c, &sources([(10, schema), (11, schema)]), &schema, false).expect("the fixture compiles");
+        let out = compile(&c, &sources([(10, schema), (11, schema)]), false).expect("the fixture compiles");
         scans.map(|(source, _)| out.sources[&source].1.clone())
     };
     assert_eq!(

@@ -123,8 +123,7 @@ pub(super) fn compile_view(
     bounded: bool,
 ) -> Result<(CompileOutput, Placement), String> {
     let (meta, placement) = ViewMeta::derive(circuit, registry, view_schema)?;
-    let EmitCtx { prog, regs, integrals, sources, .. } =
-        EmitCtx::emit(circuit, registry, &meta, (!bounded).then_some(view_id))?;
+    let EmitCtx { prog, regs, integrals, sources, .. } = EmitCtx::emit(circuit, registry, &meta, view_id)?;
     let vm = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
@@ -132,7 +131,7 @@ pub(super) fn compile_view(
         return Err("the circuit's output schema is not the view's".into());
     }
     let hydration = bounded
-        .then(|| derive_hydration(circuit, registry, view_schema, &vm, &regs, &integrals))
+        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals))
         .transpose()?;
     let sources = sources
         .into_iter()

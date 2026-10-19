@@ -1,502 +1,617 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::query::vm::Vm;
-use crate::test_support::make_schema_u64_i64;
-use gnitz_wire::{Circuit, JoinKind};
+use crate::test_support::{make_schema_u64_i64, reindexed_on_col1, scan_keyed, self_typed_slots};
+use gnitz_store::relation::RelationKind::{self, BaseTable, Stream};
+use gnitz_wire::{AggDescriptor, Circuit, JoinKind, ReindexSlot, TypeCode};
+use gnitz_zset::algebra::{Placement, Slot};
+use gnitz_zset::schema::SchemaColumn;
 
-/// Exchange-free `build` emitted whole, as one worker's plan over sources 10 and 11.
-fn plan(build: Build) -> Result<Vm, String> {
+/// `build` compiled whole over `registry`.
+fn plan(registry: &RelationRegistry, build: impl FnOnce(&mut Circuit)) -> Result<Vm, String> {
     let mut c = Circuit::default();
     build(&mut c);
-    let schema = make_schema_u64_i64();
-    let registry = sources([(10, schema), (11, schema)]);
-    let meta = routing(&c, &registry)?;
-    EmitCtx::emit(&c, &registry, &meta, None).map(|ctx| ctx.prog.finish(ctx.regs[c.out()]))
+    compile(&c, registry, false).map(|out| out.vm)
 }
 
 /// A join's two terms each read the other side as it stood before the epoch, so
 /// a relation feeding both deltas would lose their product in every epoch of
 /// it — whether through two scans or through one delta computed from the other.
-#[test]
-fn a_join_whose_deltas_one_relation_feeds_is_rejected() {
-    use crate::test_support::reindexed_on_col1;
-    use gnitz_wire::TypeCode::I64;
-    let twice = plan(|c| {
-        let deltas = [10, 10].map(|s| reindexed_on_col1(c, s, I64));
-        c.join(deltas, deltas, JoinKind::Equi);
-    });
-    let derived = plan(|c| {
-        let da = reindexed_on_col1(c, 10, I64);
-        let _ = reindexed_on_col1(c, 11, I64);
-        let dm = c.negate(da);
-        c.join([da, dm], [da, dm], JoinKind::Equi);
-    });
-    for built in [twice, derived] {
-        assert_eq!(rejection(built), "join: one relation feeds both deltas");
-    }
-    assert!(plan(|c| {
-        let deltas = [10, 11].map(|s| reindexed_on_col1(c, s, I64));
-        c.join(deltas, deltas, JoinKind::Equi);
-    })
-    .is_ok());
-}
-
 /// A `Filter` program that does not decode aborts the compile: passing every row
 /// instead would turn the WHERE into WHERE TRUE.
 #[test]
-fn a_corrupt_filter_program_aborts_the_compile() {
-    let garbled = plan(|c| {
-        let a = scan(c, 10);
-        c.filter(a, vec![0xFF; 16]);
-    });
-    let empty = plan(|c| {
-        let a = scan(c, 10);
-        c.filter(a, Vec::new());
-    });
-    for built in [garbled, empty] {
-        assert!(rejection(built).starts_with("filter: invalid predicate program"));
+fn a_join_one_relation_feeds_twice_and_a_corrupt_filter_are_rejected() {
+    use TypeCode::I64;
+    let schema = make_schema_u64_i64();
+    let registry = sources([(10, schema), (11, schema)]);
+    let cases: [(Build, &str); 4] = [
+        (
+            |c| {
+                let deltas = [10, 10].map(|s| reindexed_on_col1(c, s, I64));
+                c.join(deltas, deltas, JoinKind::Equi);
+            },
+            "join: one relation feeds both deltas",
+        ),
+        (
+            |c| {
+                let da = reindexed_on_col1(c, 10, I64);
+                let dm = c.negate(da);
+                c.join([da, dm], [da, dm], JoinKind::Equi);
+            },
+            "join: one relation feeds both deltas",
+        ),
+        (
+            |c| {
+                let a = scan(c, 10);
+                c.filter(a, vec![0xFF; 16]);
+            },
+            "filter: invalid predicate program",
+        ),
+        (
+            |c| {
+                let a = scan(c, 10);
+                c.filter(a, Vec::new());
+            },
+            "filter: invalid predicate program",
+        ),
+    ];
+    for (build, guard) in cases {
+        let refused = rejection(plan(&registry, build));
+        assert!(refused.starts_with(guard), "{guard}: got {refused}");
     }
+    let two = plan(&registry, |c| {
+        let deltas = [10, 11].map(|s| reindexed_on_col1(c, s, I64));
+        c.join(deltas, deltas, JoinKind::Equi);
+    });
+    assert!(two.is_ok(), "two relations, one delta each");
 }
 
 // ── An integral that is its source's own store ────────────────────────────
 
-/// What varies of relation 10 `(a, b | v)`, keyed `(a, b)`, and of the table it
-/// is joined with.
-#[derive(Clone, Copy)]
-struct Wide {
-    kind: gnitz_store::relation::RelationKind,
-    placement: fn(&SchemaDescriptor) -> gnitz_zset::algebra::Placement,
-    a: gnitz_wire::TypeCode,
-    /// Table 11 is replicated, where it is otherwise placed by its PK.
-    replicated_partner: bool,
+/// `(a, b | v)` keyed `(a, b)`, `a` of type `a` and the rest U64.
+fn ab(a: TypeCode) -> SchemaDescriptor {
+    let col = SchemaColumn::new(TypeCode::U64, false);
+    SchemaDescriptor::new(&[SchemaColumn::new(a, false), col, col], &[0, 1])
 }
 
-/// Relation 10 as `wide` has it and table 11 `(k | w)`, registered for worker
-/// `slot` under a fresh directory.
-fn two_tables(slot: gnitz_zset::algebra::Slot, wide: Wide) -> (RelationRegistry, tempfile::TempDir) {
-    use gnitz_store::relation::RelationKind;
-    use gnitz_zset::algebra::Placement;
-    use gnitz_zset::schema::SchemaColumn;
-    let col = SchemaColumn::new(gnitz_wire::TypeCode::U64, false);
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(wide.a, false), col, col], &[0, 1]);
-    let partner = Source::from(make_schema_u64_i64());
-    let partner = match wide.replicated_partner {
-        true => partner.placed(Placement::Replicated),
-        false => partner,
-    };
-    tables_at(
-        slot,
-        [
-            (10, wide.kind, Source::from(schema).placed((wide.placement)(&schema))),
-            (11, RelationKind::BaseTable, partner),
-        ],
-    )
-}
-
-/// The integral of the node `build` answers and every child declared, as its
-/// circuit compiled on worker `slot` under the routing derived from it.
-fn trace_and_children(
-    slot: gnitz_zset::algebra::Slot,
-    wide: Wide,
-    build: fn(&mut Circuit) -> NodeId,
-) -> (Integral, Vec<String>) {
-    let (registry, _dir) = two_tables(slot, wide);
-    let mut c = Circuit::default();
-    let integrand = build(&mut c);
-    let meta = routing(&c, &registry).unwrap();
-    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    let integral = ctx.integrals[integrand].expect("a join probes the integrand");
-    let vm = ctx.prog.finish(ctx.regs[c.out()]);
-    (integral, vm.layout().names().map(str::to_string).collect())
-}
-
-fn trace_of(slot: gnitz_zset::algebra::Slot, wide: Wide, build: fn(&mut Circuit) -> NodeId) -> Integral {
-    trace_and_children(slot, wide, build).0
-}
-
-/// `10 ⋈ 11` on `10.a = 11.k`: 10 re-keyed onto `key`, `through` in between,
-/// each side stating its key as its route; answers 10's re-key, the node 11's
-/// delta probes the integral of.
-fn rekeyed_join(
-    c: &mut Circuit,
-    key: &[gnitz_wire::ReindexSlot],
-    through: fn(&mut Circuit, NodeId) -> NodeId,
-    kind: JoinKind,
-) -> NodeId {
+/// `10 ⋈ 11` on `10.a = 11.k`, 11 being `(k | w)`: 10 re-keyed onto `key`, a
+/// `distinct` in between where `distinct`, each side stating its key as its route.
+fn rekeyed_join(c: &mut Circuit, key: &[ReindexSlot], distinct: bool, kind: JoinKind) {
     use gnitz_wire::{NullKeys, ReindexRole};
-    let role = |key: &[gnitz_wire::ReindexSlot]| ReindexRole::ScatterKey {
+    let role = |key: &[ReindexSlot]| ReindexRole::ScatterKey {
         source_cols: key.iter().map(|slot| slot.0).collect(),
     };
-    let (a, b) = (scan(c, 10), scan(c, 11));
-    let a = through(c, a);
+    let (mut a, b) = (scan(c, 10), scan(c, 11));
+    if distinct {
+        a = c.distinct(a);
+    }
     let ra = c.map_reindex(a, key, &[1, 2], role(key), NullKeys::Drop);
     // Both sides pack at the one type the pair shares.
     let b_key = [(0, key[0].1)];
     let rb = c.map_reindex(b, &b_key, &[1], role(&b_key), NullKeys::Drop);
     c.join([ra, rb], [ra, rb], kind);
-    ra
 }
 
-const A: [gnitz_wire::ReindexSlot; 1] = [(0, gnitz_wire::TypeCode::U64)];
-
-/// Nothing between the scan and the re-key.
-fn id(_: &mut Circuit, n: NodeId) -> NodeId {
-    n
-}
+const A: [ReindexSlot; 1] = [(0, TypeCode::U64)];
+const ON_A: Build = |c| rekeyed_join(c, &A, false, JoinKind::Equi);
 
 /// An integral is read off its source table exactly where the table's store
 /// holds, on this worker and in key order, every row the integral would.
 #[test]
 fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
-    use gnitz_store::relation::RelationKind::{BaseTable, Stream};
-    use gnitz_wire::TypeCode::{U128, U32, U64, UUID};
-    use gnitz_zset::algebra::{Placement, Slot};
-    let is_source = |t: Integral| t == Integral::Relation(10);
-    let table = Wide {
-        kind: BaseTable,
-        placement: Placement::full_pk,
-        a: U64,
-        replicated_partner: false,
-    };
-    let on_a: fn(&mut Circuit) -> NodeId = |c| rekeyed_join(c, &A, id, JoinKind::Equi);
-
-    assert!(is_source(trace_of(Slot::SOLO, table, on_a)), "a PK prefix");
-    assert!(
-        !is_source(trace_of(Slot::SOLO, table, |c| {
-            rekeyed_join(c, &[(1, U64)], id, JoinKind::Equi)
-        })),
-        "a key that is no PK prefix"
-    );
-    assert!(
-        !is_source(trace_of(Slot::SOLO, table, |c| {
-            rekeyed_join(c, &A, |c, n| c.distinct(n), JoinKind::Equi)
-        })),
-        "an operator between the scan and the re-key"
-    );
-    assert!(
-        !is_source(trace_of(Slot::SOLO, table, |c| {
-            let rel = gnitz_wire::RangeRel::Lt;
-            rekeyed_join(c, &A, id, JoinKind::Range { rel })
-        })),
-        "a join that walks a range of keys"
-    );
-    assert!(
-        !is_source(trace_of(Slot::SOLO, Wide { a: U32, ..table }, on_a)),
-        "a key packed wider than its column"
-    );
-    assert!(
-        is_source(trace_of(Slot::SOLO, Wide { a: UUID, ..table }, |c| {
-            rekeyed_join(c, &[(0, U128)], id, JoinKind::Equi)
-        })),
-        "a key packed at another type of the same bytes"
-    );
-    assert!(
-        !is_source(trace_of(Slot::SOLO, Wide { kind: Stream, ..table }, on_a)),
-        "a stream holds no rows"
-    );
-
+    use TypeCode::{U128, U32, U64, UUID};
+    let table = Source::from(ab(U64));
+    let partner = Source::from(make_schema_u64_i64());
     // Beside other workers, the table's delta must also stay where the table
     // holds it.
     let third = Slot::new(2, 4);
-    let by_a = Wide {
-        placement: |s| Placement::keyed(s, 1),
-        ..table
-    };
-    assert!(is_source(trace_of(third, by_a, on_a)), "placed by the key");
-    assert!(
-        is_source(trace_of(
+    let cases: [(&str, Slot, RelationKind, Source, Source, Build, bool); 11] = [
+        ("a PK prefix", Slot::SOLO, BaseTable, table, partner, ON_A, true),
+        (
+            "a key that is no PK prefix",
+            Slot::SOLO,
+            BaseTable,
+            table,
+            partner,
+            |c| rekeyed_join(c, &[(1, U64)], false, JoinKind::Equi),
+            false,
+        ),
+        (
+            "an operator between the scan and the re-key",
+            Slot::SOLO,
+            BaseTable,
+            table,
+            partner,
+            |c| rekeyed_join(c, &A, true, JoinKind::Equi),
+            false,
+        ),
+        (
+            "a join that walks a range of keys",
+            Slot::SOLO,
+            BaseTable,
+            table,
+            partner,
+            |c| rekeyed_join(c, &A, false, JoinKind::Range { rel: gnitz_wire::RangeRel::Lt }),
+            false,
+        ),
+        (
+            "a key packed wider than its column",
+            Slot::SOLO,
+            BaseTable,
+            ab(U32).into(),
+            partner,
+            ON_A,
+            false,
+        ),
+        (
+            "a key packed at another type of the same bytes",
+            Slot::SOLO,
+            BaseTable,
+            ab(UUID).into(),
+            partner,
+            |c| rekeyed_join(c, &[(0, U128)], false, JoinKind::Equi),
+            true,
+        ),
+        (
+            "a stream holds no rows",
+            Slot::SOLO,
+            Stream,
+            table,
+            partner,
+            ON_A,
+            false,
+        ),
+        (
+            "placed by the key",
             third,
-            Wide {
-                placement: |_| Placement::Replicated,
-                ..table
-            },
-            on_a
-        )),
-        "replicated"
-    );
-    assert!(
-        !is_source(trace_of(third, table, on_a)),
-        "placed by the whole PK, relayed by the key"
-    );
-    // A replicated partner makes every match where the row already is, so the
-    // delta takes no relay.
-    let (trace, children) = trace_and_children(third, Wide { replicated_partner: true, ..table }, on_a);
-    assert!(is_source(trace), "placed by the whole PK beside a replicated partner");
-    assert!(!children.iter().any(|name| name.starts_with("int_")), "{children:?}");
-}
-
-/// Seeding a bounded view's replay reads the integral of side A's delta: the
-/// child the other term's join declared, or the table's own store where that is
-/// the integral.
-#[test]
-fn a_bounded_join_seeds_from_a_stored_integral_and_from_a_source_store() {
-    use gnitz_store::relation::RelationKind::BaseTable;
-    use gnitz_zset::algebra::{Placement, Slot};
-    let table = Wide {
-        kind: BaseTable,
-        placement: Placement::full_pk,
-        a: gnitz_wire::TypeCode::U64,
-        replicated_partner: false,
-    };
-    let seed = |build: fn(&mut Circuit) -> NodeId| {
-        let (registry, _dir) = two_tables(Slot::SOLO, table);
-        let mut c = Circuit::default();
-        build(&mut c);
-        let meta = routing(&c, &registry).unwrap();
-        let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-        let view = ctx.prog.schema_of(ctx.regs[c.out()]);
-        let out = compile(c, &registry, &view, true).unwrap();
-        out.hydration.expect("a bounded view").seed
-    };
-    assert_eq!(
-        seed(|c| rekeyed_join(c, &A, id, JoinKind::Equi)),
-        Integral::Relation(10)
-    );
-    assert!(matches!(
-        seed(|c| rekeyed_join(c, &A, |c, n| c.distinct(n), JoinKind::Equi)),
-        Integral::Own(_)
-    ));
+            BaseTable,
+            table.placed(Placement::keyed(&table.schema, 1)),
+            partner,
+            ON_A,
+            true,
+        ),
+        (
+            "replicated",
+            third,
+            BaseTable,
+            table.placed(Placement::Replicated),
+            partner,
+            ON_A,
+            true,
+        ),
+        (
+            "placed by the whole PK, relayed by the key",
+            third,
+            BaseTable,
+            table,
+            partner,
+            ON_A,
+            false,
+        ),
+        // A replicated partner makes every match where the row already is, so the
+        // delta takes no relay.
+        (
+            "placed by the whole PK beside a replicated partner",
+            third,
+            BaseTable,
+            table,
+            partner.placed(Placement::Replicated),
+            ON_A,
+            true,
+        ),
+    ];
+    for (why, slot, kind, wide, partner, build, want) in cases {
+        let (registry, _dir) = tables_at(slot, [(10, kind, wide), (11, BaseTable, partner)]);
+        let vm = plan(&registry, build).expect(why);
+        let reads_10 = vm
+            .ops()
+            .any(|op| matches!(op, Op::JoinDT { trace: Integral::Relation(10), .. }));
+        assert_eq!(reads_10, want, "{why}");
+    }
 }
 
 // ── One integral per integrand ────────────────────────────────────────────
 
-/// [`left_join_circuit`] of table 10 `(id | nn, nullable)` and table 11 `(id | k, w)`,
-/// every column a U64, on column `key` of 10, compiled whole for one worker.
-/// Answers 10's join re-key beside the plan.
-fn left_join_plan(key: u32) -> (Vm, Vec<String>, NodeId) {
-    use gnitz_wire::TypeCode::U64;
-    use gnitz_zset::schema::SchemaColumn;
+/// A join names the node whose integral it probes, so the two joins reading the
+/// preserved side's re-key — the inner term and the matched term — share one
+/// store.
+#[test]
+fn two_joins_probing_one_integrand_share_one_integral() {
+    use TypeCode::U64;
     let (nn, nullable) = (SchemaColumn::new(U64, false), SchemaColumn::new(U64, true));
     let a = SchemaDescriptor::new(&[nn, nn, nullable], &[0]);
     let b = SchemaDescriptor::new(&[nn, nn, nn], &[0]);
-    let (c, ra) = crate::test_support::left_join_circuit(10, 11, key);
-    let registry = sources([(10, a), (11, b)]);
-    let meta = routing(&c, &registry).unwrap();
-    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    let vm = ctx.prog.finish(ctx.regs[c.out()]);
-    let names = vm.layout().names().map(str::to_string).collect();
-    (vm, names, ra)
-}
-
-/// A join names the node whose integral it probes, so the two joins reading the
-/// preserved side's re-key — the inner term and the matched term — share one
-/// store, and every child of the view has a name of its own.
-#[test]
-fn two_joins_probing_one_integrand_declare_one_child() {
-    let (vm, names, ra) = left_join_plan(1);
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    assert_eq!(names.iter().filter(|n| **n == format!("int_{ra}")).count(), 1);
-    assert_eq!(
-        names.iter().filter(|n| n.starts_with("int_")).count(),
-        3,
-        "A's re-key, B's, and B's key set: {names:?}"
-    );
-    let mut distinct = names.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    assert_eq!(distinct.len(), names.len(), "{names:?}");
-    assert_eq!(vm.ops().filter(|op| matches!(op, Op::JoinDT { .. })).count(), 4);
+    let (c, _) = crate::test_support::left_join_circuit(10, 11, 1);
+    let vm = compile(&c, &sources([(10, a), (11, b)]), false).unwrap().vm;
+    let (mut probes, mut distinct) = (0, Vec::new());
+    for op in vm.ops() {
+        if let Op::JoinDT { trace, .. } = op {
+            probes += 1;
+            if !distinct.contains(trace) {
+                distinct.push(*trace);
+            }
+        }
+    }
+    assert_eq!(probes, 4, "the inner and the matched join's two terms each");
+    assert_eq!(distinct.len(), 3, "A's re-key, B's, and B's key set: {distinct:?}");
 }
 
 // ── A reduce whose output is the view's ───────────────────────────────────
 
-/// The children declared by a plan over table 10 `(id | v)` whose last node is
-/// `tip`'s, output as `out` makes of it.
-fn children_of(tip: fn(&mut Circuit, NodeId) -> NodeId, store: bool) -> Vec<String> {
-    let mut c = Circuit::default();
-    let a = scan(&mut c, 10);
-    tip(&mut c, a);
-    let registry = sources([(10, make_schema_u64_i64())]);
-    let meta = routing(&c, &registry).unwrap();
-    let ctx = EmitCtx::emit(&c, &registry, &meta, store.then_some(VIEW)).unwrap();
-    let vm = ctx.prog.finish(ctx.regs[c.out()]);
-    vm.layout().names().map(str::to_string).collect()
-}
-
-/// A reduce that is the view's output declares no output trace where the view's
-/// store holds every row it emits. A bounded view's does not, and behind another
-/// operator the store holds other rows than the trace would.
+/// A reduce that is the view's output reads the view's store as its output
+/// trace; behind another operator the store holds other rows than the trace would.
 #[test]
 fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
-    use gnitz_wire::{AggDescriptor, OpNode, OrderKey};
-    let reduce = |c: &mut Circuit, a| c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
-    // No exchange in front of it: the plan is one worker's.
-    let top = |c: &mut Circuit, a| {
-        let op = OpNode::TopN {
-            group_cols: vec![1],
-            order: vec![OrderKey { col: 0, desc: true, nulls_first: false }],
-            limit: 3,
-            offset: 0,
-        };
-        c.push(op, &[a]).unwrap()
-    };
-    let negated = |c: &mut Circuit, a| {
-        let r = c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
-        c.negate(r)
-    };
-    assert_eq!(children_of(reduce, true), [""; 0]);
-    assert_eq!(children_of(reduce, false), ["reduce_1"]);
-    assert_eq!(children_of(top, true), ["topnidx_1"]);
-    assert_eq!(children_of(top, false), ["topnidx_1"]);
-    assert_eq!(children_of(negated, true), ["reduce_1"]);
+    let cases: [(&str, Stage, bool); 2] = [
+        (
+            "the output",
+            |c, a| c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]),
+            true,
+        ),
+        (
+            "behind a negate",
+            |c, a| {
+                let r = c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
+                c.negate(r)
+            },
+            false,
+        ),
+    ];
+    let registry = sources([(10, make_schema_u64_i64())]);
+    for (why, tip, want) in cases {
+        let vm = plan(&registry, |c| {
+            let a = scan(c, 10);
+            tip(c, a);
+        })
+        .expect(why);
+        assert_eq!(vm.reads_view_store(), want, "{why}");
+    }
 }
 
-// ── A routed source's relay ───────────────────────────────────────────────
+// ── A delta's relay ───────────────────────────────────────────────────────
 
-/// The relays of a plan over sources 7 and 9, beside three other workers:
+/// The relays of `build`'s plan over sources 7 and 9, as worker 0 of `of`:
 /// `(rounds, shares)`.
-fn relays(sources: [Source; 2], build: Build) -> (usize, usize) {
-    use gnitz_zset::algebra::Slot;
-    let mut c = Circuit::default();
-    build(&mut c);
-    let registry = sources_at(Slot::new(0, 4), [(7, sources[0]), (9, sources[1])]);
-    let meta = routing(&c, &registry).unwrap();
-    let vm = EmitCtx::emit(&c, &registry, &meta, None)
-        .map(|ctx| ctx.prog.finish(ctx.regs[c.out()]))
-        .unwrap();
+fn relays(of: u32, sources: [Source; 2], build: impl FnOnce(&mut Circuit)) -> (usize, usize) {
+    let registry = sources_at(Slot::new(0, of), [(7, sources[0]), (9, sources[1])]);
+    let vm = plan(&registry, build).expect("the fixture compiles");
     let rounds = vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
     let shares = vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
     (rounds, shares)
 }
 
-/// A routed source's delta is relayed by a round, and kept by share where the
-/// source is replicated: every worker already holds that delta whole.
+/// A delta stays where its rows already are, is kept by share where every worker
+/// holds or computed the same rows, and takes a round otherwise — whether a
+/// source's route relays it or an exchange does.
 #[test]
-fn a_routed_source_is_shared_where_replicated_and_relayed_by_a_round_otherwise() {
-    use crate::test_support::{scan_keyed, self_typed_slots};
-    use gnitz_zset::algebra::Placement;
+fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
     let keyed = Source::from(make_schema_u64_i64());
     let replicated = keyed.placed(Placement::Replicated);
+    let negated: Build = |c| {
+        let a = scan(c, 7);
+        let n = c.negate(a);
+        c.shard(n);
+    };
     // `7 ⋈ 9` on a payload column, 7's re-key also read beside the join: read
     // there a replicated delta counts once per worker, so neither source skips.
-    let build: Build = |c| {
+    let routed: Build = |c| {
         let key = self_typed_slots(&make_schema_u64_i64(), &[1]);
         let (a, b) = (scan_keyed(c, 7, &key), scan_keyed(c, 9, &key));
         c.negate(a);
         c.join([a, b], [a, b], JoinKind::Equi);
     };
-    assert_eq!(relays([replicated, keyed], build), (1, 1));
-    assert_eq!(relays([keyed, keyed], build), (2, 0));
+    type Case = (&'static str, u32, [Source; 2], Build, (usize, usize));
+    let cases: [Case; 10] = [
+        (
+            "a shard on the key its scan's rows are placed by",
+            4,
+            [keyed; 2],
+            |c| {
+                let a = scan(c, 7);
+                c.shard(a);
+            },
+            (0, 0),
+        ),
+        ("a negate is not row-local", 4, [keyed; 2], negated, (1, 0)),
+        ("one worker", 1, [keyed; 2], negated, (0, 0)),
+        (
+            "a view over replicated sources alone is computed whole on every worker",
+            4,
+            [replicated, keyed],
+            negated,
+            (0, 0),
+        ),
+        (
+            "every worker computed the same rows of a replicated side",
+            4,
+            [replicated, keyed],
+            |c| {
+                let [a, b] = [7, 9].map(|s| {
+                    let leaf = scan(c, s);
+                    let n = c.negate(leaf);
+                    c.shard(n)
+                });
+                c.union(a, b);
+            },
+            (1, 1),
+        ),
+        (
+            // The trim is a share of its own.
+            "a trimmed side emits a slice of the replica, not the replica",
+            4,
+            [replicated, keyed],
+            |c| {
+                let a = scan(c, 7);
+                let a = c.worker_filter(a);
+                let a = c.shard(a);
+                let b = scan(c, 9);
+                let b = c.negate(b);
+                let b = c.shard(b);
+                c.union(a, b);
+            },
+            (2, 1),
+        ),
+        (
+            "a replica's share is one worker's rows: an exchange behind it takes a round",
+            4,
+            [replicated, keyed],
+            |c| {
+                let a = scan(c, 7);
+                let a = c.negate(a);
+                let a = c.shard(a);
+                let a = c.negate(a);
+                let a = c.shard(a);
+                let b = scan(c, 9);
+                let b = c.negate(b);
+                let b = c.shard(b);
+                c.union(a, b);
+            },
+            (2, 1),
+        ),
+        (
+            "a routed replicated source is shared",
+            4,
+            [replicated, keyed],
+            routed,
+            (1, 1),
+        ),
+        (
+            "a routed partitioned source takes a round",
+            4,
+            [keyed; 2],
+            routed,
+            (2, 0),
+        ),
+        (
+            // Each source's relay runs, and so does the exchange.
+            "the output exchange behind a scan a join's relay moved off its owner",
+            4,
+            [keyed; 2],
+            |c| {
+                let key = self_typed_slots(&make_schema_u64_i64(), &[1]);
+                let deltas = [7, 9].map(|source| scan_keyed(c, source, &key));
+                c.join(deltas, deltas, JoinKind::Equi);
+                // `scan_keyed` pushed 7's scan first.
+                c.reduce_multi(0, &[0], &[AggDescriptor::COUNT_STAR]);
+            },
+            (3, 0),
+        ),
+    ];
+    for (why, of, sources, build, want) in cases {
+        assert_eq!(relays(of, sources, build), want, "{why}");
+    }
 }
 
-/// The output exchange moves nothing behind a scan placed by the shard key — but
-/// not behind one a join's relay has moved off its source's owner: each source's
-/// relay runs, and so does the exchange.
+/// The output exchange in front of a reduce moves nothing exactly where a walk
+/// back through row-local nodes ends at a scan whose rows are already placed by
+/// the reduce's group key.
 #[test]
-fn the_output_exchange_runs_behind_a_relayed_scan() {
-    use crate::test_support::{scan_keyed, self_typed_slots};
-    use gnitz_wire::AggDescriptor;
-    let keyed = Source::from(make_schema_u64_i64());
-    let build: Build = |c| {
-        let key = self_typed_slots(&make_schema_u64_i64(), &[1]);
-        let deltas = [7, 9].map(|source| scan_keyed(c, source, &key));
-        c.join(deltas, deltas, JoinKind::Equi);
-        // `scan_keyed` pushed 7's scan first.
-        c.reduce_multi(0, &[0], &[AggDescriptor::COUNT_STAR]);
+fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_by_its_key() {
+    let i64 = SchemaColumn::new(TypeCode::I64, false);
+    let u64 = SchemaColumn::new(TypeCode::U64, false);
+    // PK last, so a group column behind a map — an index into the map's output,
+    // whose leading slots are the source PK — is not the source's column index.
+    let pk_last = Source::from(SchemaDescriptor::new(&[i64, i64, u64], &[2]));
+    let clustered = crate::test_support::pk_payload_schema(&[TypeCode::U32, TypeCode::U64, TypeCode::U64]);
+    let clustered = Source::from(clustered).placed(Placement::keyed(&clustered, 1));
+    let bare: Stage = |_, n| n;
+    let fan_in: Stage = |c, n| {
+        let other = scan(c, 9);
+        c.union(n, other)
     };
-    assert_eq!(relays([keyed, keyed], build), (3, 0));
+    let cases: [(&str, Source, Stage, &[u32], bool); 14] = [
+        ("a bare scan", pk_last, bare, &[2], true),
+        ("a payload column", pk_last, bare, &[0], false),
+        ("an empty key", pk_last, bare, &[], false),
+        ("the CLUSTER BY prefix", clustered, bare, &[0], true),
+        ("not the leading PK column", clustered, bare, &[1], false),
+        (
+            "a filter is transparent",
+            pk_last,
+            |c, n| c.filter(n, predicate(0)),
+            &[2],
+            true,
+        ),
+        (
+            "a copy list carries the PK region to its leading slot",
+            pk_last,
+            |c, n| c.map(n, &[0, 1]),
+            &[0],
+            true,
+        ),
+        (
+            "a payload slot behind a map",
+            pk_last,
+            |c, n| c.map(n, &[0, 1]),
+            &[1],
+            false,
+        ),
+        (
+            "an expression map carries the PK region",
+            pk_last,
+            |c, n| {
+                let program = gnitz_expr::LogicalProgram::copy_cols(&[]).to_blob_bytes();
+                c.map_expr(n, gnitz_wire::ComputeMap { program, out_cols: vec![] })
+            },
+            &[0],
+            true,
+        ),
+        (
+            "filters and maps interleave",
+            pk_last,
+            |c, n| {
+                let f = c.filter(n, predicate(0));
+                let m = c.map(f, &[0, 1]);
+                c.filter(m, predicate(1))
+            },
+            &[0],
+            true,
+        ),
+        (
+            "a reindex re-keys the PK",
+            pk_last,
+            |c, n| {
+                let key = [(0, TypeCode::I64)];
+                c.map_reindex(
+                    n,
+                    &key,
+                    &[0],
+                    gnitz_wire::ReindexRole::Auxiliary,
+                    gnitz_wire::NullKeys::Keep,
+                )
+            },
+            &[0],
+            false,
+        ),
+        (
+            "a WorkerFilter is not a Filter",
+            pk_last,
+            |c, n| c.worker_filter(n),
+            &[2],
+            false,
+        ),
+        ("a fan-in draws from two sources", pk_last, fan_in, &[2], false),
+        (
+            "a filter over a fan-in",
+            pk_last,
+            |c, n| {
+                let other = scan(c, 9);
+                let u = c.union(n, other);
+                c.filter(u, predicate(0))
+            },
+            &[2],
+            false,
+        ),
+    ];
+    for (why, source, mid, group, skipped) in cases {
+        let (rounds, _) = relays(4, [source; 2], |c| {
+            let a = scan(c, 7);
+            let tip = mid(c, a);
+            c.reduce_multi(tip, group, &[AggDescriptor::COUNT_STAR]);
+        });
+        assert_eq!(rounds == 0, skipped, "{why}");
+    }
 }
 
 // ── A clamp whose history is its sources' stores ──────────────────────────
 
-/// One table of a set operation: its kind, and its placement from its schema.
-type Side = (
-    gnitz_store::relation::RelationKind,
-    fn(&SchemaDescriptor) -> gnitz_zset::algebra::Placement,
-);
-
-/// The children `build`'s circuit declares, compiled on worker `slot` over
-/// tables 10 and 11, each `(a, b | v)` keyed `(a, b)`, of the kind and placement
-/// `sides` gives.
-fn set_op_children(slot: gnitz_zset::algebra::Slot, sides: [Side; 2], build: Build) -> Vec<String> {
-    use gnitz_zset::schema::SchemaColumn;
-    let col = SchemaColumn::new(gnitz_wire::TypeCode::U64, false);
-    let schema = SchemaDescriptor::new(&[col, col, col], &[0, 1]);
-    let tables = [10, 11]
-        .into_iter()
-        .zip(sides)
-        .map(|(id, (kind, placement))| (id, kind, Source::from(schema).placed(placement(&schema))));
-    let (registry, _dir) = tables_at(slot, tables);
-    let mut c = Circuit::default();
-    build(&mut c);
-    let meta = routing(&c, &registry).unwrap();
-    let ctx = EmitCtx::emit(&c, &registry, &meta, None).unwrap();
-    let vm = ctx.prog.finish(ctx.regs[c.out()]);
-    vm.layout().names().map(str::to_string).collect()
-}
-
 /// `10 EXCEPT ALL 11` over leaves keyed by their own PK, each behind an exchange
 /// on it.
-fn keyed_except(c: &mut Circuit) {
+const KEYED_EXCEPT: Build = |c| {
     let [a, b] = [10, 11].map(|s| {
         let leaf = scan(c, s);
         c.shard(leaf)
     });
     c.positive_diff(a, b);
-}
+};
 
 /// A clamp declares no history of its own exactly where each term of its input
 /// is a base table's rows on the worker that stores them.
 #[test]
 fn a_clamp_reads_its_sources_where_they_hold_its_history() {
-    use gnitz_store::relation::RelationKind::{BaseTable, Stream};
-    use gnitz_zset::algebra::{Placement, Slot};
-    let reads_sources = |children: &[String]| !children.iter().any(|n| n.starts_with("hist_"));
-    let table: Side = (BaseTable, Placement::full_pk);
+    use crate::query::vm::ClampHistory;
+    let table = Source::from(ab(TypeCode::U64));
+    let by_prefix = table.placed(Placement::keyed(&table.schema, 1));
+    let replicated = table.placed(Placement::Replicated);
     let third = Slot::new(2, 4);
-
-    assert!(
-        reads_sources(&set_op_children(Slot::SOLO, [table; 2], keyed_except)),
-        "one worker"
-    );
-    assert!(
-        reads_sources(&set_op_children(third, [table; 2], keyed_except)),
-        "an exchange that moves nothing"
-    );
-    let replicated: Side = (BaseTable, |_| Placement::Replicated);
-    assert!(
-        reads_sources(&set_op_children(third, [replicated, table], keyed_except)),
-        "a replicated side's share"
-    );
-    assert!(
-        reads_sources(&set_op_children(third, [table; 2], |c| {
-            let a = scan(c, 10);
-            let a = c.filter(
-                a,
-                crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Lt, 2, 100)]).to_blob_bytes(),
-            );
-            let a = c.map(a, &[2]);
-            let b = scan(c, 11);
-            c.positive_diff(a, b);
-        })),
-        "a filter and a projection on the way"
-    );
-
-    let by_prefix: Side = (BaseTable, |s| Placement::keyed(s, 1));
-    assert!(
-        !reads_sources(&set_op_children(third, [by_prefix, table], keyed_except)),
-        "an exchange that moves a side placed by its PK prefix"
-    );
-    let stream: Side = (Stream, Placement::full_pk);
-    assert!(
-        !reads_sources(&set_op_children(Slot::SOLO, [stream, table], keyed_except)),
-        "a stream holds no rows"
-    );
-    assert!(
-        !reads_sources(&set_op_children(Slot::SOLO, [table; 2], |c| {
-            let [a, b] = [10, 11].map(|s| {
-                let leaf = scan(c, s);
-                c.map_hash_row(leaf, &[(0, gnitz_wire::TypeCode::U64), (2, gnitz_wire::TypeCode::U64)])
-            });
-            c.positive_diff(a, b);
-        })),
-        "a re-key onto a content hash"
-    );
-    // The outer clamp of a chain reads the inner one's output, which no store holds.
-    let chain = set_op_children(Slot::SOLO, [table; 2], |c| {
-        let [a, b] = [10, 11].map(|s| scan(c, s));
-        let inner = c.positive_diff(a, b);
-        c.distinct(inner);
-    });
-    assert_eq!(chain.iter().filter(|n| n.starts_with("hist_")).count(), 1, "{chain:?}");
+    /// (why, worker, tables 10 and 11, the circuit, how many clamps keep a
+    /// history of their own)
+    type Case = (&'static str, Slot, [(RelationKind, Source); 2], Build, usize);
+    let cases: [Case; 8] = [
+        ("one worker", Slot::SOLO, [(BaseTable, table); 2], KEYED_EXCEPT, 0),
+        (
+            "an exchange that moves nothing",
+            third,
+            [(BaseTable, table); 2],
+            KEYED_EXCEPT,
+            0,
+        ),
+        (
+            "a replicated side's share",
+            third,
+            [(BaseTable, replicated), (BaseTable, table)],
+            KEYED_EXCEPT,
+            0,
+        ),
+        (
+            "a filter and a projection on the way",
+            third,
+            [(BaseTable, table); 2],
+            |c| {
+                let a = scan(c, 10);
+                let a = c.filter(a, predicate(2));
+                let a = c.map(a, &[2]);
+                let b = scan(c, 11);
+                c.positive_diff(a, b);
+            },
+            0,
+        ),
+        (
+            "an exchange that moves a side placed by its PK prefix",
+            third,
+            [(BaseTable, by_prefix), (BaseTable, table)],
+            KEYED_EXCEPT,
+            1,
+        ),
+        (
+            "a stream holds no rows",
+            Slot::SOLO,
+            [(Stream, table), (BaseTable, table)],
+            KEYED_EXCEPT,
+            1,
+        ),
+        (
+            "a re-key onto a content hash",
+            Slot::SOLO,
+            [(BaseTable, table); 2],
+            |c| {
+                let [a, b] = [10, 11].map(|s| {
+                    let leaf = scan(c, s);
+                    c.map_hash_row(leaf, &[(0, TypeCode::U64), (2, TypeCode::U64)])
+                });
+                c.positive_diff(a, b);
+            },
+            1,
+        ),
+        (
+            // The outer clamp reads the inner one's output, which no store holds.
+            "a chain of clamps",
+            Slot::SOLO,
+            [(BaseTable, table); 2],
+            |c| {
+                let [a, b] = [10, 11].map(|s| scan(c, s));
+                let inner = c.positive_diff(a, b);
+                c.distinct(inner);
+            },
+            1,
+        ),
+    ];
+    for (why, slot, [(k10, s10), (k11, s11)], build, want) in cases {
+        let (registry, _dir) = tables_at(slot, [(10, k10, s10), (11, k11, s11)]);
+        let vm = plan(&registry, build).expect(why);
+        let own = vm
+            .ops()
+            .filter(|op| matches!(op, Op::WeightClamp { hist: ClampHistory::Own(_), .. }));
+        assert_eq!(own.count(), want, "{why}");
+    }
 }

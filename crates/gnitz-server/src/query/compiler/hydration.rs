@@ -48,17 +48,17 @@ fn seed_node(circuit: &Circuit) -> Result<SeedAt, String> {
     Ok(SeedAt::Trace { delta: da })
 }
 
-/// Resolve the seed against the plan the emitter produced for it.
+/// Resolve the seed against the plan the emitter produced for it. The seed is
+/// gathered by the view's own keys: the output's PK region is the seeded node's,
+/// which a row-local walk and an equi join's delta both keep.
 pub(super) fn derive_hydration(
     circuit: &Circuit,
     registry: &RelationRegistry,
-    view_schema: &SchemaDescriptor,
     vm: &Vm,
     regs: &[DeltaReg],
     integrals: &[Option<Integral>],
 ) -> Result<Hydration, String> {
-    let reg = |n: NodeId| regs[n];
-    let (in_node, seed, keyed) = match seed_node(circuit)? {
+    let (in_node, seed) = match seed_node(circuit)? {
         SeedAt::Scan { node, source } => {
             if registry
                 .relation(source)
@@ -69,7 +69,7 @@ pub(super) fn derive_hydration(
                         .into(),
                 );
             }
-            (node, Integral::Relation(source), node)
+            (node, Integral::Relation(source))
         }
         SeedAt::Trace { delta } => {
             let seed = integrals[delta].expect("the join declared its integrand's integral");
@@ -79,15 +79,13 @@ pub(super) fn derive_hydration(
                 // re-keyed by `delta`, the reindex whose integral the store is.
                 Integral::Relation(_) => circuit.inputs(delta)[0],
             };
-            (in_node, seed, delta)
+            (in_node, seed)
         }
     };
-    let entry = vm.replay_entry(reg(in_node))?;
-    // The view's own keys gather the seed.
-    if vm.schema_of(reg(keyed)).pk_stride() != view_schema.pk_stride() {
-        return Err(UNSUPPORTED.into());
-    }
-    Ok(Hydration { entry, seed })
+    Ok(Hydration {
+        entry: vm.replay_entry(regs[in_node])?,
+        seed,
+    })
 }
 
 // ---------------------------------------------------------------------------

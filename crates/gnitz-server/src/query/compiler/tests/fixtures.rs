@@ -17,28 +17,28 @@ pub(super) fn routing(circuit: &Circuit, registry: &RelationRegistry) -> Result<
 /// The id the compiled circuit's view goes by.
 pub(super) const VIEW: u64 = 99;
 
-/// `circuit` compiled into a view of schema `view`.
-pub(super) fn compile(
-    circuit: Circuit,
-    registry: &RelationRegistry,
-    view: &SchemaDescriptor,
-    bounded: bool,
-) -> Result<CompileOutput, String> {
-    compile_view(&circuit, registry, VIEW, view, bounded).map(|(out, _)| out)
+/// `circuit` compiled into a view of the schema it outputs.
+pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: bool) -> Result<CompileOutput, String> {
+    let meta = routing(circuit, registry)?;
+    let ctx = EmitCtx::emit(circuit, registry, &meta, VIEW)?;
+    let view = ctx.prog.schema_of(ctx.regs[circuit.out()]);
+    compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, _)| out)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].
 pub(super) type Build = fn(&mut Circuit);
+
+/// One table row's operators over an input node: answers the last of them.
+pub(super) type Stage = fn(&mut Circuit, NodeId) -> NodeId;
 
 /// An unbounded delta scan of `source`.
 pub(super) fn scan(circuit: &mut Circuit, source: u64) -> NodeId {
     circuit.input_delta(source, gnitz_wire::ReadBound::None)
 }
 
-/// A decodable expr-program blob for a `Filter` or computed `Map` that must
-/// exist and is never executed.
-pub(super) fn dummy_expr_blob() -> Vec<u8> {
-    gnitz_expr::LogicalProgram::copy_cols(&[]).to_blob_bytes()
+/// A filter program comparing column `col` with a constant.
+pub(super) fn predicate(col: u32) -> Vec<u8> {
+    crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Lt, col, 100)]).to_blob_bytes()
 }
 
 /// The guard that rejected a build. Naming it is what makes a guard test
@@ -113,21 +113,4 @@ pub(super) fn tables_at<S: Into<Source>>(
 /// [`sources_at`] the one worker of a single-worker process.
 pub(super) fn sources<S: Into<Source>>(rows: impl IntoIterator<Item = (u64, S)>) -> RelationRegistry {
     sources_at(Slot::SOLO, rows)
-}
-
-/// A source's route without its key, `Stays` for none: the routing decision a
-/// test compares.
-#[derive(Debug, PartialEq)]
-pub(super) enum Route {
-    Stays,
-    Broadcast,
-    Keyed,
-}
-
-pub(super) fn route(plan: Option<&Rc<ScatterPlan>>) -> Route {
-    match plan {
-        None => Route::Stays,
-        Some(plan) if plan.is_broadcast() => Route::Broadcast,
-        Some(_) => Route::Keyed,
-    }
 }

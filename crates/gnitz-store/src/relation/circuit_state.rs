@@ -20,16 +20,16 @@ pub struct StateLayout {
 }
 
 impl StateLayout {
-    /// Declare one rederived child store named `child`.
+    /// Declare one rederived child store named `child`: a name of its own, since
+    /// each child opens the store it names.
     pub fn declare(&mut self, child: String, schema: SchemaDescriptor) -> StateIdx {
+        debug_assert!(
+            self.children.iter().all(|(name, _)| *name != child),
+            "child {child} declared twice"
+        );
         let idx = StateIdx(self.children.len());
         self.children.push((child, schema));
         idx
-    }
-
-    /// The declared children's names, in [`StateIdx`] order.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.children.iter().map(|(name, _)| name.as_str())
     }
 }
 

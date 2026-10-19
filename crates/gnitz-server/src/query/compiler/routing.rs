@@ -123,9 +123,7 @@ fn placement(
         // The view's PK region is this source's, byte for byte, and its rows sit on
         // that source's owner only while nothing relays its delta: only a source
         // stating a scatter key is relayed.
-        Some(tid) if uses[&tid].key.is_none() && sources[&tid].schema().pk_cols().len() == view.pk_cols().len() => {
-            sources[&tid].placement()
-        }
+        Some(tid) if uses[&tid].key.is_none() => sources[&tid].placement(),
         Some(_) => Placement::Local,
         // Behind a join or an exchange the rows sit on their own key's owner.
         None if moves => Placement::full_pk(view),
