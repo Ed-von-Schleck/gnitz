@@ -416,15 +416,15 @@ impl ReindexPacker {
         }
     }
 
-    /// Every row of `batch` with a `width`-byte buffer, its packed key at the front.
-    pub(crate) fn for_each_key<B: BatchView>(&self, batch: &B, width: usize, mut f: impl FnMut(usize, &mut [u8])) {
-        let rows = batch.row_count();
-        let mut bufs = vec![0u8; rows.min(KEY_CHUNK) * width];
+    /// Every row of `batch` with its packed key.
+    pub(crate) fn for_each_key<B: BatchView>(&self, batch: &B, mut f: impl FnMut(usize, &[u8])) {
+        let (rows, width) = (batch.row_count(), self.out_stride);
+        let mut keys = vec![0u8; rows.min(KEY_CHUNK) * width];
         for start in (0..rows).step_by(KEY_CHUNK) {
             let n = (rows - start).min(KEY_CHUNK);
-            self.pack_rows(&mut bufs, width, batch, &[(start, start + n)]);
-            for (i, buf) in bufs.chunks_exact_mut(width).take(n).enumerate() {
-                f(start + i, buf);
+            self.pack_rows(&mut keys, width, batch, &[(start, start + n)]);
+            for (i, key) in keys.chunks_exact(width).take(n).enumerate() {
+                f(start + i, key);
             }
         }
     }

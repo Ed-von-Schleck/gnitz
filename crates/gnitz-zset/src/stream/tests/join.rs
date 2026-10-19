@@ -7,6 +7,7 @@ use crate::test_support::{
     join_reference, make_batch, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema, pk_payload_schema,
     rekey_plan, zset_of, TestTrace,
 };
+use gnitz_wire::NullKeys;
 
 /// The plan the compiler would bake for this pair, through the operator's own
 /// constructor rather than a look-alike.
@@ -370,7 +371,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
         (&[0, 1], &[3, 1, 0, 2]),
     ];
     for &(key, keep) in cases {
-        let mut map = rekey_plan(&source_schema, key, keep);
+        let mut map = rekey_plan(&source_schema, key, keep, NullKeys::Drop);
         let trace = map.evaluate_map_batch(&source).into_consolidated();
         let trace_schema = *map.out_schema();
 
@@ -439,12 +440,12 @@ fn over_source_refuses_a_trace_its_source_does_not_prefix() {
                 .collect::<Vec<_>>(),
             &(0..key.len() as u32).collect::<Vec<_>>(),
         );
-        let map = rekey_plan(&source, key, &[2]);
+        let map = rekey_plan(&source, key, &[2], NullKeys::Drop);
         assert!(
             JoinPlan::over_source(false, &delta, &source, &map).is_err(),
             "key {key:?}"
         );
     }
     let delta = SchemaDescriptor::new(&[col(0)], &[0]);
-    assert!(JoinPlan::over_source(false, &delta, &source, &rekey_plan(&source, &[0], &[2])).is_ok());
+    assert!(JoinPlan::over_source(false, &delta, &source, &rekey_plan(&source, &[0], &[2], NullKeys::Drop)).is_ok());
 }

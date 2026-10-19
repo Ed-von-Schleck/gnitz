@@ -20,7 +20,7 @@ use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
 
-use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema, zset_of, zset_sum};
+use super::shared::{arb_type_code, pk_payload_schema, self_typed_slots, u64_pk_schema, zset_of, zset_sum};
 
 /// A cursor over `batches` and `shards`, one run each.
 pub(crate) fn create_read_cursor(
@@ -38,17 +38,20 @@ pub(crate) fn create_read_cursor(
     )
 }
 
-/// The reindex of `source` onto its columns `key`, each at its own type,
-/// keeping `keep`: the map a join's trace integrates behind.
-pub(crate) fn rekey_plan(source: &SchemaDescriptor, key: &[u32], keep: &[u32]) -> crate::algebra::MapPlan {
+/// The reindex of `source` onto its columns `key`, each at its own slot type,
+/// keeping `keep` and doing `nulls` with a NULL key: with `Drop`, the map a
+/// join's trace integrates behind.
+pub(crate) fn rekey_plan(
+    source: &SchemaDescriptor,
+    key: &[u32],
+    keep: &[u32],
+    nulls: gnitz_wire::NullKeys,
+) -> crate::algebra::MapPlan {
     let rekey = gnitz_wire::MapKind::Reindex {
         keep: keep.to_vec(),
-        key: key
-            .iter()
-            .map(|&c| (c, source.columns()[c as usize].type_code))
-            .collect(),
+        key: self_typed_slots(source, key),
         role: gnitz_wire::ReindexRole::Auxiliary,
-        nulls: gnitz_wire::NullKeys::Drop,
+        nulls,
     };
     crate::algebra::MapPlan::from_wire(source, &rekey).expect("fixture reindex is well-formed")
 }

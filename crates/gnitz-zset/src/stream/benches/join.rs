@@ -3,7 +3,7 @@ use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{rekey_plan, TestTrace};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::RangeRel;
+use gnitz_wire::{NullKeys, RangeRel};
 
 /// Rows on the larger side of an equi or a range fixture.
 const N: usize = 4096;
@@ -94,7 +94,7 @@ fn join_equi_bench() {
         let narrow = schema_for(&[TypeCode::U64], p);
         let wide = schema_for(&[TypeCode::U64, TypeCode::U64], p);
         let keep: Vec<u32> = (1..wide.num_columns() as u32).collect();
-        let mut map = rekey_plan(&wide, &[0], &keep);
+        let mut map = rekey_plan(&wide, &[0], &keep, NullKeys::Drop);
         let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, map.out_schema()).unwrap();
         let over = JoinPlan::over_source(false, &narrow, &wide, &map).unwrap();
         for (name, d, t, miss_stride) in SHAPES {

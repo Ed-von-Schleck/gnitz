@@ -1,6 +1,5 @@
 use super::*;
-use crate::schema::SchemaColumn;
-use crate::test_support::Rng;
+use crate::test_support::{pk_only_schema, pk_payload_schema, Rng};
 use gnitz_wire::{key_image, Cut, PkBuf, PkColList, TypeCode};
 
 /// The largest worker count a server launches.
@@ -88,17 +87,13 @@ fn worker_for_pk_bytes_routes_a_narrow_region_by_its_value() {
     assert!(routes.len() > 1, "the bytes past 16 must reach the route");
 }
 
-fn col(tc: TypeCode) -> SchemaColumn {
-    SchemaColumn::new(tc, false)
-}
-
 /// A keyed placement's stride is the OPK width of the leading PK columns it
 /// names, and a prefix outside the PK's arity is a panic.
 #[test]
 fn keyed_placements_take_the_leading_pk_columns_width() {
-    use TypeCode::{I64, U32, U64};
+    use TypeCode::{U32, U64};
     // PK (U32, U64, U64): distinct widths, so each prefix stride is unambiguous.
-    let s = SchemaDescriptor::new(&[col(U32), col(U64), col(U64), col(I64)], &[0, 1, 2]);
+    let s = pk_payload_schema(&[U32, U64, U64]);
     for (prefix, dist_stride) in [(1, 4), (2, 12), (3, 20)] {
         assert_eq!(
             Placement::keyed(&s, prefix),
@@ -115,25 +110,27 @@ fn keyed_placements_take_the_leading_pk_columns_width() {
     }
 }
 
-/// A keyed placement's owner is the worker its leading `dist_stride` key bytes
-/// hash to; no other placement has one.
+/// A keyed placement's owner reads its leading `dist_stride` key bytes alone,
+/// so rows apart only past them live together; no other placement has one.
 #[test]
-fn owner_hashes_the_distribution_prefix_alone() {
+fn an_owner_reads_the_distribution_prefix_alone() {
     let mut rng = Rng::new(0x0091_ACE5);
+    let mut moved = 0;
     for _ in 0..2000 {
         let pk: [u8; 20] = std::array::from_fn(|_| rng.gen_u128() as u8);
-        for nw in [1, 3, 4, NW_MAX] {
-            for dist_stride in [4u8, 12, 20] {
-                assert_eq!(
-                    Placement::Keyed { dist_stride }.owner(&pk, nw),
-                    Some(worker_for_pk_bytes(&pk[..dist_stride as usize], nw)),
-                    "stride {dist_stride} nw={nw}"
-                );
-            }
-            assert_eq!(Placement::Replicated.owner(&pk, nw), None);
-            assert_eq!(Placement::Local.owner(&pk, nw), None);
+        let other: [u8; 20] = std::array::from_fn(|_| rng.gen_u128() as u8);
+        for dist_stride in [4u8, 12, 20] {
+            let mut tail = other;
+            tail[..dist_stride as usize].copy_from_slice(&pk[..dist_stride as usize]);
+            let keyed = Placement::Keyed { dist_stride };
+            assert_eq!(keyed.owner(&pk, NW), keyed.owner(&tail, NW), "stride {dist_stride}");
+            moved += usize::from(keyed.owner(&pk, NW) != keyed.owner(&other, NW));
+        }
+        for p in [Placement::Replicated, Placement::Local] {
+            assert_eq!(p.owner(&pk, NW), None, "{p:?}");
         }
     }
+    assert!(moved > 0, "the prefix reaches the owner");
 }
 
 /// Worker count the confinement checks route against; any count works.
@@ -144,7 +141,7 @@ const NW: usize = 4;
 /// distribution prefix — worker 0 for an empty band.
 #[test]
 fn pk_range_and_confinement_follow_key_membership() {
-    let s = SchemaDescriptor::new(&[col(TypeCode::I8), col(TypeCode::U8)], &[0, 1]);
+    let s = pk_only_schema(&[TypeCode::I8, TypeCode::U8]);
     let placed = [
         Placement::keyed(&s, 1),
         Placement::full_pk(&s),

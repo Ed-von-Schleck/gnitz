@@ -1,10 +1,13 @@
-use gnitz_expr::{ConstIdx, LogicalInstr, LogicalProgram, Reg, Sink};
-use gnitz_wire::{MapKind, NullKeys};
+use gnitz_expr::{ConstIdx, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
+use gnitz_wire::{MapKind, NullKeys, ReindexRole};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
-use crate::test_support::{make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, weighted_rows};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS, MAX_PK_COLUMNS};
+use crate::test_support::{
+    make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
+    weighted_rows,
+};
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 pub(super) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
@@ -47,7 +50,6 @@ pub(super) fn project(in_schema: &SchemaDescriptor, cols: &[u32]) -> MapPlan {
 /// computed columns fill the output slots in sink order.
 #[test]
 fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
-    use gnitz_expr::IntArithOp;
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
     let prog = LogicalProgram::new(
         vec![
@@ -86,113 +88,186 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
     assert_eq!((empty.count, empty.schema()), (0, plan.out_schema()));
 }
 
+/// A projection of string columns, reordered, moves each row's content; one
+/// that drops a heap-backed column relocates the strings it keeps rather than
+/// carrying the dead heap.
 #[test]
-fn test_map_blob_passthrough_and_fallback() {
-    // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
+fn a_string_projection_moves_content_and_leaves_a_dead_heap() {
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::String, TypeCode::String]);
+    let rows = [
+        (1, ["ab", "long-string-one-xyz"]),
+        (2, ["cd", "long-string-two-abcdef"]),
+    ];
     let mut batch = BatchBuilder::new(&in_schema);
-    for (pk, s1, s2) in [
-        (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
-        (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
-    ] {
+    for (pk, strs) in rows {
         batch.begin_row(pk, 1);
-        batch.put_blob(s1);
-        batch.put_blob(s2);
+        strs.iter().for_each(|s| batch.put_string(s));
         batch.end_row();
     }
     let batch = batch.finish();
-
-    // (A) Keep BOTH string columns (reordered) → passthrough fires; the shared
-    // blob keeps every long string's heap offset valid through the verbatim copy.
-    let out = project(&in_schema, &[2, 1]).evaluate_map_batch(&batch);
-    assert_eq!(out.count, 2);
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 0, 0), b"long-string-one-xyz"[..]); // s2 → out payload 0
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 0, 1), b"ab"[..]); // s1 → out payload 1
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 1, 0), b"long-string-two-abcdef"[..]);
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 1, 1), b"cd"[..]);
-
-    // (B) Drop the long string s2 → passthrough gated OFF, so the relocate path runs and the
-    // output blob carries only the referenced (here empty, short-inline) spans.
-    let out = project(&in_schema, &[1]).evaluate_map_batch(&batch);
-    assert_eq!(out.count, 2);
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 0, 0), b"ab"[..]);
-    assert_eq!(*gnitz_wire::payload_bytes(&out, 1, 0), b"cd"[..]);
-    assert!(
-        out.blob().len() < batch.blob().len(),
-        "dropped-string relocate must not copy the dead heap ({} vs {})",
-        out.blob().len(),
-        batch.blob().len(),
-    );
+    for cols in [&[2, 1][..], &[1]] {
+        let mut plan = project(&in_schema, cols);
+        let out = plan.evaluate_map_batch(&batch);
+        let mut want = BatchBuilder::new(plan.out_schema());
+        for (pk, strs) in rows {
+            want.begin_row(pk, 1);
+            cols.iter().for_each(|&c| want.put_string(strs[c as usize - 1]));
+            want.end_row();
+        }
+        assert_eq!(weighted_rows(&out), weighted_rows(&want.finish()), "{cols:?}");
+    }
+    let dropped = project(&in_schema, &[1]).evaluate_map_batch(&batch);
+    assert!(dropped.blob().len() < batch.blob().len(), "the dropped column's heap");
 }
 
-/// A narrow source column copied into a wider promoted output slot (the shape a
-/// cross-width set-op UNION produces) sign/zero-extends per the SOURCE column's
-/// signedness — from the payload region and from the PK region alike.
+/// A copied column holds each row's value in its slot — a PK column decoded
+/// from its OPK image, a narrow column sign- or zero-extended by its own
+/// signedness into a wider slot — whether it is the whole PK, one column of a
+/// compound PK whose list order is not its column order, or a payload column;
+/// the PK region and the weights carry over unchanged.
 #[test]
-fn test_map_copy_col_widens_into_promoted_slot() {
-    // PK = (U16 c0, I16 c1); payload = I8 c2 (negative), U8 c3.
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U16, false),
-            SchemaColumn::new(TypeCode::I16, false),
-            SchemaColumn::new(TypeCode::I8, false),
-            SchemaColumn::new(TypeCode::U8, false),
-        ],
-        &[0, 1],
-    );
-    let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
-    let mut batch = BatchBuilder::new(&in_schema);
-    batch.begin_row_natives(&[c0 as u128, c1 as u16 as u128], 1i64);
-    batch.put_int(c2 as u128);
-    batch.put_int(c3 as u128);
-    batch.end_row();
-    let batch = batch.finish();
-
-    // Every column lands in an I64 slot — 4 distinct narrow→wide widens.
-    let out = compute(
-        &in_schema,
-        LogicalProgram::copy_cols(&[0, 1, 2, 3]),
-        &[(TypeCode::I64, false); 4],
-    )
-    .evaluate_map_batch(&batch);
-    assert_eq!(out.count, 1);
-    let widened = |pi: usize| i64::from_le_bytes(out.col_data(pi)[..8].try_into().unwrap());
-    assert_eq!(widened(0), c0 as i64, "U16 PK zero-extends");
-    assert_eq!(widened(1), c1 as i64, "I16 PK sign-extends");
-    assert_eq!(widened(2), c2 as i64, "I8 payload sign-extends");
-    assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
-}
-
-/// A widened copy over many rows, from a PK column that is the whole key (cells
-/// back to back) and from one inside a wider key, and from a payload column.
-#[test]
-fn a_widened_copy_holds_each_rows_value() {
-    use TypeCode::{I16, I32, I64, U16, U32, U64, U8};
-    let vals: Vec<i64> = (0..300i64).map(|i| (i - 150) * 7_654_321).collect();
-    for (src, slot) in [(I32, I64), (U32, I64), (I16, I32), (U16, U64), (U8, I16)] {
-        let fi = gnitz_wire::FixedInt::from_type_code(src).unwrap();
-        let native = |v: i64| (v as u128) & gnitz_wire::image_mask(fi.width());
-        let want: Vec<i64> = vals.iter().map(|&v| fi.unpack(native(v))).collect();
-        for (pk, col) in [(&[src][..], 0u32), (&[U64, src], 1), (&[U64], 1)] {
-            let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-            cols.push(SchemaColumn::new(src, false));
-            let in_schema = SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>());
-            let mut batch = BatchBuilder::new(&in_schema);
-            for (row, &v) in vals.iter().enumerate() {
-                let natives: Vec<u128> = pk
-                    .iter()
-                    .map(|&t| if t == src { native(v) } else { row as u128 })
-                    .collect();
-                batch.begin_row_natives(&natives, 1);
-                batch.put_int(native(v));
+fn a_copied_column_holds_each_rows_value_in_its_slot() {
+    use TypeCode::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
+    let col = |tc| SchemaColumn::new(tc, false);
+    for (src, slot) in [
+        (I8, I8),
+        (U16, U16),
+        (I32, I32),
+        (U64, U64),
+        (I128, I128),
+        (I8, I64),
+        (U8, I16),
+        (I16, I32),
+        (U16, U64),
+        (I32, I64),
+        (U32, I64),
+    ] {
+        let (sw, dw) = (src.wire_stride(), slot.wire_stride());
+        // Each width's ends and the values around zero, then a spread.
+        let top = 1u128 << (8 * sw - 1);
+        let vals: Vec<u128> = [0, 1, top, top - 1, u128::MAX]
+            .into_iter()
+            .chain((0..300u128).map(|i| (i as i128 - 150).wrapping_mul(7_654_321_987_654_321) as u128))
+            .map(|v| v & gnitz_wire::image_mask(sw))
+            .collect();
+        let shift = 128 - 8 * sw as u32;
+        let want: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| {
+                let wide = match src.is_signed_int() {
+                    true => ((v << shift) as i128 >> shift) as u128,
+                    false => v,
+                };
+                wide.to_le_bytes()[..dw].to_vec()
+            })
+            .collect();
+        let permuted = SchemaDescriptor::new(&[col(U16), col(src), col(U64)], &[2, 1, 0]);
+        for (schema, c) in [
+            (pk_payload_schema(&[src]), 0),
+            (permuted, 1),
+            (u64_pk_schema(&[col(src)]), 1),
+        ] {
+            let pk = schema.pk_cols();
+            let payload: Vec<u32> = (0..schema.num_columns() as u32).filter(|ci| !pk.contains(ci)).collect();
+            // Column `c` holds the value, every other its row number.
+            let cell = |ci: u32, r: usize, v: u128| match ci == c {
+                true => v,
+                false => r as u128 & gnitz_wire::image_mask(schema.columns()[ci as usize].size()),
+            };
+            let mut batch = BatchBuilder::new(&schema);
+            for (r, &v) in vals.iter().enumerate() {
+                let natives: Vec<u128> = pk.iter().map(|&ci| cell(ci, r, v)).collect();
+                batch.begin_row_natives(&natives, [1, -2, 3][r % 3]);
+                payload.iter().for_each(|&ci| batch.put_int(cell(ci, r, v)));
                 batch.end_row();
             }
-            let out = compute(&in_schema, LogicalProgram::copy_cols(&[col]), &[(slot, false)])
-                .evaluate_map_batch(&batch.finish());
-            let w = slot.wire_stride();
-            let got: Vec<&[u8]> = out.col_data(0).chunks_exact(w).collect();
-            let want: Vec<Vec<u8>> = want.iter().map(|v| v.to_le_bytes()[..w].to_vec()).collect();
-            assert_eq!(got, want, "{src} -> {slot}, PK {pk:?} column {col}");
+            let batch = batch.finish();
+            let out = compute(&schema, LogicalProgram::copy_cols(&[c]), &[(slot, false)]).evaluate_map_batch(&batch);
+            let what = format!("{src} -> {slot}, PK {:?} column {c}", schema.pk_cols());
+            assert_eq!(out.col_data(0), &want[..], "{what}");
+            assert_eq!(
+                (out.pk_data(), out.weight_data()),
+                (batch.pk_data(), batch.weight_data()),
+                "{what}"
+            );
+        }
+    }
+}
+
+/// Survivor runs — short enough to gather into one range first or long enough
+/// to map in place — map behind rows the output still holds, and onto an
+/// output cleared of earlier rows, exactly as those rows alone map: no PK,
+/// null word or string of another row shows through.
+#[test]
+fn appended_runs_map_as_their_rows_alone() {
+    const N: usize = 600;
+    let s = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::String, TypeCode::I64]);
+    let mut b = BatchBuilder::new(&s);
+    for i in 0..N as u64 {
+        b.begin_row(i as u128, [1, -1, 2][i as usize % 3]);
+        b.put_opt_int((i % 5 != 0).then_some(((i * 7 % 13) as i64 - 6) as u128));
+        match i % 7 {
+            0 => b.put_null(),
+            k if k % 2 == 0 => b.put_string("short"),
+            _ => b.put_string(&format!("a heap-backed string {i}")),
+        }
+        b.put_opt_int((i % 3 != 0).then_some(i as u128));
+        b.end_row();
+    }
+    let src = b.finish();
+    let sum = LogicalProgram::new(
+        vec![
+            LogicalInstr::LoadCol { col: 1 },
+            LogicalInstr::LoadCol { col: 3 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            },
+        ],
+        vec![Sink::Col(2), Sink::Reg(Reg(2))],
+        vec![],
+    );
+    let plans = [
+        (
+            "compute",
+            compute(&s, sum, &[(TypeCode::String, true), (TypeCode::I64, true)]),
+        ),
+        ("int projection", project(&s, &[3, 1])),
+        ("string projection", project(&s, &[2, 1])),
+        ("reindex", rekey_plan(&s, &[1], &[0, 1, 2, 3], NullKeys::Keep)),
+        (
+            "hash-row",
+            MapPlan::from_wire(
+                &s,
+                &MapKind::HashRow {
+                    cols: vec![(1, TypeCode::I64), (2, TypeCode::String)],
+                },
+            )
+            .unwrap(),
+        ),
+    ];
+    for (name, mut plan) in plans {
+        for run in [1, 20, 30, 200] {
+            let ranges: Vec<(usize, usize)> = (0..N).step_by(run + 3).map(|s| (s, (s + run).min(N))).collect();
+            let rows: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
+            let want = weighted_rows(&plan.evaluate_map_batch(&src.ascending_subset(&rows)));
+            let mut out = Batch::empty_with_schema(plan.out_schema());
+            plan.append_map_ranges(&src, &mut out, &[(0, N)]);
+            plan.append_map_ranges(&src, &mut out, &ranges);
+            let tail: Vec<u32> = (N as u32..out.count as u32).collect();
+            assert_eq!(
+                weighted_rows(&out.ascending_subset(&tail)),
+                want,
+                "{name}, runs of {run}, behind held rows"
+            );
+            out.clear();
+            plan.append_map_ranges(&src, &mut out, &ranges);
+            assert_eq!(
+                weighted_rows(&out),
+                want,
+                "{name}, runs of {run}, onto a cleared output"
+            );
         }
     }
 }
@@ -265,9 +340,7 @@ fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let schema = make_schema_u64_i64();
     let rows = [(1, 1, 200), (2, -3, 100), (3, 1, -300)];
     let batch = make_batch(&schema, &rows);
-    let out = MapPlan::from_wire(&schema, &reindex_on(&schema, &[1], vec![1], NullKeys::Keep))
-        .unwrap()
-        .evaluate_map_batch(&batch);
+    let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch);
     assert_eq!(out.count, rows.len());
     for (r, &(_, w, v)) in rows.iter().enumerate() {
         assert_eq!(out.get_pk_bytes(r), opk_pk(&make_schema_i64pk_i64(), &[v as u128]));
@@ -305,6 +378,9 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         // 9, 10: the two columns' contents swapped.
         (5, false, b"ab", b"cd"),
         (5, false, b"cd", b"ab"),
+        // 11, 12: one content split at another byte between the columns.
+        (5, false, b"ab", b"c"),
+        (5, false, b"a", b"bc"),
     ];
 
     // The rows repeat past the map's key chunk, so every chunk must key alike.
@@ -350,177 +426,142 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         (0, 5, "a NULL cell against a non-NULL one"),
         (0, 7, "inline cells against heap-backed ones"),
         (9, 10, "the two string columns' contents swapped"),
+        (11, 12, "one content split at another byte"),
     ] {
         assert_ne!(pk(a), pk(b), "{what} must move the PK");
     }
     assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
 }
 
-/// Every PK width is its own monomorphization in `copy_column`'s unswitched PK
-/// arm. A compound PK whose list order is not its column order drives all five at
-/// once: each column lands in a payload slot of its own type, as the native
-/// little-endian value with the OPK sign flip undone, while the PK region and
-/// the weights carry over unchanged.
+/// Each way a client-supplied column list can overrun a schema array, address
+/// an unnumbered copy slot, or promote outside the copy kernel's domain — and a
+/// corrupt or over-wide computed map — is a named rejection, not a panic or a
+/// truncated key. A projection bound counts the PK column the output carries,
+/// which a list-length bound misses.
 #[test]
-fn a_compound_permuted_pk_decodes_at_every_width() {
-    let pk_types = [
-        TypeCode::I8,
-        TypeCode::U16,
-        TypeCode::I32,
-        TypeCode::U64,
-        TypeCode::I128,
-    ];
-    // PK-list order, deliberately not column order: each column's OPK byte
-    // offset comes from this list, so a width mixed up here would be caught as
-    // a wrong value rather than a wrong length.
-    let pk_order: [u32; 5] = [3, 0, 4, 1, 2];
-    let cols = pk_types.map(|t| SchemaColumn::new(t, false));
-    let in_schema = SchemaDescriptor::new(&cols, &pk_order);
-
-    // Both extremes and a wrap-adjacent value per width: the sign flip is what
-    // orders these, and dropping it shows up first at the ends.
-    let rows: [([i128; 5], i64); 3] = [
-        ([i8::MIN as i128, 0, i32::MIN as i128, 0, i128::MIN], 3),
-        ([-1, 40_000, -1, u64::MAX as i128, -1], -1),
-        ([i8::MAX as i128, u16::MAX as i128, i32::MAX as i128, 1, i128::MAX], 2),
-    ];
-    let mut batch = BatchBuilder::new(&in_schema);
-    for (vals, w) in &rows {
-        let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
-        batch.begin_row_natives(&natives, *w);
-        batch.end_row();
-    }
-    let batch = batch.finish();
-
-    // One payload slot per PK column at that column's own type, so the copy
-    // widens nothing and the bytes written are exactly what the decode produced.
-    let out = compute(
-        &in_schema,
-        LogicalProgram::copy_cols(&[0, 1, 2, 3, 4]),
-        &pk_types.map(|t| (t, true)),
-    )
-    .evaluate_map_batch(&batch);
-    assert_eq!(out.pk_data(), batch.pk_data());
-    assert_eq!(out.weight_data(), batch.weight_data());
-    for (row, (vals, _)) in rows.iter().enumerate() {
-        for (pi, (&v, &t)) in vals.iter().zip(&pk_types).enumerate() {
-            let w = t.wire_stride();
-            assert_eq!(
-                &out.col_data(pi)[row * w..row * w + w],
-                &(v as u128).to_le_bytes()[..w],
-                "row {row}, PK column {pi} (type {t}) decoded wrong",
-            );
-        }
-    }
-}
-
-// ── MapPlan::from_wire — the circuit-node trust boundary ────────────────
-//
-// Every kind's column lists are client-supplied catalog data: each way they can
-// overrun a schema array, address an unnumbered copy slot, or promote outside the
-// copy kernel's domain must be a named rejection, not a panic or a truncated key.
-
-/// The guard that refused `mk` over `in_schema`.
-fn wire_rejection(in_schema: &SchemaDescriptor, mk: MapKind) -> String {
-    MapPlan::from_wire(in_schema, &mk)
-        .map(|_| "a plan")
-        .expect_err("expected a rejection")
-        .to_string()
-}
-
-#[test]
-fn a_projection_must_name_payload_columns_that_fit_one_schema() {
+fn a_malformed_map_is_refused_by_name() {
     let s = make_schema_u64_i64();
-    let proj = |cols: Vec<u32>| wire_rejection(&s, MapKind::Projection(cols));
-    assert_eq!(
-        proj(vec![200]),
-        "projection map: column 200 is not a payload column of a 2-column schema"
-    );
-    // A PK source: the PK region already carries it.
-    assert_eq!(
-        proj(vec![0]),
-        "projection map: column 0 is not a payload column of a 2-column schema"
-    );
-    // Each index is bounded but the list length is not, and duplicates are legal.
-    // Exactly MAX_COLUMNS payload sources already overflow — the output also
-    // carries the input's PK column, which a length-only bound misses.
-    assert_eq!(
-        proj(vec![1; MAX_COLUMNS]),
-        format!(
-            "projection map: column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
-            MAX_COLUMNS + 1
-        )
-    );
-}
-
-/// A hash-row map over a `(U128 PK, I64)` input carries its payload column into
-/// an identical layout, yet rewrites every PK: the program alone reads as an
-/// identity, and only the PK source rules it out.
-#[test]
-fn a_hash_row_map_carrying_every_column_is_not_an_identity() {
-    let s = make_schema(&[TypeCode::U128, TypeCode::I64]);
-    let plan = MapPlan::from_wire(&s, &MapKind::HashRow { cols: vec![(1, TypeCode::I64)] })
-        .expect("a well-formed hash-row map");
-    assert_eq!(plan.out_schema(), &s, "the output layout is the input's");
-    assert!(!plan.is_identity(), "a hash-row map is never an identity");
-    assert!(
-        project(&s, &[1]).is_identity(),
-        "the same copy under the inherited PK is one"
-    );
-}
-
-/// An auxiliary reindex on `key`, keeping `keep`.
-fn reindex_slots(key: Vec<gnitz_wire::ReindexSlot>, keep: Vec<u32>, nulls: NullKeys) -> MapKind {
-    MapKind::Reindex {
+    let reindex = |keep: Vec<u32>, key: Vec<gnitz_wire::ReindexSlot>| MapKind::Reindex {
         keep,
         key,
-        role: gnitz_wire::ReindexRole::Auxiliary,
-        nulls,
-    }
-}
-
-/// [`reindex_slots`] on `key` of `s`, each slot self-typed.
-pub(super) fn reindex_on(s: &SchemaDescriptor, key: &[u32], keep: Vec<u32>, nulls: NullKeys) -> MapKind {
-    reindex_slots(crate::test_support::self_typed_slots(s, key), keep, nulls)
-}
-
-#[test]
-fn reindex_key_and_kept_column_lists_are_bounds_checked() {
-    let reindex = |s: &SchemaDescriptor, keep, key: Vec<u32>| reindex_on(s, &key, keep, NullKeys::Keep);
-    let three = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U32, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    // A compound key and a pruned payload both build — and neither is an
-    // identity, since a reindex overwrites every row's PK.
-    for (s, keep, key) in [
-        (make_schema_u64_i64(), vec![0, 1], vec![0, 1]),
-        (three, vec![2], vec![0]),
+        role: ReindexRole::Auxiliary,
+        nulls: NullKeys::Keep,
+    };
+    let compute = |program: Vec<u8>, n: usize| {
+        MapKind::Compute(gnitz_wire::ComputeMap {
+            program,
+            out_cols: vec![(TypeCode::I64, false); n],
+        })
+    };
+    let n = MAX_PK_COLUMNS + 1;
+    let wide = u64_pk_schema(&vec![SchemaColumn::new(TypeCode::U64, false); n - 1]);
+    let wide_key = (0..n as u32).map(|c| (c, TypeCode::U64)).collect();
+    for (schema, mk, why) in [
+        (
+            s,
+            MapKind::Projection(vec![200]),
+            "projection map: column 200 is not a payload column of a 2-column schema".to_string(),
+        ),
+        (
+            s,
+            MapKind::Projection(vec![0]),
+            "projection map: column 0 is not a payload column of a 2-column schema".to_string(),
+        ),
+        (
+            s,
+            MapKind::Projection(vec![1; MAX_COLUMNS]),
+            format!(
+                "projection map: column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+                MAX_COLUMNS + 1
+            ),
+        ),
+        (
+            s,
+            reindex(vec![9], vec![(0, TypeCode::U64)]),
+            "reindex map: payload column 9 out of range (2 cols)".to_string(),
+        ),
+        (
+            wide,
+            reindex(vec![0], wide_key),
+            format!("reindex key: {n} columns exceeds the {MAX_PK_COLUMNS}-column PK limit"),
+        ),
+        (
+            s,
+            MapKind::HashRow { cols: vec![(9, TypeCode::I64)] },
+            "hash-row map: column 9 out of range (2 cols)".to_string(),
+        ),
+        (
+            s,
+            MapKind::HashRow { cols: vec![(1, TypeCode::String)] },
+            "map: program/schema mismatch".to_string(),
+        ),
+        (s, compute(vec![0xff; 8], 1), "map: invalid program".to_string()),
+        (s, compute(Vec::new(), 1), "map: invalid program".to_string()),
+        (
+            s,
+            compute(vec![1, 2, 3], MAX_COLUMNS),
+            format!(
+                "compute map: output column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+                MAX_COLUMNS + 1
+            ),
+        ),
     ] {
-        let plan = MapPlan::from_wire(&s, &reindex(&s, keep, key)).expect("a well-formed reindex");
-        assert!(!plan.is_identity(), "a reindex is never an identity");
+        let got = MapPlan::from_wire(&schema, &mk)
+            .map(|_| ())
+            .expect_err("a malformed map");
+        assert!(got.starts_with(&why), "{got:?} is not {why:?}");
     }
+}
 
-    let s = make_schema_u64_i64();
-    assert_eq!(
-        wire_rejection(&s, reindex(&s, vec![9], vec![0])),
-        "reindex map: payload column 9 out of range (2 cols)"
-    );
-    assert_eq!(
-        wire_rejection(&s, reindex_slots(vec![(9, TypeCode::I64)], vec![0], NullKeys::Keep)),
-        "reindex key: column 9 out of range (2 cols)"
-    );
-    // A key longer than MAX_PK_COLUMNS overflows the output schema's fixed PK array.
-    let n = crate::schema::MAX_PK_COLUMNS + 1;
-    let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(TypeCode::U64, false); n], &[0]);
-    assert_eq!(
-        wire_rejection(&wide, reindex(&wide, vec![0], (0..n as u32).collect())),
-        format!("reindex key: {n} columns exceeds the {}-column PK limit", n - 1)
-    );
+/// A map is an identity only when it keeps every row under its own PK and
+/// copies every column: a hash-row map onto the input's very layout rewrites
+/// every PK, a reindex every one too, and a hash-row map's slot may widen a
+/// column within the copy kernel's domain.
+#[test]
+fn a_map_is_an_identity_only_under_the_inherited_pk() {
+    let u128_pk = make_schema(&[TypeCode::U128, TypeCode::I64]);
+    let u32s = u64_pk_schema(&[SchemaColumn::new(TypeCode::U32, false)]);
+    let three = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::U32, false),
+        SchemaColumn::new(TypeCode::I64, false),
+    ]);
+    let hash_row = |s: &SchemaDescriptor, tc: TypeCode| {
+        MapPlan::from_wire(s, &MapKind::HashRow { cols: vec![(1, tc)] }).expect("a well-formed hash-row map")
+    };
+    let u64_i64 = make_schema_u64_i64();
+    for (what, in_schema, plan, identity) in [
+        (
+            "hash-row, same layout",
+            u128_pk,
+            hash_row(&u128_pk, TypeCode::I64),
+            false,
+        ),
+        ("projection, same layout", u128_pk, project(&u128_pk, &[1]), true),
+        ("hash-row", u32s, hash_row(&u32s, TypeCode::U32), false),
+        (
+            "hash-row, U32 widened to I64",
+            u32s,
+            hash_row(&u32s, TypeCode::I64),
+            false,
+        ),
+        (
+            "compound reindex",
+            u64_i64,
+            rekey_plan(&u64_i64, &[0, 1], &[0, 1], NullKeys::Keep),
+            false,
+        ),
+        (
+            "pruned reindex",
+            three,
+            rekey_plan(&three, &[0], &[2], NullKeys::Keep),
+            false,
+        ),
+    ] {
+        assert_eq!(plan.is_identity(), identity, "{what}");
+        if what.ends_with("same layout") {
+            assert_eq!(plan.out_schema(), &in_schema, "{what}");
+        }
+    }
 }
 
 /// A `Drop` reindex over a nullable key is the filter-then-reindex it replaces,
@@ -554,7 +595,7 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
         };
         let (batch, filtered) = (make_int_batch(&s, &rows(true)), make_int_batch(&s, &rows(false)));
         for keep in [vec![2], vec![1, 2]] {
-            let run = |nulls| MapPlan::from_wire(&s, &reindex_on(&s, &[1], keep.clone(), nulls)).unwrap();
+            let run = |nulls| rekey_plan(&s, &[1], &keep, nulls);
             let mut drop = run(NullKeys::Drop);
             let dropped = drop.evaluate_map_batch(&batch);
             assert_eq!(dropped.schema(), drop.out_schema());
@@ -566,64 +607,4 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
             assert_eq!(run(NullKeys::Keep).evaluate_map_batch(&batch).count, batch.count);
         }
     }
-}
-
-/// The set-op full-row identity map: a synthetic U128 PK over the projected
-/// payload, each slot optionally promoted to a wider fixed-int type so a
-/// cross-width pair (`I32 UNION I64`) hashes one physical layout.
-#[test]
-fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
-    let hash_row = |c: u32, tc: TypeCode| MapKind::HashRow { cols: vec![(c, tc)] };
-    let s = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U32, false),
-        ],
-        &[0],
-    );
-    assert!(
-        MapPlan::from_wire(&s, &hash_row(1, TypeCode::U32)).is_ok(),
-        "no promotion"
-    );
-    assert!(
-        MapPlan::from_wire(&s, &hash_row(1, TypeCode::I64)).is_ok(),
-        "U32 → I64 is the ≤8-byte widen the copy kernel supports"
-    );
-    assert_eq!(
-        wire_rejection(&s, hash_row(9, TypeCode::U32)),
-        "hash-row map: column 9 out of range (2 cols)"
-    );
-    assert!(
-        wire_rejection(&s, hash_row(1, TypeCode::String)).starts_with("map: program/schema mismatch"),
-        "a German string is not a fixed-int widen"
-    );
-}
-
-/// A corrupt computed-map blob, garbled or empty, is refused, not decoded into a
-/// plan that maps garbage — and the rejection names the decode, not the schema.
-#[test]
-fn a_corrupt_compute_map_program_is_rejected() {
-    for program in [vec![0xff; 8], Vec::new()] {
-        let mk = MapKind::Compute(gnitz_wire::ComputeMap {
-            program,
-            out_cols: vec![(TypeCode::I64, false)],
-        });
-        assert!(wire_rejection(&make_schema_u64_i64(), mk).starts_with("map: invalid program"));
-    }
-}
-
-/// A declaration wider than a schema holds is refused by the derivation.
-#[test]
-fn compute_map_refuses_an_over_wide_declaration() {
-    let mk = MapKind::Compute(gnitz_wire::ComputeMap {
-        program: vec![1, 2, 3],
-        out_cols: vec![(TypeCode::I64, false); MAX_COLUMNS],
-    });
-    assert_eq!(
-        wire_rejection(&make_schema_u64_i64(), mk),
-        format!(
-            "compute map: output column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
-            MAX_COLUMNS + 1
-        )
-    );
 }

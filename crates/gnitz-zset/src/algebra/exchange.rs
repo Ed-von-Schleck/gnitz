@@ -203,7 +203,7 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
 /// [`route_rows`] for a packed key, packed a chunk of rows at a time.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &ReindexPacker, nw: usize) {
-    packer.for_each_key(mb, packer.out_stride, |row, key| {
+    packer.for_each_key(mb, |row, key| {
         if mb.get_weight(row) != 0 {
             sink.put(worker_for_pk_bytes(key, nw), row as u32);
         }

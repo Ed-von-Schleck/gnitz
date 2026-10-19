@@ -276,19 +276,6 @@ impl GroupOutKey {
         }
     }
 
-    /// `row`'s identity, as [`Self::with_identity`] hands it to a loop.
-    #[cfg(test)]
-    pub(crate) fn identity(&self, mb: &MemBatch, row: usize) -> u128 {
-        struct At(usize);
-        impl IdentityLoop for At {
-            type Out = u128;
-            fn run(self, identity: impl Fn(usize) -> u128) -> u128 {
-                identity(self.0)
-            }
-        }
-        self.with_identity(mb, &[(row, row + 1)], At(row))
-    }
-
     /// The input columns the output carries after its key.
     #[inline(always)]
     pub(crate) fn carried(&self) -> &[ColumnLocator] {

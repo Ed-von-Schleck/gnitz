@@ -1,8 +1,8 @@
-use super::tests::{compute, make_schema, project, reindex_on};
+use super::tests::{compute, make_schema, project};
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{pk_payload_schema, u64_pk_schema};
+use crate::test_support::{pk_payload_schema, rekey_plan, u64_pk_schema};
 use gnitz_expr::{IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
 use gnitz_wire::{MapKind, NullKeys};
 use std::hint::black_box;
@@ -18,10 +18,11 @@ fn map_ranges_bench() {
     const N: usize = 262_144;
     const GAP: usize = 16;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let whole = |name: &str, mut plan: MapPlan, src: &Batch| {
+    // `rows`: the rows the map keeps.
+    let whole = |name: &str, mut plan: MapPlan, src: &Batch, rows: usize| {
         black_box(plan.evaluate_map_batch(src));
         let (out, instructions) = counter.measure(|| plan.evaluate_map_batch(black_box(src)));
-        black_box(out);
+        assert_eq!(out.count, rows, "{name}");
         println!(
             "map_ranges_bench {name:<24} {:6.1} instr/row",
             instructions as f64 / N as f64
@@ -56,34 +57,37 @@ fn map_ranges_bench() {
     // equijoin / GROUP BY repartition shape. Column 0 is what puts a
     // `ColumnLocator::Pk` copy in the loop. Then the same map dropping NULL keys,
     // whose survivor runs shorten as the NULLs thicken.
-    let reindex = |schema: &SchemaDescriptor, nulls| {
-        MapPlan::from_wire(schema, &reindex_on(schema, &[1], vec![0, 1, 2], nulls)).unwrap()
-    };
+    let reindex = |schema: &SchemaDescriptor, nulls| rekey_plan(schema, &[1], &[0, 1, 2], nulls);
     let (two, two_batch) = source(&[I64, I64], 0);
-    whole("reindex", reindex(&two, NullKeys::Keep), &two_batch);
+    whole("reindex", reindex(&two, NullKeys::Keep), &two_batch, N);
     for null_every in [0, 100, 32, 16, 10] {
         let (schema, batch) = source(&[I64, I64], null_every);
         let name = format!("reindex_drop_null{null_every}");
-        whole(&name, reindex(&schema, NullKeys::Drop), &batch);
+        let nulls = if null_every == 0 {
+            0
+        } else {
+            N.div_ceil(null_every as usize)
+        };
+        whole(&name, reindex(&schema, NullKeys::Drop), &batch, N - nulls);
     }
 
     // --- Hash-row maps, `[U128 hash PK, payload...]`: a hashed set-op / DISTINCT leaf.
     // Fixed-width shapes on both sides of the fold's stack arm, and a
     // heap-backed string beside an integer.
-    whole("hash_row[i64x2]", hash_row(&two, &[I64, I64]), &two_batch);
+    whole("hash_row[i64x2]", hash_row(&two, &[I64, I64]), &two_batch, N);
     for (name, payload) in [("hash_row[i64x10]", &[I64; 10][..]), ("hash_row[i64,str]", &[I64, STR])] {
         let (schema, batch) = source(payload, 0);
-        whole(name, hash_row(&schema, payload), &batch);
+        whole(name, hash_row(&schema, payload), &batch, N);
     }
 
     // --- Projections: every payload column moved to another slot, and two
     // string columns of which both are kept, or only the first.
     let (ints, int_batch) = source(&[I64; 3], 0);
     let permute = || project(&ints, &[3, 1, 2]);
-    whole("permute", permute(), &int_batch);
+    whole("permute", permute(), &int_batch, N);
     let (strs, strs_batch) = source(&[STR, STR], 0);
-    whole("proj_keep_str", project(&strs, &[1, 2]), &strs_batch);
-    whole("proj_drop_str", project(&strs, &[1]), &strs_batch);
+    whole("proj_keep_str", project(&strs, &[1, 2]), &strs_batch, N);
+    whole("proj_drop_str", project(&strs, &[1]), &strs_batch, N);
 
     // --- Computed maps: three integer columns, and a string emit that grows the
     // output blob.
@@ -115,8 +119,8 @@ fn map_ranges_bench() {
         );
         compute(&str1, prog, &[(STR, true)])
     };
-    whole("int3", int3(), &int_batch);
-    whole("upper", upper(), &str_batch);
+    whole("int3", int3(), &int_batch, N);
+    whole("upper", upper(), &str_batch, N);
 
     // --- Column copies: one column of `[pk..., payload]` copied into an I64 slot,
     // widened from a PK or a payload cell, or decoded at its own width.
@@ -137,39 +141,33 @@ fn map_ranges_bench() {
             batch.end_row();
         }
         let plan = compute(&schema, LogicalProgram::copy_cols(&[col]), &[(I64, false)]);
-        whole(name, plan, &batch.finish());
+        whole(name, plan, &batch.finish(), N);
     }
 
     // --- Survivor runs. A map that computes, or that copies fixed-width columns
     // alone, gathers runs under 128 rows and maps longer ones in place; a
     // projection over a string column never gathers.
-    for (name, mut plan, src, run) in [
-        ("int3_r1", int3(), &int_batch, 1),
-        ("int3_r64", int3(), &int_batch, 64),
-        ("int3_r256", int3(), &int_batch, 256),
-        ("upper_r1", upper(), &str_batch, 1),
-        ("upper_r64", upper(), &str_batch, 64),
-        ("upper_r256", upper(), &str_batch, 256),
-        ("permute_r1", permute(), &int_batch, 1),
-        ("permute_r16", permute(), &int_batch, 16),
-        ("permute_r64", permute(), &int_batch, 64),
-        ("permute_r96", permute(), &int_batch, 96),
-        ("permute_r128", permute(), &int_batch, 128),
-        ("permute_r256", permute(), &int_batch, 256),
-        ("keep_str_r1", project(&strs, &[1, 2]), &strs_batch, 1),
-        ("keep_str_r16", project(&strs, &[1, 2]), &strs_batch, 16),
-        ("keep_str_r64", project(&strs, &[1, 2]), &strs_batch, 64),
-        ("drop_str_r16", project(&strs, &[1]), &strs_batch, 16),
-    ] {
-        let ranges: Vec<(usize, usize)> = (0..N).step_by(run + GAP).map(|s| (s, (s + run).min(N))).collect();
-        let mut keeper = Batch::empty_with_schema(plan.out_schema());
-        plan.append_map_ranges(src, &mut keeper, &ranges);
-        keeper.clear();
-        let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(src), &mut keeper, &ranges));
-        println!(
-            "map_ranges_bench {name:<24} {:6.1} instr/row ({} ranges)",
-            instructions as f64 / keeper.count as f64,
-            ranges.len()
-        );
+    let survivors = [
+        ("int3", int3(), &int_batch, &[1, 64, 256][..]),
+        ("upper", upper(), &str_batch, &[1, 64, 256]),
+        ("permute", permute(), &int_batch, &[1, 16, 64, 96, 128, 256]),
+        ("keep_str", project(&strs, &[1, 2]), &strs_batch, &[1, 16, 64]),
+        ("drop_str", project(&strs, &[1]), &strs_batch, &[16]),
+    ];
+    for (name, mut plan, src, runs) in survivors {
+        for &run in runs {
+            let ranges: Vec<(usize, usize)> = (0..N).step_by(run + GAP).map(|s| (s, (s + run).min(N))).collect();
+            let mut keeper = Batch::empty_with_schema(plan.out_schema());
+            plan.append_map_ranges(src, &mut keeper, &ranges);
+            keeper.clear();
+            let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(src), &mut keeper, &ranges));
+            assert_eq!(keeper.count, crate::repr::range_rows(&ranges), "{name}_r{run}");
+            println!(
+                "map_ranges_bench {:<24} {:6.1} instr/row ({} ranges)",
+                format!("{name}_r{run}"),
+                instructions as f64 / keeper.count as f64,
+                ranges.len()
+            );
+        }
     }
 }

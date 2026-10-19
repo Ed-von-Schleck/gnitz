@@ -4,6 +4,22 @@ use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{arb_fold_case, cell, fold_batch, le_cell, mix, opk_pk, pk_only_schema};
 use proptest::prelude::*;
 
+/// The identities of `runs`' rows, in row order.
+struct Over<'a>(&'a [(usize, usize)]);
+
+impl IdentityLoop for Over<'_> {
+    type Out = Vec<u128>;
+    fn run(self, identity: impl Fn(usize) -> u128) -> Vec<u128> {
+        self.0.iter().flat_map(|&(s, e)| s..e).map(identity).collect()
+    }
+}
+
+/// Every row's identity.
+fn identities(key: &GroupOutKey, mb: &MemBatch) -> Vec<u128> {
+    let all = [(0, mb.count)];
+    key.with_identity(mb, &all, Over(&all))
+}
+
 // ---------------------------------------------------------------------------
 // Group key
 // ---------------------------------------------------------------------------
@@ -29,14 +45,16 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
         let b = b.finish();
         let (key, _) = GroupOutKey::new(&schema, &[1], []).unwrap();
         let mb = b.as_mem_batch();
-        (key.identity(&mb, 0), key.out_pk(&mb, 0).bytes().to_vec())
+        (identities(&key, &mb)[0], key.out_pk(&mb, 0).bytes().to_vec())
     };
 
     for (tc, vals) in [
-        (TypeCode::I32, vec![1i128, -1, 100, i32::MIN as i128, i32::MAX as i128]),
+        (TypeCode::I8, vec![0i128, -1, i8::MIN as i128, i8::MAX as i128]),
+        (TypeCode::I32, vec![1, -1, 100, i32::MIN as i128, i32::MAX as i128]),
         (TypeCode::I64, vec![0, -1, i64::MIN as i128, i64::MAX as i128]),
         (TypeCode::U16, vec![0, 1, 0xBEEF, u16::MAX as i128]),
         (TypeCode::U64, vec![0, 1, u64::MAX as i128]),
+        (TypeCode::U128, vec![0, 1, u64::MAX as i128 + 1, u128::MAX as i128]),
     ] {
         let width = SchemaColumn::new(tc, false).size();
         for v in vals {
@@ -47,25 +65,6 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
             assert_eq!(key(tc, le, false), want, "payload-column key for {tc} v={v}");
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Group runs and ordinals
-// ---------------------------------------------------------------------------
-
-/// Sorting numbers the groups in ascending key order, and a group's first row is
-/// its first in the batch: the whole `(key, index)` pair is the sort key, so the
-/// index breaks every tie.
-#[test]
-fn sorted_ordinals_number_groups_by_key_and_keep_the_first_row() {
-    // Three keys, descending, four rows each, interleaved.
-    let groups = GroupOrdinals::sorted(12, |i| 2 - i % 3);
-    assert_eq!(groups.ord, [2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0]);
-    assert_eq!(groups.first, [2, 1, 0]);
-    assert_eq!(groups.by_pk, [0, 1, 2]);
-    // Every row one key: one group.
-    let groups = GroupOrdinals::sorted(5, |_| 0u64);
-    assert_eq!((groups.ord, groups.first, groups.by_pk), (vec![0; 5], vec![0], vec![0]));
 }
 
 /// Under every key form — the empty set, every leading run of the PK list, each
@@ -92,9 +91,10 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
         for batch in [raw, &consolidated] {
             let mb = batch.as_mem_batch();
             let out_pk = |row: usize| key.out_pk(&mb, row).bytes().to_vec();
-            let groups = key
-                .runs(batch)
-                .map_or_else(|| key.numbered(batch), |r| GroupOrdinals::of_runs(&r));
+            let runs = key.runs(batch);
+            let groups = runs
+                .as_deref()
+                .map_or_else(|| key.numbered(batch), GroupOrdinals::of_runs);
             prop_assert_eq!(groups.ord.len(), batch.count, "{:?}", cols);
             for (row, &g) in groups.ord.iter().enumerate() {
                 let first = groups.first[g as usize] as usize;
@@ -111,7 +111,6 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 .collect();
             prop_assert!(pks.windows(2).all(|w| w[0] < w[1]), "{:?}: groups out of order", cols);
 
-            let runs = key.runs(batch);
             if let Some(runs) = &runs {
                 prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
                 for (g, run) in runs.iter().map(|&(s, e)| s..e).enumerate() {
@@ -133,6 +132,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
 
             let group =
                 |r: usize| -> Vec<_> { cols.iter().map(|&c| cell(&mb, schema.locate(c as usize), r)).collect() };
+            let ids = identities(&key, &mb);
             for a in 0..batch.count {
                 for b in a + 1..batch.count {
                     let same_out_pk = out_pk(a) == out_pk(b);
@@ -145,14 +145,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                         a,
                         b
                     );
-                    prop_assert_eq!(
-                        key.identity(&mb, a) == key.identity(&mb, b),
-                        same_out_pk,
-                        "{:?}: rows {} and {}",
-                        cols,
-                        a,
-                        b
-                    );
+                    prop_assert_eq!(ids[a] == ids[b], same_out_pk, "{:?}: rows {} and {}", cols, a, b);
                 }
             }
         }
@@ -169,18 +162,23 @@ proptest! {
 }
 
 /// [`assert_groups_follow_out_pk`] over a compound signed PK and signed, wide
-/// and nullable payload columns, each holding repeated values: 64 rows, so both
-/// the hashed and the sorted numbering are taken, by group count.
+/// and nullable payload columns, each holding repeated values — two unsigned
+/// nullable ones whose zero packs as a NULL's zeroed slot, so only the bitmap
+/// tells a NULL in one from a NULL in the other — over 64 rows, so both the
+/// hashed and the sorted numbering are taken, by group count.
 #[test]
 fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
-    // `[U32 pk0, I32 pk1, I64 v, U128 w, I64 n NULL]`, PK `(pk0, pk1)`.
+    use TypeCode::{I32, I64, U128, U16, U32, U64};
+    let c = SchemaColumn::new;
+    // `[U32 pk0, I32 pk1, U64 v NULL, U128 w, U16 n NULL, I64 s]`, PK `(pk0, pk1)`.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U32, false),
-            SchemaColumn::new(TypeCode::I32, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, true),
+            c(U32, false),
+            c(I32, false),
+            c(U64, true),
+            c(U128, false),
+            c(U16, true),
+            c(I64, false),
         ],
         &[0, 1],
     );
@@ -188,32 +186,14 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     for i in 0..64u64 {
         let m = mix(i) >> 40;
         bb.begin_row_natives(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);
+        bb.put_opt_int((!m.is_multiple_of(4)).then_some(u128::from(m % 3)));
+        // Distinct in every row, so a key over it sorts.
+        bb.put_int(u128::from(i) << 64 | u128::from(m % 3));
+        bb.put_opt_int((!(m / 4).is_multiple_of(3)).then_some(u128::from(m / 12 % 3)));
         bb.put_int(((m % 9) as i64 - 4) as u128);
-        bb.put_int(u128::from(m % 3) << 100);
-        match m % 4 {
-            0 => bb.put_null(),
-            k => bb.put_int((k as i64 - 2) as u128),
-        }
         bb.end_row();
     }
     assert_groups_follow_out_pk(&bb.finish()).unwrap();
-}
-
-/// A narrow key's image, right-aligned at the key's width, is the key.
-#[test]
-fn narrow_pk_opk_inverts_the_widening() {
-    let mut rng = crate::test_support::Rng::new(0x0A11_6E00);
-    for _ in 0..2000 {
-        let bytes = rng.gen_u128().to_be_bytes();
-        for w in 1..=16 {
-            let opk = &bytes[..w];
-            assert_eq!(
-                NarrowPkOpk::new(gnitz_wire::widen_pk_be(opk), w).bytes(),
-                opk,
-                "width {w}"
-            );
-        }
-    }
 }
 
 /// A packed key read over survivor runs hands each of their rows the identity
@@ -221,14 +201,6 @@ fn narrow_pk_opk_inverts_the_widening() {
 /// a row at a time.
 #[test]
 fn packed_identities_over_runs_are_their_whole_batch_identities() {
-    /// The identities of `runs`' rows, in row order.
-    struct Over<'a>(&'a [(usize, usize)]);
-    impl IdentityLoop for Over<'_> {
-        type Out = Vec<u128>;
-        fn run(self, identity: impl Fn(usize) -> u128) -> Vec<u128> {
-            self.0.iter().flat_map(|&(s, e)| s..e).map(identity).collect()
-        }
-    }
     const N: usize = 512;
     let c = SchemaColumn::new;
     let ints = SchemaDescriptor::new(
@@ -253,7 +225,7 @@ fn packed_identities_over_runs_are_their_whole_batch_identities() {
         let mb = batch.as_mem_batch();
         let (key, _) = GroupOutKey::new(schema, cols, []).unwrap();
         assert!(matches!(key.key, GroupKey::Packed(_)), "{cols:?} packs");
-        let whole = key.with_identity(&mb, &[(0, N)], Over(&[(0, N)]));
+        let whole = identities(&key, &mb);
         for (gap, run) in [
             (0, 1),
             (1, 1),

@@ -98,7 +98,8 @@ impl Placement {
             return None;
         };
         key::range_shares_prefix(&start, end.as_ref(), dist_stride as usize)
-            .then(|| worker_for_pk_bytes(&start.pk_bytes()[..dist_stride as usize], num_workers))
+            .then(|| self.owner(start.pk_bytes(), num_workers))
+            .flatten()
     }
 
     /// The worker that stores the row keyed `pk`; `None` unless rows are

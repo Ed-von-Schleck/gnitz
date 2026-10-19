@@ -1,9 +1,10 @@
 use super::*;
 use crate::algebra::group_key::GroupOutKey;
-use crate::algebra::{ground_owner, Placement};
+use crate::algebra::{ground_owner, MapPlan, Placement};
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode, MAX_PK_BYTES};
-use crate::test_support::{self_typed_slots, weighted_rows};
+use crate::schema::{SchemaColumn, TypeCode};
+use crate::test_support::{pk_payload_schema, self_typed_slots, u64_pk_schema, weighted_rows};
+use gnitz_wire::{MapKind, NullKeys, ReindexRole};
 
 /// PK `(U32, I32, U64, U64)` — 24 bytes, so the whole PK routes by the wide
 /// hash and every proper prefix by its narrow image — over
@@ -44,32 +45,34 @@ fn batch(schema: &SchemaDescriptor) -> Batch {
     b.finish()
 }
 
-/// `plan` sends each nonzero-weight row of `b` to its `owner` of `nw` workers and no
-/// weight-0 row anywhere, as one ascending list per worker, and hands each rank
-/// the same rows as its share.
-fn assert_routes(plan: &ScatterPlan, b: &Batch, nw: usize, what: &str, owner: impl Fn(&MemBatch, usize) -> usize) {
+/// At every worker count of a cluster, `plan` sends each nonzero-weight row of
+/// `b` to its `owner` and no weight-0 row anywhere, as one ascending list per
+/// worker — a broadcast as one list — and hands each rank the rows of its list
+/// as its share.
+fn assert_routes(plan: &ScatterPlan, b: &Batch, what: &str, owner: impl Fn(&MemBatch, usize, usize) -> usize) {
     let mb = b.as_mem_batch();
-    let mut want = vec![Vec::new(); nw];
-    for row in (0..mb.count).filter(|&r| mb.get_weight(r) != 0) {
-        want[owner(&mb, row)].push(row as u32);
-    }
-    // A pool left over from a wider round.
-    let mut pool = vec![vec![7u32]; nw + 1];
-    assert_eq!(plan.route(b, &mut pool, nw), &want[..], "{what}");
-    for (rank, rows) in want.iter().enumerate() {
-        assert_eq!(
-            weighted_rows(&plan.share(b, Slot::new(rank as u32, nw as u32))),
-            weighted_rows(&b.ascending_subset(rows)),
-            "{what}: rank {rank}'s share"
-        );
+    for nw in [1, 2, 4, 7] {
+        let mut want = vec![Vec::new(); if plan.is_broadcast() { 1 } else { nw }];
+        for row in (0..mb.count).filter(|&r| mb.get_weight(r) != 0) {
+            want[owner(&mb, row, nw)].push(row as u32);
+        }
+        // A pool left over from a wider round.
+        let mut pool = vec![vec![7u32]; nw + 1];
+        assert_eq!(plan.route(b, &mut pool, nw), &want[..], "{what}, {nw} workers");
+        for rank in 0..nw {
+            assert_eq!(
+                weighted_rows(&plan.share(b, Slot::new(rank as u32, nw as u32))),
+                weighted_rows(&b.ascending_subset(&want[rank % want.len()])),
+                "{what}: rank {rank} of {nw}'s share"
+            );
+        }
     }
 }
 
-const NW: usize = 4;
-
 /// A group scatter sends each row to the owner of the output PK the reduce keys
 /// its group by: a PK range, one column's image, the packed key, or the
-/// NULL-distinct fold.
+/// NULL-distinct fold — over no columns [`ground_owner`], the worker the
+/// compiler lets seed a global aggregate's ground row.
 #[test]
 fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
     let schema = schema();
@@ -91,43 +94,42 @@ fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
     ] {
         let (gk, _) = GroupOutKey::new(&schema, cols, []).expect("the fixture group keys");
         let plan = ScatterPlan::group(&schema, cols).expect("the fixture key routes");
-        let owner = |mb: &MemBatch, row| worker_for_pk_bytes(gk.out_pk(mb, row).bytes(), NW);
-        assert_routes(&plan, &b, NW, &format!("group {cols:?}"), owner);
-        assert_routes(&plan, &empty, NW, &format!("group {cols:?} of no rows"), owner);
+        let owner = |mb: &MemBatch, row, nw| {
+            let owner = worker_for_pk_bytes(gk.out_pk(mb, row).bytes(), nw);
+            assert!(!cols.is_empty() || owner == ground_owner(nw), "the ground row's owner");
+            owner
+        };
+        assert_routes(&plan, &b, &format!("group {cols:?}"), owner);
+        assert_routes(&plan, &empty, &format!("group {cols:?} of no rows"), owner);
     }
 }
 
-/// A PK prefix of any byte width routes each row where those bytes hash: a narrow
-/// one by its image, at every cell width, and a wide one by its digest.
+/// A relation's own placement routes each row where it lives: a PK prefix of
+/// any byte width where those bytes hash — a narrow one by its image, at every
+/// cell width, and a wide one by its digest — and a replicated relation's rows
+/// to every worker.
 #[test]
-fn a_pk_prefix_of_every_width_routes_by_its_bytes() {
+fn the_native_plan_routes_each_row_by_its_placement() {
     let schema = schema();
     let b = batch(&schema);
-    for n in 1..=schema.pk_stride() {
-        let plan = ScatterPlan::native(Placement::Keyed { dist_stride: n as u8 });
-        assert_routes(&plan, &b, NW, &format!("prefix {n}"), |mb, row| {
-            worker_for_pk_bytes(&mb.get_pk_bytes(row)[..n], NW)
-        });
+    let keyed = (1..=schema.pk_stride()).map(|n| Placement::Keyed { dist_stride: n as u8 });
+    for placement in keyed.chain([Placement::Replicated]) {
+        assert_routes(
+            &ScatterPlan::native(placement),
+            &b,
+            &format!("{placement:?}"),
+            |mb, row, nw| placement.owner(mb.get_pk_bytes(row), nw).unwrap_or(0),
+        );
     }
 }
 
-/// A scatter keyed by no columns sends every row to [`ground_owner`] — the
-/// worker the compiler lets seed a global aggregate's ground row.
+/// A join scatter sends each row where the `_join_pk` the reindex Map stamps on
+/// it hashes, so the scattered delta and the reindexed trace co-partition; it
+/// runs the packer only for a key that is not the row's own OPK bytes: a
+/// promoted slot, string content, or several columns that are not consecutive
+/// PK columns.
 #[test]
-fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
-    let schema = schema();
-    let (b, plan) = (batch(&schema), ScatterPlan::group(&schema, &[]).unwrap());
-    for nw in [1, 2, 3, 4, 7, 16, 64] {
-        assert_routes(&plan, &b, nw, &format!("nw={nw}"), |_, _| ground_owner(nw));
-    }
-}
-
-/// A join scatter sends each row where the `_join_pk` the reindex Map packs for
-/// it hashes, and runs the packer only for a key that is not the row's own OPK
-/// bytes: a promoted slot, string content, or several columns that are not
-/// consecutive PK columns.
-#[test]
-fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
+fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
     use TypeCode::{I64, U128};
     let schema = schema();
     let b = batch(&schema);
@@ -152,29 +154,17 @@ fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
     ] {
         let plan = ScatterPlan::join(&schema, &slots).expect("the fixture key routes");
         assert_eq!(matches!(plan.0, Some(GroupKey::Packed(_))), packed, "{slots:?}");
-        let packer = ReindexPacker::new(&schema, &slots).expect("the fixture key packs");
-        assert_routes(&plan, &b, NW, &format!("join {slots:?}"), |mb, row| {
-            worker_for_pk_bytes(packer.pack_prefix(&mut [0u8; MAX_PK_BYTES], mb, row), NW)
+        let reindex = MapKind::Reindex {
+            keep: vec![],
+            key: slots.clone(),
+            role: ReindexRole::Auxiliary,
+            nulls: NullKeys::Keep,
+        };
+        let mut map = MapPlan::from_wire(&schema, &reindex).expect("the fixture key packs");
+        let (keyed, at) = (map.evaluate_map_batch(&b), Placement::full_pk(map.out_schema()));
+        assert_routes(&plan, &b, &format!("join {slots:?}"), |_, row, nw| {
+            at.owner(keyed.get_pk_bytes(row), nw).unwrap()
         });
-    }
-}
-
-/// A relation's own whole-PK route shares as a group key over every PK column
-/// does.
-#[test]
-fn the_native_whole_pk_route_shares_as_its_group_key_does() {
-    let schema = schema();
-    let b = batch(&schema);
-    let whole_pk = ScatterPlan::group(&schema, &[0, 1, 2, 3]).unwrap();
-    for nw in [1, NW as u32] {
-        for rank in 0..nw {
-            let slot = Slot::new(rank, nw);
-            assert_eq!(
-                weighted_rows(&ScatterPlan::native(Placement::full_pk(&schema)).share(&b, slot)),
-                weighted_rows(&whole_pk.share(&b, slot)),
-                "rank {rank} of {nw}"
-            );
-        }
     }
 }
 
@@ -182,13 +172,7 @@ fn the_native_whole_pk_route_shares_as_its_group_key_does() {
 /// cannot route is refused rather than panicking inside `locate` or the packer.
 #[test]
 fn a_key_the_schema_cannot_route_is_refused() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, true),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::F64, true)]);
     for (plan, why) in [
         (
             ScatterPlan::group(&schema, &[7]),
@@ -234,20 +218,16 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
     ] {
         for cols in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[0, 1, 2, 3], &[1], &[1, 0]] {
             let on_prefix = dist == Some(cols);
-            for (kind, plan, want) in [
-                ("group", ScatterPlan::group(&schema, cols), on_prefix),
-                (
-                    "join",
-                    ScatterPlan::join(&schema, &self_typed_slots(&schema, cols)),
-                    on_prefix,
-                ),
+            for (kind, plan) in [
+                ("group", ScatterPlan::group(&schema, cols)),
+                ("join", ScatterPlan::join(&schema, &self_typed_slots(&schema, cols))),
             ] {
                 let what = format!("{placement:?}, {kind} {cols:?}");
                 let plan = plan.expect("the fixture key routes");
-                assert_eq!(plan.routes_to_native_owner(placement), want, "{what}");
-                if want {
-                    assert_routes(&plan, &b, NW, &what, |mb, row| {
-                        placement.owner(mb.get_pk_bytes(row), NW).unwrap()
+                assert_eq!(plan.routes_to_native_owner(placement), on_prefix, "{what}");
+                if on_prefix {
+                    assert_routes(&plan, &b, &what, |mb, row, nw| {
+                        placement.owner(mb.get_pk_bytes(row), nw).unwrap()
                     });
                 }
             }
@@ -273,47 +253,11 @@ fn a_layout_identical_promotion_routes_natively() {
         (TypeCode::Timestamp, TypeCode::I64),
         (TypeCode::Decimal, TypeCode::I64),
     ] {
-        let s = SchemaDescriptor::new(
-            &[SchemaColumn::new(tc, false), SchemaColumn::new(TypeCode::I64, false)],
-            &[0],
-        );
+        let s = pk_payload_schema(&[tc]);
         assert!(
             ScatterPlan::join(&s, &[(0, slot)]).is_ok_and(|p| p.routes_to_native_owner(Placement::full_pk(&s))),
             "{tc:?} typed {slot:?}"
         );
-    }
-}
-
-/// Each nonzero-weight row lands in the slot of the worker its placement owns it by —
-/// one slot for a replicated relation — and a weight-0 row in none.
-#[test]
-fn the_native_plan_places_each_nonzero_weight_row_by_its_placement() {
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
-    let mut bb = BatchBuilder::new(&schema);
-    for b in 0..8u128 {
-        bb.begin_row_natives(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
-        bb.end_row();
-    }
-    let batch = bb.finish();
-    for placement in [
-        Placement::keyed(&schema, 1),
-        Placement::full_pk(&schema),
-        Placement::Replicated,
-    ] {
-        let live = (0..8u32).filter(|&i| i != 3);
-        let want = match placement {
-            Placement::Replicated => vec![live.collect::<Vec<_>>()],
-            _ => {
-                let mut want = vec![Vec::new(); NW];
-                for i in live {
-                    want[placement.owner(batch.get_pk_bytes(i as usize), NW).unwrap()].push(i);
-                }
-                want
-            }
-        };
-        let mut out = Vec::new();
-        let slots = ScatterPlan::native(placement).route(&batch, &mut out, NW);
-        assert_eq!(slots, &want[..], "{placement:?}");
     }
 }
 

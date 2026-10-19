@@ -2,7 +2,7 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
-    assert_folds, make_batch, make_schema_u64_i64, pk_payload_schema, weighted_rows, zset_of, zset_sum,
+    assert_folds, make_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows, zset_of, zset_sum,
 };
 
 /// How a fixture batch holds rows given in (PK, payload) order.
@@ -37,25 +37,22 @@ fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], how: R
 }
 
 /// Union is Z-Set `+` under the union's own schema, whichever way it gets
-/// there: two inputs in consolidated order merge into a consolidated fold, with
-/// the claim or without it, anything else
-/// concatenates and stays unconsolidated, and an empty operand on either side keeps the
-/// other's claim. A
-/// NULL and a zero hold the same bytes, so only the nullability the union
-/// merges in keeps them two elements; equal elements at opposite weights cancel.
+/// there — owned, lent or flipped: two inputs in consolidated order merge into a
+/// consolidated fold, with the claim or without it, anything else concatenates
+/// and stays unconsolidated, and an empty operand on either side keeps the
+/// other's claim. A NULL and a zero hold the same bytes, so only the
+/// nullability the union merges in, from either side, keeps them two elements;
+/// equal elements at opposite weights cancel.
 #[test]
 fn union_is_the_zset_sum_under_every_input_layout() {
     let (nonnull, nullable) = (
         make_schema_u64_i64(),
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(TypeCode::I64, true),
-            ],
-            &[0],
-        ),
+        u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]),
     );
     let out_schema = union_nullability_merge(&nonnull, &nullable).unwrap();
+    assert_eq!(union_nullability_merge(&nullable, &nonnull), Ok(out_schema));
+    assert!(out_schema.columns()[1].nullable);
+    assert_eq!(union_nullability_merge(&nonnull, &nonnull), Ok(nonnull));
     let a_rows = [(1, 1, Some(0)), (2, 1, Some(10)), (3, 2, Some(30)), (5, 1, Some(50))];
     let b_rows = [(1, -1, None), (2, -1, Some(10)), (3, 1, Some(31)), (4, 1, Some(40))];
     use Rows::*;
@@ -70,42 +67,37 @@ fn union_is_the_zset_sum_under_every_input_layout() {
         (InOrder, Claimed, &[]),
         (Scrambled, Claimed, &[]),
     ] {
-        let what = format!("a {a_how:?}, b {b_how:?}, b rows {}", b_rows.len());
         let (a, b) = (opt_batch(&nonnull, &a_rows, a_how), opt_batch(&nullable, b_rows, b_how));
-        let out = op_union(Cow::Owned(Batch::clone(&a)), Cow::Owned(Batch::clone(&b)), &out_schema);
-        let lent = op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &out_schema);
-        assert_eq!(lent.schema(), &out_schema, "{what}");
-        assert_eq!(lent.is_consolidated(), out.is_consolidated(), "{what}");
-        assert_eq!(
-            zset_of(&lent, &out_schema),
-            zset_of(&out, &out_schema),
-            "{what}: a lent operand unions as an owned one"
-        );
-        assert_eq!(out.schema(), &out_schema, "{what}");
         let consolidated = match b_rows.is_empty() {
             true => a_how == Claimed,
             false => a_how != Scrambled && b_how != Scrambled,
         };
-        assert_eq!(out.is_consolidated(), consolidated, "{what}");
-        let flipped = op_union(Cow::Borrowed(&b), Cow::Owned(Batch::clone(&a)), &out_schema);
-        assert_eq!(flipped.schema(), &out_schema, "{what}");
-        assert_eq!(flipped.is_consolidated(), consolidated, "{what}: flipped");
-        assert_eq!(
-            zset_of(&flipped, &out_schema),
-            zset_of(&out, &out_schema),
-            "{what}: the operands commute"
-        );
-        match consolidated {
-            true => assert_folds(&[a, b], &out, &what),
-            false => assert_eq!(zset_of(&out, &out_schema), zset_sum(&[a, b], &out_schema), "{what}"),
+        for (form, out) in [
+            (
+                "owned",
+                op_union(Cow::Owned(a.clone()), Cow::Owned(b.clone()), &out_schema),
+            ),
+            ("lent", op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &out_schema)),
+            (
+                "flipped",
+                op_union(Cow::Borrowed(&b), Cow::Owned(a.clone()), &out_schema),
+            ),
+        ] {
+            let what = format!("a {a_how:?}, b {b_how:?}, b rows {}, {form}", b_rows.len());
+            assert_eq!(out.schema(), &out_schema, "{what}");
+            assert_eq!(out.is_consolidated(), consolidated, "{what}");
+            let inputs = [a.clone(), b.clone()];
+            match consolidated {
+                true => assert_folds(&inputs, &out, &what),
+                false => assert_eq!(zset_of(&out, &out_schema), zset_sum(&inputs, &out_schema), "{what}"),
+            }
         }
     }
 }
 
 /// A filter keeps exactly the matching rows at their weights, in input order,
-/// and a consolidated input stays consolidated; when every row passes it
-/// answers `None`, so the caller hands its own input through rather than paying
-/// a whole-batch copy for a no-op.
+/// and a consolidated input stays consolidated; when every row passes it hands
+/// an owned input through rather than paying a whole-batch copy for a no-op.
 #[test]
 fn filter_keeps_exactly_the_matching_rows() {
     let schema = make_schema_u64_i64();
@@ -128,28 +120,6 @@ fn filter_keeps_exactly_the_matching_rows() {
 }
 
 // ── Derived output schemas ──────────────────────────────────────────────
-
-/// `union_nullability_merge` ORs the two inputs' per-column nullability,
-/// symmetrically.
-#[test]
-fn union_merges_nullability() {
-    let nonnull = pk_payload_schema(&[TypeCode::U128]);
-    let nullable = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
-    for (a, b, want_nullable) in [
-        (nonnull, nonnull, false),
-        (nonnull, nullable, true),
-        (nullable, nonnull, true),
-    ] {
-        let m = union_nullability_merge(&a, &b).expect("shared layout");
-        assert_eq!(m.columns()[1].nullable, want_nullable);
-    }
-}
 
 /// A mismatched pair is the whole layout contract, and in release there is
 /// nothing else: adopting `a`'s schema would let `op_union` read `b`'s bytes
@@ -202,11 +172,10 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     assert!(out.columns()[out.num_columns() - 1].nullable);
     // One column short of the limit, extended by two: the merged width
     // overflows, which a bound on the list length misses.
-    let wide = {
-        let mut cols = vec![SchemaColumn::new(TypeCode::I64, false); crate::schema::MAX_COLUMNS - 1];
-        cols[0] = SchemaColumn::new(TypeCode::U64, false);
-        SchemaDescriptor::new(&cols, &[0])
-    };
+    let wide = u64_pk_schema(&vec![
+        SchemaColumn::new(TypeCode::I64, false);
+        crate::schema::MAX_COLUMNS - 2
+    ]);
     assert!(extend(&wide, 1).is_ok());
     assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), guard);
 }

@@ -1,98 +1,11 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{mix, pk_payload_schema};
+use crate::schema::{SchemaColumn, TypeCode};
+use crate::test_support::{pk_payload_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
 const N: usize = 500_000;
-
-/// Instructions per row of [`ReindexPacker::for_each_key`], over join- and
-/// group-key shapes.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn reindex_pack_bench() {
-    let counter = Counter::instructions();
-    let join_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I32, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
-    let mut jb = BatchBuilder::new(&join_schema);
-    for i in 0..N as u64 {
-        jb.begin_row(i as u128, 1i64);
-        jb.put_int((i.wrapping_mul(2_654_435_761)) as u128);
-        jb.put_int(mix(i) as u128);
-        jb.put_int((!i) as u128);
-        jb.put_int((i as i32).wrapping_mul(-3) as u32 as u128);
-        jb.put_blob(format!("key-{}", i % 50_000).as_bytes());
-        jb.end_row();
-    }
-    let jb = jb.finish();
-    let join3 = ReindexPacker::new(
-        &join_schema,
-        &[(1, TypeCode::U64), (2, TypeCode::U64), (3, TypeCode::U64)],
-    )
-    .unwrap();
-    let promoted = ReindexPacker::new(&join_schema, &[(4, TypeCode::I64)]).unwrap();
-    let string = ReindexPacker::new(&join_schema, &[(5, TypeCode::U128)]).unwrap();
-
-    // Group keys over [U64 PK, I64, U32 NULL, I64, I64, I64]: (1, 2) packs under a
-    // bitmap, and all five overflow the PK column budget into a fold slot.
-    let grp_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::U32, true),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    let mut gb = BatchBuilder::new(&grp_schema);
-    for i in 0..N as u64 {
-        gb.begin_row(i as u128, 1);
-        gb.put_int((i as i64).wrapping_mul(-7) as u128);
-        gb.put_opt_int((i % 8 != 0).then_some(i as u32 as u128));
-        gb.put_int(i.wrapping_mul(2_654_435_761) as u128);
-        gb.put_int((!i) as u128);
-        gb.put_int(i as u128);
-        gb.end_row();
-    }
-    let gb = gb.finish();
-    let group = |cols: &[u32]| ReindexPacker::new_group_key(&grp_schema, cols, &[]).unwrap().0;
-    let (group2, group5) = (group(&[1, 2]), group(&[1, 2, 3, 4, 5]));
-    assert!(group2.packs_whole() && !group5.packs_whole());
-
-    for (name, packer, batch) in [
-        ("join3", &join3, &jb),
-        ("promoted-i32", &promoted, &jb),
-        ("string", &string, &jb),
-        ("group2-nullable", &group2, &gb),
-        ("group5-fold", &group5, &gb),
-    ] {
-        let mb = &batch.as_mem_batch();
-        let pack = || {
-            packer.for_each_key(mb, packer.out_stride, |_, key| {
-                black_box(key);
-            })
-        };
-        pack();
-        let ((), instructions) = counter.measure(pack);
-        println!(
-            "reindex_pack_bench {name:<16} {:6.1} instr/row (stride {})",
-            instructions as f64 / N as f64,
-            packer.out_stride
-        );
-    }
-}
 
 /// Instructions and cycles per row of [`FoldCols::key_row`] by column count,
 /// over `[U64 PK, I64, U32 NULL, I64, I64, I64]` — the cycles the least of
@@ -101,17 +14,13 @@ fn reindex_pack_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn fold_key_bench() {
     let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::U32, true),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::U32, true),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+    ]);
     let mut b = BatchBuilder::new(&schema);
     for i in 0..N as u64 {
         b.begin_row(i as u128, 1);
@@ -152,7 +61,8 @@ fn fold_key_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn index_entries_bench() {
     let counter = Counter::instructions();
-    let measure = |label: &str, batch: &Batch, cols: &[u32]| {
+    // `live`: the rows NULL in no indexed column, each an entry.
+    let measure = |label: &str, batch: &Batch, cols: &[u32], live: usize| {
         let (spec, idx_schema) = crate::schema::KeySpec::new(cols, batch.schema())
             .map(|spec| (spec, spec.index_schema(batch.schema())))
             .unwrap();
@@ -165,23 +75,19 @@ fn index_entries_bench() {
         black_box(&spans);
         black_box(index_entries(batch, &spec, &idx_schema));
         let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
+        assert_eq!((entries.len(), spans.len()), (live, live * slot), "{label}");
         println!(
-            "index_entries_bench {label:<40} spans {:5.1}, entries {:5.1} instr/row ({} entries)",
+            "index_entries_bench {label:<40} spans {:5.1}, entries {:5.1} instr/row ({live} entries)",
             span as f64 / N as f64,
             entry as f64 / N as f64,
-            entries.len()
         );
     };
     let spread = |row: usize| (row as u64).wrapping_mul(2_654_435_761);
 
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::U32, true),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::U32, true),
+    ]);
     for null_every in [0usize, 8, 2] {
         let mut b = BatchBuilder::new(&schema);
         for row in 0..N {
@@ -192,6 +98,10 @@ fn index_entries_bench() {
             b.end_row();
         }
         let batch = b.finish();
+        let live = match null_every {
+            0 => N,
+            k => N - N.div_ceil(k),
+        };
         for (shape, cols) in [
             ("I64 payload", &[1u32][..]),
             ("U32 payload, 8-byte slot", &[2]),
@@ -202,7 +112,7 @@ fn index_entries_bench() {
             if cols == [0] && null_every != 0 {
                 continue;
             }
-            measure(&format!("{shape}, NULL every {null_every}"), &batch, cols);
+            measure(&format!("{shape}, NULL every {null_every}"), &batch, cols, live);
         }
     }
 
@@ -213,5 +123,5 @@ fn index_entries_bench() {
         b.put_int(spread(row) as i64 as u128);
         b.end_row();
     }
-    measure("I64 payload, 16-byte source PK", &b.finish(), &[2]);
+    measure("I64 payload, 16-byte source PK", &b.finish(), &[2], N);
 }

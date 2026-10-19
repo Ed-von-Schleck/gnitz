@@ -2,22 +2,32 @@ use super::*;
 use crate::algebra::Placement;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_schema_u64_i64, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
+use crate::test_support::{
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema,
+};
 use std::hint::black_box;
 
-/// `n` rows, none NULL, over a U64-PK-columns, all-I64-payload `schema`, the last PK column
-/// `0..n`, every other column a spread function of it.
+/// `n` rows, none NULL: the last PK column `0..n` and every other column a
+/// spread function of it, each cut to its column's width, a string one of
+/// 50 000 values.
 fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
     let mut b = BatchBuilder::new(schema);
-    let lead = schema.pk_cols().len() as u64 - 1;
-    for pk in 0..n as u64 {
-        let mut natives: Vec<u128> = (0..lead)
-            .map(|c| pk.wrapping_mul(0x9E37_79B9_7F4A_7C15 + 2 * c) as u128)
+    let pk = schema.pk_cols();
+    let width = |c: u32| gnitz_wire::image_mask(schema.columns()[c as usize].size());
+    for row in 0..n as u64 {
+        let spread = |c: u64| row.wrapping_mul(0x9E37_79B9_7F4A_7C15 + 2 * c) as u128;
+        let natives: Vec<u128> = (0..pk.len())
+            .map(|i| match i + 1 == pk.len() {
+                true => row as u128,
+                false => spread(i as u64),
+            } & width(pk[i]))
             .collect();
-        natives.push(pk as u128);
         b.begin_row_natives(&natives, 1);
-        for c in 1..=schema.num_payload_cols() as i64 {
-            b.put_int((pk as i64).wrapping_mul(2_654_435_761 + c) as u128);
+        for (pc, col) in schema.payload_columns() {
+            match col.type_code.is_german_string() {
+                true => b.put_string(&format!("key-{}", row % 50_000)),
+                false => b.put_int(spread(pc as u64 + 8) & gnitz_wire::image_mask(col.size())),
+            }
         }
         b.end_row();
     }
@@ -30,30 +40,39 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn exchange_route_bench() {
+    use TypeCode::{I128, I64, U128, U16, U64, U8};
     let instructions = gnitz_foundation::perf::Counter::instructions();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
-    let wide = pk_payload_schema(&[TypeCode::U64; 3]);
-    let nullable = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
-    let mut three = vec![SchemaColumn::new(TypeCode::I64, false); 4];
-    three[0] = SchemaColumn::new(TypeCode::U64, false);
-    let three = SchemaDescriptor::new(&three, &[0]);
-    let prefix = |n: u8| Ok(ScatterPlan::native(Placement::Keyed { dist_stride: n }));
+    let wide = pk_payload_schema(&[U64; 3]);
+    let mixed = pk_payload_schema(&[U8, U16, U64, U8]);
+    let nullable = u64_pk_schema(&[SchemaColumn::new(I64, true)]);
+    let three = u64_pk_schema(&[SchemaColumn::new(I64, false); 3]);
+    let strs = make_schema_pk_u64_payload_string();
+    let native = |placement| Ok(ScatterPlan::native(placement));
     for (name, schema, plan, workers) in [
         ("pk", &one, ScatterPlan::group(&one, &[0]), 4),
-        ("prefix 3", &wide, prefix(3), 4),
-        ("prefix 12", &wide, prefix(12), 4),
-        ("prefix 16", &wide, prefix(16), 4),
+        ("prefix 3", &mixed, native(Placement::keyed(&mixed, 2)), 4),
+        ("prefix 12", &mixed, native(Placement::full_pk(&mixed)), 4),
+        ("prefix 16", &wide, native(Placement::keyed(&wide, 2)), 4),
         ("pk column in a 24-byte pk", &wide, ScatterPlan::group(&wide, &[1]), 4),
         (
             "pk range past the start",
             &wide,
-            ScatterPlan::join(&wide, &[(1, TypeCode::U64), (2, TypeCode::U64)]),
+            ScatterPlan::join(&wide, &[(1, U64), (2, U64)]),
             4,
         ),
         ("whole 24-byte pk", &wide, ScatterPlan::group(&wide, &[0, 1, 2]), 4),
         ("image", &one, ScatterPlan::group(&one, &[1]), 4),
         ("packed", &two, ScatterPlan::group(&two, &[1, 2]), 4),
         ("packed nullable", &nullable, ScatterPlan::group(&nullable, &[1]), 4),
+        (
+            "join 3 columns",
+            &three,
+            ScatterPlan::join(&three, &[(1, I64), (2, I64), (3, I64)]),
+            4,
+        ),
+        ("join promoted", &one, ScatterPlan::join(&one, &[(1, I128)]), 4),
+        ("join string", &strs, ScatterPlan::join(&strs, &[(1, U128)]), 4),
         ("fold", &three, ScatterPlan::group(&three, &[1, 2, 3]), 4),
         ("global", &one, ScatterPlan::group(&one, &[]), 4),
         // Reads no key, whatever the plan.
