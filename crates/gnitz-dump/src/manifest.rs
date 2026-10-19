@@ -68,7 +68,7 @@ impl Manifest {
         let doc = Doc {
             format: FORMAT,
             version: VERSION,
-            gnitz: env!("CARGO_PKG_VERSION"),
+            gnitz: gnitz_wire::RELEASE,
             manifest: self,
         };
         serde_json::to_string_pretty(&doc).expect("a manifest serializes")

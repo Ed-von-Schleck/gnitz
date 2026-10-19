@@ -1,0 +1,8 @@
+# Steps release.yml runs before dist builds a target's binaries.
+#
+# dist runs cargo with RUSTFLAGS set, which replaces the per-target flags of
+# crates/.cargo/config.toml, so the x86-64 Linux binaries' CPU floor is set
+# here as that file sets it.
+- name: Build for x86-64-v3
+  if: ${{ contains(matrix.targets, 'x86_64-unknown-linux-gnu') }}
+  run: echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"

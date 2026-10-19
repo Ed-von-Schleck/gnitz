@@ -11,6 +11,7 @@ test = false
 doctest = false
 
 [dependencies]
+gnitz-foundation.workspace = true
 libc.workspace = true
 tempfile.workspace = true
 # `start_mtls` mints a client CA + a CA-signed leaf.

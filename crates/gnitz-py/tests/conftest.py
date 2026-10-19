@@ -7,6 +7,7 @@ import warnings
 import pytest
 import gnitz
 from gnitz import aio
+from gnitz.testing import fresh_schema
 from _paths import REPO_ROOT
 from _uid import uid
 from _serverproc import SWEEP_ENV, ServerProc
@@ -194,25 +195,9 @@ def server(server_proc):
     return server_proc.target
 
 
-@contextlib.contextmanager
 def _in_fresh_schema(target, prefix):
-    """A connection bound to a schema of its own, dropped whole on exit.
-
-    `drop_schema` is `DROP SCHEMA ... CASCADE`: one atomic DDL bundle that
-    retracts every view, then every table (each cascading its own indexes),
-    then the schema row. So a test never names its own objects to tear them
-    down, and dropping them by hand only adds round trips that must be
-    redundant or fail.
-
-    The drop is not wrapped: a schema that refuses to drop is a finding, and
-    swallowing it leaks the objects into the shared session catalog for every
-    later test.
-    """
-    name = prefix + uid()
-    with gnitz.connect(target, schema=name) as conn:
-        conn.create_schema(name)
-        yield conn
-        conn.drop_schema(name)
+    """`fresh_schema` under a name no other test of the session uses."""
+    return fresh_schema(target, prefix + uid())
 
 
 @pytest.fixture

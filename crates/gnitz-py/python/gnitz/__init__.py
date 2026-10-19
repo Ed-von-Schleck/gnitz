@@ -9,6 +9,7 @@ from gnitz._native import (
     FIRST_USER_TABLE_ID, MAX_COLUMNS, MAX_IN_FLIGHT,
     debug_assertions, sys_schema,
 )
+from gnitz.server import LocalServer, find_server, local_server
 from gnitz._types import (
     TypeCode, SqlResult,
     DdlResult, RowsAffectedResult, RowsResult,
@@ -32,11 +33,13 @@ __all__ = [
     "DdlResult", "RowsAffectedResult", "RowsResult",
     "TransactionStartedResult", "TransactionCommittedResult",
     "TransactionRolledBackResult",
-    "connect",
+    "connect", "LocalServer", "find_server", "local_server",
 ]
 
 
-def connect(target: str, schema: str = "public") -> GnitzClient:
-    """A connection whose unqualified relation names resolve in `schema`;
-    `other.name` names a relation of another schema."""
+def connect(target: str | None = None, schema: str = "public") -> GnitzClient:
+    """A connection to the server at `target` — a Unix socket path or a
+    ``tls://`` target, ``GNITZ_TARGET`` where it is not given — whose
+    unqualified relation names resolve in `schema`; `other.name` names a
+    relation of another schema."""
     return GnitzClient(target, schema)

@@ -776,6 +776,18 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyA
     dicts.collect::<PyResult<Vec<_>>>()?.into_py_any(py)
 }
 
+/// The server a connection dials: `target`, or `GNITZ_TARGET` where it is not
+/// given.
+fn resolve_target(target: Option<String>) -> PyResult<String> {
+    target
+        .or_else(|| std::env::var("GNITZ_TARGET").ok().filter(|t| !t.is_empty()))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "no target: pass the server's socket path or tls:// target, or set GNITZ_TARGET",
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // The blocking class
 // ---------------------------------------------------------------------------
@@ -787,10 +799,11 @@ pub struct PyGnitzClient;
 #[pymethods]
 impl PyGnitzClient {
     #[new]
-    #[pyo3(signature = (target, schema = "public"))]
-    fn new(py: Python<'_>, target: &str, schema: &str) -> PyResult<PyClassInitializer<Self>> {
+    #[pyo3(signature = (target = None, schema = "public"))]
+    fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
+        let target = resolve_target(target)?;
         let base = PyClient {
-            mode: Mutex::new(Mode::Blocking(Box::new(Blocking::connect(py, target)?))),
+            mode: Mutex::new(Mode::Blocking(Box::new(Blocking::connect(py, &target)?))),
             schema: schema.to_string(),
         };
         Ok(PyClassInitializer::from(base).add_subclass(PyGnitzClient))
@@ -860,10 +873,11 @@ impl PyAsyncClient {
 impl PyAsyncClient {
     /// Connect on the calling thread, and serve on the running loop.
     #[new]
-    #[pyo3(signature = (target, schema = "public"))]
-    fn new(py: Python<'_>, target: &str, schema: &str) -> PyResult<PyClassInitializer<Self>> {
+    #[pyo3(signature = (target = None, schema = "public"))]
+    fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
+        let target = resolve_target(target)?;
         let base = PyClient {
-            mode: Mutex::new(Mode::Loop(LoopHandle::connect(py, target)?)),
+            mode: Mutex::new(Mode::Loop(LoopHandle::connect(py, &target)?)),
             schema: schema.to_string(),
         };
         Ok(PyClassInitializer::from(base).add_subclass(PyAsyncClient))

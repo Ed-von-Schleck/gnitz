@@ -62,6 +62,7 @@ fn a_refused_setup_names_its_cause() {
         (libc::EACCES, Some("1"), "io_uring_group"),
         (libc::ENOSYS, Some("0"), "seccomp profile that also allows"),
         (libc::ENOSYS, None, "no io_uring"),
+        (libc::ENOSYS, None, "an emulator"),
         (libc::EPERM, Some("0"), "Docker's default profile"),
         (libc::EPERM, None, "seccomp profile that also allows"),
     ] {

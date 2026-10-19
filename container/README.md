@@ -1,5 +1,16 @@
 # The gnitz server image
 
+Each release publishes the image for amd64 and arm64, tagged with its version and,
+unless it is a prerelease, `latest`, and attaches the seccomp profile it runs under:
+
+```bash
+docker pull ghcr.io/ed-von-schleck/gnitz-server
+curl -LO https://github.com/Ed-von-Schleck/gnitz/releases/latest/download/seccomp.json
+```
+
+A client and a server must be of the same release, so a deployment pins the
+version tag rather than `latest`. To build the image from a checkout instead:
+
 ```bash
 make image        # build gnitz-server:<git describe> and gnitz-server:latest
 make image-test   # boot it the way it is deployed, query it, restart it, and see it refused without the profile
@@ -43,13 +54,13 @@ digest in [`seccomp.py`](seccomp.py). To move to a new upstream tag, bump both v
 ```bash
 docker volume create gnitz
 # An access token, minted by the image into the volume; the token is printed once.
-docker run --rm -v gnitz:/data gnitz-server --new-token /data/tokens app
+docker run --rm -v gnitz:/data ghcr.io/ed-von-schleck/gnitz-server --new-token /data/tokens app
 
 docker run -d --name gnitz \
-    --security-opt seccomp=container/seccomp.json \
+    --security-opt seccomp=seccomp.json \
     --stop-timeout 120 \
     -v gnitz:/data -p 7543:7543 \
-    gnitz-server --workers=auto \
+    ghcr.io/ed-von-schleck/gnitz-server --workers=auto \
         --tls-listen=0.0.0.0:7543 --tls-name=db.example.com --auth-tokens=/data/tokens \
         /data /data/gnitz.sock
 ```
@@ -109,10 +120,10 @@ one relay at its next start. Pass `--workers=N` to keep the count fixed.
 ```yaml
 services:
   gnitz:
-    image: gnitz-server
+    image: ghcr.io/ed-von-schleck/gnitz-server
     command: [--workers=auto, --tls-listen=0.0.0.0:7543, --tls-name=localhost,
               --auth-tokens=/data/tokens, /data, /data/gnitz.sock]
-    security_opt: [seccomp=./container/seccomp.json]
+    security_opt: [seccomp=./seccomp.json]
     stop_grace_period: 2m
     ports: ["7543:7543"]
     volumes: [gnitz:/data]
@@ -143,7 +154,7 @@ spec:
         seccompProfile: { type: Localhost, localhostProfile: gnitz-seccomp.json }
       containers:
         - name: gnitz
-          image: gnitz-server
+          image: ghcr.io/ed-von-schleck/gnitz-server
           args: [--workers=auto, --tls-listen=0.0.0.0:7543, --tls-name=gnitz.default.svc,
                  --auth-tokens=/data/tokens, /data, /data/gnitz.sock]
           ports: [{ containerPort: 7543 }]

@@ -1,14 +1,17 @@
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Parser;
+use gnitz_cli::editor::{self, ShellPrompt};
+use gnitz_cli::render::{Expanded, Format, Settings};
+use gnitz_cli::shell::{Flow, Options, Shell};
 use gnitz_core::RelName;
-use gnitz_repl::editor::{self, ShellPrompt};
-use gnitz_repl::render::{Expanded, Format, Settings};
-use gnitz_repl::shell::{Flow, Options, Shell};
 use reedline::{EditCommand, Signal};
+
+mod local;
 
 /// The interactive SQL shell for gnitz.
 ///
@@ -17,9 +20,16 @@ use reedline::{EditCommand, Signal};
 #[derive(Parser)]
 #[command(name = "gnitz", version)]
 struct Cli {
-    /// The server: its Unix socket path, or a tls:// target.
+    /// The server: its Unix socket path, or a tls:// target. Without one, the
+    /// shell runs a gnitz-server installed beside it or on PATH for the
+    /// session.
     #[arg(env = "GNITZ_TARGET")]
-    target: String,
+    target: Option<String>,
+
+    /// With no target: keep the session's data in DIR, where the next session
+    /// given DIR finds it, instead of deleting it when the shell exits.
+    #[arg(long, value_name = "DIR", conflicts_with = "target")]
+    data: Option<PathBuf>,
 
     /// The schema unqualified names resolve in.
     #[arg(short, long, default_value = "public", value_parser = RelName::schema_key)]
@@ -72,6 +82,19 @@ fn main() -> ExitCode {
         flag
     });
 
+    // Declared ahead of the shell, so the shell's connection closes before the
+    // server it dials is stopped.
+    let (target, _local) = match cli.target.clone() {
+        Some(target) => (target, None),
+        None => match local::Held::start(cli.data.as_deref(), interactive) {
+            Ok(held) => (held.socket().to_string_lossy().into_owned(), Some(held)),
+            Err(e) => {
+                eprintln!("gnitz: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
     let settings = Settings {
         format: cli.format,
         expanded: if cli.expanded { Expanded::On } else { Expanded::Off },
@@ -79,7 +102,7 @@ fn main() -> ExitCode {
         ..Settings::default()
     };
     let options = Options {
-        target: cli.target.clone(),
+        target: target.clone(),
         schema: cli.schema.clone(),
         settings,
         interactive,
@@ -89,7 +112,7 @@ fn main() -> ExitCode {
     let mut shell = match Shell::connect(options) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("gnitz: could not connect to {}: {e}", cli.target);
+            eprintln!("gnitz: could not connect to {target}: {e}");
             return ExitCode::from(2);
         }
     };
@@ -139,7 +162,7 @@ fn repl(shell: &mut Shell, vi: bool) -> ExitCode {
     let mut line_editor = editor::build(vi, shell.settings.color, buffer);
     println!(
         "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
-        env!("CARGO_PKG_VERSION"),
+        gnitz_wire::RELEASE,
         shell.target()
     );
     loop {

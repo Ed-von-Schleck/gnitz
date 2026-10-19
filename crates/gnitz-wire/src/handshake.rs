@@ -15,40 +15,61 @@ pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 
 /// What the first frame's payload in each direction opens with, in the one
 /// layout no version may change. A server refusing a client's HELLO answers it
-/// bare.
+/// with [`refusal_hello`].
 pub const HELLO: [u8; 8] = {
     let v = WAL_FORMAT_VERSION.to_le_bytes();
     [b'G', b'N', b'T', b'Z', v[0], v[1], v[2], v[3]]
 };
 
+/// The release this build is: the version every crate of a release shares. Two
+/// builds of one release may still speak different wire versions, as a build of
+/// unreleased source does.
+pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+/// The longest release name a refusing server's HELLO carries.
+const MAX_RELEASE_BYTES: usize = 64;
+
 /// Why a peer's HELLO was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloError {
     /// Not opening with "GNTZ", or not followed by what its sender's HELLO
     /// carries: the peer is not a gnitz endpoint.
     Malformed,
-    /// A gnitz peer built at another wire version.
-    Version { peer: u32 },
+    /// A gnitz peer built at another wire version. `release` is the release a
+    /// refusing server names, `None` from a client or from a server that
+    /// names none.
+    Version { peer: u32, release: Option<String> },
 }
 
 impl fmt::Display for HelloError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HelloError::Malformed => f.write_str("peer is not a gnitz endpoint (malformed HELLO)"),
-            HelloError::Version { peer } => {
-                write!(f, "wire version mismatch: peer={peer}, local={WAL_FORMAT_VERSION}")
-            }
+            HelloError::Version { peer, release: Some(theirs) } if theirs == RELEASE => write!(
+                f,
+                "version mismatch: the server and this client are both gnitz {RELEASE}, but built from \
+                 different sources (wire versions {peer} and {WAL_FORMAT_VERSION}); use a client built \
+                 from the server's source"
+            ),
+            HelloError::Version { release: Some(theirs), .. } => write!(
+                f,
+                "version mismatch: the server is gnitz {theirs} and this client gnitz {RELEASE}; use a \
+                 client of release {theirs}"
+            ),
+            HelloError::Version { peer, release: None } => write!(
+                f,
+                "version mismatch: the peer speaks wire version {peer}, this build (gnitz {RELEASE}) wire \
+                 version {WAL_FORMAT_VERSION}"
+            ),
         }
     }
 }
 
-/// What a peer's HELLO carries behind [`HELLO`], once its prefix matches this build's.
-fn check_hello(payload: &[u8]) -> Result<&[u8], HelloError> {
+/// A HELLO split at its prefix: the wire version the prefix names, and what
+/// follows it.
+fn split_hello(payload: &[u8]) -> Result<(u32, &[u8]), HelloError> {
     match payload.split_at_checked(HELLO.len()) {
-        Some((prefix, rest)) if prefix[..4] == HELLO[..4] => match crate::read_u32_le(prefix, 4) {
-            WAL_FORMAT_VERSION => Ok(rest),
-            peer => Err(HelloError::Version { peer }),
-        },
+        Some((prefix, rest)) if prefix[..4] == HELLO[..4] => Ok((crate::read_u32_le(prefix, 4), rest)),
         _ => Err(HelloError::Malformed),
     }
 }
@@ -68,10 +89,18 @@ pub fn client_hello(token: &[u8]) -> Vec<u8> {
 
 /// The access token a client's HELLO carries, empty when it holds none.
 pub fn read_client_hello(payload: &[u8]) -> Result<&[u8], HelloError> {
-    match check_hello(payload)? {
-        token if token.len() <= MAX_TOKEN_BYTES => Ok(token),
-        _ => Err(HelloError::Malformed),
+    match split_hello(payload)? {
+        (WAL_FORMAT_VERSION, token) if token.len() <= MAX_TOKEN_BYTES => Ok(token),
+        (WAL_FORMAT_VERSION, _) => Err(HelloError::Malformed),
+        (peer, _) => Err(HelloError::Version { peer, release: None }),
     }
+}
+
+/// The HELLO payload a server answers a HELLO it does not admit with, another
+/// version's or no gnitz endpoint's: [`HELLO`], then this build's [`RELEASE`],
+/// so that a client of another version can name the release it would need.
+pub fn refusal_hello() -> Vec<u8> {
+    [&HELLO[..], RELEASE.as_bytes()].concat()
 }
 
 crate::wire_enum! {
@@ -94,10 +123,20 @@ pub const fn server_hello(status: AuthStatus) -> [u8; HELLO.len() + 1] {
 
 /// The verdict a server's HELLO carries.
 pub fn read_server_hello(payload: &[u8]) -> Result<AuthStatus, HelloError> {
-    match check_hello(payload)? {
-        &[v] => AuthStatus::from_wire(v).ok_or(HelloError::Malformed),
-        _ => Err(HelloError::Malformed),
+    match split_hello(payload)? {
+        (WAL_FORMAT_VERSION, &[v]) => AuthStatus::from_wire(v).ok_or(HelloError::Malformed),
+        (WAL_FORMAT_VERSION, _) => Err(HelloError::Malformed),
+        (peer, rest) => Err(HelloError::Version { peer, release: release_name(rest) }),
     }
+}
+
+/// The release a refusing server's HELLO names behind its prefix: `None` where it
+/// names none, as a server older than the release name does, or where what
+/// follows is no release name.
+fn release_name(rest: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(rest).ok()?;
+    let printable = name.bytes().all(|b| b.is_ascii_graphic());
+    (!name.is_empty() && name.len() <= MAX_RELEASE_BYTES && printable).then(|| name.to_string())
 }
 
 #[cfg(test)]

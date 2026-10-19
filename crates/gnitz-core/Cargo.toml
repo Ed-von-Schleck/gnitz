@@ -19,6 +19,8 @@ gnitz-foundation.workspace = true
 gnitz-wire.workspace = true
 libc.workspace = true
 rustls.workspace = true
+# The scratch directory of a server `local_server` runs.
+tempfile.workspace = true
 webpki-roots = "1"
 
 [dev-dependencies]
@@ -28,7 +30,6 @@ gnitz-zset = { path = "../gnitz-zset" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 # The loopback TLS peer the framing tests drive a real `connect_tls` against.
 rcgen.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

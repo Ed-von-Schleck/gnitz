@@ -1,10 +1,9 @@
 //! Syscall idioms `std` does not offer. Each returns `io::Result`, the errno
 //! captured at the syscall.
 
-use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 use libc::c_int;
 
@@ -66,17 +65,6 @@ pub fn map_shared(fd: Option<BorrowedFd<'_>>, len: usize) -> io::Result<*mut u8>
         return Err(io::Error::last_os_error());
     }
     Ok(ptr.cast())
-}
-
-/// A close-on-exec memfd named `name`.
-pub fn memfd(name: &CStr) -> io::Result<File> {
-    // SAFETY: `name` is NUL-terminated.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor nothing else owns.
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Make the entries of directory `dir` durable.

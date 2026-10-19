@@ -1,6 +1,7 @@
 //! `gnitz`, the interactive SQL shell: a line editor with highlighting and
 //! catalog-aware completion over the SQL front end, psql-style meta-commands,
-//! and `\watch` over a view's delta feed.
+//! and `\watch` over a view's delta feed. Given no server, the binary runs a
+//! separately installed one for the session.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover; the crate-root `tests/` is the integration suite, gated on the

@@ -466,7 +466,7 @@ pub fn run(
     install_handler(libc::SIGINT, handle_shutdown_signal);
     // Past the last env knob the boot reads, so one it refuses stops the
     // server before it reports ready.
-    gnitz_note!("GnitzDB ready");
+    gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
 
     let tls = listeners.iter().find_map(|l| l.tls.clone());
     reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
@@ -565,8 +565,9 @@ async fn handshake(peer: &Peer, served: Option<Rc<Served>>) -> bool {
         return false;
     };
     let Ok(token) = gnitz_wire::read_client_hello(hello.as_slice()) else {
-        // Bare, so a client of another version reports the mismatch.
-        peer.cork_frame(&gnitz_wire::HELLO);
+        // This build's HELLO, so a client of another version reports the
+        // mismatch, and its release, which the client names.
+        peer.cork_frame(&gnitz_wire::refusal_hello());
         return false;
     };
     let admitted = match served.as_deref().and_then(|s| s.tokens.as_ref()) {

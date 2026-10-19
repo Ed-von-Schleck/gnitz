@@ -1,0 +1,50 @@
+# The release: `dist` (axodotdev's cargo-dist) builds the binaries, archives and
+# installers, and `.github/workflows/release.yml`, which it generates from this
+# file, runs on a pushed version tag. `dist generate` rewrites the workflow
+# after a change here.
+[workspace]
+members = ["cargo:crates"]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+installers = ["shell"]
+# The shell builds everywhere; the server, Linux-only, narrows this in its own
+# manifest.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+install-path = ["$XDG_BIN_HOME/", "~/.local/bin/"]
+install-updater = false
+hosting = "github"
+# Builds only what ships: not the Python extension, the fuzzer or test crates.
+precise-builds = true
+# The x86-64 Linux binaries' CPU floor, which dist's RUSTFLAGS would drop.
+github-build-setup = "../build-setup.yml"
+# The wheels, the sdists and the container profile, each attached to the
+# release; then the image and the PyPI upload, once the release exists.
+global-artifacts-jobs = ["./build-python"]
+publish-jobs = ["./publish-image", "./publish-pypi"]
+
+[dist.github-custom-job-permissions]
+"publish-image" = { packages = "write", contents = "read" }
+"publish-pypi" = { id-token = "write", contents = "read" }
+
+# The Linux binaries link against manylinux_2_28's glibc, the floor the Python
+# wheels hold too, so they run on every distribution with a kernel the server
+# boots on. dist itself runs inside the image as a musl build.
+[dist.github-custom-runners.x86_64-unknown-linux-gnu]
+runner = "ubuntu-24.04"
+container = { image = "quay.io/pypa/manylinux_2_28_x86_64", host = "x86_64-unknown-linux-musl" }
+
+[dist.github-custom-runners.aarch64-unknown-linux-gnu]
+runner = "ubuntu-24.04-arm"
+container = { image = "quay.io/pypa/manylinux_2_28_aarch64", host = "aarch64-unknown-linux-musl" }
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15"
+global = "ubuntu-24.04"

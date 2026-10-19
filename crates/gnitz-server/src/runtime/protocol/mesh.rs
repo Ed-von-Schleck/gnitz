@@ -62,12 +62,24 @@ pub(crate) fn outbox_bytes() -> usize {
 
 /// The mesh among `parks.len()` workers, over outboxes of `outbox_bytes`: one fresh
 /// shared mapping, never unmapped, and every worker's view of it in rank order.
+/// A close-on-exec memfd named `name`.
+pub(super) fn memfd(name: &std::ffi::CStr) -> std::io::Result<File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `name` is NUL-terminated.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// Zeroed. A memfd, so [`Mesh::trim`] can return pages by file offset.
 pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result<Vec<Mesh>> {
     let nw = parks.len();
     let len = HEADER_BYTES + 2 * nw * outbox_bytes;
     // Leaked with the mapping.
-    let file: &'static File = Box::leak(Box::new(posix_io::memfd(c"gnitz-mesh")?));
+    let file: &'static File = Box::leak(Box::new(memfd(c"gnitz-mesh")?));
     file.set_len(len as u64)?;
     let base = posix_io::map_shared(Some(file.as_fd()), len)?;
     Ok((0..nw)

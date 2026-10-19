@@ -36,7 +36,7 @@ def wait_ready(name: str, timeout: float = 60.0) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         logs = run("logs", name).stderr
-        if "GnitzDB ready" in logs:
+        if gnitz._native.READY_LINE in logs:
             return logs
         if run("inspect", "--format", "{{.State.Running}}", name).stdout.strip() != "true":
             sys.exit(f"{name} exited before it was ready:\n{logs}")

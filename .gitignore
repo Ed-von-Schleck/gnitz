@@ -158,6 +158,8 @@ $RECYCLE.BIN/
 debug*
 test_results.txt
 *.lock
+# The workspace's lock is tracked: a release and the image build with --locked.
+!crates/Cargo.lock
 translate_test_db
 *.db
 

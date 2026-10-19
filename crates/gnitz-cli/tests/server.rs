@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gnitz_cli::render::{Format, Settings};
+use gnitz_cli::shell::{Flow, Options, Shell};
 use gnitz_core::{RelName, RelProps};
-use gnitz_repl::render::{Format, Settings};
-use gnitz_repl::shell::{Flow, Options, Shell};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{RelClass, ViewBudget, ViewProps};
 
@@ -386,4 +386,121 @@ fn backup_writes_an_entry_of_the_backup_directory() {
     assert!(server.backups().join("nightly").join("_relations").is_dir());
     assert!(sh.meta("\\backup nightly").is_err());
     assert!(sh.meta("\\backup").is_err());
+}
+
+/// The shell binary with `args`, given no target: the server it starts is the
+/// suites' one, its scratch directories go under `tmp`, and its SAL is small
+/// even on a kept data directory, as the harness's servers' are.
+fn gnitz(tmp: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gnitz"));
+    cmd.args(args)
+        .env("GNITZ_SERVER_BIN", gnitz_test_harness::server_bin())
+        .env("GNITZ_SAL_BYTES", "67108864")
+        .env("TMPDIR", tmp)
+        .env_remove("GNITZ_TARGET");
+    cmd
+}
+
+/// What the run of `cmd` printed to stdout, once it has succeeded.
+fn stdout_of(mut cmd: std::process::Command) -> String {
+    let out = cmd.stdin(std::process::Stdio::null()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}: {stderr}", out.status);
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn is_empty_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().next().is_none()
+}
+
+#[test]
+fn with_no_target_a_session_runs_a_server_of_its_own_and_removes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = stdout_of(gnitz(
+        tmp.path(),
+        &[
+            "-F",
+            "csv",
+            "-c",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "-c",
+            "INSERT INTO t VALUES (1, 10), (2, 20)",
+            "-c",
+            "SELECT * FROM t ORDER BY id",
+        ],
+    ));
+    assert!(out.ends_with("id,v\n1,10\n2,20\n"), "{out}");
+    assert!(
+        is_empty_dir(tmp.path()),
+        "the session left its scratch directory behind"
+    );
+}
+
+#[test]
+fn a_session_given_a_data_directory_leaves_its_rows_to_the_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("db");
+    let data = data.to_str().unwrap();
+    stdout_of(gnitz(
+        tmp.path(),
+        &[
+            "--data",
+            data,
+            "-c",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "-c",
+            "INSERT INTO t VALUES (7, 70)",
+        ],
+    ));
+    let out = stdout_of(gnitz(
+        tmp.path(),
+        &["--data", data, "-F", "csv", "-c", "SELECT * FROM t"],
+    ));
+    assert!(out.ends_with("id,v\n7,70\n"), "{out}");
+}
+
+#[test]
+fn a_session_with_no_server_to_start_says_so_and_starts_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("no-such-server");
+    let out = gnitz(tmp.path(), &["-c", "SELECT 1"])
+        .env("GNITZ_SERVER_BIN", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("GNITZ_SERVER_BIN names"), "{stderr}");
+    assert!(is_empty_dir(tmp.path()));
+}
+
+#[test]
+fn an_interrupted_script_stops_its_server_and_removes_its_data() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = gnitz(tmp.path(), &["-F", "csv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // One answered statement: the session is connected, so its server is held.
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "SELECT 1 AS one;").unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while line.trim() != "1" {
+        line.clear();
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "the script ended unanswered");
+    }
+    // SAFETY: `kill` takes no pointer; the child is not yet reaped.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(128 + libc::SIGINT));
+    drop(stdin);
+    assert!(
+        is_empty_dir(tmp.path()),
+        "the interrupted session left its scratch directory behind"
+    );
 }

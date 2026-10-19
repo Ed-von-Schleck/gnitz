@@ -31,9 +31,10 @@ from gnitz._native import AsyncGnitzClient
 __all__ = ["AsyncGnitzClient", "connect"]
 
 
-def connect(target: str, schema: str = "public") -> AsyncGnitzClient:
-    """Connect to a gnitz server, with unqualified relation names resolving
-    in `schema`; `other.name` names a relation of another schema. The
-    connection is made when this returns, so awaiting it yields itself, and
-    `async with` closes it on exit."""
+def connect(target: str | None = None, schema: str = "public") -> AsyncGnitzClient:
+    """Connect to the gnitz server at `target`, ``GNITZ_TARGET`` where it is
+    not given, with unqualified relation names resolving in `schema`;
+    `other.name` names a relation of another schema. The connection is made
+    when this returns, so awaiting it yields itself, and `async with` closes
+    it on exit."""
     return AsyncGnitzClient(target, schema)

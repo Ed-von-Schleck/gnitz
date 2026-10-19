@@ -15,7 +15,7 @@ COPY crates crates
 RUN --mount=type=cache,id=gnitz-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=gnitz-cargo-target,target=/src/crates/target \
     cd crates \
- && cargo build --release --locked -p gnitz \
+ && cargo build --release --locked -p gnitz-server \
  && install -D -m 0755 target/release/gnitz-server /out/gnitz-server \
  && install -d -m 0700 /out/data
 
@@ -24,6 +24,7 @@ ARG VERSION=unknown
 LABEL org.opencontainers.image.title="gnitz-server" \
       org.opencontainers.image.description="GnitzDB: incrementally maintained materialized views over Z-sets" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/Ed-von-Schleck/gnitz" \
       org.opencontainers.image.version="${VERSION}"
 COPY --from=build /out/gnitz-server /usr/local/bin/gnitz-server
 # Owned by distroless's `nonroot`, which the server runs as: a named volume

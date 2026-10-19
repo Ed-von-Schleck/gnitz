@@ -1,0 +1,53 @@
+# gnitz-server under systemd. Install the binary and this unit, create the
+# user, and start it:
+#
+#   sudo install -m 0755 gnitz-server /usr/local/bin/
+#   sudo install -m 0644 gnitz-server.service /etc/systemd/system/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin gnitz
+#   sudo systemctl enable --now gnitz-server
+#
+# The data lives in /var/lib/gnitz. Clients connect over /run/gnitz/gnitz.sock;
+# a user in the `gnitz` group may (`sudo usermod -aG gnitz <user>`). For TCP
+# clients add `--tls-listen=0.0.0.0:7543 --tls-name=<the name they dial>
+# --auth-tokens=/var/lib/gnitz/tokens` to ExecStart, and mint a token with
+# `sudo -u gnitz gnitz-server --new-token /var/lib/gnitz/tokens <name>`.
+
+[Unit]
+Description=gnitz database server
+Documentation=https://github.com/Ed-von-Schleck/gnitz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=gnitz
+Group=gnitz
+ExecStart=/usr/local/bin/gnitz-server --workers=auto /var/lib/gnitz /run/gnitz/gnitz.sock
+# SIGHUP reloads the TLS certificate, the client CA and the token file.
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGTERM drains and checkpoints; the workers exit with the master.
+KillMode=mixed
+TimeoutStopSec=120
+Restart=on-failure
+StateDirectory=gnitz
+StateDirectoryMode=0700
+RuntimeDirectory=gnitz
+RuntimeDirectoryMode=0750
+# The socket is created group-writable, so the `gnitz` group may connect.
+UMask=0007
+Environment=GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+# Confinement that leaves io_uring alone: a SystemCallFilter would have to
+# allow io_uring_setup, io_uring_enter and io_uring_register.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

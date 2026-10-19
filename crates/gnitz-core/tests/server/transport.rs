@@ -162,7 +162,7 @@ fn an_mtls_server_admits_only_a_leaf_its_client_ca_signed() {
 }
 
 #[test]
-fn a_wire_version_mismatch_is_answered_with_the_servers_hello_then_closed() {
+fn a_wire_version_mismatch_is_answered_with_the_servers_refusal_then_closed() {
     let srv = ServerHandle::start();
     let mut sock = UnixStream::connect(srv.sock_path()).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -172,7 +172,8 @@ fn a_wire_version_mismatch_is_answered_with_the_servers_hello_then_closed() {
     sock.write_all(&hello).unwrap();
     let mut reply = Vec::new();
     sock.read_to_end(&mut reply).unwrap();
-    let want = [&gnitz_wire::frame_len_prefix(hello.len())[..], &gnitz_wire::HELLO].concat();
+    let refusal = gnitz_wire::refusal_hello();
+    let want = [&gnitz_wire::frame_len_prefix(refusal.len())[..], &refusal].concat();
     assert_eq!(reply, want);
 }
 

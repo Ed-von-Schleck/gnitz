@@ -9,6 +9,7 @@ mod catalog;
 mod client;
 mod connection;
 mod error;
+pub mod local_server;
 mod mirror;
 mod protocol;
 mod pushed;

@@ -8,7 +8,7 @@ members = [
     "gnitz-sql",
     "gnitz-tokio",
     "gnitz-py",
-    "gnitz-repl",
+    "gnitz-cli",
     "gnitz-dump",
     "gnitz-store",
     "gnitz-zset",
@@ -63,6 +63,8 @@ gnitz-expr = { path = "gnitz-expr", version = "=0.1.8" }
 gnitz-core = { path = "gnitz-core", version = "=0.1.8" }
 gnitz-zset = { path = "gnitz-zset", version = "=0.1.8" }
 gnitz-store = { path = "gnitz-store", version = "=0.1.8" }
+gnitz-sql = { path = "gnitz-sql", version = "=0.1.8" }
+gnitz-dump = { path = "gnitz-dump", version = "=0.1.8" }
 
 # Release: panic aborts the process so reactor-task panics surface as a
 # backtrace on stderr instead of being silently dropped.  Dev keeps unwind
@@ -123,3 +125,7 @@ debug-assertions = true
 overflow-checks = false
 incremental = false
 codegen-units = 1
+
+# What `dist` builds a release's binaries with: the release profile as it is.
+[profile.dist]
+inherits = "release"

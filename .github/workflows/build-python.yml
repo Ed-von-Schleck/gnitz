@@ -1,0 +1,109 @@
+# The Python half of a release, and the files a release carries beside the
+# archives: the client's wheels, the server's wheels (the binary alone, which
+# `gnitz[server]` installs), both sdists, and the seccomp profile a container
+# runs the server under. Each is uploaded as an `artifacts-*` artifact, which
+# the release attaches; publish-pypi.yml uploads the Python ones to PyPI.
+#
+# release.yml, which dist generates, calls this as a global-artifacts job.
+name: build-python
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build the client's wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/gnitz-py
+          manylinux: "2_28"
+          args: --release --locked --interpreter python3.14 --out ../../wheels
+      - name: Build the server's wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/gnitz-server
+          manylinux: "2_28"
+          args: --release --locked --out ../../wheels
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install both wheels and run a query on the server they bring
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install wheels/*.whl
+          "$RUNNER_TEMP/venv/bin/python" - <<'EOF'
+          import gnitz
+          with gnitz.local_server() as server, gnitz.connect(server.target) as conn:
+              [result] = conn.execute_sql("SELECT 1 AS one")
+              assert [tuple(r) for r in result["rows"]] == [(1,)], result
+          EOF
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-wheels-${{ matrix.arch }}
+          path: wheels/*.whl
+          if-no-files-found: error
+
+  sdists:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check the release's own pins agree with its version
+        run: |
+          python3 - <<'EOF'
+          import tomllib
+          workspace = tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]
+          version = workspace["package"]["version"]
+          pins = {
+              name: dep["version"]
+              for name, dep in workspace["dependencies"].items()
+              if name.startswith("gnitz-")
+          }
+          stale = {name: pin for name, pin in pins.items() if pin != f"={version}"}
+          assert not stale, f"workspace pins other than ={version}: {stale}"
+          client = tomllib.load(open("crates/gnitz-py/pyproject.toml", "rb"))["project"]
+          extra = client["optional-dependencies"]["server"]
+          assert extra == [f"gnitz-server=={version}"], f"the server extra pins {extra}, not {version}"
+          EOF
+      - name: Build the client's sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          working-directory: crates/gnitz-py
+          args: --out ../../sdists
+      - name: Build the server's sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          working-directory: crates/gnitz-server
+          args: --out ../../sdists
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-sdists
+          path: sdists/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-seccomp
+          path: container/seccomp.json
+          if-no-files-found: error

@@ -1,0 +1,91 @@
+# The server image of a release, on ghcr.io: built for each architecture on a
+# runner of that architecture, booted as it is deployed (container/smoke.py)
+# with the client wheel of the same release, then pushed, and joined into one
+# multi-architecture tag. A release that is no prerelease also moves `latest`.
+#
+# release.yml, which dist generates, calls this as a publish job, once the
+# GitHub release exists.
+name: publish-image
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    strategy:
+      matrix:
+        include:
+          - platform: amd64
+            arch: x86_64
+            runner: ubuntu-24.04
+          - platform: arm64
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Name the image
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/gnitz-server" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        run: |
+          docker buildx build --load --file container/Containerfile \
+            --build-arg VERSION="$VERSION" --tag gnitz-server:smoke .
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@v8
+        with:
+          name: artifacts-wheels-${{ matrix.arch }}
+          path: wheels
+      - name: Boot it as it is deployed, and see the default profile refuse it
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install wheels/gnitz-*.whl
+          "$RUNNER_TEMP/venv/bin/python" container/smoke.py docker gnitz-server:smoke
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push it
+        run: |
+          docker tag gnitz-server:smoke "$IMAGE:$VERSION-${{ matrix.platform }}"
+          docker push "$IMAGE:$VERSION-${{ matrix.platform }}"
+
+  manifest:
+    needs: image
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+      PRERELEASE: ${{ fromJson(inputs.plan).announcement_is_prerelease }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Join the architectures under the release's tag
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/gnitz-server"
+          VERSION="${TAG#v}"
+          tags=(--tag "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" != "true" ]; then
+            tags+=(--tag "$IMAGE:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"

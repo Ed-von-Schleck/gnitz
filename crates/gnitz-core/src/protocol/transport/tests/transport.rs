@@ -75,6 +75,15 @@ fn other_version_hello() -> Vec<u8> {
     framed(&other)
 }
 
+/// The HELLO a server of another protocol version refuses ours with, naming
+/// its release `release`.
+fn other_release_hello(release: &str) -> Vec<u8> {
+    let mut other = gnitz_wire::HELLO.to_vec();
+    other[4] ^= 1;
+    other.extend_from_slice(release.as_bytes());
+    framed(&other)
+}
+
 #[track_caller]
 fn assert_refusal(r: Result<(), ClientError>, names: &str) {
     match r {
@@ -91,6 +100,25 @@ fn hello_checks_the_server_hello() {
         hello_against(b"", &framed(b"GNTX\0\0\0\0\0")),
         Err(ClientError::Protocol(ProtocolError::DecodeError(_)))
     ));
+}
+
+#[test]
+fn hello_names_both_releases_of_a_version_mismatch() {
+    let ours = gnitz_wire::RELEASE;
+    assert_refusal(
+        hello_against(b"", &other_release_hello("9.9.9")),
+        &format!("the server is gnitz 9.9.9 and this client gnitz {ours}; use a client of release 9.9.9"),
+    );
+    // One release, two wire versions: builds of different sources.
+    assert_refusal(
+        hello_against(b"", &other_release_hello(ours)),
+        &format!("both gnitz {ours}, but built from different sources"),
+    );
+    // A server that names no release is reported by its wire version.
+    assert_refusal(
+        hello_against(b"", &other_version_hello()),
+        &format!("this build (gnitz {ours})"),
+    );
 }
 
 #[test]

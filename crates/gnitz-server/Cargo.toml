@@ -1,18 +1,24 @@
 [package]
-name = "gnitz"
+name = "gnitz-server"
 description = "The gnitz database server: SQL with incrementally maintained materialized views, implementing DBSP"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
 [[bin]]
 name = "gnitz-server"
 path = "src/main.rs"
+
+# The release archive: the server runs on Linux only, and ships with the
+# seccomp profile a container runs it under and the systemd unit a host does.
+[package.metadata.dist]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+include = ["../../container/seccomp.json", "../../packaging/gnitz-server.service"]
 
 [dependencies]
 gnitz-foundation.workspace = true

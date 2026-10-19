@@ -398,6 +398,7 @@ pub(crate) fn eval_level() -> crate::simd::Level {
     let levels = simd_levels();
     match levels.iter().find(|(name, _)| *name == want) {
         Some(&(_, level)) => level,
+        #[cfg(target_arch = "x86_64")]
         None if want == "avx2" && levels[0].1.as_avx2().is_some() => levels[0].1,
         None => panic!(
             "GNITZ_BENCH_LEVEL={want:?} names no level of {:?}",

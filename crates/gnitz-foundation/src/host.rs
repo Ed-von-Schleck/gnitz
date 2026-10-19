@@ -86,9 +86,11 @@ fn refusal(errno: Option<i32>, disabled: Option<&str>) -> Option<String> {
         (libc::EPERM | libc::EACCES, Some("1")) => "kernel.io_uring_disabled=1 allows io_uring only to \
              CAP_SYS_ADMIN and the group kernel.io_uring_group names; set it to 0, or run the server in that group"
             .to_string(),
-        (libc::ENOSYS, _) => {
-            format!("a seccomp filter denies it (podman's default profile does), or the kernel has no io_uring; {SECCOMP_REMEDY}")
-        }
+        (libc::ENOSYS, _) => format!(
+            "a seccomp filter denies it (podman's default profile does), the kernel has no io_uring, or the \
+             binary runs under an emulator that has none (qemu-user does not: run the build for this \
+             machine's architecture); {SECCOMP_REMEDY}"
+        ),
         (libc::EPERM | libc::EACCES, _) => format!(
             "a seccomp filter denies it (Docker's default profile does), or a security module does; {SECCOMP_REMEDY}"
         ),

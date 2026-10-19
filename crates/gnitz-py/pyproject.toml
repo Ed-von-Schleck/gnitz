@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name             = "gnitz"
-version          = "0.1.8"
+dynamic          = ["version"]
 description      = "Client for Gnitz, a SQL database whose views are all materialized and incrementally updated"
 readme           = "README.md"
 requires-python  = ">=3.14"
@@ -26,6 +26,9 @@ classifiers      = [
 Repository = "https://github.com/Ed-von-Schleck/gnitz"
 
 [project.optional-dependencies]
+# The server of this release, for `gnitz.local_server` and the `gnitz.testing`
+# fixtures. Its pin moves with the workspace version.
+server = ["gnitz-server==0.1.8"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -50,3 +53,8 @@ features       = ["pyo3/extension-module"]
 module-name    = "gnitz._native"
 python-source  = "python"
 exclude        = ["**/__pycache__/**"]
+
+[tool.uv.sources]
+# In this checkout the server extra is the server crate beside the client, so
+# the lock resolves without a release of it on the index.
+gnitz-server = { path = "../gnitz-server" }

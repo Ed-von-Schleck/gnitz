@@ -8,12 +8,14 @@ use gnitz_wire::{TypeCode, WireStatus};
 
 mod client;
 mod drive;
+mod local_server;
 mod read;
 mod schema;
 mod write;
 
 use client::{PyAsyncClient, PyClient, PyGnitzClient, PyPollResult, PyPushed, PySynced, PyTxn};
 use drive::{LoopCore, PyPending, PyPipeline};
+use local_server::PyLocalServer;
 use read::{PyRow, PyRowIterator, PyScanResult};
 use schema::{PyColumnDef, PySchema};
 use write::{install_append_method, PyZSetBatch};
@@ -128,6 +130,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyPending>()?;
     m.add_class::<PyPollResult>()?;
+    m.add_class::<PyLocalServer>()?;
     m.add_class::<PyPushed>()?;
     m.add_class::<PySynced>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
@@ -154,6 +157,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MAX_COLUMNS", gnitz_wire::MAX_COLUMNS)?;
     // The requests one connection may hold in flight, for the same reason.
     m.add("MAX_IN_FLIGHT", gnitz_core::MAX_IN_FLIGHT)?;
+    // What a server logs once it serves, for the code that starts one.
+    m.add("READY_LINE", gnitz_foundation::log::READY_LINE)?;
     // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
     // The seams a mirroring test arms live in gnitz-mirror and gnitz-store, which
     // are linked here and not into the server, so the server's build says nothing
@@ -162,5 +167,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;
     m.add_function(wrap_pyfunction!(schema::sys_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(local_server::find_server, m)?)?;
     Ok(())
 }

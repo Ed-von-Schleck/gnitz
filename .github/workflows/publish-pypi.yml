@@ -1,0 +1,38 @@
+# The Python packages of a release, uploaded to PyPI by trusted publishing: the
+# wheels and sdists build-python.yml built for `gnitz` and `gnitz-server`.
+#
+# release.yml, which dist generates, calls this as a publish job, once the
+# GitHub release exists. PyPI admits the upload from the `pypi` environment of
+# release.yml, the trusted publisher each of the two projects names.
+name: publish-pypi
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pypi:
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/gnitz/
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: artifacts-sdists
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

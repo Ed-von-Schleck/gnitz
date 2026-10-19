@@ -40,7 +40,7 @@ TARGET_CPU ?= x86-64-v3
 
 # The features that compile the suites driving a real server.
 INTEGRATION := --features gnitz-sql/integration --features gnitz-core/integration \
-               --features gnitz-tokio/integration --features gnitz-repl/integration \
+               --features gnitz-tokio/integration --features gnitz/integration \
                --features gnitz-dump/integration
 
 .PHONY: all help \
@@ -67,7 +67,7 @@ test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integrat
 	cd crates && cargo test --workspace --exclude gnitz-py $(INTEGRATION) $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
-	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz $(T)
+	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz-server $(T)
 
 fmt: ## Format the whole workspace
 	cd crates && cargo fmt --all
@@ -88,15 +88,15 @@ verify: fmt-check clippy test ## Pre-commit gate: format + lint + tests
 # ---------------------------------------------------------------------------
 
 server: ## Build the debug server binary -> ./gnitz-server
-	cd crates && cargo build -p gnitz
+	cd crates && cargo build -p gnitz-server
 	cp crates/target/debug/gnitz-server gnitz-server
 
 release-server: ## Build the release server binary -> ./gnitz-server-release
-	cd crates && cargo build --release -p gnitz
+	cd crates && cargo build --release -p gnitz-server
 	cp crates/target/release/gnitz-server gnitz-server-release
 
 checked-server: ## Build the release server WITH the Z-set layout verifiers -> ./gnitz-server-checked
-	cd crates && cargo build --profile release-checked -p gnitz
+	cd crates && cargo build --profile release-checked -p gnitz-server
 	cp crates/target/release-checked/gnitz-server gnitz-server-checked
 
 pyext: ## Build & install the Python extension (debug) into the uv venv
@@ -173,7 +173,7 @@ fuzz-seeds: server pyext ## Record the traffic of every test that drives a serve
 fuzz-server: ## Fuzz real servers with edited seed traffic under AFL++ (JOBS=, TIME=; after fuzz-seeds)
 	@test -d $(FUZZ)/starts/traffic || { echo "no fuzz seeds: run make fuzz-seeds first" >&2; exit 1; }
 	cd crates && AFL_USE_ASAN=1 AFLRS_NO_CMPLOG=1 RUSTFLAGS="$(FUZZ_RUSTFLAGS)" \
-		cargo +nightly afl build -p gnitz --target-dir target/afl
+		cargo +nightly afl build -p gnitz-server --target-dir target/afl
 	cd crates && cargo build --release -p gnitz-fuzz
 	mkdir -p $(FUZZ)/run
 	export GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds GNITZ_SERVER_BIN=$(FUZZ_SERVER) TMPDIR=$(FUZZ)/run \
@@ -317,7 +317,7 @@ bench-native: bench ## The benchmark built for the host CPU (non-portable binary
 PROFILING = CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-frame-pointers=yes"
 
 profiling-server: ## Build the release server with frame pointers and debug info -> ./gnitz-server-profiling
-	cd crates && $(PROFILING) CARGO_TARGET_DIR=target/profiling cargo build --release -p gnitz
+	cd crates && $(PROFILING) CARGO_TARGET_DIR=target/profiling cargo build --release -p gnitz-server
 	cp crates/target/profiling/release/gnitz-server gnitz-server-profiling
 
 pyext-profiling: ## Build & install the Python extension with frame pointers and debug info

@@ -5,6 +5,11 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// What a server logs, at NOTE, once it boots: its listeners are bound, and a
+/// connection to one is served from here on. A process that starts a server waits for this
+/// line on the server's stderr.
+pub const READY_LINE: &str = "GnitzDB ready";
+
 /// Line buffer size. A line is assembled on the stack and written whole, so an
 /// over-long message is truncated rather than split across two `write(2)`s.
 const LINE_MAX: usize = 512;

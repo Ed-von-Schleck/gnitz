@@ -1,6 +1,6 @@
 [package]
-name = "gnitz-repl"
-description = "Interactive SQL shell for the gnitz database"
+name = "gnitz"
+description = "The SQL shell for gnitz, a database whose views are all materialized and incrementally maintained"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,7 +8,12 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
-categories.workspace = true
+categories = ["command-line-utilities", "database"]
+
+# The library is the shell's parts, which its integration tests drive; named
+# apart from the binary so the two build outputs do not collide.
+[lib]
+name = "gnitz_cli"
 
 [[bin]]
 name = "gnitz"
@@ -20,8 +25,8 @@ integration = []
 [dependencies]
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
-gnitz-sql = { path = "../gnitz-sql" }
-gnitz-dump = { path = "../gnitz-dump" }
+gnitz-sql.workspace = true
+gnitz-dump.workspace = true
 gnitz-wire.workspace = true
 reedline = "0.52"
 nu-ansi-term = "0.50"
@@ -35,6 +40,7 @@ crossterm = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 console = "0.16"
 tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }

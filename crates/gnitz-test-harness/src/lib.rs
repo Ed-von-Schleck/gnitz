@@ -12,19 +12,18 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
+use gnitz_foundation::log::READY_LINE;
 use tempfile::TempDir;
 
 /// Wall-clock budget for the server to log its readiness marker.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the boot is checked for readiness or an early exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
-/// What the server logs once every listener is bound and published.
-const READY_MARKER: &str = "GnitzDB ready";
 
 /// Server binary plus the tmpdir's data/socket/stderr paths: what a boot and a
 /// restart both spawn from.
 struct BootPaths {
-    bin: String,
+    bin: PathBuf,
     data_dir: PathBuf,
     sock_path: PathBuf,
     stderr_path: PathBuf,
@@ -174,19 +173,12 @@ impl ServerHandle {
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) == 0 }
     }
 
-    /// A missing binary panics rather than skips: a suite passing without a
-    /// server tests nothing.
     fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, auth: Auth) -> Self {
         Self::boot(workers, extra_env, tls_listen, auth, Boot::Fresh)
     }
 
     fn boot(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, auth: Auth, how: Boot) -> Self {
-        let bin = env::var("GNITZ_SERVER_BIN")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
-        assert!(
-            PathBuf::from(&bin).is_file(),
-            "no server binary at {bin}: `make server` builds one (`make test` does it for you)"
-        );
+        let bin = server_bin();
         let tmpdir = tempfile::Builder::new()
             .prefix("gnitz_test_")
             .tempdir()
@@ -384,7 +376,7 @@ fn worker_pidfds(master: &Child) -> Vec<OwnedFd> {
 }
 
 /// Run `bin --new-token file name`, returning the token it prints.
-fn mint_token(bin: &str, file: &Path, name: &str) -> String {
+fn mint_token(bin: &Path, file: &Path, name: &str) -> String {
     let out = Command::new(bin)
         .arg("--new-token")
         .arg(file)
@@ -425,7 +417,7 @@ fn mint_client_ca_and_leaf(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (ca_path, leaf_cert_path, leaf_key_path)
 }
 
-/// Spawn the server and block until it logs [`READY_MARKER`]; `Err` carries the
+/// Spawn the server and block until it logs [`READY_LINE`]; `Err` carries the
 /// stderr tail of an early exit or a timeout.
 fn spawn_and_wait_ready(
     paths: &BootPaths,
@@ -472,12 +464,12 @@ fn spawn_and_wait_ready(
     let mut proc = cmd.spawn().expect("failed to spawn server");
 
     await_log(&mut proc, &paths.stderr_path, offset, |log| {
-        log.contains(READY_MARKER).then_some(())
+        log.contains(READY_LINE).then_some(())
     })
     .map_err(|e| {
         proc.kill().ok();
         proc.wait().ok();
-        format!("server did not log {READY_MARKER:?}: {e}")
+        format!("server did not log {READY_LINE:?}: {e}")
     })?;
     Ok(proc)
 }
@@ -565,6 +557,21 @@ fn read_tail(path: &Path) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(MAX_TAIL_LINES);
     lines[start..].join("\n")
+}
+
+/// The server binary the suites run: `GNITZ_SERVER_BIN`, or the one `make
+/// server` builds at the repository root. A missing binary panics rather than
+/// skips: a suite passing without a server tests nothing.
+pub fn server_bin() -> PathBuf {
+    let bin = env::var_os("GNITZ_SERVER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server")));
+    assert!(
+        bin.is_file(),
+        "no server binary at {}: `make server` builds one (`make test` does it for you)",
+        bin.display()
+    );
+    bin
 }
 
 /// A schema name no other test in this process has used: `prefix` plus a

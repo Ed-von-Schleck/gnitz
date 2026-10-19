@@ -342,11 +342,11 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
 | `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
-| `gnitz-repl` | The interactive SQL shell, binary `gnitz`: a line editor over `gnitz-sql`, with psql-style meta-commands and `\watch` over a delta feed |
+| `gnitz-cli` | The interactive SQL shell, whose cargo package and binary are `gnitz`: a line editor over `gnitz-sql`, with psql-style meta-commands and `\watch` over a delta feed. Given no server, it runs a separately installed `gnitz-server` for the session |
 | `gnitz-dump` | Logical dump and restore: a database as SQL and Parquet, read from one snapshot, restored into a build of the same formats or a later one |
 | `gnitz-zset` | The Z-set kernel: the key and payload-order kernels, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
-| `gnitz-server` | The multi-process server binary, whose cargo package is `gnitz`: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
+| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
 | `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
@@ -402,6 +402,20 @@ A module's unit tests live in `<dir>/tests/<module>.rs`, attached back with
 `<dir>/tests/<dir-name>.rs`. Tests no single module owns live in the subsystem's
 `suites/`, which reaches only that subsystem's surface.
 
+## Releases
+
+A pushed version tag is a release: the GitHub release with the shell's and the
+server's archives and installers, the server image on ghcr.io, and the Python
+wheels on PyPI. `dist-workspace.toml` configures it, and
+`.github/workflows/release.yml` is generated from it by `dist generate` — never
+edited by hand; the jobs dist does not know are the other workflows it calls.
+crates.io is published by hand.
+
+**A client speaks only to a server of its own release.** So one version moves
+everything: the workspace version, the workspace's exact pins on its own crates
+and the `gnitz[server]` extra's pin on `gnitz-server` change together, and a
+release refuses to build if they disagree.
+
 ## Running E2E tests
 
 **Always run E2E with multiple workers.** Single-worker mode skips
@@ -428,7 +442,8 @@ before anything is created.
 |-----|--------|
 | `GNITZ_WORKERS` | Worker count (Makefile/tests → server `--workers`) |
 | `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
-| `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
+| `GNITZ_SERVER_BIN` | The server binary the test suites, a `gnitz` shell given no server, and `gnitz.local_server` run (e.g. aim E2E at the release build) |
+| `GNITZ_TARGET` | The server the `gnitz` shell and a Python `connect()` given none dial |
 | `GNITZ_RAM_TIER_BYTES` | Per-store RAM-tier ceiling before it spills to a shard; shrink it to reach the disk regime on small data |
 | `GNITZ_RECORD_FRAMES` | A directory every client connection of the process records its frames into: fuzz seeds |
 
@@ -706,7 +721,7 @@ the whole workspace in release, so iterate on a single crate with cargo directly
 ```bash
 cd crates && cargo test -p gnitz-zset --release <name>_bench \
     -- --ignored --nocapture --test-threads=1
-# LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz
+# LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz-server
 ```
 
 A module's benchmarks live in `<dir>/benches/<module>.rs`, attached the way its

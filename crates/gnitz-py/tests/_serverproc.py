@@ -38,9 +38,6 @@ from _paths import REPO_ROOT
 # Every loop polling at this has its own deadline; the interval is granularity.
 _READY_POLL_S = 0.002
 
-# What the server logs once every listener is bound and published.
-_READY_MARKER = "GnitzDB ready"
-
 _PR_SET_PDEATHSIG = 1
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
@@ -315,7 +312,7 @@ class ServerProc:
             self.workers = workers
         self.proc = self._popen(extra_env)
         try:
-            await_log(self.proc, self.log_text, _READY_MARKER, timeout)
+            await_log(self.proc, self.log_text, gnitz._native.READY_LINE, timeout)
         except TimeoutError as e:
             self.stop()
             raise RuntimeError(str(e)) from None
@@ -343,7 +340,7 @@ class ServerProc:
                 assert marker in self.log_text() or any(marker in t for t in self.worker_log_texts()), \
                     f"the boot died without logging {marker!r}, rc={rc}\n{self.log_tail()}"
                 return rc
-            if _READY_MARKER in self.log_text():
+            if gnitz._native.READY_LINE in self.log_text():
                 self.stop()
                 raise RuntimeError("server became ready; expected a boot crash")
             time.sleep(_READY_POLL_S)
