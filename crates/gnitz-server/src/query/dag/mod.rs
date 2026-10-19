@@ -1,10 +1,6 @@
 //! DagEngine: every registered view's compiled plan, and the operator state of
 //! the views this process runs. Epoch execution lives in `exec`, per-key
 //! hydration in `hydrate`, the dependency map in `meta`.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -71,15 +67,14 @@ impl DagEngine {
 
     /// Compile `circuit` as `view_id`'s plan and link the view to its sources, both
     /// kept until [`Self::forget`], and answer the placement its store registers
-    /// under. `owner`: the user view whose chain it is a segment of, `None` for a
-    /// user view.
+    /// under. `chain`: the user view whose chain holds it — itself for a user view.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
         view_id: u64,
         view: &SchemaDescriptor,
         bounded: bool,
-        owner: Option<u64>,
+        chain: u64,
         circuit: &gnitz_wire::Circuit,
     ) -> Result<Placement, String> {
         // Tick scheduling and backfill take ascending id order as dependency order.
@@ -88,7 +83,6 @@ impl DagEngine {
         }
         let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
         self.dep.link(view_id, circuit.sources());
-        let chain = owner.unwrap_or(view_id);
         self.views.insert(view_id, RegisteredView { code, state: None, chain });
         Ok(placement)
     }
@@ -121,8 +115,8 @@ impl DagEngine {
     }
 
     /// Replace the set of views awaiting a rebuild backfill.
-    pub(crate) fn set_rebuild(&mut self, ids: FxHashSet<u64>) {
-        self.rebuild = ids;
+    pub(crate) fn set_rebuild(&mut self, ids: impl IntoIterator<Item = u64>) {
+        self.rebuild = ids.into_iter().collect();
     }
 
     /// Every view awaiting a rebuild backfill, removed.
@@ -140,24 +134,18 @@ impl DagEngine {
     }
 }
 
-fn unregistered(view_id: u64) -> String {
-    format!("view {view_id} is not registered")
-}
-
 /// `view_id`'s plan and its operator state, opened on a miss.
 fn opened<'a>(
     views: &'a mut FxHashMap<u64, RegisteredView>,
     registry: &RelationRegistry,
     view_id: u64,
 ) -> Result<(&'a mut CompileOutput, &'a mut CircuitState), String> {
-    let RegisteredView { code, state, .. } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
+    let RegisteredView { code, state, .. } = views
+        .get_mut(&view_id)
+        .ok_or_else(|| format!("view {view_id} is not registered"))?;
     if state.is_none() {
         let open = CircuitState::open(registry, view_id, code.vm.layout());
         *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
     }
     Ok((code, state.as_mut().expect("opened above")))
 }
-
-#[cfg(test)]
-#[path = "tests/dag.rs"]
-mod tests;

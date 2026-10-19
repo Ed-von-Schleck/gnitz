@@ -80,7 +80,7 @@ impl CatalogEngine {
                     rel.id,
                     &schema,
                     rel.kind().is_bounded(),
-                    owner,
+                    chain,
                     &circuit,
                 )?
             }

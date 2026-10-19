@@ -7,9 +7,7 @@ use gnitz_wire::PkKeys;
 
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String> {
-        let view_schema = registry.relation_or_err(view_id)?.schema();
-        let DagEngine { views, .. } = self;
-        let (code, state) = opened(views, registry, view_id)?;
+        let (code, state) = opened(&mut self.views, registry, view_id)?;
         let hydration = code
             .hydration
             .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");
@@ -17,7 +15,7 @@ impl SkeletonHydrator for DagEngine {
         let vm = &mut code.vm;
         let mut stores = vm::Stores { own: state, registry, unfed: &[] };
         let mut gather = stores.gather(hydration.seed, keys)?;
-        let mut out = Batch::empty_with_schema(&view_schema);
+        let mut out = Batch::empty_with_schema(vm.out_schema());
         while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
             let produced = vm::replay_chunk(vm, &mut stores, hydration.entry, seed)?;
             out.append_above(produced.into_consolidated());

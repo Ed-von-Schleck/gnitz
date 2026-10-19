@@ -171,7 +171,7 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     let rejected = engine.create_table("public.rejected", &cols(), &[0]).unwrap();
     crate::test_support::register_identity_view(&mut engine, kept, "v_kept", &cols());
     let rebuilt = crate::test_support::register_identity_view(&mut engine, rejected, "v_rejected", &cols());
-    engine.dag.set_rebuild([rebuilt].into_iter().collect());
+    engine.dag.set_rebuild([rebuilt]);
     let rows = make_batch(
         &engine.registry.relation(kept).unwrap().schema(),
         &[(1, 1, 10), (2, 1, 20)],

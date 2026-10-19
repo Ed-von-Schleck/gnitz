@@ -48,7 +48,7 @@ impl CatalogEngine {
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
         // view resumes and nothing below need be read.
         if !topo_valid {
-            self.dag.set_rebuild(view_ids.into_iter().collect());
+            self.dag.set_rebuild(view_ids);
             return;
         }
 

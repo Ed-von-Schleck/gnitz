@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::catalog::{unique_index_creates, SysFamily, ZoneError};
 use crate::test_support::{
-    col_def, col_tab_batch, left_join_circuit, nullable_def, push_view_tab_row, table_tab_batch, view_blocks, EchoDrive,
+    col_def, col_tab_batch, left_join_circuit, nullable_def, push_view_tab_row, table_tab_batch, view_blocks,
 };
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
@@ -182,7 +182,7 @@ impl Session {
         // Ascending id order is dependency order.
         views.sort_unstable();
         for view in views {
-            crate::query::backfill(&mut EchoDrive::new(&mut self.cat), view)
+            crate::query::backfill(&mut self.cat, view)
                 .unwrap_or_else(|e| panic!("the backfill of new view {view} failed: {e}"));
         }
         applied.held_above.into_iter().for_each(|family| self.tick(family));
@@ -225,7 +225,7 @@ impl Session {
     }
 
     fn tick(&mut self, source: u64) {
-        crate::query::tick(&mut EchoDrive::new(&mut self.cat), source, self.round)
+        crate::query::tick(&mut self.cat, source, self.round)
             .unwrap_or_else(|e| panic!("a tick of {source} failed: {e}"));
         self.round += 1;
     }

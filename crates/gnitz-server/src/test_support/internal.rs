@@ -274,34 +274,37 @@ pub fn left_join_engine(dir: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
     (engine, [a, b], view)
 }
 
-/// A drive host for circuits that exchange nothing.
-pub struct LocalDrive<'a>(pub &'a mut CatalogEngine);
-
-impl crate::query::DriveHost for LocalDrive<'_> {
+/// An engine drives itself as one worker whose exchange hands it its own rows
+/// back: every round of a drive runs, as at one worker.
+impl crate::query::DriveHost for CatalogEngine {
     fn parts(
         &mut self,
     ) -> (
         &mut crate::query::DagEngine,
         &mut gnitz_store::relation::RelationRegistry,
     ) {
-        (&mut self.0.dag, &mut self.0.registry)
+        (&mut self.dag, &mut self.registry)
     }
 
     fn exchange(
         &mut self,
-        view_id: u64,
-        _batch: std::borrow::Cow<'_, Batch>,
+        _view_id: u64,
+        batch: std::borrow::Cow<'_, Batch>,
         _plan: &gnitz_zset::algebra::ScatterPlan,
         _fold: bool,
-        _drained: bool,
+        drained: bool,
     ) -> (Batch, bool) {
-        panic!("view {view_id} relayed: this host serves exchange-free circuits only");
+        (batch.into_owned(), drained)
     }
 }
 
-/// A drive host whose exchange hands its one worker its own rows back: every
-/// round of a drive runs, as at one worker, at the cost of everything but the
-/// mesh. Counts the rounds it exchanged.
+/// Push `rows` into `tid` and tick it, as a worker applies a push.
+pub fn push_and_tick(engine: &mut CatalogEngine, tid: u64, rows: Batch) {
+    engine.ingest_unticked(tid, rows).unwrap();
+    crate::query::tick(engine, tid, 1).unwrap();
+}
+
+/// A [`CatalogEngine`] driven as itself, counting the rounds it exchanged.
 pub struct EchoDrive<'a> {
     pub cat: &'a mut CatalogEngine,
     pub rounds: u64,
@@ -320,19 +323,19 @@ impl crate::query::DriveHost for EchoDrive<'_> {
         &mut crate::query::DagEngine,
         &mut gnitz_store::relation::RelationRegistry,
     ) {
-        (&mut self.cat.dag, &mut self.cat.registry)
+        crate::query::DriveHost::parts(self.cat)
     }
 
     fn exchange(
         &mut self,
-        _view_id: u64,
+        view_id: u64,
         batch: std::borrow::Cow<'_, Batch>,
-        _plan: &gnitz_zset::algebra::ScatterPlan,
-        _fold: bool,
+        plan: &gnitz_zset::algebra::ScatterPlan,
+        fold: bool,
         drained: bool,
     ) -> (Batch, bool) {
         self.rounds += 1;
-        (batch.into_owned(), drained)
+        crate::query::DriveHost::exchange(self.cat, view_id, batch, plan, fold, drained)
     }
 }
 

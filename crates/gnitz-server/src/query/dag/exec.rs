@@ -61,26 +61,6 @@ fn run_view_epoch(
 
 // ── DAG traversal driver ────────────────────────────────────────────────
 
-impl DagEngine {
-    /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
-    /// execution order, skipping non-resumable views: their backfill fills them.
-    /// The skipped set is closed under dependents, so no step reads a skipped
-    /// producer. Worker-identical, which keeps the workers in lockstep.
-    fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
-        let steps = self.dep.tick_steps(source_id);
-        match self.rebuild.is_empty() {
-            true => steps,
-            false => meta::schedule(
-                steps
-                    .iter()
-                    .filter(|s| !self.awaits_rebuild(s.view))
-                    .map(|s| (s.view, s.producer))
-                    .collect(),
-            ),
-        }
-    }
-}
-
 /// Whether this process mints the row a global aggregate owes over an empty input: each
 /// process holding the view's whole input does, else the one worker the empty group's
 /// exchange sends every row to.
@@ -91,14 +71,8 @@ fn mints_ground_row(slot: Slot, view: Placement) -> bool {
 /// Seal `source` and run its whole dependent closure over what the seal answers,
 /// fed views' deltas captured as `round`.
 pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result<(), String> {
-    let (dag, registry) = host.parts();
-    let delta = match registry.seal(source)? {
-        Some(delta) => delta,
-        // Driven all the same: the other workers' exchange rounds wait on this one.
-        None => Batch::empty_with_schema(&registry.relation_or_err(source)?.schema()),
-    };
-    let schedule = dag.tick_schedule(source);
-    run_schedule(host, source, &schedule, round, delta)
+    let delta = host.parts().1.seal(source)?;
+    run_tick(host, source, round, delta)
 }
 
 /// Fill `view`, and it alone, from each relation it scans, in scan order.
@@ -117,9 +91,9 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     }
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
-        let code = &dag.views.get(&view).ok_or_else(|| unregistered(view))?.code;
-        // `sources_of` names only relations the circuit scans.
-        let bound = code.sources[&source].1.clone();
+        // `sources_of` names only registered views, and of each only the
+        // relations its circuit scans.
+        let bound = dag.views[&view].code.sources[&source].1.clone();
         let (mut cursor, _unapplied) = registry.open_bound(source, bound, Cut::Sealed)?;
         let schema = registry.relation_or_err(source)?.schema();
         let unfed = &sources[at + 1..];
@@ -145,21 +119,22 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     host.parts().1.fold_to_ram(view)
 }
 
-/// Run `schedule`, a tick of `source`, over `delta`, and ingest every view's
-/// output into its family.
+/// Run `source`'s tick schedule over `delta`, `None` where it brings this process
+/// no row, and ingest every view's output into its family.
 // Inlined: `delta` is taken by value, and at a call it is copied whole.
 #[inline(always)]
-fn run_schedule(
-    host: &mut impl DriveHost,
-    source: u64,
-    schedule: &[Step],
-    round: u64,
-    delta: Batch,
-) -> Result<(), String> {
+fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Batch>) -> Result<(), String> {
+    let (dag, registry) = host.parts();
+    let delta = match delta {
+        Some(delta) => delta,
+        // Driven all the same: the other workers' exchange rounds wait on this one.
+        None => Batch::empty_with_schema(&registry.relation_or_err(source)?.schema()),
+    };
+    let schedule = dag.tick_schedule(source);
     // Sized for the schedule: growing it rehashes it once per doubling.
     let mut outputs: FxHashMap<u64, Batch> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
     outputs.insert(source, delta);
-    for &Step { view, producer, last, needed } in schedule {
+    for &Step { view, producer, last, needed } in schedule.iter() {
         // Lent to every reader, the last of which may take it.
         let input = outputs.get_mut(&producer);
         let input = input.expect("the schedule runs every producer before the steps it feeds");

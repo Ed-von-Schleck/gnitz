@@ -20,7 +20,7 @@ const ROWS: u64 = 1_000_000;
 /// instructions the tick took, its seal among them.
 fn tick(engine: &mut CatalogEngine, counter: &perf::Counter, source: u64, rows: Batch) -> u64 {
     engine.ingest_unticked(source, rows).unwrap();
-    let (res, instructions) = counter.measure(|| crate::query::tick(&mut LocalDrive(engine), source, 1));
+    let (res, instructions) = counter.measure(|| crate::query::tick(engine, source, 1));
     res.unwrap();
     instructions
 }

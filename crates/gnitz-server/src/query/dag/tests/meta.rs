@@ -35,48 +35,32 @@ fn the_closures_walk_both_directions_transitively() {
     assert!(dag.dependent_closure([21]).is_empty());
 }
 
-/// A view links to each source once however many scans name it. Forgetting it
-/// unlinks it, and both are no-ops when repeated — including a forget of a view
-/// that never linked.
+/// A view links to each source once however many scans name it, and a view
+/// that scans nothing links nothing. Forgetting a view drops its edges and its
+/// pending rebuild, leaves a sibling over the same source linked, keeps no
+/// emptied entry, and is a no-op when repeated or for an id never linked.
 #[test]
-fn linking_and_forgetting_are_idempotent() {
+fn forgetting_a_view_drops_only_what_it_linked() {
     let mut dag = DagEngine::default();
-    dag.forget(5);
-    assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
+    dag.dep.link(5, [1, 1, 2]);
+    dag.dep.link(6, [1]);
+    dag.dep.link(7, []);
+    assert_eq!(dag.sources_of(5), [1, 2]);
+    assert_eq!(dag.dependents_of(1), [5, 6]);
+    assert_eq!(dag.dependents_of(2), [5]);
+    assert!(!dag.dep.reverse.contains_key(&7));
+    dag.set_rebuild([5]);
 
-    for _ in 0..2 {
-        dag.dep.link(5, [1, 1, 2].into_iter());
-        assert_eq!(dag.sources_of(5), [1, 2]);
-        assert_eq!(dag.dependents_of(1), [5]);
-        assert_eq!(dag.dependents_of(2), [5]);
-    }
     for _ in 0..2 {
         dag.forget(5);
-        assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
+        dag.forget(99);
+        assert!(dag.sources_of(5).is_empty() && !dag.awaits_rebuild(5));
+        assert_eq!(dag.dependents_of(1), [6]);
+        assert_eq!(dag.sources_of(6), [1]);
+        assert!(!dag.dep.forward.contains_key(&2));
     }
-}
-
-/// A view that scans nothing leaves no entry behind.
-#[test]
-fn a_scanless_view_links_nothing() {
-    let mut dag = DagEngine::default();
-    dag.dep.link(6, std::iter::empty());
+    dag.forget(6);
     assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
-}
-
-/// Forgetting one view unlinks only it, leaving a sibling over the same source
-/// linked.
-#[test]
-fn forgetting_a_view_unlinks_only_its_own_edges() {
-    let mut dag = DagEngine::default();
-    dag.dep.link(5, [1].into_iter());
-    dag.dep.link(6, [1].into_iter());
-    assert_eq!(dag.dependents_of(1), [5, 6]);
-
-    dag.forget(5);
-    assert_eq!(dag.dependents_of(1), [6]);
-    assert!(dag.sources_of(5).is_empty());
-    assert_eq!(dag.sources_of(6), [1]);
 }
 
 /// A tick of a relation drives a view while one that scans it does not await
@@ -84,12 +68,55 @@ fn forgetting_a_view_unlinks_only_its_own_edges() {
 #[test]
 fn a_relation_is_ticked_while_a_view_scanning_it_is_not_awaiting_its_rebuild() {
     let mut dag = DagEngine::default();
-    dag.dep.link(5, [1].into_iter());
-    dag.dep.link(6, [1].into_iter());
+    dag.dep.link(5, [1]);
+    dag.dep.link(6, [1]);
     assert!(dag.is_ticked(1) && !dag.is_ticked(2));
 
-    dag.set_rebuild(set(&[5]));
+    dag.set_rebuild([5]);
     assert!(dag.is_ticked(1));
-    dag.set_rebuild(set(&[5, 6]));
+    dag.set_rebuild([5, 6]);
     assert!(!dag.is_ticked(1) && dag.is_scanned(1));
+}
+
+/// The schedule names one step per dependency edge out of the source's forward
+/// closure, ordered by view id — so a producer always precedes the steps it
+/// feeds — and leaves out the views awaiting a rebuild. Each step says whether
+/// it is its producer's last reader and whether a later one reads its view, of
+/// the steps the schedule runs.
+#[test]
+fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
+    // `(view, producer, last, needed)` of each step.
+    let steps = |dag: &mut DagEngine| -> Vec<(u64, u64, bool, bool)> {
+        let steps = dag.tick_schedule(1);
+        steps.iter().map(|s| (s.view, s.producer, s.last, s.needed)).collect()
+    };
+    let mut dag = DagEngine::default();
+    for (view, sources) in [(2, &[1][..]), (3, &[1]), (4, &[2, 3]), (5, &[4]), (7, &[6])] {
+        dag.dep.link(view, sources.iter().copied());
+    }
+
+    let every = [
+        (2, 1, false, true),
+        (3, 1, true, true),
+        (4, 2, true, true),
+        (4, 3, true, true),
+        (5, 4, true, false),
+    ];
+    assert_eq!(steps(&mut dag), every);
+
+    // A rebuild set is closed under dependents.
+    dag.set_rebuild([2, 4, 5]);
+    assert_eq!(steps(&mut dag), [(3, 1, true, false)], "of the steps it runs");
+    dag.rebuild.remove(&2);
+    assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
+
+    // A view linked or dropped after a schedule was read moves that schedule.
+    dag.take_rebuild();
+    dag.dep.link(8, [5]);
+    let mut grown = every.to_vec();
+    grown[4].3 = true;
+    grown.push((8, 5, true, false));
+    assert_eq!(steps(&mut dag), grown);
+    dag.dep.unlink(4);
+    assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
 }

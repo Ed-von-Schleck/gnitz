@@ -4,7 +4,7 @@ use super::*;
 use std::collections::hash_map::Entry;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct Step {
     pub(super) view: u64,
     pub(super) producer: u64,
@@ -16,7 +16,7 @@ pub(super) struct Step {
 
 /// `edges`, each `(view, producer)`, as one schedule. Sorting puts a view after every
 /// view it reads, because ids ascend along scan edges.
-pub(super) fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
+fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
     edges.sort_unstable();
     let mut steps: Vec<Step> = edges
         .into_iter()
@@ -51,7 +51,7 @@ pub(super) struct DepMap {
 
 impl DepMap {
     /// Link `view` to each relation its circuit scans. A source may repeat.
-    pub(super) fn link(&mut self, view: u64, sources: impl Iterator<Item = u64>) {
+    pub(super) fn link(&mut self, view: u64, sources: impl IntoIterator<Item = u64>) {
         self.tick_steps.clear();
         for source in sources {
             let srcs = self.reverse.entry(view).or_default();
@@ -112,6 +112,24 @@ impl DepMap {
 }
 
 impl DagEngine {
+    /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
+    /// execution order, skipping non-resumable views: their backfill fills them.
+    /// The skipped set is closed under dependents, so no step reads a skipped
+    /// producer. Worker-identical, which keeps the workers in lockstep.
+    pub(super) fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
+        let steps = self.dep.tick_steps(source_id);
+        match self.rebuild.is_empty() {
+            true => steps,
+            false => schedule(
+                steps
+                    .iter()
+                    .filter(|s| !self.awaits_rebuild(s.view))
+                    .map(|s| (s.view, s.producer))
+                    .collect(),
+            ),
+        }
+    }
+
     // ── Dependency map ──────────────────────────────────────────────────
 
     /// The views that scan `id` directly. Empty when none do.

@@ -57,7 +57,7 @@ use crate::test_support::{
     fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
     pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, refusal, register_identity_view, scan_all,
     schema_tab_batch, scratch_dir, sum_weights, table_tab_batch, try_register_identity_view, try_register_view,
-    two_term_join_circuit, uuid_def, view_blocks, LocalDrive,
+    two_term_join_circuit, uuid_def, view_blocks,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -178,7 +178,7 @@ fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, Str
 
 /// Backfill `view`, as a worker's `Backfill` does.
 fn backfill(engine: &mut CatalogEngine, view: u64) {
-    crate::query::backfill(&mut LocalDrive(engine), view).unwrap();
+    crate::query::backfill(engine, view).unwrap();
 }
 
 /// The child directories of relation `id` holding a manifest.
@@ -215,7 +215,7 @@ fn held(engine: &CatalogEngine, id: u64) -> (usize, i64) {
 
 /// Seal `source` and tick what the seal answers, as a worker's `Tick` does.
 fn seal_and_tick(engine: &mut CatalogEngine, source: u64) {
-    crate::query::tick(&mut LocalDrive(engine), source, 1).unwrap();
+    crate::query::tick(engine, source, 1).unwrap();
 }
 
 /// `ids` as rows of `tid` at `weight`, in the order given; `cells(id)` is one
