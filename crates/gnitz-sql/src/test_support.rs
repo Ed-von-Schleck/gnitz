@@ -277,18 +277,28 @@ impl Cell<'_> {
     }
 }
 
+/// A batch of `schema`: one row per `(key, weight, cells)`, the key as its columns'
+/// natives, one cell per payload slot.
+pub(crate) fn keyed_batch(schema: &Schema, rows: &[(&[u128], i64, &[Cell])]) -> ZSetBatch {
+    let mut b = ZSetBatch::new(schema);
+    let mut app = BatchAppender::new(&mut b);
+    for &(key, w, cells) in rows {
+        app.add_row_natives(key, w);
+        cells.iter().for_each(|c| c.push(&mut app));
+    }
+    b
+}
+
 /// A batch of `schema`, single-column PK: one weight-1 row per entry of `rows`,
 /// its PK the row's 1-based position, its payload the entry's cells.
 pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
-    let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b);
-    for (r, cells) in rows.iter().enumerate() {
-        app.add_row(r as u128 + 1, 1);
-        for cell in *cells {
-            cell.push(&mut app);
-        }
-    }
-    b
+    let keys: Vec<u128> = (1..=rows.len() as u128).collect();
+    let rows: Vec<_> = keys
+        .iter()
+        .zip(rows)
+        .map(|(k, &cells)| (std::slice::from_ref(k), 1, cells))
+        .collect();
+    keyed_batch(schema, &rows)
 }
 
 /// Each row of `b` (in `schema`) as its payload cells and weight — what

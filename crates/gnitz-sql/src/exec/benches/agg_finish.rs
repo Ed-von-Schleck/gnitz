@@ -1,8 +1,6 @@
-use super::tests::{plan, t};
+use super::tests::{plan, t, wide};
 use super::*;
-use crate::test_support::{col, ncol, table};
 use gnitz_core::BatchAppender;
-use gnitz_wire::TypeCode;
 
 /// Instructions per partial row of `combine` over four workers' replies, each holding a
 /// group at most once.
@@ -12,16 +10,6 @@ fn agg_combine_bench() {
     const REPLY: u64 = 65_536;
     const N: u64 = 4 * REPLY;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let wide = table(
-        2,
-        vec![
-            col("a", TypeCode::U64),
-            col("b", TypeCode::U64),
-            col("c", TypeCode::U64),
-            ncol("x", TypeCode::I64),
-        ],
-        vec![0, 1, 2],
-    );
     let sums = "SELECT g, COUNT(*), SUM(x) FROM t GROUP BY g";
     let float = "SELECT g, COUNT(*), SUM(f) FROM t GROUP BY g";
     let extremes = "SELECT g, COUNT(*), SUM(x), MIN(x), MAX(x) FROM t GROUP BY g";
@@ -40,7 +28,7 @@ fn agg_combine_bench() {
         ),
         ("float SUM", float, &t(), |i| i % REPLY, REPLY),
         ("MIN, MAX added", extremes, &t(), |i| i % REPLY, REPLY),
-        ("24-byte key", by_pk, &wide, |i| i % REPLY, REPLY),
+        ("20-byte key", by_pk, &wide(), |i| i % REPLY, REPLY),
     ] {
         let f = plan(sql, rel);
         let schema = f.partial_schema.as_ref();

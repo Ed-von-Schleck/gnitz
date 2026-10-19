@@ -291,10 +291,10 @@ fn a_refused_insert_names_its_rule() {
     }
 }
 
-/// RETURNING a relation's own columns replies in the relation's regions, numbered by the
-/// list, with no program — wherever the key stands in the relation.
+/// RETURNING a relation's own columns replies with the rows written, verbatim, numbered by
+/// the list — wherever the key stands in the relation.
 #[test]
-fn returning_a_relations_columns_ships_no_program() {
+fn returning_a_relations_columns_replies_the_rows_written() {
     let i = TypeCode::I64;
     let cat = catalog(vec![("m", table(1, vec![col("v", i), col("id", i)], vec![1]))]);
     for (list, names, key) in [
@@ -303,8 +303,9 @@ fn returning_a_relations_columns_ships_no_program() {
         ("*", ["v", "id"], 1),
     ] {
         let plan = insert(&cat, &format!("INSERT INTO m VALUES (10, 1) RETURNING {list}")).unwrap();
-        let (schema, map) = plan.returning.unwrap();
-        assert!(map.is_none(), "RETURNING {list}");
+        let mut map = plan.returning.unwrap();
+        assert_eq!(map.apply(plan.rows.clone()), plan.rows, "RETURNING {list}");
+        let schema = map.out_schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             (got, schema.pk_cols()),

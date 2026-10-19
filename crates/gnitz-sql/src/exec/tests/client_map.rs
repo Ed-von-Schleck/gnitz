@@ -1,8 +1,7 @@
 use super::*;
 use crate::project::reply_program;
-use crate::test_support::{col, ncol, schema};
-use gnitz_core::BatchAppender;
-use gnitz_wire::{payload_is_null, payload_str, payload_u64};
+use crate::test_support::Cell::{Int, Null, Str};
+use crate::test_support::{col, keyed_batch, ncol, rows_of, schema};
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// A spilled body, and one the map computes.
@@ -33,56 +32,50 @@ pub(super) fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
         })
         .collect();
     let (out, program) = reply_program(payload, src).unwrap();
-    ClientMap::new(program, src, Arc::new(out)).unwrap()
+    ClientMap::new(Some(program), src, Arc::new(out)).unwrap()
 }
 
-/// A PK copy is the key's native value — the OPK sign flip undone — a payload copy
-/// moves with its NULLs, and every row keeps its key and weight.
+/// Every row keeps its key and weight. A PK copy is the key's native value — the OPK sign
+/// flip undone — and never NULL. A payload copy moves its source region, cloned only while
+/// a later slot still reads it. A computed string spills into the output arena while a
+/// copied one keeps its offset into the source's, so both read back from one batch.
 #[test]
-fn a_key_copy_decodes_and_a_payload_copy_moves() {
+fn a_map_keeps_key_and_weight_and_fills_each_slot() {
     let src = source();
-    let mut b = ZSetBatch::new(&src);
-    let mut app = BatchAppender::new(&mut b);
-    app.add_row((-5i64) as u128, 1).i64_val(7).null();
-    app.add_row(3, 2).null().null();
-    let pks = b.pks.clone();
-
-    let out = map_of(&src, &["v", "k"]).apply(b);
-
-    assert_eq!(out.pks, pks);
-    assert_eq!(out.weights, [1, 2]);
-    assert_eq!(payload_u64(&out, 0, 0) as i64, 7);
-    assert!(payload_is_null(&out, 1, 0));
-    assert_eq!(
-        [payload_u64(&out, 0, 1) as i64, payload_u64(&out, 1, 1) as i64],
-        [-5, 3]
-    );
-    assert!(!payload_is_null(&out, 1, 1), "a key copy is never NULL");
-}
-
-/// A computed string spills into the output arena while a copied one keeps its
-/// offset into the source's, so both must read back in one batch.
-#[test]
-fn a_computed_string_spills_beside_a_copied_one() {
-    let src = source();
-    let mut b = ZSetBatch::new(&src);
-    let mut app = BatchAppender::new(&mut b);
-    app.add_row(1, 1).i64_val(0).str_val(LONG);
-    app.add_row(2, 1).null().null();
-
-    let out = map_of(
-        &src,
-        &["s", &format!("COALESCE(CASE WHEN v IS NULL THEN s END, '{FALLBACK}')")],
-    )
-    .apply(b);
-
-    assert_eq!(payload_str(&out, 0, 0).unwrap().into_owned(), LONG);
-    assert!(payload_is_null(&out, 1, 0));
-    assert_eq!(
-        [
-            payload_str(&out, 0, 1).unwrap().into_owned(),
-            payload_str(&out, 1, 1).unwrap().into_owned()
-        ],
-        [FALLBACK, FALLBACK]
-    );
+    let fallback = format!("COALESCE(CASE WHEN v IS NULL THEN s END, '{FALLBACK}')");
+    // (items, whether each output slot holds a source region, rows)
+    for (items, moved, want) in [
+        (&["v", "k"][..], [true, false], [[Int(7), Int(-5)], [Null, Int(3)]]),
+        (&["v", "v"], [false, true], [[Int(7), Int(7)], [Null, Null]]),
+        (
+            &["s", &fallback],
+            [true, false],
+            [[Str(LONG), Str(FALLBACK)], [Null, Str(FALLBACK)]],
+        ),
+        (&["s", "v + 1"], [true, false], [[Str(LONG), Int(8)], [Null, Null]]),
+        // The source's own layout: the batch comes back as it went in.
+        (&["v", "s"], [true, true], [[Int(7), Str(LONG)], [Null, Null]]),
+    ] {
+        let b = keyed_batch(
+            &src,
+            &[(&[(-5i64) as u128], 1, &[Int(7), Str(LONG)]), (&[3], 2, &[Null, Null])],
+        );
+        let (pks, regions) = (
+            b.pks.clone(),
+            b.payload.iter().map(|c| c.bytes.as_ptr()).collect::<Vec<_>>(),
+        );
+        let mut map = map_of(&src, items);
+        let out = map.apply(b);
+        assert_eq!(out.pks, pks, "{items:?}");
+        assert_eq!(
+            out.payload
+                .iter()
+                .map(|c| regions.contains(&c.bytes.as_ptr()))
+                .collect::<Vec<_>>(),
+            moved,
+            "{items:?}"
+        );
+        let want: Vec<_> = want.into_iter().map(Vec::from).zip([1, 2]).collect();
+        assert_eq!(rows_of(map.out_schema(), &out), want, "{items:?}");
+    }
 }

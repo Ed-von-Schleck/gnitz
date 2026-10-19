@@ -1,8 +1,8 @@
 use super::*;
 use crate::hir::{bind_adhoc_read, AdhocShape};
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
-use crate::test_support::{catalog, col, ncol, parse_query, rows_of, table};
-use gnitz_core::{BatchAppender, PkColumn, RelDescriptor};
+use crate::test_support::{catalog, col, keyed_batch, ncol, parse_query, rows_of, table};
+use gnitz_core::RelDescriptor;
 use gnitz_wire::{global_group_key, TypeCode};
 
 /// A long body, spilled to the arena rather than inlined in its German cell.
@@ -26,6 +26,20 @@ pub(super) fn t() -> Arc<RelDescriptor> {
     )
 }
 
+/// `(a U64, b U64, c I32 | x I64)`: a 20-byte key, past the narrow image, groups by its bytes.
+pub(super) fn wide() -> Arc<RelDescriptor> {
+    table(
+        3,
+        vec![
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+            col("c", TypeCode::I32),
+            ncol("x", TypeCode::I64),
+        ],
+        vec![0, 1, 2],
+    )
+}
+
 /// The finisher the ad-hoc read path plans for `sql` over `rel`, bound as `t`.
 pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     let query = parse_query(sql);
@@ -38,180 +52,187 @@ pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     FoldFinish::new(pieces.partial_schema, &pieces.agg.aggs, &pieces.having, pieces.finalize).unwrap()
 }
 
-/// A concatenated partial reply to `f`: one weight-1 row per `(key, cells)`, the key as
-/// its columns' natives, one cell per payload slot.
-fn reply(f: &FoldFinish, rows: &[(&[u128], &[Cell])]) -> ZSetBatch {
-    let schema = f.partial_schema.as_ref();
-    let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b);
-    for &(key, cells) in rows {
-        app.add_row_natives(key, 1);
-        for cell in cells {
-            cell.push(&mut app);
-        }
-    }
-    b
-}
+type Rows<'a> = &'a [(&'a [u128], &'a [Cell<'a>])];
 
-/// Replies concatenate in worker order: keys unsorted, a group split across two workers.
+/// Worker replies concatenate in worker order, keys unsorted: a group's first row absorbs
+/// its later ones — a linear partial adds, wrapping as the engine accumulator does, an
+/// extreme takes the winner with NULL as identity — then HAVING filters the combined
+/// groups and finalize maps them. Each row is `(key, cells)` at weight 1.
 #[test]
-fn the_output_row_carries_the_engine_group_key() {
-    let mut f = plan("SELECT g, COUNT(*) FROM t GROUP BY g", &t());
-    let got = f.finish(reply(
-        &f,
-        &[
-            (&[0x2222], &[Int(20), Int(1)]),
-            (&[0x1111], &[Int(10), Int(2)]),
-            (&[0x1111], &[Int(10), Int(3)]),
-        ],
-    ));
-
-    assert_eq!(got.pks, PkColumn::from_natives(f.out_schema(), [0x2222, 0x1111]));
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [(vec![Int(20), Int(1)], 1), (vec![Int(10), Int(5)], 1)]
+fn partials_finish_to_one_row_per_group() {
+    let (t, pk2, wide) = (
+        t(),
+        table(
+            2,
+            vec![
+                col("a", TypeCode::U64),
+                col("b", TypeCode::I32),
+                ncol("x", TypeCode::I64),
+            ],
+            vec![0, 1],
+        ),
+        wide(),
     );
-}
-
-/// Every worker emits a global fold's row, most of them the empty-input ground row.
-#[test]
-fn partials_merge_per_aggregate_with_null_as_identity() {
-    let mut f = plan("SELECT COUNT(*), SUM(x), SUM(f), MIN(sm), MAX(s) FROM t", &t());
-    let v0 = global_group_key();
-    // COUNT(*), then each SUM with its non-null companion, then MIN and MAX.
-    let ground: &[Cell] = &[Int(0), Int(0), Int(0), F64(0.0), Int(0), Null, Null];
-
-    let got = f.finish(reply(
-        &f,
-        &[
-            (&[v0], ground),
-            (
-                &[v0],
-                &[Int(3), Int(i64::MAX as i128), Int(3), F64(1.5), Int(3), Int(-5), Null],
-            ),
-            (&[v0], ground),
-            (&[v0], &[Int(2), Int(1), Int(2), F64(2.25), Int(2), Int(3), Str(LONG_Z)]),
-            (&[v0], &[Int(1), Int(0), Int(1), F64(0.0), Int(1), Int(-7), Str(LONG_M)]),
-        ],
-    ));
-    let (wrapped, signed_min, past_prefix) = (Int(i64::MIN as i128), Int(-7), Str(LONG_Z));
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [(vec![Int(6), wrapped, F64(3.75), signed_min, past_prefix], 1)]
-    );
-
-    let got = f.finish(reply(&f, &[(&[v0], ground), (&[v0], ground)]));
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [(vec![Int(0), Null, Null, Null, Null], 1)]
-    );
-}
-
-/// Group 0x2 passes HAVING only once its two partials merge.
-#[test]
-fn having_filters_combined_groups_before_the_finalize_map() {
-    let mut f = plan(
-        "SELECT COUNT(*) AS c, s, COUNT(*) + 1 AS c1 FROM t GROUP BY s HAVING COUNT(*) > 1",
-        &t(),
-    );
-    let got = f.finish(reply(
-        &f,
-        &[
-            (&[0x1], &[Null, Int(2)]),
-            (&[0x3], &[Str("x"), Int(1)]),
-            (&[0x2], &[Str(LONG_M), Int(1)]),
-            (&[0x2], &[Str(LONG_M), Int(1)]),
-        ],
-    ));
-
-    got.validate(f.out_schema()).unwrap();
-    assert_eq!(got.pks, PkColumn::from_natives(f.out_schema(), [0x1, 0x2]));
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [(vec![Int(2), Null, Int(3)], 1), (vec![Int(2), Str(LONG_M), Int(3)], 1)]
-    );
-}
-
-#[test]
-fn avg_divides_an_unsigned_sum_unsigned_and_nulls_on_a_zero_count() {
-    let mut f = plan("SELECT AVG(u) FROM t", &t());
-    let got = f.finish(reply(
-        &f,
-        &[(&[1], &[Int(u64::MAX as i128), Int(1)]), (&[2], &[Int(0), Int(0)])],
-    ));
-
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [(vec![F64(u64::MAX as f64)], 1), (vec![Null], 1)]
-    );
-}
-
-/// Grouped by the whole PK, the partial is keyed by it and holds no group column.
-#[test]
-fn a_whole_pk_natural_partial_merges_only_its_aggregates() {
-    let c = table(
-        2,
-        vec![
-            col("a", TypeCode::U64),
-            col("b", TypeCode::I32),
-            ncol("x", TypeCode::I64),
-        ],
-        vec![0, 1],
-    );
-    let mut f = plan("SELECT a, b, COUNT(*), SUM(x), MIN(x) FROM t GROUP BY a, b", &c);
+    let v0: &[u128] = &[global_group_key()];
+    let global = "SELECT COUNT(*), SUM(x), SUM(f), MIN(sm), MAX(s), AVG(u) FROM t";
+    // COUNT(*), then SUM(x), SUM(f) and AVG(u)'s sum each with its non-null count, MIN, MAX.
+    let ground: &[Cell] = &[Int(0), Int(0), Int(0), F64(0.0), Int(0), Null, Null, Int(0), Int(0)];
     let neg = -1i32 as u128;
-    // COUNT(*), SUM(x) with its non-null companion, MIN(x).
-    let got = f.finish(reply(
-        &f,
-        &[
-            (&[7, neg], &[Int(1), Int(10), Int(1), Int(10)]),
-            (&[7, 2], &[Int(2), Int(5), Int(2), Int(1)]),
-            (&[7, neg], &[Int(3), Int(20), Int(3), Int(-4)]),
-        ],
-    ));
-
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [
-            (vec![Int(7), Int(-1), Int(4), Int(30), Int(-4)], 1),
-            (vec![Int(7), Int(2), Int(2), Int(5), Int(1)], 1)
-        ]
-    );
-}
-
-/// A key past 16 bytes groups by its bytes; partials of one group merge wherever they
-/// stand in the reply, and a reply of distinct keys comes back as it went in.
-#[test]
-fn a_wide_key_groups_by_its_bytes() {
-    let c = table(
-        3,
-        vec![
-            col("a", TypeCode::U64),
-            col("b", TypeCode::U64),
-            col("c", TypeCode::I32),
-            ncol("x", TypeCode::I64),
-        ],
-        vec![0, 1, 2],
-    );
-    let mut f = plan("SELECT a, b, c, COUNT(*), MAX(x) FROM t GROUP BY a, b, c", &c);
-    assert_eq!(f.partial_schema.layout().pk_stride(), 20);
-    let got = f.finish(reply(
-        &f,
-        &[
-            (&[1, 2, 3], &[Int(1), Null]),
-            (&[1, 2, 4], &[Int(2), Int(9)]),
-            (&[1, 2, 3], &[Int(3), Int(-4)]),
-            (&[1, 2, 3], &[Int(1), Int(-6)]),
-        ],
-    ));
-    assert_eq!(
-        rows_of(f.out_schema(), &got),
-        [
-            (vec![Int(1), Int(2), Int(3), Int(5), Int(-4)], 1),
-            (vec![Int(1), Int(2), Int(4), Int(2), Int(9)], 1)
-        ]
-    );
-
-    let distinct = reply(&f, &[(&[1, 2, 3], &[Int(1), Null]), (&[1, 2, 4], &[Int(2), Int(9)])]);
-    assert_eq!(f.combine(distinct.clone()), distinct);
+    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 9] = [
+        (
+            "SELECT g, COUNT(*) FROM t GROUP BY g",
+            &t,
+            &[
+                (&[0x2222], &[Int(20), Int(1)]),
+                (&[0x1111], &[Int(10), Int(2)]),
+                (&[0x1111], &[Int(10), Int(3)]),
+            ],
+            &[(&[0x2222], &[Int(20), Int(1)]), (&[0x1111], &[Int(10), Int(5)])],
+        ),
+        // Every worker emits a global fold's row, most of them the empty-input ground row.
+        // AVG divides an unsigned sum unsigned.
+        (
+            global,
+            &t,
+            &[
+                (v0, ground),
+                (
+                    v0,
+                    &[
+                        Int(3),
+                        Int(i64::MAX as i128),
+                        Int(3),
+                        F64(1.5),
+                        Int(3),
+                        Int(-5),
+                        Null,
+                        Int(u64::MAX as i128),
+                        Int(1),
+                    ],
+                ),
+                (v0, ground),
+                (
+                    v0,
+                    &[
+                        Int(2),
+                        Int(1),
+                        Int(2),
+                        F64(2.25),
+                        Int(2),
+                        Int(3),
+                        Str(LONG_Z),
+                        Int(0),
+                        Int(0),
+                    ],
+                ),
+                (
+                    v0,
+                    &[
+                        Int(1),
+                        Int(0),
+                        Int(1),
+                        F64(0.0),
+                        Int(1),
+                        Int(-7),
+                        Str(LONG_M),
+                        Int(0),
+                        Int(0),
+                    ],
+                ),
+            ],
+            &[(
+                v0,
+                &[
+                    Int(6),
+                    Int(i64::MIN as i128),
+                    F64(3.75),
+                    Int(-7),
+                    Str(LONG_Z),
+                    F64(u64::MAX as f64),
+                ],
+            )],
+        ),
+        // AVG of a zero count is NULL.
+        (
+            global,
+            &t,
+            &[(v0, ground), (v0, ground)],
+            &[(v0, &[Int(0), Null, Null, Null, Null, Null])],
+        ),
+        // Group 0x2 passes HAVING only once its two partials merge.
+        (
+            "SELECT COUNT(*) AS c, s, COUNT(*) + 1 AS c1 FROM t GROUP BY s HAVING COUNT(*) > 1",
+            &t,
+            &[
+                (&[0x1], &[Null, Int(2)]),
+                (&[0x3], &[Str("x"), Int(1)]),
+                (&[0x2], &[Str(LONG_M), Int(1)]),
+                (&[0x2], &[Str(LONG_M), Int(1)]),
+            ],
+            &[
+                (&[0x1], &[Int(2), Null, Int(3)]),
+                (&[0x2], &[Int(2), Str(LONG_M), Int(3)]),
+            ],
+        ),
+        // No aggregate: the partials only dedup.
+        (
+            "SELECT DISTINCT g, s FROM t",
+            &t,
+            &[
+                (&[0x5], &[Int(1), Str("x")]),
+                (&[0x6], &[Int(2), Str(LONG_M)]),
+                (&[0x5], &[Int(1), Str("x")]),
+            ],
+            &[(&[0x5], &[Int(1), Str("x")]), (&[0x6], &[Int(2), Str(LONG_M)])],
+        ),
+        ("SELECT g, COUNT(*) FROM t GROUP BY g", &t, &[], &[]),
+        // Grouped by the whole PK, the partial is keyed by it and holds no group column.
+        (
+            "SELECT a, b, COUNT(*), SUM(x), MIN(x) FROM t GROUP BY a, b",
+            &pk2,
+            &[
+                (&[7, neg], &[Int(1), Int(10), Int(1), Int(10)]),
+                (&[7, 2], &[Int(2), Int(5), Int(2), Int(1)]),
+                (&[7, neg], &[Int(3), Int(20), Int(3), Int(-4)]),
+            ],
+            &[
+                (&[7, neg], &[Int(7), Int(-1), Int(4), Int(30), Int(-4)]),
+                (&[7, 2], &[Int(7), Int(2), Int(2), Int(5), Int(1)]),
+            ],
+        ),
+        (
+            "SELECT a, b, c, COUNT(*), MAX(x) FROM t GROUP BY a, b, c",
+            &wide,
+            &[
+                (&[1, 2, 3], &[Int(1), Null]),
+                (&[1, 2, 4], &[Int(2), Int(9)]),
+                (&[1, 2, 3], &[Int(3), Int(-4)]),
+                (&[1, 2, 3], &[Int(1), Int(-6)]),
+            ],
+            &[
+                (&[1, 2, 3], &[Int(1), Int(2), Int(3), Int(5), Int(-4)]),
+                (&[1, 2, 4], &[Int(1), Int(2), Int(4), Int(2), Int(9)]),
+            ],
+        ),
+        // Every row its own group: the reply comes back as it went in.
+        (
+            "SELECT a, b, c, COUNT(*), MAX(x) FROM t GROUP BY a, b, c",
+            &wide,
+            &[(&[1, 2, 3], &[Int(1), Null]), (&[1, 2, 4], &[Int(2), Int(9)])],
+            &[
+                (&[1, 2, 3], &[Int(1), Int(2), Int(3), Int(1), Null]),
+                (&[1, 2, 4], &[Int(1), Int(2), Int(4), Int(2), Int(9)]),
+            ],
+        ),
+    ];
+    let batch =
+        |schema: &Schema, rows: Rows| keyed_batch(schema, &rows.iter().map(|&(k, c)| (k, 1, c)).collect::<Vec<_>>());
+    for (sql, rel, partials, want) in cases {
+        let mut f = plan(sql, rel);
+        let got = f.finish(batch(&f.partial_schema, partials));
+        let want = batch(f.out_schema(), want);
+        got.validate(f.out_schema()).unwrap();
+        assert_eq!(got.pks, want.pks, "{sql}");
+        assert_eq!(rows_of(f.out_schema(), &got), rows_of(f.out_schema(), &want), "{sql}");
+    }
 }

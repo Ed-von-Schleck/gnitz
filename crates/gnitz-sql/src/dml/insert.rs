@@ -116,9 +116,8 @@ pub(crate) struct InsertPlan {
     /// until [`execute_insert`] stamps it.
     rows: ZSetBatch,
     conflict: ConflictPlan,
-    /// The RETURNING reply's schema, and the map filling it when it is not the
-    /// table's own layout.
-    returning: Option<(Arc<Schema>, Option<ClientMap>)>,
+    /// The RETURNING reply's map over the rows written.
+    returning: Option<ClientMap>,
 }
 
 /// The table's SERIAL column, whose keys the server assigns.
@@ -355,10 +354,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
         .map(|items| {
             let RowsReply { schema: out_schema, program, .. } =
                 crate::hir::bind_returning(items, &target, table_name.spelled_name())?.reply(&[], true)?;
-            let map = program
-                .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
-                .transpose()?;
-            Ok::<_, GnitzSqlError>((out_schema, map))
+            ClientMap::new(program, schema, out_schema)
         })
         .transpose()?;
     Ok(InsertPlan { target, rows, conflict, returning })
@@ -400,14 +396,11 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
             // Split on RETURNING: the batch is given away when nothing will
             // project it, saving a deep clone inside a transaction.
             match returning {
-                Some((schema_out, map)) => {
+                Some(mut map) => {
                     client.push(&*target, schema, &rows, mode).await?;
                     Ok(SqlResult::Rows(ScanReply {
-                        schema: schema_out,
-                        batch: match map {
-                            Some(mut m) => m.apply(rows),
-                            None => rows,
-                        },
+                        schema: Arc::clone(map.out_schema()),
+                        batch: map.apply(rows),
                         lsn: None,
                     }))
                 }

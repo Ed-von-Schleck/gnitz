@@ -12,32 +12,32 @@ use crate::error::GnitzSqlError;
 /// the source's key, then what the program writes.
 pub(crate) struct ClientMap {
     out_schema: Arc<Schema>,
-    ev: MapEval,
-    /// Some computed slot is a German string, whose cell may spill into the output heap.
-    computes_a_string: bool,
+    /// `None` when the output is the source's own layout: no program, or one that
+    /// reproduces its input.
+    ev: Option<MapEval>,
 }
 
 impl ClientMap {
-    pub(crate) fn new(program: LogicalProgram, src: &Schema, out_schema: Arc<Schema>) -> Result<Self, GnitzSqlError> {
+    pub(crate) fn new(
+        program: Option<LogicalProgram>,
+        src: &Schema,
+        out_schema: Arc<Schema>,
+    ) -> Result<Self, GnitzSqlError> {
         let key = |s: &Schema| {
             s.pk_cols()
                 .iter()
                 .map(|&c| s.columns()[c as usize].ty.tc)
                 .collect::<Vec<_>>()
         };
-        if key(src) != key(&out_schema) {
-            return Err(GnitzSqlError::Internal(
-                "a client map must keep its source's key".into(),
-            ));
-        }
-        let ev = program.resolve_map(src.layout(), out_schema.layout())?;
-        if ev.copies().iter().any(|c| c.src.size() != c.width) {
+        debug_assert_eq!(key(src), key(&out_schema), "a client map keeps its source's key");
+        let ev = program
+            .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
+            .transpose()?
+            .filter(|ev| !ev.is_identity());
+        if ev.iter().flat_map(|ev| ev.copies()).any(|c| c.src.size() != c.width) {
             return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
         }
-        let computes_a_string = out_schema
-            .payload_columns()
-            .any(|(pi, _, c)| c.ty.tc.is_german_string() && !ev.copies().iter().any(|k| k.slot == pi));
-        Ok(ClientMap { out_schema, ev, computes_a_string })
+        Ok(ClientMap { out_schema, ev })
     }
 
     pub(crate) fn out_schema(&self) -> &Arc<Schema> {
@@ -46,21 +46,22 @@ impl ClientMap {
 
     /// The map over every row of `src`, each row keeping its PK and weight.
     pub(crate) fn apply(&mut self, src: ZSetBatch) -> ZSetBatch {
-        if self.ev.is_identity() {
+        let Some(ev) = &mut self.ev else {
             return src;
-        }
+        };
         let n = src.len();
         let mut out = ZSetBatch::new(&self.out_schema);
         out.nulls = vec![0; n];
         out.payload = ZSetBatch::filler_columns(&self.out_schema, n);
-        if self.computes_a_string {
+        let computes_a_string = ev.emits_a_string();
+        if computes_a_string {
             // Appended to, so copied: a copied German cell keeps its offset into it.
             out.blob = src.blob.clone();
         }
-        self.ev.write_computed(&src, 0, n, &mut out, 0);
+        ev.write_computed(&src, 0, n, &mut out, 0);
         // A key column's copy decodes it out of the key region; a key is never NULL.
         let mut moves = Vec::new();
-        for c in self.ev.copies() {
+        for c in ev.copies() {
             match c.src {
                 ColumnLocator::Payload { slot, .. } => moves.push((c.slot, slot as usize)),
                 ColumnLocator::Pk { byte_off, type_code, .. } => gnitz_wire::decode_pk_cells(
@@ -76,7 +77,7 @@ impl ClientMap {
         // The evaluator is done with `src`; its parts move into the output.
         let ZSetBatch { pks, weights, mut payload, blob, .. } = src;
         move_payload(&mut out.payload, &mut payload, &moves);
-        if !self.computes_a_string {
+        if !computes_a_string {
             out.blob = blob;
         }
         out.pks = pks;

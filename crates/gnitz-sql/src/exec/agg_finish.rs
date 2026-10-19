@@ -49,7 +49,7 @@ impl FoldFinish {
             .map(|p| p.resolve_filter(partial_schema.as_ref().layout()))
             .transpose()?;
         let (out_schema, program) = reply_program(finalize, &partial_schema)?;
-        let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
+        let finalize = ClientMap::new(Some(program), &partial_schema, Arc::new(out_schema))?;
         Ok(FoldFinish { partial_schema, merge, having, finalize })
     }
 

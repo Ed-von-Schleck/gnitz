@@ -66,15 +66,12 @@ fn order_window_bench() {
         ("16 values, LIMIT 10", ints(16), &by_v[..], top10),
         ("pk, LIMIT 10", ints(0), &by_id[..], top10),
     ] {
-        std::hint::black_box(order_and_window(&sch, b.clone(), order, window));
-        // The call consumes its batch, so the clone it is handed is measured and subtracted.
-        let (copy, clone) = counter.measure(|| b.clone());
-        let (out, sort) = counter.measure(|| order_and_window(&sch, b.clone(), order, window));
+        let (out, sort) = counter.measure(|| order_and_window(&sch, b, order, window));
         assert_eq!(out.len(), window.limit.unwrap_or(ROWS), "{name}");
-        std::hint::black_box((copy, out));
+        std::hint::black_box(out);
         println!(
             "order_window_bench {name:<30} {:7.1} instr/row",
-            (sort - clone) as f64 / ROWS as f64
+            sort as f64 / ROWS as f64
         );
     }
 }

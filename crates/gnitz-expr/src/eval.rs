@@ -286,6 +286,12 @@ impl MapEval {
         !self.sinks.scalar_emits.is_empty() || !self.sinks.str_emits.is_empty()
     }
 
+    /// True iff some computed output slot is a German string, whose cell may spill into the
+    /// output heap.
+    pub fn emits_a_string(&self) -> bool {
+        !self.sinks.str_emits.is_empty()
+    }
+
     /// True iff the map reproduces its input, given the input's PK carried through.
     pub fn is_identity(&self) -> bool {
         self.is_identity
