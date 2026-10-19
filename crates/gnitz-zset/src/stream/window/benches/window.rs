@@ -49,7 +49,7 @@ fn op_window_bench() {
         // Bulk keys stand in the middle of the key space.
         let bulk = |i: u64| (mix(i) >> 2) | (1 << 61);
         let plan = OrderedPlan::window(&schema(), &[1], &order, &sum, true, false).unwrap();
-        let mut h = Harness::new(plan, &[]);
+        let mut h = Harness::new(plan);
         let empty = h.measure(&counter, &rows(0..N, group, bulk)) as f64 / N as f64;
         let mut ones = |key: &dyn Fn(u64) -> u64, base: u64| {
             let total: u64 = (base..base + ONES)
