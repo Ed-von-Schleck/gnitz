@@ -33,7 +33,7 @@ fn exchange_route_bench() {
     let instructions = gnitz_foundation::perf::Counter::instructions();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
     let wide = pk_payload_schema(&[TypeCode::U64; 3]);
-    let nullable = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let nullable = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let mut three = vec![SchemaColumn::new(TypeCode::I64, false); 4];
     three[0] = SchemaColumn::new(TypeCode::U64, false);
     let three = SchemaDescriptor::new(&three, &[0]);

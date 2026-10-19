@@ -178,15 +178,11 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
 /// A `U64` key over `U8`, nullable `I64` and `U16` columns: a row is 35 bytes
 /// and no payload region starts at a multiple of 8 of them.
 pub(crate) fn ragged_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U8, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::U16, false),
-        ],
-        &[0],
-    )
+    u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::U8, false),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::U16, false),
+    ])
 }
 
 /// `rows` rows of [`ragged_schema`], every fifth with its `I64` NULL.
@@ -255,7 +251,7 @@ pub(crate) fn map_coded_shard(path: &Path, batch: &Batch, codebook: &Codebook) -
 
 /// U64 pk + a single BLOB payload column.
 pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::Blob, false))
+    u64_pk_schema(&[SchemaColumn::new(TypeCode::Blob, false)])
 }
 
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving

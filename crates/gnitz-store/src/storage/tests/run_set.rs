@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    arb_fold_case, fold_batch, fold_schemas, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_of, zset_sum, RowKey,
+    arb_fold_case, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    opk_pk, row_key, u64_pk_schema, weighted_rows, zset_of, zset_sum, RowKey,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
@@ -16,11 +16,10 @@ proptest! {
     /// written.
     #[test]
     fn a_run_set_holds_the_zset_of_its_pushes(
-        (si, rows) in arb_fold_case(),
+        (s, rows) in arb_fold_case(),
         steps in prop::collection::vec((0usize..10, 0u8..8), 1..40),
         cancelling in any::<bool>(),
     ) {
-        let s = fold_schemas()[si];
         let mut set = if cancelling { RunSet::cancelling(1 << 20) } else { RunSet::new(1 << 20) };
         let mut pushed: Vec<Batch> = Vec::new();
         let mut rows = rows.iter().cycle();
@@ -169,7 +168,7 @@ fn widening_fills_nulls_and_keeps_the_filter() {
 /// fold is handed, not the dominant run's NOT NULL label.
 #[test]
 fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
-    let label = |nullable| u64_pk_schema(SchemaColumn::new(TypeCode::I64, nullable));
+    let label = |nullable| u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, nullable)]);
     let (not_null, nullable) = (label(false), label(true));
     let run = |schema: SchemaDescriptor, rows: &[(u128, Option<i64>, i64)]| {
         let mut b = BatchBuilder::new(&schema);

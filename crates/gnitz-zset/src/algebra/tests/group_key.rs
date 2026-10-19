@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, TypeCode};
-use crate::test_support::{arb_fold_case, cell, fold_batch, fold_schemas, le_cell, mix, opk_pk, pk_only_schema};
+use crate::test_support::{arb_fold_case, cell, fold_batch, le_cell, mix, opk_pk, pk_only_schema};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -163,8 +163,8 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
 proptest! {
     /// [`assert_groups_follow_out_pk`] over every PK width arm.
     #[test]
-    fn groups_follow_out_pk_at_every_pk_width((si, rows) in arb_fold_case()) {
-        assert_groups_follow_out_pk(&fold_batch(&fold_schemas()[si], &rows))?;
+    fn groups_follow_out_pk_at_every_pk_width((s, rows) in arb_fold_case()) {
+        assert_groups_follow_out_pk(&fold_batch(&s, &rows))?;
     }
 }
 

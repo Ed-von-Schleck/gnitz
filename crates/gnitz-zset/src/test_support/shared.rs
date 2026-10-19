@@ -60,11 +60,12 @@ pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Ba
     b.finish()
 }
 
-/// A U64 PK plus one `payload` column — the reindex/promotion tests' counterpart
-/// to [`pk_payload_schema`], parameterized by the payload column rather than only its
-/// type, so a nullable payload needs no second builder.
-pub fn u64_pk_schema(payload: SchemaColumn) -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), payload], &[0])
+/// A U64 PK ahead of the `payload` columns — the counterpart to
+/// [`pk_payload_schema`] parameterized by the payload columns rather than the key.
+pub fn u64_pk_schema(payload: &[SchemaColumn]) -> SchemaDescriptor {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend_from_slice(payload);
+    SchemaDescriptor::new(&cols, &[0])
 }
 
 /// Every wire `TypeCode`; since any column type is a valid payload, this
@@ -271,7 +272,7 @@ pub fn make_schema_u128_i64() -> SchemaDescriptor {
 
 /// U64 pk + a single STRING payload column.
 pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
+    u64_pk_schema(&[SchemaColumn::new(TypeCode::String, false)])
 }
 
 /// [`make_batch_bytes`] under [`make_schema_pk_u64_payload_string`].
@@ -397,24 +398,18 @@ pub fn join_reference(
     (m, rows)
 }
 
-/// `batch` framed as one WAL block in a buffer of its own.
+/// `batch`, which holds rows, encoded whole as one WAL block in a buffer of its own.
 pub fn encode_to_wire_vec(batch: &Batch) -> Vec<u8> {
-    let mut out = Vec::new();
-    gnitz_wire::wal::append_block(&batch.wire_regions(), batch.dead_heap(), &mut out);
+    let whole = batch.wire_whole().expect("a batch of no rows encodes to no block");
+    let mut out = vec![0; whole.byte_size()];
+    whole.encode(&mut out);
     out
 }
 
 /// U64 pk + two I64 payload columns — the flush/merge fixtures' shape, where a
 /// second payload column is what makes a partially-written row detectable.
 pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    )
+    u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, false); 2])
 }
 
 /// Build a batch from raw OPK key bytes, one row per `(pk, weight, payload)`,
@@ -464,10 +459,12 @@ pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, 
 }
 
 /// Fixed-int schemas at both edges of every argsort key form — `≤8` (strides 1,
-/// 4, 8), `9..=16` (12, 16), the packed `17..=28` (17, 24, 28), `29..=32` (29,
-/// 32) and the `>32` fallback (80) — and a nullable-string schema
-/// under the generic comparator at a narrow PK, a wide one, and one whose PK
-/// columns sit among the payload columns in an order other than the schema's.
+/// 2, 4, 8), `9..=16` (12, 16), the packed `17..=28` (17, 24, 28), `29..=32` (29,
+/// 32) and the `>32` fallback (80) — one whose fixed-int payload spans every
+/// column width, signed and not, past one 128-bit sort key, and a
+/// nullable-string schema under the generic comparator at a narrow PK, a wide
+/// one, and one whose PK columns sit among the payload columns in an order other
+/// than the schema's.
 pub fn fold_schemas() -> Vec<SchemaDescriptor> {
     use TypeCode::*;
     let generic = |pk: &[TypeCode]| {
@@ -475,8 +472,10 @@ pub fn fold_schemas() -> Vec<SchemaDescriptor> {
         cols.extend([SchemaColumn::new(String, true), SchemaColumn::new(I64, true)]);
         SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
     };
+    let wide_ints = [I8, U16, I32, U64, I64, I16, U8].map(|t| SchemaColumn::new(t, false));
     vec![
         pk_payload_schema(&[U8]),
+        pk_payload_schema(&[U16]),
         pk_payload_schema(&[I64]),
         pk_payload_schema(&[I32]),
         pk_payload_schema(&[U32, U64]),
@@ -488,6 +487,7 @@ pub fn fold_schemas() -> Vec<SchemaDescriptor> {
         pk_payload_schema(&[U128, U64, U32, U8]),
         pk_payload_schema(&[U128, U128]),
         pk_payload_schema(&[U128; 5]),
+        u64_pk_schema(&wide_ints),
         generic(&[U64]),
         generic(&[U64; 3]),
         SchemaDescriptor::new(
@@ -502,8 +502,9 @@ pub fn fold_schemas() -> Vec<SchemaDescriptor> {
     ]
 }
 
-/// `(pk bytes, weight, string, int)`; `None` is NULL.
-pub type FoldRow = (Vec<u8>, i64, Option<u8>, Option<i64>);
+/// `(pk bytes, weight, string, ints)`; `None` is NULL. `ints` sets each
+/// fixed-int column as [`fold_batch`] reads it.
+pub type FoldRow = (Vec<u8>, i64, Option<u8>, Option<u8>);
 
 /// One inline string and three spilling ones, two of them equal in length and
 /// in all but their last byte.
@@ -514,18 +515,19 @@ const FOLD_STRS: [&[u8]; 4] = [
     b"another-long-spilling-value",
 ];
 
-/// An index into [`fold_schemas`] and rows over eight keys of its stride that
-/// differ only in their first and last byte, with small weight and payload
-/// domains, so folds and ghost cancels are common.
-pub fn arb_fold_case() -> impl Strategy<Value = (usize, Vec<FoldRow>)> {
-    (0..fold_schemas().len()).prop_flat_map(|si| {
-        let stride = fold_schemas()[si].pk_stride();
+/// A [`fold_schemas`] schema and rows over up to eight keys of its stride that
+/// differ in their first byte, their middle one and their last — so a wide key's
+/// rows can share a prefix, tie on the span past it and differ behind it — with
+/// small weight and payload domains, so folds and ghost cancels are common.
+pub fn arb_fold_case() -> impl Strategy<Value = (SchemaDescriptor, Vec<FoldRow>)> {
+    prop::sample::select(fold_schemas()).prop_flat_map(|s| {
+        let stride = s.pk_stride();
         let row = (
             0u8..2,
             0u8..4,
             -3i64..=3,
             prop::option::of(0..FOLD_STRS.len() as u8),
-            prop::option::of(0i64..2),
+            prop::option::of(0u8..4),
         );
         let rows = (
             prop::collection::vec(any::<u8>(), stride),
@@ -536,30 +538,39 @@ pub fn arb_fold_case() -> impl Strategy<Value = (usize, Vec<FoldRow>)> {
                     .map(|(lead, tail, w, s, v)| {
                         let mut pk = base.clone();
                         pk[0] = lead;
-                        pk[stride - 1] = base[stride - 1].wrapping_add(tail);
+                        pk[stride / 2] = pk[stride / 2].wrapping_add(tail & 2);
+                        pk[stride - 1] = pk[stride - 1].wrapping_add(tail & 1);
                         (pk, w, s, v)
                     })
                     .collect()
             });
-        (Just(si), rows)
+        (Just(s), rows)
     })
 }
 
-/// `rows` as an unconsolidated batch over a [`fold_schemas`] schema. A NULL and a zero
-/// hold the same cell bytes and must not fold; each long string lands at its
+/// `rows` as an unconsolidated batch over a [`fold_schemas`] schema. A NULL and a
+/// zero hold the same cell bytes and must not fold; each long string lands at its
 /// own heap offset, and equal ones must.
+///
+/// A fixed-int column holds 0 or -1, whose order a sign flip reverses: the first
+/// half of the payload columns as bit 0 of the row's `ints` says, the rest as bit
+/// 1, so rows can tie on the leading columns and differ behind them. `None` is
+/// NULL in a nullable column and 0 in another.
 pub fn fold_batch(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
+    let n = schema.num_payload_cols();
     let mut b = BatchBuilder::new(schema);
     for (pk, w, s, v) in rows {
         b.begin_row_bytes(pk, *w);
-        if schema.num_payload_cols() == 2 {
-            match s {
-                Some(i) => b.put_blob(FOLD_STRS[*i as usize]),
-                None => b.put_null(),
+        for (pc, col) in schema.payload_columns() {
+            match (col.type_code.is_german_string(), s, v) {
+                (true, Some(i), _) => b.put_blob(FOLD_STRS[*i as usize]),
+                (true, None, _) | (false, _, None) if col.nullable => b.put_null(),
+                (false, _, v) => {
+                    let bit = v.unwrap_or(0) >> (2 * pc >= n) as u8 & 1;
+                    b.put_int(if bit == 1 { u128::MAX } else { 0 });
+                }
+                (true, None, _) => unreachable!("fold schemas' strings are nullable"),
             }
-            b.put_opt_int(v.map(|v| v as u128));
-        } else {
-            b.put_int(v.unwrap_or(0) as u128);
         }
         b.end_row();
     }

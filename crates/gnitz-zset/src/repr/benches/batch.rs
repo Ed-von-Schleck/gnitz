@@ -1,8 +1,8 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema, string_batch,
+    make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema, string_batch, u64_pk_schema,
 };
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
@@ -73,9 +73,7 @@ fn consolidate_runs_bench() {
     const N: u64 = 1 << 17;
     let counter = Counter::instructions();
     for payload_cols in [2usize, 3] {
-        let mut cols = vec![SchemaColumn::new(TypeCode::I64, false); 1 + payload_cols];
-        cols[0] = SchemaColumn::new(TypeCode::U64, false);
-        let schema = SchemaDescriptor::new(&cols, &[0]);
+        let schema = u64_pk_schema(&vec![SchemaColumn::new(TypeCode::I64, false); payload_cols]);
         for per_pk in [32u64, 256] {
             let [_, (out, instructions)] = [(); 2].map(|()| {
                 let mut b = BatchBuilder::new(&schema);
@@ -133,11 +131,14 @@ fn consolidate_small_bench() {
                 make_batch_raw(&schema, &rows)
             })
             .collect();
-        let ((), instructions) = counter.measure(|| {
-            for batch in batches {
-                black_box(black_box(batch).into_consolidated());
-            }
+        let (kept, instructions) = counter.measure(|| {
+            batches
+                .into_iter()
+                .map(|batch| black_box(black_box(batch).into_consolidated()).count)
+                .sum::<usize>()
         });
+        // An update's two rows differ in payload, so no row folds.
+        assert_eq!(kept as u64, BATCHES * rows);
         println!(
             "into_consolidated, {:>2} {label:<7} a batch {:>9.1} instr/batch",
             rows / per_pk,
@@ -177,8 +178,7 @@ fn append_batch_strings_bench() {
 fn from_ranges_run_length_bench() {
     const ROWS: usize = 1 << 16;
     const PASSES: usize = 20;
-    let u64_col = SchemaColumn::new(TypeCode::U64, false);
-    let schema = SchemaDescriptor::new(&[u64_col; 4], &[0]);
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false); 3]);
     let mut b = BatchBuilder::new(&schema);
     for i in 0..ROWS as u128 {
         b.begin_row(i, 1);
@@ -213,14 +213,10 @@ fn from_ranges_run_length_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn blob_cache_session_bench() {
     const SESSIONS: u64 = 200;
-    let two_strings = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
+    let two_strings = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::String, false),
+    ]);
     let build = |rows: usize| {
         let mut b = BatchBuilder::new(&two_strings);
         for i in 0..rows {
@@ -234,6 +230,9 @@ fn blob_cache_session_bench() {
     let (one, hundred, many) = (make_string_batch(&[(1, 1, &[b'x'; 40])]), build(100), build(25_000));
     // A relocating session over every row of `src`: `compacted` carries no heap.
     let session = |src: &Batch| black_box(black_box(src).compacted()).count;
+    for src in [&one, &hundred, &many] {
+        assert_eq!(session(src), src.count);
+    }
     let counters = [("instr", Counter::instructions()), ("cycles", Counter::cycles())];
     for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
         for (unit, counter) in &counters {

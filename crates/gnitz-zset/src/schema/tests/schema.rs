@@ -11,8 +11,9 @@ fn col(tc: TypeCode) -> SchemaColumn {
 
 /// Over random schemas — any column types and nullability, the PK anywhere and
 /// in any order — the regions lie back to back at their columns' widths, an
-/// arena of eight rows or more starts each one 8-aligned, and the schema record
-/// round-trips the descriptor.
+/// arena below eight rows holds exactly its rows, one of eight or more is the
+/// fewest rows from there that start each region 8-aligned, and the schema
+/// record round-trips the descriptor.
 #[test]
 fn regions_follow_the_columns_and_the_record_round_trips() {
     let mut rng = Rng::new(0x005C_4E3A);
@@ -35,16 +36,14 @@ fn regions_follow_the_columns_and_the_record_round_trips() {
             "{s:?}"
         );
         for rows in [0, 1, 7, 8, 9, 100] {
-            let cap = s.arena_rows(rows);
-            assert!((rows..rows + 8).contains(&cap), "{s:?}: {rows} rows");
-            if rows >= 8 {
-                assert!(
-                    (0..s.num_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8)),
-                    "{s:?}: {rows} rows"
-                );
-            } else {
-                assert_eq!(cap, rows, "{s:?}");
-            }
+            let aligned = |cap: usize| (0..s.num_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8));
+            let want = match rows {
+                0..8 => rows,
+                _ => (rows..rows + 8)
+                    .find(|&cap| aligned(cap))
+                    .expect("eight rows align any stride"),
+            };
+            assert_eq!(s.arena_rows(rows), want, "{s:?}: {rows} rows");
         }
         assert_eq!(decode_schema_block(&encode_schema_block(&s)).unwrap(), s);
     }

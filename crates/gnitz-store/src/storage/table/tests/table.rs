@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::super::manifest::{manifest_path, shard_seqs};
@@ -8,8 +8,8 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, fold_schemas, make_batch_raw, make_schema_u64_i64, new_table, row_key, zset_of,
-    zset_sum, FoldRow, RowKey,
+    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, zset_of, zset_sum, FoldRow,
+    RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -46,26 +46,15 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// A row's element identity under `schema` — what [`fold_batch`] writes.
-type Elem = (Vec<u8>, Option<u8>, Option<i64>);
-
-fn elem(schema: &SchemaDescriptor, (pk, _, s, v): &FoldRow) -> Elem {
-    match schema.num_payload_cols() {
-        2 => (pk.clone(), *s, *v),
-        _ => (pk.clone(), None, Some(v.unwrap_or(0))),
-    }
-}
-
-/// The Z-set `model` holds, keyed as a batch of `schema` is.
-fn zset(schema: &SchemaDescriptor, model: &BTreeMap<Elem, i64>) -> HashMap<RowKey, i64> {
-    let rows: Vec<FoldRow> = model.iter().map(|((pk, st, v), &w)| (pk.clone(), w, *st, *v)).collect();
-    zset_of(&fold_batch(schema, &rows), schema)
+/// A row's element identity under `schema`: the one row [`fold_batch`] writes for it.
+fn elem(schema: &SchemaDescriptor, r: &FoldRow) -> RowKey {
+    row_key(&fold_batch(schema, std::slice::from_ref(r)), schema, 0)
 }
 
 /// Every read `t` serves agrees with `live`, and one at the cut with `sealed`.
-fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, i64>, keys: &[Vec<u8>]) {
+fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey, i64>, keys: &[Vec<u8>]) {
     let s = *t.schema();
-    let want = zset(&s, live);
+    let want = live.clone();
     assert_eq!(zset_of(&t.full_scan(), &s), want, "full_scan");
 
     for k in keys {
@@ -82,7 +71,7 @@ fn assert_serves(t: &Table, live: &BTreeMap<Elem, i64>, sealed: &BTreeMap<Elem, 
         }
     }
 
-    for (cut, want) in [(Cut::Now, want.clone()), (Cut::Sealed, zset(&s, sealed))] {
+    for (cut, want) in [(Cut::Now, want.clone()), (Cut::Sealed, sealed.clone())] {
         let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), cut);
         let mut gathered: HashMap<RowKey, i64> = HashMap::new();
         while let Some(b) = gather.drain_chunk(3) {
@@ -140,12 +129,11 @@ proptest! {
     /// above the cut since the last, and a crash reopens at the last barrier.
     #[test]
     fn a_table_serves_the_zset_its_ingests_sum_to(
-        (si, stream) in arb_fold_case(),
+        (s, stream) in arb_fold_case(),
         ops in prop::collection::vec(arb_op(), 1..48),
         salreplay in any::<bool>(),
         spills in any::<bool>(),
     ) {
-        let s = fold_schemas()[si];
         let rs = match salreplay {
             true => RecoverySource::SalReplay,
             false => RecoverySource::Rederive { resume_at: Some(0) },
@@ -159,7 +147,7 @@ proptest! {
         keys.dedup();
 
         let mut t = open();
-        let (mut live, mut sealed, mut durable) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let (mut live, mut sealed, mut durable) = (HashMap::new(), HashMap::new(), HashMap::new());
         let mut stream = stream.into_iter().cycle();
         // A reopen finds the pending shards its last barrier published in L0,
         // however many they are, until the next upkeep.
@@ -195,7 +183,7 @@ proptest! {
                     moved.retain(|_, w| *w != 0);
                     let delta = t.seal().unwrap();
                     let delta = delta.map(|d| zset_of(&d, &s)).unwrap_or_default();
-                    prop_assert_eq!(delta, zset(&s, &moved), "the seal's delta");
+                    prop_assert_eq!(delta, moved, "the seal's delta");
                     prop_assert!(!t.has_pending());
                     sealed = live.clone();
                 }

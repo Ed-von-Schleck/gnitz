@@ -1,6 +1,6 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{encode_to_wire_vec, pk_u64_two_i64_schema, string_batch, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
@@ -70,7 +70,7 @@ fn foreign_decode_bench() {
         );
     };
 
-    let mut b = BatchBuilder::new(&u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)));
+    let mut b = BatchBuilder::new(&u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]));
     for i in 0..ROWS {
         b.begin_row(i as u128, 1);
         b.put_opt_int((i % 5 != 0).then_some(i as u128));
@@ -106,10 +106,9 @@ fn reply_chunk_strings_bench() {
 
     let long = string_batch(&(0..N as u64).map(|i| (i, format!("{i:040}"))).collect::<Vec<_>>());
 
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend([SchemaColumn::new(TypeCode::I64, false); 6]);
+    let mut cols = vec![SchemaColumn::new(TypeCode::I64, false); 6];
     cols.push(SchemaColumn::new(TypeCode::String, false));
-    let wide_schema = SchemaDescriptor::new(&cols, &[0]);
+    let wide_schema = u64_pk_schema(&cols);
     let mut b = BatchBuilder::new(&wide_schema);
     for i in 0..N as u64 {
         b.begin_row(i as u128, 1);

@@ -123,8 +123,8 @@ fn map_ranges_bench() {
     for (name, schema, col) in [
         ("widen_pk_i32", pk_payload_schema(&[I32]), 0),
         ("widen_pk_i32_u64", pk_payload_schema(&[I32, U64]), 0),
-        ("widen_payload_i32", u64_pk_schema(SchemaColumn::new(I32, false)), 1),
-        ("widen_payload_u16", u64_pk_schema(SchemaColumn::new(U16, false)), 1),
+        ("widen_payload_i32", u64_pk_schema(&[SchemaColumn::new(I32, false)]), 1),
+        ("widen_payload_u16", u64_pk_schema(&[SchemaColumn::new(U16, false)]), 1),
         ("copy_pk_i64", pk_payload_schema(&[I64]), 0),
     ] {
         let mut batch = BatchBuilder::new(&schema);

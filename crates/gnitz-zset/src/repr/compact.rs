@@ -21,6 +21,7 @@ use crate::schema::SchemaDescriptor;
 use gnitz_wire::RowSource;
 use gnitz_wire::{CodedHeap, Heap, PkBuf};
 use std::ops::Range;
+use std::rc::Rc;
 
 /// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
 /// to slot 0 for keys below the first guard.
@@ -107,7 +108,7 @@ impl RowSource for GuardRun<'_> {
 /// caller, the payload comparator drops out of the merge loop.
 #[inline(never)]
 pub fn merge_guard<'a>(
-    shards: &[&MappedShard],
+    shards: &[Rc<MappedShard>],
     guards: &[PkBuf],
     g: usize,
     starts: &mut [usize],

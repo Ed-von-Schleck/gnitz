@@ -15,7 +15,7 @@ fn group_ordinals_bench() {
     let three = pk_payload_schema(&[U64; 3]);
     let four = pk_payload_schema(&[U64; 4]);
     let short = pk_payload_schema(&[U32, U64]);
-    let narrow = u64_pk_schema(SchemaColumn::new(I32, false));
+    let narrow = u64_pk_schema(&[SchemaColumn::new(I32, false)]);
     let nullable = {
         let mut cols = [SchemaColumn::new(U64, false); 4];
         cols[3] = SchemaColumn::new(TypeCode::I64, true);

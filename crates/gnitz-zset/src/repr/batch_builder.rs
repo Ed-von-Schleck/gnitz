@@ -157,7 +157,3 @@ impl BatchBuilder {
         self.schema().payload_col_idx(self.curr_col)
     }
 }
-
-#[cfg(test)]
-#[path = "tests/batch_builder.rs"]
-mod tests;

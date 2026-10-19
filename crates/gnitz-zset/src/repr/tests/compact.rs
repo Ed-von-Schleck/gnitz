@@ -4,7 +4,7 @@ use super::super::layout::{spans_of, ShardHeader};
 use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_u64_i64, map_shard, FoldRow,
+    arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_u64_i64, map_shard, FoldRow,
 };
 use gnitz_wire::PkBuf;
 use proptest::prelude::*;
@@ -19,14 +19,13 @@ fn route(
     dehydrate: bool,
     schema: &SchemaDescriptor,
 ) -> Vec<(PkBuf, bool, Batch)> {
-    let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
-    for s in &inputs {
+    for s in shards {
         s.verify_body().unwrap();
     }
-    let mut starts = vec![0usize; inputs.len()];
+    let mut starts = vec![0usize; shards.len()];
     (0..guards.len())
         .filter_map(|g| {
-            let (skeleton, run) = merge_guard(&inputs, guards, g, &mut starts, dehydrate, schema, None)?;
+            let (skeleton, run) = merge_guard(shards, guards, g, &mut starts, dehydrate, schema, None)?;
             Some((
                 guards[g],
                 skeleton,
@@ -68,12 +67,11 @@ proptest! {
     /// per-PK sums for a skeleton guard — and a share folding to nothing emits nothing.
     #[test]
     fn each_guard_receives_its_share_of_the_zset_sum(
-        (si, rows) in arb_fold_case(),
+        (s, rows) in arb_fold_case(),
         picks in prop::collection::vec(any::<prop::sample::Index>(), 0..5),
         below_all in any::<bool>(),
         dehydrate in any::<bool>(),
     ) {
-        let s = fold_schemas()[si];
         let runs: Vec<Batch> = rows
             .chunks(7)
             .map(|c| fold_batch(&s, c).into_consolidated())
@@ -134,36 +132,10 @@ proptest! {
     }
 }
 
-/// A skeleton output declares itself: zero payload arity, the skeleton flag,
-/// and a null region collapsed to one `Constant` element for the whole file.
-#[test]
-fn a_skeleton_output_is_payload_free_on_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let src = map_shard(
-        &dir.path().join("in.db"),
-        &make_batch(&schema, &[(1, 1, 10), (1, 2, 20), (2, 5, 30)]),
-    );
-    let [(_, true, batch)] = &route(&[src], &[PkBuf::zeroed(8)], true, &schema)[..] else {
-        panic!("one skeleton guard, one output");
-    };
-    let path = dir.path().join("out.db");
-    batch
-        .write_as_shard(
-            path.to_str().unwrap(),
-            ShardWriteOpts { skeleton: true, ..Default::default() },
-        )
-        .unwrap();
-    let raw = std::fs::read(&path).unwrap();
-    let header = ShardHeader::read(&raw).unwrap();
-    assert_eq!(header.file_npc, 0, "zero payload arity");
-    assert!(header.skeleton, "declared skeleton");
-    let nulls = &spans_of(&raw)[REG_NULL_BMP];
-    assert_eq!((nulls.size, nulls.encoding), (8, Encoding::Constant));
-}
-
-/// A skeleton input makes every output a skeleton, asked or not: its rows carry
-/// no payload to write back full width.
+/// A skeleton output declares itself on disk — zero payload arity, the skeleton
+/// flag, and a null region collapsed to one `Constant` element for the whole
+/// file — and a skeleton input makes every output a skeleton, asked or not: its
+/// rows carry no payload to write back full width.
 #[test]
 fn a_skeleton_input_makes_every_output_a_skeleton() {
     let dir = tempfile::tempdir().unwrap();
@@ -181,6 +153,11 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     let path = dir.path().join("b.db");
     let opts = ShardWriteOpts { skeleton: true, ..Default::default() };
     coarse.write_as_shard(path.to_str().unwrap(), opts).unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let header = ShardHeader::read(&raw).unwrap();
+    assert_eq!((header.file_npc, header.skeleton), (0, true));
+    let nulls = &spans_of(&raw)[REG_NULL_BMP];
+    assert_eq!((nulls.size, nulls.encoding), (8, Encoding::Constant));
     let skeleton = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
     let fresh = map_shard(
         &dir.path().join("c.db"),
@@ -248,11 +225,10 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_coded_shard(&dir.path().join("late.db"), &late, &book),
         crate::test_support::map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
-    let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
     let guards = [PkBuf::zeroed(schema.pk_stride())];
 
-    let (_, plain) = merge_guard(&inputs, &guards, 0, &mut [0; 4], false, &schema, None).unwrap();
-    let (_, coded) = merge_guard(&inputs, &guards, 0, &mut [0; 4], false, &schema, Some(&book)).unwrap();
+    let (_, plain) = merge_guard(&shards, &guards, 0, &mut [0; 4], false, &schema, None).unwrap();
+    let (_, coded) = merge_guard(&shards, &guards, 0, &mut [0; 4], false, &schema, Some(&book)).unwrap();
     let plain = plain.plain().unwrap();
     let want = string_rows(plain, |r| plain.get_weight(r));
     assert_eq!(want.len(), 250 + 280 + 300);

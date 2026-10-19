@@ -1,7 +1,10 @@
 use super::*;
 use crate::repr::merge::run_merge;
-use crate::test_support::{map_shard, mix};
-use gnitz_wire::PkBuf;
+use crate::repr::BatchBuilder;
+use crate::test_support::{map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema};
+use gnitz_foundation::perf::Counter;
+use gnitz_wire::{PkBuf, TypeCode};
+use std::hint::black_box;
 use std::rc::Rc;
 
 /// Compaction over packed inputs that all hold the same keys, so the merge breaks
@@ -10,10 +13,6 @@ use std::rc::Rc;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn for_compaction_bench() {
-    use crate::repr::BatchBuilder;
-    use crate::test_support::pk_u64_two_i64_schema;
-    use gnitz_foundation::perf::Counter;
-    use std::hint::black_box;
     const TOTAL: usize = 1 << 20;
     let schema = pk_u64_two_i64_schema();
     let dir = tempfile::tempdir().unwrap();
@@ -36,7 +35,6 @@ fn for_compaction_bench() {
         let guard_keys: Vec<PkBuf> = (0..guards)
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
-        let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
         for s in &inputs {
             s.verify_body().unwrap();
         }
@@ -68,11 +66,6 @@ fn for_compaction_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn distinct_compaction_bench() {
-    use crate::repr::BatchBuilder;
-    use crate::test_support::pk_payload_schema;
-    use gnitz_foundation::perf::Counter;
-    use gnitz_wire::TypeCode;
-    use std::hint::black_box;
     const TOTAL: u64 = 1 << 20;
     let dir = tempfile::tempdir().unwrap();
     let instructions = Counter::instructions();
@@ -111,7 +104,6 @@ fn distinct_compaction_bench() {
                 .zip(builders)
                 .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
                 .collect();
-            let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
             let guard_keys = [PkBuf::zeroed(schema.pk_stride())];
             for s in &inputs {
                 s.verify_body().unwrap();

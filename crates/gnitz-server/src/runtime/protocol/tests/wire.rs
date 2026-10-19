@@ -1,5 +1,5 @@
 use crate::runtime::wire::{decode_client_rows, WireMsg};
-use crate::test_support::{encode_to_wire_vec, make_batch, make_schema_u64_i64, weighted_rows};
+use crate::test_support::{make_batch, make_schema_u64_i64, weighted_rows};
 use gnitz_wire::control::{encode_frame_head, frame_head_size, peek_control_block, ControlHeader};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
@@ -45,7 +45,8 @@ fn a_client_frames_rows_are_a_foreign_block_under_the_callers_schema() {
     assert_eq!(decode(&nulled).err(), Some("a null bit on a NOT NULL column"));
 
     // A well-formed block of zero rows, which `WireMsg` never emits.
-    let block = encode_to_wire_vec(&make_batch(&sd, &[]));
+    let mut block = Vec::new();
+    gnitz_wire::wal::append_block(&make_batch(&sd, &[]).wire_regions(), 0, &mut block);
     let mut hollow = vec![0; frame_head_size(0, None) + block.len()];
     let pos = encode_frame_head(&mut hollow, &ControlHeader::default(), &[], None, true);
     hollow[pos..].copy_from_slice(&block);

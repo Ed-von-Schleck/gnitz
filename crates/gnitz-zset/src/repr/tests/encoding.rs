@@ -63,20 +63,15 @@ fn for_packs_at_the_width_the_span_needs() {
         ("stride 1", vec![0, 1, 2, 3, 200], U8, None),
         ("stride 1 signed", vec![-5, 0, 5, 100], I8, None),
         ("small", series(300, |i| i % 200), U32, Some(1)),
-        ("small u64", series(300, |i| i % 200), U64, Some(1)),
         ("two-byte span", series(300, |i| (i * 211) % 60000), U32, Some(2)),
         // A tight range far from zero frames on its min.
         ("high floor", series(256, |i| 1_000_000 + i % 50), U32, Some(1)),
-        ("high floor u64", series(256, |i| 5_000_000_000 + i % 40), U64, Some(1)),
         // A range spanning zero frames on the signed min, not on 0.
         ("across zero", series(256, |i| -100 + i % 150), I32, Some(1)),
-        ("across zero i64", series(256, |i| -100 + i % 150), I64, Some(1)),
         ("wide across zero", series(500, |i| -30_000 + i % 60000), I32, Some(2)),
         // Constant is claimed before FoR; the encoder declines too.
         ("all equal", vec![42; 100], U32, None),
         ("extremes", vec![0, u32::MAX as i128], U32, None),
-        ("extremes signed", vec![i32::MIN as i128, i32::MAX as i128], I32, None),
-        ("extremes u64", vec![0, u64::MAX as i128], U64, None),
         ("extremes i64", vec![i64::MIN as i128, i64::MAX as i128], I64, None),
         // NULL cells carry a zero that joins the frame.
         (

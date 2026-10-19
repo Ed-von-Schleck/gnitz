@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{arb_fold_case, fold_batch, fold_schemas, make_schema_u64_i64, zset_of, zset_sum, TestTrace};
+use crate::test_support::{arb_fold_case, fold_batch, make_schema_u64_i64, zset_of, zset_sum, TestTrace};
 use gnitz_wire::ClampKind::{Distinct, PositivePart};
 use proptest::prelude::*;
 
@@ -22,12 +22,11 @@ proptest! {
     /// output holds one row per element.
     #[test]
     fn the_output_integral_is_the_clamped_input_integral(
-        (si, rows) in arb_fold_case(),
+        (s, rows) in arb_fold_case(),
         tick_len in 1usize..8,
         kind in prop_oneof![Just(Distinct), Just(PositivePart)],
         absorbed: bool,
     ) {
-        let s = fold_schemas()[si];
         let mut hist = TestTrace::new(s);
         let mut input = Vec::new();
         let mut outs = Vec::new();

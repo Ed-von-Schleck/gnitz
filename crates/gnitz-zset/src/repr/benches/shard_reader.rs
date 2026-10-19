@@ -6,9 +6,10 @@ use super::super::string_heap::{carried_dead, long_bytes_outside};
 use super::tests::{build, wide_string};
 use super::*;
 use crate::schema::key::probe_key;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema, Rng,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
+    weighted_rows, Rng,
 };
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
@@ -32,7 +33,7 @@ fn slice_blob_relocate_bench() {
         let carried = (!relocate).then(|| shard.heap().plain().expect("a plain heap").len());
         let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried)));
         // The first slice faults in the cold mmap pages.
-        slice();
+        assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried).count, rc);
         cycles.measure(|| (0..ITERS).for_each(|_| slice())).1 as f64 / ITERS as f64
     };
 
@@ -72,7 +73,8 @@ fn slice_blob_relocate_bench() {
 /// whole and in 1024-row windows, to read every payload cell through the per-row
 /// accessor on a fresh handle and again once its blocks are decoded, to read
 /// every weight and null word, and to materialize it through a `UnifiedSet` as a
-/// compaction does. The regions' stored sizes and encodings name what each
+/// read cursor does. The whole slice and the materialized batch read back as the
+/// batch written. The regions' stored sizes and encodings name what each
 /// shape packed to. A shape whose heap a symbol table codes is measured twice:
 /// plain, and coded under a codebook trained on it beforehand.
 #[test]
@@ -81,21 +83,17 @@ fn shard_read_bench() {
     const N: usize = 200_000;
     const WINDOW: usize = 1024;
     let str_col = SchemaColumn::new(TypeCode::String, false);
-    let events = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            str_col,
-            str_col,
-            str_col,
-            str_col,
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
+    let events = u64_pk_schema(&[
+        str_col,
+        str_col,
+        str_col,
+        str_col,
+        SchemaColumn::new(TypeCode::I64, false),
+    ]);
     let one_string = make_schema_pk_u64_payload_string();
-    let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
+    let nullable_string = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
     let i64_col = make_schema_u64_i64();
-    let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let nullable_i64 = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let one_in_ten = |i: usize| i.is_multiple_of(10).then_some(3_000_000_000 + i as u128);
 
     let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
@@ -261,7 +259,9 @@ fn shard_read_bench() {
             .map(|(role, encoding, size)| format!("{role}:{size}/{encoding}"))
             .collect();
         let shard = MappedShard::open(&path, &schema).unwrap();
-        let (_, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
+        let (whole, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
+        let want = weighted_rows(batch);
+        assert_eq!(weighted_rows(&whole), want, "{label}: slice");
         let (_, window_i) = instructions.measure(|| {
             for start in (0..N).step_by(WINDOW) {
                 black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
@@ -287,11 +287,12 @@ fn shard_read_bench() {
             }
             black_box(sink)
         });
-        let rows: Vec<(u32, u32, i64)> = (0..N as u32).map(|r| (0, r, 1)).collect();
-        let (_, merge_i) = instructions.measure(|| {
+        let rows: Vec<(u32, u32, i64)> = (0..N).map(|r| (0, r as u32, batch.get_weight(r))).collect();
+        let (merged, merge_i) = instructions.measure(|| {
             let set = UnifiedSet::whole(std::slice::from_ref(&shard), &schema);
             black_box(set.materialize(&rows, N))
         });
+        assert_eq!(weighted_rows(&merged), want, "{label}: materialize");
         let per_row = |i: u64| i as f64 / N as f64;
         println!(
             "{label}\n  {:.1} bytes per row; instructions per row: write {:.1}, slice {:.1}, windows {:.1}, \
@@ -328,9 +329,10 @@ fn pk_filter_bench() {
             let write = |pass: &str| {
                 let path = dir.path().join(format!("{rows}_{skip_pk_filter}_{pass}.db"));
                 batch.write_as_shard(path.to_str().unwrap(), opts).unwrap();
-                MappedShard::open(path.to_str().unwrap(), &schema).unwrap()
+                path
             };
-            let (shard, i) = instructions.measure(|| write("instructions"));
+            let (path, i) = instructions.measure(|| write("instructions"));
+            let shard = MappedShard::open(path.to_str().unwrap(), &schema).unwrap();
             assert_eq!(shard.has_shard_filter(), !skip_pk_filter);
             let per_row = [i, cycles.measure(|| write("cycles")).1].map(|n| n as f64 / rows as f64);
             (shard, per_row)

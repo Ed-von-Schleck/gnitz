@@ -4,7 +4,7 @@ use gnitz_wire::TypeCode;
 use gnitz_zset::schema::SchemaColumn;
 
 fn batch(rows: impl IntoIterator<Item = (u64, i64)>) -> Batch {
-    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false)]);
     let rows: Vec<_> = rows.into_iter().map(|(pk, weight)| (pk, weight, 0)).collect();
     make_batch_raw(&schema, &rows)
 }

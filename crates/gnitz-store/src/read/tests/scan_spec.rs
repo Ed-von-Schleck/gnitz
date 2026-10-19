@@ -381,7 +381,7 @@ fn a_pk_sourced_map_zeroes_every_null_word() {
         SchemaColumn::new(TypeCode::I64, false),
     ];
     let r = map_fixture(&cols, 300, 32, |bb, id| bb.put_u64(id * 7));
-    let reply = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
+    let reply = crate::test_support::u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false)]);
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), None);
     let got = run(&r, spec.clone()).unwrap();
     assert!((0..got.len()).all(|row| got.get_null_word(row) == 0));

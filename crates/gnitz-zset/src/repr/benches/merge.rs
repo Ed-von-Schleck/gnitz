@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, Rng};
+use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows, Rng};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -40,15 +40,11 @@ fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize)
 /// A U64 PK over a float, a U128 and a nullable column, each of which forces
 /// the `Generic` payload comparator.
 fn generic_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, false),
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    )
+    u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::F64, false),
+        SchemaColumn::new(TypeCode::U128, false),
+        SchemaColumn::new(TypeCode::I64, true),
+    ])
 }
 
 /// `run_merge`'s compare loop alone — the emit materializes nothing — under a
@@ -68,7 +64,8 @@ fn run_merge_dup_pk_bench() {
             run_merge(black_box(&mem), &schema, |_s, _r, w| sink = sink.wrapping_add(w));
             black_box(sink)
         };
-        merge();
+        // K copies of one batch: every row folds with its twins.
+        assert_eq!(merge(), (K * N) as i64);
         let (instr, cyc) = (instructions.measure(merge).1, cycles.measure(merge).1);
         println!(
             "run_merge_dup_pk_bench {label:<9} {:5.1} instr/row, {:5.1} cycles/row",
@@ -250,20 +247,16 @@ fn seeded_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, u64)]) -> Batch {
 fn two_way_shapes_bench() {
     let (instructions, cycles, misses) = (Counter::instructions(), Counter::cycles(), Counter::branch_misses());
     let col = SchemaColumn::new;
-    let wide = SchemaDescriptor::new(
-        &[
-            col(TypeCode::U64, false),
-            col(TypeCode::I64, false),
-            col(TypeCode::I32, false),
-            col(TypeCode::F64, true),
-            col(TypeCode::String, false),
-            col(TypeCode::I64, true),
-            col(TypeCode::U128, false),
-            col(TypeCode::I16, false),
-            col(TypeCode::String, true),
-        ],
-        &[0],
-    );
+    let wide = u64_pk_schema(&[
+        col(TypeCode::I64, false),
+        col(TypeCode::I32, false),
+        col(TypeCode::F64, true),
+        col(TypeCode::String, false),
+        col(TypeCode::I64, true),
+        col(TypeCode::U128, false),
+        col(TypeCode::I16, false),
+        col(TypeCode::String, true),
+    ]);
     let wide_pk = SchemaDescriptor::new(
         &[
             col(TypeCode::U128, false),
@@ -321,10 +314,11 @@ fn two_way_shapes_bench() {
                     ("two-way", &|| a.merged_consolidated(&b, &schema)),
                     ("n-way", &|| merge_consolidated(&mem, &schema)),
                 ];
-                let (two, n) = (kernels[0].1(), kernels[1].1());
-                assert_eq!(two.pk_data(), n.pk_data(), "the kernels agree on keys");
-                assert_eq!(two.weight_data(), n.weight_data(), "the kernels agree on weights");
-                drop((two, n));
+                assert_eq!(
+                    weighted_rows(&kernels[0].1()),
+                    weighted_rows(&kernels[1].1()),
+                    "the kernels agree"
+                );
                 let mut line = format!("{ty:<7} {shape:<8} {d:>7}+{s:<6}");
                 for (name, kernel) in kernels {
                     let run = || (0..calls).for_each(|_| drop(black_box(kernel())));

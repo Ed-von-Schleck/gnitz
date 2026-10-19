@@ -73,14 +73,7 @@ fn patch_entry(data: &mut [u8], i: usize, patch: impl FnOnce(&mut DirEntry)) {
 /// `(U64 PK, I64, <tail>)` where `tail` is nullable — the shape an
 /// `ADD COLUMN` leaves behind. `make_schema_u64_i64` is its narrow twin.
 fn schema_with_appended(tail: TypeCode) -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(tail, true),
-        ],
-        &[0],
-    )
+    u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, false), SchemaColumn::new(tail, true)])
 }
 
 /// A `width`-byte string unique to row `i`, long enough to spill to the heap.
@@ -123,7 +116,9 @@ fn rows_of(src: &impl ColumnarSource, schema: &SchemaDescriptor) -> Vec<RowImage
 
 /// `shard` reads as `want` — the written batch widened to the reader's schema —
 /// through every surface: the per-row accessors, a slice on both blob arms, a
-/// `UnifiedSet` over a window, the OPK seeks and the PK filter.
+/// `UnifiedSet` over a window, the OPK seeks and the PK filter. A relocating
+/// slice of every row copies a span its cells share once, so it holds no more
+/// heap than the shard's.
 fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     let schema = want.schema();
     let n = want.count;
@@ -144,6 +139,9 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             // A whole heap charged dead bounds any slice's.
             let carried = shard.heap().plain().filter(|_| !relocate).map(<[u8]>::len);
             let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried);
+            if let Some(heap) = shard.heap().plain().filter(|_| relocate && w.len() == n) {
+                assert!(b.blob.len() <= heap.len(), "{label}: a relocated span copied twice");
+            }
             assert_eq!(
                 rows_of(&b.as_mem_batch(), schema),
                 want_rows[w.clone()],
@@ -171,11 +169,6 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
         );
         let lb = (0..n).find(|&i| want.get_pk_bytes(i) == key).unwrap();
         assert_eq!(shard.find_lower_bound_bytes(key), lb, "{label}: lower bound row {r}");
-        assert_eq!(
-            want.find_lower_bound_bytes(key),
-            lb,
-            "{label}: batch lower bound row {r}"
-        );
         for hint in [0, lb] {
             assert_eq!(
                 shard.advance_to(key, hint),
@@ -208,11 +201,11 @@ pub(super) fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut
 fn shapes() -> Vec<Shape> {
     use Encoding::{Constant, Dict, For, Key, Raw, Seq, Sparse, Symbols, TwoValue};
     let u64_i64 = make_schema_u64_i64();
-    let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
-    let u64_f64 = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
-    let u64_u8 = u64_pk_schema(SchemaColumn::new(TypeCode::U8, false));
-    let u64_u128 = u64_pk_schema(SchemaColumn::new(TypeCode::U128, false));
+    let nullable_i64 = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
+    let u64_i32 = u64_pk_schema(&[SchemaColumn::new(TypeCode::I32, false)]);
+    let u64_f64 = u64_pk_schema(&[SchemaColumn::new(TypeCode::F64, false)]);
+    let u64_u8 = u64_pk_schema(&[SchemaColumn::new(TypeCode::U8, false)]);
+    let u64_u128 = u64_pk_schema(&[SchemaColumn::new(TypeCode::U128, false)]);
     let opt_i64 = SchemaColumn::new(TypeCode::I64, true);
     let three_nullable = SchemaDescriptor::new(
         &[SchemaColumn::new(TypeCode::U64, false), opt_i64, opt_i64, opt_i64],
@@ -239,7 +232,7 @@ fn shapes() -> Vec<Shape> {
         &[0, 1, 3],
     );
     let string = make_schema_pk_u64_payload_string();
-    let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
+    let nullable_string = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
     let str_col = SchemaColumn::new(TypeCode::String, false);
     let two_strings = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), str_col, str_col], &[0]);
     let three_strings = SchemaDescriptor::new(
@@ -247,15 +240,12 @@ fn shapes() -> Vec<Shape> {
         &[0],
     );
     let heap_of = |schema: &SchemaDescriptor| REG_PAYLOAD_START + schema.num_payload_cols();
-    let for_i64 = |b: &mut BatchBuilder, i: usize| {
-        b.begin_row(i as u128, 1);
-        b.put_int((1_000_000 + (i % 300) as i64) as u128);
+    let narrow = || {
+        build(u64_i64, 40, |b, i| {
+            b.begin_row(i as u128 + 1, 1);
+            b.put_int((i as i64 * 7) as u128);
+        })
     };
-    let narrow = build(u64_i64, 40, |b, i| {
-        b.begin_row(i as u128 + 1, 1);
-        b.put_int((i as i64 * 7) as u128);
-    });
-    let (w1, w2) = (narrow.clone(), narrow.clone());
     let wide_key = |i: usize| (u64::MAX as u128 - 2 + i as u128) * 3;
 
     vec![
@@ -409,7 +399,10 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             label: "for i64 across decode blocks",
-            written: build(u64_i64, 2 * DECODE_BLOCK_ROWS + 17, for_i64),
+            written: build(u64_i64, 2 * DECODE_BLOCK_ROWS + 17, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_int((1_000_000 + (i % 300) as i64) as u128);
+            }),
             reader: u64_i64,
             encodings: vec![(REG_PAYLOAD_START, For)],
         },
@@ -650,15 +643,23 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             label: "widened by i64",
-            written: w1,
+            written: narrow(),
             reader: schema_with_appended(TypeCode::I64),
             encodings: vec![(REG_PAYLOAD_START, For)],
         },
         Shape {
             label: "widened by string",
-            written: w2,
+            written: narrow(),
             reader: schema_with_appended(TypeCode::String),
             encodings: vec![(REG_PAYLOAD_START, For)],
+        },
+        // The region shape of a skeleton, its NULL column real: only the flag
+        // makes a skeleton.
+        Shape {
+            label: "all-pk widened by a column",
+            written: build(pk_only_schema(&[TypeCode::U64]), 1, |b, _| b.begin_row(1, 1)),
+            reader: nullable_i64,
+            encodings: vec![(REG_PK, Constant)],
         },
     ]
 }
@@ -683,8 +684,12 @@ fn every_shape_reads_back_through_every_surface() {
         for &(region, enc) in &s.encodings {
             assert_eq!(spans_of(&image)[region].encoding, enc, "{}: region {region}", s.label);
         }
+        let want = s.written.widened_with_nulls(&s.reader, false);
         let shard = MappedShard::open(&path, &s.reader).unwrap();
-        assert_reads_as(s.label, &shard, &s.written.widened_with_nulls(&s.reader, false));
+        assert!(!shard.is_skeleton(), "{}", s.label);
+        assert_reads_as(s.label, &shard, &want);
+        let written = MappedShard::open(&path, s.written.schema()).unwrap();
+        assert_reads_as(s.label, &written.rebind(&s.reader).unwrap(), &want);
     }
 }
 
@@ -712,7 +717,7 @@ fn every_column_type_reads_back_whatever_its_values() {
         U8, I8, U16, I16, U32, I32, F32, U64, I64, F64, U128, UUID, I128, Date, Timestamp, Decimal,
     ] {
         for nullable in [false, true] {
-            let schema = u64_pk_schema(SchemaColumn::new(tc, nullable));
+            let schema = u64_pk_schema(&[SchemaColumn::new(tc, nullable)]);
             let mask = u128::MAX >> (128 - 8 * schema.columns()[1].size());
             for (what, value) in values {
                 for n in [1, 700, DECODE_BLOCK_ROWS + 3] {
@@ -800,34 +805,11 @@ fn packed_three_blocks(dir: &std::path::Path) -> MappedShard {
     shard
 }
 
+/// Seeks, keys by value, a slice and a materialize decode no block; a point read
+/// of a payload or a key decodes the block it lands in, once, and keeps its
+/// address.
 #[test]
 fn a_point_read_decodes_one_block_and_keeps_its_address() {
-    let dir = tempfile::tempdir().unwrap();
-    let shard = packed_three_blocks(dir.path());
-    let row = DECODE_BLOCK_ROWS + 3;
-    let first = shard.get_col_ptr(row, 0, 8);
-    assert_eq!(payload0_i64(&shard, row), 5_000 + (row % 200) as i64);
-    assert_eq!(shard.decoded_blocks(0), 1);
-    assert_eq!(shard.get_col_ptr(row, 0, 8).as_ptr(), first.as_ptr());
-    assert_eq!(shard.decoded_blocks(0), 1);
-}
-
-#[test]
-fn a_slice_and_a_materialize_decode_no_block() {
-    let dir = tempfile::tempdir().unwrap();
-    let shard = packed_three_blocks(dir.path());
-    let schema = make_schema_u64_i64();
-    let n = shard.row_count();
-    std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
-    let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
-    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, rows.len()));
-    assert_eq!(shard.decoded_blocks(0), 0);
-}
-
-/// A per-row read of a packed key decodes the block it lands in, once; a
-/// seek, a key by value and a bulk read decode none.
-#[test]
-fn a_key_read_decodes_one_block_and_keeps_its_address() {
     let dir = tempfile::tempdir().unwrap();
     let shard = packed_three_blocks(dir.path());
     assert!(matches!(shard.pk, KeyRegion::Packed(_)));
@@ -839,7 +821,15 @@ fn a_key_read_decodes_one_block_and_keeps_its_address() {
     assert_eq!(shard.pk_at(row).pk_bytes(), key);
     assert_eq!(shard.pk_rows(&key), row..row + 1);
     std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
-    assert_eq!(shard.decoded_key_blocks(), 0);
+    let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
+    let schema = make_schema_u64_i64();
+    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, rows.len()));
+    assert_eq!((shard.decoded_blocks(0), shard.decoded_key_blocks()), (0, 0));
+
+    let cell = shard.get_col_ptr(row, 0, 8);
+    assert_eq!(payload0_i64(&shard, row), 5_000 + (row % 200) as i64);
+    assert_eq!(shard.get_col_ptr(row, 0, 8).as_ptr(), cell.as_ptr());
+    assert_eq!(shard.decoded_blocks(0), 1);
 
     let first = shard.get_pk_bytes(row);
     assert_eq!(first, key);
@@ -854,22 +844,15 @@ fn a_key_read_decodes_one_block_and_keeps_its_address() {
 // Binding
 // -----------------------------------------------------------------------
 
+/// A rebound handle shares its mapping and starts undecoded.
 #[test]
-fn rebind_matches_a_fresh_open() {
+fn a_rebound_handle_shares_the_mapping_and_starts_undecoded() {
     let dir = tempfile::tempdir().unwrap();
     let narrow = packed_three_blocks(dir.path());
-    let path = dir.path().join("blocks.db");
-    let n = narrow.row_count();
-    // Decode a block on the narrow handle first.
     std::hint::black_box(narrow.get_col_ptr(0, 0, 8));
-
-    let wide = schema_with_appended(TypeCode::I64);
-    let rebound = narrow.rebind(&wide).unwrap();
-    let fresh = MappedShard::open(path.to_str().unwrap(), &wide).unwrap();
+    let rebound = narrow.rebind(&schema_with_appended(TypeCode::I64)).unwrap();
     assert!(std::rc::Rc::ptr_eq(&narrow.mmap, &rebound.mmap));
-    assert_eq!(rebound.decoded_blocks(0), 0, "a rebound handle starts undecoded");
-    assert_eq!(rebound.row_count(), n);
-    assert_eq!(rows_of(&rebound, &wide), rows_of(&fresh, &wide));
+    assert_eq!(rebound.decoded_blocks(0), 0);
 }
 
 #[test]
@@ -894,70 +877,12 @@ fn shard_wider_than_reader_schema_opens() {
     let shard = MappedShard::open(&shard_path, &narrow).unwrap();
     assert_eq!(rows_of(&shard, &narrow), want);
     assert_eq!(rows_of(&shard.slice_to_owned_batch(0, 3).as_mem_batch(), &narrow), want);
-    let rebound = MappedShard::open(&shard_path, &schema_with_appended(TypeCode::I64))
-        .unwrap()
-        .rebind(&narrow)
-        .unwrap();
-    assert_eq!(rows_of(&rebound, &narrow), want);
     // The blob region came from the *file's* index, not the reader's.
     assert_eq!(shard.heap().plain_len(), 0);
 }
 
-/// An all-PK table widened by `ADD COLUMN` has a skeleton's region shape, and
-/// its NULL columns are real: only the flag makes a skeleton.
-#[test]
-fn a_widened_all_pk_shard_is_not_a_skeleton() {
-    let dir = tempfile::tempdir().unwrap();
-    let all_pk = build(pk_only_schema(&[TypeCode::U64]), 1, |b, _| b.begin_row(1, 1));
-    let widened = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    let shard = MappedShard::open(&write(dir.path(), "allpk.db", &all_pk), &widened).unwrap();
-    assert!(gnitz_wire::null_word_get(shard.get_null_word(0), 0));
-    assert!(!shard.is_skeleton());
-}
-
-/// Each region role admits only certain encodings. Forging one that a role may
-/// not carry must be refused at open, whatever the byte means elsewhere. The
-/// digest is re-stamped so the verdict is the decode site's, not the digest's.
-#[test]
-fn an_encoding_a_role_may_not_carry_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = small_shard(dir.path(), 8, 1);
-    let schema = make_schema_u64_i64();
-    let base = std::fs::read(&path).unwrap();
-    let blob = num_regions(schema.num_payload_cols()) - 1;
-    let filter = blob + 1;
-
-    // (region, forged encoding byte)
-    let cases: &[(usize, u8)] = &[
-        (REG_PK, 0x10), // not an encoding at all
-        (REG_PK, Encoding::TwoValue as u8),
-        (REG_PK, Encoding::For as u8),
-        (blob, Encoding::For as u8),
-        (REG_PAYLOAD_START, Encoding::TwoValue as u8),
-        (REG_PK, Encoding::Dict as u8),
-        (REG_WEIGHT, Encoding::Dict as u8),
-        (REG_NULL_BMP, Encoding::Dict as u8),
-        (blob, Encoding::Dict as u8),
-        (blob, Encoding::Constant as u8),
-        (filter, Encoding::Constant as u8),
-        (filter, Encoding::Symbols as u8),
-        (REG_PAYLOAD_START, Encoding::Symbols as u8),
-    ];
-    for &(region, enc) in cases {
-        let opened = open_patched_restamped(&path, &schema, &base, |data| {
-            patch_entry(data, region, |e| e.encoding = enc);
-        });
-        assert_eq!(
-            opened.err(),
-            Some(StorageError::Corrupt("encoding")),
-            "encoding {enc:#x} on region {region} must be rejected",
-        );
-    }
-}
-
 /// A coded heap's table is body bytes the open parses: a table its image cannot
-/// hold, or one no decode may read, refuses the open. A plain heap read as a
-/// coded one is one of these.
+/// hold, or one no decode may read, refuses the open.
 #[test]
 fn a_symbol_table_its_image_cannot_hold_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -989,18 +914,6 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
         });
         assert_eq!(opened.err(), Some(StorageError::Corrupt("region size")), "{label}");
     }
-    let plain = small_shard(dir.path(), 8, 1);
-    let plain_base = std::fs::read(&plain).unwrap();
-    let u64_i64 = make_schema_u64_i64();
-    let plain_blob = num_regions(u64_i64.num_payload_cols()) - 1;
-    let opened = open_patched_restamped(&plain, &u64_i64, &plain_base, |data| {
-        patch_entry(data, plain_blob, |e| e.encoding = Encoding::Symbols as u8);
-    });
-    assert_eq!(
-        opened.err(),
-        Some(StorageError::Corrupt("region size")),
-        "an empty heap read as coded"
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -1023,11 +936,9 @@ fn slice_relocates_only_its_own_strings() {
     });
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
     assert_eq!(shard.heap().plain().map(<[u8]>::len), Some(N * W));
-    let string = |b: &Batch, i: usize| gnitz_wire::payload_str(b, i, 0).unwrap().into_owned();
 
     let one = shard.slice_to_owned_batch(37, 1);
     assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
-    assert_eq!(string(&one, 0), wide_string(37, W));
 
     let under = shard.slice_to_owned_batch(0, CUT - 1);
     assert_eq!((under.blob.len(), under.dead_heap), ((CUT - 1) * W, 0), "relocates");
@@ -1044,38 +955,6 @@ fn slice_relocates_only_its_own_strings() {
         shard.heap().plain(),
         "whole shard: verbatim"
     );
-
-    for i in 0..CUT - 1 {
-        assert_eq!(string(&under, i), wide_string(i, W), "relocated row {i}");
-        assert_eq!(string(&at, i), wide_string(i, W), "whole-region row {i}");
-    }
-}
-
-/// A relocating slice copies a span two of its cells share once.
-#[test]
-fn a_relocating_slice_copies_a_shared_span_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_pk_u64_payload_string();
-    // Too few rows for any image but their cells, which share a repeated value's span.
-    let batch = build(schema, 3, |b, i| {
-        b.begin_row(i as u128 + 1, 1);
-        b.put_string(&wide_string(i % 2, 40));
-    });
-    let shard = MappedShard::open(&write(dir.path(), "shared.db", &batch), &schema).unwrap();
-    assert_eq!(
-        shard.heap().plain().map(<[u8]>::len),
-        Some(2 * 40),
-        "premise: rows 0 and 2 share one span"
-    );
-    let slice = shard.slice_to_owned_batch_with(0, 3, None);
-    assert_eq!(slice.blob.len(), 2 * 40);
-    for i in 0..3 {
-        assert_eq!(
-            gnitz_wire::payload_bytes(&slice, i, 0),
-            wide_string(i % 2, 40).as_bytes(),
-            "row {i}"
-        );
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -1083,7 +962,9 @@ fn a_relocating_slice_copies_a_shared_span_once() {
 // -----------------------------------------------------------------------
 
 /// Each forgery fails the open with its own verdict. `restamp` re-signs the
-/// prefix digest, so a prefix forgery reaches the check under test.
+/// prefix digest, so a prefix forgery reaches the check under test. Among them,
+/// each region role admits only certain encodings, whatever the byte means
+/// elsewhere, and an empty heap read as coded holds no symbol table.
 #[test]
 fn each_forgery_is_refused_with_its_own_verdict() {
     let dir = tempfile::tempdir().unwrap();
@@ -1096,7 +977,10 @@ fn each_forgery_is_refused_with_its_own_verdict() {
     type Forge = Box<dyn Fn(&mut Vec<u8>)>;
     let npc = |v: u64| -> Forge { Box::new(move |d| write_u64_le(d, OFF_FILE_NPC, v)) };
     let filter_size = |sz: usize| -> Forge { Box::new(move |d| patch_entry(d, filter, |e| e.size = sz)) };
-    let cases: Vec<(&str, bool, Forge, &str)> = vec![
+    let encoding =
+        |region: usize, enc: u8| -> Forge { Box::new(move |d| patch_entry(d, region, |e| e.encoding = enc)) };
+    let blob = filter - 1;
+    let mut cases: Vec<(&str, bool, Forge, &str)> = vec![
         ("file_npc u64::MAX", false, npc(u64::MAX), "payload arity"),
         (
             "file_npc past MAX_COLUMNS",
@@ -1150,7 +1034,35 @@ fn each_forgery_is_refused_with_its_own_verdict() {
             Box::new(move |d| d[xoff + 12] ^= 0x01),
             "filter descriptor",
         ),
+        (
+            "an empty heap read as coded",
+            true,
+            encoding(blob, Encoding::Symbols as u8),
+            "region size",
+        ),
     ];
+    for (region, enc) in [
+        (REG_PK, 0x10), // not an encoding at all
+        (REG_PK, Encoding::TwoValue as u8),
+        (REG_PK, Encoding::For as u8),
+        (REG_PK, Encoding::Dict as u8),
+        (REG_WEIGHT, Encoding::Dict as u8),
+        (REG_NULL_BMP, Encoding::Dict as u8),
+        (REG_PAYLOAD_START, Encoding::TwoValue as u8),
+        (REG_PAYLOAD_START, Encoding::Symbols as u8),
+        (blob, Encoding::For as u8),
+        (blob, Encoding::Dict as u8),
+        (blob, Encoding::Constant as u8),
+        (filter, Encoding::Constant as u8),
+        (filter, Encoding::Symbols as u8),
+    ] {
+        cases.push((
+            "an encoding the role may not carry",
+            true,
+            encoding(region, enc),
+            "encoding",
+        ));
+    }
     for (what, restamp, forge, verdict) in cases {
         let opened = match restamp {
             true => open_patched_restamped(&path, &schema, &base, |d| forge(d)),

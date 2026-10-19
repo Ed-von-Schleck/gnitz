@@ -3,7 +3,7 @@ use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::schema::TypeCode;
 use crate::test_support::Rng;
-use crate::test_support::{le_cell, opk_pk, random_schema, row_key};
+use crate::test_support::{le_cell, opk_pk, random_schema, row_key, RowKey};
 
 /// A payload cell by its type's own order: integers numerically at their
 /// signedness, floats by `total_cmp`, strings and blobs bytewise. One column
@@ -23,8 +23,9 @@ type Model = (Vec<u8>, Vec<Option<Cell>>);
 
 /// Draw a value `put` into the current payload column of `col`'s type, from a
 /// small pool per type, so equal cells are common and a tie falls through to
-/// the next column.
-fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Option<Cell> {
+/// the next column; with it, the bytes the cell must hold: its little-endian
+/// image at the column's own width, a string's content.
+fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Option<(Cell, Vec<u8>)> {
     if col.nullable && rng.gen_range(4) == 0 {
         bb.put_null();
         return None;
@@ -35,7 +36,7 @@ fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Opti
         let long = |c: u8| [&[b'x'; 20][..], &[c]].concat();
         let v = rng.pick(&[vec![], b"a".to_vec(), b"ab".to_vec(), long(b'a'), long(b'b')]);
         bb.put_blob(&v);
-        Cell::Bytes(v)
+        (Cell::Bytes(v.clone()), v)
     } else if matches!(tc, TypeCode::F32 | TypeCode::F64) {
         let v = rng.pick(&[0.0, -0.0, 1.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
         bb.put_float(v);
@@ -44,7 +45,10 @@ fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Opti
             _ => (v.to_bits(), 63),
         };
         let key = if bits >> top == 1 { !bits } else { bits | 1 << top };
-        Cell::Float(key & u64::MAX >> (63 - top))
+        (
+            Cell::Float(key & u64::MAX >> (63 - top)),
+            bits.to_le_bytes()[..w].to_vec(),
+        )
     } else {
         // Zero, one, all-ones, and the signed extremes, as little-endian cells.
         let mut le = vec![0u8; w];
@@ -62,23 +66,27 @@ fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Opti
         let negative = tc.is_signed_int() && le[w - 1] & 0x80 != 0;
         let mut v = [if negative { 0xFF } else { 0 }; 16];
         v[..w].copy_from_slice(&le);
-        match tc.is_signed_int() {
+        let cell = match tc.is_signed_int() {
             true => Cell::Signed(i128::from_le_bytes(v)),
             false => Cell::Unsigned(u128::from_le_bytes(v)),
-        }
+        };
+        (cell, le)
     })
 }
 
 /// One row over `s` in a batch of its own, so each row's strings live in a blob
 /// arena of their own, as a shard's and a `MemBatch`'s do.
-fn random_row(rng: &mut Rng, s: &SchemaDescriptor) -> (Batch, Model) {
+fn random_row(rng: &mut Rng, s: &SchemaDescriptor) -> (Batch, Model, RowKey) {
     let natives: Vec<u128> = s.pk_columns().map(|_| rng.pick(&[0, 1, u128::MAX])).collect();
     let pk = opk_pk(s, &natives);
     let mut bb = BatchBuilder::new(s);
     bb.begin_row_bytes(&pk, 1);
-    let cells = s.payload_columns().map(|(_, c)| random_cell(rng, c, &mut bb)).collect();
+    let (cells, raw) = s
+        .payload_columns()
+        .map(|(_, c)| random_cell(rng, c, &mut bb).map_or((None, None), |(c, raw)| (Some(c), Some(raw))))
+        .unzip();
     bb.end_row();
-    (bb.finish(), (pk, cells))
+    (bb.finish(), (pk.clone(), cells), (pk, raw))
 }
 
 fn selected<O: PayloadOrder>(s: &SchemaDescriptor, a: &Batch, b: &Batch, order: O) -> Ordering {
@@ -86,8 +94,9 @@ fn selected<O: PayloadOrder>(s: &SchemaDescriptor, a: &Batch, b: &Batch, order: 
 }
 
 /// Over random schemas — any payload types and nullability, the PK anywhere and
-/// in any order — the (PK, payload) order is the PK bytes, then each payload cell
-/// by its type's order; `Equal` is exactly row identity; and the comparator the
+/// in any order — a built row holds each cell at its payload slot and width, a
+/// NULL as a zeroed cell under its bit; the (PK, payload) order is the PK bytes,
+/// then each payload cell by its type's order; `Equal` is exactly row identity; and the comparator the
 /// schema selects orders as the generic one. Every schema whose payload is
 /// non-null fixed-width integers selects the fast one.
 #[test]
@@ -100,8 +109,10 @@ fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
             0 => random_schema(&mut rng, TypeCode::ALL, true),
             _ => random_schema(&mut rng, &fixed_ints, false),
         };
-        let (a, ma) = random_row(&mut rng, &s);
-        let (b, mb) = random_row(&mut rng, &s);
+        let (a, ma, ka) = random_row(&mut rng, &s);
+        let (b, mb, _) = random_row(&mut rng, &s);
+        assert_eq!(row_key(&a, &s, 0), ka, "{s:?}");
+        a.debug_verify_null_bits();
         let payload = compare_rows(&s, &a, 0, &b, 0);
         assert_eq!(payload, ma.1.cmp(&mb.1), "{s:?}: {ma:?} vs {mb:?}");
         assert_eq!(

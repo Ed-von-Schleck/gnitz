@@ -292,11 +292,6 @@ impl Batch {
 
     // ── Mutable slice accessors ─────────────────────────────────────────
 
-    #[cfg(test)]
-    pub(crate) fn null_bmp_data_mut(&mut self) -> &mut [u8] {
-        self.region_at_mut(REG_NULL_BMP)
-    }
-
     /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
     #[cfg(test)]
     pub(crate) fn padded(mut self, pad: usize) -> Batch {

@@ -1,4 +1,4 @@
-use gnitz_expr::{LogicalInstr, LogicalProgram, Reg, Sink};
+use gnitz_expr::{ConstIdx, LogicalInstr, LogicalProgram, Reg, Sink};
 use gnitz_wire::{MapKind, NullKeys};
 
 use super::MapPlan;
@@ -199,46 +199,49 @@ fn a_widened_copy_holds_each_rows_value() {
 
 /// A computed string beside a copy of its source column: the copy still
 /// resolves against the blob the emit appends to, a heap-backed result lands in
-/// the output's own blob, and a NULL source ships a zeroed computed cell — a
-/// non-deterministic value there would leave an insert and its retraction
-/// unable to cancel. The emit is the map's only computed column, so the compute
-/// kernel runs on the string emit list alone.
+/// the output's own blob, and a NULL result ships a zeroed computed cell, though
+/// its lane computed bytes — a non-deterministic value there would leave an
+/// insert and its retraction unable to cancel. The emit is the map's only
+/// computed column, so the compute kernel runs on the string emit list alone.
 #[test]
 fn a_string_emit_composes_with_a_copy_of_its_source() {
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::String]);
     let long = b"a-long-value-past-twelve".as_slice();
     let mut batch = BatchBuilder::new(&in_schema);
-    for (pk, s) in [(1u128, long), (2, b"short"), (3, b"def")] {
+    for (pk, s) in [(1u128, Some(long)), (2, Some(b"short".as_slice())), (3, None)] {
         batch.begin_row(pk, 1);
-        batch.put_blob(s);
+        match s {
+            Some(s) => batch.put_blob(s),
+            None => batch.put_null(),
+        }
         batch.end_row();
     }
-    let mut batch = batch.finish();
-    // Row 2's source is NULL, over real string bytes.
-    gnitz_wire::write_u64_le(batch.null_bmp_data_mut(), 16, 1);
+    let batch = batch.finish();
 
+    // `||` propagates the NULL source, over the suffix its lane still concatenates.
     let prog = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColStr { col: 1 },
-            LogicalInstr::StrCase { a: Reg(0), upper: true },
+            LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
+            LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null: false },
         ],
-        vec![Sink::Col(1), Sink::Reg(Reg(1))],
-        vec![],
+        vec![Sink::Col(1), Sink::Reg(Reg(2))],
+        vec![b"-suffix".to_vec()],
     );
     let mut plan = compute(&in_schema, prog, &[(TypeCode::String, true); 2]);
     let out = plan.evaluate_map_batch(&batch);
 
     let mut want = BatchBuilder::new(plan.out_schema());
     for (pk, cells) in [
-        (1u128, Some((long, b"A-LONG-VALUE-PAST-TWELVE".as_slice()))),
-        (2, Some((b"short", b"SHORT"))),
+        (1u128, Some((long, b"a-long-value-past-twelve-suffix".as_slice()))),
+        (2, Some((b"short", b"short-suffix"))),
         (3, None),
     ] {
         want.begin_row(pk, 1);
         match cells {
-            Some((copy, upper)) => {
+            Some((copy, cat)) => {
                 want.put_blob(copy);
-                want.put_blob(upper);
+                want.put_blob(cat);
             }
             None => {
                 want.put_null();

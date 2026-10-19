@@ -42,7 +42,7 @@ fn an_output_schema_unequal_to_the_view_schema_is_rejected() {
 /// rejection, even on one worker, where nothing relays.
 #[test]
 fn a_float_group_column_behind_an_exchange_is_rejected() {
-    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::F64, false)]);
     let aggs = [AggDescriptor::COUNT_STAR];
     let compile = |group: u32, view: SchemaDescriptor| {
         let mut c = Circuit::default();

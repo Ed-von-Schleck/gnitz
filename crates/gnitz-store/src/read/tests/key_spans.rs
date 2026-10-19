@@ -16,7 +16,7 @@ fn val(id: u64) -> Option<i64> {
 /// read `chunk_rows` rows a chunk and spilling its sorts three 8-byte records a run.
 /// Indexed on `val` when `indexed`.
 fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
-    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let rows = |w: i64, ids: &mut dyn Iterator<Item = u64>| {
         id_rows(&schema, ids.map(|id| (id, w)), |bb, id| {
             bb.put_opt_int(val(id).map(|v| v as u128))

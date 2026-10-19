@@ -4,9 +4,9 @@ use crate::repr::shard_file::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{
-    arb_fold_case, assert_folds, create_read_cursor, fold_batch, fold_schemas, make_batch_u128,
-    make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key,
-    u64_pk_schema, weighted_rows, zset_of, RowKey,
+    arb_fold_case, assert_folds, create_read_cursor, fold_batch, make_batch_u128, make_schema_pk_u64_payload_string,
+    make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
+    RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -45,13 +45,12 @@ proptest! {
     /// in (PK, payload) order.
     #[test]
     fn every_read_verb_is_a_view_of_the_zset_sum(
-        (si, rows) in arb_fold_case(),
+        (s, rows) in arb_fold_case(),
         run_len in 1usize..12,
         as_shard in any::<u16>(),
         probes in prop::collection::vec((any::<prop::sample::Index>(), -1i8..=1), 0..8),
         chunk in 1usize..6,
     ) {
-        let s = fold_schemas()[si];
         let stride = s.pk_stride();
         let dir = tempfile::tempdir().unwrap();
         let batches: Vec<Batch> = rows.chunks(run_len).map(|c| fold_batch(&s, c).into_consolidated()).collect();
@@ -338,7 +337,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
 #[test]
 fn a_skeleton_row_coarsens_its_whole_pk_group() {
     let dir = tempfile::tempdir().unwrap();
-    let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
+    let nullable_string = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
     for (name, schema) in [("fixedint", make_schema_u64_i64()), ("generic", nullable_string)] {
         // PK 1: skeleton (coarse +3) plus two newer hydrated rows, one of which
         // compares `Equal` to a skeleton row under this arm. PK 2: hydrated only.

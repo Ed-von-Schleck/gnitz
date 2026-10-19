@@ -258,7 +258,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
     }
     // A float key is refused: its raw bits are equality-incorrect (±0.0).
     for float_tc in [F32, F64] {
-        let in_schema = u64_pk_schema(SchemaColumn::new(float_tc, false));
+        let in_schema = u64_pk_schema(&[SchemaColumn::new(float_tc, false)]);
         assert!(
             ReindexPacker::new(&in_schema, &[(1, float_tc.reindex_output_type())]).is_err(),
             "a float reindex key must be refused, not packed"

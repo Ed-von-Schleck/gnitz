@@ -5,7 +5,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, make_string_batch, payload0_i64, pk_only_schema, ragged_batch, ragged_schema, read_strings,
-    weighted_rows,
+    u64_pk_schema, weighted_rows,
 };
 
 /// `append_row_from_source` copies the PK verbatim and carries the
@@ -74,14 +74,10 @@ fn every_producer_states_its_claim() {
     const RAW: bool = false;
     const CONSOLIDATED: bool = true;
     let schema = make_schema_u64_i64();
-    let wider = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
+    let wider = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+    ]);
     let src = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut appended = src.clone();
     appended.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
@@ -111,25 +107,16 @@ fn every_producer_states_its_claim() {
     }
 }
 
-/// An arena below eight rows holds exactly its rows; from eight up its capacity
-/// is rounded so that every region starts 8-aligned, by as little as the
-/// schema needs.
+/// A batch's arena is the schema's `arena_rows` of the capacity asked for, its
+/// regions laid out at that row count.
 #[test]
-fn an_arena_of_eight_rows_or_more_starts_every_region_aligned() {
+fn a_batch_arena_is_laid_out_at_its_schemas_arena_rows() {
     let schema = ragged_schema();
-    assert_eq!([1, 7, 9].map(|rows| schema.arena_rows(rows)), [1, 7, 16]);
     let b = Batch::with_capacity(&schema, 9);
-    assert_eq!(b.capacity, 16);
+    assert_eq!(b.capacity, schema.arena_rows(9));
     for r in 0..schema.num_regions() {
-        assert!(b.region_start(r).is_multiple_of(8), "region {r}");
+        assert_eq!(b.region_start(r), schema.region_start(r, b.capacity), "region {r}");
     }
-    assert_eq!(
-        make_schema_u64_i64().arena_rows(9),
-        9,
-        "8-byte regions align at any count"
-    );
-    let key = pk_only_schema(&[TypeCode::U64, TypeCode::U32]);
-    assert_eq!(key.arena_rows(9), 10, "a 12-byte key aligns at every second row");
 }
 
 /// Rows appended whole or three at a time under a layout whose regions move
@@ -193,15 +180,11 @@ fn put_null_leaves_a_zeroed_cell_under_its_bit() {
 /// zero, over a recycled buffer and under NOT NULL and string columns.
 #[test]
 fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::U16, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::U16, false),
+    ]);
     // Leave a dirty buffer of the same size in the pool.
     let mut dirty = Batch::with_capacity(&schema, 3);
     dirty.data.fill(0xFF);
@@ -220,26 +203,6 @@ fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
     }
     b.debug_verify_null_bits();
     assert!(Batch::key_retractions(&schema, &[]).is_empty());
-}
-
-/// Dropping a batch returns its data buffer to the thread-local pool; an empty
-/// batch holds none to return.
-#[test]
-fn drop_pools_a_batch_buffer() {
-    let schema = make_schema_u64_i64();
-    drain_pool();
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    let cap = batch.data.capacity();
-    drop(batch);
-    assert!(
-        drain_pool().iter().any(|b| b.capacity() == cap),
-        "the data buffer is pooled"
-    );
-
-    let empty = Batch::empty_with_schema(&schema);
-    assert_eq!(empty.data.capacity(), 0);
-    drop(empty);
-    assert!(drain_pool().is_empty(), "an empty batch pools nothing");
 }
 
 /// A batch whose buffers hold more than twice what its rows need comes back as
@@ -461,14 +424,10 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
 /// row it keeps, and refused once they leave the heap wasteful.
 #[test]
 fn carry_heap_charges_the_dropped_slots() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::String, false),
+    ]);
     let mut b = BatchBuilder::new(&schema);
     for pk in 1..=4u128 {
         b.begin_row(pk, 1);

@@ -4,7 +4,7 @@ use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    ragged_batch, ragged_schema, string_batch, weighted_rows,
+    ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
 };
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
@@ -45,14 +45,10 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
 #[test]
 fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     // `(U64 pk, I64 NOT NULL, I64 NULL)`: the nullable column is payload slot 1.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+    ]);
     // Row 2's NOT NULL cell is zero, the NULL encoding should its bit be set.
     let block = |not_null_bit: bool| {
         let mut b = BatchBuilder::new(&schema);
@@ -138,8 +134,9 @@ fn shared_span() -> Batch {
 }
 
 /// The batches every wire encoder is checked over: fixed-width rows; inline,
-/// mixed, spilling and page-sized strings; rows naming one span; and narrow and
-/// odd PK and payload strides, where a block's regions start unaligned.
+/// mixed, spilling and page-sized strings; rows naming one span; and PK and
+/// payload strides at every copy width, narrow and odd ones leaving a block's
+/// regions unaligned.
 fn wire_batches() -> Vec<Batch> {
     use TypeCode::*;
     let mut mixed = vec![(0u64, "a".repeat(64))];
@@ -159,6 +156,7 @@ fn wire_batches() -> Vec<Batch> {
         (&[U32], I32),
         (&[U64, U32], U16),
         (&[U64], I64),
+        (&[U128], U128),
     ] {
         let mut cols: Vec<SchemaColumn> = pk.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
         cols.extend([SchemaColumn::new(payload, true), SchemaColumn::new(String, false)]);
@@ -233,11 +231,9 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
                 "{list:?}: the size is the bytes written"
             );
             let decoded = Batch::decode_foreign_wal_block(&buf, b.schema()).unwrap();
-            assert_eq!(
-                weighted_rows(&decoded),
-                weighted_rows(&b.indexed_rows(list)),
-                "{list:?}"
-            );
+            let all = weighted_rows(&b);
+            let want: Vec<_> = list.iter().map(|&r| all[r as usize].clone()).collect();
+            assert_eq!(weighted_rows(&decoded), want, "{list:?}");
             assert_eq!(decoded.dead_heap, 0, "{list:?}: every heap byte is referenced");
         }
         assert!(b.wire_listed(&[]).is_none());
@@ -330,15 +326,11 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
 /// ones. A BLOB column between the two STRING columns may hold anything.
 #[test]
 fn foreign_decode_utf8_matches_per_cell_oracle() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::Blob, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::Blob, false),
+        SchemaColumn::new(TypeCode::String, false),
+    ]);
     const PIECES: [&[u8]; 12] = [
         b"a",
         b"xyz",
@@ -397,14 +389,10 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
 /// may span two cells, or a cell and the heap bytes beside it.
 #[test]
 fn foreign_decode_utf8_spans_split_across_cells() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::Blob, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::Blob, false),
+    ]);
     let accepts = |rows: &[(&[u8], &[u8])]| {
         let mut b = BatchBuilder::new(&schema);
         for (i, (s, x)) in rows.iter().enumerate() {

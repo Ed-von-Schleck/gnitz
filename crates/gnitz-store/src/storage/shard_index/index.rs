@@ -350,13 +350,12 @@ impl ShardIndex {
     /// A failure registers nothing and unlinks every output the fold wrote.
     fn step(&mut self, read: &mut u64) -> Result<(), StorageError> {
         let mut run = self.running.take().expect("a fold is under way");
-        let inputs: Vec<&MappedShard> = run.shards.iter().map(|s| &**s).collect();
         let before: usize = run.starts.iter().sum();
         let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
         let schema = self.schema;
         let codebook = self.codebook.clone();
         let merged = merge_guard(
-            &inputs,
+            &run.shards,
             &run.fold.keys,
             run.next,
             &mut run.starts,
@@ -365,7 +364,8 @@ impl ShardIndex {
             codebook.as_deref(),
         );
         // Row share stands in for byte share.
-        let (rows, bytes): (usize, u64) = inputs
+        let (rows, bytes): (usize, u64) = run
+            .shards
             .iter()
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
         let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
