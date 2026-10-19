@@ -8,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -18,13 +19,21 @@ use super::tokens::{sha256, Tokens};
 /// The `--tls-*` and `--auth-tokens` flags.
 pub(crate) struct TlsArgs {
     pub listen: SocketAddr,
-    pub cert_key: Option<(String, String)>,
-    /// `--tls-name`: the names a minted certificate covers beside [`LOOPBACK_NAMES`].
-    pub names: Vec<String>,
+    pub cert: CertSource,
     pub client_ca: Option<String>,
     /// `--auth-tokens`: the token file every client's HELLO is judged against.
     pub auth_tokens: Option<String>,
     pub allow_unauthenticated: bool,
+}
+
+/// Where the served certificate comes from.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CertSource {
+    /// `--tls-cert` and `--tls-key`: the operator's chain and key files.
+    Operator { cert: String, key: String },
+    /// The identity minted in the data directory, covering [`LOOPBACK_NAMES`]
+    /// and these `--tls-name`s.
+    Minted(Vec<ServerName<'static>>),
 }
 
 /// The names every minted certificate covers.
@@ -32,8 +41,8 @@ const LOOPBACK_NAMES: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 /// `<data_dir>/<name>` files of the minted identity: the certificate a client
 /// pins with `ca=`, and its key.
-pub(crate) const TLS_CERT_FILE: &str = "tls_cert.pem";
-pub(crate) const TLS_KEY_FILE: &str = "tls_key.pem";
+pub(super) const TLS_CERT_FILE: &str = "tls_cert.pem";
+pub(super) const TLS_KEY_FILE: &str = "tls_key.pem";
 
 /// What one load of a [`TlsArgs`] serves connections under.
 pub(crate) struct Served {
@@ -50,8 +59,7 @@ impl TlsArgs {
     pub(crate) fn on(listen: &str) -> TlsArgs {
         TlsArgs {
             listen: listen.parse().unwrap(),
-            cert_key: None,
-            names: Vec::new(),
+            cert: CertSource::Minted(Vec::new()),
             client_ca: None,
             auth_tokens: None,
             allow_unauthenticated: false,
@@ -76,18 +84,9 @@ impl TlsArgs {
                  --auth-tokens=FILE.",
             );
         }
-        if self.cert_key.is_some() && !self.names.is_empty() {
-            return Err(
-                "--tls-name names the minted certificate; an operator certificate (--tls-cert) carries its own names"
-                    .to_string(),
-            );
-        }
-        for name in &self.names {
-            ServerName::try_from(name.as_str()).map_err(|e| format!("--tls-name {name:?}: {e}"))?;
-        }
         // A minted certificate names loopback and `--tls-name`. A wildcard bind
         // is still reachable through loopback; a specific address is not.
-        if self.cert_key.is_none() && self.names.is_empty() && !listen.ip().is_loopback() {
+        if self.cert == CertSource::Minted(Vec::new()) && !listen.ip().is_loopback() {
             if !listen.ip().is_unspecified() {
                 return Err(format!(
                     "refusing to bind the TLS listener to {listen} without a certificate naming it: pass \
@@ -102,9 +101,9 @@ impl TlsArgs {
         }
         // Every file the flags name is loaded once now, so one that does not
         // load is refused as argv. A minted identity is the data directory's.
-        match &self.cert_key {
-            Some(ck) => drop(self.serve(operator_identity(ck)?)?),
-            None => {
+        match &self.cert {
+            CertSource::Operator { cert, key } => drop(self.serve(operator_identity(cert, key)?)?),
+            CertSource::Minted(_) => {
                 self.client_ca.as_deref().map(client_verifier).transpose()?;
                 self.auth_tokens.as_deref().map(Tokens::load).transpose()?;
             }
@@ -115,9 +114,9 @@ impl TlsArgs {
     /// Read every file the flags name, and the identity minted in `data_dir`
     /// unless an operator's is named, into what connections are served under.
     fn load(&self, data_dir: &str) -> Result<Served, String> {
-        let identity = match &self.cert_key {
-            Some(ck) => operator_identity(ck)?,
-            None => minted_identity(data_dir, &self.names)?,
+        let identity = match &self.cert {
+            CertSource::Operator { cert, key } => operator_identity(cert, key)?,
+            CertSource::Minted(names) => minted_identity(data_dir, names)?,
         };
         self.serve(identity)
     }
@@ -198,7 +197,7 @@ impl TlsListener {
 type Identity = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
 
 /// The operator's certificate chain and key, as `--tls-cert`/`--tls-key` name them.
-fn operator_identity((cert_path, key_path): &(String, String)) -> Result<Identity, String> {
+fn operator_identity(cert_path: &str, key_path: &str) -> Result<Identity, String> {
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .and_then(|it| it.collect())
         .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?;
@@ -212,21 +211,21 @@ fn operator_identity((cert_path, key_path): &(String, String)) -> Result<Identit
 /// The client certificate verifier `--tls-client-ca` names: a client
 /// certificate chaining to it is mandatory.
 fn client_verifier(path: &str) -> Result<Arc<dyn ClientCertVerifier>, String> {
-    let cas = CertificateDer::pem_file_iter(path)
-        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| format!("tls client-ca {path:?}: {e}"))?;
-    let mut roots = rustls::RootCertStore::empty();
-    for ca in cas {
-        roots.add(ca).map_err(|e| format!("tls client-ca {path:?}: {e}"))?;
-    }
-    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|e| format!("tls client-ca {path:?}: verifier build failed: {e}"))
+    let verifier = || -> Result<_, Box<dyn std::error::Error>> {
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_file_iter(path)? {
+            roots.add(ca?)?;
+        }
+        Ok(rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?)
+    };
+    verifier().map_err(|e| format!("tls client-ca {path:?}: {e}"))
 }
 
 /// [`LOOPBACK_NAMES`], then each of `names` not among them.
-fn minted_names(names: &[String]) -> Vec<String> {
-    let mut all: Vec<String> = LOOPBACK_NAMES.map(String::from).to_vec();
+fn minted_names(names: &[ServerName<'static>]) -> Vec<ServerName<'static>> {
+    let mut all: Vec<ServerName<'static>> = LOOPBACK_NAMES
+        .map(|n| ServerName::try_from(n).expect("a loopback name"))
+        .to_vec();
     for name in names {
         if !all.contains(name) {
             all.push(name.clone());
@@ -237,38 +236,40 @@ fn minted_names(names: &[String]) -> Vec<String> {
 
 /// The self-signed identity kept in `data_dir`, minted for [`LOOPBACK_NAMES`]
 /// and `names` when absent. Clients pin it, so a kept one is never replaced.
-fn minted_identity(data_dir: &str, names: &[String]) -> Result<Identity, String> {
+fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Identity, String> {
     let cert_path = format!("{data_dir}/{TLS_CERT_FILE}");
     let key_path = format!("{data_dir}/{TLS_KEY_FILE}");
     let all = minted_names(names);
     if !(std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists()) {
-        let ck =
-            rcgen::generate_simple_self_signed(all.clone()).map_err(|e| format!("tls certificate mint failed: {e}"))?;
+        let sans: Vec<String> = all.iter().map(|n| n.to_str().into_owned()).collect();
+        let ck = rcgen::generate_simple_self_signed(sans.clone())
+            .map_err(|e| format!("tls certificate mint failed: {e}"))?;
         // The certificate last: a crash leaves no certificate, which mints anew.
         write_file(&key_path, ck.signing_key.serialize_pem().as_bytes(), 0o600)?;
         write_file(&cert_path, ck.cert.pem().as_bytes(), 0o644)?;
         gnitz_note!(
             "TLS: minted a self-signed certificate for {}; a client trusts it with ca={cert_path}",
-            all.join(", ")
+            sans.join(", ")
         );
     }
-    let identity = operator_identity(&(cert_path.clone(), key_path))?;
+    let identity = operator_identity(&cert_path, &key_path)?;
     let leaf = rustls::server::ParsedCertificate::try_from(&identity.0[0])
         .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?;
     for name in &all {
-        let server_name = ServerName::try_from(name.as_str()).map_err(|e| format!("--tls-name {name:?}: {e}"))?;
-        if rustls::client::verify_server_name(&leaf, &server_name).is_err() {
+        if rustls::client::verify_server_name(&leaf, name).is_err() {
             return Err(format!(
-                "the kept certificate {cert_path} does not cover {name:?}; remove {TLS_CERT_FILE} and \
+                "the kept certificate {cert_path} does not cover {:?}; remove {TLS_CERT_FILE} and \
                  {TLS_KEY_FILE} from the data directory to mint one for every --tls-name, and give every \
-                 client the new {TLS_CERT_FILE}"
+                 client the new {TLS_CERT_FILE}",
+                name.to_str()
             ));
         }
     }
     Ok(identity)
 }
 
-/// Replace `path` with `bytes`, permission bits `mode`, whole or not at all.
+/// Replace `path` with `bytes`, permission bits `mode`, whole or not at all, and
+/// durably once it returns.
 pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), String> {
     let tmp = format!("{path}.tmp");
     let _ = std::fs::remove_file(&tmp);
@@ -279,14 +280,16 @@ pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), Stri
         .open(&tmp)
         .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
         .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(
+            |()| match std::path::Path::new(path).parent().and_then(|p| p.to_str()) {
+                Some("") | None => fsync_dir("."),
+                Some(dir) => fsync_dir(dir),
+            },
+        )
         .map_err(|e| format!("failed to write {path}: {e}"))
 }
 
 /// `der`'s SHA-256 as colon-separated upper-case hex.
 fn fingerprint(der: &CertificateDer<'_>) -> String {
-    sha256(der)
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
+    sha256(der).map(|b| format!("{b:02X}")).join(":")
 }

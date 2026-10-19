@@ -5,12 +5,8 @@
 mod config;
 mod tokens;
 
-pub(crate) use config::{Served, TlsArgs, TlsListener};
-#[cfg(test)]
-pub(crate) use config::{TLS_CERT_FILE, TLS_KEY_FILE};
+pub(crate) use config::{CertSource, Served, TlsArgs, TlsListener};
 pub(crate) use tokens::mint as mint_token;
-#[cfg(test)]
-pub(crate) use tokens::Tokens;
 
 use std::cell::RefCell;
 use std::io::{BufRead, ErrorKind, Write};
@@ -85,7 +81,7 @@ impl TlsShared {
         const SEND_BUFFER_BYTES: usize = 256 * 1024;
 
         let mut sess = rustls::ServerConnection::new(cfg)
-            .expect("a session fails to build only on a max_fragment_size TlsArgs::resolve never sets");
+            .expect("a session fails to build only on a max_fragment_size TlsArgs::serve never sets");
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let tls = Rc::new(TlsShared {

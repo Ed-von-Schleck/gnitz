@@ -4,7 +4,7 @@
 use std::collections::hash_map::Entry;
 
 use ring::digest::{digest, SHA256};
-use ring::rand::{SecureRandom as _, SystemRandom};
+use ring::rand::{generate, SystemRandom};
 use rustc_hash::FxHashMap;
 
 use super::config::write_file;
@@ -32,14 +32,6 @@ impl Tokens {
     /// The number of tokens held.
     pub(crate) fn len(&self) -> usize {
         self.by_digest.len()
-    }
-
-    /// Tokens holding `token` alone, under `name`.
-    #[cfg(test)]
-    pub(crate) fn holding(name: &str, token: &[u8]) -> Tokens {
-        Tokens {
-            by_digest: [(sha256(token), name.to_string())].into_iter().collect(),
-        }
     }
 
     /// The name `token` is held under; `None` when it is none held.
@@ -121,10 +113,9 @@ pub(crate) fn mint(path: &str, name: &str) -> Result<String, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("auth tokens {path:?}: {e}")),
     };
-    let mut secret = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut secret)
-        .map_err(|_| "the OS random number generator failed".to_string())?;
+    let secret: [u8; 32] = generate(&SystemRandom::new())
+        .map_err(|_| "the OS random number generator failed".to_string())?
+        .expose();
     let token = format!("{TOKEN_PREFIX}{}", to_hex(&secret));
     // A file that does not end its last line gets one, so the new line stands alone.
     if !text.is_empty() && !text.ends_with('\n') {

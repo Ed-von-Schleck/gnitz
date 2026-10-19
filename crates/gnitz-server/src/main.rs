@@ -34,6 +34,7 @@ mod query;
 mod runtime;
 
 use gnitz_foundation::log::Level;
+use rustls::pki_types::ServerName;
 use std::env;
 use std::process;
 
@@ -188,7 +189,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     };
     let mut workers = Some(1);
     let (mut tls_listen, mut cert, mut key, mut client_ca, mut auth_tokens) = (None, None, None, None, None);
-    let mut names: Vec<String> = Vec::new();
+    let mut names = Vec::new();
     let mut allow_unauthenticated = false;
     let mut backup_dir = None;
     let mut positional: Vec<&String> = Vec::new();
@@ -210,10 +211,8 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             client_ca = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-name=") {
             for name in val.split(',') {
-                if name.is_empty() {
-                    return Err(format!("--tls-name={val}: an empty name"));
-                }
-                names.push(name.to_string());
+                let parsed = ServerName::try_from(name.to_string()).map_err(|e| format!("--tls-name {name:?}: {e}"))?;
+                names.push(parsed);
             }
         } else if let Some(val) = arg.strip_prefix("--auth-tokens=") {
             auth_tokens = Some(val.to_string());
@@ -233,12 +232,16 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     let tls = match tls_listen {
         Some(listen) => Some(runtime::TlsArgs {
             listen,
-            cert_key: match (cert, key) {
-                (None, None) => None,
-                (Some(c), Some(k)) => Some((c, k)),
+            cert: match (cert, key) {
+                (None, None) => runtime::CertSource::Minted(names),
+                (Some(cert), Some(key)) if names.is_empty() => runtime::CertSource::Operator { cert, key },
+                (Some(_), Some(_)) => {
+                    let e = "--tls-name names the minted certificate; an operator certificate (--tls-cert) \
+                             carries its own names";
+                    return Err(e.to_string());
+                }
                 _ => return Err("--tls-cert and --tls-key must be given together".to_string()),
             },
-            names,
             client_ca,
             auth_tokens,
             allow_unauthenticated,

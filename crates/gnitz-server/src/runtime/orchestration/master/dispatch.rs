@@ -17,11 +17,12 @@ pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
 /// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],
 /// so two back-to-back boots cannot collide.
 fn boot_nonce() -> u64 {
-    let mut bytes = [0u8; 8];
-    let n = retry_eintr(|| unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) } as libc::c_int)
-        .expect("getrandom");
-    assert_eq!(n as usize, bytes.len(), "getrandom returns up to 256 bytes whole");
-    u64::from_ne_bytes(bytes)
+    let rng = ring::rand::SystemRandom::new();
+    u64::from_ne_bytes(
+        ring::rand::generate(&rng)
+            .expect("the OS random number generator")
+            .expose(),
+    )
 }
 
 impl MasterDispatcher {

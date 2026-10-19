@@ -424,13 +424,6 @@ class ServerProc:
     def log_tail(self, max_bytes=4096):
         return self.log_text()[-max_bytes:]
 
-    def sighup(self, timeout=10.0):
-        """SIGHUP the master, which reloads its TLS listener, and return the line
-        it logs the reload's outcome on."""
-        seen = len(self.log_text())
-        os.kill(self.proc.pid, signal.SIGHUP)
-        return await_log(self.proc, lambda: self.log_text()[seen:], "SIGHUP:", timeout)
-
     def worker_pids(self):
         """`{worker index: pid}` of the running master's children: each worker's
         stdout is its own `worker_<N>.log`."""

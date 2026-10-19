@@ -1,7 +1,7 @@
 """The server refuses what it cannot serve before anything exists.
 
 The refusals themselves, and what each names, are unit-tested
-(`gnitz-server/src/tests/main.rs`, and the TLS ones beside `TlsArgs::resolve`).
+(`gnitz-server/src/tests/main.rs`, the TLS resolution's among them).
 What only a spawn can show is that a refusal ends the process as a usage error
 with no data directory created — from the argv parser and from the TLS
 resolution that runs after it — and that an environment knob the server cannot

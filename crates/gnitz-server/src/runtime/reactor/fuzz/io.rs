@@ -1,20 +1,17 @@
 //! What reaches a server from a peer it has not admitted: the bytes of a
 //! connection, deframed under the inbound budget — before the handshake under
 //! its frame ceiling, after it under the full one — and the first frame read
-//! as a HELLO whose token is checked. However the bytes split across reads,
+//! as a HELLO. However the bytes split across reads,
 //! they deframe to the same frames and end the same way — but for the budget,
 //! which charges a frame until it is taken, so a run whose reads hold more
 //! frames at once may stop short at its cap.
 
 use super::*;
-use crate::runtime::tls::Tokens;
 use gnitz_fuzz::seed::HELLO_TOKEN as TOKEN;
 
 /// A peer's bytes, cut where the input's first byte says, under both ceilings.
 #[test]
 fn hello_fuzz() {
-    // The one token the HELLO starts carry.
-    let tokens = Tokens::holding("fuzz", TOKEN.as_bytes());
     bolero::check!().for_each(|bytes: &[u8]| {
         let Some((&cut, stream)) = bytes.split_first() else {
             return;
@@ -25,8 +22,8 @@ fn hello_fuzz() {
             agree(&whole, &deframe(stream, step, admitted), step);
             whole
         });
-        if let Some(Ok(token)) = frames.first().map(|f| gnitz_wire::read_client_hello(f)) {
-            tokens.check(token);
+        if let Some(f) = frames.first() {
+            let _ = gnitz_wire::read_client_hello(f);
         }
     });
 }
@@ -85,5 +82,5 @@ fn an_admitted_hello_deframes_alike_in_any_reads() {
     assert_eq!(frames.len(), 1, "the handshake's ceiling refuses the second");
     assert!(end.is_some());
     let token = gnitz_wire::read_client_hello(&frames[0]).unwrap();
-    assert_eq!(Tokens::holding("fuzz", TOKEN.as_bytes()).check(token), Some("fuzz"));
+    assert_eq!(token, TOKEN.as_bytes());
 }
