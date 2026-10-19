@@ -4,11 +4,9 @@
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use super::*;
-pub(super) use crate::runtime::test_support::within;
+pub(super) use crate::runtime::test_support::{try_poll_once, within};
 use crate::runtime::w2m::fixtures::test_rings;
 use crate::runtime::w2m::W2mWriter;
 
@@ -18,13 +16,8 @@ pub(super) fn make_reactor() -> Reactor {
 }
 
 /// [`make_reactor`] built with `limits`.
-pub(crate) fn make_reactor_with(limits: Limits) -> Reactor {
+pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
     Reactor::new(16, limits, test_rings(&[]).1).expect("reactor")
-}
-
-/// A test reactor reading the rings `w2m` covers.
-pub(crate) fn make_reactor_over(w2m: W2mReceiver) -> Reactor {
-    Reactor::new(16, Limits::TEST, w2m).expect("reactor")
 }
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
@@ -49,7 +42,7 @@ impl Reactor {
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     let (writers, receiver) = test_rings(&vec![64 * 1024; n]);
-    (make_reactor_over(receiver), writers)
+    (Reactor::new(16, Limits::TEST, receiver).expect("reactor"), writers)
 }
 
 /// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
@@ -61,27 +54,6 @@ pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     writers[0].send_msg(1, &msg);
     let slot = receiver.try_read_slot(0).expect("a frame");
     (receiver, slot)
-}
-
-/// A waker that records being woken, for a test that polls a future by hand.
-#[derive(Default)]
-pub(super) struct WakeFlag(AtomicBool);
-
-impl std::task::Wake for WakeFlag {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
-impl WakeFlag {
-    pub(super) fn new() -> (Arc<WakeFlag>, Waker) {
-        let flag = Arc::new(WakeFlag::default());
-        (Arc::clone(&flag), Waker::from(flag))
-    }
-
-    pub(super) fn woken(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
 }
 
 /// Future that returns Pending exactly once, then Ready.
@@ -129,16 +101,10 @@ pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     (conn, partner)
 }
 
-/// A reactor built with `limits`, and a [`client_pair`] on it. `sndbuf` shrinks
-/// both socket buffers.
-pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Reactor, Rc<ClientConn>, UnixStream) {
-    let r = make_reactor_with(limits);
+/// A reactor, and a [`client_pair`] on it.
+pub(crate) fn egress_pair() -> (Reactor, Rc<ClientConn>, UnixStream) {
+    let r = make_reactor();
     let (conn, partner) = client_pair(&r);
-    if let Some(bytes) = sndbuf {
-        for (fd, opt) in [(conn.fd(), libc::SO_SNDBUF), (partner.as_raw_fd(), libc::SO_RCVBUF)] {
-            gnitz_foundation::posix_io::set_sockopt_int(fd, libc::SOL_SOCKET, opt, bytes).unwrap();
-        }
-    }
     (r, conn, partner)
 }
 
@@ -149,21 +115,19 @@ pub(crate) fn spawn_drain(s: UnixStream, expect: usize) -> std::thread::JoinHand
 }
 
 /// One non-blocking read of up to `cap` bytes off `s`: empty at EOF, `None` when
-/// nothing is readable yet.
+/// nothing is readable yet. `s` stays blocking for its other readers.
 pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
-    s.set_nonblocking(true).expect("nonblocking");
     let mut buf = vec![0u8; cap];
-    match (&*s).read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            Some(buf)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
-        Err(e) => panic!("read: {e}"),
+    // SAFETY: `buf` is `cap` writable bytes.
+    let n = unsafe { libc::recv(s.as_raw_fd(), buf.as_mut_ptr().cast(), cap, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "recv: {e}");
+        return None;
     }
+    buf.truncate(n as usize);
+    Some(buf)
 }
-
-pub(crate) use gnitz_wire::framed;
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at
 /// most ten seconds; `false` if it never does.

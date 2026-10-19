@@ -474,15 +474,13 @@ fn run_server(
     // every W2M frame no lease routes.
     let ready = dispatcher.reactor().lease_ready();
     let live_epoch = tail.live_epoch();
-    let d = Rc::clone(&dispatcher);
-    let logs = data_dir.to_owned();
     // Raced against a worker's death, which would leave recovery waiting forever.
-    dispatcher.reactor().block_on(async move {
-        let recovery = master_post_fork_recovery(&d, ready, live_epoch);
-        match select2(recovery, d.worker_death()).await {
+    dispatcher.reactor().block_on(async {
+        let recovery = master_post_fork_recovery(&dispatcher, ready, live_epoch);
+        match select2(recovery, dispatcher.worker_death()).await {
             Either::A(r) => r,
             Either::B(w) => Err(format!(
-                "worker {w} exited during recovery (log: {logs}/worker_{w}.log)"
+                "worker {w} exited during recovery (log: {data_dir}/worker_{w}.log)"
             )),
         }
     })?;

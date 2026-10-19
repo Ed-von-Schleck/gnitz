@@ -61,14 +61,11 @@ impl Train {
                 (spans.chunk(), false)
             }
         };
-        let head = WireMsg::train_frame(self.route.target_id, false).size();
+        let head = WireMsg::train_frame(self.route.target_id, false, None).size();
         let rows = batch.wire_rows_within(self.next_row, budget.saturating_sub(head));
         self.next_row += rows.map_or(0, |r| r.rows());
         let last = self.next_row == batch.len() && (whole || batch.is_empty());
-        let msg = WireMsg {
-            data: rows,
-            ..WireMsg::train_frame(self.route.target_id, last)
-        };
+        let msg = WireMsg::train_frame(self.route.target_id, last, rows);
         if msg.size() > gnitz_wire::MAX_FRAME_PAYLOAD {
             return Err(crate::runtime::wire::oversized_frame_message(msg.size()).into());
         }
@@ -99,10 +96,7 @@ impl WorkerProcess<'_> {
 
     /// `batch` as the one frame of its reply, when it fits the budget and the ring.
     fn try_send_whole(&mut self, route: ReplyRoute, batch: &Batch) -> bool {
-        let msg = WireMsg {
-            data: batch.wire_whole(),
-            ..WireMsg::train_frame(route.target_id, true)
-        };
+        let msg = WireMsg::train_frame(route.target_id, true, batch.wire_whole());
         (msg.data.is_none() || msg.size() <= self.reply_frame_budget)
             && self.w2m_writer.try_send_msg(route.request_id, &msg)
     }

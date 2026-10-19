@@ -1,19 +1,9 @@
 use super::*;
 use crate::runtime::reactor::reactor_with_rings;
 use crate::runtime::sal::SalMessageKind;
-use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::WireMsg;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::TypeCode;
-
-/// One frame of a span train answering `req`.
-fn send(writer: &mut W2mWriter, req: u32, last: bool, spans: &Batch) {
-    let msg = WireMsg {
-        data: spans.wire_whole(),
-        ..WireMsg::train_frame(1, last)
-    };
-    writer.send_msg(req, &msg);
-}
 
 /// Merge the trains the workers send for `partitions[w]`, two spans a frame and
 /// a row-less terminal frame.
@@ -21,6 +11,7 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
     let (reactor, mut writers) = reactor_with_rings(partitions.len());
     let lease = reactor.lease_train(WorkerSet::ALL, SalMessageKind::KeySpans);
+    let req = lease.targets().request_id;
     for (writer, keys) in writers.iter_mut().zip(partitions) {
         let mut spans = Batch::empty_with_schema(&frame_schema);
         for pair in keys.chunks(2) {
@@ -28,12 +19,13 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
             for key in pair {
                 spans.push_key_row(&key.to_be_bytes(), 1);
             }
-            send(writer, lease.id(), false, &spans);
+            writer.send_msg(req, &WireMsg::train_frame(1, false, spans.wire_whole()));
         }
-        spans.clear();
-        send(writer, lease.id(), true, &spans);
+        writer.send_msg(req, &WireMsg::train_frame(1, true, None));
     }
-    reactor.block_on(async move { merge_index_scan(&lease, &frame_schema).await.expect("no fault") })
+    reactor
+        .block_on(merge_index_scan(&lease, &frame_schema))
+        .expect("no fault")
 }
 
 /// An equal pair is a duplicate whether two workers hold it or one worker's

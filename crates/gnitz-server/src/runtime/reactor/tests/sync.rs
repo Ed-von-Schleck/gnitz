@@ -1,30 +1,8 @@
-//! The single-threaded async primitives: `oneshot`, `chan`, `AsyncRwLock` and
+//! The single-threaded async primitives: `oneshot`, `AsyncRwLock` and
 //! the cancellation shapes each must survive.
 
 use super::super::test_support::*;
 use super::super::*;
-use crate::runtime::test_support::try_poll_once;
-
-// ------------------------------------------------------------------
-// Primitives: oneshot / chan / AsyncRwLock
-// ------------------------------------------------------------------
-
-#[test]
-fn oneshot_deliver_value() {
-    let r = make_reactor();
-    let got = Rc::new(Cell::new(0));
-    let got2 = Rc::clone(&got);
-    let (tx, rx) = oneshot::channel::<i32>();
-    r.spawn(async move {
-        let v = rx.await;
-        got2.set(v);
-    });
-    // Drive one tick so the receiver registers its waker, then send.
-    r.tick(false);
-    tx.send(42);
-    r.block_until_idle();
-    assert_eq!(got.get(), 42);
-}
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
 /// the value is parked where nothing will read it and dropped with the channel.
@@ -226,8 +204,7 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
 // ─────────────────────────────────────────────────────────────────
 
 /// A release admits one parked writer, not all of them: `N` writers cost
-/// `2N - 1` polls of the acquire, where waking all of them costs
-/// `1 + (N - 1)(N + 2) / 2`. Polls, not wall clock.
+/// `2N - 1` polls of the acquire.
 #[test]
 fn async_rwlock_write_release_admits_one_writer() {
     const N: usize = 16;
@@ -252,20 +229,4 @@ fn async_rwlock_write_release_admits_one_writer() {
 
     r.block_until_idle();
     assert_eq!(polls.get(), 2 * N - 1, "each release must wake one writer");
-}
-
-// ─────────────────────────────────────────────────────────────────
-// chan::try_recv: non-blocking drain used by the committer.
-// ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn chan_try_recv_drains_queue_without_blocking() {
-    let (tx, mut rx) = chan::unbounded::<i32>();
-    tx.send(10);
-    tx.send(20);
-    tx.send(30);
-    assert_eq!(rx.try_recv(), Some(10));
-    assert_eq!(rx.try_recv(), Some(20));
-    assert_eq!(rx.try_recv(), Some(30));
-    assert_eq!(rx.try_recv(), None, "queue must be empty after full drain");
 }

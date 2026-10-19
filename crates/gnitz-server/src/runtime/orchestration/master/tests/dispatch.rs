@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use super::super::fixtures::test_dispatcher;
 use crate::catalog::CatalogEngine;
 use crate::runtime::park::WorkerSet;
@@ -56,9 +54,7 @@ fn check_workers_keeps_reporting_a_dead_worker() {
 fn worker_death_names_the_dead_worker() {
     within(|| {
         let (disp, _) = test_dispatcher(vec![0, spawn_and_reap_dead()], std::ptr::null_mut());
-        let disp = Rc::new(disp);
-        let d = Rc::clone(&disp);
-        assert_eq!(disp.reactor().block_on(async move { d.worker_death().await }), 1);
+        assert_eq!(disp.reactor().block_on(disp.worker_death()), 1);
     });
 }
 
@@ -69,16 +65,14 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
         for refused in [false, true] {
             let (disp, mut writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
-            let disp = Rc::new(disp);
-            let d = Rc::clone(&disp);
-            let got = disp.reactor().block_on(async move {
+            let got = disp.reactor().block_on(async {
                 // Wider than the fixture's whole SAL.
                 let tick = Apply::Tick {
                     first_round: 2,
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
-                let lease = d.write_acked(&d.sal().lock().await, DirectGroup::new(tick))?;
-                writers.iter_mut().for_each(|w| w.send_ack(lease.id()));
+                let lease = disp.write_acked(&disp.sal().lock().await, DirectGroup::new(tick))?;
+                writers.iter_mut().for_each(|w| w.send_ack(lease.targets().request_id));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
             });
@@ -251,15 +245,13 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
-    let disp = Rc::new(disp);
     let gen = disp.cat().durable_generation();
-    let checkpoint = |disp: &Rc<super::super::MasterDispatcher>| {
-        let d = Rc::clone(disp);
+    let checkpoint = |disp: &super::super::MasterDispatcher| {
         disp.reactor()
-            .block_on(async move {
-                d.checkpoint_base().await?;
-                d.checkpoint_ephemeral().await?;
-                d.boot_checkpoint().await
+            .block_on(async {
+                disp.checkpoint_base().await?;
+                disp.checkpoint_ephemeral().await?;
+                disp.boot_checkpoint().await
             })
             .unwrap();
         disp.cat().durable_generation()

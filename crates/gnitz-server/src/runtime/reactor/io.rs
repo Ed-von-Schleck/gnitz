@@ -96,7 +96,7 @@ impl RecvBuf {
 
 /// Why a connection's recv side ended. Logged once, where the reactor retires
 /// the connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecvEnd {
     /// EOF or a `close_notify`: the peer is done.
     PeerClosed,

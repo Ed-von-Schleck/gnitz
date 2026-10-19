@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::reactor::{egress_pair, spawn_drain, Limits};
+use crate::runtime::reactor::{egress_pair, spawn_drain};
 use std::time::{Duration, Instant};
 
 /// W frames as W sends versus `Peer` corking them into one send, by frame
@@ -15,7 +15,7 @@ fn fanout_coalesced_egress_bench() {
     for w in [2usize, 8] {
         for frame_len in [CAP / 32, CAP / 8, CAP / 2, CAP, 2 * CAP] {
             let total = w * frame_len;
-            let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+            let (r, conn, receiver) = egress_pair();
             let peer = Peer::new(&r, conn, None);
             // The reader keeps the socket buffers from ever stalling a send, so
             // the timed region is kernel-op cost, not backpressure.
@@ -93,7 +93,7 @@ fn pushed_train_band_bench() {
             CAP + 1,
             4 * CAP,
         ] {
-            let (r, conn0, receiver0) = egress_pair(Limits::TEST, None);
+            let (r, conn0, receiver0) = egress_pair();
             let mut first = Some((conn0, receiver0));
             let per_peer = 3 * 2 * ROUNDS * (HEAD + body_len + ANSWER);
             let mut peers = Vec::new();
@@ -103,7 +103,6 @@ fn pushed_train_band_bench() {
                 peers.push(Peer::new(&r, conn, None));
                 drains.push(spawn_drain(receiver, per_peer));
             }
-            let peers = Rc::new(peers);
             let body = Rc::new(vec![0xA5u8; body_len]);
             let head = [0x11u8; HEAD];
             let answer = [0x22u8; ANSWER];
@@ -115,11 +114,10 @@ fn pushed_train_band_bench() {
             for (which, counter) in [(1usize, &user), (2, &all), (3, &cycles)] {
                 for i in 0..2 * ROUNDS {
                     let arm = usize::from(matches!(i % 4, 1 | 2));
-                    let (peers, body) = (Rc::clone(&peers), Rc::clone(&body));
                     let before = SENDS.with(Cell::get);
                     let ((), counted) = counter.measure(|| {
-                        r.block_on(async move {
-                            for peer in peers.iter() {
+                        r.block_on(async {
+                            for peer in &peers {
                                 peer.cork(&head);
                                 let body = SendBody::Shared(Rc::clone(&body));
                                 if arm == 0 && body_len > CAP / 2 {

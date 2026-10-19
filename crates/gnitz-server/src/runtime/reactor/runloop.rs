@@ -9,6 +9,10 @@ use io_uring::cqueue;
 
 use super::*;
 
+/// The waker key of `block_on`'s own future; no task takes it, since task keys
+/// count up from 0.
+const ROOT: usize = usize::MAX;
+
 impl Reactor {
     /// Spawn a task that runs detached.
     pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
@@ -19,40 +23,47 @@ impl Reactor {
         RUN_QUEUE.with(|q| q.borrow_mut().push(key));
     }
 
-    /// Drive `fut` to completion as a task among the others, and return its
-    /// output. The one driver of the loop, called outside any task.
-    pub(crate) fn block_on<F>(&self, fut: F) -> F::Output
-    where
-        F: Future + 'static,
-        F::Output: 'static,
-    {
-        let out = Rc::new(Cell::new(None));
-        let slot = Rc::clone(&out);
-        self.spawn(async move { slot.set(Some(fut.await)) });
-        loop {
-            self.run_ready();
-            let done = out.take();
-            // The pass that completed `fut` submits and returns; any other may sleep.
-            self.submit_or_sleep(done.is_none());
-            if let Some(v) = done {
-                return v;
+    /// Drive `fut` to completion beside the spawned tasks, and return its output.
+    /// The one driver of the loop, called outside any task. `fut` is polled in
+    /// place under the [`ROOT`] key, after the tasks of each pass that woke it.
+    pub(crate) fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        let out = {
+            let mut fut = std::pin::pin!(fut);
+            let waker = make_waker(ROOT);
+            let mut cx = Context::from_waker(&waker);
+            let mut woken = true;
+            loop {
+                woken |= self.run_ready();
+                if std::mem::take(&mut woken) {
+                    if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                        break v;
+                    }
+                }
+                self.submit_or_sleep(true);
             }
-        }
+        };
+        // The pass that completed `fut` submits and returns; any other may sleep.
+        self.submit_or_sleep(false);
+        out
     }
 
     /// Drain CQEs and every W2M ring, then fire every passed deadline — ahead of
     /// the poll, so what landed since the last pass is served in this one. Then
     /// poll each task queued on entry, once; a task woken or spawned by those
-    /// polls runs next pass.
-    pub(super) fn run_ready(&self) {
+    /// polls runs next pass. True when [`ROOT`] was among those queued.
+    pub(super) fn run_ready(&self) -> bool {
         self.drain_cqes_into_wakers();
         self.drain_all_w2m();
         self.fire_deadlines();
 
+        let mut root = false;
         for _ in 0..RUN_QUEUE.with(|q| q.borrow().len()) {
-            let key = RUN_QUEUE.with(|q| q.borrow_mut().pop());
-            self.poll_task(key);
+            match RUN_QUEUE.with(|q| q.borrow_mut().pop()) {
+                ROOT => root = true,
+                key => self.poll_task(key),
+            }
         }
+        root
     }
 
     /// Submit queued SQEs. When `block` and nothing is runnable, arm the W2M park
@@ -122,7 +133,7 @@ impl Reactor {
         }
     }
 
-    pub(super) fn dispatch_cqe(&self, user_data: u64, res: i32) {
+    fn dispatch_cqe(&self, user_data: u64, res: i32) {
         let id = udata_id(user_data);
         match udata_kind(user_data) {
             KIND_FUTEX_WAITV => {

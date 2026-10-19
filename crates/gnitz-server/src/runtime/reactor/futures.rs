@@ -150,11 +150,6 @@ pub(crate) struct AckLease {
 }
 
 impl AckLease {
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> u32 {
-        self.id
-    }
-
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
         GroupTargets { set: self.workers, request_id: self.id }
@@ -221,12 +216,6 @@ impl TrainFrame {
 }
 
 impl TrainLease {
-    /// The request id, for a test to answer on.
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> u32 {
-        self.id
-    }
-
     /// The workers answering, each launched.
     pub(crate) fn workers(&self) -> WorkerSet {
         self.workers

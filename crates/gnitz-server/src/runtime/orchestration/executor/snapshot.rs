@@ -87,13 +87,7 @@ pub(super) async fn page(
     let request = PageRequest::decode(blob).map_err(|e| format!("decode error: {e}"))?;
     if shared.cat().registry.pins(id, tid) {
         let rows = shared.cat().registry.pinned_page(id, tid, &request, Slot::SOLO)?;
-        send_msg(
-            peer,
-            ipc::WireMsg {
-                data: rows.wire_whole(),
-                ..ipc::WireMsg::train_frame(tid, true)
-            },
-        );
+        send_msg(peer, ipc::WireMsg::train_frame(tid, true, rows.wire_whole()));
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
         let mut leases = shared.disp().scan_cut(|cut| cut.read_all(read)).await?;
@@ -108,7 +102,7 @@ pub(super) async fn page(
             }
             // A train with no rows ends in a frame `next_of` does not hand out.
             if !forwarded {
-                send_msg(peer, ipc::WireMsg::train_frame(tid, true));
+                send_msg(peer, ipc::WireMsg::train_frame(tid, true, None));
             }
         }
     }

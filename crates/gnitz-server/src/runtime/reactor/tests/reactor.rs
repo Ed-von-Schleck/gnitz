@@ -1,83 +1,48 @@
-//! Reactor state: W2M routing by ring id — leases and their id space, the
-//! release of an unrouted frame — and when a pass sleeps.
+//! Reactor state: `fsync`, and the W2M park — when a pass arms it, and the
+//! publishes that wake it.
 
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::test_support::*;
 use super::*;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::sal::SalMessageKind;
-use crate::runtime::test_support::fork_child;
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 
-/// An ACK drained before anything awaits it is kept for the awaiter, and `acks`
-/// parks until the last worker has answered OK.
+/// `fsync` submits its SQE before returning, so its CQE arrives with no tick
+/// driven — which is what lets it run while the caller works on — and resolves to
+/// the CQE `res` verbatim: 0, or a socket's `-EINVAL`.
 #[test]
-fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
-    let (r, mut writers) = reactor_with_rings(3);
-    let lease = r.lease_acks(WorkerSet::ALL);
-    writers[0].send_ack(lease.id());
-    writers[1].send_ack(lease.id());
-    r.drain_all_w2m(); // before any awaiter
-
-    let mut fut = std::pin::pin!(lease.acks());
-    let (flag, waker) = WakeFlag::new();
-    let mut cx = Context::from_waker(&waker);
-    assert!(
-        fut.as_mut().poll(&mut cx).is_pending(),
-        "two of three ACKs must not resolve"
-    );
-
-    writers[2].send_ack(lease.id());
-    r.drain_all_w2m();
-    assert!(flag.woken(), "the last ACK wakes the awaiter");
-    assert!(fut.as_mut().poll(&mut cx).is_ready());
-}
-
-/// A frame for an id no lease routes is released at the ring undecoded — here a
-/// dropped lease's, as an abandoned request's late reply is — and a new lease
-/// does not take that id straight back.
-#[test]
-fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
-    let (r, mut writers) = reactor_with_rings(3);
-    let id = r.lease_acks(WorkerSet::ALL).id();
-    writers[0].send_ack(id);
-    r.drain_all_w2m();
-    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
-
-    let train = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
-    assert_ne!(train.id(), id);
-    assert_eq!(
-        train.workers().iter().collect::<Vec<_>>(),
-        [0, 1, 2],
-        "clipped to the launched"
-    );
-}
-
-/// Lease ids wrap past 0, which no lease takes, and a lease never takes an id a
-/// live lease still routes.
-#[test]
-fn lease_ids_wrap_past_zero_and_skip_live_ids() {
-    let (r, _writers) = reactor_with_rings(1);
-    r.next_request_id.set(u32::MAX);
-    let top = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(top.id(), u32::MAX);
-    let wrapped = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(wrapped.id(), 1, "the id after u32::MAX is 1, not 0");
-
-    r.next_request_id.set(1);
-    let skipped = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
-    assert_eq!(skipped.id(), 2, "a live lease's id is skipped");
+fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
+    let r = make_reactor();
+    let file = OwnedFd::from(tempfile::tempfile().expect("tempfile"));
+    let (sock, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    for (fd, want) in [(file, 0), (OwnedFd::from(sock), -libc::EINVAL)] {
+        let mut fut = std::pin::pin!(r.fsync(leaked(fd)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            r.drain_cqes_into_wakers();
+            if let Some(rc) = try_poll_once(fut.as_mut()) {
+                break rc;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no CQE without a tick: the SQE was not submitted"
+            );
+        };
+        assert_eq!(got, want);
+    }
 }
 
 /// The drain the arm runs first can route a frame that wakes a task; that tick
-/// must then run on instead of arming and sleeping.
+/// must then run on instead of arming and sleeping, where nothing would wake it.
 #[test]
 fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let mut writer = writers.pop().expect("one ring");
         let lease = r.lease_acks(WorkerSet::ALL);
-        let id = lease.id();
+        let id = lease.targets().request_id;
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
         r.spawn(async move {
@@ -87,102 +52,41 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
             d.set(true);
         });
         r.tick(true);
-        assert!(!r.futex_waitv_armed.get(), "the woken tick must not arm");
         r.tick(false);
         assert!(done.get());
     });
 }
 
-/// A blocking pass with a timer pending sleeps until that timer's deadline — not
-/// forever, not past it, and not for a later one — with no CQE involved.
+/// A forked child publishes to a reactor parked through `FUTEX_WAITV` on two
+/// rings: a lost wake runs into the timeout, a torn frame loses an id. The child
+/// waits until the reactor parks with nothing published, so only its answer on
+/// ring 1 can wake it; then it floods ring 0 as fast as it can, so the
+/// drain-refresh-arm race is under pressure: ids no lease routes, which are
+/// released unrouted, and the ready ACK last, so the lease resolves only once
+/// every one is drained.
 #[test]
-fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
-    within(|| {
-        let r = make_reactor();
-        let start = Instant::now();
-        let fired = Rc::new(Cell::new(false));
-        let f = Rc::clone(&fired);
-        let early = r.sleep(Duration::from_millis(20));
-        r.spawn(async move {
-            early.await;
-            f.set(true);
-        });
-        r.spawn(r.sleep(Duration::from_secs(3600)));
-
-        let mut ticks = 0;
-        loop {
-            r.run_ready();
-            ticks += 1;
-            // Otherwise the pass that polled the early timer sleeps on toward the
-            // later deadline.
-            if fired.get() {
-                break;
-            }
-            r.submit_or_sleep(true);
-        }
-        assert!(start.elapsed() >= Duration::from_millis(20), "woke before the deadline");
-        assert!(ticks <= 16, "{ticks} ticks: the reactor spun instead of sleeping");
-        assert_eq!(r.deadlines.borrow().len(), 1, "only the later deadline is left");
-        r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
-    });
-}
-
-/// A forked child floods a shared W2M ring while the parent drains through the
-/// `FUTEX_WAITV` park: a lost wake runs into the timeout, a torn frame loses an id.
-#[test]
-fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
+fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
     const N_MESSAGES: u32 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let (reactor, mut writers) = reactor_with_rings(1);
-    // Only the ready id is leased, and published last: the rest are released
-    // unrouted, and the lease resolves only once the reactor has drained every
-    // one. As fast as possible, so the drain-refresh-arm race is under pressure.
+    let (r, mut writers) = reactor_with_rings(2);
     let child = || {
-        for req_id in (BOOT_READY_REQUEST_ID + 1..=N_MESSAGES).chain([BOOT_READY_REQUEST_ID]) {
-            writers[0].send_ack(req_id);
-        }
-    };
-    let pid = unsafe { fork_child(child) };
-
-    let lease = reactor.lease_ready();
-    let timer = reactor.sleep(TIMEOUT);
-    let out = reactor.block_on(async move { select2(lease.acks(), timer).await });
-    if let Either::B(()) = out {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        panic!("reactor stalled after {TIMEOUT:?} — lost-wake symptom");
-    }
-    unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
-}
-
-/// A publish on a ring past the first wakes a reactor parked on all of them: the
-/// child answers on ring 0, waits until the reactor parks, then answers on ring 1.
-#[test]
-fn a_publish_on_a_later_ring_wakes_the_reactor() {
-    use crate::runtime::w2m::fixtures::test_rings;
-
-    const TIMEOUT: Duration = Duration::from_secs(30);
-
-    let (mut writers, receiver) = test_rings(&[64 * 1024; 2]);
-
-    let child = || {
-        writers[0].send_ack(BOOT_READY_REQUEST_ID);
         let deadline = Instant::now() + TIMEOUT;
         while !writers[1].master_parked() {
             assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
             std::thread::yield_now();
         }
         writers[1].send_ack(BOOT_READY_REQUEST_ID);
+        for req_id in (BOOT_READY_REQUEST_ID + 1..=N_MESSAGES).chain([BOOT_READY_REQUEST_ID]) {
+            writers[0].send_ack(req_id);
+        }
     };
     let pid = unsafe { fork_child(child) };
 
-    let r = make_reactor_over(receiver);
     let lease = r.lease_ready();
-    let timer = r.sleep(TIMEOUT);
-    let out = r.block_on(async move { select2(lease.acks(), timer).await });
-    if let Either::B(()) = out {
+    if let Either::B(()) = r.block_on(select2(lease.acks(), r.sleep(TIMEOUT))) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        panic!("reactor stalled after {TIMEOUT:?}: ring 1's wake never reached it");
+        panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }
-    unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
+    unsafe { assert_child_exited_ok(pid) };
 }

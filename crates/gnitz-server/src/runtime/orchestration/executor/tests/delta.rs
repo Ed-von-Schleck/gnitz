@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use super::*;
-use crate::runtime::reactor::{egress_pair, Limits};
+use crate::runtime::reactor::egress_pair;
 
 /// Trains queued for a connection reach the wire whole and in queue order
 /// behind the reply already corked, and are counted until the connection's
@@ -9,9 +9,9 @@ use crate::runtime::reactor::{egress_pair, Limits};
 #[test]
 fn queued_trains_are_shipped_whole_behind_the_reply() {
     const LARGE: usize = 1 << 20;
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Rc::new(Peer::new(&r, conn, None));
-    let subs = Rc::new(Subscriptions::default());
+    let (r, conn, receiver) = egress_pair();
+    let peer = Peer::new(&r, conn, None);
+    let subs = Subscriptions::default();
     subs.out.send(vec![0x10; 8], Rc::new(vec![0x11; 100]));
     subs.out.send(vec![0x20; 8], Rc::new(vec![0x21; LARGE]));
     subs.out.send(vec![0x30; 8], Rc::new(vec![0x31; 100]));
@@ -24,10 +24,9 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
         (&receiver).read_exact(&mut wire).expect("the reply and every train");
         wire
     });
-    let (shipping, sender) = (Rc::clone(&subs), Rc::clone(&peer));
-    r.block_on(async move {
-        shipping.ship(&sender).await.expect("an open peer");
-        sender.flush_egress().await.expect("an open peer");
+    r.block_on(async {
+        subs.ship(&peer).await.expect("an open peer");
+        peer.flush_egress().await.expect("an open peer");
     });
     assert!(subs.out.is_empty());
     assert_eq!(subs.out.unsynced(), queued, "a ship is no sync");

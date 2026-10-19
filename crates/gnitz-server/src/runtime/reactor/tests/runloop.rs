@@ -1,5 +1,7 @@
-//! Task scheduling and the tick body: `spawn`, the run queue's dedup, and the
-//! waker vtable the wakes land in.
+//! Task scheduling and the pass: `spawn`, the run queue's dedup, the waker
+//! vtable the wakes land in, `block_on`, and how long a pass sleeps.
+
+use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
@@ -68,5 +70,54 @@ fn block_on_returns_beside_a_parked_task() {
         let r = make_reactor();
         r.spawn(std::future::pending());
         assert_eq!(r.block_on(async { 7 }), 7);
+    });
+}
+
+/// `block_on`'s future is woken as a task is: here by a task's send, once the
+/// future has parked on the receiver.
+#[test]
+fn block_on_is_woken_by_a_task() {
+    within(|| {
+        let r = make_reactor();
+        let (tx, rx) = oneshot::channel();
+        r.spawn(async move {
+            YieldOnce::new().await;
+            tx.send(9);
+        });
+        assert_eq!(r.block_on(rx), 9);
+    });
+}
+
+/// A blocking pass with a timer pending sleeps until that timer's deadline — not
+/// forever, not past it, and not for a later one — with no CQE involved.
+#[test]
+fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
+    within(|| {
+        let r = make_reactor();
+        let start = Instant::now();
+        let fired = Rc::new(Cell::new(false));
+        let f = Rc::clone(&fired);
+        let early = r.sleep(Duration::from_millis(20));
+        r.spawn(async move {
+            early.await;
+            f.set(true);
+        });
+        r.spawn(r.sleep(Duration::from_secs(3600)));
+
+        let mut ticks = 0;
+        loop {
+            r.run_ready();
+            ticks += 1;
+            // Otherwise the pass that polled the early timer sleeps on toward the
+            // later deadline.
+            if fired.get() {
+                break;
+            }
+            r.submit_or_sleep(true);
+        }
+        assert!(start.elapsed() >= Duration::from_millis(20), "woke before the deadline");
+        assert!(ticks <= 16, "{ticks} ticks: the reactor spun instead of sleeping");
+        assert_eq!(r.deadlines.borrow().len(), 1, "only the later deadline is left");
+        r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }

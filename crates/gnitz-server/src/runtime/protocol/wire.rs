@@ -55,11 +55,12 @@ impl<'a> WireMsg<'a> {
         }
     }
 
-    /// One frame of a reply train for `target_id`, but for its rows.
-    pub(crate) fn train_frame(target_id: u64, last: bool) -> Self {
+    /// One frame of a reply train for `target_id`, carrying `data`.
+    pub(crate) fn train_frame(target_id: u64, last: bool, data: Option<WireRows<'a>>) -> Self {
         WireMsg {
             target_id,
             flags: WireFlags::train_frame(last),
+            data,
             ..Default::default()
         }
     }

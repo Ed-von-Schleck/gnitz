@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use super::*;
-use crate::runtime::reactor::{egress_pair, framed, read_nonblocking, ring_slot, select2, Either, Limits};
+use crate::runtime::reactor::{egress_pair, read_nonblocking, ring_slot, select2, Either};
+use gnitz_wire::framed;
 
 /// `send` corks a slot that fits beside the cork, ships the cork first when the
 /// slot would overflow it, and sends a slot over half the ceiling alone; the bytes
@@ -28,13 +29,10 @@ fn send_corks_what_fits_and_never_reorders() {
     ] {
         let (_ring, slot) = ring_slot(pad);
         let all = [vec![0x5Au8; pre], slot.frame_bytes().to_vec()].concat();
-        let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+        let (r, conn, receiver) = egress_pair();
         let peer = Peer::new(&r, conn, None);
         peer.cork(&all[..pre]);
-        let peer = r.block_on(async move {
-            peer.send(SendBody::Slot(slot)).await.expect("an open peer");
-            peer
-        });
+        r.block_on(peer.send(SendBody::Slot(slot))).expect("an open peer");
 
         let wire = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
         let (want_wire, want_corked) = match ships {
@@ -48,7 +46,7 @@ fn send_corks_what_fits_and_never_reorders() {
             "pre={pre} pad={pad}"
         );
 
-        r.block_on(async move { peer.flush_egress().await.expect("an open peer") });
+        r.block_on(peer.flush_egress()).expect("an open peer");
         let rest = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
         assert_eq!([wire, rest].concat(), all, "pre={pre} pad={pad}: call order");
     }
@@ -59,13 +57,11 @@ fn send_corks_what_fits_and_never_reorders() {
 #[test]
 fn flush_if_full_ships_only_a_full_cork() {
     for corked in [COALESCE_MAX_BYTES - 1, COALESCE_MAX_BYTES] {
-        let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+        let (r, conn, receiver) = egress_pair();
         let peer = Peer::new(&r, conn, None);
         peer.cork(&vec![0x3Cu8; corked]);
-        let left = r.block_on(async move {
-            peer.flush_if_full().await.expect("an open peer");
-            peer.corked_len()
-        });
+        r.block_on(peer.flush_if_full()).expect("an open peer");
+        let left = peer.corked_len();
         let wire = read_nonblocking(&receiver, 64 * 1024).map_or(0, |b| b.len());
         let full = corked == COALESCE_MAX_BYTES;
         assert_eq!(
@@ -84,11 +80,11 @@ fn a_failed_send_finishes_the_peer() {
     let (_big_ring, big) = ring_slot(COALESCE_MAX_BYTES);
     let (_small_ring, small) = ring_slot(64);
 
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let (r, conn, receiver) = egress_pair();
     let peer = Peer::new(&r, conn, None);
     drop(receiver);
 
-    r.block_on(async move {
+    r.block_on(async {
         assert_eq!(
             peer.send(SendBody::Slot(small)).await,
             Ok(()),
@@ -110,20 +106,19 @@ fn a_failed_send_finishes_the_peer() {
 /// cork alone, so a pipelined run of replies leaves as one send.
 #[test]
 fn next_request_keeps_the_cork_while_requests_are_queued() {
-    let (r, conn, partner) = egress_pair(Limits::TEST, None);
+    let (r, conn, partner) = egress_pair();
     let peer = Peer::new(&r, conn, None);
     (&partner)
         .write_all(&[framed(b"a"), framed(b"b")].concat())
         .expect("write");
 
-    let corked = r.block_on(async move {
+    r.block_on(async {
         peer.next_request().await.expect("the first request");
         peer.cork(b"reply");
         peer.next_request().await.expect("the second request, already queued");
-        peer.corked_len()
     });
 
-    assert_eq!(corked, 5, "the reply stays corked");
+    assert_eq!(peer.corked_len(), 5, "the reply stays corked");
     assert!(read_nonblocking(&partner, 64).is_none(), "nothing shipped");
 }
 
@@ -131,13 +126,13 @@ fn next_request_keeps_the_cork_while_requests_are_queued() {
 /// the client.
 #[test]
 fn next_request_ships_before_parking() {
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let (r, conn, receiver) = egress_pair();
     let peer = Peer::new(&r, conn, None);
     let frame = vec![0x6Bu8; 300];
     peer.cork(&frame);
 
     let timer = r.sleep(Duration::from_millis(50));
-    let parked = r.block_on(async move { matches!(select2(peer.next_request(), timer).await, Either::B(())) });
+    let parked = matches!(r.block_on(select2(peer.next_request(), timer)), Either::B(()));
 
     assert!(parked, "no request is queued, so the timer wins");
     assert_eq!(
@@ -151,23 +146,20 @@ fn next_request_ships_before_parking() {
 /// otherwise leaves alone behind a flush of what was corked.
 #[test]
 fn a_shared_body_is_sent_behind_what_is_corked() {
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Rc::new(Peer::new(&r, conn, None));
+    let (r, conn, receiver) = egress_pair();
+    let peer = Peer::new(&r, conn, None);
     let small = Rc::new(vec![0x11u8; 100]);
     let large = Rc::new(vec![0x21u8; COALESCE_MAX_BYTES]);
 
     peer.cork(b"reply");
-    let sending = Rc::clone(&peer);
-    let body = Rc::clone(&small);
-    r.block_on(async move { sending.send(SendBody::Shared(body)).await.expect("an open peer") });
+    r.block_on(peer.send(SendBody::Shared(Rc::clone(&small))))
+        .expect("an open peer");
     assert_eq!(peer.corked_len(), 105, "a body that fits is corked");
     assert!(
         read_nonblocking(&receiver, 1024).is_none(),
         "nothing leaves before a flush"
     );
 
-    // The read above left the socket non-blocking.
-    receiver.set_nonblocking(false).expect("blocking");
     let wire = std::thread::spawn(move || {
         let reader = receiver;
         let mut wire = vec![0u8; 105 + COALESCE_MAX_BYTES];
@@ -176,9 +168,8 @@ fn a_shared_body_is_sent_behind_what_is_corked() {
             .expect("the cork and the body behind it");
         wire
     });
-    let sending = Rc::clone(&peer);
-    let body = Rc::clone(&large);
-    r.block_on(async move { sending.send(SendBody::Shared(body)).await.expect("an open peer") });
+    r.block_on(peer.send(SendBody::Shared(Rc::clone(&large))))
+        .expect("an open peer");
     assert_eq!(peer.corked_len(), 0, "a body that does not fit is not corked");
     let want = [&b"reply"[..], &small, &large].concat();
     assert!(wire.join().unwrap() == want, "the body left behind what was corked");

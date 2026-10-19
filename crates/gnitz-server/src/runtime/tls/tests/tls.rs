@@ -18,7 +18,8 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
-use crate::runtime::reactor::{egress_pair, framed, poll_until, read_nonblocking, Budget, Limits};
+use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, Budget};
+use gnitz_wire::framed;
 
 const LOOPBACK: &str = "127.0.0.1:0";
 
@@ -253,7 +254,7 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
 /// A `TlsShared` over one end of a socketpair, the other end, which is the
 /// client's, and the PEM the client trusts.
 fn tls_over_socketpair() -> (Reactor, Rc<TlsShared>, UnixStream, String) {
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let (r, conn, receiver) = egress_pair();
     let (served, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
     let tls = TlsShared::start(r.clone(), conn, Arc::clone(&served.cfg));
     (r, tls, receiver, pem)

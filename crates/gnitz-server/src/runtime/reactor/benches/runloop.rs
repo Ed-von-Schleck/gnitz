@@ -1,4 +1,5 @@
 use std::hint::black_box;
+use std::io::Write;
 
 use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 
@@ -19,9 +20,9 @@ fn nop(r: &Reactor) -> oneshot::Receiver<OpResult> {
 }
 
 /// Spawn a task on `r` that parks in `park` over and over, then run `PASSES`
-/// passes, `publish` ahead of each and outside the count. Every pass must bring
-/// the task back from one park.
-fn arm(counter: &Counter, label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: impl FnMut()) {
+/// passes under each counter, `publish` ahead of each pass and outside the count.
+/// Every pass must bring the task back from one park.
+fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: impl FnMut()) {
     let parks = Rc::new(Cell::new(0u64));
     let p = Rc::clone(&parks);
     r.spawn(async move {
@@ -31,17 +32,19 @@ fn arm(counter: &Counter, label: &str, r: Reactor, park: impl AsyncFn() + 'stati
         }
     });
     r.tick(false); // the first poll parks the task
-    let mut instructions = 0;
-    for _ in 0..PASSES {
-        publish();
-        instructions += counter.measure(|| r.tick(false)).1;
-    }
-    let empty = (0..PASSES).map(|_| counter.measure(|| ()).1).sum::<u64>();
-    assert_eq!(parks.get(), PASSES, "{label}: a pass that woke nothing");
-    println!(
-        "reactor_pass_bench {label:<12} {:>7.1} instr/pass",
+                   // One counter at a time: two open at once would count each other's ioctls.
+    let [user, all] = [Counter::instructions as fn() -> Counter, Counter::instructions_all].map(|open| {
+        let counter = open();
+        let mut instructions = 0;
+        for _ in 0..PASSES {
+            publish();
+            instructions += counter.measure(|| r.tick(false)).1;
+        }
+        let empty = (0..PASSES).map(|_| counter.measure(|| ()).1).sum::<u64>();
         (instructions - empty) as f64 / PASSES as f64
-    );
+    });
+    assert_eq!(parks.get(), 2 * PASSES, "{label}: a pass that woke nothing");
+    println!("reactor_pass_bench {label:<12} {user:>7.1} user, {all:>8.1} user+kernel instr/pass");
     r.tasks.borrow_mut().clear(); // the task holds the reactor
 }
 
@@ -50,18 +53,17 @@ fn arm(counter: &Counter, label: &str, r: Reactor, park: impl AsyncFn() + 'stati
 ///
 /// `task` wakes itself, and is the floor under the others. `op` is a one-shot op
 /// through the ring, `op+deadline` the same raced against a timer as every client
-/// send is. `acks` is a lease over every worker, answered by each, and `train` one
-/// row frame of a scan's reply.
+/// send is. `recv` is one client frame through the armed recv, its filter and the
+/// connection's queue. `acks` is a lease over every worker, answered by each, and
+/// `train` one row frame of a scan's reply.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reactor_pass_bench() {
-    let counter = Counter::instructions();
-
-    arm(&counter, "task", make_reactor(), async || YieldOnce::new().await, || ());
+    arm("task", make_reactor(), async || YieldOnce::new().await, || ());
 
     let r = make_reactor();
     let r2 = r.clone();
-    arm(&counter, "op", r, async move || drop(black_box(nop(&r2).await)), || ());
+    arm("op", r, async move || drop(black_box(nop(&r2).await)), || ());
 
     let r = make_reactor();
     let r2 = r.clone();
@@ -69,7 +71,13 @@ fn reactor_pass_bench() {
         let op = select2(nop(&r2), r2.sleep(r2.limits.client_send_timeout)).await;
         assert!(matches!(op, Either::A(_)));
     };
-    arm(&counter, "op+deadline", r, send, || ());
+    arm("op+deadline", r, send, || ());
+
+    let r = make_reactor();
+    let (conn, partner) = registered(&r);
+    let frame = gnitz_wire::framed(b"x");
+    let recv = async move || drop(black_box(conn.recv().await.expect("a frame")));
+    arm("recv", r, recv, || (&partner).write_all(&frame).expect("write"));
 
     for nw in [1, 4, 16] {
         let (r, mut writers) = reactor_with_rings(nw);
@@ -77,25 +85,22 @@ fn reactor_pass_bench() {
         let (r2, leased) = (r.clone(), Rc::clone(&id));
         let acks = async move || {
             let lease = r2.lease_acks(WorkerSet::ALL);
-            leased.set(lease.id());
+            leased.set(lease.targets().request_id);
             lease.acks().await;
         };
-        arm(&counter, &format!("acks nw={nw}"), r, acks, || {
+        arm(&format!("acks nw={nw}"), r, acks, || {
             writers.iter_mut().for_each(|w| w.send_ack(id.get()));
         });
     }
 
     let (r, mut writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
-    let id = lease.id();
+    let id = lease.targets().request_id;
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(1, 1, 0)]);
-    let frame = WireMsg {
-        data: rows.wire_whole(),
-        ..WireMsg::train_frame(0, false)
-    };
+    let frame = WireMsg::train_frame(0, false, rows.wire_whole());
     let next = async move || assert!(matches!(black_box(lease.next().await), Ok(Some(_))));
-    arm(&counter, "train", r, next, || writers[0].send_msg(id, &frame));
+    arm("train", r, next, || writers[0].send_msg(id, &frame));
 }
 
 /// What a flood of worker frames costs the master through its `FUTEX_WAITV`
@@ -130,17 +135,17 @@ fn reactor_flood_bench() {
                 })
                 .collect();
             let before = voluntary_ctx_switches();
-            let ((), instructions) = counter.measure(|| r.block_on(async move { lease.acks().await }));
+            let ((), instructions) = counter.measure(|| r.block_on(lease.acks()));
             let sleeps = voluntary_ctx_switches() - before;
             let wakes: u64 = floods.into_iter().map(|f| f.join().expect("a flood thread")).sum();
             (instructions, sleeps, wakes)
         });
-        let kmsgs = (nw as u64 * N as u64) as f64 / 1000.0;
+        let msgs = (nw as u64 * N as u64) as f64;
         println!(
             "reactor_flood_bench nw={nw:<2} {:>6.1} instr/msg, per 1k msgs {:>6.2} master sleeps and {:>6.2} worker wakes",
-            instructions as f64 / (kmsgs * 1000.0),
-            sleeps as f64 / kmsgs,
-            wakes as f64 / kmsgs,
+            instructions as f64 / msgs,
+            sleeps as f64 * 1000.0 / msgs,
+            wakes as f64 * 1000.0 / msgs,
         );
     }
 }
