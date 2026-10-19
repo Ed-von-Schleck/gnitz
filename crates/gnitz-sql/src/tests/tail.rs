@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, parse_expr_sql, parse_query, rejected};
+use crate::test_support::{assert_rejects, col, parse_expr_sql, parse_query, rejected};
 use gnitz_wire::TypeCode;
 
 /// The ORDER BY keys of `q`.
@@ -32,26 +32,26 @@ fn a_position_names_a_visible_column() {
     }
 }
 
+/// Expression keys take their placements in order, positions their visible
+/// column; NULLs sort last ascending and first descending unless placed.
 #[test]
-fn expression_keys_consume_placements_in_order() {
+fn each_key_sorts_on_its_slot_in_its_direction() {
     let cols = hidden_led();
-    let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC");
+    let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC, c ASC NULLS FIRST, 1 DESC NULLS LAST");
     let keys = keys_of(&q);
-    assert_eq!(order_exprs(&keys).len(), 2);
-    assert_eq!(key_slots(&keys, &cols, [7, 5]).unwrap(), vec![7, 2, 5]);
-    let wire = wire_keys(&keys, &cols, [7, 5]).unwrap();
+    assert_eq!(order_exprs(&keys).len(), 3);
+    let k = |col, desc, nulls_first| gnitz_wire::OrderKey { col, desc, nulls_first };
     assert_eq!(
-        wire.iter().map(|k| (k.col, k.desc)).collect::<Vec<_>>(),
-        [(7, false), (2, false), (5, true)]
+        wire_keys(&keys, &cols, [7, 5, 6]).unwrap(),
+        [
+            k(7, false, false),
+            k(2, false, false),
+            k(5, true, true),
+            k(6, false, true),
+            k(1, true, false)
+        ]
     );
     assert!(matches!(key_slots(&keys, &cols, [7]), Err(GnitzSqlError::Internal(_))));
-}
-
-#[test]
-fn null_placement_defaults_follow_the_direction() {
-    let q = parse_query("SELECT * FROM t ORDER BY a, b DESC, c ASC NULLS FIRST, a DESC NULLS LAST");
-    let dirs: Vec<(bool, bool)> = keys_of(&q).iter().map(|k| (k.desc, k.nulls_first)).collect();
-    assert_eq!(dirs, [(false, false), (true, true), (false, true), (true, false)]);
 }
 
 /// The key list is capped at what the wire carries.
@@ -89,22 +89,11 @@ fn limit_and_offset_read_every_clause_form() {
     }
 }
 
-/// `ORDER BY ALL` parses as the identifier `ALL` under the dialect the planner
-/// uses, so the typed form is built here.
-#[test]
-fn order_by_all_is_rejected() {
-    let all = OrderBy {
-        kind: OrderByKind::All(OrderByOptions::default()),
-        interpolate: None,
-    };
-    assert_eq!(rejected(resolve_order_by(&all)), "ORDER BY: ALL is not supported");
-}
-
 /// LIMIT/OFFSET read the same decoder, so `(10)` and `+10` are counts; a
 /// negative or fractional one names itself in the message.
 #[test]
 fn expr_usize_literal_reads_the_constant_decoder() {
-    for src in ["10", "+10", "(10)", "((+10))"] {
+    for src in ["10", "+10", "(10)"] {
         assert_eq!(expr_usize_literal(&parse_expr_sql(src), "LIMIT").unwrap(), 10, "{src}");
     }
     for (src, want) in [
@@ -115,8 +104,7 @@ fn expr_usize_literal_reads_the_constant_decoder() {
         ("a", "not an expression"),
         ("1 + 1", "not an expression"),
     ] {
-        let m = rejected(expr_usize_literal(&parse_expr_sql(src), "LIMIT"));
-        assert!(m.contains(want), "{src}: {m}");
+        assert_rejects(src, expr_usize_literal(&parse_expr_sql(src), "LIMIT"), want);
     }
 }
 

@@ -40,7 +40,7 @@ fn a_view_body_starts_after_the_first_top_level_as() {
 #[test]
 fn a_location_maps_to_its_byte_offset_across_lines_and_wide_characters() {
     let script = "SELECT 'ä'\n, x FROM \"ü\".t";
-    let text = StatementText::whole(script);
+    let (_, text) = split_statements(script).unwrap().remove(0);
     let at = |line, column| text.offset(Location { line, column }).unwrap();
     assert_eq!(&script[at(1, 9)..], "ä'\n, x FROM \"ü\".t");
     assert_eq!(&script[at(2, 10)..], "\"ü\".t");

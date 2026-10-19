@@ -35,7 +35,7 @@ fn voluntary_switches(pid: u32) -> u64 {
 /// A filter keeps its rows on the worker that holds them; a GROUP BY trades
 /// them in an exchange round.
 #[test]
-#[ignore]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn view_read_after_write_bench() {
     for (shape, body) in [
         ("filter", "SELECT pk, a FROM t WHERE a >= 0"),

@@ -22,17 +22,6 @@ pub(crate) struct StatementText<'a> {
 }
 
 impl<'a> StatementText<'a> {
-    /// A script that is one statement.
-    #[cfg(test)]
-    pub(crate) fn whole(script: &'a str) -> Self {
-        let trimmed = script.trim_end().trim_end_matches(';').trim_end();
-        StatementText {
-            script,
-            range: (script.len() - script.trim_start().len(), trimmed.len()),
-            origin: (Location { line: 1, column: 1 }, 0),
-        }
-    }
-
     /// The statement's own text.
     pub(crate) fn text(&self) -> &'a str {
         &self.script[self.range.0..self.range.1]

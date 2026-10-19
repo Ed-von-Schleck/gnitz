@@ -5,7 +5,7 @@ use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
-use gnitz_expr::ColumnLocator;
+use gnitz_expr::{CmpOp, ColumnLocator};
 use gnitz_wire::{payload_u64, RowSource};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
@@ -154,15 +154,105 @@ pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Schema {
     schema(columns, &[0])
 }
 
-/// `(a U64, b U64) PRIMARY KEY (a, b)` plus a nullable I64 payload.
-pub(crate) fn compound_schema_u64_u64() -> Schema {
-    schema(
-        vec![
-            col("a", TypeCode::U64),
-            col("b", TypeCode::U64),
-            ncol("v", TypeCode::I64),
-        ],
-        &[0, 1],
+/// Each comparison as SQL spells it, beside the operator that holds with the
+/// operands transposed and the opcode operand it lowers to.
+pub(crate) const CMP: [(&str, &str, CmpOp); 6] = [
+    ("=", "=", CmpOp::Eq),
+    ("<>", "<>", CmpOp::Ne),
+    ("<", ">", CmpOp::Lt),
+    ("<=", ">=", CmpOp::Le),
+    (">", "<", CmpOp::Gt),
+    (">=", "<=", CmpOp::Ge),
+];
+
+/// Whether `a op b`.
+pub(crate) fn holds(op: CmpOp, a: i128, b: i128) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Le => a <= b,
+        CmpOp::Gt => a > b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+/// A column type, literals to compare it against, and the integers its column
+/// stores (`None` a NULL).
+pub(crate) type ExactCase = (ColType, &'static [&'static str], &'static [Option<i128>]);
+
+/// Columns compared against literals at and past their edges.
+pub(crate) const EXACT_CASES: &[ExactCase] = {
+    const P53: i128 = 1 << 53;
+    &[
+        (
+            ColType::of(TypeCode::U64),
+            &[
+                "-5",
+                "-1",
+                "0",
+                "1",
+                "9223372036854775808",
+                "18446744073709551615",
+                "18446744073709551616",
+            ],
+            &[
+                Some(0),
+                Some(1),
+                Some(1 << 63),
+                Some((1 << 63) - 1),
+                Some(u64::MAX as i128),
+                None,
+            ],
+        ),
+        (
+            ColType::of(TypeCode::I8),
+            &["-129", "-128", "127", "128"],
+            &[Some(-128), Some(-1), Some(0), Some(127), None],
+        ),
+        (
+            ColType::of(TypeCode::I64),
+            &[
+                "1.5",
+                "-1.5",
+                "2.5",
+                "-2.5",
+                "9007199254740993.5",
+                "-9007199254740992.5",
+            ],
+            &[
+                Some(-3),
+                Some(-2),
+                Some(-1),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(P53),
+                Some(P53 + 1),
+                Some(P53 + 2),
+                Some(-P53 - 1),
+                None,
+            ],
+        ),
+        // A literal finer than a DECIMAL column's scale, one whose scale-up would
+        // wrap an `i64` included.
+        (
+            ColType::decimal(2),
+            &["1.005", "1.000000000000000001"],
+            &[None, Some(100), Some(101), Some(1000), Some(-1000)],
+        ),
+    ]
+};
+
+/// The exact answer to `x op lit`, `x` an integer a `ty` column stores and `lit`
+/// a numeric literal's text, compared as the rationals they are.
+pub(crate) fn holds_exact(ty: ColType, x: i128, op: CmpOp, lit: &str) -> bool {
+    let (mag, scale) = gnitz_wire::decimal::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
+    let v = if lit.starts_with('-') { -mag } else { mag };
+    holds(
+        op,
+        x * 10i128.pow(u32::from(scale)),
+        v * 10i128.pow(u32::from(ty.scale)),
     )
 }
 
@@ -233,9 +323,9 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
 }
 
 /// Parse + bind an expression against `schema` as relation `t`, which is what
-/// every qualified reference in these tests writes.
-pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-    crate::hir::bind_single_table(&parse_expr_sql(sql), schema, "t")
+/// every qualified reference in these tests writes; a refusal panics, naming `sql`.
+pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> BoundExpr {
+    crate::hir::bind_single_table(&parse_expr_sql(sql), schema, "t").unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 /// The message of the `Rejected` error `r` must be.
@@ -263,9 +353,7 @@ pub(crate) fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &
 
 /// [`bind_sql`] of a WHERE predicate, as its bound conjuncts.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
-    bind_sql(sql, schema)
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .conjuncts()
+    bind_sql(sql, schema).conjuncts()
 }
 
 /// [`bind_where`] for a predicate that is one conjunct — the input of the

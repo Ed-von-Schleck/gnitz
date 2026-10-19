@@ -290,6 +290,12 @@ fn every_unsupported_window_names_its_clause() {
             "SELECT id, ABS(a) OVER (ORDER BY a) + 1 AS x FROM t",
             "ABS: not supported as a window function",
         ),
+        // A window's keys are held to the cap a query ORDER BY is.
+        (
+            "SELECT id, RANK() OVER (ORDER BY a, a + 1, a + 2, a + 3, a + 4, a + 5, a + 6, a + 7, a + 8, a + 9, \
+             a + 10, a + 11, a + 12, a + 13, a + 14, a + 15, a + 16) FROM t",
+            "ORDER BY has more than 16 keys",
+        ),
         (
             "SELECT id, SUM(DISTINCT a) OVER () FROM t",
             "window functions: DISTINCT is not supported",

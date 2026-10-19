@@ -137,24 +137,32 @@ fn a_written_key_packs_in_pk_list_order() {
 }
 
 /// The key an INSERT stores under a literal is the key `WHERE id = <literal>`
-/// seeks, at every key type.
+/// seeks, at every key type, and the one a list repeating it seeks.
 #[test]
 fn an_inserted_key_is_the_key_its_literal_seeks() {
     use TypeCode::*;
     for (tc, lit) in [
         (I8, "-1"),
+        (I16, "-1"),
+        (I32, "-1"),
+        (I64, "-1"),
         (I64, "-9223372036854775808"),
         (U16, "65535"),
+        (U32, "4294967295"),
         (U64, "18446744073709551615"),
+        // `-0` names the value `0`, so an unsigned column takes it.
         (U128, "-0"),
+        (UUID, "-0"),
         (UUID, "'550e8400-e29b-41d4-a716-446655440000'"),
     ] {
         let s = pk_schema(tc);
         let cat = catalog(vec![("t", table(1, s.columns().to_vec(), vec![0]))]);
         let plan =
             insert(&cat, &format!("INSERT INTO t VALUES ({lit}, 0)")).unwrap_or_else(|e| panic!("{tc:?}: {e:?}"));
-        let (bound, _) = access_path(&s, "t", Some(&parse_expr_sql(&format!("id = {lit}"))), &[]).unwrap();
-        assert_eq!(bound, ReadBound::PkSet(plan.rows.pks.keys()), "{tc:?} {lit}");
+        for pred in [format!("id = {lit}"), format!("id IN ({lit}, {lit})")] {
+            let (bound, _) = access_path(&s, "t", Some(&parse_expr_sql(&pred)), &[]).unwrap();
+            assert_eq!(bound, ReadBound::PkSet(plan.rows.pks.keys()), "{tc:?}: {pred}");
+        }
     }
 }
 

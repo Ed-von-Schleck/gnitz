@@ -38,7 +38,7 @@ pub(super) fn lower_ordered(
     let group = frame.reduce_group(partition)?;
     if order.len() > gnitz_wire::MAX_ORDER_KEYS {
         return Err(GnitzSqlError::Rejected(format!(
-            "ORDER BY: more than {} keys",
+            "ORDER BY has more than {} keys",
             gnitz_wire::MAX_ORDER_KEYS
         )));
     }

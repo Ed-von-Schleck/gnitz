@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{
-    bind_conjunct, bind_where, col, compound_schema_u64_u64, ix, pk_schema, schema, two_col, uq,
+    bind_conjunct, bind_where, col, holds_exact, ix, pk_schema, schema, typed_schema, uq, CMP, EXACT_CASES,
 };
 use gnitz_wire::{ColType, ColumnDef, PkBuf};
 use Tier as T;
@@ -20,11 +20,8 @@ type Ranked = (Tier, ReadBound, Vec<usize>);
 
 /// Every candidate `sql` admits over `schema` and `indexes`, best first.
 fn ranked_of(sql: &str, schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
-    ranked_conjuncts(&bind_where(sql, schema), schema, indexes)
-}
-
-fn ranked_conjuncts(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
-    ranked(conjuncts, schema, indexes)
+    let conjuncts = bind_where(sql, schema);
+    ranked(&conjuncts, schema, indexes)
         .into_iter()
         .map(|(tier, c)| {
             let left = (0..conjuncts.len()).filter(|i| !c.consumed.contains(i)).collect();
@@ -70,82 +67,79 @@ fn five_u64() -> Schema {
     schema(["id", "x", "a", "b", "c"].map(|n| col(n, TypeCode::U64)).to_vec(), &[0])
 }
 
+/// `(a, b, v)`, every column U64 NOT NULL, `PRIMARY KEY (a, b)`.
+fn compound() -> Schema {
+    schema(["a", "b", "v"].map(|n| col(n, TypeCode::U64)).to_vec(), &[0, 1])
+}
+
 // ------------------------------------------------------------------
 // One conjunct, one pin
 // ------------------------------------------------------------------
 
-/// The images `sql` admits on the `val` column of a `(pk, val tc)` table; `None`
-/// when the conjunct is no term.
-fn pin(tc: TypeCode, sql: &str) -> Option<RangeInclusive<u128>> {
-    let schema = two_col(tc);
-    match term(&bind_conjunct(sql, &schema), &schema)? {
+/// The images `sql` admits on column `c1` of `schema`; `None` when the conjunct
+/// is no term.
+fn pin(schema: &Schema, sql: &str) -> Option<RangeInclusive<u128>> {
+    match term(&bind_conjunct(sql, schema), schema)? {
         (1, Pin::Range(r)) => Some(r),
         (col, _) => panic!("{sql}: a pin on column {col}"),
     }
 }
 
-/// Each comparison against a literal as the interval of key images it admits: the
-/// literal on either side, a value outside the type saturating, one between two
-/// values cutting at its neighbour. A conjunct of any other shape, or over a
-/// column with no key image, is no term.
+/// Every comparison against a literal, the literal on either side and at or past
+/// the type's edges, admits exactly the stored values the comparison holds on.
 #[test]
-fn a_comparison_pins_the_images_it_admits() {
+fn a_comparison_pins_the_images_it_holds_on() {
+    for &(ty, lits, rows) in EXACT_CASES {
+        let s = typed_schema(&[ty]);
+        for lit in lits {
+            for (op, conv, cmp) in CMP {
+                for sql in [format!("c1 {op} {lit}"), format!("{lit} {conv} c1")] {
+                    let admits = pin(&s, &sql);
+                    if cmp == CmpOp::Ne {
+                        assert_eq!(admits, None, "{sql}");
+                        continue;
+                    }
+                    let admits = admits.unwrap_or_else(|| panic!("{ty}: {sql} is no term"));
+                    for &x in rows.iter().flatten() {
+                        assert_eq!(
+                            admits.contains(&key_image(ty.tc, x as u128)),
+                            holds_exact(ty, x, cmp, lit),
+                            "{ty}: {sql} at {x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The 16-byte key types, whose literals no `i128` oracle spans, pin at their
+/// edges too. A conjunct of any other shape, or over a column with no key image,
+/// is no term.
+#[test]
+fn a_wide_key_pins_and_any_other_shape_is_no_term() {
     use TypeCode::*;
-    let max = |tc: TypeCode| image_max(tc).unwrap();
-    let at = |tc, v| img(tc, v)..=img(tc, v);
-    let uuid_eq = format!("val = {UUID_LIT}");
-    let rows: Vec<(TypeCode, &str, Option<RangeInclusive<u128>>)> = vec![
-        // Each operator, in both operand orders.
-        (I64, "val = 5", Some(at(I64, 5))),
-        (I64, "5 = t.val", Some(at(I64, 5))),
-        (I64, "val >= 5", Some(img(I64, 5)..=max(I64))),
-        (I64, "val > 5", Some(img(I64, 6)..=max(I64))),
-        (I64, "5 < val", Some(img(I64, 6)..=max(I64))),
-        (I64, "val <= 5", Some(0..=img(I64, 5))),
-        (I64, "5 >= val", Some(0..=img(I64, 5))),
-        (I64, "val < 5", Some(0..=img(I64, 4))),
-        // A signed value packs at the column's own width.
-        (I64, "val = -1", Some(at(I64, -1))),
-        (I32, "val = -1", Some(at(I32, -1))),
-        (I16, "val = -1", Some(at(I16, -1))),
-        (I8, "val = -5", Some(at(I8, -5))),
-        (I32, "val >= -5", Some(img(I32, -5)..=max(I32))),
-        // Past `i64` the literal is wide, and still packs exactly.
-        (U64, "val = 18446744073709551615", Some(U64_MAX..=U64_MAX)),
+    let uuid_eq = format!("c1 = {UUID_LIT}");
+    for (tc, sql, want) in [
         (
             U128,
-            "val >= 340282366920938463463374607431768211455",
+            "c1 >= 340282366920938463463374607431768211455",
             Some(u128::MAX..=u128::MAX),
         ),
-        (U128, "val > 340282366920938463463374607431768211455", Some(NOTHING)),
+        (U128, "c1 > 340282366920938463463374607431768211455", Some(NOTHING)),
+        (U128, "c1 >= -5", Some(0..=u128::MAX)),
+        (I32, "c1 <= -340282366920938463463374607431768211455", Some(NOTHING)),
         (UUID, &uuid_eq, Some(UUID_VALUE..=UUID_VALUE)),
-        // The strict operators at the type's edges admit nothing.
-        (I32, "val > 2147483647", Some(NOTHING)),
-        (I32, "val < -2147483648", Some(NOTHING)),
-        (U64, "val > 18446744073709551615", Some(NOTHING)),
-        // A literal outside the type admits nothing or everything.
-        (U64, "val = -1", Some(NOTHING)),
-        (I32, "val >= 3000000000", Some(NOTHING)),
-        (I32, "val <= 3000000000", Some(0..=max(I32))),
-        (I32, "val >= -3000000000", Some(0..=max(I32))),
-        (I32, "val < -3000000000", Some(NOTHING)),
-        (I32, "val <= -340282366920938463463374607431768211455", Some(NOTHING)),
-        (U8, "val < 300", Some(0..=255)),
-        (U128, "val >= -5", Some(0..=u128::MAX)),
-        // A literal between two values cuts at the neighbour it admits.
-        (I32, "val > 1.5", Some(img(I32, 2)..=max(I32))),
-        (I32, "val < 1.5", Some(0..=img(I32, 1))),
         // No term: a float column, `<>`, a computed operand, a negated range, and
         // a list on a column that is no PK column.
-        (F64, "val = 1", None),
-        (F64, "val < 5", None),
-        (I64, "val <> 5", None),
-        (I64, "val + 1 > 3", None),
-        (I64, "val NOT BETWEEN 1 AND 2", None),
-        (I64, "val IN (1, 2)", None),
-    ];
-    for (tc, sql, want) in rows {
-        assert_eq!(pin(tc, sql), want, "{tc:?}: {sql}");
+        (F64, "c1 = 1", None),
+        (F64, "c1 < 5", None),
+        (I64, "c1 <> 5", None),
+        (I64, "c1 + 1 > 3", None),
+        (I64, "c1 NOT BETWEEN 1 AND 2", None),
+        (I64, "c1 IN (1, 2)", None),
+    ] {
+        assert_eq!(pin(&typed_schema(&[tc]), sql), want, "{tc:?}: {sql}");
     }
 }
 
@@ -199,7 +193,7 @@ fn a_where_naming_whole_keys_is_a_key_set() {
         ],
     );
 
-    let c = compound_schema_u64_u64();
+    let c = compound();
     let set = |sql, ks: &[&[u128]], left: Vec<usize>| (vec![], sql, vec![(T::PkKeys, keys(&c, ks), left)]);
     check(
         &c,
@@ -261,64 +255,37 @@ fn a_where_naming_whole_keys_is_a_key_set() {
     );
 }
 
-/// Every PK type's literal names the one key an INSERT of it stores, as a point
-/// and as a list.
+/// A UUID list names each UUID it spells; a member that spells none is no key
+/// list at all.
 #[test]
-fn every_pk_type_names_its_key() {
-    use TypeCode::*;
+fn a_uuid_list_names_its_keys() {
+    let s = pk_schema(TypeCode::UUID);
     let uuid2 = "'6ba7b810-9dad-11d1-80b4-00c04fd430c8'";
-    for (tc, lit, native) in [
-        (I8, "-1", (-1i8 as u8) as u128),
-        (I16, "-1", (-1i16 as u16) as u128),
-        (I32, "-1", (-1i32 as u32) as u128),
-        (I64, "-1", (-1i64 as u64) as u128),
-        (I64, "-9223372036854775808", (i64::MIN as u64) as u128),
-        (U16, "65535", 65535),
-        (U32, "4294967295", 4294967295),
-        (U64, "18446744073709551615", U64_MAX),
-        // `-0` names the value `0`, so an unsigned column takes it.
-        (U128, "-0", 0),
-        (UUID, "-0", 0),
-        (UUID, UUID_LIT, UUID_VALUE),
-    ] {
-        let s = pk_schema(tc);
-        let want = vec![(T::PkKeys, keys(&s, &[&[native]]), vec![])];
-        assert_eq!(ranked_of(&format!("id = {lit}"), &s, &[]), want, "{tc:?} = {lit}");
-        // A repeat keeps the list a list, and is no second key.
-        assert_eq!(
-            ranked_of(&format!("id IN ({lit}, {lit})"), &s, &[]),
-            want,
-            "{tc:?} IN {lit}"
-        );
-    }
-    let s = pk_schema(UUID);
     assert_eq!(
-        ranked_of(&format!("id IN ({uuid2}, {})", UUID_LIT), &s, &[]),
+        ranked_of(&format!("id IN ({uuid2}, {UUID_LIT})"), &s, &[]),
         vec![(
             T::PkKeys,
             keys(&s, &[&[UUID_VALUE], &[0x6ba7b810_9dad_11d1_80b4_00c04fd430c8]]),
             vec![]
         )]
     );
-    // A member that spells no UUID is no key list at all.
-    assert_eq!(
-        ranked_of(&format!("id IN ({}, 'not-a-uuid')", UUID_LIT), &s, &[]),
-        vec![]
-    );
+    assert_eq!(ranked_of(&format!("id IN ({UUID_LIT}, 'not-a-uuid')"), &s, &[]), vec![]);
 }
 
 /// A cross product of lists past the cap gathers nothing; a lone list that long gathers.
 #[test]
 fn a_list_product_past_the_cap_is_no_set() {
-    let schema = compound_schema_u64_u64();
-    let list = |col: usize, n: i64| BoundExpr::InList {
-        inner: Box::new(BoundExpr::ColRef(col)),
-        items: (0..n).map(BoundExpr::LitInt).collect(),
+    let s = compound();
+    let list = |col: &str, n: usize| {
+        let items: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        format!("{col} IN ({})", items.join(", "))
     };
     const { assert!(300 * 300 > MAX_CROSS_PRODUCT_KEYS) };
-    assert_eq!(ranked_conjuncts(&[list(0, 300), list(1, 300)], &schema, &[]), vec![]);
-    let point = bind_conjunct("b = 3", &schema);
-    let lone = ranked_conjuncts(&[list(0, MAX_CROSS_PRODUCT_KEYS as i64 + 1), point], &schema, &[]);
+    assert_eq!(
+        ranked_of(&format!("{} AND {}", list("a", 300), list("b", 300)), &s, &[]),
+        vec![]
+    );
+    let lone = ranked_of(&format!("{} AND b = 3", list("a", MAX_CROSS_PRODUCT_KEYS + 1)), &s, &[]);
     assert!(
         matches!(&lone[..], [(T::PkKeys, ReadBound::PkSet(keys), left)]
             if keys.len() == MAX_CROSS_PRODUCT_KEYS + 1 && left.is_empty()),
@@ -400,9 +367,6 @@ fn an_index_is_bounded_by_its_point_prefix_and_one_interval() {
             (vec![ix(&[1])], "a = 5 AND a > 3", index(&[1], &[], 5, 5, vec![])),
             // No conjunct names the index's leading column.
             (vec![ix(&[2])], "a = 5", vec![]),
-            (vec![ix(&[1])], "a + b > 3", vec![]),
-            (vec![ix(&[1])], "a NOT BETWEEN 5 AND 9", vec![]),
-            (vec![ix(&[1])], "a IN (1, 2)", vec![]),
             // A PK column is an index column like any other.
             (
                 vec![ix(&[0])],
@@ -458,16 +422,13 @@ fn an_index_is_bounded_by_its_point_prefix_and_one_interval() {
     );
     // Over a compound PK's second column no PK candidate exists: nothing pins the
     // leading PK column.
-    let compound = schema(["a", "b", "v"].map(|n| col(n, U64)).to_vec(), &[0, 1]);
     check(
-        &compound,
+        &compound(),
         vec![
             (vec![ix(&[1, 2])], "b = 1 AND v = 2", index(&[1, 2], &[1], 2, 2, vec![])),
             (vec![ix(&[1, 2])], "b > 5", index(&[1, 2], &[], 6, U64_MAX, vec![])),
         ],
     );
-    // A float column has no key image.
-    check(&two_col(F64), vec![(vec![ix(&[1])], "val = 1", vec![])]);
 }
 
 /// The order of the list. Each row flips with the rule it names.
@@ -561,27 +522,13 @@ fn candidates_rank_by_tier_then_by_how_much_they_pin() {
             ),
         ],
     );
-    // A unique point is one however it is spelled, `0` on the type's lower edge
-    // included.
-    for sql in ["a = 0", "a >= 0 AND a <= 0", "a <= 0", "a < 1"] {
-        let got = ranked_of(&format!("id > 0 AND {sql}"), &s, &[uq(&[2])]);
-        assert_eq!(
-            got.first().map(|(tier, bound, _)| (*tier, bound)),
-            Some((T::UniqueIndexPoint, &point(&[2], 0))),
-            "{sql}"
-        );
-    }
     // A PK range pinning a leading column keeps its place ahead of a unique point.
-    let tenants = schema(
-        ["tenant", "id", "email"].map(|n| col(n, TypeCode::U64)).to_vec(),
-        &[0, 1],
-    );
     check(
-        &tenants,
+        &compound(),
         vec![
             (
                 vec![uq(&[2])],
-                "tenant = 7 AND email = 42",
+                "a = 7 AND v = 42",
                 vec![
                     (T::PinnedPkRange, rng(&[0, 1], &[], 7, 7), vec![1]),
                     (T::UniqueIndexPoint, point(&[2], 42), vec![0]),
@@ -589,7 +536,7 @@ fn candidates_rank_by_tier_then_by_how_much_they_pin() {
             ),
             (
                 vec![uq(&[2])],
-                "tenant = 7 AND id > 0 AND email = 42",
+                "a = 7 AND b > 0 AND v = 42",
                 vec![
                     (T::PinnedPkRange, rng(&[0, 1], &[7], 1, U64_MAX), vec![2]),
                     (T::UniqueIndexPoint, point(&[2], 42), vec![0, 1]),

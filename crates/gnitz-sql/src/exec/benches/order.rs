@@ -70,6 +70,7 @@ fn order_window_bench() {
         // The call consumes its batch, so the clone it is handed is measured and subtracted.
         let (copy, clone) = counter.measure(|| b.clone());
         let (out, sort) = counter.measure(|| order_and_window(&sch, b.clone(), order, window));
+        assert_eq!(out.len(), window.limit.unwrap_or(ROWS), "{name}");
         std::hint::black_box((copy, out));
         println!(
             "order_window_bench {name:<30} {:7.1} instr/row",

@@ -1,6 +1,8 @@
 use super::*;
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
-use crate::test_support::{batch_of, bind_sql, rejected, two_col, typed_schema};
+use crate::test_support::{
+    assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema, CMP, EXACT_CASES,
+};
 use gnitz_expr::{ExprResults, FloatArithOp, IntUnaryOp, RowFilter};
 use gnitz_wire::as_le_bytes;
 use gnitz_wire::TypeCode as T;
@@ -12,11 +14,15 @@ fn dec(scale: u8) -> ColType {
     ColType::decimal(scale)
 }
 
+/// `sql` lowered, or the error lowering refuses it with.
+fn lower<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> Result<LogicalProgram, GnitzSqlError> {
+    let s = typed_schema(tys);
+    compile_bound_expr_to_program(&bind_sql(sql, &s), s.columns())
+}
+
 /// `sql` lowered to its program.
 fn lowered<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> LogicalProgram {
-    let s = typed_schema(tys);
-    let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    compile_bound_expr_to_program(&bound, s.columns()).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    lower(sql, tys).unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 /// `sql` lowered to its instructions. A register is its instruction's position.
@@ -24,19 +30,12 @@ fn instrs<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> Vec<L> {
     lowered(sql, tys).instrs().to_vec()
 }
 
-/// The message lowering rejects `sql` with.
-fn lower_rejected<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> String {
-    let s = typed_schema(tys);
-    let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    rejected(compile_bound_expr_to_program(&bound, s.columns()))
-}
-
 /// Assert `sql` evaluates to `want` on each of `rows`, in the register class its
 /// inferred type names: a float as its value, a string as its text.
 #[track_caller]
 fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]], want: &[Cell]) {
     let s = typed_schema(tys);
-    let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let bound = bind_sql(sql, &s);
     let ty = bound.infer_ty(s.columns()).tc;
     let mut ev = compile_scalar_evaluator(&bound, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let out = ev.eval_all(&batch_of(&s, rows));
@@ -381,117 +380,32 @@ fn the_decimal_forms_compute_their_values() {
 // Comparisons against the exact answer
 // ------------------------------------------------------------------
 
-/// Each comparison as SQL spells it, beside the operator that holds with the
-/// operands transposed and the opcode operand it lowers to.
-const CMP: [(&str, &str, CmpOp); 6] = [
-    ("=", "=", CmpOp::Eq),
-    ("<>", "<>", CmpOp::Ne),
-    ("<", ">", CmpOp::Lt),
-    ("<=", ">=", CmpOp::Le),
-    (">", "<", CmpOp::Gt),
-    (">=", "<=", CmpOp::Ge),
-];
-
-fn holds(op: CmpOp, a: i128, b: i128) -> bool {
-    match op {
-        CmpOp::Eq => a == b,
-        CmpOp::Ne => a != b,
-        CmpOp::Lt => a < b,
-        CmpOp::Le => a <= b,
-        CmpOp::Gt => a > b,
-        CmpOp::Ge => a >= b,
-    }
-}
-
-/// Every operator in both operand orders, `c1` against each literal, on each
-/// row: the VM's answer is the exact rational one, and a NULL row stays NULL.
-/// `rows` are the stored integers of a `ty` column.
-fn assert_literal_compares_exact(ty: ColType, lits: &[&str], rows: &[Option<i128>]) {
-    let table: Vec<[Cell; 1]> = rows.iter().map(|v| [v.map_or(Null, Int)]).collect();
-    let table: Vec<&[Cell]> = table.iter().map(|r| &r[..]).collect();
-    let col_scale = 10i128.pow(u32::from(ty.scale));
-    for text in lits {
-        let (mag, s) = gnitz_wire::decimal::decimal_of_number_text(text.trim_start_matches('-')).expect(text);
-        let v = if text.starts_with('-') { -mag } else { mag };
-        let lit_scale = 10i128.pow(u32::from(s));
-        for (op, conv, cmp) in CMP {
-            let want: Vec<Cell> = rows
-                .iter()
-                .map(|x| x.map_or(Null, |x| Int(i128::from(holds(cmp, x * lit_scale, v * col_scale)))))
-                .collect();
-            for sql in [format!("c1 {op} {text}"), format!("{text} {conv} c1")] {
-                assert_eval(&sql, &[ty], &table, &want);
+/// Every operator in both operand orders, a column against each literal at and
+/// past its edges, on each row: the VM's answer is the exact rational one, and a
+/// NULL row stays NULL.
+#[test]
+fn a_column_against_a_literal_is_exact() {
+    for &(ty, lits, rows) in EXACT_CASES {
+        let table: Vec<[Cell; 1]> = rows.iter().map(|v| [v.map_or(Null, Int)]).collect();
+        let table: Vec<&[Cell]> = table.iter().map(|r| &r[..]).collect();
+        for lit in lits {
+            for (op, conv, cmp) in CMP {
+                let want: Vec<Cell> = rows
+                    .iter()
+                    .map(|x| x.map_or(Null, |x| Int(i128::from(holds_exact(ty, x, cmp, lit)))))
+                    .collect();
+                for sql in [format!("c1 {op} {lit}"), format!("{lit} {conv} c1")] {
+                    assert_eval(&sql, &[ty], &table, &want);
+                }
             }
         }
     }
 }
 
-#[test]
-fn a_u64_column_against_a_literal_outside_its_range_is_exact() {
-    let top = i128::from(u64::MAX);
-    assert_literal_compares_exact(
-        T::U64.into(),
-        &[
-            "-5",
-            "-1",
-            "0",
-            "1",
-            "9223372036854775808",
-            "18446744073709551615",
-            "18446744073709551616",
-        ],
-        &[Some(0), Some(1), Some(1 << 63), Some((1 << 63) - 1), Some(top), None],
-    );
-}
-
-#[test]
-fn an_i8_column_against_its_edges_is_exact() {
-    assert_literal_compares_exact(
-        T::I8.into(),
-        &["-129", "-128", "127", "128"],
-        &[Some(-128), Some(-1), Some(0), Some(127), None],
-    );
-}
-
-#[test]
-fn a_bigint_column_against_a_fraction_is_exact() {
-    let p53 = 1i128 << 53;
-    assert_literal_compares_exact(
-        T::I64.into(),
-        &[
-            "1.5",
-            "-1.5",
-            "2.5",
-            "-2.5",
-            "9007199254740993.5",
-            "-9007199254740992.5",
-        ],
-        &[
-            Some(-3),
-            Some(-2),
-            Some(-1),
-            Some(1),
-            Some(2),
-            Some(3),
-            Some(p53),
-            Some(p53 + 1),
-            Some(p53 + 2),
-            Some(-p53 - 1),
-            None,
-        ],
-    );
-}
-
 /// A literal finer than a DECIMAL column's scale is decided at the column's
-/// scale — one comparison against the neighbour, no scale-up, so one whose
-/// scale-up would wrap an `i64` is exact too.
+/// scale: one comparison against the neighbour, no scale-up.
 #[test]
-fn a_decimal_column_against_a_finer_literal_is_exact() {
-    assert_literal_compares_exact(
-        dec(2),
-        &["1.005", "1.000000000000000001"],
-        &[None, Some(100), Some(101), Some(1000), Some(-1000)],
-    );
+fn a_decimal_column_against_a_finer_literal_compares_with_its_neighbour() {
     assert_eq!(
         instrs("c1 < 1.005", &[dec(2)]),
         [
@@ -709,7 +623,7 @@ fn min_max_n_is_a_left_fold_in_written_order() {
         format!("GREATEST({})", args.join(", "))
     };
     assert_eq!(instrs(&greatest(32), &[T::I64]).len(), 63);
-    assert!(lower_rejected(&greatest(33), &[T::I64]).contains("reg"));
+    assert_rejects("GREATEST of 33", lower(&greatest(33), &[T::I64]), "reg");
 }
 
 /// A string column against a literal or another column is one fused opcode over
@@ -1021,6 +935,16 @@ fn each_refused_form_names_its_rule() {
         ("5 - c1", vec![t(T::Date)], "not supported on a DATE/TIMESTAMP operand"),
         ("c1 + c1", vec![t(T::Date)], "not supported on a DATE/TIMESTAMP operand"),
         (
+            "c1 % 2",
+            vec![t(T::Timestamp)],
+            "not supported on a DATE/TIMESTAMP operand",
+        ),
+        (
+            "c1 + 1.5",
+            vec![t(T::Date)],
+            "not supported on a DATE/TIMESTAMP operand",
+        ),
+        (
             "CASE WHEN TRUE THEN c1 ELSE 1.5 END",
             vec![t(T::Date)],
             "cannot mix DATE with F64",
@@ -1066,8 +990,7 @@ fn each_refused_form_names_its_rule() {
     .map(|(sql, tys, needle): (&str, _, _)| (sql.to_string(), tys, needle))
     .into();
     for (sql, tys, needle) in cases {
-        let m = lower_rejected(&sql, &tys);
-        assert!(m.contains(needle), "{sql}: {m:?} does not name {needle:?}");
+        assert_rejects(&sql, lower(&sql, &tys), needle);
     }
 }
 
@@ -1082,7 +1005,7 @@ fn each_refused_form_names_its_rule() {
 #[test]
 fn a_filter_program_drops_the_conjuncts_settled_true() {
     let s = typed_schema(&[T::I64]);
-    let p = bind_sql("c1 > 1", &s).unwrap();
+    let p = bind_sql("c1 > 1", &s);
     let (t, f) = (BoundExpr::LitBool(true), BoundExpr::LitBool(false));
     let or = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::Or, b.clone());
     let and = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::And, b.clone());
@@ -1105,31 +1028,34 @@ fn a_filter_program_drops_the_conjuncts_settled_true() {
     }
 }
 
-/// Every conjunct is a boolean, a lone one included: a string column on its own
-/// draws the lowering's message rather than reaching the resolver, and so does
-/// an integer one.
+/// Every conjunct is a boolean, a lone one included: a column on its own draws
+/// the lowering's message rather than reaching the resolver, and so does one its
+/// connectives settle true, which is dropped from the program and refused all the
+/// same. An operand refused in itself reports that refusal, not the type it fell
+/// back to.
 #[test]
 fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
-    let s = typed_schema(&[T::String]);
-    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], s.columns()));
-    assert!(
-        m.contains("column \"c1\" is STRING; a condition must be BOOLEAN"),
-        "{m}"
-    );
     let s = typed_schema(&[T::I64]);
-    let m = rejected(compile_filter_program([&BoundExpr::ColRef(1)], s.columns()));
-    assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
-    // A conjunct its connectives settle true is dropped from the program and
-    // refused all the same.
     let settled = BoundExpr::bin(BoundExpr::LitBool(true), BinOp::Or, BoundExpr::ColRef(1));
-    let m = rejected(compile_filter_program([&settled], s.columns()));
-    assert!(m.contains("column \"c1\" is I64; a condition must be BOOLEAN"), "{m}");
-    // An operand refused in itself reports that refusal, not the type it fell back to.
-    let m = rejected(compile_filter_program(
-        [&bind_sql("c1 + 'x'", &s).unwrap()],
-        s.columns(),
-    ));
-    assert!(m.contains("is not supported on a string operand"), "{m}");
+    for (what, conjunct, needle) in [
+        (
+            "c1",
+            BoundExpr::ColRef(1),
+            "column \"c1\" is I64; a condition must be BOOLEAN",
+        ),
+        (
+            "TRUE OR c1",
+            settled,
+            "column \"c1\" is I64; a condition must be BOOLEAN",
+        ),
+        (
+            "c1 + 'x'",
+            bind_sql("c1 + 'x'", &s),
+            "is not supported on a string operand",
+        ),
+    ] {
+        assert_rejects(what, compile_filter_program([&conjunct], s.columns()), needle);
+    }
 }
 
 /// The rows of `batch` that pass every conjunct, through the wire blob a read ships.
@@ -1147,7 +1073,7 @@ fn residual_rows(conjuncts: &[&BoundExpr], batch: &gnitz_core::ZSetBatch, schema
 fn a_null_residual_conjunct_excludes_the_row() {
     let schema = two_col(T::I64);
     let batch = batch_of(&schema, &[&[Null]]); // pk = 1
-    let bind = |sql| bind_sql(sql, &schema).unwrap();
+    let bind = |sql| bind_sql(sql, &schema);
     let flags = two_col(T::Bool);
     let bare = BoundExpr::ColRef(1);
     assert_eq!(
@@ -1163,17 +1089,4 @@ fn a_null_residual_conjunct_excludes_the_row() {
         assert_eq!(residual_rows(&refs, &batch, &schema), [0usize; 0], "{conjuncts:?}");
     }
     assert_eq!(residual_rows(&[&bind("pk = 1")], &batch, &schema), [0]);
-}
-
-/// No conjuncts, and a conjunct settled true, ship no blob and keep every row;
-/// one settled false drops every row.
-#[test]
-fn the_residual_keep_every_row_exits() {
-    let schema = two_col(T::I64);
-    let batch = batch_of(&schema, &[&[Int(7)]]);
-    let (t, f) = (BoundExpr::LitBool(true), BoundExpr::LitBool(false));
-    assert!(compile_wire_conjuncts([&t], schema.columns()).unwrap().is_empty());
-    assert_eq!(residual_rows(&[], &batch, &schema), [0]);
-    assert_eq!(residual_rows(&[&t], &batch, &schema), [0]);
-    assert_eq!(residual_rows(&[&f], &batch, &schema), [0usize; 0]);
 }

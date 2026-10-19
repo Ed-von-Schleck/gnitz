@@ -17,7 +17,7 @@ use crate::bind::Catalog;
 use crate::ddl::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
-use crate::source::StatementText;
+use crate::source::split_statements;
 use crate::test_support::*;
 use gnitz_core::PlannedView;
 use gnitz_wire::{OpNode, RelClass, TypeCode};
@@ -87,11 +87,13 @@ fn base() -> TestCatalog {
 /// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
 /// here carry `IF NOT EXISTS`, the one clause that plans nothing.
 fn plan(cat: &dyn Catalog, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
-    match parse_stmt(sql) {
-        Statement::CreateView(cv) => plan_create_view(&cv, StatementText::whole(sql), cat)
-            .map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing"))),
+    let (stmt, text) = split_statements(sql).expect("parses").remove(0);
+    match stmt {
+        Statement::CreateView(cv) => {
+            plan_create_view(&cv, text, cat).map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing")))
+        }
         Statement::AlterView { name, columns, query, with_options } => {
-            plan_alter_view(&name, &columns, &query, &with_options, StatementText::whole(sql), cat)
+            plan_alter_view(&name, &columns, &query, &with_options, text, cat)
         }
         _ => panic!("`{sql}` is not a view statement"),
     }

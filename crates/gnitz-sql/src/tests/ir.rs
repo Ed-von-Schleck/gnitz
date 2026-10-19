@@ -1,6 +1,9 @@
 use super::*;
-use crate::test_support::{bind_sql, bind_where, col, ncol, schema};
+use crate::expr_lower::compile_scalar_evaluator;
+use crate::test_support::Cell::{self, Int, Null};
+use crate::test_support::{batch_of, bind_sql, bind_where, col, ncol, schema};
 use gnitz_core::Schema;
+use gnitz_expr::ExprResults;
 use gnitz_wire::ColumnDef;
 
 /// `(pk | u U64 | u32 | i8 | i I64 | f F64 | f32 | s STRING | d DATE | ts TIMESTAMP
@@ -64,8 +67,10 @@ fn each_node_types_as_the_value_it_computes() {
         ("-f32", t(F64)),
         ("-u", t(U64)),
         ("-p", dec(2)),
-        // A shift keeps the temporal type; a difference is an integer.
+        // A shift keeps the temporal type, either side; a difference is an integer.
         ("d + 1", t(Date)),
+        ("1 + d", t(Date)),
+        ("ts - i8", t(Timestamp)),
         ("ts - d", t(I64)),
         ("d - d", t(I64)),
         ("DATE_TRUNC('month', ts)", t(Timestamp)),
@@ -114,9 +119,21 @@ fn each_node_types_as_the_value_it_computes() {
         ("ABS(q)", dec(3)),
         ("SQRT(q)", t(F64)),
         ("SIGN(q)", t(I64)),
+        // The rounding family and ABS keep the argument's register image, the
+        // transcendentals lift to F64, SIGN is I64 over an integer and F64 over a float.
+        ("ABS(u)", t(U64)),
+        ("FLOOR(u32)", t(I64)),
+        ("CEIL(f32)", t(F64)),
+        ("TRUNC(i8)", t(I64)),
+        ("ROUND(u, 2)", t(U64)),
+        ("ROUND(i, -1)", t(F64)),
+        ("LN(i)", t(F64)),
+        ("EXP(f)", t(F64)),
+        ("SIGN(u)", t(I64)),
+        ("SIGN(i8)", t(I64)),
+        ("SIGN(f32)", t(F64)),
     ] {
-        let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(bound.infer_ty(s.columns()), want, "{sql}");
+        assert_eq!(bind_sql(sql, &s).infer_ty(s.columns()), want, "{sql}");
     }
 }
 
@@ -147,57 +164,10 @@ fn unify_blend_type_rule() {
     }
 }
 
-/// Arithmetic with a temporal operand: a shift keeps the type, a difference is
-/// an integer, and nothing else is typed.
-#[test]
-fn temporal_arithmetic_is_an_allow_list() {
-    use TypeCode::*;
-    let t = |op, l: TypeCode, r: TypeCode| temporal_arith_type(op, l.into(), r.into());
-    assert_eq!(t(BinOp::Add, Date, I64), Some(Date.into()));
-    assert_eq!(t(BinOp::Sub, Timestamp, I32), Some(Timestamp.into()));
-    assert_eq!(t(BinOp::Add, I64, Date), Some(Date.into()));
-    assert_eq!(t(BinOp::Sub, Date, Date), Some(I64.into()));
-    assert_eq!(t(BinOp::Sub, Timestamp, Date), Some(I64.into()));
-    for (op, l, r) in [
-        (BinOp::Mul, Date, I64),
-        (BinOp::Div, Timestamp, I64),
-        (BinOp::Mod, Timestamp, I64),
-        (BinOp::Sub, I64, Date),
-        (BinOp::Add, Date, Date),
-        (BinOp::Add, Date, F64),
-    ] {
-        assert_eq!(t(op, l, r), None, "{op:?} {l:?} {r:?}");
-    }
-}
-
-/// The numeric functions' result types: the rounding family and ABS keep the
-/// argument's register image, the transcendentals lift to F64, and SIGN is a
-/// signed integer over any integer argument and a float over a float one.
-#[test]
-fn num_func_result_types() {
-    use FloatUnaryOp as F;
-    use TypeCode::*;
-    let ty = |f: NumFunc, arg: TypeCode| f.result_type(arg.into());
-    for f in [F::Abs, F::Floor, F::Ceil, F::Trunc, F::Round].map(NumFunc::Unary) {
-        assert_eq!(ty(f, U64), U64.into(), "{f:?}");
-        assert_eq!(ty(f, I32), I64.into(), "{f:?}");
-        assert_eq!(ty(f, F32), F64.into(), "{f:?}");
-    }
-    assert_eq!(ty(NumFunc::Round(2), U64), U64.into());
-    assert_eq!(ty(NumFunc::Round(-1), I64), F64.into());
-    for f in [F::Sqrt, F::Ln, F::Log10, F::Exp].map(NumFunc::Unary) {
-        assert_eq!(ty(f, I64), F64.into(), "{f:?}");
-        assert_eq!(ty(f, F64), F64.into(), "{f:?}");
-    }
-    let sign = NumFunc::Unary(F::Sign);
-    assert_eq!(ty(sign, U64), I64.into());
-    assert_eq!(ty(sign, I8), I64.into());
-    assert_eq!(ty(sign, F32), F64.into());
-}
-
 /// Each shape with `{x}` a NOT NULL column and with it a nullable one:
 /// `never_null` proves the first exactly when no kernel the shape lowers to
-/// makes a NULL of its own, and never proves the second.
+/// makes a NULL of its own, and never proves the second. What it proves, the
+/// evaluator holds to over every column at its edges.
 #[test]
 fn never_null_follows_the_kernels_that_make_a_null() {
     // `c`, `nts` and `nu` are nullable, every other column NOT NULL.
@@ -214,11 +184,8 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         ],
         &[0],
     );
-    let never_null = |sql: &str| {
-        bind_sql(sql, &s)
-            .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .never_null(s.columns())
-    };
+    let never_null = |sql: &str| bind_sql(sql, &s).never_null(s.columns());
+    let mut proven = Vec::new();
     for (shape, over_not_null) in [
         ("{x} + 1", true),
         ("POWER({x}, 2)", true),
@@ -258,7 +225,11 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         ("pk / -2 + 0 * {x}", false),
         ("d + pk < d OR {x} = 1", false),
     ] {
-        assert_eq!(never_null(&shape.replace("{x}", "n")), over_not_null, "{shape}");
+        let sql = shape.replace("{x}", "n");
+        assert_eq!(never_null(&sql), over_not_null, "{shape}");
+        if over_not_null {
+            proven.push(sql);
+        }
         assert!(
             !never_null(&shape.replace("{x}", "c")),
             "{shape} over a nullable column"
@@ -290,7 +261,37 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         ("GREATEST(p, pk)", true),
     ] {
         assert_eq!(never_null(sql), want, "{sql}");
+        if want {
+            proven.push(sql.to_string());
+        }
     }
+    // `(n, c, d, ts, nts, nu, p)`: each NOT NULL column cycles through its edges,
+    // each nullable one is NULL on every other row.
+    let i64s = [0, 1, -1, i128::from(i64::MIN), i128::from(i64::MAX)];
+    let days = [0, i128::from(i32::MIN), i128::from(i32::MAX)];
+    let rows: Vec<Vec<Cell>> = (0..30)
+        .map(|r| {
+            let (v, day) = (Int(i64s[r % 5]), Int(days[r % 3]));
+            let maybe = |cell| if r % 2 == 0 { Null } else { cell };
+            vec![v, maybe(v), day, v, maybe(v), maybe(Int(i128::from(u64::MAX))), v]
+        })
+        .collect();
+    let rows: Vec<&[Cell]> = rows.iter().map(|r| &r[..]).collect();
+    let batch = batch_of(&s, &rows);
+    let mut lowered = 0;
+    for sql in &proven {
+        // A shape lowering refuses over these columns is the classifier's alone.
+        let Ok(mut ev) = compile_scalar_evaluator(&bind_sql(sql, &s), &s) else {
+            continue;
+        };
+        lowered += 1;
+        let nulls = match ev.eval_all(&batch) {
+            ExprResults::Int(vals) => vals.iter().filter(|v| v.is_none()).count(),
+            ExprResults::Str { spans, .. } => spans.iter().filter(|v| v.is_none()).count(),
+        };
+        assert_eq!(nulls, 0, "{sql} is proven never NULL");
+    }
+    assert!(lowered >= 17, "only {lowered} proven shapes lower");
 }
 
 /// A predicate splits at every top-level AND, however the tree nests, in written
@@ -299,7 +300,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
 fn conjuncts_are_the_leaves_of_the_and_tree_in_order() {
     let s = typed();
     let leaves: Vec<BoundExpr> = ["u = 1", "i = 2 OR f = 0", "d = 3"]
-        .map(|sql| bind_sql(sql, &s).unwrap())
+        .map(|sql| bind_sql(sql, &s))
         .to_vec();
     for sql in [
         "u = 1 AND (i = 2 OR f = 0) AND d = 3",

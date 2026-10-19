@@ -694,8 +694,6 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT id FROM t FOR UPDATE", "FOR UPDATE"),
         ("SELECT id FROM t SETTINGS max_threads = 1", "SETTINGS"),
         ("SELECT id FROM t FORMAT JSON", "FORMAT"),
-        ("SELECT * REPLACE (v + 1 AS v) FROM t", "REPLACE"),
-        ("SELECT * ILIKE 'v%' FROM t", "ILIKE"),
         // Zero rows would make a stream indistinguishable from an empty table.
         ("SELECT * FROM st", "is a stream"),
         ("WITH c AS (SELECT id FROM st) SELECT id FROM c", "is a stream"),
@@ -747,9 +745,6 @@ fn a_read_the_planner_rejects_names_its_rule() {
     ] {
         assert_rejects(sql, read(&cat, sql), msg);
     }
-    // The CTE rejection names the offending clause too.
-    let m = rejected(read(&cat, "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x"));
-    assert!(m.contains("DISTINCT"), "got {m}");
 }
 
 /// A subscription is a rows read: a delta of an aggregate, an order or a cut is

@@ -19,11 +19,11 @@ fn schema() -> gnitz_core::Schema {
 }
 
 fn b(src: &str) -> BoundExpr {
-    bind_sql(src, &schema()).unwrap_or_else(|e| panic!("{src}: {e}"))
+    bind_sql(src, &schema())
 }
 
 fn b_err(src: &str) -> String {
-    rejected(bind_sql(src, &schema()))
+    rejected(bind_single_table(&parse_expr_sql(src), &schema(), "t"))
 }
 
 const C: BoundExpr = BoundExpr::ColRef(1);

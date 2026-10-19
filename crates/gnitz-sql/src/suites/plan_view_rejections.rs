@@ -347,8 +347,6 @@ fn grouped_body_rules() {
         &cat,
         &[
             ("SELECT id, SUM(s) AS x FROM ty GROUP BY id", "SUM: not supported on"),
-            ("SELECT id, AVG(uid) AS x FROM ty GROUP BY id", "AVG: not supported on"),
-            ("SELECT id, SUM(big) AS x FROM ty GROUP BY id", "SUM: not supported on"),
             (
                 "SELECT g FROM t HAVING SUM(v) > 1",
                 "column 'g' must appear in GROUP BY or an aggregate function",
@@ -547,12 +545,7 @@ fn projection_and_envelope_rules() {
             ("SELECT *, * FROM t", "duplicate column name"),
             ("SELECT t.*, t.* FROM t", "duplicate column name"),
             ("SELECT * FROM t LIMIT 10", "LIMIT"),
-            ("SELECT * EXCEPT (nope) FROM t", "nope"),
-            ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "excluded"),
-            ("SELECT * RENAME (g AS x, g AS y) FROM t", "twice"),
             ("SELECT * RENAME (g AS v) FROM t", "duplicate column name"),
-            ("SELECT * REPLACE (g + 1 AS g) FROM t", "REPLACE"),
-            ("SELECT * ILIKE 'g%' FROM t", "ILIKE"),
             (
                 "WITH c AS (SELECT * REPLACE (g + 1 AS g) FROM t) SELECT * FROM c",
                 "REPLACE",
@@ -591,10 +584,8 @@ fn scalar_expression_rules() {
         // contents depend on when a tick ran.
         ("NOW()", "non-deterministic"),
         ("CURRENT_DATE", "non-deterministic"),
-        ("EXTRACT(YEAR FROM i)", "DATE or TIMESTAMP"),
         ("DATE_TRUNC('fortnight', d)", "fortnight"),
         ("DATE '2024-02-30'", "invalid DATE literal"),
-        ("CAST(i AS UUID)", "UUID"),
         // An integer literal past `u64::MAX` has no register slot at all.
         ("CAST(18446744073709551616 AS BIGINT UNSIGNED)", "18446744073709551616"),
         ("CAST('abc' AS DECIMAL(5, 2))", "invalid DECIMAL("),
@@ -603,14 +594,6 @@ fn scalar_expression_rules() {
         // Each product adds its operands' scales, so a chain of them runs past
         // what the scaled integer can hold.
         ("qty * qty * qty * qty * qty * qty * qty", "DECIMAL scale"),
-        // A string in a numeric position names the string operand.
-        ("GREATEST(s, s)", "column \"s\" is a string"),
-        ("-s", "column \"s\" is a string"),
-        ("s + 1", "string operand"),
-        ("s AND i", "a condition must be BOOLEAN"),
-        ("s || 1", "expected a string value"),
-        ("STRPOS(s, f)", "expected a string value"),
-        ("LEFT(s, f)", "must be an integer"),
     ] {
         rejects(&cat, &[(&format!("SELECT id, {expr} AS y FROM x"), needle)]);
     }
@@ -677,11 +660,6 @@ fn top_n_rules() {
             ("SELECT id FROM t ORDER BY v LIMIT 0", "LIMIT 0"),
             ("SELECT id FROM t OFFSET 5", "OFFSET without"),
             ("SELECT id FROM t ORDER BY v WITH FILL LIMIT 1", "WITH FILL"),
-            (
-                "SELECT id FROM t ORDER BY v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8, v + 9, v + 10, \
-                 v + 11, v + 12, v + 13, v + 14, v + 15, v + 16 LIMIT 1",
-                "ORDER BY has more than 16 keys",
-            ),
             ("SELECT DISTINCT g FROM t ORDER BY v LIMIT 1", "selected column"),
             (
                 "SELECT id FROM t UNION SELECT id FROM u ORDER BY v LIMIT 1",

@@ -1,31 +1,41 @@
 use super::*;
 
+/// Every keyword, and names no keyword is, written as a column or as the parts of
+/// a relation name it may be, reads back as itself; a name that reads back bare is written
+/// bare, and a quote inside one is doubled.
 #[test]
-fn a_column_is_written_bare_only_when_it_reads_back_as_itself() {
+fn a_name_is_written_as_sql_reads_it_back() {
+    let specials = ["id", "orders", "a b", "say \"hi\"", "2024_sales", "ü"];
+    let keywords = sqlparser::keywords::ALL_KEYWORDS.iter().map(|k| k.to_lowercase());
+    for n in keywords.chain(specials.map(String::from)) {
+        let sql = format!("SELECT {} FROM t", column_text(&n));
+        let read = match &Parser::parse_sql(&DIALECT, &sql).unwrap()[..] {
+            [Statement::Query(q)] => match &*q.body {
+                SetExpr::Select(s) => match &s.projection[..] {
+                    [SelectItem::UnnamedExpr(Expr::Identifier(i))] => Some(i.value.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        assert_eq!(read.as_deref(), Some(&n[..]), "{sql}");
+        if RelName::new(&n, &n).is_err() {
+            continue;
+        }
+        let text = format!("{}.{}", relation_text(&n), relation_text(&n));
+        let rel = parse_relation_name(&text, "public").unwrap_or_else(|| panic!("{text}"));
+        assert_eq!((rel.schema(), rel.name()), (&n[..], &n[..]), "{text}");
+    }
     assert_eq!(column_text("id"), "id");
-    assert_eq!(column_text("name"), "name");
-    assert_eq!(column_text("a b"), "\"a b\"");
-    assert_eq!(column_text("null"), "\"null\"");
-    assert_eq!(column_text("true"), "\"true\"");
-    assert_eq!(column_text("from"), "\"from\"");
-    assert_eq!(column_text("exists"), "\"exists\"");
-    assert_eq!(column_text("say \"hi\""), "\"say \"\"hi\"\"\"");
-}
-
-#[test]
-fn a_relation_part_is_written_bare_only_when_it_reads_back_as_itself() {
     assert_eq!(relation_text("orders"), "orders");
-    assert_eq!(relation_text("2024_sales"), "\"2024_sales\"");
-    assert_eq!(relation_text("table"), "\"table\"");
-    assert_eq!(relation_text("lateral"), "\"lateral\"");
+    assert_eq!(column_text("say \"hi\""), "\"say \"\"hi\"\"\"");
 }
 
 #[test]
 fn a_relation_name_reads_as_sql_reads_it() {
     let n = parse_relation_name("\"orders\"", "public").unwrap();
     assert_eq!((n.schema(), n.name()), ("public", "orders"));
-    let n = parse_relation_name("sales.\"leads\"", "public").unwrap();
-    assert_eq!((n.schema(), n.name()), ("sales", "leads"));
     assert!(parse_relation_name("hot oops", "public").is_none());
     assert!(parse_relation_name("a.b.c", "public").is_none());
     assert!(parse_relation_name("", "public").is_none());

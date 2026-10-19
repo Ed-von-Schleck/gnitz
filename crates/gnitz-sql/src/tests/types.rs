@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{parse_stmt, rejected};
+use crate::test_support::{assert_rejects, parse_stmt};
 use sqlparser::ast::Statement;
 use sqlparser::parser::Parser;
 
@@ -11,49 +11,31 @@ fn declared(decl: &str) -> Result<(ColumnDef, bool), GnitzSqlError> {
     column_def(&create.columns[0])
 }
 
-/// Every accepted spelling, as the type it declares. A column is nullable unless
-/// it says otherwise, and a SERIAL spelling is its signed integer, NOT NULL.
+/// Every alias and modifier, as the type it declares — each type's own spelling
+/// is [`sql_type_name_round_trips`]'s. A column is nullable unless it says
+/// otherwise, and a SERIAL spelling is its signed integer, NOT NULL.
 #[test]
 fn each_accepted_spelling_declares_its_type() {
     use TypeCode::*;
     let t = ColType::of;
     let dec = ColType::decimal;
     let plain: &[(&str, ColType)] = &[
-        ("TINYINT", t(I8)),
         ("TINYINT(3)", t(I8)),
-        ("SMALLINT", t(I16)),
-        ("INT", t(I32)),
         ("INTEGER", t(I32)),
-        ("BIGINT", t(I64)),
-        ("TINYINT UNSIGNED", t(U8)),
-        ("SMALLINT UNSIGNED", t(U16)),
-        ("INT UNSIGNED", t(U32)),
         ("INTEGER UNSIGNED", t(U32)),
         ("UNSIGNED INTEGER", t(U32)),
-        ("BIGINT UNSIGNED", t(U64)),
         ("UINT128", t(U128)),
-        ("UHUGEINT", t(U128)),
         ("INT128", t(I128)),
-        ("HUGEINT", t(I128)),
-        ("FLOAT", t(F32)),
         ("FLOAT(24)", t(F32)),
-        ("DOUBLE", t(F64)),
         ("DOUBLE PRECISION", t(F64)),
         ("REAL", t(F64)),
         ("VARCHAR", t(String)),
-        ("TEXT", t(String)),
         ("CHAR", t(String)),
-        ("BLOB", t(Blob)),
         ("BYTEA", t(Blob)),
-        ("UUID", t(UUID)),
-        ("BOOLEAN", t(Bool)),
         ("BOOL", t(Bool)),
-        ("DATE", t(Date)),
-        ("TIMESTAMP", t(Timestamp)),
         ("TIMESTAMP WITHOUT TIME ZONE", t(Timestamp)),
         ("DATETIME", t(Timestamp)),
         ("TIMESTAMP_NTZ", t(Timestamp)),
-        ("DECIMAL(10, 2)", dec(2)),
         ("DECIMAL(18, 0)", dec(0)),
         ("DECIMAL(5)", dec(0)),
         ("NUMERIC(18, 18)", dec(18)),
@@ -83,15 +65,6 @@ fn each_accepted_spelling_declares_its_type() {
             "{decl}"
         );
     }
-    // Written back by a spelling that declares the same column.
-    for tc in [I16, I32, I64] {
-        let name = serial_type_name(tc).unwrap();
-        assert_eq!(
-            declared(name).unwrap(),
-            (ColumnDef::new("c", tc, false), true),
-            "{name}"
-        );
-    }
     assert_eq!(serial_type_name(U64), None);
 }
 
@@ -115,8 +88,7 @@ fn each_refused_spelling_names_its_reason() {
         // A BLOB is unbounded; a length would have to be enforced or ignored.
         ("BLOB(16)", "unsupported SQL type: BLOB(16)"),
     ] {
-        let m = rejected(declared(decl));
-        assert!(m.contains(needle), "{decl}: {m:?} does not name {needle:?}");
+        assert_rejects(decl, declared(decl), needle);
     }
 }
 

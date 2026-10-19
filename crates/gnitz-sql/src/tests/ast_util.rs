@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, parse_expr_sql, rejected};
+use crate::test_support::{assert_rejects, col, parse_expr_sql};
 use gnitz_wire::TypeCode;
 
 /// An aggregate is found wherever it is written outside a subquery's body — the
@@ -77,8 +77,7 @@ fn a_wildcard_expands_through_its_modifiers() {
         ("SELECT * RENAME (a AS x, a AS y) FROM t", "'a' twice"),
     ];
     for (sql, want) in refused {
-        let msg = rejected(expand_wildcard_item(&wildcard_item(sql), &cols, "SELECT"));
-        assert!(msg.contains(want), "{sql}: {msg}");
+        assert_rejects(sql, expand_wildcard_item(&wildcard_item(sql), &cols, "SELECT"), want);
     }
 }
 
