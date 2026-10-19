@@ -10,7 +10,6 @@ use crate::hir::ViewBody;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::source::StatementText;
-use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use gnitz_core::{GnitzClient, RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};
 use std::num::NonZeroU64;
@@ -244,7 +243,6 @@ fn plan_segments<'a>(
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
     props: ViewProps,
 ) -> Result<ViewBundle, GnitzSqlError> {
-    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
     let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
     let lowered = crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
     let definition = record_definition(text, &lowered)?;

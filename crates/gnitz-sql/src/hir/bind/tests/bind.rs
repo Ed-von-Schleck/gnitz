@@ -1,7 +1,6 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_stmt, rel, table, TestCatalog};
+use crate::test_support::{col, ncol, parse_query, rel, table, TestCatalog};
 use gnitz_wire::{RelClass, TypeCode};
-use sqlparser::ast::Statement;
 use std::rc::Rc;
 
 /// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)`,
@@ -32,145 +31,138 @@ fn catalog() -> TestCatalog {
     ])
 }
 
-/// Bind one `CREATE VIEW` body as a view binds it: its CTEs, then its query.
+/// Bind one view body as `CREATE VIEW` binds it.
 pub(in crate::hir) fn bound(sql: &str) -> Rc<RelExpr> {
-    let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
-        panic!("not a CREATE VIEW");
-    };
-    let cat = catalog();
-    let ids = ColIdGen::new();
-    let view = crate::hir::bind::ViewBody { stmt: "CREATE VIEW", replacing: None };
-    let mut cx = BindCx::new(&cat, &ids, view);
-    bind_ctes(&mut cx, &cv.query)
-        .and_then(|()| bind_query(&mut cx, &cv.query))
-        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+    let (cat, ids) = (catalog(), ColIdGen::new());
+    let mut cx = BindCx::new(&cat, &ids, ViewBody { stmt: "CREATE VIEW", replacing: None });
+    bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
 
-/// `(name, type, nullable)` of every output column — what a projection item's
-/// def declares, and what the view schema publishes.
-fn shape(sql: &str) -> Vec<(String, TypeCode, bool)> {
-    bound(sql)
-        .cols()
-        .iter()
-        .map(|c| (c.def.name.clone(), c.def.ty.tc, c.def.is_nullable))
-        .collect()
-}
-
-fn s(name: &str, tc: TypeCode, nullable: bool) -> (String, TypeCode, bool) {
-    (name.to_string(), tc, nullable)
-}
-
-/// A RIGHT join widens the left side's columns, and the projection resolves
-/// against that widened scope.
+/// Each output column's `(name, type, nullable)`, as the view schema publishes
+/// it. An outer join widens its null-supplying side in scope, and a USING keeps
+/// the preserved side's copy. A derived table's `AS d(col…)` names its columns
+/// through a join and a GROUP BY. A computed group key reads as computed, and an
+/// aggregate over a computed argument takes its default name and the argument's
+/// type, nullable because the pre-map column holding it is minted nullable.
 #[test]
-fn a_right_join_body_projects_the_widened_scope() {
-    assert_eq!(
-        shape("SELECT t.id, u.a FROM t RIGHT JOIN u ON t.a = u.a"),
-        vec![s("id", TypeCode::I64, true), s("a", TypeCode::I64, false)]
-    );
-}
-
-/// A derived table's `AS d(col…)` aliases rename its output columns — with and
-/// without a GROUP BY over them, which must agree.
-#[test]
-fn a_derived_tables_positional_aliases_name_the_projection() {
-    assert_eq!(
-        shape("SELECT x FROM (SELECT a FROM t) AS d(x)"),
-        vec![s("x", TypeCode::I64, false)]
-    );
-    assert_eq!(
-        shape("SELECT x, COUNT(*) AS n FROM (SELECT a FROM t) AS d(x) GROUP BY x"),
-        vec![s("x", TypeCode::I64, false), s("n", TypeCode::I64, false)]
-    );
-}
-
-/// A computed group key and a computed aggregate argument both land in the
-/// pre-map; the key reads as computed (it has no name the user wrote), the
-/// aggregate takes its own default name and typing.
-#[test]
-fn a_grouped_body_types_computed_keys_and_arguments() {
-    assert_eq!(
-        shape("SELECT a + 1, SUM(a * 2) FROM t GROUP BY a + 1"),
-        // The pre-map column holding `a * 2` is minted nullable (a computed value
-        // can be NULL), so the SUM over it carries a COUNT companion and its
-        // finalize is nullable.
-        vec![s("_expr0", TypeCode::I64, true), s("_sum1", TypeCode::I64, true)]
-    );
-}
-
-/// The bound body's reduce, under its HAVING filter if any: its input, and the
-/// physical op of each aggregate column.
-fn reduce_of(sql: &str) -> (Rc<RelExpr>, Vec<gnitz_wire::AggFunc>) {
-    let rel = bound(sql);
-    let RelExpr::Project { input, .. } = rel.as_ref() else {
-        panic!("{sql}: no projection")
-    };
-    let RelExpr::Reduce { input, aggs, .. } = crate::hir::split_filter(input).1.as_ref() else {
-        panic!("{sql}: no reduce")
-    };
-    (Rc::clone(input), aggs.iter().map(|c| c.op).collect())
-}
-
-/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`;
-/// every DISTINCT aggregate of one body rides that one set, HAVING's included.
-/// `MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so it needs no set, and neither
-/// does an argument that keeps the source's PK. Each row names the projection
-/// under the `Distinct` (`<computed>` for a materialized column), or `None`
-/// when the reduce reads its input directly.
-#[test]
-fn a_distinct_aggregate_reduces_over_one_distinct_input() {
+fn a_body_declares_its_output_columns() {
+    use TypeCode::{F64, I64};
     for (sql, want) in [
-        ("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a", Some(&["a", "b"][..])),
-        ("SELECT COUNT(DISTINCT b) FROM t", Some(&["b"])),
+        (
+            "SELECT t.id, u.a FROM t RIGHT JOIN u ON t.a = u.a",
+            &[("id", I64, true), ("a", I64, false)][..],
+        ),
+        (
+            "SELECT * FROM t RIGHT JOIN u USING (a)",
+            &[
+                ("id", I64, true),
+                ("b", I64, true),
+                ("f", F64, true),
+                ("uid", I64, false),
+                ("a", I64, false),
+            ],
+        ),
+        ("SELECT x FROM (SELECT a FROM t) AS d(x)", &[("x", I64, false)]),
+        (
+            "SELECT x, COUNT(*) AS n FROM (SELECT a FROM t) AS d(x) GROUP BY x",
+            &[("x", I64, false), ("n", I64, false)],
+        ),
+        (
+            "SELECT x, uid FROM u LEFT JOIN (SELECT a FROM t) AS d(x) ON x = u.a",
+            &[("x", I64, true), ("uid", I64, false)],
+        ),
+        (
+            "SELECT a + 1, SUM(a * 2) FROM t GROUP BY a + 1",
+            &[("_expr0", I64, true), ("_sum1", I64, true)],
+        ),
+        (
+            "SELECT a, SUM(f * 2) FROM t GROUP BY a",
+            &[("a", I64, false), ("_sum1", F64, true)],
+        ),
+    ] {
+        let cols = bound(sql).cols();
+        let got: Vec<_> = cols
+            .iter()
+            .map(|c| (c.def.name.as_str(), c.def.ty.tc, c.def.is_nullable))
+            .collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
+/// A grouped body's reduce: the set it reduces over, and its physical columns.
+/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`,
+/// and every DISTINCT aggregate of one body rides that one set, HAVING's
+/// included. `MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so it needs no set, and
+/// neither does an argument that keeps the source's PK. Aggregates computing one
+/// op over one argument share one column. The set names the projection under the
+/// `Distinct`, `<computed>` for a materialized column.
+#[test]
+fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
+    use gnitz_wire::AggFunc::{Count, CountNonNull, Max, Min, Sum};
+    for (sql, want_set, want_ops) in [
+        (
+            "SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a",
+            Some("a b"),
+            &[CountNonNull][..],
+        ),
+        ("SELECT COUNT(DISTINCT b) FROM t", Some("b"), &[CountNonNull]),
         (
             "SELECT COUNT(DISTINCT a + 1) FROM t GROUP BY b",
-            Some(&["b", "<computed>"]),
+            Some("b <computed>"),
+            &[CountNonNull],
         ),
         (
             "SELECT a, COUNT(DISTINCT b), SUM(DISTINCT b), MAX(DISTINCT b) FROM t GROUP BY a \
              HAVING COUNT(DISTINCT b) > 1",
-            Some(&["a", "b"]),
+            Some("a b"),
+            &[CountNonNull, Sum, Max],
         ),
-        ("SELECT a, MAX(DISTINCT b) FROM t GROUP BY a", None),
-        ("SELECT MIN(DISTINCT b), MAX(DISTINCT a) FROM t", None),
+        ("SELECT MIN(DISTINCT b), MAX(DISTINCT a) FROM t", None, &[Min, Max]),
         // Keeps company the all-or-nothing DISTINCT rule would otherwise refuse.
-        ("SELECT a, MAX(DISTINCT b), COUNT(*) FROM t GROUP BY a", None),
+        (
+            "SELECT a, MAX(DISTINCT b), COUNT(*) FROM t GROUP BY a",
+            None,
+            &[Max, Count],
+        ),
         // A float argument is no key here, because nothing hashes it.
-        ("SELECT MIN(DISTINCT f) FROM t", None),
-        ("SELECT a, COUNT(DISTINCT id) FROM t GROUP BY a", None),
+        ("SELECT MIN(DISTINCT f) FROM t", None, &[Min]),
+        ("SELECT a, COUNT(DISTINCT id) FROM t GROUP BY a", None, &[Count]),
+        // Over a nullable `b`, SUM's companion, AVG's two columns and COUNT(b) are
+        // one `Sum(b)` and one `CountNonNull(b)`; an inert DISTINCT is one `Max(b)`.
+        (
+            "SELECT SUM(b), AVG(b), COUNT(b) FROM t GROUP BY a",
+            None,
+            &[Sum, CountNonNull],
+        ),
+        ("SELECT a, MAX(DISTINCT b), MAX(b) FROM t GROUP BY a", None, &[Max]),
     ] {
-        let (input, _) = reduce_of(sql);
-        let got = match input.as_ref() {
+        let rel = bound(sql);
+        let RelExpr::Project { input, .. } = rel.as_ref() else {
+            panic!("{sql}: no projection")
+        };
+        let RelExpr::Reduce { input, aggs, .. } = crate::hir::split_filter(input).1.as_ref() else {
+            panic!("{sql}: no reduce")
+        };
+        let set = match input.as_ref() {
             RelExpr::Distinct { input } => {
                 let RelExpr::Project { items, .. } = input.as_ref() else {
                     panic!("{sql}: no distinct projection")
                 };
-                let names = items.iter().map(|e| match e.out.def.is_hidden {
-                    true => "<computed>",
-                    false => e.out.def.name.as_str(),
-                });
-                Some(names.collect::<Vec<_>>())
+                let names: Vec<&str> = items
+                    .iter()
+                    .map(|e| {
+                        if e.out.def.is_hidden {
+                            "<computed>"
+                        } else {
+                            e.out.def.name.as_str()
+                        }
+                    })
+                    .collect();
+                Some(names.join(" "))
             }
             _ => None,
         };
-        assert_eq!(got.as_deref(), want, "{sql}");
-    }
-}
-
-/// Aggregates of one reduce computing the same op over the same argument share
-/// one physical column: over a nullable `b`, SUM's companion, AVG's two columns
-/// and COUNT(b) are the one `Sum(b)` and the one `CountNonNull(b)`; a MAX with
-/// and without an inert DISTINCT is one `Max(b)`.
-#[test]
-fn aggregates_of_one_reduce_share_their_physical_columns() {
-    use gnitz_wire::AggFunc::{CountNonNull, Max, Sum};
-    for (sql, want) in [
-        (
-            "SELECT SUM(b), AVG(b), COUNT(b) FROM t GROUP BY a",
-            &[Sum, CountNonNull][..],
-        ),
-        ("SELECT a, MAX(DISTINCT b), MAX(b) FROM t GROUP BY a", &[Max]),
-    ] {
-        assert_eq!(reduce_of(sql).1, want, "{sql}");
+        assert_eq!(set.as_deref(), want_set, "{sql}");
+        assert_eq!(aggs.iter().map(|c| c.op).collect::<Vec<_>>(), want_ops, "{sql}");
     }
 }

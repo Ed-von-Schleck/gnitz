@@ -41,7 +41,7 @@ pub(crate) struct LoweredView {
     pub(crate) body_columns: Vec<String>,
 }
 
-/// The one compiler core: bind a query — its CTEs, then its body — to one
+/// The one compiler core: bind a query — its envelope, its CTEs, then its body — to one
 /// `RelExpr` tree, and lower it to its segments and view. A CTE is a subtree of that
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
@@ -55,7 +55,6 @@ pub(crate) fn bind_and_lower<'a>(
     let ids = ColIdGen::new();
     let stmt = view.stmt;
     let mut cx = bind::BindCx::new(cat, &ids, view);
-    bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
     let mut names = rel.cols();
     let body_columns = names

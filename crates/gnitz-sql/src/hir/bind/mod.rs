@@ -32,7 +32,8 @@ use crate::ir::{BExpr, BoundExpr, LeafTyping, BOOL};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
-    cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses,
+    cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_query_clauses,
+    reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
 };
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColType, ColumnDef};
@@ -303,16 +304,21 @@ impl<'a> QueryTail<'a> {
     }
 }
 
-/// Bind a whole query: its body, then the `ORDER BY … LIMIT` tail as a top-N over
-/// it. A SELECT body places the keys in its own scope; any other body orders by
-/// its output columns.
+/// Bind a whole view query: its envelope checked, its CTEs, its body, then the
+/// `ORDER BY … LIMIT` tail as a top-N over it. A SELECT body places the keys in
+/// its own scope; any other body orders by its output columns.
 pub(crate) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, cx.view.stmt)?;
+    bind_ctes(cx, query)?;
     let tail = QueryTail::parse(query, cx.view.stmt)?;
     match (query.body.as_ref(), tail) {
         (SetExpr::Select(select), tail) => {
             let order_exprs: Vec<&Expr> = tail.as_ref().map(QueryTail::exprs).unwrap_or_default();
             let (rel, placed) = bind_select(cx, select, &order_exprs)?;
-            wrap_tail(tail.as_ref(), rel, &placed)
+            match tail {
+                Some(t) => t.wrap(rel, &placed),
+                None => Ok(rel),
+            }
         }
         (body, None) => bind_body(cx, body),
         (body, Some(tail)) => {
@@ -478,15 +484,6 @@ struct BodyShape {
     surface: Surface,
     grouped: bool,
     distinct: bool,
-}
-
-/// Wrap `rel` in `tail`'s top-N, `placed` being the output slot of each of its
-/// expression keys. The one place a bound body becomes a maintained window.
-fn wrap_tail(tail: Option<&QueryTail<'_>>, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    match tail {
-        Some(t) => t.wrap(rel, placed),
-        None => Ok(rel),
-    }
 }
 
 /// WHERE, then the projection in whichever shape the body carries — the tail

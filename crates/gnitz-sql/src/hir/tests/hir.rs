@@ -1,4 +1,5 @@
 use super::*;
+use crate::hir::bind::tests::bound;
 
 /// A differing set-op pair promotes on the join-key ladder, and only to a target
 /// a column copy can widen into.
@@ -83,7 +84,7 @@ fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
         ("WITH c AS (SELECT id, a FROM t) SELECT x.id, y.id AS y FROM c x JOIN c y ON x.a = y.id", Some("id")),
     ];
     for (sql, want) in cases {
-        let rel = crate::hir::bind::tests::bound(sql);
+        let rel = bound(sql);
         let cols = rel.cols();
         let key = rel.unique_key().map(|k| {
             let names: Vec<&str> = k.iter().map(|&id| hircol_of(&cols, id).def.name.as_str()).collect();
