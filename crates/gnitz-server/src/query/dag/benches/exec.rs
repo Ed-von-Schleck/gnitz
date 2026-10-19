@@ -76,8 +76,7 @@ fn drive_tick_bench() {
 
 /// Ticks of a worker beside three others, through views that exchange: a
 /// `GROUP BY`, a global `COUNT(*)` and a hash-keyed `DISTINCT`, per step over
-/// one row and per row of a wide tick; then wide ticks of a source eight
-/// projections read.
+/// one row and per row of a wide tick.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn drive_round_bench() {
@@ -166,24 +165,5 @@ fn drive_round_bench() {
     println!(
         "{steps}-round {WIDE_TICK_ROWS}-row tick: {:>6.1} instr/row",
         wide_instr as f64 / (WIDE_TICKS * WIDE_TICK_ROWS) as f64
-    );
-
-    let mut engine = crate::catalog::CatalogEngine::open(&scratch_dir("dag_exec", "round_bench_fanout"), 1).unwrap();
-    let base = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let narrow = vec![col_def("id", TypeCode::U64), col_def("b", TypeCode::I64)];
-    for r in 0..8 {
-        let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(base, ReadBound::None);
-        circuit.map(scan, &[2]);
-        try_register_view(&mut engine, circuit, &format!("p{r}"), &narrow, 0, 0).unwrap();
-    }
-    tick_over(&mut engine, base, None);
-    let wide: Vec<Batch> = (0..WIDE_TICKS)
-        .map(|t| delta(&engine, base, t * WIDE_TICK_ROWS..(t + 1) * WIDE_TICK_ROWS))
-        .collect();
-    let ((), instr) = counter.measure(|| wide.into_iter().for_each(|d| tick_over(&mut engine, base, d)));
-    println!(
-        "{WIDE_TICK_ROWS}-row tick, source read by 8 projections: {:>6.1} instr/row",
-        instr as f64 / (WIDE_TICKS * WIDE_TICK_ROWS) as f64
     );
 }

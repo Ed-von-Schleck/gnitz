@@ -198,13 +198,7 @@ impl<'a> EmitCtx<'a> {
         if let Some(Integral::Own(trace)) = self.integrals[of] {
             return trace;
         }
-        self.integrated_child("int", of, reg)
-    }
-
-    /// A child store of `reg`'s schema, declared under `kind` and node `nid`, that
-    /// `reg` is integrated into.
-    fn integrated_child(&mut self, kind: &str, nid: NodeId, reg: DeltaReg) -> StateIdx {
-        let trace = self.declare_child(kind, nid, self.prog.schema_of(reg));
+        let trace = self.declare_child("int", of, self.prog.schema_of(reg));
         self.prog.integrate(reg, trace);
         trace
     }
@@ -273,7 +267,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             let schema = ctx.prog.schema_of(in_reg);
             let hist = match ctx.source_history(in_reg) {
                 Some(terms) => ClampHistory::Sources(terms),
-                None => ClampHistory::Own(ctx.integrated_child("hist", nid, in_reg)),
+                None => ClampHistory::Own(ctx.declare_child("hist", nid, schema)),
             };
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
@@ -456,11 +450,7 @@ fn push_reduce(
         .index_schema()
         .map(|schema| ctx.declare_child(index_kind, nid, *schema));
     let plan = Box::new(plan);
-    let out = ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan });
-    if let Integral::Own(trace) = out_trace {
-        ctx.prog.integrate(out, trace);
-    }
-    out
+    ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, index, plan })
 }
 
 /// Declare `plan`'s index — every input row in order, the operator's whole

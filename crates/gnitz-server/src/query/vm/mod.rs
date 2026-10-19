@@ -16,10 +16,6 @@ use gnitz_zset::stream;
 mod builder;
 mod exec;
 
-#[cfg(test)]
-#[path = "tests/fixtures.rs"]
-mod fixtures;
-
 pub(in crate::query) use builder::ProgramBuilder;
 pub(in crate::query) use exec::{mint_ground_rows, replay_chunk, run, Epoch, Ran, Stores};
 

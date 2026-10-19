@@ -63,7 +63,9 @@ impl ProgramBuilder {
         self.push(in_reg, self.schema_of(in_reg), Op::Round { plan, seeds })
     }
 
-    /// Accumulate `reg` into `trace` after every instruction of each epoch.
+    /// Accumulate `reg` into `trace` after every instruction of each epoch: a
+    /// join's integrand. A reduce's own output trace and a clamp's own history
+    /// are named by their operator, and [`Self::finish`] integrates them.
     pub(in crate::query) fn integrate(&mut self, reg: DeltaReg, trace: StateIdx) {
         self.integrates.push((reg, trace));
     }
@@ -82,11 +84,18 @@ impl ProgramBuilder {
     pub(in crate::query) fn finish(self, out_reg: DeltaReg) -> Vm {
         let ProgramBuilder {
             instructions,
-            integrates,
+            mut integrates,
             schemas,
             layout,
             ..
         } = self;
+        for instr in &instructions {
+            match &instr.op {
+                Op::Reduce { out_trace: Integral::Own(trace), .. } => integrates.push((instr.out_reg, *trace)),
+                Op::WeightClamp { hist: ClampHistory::Own(hist), .. } => integrates.push((instr.in_reg, *hist)),
+                _ => {}
+            }
+        }
 
         // Over the emitted instructions, which already name the register an
         // elided node's readers read.
