@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ee61246e098accb87c672dbf9fb3f367c7abf0d55dfe8164ddf4244332270652 # shrinks to (kind, delta_is_right, (d_pk, t_pk), (d_pay, d_wide), (t_pay, t_wide)) = (Cross, false, ([U8], [U8]), (U8, false), (U8, false)), (delta_rows, trace_rows) = ([([Some(0), Some(0), Some(0)], 4294967296, 0)], [([Some(0), Some(0), Some(0)], 4294967296, 0)])
